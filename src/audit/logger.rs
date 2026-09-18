@@ -190,6 +190,20 @@ impl AuditLogger {
             return Ok(());
         }
 
+        // sprinter f4f5d450e816: `[audit] capture_application_name` has existed
+        // as a flag since the audit layer landed, but nothing ever populated the
+        // field — there was no `application_name` to capture. Now that the GUC
+        // is real, fill it from the backend running THIS statement (the
+        // per-statement thread-local the session entry point installed). An
+        // explicit value already on the metadata wins; an empty
+        // `application_name` stays `None` rather than becoming `Some("")`.
+        let mut metadata = metadata;
+        if self.config.capture_metadata.capture_application_name && metadata.application_name.is_none() {
+            metadata.application_name = crate::session_scoped_state_tls()
+                .map(|state| state.application_name())
+                .filter(|name| !name.is_empty());
+        }
+
         // Get next event ID
         let id = {
             let mut next_id = self.next_id.write();

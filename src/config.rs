@@ -1974,6 +1974,18 @@ pub struct ResourceQuotaConfig {
     pub max_concurrent_queries: u32,
     /// Query execution timeout in seconds (default: 300 = 5 minutes)
     pub query_timeout_secs: u64,
+    /// Length of the per-tenant QPS window in milliseconds (default: 1000).
+    ///
+    /// F3 (sprinter c837352dabef): a tenant's `max_qps` is the budget for ONE
+    /// window, and this is how long that window lasts. It used to be implicit —
+    /// `TenantManager::reset_qps_window` had to be driven by a caller at the
+    /// intended cadence, and no caller existed anywhere in the tree, so
+    /// `queries_this_window` only ever climbed and `max_qps` behaved as a
+    /// LIFETIME quota: a tenant got `max_qps` statements for the life of the
+    /// process and was refused forever after. The window is now evaluated
+    /// lazily against this length on every quota check, so it holds on the
+    /// embedded/library path too (no tokio runtime, no background task).
+    pub tenant_qps_window_ms: u64,
 }
 
 impl Default for ResourceQuotaConfig {
@@ -1982,6 +1994,9 @@ impl Default for ResourceQuotaConfig {
             memory_limit_per_user_mb: 1024,
             max_concurrent_queries: 100,
             query_timeout_secs: 300,
+            // 1 second: the cadence `start_qps_reset_task` always used, so a
+            // deployment that relied on that task sees identical behavior.
+            tenant_qps_window_ms: 1000,
         }
     }
 }
@@ -2002,6 +2017,13 @@ impl ResourceQuotaConfig {
         if self.query_timeout_secs < 1 {
             return Err(crate::Error::config(
                 "resource_quotas.query_timeout_secs must be at least 1 second",
+            ));
+        }
+        // F3: a zero-length window would roll on every single check, which
+        // makes `max_qps` unenforceable (every query starts a fresh budget).
+        if self.tenant_qps_window_ms < 1 {
+            return Err(crate::Error::config(
+                "resource_quotas.tenant_qps_window_ms must be at least 1 millisecond",
             ));
         }
         Ok(())

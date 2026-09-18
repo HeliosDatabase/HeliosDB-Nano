@@ -91,6 +91,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         } else if let Some((schema, plan, epoch)) = self.shared_query_schema(&statement, &query) {
             (Some(schema), Some(plan), epoch)
         } else {
+            // KNOWN DIVERGENCE, deliberately left here (sprinter 84ac05bd69c4).
+            //
+            // This swallow also catches the `RETURNING`-list refusals
+            // (`ReturningProjection::bind`: 42703 for a column the target table
+            // does not have, 42803 / 42P20 for an aggregate or window call in
+            // the list). PostgreSQL raises all three during PARSE — its
+            // `exec_parse_message` runs full parse analysis
+            // (`parse_analyze_varparams` → `transformInsertStmt` /
+            // `transformUpdateStmt` / `transformDeleteStmt` →
+            // `transformReturningList`, `EXPR_KIND_RETURNING`) — so the client
+            // gets an ErrorResponse instead of ParseComplete and never reaches
+            // Bind. Nano instead answers ParseComplete + `NoData` (DML
+            // synthesises no AST schema) and refuses at EXECUTE.
+            //
+            // It is still FAIL-CLOSED: every executor family binds the
+            // RETURNING list before its first write, so nothing is written and
+            // no NULL column is ever invented — the client is simply told one
+            // round trip late. `wire_tests::
+            // gh23_c3_returning_aggregate_and_window_are_refused_with_zero_rows_written`
+            // pins that Execute-time timing for the 42803 / 42P20 siblings, so
+            // moving 42703 alone would leave the three inconsistent; the fix is
+            // to move ALL THREE together (and rework `gh23_c2_extended`, which
+            // asserts "Parse/Bind/Describe must not fail"). Filed separately
+            // rather than smuggled in here.
             let schema = match self.derive_result_schema(&statement) {
                 Ok(schema) => schema,
                 Err(e) => {
@@ -235,6 +259,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // delegate so psycopg3 / JDBC / sqlx / node-postgres get the same
         // answer as psql instead of the params planner's error.
         let is_timeout_guc = crate::EmbeddedDatabase::is_timeout_guc_statement(trimmed_query);
+        // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET application_name`.
+        // The engine would honour it on this path anyway (the session
+        // interceptor runs inside `execute_params_for_session`), but delegating
+        // to the simple-query arm is what makes the extended protocol emit the
+        // same GUC_REPORT `ParameterStatus` psql gets — the thing a driver reads
+        // to learn the value stuck. `SHOW` is excluded: it is answered below
+        // under the portal's own wire plan, which already sent a RowDescription.
+        let is_application_name_set = crate::EmbeddedDatabase::is_application_name_statement(trimmed_query)
+            && !super::handler::starts_with_icase(trimmed_query, "SHOW");
         // HDB-008: `ROLLBACK TO SAVEPOINT` is not a transaction BOUNDARY, so it
         // is normally executed as an ordinary statement — but inside an ABORTED
         // block the `transaction_failed()` guard below refuses it before the
@@ -246,7 +279,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         let is_failed_savepoint_recovery = self.transaction_failed()
             && super::handler::classify_transaction_control(trimmed_query)
                 == Some(super::handler::TxnControl::RollbackToSavepoint);
-        if is_transaction_control || is_set_role || is_timeout_guc || is_failed_savepoint_recovery {
+        if is_transaction_control
+            || is_set_role
+            || is_timeout_guc
+            || is_application_name_set
+            || is_failed_savepoint_recovery
+        {
             let previous_suppress_ready = self.suppress_ready_for_query;
             self.suppress_ready_for_query = true;
             let result = self.handle_single_query(&statement.query).await;

@@ -239,7 +239,7 @@ pub struct Session {
     pub login_user: Option<String>,
     /// HDB-009: the same login name as [`Self::login_user`], pre-interned as an
     /// `Arc<str>` so the per-statement SQL-identity guard
-    /// (`EmbeddedDatabase::session_login_user_override_guard`) can install it
+    /// (`EmbeddedDatabase::session_statement_context_guard`) can install it
     /// with one atomic increment instead of allocating and copying the name on
     /// every statement of every wire connection. Always written together with
     /// `login_user` by [`Self::set_login`], the single writer of both.
@@ -252,6 +252,17 @@ pub struct Session {
     /// GH#28: per-session `SET idle_in_transaction_session_timeout` override
     /// in milliseconds (`None` = inherit the listener policy).
     pub idle_in_transaction_session_timeout_ms: Option<u64>,
+    /// sprinter 6dc0cc115db9 + f4f5d450e816: the slice of this session's state
+    /// that the STORAGE-LESS, SESSION-LESS expression evaluator must reach —
+    /// `lastval()`, `pg_backend_pid()` and `application_name`.
+    ///
+    /// An `Arc` rather than plain fields because two of the three are WRITTEN
+    /// from inside statement execution (`nextval()` and the SERIAL/IDENTITY
+    /// fill both land on `lastval`), so the per-statement guard installs a
+    /// clone of the HANDLE — one atomic increment — instead of a snapshot of
+    /// the values. See `crate::session::scoped` for why this must never be a
+    /// process global.
+    pub scoped: std::sync::Arc<super::scoped::SessionScopedState>,
     /// Active transaction ID (None if no transaction in progress)
     pub active_txn: Option<u64>,
     /// Session creation timestamp (Unix epoch seconds)
@@ -282,6 +293,10 @@ impl Session {
             login_identity: None,
             idle_session_timeout_ms: None,
             idle_in_transaction_session_timeout_ms: None,
+            // Minting this registers a live backend in
+            // `scoped::live_backends()` (the `pg_stat_activity` source) and
+            // deregisters it when the last handle drops.
+            scoped: super::scoped::SessionScopedState::new(),
             active_txn: None,
             created_at: now,
             last_activity: now,
@@ -323,6 +338,11 @@ impl Session {
             (!name.is_empty()).then_some(name)
         });
         self.login_identity = published.as_deref().map(std::sync::Arc::<str>::from);
+        // sprinter f4f5d450e816: republish onto the scoped state so
+        // `pg_stat_activity.usename` reports the same name `current_user` does.
+        // Routed through the ONE writer of the session identity so the view and
+        // the scalar cannot drift.
+        self.scoped.set_username(published.as_deref().unwrap_or(""));
         self.login_user = published;
     }
 

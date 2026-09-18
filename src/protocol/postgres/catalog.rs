@@ -1449,10 +1449,18 @@ impl PgCatalog {
                         continue;
                     }
                 }
+                // sprinter cec8ab163448: `relhasindex` gates psql's follow-up
+                // query — with `f` here psql prints the column list and never
+                // ASKS for the index list, so a table whose only index is an
+                // HNSW one (or a manual `CREATE INDEX`) showed no "Indexes:"
+                // section no matter what the index-list branch below answered.
+                // Count every registry, not just PK/UNIQUE columns.
                 let has_index = catalog
                     .get_table_schema(name)
                     .map(|s| s.columns.iter().any(|c| c.primary_key || c.unique))
-                    .unwrap_or(false);
+                    .unwrap_or(false)
+                    || !Self::manual_art_indexes_for(db, name).is_empty()
+                    || !Self::vector_indexes_for(db, name).is_empty();
                 rows.push(Tuple::new(vec![
                     Value::Int2(0),               // relchecks
                     Value::String("r".into()),    // relkind = ordinary table
@@ -1641,6 +1649,55 @@ impl PgCatalog {
                         }
                     }
                 }
+
+                // sprinter cec8ab163448 — the two index kinds this shape used
+                // to have no source for. Everything above is derived from the
+                // table SCHEMA (primary_key / unique column flags), so an index
+                // that exists only in an index registry — a manual
+                // `CREATE INDEX`, and above all a `CREATE INDEX … USING HNSW`
+                // — was reported as not existing: `\d items` showed the vector
+                // column and no "Indexes:" line at all.
+                //
+                // `constraintdef` is NULL and `contype` empty for both: neither
+                // backs a constraint, which is exactly what psql's LEFT JOIN to
+                // pg_constraint yields for a plain index.
+                for (index_name, columns) in Self::manual_art_indexes_for(db, name) {
+                    rows.push(Tuple::new(vec![
+                        Value::String(index_name.clone()),
+                        Value::Boolean(false), // indisprimary
+                        Value::Boolean(false), // indisunique
+                        Value::Boolean(false), // indisclustered
+                        Value::Boolean(true),  // indisvalid
+                        Value::String(format!(
+                            "CREATE INDEX {} ON public.{} USING btree ({})",
+                            index_name,
+                            name,
+                            columns.join(", ")
+                        )),
+                        Value::Null, // constraintdef — a plain index backs no constraint
+                        Value::Null, // contype (psql only reads it when indisunique is true)
+                        Value::Boolean(false),
+                        Value::Boolean(false),
+                        Value::Boolean(false),
+                        Value::Int4(0),
+                    ]));
+                }
+                for metadata in Self::vector_indexes_for(db, name) {
+                    rows.push(Tuple::new(vec![
+                        Value::String(metadata.name.clone()),
+                        Value::Boolean(false), // indisprimary
+                        Value::Boolean(false), // indisunique — HNSW is approximate
+                        Value::Boolean(false), // indisclustered
+                        Value::Boolean(true),  // indisvalid
+                        Value::String(crate::sql::phase3::system_views::vector_indexdef(&metadata)),
+                        Value::Null, // constraintdef — a plain index backs no constraint
+                        Value::Null, // contype (psql only reads it when indisunique is true)
+                        Value::Boolean(false),
+                        Value::Boolean(false),
+                        Value::Boolean(false),
+                        Value::Int4(0),
+                    ]));
+                }
             }
             return Ok(Some((schema, rows)));
         }
@@ -1682,11 +1739,76 @@ impl PgCatalog {
                         }
                     }
                 }
+
+                // sprinter cec8ab163448: same omission as the `\d <table>`
+                // index list above — this loop only ever read the table
+                // SCHEMA, so `\di` listed PK and UNIQUE indexes and nothing
+                // from either index registry. A `CREATE INDEX … USING HNSW`
+                // index was invisible to the one meta-command whose entire job
+                // is "list the indexes".
+                for (index_name, _columns) in Self::manual_art_indexes_for(db, &name) {
+                    rows.push(Tuple::new(vec![
+                        Value::String("public".into()),
+                        Value::String(index_name),
+                        Value::String("index".into()),
+                        Value::String("heliosdb".into()),
+                        Value::String(name.clone()),
+                    ]));
+                }
+                for metadata in Self::vector_indexes_for(db, &name) {
+                    rows.push(Tuple::new(vec![
+                        Value::String("public".into()),
+                        Value::String(metadata.name),
+                        Value::String("index".into()),
+                        Value::String("heliosdb".into()),
+                        Value::String(name.clone()),
+                    ]));
+                }
             }
             return Ok(Some((schema, rows)));
         }
 
         Ok(None)
+    }
+
+    /// sprinter cec8ab163448 — every USER-CREATED btree index on `table`, as
+    /// `(index name, indexed columns)`.
+    ///
+    /// `PrimaryKey` / `Unique` / `ForeignKey` ART entries are skipped: the
+    /// psql shapes below already synthesise the first two from the table
+    /// schema (and would list them twice), and PostgreSQL has no index row for
+    /// a bare foreign key. Sorted by name so `\d` output is stable.
+    fn manual_art_indexes_for(db: &EmbeddedDatabase, table: &str) -> Vec<(String, Vec<String>)> {
+        let mut found: Vec<(String, Vec<String>)> = db
+            .storage
+            .art_indexes()
+            .list_indexes()
+            .into_iter()
+            .filter(|(_, index_table, index_type, _)| {
+                *index_type == crate::storage::ArtIndexType::Manual && index_table.eq_ignore_ascii_case(table)
+            })
+            .map(|(name, _, _, columns)| (name, columns))
+            .collect();
+        found.sort_by(|left, right| left.0.cmp(&right.0));
+        found
+    }
+
+    /// sprinter cec8ab163448 — every HNSW/vector index on `table`.
+    ///
+    /// These live in a DIFFERENT registry from the ART indexes above
+    /// (`storage.vector_indexes()`), which is the whole reason psql reported
+    /// that a `CREATE INDEX … USING HNSW` index did not exist: every psql
+    /// shape in this file derived its index list from the table schema alone.
+    fn vector_indexes_for(db: &EmbeddedDatabase, table: &str) -> Vec<crate::storage::VectorIndexMetadata> {
+        let mut found: Vec<crate::storage::VectorIndexMetadata> = db
+            .storage
+            .vector_indexes()
+            .list_all_metadata()
+            .into_iter()
+            .filter(|metadata| metadata.table_name.eq_ignore_ascii_case(table))
+            .collect();
+        found.sort_by(|left, right| left.name.cmp(&right.name));
+        found
     }
 
     /// Extract the table OID literal from psql's

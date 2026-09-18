@@ -920,17 +920,34 @@ fn decode_binary_param(payload: &mut Bytes, mysql_type: u8, unsigned: bool) -> R
 // Case-insensitive prefix check (same helper as PG handler)
 // ============================================================================
 
-/// Split SQL on semicolons, but only OUTSIDE single-quoted string literals.
-/// This prevents splitting serialized PHP data like 'a:1:{s:13:"admin";b:1;}'.
+/// Split SQL on semicolons, but only OUTSIDE quoted regions.
+///
+/// Two regions, and both of them matter:
+///
+/// * A single-quoted string literal, so serialized PHP data like
+///   `'a:1:{s:13:"admin";b:1;}'` is not split.
+/// * A double-quoted IDENTIFIER — sprinter ecc77a75df2b. The translator now
+///   renders a backtick-quoted name that is not a plain identifier as
+///   `"…"` rather than splicing it bare, so a name carrying `;` arrives here
+///   inside quotes. Splitting on that `;` would hand the tail straight back to
+///   the executor as its own statement and undo the fix: the whole point is
+///   that a NAME can never become a second statement. A `""` inside is an
+///   escaped quote, not a close; a backslash is not an escape in an
+///   identifier, so that arm stays single-quote-only.
+///
+/// The PostgreSQL twin this is documented as mirroring
+/// (`pg_split_sql_respecting_quotes`) already tracked both regions; only this
+/// one did not.
 fn split_sql_respecting_quotes(sql: &str) -> Vec<String> {
     let mut statements = Vec::new();
     let mut current = String::new();
     let mut in_single_quote = false;
+    let mut in_double_quote = false;
     let mut chars = sql.chars().peekable();
 
     while let Some(ch) = chars.next() {
         match ch {
-            '\'' if !in_single_quote => {
+            '\'' if !in_single_quote && !in_double_quote => {
                 in_single_quote = true;
                 current.push(ch);
             }
@@ -943,6 +960,19 @@ fn split_sql_respecting_quotes(sql: &str) -> Vec<String> {
                     in_single_quote = false;
                 }
             }
+            '"' if !in_single_quote && !in_double_quote => {
+                in_double_quote = true;
+                current.push(ch);
+            }
+            '"' if in_double_quote => {
+                current.push(ch);
+                // Check for an escaped quote ("") inside the identifier
+                if chars.peek() == Some(&'"') {
+                    current.push(chars.next().unwrap_or('"'));
+                } else {
+                    in_double_quote = false;
+                }
+            }
             '\\' if in_single_quote => {
                 // Backslash escape inside string — push both chars
                 current.push(ch);
@@ -950,7 +980,7 @@ fn split_sql_respecting_quotes(sql: &str) -> Vec<String> {
                     current.push(next);
                 }
             }
-            ';' if !in_single_quote => {
+            ';' if !in_single_quote && !in_double_quote => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
                     statements.push(trimmed);
@@ -1581,6 +1611,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let trimmed = sql.trim();
         if trimmed.is_empty() {
             return self.send_ok(0, 0).await;
+        }
+
+        // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET application_name`
+        // must actually take effect. The blanket `SET` acknowledgement below
+        // answers OK to EVERY `SET` this listener sees and applies none of them,
+        // so a PHP/WordPress client that tagged its connection was told the tag
+        // stuck while `current_setting('application_name')` stayed empty.
+        // (The blanket ack is a broader pre-existing gap — it also swallows
+        // GH#28's `SET idle_session_timeout` on COM_QUERY — but widening it is
+        // not this item's business; only the GUC these items own is routed.)
+        if (starts_with_icase(trimmed, "SET ") || starts_with_icase(trimmed, "RESET "))
+            && EmbeddedDatabase::is_application_name_statement(trimmed)
+        {
+            return match self
+                .database
+                .try_handle_session_application_name(self.session_id, trimmed)
+            {
+                Ok(_) => self.send_ok(0, 0).await,
+                Err(e) => self.send_error(1064, "42000", &e.to_string()).await,
+            };
         }
 
         // ---- SET (session variables) — acknowledge silently ----

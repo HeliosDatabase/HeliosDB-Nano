@@ -43,7 +43,9 @@
 //! ```
 
 mod manager;
+pub mod scoped;
 mod types;
 
 pub use manager::{ResourceQuota, SessionManager};
+pub use scoped::{BackendSnapshot, SessionScopedState};
 pub use types::{IsolationLevel, Session, SessionId, SessionStats, User, UserId};

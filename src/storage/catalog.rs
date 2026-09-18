@@ -2847,6 +2847,9 @@ impl<'a> Catalog<'a> {
         self.storage.invalidate_table_constraints_cache(old);
         self.storage.clear_referencing_fk_cache();
 
+        // The INBOUND half: every OTHER table's foreign keys that name `old`.
+        self.move_inbound_foreign_keys(old, new)?;
+
         // IDENTITY-column side record.
         let identity = self.list_identity_columns(old)?;
         if !identity.is_empty() {
@@ -2889,6 +2892,62 @@ impl<'a> Catalog<'a> {
                 .map_err(|e| Error::query_execution(format!("partition-child serialize: {e}")))?;
             self.storage.put(&Self::partition_children_key(new), &value)?;
             self.storage.delete(&Self::partition_children_key(old))?;
+        }
+        Ok(())
+    }
+
+    /// Repoint every OTHER table's INBOUND foreign keys from `old` to `new`.
+    ///
+    /// # sprinter 6d501be6013f
+    ///
+    /// [`Self::move_table_side_records`] above rewrites the `references_table`
+    /// of the MOVED table's own constraint record — the SELF-reference case,
+    /// and only that one, because it loads exactly one record:
+    /// `load_table_constraints(old)`. A foreign key lives on the CHILD, in
+    /// `table_constraints:{child}`, so `ALTER TABLE parent RENAME TO parent2`
+    /// left every child of `parent` naming a relation that no longer exists.
+    ///
+    /// That is not a dormant inconsistency, it BREAKS THE CHILD: the write-path
+    /// probe `check_referencing_rows_exist(&fk.references_table, …)` finds no
+    /// ART index under the old name (the rename moved those with the table),
+    /// falls through to its slow path, and fails on
+    /// `catalog.get_table_schema(old)`. Every INSERT into the child — valid
+    /// parent or not — then errors with a missing-table diagnostic, and the
+    /// cascade direction is blind the same way: nothing lists the child as
+    /// referencing `parent2`, so `DROP`/`DELETE` on the parent stops cascading.
+    /// PostgreSQL has nothing to rewrite here — `pg_constraint.confrelid` is an
+    /// OID and a rename does not change it.
+    ///
+    /// DURABLE and cache-correct: `save_table_constraints` writes the record,
+    /// logs it to the logical WAL, refreshes that table's constraint cache and
+    /// clears the reverse-FK cache, so the fix survives a reopen and is visible
+    /// to the very next statement. Only records that actually change are
+    /// rewritten, so a rename in a database with many tables costs reads.
+    ///
+    /// Reached from `move_table_side_records`, which is exactly the right call
+    /// set: plain `ALTER TABLE … RENAME TO`, `ALTER TABLE … SET SCHEMA` (a
+    /// rename onto a new storage key) and WAL replay all go through it, while
+    /// the CONCURRENT MV-refresh swap (`rename_table_data_swap`) deliberately
+    /// does not — there the row set moves under a STABLE name, so an inbound
+    /// foreign key must keep naming that name.
+    fn move_inbound_foreign_keys(&self, old: &str, new: &str) -> Result<()> {
+        for table in self.list_tables()? {
+            // The moved table's own record was handled by the caller (and by
+            // this point it lives under `new`, not `old`).
+            if table == old || table == new {
+                continue;
+            }
+            let mut constraints = self.load_table_constraints(&table)?;
+            let mut changed = false;
+            for fk in constraints.foreign_keys.iter_mut() {
+                if fk.references_table == old {
+                    fk.references_table = new.to_string();
+                    changed = true;
+                }
+            }
+            if changed {
+                self.save_table_constraints(&table, &constraints)?;
+            }
         }
         Ok(())
     }
@@ -2946,19 +3005,160 @@ impl<'a> Catalog<'a> {
         self.storage.delete(&key)
     }
 
-    /// The PRIMARY KEY columns of `table` (its declared key, in column order),
+    /// The PRIMARY KEY columns of `table` **in the order the key was DECLARED**,
     /// or an empty Vec if it has none. `table` must be a resolved storage key
     /// (schema-qualified when non-`public`). Used to default a foreign key's
     /// referenced-column list when the `REFERENCES parent` clause omits it —
     /// PostgreSQL parity: `REFERENCES parent` binds to `parent`'s primary key.
+    ///
+    /// # sprinter b9aa53f0e6ca — declared order, not schema order
+    ///
+    /// This used to read the per-column `primary_key` FLAG off the schema, which
+    /// only records WHICH columns are in the key, never their POSITION in it. A
+    /// `CREATE TABLE t (a INT, b INT, PRIMARY KEY (b, a))` therefore defaulted a
+    /// list-less `FOREIGN KEY (x, y) REFERENCES t` to `(a, b)` — SCHEMA order —
+    /// where PostgreSQL binds `(b, a)`, the CONSTRAINT's order. The referenced
+    /// list is positional everywhere downstream (`check_referencing_rows_exist`
+    /// zips `references_columns` against the child's probe values), so the
+    /// transposed default silently bound `x→a, y→b`: a composite key checked
+    /// against the wrong columns, with no error on either side.
+    ///
+    /// No new persistence was needed. The declared order is ALREADY durable: a
+    /// table-level `PRIMARY KEY (…)` is persisted as a `UniqueConstraint` with
+    /// `is_primary_key = true` in `table_constraints:{t}` (src/lib.rs, the
+    /// `TableConstraint::PrimaryKey` arm of `execute_create_table_plan`), whose
+    /// `columns` are the declared list verbatim. This reads that record and
+    /// falls back to the schema-flag scan for the spellings that do not write
+    /// one — an INLINE `id INT PRIMARY KEY` (single column, so order is not a
+    /// question) and any table whose record predates or lacks the constraint.
+    ///
+    /// The declared names are mapped back onto the SCHEMA's spelling of each
+    /// column: the record stores the identifiers as the user typed them, while
+    /// every consumer of this list compares column names with `==` against
+    /// `Schema::columns`. A declared name that resolves to no column, or a
+    /// record whose column SET differs from the schema's PK flags, is treated as
+    /// untrustworthy and the schema-order scan wins — fail-safe, never a
+    /// partially-resolved key.
     pub fn primary_key_columns(&self, table: &str) -> Result<Vec<String>> {
         let schema = self.get_table_schema(table)?;
-        Ok(schema
+        let flagged: Vec<String> = schema
             .columns
             .iter()
             .filter(|c| c.primary_key)
             .map(|c| c.name.clone())
-            .collect())
+            .collect();
+        if flagged.len() < 2 {
+            // Nothing to reorder: no key, or a single-column key.
+            return Ok(flagged);
+        }
+        let Ok(constraints) = self.load_table_constraints(table) else {
+            return Ok(flagged);
+        };
+        // `is_primary_key` is NOT unique in this record. A table-level
+        // `PRIMARY KEY (b, a)` also sets each column's `primary_key` flag, and
+        // `execute_create_table_plan` then mints a SINGLE-column
+        // `{table}_{col}_pkey` record per flagged column alongside the composite
+        // declaration — so the first `is_primary_key` match is usually one of
+        // those one-column records, whose order says nothing. Take the record
+        // whose arity matches the flagged key: that is the composite
+        // declaration, and it is the only one that carries a column ORDER.
+        let Some(pk) = constraints
+            .unique_constraints
+            .iter()
+            .find(|u| u.is_primary_key && u.columns.len() == flagged.len())
+        else {
+            return Ok(flagged);
+        };
+        let mut declared: Vec<String> = Vec::with_capacity(pk.columns.len());
+        let mut is_permutation = true;
+        for name in &pk.columns {
+            // Canonicalize to the schema's spelling, and accept only a name that
+            // is part of the flagged key and not already taken — anything else
+            // is not a key order we can trust.
+            match flagged.iter().find(|c| c.eq_ignore_ascii_case(name)) {
+                Some(col) if !declared.iter().any(|d| d == col) => declared.push(col.clone()),
+                _ => {
+                    is_permutation = false;
+                    break;
+                }
+            }
+        }
+        if is_permutation {
+            Ok(declared)
+        } else {
+            Ok(flagged)
+        }
+    }
+
+    /// Is `columns` — compared as a case-insensitive SET — the PRIMARY KEY of
+    /// `table`, or covered by a UNIQUE constraint or UNIQUE index on it?
+    ///
+    /// sprinter fb9aec923da8. A foreign key may only reference a column set
+    /// that is itself a key: with a non-unique target a child row can match
+    /// several parent rows, so "does the parent exist" has no single answer and
+    /// `ON DELETE CASCADE` / `SET NULL` have no defined victim. PostgreSQL
+    /// refuses the declaration at DDL time with 42830 invalid_foreign_key
+    /// (`tablecmds.c`, `transformFkeyCheckAttrs`); this is the question it asks.
+    ///
+    /// # SET, not sequence
+    ///
+    /// PostgreSQL matches the referenced list against the constraint's column
+    /// SET, so a `UNIQUE (a, b)` satisfies a reference to `(b, a)` as well as to
+    /// `(a, b)`. The key really is unique under either permutation, and the
+    /// PERMUTATION still matters downstream — it is what the referenced list
+    /// binds positionally — so this answers only "is it a key", never "in what
+    /// order". Every source below is therefore compared lowercased and sorted.
+    ///
+    /// # Four sources, because there are four spellings
+    ///
+    /// The PK (whose columns carry no constraint record when declared inline),
+    /// a column-level `UNIQUE` flag, the `TableConstraints` record (table-level
+    /// and `ALTER TABLE … ADD CONSTRAINT … UNIQUE`, including composites), and
+    /// the live PK/UNIQUE ART indexes (which is what `CREATE UNIQUE INDEX`
+    /// leaves behind). Any one of them makes the set a key; asking only the
+    /// index registry would miss a constraint whose index failed to register,
+    /// and asking only the records would miss a user's unique index.
+    pub fn unique_key_covers(&self, table: &str, columns: &[String]) -> Result<bool> {
+        if columns.is_empty() {
+            return Ok(false);
+        }
+        let normalize = |cols: &[String]| -> Vec<String> {
+            let mut v: Vec<String> = cols.iter().map(|c| c.to_ascii_lowercase()).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let wanted = normalize(columns);
+        if wanted.len() != columns.len() {
+            // A repeated column cannot name a key.
+            return Ok(false);
+        }
+        let same = |set: &[String]| -> bool { set.len() == wanted.len() && normalize(set) == wanted };
+
+        // 1. The declared PRIMARY KEY.
+        if same(&self.primary_key_columns(table)?) {
+            return Ok(true);
+        }
+        // 2. A column-level `UNIQUE` flag (single-column keys only).
+        if wanted.len() == 1 {
+            let schema = self.get_table_schema(table)?;
+            if schema
+                .columns
+                .iter()
+                .any(|c| c.unique && same(std::slice::from_ref(&c.name)))
+            {
+                return Ok(true);
+            }
+        }
+        // 3. Table-level / ALTER-added UNIQUE constraint records.
+        if let Ok(constraints) = self.load_table_constraints(table) {
+            if constraints.unique_constraints.iter().any(|u| same(&u.columns)) {
+                return Ok(true);
+            }
+        }
+        // 4. Any live PK/UNIQUE ART index — what `CREATE UNIQUE INDEX` leaves.
+        let art_manager = self.storage.art_indexes();
+        Ok(art_manager.unique_column_sets(table).iter().any(|set| same(set)))
     }
 
     /// The member tables of a schema: every catalogued table whose key is

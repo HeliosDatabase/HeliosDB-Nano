@@ -1951,6 +1951,13 @@ impl PhysicalOperator for VectorScanOperator {
                 return Ok(Some(tuple));
             };
             if self.evaluator.is_none() {
+                // sprinter a3a6cc7c59d6 (`Evaluator::new` audit): no `$n` can
+                // reach `prefilter` today — `with_prefilter` has NO caller in
+                // this crate, so `prefilter` is always `None` and this line is
+                // unreachable. A future caller that pushes a predicate down
+                // here MUST take the parameters alongside it and switch this to
+                // `Evaluator::with_parameters` (and fix the `Err(_) => false`
+                // arm below, which is the same swallow the HAVING filter had).
                 self.evaluator = Some(crate::sql::Evaluator::new(self.schema.clone()));
             }
             let pass = match self.evaluator.as_ref() {

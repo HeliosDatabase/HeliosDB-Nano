@@ -1054,8 +1054,50 @@ impl Evaluator {
                 // `try_nextval`; the process-global persistence handle lets this
                 // storage-less evaluator reach storage without any per-statement
                 // hot-path cost.
-                Ok(Value::Int8(crate::sql::sequences::try_nextval(&name)?))
+                let value = crate::sql::sequences::try_nextval(&name)?;
+                // sprinter 6dc0cc115db9: `lastval()` is "the value most recently
+                // returned by nextval IN THIS SESSION", so it is recorded HERE,
+                // on the one arm that returns such a value — never derived from
+                // the sequence store, which is process-scoped and would answer
+                // another connection's id. The SERIAL / IDENTITY half of the
+                // same contract is recorded by the insert funnels, which fill
+                // those columns from the row-id allocator without ever
+                // evaluating a `nextval()` call.
+                crate::note_session_lastval(value);
+                Ok(Value::Int8(value))
             }
+            // sprinter 6dc0cc115db9: `lastval()` — the value most recently
+            // returned by `nextval` in THIS session, for ANY sequence. This is
+            // the function every DB-API-2.0 shim implements `cursor.lastrowid`
+            // on top of, precisely because — unlike `currval('seq')` — it does
+            // not require the caller to know the sequence name, which a generic
+            // driver does not.
+            //
+            // Reads the per-statement session backend
+            // (`crate::session_scoped_state_tls`), the same mechanism
+            // `current_user` above uses, because this evaluator holds no session
+            // handle. A session that has produced no sequence value ERRORS with
+            // PostgreSQL's own wording and SQLSTATE 55000 — it must NOT answer
+            // 0 or NULL, either of which a driver would hand back as a real row
+            // id.
+            "lastval" | "pg_catalog.lastval" => {
+                match crate::session_scoped_state_tls().and_then(|state| state.lastval()) {
+                    Some(v) => Ok(Value::Int8(v)),
+                    None => Err(Error::query_execution(
+                        crate::session::scoped::LASTVAL_UNDEFINED_MESSAGE,
+                    )),
+                }
+            }
+            // sprinter f4f5d450e816: `pg_backend_pid()` — the stable, unique
+            // identifier of THIS connection, which is how a pool proves that
+            // statement A and statement B ran on the same backend and how a
+            // client joins itself to `pg_stat_activity`. Not an OS pid (every
+            // connection in this process would then report the same number);
+            // the per-connection id minted by `session::scoped`, which is also
+            // what `pg_stat_activity.pid` reports, so the join holds.
+            "pg_backend_pid" | "pg_catalog.pg_backend_pid" => Ok(Value::Int4(
+                crate::session_scoped_state_tls().map_or(0, |state| state.backend_pid()),
+            )),
             "currval" | "pg_catalog.currval" => {
                 let name = match arg_values.first() {
                     Some(Value::String(s)) => s.clone(),
@@ -1194,6 +1236,22 @@ impl Evaluator {
                     // HDB-009: the session's real login identity, not a
                     // hardcoded `postgres` that contradicted `current_user`.
                     "session_authorization" | "current_user" | "current_role" => Some(Self::session_identity()),
+                    // sprinter f4f5d450e816: the session's own `application_name`
+                    // — set by `SET`, by `SET LOCAL`, or (the way every driver
+                    // actually does it) by the PostgreSQL startup packet. Read
+                    // from the per-statement session backend for the same reason
+                    // `current_user` above is: this evaluator has no session
+                    // handle, and the process-global `SessionSettings` registry
+                    // would answer connection A with connection B's value.
+                    //
+                    // The default is the EMPTY STRING, not a missing setting: a
+                    // stock PostgreSQL prints a blank line for
+                    // `SHOW application_name`, it does not raise 42704.
+                    "application_name" => Some(
+                        crate::session_scoped_state_tls()
+                            .map(|state| state.application_name())
+                            .unwrap_or_default(),
+                    ),
                     "search_path" => Some("\"$user\", public".to_string()),
                     _ => None,
                 };

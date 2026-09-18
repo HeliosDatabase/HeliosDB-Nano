@@ -5,6 +5,168 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.38.0] - 2026-09-18
+
+Seventeen backlog items in one release, spanning storage/DML correctness, executor
+semantics, both wire protocols, session introspection, and tenant limits. Two of the
+fixes close silent data-corruption paths.
+
+### Fixed — storage and DML correctness
+
+- **Fast DELETE and fast UPDATE could destroy or rewrite the WRONG ROW** when another
+  open transaction had moved a primary key. The PK ART index is maintained eagerly, so an
+  uncommitted `UPDATE t SET id = 99 WHERE id = 2` already points key 99 at the row that
+  still holds `id = 2` in committed storage. The `pk_only_delete` shortcut resolved the row
+  id from that index and deleted `data:{table}:{row_id}` without ever reading the row, and
+  the fast UPDATE paths resolved their target the same way. Both now decline to the planner
+  (which re-evaluates the predicate per tuple) while any transaction has staged an index
+  removal for the table, and verify that a fetched row actually carries the probed key.
+  Switching to the "non-shortcut" arm would not have been a fix: it resolves through the
+  same index-as-truth lookup and materialises the same wrong row. Silent, and it survived
+  the other transaction rolling back. (sprinter 79efe5ebda6e)
+- **Multi-row params INSERT in autocommit is now atomic.** A `INSERT … VALUES ($1,…),($4,…)`
+  over the extended protocol that violated UNIQUE on row N kept rows 1..N-1; PostgreSQL
+  fails the whole statement. Multi-row params INSERTs now run in an implicit statement
+  transaction, mirroring the text family's existing mechanism. Single-row fast paths are
+  unchanged, and `ON CONFLICT` is deliberately excluded (its DO UPDATE leg writes outside
+  the write set). Prisma `createMany` and portal batch inserts hit exactly this shape.
+  (sprinter 6780488554df)
+- **`create_pk_index` no longer evicts an existing index of the same name.** Every insert
+  into the database-global index map now goes through one non-clobbering choke point that
+  refuses or mints a free name. The consequence was worse than a lost index: the evicted
+  index stayed listed in `table_indexes`, and `on_insert` resolves a table's indexes from
+  that list without re-checking the owner, so writes to one table wrote keys into another
+  table's PRIMARY KEY tree and raised false 23505s. (sprinter 3f8e05a39baf)
+
+### Fixed — executor and SQL semantics
+
+- **`HAVING <agg> > $1` no longer returns zero rows on the params family.** The HAVING
+  evaluator was built with an empty bind vector, so `$1` raised "Parameter $1 not provided",
+  and the filter's catch-all arm swallowed that error as "row does not qualify" — a
+  successful, empty result. Parameters are now threaded, and an evaluation error propagates
+  instead of being absorbed. Fixed at both HAVING sites: the aggregate operator and the
+  aggregate-pushdown twin in the executor. `Evaluator::new` was audited across the executor;
+  window-function arguments were found to have the same missing-parameters shape and are now
+  threaded too. (sprinter a3a6cc7c59d6)
+- **A foreign key must now reference a PRIMARY KEY or UNIQUE column set**, raising 42830
+  rather than accepting a constraint with undefined semantics. Matching is by column SET, as
+  in PostgreSQL. (sprinter fb9aec923da8)
+- **A list-less composite `REFERENCES` binds the parent key in DECLARED order**, not schema
+  order. `PRIMARY KEY (b, a)` on a table whose columns are `(a, b)` previously bound a
+  list-less FK to `(a, b)` — a silent transposition. The declared order was already
+  persisted; `Catalog::primary_key_columns` simply never read it. (sprinter b9aa53f0e6ca)
+- **`ALTER TABLE … RENAME TO` / `SET SCHEMA` now repoint inbound foreign keys** from other
+  tables. Only self-references were rewritten before, so after renaming a parent the child's
+  FK named a table that no longer existed — which refused VALID child inserts, not merely
+  invalid ones. (sprinter 6d501be6013f)
+
+### Fixed — PostgreSQL wire
+
+- **The database/tenant name is no longer validated before authentication.** An
+  unauthenticated peer could enumerate tenants one connection at a time, since a nonexistent
+  name got a FATAL with zero authentication messages while a valid one got the full
+  SCRAM/cleartext exchange — and libpq defaults `dbname` to the user name. Validation now
+  runs after authentication, where PostgreSQL does it (`InitPostgres`, after
+  `PerformAuthentication`), and the SQLSTATE is corrected from 08P01 to **3D000**
+  (`ERRCODE_UNDEFINED_DATABASE`). An explicitly empty `database` now means "absent", as in
+  PostgreSQL. (sprinter c5afe5e41eac)
+- **HNSW vector indexes are now visible in the catalog**: `pg_class`, `pg_index`, `\d`,
+  `\di`, and the `relhasindex` flag that gates psql's index-list query. They live in a
+  separate registry from ART indexes, which every catalogue surface walked. Plain
+  `CREATE INDEX` btree indexes were missing from `\d`/`\di` for the same reason and are
+  fixed in the same pass. (sprinter cec8ab163448)
+
+### Fixed — MySQL wire
+
+- **Backtick-quoted identifiers are no longer stripped**, closing an identifier-injection
+  route where a backticked name carrying SQL was spliced in as code. Plain identifiers are
+  still emitted bare (preserving case-folding and WordPress compatibility); anything else is
+  double-quoted with `""` doubling. `translate_backticks` is gone — no code path strips a
+  backtick, and none can reach the parser. Also closed: an unterminated backtick, and
+  doubled backticks now form one identifier. This required fixing
+  `split_sql_respecting_quotes`, which did not track double quotes — without it the fix
+  would have been cosmetic, since a quoted identifier could still split into two statements.
+  (sprinter ecc77a75df2b)
+- **An apostrophe inside a double-quoted identifier or a `/*! */` executable comment no
+  longer opens a phantom string.** Every `"…"` is treated as an opaque region by the escape
+  pass, and `/*! … */` is stripped inside the masker so no unmasked text can carry a quote.
+  Version-gated `/*!50100 … */` semantics are unchanged. (sprinter 948023755a35)
+
+### Added — session introspection
+
+- **`LASTVAL()`**, matching PostgreSQL exactly: the value most recently returned by
+  `nextval` in the CURRENT session, 55000 `lastval is not yet defined in this session` when
+  undefined, never 0 or NULL, and never another session's value. SERIAL/IDENTITY inserts
+  update it too — they draw from the row-id allocator rather than the sequence store, so
+  hooking only the evaluator would have left the actual use case dead. Every DB-API driver's
+  `cursor.lastrowid` builds on this. (sprinter 6dc0cc115db9)
+- **`pg_backend_pid()`** — a stable, per-connection identifier, with `pg_stat_activity`
+  reporting the same value so a client can join on it. `pg_stat_activity` did not resolve
+  from SQL at all before this; it was declared only in a registry nothing routes to.
+- **`application_name`** as a real session GUC: `SET` / `RESET` / `SET LOCAL`, `SHOW`,
+  `current_setting()`, both executor families, both wires, honoured from the PostgreSQL
+  startup packet, and surfaced in `pg_stat_activity` and audit capture.
+  (sprinter f4f5d450e816)
+
+### Fixed — locking and tenant limits
+
+- **`LockGuard` now refcounts re-entrant acquisitions.** The first drop released the holder
+  even when the transaction held N guards — latent today only because a session transaction
+  parks all guards until commit. `LockGuard`'s derived `Clone` was the same fail-open by
+  another door and is now hand-written. (sprinter 68b70030ba28)
+- **`test_deadlock_detection_simple` is deterministic.** It raced a 50 ms sleep and asserted
+  a specific deadlock victim; neither is a property of the lock manager. It now registers
+  the waiter synchronously and asserts exactly one of the two acquires fails, plus that the
+  cycle was broken. (sprinter fab4dd25bf29)
+- **Tenant `max_qps` is a rate again, not a lifetime quota.** The windowing machinery
+  existed but nothing ever started it — `start_qps_reset_task()` and
+  `reset_all_qps_windows()` had zero callers — so a tenant got `max_qps` statements for the
+  life of the process. The window is now evaluated lazily inside the quota check, which is
+  correct on the embedded path too (it never starts a tokio task) and cannot be starved.
+  Window length is configurable via `[resource_quotas].tenant_qps_window_ms`, default 1000.
+  Both public reset functions keep working. (sprinter c837352dabef)
+
+### Changed — behaviour
+
+These change results for statements that previously succeeded or silently returned nothing.
+
+- `CREATE TABLE … REFERENCES parent(non_unique_col)` was accepted and is now rejected
+  **42830**. One existing test asserted the old acceptance; it pinned GH#27's scope (the
+  42704 defaulting rule stops at an explicit list) rather than a deliberate divergence, and
+  now asserts the refusal.
+- `HAVING` over a shape the rewriter does not recurse into (e.g. `CASE WHEN count(*) > 1 …`)
+  previously returned a silently-empty result and now returns an explicit error. Every
+  `HAVING` in the repository was censused before accepting this; an error beats a silent
+  empty result.
+- PostgreSQL startup: a nonexistent database now yields **3D000** after authentication
+  rather than 08P01 before it.
+
+### Verified — no change needed
+
+- `84ac05bd69c4` RETURNING residuals: expression items are already typed from the catalog
+  and an unknown column is already refused 42703 on every route, both closed by the earlier
+  `ReturningProjection` rework. `Describe(Statement)` reporting text format codes is **not a
+  bug** — PostgreSQL's `exec_describe_statement_message` passes a NULL formats array because
+  no portal exists yet. Pinned by test rather than closed on a source reading.
+
+### Known follow-ups (filed)
+
+- `f32ba64c00a7` — a NULL primary key of any declared type is overwritten with an integer
+  row id, so a TEXT primary key gets an `Int8` and the row becomes unfindable by point lookup.
+- `8a9b60eeef87` — the RAII `begin_transaction().rollback()` never replays the ART undo log,
+  leaving the index permanently diverged from committed data after a rolled-back PK move.
+- `7903b7111cb4` — `currval()` is process-scoped, so one connection's `nextval` sets
+  another's `currval`; `LASTVAL()` deliberately does not copy this.
+- `d03de7fc3b22` — `max_qps` is unenforced for the params/extended-protocol family:
+  `record_query` has a single caller on the simple-query path. The windowing fix above makes
+  the window correct; it does not make the limit apply to bound-parameter traffic.
+- `deada0f71df8` — the extended protocol defers RETURNING-bind refusals (42703/42803/42P20)
+  to Execute where PostgreSQL raises them at Parse. Fail-closed either way; moving one
+  SQLSTATE without the other two would make the protocol internally inconsistent.
+- `9e61e79d87ca` — the predicate-pushdown write path has zero callers two levels up, so
+  bloom filters and zone maps are never populated and `scan_with_pushdown` always runs with
+  empty prune structures.
+
 ## [4.37.0] - 2026-09-18
 
 20 low-effort sprinter backlog items, one release: DDL validation gaps, join-semantics regression

@@ -485,12 +485,43 @@ fn a_reference_to_a_table_without_a_primary_key_is_rejected_in_every_spelling() 
             .unwrap_or_else(|e| panic!("[{fam}] a refused FK left a constraint behind: {e}"));
     }
 
-    // An EXPLICIT column list against a key-less table is still fine — the
-    // 42704 rule is about the DEFAULT, not about the parent's constraints.
+    // An EXPLICIT column list against a key-less table does not take the 42704
+    // path — that rule is about the DEFAULT, not about the parent's
+    // constraints — but it is not ACCEPTED either.
+    //
+    // UPDATED by sprinter fb9aec923da8, which is the rule this case always
+    // wanted: PostgreSQL refuses `REFERENCES npx_par(id)` against a column with
+    // no uniqueness with 42830 `there is no unique constraint matching given
+    // keys for referenced table "npx_par"` (tablecmds.c
+    // `transformFkeyCheckAttrs`). This assertion previously read
+    // `.expect("an explicit referenced column needs no primary key")`, which
+    // pinned GH#27's SCOPE (the 42704 defaulting rule stops at the explicit
+    // list) and was read as also blessing the acceptance. It is not a
+    // deliberate divergence — the acceptance left a constraint with undefined
+    // semantics, since a child value could match several parent rows — so the
+    // case is kept, with the refusal it should always have had. The 42704
+    // wording must NOT appear: a key-less parent is not why this is refused.
     let db = fresh_db();
     db.execute("CREATE TABLE npx_par (id INT, name TEXT)").unwrap();
-    db.execute("CREATE TABLE npx_c (id INT PRIMARY KEY, p INT REFERENCES npx_par(id))")
-        .expect("an explicit referenced column needs no primary key");
+    let err = must_reject(
+        &db,
+        "CREATE TABLE npx_c (id INT PRIMARY KEY, p INT REFERENCES npx_par(id))",
+        false,
+    );
+    let lower = err.to_ascii_lowercase();
+    assert!(
+        lower.contains("there is no unique constraint matching given keys for referenced table")
+            && lower.contains("npx_par"),
+        "expected PostgreSQL's 42830 wording for a non-unique referenced column, got: {err}"
+    );
+    assert!(
+        !lower.contains("there is no primary key for referenced table"),
+        "an EXPLICIT referenced column must not take the 42704 defaulting path: {err}"
+    );
+    assert!(
+        !table_exists(&db, "npx_c"),
+        "the rejected CREATE TABLE left npx_c behind"
+    );
 }
 
 /// A self-referencing CREATE TABLE with NO primary key and a list-less

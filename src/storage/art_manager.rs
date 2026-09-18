@@ -26,6 +26,20 @@ use std::sync::{Arc, RwLock, RwLockReadGuard};
 /// follow the locking rules documented on [`ArtIndexManager`].
 pub type SharedArtIndex = Arc<RwLock<AdaptiveRadixTree>>;
 
+/// What [`ArtIndexManager::register_index_entry`] does when the key it is asked
+/// for is already held by another index (sprinter 3f8e05a39baf).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexNamePolicy {
+    /// The RELATION namespace — the caller NAMED this index (`CREATE INDEX ux`,
+    /// a named FK constraint). A taken name is the user's to resolve, so the DDL
+    /// fails with `IndexAlreadyExists` rather than quietly using another name.
+    Refuse,
+    /// The CONSTRAINT namespace — the name is DERIVED from `(table, columns)`,
+    /// so a clash is the engine's to solve: register under the smallest free
+    /// `{base}_{n}`. Never fails for a name reason, and never evicts the holder.
+    MintFree,
+}
+
 /// A registered index: per-registration metadata plus the shared tree handle.
 ///
 /// The metadata mirrors the immutable identity fields inside the tree
@@ -522,12 +536,99 @@ impl ArtIndexManager {
     // INDEX CREATION
     // =========================================================================
 
+    /// THE one place an entry is added to the database-global `indexes` map, and
+    /// the one place that decides what a name clash means (sprinter 3f8e05a39baf).
+    ///
+    /// `indexes` is ONE map for the whole database while every name that feeds it
+    /// is derived per TABLE (`{table}_pkey`, `{table}_{cols}_key`,
+    /// `{table}_{cols}_fkey`) or chosen by a user who has no idea what the engine
+    /// derives. A bare `insert` therefore EVICTS whatever held the key, and the
+    /// evicted index's side maps (`pk_indexes` / `unique_indexes` / `fk_indexes`
+    /// / `table_indexes`) go on naming it — so it is claimed, gone, and its
+    /// former owner's rows are silently maintained in, or probed against, the
+    /// wrong tree. Every registration goes through here so that cannot happen by
+    /// omission at a sixth site.
+    ///
+    /// Two policies, because the two namespaces mean different things:
+    ///
+    /// * [`IndexNamePolicy::Refuse`] — the caller NAMED the index
+    ///   (`CREATE INDEX ux …`, a named FK constraint). A taken name is the user's
+    ///   to resolve and the DDL must say so.
+    /// * [`IndexNamePolicy::MintFree`] — the name is DERIVED, so a clash is the
+    ///   engine's problem: take the smallest free `{base}_{n}` from `n = 2` and
+    ///   name the squatter at WARN. Refusing would turn a name clash into a
+    ///   rejected CREATE (or a database that cannot reopen enforcing), whereas a
+    ///   suffixed name still INSTALLS the index — which is the point of failing
+    ///   closed. The map is finite so the loop terminates; not a tunable.
+    ///
+    /// The `indexes` write lock covers "pick a free key AND claim it" in one
+    /// critical section: testing under a read lock and inserting under a write
+    /// lock lets a concurrent DDL claim the key in between. `make` runs while
+    /// that lock is held, so it must take no other lock (locking rule #4) —
+    /// building an `AdaptiveRadixTree` takes none.
+    fn register_index_entry(
+        &self,
+        base: &str,
+        policy: IndexNamePolicy,
+        describe: impl FnOnce() -> String,
+        make: impl FnOnce(&str) -> IndexEntry,
+    ) -> ArtResult<String> {
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        if policy == IndexNamePolicy::Refuse {
+            if indexes.contains_key(base) {
+                return Err(ArtIndexError::IndexAlreadyExists(base.to_string()));
+            }
+            indexes.insert(base.to_string(), make(base));
+            return Ok(base.to_string());
+        }
+
+        let mut candidate = base.to_string();
+        let mut n: u32 = 1;
+        while indexes.contains_key(&candidate) {
+            n += 1;
+            candidate = format!("{}_{}", base, n);
+        }
+        if n > 1 {
+            let squatter = indexes
+                .get(base)
+                .map(|e| format!("{} on {}({})", e.index_type, e.table, e.columns.join(", ")))
+                .unwrap_or_else(|| "an unknown index".to_string());
+            tracing::warn!(
+                "{} registered as '{}': the derived name '{}' is already taken by {}. \
+                 The index IS installed and enforcing, under the suffixed name.",
+                describe(),
+                candidate,
+                base,
+                squatter
+            );
+        }
+        let entry = make(&candidate);
+        indexes.insert(candidate.clone(), entry);
+        Ok(candidate)
+    }
+
     /// Create a primary key index (auto-called on CREATE TABLE with PRIMARY KEY)
+    ///
+    /// sprinter 3f8e05a39baf: the derived name `{table}_pkey` is NOT unique by
+    /// construction — `CREATE INDEX t_pkey ON other (x)` is a perfectly legal
+    /// statement that claims it before table `t` exists. This used to check only
+    /// the per-table `pk_indexes` map and then insert into the database-global
+    /// `indexes` map unconditionally, evicting the other table's entry while
+    /// `table_indexes["other"]` went on listing the name — after which every
+    /// INSERT into `other` was maintained in THIS table's PK tree (`on_insert`
+    /// resolves names from `table_indexes` and does not re-check the owner), so
+    /// `other`'s keys raised duplicate-key errors on this table's PRIMARY KEY.
+    /// The PK now mints a free key exactly as the constraint path does: a name
+    /// clash costs a suffix, never an evicted index and never an unenforced
+    /// PRIMARY KEY.
     pub fn create_pk_index(&self, table: &str, columns: &[String]) -> ArtResult<String> {
         self.note_mutation();
-        let index_name = Self::pk_index_name(table);
 
-        // Check if PK already exists for this table
+        // Check if PK already exists for this table. Unchanged and still FIRST:
+        // it is what makes a second registration for the same table idempotent
+        // (`Catalog::rebuild_all_indexes` re-calls this after `create_table` ran
+        // in the same process and relies on the `IndexAlreadyExists`), and
+        // minting instead would install a duplicate `{table}_pkey_2` tree.
         {
             let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
             if pk_indexes.contains_key(table) {
@@ -538,14 +639,20 @@ impl ArtIndexManager {
             }
         }
 
-        // Create the index
-        let index = AdaptiveRadixTree::new(&index_name, table, columns.to_vec(), ArtIndexType::PrimaryKey);
-
-        // Register the index
-        {
-            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-            indexes.insert(index_name.clone(), IndexEntry::new(index));
-        }
+        let columns_owned = columns.to_vec();
+        let index_name = self.register_index_entry(
+            &Self::pk_index_name(table),
+            IndexNamePolicy::MintFree,
+            || format!("PRIMARY KEY index for {}({})", table, columns.join(", ")),
+            |name| {
+                IndexEntry::new(AdaptiveRadixTree::new(
+                    name,
+                    table,
+                    columns_owned,
+                    ArtIndexType::PrimaryKey,
+                ))
+            },
+        )?;
 
         {
             let mut pk_indexes = self.pk_indexes.write().unwrap_or_else(|e| e.into_inner());
@@ -572,19 +679,28 @@ impl ArtIndexManager {
             .map(|n| n.to_string())
             .unwrap_or_else(|| Self::fk_index_name(table, columns));
 
-        // Check if index already exists
-        {
-            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-            if indexes.contains_key(&index_name) {
-                return Err(ArtIndexError::IndexAlreadyExists(index_name));
-            }
-        }
-
         // Verify that the referenced table has a PK or unique constraint on ref_columns
         // (This would be checked during DDL execution)
 
-        // Create the index
-        let index = AdaptiveRadixTree::new(&index_name, table, columns.to_vec(), ArtIndexType::ForeignKey);
+        // sprinter 3f8e05a39baf: check-and-claim in ONE `indexes` critical
+        // section. The name is either the user's `CONSTRAINT` name or the
+        // derived `{table}_{cols}_fkey`, and either way a taken one is refused —
+        // the behaviour this arm already had, minus the window between the read
+        // and the write in which a concurrent DDL could take the key.
+        let columns_owned = columns.to_vec();
+        let index_name = self.register_index_entry(
+            &index_name,
+            IndexNamePolicy::Refuse,
+            || format!("FOREIGN KEY index for {}({})", table, columns.join(", ")),
+            |name| {
+                IndexEntry::new(AdaptiveRadixTree::new(
+                    name,
+                    table,
+                    columns_owned,
+                    ArtIndexType::ForeignKey,
+                ))
+            },
+        )?;
 
         // Create FK info
         let fk_info = ForeignKeyInfo {
@@ -595,12 +711,6 @@ impl ArtIndexManager {
             ref_columns: ref_columns.to_vec(),
             index_name: index_name.clone(),
         };
-
-        // Register everything
-        {
-            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-            indexes.insert(index_name.clone(), IndexEntry::new(index));
-        }
 
         {
             let mut fk_indexes = self.fk_indexes.write().unwrap_or_else(|e| e.into_inner());
@@ -640,22 +750,16 @@ impl ArtIndexManager {
             .map(|n| n.to_string())
             .unwrap_or_else(|| Self::unique_index_name(table, columns));
 
-        // Check if index already exists
-        {
-            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-            if indexes.contains_key(&index_name) {
-                return Err(ArtIndexError::IndexAlreadyExists(index_name));
-            }
-        }
-
-        // Create the index
-        let index = AdaptiveRadixTree::new(&index_name, table, columns.to_vec(), ArtIndexType::Unique);
-
-        // Register the index
-        {
-            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-            indexes.insert(index_name.clone(), IndexEntry::new(index));
-        }
+        // sprinter 3f8e05a39baf: check-and-claim in ONE `indexes` critical
+        // section. RELATION namespace — a taken name is still refused, exactly
+        // as before.
+        let columns_owned = columns.to_vec();
+        let index_name = self.register_index_entry(
+            &index_name,
+            IndexNamePolicy::Refuse,
+            || format!("UNIQUE index for {}({})", table, columns.join(", ")),
+            |name| IndexEntry::new(AdaptiveRadixTree::new(name, table, columns_owned, ArtIndexType::Unique)),
+        )?;
 
         {
             let mut unique_indexes = self.unique_indexes.write().unwrap_or_else(|e| e.into_inner());
@@ -715,45 +819,26 @@ impl ArtIndexManager {
         self.note_mutation();
         let base = Self::unique_index_name(table, columns);
 
-        // ONE `indexes` write lock covers "pick a free key AND claim it".
-        // Testing under a read lock and inserting under a write lock would let
-        // a concurrent DDL claim the key in between — exactly the race the
-        // fail-closed callers would have to unwind for. No other lock is held
-        // while this one is (locking rule #4): `unique_indexes` and
-        // `table_indexes` are updated only after it is released.
-        let index_name = {
-            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-            let mut candidate = base.clone();
-            let mut n: u32 = 1;
-            while indexes.contains_key(&candidate) {
-                n += 1;
-                candidate = format!("{}_{}", base, n);
-            }
-            if n > 1 {
-                let squatter = indexes
-                    .get(&base)
-                    .map(|e| format!("{} on {}({})", e.index_type, e.table, e.columns.join(", ")))
-                    .unwrap_or_else(|| "an unknown index".to_string());
-                tracing::warn!(
-                    "Constraint index for {}({}) registered as '{}': the derived name '{}' is already \
-                     taken by {}. The constraint IS enforced, under the suffixed name.",
-                    table,
-                    columns.join(", "),
-                    candidate,
-                    base,
-                    squatter
-                );
-            }
-            let tree = AdaptiveRadixTree::new(&candidate, table, columns.to_vec(), ArtIndexType::Unique);
-            // A label identical to the key carries no information; keeping it
-            // `None` there means the violation text is byte-for-byte what it
-            // was before this change.
-            let label = constraint_label
-                .filter(|l| *l != candidate.as_str())
-                .map(|l| l.to_string());
-            indexes.insert(candidate.clone(), IndexEntry::with_label(tree, label));
-            candidate
-        };
+        // sprinter 3f8e05a39baf: the free-key mint now lives in
+        // `register_index_entry`, THE single `indexes` registration choke point,
+        // so the PRIMARY KEY path gets the identical treatment from the identical
+        // code. Same one-critical-section "pick a free key AND claim it", same
+        // WARN naming the squatter; only the message's leading clause moved into
+        // `describe`.
+        let columns_owned = columns.to_vec();
+        let index_name = self.register_index_entry(
+            &base,
+            IndexNamePolicy::MintFree,
+            || format!("Constraint index for {}({})", table, columns.join(", ")),
+            |name| {
+                let tree = AdaptiveRadixTree::new(name, table, columns_owned, ArtIndexType::Unique);
+                // A label identical to the key carries no information; keeping it
+                // `None` there means the violation text is byte-for-byte what it
+                // was before this change.
+                let label = constraint_label.filter(|l| *l != name).map(|l| l.to_string());
+                IndexEntry::with_label(tree, label)
+            },
+        )?;
 
         {
             let mut unique_indexes = self.unique_indexes.write().unwrap_or_else(|e| e.into_inner());
@@ -818,22 +903,23 @@ impl ArtIndexManager {
     /// Create a manual index (via CREATE INDEX ... USING ART)
     pub fn create_manual_index(&self, name: &str, table: &str, columns: &[String]) -> ArtResult<String> {
         self.note_mutation();
-        // Check if index already exists
-        {
-            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-            if indexes.contains_key(name) {
-                return Err(ArtIndexError::IndexAlreadyExists(name.to_string()));
-            }
-        }
-
-        // Create the index
-        let index = AdaptiveRadixTree::new(name, table, columns.to_vec(), ArtIndexType::Manual);
-
-        // Register the index
-        {
-            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
-            indexes.insert(name.to_string(), IndexEntry::new(index));
-        }
+        // sprinter 3f8e05a39baf: check-and-claim in ONE `indexes` critical
+        // section. RELATION namespace — the user named this index, so a taken
+        // name is refused, exactly as before.
+        let columns_owned = columns.to_vec();
+        self.register_index_entry(
+            name,
+            IndexNamePolicy::Refuse,
+            || format!("Index '{}' for {}({})", name, table, columns.join(", ")),
+            |index_name| {
+                IndexEntry::new(AdaptiveRadixTree::new(
+                    index_name,
+                    table,
+                    columns_owned,
+                    ArtIndexType::Manual,
+                ))
+            },
+        )?;
 
         self.table_index_add(table, name);
         self.stats.add_index(ArtIndexType::Manual);
@@ -3301,6 +3387,40 @@ mod tests {
         // Duplicate should fail
         let result = manager.create_pk_index("users", &["id".to_string()]);
         assert!(result.is_err());
+    }
+
+    /// sprinter 3f8e05a39baf: `{table}_pkey` is DERIVED, `indexes` is ONE
+    /// database-global map, and `CREATE INDEX t_pkey ON other (x)` is a legal
+    /// statement that claims the name before table `t` exists. `create_pk_index`
+    /// used to check only the per-table `pk_indexes` map and then insert into
+    /// `indexes` unconditionally, EVICTING the other table's entry — after which
+    /// `other`'s index was claimed (still listed in `table_indexes` and still
+    /// named by whoever created it) but gone, and `on_insert` maintained
+    /// `other`'s rows in THIS table's PRIMARY KEY tree.
+    #[test]
+    fn test_pk_index_does_not_evict_a_squatting_index_of_the_same_name() {
+        let manager = ArtIndexManager::new();
+        manager
+            .create_manual_index("t_pkey", "other", &["x".to_string()])
+            .unwrap();
+
+        let pk_name = manager.create_pk_index("t", &["id".to_string()]).unwrap();
+
+        // The PK took the smallest free key instead of the squatter's.
+        assert_eq!(pk_name, "t_pkey_2");
+        // The squatter is intact: same key, same table, same column.
+        assert_eq!(
+            manager.find_column_index("other", "x").as_deref(),
+            Some("t_pkey"),
+            "the user's index on `other` must still be registered under its own name"
+        );
+        // And the PRIMARY KEY is registered, resolvable and usable for `t`.
+        assert_eq!(manager.find_column_index("t", "id").as_deref(), Some("t_pkey_2"));
+        assert!(manager.index_exists("t_pkey_2"));
+
+        // Idempotency is unchanged: the per-table `pk_indexes` gate still
+        // refuses a second PK for the same table rather than minting `_3`.
+        assert!(manager.create_pk_index("t", &["id".to_string()]).is_err());
     }
 
     #[test]

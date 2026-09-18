@@ -37,7 +37,7 @@ impl SystemViewRegistry {
     ///
     /// The Phase-3 system-view set is static — `register_phase3_views` consumes
     /// no runtime/storage state, it only allocates string/enum literals — so a
-    /// fresh `new()` produces a byte-identical 48-view, hundreds-of-`Column`
+    /// fresh `new()` produces a byte-identical 49-view, hundreds-of-`Column`
     /// HashMap every time. Table resolution (`Planner::table_factor_to_plan`
     /// and the executor scan twins) rebuilt it per query just to answer one
     /// `is_system_view()` membership test, which the profile showed hotter than
@@ -2726,6 +2726,43 @@ impl SystemViewRegistry {
             },
             description: "Lists every tree-sitter grammar the indexer can parse".to_string(),
         });
+
+        // sprinter f4f5d450e816: pg_stat_activity — one row per LIVE backend.
+        //
+        // This registry (`sql::phase3::SystemViewRegistry`) is the one the
+        // planner and the executor scan; the older `sql::system_views` module
+        // also declares a `pg_stat_activity`, but nothing routes SQL to it, so
+        // `SELECT * FROM pg_stat_activity` simply did not resolve. It has to
+        // exist here for `pg_backend_pid()` to be joinable at all, which is the
+        // whole point of the function: `... WHERE pid = pg_backend_pid()` is how
+        // a pool, a health check and a test suite prove statement A and
+        // statement B ran on the same backend.
+        //
+        // Column set and order mirror the `sql::system_views` declaration so the
+        // two cannot disagree about shape. `query` is always NULL and `state` is
+        // reported per the executor's own row only: stamping the current
+        // statement text onto shared state for EVERY statement would be a wire
+        // hot-path cost paid by workloads that never read this view.
+        self.register_view(SystemViewSchema {
+            name: "pg_stat_activity".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("datid", DataType::Int4),
+                    sv_col("datname", DataType::Text),
+                    sv_col("pid", DataType::Int4),
+                    sv_col("usesysid", DataType::Int4),
+                    sv_col("usename", DataType::Text),
+                    sv_col("application_name", DataType::Text),
+                    sv_col("client_addr", DataType::Text),
+                    sv_col("client_port", DataType::Int4),
+                    sv_col("backend_start", DataType::Timestamp),
+                    sv_col("state_change", DataType::Timestamp),
+                    sv_col("state", DataType::Text),
+                    sv_col("query", DataType::Text),
+                ],
+            },
+            description: "One row per live backend (connection), joinable on pg_backend_pid()".to_string(),
+        });
     }
 
     /// Register a system view
@@ -3522,6 +3559,15 @@ const PG_SEQ_OID_BASE: i32 = 6000;
 /// tunable: clients JOIN `pg_class.oid` to `pg_attribute.attrelid`, so the two
 /// surfaces must derive the value the same way, every process, forever.
 const PG_VIEW_OID_BASE: i32 = 7000;
+/// Distinct OID base for VECTOR (HNSW) index relations (pg_class relkind='i').
+/// Kept clear of the table (1000), constraint (4000), ART-index (5000),
+/// sequence (6000) and view (7000) bases. Vector indexes need their OWN base
+/// rather than continuing the 5000 one because the two index registries are
+/// enumerated independently: sharing a counter would make an HNSW index's OID
+/// move whenever an unrelated ART index was created or dropped, and
+/// `pg_index.indexrelid` would stop resolving to the same `pg_class.oid`
+/// (sprinter cec8ab163448).
+const PG_VECTOR_INDEX_OID_BASE: i32 = 8000;
 const PG_PUBLIC_NAMESPACE_OID: i32 = 2200;
 
 /// The catalogue (database) name every introspection surface reports. One
@@ -3546,6 +3592,45 @@ fn sorted_art_indexes(storage: &StorageEngine) -> Vec<(String, String, ArtIndexT
     indexes
 }
 
+/// sprinter cec8ab163448: HNSW / vector indexes live in a DIFFERENT registry
+/// from ART indexes — `storage.vector_indexes()`, not `storage.art_indexes()`
+/// — which is precisely why every catalogue surface built on
+/// [`sorted_art_indexes`] reported a `CREATE INDEX … USING HNSW` index as not
+/// existing at all.
+///
+/// Sorted by (table, index name) exactly like `sorted_art_indexes`, because
+/// `list_all_metadata` walks a `HashMap` and would otherwise hand pg_class a
+/// different OID to the same index on every call.
+fn sorted_vector_indexes(storage: &StorageEngine) -> Vec<crate::storage::VectorIndexMetadata> {
+    let mut indexes = storage.vector_indexes().list_all_metadata();
+    indexes.sort_by(|left, right| left.table_name.cmp(&right.table_name).then(left.name.cmp(&right.name)));
+    indexes
+}
+
+/// The pgvector operator class a vector index's distance metric corresponds
+/// to. ONE spelling, shared by `pg_indexes.indexdef` and the `\d` / `\di`
+/// wire shapes, so the two can never disagree about the same index.
+pub(crate) fn vector_index_opclass(metadata: &crate::storage::VectorIndexMetadata) -> &'static str {
+    match metadata.distance_metric() {
+        crate::vector::DistanceMetric::Cosine => "vector_cosine_ops",
+        crate::vector::DistanceMetric::L2 => "vector_l2_ops",
+        crate::vector::DistanceMetric::InnerProduct => "vector_ip_ops",
+    }
+}
+
+/// `pg_get_indexdef()` for a vector index, in pgvector's own spelling.
+pub(crate) fn vector_indexdef(metadata: &crate::storage::VectorIndexMetadata) -> String {
+    let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(&metadata.table_name);
+    format!(
+        "CREATE INDEX {} ON {}.{} USING hnsw ({} {})",
+        metadata.name,
+        schema_name,
+        bare_table,
+        metadata.column_name,
+        vector_index_opclass(metadata)
+    )
+}
+
 fn pg_index_oid(index_idx: usize) -> i32 {
     PG_INDEX_OID_BASE + index_idx as i32
 }
@@ -3556,6 +3641,10 @@ fn pg_index_oid_by_name(indexes: &[(String, String, ArtIndexType, Vec<String>)],
         .position(|(name, _, _, _)| name.eq_ignore_ascii_case(index_name))
         .map(pg_index_oid)
         .unwrap_or(0)
+}
+
+fn pg_vector_index_oid(index_idx: usize) -> i32 {
+    PG_VECTOR_INDEX_OID_BASE + index_idx as i32
 }
 
 fn pg_sequence_oid(seq_idx: usize) -> i32 {
@@ -3732,6 +3821,55 @@ fn push_pg_constraint_row(
 }
 
 impl SystemViewRegistry {
+    /// sprinter f4f5d450e816: the `pg_stat_activity` rows — one per backend
+    /// currently registered in `session::scoped::live_backends()`.
+    ///
+    /// `pid` here is the SAME number `pg_backend_pid()` returns, because both
+    /// read the one `SessionScopedState` the connection owns; a catalog that
+    /// disagreed with the function would be worse than no catalog at all, since
+    /// the join a client writes would silently return zero rows.
+    ///
+    /// Divergences, all deliberate and cheap-by-design:
+    /// * `state` is `active` for the backend running THIS scan and `idle` for
+    ///   every other — true at the instant of the scan for the row that matters
+    ///   (your own), and not worth a per-statement write to make exact for the
+    ///   others.
+    /// * `query` is always NULL, for the same reason.
+    /// * `datid` / `usesysid` are constants: Nano has one database and reports
+    ///   no role OIDs.
+    fn execute_pg_stat_activity() -> Vec<Tuple> {
+        let self_pid = crate::session_scoped_state_tls().map(|s| s.backend_pid());
+        crate::session::scoped::snapshot_live_backends()
+            .into_iter()
+            .map(|b| {
+                let start = chrono::DateTime::from_timestamp(b.backend_start, 0).unwrap_or_default();
+                Tuple::new(vec![
+                    Value::Int4(1),                        // datid
+                    Value::String("heliosdb".to_string()), // datname
+                    Value::Int4(b.pid),                    // pid
+                    Value::Int4(1),                        // usesysid
+                    // Empty == a connection that has not published a login
+                    // identity (`create_session_unchecked`, the embedded
+                    // funnels). Report the SAME documented service user
+                    // `current_user` falls back to, so a client joining this row
+                    // never sees the view and the scalar disagree.
+                    Value::String(if b.username.is_empty() {
+                        "heliosdb".to_string()
+                    } else {
+                        b.username
+                    }), // usename
+                    Value::String(b.application_name), // application_name
+                    b.client_addr.map(Value::String).unwrap_or(Value::Null),
+                    b.client_port.map(Value::Int4).unwrap_or(Value::Null),
+                    Value::Timestamp(start), // backend_start
+                    Value::Timestamp(start), // state_change
+                    Value::String(if self_pid == Some(b.pid) { "active" } else { "idle" }.to_string()),
+                    Value::Null, // query
+                ])
+            })
+            .collect()
+    }
+
     /// Get system view schema
     pub fn get_schema(&self, view_name: &str) -> Option<&Schema> {
         self.views.get(view_name).map(|v| &v.schema)
@@ -3757,6 +3895,9 @@ impl SystemViewRegistry {
 
         match view_name {
             "pg_database_branches" => Self::execute_pg_database_branches(storage),
+            // sprinter f4f5d450e816: storage-independent — live connections are
+            // process state, not catalog state.
+            "pg_stat_activity" => Ok(Self::execute_pg_stat_activity()),
             "pg_mv_staleness" => Self::execute_pg_mv_staleness(storage),
             "pg_vector_index_stats" => Self::execute_pg_vector_index_stats(storage),
             "pg_compare_branches" => {
@@ -4093,6 +4234,29 @@ impl SystemViewRegistry {
                 Value::Int4(oid),
                 Value::String(index_name.clone()),
                 Value::Int4(PG_PUBLIC_NAMESPACE_OID),
+                Value::Int4(0),
+                Value::String("i".to_string()),
+                Value::Int4(oid),
+                Value::Boolean(false),
+                Value::Null, // relpartbound
+            ]));
+        }
+
+        // sprinter cec8ab163448: HNSW / vector indexes. They are relations of
+        // relkind 'i' in PostgreSQL exactly like btree indexes are, and pgvector
+        // changes nothing about that — but they are held in a SEPARATE registry
+        // (`storage.vector_indexes()`), so the ART loop above walked straight
+        // past them and `\d`, `\di` and every ORM that enumerates relations
+        // through pg_class reported that the index did not exist. Their OIDs
+        // come from the dedicated 8000 base so they can never collide with an
+        // ART index's.
+        for (idx, metadata) in sorted_vector_indexes(storage).iter().enumerate() {
+            let oid = pg_vector_index_oid(idx);
+            let (index_schema, _) = crate::sql::Planner::split_schema_key(&metadata.table_name);
+            results.push(Tuple::new(vec![
+                Value::Int4(oid),
+                Value::String(metadata.name.clone()),
+                Value::Int4(crate::sql::Planner::schema_name_to_oid(&index_schema)),
                 Value::Int4(0),
                 Value::String("i".to_string()),
                 Value::Int4(oid),
@@ -4982,23 +5146,18 @@ impl SystemViewRegistry {
             ]));
         }
 
-        for metadata in storage.vector_indexes().list_all_metadata() {
-            let opclass = match metadata.distance_metric() {
-                crate::vector::DistanceMetric::Cosine => "vector_cosine_ops",
-                crate::vector::DistanceMetric::L2 => "vector_l2_ops",
-                crate::vector::DistanceMetric::InnerProduct => "vector_ip_ops",
-            };
+        // sprinter cec8ab163448: sorted, and through the SHARED indexdef
+        // builder the `\d` / `\di` wire shapes also use — `list_all_metadata`
+        // walks a HashMap, so the row order (and therefore the pg_class OID
+        // derived from the same position) used to vary call to call.
+        for metadata in sorted_vector_indexes(storage) {
             let (schema_name, bare_table) = crate::sql::Planner::split_schema_key(&metadata.table_name);
-            let indexdef = format!(
-                "CREATE INDEX {} ON {}.{} USING hnsw ({} {})",
-                metadata.name, schema_name, bare_table, metadata.column_name, opclass
-            );
             rows.push(Tuple::new(vec![
                 Value::String(schema_name),
                 Value::String(bare_table),
-                Value::String(metadata.name),
+                Value::String(metadata.name.clone()),
                 Value::Null,
-                Value::String(indexdef),
+                Value::String(vector_indexdef(&metadata)),
             ]));
         }
 
@@ -5078,6 +5237,37 @@ impl SystemViewRegistry {
                 Value::Boolean(false),                                   // indisreplident
                 Value::Null,                                             // indexprs
                 Value::Null,                                             // indpred
+            ]));
+        }
+
+        // sprinter cec8ab163448: the vector-index registry, under the SAME
+        // `indexrelid` OIDs `execute_pg_class` gives these relations, so a
+        // client that JOINs pg_index to pg_class (which is how psql's `\d`
+        // resolves an index's name) lands on the right row. An HNSW index is
+        // neither primary nor unique and indexes exactly one column.
+        for (idx, metadata) in sorted_vector_indexes(storage).iter().enumerate() {
+            let Some(table_oid) = pg_table_oid_by_name(&tables, &metadata.table_name) else {
+                continue;
+            };
+            let Ok(schema) = catalog.get_table_schema(&metadata.table_name) else {
+                continue;
+            };
+            let indkey = pg_indkey(&schema, std::slice::from_ref(&metadata.column_name));
+            results.push(Tuple::new(vec![
+                Value::Int4(pg_vector_index_oid(idx)), // indexrelid
+                Value::Int4(table_oid),                // indrelid
+                Value::Boolean(false),                 // indisprimary
+                Value::Boolean(false),                 // indisunique
+                Value::Boolean(false),                 // indisexclusion
+                Value::String(indkey),                 // indkey
+                Value::Int2(1),                        // indnatts
+                Value::Int2(1),                        // indnkeyatts
+                Value::Boolean(false),                 // indisclustered
+                Value::Boolean(true),                  // indisvalid
+                Value::Boolean(true),                  // indisready
+                Value::Boolean(false),                 // indisreplident
+                Value::Null,                           // indexprs
+                Value::Null,                           // indpred
             ]));
         }
 

@@ -52,6 +52,15 @@ impl AggregateOperator {
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
         let input_schema = input.schema();
+        // sprinter a3a6cc7c59d6: the HAVING evaluator below needs the SAME bind
+        // vector this one gets, so keep a copy before ownership moves. Cloned
+        // only when there is a HAVING clause — the common no-HAVING aggregate
+        // stays allocation-free.
+        let having_parameters = if having.is_some() {
+            parameters.clone()
+        } else {
+            Vec::new()
+        };
         let evaluator = crate::sql::Evaluator::with_parameters(input_schema.clone(), parameters);
 
         // Streaming fast path: no DISTINCT and all aggregates are streamable.
@@ -82,14 +91,39 @@ impl AggregateOperator {
             // Rewrite HAVING expression to replace aggregate functions with column references
             let rewritten_having = Self::rewrite_having_expr(&having_expr, &aggr_exprs);
 
-            let having_evaluator = crate::sql::Evaluator::new(schema.clone());
-            output_tuples = output_tuples
-                .into_iter()
-                .filter(|tuple| match having_evaluator.evaluate(&rewritten_having, tuple) {
-                    Ok(crate::Value::Boolean(true)) => true,
-                    _ => false,
-                })
-                .collect();
+            // sprinter a3a6cc7c59d6 — two stacked defects lived in the three
+            // lines this replaces.
+            //
+            // 1. PARAMETERS. The evaluator was `Evaluator::new(schema)`, i.e.
+            //    an EMPTY bind vector, so `HAVING count(*) > $1` evaluated to
+            //    `Err("Parameter $1 not provided")` for EVERY group. Nothing
+            //    substitutes `$n` ahead of execution on the params family
+            //    (`query_params` / `execute_params`, the PostgreSQL extended
+            //    protocol through `parameterized_plan_cached`, and the MySQL
+            //    prepared path through `query_params_with_schema`), so the bind
+            //    vector is the only source — the very one the input `evaluator`
+            //    built at the top of this function already uses for the
+            //    aggregate INPUTS.
+            // 2. ERRORS ARE NOT A FILTER VERDICT. The `_ => false` arm swallowed
+            //    that `Err` and reported it as "this group does not qualify", so
+            //    the caller got a SUCCESSFUL, EMPTY result set instead of an
+            //    error. `Iterator::filter` cannot carry a failure, which is why
+            //    this is a fallible loop: `Ok(Boolean(true))` keeps the row,
+            //    every other `Ok` — NULL included, SQL three-valued logic —
+            //    drops it, and `Err` PROPAGATES. Kept in lockstep with
+            //    `Executor::apply_having_post_filter`, the aggregate-pushdown
+            //    twin of this filter.
+            let having_evaluator = crate::sql::Evaluator::with_parameters(schema.clone(), having_parameters);
+            let mut kept = Vec::with_capacity(output_tuples.len());
+            for tuple in output_tuples {
+                if matches!(
+                    having_evaluator.evaluate(&rewritten_having, &tuple)?,
+                    crate::Value::Boolean(true)
+                ) {
+                    kept.push(tuple);
+                }
+            }
+            output_tuples = kept;
         }
 
         Ok(Self {

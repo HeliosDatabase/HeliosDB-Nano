@@ -165,6 +165,18 @@ impl SessionSettings {
         settings.insert("smfi_parallel_threshold".to_string(), SettingValue::Integer(10000));
         settings.insert("smfi_max_workers".to_string(), SettingValue::Integer(8));
 
+        // sprinter f4f5d450e816: `application_name` — REGISTERED so the name is
+        // known (a `SHOW`/`RESET` of it is no longer "unrecognized configuration
+        // parameter"), with PostgreSQL's default of the empty string.
+        //
+        // This entry is a DECLARATION, never the value. `application_name` is
+        // per-connection, and this registry is ONE process-global map, so
+        // `EmbeddedDatabase::try_handle_application_name_setting` intercepts
+        // every `SET` / `RESET` / `SHOW` of it BEFORE this map is consulted and
+        // answers from the session's own backend state — the same separation
+        // GH#28 made for the connection-lifetime timeouts.
+        settings.insert("application_name".to_string(), SettingValue::String(String::new()));
+
         // Display settings
         settings.insert("client_encoding".to_string(), SettingValue::String("UTF8".to_string()));
         settings.insert("datestyle".to_string(), SettingValue::String("ISO, MDY".to_string()));

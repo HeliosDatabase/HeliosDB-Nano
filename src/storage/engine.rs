@@ -11389,6 +11389,7 @@ impl StorageEngine {
 
         // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
         let mut tuple = tuple;
+        let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
             if col.primary_key {
                 if let Some(v) = tuple.values.get(i) {
@@ -11405,9 +11406,21 @@ impl StorageEngine {
                                 tuple.values[i] = crate::Value::Int8(row_id as i64);
                             }
                         }
+                        generated_identity = true;
                     }
                 }
             }
+        }
+        // sprinter 6dc0cc115db9: a SERIAL / IDENTITY value generated HERE is
+        // what `LASTVAL()` must report — `INSERT INTO t (name) VALUES ('a')`
+        // never evaluates a `nextval()` call in this engine (these columns draw
+        // from the row-id allocator, not the sequence store), so hooking only
+        // the evaluator arm would leave `cursor.lastrowid` dead for the exact
+        // shape the item exists to fix. Gated on an actual fill: an INSERT that
+        // supplies the id explicitly does not define `lastval` in PostgreSQL
+        // either. No-op when no session backend is installed.
+        if generated_identity {
+            crate::note_session_lastval(row_id as i64);
         }
 
         let logical_tuple = tuple.clone();
@@ -11537,6 +11550,7 @@ impl StorageEngine {
 
         // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
         let mut tuple = tuple;
+        let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
             if col.primary_key {
                 if let Some(v) = tuple.values.get(i) {
@@ -11553,9 +11567,21 @@ impl StorageEngine {
                                 tuple.values[i] = crate::Value::Int8(row_id as i64);
                             }
                         }
+                        generated_identity = true;
                     }
                 }
             }
+        }
+        // sprinter 6dc0cc115db9: a SERIAL / IDENTITY value generated HERE is
+        // what `LASTVAL()` must report — `INSERT INTO t (name) VALUES ('a')`
+        // never evaluates a `nextval()` call in this engine (these columns draw
+        // from the row-id allocator, not the sequence store), so hooking only
+        // the evaluator arm would leave `cursor.lastrowid` dead for the exact
+        // shape the item exists to fix. Gated on an actual fill: an INSERT that
+        // supplies the id explicitly does not define `lastval` in PostgreSQL
+        // either. No-op when no session backend is installed.
+        if generated_identity {
+            crate::note_session_lastval(row_id as i64);
         }
 
         // Check PK/UNIQUE constraints BEFORE writing data to prevent duplicates.
@@ -14358,6 +14384,7 @@ impl StorageEngine {
 
         // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
         let mut tuple = tuple;
+        let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
             if col.primary_key {
                 if let Some(v) = tuple.values.get(i) {
@@ -14374,9 +14401,21 @@ impl StorageEngine {
                                 tuple.values[i] = crate::Value::Int8(row_id as i64);
                             }
                         }
+                        generated_identity = true;
                     }
                 }
             }
+        }
+        // sprinter 6dc0cc115db9: a SERIAL / IDENTITY value generated HERE is
+        // what `LASTVAL()` must report — `INSERT INTO t (name) VALUES ('a')`
+        // never evaluates a `nextval()` call in this engine (these columns draw
+        // from the row-id allocator, not the sequence store), so hooking only
+        // the evaluator arm would leave `cursor.lastrowid` dead for the exact
+        // shape the item exists to fix. Gated on an actual fill: an INSERT that
+        // supplies the id explicitly does not define `lastval` in PostgreSQL
+        // either. No-op when no session backend is installed.
+        if generated_identity {
+            crate::note_session_lastval(row_id as i64);
         }
 
         // Serialize tuple directly (RocksDB LZ4 handles compression at block level)

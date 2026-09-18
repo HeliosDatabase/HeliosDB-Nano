@@ -347,6 +347,16 @@ enum StartupError {
     /// `Protocol error: `; carrying the error itself would ship that prefix to
     /// the client, which no PostgreSQL server emits.
     InvalidPassword(String),
+    /// The `database` name in the startup packet (or, when that is absent, the
+    /// `user` name PostgreSQL falls back to) names neither a reserved keyspace
+    /// nor a registered tenant.
+    ///
+    /// sprinter c5afe5e41eac: this is raised ONLY after authentication, and it
+    /// carries PostgreSQL's own SQLSTATE for the condition —
+    /// ERRCODE_UNDEFINED_DATABASE / 3D000, not the 08P01 a generic protocol
+    /// violation gets. Like `InvalidPassword` it holds the BARE wire message,
+    /// so no `Protocol error: ` wrapper prefix reaches libpq.
+    UndefinedDatabase(String),
 }
 
 impl StartupError {
@@ -368,6 +378,13 @@ impl StartupError {
             Self::InvalidPassword(wire_message) => (
                 Error::authentication(wire_message.clone()),
                 crate::network::protocol::sqlstate::INVALID_PASSWORD,
+                wire_message,
+            ),
+            Self::UndefinedDatabase(wire_message) => (
+                // NOT `Error::authentication`: by the time this is raised the
+                // peer HAS authenticated. The catalogue lookup is what failed.
+                Error::query_execution(wire_message.clone()),
+                crate::network::protocol::sqlstate::INVALID_CATALOG_NAME,
                 wire_message,
             ),
         }
@@ -743,7 +760,14 @@ where
     async fn startup(&mut self) -> Result<()> {
         if let Err(startup_error) = self.handle_startup().await {
             let (e, code, wire_message) = startup_error.into_wire_error();
-            if code == crate::network::protocol::sqlstate::INVALID_PASSWORD {
+            if code == crate::network::protocol::sqlstate::INVALID_PASSWORD
+                // sprinter c5afe5e41eac: an unknown database name is now a
+                // post-authentication client mistake (a typo'd `dbname`, a
+                // dropped tenant), not a server failure — and its message
+                // carries a client-chosen string just like a credential
+                // rejection does. Same treatment.
+                || code == crate::network::protocol::sqlstate::INVALID_CATALOG_NAME
+            {
                 // A credential rejection carries the client-chosen user name;
                 // keep it out of the ERROR log (scanners produce these at
                 // volume) and Debug-escape it so it cannot forge log lines.
@@ -1043,8 +1067,13 @@ where
 
             // PostgreSQL requires the `user` startup parameter and refuses the
             // connection without it (08P01), so Nano does too. This runs BEFORE
-            // the database-name check below, which falls back to this very
-            // parameter.
+            // the database-name RESOLUTION below, which falls back to this very
+            // parameter. (The database name's VALIDATION moved after
+            // authentication — sprinter c5afe5e41eac; this refusal did not, and
+            // must not: PostgreSQL's postmaster rejects a packet with no `user`
+            // in `ProcessStartupPacket`, before any authentication method is
+            // even selected, and it leaks nothing — the peer is being told
+            // about its OWN packet.)
             //
             // HDB-009: the login role used to be threaded onto the session
             // right here — BEFORE authentication — so a connection that then
@@ -1056,18 +1085,22 @@ where
                 return Err(Error::protocol("no PostgreSQL user name specified in startup packet").into());
             }
 
-            // Bug 5 — validate the requested database name. Reject
-            // unknown names rather than silently routing every
-            // connection to the default `heliosdb` keyspace. Reserved
-            // names (`heliosdb`, `postgres`) and any registered tenant
-            // are accepted. An empty / missing `database` parameter
-            // falls back to the username, matching libpq behaviour;
-            // we still validate that fallback.
-            if let Some(requested) = params.get("database").cloned().or_else(|| params.get("user").cloned()) {
-                if !self.database.database_name_is_valid(&requested) {
-                    return Err(Error::authentication(format!("database \"{requested}\" does not exist")).into());
-                }
-            }
+            // Bug 5 — the requested database name. RESOLVED here (the startup
+            // packet is the only place it exists) but VALIDATED after
+            // authentication; see the check below the auth match.
+            //
+            // An empty or missing `database` falls back to the user name, which
+            // is PostgreSQL's own server-side rule — `ProcessStartupPacket`
+            // ends with `if (port->database_name[0] == '\0')
+            // port->database_name = port->user_name;` — and is what libpq's
+            // `dbname` default relies on. The `filter` reproduces the
+            // `[0] == '\0'` half: an explicitly EMPTY `database` is "absent",
+            // not "a database named ''".
+            let requested_database = params
+                .get("database")
+                .filter(|name| !name.is_empty())
+                .or_else(|| params.get("user"))
+                .cloned();
 
             // Send authentication request
             match self.auth_manager.method() {
@@ -1154,6 +1187,53 @@ where
             self.database
                 .set_session_login_user(self.session_id, self.username.clone())?;
 
+            // sprinter f4f5d450e816: the startup packet is where EVERY driver
+            // sends `application_name` (psycopg, JDBC, node-postgres and sqlx
+            // all do it by default), so honouring only `SET application_name`
+            // would have left the common case dead. Published on the same
+            // post-authentication line as the login identity, and from the same
+            // client-asserted source, so it is truncated the same way.
+            if let Some(app) = params.get("application_name").filter(|v| !v.is_empty()) {
+                let _ = self.database.set_session_application_name(self.session_id, app);
+            }
+            // `pg_stat_activity.client_addr` / `client_port` stay NULL: this
+            // handler is constructed from an already-accepted stream and never
+            // sees the peer address. Plumbing it through is a listener change
+            // with no bearing on either item's contract, so it is left as a
+            // recorded gap rather than guessed at.
+
+            // sprinter c5afe5e41eac: the database/tenant name is validated
+            // HERE — after every authentication arm above has succeeded, and
+            // before the ParameterStatus burst.
+            //
+            // It used to run BEFORE the authentication request was even sent.
+            // The comment it carried ("this runs BEFORE the database-name
+            // check below, which falls back to this very parameter") was about
+            // the `user`-presence check, and what it was protecting is
+            // untouched: a startup packet with no `user` is still refused
+            // first, and an unknown database still refuses the connection
+            // before a single statement can run. Fail-closed is preserved.
+            //
+            // What changed is WHO can observe the answer. With the check ahead
+            // of authentication, an unknown name got a FATAL that named the
+            // condition and ZERO authentication messages, while a known name
+            // got the full SCRAM/password exchange — so an unauthenticated
+            // peer could enumerate tenants (and, via libpq's `dbname` = user
+            // default, accounts) one connection per guess. PostgreSQL resolves
+            // the database in `InitPostgres`, AFTER `PerformAuthentication`,
+            // and answers ERRCODE_UNDEFINED_DATABASE; that is what this is.
+            //
+            // The fallback to the user name is kept (PostgreSQL has it too,
+            // see above) because once the peer is authenticated it discloses
+            // nothing: the name it is told about is one it just proved it owns.
+            if let Some(requested) = requested_database {
+                if !self.database.database_name_is_valid(&requested) {
+                    return Err(StartupError::UndefinedDatabase(format!(
+                        "database \"{requested}\" does not exist"
+                    )));
+                }
+            }
+
             // Send parameter status messages
             self.send_parameter_status(
                 "server_version",
@@ -1191,8 +1271,19 @@ where
             self.send_parameter_status("helios.fast_autocommit", "off").await?;
 
             // Send backend key data
+            // sprinter f4f5d450e816: BackendKeyData carries the backend's pid,
+            // and PostgreSQL clients treat it as the same number
+            // `pg_backend_pid()` returns. This used to send the OS process id —
+            // identical for every connection in this process, which makes the
+            // key useless for identifying a backend (and would contradict
+            // `pg_backend_pid()` / `pg_stat_activity.pid` now that those are
+            // per-connection). Nothing in this server routes CancelRequest by
+            // it, so there is no compatibility cost to reporting the truth.
             self.send_message(BackendMessage::BackendKeyData {
-                process_id: std::process::id() as i32,
+                process_id: self
+                    .database
+                    .session_backend_pid(self.session_id)
+                    .unwrap_or_else(|_| std::process::id() as i32),
                 secret_key: rand::random(),
             })
             .await?;
@@ -1766,6 +1857,30 @@ where
             if let Some(handled) = self.handle_timeout_guc_statement(trimmed, "SET").await? {
                 return Ok(handled);
             }
+            // sprinter f4f5d450e816: `SET` / `SET LOCAL application_name`. The
+            // generic ack below would drop it — the same "silently acked a SET
+            // that did nothing" defect as HC4's `SET ROLE` — and this is the one
+            // GUC every driver sets, so the drop was universal.
+            if EmbeddedDatabase::is_application_name_statement(trimmed) {
+                if let Err(e) = self
+                    .database
+                    .try_handle_session_application_name(self.session_id, trimmed)
+                {
+                    self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
+                    return Ok(());
+                }
+                // PostgreSQL marks `application_name` GUC_REPORT: the server
+                // echoes every change as a ParameterStatus so a pool/driver can
+                // track it without a round trip. psycopg and JDBC both read it.
+                let value = self
+                    .database
+                    .session_application_name(self.session_id)
+                    .unwrap_or_default();
+                self.send_parameter_status("application_name", &value).await?;
+                self.send_command_complete("SET").await?;
+                self.send_ready_for_query().await?;
+                return Ok(());
+            }
             // Handle generic SET commands for client compatibility (e.g., SET client_encoding = 'UTF8').
             self.send_command_complete("SET").await?;
             self.send_ready_for_query().await?;
@@ -1804,6 +1919,20 @@ where
                 self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
                 return Ok(());
             }
+            self.send_command_complete("RESET").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        } else if starts_with_icase(trimmed, "RESET ") && EmbeddedDatabase::is_application_name_statement(trimmed) {
+            // sprinter f4f5d450e816: `RESET application_name` -> the empty
+            // string (PostgreSQL's default VALUE), on THIS session only.
+            if let Err(e) = self
+                .database
+                .try_handle_session_application_name(self.session_id, trimmed)
+            {
+                self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
+                return Ok(());
+            }
+            self.send_parameter_status("application_name", "").await?; // GUC_REPORT
             self.send_command_complete("RESET").await?;
             self.send_ready_for_query().await?;
             return Ok(());
@@ -3630,6 +3759,10 @@ where
                 | "authentication_timeout"
                 | "max_connections"
                 | "session_authorization"
+                // sprinter f4f5d450e816: `SHOW application_name` must answer the
+                // same per-session value on BOTH protocols; without this the
+                // extended path fell through to the params planner.
+                | "application_name"
                 | "role"
         ) {
             Some(name)
@@ -3670,6 +3803,14 @@ where
             // SQLAlchemy and Npgsql probe, and it must agree with
             // `current_user`.
             "session_authorization" => self.session_login_identity(),
+            // sprinter f4f5d450e816: THIS connection's `application_name` —
+            // whether it arrived in the startup packet or from a later `SET`.
+            // The static table below cannot answer it (it has no idea who this
+            // connection is), exactly like `session_authorization` above.
+            "application_name" => self
+                .database
+                .session_application_name(self.session_id)
+                .unwrap_or_default(),
             // PostgreSQL's value when no `SET ROLE` is in effect, which is
             // always here: `SET ROLE` / `SET SESSION AUTHORIZATION` stay
             // REFUSED (0A000, HC4). Identity switching is not implemented, and
@@ -5228,6 +5369,15 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     if lower.starts_with("invalid value for parameter") {
         return sqlstate::INVALID_PARAMETER_VALUE; // 22023
     }
+    // sprinter 6dc0cc115db9: `lastval()` before any `nextval()` in this session.
+    // PostgreSQL reports 55000 object_not_in_prerequisite_state, and a DB-API
+    // shim branches on it to decide that `cursor.lastrowid` is simply unknown
+    // rather than that the connection is broken — which is what the XX000
+    // internal_error this would otherwise degrade to means to a pooler. Anchored
+    // on the emitter's const (`session::scoped`), marker-const discipline.
+    if message.contains(crate::session::scoped::LASTVAL_UNDEFINED_MESSAGE) {
+        return sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE; // 55000
+    }
     // GH#28 (c2): `SET LOCAL idle_session_timeout` /
     // `idle_in_transaction_session_timeout` is refused rather than silently
     // widened to the session. Marker const owned by the single emitter
@@ -5346,6 +5496,20 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         // Referencing/referenced column-count mismatch (GH#27): PostgreSQL
         // reports 42830 invalid_foreign_key (tablecmds.c). Same ordering reason
         // as the arm above.
+        sqlstate::INVALID_FOREIGN_KEY // 42830
+    } else if lower.contains("there is no unique constraint matching given keys for referenced table") {
+        // sprinter fb9aec923da8: the OTHER 42830 the comment above reserves —
+        // a foreign key whose referenced column set is neither the parent's
+        // PRIMARY KEY nor covered by a UNIQUE constraint or index
+        // (`EmbeddedDatabase::validate_fk_reference`). PostgreSQL's own
+        // wording (tablecmds.c `transformFkeyCheckAttrs`).
+        //
+        // Distinct from the ON CONFLICT arm at the top of this chain ("no
+        // unique OR EXCLUSION constraint matching …", 42P10): different
+        // statement, different code, and that arm is checked first, so the two
+        // cannot be confused. Checked ahead of the table/relation arms for the
+        // same reason as the two above — the message names a table but carries
+        // no not-found token, so it would otherwise degrade to XX000.
         sqlstate::INVALID_FOREIGN_KEY // 42830
     } else if lower.contains("cannot be dropped because some objects depend")
         // `DROP INDEX` on a PK/UNIQUE/FK backing index, worded the way

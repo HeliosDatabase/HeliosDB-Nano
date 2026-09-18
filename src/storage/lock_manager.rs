@@ -14,7 +14,7 @@ use crate::config::LockConfig;
 use crate::{Error, Result};
 use dashmap::DashMap;
 use rand::Rng;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{trace, warn};
@@ -49,6 +49,17 @@ pub struct LockState {
     pub lock_type: Option<LockType>,
     /// Transactions waiting to acquire this lock
     pub waiters: Vec<(u64, LockType)>,
+    /// How many times each holder has acquired this lock (F1, sprinter
+    /// 68b70030ba28). Re-entrancy (see `can_acquire`) lets one
+    /// transaction take N guards on the same resource; without a count the
+    /// FIRST guard to drop released the holder outright, handing the row to
+    /// another transaction while the first still logically held it.
+    ///
+    /// Invariant: the key set is exactly `holders`, and every value is >= 1.
+    /// `holders` stays a set of DISTINCT ids so `get_lock_holders`,
+    /// `can_acquire`'s sole-holder test and the wait-for graph keep their
+    /// existing meaning.
+    pub acquisition_counts: HashMap<u64, u32>,
 }
 
 impl LockState {
@@ -58,6 +69,7 @@ impl LockState {
             holders: Vec::new(),
             lock_type: None,
             waiters: Vec::new(),
+            acquisition_counts: HashMap::new(),
         }
     }
 
@@ -113,21 +125,84 @@ impl LockState {
     /// stamping `Read` there would advertise the resource as shared — another
     /// transaction's Read would then be granted against uncommitted data. Write
     /// wins over Read, always.
+    ///
+    /// Every call counts as one acquisition (F1): the Nth re-entrant acquire
+    /// by an existing holder does not push a duplicate id, it bumps the count,
+    /// so the matching Nth release is the one that actually frees the row.
     fn add_holder(&mut self, transaction_id: u64, lock_type: LockType) {
         if !self.holders.contains(&transaction_id) {
             self.holders.push(transaction_id);
         }
+        *self.acquisition_counts.entry(transaction_id).or_insert(0) += 1;
         self.lock_type = match (self.lock_type, lock_type) {
             (Some(LockType::Write), _) => Some(LockType::Write),
             (_, requested) => Some(requested),
         };
     }
 
-    /// Remove a holder from this lock
+    /// Drop a holder ENTIRELY, discarding every re-entrant acquisition it had.
+    ///
+    /// This is the abort path (deadlock victim / lock timeout /
+    /// `cleanup_transaction`): the transaction is being torn down, so all of
+    /// its acquisitions on this resource go with it. The ordinary guard-drop
+    /// path uses `release_once` instead.
     fn remove_holder(&mut self, transaction_id: u64) {
         self.holders.retain(|&id| id != transaction_id);
+        self.acquisition_counts.remove(&transaction_id);
         if self.holders.is_empty() {
             self.lock_type = None;
+        }
+    }
+
+    /// Release ONE acquisition by `transaction_id` (F1, sprinter 68b70030ba28).
+    ///
+    /// Returns `true` only when that was the last one and the holder is now
+    /// really gone — which is the condition the caller needs before reaping the
+    /// whole lock entry. A transaction that acquired the resource N times must
+    /// drop N guards before anyone else can have it; dropping guard 1 of N (a
+    /// statement-scoped lock, or a savepoint rollback releasing a subset) must
+    /// leave the row locked, or the release fails OPEN and another transaction
+    /// is granted a row this one is still writing.
+    ///
+    /// Releasing a transaction that is not a holder is a no-op: a stale guard
+    /// (its transaction already aborted and was cleaned up, or the lock was
+    /// released explicitly before the guard dropped) must never evict the
+    /// CURRENT holder. The `retain` keeps that idempotent.
+    fn release_once(&mut self, transaction_id: u64) -> bool {
+        match self.acquisition_counts.get_mut(&transaction_id) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => {
+                self.remove_holder(transaction_id);
+                true
+            }
+            // Not a counted holder: nothing to release. Still re-assert the
+            // invariant (`holders` == keys of `acquisition_counts`) defensively
+            // — it is a no-op unless something desynced the two.
+            None => {
+                self.holders.retain(|&id| id != transaction_id);
+                if self.holders.is_empty() {
+                    self.lock_type = None;
+                }
+                false
+            }
+        }
+    }
+
+    /// Register one EXTRA acquisition for an existing holder, without granting
+    /// anything new (F1). Used by `LockGuard`'s `Clone`: a cloned guard is a
+    /// second live handle to the same lock and will run `Drop` of its own, so
+    /// the count has to match the number of guards or the first drop releases
+    /// a lock two handles still believe in.
+    ///
+    /// Fails closed: if `transaction_id` is not already a holder (a clone of a
+    /// stale guard whose transaction was cleaned up) nothing is granted and the
+    /// clone behaves like the stale guard it came from.
+    fn duplicate_acquisition(&mut self, transaction_id: u64) {
+        if let Some(count) = self.acquisition_counts.get_mut(&transaction_id) {
+            *count += 1;
         }
     }
 
@@ -145,7 +220,7 @@ impl LockState {
 }
 
 /// RAII guard for automatic lock release
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LockGuard {
     /// Unique identifier for this lock
     pub lock_id: String,
@@ -158,7 +233,31 @@ pub struct LockGuard {
 impl Drop for LockGuard {
     fn drop(&mut self) {
         if let Some(ref mgr) = self.lock_manager {
+            // Releases exactly ONE acquisition (F1). A transaction holding N
+            // guards on this resource stays the holder until the Nth drop.
             let _ = mgr.release_lock_internal(&self.lock_id, self.transaction_id);
+        }
+    }
+}
+
+/// Hand-written so a clone is COUNTED (F1, sprinter 68b70030ba28).
+///
+/// `LockGuard` is an RAII handle with a `Drop` that releases one acquisition.
+/// The derived `Clone` produced a second handle sharing ONE acquisition, so the
+/// first of the two drops released a lock the other clone still stood for —
+/// the same fail-open shape the refcount exists to close. Cloning now registers
+/// an extra acquisition, so N live guards always mean N pending releases.
+impl Clone for LockGuard {
+    fn clone(&self) -> Self {
+        if let Some(ref mgr) = self.lock_manager {
+            if let Some(mut state) = mgr.locks.get_mut(&self.lock_id) {
+                state.duplicate_acquisition(self.transaction_id);
+            }
+        }
+        Self {
+            lock_id: self.lock_id.clone(),
+            transaction_id: self.transaction_id,
+            lock_manager: self.lock_manager.clone(),
         }
     }
 }
@@ -514,7 +613,14 @@ impl LockManager {
             .unwrap_or(0)
     }
 
-    /// Internal lock release logic
+    /// Internal lock release logic — releases ONE acquisition.
+    ///
+    /// F1 (sprinter 68b70030ba28): with a re-entrant holder this is a
+    /// decrement, not a removal. The lock entry is only reaped once the last
+    /// acquisition is gone; releasing guard 1 of N leaves the transaction
+    /// holding the resource, so a partial release (statement-scoped lock,
+    /// savepoint rollback dropping a subset of guards) cannot hand the row to
+    /// another transaction while this one still holds it.
     pub fn release_lock_internal(&self, resource: &str, transaction_id: u64) -> Result<()> {
         trace!(
             txn_id = transaction_id,
@@ -522,12 +628,14 @@ impl LockManager {
             "Releasing lock"
         );
 
-        // Remove holder from lock state
+        // Decrement this transaction's acquisition count on the lock state
         if let Some(mut lock_state) = self.locks.get_mut(resource) {
-            lock_state.remove_holder(transaction_id);
+            let fully_released = lock_state.release_once(transaction_id);
 
-            // If no more holders and no waiters, remove the lock entry
-            if lock_state.holders.is_empty() && lock_state.waiters.is_empty() {
+            // If the holder is really gone and nothing else references the
+            // resource, remove the lock entry. Guarded on `fully_released` so a
+            // still-held re-entrant lock is never reaped.
+            if fully_released && lock_state.holders.is_empty() && lock_state.waiters.is_empty() {
                 drop(lock_state);
                 self.locks.remove(resource);
             }
@@ -540,6 +648,10 @@ impl LockManager {
     }
 
     /// Release a lock held by a transaction
+    ///
+    /// Releases ONE acquisition — the same unit `LockGuard::drop` releases. A
+    /// transaction that acquired the resource N times still holds it after this
+    /// call until the remaining N-1 acquisitions are released (F1).
     ///
     /// # Arguments
     /// * `lock_guard` - Guard returned from acquire_lock
@@ -642,6 +754,9 @@ impl LockManager {
     /// Clean up all state for a transaction
     ///
     /// Removes transaction from all locks (holders and waiters) and wait graph.
+    /// F1: this is the abort path, so it uses `remove_holder` — every
+    /// re-entrant acquisition the transaction had on every resource goes at
+    /// once. Only the ordinary guard-drop path decrements one at a time.
     fn cleanup_transaction(&self, transaction_id: u64) {
         // Remove from wait graph
         self.wait_graph.remove(&transaction_id);
@@ -832,8 +947,38 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// True for the error the detector raises on a cycle. `Error::deadlock` is
+    /// not its own variant — it formats into `Error::Transaction` with a
+    /// `Deadlock:` prefix — and the *conflict* error `try_acquire_lock` returns
+    /// is also an `Error::Transaction`, so the prefix is what separates "you
+    /// are the deadlock victim" from "the lock is simply busy".
+    fn is_deadlock_error<T>(result: &Result<T>) -> bool {
+        matches!(result, Err(Error::Transaction(msg)) if msg.starts_with("Deadlock:"))
+    }
+
     #[test]
     fn test_deadlock_detection_simple() {
+        // F2 (sprinter fab4dd25bf29). The previous shape of this test was a
+        // PROVEN flake (GH Actions run 34426473254 failed only this test on
+        // d1c48b3; the same-commit rerun passed): it spawned a thread to make
+        // tx1 block on B, slept 50 ms hoping the wait had registered, then
+        // asserted that tx2 — specifically tx2 — was the victim. Two things
+        // there are not properties of the lock manager: (a) 50 ms of wall clock
+        // is not a happens-before edge, so on a slow runner tx2 could ask for A
+        // before tx1's wait edge existed and simply be granted it; (b) with
+        // both parties spinning in `acquire_lock`, EITHER can run the detector
+        // first, and the detector aborts whoever asked — so tx1 could be the
+        // victim, its cleanup frees A, and tx2's acquire then SUCCEEDS.
+        //
+        // The fix removes the race instead of widening the sleep: tx1's wait is
+        // registered SYNCHRONOUSLY on this thread. `try_acquire_lock` is
+        // literally the first (failing) iteration of the blocking
+        // `acquire_lock` loop — it enqueues tx1 as a waiter on B and writes the
+        // wait-for edge 1 -> 2 — so after it returns, "tx1 is registered as
+        // waiting" is a fact, not a hope. It also needs ZERO production-code
+        // surface (no test-only wait-count accessor). With only one party
+        // running the detector there is no second detector to race, and no
+        // sleep anywhere, so the outcome is deterministic on any runner.
         let manager = Arc::new(LockManager::new(5000));
 
         // Transaction 1 holds lock on resource A
@@ -846,23 +991,40 @@ mod tests {
             .acquire_lock("resourceB", 2, LockType::Write)
             .expect("Failed to acquire lock B for tx 2");
 
-        // Transaction 1 tries to acquire lock on resource B (will wait)
-        let manager1 = Arc::clone(&manager);
-        let handle1 = thread::spawn(move || manager1.acquire_lock("resourceB", 1, LockType::Write));
+        // Transaction 1 asks for B and is enqueued behind tx2: edge 1 -> 2.
+        let tx1_result = manager.try_acquire_lock("resourceB", 1, LockType::Write);
+        assert!(tx1_result.is_err(), "tx1 must not be granted B while tx2 holds it");
+        assert_eq!(
+            manager.wait_graph.get(&1).map(|e| e.value().clone()),
+            Some(vec![2]),
+            "tx1's wait for tx2 must be registered before tx2 closes the cycle"
+        );
 
-        // Give tx1 time to start waiting
-        thread::sleep(Duration::from_millis(50));
+        // Transaction 2 asks for A, closing the cycle 1 -> 2 -> 1.
+        let tx2_result = manager.acquire_lock("resourceA", 2, LockType::Write);
 
-        // Transaction 2 tries to acquire lock on resource A (deadlock!)
-        let result = manager.acquire_lock("resourceA", 2, LockType::Write);
+        // The property: a cycle aborts EXACTLY ONE of the two parties with a
+        // deadlock error. Which one is the manager's choice, not this test's.
+        let victims = usize::from(is_deadlock_error(&tx1_result)) + usize::from(is_deadlock_error(&tx2_result));
+        assert_eq!(
+            victims, 1,
+            "exactly one party must be aborted as the deadlock victim \
+             (tx1: {tx1_result:?}, tx2: {tx2_result:?})"
+        );
 
-        // Should detect deadlock
-        assert!(result.is_err());
+        // …and the cycle must actually be BROKEN, not merely reported: the
+        // victim's locks are gone, so the survivor now makes progress. (The old
+        // test never checked this.)
+        let survivor = manager.acquire_lock("resourceB", 1, LockType::Write);
+        assert!(
+            survivor.is_ok(),
+            "aborting the victim must release its locks so the survivor proceeds: {survivor:?}"
+        );
 
         // Clean up
+        drop(survivor);
         drop(guard1);
         drop(guard2);
-        let _ = handle1.join();
     }
 
     #[test]
@@ -1152,6 +1314,173 @@ mod tests {
 
         drop(theirs);
         drop(mine);
+    }
+
+    /// The recorded acquisition count for `(resource, txn)`, or `None` when
+    /// the transaction is not a holder. Reads the refcount F1 added directly,
+    /// so the tests below assert on the mechanism, not on a proxy for it.
+    fn acquisition_count(manager: &LockManager, resource: &str, txn: u64) -> Option<u32> {
+        manager
+            .locks
+            .get(resource)
+            .and_then(|state| state.acquisition_counts.get(&txn).copied())
+    }
+
+    // -----------------------------------------------------------------------
+    // F1 (sprinter 68b70030ba28): re-entrancy needs an acquisition REFCOUNT.
+    //
+    // Re-entrancy (above) lets one transaction hold N guards for one resource.
+    // Before the refcount, `LockGuard::drop` released the holder on the FIRST
+    // drop, so guard 1 of N freed a row the transaction was still writing.
+    // Nothing observable broke *today* only because every guard is parked in
+    // `Transaction::acquired_locks` until commit/rollback and they all drop
+    // together — a latent fail-open that any early-drop path (statement-scoped
+    // locks, a savepoint rollback releasing a subset) would have turned live.
+    // These tests therefore drive the lock-manager API DIRECTLY rather than a
+    // SQL path, which is the only way to construct the early drop.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dropping_one_of_two_re_entrant_guards_keeps_the_lock_held() {
+        let manager = Arc::new(LockManager::new(200));
+
+        let first = manager
+            .acquire_lock("data:t:1", 7, LockType::Write)
+            .expect("the first write lock must be granted");
+        let second = manager
+            .acquire_lock("data:t:1", 7, LockType::Write)
+            .expect("the re-entrant write lock must be granted");
+        assert_eq!(
+            acquisition_count(&manager, "data:t:1", 7),
+            Some(2),
+            "two acquires must be counted as two"
+        );
+
+        // The early drop: one guard goes, the transaction still logically holds
+        // the row. Pre-fix this single `remove_holder` emptied `holders`, the
+        // entry was reaped, and the three assertions below all failed.
+        drop(second);
+
+        assert!(
+            manager.is_locked("data:t:1"),
+            "*** the row was released while its transaction still held a guard ***"
+        );
+        assert_eq!(manager.get_lock_holders("data:t:1"), vec![7]);
+        assert!(
+            manager.try_acquire_lock("data:t:1", 8, LockType::Write).is_err(),
+            "*** another transaction was granted a row txn 7 still holds ***"
+        );
+
+        // The LAST release is the one that frees it.
+        drop(first);
+        assert!(!manager.is_locked("data:t:1"));
+        let other = manager
+            .acquire_lock("data:t:1", 8, LockType::Write)
+            .expect("once every acquisition is released the row is free");
+        drop(other);
+    }
+
+    #[test]
+    fn n_acquires_need_n_drops_before_the_lock_is_free() {
+        let manager = Arc::new(LockManager::new(200));
+
+        // Savepoint-style: a nested scope takes extra locks on the same row and
+        // its rollback drops just that subset. The outer statement's lock must
+        // survive it.
+        let mut guards: Vec<LockGuard> = (0..4)
+            .map(|_| {
+                manager
+                    .acquire_lock("data:t:1", 7, LockType::Write)
+                    .expect("every re-entrant acquire must be granted")
+            })
+            .collect();
+        assert_eq!(acquisition_count(&manager, "data:t:1", 7), Some(4));
+
+        // Partial release (the savepoint subset): 4 -> 1 acquisitions.
+        guards.truncate(1);
+        assert!(manager.is_locked("data:t:1"), "the outer lock outlives the subset");
+        assert_eq!(manager.get_lock_holders("data:t:1"), vec![7]);
+        assert!(
+            manager.try_acquire_lock("data:t:1", 8, LockType::Read).is_err(),
+            "a partially released row must still fail closed for everyone else"
+        );
+
+        // The final drop releases it.
+        guards.clear();
+        assert!(!manager.is_locked("data:t:1"));
+    }
+
+    #[test]
+    fn mixed_read_write_re_entrancy_is_counted_once_per_acquire() {
+        let manager = Arc::new(LockManager::new(200));
+
+        // REPEATABLE READ shape: read the row, write it, read it again.
+        let read = manager.acquire_lock("data:t:1", 7, LockType::Read).expect("read");
+        let write = manager.acquire_lock("data:t:1", 7, LockType::Write).expect("upgrade");
+        let read_again = manager.acquire_lock("data:t:1", 7, LockType::Read).expect("re-read");
+
+        drop(read_again);
+        drop(write);
+        // One acquisition (the original Read) is still outstanding, and the
+        // resource stays EXCLUSIVE — `lock_type` only ever strengthens, so a
+        // dropped upgrade must not re-advertise the row as shared.
+        assert!(manager.is_locked("data:t:1"));
+        assert!(
+            manager.try_acquire_lock("data:t:1", 8, LockType::Read).is_err(),
+            "another transaction must not be let in while txn 7 holds an acquisition"
+        );
+
+        drop(read);
+        assert!(!manager.is_locked("data:t:1"));
+    }
+
+    #[test]
+    fn aborting_a_transaction_discards_all_its_acquisitions() {
+        let manager = Arc::new(LockManager::new(200));
+
+        let guards: Vec<LockGuard> = (0..3)
+            .map(|_| manager.acquire_lock("data:t:1", 7, LockType::Write).expect("acquire"))
+            .collect();
+
+        // The abort path (deadlock victim / lock timeout) must NOT need three
+        // decrements: `cleanup_transaction` drops the holder outright.
+        manager.resolve_deadlock(7).expect("victim cleanup");
+        assert!(!manager.is_locked("data:t:1"), "an aborted transaction holds nothing");
+
+        let other = manager
+            .acquire_lock("data:t:1", 8, LockType::Write)
+            .expect("the row is free for the survivor");
+
+        // The victim's stale guards now drop. Each is a no-op: they must never
+        // evict txn 8, which acquired the row after the abort.
+        drop(guards);
+        assert_eq!(
+            manager.get_lock_holders("data:t:1"),
+            vec![8],
+            "stale guards from an aborted transaction must not release the new holder"
+        );
+        drop(other);
+        assert!(!manager.is_locked("data:t:1"));
+    }
+
+    #[test]
+    fn cloning_a_guard_registers_another_acquisition() {
+        let manager = Arc::new(LockManager::new(200));
+
+        let guard = manager
+            .acquire_lock("data:t:1", 7, LockType::Write)
+            .expect("the write lock must be granted");
+        // A clone is a second live RAII handle with its own `Drop`; with the
+        // derived `Clone` the first of the two drops released the lock while
+        // the other clone was still alive — the same fail-open as the missing
+        // refcount, arriving by a different door.
+        let copy = guard.clone();
+        assert_eq!(acquisition_count(&manager, "data:t:1", 7), Some(2));
+
+        drop(copy);
+        assert!(manager.is_locked("data:t:1"), "the surviving clone still holds the row");
+        drop(guard);
+        assert!(!manager.is_locked("data:t:1"));
     }
 
     #[test]

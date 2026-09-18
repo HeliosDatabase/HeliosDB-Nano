@@ -23,7 +23,7 @@ fn init_regex(pattern: &str) -> Regex {
 
 /// Translate MySQL SQL to PostgreSQL-compatible SQL.
 ///
-/// Every pass after `translate_backticks` is a `Regex::replace_all` over the
+/// Every pass below is a `Regex::replace_all` over the
 /// whole statement, so on its own it would happily rewrite MySQL keywords that
 /// appear *inside* string literals, quoted identifiers or comments — HDB-007:
 /// `INSERT INTO t VALUES ('TINYINT(1)')` used to store `BOOLEAN`, and
@@ -39,11 +39,15 @@ pub fn translate(sql: &str) -> String {
 
     // Hide string literals, quoted identifiers and comments from the regex
     // passes; `regions` keeps their exact bytes for the final restore.
+    // Backtick-quoted identifiers are RESOLVED here rather than masked
+    // verbatim (sprinter ecc77a75df2b): the region a placeholder stands for is
+    // already the PostgreSQL spelling of that name, so no later pass — and
+    // nothing at all after `unmask_protected_regions` — has to touch a
+    // backtick.  There is therefore no "strip the delimiters" step left.
     let (masked, regions) = mask_protected_regions(&normalized);
 
     // Apply transformations in order, on the masked text.
-    let mut result = translate_backticks(&masked);
-    result = translate_types(&result);
+    let mut result = translate_types(&masked);
     result = translate_auto_increment(&result);
     result = translate_charset_collation(&result);
     result = translate_on_duplicate_key(&result);
@@ -79,13 +83,15 @@ pub fn translate(sql: &str) -> String {
 ///   `\0` → NUL  (stripped — Postgres can't store NUL in text)
 ///   `\'` left unchanged (already handled by the SQL parser as `''`)
 ///
-/// Comments (`--`, `#`, `/* … */`, `/*! … */`) and backtick-quoted identifiers
-/// are copied through byte-for-byte: an apostrophe inside one of them is part
-/// of that region, and must not open a phantom string literal that then
-/// "closes" on the next *real* quote — which used to escape-process the
-/// following literal's bytes (`` `it's_col` = 'a = "b" c' `` came back as
-/// `'a = 'b' c'`).  What counts as a comment is [`comment_len`], the same rule
-/// `mask_protected_regions` applies one step later.
+/// Comments (`--`, `#`, `/* … */`, `/*! … */`), backtick-quoted identifiers
+/// and double-quoted identifiers are copied through byte-for-byte: an
+/// apostrophe inside one of them is part of that region, and must not open a
+/// phantom string literal that then "closes" on the next *real* quote — which
+/// used to escape-process the following literal's bytes
+/// (`` `it's_col` = 'a = "b" c' `` came back as `'a = 'b' c'`).  What counts as
+/// a comment is [`comment_len`], and what counts as a quoted region is
+/// [`scan_quoted_region`] — the same rules `mask_protected_regions` applies one
+/// step later, so the two passes can never disagree about where a region ends.
 fn translate_backslash_escapes(sql: &str) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut cursor = 0usize;
@@ -103,9 +109,9 @@ fn translate_backslash_escapes(sql: &str) -> String {
             out.push_str(&rest[..comment]);
             comment
         } else if ch == '`' {
-            // Backtick-quoted identifier: copied through untouched; the
-            // delimiters are stripped later by `translate_backticks`.
-            let (_, ident_len, _) = scan_quoted_region(rest, '`', false);
+            // Backtick-quoted identifier: copied through untouched; it is
+            // resolved to PostgreSQL identifier text by `mask_protected_regions`.
+            let (_, ident_len, _) = scan_quoted_region(rest, '`', true);
             out.push_str(&rest[..ident_len]);
             ident_len
         } else if ch == '\'' {
@@ -118,6 +124,20 @@ fn translate_backslash_escapes(sql: &str) -> String {
             // Context check: after VALUES(, SET =, etc. — not after FROM/TABLE/INTO
             out.push('\'');
             ch.len_utf8() + process_string_interior(&mut out, &rest[1..], '"')
+        } else if ch == '"' {
+            // sprinter 948023755a35 (carrier 1): a double-quoted IDENTIFIER is
+            // a region too, and is just as opaque to this pass as a literal.
+            // This arm used to push the bare `"` and keep scanning the
+            // interior, so an apostrophe in the NAME opened a phantom literal
+            // that then "closed" on the next real literal's opening quote —
+            // from there every quote was paired one position off, and the
+            // bytes of whatever the mis-paired region covered were
+            // escape-processed (`'q\\r'` came back with its `\\` uncollapsed)
+            // or re-quoted.  `""` is an escaped quote inside the name, the
+            // same rule `mask_protected_regions` applies one step later.
+            let (_, ident_len, _) = scan_quoted_region(rest, '"', true);
+            out.push_str(&rest[..ident_len]);
+            ident_len
         } else {
             out.push(ch);
             ch.len_utf8()
@@ -204,6 +224,16 @@ fn looks_like_mysql_string_context(out: &str) -> bool {
     // them apart. Inside a CREATE TABLE's column/constraint list, `"` is
     // always a quoted identifier, never a MySQL string literal, regardless
     // of what immediately precedes it.
+    //
+    // sprinter 948023755a35 kept this guard rather than folding it away. The
+    // "every `"…"` is an opaque region" rule it added governs how far the
+    // escape pass SCANS; this function governs which of the two things the
+    // region IS. They are independent: without the guard, `"Id"` is still
+    // consumed in one piece — as a string literal `'Id'`, which is exactly the
+    // `SQL parse error: Expected: column name …, found: 'Id'` 57416d9c fixed.
+    // Dropping the string branch altogether is not an option either: MySQL's
+    // default sql_mode has no ANSI_QUOTES, so in value position `"…"` really
+    // is a string literal and PHP applications send it that way.
     if in_create_table_column_list(out) {
         return false;
     }
@@ -380,8 +410,11 @@ fn push_masked_region(
 /// belongs to the interior instead of closing the region — note that a
 /// backslash is *not* an escape here: `translate_backslash_escapes` has
 /// already turned `\'` into `''` and `\\` into `\`, so a literal may
-/// legitimately end with a backslash (`'a\'`).  Backticks do not double,
-/// which reproduces `translate_backticks`, which simply drops every backtick.
+/// legitimately end with a backslash (`'a\'`).  All three delimiters double:
+/// `''`, `""` and (sprinter ecc77a75df2b) ``` `` ```, which is how MySQL
+/// spells a backtick inside a backtick-quoted name.  Reading ``` `a``b` ``` as
+/// two adjacent regions instead of one used to concatenate the halves into the
+/// single bare name `ab`.
 fn scan_quoted_region(rest: &str, quote: char, doubling: bool) -> (&str, usize, bool) {
     let quote_len = quote.len_utf8();
     let mut cursor = quote_len;
@@ -412,7 +445,7 @@ fn scan_quoted_region(rest: &str, quote: char, doubling: bool) -> (&str, usize, 
 /// |---|---|---|
 /// | string literal | `'` | `'` not followed by `'` |
 /// | quoted identifier | `"` | `"` not followed by `"` |
-/// | backtick identifier | `` ` `` | `` ` `` |
+/// | backtick identifier | `` ` `` | `` ` `` not followed by `` ` `` |
 /// | line comment | `--` or `#` | end of line |
 /// | block comment | `/*` | `*/` |
 ///
@@ -420,18 +453,29 @@ fn scan_quoted_region(rest: &str, quote: char, doubling: bool) -> (&str, usize, 
 /// `#` that belongs to the `<#>`, `#>`, `#>>` or `#-` operators is *not* a
 /// comment marker, so `emb <#> '[1,2,3]' LIMIT 0, 10` keeps its LIMIT.
 ///
-/// `/*! … */` executable comments are the one exception: they are copied
-/// through unmasked *and unscanned*, so `EXEC_COMMENT_RE` in `translate_misc`
-/// keeps stripping them exactly as before.  Quoted regions keep their
-/// delimiters (patterns such as `\bBINARY\s+(')` still need to see them);
-/// comments are replaced by a bare placeholder and restored in full.
+/// `/*! … */` executable comments are the one exception: they are STRIPPED
+/// here rather than masked.  They used to be copied through unmasked so
+/// `translate_misc` could strip them with a regex, which left the one piece of
+/// text in the masked statement that could still contain a quote or a backtick
+/// — sprinter 948023755a35 (carrier 2): the apostrophe in `` SELECT /*! it's */
+/// `c` FROM t `` put the backtick pass into literal-skipping mode for the rest
+/// of the statement, and `c` kept its backticks.  Stripping them here is the
+/// same whole-comment removal (body included, version prefix or not) with
+/// nothing left over to desynchronise.
+///
+/// Quoted string literals and double-quoted identifiers keep their delimiters
+/// (patterns such as `\bBINARY\s+(')` still need to see them); comments are
+/// replaced by a bare placeholder and restored in full; a backtick identifier
+/// is replaced by a bare placeholder whose region is the already-resolved
+/// PostgreSQL spelling of the name (see [`render_backtick_identifier`]).
 ///
 /// An unterminated literal / identifier / comment is masked through the end of
-/// the input (the opening delimiter is kept); nothing panics.  A stray
+/// the input (the opening delimiter is kept — except for a backtick
+/// identifier, which has no delimiters to keep); nothing panics.  A stray
 /// placeholder code point in the client's SQL is masked as a one-character
-/// region of its own, so outside an unterminated `/*!` hint (copied through
-/// unscanned, after which the statement is unparsable anyway) the masked text
-/// only contains placeholders this function emitted.
+/// region of its own, so the masked text only ever contains placeholders this
+/// function emitted — every byte of the input is either copied through, masked,
+/// resolved, or (for an executable comment) dropped.
 fn mask_protected_regions(sql: &str) -> (String, Vec<String>) {
     let mut out = String::with_capacity(sql.len());
     let mut regions: Vec<String> = Vec::new();
@@ -447,19 +491,40 @@ fn mask_protected_regions(sql: &str) -> (String, Vec<String>) {
 
         // Bytes consumed by this step; every arm consumes at least one.
         let consumed = if rest.starts_with("/*!") {
-            // `/*! … */` — executable comment: stays visible to translate_misc.
-            let len = rest[3..].find("*/").map_or(rest.len(), |end| 3 + end + 2);
-            out.push_str(&rest[..len]);
-            len
+            // `/*! … */` — executable comment: stripped whole, body included,
+            // whether or not it carries a version prefix (`/*!50100 … */`).
+            // That is byte-for-byte what `EXEC_COMMENT_RE` used to do in
+            // `translate_misc`; sprinter 948023755a35 only moves it here, so
+            // that no text visible to the regex passes can contain a quote or
+            // a backtick.  An UNTERMINATED `/*!` runs to the end of the input:
+            // the regex could not match one at all and leaked its text to the
+            // parser, which is broken SQL either way.
+            rest[3..].find("*/").map_or(rest.len(), |end| 3 + end + 2)
         } else if let Some(len) = comment_len(rest, prev) {
             // `/* … */` block comment, or a `-- …` / `# …` line comment (the
             // downstream parser treats `--` as a comment whatever follows it,
             // so we do too).
             push_masked_region(&mut out, &mut regions, &mut interned, None, None, &rest[..len]);
             len
-        } else if ch == '\'' || ch == '"' || ch == '`' {
-            // String literal / quoted identifier / backtick identifier.
-            let (interior, len, closed) = scan_quoted_region(rest, ch, ch != '`');
+        } else if ch == '`' {
+            // Backtick identifier: sprinter ecc77a75df2b.  The name is
+            // RESOLVED to PostgreSQL identifier text here and the placeholder
+            // carries no delimiters, so the statement that reaches the parser
+            // never contains a backtick and no later pass has to strip one.
+            // Masking the raw bytes and dropping the delimiters afterwards —
+            // what the pipeline used to do — spliced the name in as CODE:
+            // ``VALUES(`a) ; DROP TABLE x --`)`` became
+            // `EXCLUDED.a) ; DROP TABLE x --`, and `execute_dml` splits the
+            // translated text on `;`.  An unterminated region is resolved the
+            // same way (there is no opening delimiter to keep), because
+            // keeping it and stripping it later was that same splice route.
+            let (interior, len, _closed) = scan_quoted_region(rest, '`', true);
+            let rendered = render_backtick_identifier(interior);
+            push_masked_region(&mut out, &mut regions, &mut interned, None, None, &rendered);
+            len
+        } else if ch == '\'' || ch == '"' {
+            // String literal / double-quoted identifier.
+            let (interior, len, closed) = scan_quoted_region(rest, ch, true);
             let close = if closed { Some(ch) } else { None };
             push_masked_region(&mut out, &mut regions, &mut interned, Some(ch), close, interior);
             len
@@ -547,54 +612,67 @@ fn unmask_protected_regions(masked: &str, regions: &[String]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 1. Backtick-quoted identifiers → double-quoted
+// 1. Backtick-quoted identifiers → PostgreSQL identifier text
 // ---------------------------------------------------------------------------
 
-/// Replace backtick-quoted identifiers with double-quoted identifiers.
-/// String literals enclosed in single quotes are left untouched.
-fn translate_backticks(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut chars = sql.chars().peekable();
+/// Render the interior of a backtick-quoted MySQL identifier as PostgreSQL
+/// SQL text (sprinter ecc77a75df2b).
+///
+/// This pipeline used to simply DROP every backtick, on the reasoning that
+/// WordPress identifiers are simple names and that `"Foo"` is case-SENSITIVE
+/// to the PostgreSQL parser while bare `Foo` folds to `foo` — so quoting broke
+/// name resolution.  That reasoning holds only for names that *are* simple:
+/// for anything else, dropping the delimiters spliced the client's text into
+/// the statement as CODE.  ``VALUES(`a) ; DROP TABLE x --`)`` came back as
+/// `EXCLUDED.a) ; DROP TABLE x --`, and the MySQL DML path then splits the
+/// translated statement on `;`.  Real MySQL reads those same bytes as one
+/// (non-existent) column name and drops nothing, so the injection route was
+/// introduced here, not by the calling application.
+///
+/// So both halves of the remediation apply, chosen per name:
+///
+/// * A name the PostgreSQL tokenizer reads as exactly one identifier token
+///   ([`is_plain_identifier`]) is emitted BARE and byte-for-byte — the old
+///   behaviour, and the reason every WordPress statement and every existing
+///   MySQL-wire test still resolves: the parser folds it to lower case exactly
+///   as it did before.
+/// * Anything else is emitted as a double-quoted identifier with `""`
+///   doubling, which cannot be closed from inside and therefore cannot reach
+///   executable position.  The statement then fails closed at name resolution
+///   ("column not found") instead of running the payload.
+///
+/// MySQL escapes a backtick inside such a name by doubling it; `interior`
+/// still carries that spelling, so it is collapsed here.
+fn render_backtick_identifier(interior: &str) -> String {
+    let name = if interior.contains('`') {
+        interior.replace("``", "`")
+    } else {
+        interior.to_string()
+    };
 
-    while let Some(ch) = chars.next() {
-        match ch {
-            // Skip over single-quoted string literals unchanged.
-            '\'' => {
-                out.push('\'');
-                loop {
-                    match chars.next() {
-                        Some('\\') => {
-                            out.push('\\');
-                            if let Some(escaped) = chars.next() {
-                                out.push(escaped);
-                            }
-                        }
-                        Some('\'') => {
-                            // Check for escaped quote ('')
-                            if chars.peek() == Some(&'\'') {
-                                out.push('\'');
-                                out.push('\'');
-                                chars.next();
-                            } else {
-                                out.push('\'');
-                                break;
-                            }
-                        }
-                        Some(c) => out.push(c),
-                        None => break,
-                    }
-                }
-            }
-            // Strip backticks entirely — WordPress identifiers are simple names.
-            // Double-quoted identifiers cause "table not found" because the PG parser
-            // treats them as case-sensitive quoted identifiers that don't match the
-            // stored (unquoted) table names.
-            '`' => {}
-            _ => out.push(ch),
-        }
+    if is_plain_identifier(&name) {
+        name
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
     }
+}
 
-    out
+/// Does `name` tokenize as exactly one bare identifier?
+///
+/// This is `PostgreSqlDialect::is_identifier_start` / `is_identifier_part`
+/// spelled out — the dialect the SQL parser runs for BOTH wires.  Matching it
+/// exactly is what makes the bare branch above provably equivalent to the old
+/// backtick-stripping for every name it accepts: the token boundaries, and so
+/// the parse, are identical.  A name that is empty, starts with a digit, or
+/// carries a space, quote, parenthesis, semicolon or comment introducer is not
+/// one token and must be quoted instead.
+fn is_plain_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_alphabetic() || ch.is_ascii_digit() || ch == '$' || ch == '_')
 }
 
 // ---------------------------------------------------------------------------
@@ -1203,10 +1281,14 @@ fn translate_alter_table_keys(sql: &str) -> String {
 fn translate_misc(sql: &str) -> String {
     let mut s = sql.to_string();
 
-    // Strip MySQL-specific /*! ... */ executable comments / optimizer hints
-    static EXEC_COMMENT_RE: OnceLock<Regex> = OnceLock::new();
-    let re = EXEC_COMMENT_RE.get_or_init(|| init_regex(r"/\*![\s\S]*?\*/"));
-    s = re.replace_all(&s, "").to_string();
+    // `/*! … */` executable comments / optimizer hints are stripped by
+    // `mask_protected_regions` (sprinter 948023755a35), not here: a regex that
+    // runs at this point can only see them because they were left UNMASKED,
+    // and an apostrophe or backtick in one then desynchronised the passes that
+    // skip literals.  Nothing reaches this pass with a `/*!` in it any more —
+    // one inside a string literal or a comment is masked, and one outside is
+    // already gone — so the pattern is not kept as a "safety net" that could
+    // only ever mislead a reader about where the stripping happens.
 
     // STRAIGHT_JOIN → JOIN
     static STRAIGHT_JOIN_RE: OnceLock<Regex> = OnceLock::new();
@@ -2011,5 +2093,57 @@ mod tests {
             1,
             "one table quoted twice is still one target: {result}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // sprinter ecc77a75df2b: the backtick → PostgreSQL identifier rendering.
+    // The end-to-end proofs live in `tests/mysql_translator_batch_d.rs`;
+    // these pin the two private helpers directly.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_is_plain_identifier_matches_the_pg_tokenizer() {
+        // Accepted: exactly what `PostgreSqlDialect` reads as one identifier.
+        for name in ["a", "_a", "wp_posts", "Foo", "a1", "a$b", "_", "café"] {
+            assert!(is_plain_identifier(name), "must be one bare identifier: {name}");
+        }
+        // Rejected: everything that would tokenize as more than one thing —
+        // and therefore everything that could carry SQL into the statement.
+        for name in [
+            "",
+            "1a",
+            "$a",
+            "my col",
+            "a) ; DROP TABLE x --",
+            "a\"b",
+            "it's",
+            "a.b",
+            "a-b",
+            "a;b",
+        ] {
+            assert!(!is_plain_identifier(name), "must be quoted, not spliced: {name}");
+        }
+    }
+
+    #[test]
+    fn test_render_backtick_identifier() {
+        // A plain name is emitted BARE and byte-for-byte: this is the old
+        // behaviour, and the parser folds its case exactly as it did before.
+        assert_eq!(render_backtick_identifier("wp_posts"), "wp_posts");
+        assert_eq!(render_backtick_identifier("TINYINT"), "TINYINT");
+
+        // Anything else is quoted, with `"` doubled so the quoting cannot be
+        // closed from inside.
+        assert_eq!(render_backtick_identifier("my col"), "\"my col\"");
+        assert_eq!(render_backtick_identifier("a\"b"), "\"a\"\"b\"");
+        assert_eq!(
+            render_backtick_identifier("a) ; DROP TABLE x --"),
+            "\"a) ; DROP TABLE x --\""
+        );
+        assert_eq!(render_backtick_identifier(""), "\"\"");
+
+        // MySQL's doubled-backtick escape collapses to one backtick, and the
+        // result is then not a plain name.
+        assert_eq!(render_backtick_identifier("a``b"), "\"a`b\"");
     }
 }

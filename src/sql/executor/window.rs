@@ -59,9 +59,21 @@ impl WindowOperator {
         input: Box<dyn PhysicalOperator>,
         window_exprs: Vec<(LogicalExpr, String)>,
         schema: Arc<Schema>,
+        parameters: Vec<Value>,
     ) -> Self {
         let input_schema = input.schema();
-        let evaluator = Evaluator::new(input_schema);
+        // sprinter a3a6cc7c59d6 (`Evaluator::new` audit): a `$n` DOES reach
+        // this evaluator. Window-function ARGUMENTS are lowered by the generic
+        // `Planner::expr_to_logical` (src/sql/planner.rs, `parse_window_function`),
+        // so `FIRST_VALUE($1) OVER (…)` — and any PARTITION BY / ORDER BY key
+        // spelled with a parameter — arrives as `LogicalExpr::Parameter`. With
+        // an empty bind vector every one of those evaluated to
+        // `Err("Parameter $n not provided")`, and every call site in this file
+        // swallows the error as `.unwrap_or(Value::Null)`, so the bound value
+        // silently became NULL. (The `unwrap_or` swallowing itself is a wider
+        // defect than this item covers and is left alone; with the parameters
+        // threaded there is no longer an error for it to swallow on this path.)
+        let evaluator = Evaluator::with_parameters(input_schema, parameters);
 
         let window_infos: Vec<WindowExprInfo> = window_exprs
             .into_iter()

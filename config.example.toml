@@ -913,3 +913,11 @@ max_concurrent_queries = 100
 # Queries exceeding this duration will be automatically terminated
 # Default: 300 (5 minutes)
 query_timeout_secs = 300
+
+# Per-tenant QPS window (milliseconds)
+# A tenant's plan limit `max_qps` is a budget for ONE window of this length —
+# this is what makes it a RATE rather than a lifetime quota. The window is
+# evaluated lazily on the quota check, so it needs no background task and
+# applies to the embedded library as well as the server.
+# Default: 1000 (1 second)
+tenant_qps_window_ms = 1000

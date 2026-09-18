@@ -481,7 +481,7 @@ thread_local! {
     /// The login identity of the session whose statement is running on THIS
     /// thread (HDB-009), installed for the duration of ONE synchronous
     /// statement by every session entry point (see
-    /// `EmbeddedDatabase::session_login_user_override_guard`).
+    /// `EmbeddedDatabase::session_statement_context_guard`).
     ///
     /// The expression evaluator that serves `current_user` / `session_user` /
     /// `current_role` and `current_setting('session_authorization')` is
@@ -493,6 +493,22 @@ thread_local! {
     /// service user. `Arc<str>` rather than `String` so installing one costs a
     /// single atomic increment on a path that runs for every statement.
     static SESSION_LOGIN_USER_OVERRIDE: std::cell::RefCell<Option<std::sync::Arc<str>>> =
+        const { std::cell::RefCell::new(None) };
+    /// sprinter 6dc0cc115db9 + f4f5d450e816: the per-connection state the
+    /// statement running on THIS thread may read AND WRITE — `lastval()`,
+    /// `pg_backend_pid()` and `application_name` (see
+    /// `crate::session::scoped::SessionScopedState`).
+    ///
+    /// Unlike every other slot in this block it carries a shared HANDLE rather
+    /// than a copied value, because two of the three are written from inside
+    /// statement execution: the `nextval()` evaluator arm and the
+    /// SERIAL/IDENTITY fill in the insert funnels both have to land on the
+    /// SESSION, not on a snapshot the guard took. Installing one is therefore
+    /// a single `Arc` refcount increment, like the identity slot above.
+    ///
+    /// `None` (nothing installed) is only reachable from engine-internal
+    /// evaluation: every session AND embedded entry point installs one.
+    static SESSION_SCOPED_STATE: std::cell::RefCell<Option<std::sync::Arc<crate::session::scoped::SessionScopedState>>> =
         const { std::cell::RefCell::new(None) };
     /// True while THIS thread holds the global `current_transaction`
     /// `parking_lot::Mutex` **across** statement execution — i.e. inside
@@ -586,6 +602,98 @@ impl Drop for SessionLoginUserOverrideGuard {
         let previous = self.0.take();
         SESSION_LOGIN_USER_OVERRIDE.with(|c| *c.borrow_mut() = previous);
     }
+}
+
+/// RAII installer for the per-statement session-scoped state
+/// (`SESSION_SCOPED_STATE`, sprinter 6dc0cc115db9 / f4f5d450e816).
+///
+/// Restores the PREVIOUS handle on `Drop` — including on an unwinding panic —
+/// for exactly the reason [`SessionLoginUserOverrideGuard`] does: the engine
+/// re-enters itself on the SAME worker thread (SQL UDF bodies, trigger row
+/// hooks, `CALL`), and a nested guard that CLEARED the slot would leave the
+/// rest of the outer statement writing `lastval` into a void.
+///
+/// The `PhantomData<*const ()>` makes "never held across an `.await`"
+/// structural rather than a comment: the guard is not `Send`, so no `async fn`
+/// can carry one across a yield point and publish one connection's backend onto
+/// a worker thread it has since migrated to.
+struct SessionScopedStateGuard(
+    Option<std::sync::Arc<crate::session::scoped::SessionScopedState>>,
+    std::marker::PhantomData<*const ()>,
+);
+
+impl SessionScopedStateGuard {
+    /// Publish `state` as this thread's backend for the duration of one
+    /// statement, saving whatever was installed before.
+    fn install(state: std::sync::Arc<crate::session::scoped::SessionScopedState>) -> Self {
+        Self(
+            SESSION_SCOPED_STATE.with(|c| c.borrow_mut().replace(state)),
+            std::marker::PhantomData,
+        )
+    }
+
+    /// Publish `state` ONLY when nothing is installed yet.
+    ///
+    /// This is what the session-less embedded funnels call. A wire session's
+    /// `_for_session` entry point installs ITS session's backend first and then
+    /// delegates into those same funnels for the autocommit case; without this
+    /// check the funnel would overwrite the connection's backend with the
+    /// handle's, and `lastval()` would answer from a slot shared by every
+    /// connection — precisely the leak this item exists to prevent.
+    fn install_if_absent(state: &std::sync::Arc<crate::session::scoped::SessionScopedState>) -> Option<Self> {
+        if SESSION_SCOPED_STATE.with(|c| c.borrow().is_some()) {
+            return None;
+        }
+        Some(Self::install(std::sync::Arc::clone(state)))
+    }
+}
+
+impl Drop for SessionScopedStateGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        SESSION_SCOPED_STATE.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
+/// Everything one statement of one wire/embedded SESSION needs installed on the
+/// thread that runs it: the SQL identity (HDB-009) and the session's backend
+/// state (sprinter 6dc0cc115db9 / f4f5d450e816).
+///
+/// One type, and one `session_manager` lookup, because both halves come from
+/// the same `Session` behind the same read lock — the per-statement cost stays
+/// exactly what it was before this item (one DashMap probe + one read lock),
+/// plus two `Arc` refcount increments.
+struct SessionStatementGuard {
+    _identity: Option<SessionLoginUserOverrideGuard>,
+    _scoped: SessionScopedStateGuard,
+}
+
+/// The calling thread's per-connection backend state — what `lastval()`,
+/// `pg_backend_pid()` and `application_name` read and write (sprinter
+/// 6dc0cc115db9 / f4f5d450e816).
+///
+/// `None` means no entry point installed one, which is engine-internal
+/// evaluation only; every session and embedded funnel installs one before any
+/// statement runs.
+pub(crate) fn session_scoped_state_tls() -> Option<std::sync::Arc<crate::session::scoped::SessionScopedState>> {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().clone())
+}
+
+/// Record the value a sequence just produced as THIS connection's `lastval()`
+/// (sprinter 6dc0cc115db9).
+///
+/// Called from the `nextval()` evaluator arm and from every insert funnel that
+/// fills a SERIAL / IDENTITY column from the row-id allocator — the second half
+/// is the whole point of the item, since `INSERT INTO t (name) VALUES ('a')`
+/// never evaluates a `nextval()` call in this engine. A caller with no backend
+/// installed (engine-internal evaluation) silently records nothing rather than
+/// writing into a shared slot.
+pub(crate) fn note_session_lastval(value: i64) {
+    SESSION_SCOPED_STATE.with(|c| {
+        if let Some(state) = c.borrow().as_ref() {
+            state.note_lastval(value);
+        }
+    });
 }
 
 /// The calling thread's effective `search_path` current schema, as seen by the
@@ -780,6 +888,19 @@ pub struct EmbeddedDatabase {
     /// this relaxed atomic instead of taking the `current_schema` lock on every
     /// query, so the default `public` path stays lock-free.
     current_schema_set: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// sprinter 6dc0cc115db9 + f4f5d450e816: THIS HANDLE's backend, for the
+    /// session-less embedded funnels (`query()` / `execute()` /
+    /// `query_params()` / `execute_params()`, and through them the REST/BaaS
+    /// layer, MCP and the REPL).
+    ///
+    /// A wire connection has a `Session` that owns its own
+    /// `SessionScopedState`; the embedded API has no session at all, so the
+    /// handle itself is the backend. Deliberately per-HANDLE and not a process
+    /// global: two `EmbeddedDatabase`s are two backends, and `lastval()` on one
+    /// must never report the other's row id. The same reasoning as the
+    /// `current_schema` embedded shared field above, which a wire session's
+    /// per-statement thread-local override wins over.
+    embedded_scoped: std::sync::Arc<crate::session::scoped::SessionScopedState>,
     /// Active savepoints stack (name -> transaction state)
     savepoints: std::sync::Arc<parking_lot::RwLock<Vec<SavepointState>>>,
     /// Plan cache: SQL string → `Arc<LogicalPlan>` (sharded LRU, skips parse+plan for repeated queries)
@@ -1144,6 +1265,11 @@ struct FastParamUpdateSpec {
     schema: std::sync::Arc<Schema>,
     pk_expr: sql::LogicalExpr,
     pk_data_type: DataType,
+    /// Position of the (sole) PRIMARY KEY column in `schema` — see
+    /// [`FastParamDeleteSpec::pk_col_idx`]. sprinter 79efe5ebda6e: the UPDATE
+    /// fast paths resolve their target row through the same index-as-truth PK
+    /// probe as the DELETE ones and need the same verification.
+    pk_col_idx: usize,
     assignments: Vec<FastParamUpdateAssignment>,
     assignments_affect_indexes: bool,
 }
@@ -1153,6 +1279,11 @@ struct FastParamDeleteSpec {
     schema: std::sync::Arc<Schema>,
     pk_expr: sql::LogicalExpr,
     pk_data_type: DataType,
+    /// Position of the (sole) PRIMARY KEY column in `schema`. sprinter
+    /// 79efe5ebda6e: the delete path verifies that the row the ART index points
+    /// at actually carries the probed key, and this keeps that check free of a
+    /// per-statement column lookup (same role as `FastSelectSpec::pk_col_idx`).
+    pk_col_idx: usize,
     pk_only_delete: bool,
 }
 
@@ -1160,6 +1291,9 @@ struct FastLiteralUpdateSpec {
     table_name: String,
     schema: std::sync::Arc<Schema>,
     pk_data_type: DataType,
+    /// Position of the (sole) PRIMARY KEY column in `schema` — see
+    /// [`FastParamDeleteSpec::pk_col_idx`].
+    pk_col_idx: usize,
     set_col_idx: usize,
     set_col_name: String,
     set_data_type: DataType,
@@ -1171,6 +1305,9 @@ struct FastLiteralDeleteSpec {
     table_name: String,
     schema: std::sync::Arc<Schema>,
     pk_data_type: DataType,
+    /// Position of the (sole) PRIMARY KEY column in `schema` — see
+    /// [`FastParamDeleteSpec::pk_col_idx`].
+    pk_col_idx: usize,
     pk_only_delete: bool,
 }
 
@@ -1911,6 +2048,168 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// sprinter f4f5d450e816: `application_name` — the GUC every PostgreSQL
+    /// driver (psycopg, JDBC, node-postgres, sqlx) sets on connect and which
+    /// this server used to drop on the floor.
+    ///
+    /// Handled HERE rather than through the `SessionSettings` registry for the
+    /// same reason GH#28 kept the connection-lifetime timeouts off it: that
+    /// registry is ONE process-global map, so a `SET application_name` landing
+    /// in it would rename every other connection. The value lives on the
+    /// session's own backend state (`session::scoped::SessionScopedState`),
+    /// reached through the per-statement thread-local the entry-point guard
+    /// installs — the same mechanism `current_schema()` and `current_user` use.
+    ///
+    /// * `SET application_name = '…'` — session scope.
+    /// * `SET LOCAL application_name = '…'` — transaction scope. Unlike the
+    ///   timeout GUCs (which are REFUSED for `SET LOCAL`, because silently
+    ///   widening a connection-closing timer to the session is dangerous), this
+    ///   one is implemented: `application_name` is a label, the revert is
+    ///   cheap, and PostgreSQL clients do use `SET LOCAL` for per-transaction
+    ///   tagging. Outside a transaction block PostgreSQL warns and the
+    ///   statement has NO EFFECT; so does this.
+    /// * `RESET application_name` / `SET application_name TO DEFAULT` — back to
+    ///   the empty string, which is PostgreSQL's default VALUE (not an error).
+    /// * `SHOW application_name` — one TEXT row.
+    ///
+    /// Returns `None` for any statement that does not name `application_name`.
+    fn setting_statement_targets_application_name(statement: &DbSettingStatement) -> bool {
+        match statement {
+            DbSettingStatement::Set { name, .. }
+            | DbSettingStatement::Reset { name }
+            | DbSettingStatement::Show { name } => name == "application_name",
+        }
+    }
+
+    /// Apply the statement to `state`, THE BACKEND THE CALLER RESOLVED.
+    ///
+    /// The target is a parameter rather than something this function looks up,
+    /// because the two callers know it by different routes and only one of them
+    /// can use a thread-local: a session caller has a `SessionId` and must
+    /// resolve from it (the protocol layer calls in before any statement guard
+    /// exists), while the session-less embedded funnels have no id at all and
+    /// the per-statement thread-local their own guard installed IS the answer.
+    /// `None` is engine-internal evaluation, where there is nothing to set and
+    /// nothing to show — answer the default rather than inventing a slot.
+    fn try_handle_application_name_setting(
+        &self,
+        statement: &DbSettingStatement,
+        sql: &str,
+        in_transaction: bool,
+        state: Option<std::sync::Arc<crate::session::scoped::SessionScopedState>>,
+    ) -> Option<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        if !Self::setting_statement_targets_application_name(statement) {
+            return None;
+        }
+        match statement {
+            DbSettingStatement::Set { value, .. } => {
+                if let Some(state) = state {
+                    let to_default = value.eq_ignore_ascii_case("default");
+                    let new_value = if to_default { "" } else { value.as_str() };
+                    if Self::set_statement_is_local(sql) {
+                        // PostgreSQL: `SET LOCAL` outside a transaction block
+                        // emits a warning and otherwise has no effect. Applying
+                        // it would be worse than dropping it — the label would
+                        // then outlive a block that never existed.
+                        if in_transaction {
+                            state.set_local_application_name(new_value);
+                        }
+                    } else {
+                        state.set_application_name(new_value);
+                    }
+                }
+                Some((Vec::new(), Self::empty_result_schema()))
+            }
+            DbSettingStatement::Reset { .. } => {
+                if let Some(state) = state {
+                    state.set_application_name("");
+                }
+                Some((Vec::new(), Self::empty_result_schema()))
+            }
+            DbSettingStatement::Show { .. } => {
+                let value = state.map(|s| s.application_name()).unwrap_or_default();
+                Some((
+                    vec![Tuple {
+                        values: vec![Value::String(value)],
+                        row_id: None,
+                        branch_id: None,
+                    }],
+                    Self::typed_result_schema("application_name", DataType::Text),
+                ))
+            }
+        }
+    }
+
+    /// sprinter f4f5d450e816: true for `SET` / `SET LOCAL` / `RESET` / `SHOW`
+    /// of `application_name` — the predicate the PostgreSQL extended-protocol
+    /// Execute arm uses to delegate the statement to the simple-query handler,
+    /// exactly as GH#28's `is_timeout_guc_statement` does. ONE definition of
+    /// the rule rather than a second copy on the other protocol.
+    pub fn is_application_name_statement(sql: &str) -> bool {
+        Self::parse_db_setting_statement(sql)
+            .as_ref()
+            .is_some_and(Self::setting_statement_targets_application_name)
+    }
+
+    /// sprinter f4f5d450e816: the `_for_session` interceptor for
+    /// `application_name`, modelled on `try_handle_session_timeout_guc`.
+    ///
+    /// Installed in EVERY session entry point, ahead of the
+    /// "is there an open transaction?" fork, so `SET` / `RESET` / `SHOW` behave
+    /// identically inside and outside a transaction block — the in-transaction
+    /// branch is sqlparser-first and the planner has no `SetVariable` /
+    /// `ShowVariable` arm for a generic GUC, so without this a
+    /// `BEGIN; SET LOCAL application_name = …` would simply error.
+    ///
+    /// The backend it writes is resolved from `session_id`, NOT from the
+    /// per-statement thread-local.
+    ///
+    /// THE WRITE END WAS BROKEN HERE. This used to read
+    /// `session_scoped_state_tls()`, which only the engine's `_for_session`
+    /// entry points install. Three callers are in the PROTOCOL layer — the
+    /// PostgreSQL simple-query `SET` and `RESET` arms and the MySQL COM_QUERY
+    /// arm — and they run before any engine entry point, so the thread-local
+    /// was empty and every `SET application_name` that arrived over a wire was
+    /// acknowledged and silently discarded. Resolving from the `SessionId` this
+    /// function is handed (the only reason it takes one) makes both routes
+    /// write the same `SessionScopedState` the reader upgrades out of
+    /// `live_backends()`.
+    ///
+    /// The extra session lookup is paid ONLY by a statement that actually names
+    /// `application_name`: the byte gate and the name check below both run
+    /// first, so the per-statement hot path is unchanged.
+    pub(crate) fn try_handle_session_application_name(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
+        // PERF: this runs on EVERY statement of every session entry point, so it
+        // bails on the cheapest possible discriminator first — only `SET`,
+        // `SHOW` and `RESET` can name a GUC, and nothing else starts with S or
+        // R. (`SELECT` survives the byte check and is rejected one prefix
+        // comparison later, inside `parse_db_setting_statement`.)
+        if !matches!(
+            sql.trim_start().as_bytes().first().copied(),
+            Some(b'S' | b's' | b'R' | b'r')
+        ) {
+            return Ok(None);
+        }
+        let Some(statement) = Self::parse_db_setting_statement(sql) else {
+            return Ok(None);
+        };
+        if !Self::setting_statement_targets_application_name(&statement) {
+            return Ok(None);
+        }
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        Ok(self.try_handle_application_name_setting(
+            &statement,
+            sql,
+            self.session_has_open_transaction(session_id),
+            Some(scoped),
+        ))
+    }
+
     /// GH#28 (candidate 2): the params family's registry hook, NARROWED.
     ///
     /// `SessionSettings` is ONE process-global registry (`self.session_settings`)
@@ -1944,6 +2243,14 @@ impl EmbeddedDatabase {
             Some(DbSettingStatement::Show { .. }) => {}
             Some(DbSettingStatement::Set { ref name, .. }) | Some(DbSettingStatement::Reset { ref name })
                 if Self::is_timeout_guc_name(name) => {}
+            // sprinter f4f5d450e816: `application_name` is session-scoped state,
+            // never a registry write, so letting it through here cannot leak
+            // across connections the way a `SET statement_timeout` would. It
+            // MUST be here: every extended-protocol driver reaches the params
+            // family for every statement it sends, and GH#28's own lesson was a
+            // feature that silently worked on the text family only.
+            Some(DbSettingStatement::Set { ref name, .. }) | Some(DbSettingStatement::Reset { ref name })
+                if name == "application_name" => {}
             _ => return Ok(None),
         }
         self.try_handle_db_setting_statement_with_schema(sql)
@@ -1958,6 +2265,23 @@ impl EmbeddedDatabase {
         };
 
         if let Some(handled) = self.try_handle_search_path_setting(&statement)? {
+            return Ok(Some(handled));
+        }
+
+        // sprinter f4f5d450e816: `application_name` is per-connection state, so
+        // it is answered BEFORE the process-global registry gate below — the
+        // registry entry exists only so the name is discoverable, never as the
+        // value. This arm is what serves the session-less embedded funnels and,
+        // through them, a wire session's autocommit delegate.
+        if let Some(handled) = self.try_handle_application_name_setting(
+            &statement,
+            sql,
+            self.global_txn_active.load(std::sync::atomic::Ordering::Acquire),
+            // The session-less funnels have no `SessionId`; the per-statement
+            // thread-local their own `install_if_absent` guard set IS this
+            // caller's backend (the handle's).
+            crate::session_scoped_state_tls(),
+        ) {
             return Ok(Some(handled));
         }
 
@@ -2622,6 +2946,26 @@ impl EmbeddedDatabase {
             // spellings plus the unlocks; `PG_TRY_ADVISORY` the `try` ones.
             b"PG_ADVISORY".as_slice(),
             b"PG_TRY_ADVISORY".as_slice(),
+            // sprinter 6dc0cc115db9 / f4f5d450e816: PER-CONNECTION answers.
+            //
+            // This is a correctness requirement, not an optimisation. The result
+            // cache is keyed by SQL TEXT and tagged only with the login
+            // principal ([`CachedRows`]), and two wire connections that have not
+            // published a login identity share that principal — so a cached
+            // `SELECT lastval()` row from connection A would be served verbatim
+            // to connection B. That is precisely the cross-connection leak these
+            // items exist to prevent, and it would be worse than the absence
+            // they replace: a driver would report another connection's row id as
+            // its own `cursor.lastrowid`.
+            //
+            // `APPLICATION_NAME` covers `SHOW application_name`,
+            // `current_setting('application_name')` and any projection of the
+            // `pg_stat_activity` column; `PG_STAT_ACTIVITY` covers the view
+            // itself, whose `state` column is relative to the scanning backend.
+            b"LASTVAL".as_slice(),
+            b"PG_BACKEND_PID".as_slice(),
+            b"APPLICATION_NAME".as_slice(),
+            b"PG_STAT_ACTIVITY".as_slice(),
         ]
         .iter()
         .any(|needle| Self::contains_ascii_case_insensitive(sql, needle))
@@ -3593,6 +3937,9 @@ impl EmbeddedDatabase {
             self.invalidate_result_cache();
             // Increment LSN to track transaction commits
             self.storage.increment_lsn();
+            // sprinter f4f5d450e816: the embedded twin of the session hook — a
+            // `SET LOCAL application_name` on the handle's backend reverts here.
+            self.embedded_scoped.end_transaction();
             Ok(())
         } else {
             Err(Error::transaction("No active transaction to commit"))
@@ -3636,6 +3983,11 @@ impl EmbeddedDatabase {
             // errors) — clear the fast-out.
             self.global_txn_active
                 .store(false, std::sync::atomic::Ordering::Release);
+            // sprinter f4f5d450e816: revert a `SET LOCAL application_name`
+            // BEFORE the `?` below, so a rollback that itself errors still ends
+            // the block's transaction-scoped state. PostgreSQL reverts SET LOCAL
+            // on ROLLBACK exactly as on COMMIT.
+            self.embedded_scoped.end_transaction();
             txn.rollback()?;
             self.deferred_fk_checks.lock().clear();
             self.constraints_all_deferred
@@ -6709,6 +7061,7 @@ impl EmbeddedDatabase {
 
                         // Fill NULL values in SERIAL/BIGSERIAL PK columns with the auto-generated row_id.
                         // This makes LAST_INSERT_ID() and MAX(pk) return the correct value.
+                        let mut generated_identity = false;
                         for (i, col) in schema.columns.iter().enumerate() {
                             if col.primary_key {
                                 if let Some(v) = tuple.values.get(i) {
@@ -6726,10 +7079,19 @@ impl EmbeddedDatabase {
                                                     tuple.values[i] = Value::Int8(row_id as i64);
                                                 }
                                             }
+                                            generated_identity = true;
                                         }
                                     }
                                 }
                             }
+                        }
+                        // sprinter 6dc0cc115db9: a SERIAL / IDENTITY value generated
+                        // here is what `LASTVAL()` reports (see
+                        // `StorageEngine::insert_tuple_fast` for the full note).
+                        // Gated on an actual fill — an INSERT that supplies the id
+                        // does not define `lastval` in PostgreSQL either.
+                        if generated_identity {
+                            crate::note_session_lastval(row_id as i64);
                         }
 
                         // Build column-name → Value map up front; reused for
@@ -8407,6 +8769,15 @@ impl EmbeddedDatabase {
         // 0 marker would make the first cached read discard a valid warm cache.
         let initial_schema_generation = storage.schema_generation();
 
+        // F3 (sprinter c837352dabef): the per-tenant QPS window length comes from
+        // `[resource_quotas].tenant_qps_window_ms` (default 1 s). The window is
+        // evaluated lazily inside the quota check, so `max_qps` is a RATE on this
+        // path too — with no background task, which the embedded library could not
+        // start anyway (it may have no tokio runtime). Built here, before `config`
+        // is moved into `Self`.
+        let tenant_manager =
+            std::sync::Arc::new(crate::tenant::TenantManager::from_quota_config(&config.resource_quotas));
+
         // Built, then FINISHED: `install_routine_runtime` rebuilds the routine
         // registry from the durable `meta:function:` / `meta:procedure:` records
         // and installs the UDF invocation bridge. It runs here, not beside
@@ -8417,7 +8788,7 @@ impl EmbeddedDatabase {
             config,
             current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            tenant_manager: std::sync::Arc::new(crate::tenant::TenantManager::new()),
+            tenant_manager,
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
             function_registry: std::sync::Arc::new(sql::FunctionRegistry::new()),
             mv_scheduler,
@@ -8434,6 +8805,7 @@ impl EmbeddedDatabase {
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            embedded_scoped: crate::session::scoped::SessionScopedState::new(),
             any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
@@ -8528,6 +8900,15 @@ impl EmbeddedDatabase {
         // See `new_with_config`: seed from storage, not 0.
         let initial_schema_generation = storage.schema_generation();
 
+        // F3 (sprinter c837352dabef): the per-tenant QPS window length comes from
+        // `[resource_quotas].tenant_qps_window_ms` (default 1 s). The window is
+        // evaluated lazily inside the quota check, so `max_qps` is a RATE on this
+        // path too — with no background task, which the embedded library could not
+        // start anyway (it may have no tokio runtime). Built here, before `config`
+        // is moved into `Self`.
+        let tenant_manager =
+            std::sync::Arc::new(crate::tenant::TenantManager::from_quota_config(&config.resource_quotas));
+
         // Built, then FINISHED: `install_routine_runtime` rebuilds the routine
         // registry from the durable `meta:function:` / `meta:procedure:` records
         // and installs the UDF invocation bridge. It runs here, not beside
@@ -8538,7 +8919,7 @@ impl EmbeddedDatabase {
             config,
             current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            tenant_manager: std::sync::Arc::new(crate::tenant::TenantManager::new()),
+            tenant_manager,
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
             function_registry: std::sync::Arc::new(sql::FunctionRegistry::new()),
             mv_scheduler,
@@ -8555,6 +8936,7 @@ impl EmbeddedDatabase {
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            embedded_scoped: crate::session::scoped::SessionScopedState::new(),
             any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
@@ -8691,6 +9073,15 @@ impl EmbeddedDatabase {
         // See `new_with_config`: seed from storage, not 0.
         let initial_schema_generation = storage.schema_generation();
 
+        // F3 (sprinter c837352dabef): the per-tenant QPS window length comes from
+        // `[resource_quotas].tenant_qps_window_ms` (default 1 s). The window is
+        // evaluated lazily inside the quota check, so `max_qps` is a RATE on this
+        // path too — with no background task, which the embedded library could not
+        // start anyway (it may have no tokio runtime). Built here, before `config`
+        // is moved into `Self`.
+        let tenant_manager =
+            std::sync::Arc::new(crate::tenant::TenantManager::from_quota_config(&config.resource_quotas));
+
         // Built, then FINISHED: `install_routine_runtime` rebuilds the routine
         // registry from the durable `meta:function:` / `meta:procedure:` records
         // and installs the UDF invocation bridge. It runs here, not beside
@@ -8701,7 +9092,7 @@ impl EmbeddedDatabase {
             config,
             current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            tenant_manager: std::sync::Arc::new(crate::tenant::TenantManager::new()),
+            tenant_manager,
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
             function_registry: std::sync::Arc::new(sql::FunctionRegistry::new()),
             mv_scheduler,
@@ -8718,6 +9109,7 @@ impl EmbeddedDatabase {
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            embedded_scoped: crate::session::scoped::SessionScopedState::new(),
             any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
@@ -9466,6 +9858,12 @@ impl EmbeddedDatabase {
         // Spec 03: advisory-lock owner for a statement with no session. A no-op
         // when `execute_for_session` already installed its own.
         let _advisory = self.embedded_advisory_context_guard(sql);
+        // sprinter 6dc0cc115db9 / f4f5d450e816: THIS HANDLE is the backend for a
+        // statement that arrives without a session. `install_if_absent`, because a
+        // wire session's `_for_session` entry point delegates into this very funnel
+        // for the autocommit case — it has already installed ITS session's backend,
+        // and overwriting it here would make every connection share one `lastval()`.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
         // SQLite-compat: PRAGMA without a result-set (assignments / no-op
         // tunables) — `execute()` callers don't expect rows back.
         if let Some((_, _)) = crate::sql::sqlite_compat::parse_pragma(sql) {
@@ -9884,7 +10282,7 @@ impl EmbeddedDatabase {
         columns: &[String],
         rows: &[Vec<Option<String>>],
     ) -> Option<Result<u64>> {
-        let _identity_override = match self.session_login_user_override_guard(session_id) {
+        let _identity_override = match self.session_statement_context_guard(session_id) {
             Ok(guard) => guard,
             Err(e) => return Some(Err(e)),
         };
@@ -10780,6 +11178,16 @@ impl EmbeddedDatabase {
                     Ok(spec) => spec,
                     Err(e) => return Some(Err(e)),
                 };
+                // sprinter 79efe5ebda6e: the per-row call declines (`None`) when
+                // an open transaction has moved keys in this table, and in THIS
+                // loop a mid-batch `None` is reported as "batch became
+                // ineligible" — a hard error where a slower correct path is what
+                // is wanted. Ask the same question once, up front, and hand the
+                // whole batch back to the per-row planner path instead (same
+                // treatment as the DELETE arm below).
+                if self.storage.has_uncommitted_index_removals_for_table(table_name) {
+                    return None;
+                }
                 let mut total = 0_u64;
                 for params in rows {
                     match self.try_execute_fast_update_param_spec(&spec, params) {
@@ -10811,6 +11219,15 @@ impl EmbeddedDatabase {
                     Ok(spec) => spec,
                     Err(e) => return Some(Err(e)),
                 };
+                // sprinter 79efe5ebda6e: the per-row call declines (`None`) when
+                // an open transaction has moved keys in this table, and in THIS
+                // loop a mid-batch `None` is reported as "batch became
+                // ineligible" — a hard error where a slower correct path is what
+                // is wanted. Ask the same question once, up front, and hand the
+                // whole batch back to the per-row planner path instead.
+                if self.storage.has_uncommitted_index_removals_for_table(table_name) {
+                    return None;
+                }
                 let mut total = 0_u64;
                 for params in rows {
                     match self.try_execute_fast_delete_param_spec_inner(&spec, params, false) {
@@ -10938,6 +11355,26 @@ impl EmbeddedDatabase {
         };
         let pk_value = pk_value.as_ref();
 
+        // sprinter 79efe5ebda6e: identical defect, identical repair, as the fast
+        // DELETE paths — this arm resolves the row it is about to overwrite from
+        // the eagerly-maintained PK ART index. While an open transaction has
+        // REMOVED index entries for this table, a HIT names a committed row that
+        // does not carry the probed key (the other transaction's uncommitted
+        // `UPDATE t SET id = 99 WHERE id = 2` moved the entry, the row still says
+        // 2) and a MISS hides a row that is still committed. `UPDATE … WHERE
+        // id = 99` would then rewrite the row holding id = 2.
+        //
+        // DECLINE rather than "read the row first": `get_row_by_pk_inner`
+        // resolves through the SAME probe, so reading changes nothing. Both
+        // planner Update arms work the truth out — the text family's
+        // (`execute_in_transaction_inner`) may fetch its candidate through the
+        // same PK point lookup but then re-evaluates the real predicate per
+        // tuple, and the params family's (`execute_plan_with_params_inner`)
+        // scans and filters with no probe at all. One `Acquire` load when
+        // nothing is staged anywhere.
+        if self.storage.has_uncommitted_index_removals_for_table(&spec.table_name) {
+            return None;
+        }
         let existing_row =
             match self
                 .storage
@@ -10947,6 +11384,12 @@ impl EmbeddedDatabase {
                 Ok(None) => return Some(Ok(0)),
                 Err(e) => return Some(Err(e)),
             };
+        // sprinter 79efe5ebda6e: the tuple IS in hand here, so hold the index to
+        // the read path's rule — the row it names must carry the key that was
+        // probed. `false` DECLINES to the planner; it never means "no such row".
+        if !Self::fast_row_matches_probed_pk(&existing_row, spec.pk_col_idx, pk_value) {
+            return None;
+        }
         let row_id = existing_row.row_id.unwrap_or(0);
         if row_id == 0 {
             return None;
@@ -11114,6 +11557,34 @@ impl EmbeddedDatabase {
         };
         let pk_value = pk_value.as_ref();
 
+        // sprinter 79efe5ebda6e: the PK ART index is a HINT on the WRITE path
+        // too, and this whole path resolves its victim from it. While some
+        // transaction has REMOVED index entries for this table — a staged
+        // DELETE, or an UPDATE that moved a key — both directions of the probe
+        // lie, and a DELETE acts on the lie instead of merely reporting it:
+        //
+        // * a HIT on a key another transaction has already MOVED onto a row
+        //   (`UPDATE t SET id = 99 WHERE id = 2`, uncommitted) resolves to the
+        //   row that still holds id = 2 in committed storage, and
+        //   `delete_tuple_fast_pk_only` then deletes `data:{t}:{row_id}` without
+        //   ever reading it. A row nobody asked about is destroyed, and it stays
+        //   destroyed when the other transaction rolls back.
+        // * a MISS on a key whose entry a staged DELETE has already stripped
+        //   reports "0 rows deleted" for a row that is still committed.
+        //
+        // Reading the tuple is NOT the repair on its own: the non-shortcut arm
+        // resolves the same row_id through the same probe
+        // (`get_row_by_pk_inner`), so it materialises the same wrong row and
+        // misses on the same stripped key. The repair is to DECLINE — the
+        // planner's scan re-applies the real predicate to every row it fetches
+        // (`sql::executor::scan::try_index_point_lookup_for_scan`) and is the
+        // only path that works the truth out. Same rule, same census, as the
+        // read side's `fast_lookup_miss_is_authoritative`; one `Acquire` load
+        // when nothing is staged anywhere, and the shortcut is surrendered only
+        // while some transaction is actually moving keys in THIS table.
+        if self.storage.has_uncommitted_index_removals_for_table(&spec.table_name) {
+            return None;
+        }
         let pk_key = crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(pk_value));
         let (row_id, existing_row) = if spec.pk_only_delete {
             match self.storage.art_indexes().pk_index_lookup(&spec.table_name, &pk_key) {
@@ -11130,6 +11601,15 @@ impl EmbeddedDatabase {
                     Ok(None) => return Some(Ok(0)),
                     Err(e) => return Some(Err(e)),
                 };
+            // sprinter 79efe5ebda6e: whenever the tuple IS in hand, hold the
+            // index to the read path's rule — the row it points at must carry
+            // the key that was probed. Belt to the census's braces (a dishonest
+            // hit with nothing staged would be an index/row inconsistency, not
+            // an isolation artefact) and, like the read path, a `false` here
+            // DECLINES to the planner; it never means "no such row".
+            if !Self::fast_row_matches_probed_pk(&existing_row, spec.pk_col_idx, pk_value) {
+                return None;
+            }
             let row_id = existing_row.row_id.unwrap_or(0);
             if row_id == 0 {
                 return None;
@@ -11262,11 +11742,15 @@ impl EmbeddedDatabase {
             .art_indexes()
             .columns_affect_indexes(table_name, &assignment_columns);
 
+        // `fast_pk_expr_from_selection` has already refused anything but a SOLE
+        // primary-key column, so the first `primary_key` column IS the probed one.
+        let pk_col_idx = schema.columns.iter().position(|column| column.primary_key)?;
         Some(Ok(FastParamUpdateSpec {
             table_name: table_name.to_string(),
             schema,
             pk_expr,
             pk_data_type,
+            pk_col_idx,
             assignments: fast_assignments,
             assignments_affect_indexes,
         }))
@@ -11339,12 +11823,16 @@ impl EmbeddedDatabase {
         }
 
         let (pk_expr, pk_data_type) = Self::fast_pk_expr_from_selection(selection, &schema)?;
+        // `fast_pk_expr_from_selection` has already refused anything but a SOLE
+        // primary-key column, so the first `primary_key` column IS the probed one.
+        let pk_col_idx = schema.columns.iter().position(|column| column.primary_key)?;
         Some(Ok(FastParamDeleteSpec {
             table_name: table_name.to_string(),
             pk_only_delete: self.fast_delete_can_skip_tuple_fetch(table_name, &schema),
             schema,
             pk_expr,
             pk_data_type,
+            pk_col_idx,
         }))
     }
 
@@ -12898,6 +13386,7 @@ impl EmbeddedDatabase {
     ) -> (u64, Tuple) {
         let row_id = self.storage.next_row_id_volatile(table_name);
 
+        let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
             if col.primary_key {
                 if let Some(value) = tuple.values.get(i) {
@@ -12907,9 +13396,15 @@ impl EmbeddedDatabase {
                             DataType::Int4 => tuple.values[i] = Value::Int4(row_id as i32),
                             _ => tuple.values[i] = Value::Int8(row_id as i64),
                         }
+                        generated_identity = true;
                     }
                 }
             }
+        }
+        // sprinter 6dc0cc115db9: the session-transaction fast INSERT path fills
+        // SERIAL / IDENTITY the same way, so it defines `LASTVAL()` the same way.
+        if generated_identity {
+            crate::note_session_lastval(row_id as i64);
         }
 
         (row_id, tuple)
@@ -13113,6 +13608,7 @@ impl EmbeddedDatabase {
             table_name: table_name.to_string(),
             schema,
             pk_data_type,
+            pk_col_idx,
             set_col_idx,
             set_col_name: set_col.to_string(),
             set_data_type,
@@ -13189,12 +13685,24 @@ impl EmbeddedDatabase {
             pk_only_delete: self.fast_delete_can_skip_tuple_fetch(table_name, &schema),
             schema,
             pk_data_type,
+            pk_col_idx,
         });
         self.fast_literal_delete_cache
             .put(cache_key, std::sync::Arc::clone(&spec));
         Some(Ok(spec))
     }
 
+    /// Is this table SHAPED so that a DELETE never needs the old tuple?
+    ///
+    /// Purely a STATIC property of the table (column storage modes + "the only
+    /// ART index is a single-column PK"), because the answer is cached inside a
+    /// `FastParamDeleteSpec` / `FastLiteralDeleteSpec` for the lifetime of the
+    /// spec caches. sprinter 79efe5ebda6e: the uncommitted-index-removal census
+    /// deliberately does NOT belong here — it is a property of the INSTANT a
+    /// statement runs, and baking it into a cached spec would be wrong in both
+    /// directions (a spec built while nothing was staged would keep the unsafe
+    /// shortcut forever; one built under an open writer would keep the slow path
+    /// forever). The census is consulted at each USE site instead.
     fn fast_delete_can_skip_tuple_fetch(&self, table_name: &str, schema: &Schema) -> bool {
         schema
             .columns
@@ -13324,6 +13832,14 @@ impl EmbeddedDatabase {
             return None; // Complex expression — fall through to normal path
         }
 
+        // sprinter 79efe5ebda6e: the literal UPDATE family resolves its target
+        // from the same index-as-truth PK probe as the params one. See the guard
+        // in `try_execute_fast_update_param_spec` for why a staged index removal
+        // anywhere in this table makes both the HIT and the MISS untrustworthy,
+        // and why reading the tuple is not a repair on its own.
+        if self.storage.has_uncommitted_index_removals_for_table(&spec.table_name) {
+            return None;
+        }
         // Look up the existing row by PK (needed for both literal and expression SET)
         let existing_row =
             match self
@@ -13334,6 +13850,11 @@ impl EmbeddedDatabase {
                 Ok(None) => return Some(Ok(0)), // No matching row
                 Err(e) => return Some(Err(e)),
             };
+        // sprinter 79efe5ebda6e: the index hit must be honest about the row it
+        // names (see the params-family arm).
+        if !Self::fast_row_matches_probed_pk(&existing_row, spec.pk_col_idx, &pk_value) {
+            return None;
+        }
 
         let row_id = existing_row.row_id.unwrap_or(0);
         if row_id == 0 {
@@ -13518,6 +14039,15 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
 
+        // sprinter 79efe5ebda6e: the literal family resolves its victim from the
+        // same eagerly-maintained PK ART index as the params family, and deletes
+        // `data:{table}:{row_id}` without reading the row. See the identical
+        // guard in `try_execute_fast_delete_param_spec_inner` for why a staged
+        // index removal anywhere in this table makes both the HIT and the MISS
+        // untrustworthy, and why reading the tuple is not a repair on its own.
+        if self.storage.has_uncommitted_index_removals_for_table(&spec.table_name) {
+            return None;
+        }
         // The PK literal must consume the whole token — trailing text means
         // an unparsed construct; fall back to the planner. So does a literal
         // with no valid key for the PK column's type (GH#15).
@@ -13539,6 +14069,11 @@ impl EmbeddedDatabase {
                     Err(e) => return Some(Err(e)),
                 };
 
+            // sprinter 79efe5ebda6e: the index hit must be honest about the row
+            // it names (see the params-family arm).
+            if !Self::fast_row_matches_probed_pk(&existing_row, spec.pk_col_idx, &pk_value) {
+                return None;
+            }
             let row_id = existing_row.row_id.unwrap_or(0);
             if row_id == 0 {
                 return None;
@@ -13896,8 +14431,13 @@ impl EmbeddedDatabase {
     /// A `false` here means DECLINE, never "no such row": the statement falls
     /// back to the planner, whose scan (and whose index probes, which re-apply
     /// the real predicate to every row they fetch) works out the truth.
-    fn fast_row_matches_probed_pk(row: &Tuple, spec: &FastSelectSpec, probe: &Value) -> bool {
-        let Some(value) = row.values.get(spec.pk_col_idx) else {
+    ///
+    /// sprinter 79efe5ebda6e: takes the PK column INDEX rather than a
+    /// `FastSelectSpec`, so the fast DELETE specs — which carry the same index —
+    /// can apply the identical rule. One rule, one body: the read and the write
+    /// path cannot drift on what "this index hit is honest" means.
+    fn fast_row_matches_probed_pk(row: &Tuple, pk_col_idx: usize, probe: &Value) -> bool {
+        let Some(value) = row.values.get(pk_col_idx) else {
             return false;
         };
         if value == probe {
@@ -13923,7 +14463,7 @@ impl EmbeddedDatabase {
         match result {
             // The index says this row holds the probed key; check that it does
             // (see `fast_row_matches_probed_pk`).
-            Ok(Some(row)) if Self::fast_row_matches_probed_pk(&row, spec, pk_value) => Some(Ok(vec![row])),
+            Ok(Some(row)) if Self::fast_row_matches_probed_pk(&row, spec.pk_col_idx, pk_value) => Some(Ok(vec![row])),
             Ok(Some(_)) => None,
             Ok(None) => {
                 if self.fast_lookup_miss_is_authoritative(&spec.table_name) {
@@ -14439,7 +14979,9 @@ impl EmbeddedDatabase {
                     .get_row_by_typed_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
                 {
                     // Same hit and miss rules as `fast_select_rows`.
-                    Ok(Some(row)) if Self::fast_row_matches_probed_pk(&row, &spec, &pk_value) => Some(Ok(vec![row])),
+                    Ok(Some(row)) if Self::fast_row_matches_probed_pk(&row, spec.pk_col_idx, &pk_value) => {
+                        Some(Ok(vec![row]))
+                    }
                     Ok(Some(_)) => None,
                     Ok(None) => {
                         if self.fast_lookup_miss_is_authoritative(&spec.table_name) {
@@ -14486,7 +15028,7 @@ impl EmbeddedDatabase {
             .get_row_by_typed_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
         {
             // Same hit and miss rules as `fast_select_rows`.
-            Ok(Some(row)) if Self::fast_row_matches_probed_pk(&row, &spec, &pk_value) => Some(Ok(vec![row])),
+            Ok(Some(row)) if Self::fast_row_matches_probed_pk(&row, spec.pk_col_idx, &pk_value) => Some(Ok(vec![row])),
             Ok(Some(_)) => None,
             Ok(None) => {
                 if self.fast_lookup_miss_is_authoritative(&spec.table_name) {
@@ -15352,6 +15894,12 @@ impl EmbeddedDatabase {
         // Spec 03: advisory-lock owner for a params-family statement with no
         // session. A no-op under `execute_params_for_session_inner`.
         let _advisory = self.embedded_advisory_context_guard(sql);
+        // sprinter 6dc0cc115db9 / f4f5d450e816: THIS HANDLE is the backend for a
+        // statement that arrives without a session. `install_if_absent`, because a
+        // wire session's `_for_session` entry point delegates into this very funnel
+        // for the autocommit case — it has already installed ITS session's backend,
+        // and overwriting it here would make every connection share one `lastval()`.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
         // GH#28: the params family answers `SHOW <setting>` and `SET` /
         // `RESET` of the three connection-lifetime GUCs from the registry —
         // and NOTHING else (candidate 2: every other `SET` keeps erroring in
@@ -15505,6 +16053,12 @@ impl EmbeddedDatabase {
         // Spec 03: advisory-lock owner for a statement with no session. A no-op
         // under `execute_returning_for_session`.
         let _advisory = self.embedded_advisory_context_guard(sql);
+        // sprinter 6dc0cc115db9 / f4f5d450e816: THIS HANDLE is the backend for a
+        // statement that arrives without a session. `install_if_absent`, because a
+        // wire session's `_for_session` entry point delegates into this very funnel
+        // for the autocommit case — it has already installed ITS session's backend,
+        // and overwriting it here would make every connection share one `lastval()`.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
         let plan = self.parameterized_plan_cached(sql)?;
 
         let out = self.execute_plan_with_params(&plan, params, None);
@@ -15713,7 +16267,18 @@ impl EmbeddedDatabase {
         session_txn: Option<&storage::Transaction>,
         original_sql: Option<&str>,
     ) -> Result<(u64, Vec<Tuple>)> {
-        let result = self.execute_plan_with_params_inner(plan, params, session_txn, original_sql);
+        // sprinter 6780488554df: THE choke point where an autocommit multi-row
+        // params INSERT acquires the statement transaction the text family has
+        // always had. Every params-family route funnels through here — embedded
+        // `execute_params` / `execute_params_returning`, `EXECUTE stmt`, and the
+        // extended protocol's autocommit path (`execute_params_for_session_inner`
+        // delegates to `execute_params_inner` when the session holds no
+        // transaction) — so one gate covers them all and none of them can drift.
+        let result = if self.params_insert_needs_implicit_transaction(plan, session_txn) {
+            self.execute_plan_with_params_in_implicit_transaction(plan, params, original_sql)
+        } else {
+            self.execute_plan_with_params_inner(plan, params, session_txn, original_sql)
+        };
         // Invalidate the result cache on any successful mutating plan.
         // Without this, an earlier `SELECT ... WHERE col = 'v'` that
         // returned `[]` (e.g. a login probe before register) is served
@@ -15736,6 +16301,96 @@ impl EmbeddedDatabase {
             self.invalidate_result_cache();
         }
         result
+    }
+
+    /// sprinter 6780488554df: does this params-family statement need an implicit
+    /// statement transaction of its own?
+    ///
+    /// Only a MULTI-ROW `INSERT … VALUES (…),(…)` with no transaction anywhere
+    /// in scope. The Insert arm below writes each row STRAIGHT to storage
+    /// (`insert_tuple_branch_aware_with_schema`) when it resolves no active
+    /// transaction, so a UNIQUE violation on row N used to leave rows 1..N-1
+    /// committed — PostgreSQL fails the whole statement and persists nothing,
+    /// and Prisma's `createMany` is exactly this shape over the extended
+    /// protocol. The text family never had the hole because every statement that
+    /// falls out of its fast paths runs inside
+    /// [`Self::execute_with_implicit_transaction`]; this is that same mechanism,
+    /// reached from the other family, not a second one.
+    ///
+    /// Deliberately narrow:
+    ///
+    /// * SINGLE-row inserts are untouched — they are atomic by construction (one
+    ///   row, one write) and they are the throughput-critical shape.
+    /// * A session transaction, or a text `BEGIN` holding the global slot,
+    ///   already makes the statement part of a larger unit that rolls back whole;
+    ///   the Insert arm picks those up itself.
+    /// * A live BRANCH writes to `bdata:` and keeps the process-wide ART
+    ///   branch-free; that path is left exactly as it was.
+    fn params_insert_needs_implicit_transaction(
+        &self,
+        plan: &sql::LogicalPlan,
+        session_txn: Option<&storage::Transaction>,
+    ) -> bool {
+        if session_txn.is_some() {
+            return false;
+        }
+        let sql::LogicalPlan::Insert {
+            values, on_conflict, ..
+        } = plan
+        else {
+            return false;
+        };
+        if values.len() < 2 {
+            return false;
+        }
+        // `ON CONFLICT` is excluded deliberately, not overlooked. Its DO UPDATE
+        // leg writes the conflicting row with `update_tuple_fast`, which goes
+        // STRAIGHT to `data:` and not through the write set: staging the INSERT
+        // half while the UPDATE half bypasses the transaction would make a
+        // conflict against a row staged EARLIER IN THE SAME STATEMENT update a
+        // `data:` key the commit is about to overwrite. There is also nothing to
+        // repair here — the whole point of `ON CONFLICT` is that the duplicate
+        // does not raise. Left byte-for-byte as it was (sprinter 6780488554df).
+        if on_conflict.is_some() {
+            return false;
+        }
+        !self.in_transaction() && self.savepoints.read().is_empty() && self.storage.get_current_branch_id().is_none()
+    }
+
+    /// Run one params-family plan inside an implicit statement transaction —
+    /// the params-family twin of [`Self::execute_with_implicit_transaction`],
+    /// with the same begin → execute → commit-or-rollback shape, the same
+    /// deferred-FK validation before the commit, and the same ART/vector undo
+    /// handling (`begin_autocommit_transaction` carries no session id, so its
+    /// eager index ops land in the global `art_undo_log`).
+    fn execute_plan_with_params_in_implicit_transaction(
+        &self,
+        plan: &sql::LogicalPlan,
+        params: &[Value],
+        original_sql: Option<&str>,
+    ) -> Result<(u64, Vec<Tuple>)> {
+        let txn = self.storage.begin_autocommit_transaction()?;
+        match self.execute_plan_with_params_inner(plan, params, Some(&txn), original_sql) {
+            Ok(out) => {
+                if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
+                    let _ = txn.rollback();
+                    self.rollback_art_undo_log();
+                    self.deferred_fk_checks.lock().clear();
+                    return Err(e);
+                }
+                txn.commit()?;
+                self.art_undo_log.write().clear();
+                self.deferred_fk_checks.lock().clear();
+                self.storage.increment_lsn();
+                Ok(out)
+            }
+            Err(e) => {
+                let _ = txn.rollback();
+                self.rollback_art_undo_log();
+                self.deferred_fk_checks.lock().clear();
+                Err(e)
+            }
+        }
     }
 
     fn execute_plan_with_params_inner(
@@ -16053,6 +16708,7 @@ impl EmbeddedDatabase {
                                 let row_id = self.storage.next_row_id_volatile(table_name);
                                 self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
                                 let mut staged = tuple.clone();
+                                let mut generated_identity = false;
                                 for (i, col) in schema.columns.iter().enumerate() {
                                     if col.primary_key {
                                         if let Some(Value::Null) = staged.values.get(i) {
@@ -16062,9 +16718,18 @@ impl EmbeddedDatabase {
                                                     DataType::Int4 => Value::Int4(row_id as i32),
                                                     _ => Value::Int8(row_id as i64),
                                                 };
+                                                generated_identity = true;
                                             }
                                         }
                                     }
+                                }
+                                // sprinter 6dc0cc115db9: the PARAMS family's
+                                // in-transaction INSERT arm — the shape Prisma and
+                                // every extended-protocol driver sends. Without this
+                                // the feature would work on the text family only,
+                                // which is exactly how GH#28 nearly shipped half-done.
+                                if generated_identity {
+                                    crate::note_session_lastval(row_id as i64);
                                 }
                                 let mut staged_col_values =
                                     std::collections::HashMap::with_capacity(schema.columns.len());
@@ -17325,6 +17990,12 @@ impl EmbeddedDatabase {
         // Spec 03: advisory-lock owner for a statement with no session. A no-op
         // when a wire/`_in_session` entry point already installed its own.
         let _advisory = self.embedded_advisory_context_guard(sql);
+        // sprinter 6dc0cc115db9 / f4f5d450e816: THIS HANDLE is the backend for a
+        // statement that arrives without a session. `install_if_absent`, because a
+        // wire session's `_for_session` entry point delegates into this very funnel
+        // for the autocommit case — it has already installed ITS session's backend,
+        // and overwriting it here would make every connection share one `lastval()`.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
         // SQLite-compat: PRAGMA short-circuit. `table_info(t)` returns
         // SQLite-shaped rows; everything else returns an empty result so
         // sqlite3-driven apps can issue PRAGMAs without parser errors.
@@ -17833,7 +18504,7 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Option<(std::sync::Arc<Vec<Tuple>>, std::sync::Arc<Schema>)> {
-        let _identity_override = self.session_login_user_override_guard(session_id).ok()?;
+        let _identity_override = self.session_statement_context_guard(session_id).ok()?;
         self.try_cached_query_with_schema(sql)
     }
 
@@ -17982,6 +18653,12 @@ impl EmbeddedDatabase {
         // when `query_with_columns_for_session` already installed its own — the
         // wire simple-query path always does.
         let _advisory = self.embedded_advisory_context_guard(sql);
+        // sprinter 6dc0cc115db9 / f4f5d450e816: THIS HANDLE is the backend for a
+        // statement that arrives without a session. `install_if_absent`, because a
+        // wire session's `_for_session` entry point delegates into this very funnel
+        // for the autocommit case — it has already installed ITS session's backend,
+        // and overwriting it here would make every connection share one `lastval()`.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
         if let Some(result) = self.try_fast_select_with_schema(sql) {
             return result;
         }
@@ -18713,8 +19390,30 @@ impl EmbeddedDatabase {
     /// # Errors
     ///
     /// Returns an error if the session has no active transaction.
+    /// sprinter f4f5d450e816: end-of-transaction-block hook for a session's
+    /// backend state — today, reverting a `SET LOCAL application_name`.
+    ///
+    /// Looked up by session id rather than read off the per-statement
+    /// thread-local, because the MySQL listener's `handle_commit` calls
+    /// `commit_transaction_for_session` DIRECTLY, without going through a
+    /// statement entry point that would have installed one. A session that has
+    /// already been destroyed is a no-op, not an error.
+    fn end_session_transaction_scoped_state(&self, session_id: crate::session::SessionId) {
+        if let Ok(session_lock) = self.session_manager.get_session(session_id) {
+            let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+            scoped.end_transaction();
+        }
+    }
+
     pub fn commit_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
         let result = self.commit_transaction_for_session_inner(session_id);
+        // sprinter f4f5d450e816: a `SET LOCAL application_name` reverts at the
+        // END of the transaction block — on COMMIT and ROLLBACK alike, and
+        // whether or not the commit succeeded (a failed COMMIT still ends the
+        // block). Hooked on the OUTER wrapper, which is also what the MySQL
+        // listener calls directly rather than through
+        // `handle_transaction_control_for_session`.
+        self.end_session_transaction_scoped_state(session_id);
         // Spec 03: `pg_advisory_xact_lock` locks end with the transaction, and
         // the transaction is over on EVERY exit below — a clean commit, a
         // deferred-FK failure, a serialization failure (all of which abort it).
@@ -18859,6 +19558,8 @@ impl EmbeddedDatabase {
     /// Returns an error if the session has no active transaction.
     pub fn rollback_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
         let result = self.rollback_transaction_for_session_inner(session_id);
+        // sprinter f4f5d450e816: see `commit_transaction_for_session`.
+        self.end_session_transaction_scoped_state(session_id);
         // Spec 03: `pg_advisory_xact_lock` locks end with the transaction —
         // ROLLBACK releases them exactly as COMMIT does. Same lock-free gate as
         // the commit path.
@@ -18935,7 +19636,14 @@ impl EmbeddedDatabase {
         // HDB-009: this session's login identity answers `current_user` and
         // keys the result cache for everything below, including every early
         // return.
-        let _identity_override = self.session_login_user_override_guard(session_id)?;
+        let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
+        // application_name lands on THIS session's backend, ahead of the
+        // open-transaction fork below — the in-transaction branch is
+        // sqlparser-first and would fail on a generic GUC statement.
+        if let Some(_handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(0);
+        }
         // R1.3-p2: session-scoped SET/RESET synchronous_commit. Must run
         // BEFORE the session write lock below (the handler re-locks it).
         if let Some(handled) = self.try_handle_session_synchronous_commit(session_id, sql)? {
@@ -19074,7 +19782,14 @@ impl EmbeddedDatabase {
         // funnel does not re-attribute the lock to the embedded handle.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
-        let _identity_override = self.session_login_user_override_guard(session_id)?;
+        let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
+        // application_name lands on THIS session's backend, ahead of the
+        // open-transaction fork below — the in-transaction branch is
+        // sqlparser-first and would fail on a generic GUC statement.
+        if let Some(handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(handled.0);
+        }
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
         session.touch();
@@ -19375,6 +20090,52 @@ impl EmbeddedDatabase {
         Ok(())
     }
 
+    /// sprinter f4f5d450e816: this session's `application_name`.
+    ///
+    /// The one reader for surfaces that have a session id but no statement
+    /// running on this thread — the PostgreSQL wire's `SHOW` arm, its
+    /// `ParameterStatus` (GUC_REPORT) echo, and the audit logger.
+    pub fn session_application_name(&self, session_id: crate::session::SessionId) -> Result<String> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        Ok(scoped.application_name())
+    }
+
+    /// sprinter f4f5d450e816: publish `application_name` onto a session without
+    /// a SQL statement — the PostgreSQL startup packet, which is where every
+    /// driver (psycopg, JDBC, node-postgres, sqlx) actually sends it. A client
+    /// that never issues `SET application_name` still expects
+    /// `current_setting('application_name')` and `pg_stat_activity` to name it.
+    pub fn set_session_application_name(&self, session_id: crate::session::SessionId, value: &str) -> Result<()> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        scoped.set_application_name(value);
+        Ok(())
+    }
+
+    /// sprinter f4f5d450e816: record the peer this session was accepted from,
+    /// for `pg_stat_activity.client_addr` / `client_port`. A listener that does
+    /// not know one (an in-memory duplex stream, the embedded funnels) simply
+    /// never calls this and both columns stay NULL.
+    pub fn set_session_client_address(
+        &self,
+        session_id: crate::session::SessionId,
+        addr: Option<&str>,
+        port: i32,
+    ) -> Result<()> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        scoped.set_client_address(addr, port);
+        Ok(())
+    }
+
+    /// sprinter f4f5d450e816: this session's `pg_backend_pid()`.
+    pub fn session_backend_pid(&self, session_id: crate::session::SessionId) -> Result<i32> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let pid = session_lock.read().scoped.backend_pid();
+        Ok(pid)
+    }
+
     /// Read this session's login role/username (default `None`).
     pub(crate) fn session_login_user(&self, session_id: crate::session::SessionId) -> Result<Option<String>> {
         let session_lock = self.session_manager.get_session(session_id)?;
@@ -19420,45 +20181,62 @@ impl EmbeddedDatabase {
         }
     }
 
-    /// Install THIS session's login identity as the thread-local
-    /// `current_user` / `session_user` / `current_role` /
-    /// `current_setting('session_authorization')` value for the duration of one
-    /// statement (HDB-009).
+    /// Install everything ONE statement of THIS session needs on the thread
+    /// that runs it:
     ///
-    /// The evaluator that answers those functions is storage-less and
-    /// session-less (see `crate::session_login_user_tls`), so this per-statement
-    /// thread-local is the ONLY way the authenticated name reaches SQL — the
-    /// same mechanism `session_schema_override_guard` uses for `search_path`
-    /// and `advisory_context_guard` uses for lock ownership. It is also what
-    /// makes the shared result cache principal-aware ([`CachedRows`]), so it
-    /// must be installed BEFORE any cache lookup — i.e. as the first
-    /// statement-scoped guard of every session entry point, ahead of every
-    /// early return.
+    /// * the session's login identity — what `current_user` / `session_user` /
+    ///   `current_role` / `current_setting('session_authorization')` answer
+    ///   (HDB-009); and
+    /// * the session's backend state — `lastval()`, `pg_backend_pid()` and
+    ///   `application_name` (sprinter 6dc0cc115db9 / f4f5d450e816).
     ///
-    /// Returns `None` — no guard, no thread-local write — when the session has
-    /// no login identity: every `create_wire_session` handle that has not
-    /// authenticated yet, and every embedded caller that never named a user. An
-    /// empty name counts as no identity rather than becoming an empty
-    /// `current_user`.
+    /// The evaluator that answers all of those is storage-less and
+    /// session-less (see `crate::session_login_user_tls` /
+    /// `crate::session_scoped_state_tls`), so these per-statement thread-locals
+    /// are the ONLY way session state reaches SQL — the same mechanism
+    /// `session_schema_override_guard` uses for `search_path` and
+    /// `advisory_context_guard` uses for lock ownership. The identity half is
+    /// also what makes the shared result cache principal-aware
+    /// ([`CachedRows`]), so this must be installed BEFORE any cache lookup —
+    /// i.e. as the first statement-scoped guard of every session entry point,
+    /// ahead of every early return.
     ///
-    /// PERF: one session read-lock and one `Arc` refcount increment per
-    /// statement — no allocation and no copy of the name. That is why the
+    /// The identity half installs NOTHING when the session has no login
+    /// identity: every `create_wire_session` handle that has not authenticated
+    /// yet, and every embedded caller that never named a user. An empty name
+    /// counts as no identity rather than becoming an empty `current_user`. The
+    /// backend half is always installed — a session with no name still has its
+    /// own `lastval()` and its own pid.
+    ///
+    /// PERF: one session read-lock and two `Arc` refcount increments per
+    /// statement — no allocation and no copy of either value. That is why the
     /// session stores the identity pre-interned as `Session.login_identity`
     /// alongside the `String` the `search_path` expansion reads; building an
     /// `Arc<str>` from the `String` here would have meant a fresh heap
     /// allocation plus a memcpy on every statement of every wire connection.
-    /// The value cannot be cached on the handle: one `EmbeddedDatabase` serves
-    /// every connection, and the identity is per SESSION, not per handle.
-    fn session_login_user_override_guard(
-        &self,
-        session_id: crate::session::SessionId,
-    ) -> Result<Option<SessionLoginUserOverrideGuard>> {
+    /// Neither value can be cached on the handle: one `EmbeddedDatabase` serves
+    /// every connection, and both are per SESSION, not per handle.
+    fn session_statement_context_guard(&self, session_id: crate::session::SessionId) -> Result<SessionStatementGuard> {
         let session_lock = self.session_manager.get_session(session_id)?;
-        let login_user = match session_lock.read().login_identity.as_ref() {
-            Some(name) if !name.is_empty() => std::sync::Arc::clone(name),
-            _ => return Ok(None),
+        // ONE read lock for both halves. sprinter 6dc0cc115db9 / f4f5d450e816
+        // added the second one (`scoped`); taking a separate session lookup for
+        // it would have doubled the per-statement session traffic on the wire
+        // hot path for no reason — both live on the same `Session`.
+        let (login_user, scoped) = {
+            let session = session_lock.read();
+            let login_user = match session.login_identity.as_ref() {
+                Some(name) if !name.is_empty() => Some(std::sync::Arc::clone(name)),
+                _ => None,
+            };
+            (login_user, std::sync::Arc::clone(&session.scoped))
         };
-        Ok(Some(SessionLoginUserOverrideGuard::install(login_user)))
+        Ok(SessionStatementGuard {
+            _identity: login_user.map(SessionLoginUserOverrideGuard::install),
+            // Installed UNCONDITIONALLY, unlike the identity half: a session
+            // with no login name still has its own backend, and `lastval()` on
+            // it must never fall through to the handle-wide embedded one.
+            _scoped: SessionScopedStateGuard::install(scoped),
+        })
     }
 
     /// Install THIS embedded connection's `search_path` schema as the
@@ -19858,7 +20636,14 @@ impl EmbeddedDatabase {
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
-        let _identity_override = self.session_login_user_override_guard(session_id)?;
+        let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
+        // application_name lands on THIS session's backend, ahead of the
+        // open-transaction fork below — the in-transaction branch is
+        // sqlparser-first and would fail on a generic GUC statement.
+        if let Some(_handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(0);
+        }
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
@@ -19960,7 +20745,14 @@ impl EmbeddedDatabase {
         // does not re-attribute the lock to the embedded handle.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
-        let _identity_override = self.session_login_user_override_guard(session_id)?;
+        let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
+        // application_name lands on THIS session's backend, ahead of the
+        // open-transaction fork below — the in-transaction branch is
+        // sqlparser-first and would fail on a generic GUC statement.
+        if let Some(handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(handled);
+        }
         // Resolve bare names against THIS session's schema for both the
         // autocommit delegate and the in-transaction planner below.
         let _schema_override = self.session_schema_override_guard(session_id);
@@ -20023,7 +20815,14 @@ impl EmbeddedDatabase {
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
-        let _identity_override = self.session_login_user_override_guard(session_id)?;
+        let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
+        // application_name lands on THIS session's backend, ahead of the
+        // open-transaction fork below — the in-transaction branch is
+        // sqlparser-first and would fail on a generic GUC statement.
+        if let Some(_handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok((0, Vec::new()));
+        }
         if Self::is_transaction_control(sql) {
             let count = self.handle_transaction_control_for_session(session_id, sql)?;
             return Ok((count, Vec::new()));
@@ -20123,7 +20922,14 @@ impl EmbeddedDatabase {
         // this connection as the owner.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
-        let _identity_override = self.session_login_user_override_guard(session_id)?;
+        let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
+        // application_name lands on THIS session's backend, ahead of the
+        // open-transaction fork below — the in-transaction branch is
+        // sqlparser-first and would fail on a generic GUC statement.
+        if let Some(_handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok((0, Vec::new()));
+        }
         // The interceptor prologue is the simple-protocol twin's: a driver that
         // binds parameters reaches Execute for EVERY statement it sends, so this
         // entry point must recognise the same session-owned classes rather than
@@ -20217,7 +21023,14 @@ impl EmbeddedDatabase {
         // (extended protocol / params family).
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
-        let _identity_override = self.session_login_user_override_guard(session_id)?;
+        let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
+        // application_name lands on THIS session's backend, ahead of the
+        // open-transaction fork below — the in-transaction branch is
+        // sqlparser-first and would fail on a generic GUC statement.
+        if let Some(_handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(0);
+        }
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control_for_session(session_id, sql);
         }
@@ -20307,7 +21120,14 @@ impl EmbeddedDatabase {
         // clients send).
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
-        let _identity_override = self.session_login_user_override_guard(session_id)?;
+        let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
+        // application_name lands on THIS session's backend, ahead of the
+        // open-transaction fork below — the in-transaction branch is
+        // sqlparser-first and would fail on a generic GUC statement.
+        if let Some(handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(handled.0);
+        }
         // GH#28 (c2): a `SET` / `RESET` of a connection-lifetime GUC arriving
         // through the query-shaped route (MySQL COM_STMT_EXECUTE) is stored
         // on THIS session, never on the process-global registry.
@@ -20381,7 +21201,14 @@ impl EmbeddedDatabase {
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
-        let _identity_override = self.session_login_user_override_guard(session_id)?;
+        let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
+        // application_name lands on THIS session's backend, ahead of the
+        // open-transaction fork below — the in-transaction branch is
+        // sqlparser-first and would fail on a generic GUC statement.
+        if let Some(handled) = self.try_handle_session_application_name(session_id, sql)? {
+            return Ok(handled);
+        }
         let _schema_override = self.session_schema_override_guard(session_id);
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_params_with_schema(sql, params);
@@ -20592,6 +21419,12 @@ impl EmbeddedDatabase {
         // Spec 03: advisory-lock owner for a params-family statement with no
         // session. A no-op under `query_params_for_session_inner`.
         let _advisory = self.embedded_advisory_context_guard(sql);
+        // sprinter 6dc0cc115db9 / f4f5d450e816: THIS HANDLE is the backend for a
+        // statement that arrives without a session. `install_if_absent`, because a
+        // wire session's `_for_session` entry point delegates into this very funnel
+        // for the autocommit case — it has already installed ITS session's backend,
+        // and overwriting it here would make every connection share one `lastval()`.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
         // Code-graph pre-parser: see `maybe_rewrite_code_graph`.
         // `ON BRANCH '…'` directives swap the active branch via a
         // Drop guard for the duration of this query.
@@ -20826,6 +21659,12 @@ impl EmbeddedDatabase {
         // Spec 03: advisory-lock owner for a params-family statement with no
         // session. A no-op under `query_params_with_columns_for_session`.
         let _advisory = self.embedded_advisory_context_guard(sql);
+        // sprinter 6dc0cc115db9 / f4f5d450e816: THIS HANDLE is the backend for a
+        // statement that arrives without a session. `install_if_absent`, because a
+        // wire session's `_for_session` entry point delegates into this very funnel
+        // for the autocommit case — it has already installed ITS session's backend,
+        // and overwriting it here would make every connection share one `lastval()`.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
         #[cfg(feature = "code-graph")]
         let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
         #[cfg(feature = "code-graph")]
@@ -21985,6 +22824,10 @@ impl EmbeddedDatabase {
             current_schema: self.current_schema.clone(),
             search_path: self.search_path.clone(),
             current_schema_set: self.current_schema_set.clone(),
+            // A trigger body / `CALL` re-enters the engine on the same
+            // connection: it is the SAME backend, so it shares the handle's
+            // scoped state rather than minting a second pid.
+            embedded_scoped: std::sync::Arc::clone(&self.embedded_scoped),
             any_session_schema_active: self.any_session_schema_active.clone(),
             savepoints: self.savepoints.clone(),
             plan_cache: self.plan_cache.clone(),
@@ -22103,6 +22946,29 @@ impl EmbeddedDatabase {
         if referencing_columns.len() != referenced_count {
             return Err(Self::fk_arity_error());
         }
+        // sprinter fb9aec923da8: the referenced column set must BE a key.
+        //
+        // Nano used to accept `REFERENCES p(any_col)` against a column with no
+        // uniqueness at all. The constraint that left behind has undefined
+        // semantics: a child value can match several parent rows, so "the
+        // parent exists" is ambiguous, `ON DELETE CASCADE` / `SET NULL` have no
+        // single victim, and the ART fast path in
+        // `check_referencing_rows_exist` — which looks for an index covering
+        // the referenced columns — never finds one, so every probe degrades to
+        // a full parent scan. PostgreSQL refuses the declaration outright
+        // (42830 invalid_foreign_key, `tablecmds.c transformFkeyCheckAttrs`).
+        //
+        // LAST, deliberately: the 42P01 / 42703 / 42704 / 42830-arity order
+        // GH#27 pinned is untouched, so a statement that is wrong in more than
+        // one way reports exactly what it reported before. Only a declaration
+        // that used to be ACCEPTED can reach this line.
+        //
+        // The list-less case is skipped because it cannot fail it: an empty
+        // list defaults to the parent's PRIMARY KEY, which is a key by
+        // construction (and a key-less parent already returned 42704 above).
+        if !referenced_columns.is_empty() && !catalog.unique_key_covers(references_table, referenced_columns)? {
+            return Err(Self::fk_not_unique_error(references_table));
+        }
         Ok(())
     }
 
@@ -22134,6 +23000,65 @@ impl EmbeddedDatabase {
     /// mismatch. SQLSTATE 42830 invalid_foreign_key on the wire.
     fn fk_arity_error() -> Error {
         Error::query_execution("number of referencing and referenced columns for foreign key disagree")
+    }
+
+    /// PostgreSQL's `transformFkeyCheckAttrs` diagnostic: the referenced column
+    /// set is neither the parent's PRIMARY KEY nor covered by a UNIQUE
+    /// constraint or index (sprinter fb9aec923da8). SQLSTATE 42830
+    /// invalid_foreign_key on the wire — the arm in
+    /// `sqlstate_for_query_execution_message` anchors on this text, and it is
+    /// deliberately NOT the wording the ON CONFLICT resolver uses ("no unique
+    /// or exclusion constraint matching …", 42P10), which is checked first.
+    fn fk_not_unique_error(references_table: &str) -> Error {
+        Error::query_execution(format!(
+            "there is no unique constraint matching given keys for referenced table \"{}\"",
+            references_table
+        ))
+    }
+
+    /// The self-reference twin of [`storage::Catalog::unique_key_covers`], over
+    /// the columns a `CREATE TABLE` is DECLARING.
+    ///
+    /// `validate_create_table_fk_targets` runs BEFORE `catalog.create_table`,
+    /// so a `REFERENCES <self>(col)` has no catalogued parent to ask — the
+    /// declaration itself is the only source of truth. Same rule, same SET
+    /// comparison, same four spellings minus the two that need a catalogued
+    /// table: the planner has already propagated a table-level
+    /// `PRIMARY KEY (…)` onto the ColumnDefs, and a table-level `UNIQUE (…)`
+    /// (composite included) is read straight off the constraint list.
+    fn declared_columns_form_a_key(
+        columns: &[sql::logical_plan::ColumnDef],
+        constraints: &[sql::logical_plan::TableConstraint],
+        referenced: &[String],
+    ) -> bool {
+        let normalize = |cols: &[String]| -> Vec<String> {
+            let mut v: Vec<String> = cols.iter().map(|c| c.to_ascii_lowercase()).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let wanted = normalize(referenced);
+        if wanted.is_empty() || wanted.len() != referenced.len() {
+            return false;
+        }
+        let same = |set: &[String]| -> bool { set.len() == wanted.len() && normalize(set) == wanted };
+
+        let pk: Vec<String> = columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.clone())
+            .collect();
+        if same(&pk) {
+            return true;
+        }
+        if wanted.len() == 1 && columns.iter().any(|c| c.unique && same(std::slice::from_ref(&c.name))) {
+            return true;
+        }
+        constraints.iter().any(|c| match c {
+            sql::logical_plan::TableConstraint::PrimaryKey { columns: pk_cols, .. } => same(pk_cols),
+            sql::logical_plan::TableConstraint::Unique { columns: uq_cols, .. } => same(uq_cols),
+            _ => false,
+        })
     }
 
     /// True when a foreign key declared on `table_name` targets `table_name`
@@ -22173,11 +23098,13 @@ impl EmbeddedDatabase {
             };
             // Self-reference: validated against the columns being DECLARED
             // (see `fk_targets_self` for why the bare name is compared too).
-            // The same three checks `validate_fk_reference` applies to a
+            // The same FOUR checks `validate_fk_reference` applies to a
             // catalogued parent — 42703 for a named column, 42704 for a
             // list-less reference to a key-less table, 42830 for an arity
-            // mismatch — run here over the ColumnDefs; the planner has already
-            // propagated a table-level `PRIMARY KEY (…)` onto them.
+            // mismatch and 42830 for a referenced set that is not a key
+            // (sprinter fb9aec923da8) — run here over the ColumnDefs; the
+            // planner has already propagated a table-level `PRIMARY KEY (…)`
+            // onto them.
             if Self::fk_targets_self(table_name, references_table) {
                 for col in references_columns {
                     if !columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
@@ -22195,6 +23122,14 @@ impl EmbeddedDatabase {
                 };
                 if fk_columns.len() != referenced_count {
                     return Err(Self::fk_arity_error());
+                }
+                // sprinter fb9aec923da8, the self-reference arm. Same rule and
+                // same position (LAST) as the catalogued path, so the GH#27
+                // orders are untouched here too.
+                if !references_columns.is_empty()
+                    && !Self::declared_columns_form_a_key(columns, constraints, references_columns)
+                {
+                    return Err(Self::fk_not_unique_error(references_table));
                 }
             } else {
                 Self::validate_fk_reference(catalog, references_table, fk_columns, references_columns)?;
@@ -23660,7 +24595,17 @@ impl EmbeddedDatabase {
     /// Start QPS quota window reset background task
     ///
     /// This spawns a background task that resets the QPS window counter for all tenants
-    /// every second. This enables accurate rate limiting.
+    /// every second.
+    ///
+    /// **No longer required for rate limiting (F3, sprinter c837352dabef).** The
+    /// per-tenant QPS window is evaluated lazily inside the quota check against
+    /// `[resource_quotas].tenant_qps_window_ms`, so `max_qps` is enforced as a
+    /// RATE on every path — server, embedded library and tests alike — whether
+    /// or not this task runs. (It previously had ZERO callers in the whole
+    /// tree, which is exactly how `max_qps` degraded into a lifetime quota.)
+    /// The task remains available for callers that want the window advanced on
+    /// a fixed cadence even while a tenant is idle, e.g. so `window_reset_at`
+    /// and the QPS averages keep ticking on a monitoring dashboard.
     ///
     /// # Returns
     ///
@@ -23706,7 +24651,8 @@ impl EmbeddedDatabase {
     /// Reset QPS quota window for all tenants (synchronous version)
     ///
     /// This is a synchronous alternative to `start_qps_reset_task()` that can be
-    /// called manually or from a custom scheduler.
+    /// called manually or from a custom scheduler. Like that task it is
+    /// OPTIONAL for enforcement (F3): the window rolls lazily on the quota path.
     ///
     /// # Examples
     ///

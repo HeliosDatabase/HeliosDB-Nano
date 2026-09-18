@@ -17,6 +17,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub use expression::{evaluate_rls_expression, RLSExpressionEvaluator};
@@ -587,6 +588,23 @@ pub struct QuotaTracking {
     pub started_at: String,
     /// Total seconds elapsed (for average calculation)
     pub total_seconds: u64,
+
+    /// Monotonic start of the CURRENT QPS window (F3, sprinter c837352dabef).
+    ///
+    /// `window_reset_at` above is an RFC3339 string for display; it cannot be
+    /// used to decide when the window rolls (wall-clock, re-parsed per query,
+    /// and it moves backwards when the system clock does). This `Instant` is
+    /// the authoritative window start, and it is what `check_quota` /
+    /// `record_query` compare against the configured window length.
+    pub window_started_at: Instant,
+    /// Window time already folded into `total_seconds`, in milliseconds (F3).
+    ///
+    /// `avg_qps()` divides `total_queries` by `total_seconds`, which is a whole
+    /// number of seconds. A sub-second window (used by tests, and legal in
+    /// config) would otherwise round to zero on every roll and never advance
+    /// the denominator at all, so the remainder is carried here and only whole
+    /// newly-completed seconds are credited to `total_seconds`.
+    pub measured_window_millis: u64,
 }
 
 impl QuotaTracking {
@@ -626,6 +644,58 @@ impl QuotaTracking {
 
         self.total_seconds += 1;
     }
+
+    /// Roll the fixed QPS window forward if `window_len` has elapsed since it
+    /// started (F3, sprinter c837352dabef). Returns true if the window rolled.
+    ///
+    /// This is the whole rate limiter: evaluated lazily on the quota path, it
+    /// needs no background task and therefore works identically on the server,
+    /// the embedded library (which has no tokio runtime at all) and in tests.
+    /// The previous design required an external driver to call
+    /// `TenantManager::reset_qps_window` on a cadence — and NOTHING in the tree
+    /// ever did, so `queries_this_window` only ever climbed and `max_qps`
+    /// silently degraded into a lifetime quota.
+    ///
+    /// Fixed window, restarted at `now` rather than aligned to a multiple of
+    /// `window_len` — the same shape as the sibling limiter in
+    /// `multi_tenant::quotas::RateLimiter::check`.
+    pub(crate) fn roll_qps_window_if_elapsed(&mut self, window_len: Duration, now: Instant) -> bool {
+        if now.saturating_duration_since(self.window_started_at) < window_len {
+            return false;
+        }
+        self.force_roll_qps_window(now);
+        true
+    }
+
+    /// Close the current QPS window and open a fresh one at `now`, whatever
+    /// the elapsed time (F3). This is the body an external driver gets through
+    /// [`TenantManager::reset_qps_window`]; the lazy path above reaches it once
+    /// the configured window length has elapsed. Sharing one body is what keeps
+    /// the two drivers from disagreeing about when the window started.
+    pub(crate) fn force_roll_qps_window(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.window_started_at);
+
+        // The window that just closed contributes its peak to the HWM before
+        // the counter is zeroed — the order `reset_qps_window` has always used.
+        if self.queries_this_window > self.qps_hwm {
+            self.qps_hwm = self.queries_this_window;
+        }
+
+        // `avg_qps()` = total_queries / total_seconds, so the denominator has to
+        // advance with measured window time or the average is meaningless (it
+        // reads 0.0 today, because nothing ever advanced it). Credit only whole
+        // newly-completed seconds and carry the remainder, so a sub-second
+        // window accumulates instead of truncating to nothing on every roll.
+        let credited_before = self.measured_window_millis / 1000;
+        self.measured_window_millis = self
+            .measured_window_millis
+            .saturating_add(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
+        self.total_seconds += (self.measured_window_millis / 1000).saturating_sub(credited_before);
+
+        self.queries_this_window = 0;
+        self.window_started_at = now;
+        self.window_reset_at = chrono::Utc::now().to_rfc3339();
+    }
 }
 
 impl Default for QuotaTracking {
@@ -643,6 +713,8 @@ impl Default for QuotaTracking {
             window_reset_at: now.clone(),
             started_at: now,
             total_seconds: 0,
+            window_started_at: Instant::now(),
+            measured_window_millis: 0,
         }
     }
 }
@@ -764,11 +836,29 @@ pub struct TenantManager {
     replication_targets: Arc<parking_lot::RwLock<HashMap<TenantId, Vec<ReplicationTarget>>>>,
     /// Global event ID counter
     event_id_counter: AtomicU64,
+    /// Length of one QPS window, in milliseconds (F3, sprinter c837352dabef).
+    ///
+    /// `max_qps` is a budget PER WINDOW; this is the window. Configured by
+    /// `[resource_quotas].tenant_qps_window_ms` (default 1000 ms) and readable
+    /// per-manager so tests can use a short window without sleeping.
+    qps_window_ms: AtomicU64,
 }
 
+/// Default QPS window: one second — the cadence `start_qps_reset_task` used.
+const DEFAULT_QPS_WINDOW_MS: u64 = 1000;
+
 impl TenantManager {
-    /// Create a new tenant manager
+    /// Create a new tenant manager (1-second QPS window)
     pub fn new() -> Self {
+        Self::with_qps_window(Duration::from_millis(DEFAULT_QPS_WINDOW_MS))
+    }
+
+    /// Create a tenant manager with an explicit QPS window length (F3).
+    ///
+    /// The window is what turns `max_qps` into a RATE. A test (or an embedder
+    /// with a different SLA shape) can pick a short window and observe the
+    /// refill without waiting a real second.
+    pub fn with_qps_window(qps_window: Duration) -> Self {
         Self {
             tenants: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             plan_manager: PlanManager::new(),
@@ -778,7 +868,33 @@ impl TenantManager {
             cdc_logs: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             replication_targets: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             event_id_counter: AtomicU64::new(1),
+            // A zero-length window would refill the budget on every query and
+            // make `max_qps` unenforceable — clamp it the way config validation
+            // does, so a programmatic caller cannot open that hole either.
+            qps_window_ms: AtomicU64::new((qps_window.as_millis() as u64).max(1)),
         }
+    }
+
+    /// Build a `TenantManager` from the `[resource_quotas]` config section.
+    ///
+    /// Mirrors `LockManager::from_lock_config`: the config value reaches the
+    /// component that enforces it, instead of being validated and orphaned.
+    pub fn from_quota_config(cfg: &crate::config::ResourceQuotaConfig) -> Self {
+        Self::with_qps_window(Duration::from_millis(cfg.tenant_qps_window_ms))
+    }
+
+    /// The configured QPS window length.
+    pub fn qps_window(&self) -> Duration {
+        Duration::from_millis(self.qps_window_ms.load(Ordering::Relaxed))
+    }
+
+    /// Change the QPS window length at runtime (F3).
+    ///
+    /// Takes effect at the next quota check; the in-flight window keeps its
+    /// existing start instant, so a shortened window may roll immediately.
+    pub fn set_qps_window(&self, qps_window: Duration) {
+        self.qps_window_ms
+            .store((qps_window.as_millis() as u64).max(1), Ordering::Relaxed);
     }
 
     /// Register a new tenant with a plan
@@ -963,26 +1079,44 @@ impl TenantManager {
     }
 
     /// Check resource quota for tenant
+    ///
+    /// F3 (sprinter c837352dabef): the `"qps"` arm ROLLS the tenant's rate
+    /// window first if it has expired, which is why it takes the write lock.
+    /// `max_qps` is a per-window budget, and a check that never rolls the
+    /// window compares against a counter that only climbs — which is exactly
+    /// how `max_qps` degraded into a lifetime quota. Rolling inside the check
+    /// is the normal shape for a rate limiter (see
+    /// `multi_tenant::quotas::RateLimiter::check`) and it keeps the limiter
+    /// correct on every path, with no background task to be starved or
+    /// forgotten.
     pub fn check_quota(&self, tenant_id: TenantId, resource_type: &str) -> bool {
-        if let Some(tenant) = self.get_tenant(tenant_id) {
-            if let Some(tracking) = self.quota_tracking.read().get(&tenant_id) {
-                match resource_type {
-                    "connections" => {
-                        // Check if adding one more connection would exceed limit
-                        tracking.active_connections < tenant.limits.max_connections
-                    }
-                    "storage" => {
-                        // Check if current storage is below limit
-                        tracking.storage_bytes_used < tenant.limits.max_storage_bytes
-                    }
-                    "qps" => {
-                        // Check if queries in current window are below limit
-                        tracking.queries_this_window < tenant.limits.max_qps
-                    }
-                    _ => false,
+        let Some(tenant) = self.get_tenant(tenant_id) else {
+            return false;
+        };
+
+        if resource_type == "qps" {
+            let window = self.qps_window();
+            let mut tracking_map = self.quota_tracking.write();
+            return match tracking_map.get_mut(&tenant_id) {
+                Some(tracking) => {
+                    tracking.roll_qps_window_if_elapsed(window, Instant::now());
+                    tracking.queries_this_window < tenant.limits.max_qps
                 }
-            } else {
-                false
+                None => false,
+            };
+        }
+
+        if let Some(tracking) = self.quota_tracking.read().get(&tenant_id) {
+            match resource_type {
+                "connections" => {
+                    // Check if adding one more connection would exceed limit
+                    tracking.active_connections < tenant.limits.max_connections
+                }
+                "storage" => {
+                    // Check if current storage is below limit
+                    tracking.storage_bytes_used < tenant.limits.max_storage_bytes
+                }
+                _ => false,
             }
         } else {
             false
@@ -1050,36 +1184,54 @@ impl TenantManager {
     }
 
     /// Record a query execution for quota tracking (QPS)
+    ///
+    /// F3: roll-check-increment happens under ONE write lock. Splitting it
+    /// (check_quota, then a second lock to increment) left a window in which
+    /// two threads both passed the check at `max_qps - 1` and both incremented,
+    /// so a tenant could exceed its budget; holding the lock across the whole
+    /// operation makes the limit hold under concurrency. `check_quota` is not
+    /// called from here for the same reason — `parking_lot::RwLock` is not
+    /// reentrant, and re-locking inside the guard would deadlock.
     pub fn record_query(&self, tenant_id: TenantId) -> Result<(), String> {
-        if !self.check_quota(tenant_id, "qps") {
+        let Some(tenant) = self.get_tenant(tenant_id) else {
+            return Err(format!("Tenant {} not found", tenant_id));
+        };
+        let window = self.qps_window();
+
+        let mut tracking_map = self.quota_tracking.write();
+        let Some(tracking) = tracking_map.get_mut(&tenant_id) else {
+            return Err(format!("Tenant {} not found", tenant_id));
+        };
+
+        // Start a fresh budget if this query lands in a new window.
+        tracking.roll_qps_window_if_elapsed(window, Instant::now());
+
+        if tracking.queries_this_window >= tenant.limits.max_qps {
             return Err(format!("Query rate limit exceeded for tenant {}", tenant_id));
         }
 
-        if let Some(tracking) = self.quota_tracking.write().get_mut(&tenant_id) {
-            tracking.queries_this_window += 1;
-            tracking.total_queries += 1;
+        tracking.queries_this_window += 1;
+        tracking.total_queries += 1;
 
-            // Update QPS HWM
-            if tracking.queries_this_window > tracking.qps_hwm {
-                tracking.qps_hwm = tracking.queries_this_window;
-            }
-            Ok(())
-        } else {
-            Err(format!("Tenant {} not found", tenant_id))
+        // Update QPS HWM
+        if tracking.queries_this_window > tracking.qps_hwm {
+            tracking.qps_hwm = tracking.queries_this_window;
         }
+        Ok(())
     }
 
     /// Reset QPS quota (call periodically, e.g., per second or per minute)
+    ///
+    /// F3: enforcement no longer DEPENDS on this being called — the window
+    /// rolls lazily on the quota path — but it stays fully supported (it is
+    /// public API with doc examples, and is what `EmbeddedDatabase`'s
+    /// `start_qps_reset_task` / `reset_all_qps_windows` drive). It now also
+    /// restarts the monotonic window start, so an external driver and the lazy
+    /// roll agree on when the current window began instead of the lazy roll
+    /// firing again immediately after a manual reset.
     pub fn reset_qps_window(&self, tenant_id: TenantId) -> Result<(), String> {
         if let Some(tracking) = self.quota_tracking.write().get_mut(&tenant_id) {
-            // Update HWM before reset
-            if tracking.queries_this_window > tracking.qps_hwm {
-                tracking.qps_hwm = tracking.queries_this_window;
-            }
-
-            tracking.queries_this_window = 0;
-            tracking.window_reset_at = chrono::Utc::now().to_rfc3339();
-            tracking.total_seconds += 1; // Increment time for average calculation
+            tracking.force_roll_qps_window(Instant::now());
             Ok(())
         } else {
             Err(format!("Tenant {} not found", tenant_id))

@@ -2838,8 +2838,17 @@ impl<'a> Executor<'a> {
     /// an aggregate pushdown, mirroring the slow path in
     /// `AggregateOperator::new` exactly: aggregate calls are rewritten to
     /// `agg_{i}` column references and groups whose predicate doesn't
-    /// evaluate to `Boolean(true)` are dropped (including evaluation errors —
-    /// identical semantics in and out of transactions).
+    /// evaluate to `Boolean(true)` are dropped — identical semantics in and out
+    /// of transactions.
+    ///
+    /// sprinter a3a6cc7c59d6: "and evaluation errors too" used to be part of
+    /// that mirror, on BOTH sides. It is gone from both: an `Err` from the
+    /// predicate is a failed statement, not a group that failed to qualify, and
+    /// swallowing it turned `HAVING count(*) > $1` — which errored on every
+    /// group because the evaluator carried no bind vector — into a SUCCESSFUL,
+    /// EMPTY result. The bind vector is threaded here for the same reason it is
+    /// threaded in `AggregateOperator::new`: this pushdown path serves the
+    /// params family too, and nothing substitutes `$n` before execution there.
     fn apply_having_post_filter(
         &mut self,
         tuples: Vec<crate::Tuple>,
@@ -2854,11 +2863,14 @@ impl<'a> Executor<'a> {
         // (sub)queries in HAVING must be materialized or every group drops.
         let having_expr = self.materialize_subqueries(having_expr)?;
         let rewritten = AggregateOperator::rewrite_having_expr(&having_expr, aggr_exprs);
-        let evaluator = crate::sql::Evaluator::new(output_schema.clone());
-        Ok(tuples
-            .into_iter()
-            .filter(|tuple| matches!(evaluator.evaluate(&rewritten, tuple), Ok(crate::Value::Boolean(true))))
-            .collect())
+        let evaluator = crate::sql::Evaluator::with_parameters(output_schema.clone(), self.parameters.clone());
+        let mut kept = Vec::with_capacity(tuples.len());
+        for tuple in tuples {
+            if matches!(evaluator.evaluate(&rewritten, &tuple)?, crate::Value::Boolean(true)) {
+                kept.push(tuple);
+            }
+        }
+        Ok(kept)
     }
 
     fn try_columnar_aggregate(
@@ -3609,7 +3621,7 @@ impl<'a> Executor<'a> {
                     });
 
                     // Create window operator
-                    let window_op = WindowOperator::new(input_op, window_exprs, window_schema);
+                    let window_op = WindowOperator::new(input_op, window_exprs, window_schema, self.parameters.clone());
 
                     // Create modified expressions that reference window columns
                     // Window function results are appended after input columns

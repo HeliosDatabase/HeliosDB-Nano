@@ -153,6 +153,16 @@ impl TypeInference for LogicalExpr {
                         fun,
                         args.first().and_then(|a| a.infer_type(schema).ok()),
                     )),
+                    // sprinter 6dc0cc115db9 / f4f5d450e816: declared types for the
+                    // two session scalars. The EXTENDED protocol's Describe runs
+                    // BEFORE any row exists, so it cannot fall back to the
+                    // simple path's value sniff (`result_schema_for_rows`) — an
+                    // undeclared function is advertised as `text` and a typed
+                    // client (`row.get::<i64>`) then fails on a perfectly good
+                    // answer. PostgreSQL's own return types: `lastval()` bigint,
+                    // `pg_backend_pid()` integer.
+                    "lastval" | "pg_catalog.lastval" => Ok(DataType::Int8),
+                    "pg_backend_pid" | "pg_catalog.pg_backend_pid" => Ok(DataType::Int4),
                     "now" | "current_timestamp" => Ok(DataType::Timestamp),
                     "current_date" => Ok(DataType::Date),
                     "current_time" => Ok(DataType::Time),
