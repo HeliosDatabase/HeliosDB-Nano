@@ -856,6 +856,112 @@ impl<'a> Planner<'a> {
         out
     }
 
+    /// Expand a BARE `*` over the RANGE TABLE rather than over the input
+    /// schema's bare names (sprinter a50328143c63).
+    ///
+    /// `SELECT * FROM t JOIN (SELECT id, upper(v) AS v FROM t) s ON …` — or
+    /// any join whose two sides carry the same column name — expanded to one
+    /// UNQUALIFIED `Column { table: None, name }` per input column, and
+    /// `ProjectOperator` resolves an unqualified name by FIRST match, so both
+    /// `v` output slots re-read the LEFT side's `v`. `s.*` and `s.v` were
+    /// already right (they carry the entry's qualifier); only the bare `*`
+    /// was wrong.
+    ///
+    /// Returns `None` — meaning "keep the by-name expansion, byte for byte" —
+    /// unless ALL of the following hold, so the plan changes ONLY where the
+    /// by-name expansion can actually read the wrong side:
+    ///
+    /// * a scope is pushed and its innermost level has at least one entry
+    ///   (the catalog-less planner pushes none, and `SELECT 1` records none);
+    /// * the entries' column names, concatenated in FROM order, ARE the input
+    ///   schema's column names in order — the proof that entry `i`'s column
+    ///   `j` is the very slot the by-name expansion aims at. Anything that
+    ///   breaks that correspondence (an aggregate's `group_N` / `agg_N`
+    ///   schema, a `TableFactor` shape `record_range_entry` does not record)
+    ///   falls back instead of guessing;
+    /// * some column name is carried by MORE THAN ONE entry — the only case
+    ///   in which resolving by name alone can reach another entry's slot.
+    ///
+    /// Only the columns whose name more than one entry carries are qualified,
+    /// and only with the qualifier that entry actually answers to at runtime
+    /// (`RangeEntry::runtime_qualifier` — the same stamp
+    /// [`Self::expand_qualified_wildcard`] uses for `q.*`, which is what
+    /// `scan::handle_scan` / `SourceAliasOperator` put on the executor's
+    /// schema). An unaliased sub-select has no qualifier to stamp and keeps
+    /// the bare reference, exactly as before.
+    ///
+    /// Qualifying is also what makes the expansion survive
+    /// `JoinReorderingRule`, which may swap an inner join's sides AFTER
+    /// planning: a bare duplicate name then reads whichever side ended up
+    /// first, a qualified one still reads its own.
+    ///
+    /// The ALIAS stays the BARE column name in every case: the qualifier is
+    /// for resolution, never for display — PostgreSQL names both output
+    /// columns `v` too.
+    fn expand_bare_wildcard(&self, input: &LogicalPlan) -> Option<Vec<(LogicalExpr, String)>> {
+        let scopes = self.scopes.borrow();
+        let entries = scopes.top_entries()?;
+        if entries.is_empty() {
+            return None;
+        }
+        // The entries' columns, walked in FROM order, MUST BE the input's
+        // columns, in order: that is the proof that entry `i`'s column `j` is
+        // the very output slot the by-name expansion aims at. A schema the
+        // entries do not reproduce (an aggregate's `group_N` / `agg_N`, a
+        // FROM shape `record_range_entry` records nothing for) falls back.
+        let schema = input.schema();
+        let mut position = 0usize;
+        for entry in entries {
+            for column in &entry.schema.columns {
+                match schema.columns.get(position) {
+                    Some(input_column) if input_column.name == column.name => position += 1,
+                    _ => return None,
+                }
+            }
+        }
+        if position != schema.columns.len() {
+            return None;
+        }
+
+        let carried_by_two_entries = |name: &str| {
+            entries
+                .iter()
+                .filter(|entry| entry.schema.columns.iter().any(|column| column.name == name))
+                .count()
+                > 1
+        };
+        let mut out: Vec<(LogicalExpr, String)> = Vec::with_capacity(schema.columns.len());
+        let mut qualified_any = false;
+        for entry in entries {
+            for column in &entry.schema.columns {
+                let table = match &entry.runtime_qualifier {
+                    Some(qualifier) if carried_by_two_entries(&column.name) => {
+                        qualified_any = true;
+                        Some(qualifier.clone())
+                    }
+                    // A name only one entry carries resolves by name alone;
+                    // an unaliased sub-select has no qualifier to stamp.
+                    // Both keep the reference the by-name expansion emits.
+                    _ => None,
+                };
+                out.push((
+                    LogicalExpr::Column {
+                        table,
+                        name: column.name.clone(),
+                    },
+                    column.name.clone(),
+                ));
+            }
+        }
+        // Nothing was qualified: the list is the by-name expansion, term for
+        // term. Say so, so the caller's own expansion stays the one shape the
+        // rest of the engine has always seen.
+        if !qualified_any {
+            return None;
+        }
+        Some(out)
+    }
+
     /// RETURNING (GH#23's stated residual): a qualifier in a DML RETURNING
     /// item must name the statement's own target — by alias, key or bare
     /// component — or be `EXCLUDED` (which `returning::ReturningProjection::bind`
@@ -2644,10 +2750,41 @@ impl<'a> Planner<'a> {
                     grantees: grantees.iter().map(Self::normalize_ident).collect(),
                 })
             }
-            _ => Err(Error::query_execution(format!(
-                "Statement not yet supported: {:?}",
-                statement
-            ))),
+            // A statement kind this planner has no arm for. TWO defects lived
+            // in the three lines this replaces (sprinter e143ae12ea2d):
+            //
+            // 1. Nothing classified the message, so it reported `XX000
+            //    internal_error` on the PostgreSQL wire (and `1105 HY000` on
+            //    the MySQL one). PgBouncer, pgpool and HA proxies read XX000
+            //    as "this backend is broken" and may drop the backend — for a
+            //    statement that parsed perfectly and is merely unimplemented.
+            //    The honest class is `0A000 feature_not_supported`, which both
+            //    wires now derive from `UNSUPPORTED_STATEMENT_KIND_MARKER`.
+            // 2. `{:?}` on the sqlparser `Statement` dumped the whole Rust AST
+            //    — `Ident { value: "x", quote_style: None, span: Span(
+            //    Location(..), ..) }` — into the text shown to the client. The
+            //    AST is still available for diagnosis, at DEBUG level.
+            _ => {
+                tracing::debug!(statement = ?statement, "no planner arm for this statement kind");
+                // The variant NAME and nothing else: the derived `Debug` output
+                // starts with it, and the first character that cannot appear in
+                // a Rust identifier ends it — so no field of the AST can reach
+                // the message even for a variant this match has never heard of.
+                let debug = format!("{statement:?}");
+                let name = debug.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').next();
+                let kind = name.filter(|n| !n.is_empty()).unwrap_or("This statement");
+                // Plus the object the user actually wrote, for the kinds that
+                // carry exactly one name (PostgreSQL's LISTEN/NOTIFY family).
+                let subject = match &statement {
+                    Statement::LISTEN { channel } | Statement::UNLISTEN { channel } => {
+                        format!("{kind} \"{}\"", channel.value)
+                    }
+                    Statement::NOTIFY { channel, .. } => format!("{kind} \"{}\"", channel.value),
+                    _ => kind.to_string(),
+                };
+                let marker = crate::error::UNSUPPORTED_STATEMENT_KIND_MARKER;
+                Err(Error::query_execution(format!("{subject} {marker}")))
+            }
         }
     }
 
@@ -4226,6 +4363,20 @@ impl<'a> Planner<'a> {
                     from_wildcard.push(false);
                 }
                 SelectItem::Wildcard(_) => {
+                    // Expand the bare wildcard over the RANGE TABLE when two
+                    // FROM entries share a column name — otherwise both output
+                    // slots resolve by name to the FIRST one (sprinter
+                    // a50328143c63). `expand_bare_wildcard` returns `None` for
+                    // every other shape, and the by-name expansion below is
+                    // then what it always was.
+                    if let Some(expanded) = self.expand_bare_wildcard(input) {
+                        for (expr, name) in expanded {
+                            exprs.push(expr);
+                            aliases.push(name);
+                            from_wildcard.push(true);
+                        }
+                        continue;
+                    }
                     // Expand wildcard to all columns from input schema
                     let schema = input.schema();
                     for column in &schema.columns {
@@ -6297,17 +6448,28 @@ impl<'a> Planner<'a> {
         // Propagate table-level PRIMARY KEY constraint to column defs.
         // WordPress uses `PRIMARY KEY (col)` at the table level, not inline.
         // Without this, col.primary_key stays false and SERIAL auto-fill never fires.
+        //
+        // sprinter cd879f076084: a name that matches NO declared column is a
+        // hard planning error (42703), not a silent miss. This `.find()` used
+        // to drop through: `CREATE TABLE t (a int, PRIMARY KEY (nosuch))`
+        // reported success and created a table with NO primary key at all —
+        // no column marked, and the `UNIQUE` record persisted for it in
+        // `TableConstraints` naming a column that does not exist, so nothing
+        // enforced it either. PostgreSQL refuses the statement
+        // (`column "nosuch" named in key does not exist`); so do we, with the
+        // message shape the wire classifier already maps to 42703.
         for constraint in &constraints {
             if let TableConstraint::PrimaryKey { columns: pk_cols, .. } = constraint {
                 for pk_col_name in pk_cols {
-                    if let Some(col_def) = column_defs
+                    let Some(col_def) = column_defs
                         .iter_mut()
                         .find(|c| c.name.eq_ignore_ascii_case(pk_col_name))
-                    {
-                        col_def.primary_key = true;
-                        // Don't override not_null if already set to false by SERIAL detection
-                        // (SERIAL columns must stay nullable for auto-fill: INSERT NULL → row_id)
-                    }
+                    else {
+                        return Err(super::scope::undefined_column(None, pk_col_name));
+                    };
+                    col_def.primary_key = true;
+                    // Don't override not_null if already set to false by SERIAL detection
+                    // (SERIAL columns must stay nullable for auto-fill: INSERT NULL → row_id)
                 }
             }
         }
@@ -7644,6 +7806,23 @@ impl<'a> Planner<'a> {
             Some(json) => serde_json::from_str::<LogicalExpr>(json).map_err(|e| {
                 Error::query_execution(format!("cannot apply the DEFAULT of column \"{}\": {e}", column.name))
             }),
+            // sprinter 332da6771914: a SERIAL / IDENTITY column has NO stored
+            // `default_expr` — the value is generated at storage time when the
+            // INSERT omits it — so the NULL below was flatly wrong for it. On a
+            // SERIAL PRIMARY KEY the NULL-PK guard caught it (fail-closed, but
+            // reported as a NOT NULL violation, which is not what the statement
+            // asked for); on any OTHER serial column nothing caught it and
+            // `UPDATE t SET n = DEFAULT` silently NULLed the column. PostgreSQL
+            // substitutes `nextval()` here; that is not implemented, so the
+            // statement is refused rather than guessed at — 0A000
+            // feature_not_supported, the class this codebase already uses for
+            // "the honest answer is an error".
+            None if catalog.is_identity_column(table_name, &column.name).unwrap_or(false) => {
+                Err(Error::query_execution(format!(
+                    "SET {} = DEFAULT on a serial column is not supported",
+                    column.name
+                )))
+            }
             None => Ok(LogicalExpr::Literal(Value::Null)),
         }
     }

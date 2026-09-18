@@ -24,6 +24,10 @@ use tracing::{debug, error, info, warn};
 use regex::Regex;
 
 use crate::protocol::postgres::timeouts::{ConnectionTimeouts, SessionActivity};
+// The one identifier quoter in this crate (`"x"`, doubling an embedded `"`).
+// Reused rather than re-spelled so every generated statement quotes the same
+// way — see `query_last_serial_id`.
+use crate::storage::dump::sql_text::quote_ident as quote_sql_ident;
 use crate::{EmbeddedDatabase, Tuple, Value};
 
 // ============================================================================
@@ -94,26 +98,26 @@ impl CapabilityFlags {
     /// cannot actually upgrade the connection must not advertise the bit.
     pub fn server_default(has_tls: bool) -> Self {
         let base = Self::CLIENT_LONG_PASSWORD
-                | Self::CLIENT_FOUND_ROWS
-                | Self::CLIENT_LONG_FLAG
-                | Self::CLIENT_CONNECT_WITH_DB
-                | Self::CLIENT_NO_SCHEMA
-                | Self::CLIENT_ODBC
-                | Self::CLIENT_LOCAL_FILES
-                | Self::CLIENT_IGNORE_SPACE
-                | Self::CLIENT_PROTOCOL_41
-                | Self::CLIENT_INTERACTIVE
-                | Self::CLIENT_IGNORE_SIGPIPE
-                | Self::CLIENT_TRANSACTIONS
-                | Self::CLIENT_SECURE_CONNECTION
-                | Self::CLIENT_MULTI_STATEMENTS
-                | Self::CLIENT_MULTI_RESULTS
-                | Self::CLIENT_PS_MULTI_RESULTS
-                | Self::CLIENT_PLUGIN_AUTH
-                | Self::CLIENT_CONNECT_ATTRS
-                | Self::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
-                | Self::CLIENT_SESSION_TRACK
-                | Self::CLIENT_DEPRECATE_EOF;
+            | Self::CLIENT_FOUND_ROWS
+            | Self::CLIENT_LONG_FLAG
+            | Self::CLIENT_CONNECT_WITH_DB
+            | Self::CLIENT_NO_SCHEMA
+            | Self::CLIENT_ODBC
+            | Self::CLIENT_LOCAL_FILES
+            | Self::CLIENT_IGNORE_SPACE
+            | Self::CLIENT_PROTOCOL_41
+            | Self::CLIENT_INTERACTIVE
+            | Self::CLIENT_IGNORE_SIGPIPE
+            | Self::CLIENT_TRANSACTIONS
+            | Self::CLIENT_SECURE_CONNECTION
+            | Self::CLIENT_MULTI_STATEMENTS
+            | Self::CLIENT_MULTI_RESULTS
+            | Self::CLIENT_PS_MULTI_RESULTS
+            | Self::CLIENT_PLUGIN_AUTH
+            | Self::CLIENT_CONNECT_ATTRS
+            | Self::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
+            | Self::CLIENT_SESSION_TRACK
+            | Self::CLIENT_DEPRECATE_EOF;
         Self(if has_tls { base | Self::CLIENT_SSL } else { base })
     }
 }
@@ -1029,6 +1033,18 @@ pub struct MySqlHandler<S: AsyncRead + AsyncWrite + Unpin + Send> {
 const MYSQL_IDLE_DISCONNECT_MESSAGE: &str = "The client was disconnected by the server because of inactivity. \
                                              See wait_timeout and interactive_timeout for configuring this behavior.";
 
+/// MySQL's own "effectively never" value for the session timeout variables:
+/// the documented MAXIMUM of `wait_timeout` / `interactive_timeout` /
+/// `net_read_timeout` / `net_write_timeout` (31 536 000 s = 365 days on every
+/// non-Windows build).
+///
+/// MySQL has no `0 = disabled` spelling for these — `0` is below their
+/// documented minimum of `1` — so a listener whose `idle_session_timeout` is
+/// DISABLED reports the maximum instead. A connection pool that sizes its idle
+/// recycling from `wait_timeout` then simply never recycles on a timeout,
+/// which is exactly what this server does.
+const MYSQL_TIMEOUT_NEVER_SECS: i64 = 31_536_000;
+
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> Drop for MySqlHandler<S> {
     fn drop(&mut self) {
         // Roll back any open transaction and release the session when the
@@ -1187,6 +1203,39 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// variables).
     fn ssl_kx_group_value(&self) -> String {
         self.tls_kx_group.clone().unwrap_or_default()
+    }
+
+    /// The value THIS connection reports for MySQL's session timeout
+    /// variables — `wait_timeout`, `interactive_timeout`, `net_read_timeout`
+    /// and `net_write_timeout` — in SECONDS.
+    ///
+    /// All four used to be MySQL's stock defaults (`28800` / `30`) spliced in
+    /// verbatim, which LIED the moment a listener was configured: a connection
+    /// pool that sizes its idle recycling from `wait_timeout` was told 8 hours
+    /// while the server was closing idle sessions after (say) 45 seconds, and
+    /// the client only found out when its pooled connection came back dead.
+    ///
+    /// This listener enforces exactly ONE peer-wait budget on an authenticated
+    /// connection — GH#28's `idle_session_timeout` (see
+    /// [`Self::run_command_loop`]) — and does not distinguish a read timeout
+    /// from a write one, so all four variables report that one budget. Values
+    /// are converted from the policy's milliseconds to MySQL's seconds, a
+    /// sub-second budget rounding UP to `1` (MySQL's minimum) rather than down
+    /// to `0`, which would read as "no timeout". A DISABLED budget reports
+    /// [`MYSQL_TIMEOUT_NEVER_SECS`].
+    ///
+    /// Mirrors what the PostgreSQL wire does for `SHOW idle_session_timeout`
+    /// (`PgHandler::resolve_session_show_parameter`), rendered in the units
+    /// MySQL clients parse. Unlike that handler there is no session-level
+    /// override to layer on: the MySQL listener has no `SET` surface for the
+    /// idle GUCs, so the listener policy IS the effective policy.
+    fn session_timeout_secs(&self) -> i64 {
+        let ms = self.timeouts.idle_session_timeout.as_millis();
+        if ms == 0 {
+            return MYSQL_TIMEOUT_NEVER_SECS;
+        }
+        let secs = i64::try_from(ms / 1_000).unwrap_or(MYSQL_TIMEOUT_NEVER_SECS);
+        secs.clamp(1, MYSQL_TIMEOUT_NEVER_SECS)
     }
 
     // ------------------------------------------------------------------
@@ -2015,8 +2064,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             None => return 0,
         };
 
-        // Query MAX(pk_col) — no double-quotes (they cause case-sensitive mismatch)
-        let query = format!("SELECT MAX({}) FROM {}", pk_col, table_name);
+        // sprinter 57416d9c: both identifiers are QUOTED. Splicing them raw
+        // made the probe a parse error for every table or PK whose name is a
+        // reserved word (`CREATE TABLE "select" …` → `… FROM select`) or
+        // carries a space / an embedded quote — and the error is swallowed
+        // below, so the client silently saw `LAST_INSERT_ID() = 0` after
+        // EVERY insert into such a table.
+        //
+        // Quoting is also the only spelling that is right for case: both
+        // names come from the CATALOG (`table_name` is the key
+        // `get_table_schema` just resolved, `pk_col` the column name it
+        // returned), and a stored name is already in its final form —
+        // lower-cased if it was written unquoted, preserved if it was not.
+        // `Planner::normalize_ident` takes a quoted identifier verbatim, so
+        // re-emitting it quoted round-trips both. The old comment claimed
+        // double quotes "cause case-sensitive mismatch"; that is true only of
+        // a name lifted from the client's SQL text, which this is not.
+        let query = format!(
+            "SELECT MAX({}) FROM {}",
+            quote_sql_ident(&pk_col),
+            quote_sql_ident(table_name)
+        );
         match self.database.query_with_columns_for_session(self.session_id, &query) {
             Ok((rows, _)) => {
                 let result = rows
@@ -2590,13 +2658,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             })
             .collect();
 
-        // Dynamic, per-connection SSL status variables (not `'static str`,
-        // so kept out of the `vars` table above): `have_ssl` mirrors the
-        // `@@have_ssl` answer, and `ssl_kx_group` reports the negotiated
-        // key-exchange group (PQ hybrid vs classical) for THIS connection.
-        let dynamic_vars: [(&str, String); 2] = [
+        // Dynamic, per-connection variables (not `'static str`, so kept out of
+        // the `vars` table above): `have_ssl` mirrors the `@@have_ssl` answer,
+        // `ssl_kx_group` reports the negotiated key-exchange group (PQ hybrid
+        // vs classical) for THIS connection, and the four timeout variables
+        // report the listener's CONFIGURED idle budget (sprinter 35c74e86 —
+        // see `session_timeout_secs`). The timeouts were previously absent
+        // from `SHOW VARIABLES` altogether, so a client that probed them this
+        // way (rather than through `SELECT @@wait_timeout`) got an EMPTY
+        // result set and fell back to its own driver default.
+        let timeout_secs = self.session_timeout_secs().to_string();
+        let dynamic_vars: [(&str, String); 6] = [
             ("have_ssl", self.have_ssl_value().to_string()),
             ("ssl_kx_group", self.ssl_kx_group_value()),
+            ("wait_timeout", timeout_secs.clone()),
+            ("interactive_timeout", timeout_secs.clone()),
+            ("net_read_timeout", timeout_secs.clone()),
+            ("net_write_timeout", timeout_secs),
         ];
         for (name, val) in dynamic_vars {
             let matches_filter = match &filter {
@@ -2794,8 +2872,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 "collation_connection" | "collation_server"
                 | "collation_database" => Value::String("utf8mb4_general_ci".to_string()),
                 "auto_increment_increment" | "auto_increment_offset" => Value::Int8(1),
-                "interactive_timeout" | "wait_timeout" => Value::Int8(28800),
-                "net_write_timeout" | "net_read_timeout" => Value::Int8(30),
+                // sprinter 35c74e86: the CONFIGURED idle budget, not MySQL's
+                // stock 28800/30 — see `session_timeout_secs`.
+                "interactive_timeout" | "wait_timeout" | "net_write_timeout" | "net_read_timeout" => {
+                    Value::Int8(self.session_timeout_secs())
+                }
                 "sql_mode" => Value::String(
                     "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION".to_string()
                 ),
@@ -3614,6 +3695,14 @@ fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     // Without this the identical statement reported 1105 / HY000 "unknown
     // error" on the MySQL listener.
     if err_msg.contains(crate::sql::scope::CORRELATED_JOIN_SUBQUERY_UNSUPPORTED) {
+        return (1235, "0A000"); // ER_NOT_SUPPORTED_YET
+    }
+    // Batch C (sprinter e143ae12ea2d): same rule for a statement KIND the
+    // planner has no arm for. Both wires read the one marker const so they
+    // cannot disagree about which refusals are "not implemented" (0A000)
+    // rather than "the server is broken" (1105 / HY000, which is what this
+    // reported before).
+    if err_msg.contains(crate::error::UNSUPPORTED_STATEMENT_KIND_MARKER) {
         return (1235, "0A000"); // ER_NOT_SUPPORTED_YET
     }
     // HDB-008: the engine's aborted-transaction refusals — the 25P02 statement

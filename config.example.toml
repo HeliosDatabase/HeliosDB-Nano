@@ -327,6 +327,15 @@ idle_session_timeout = "0"
 # transaction never outlives one sitting idle). Sessions may override it with SET.
 idle_in_transaction_session_timeout = "0"
 
+# How long a TEARDOWN write may block: the FATAL the server owes a client it is
+# disconnecting (idle-session / idle-in-transaction timeout). Deliberately short
+# and INDEPENDENT of the timeout that fired — bounding that write by the idle
+# budget that just expired let a peer which stops reading hold its connection
+# slot for another full idle_session_timeout. Bare integer = SECONDS.
+# Listener-scoped (no SET close_timeout); "0" is not "wait forever" — it falls
+# back to a 1s floor.
+close_timeout = "5s"
+
 # TCP keepalive on every accepted PostgreSQL / MySQL / replication socket, so
 # half-open peers are reaped by the kernel. SO_KEEPALIVE is always on; these
 # tune the timers (bare integer = SECONDS; "0" / 0 = operating-system default).

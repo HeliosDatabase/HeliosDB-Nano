@@ -843,6 +843,14 @@ fn drop_table_and_partition_children(
     // KanttBan #23 (v3.31.1 phase 2): clean up the identity side-table record.
     // Best-effort; a missing record is fine.
     let _ = catalog.drop_identity_columns(table_name);
+    // sprinter 29ecb34e3245: purge this table's storage-level pushdown
+    // structures (bloom filters + zone maps). Keeping them past the drop is a
+    // leak AND a wrong-answer hazard: a bloom filter is an authoritative
+    // "no such value in this table" answer, so a stale one left behind by
+    // `DROP TABLE t` would prune real rows out of a later `CREATE TABLE t`
+    // with different data. Inside the recursion, so every cascaded partition
+    // child is purged too. Infallible and cheap (two hash-map removes).
+    storage.predicate_pushdown().remove_table(table_name);
 
     // Registry bookkeeping: detach this table from its own parent (if it is
     // itself a partition child) and take the list of children registered under
@@ -923,6 +931,14 @@ pub(super) fn handle_truncate(executor: &Executor, table_name: &str) -> Result<B
         if !has_user_branches {
             storage.art_indexes().clear_table_indexes(table_name);
         }
+
+        // sprinter 29ecb34e3245 (same hazard as the DROP TABLE purge above):
+        // the rows these bloom filters / zone maps summarise are gone, and
+        // nothing rebuilds them incrementally, so a surviving structure would
+        // keep pruning against the PRE-truncate contents once rows are
+        // re-inserted. Dropping them degrades to "no storage-level pruning for
+        // this table", never to a wrong answer.
+        storage.predicate_pushdown().remove_table(table_name);
 
         // Log to WAL for replication
         if let Err(e) = storage.log_truncate(table_name) {

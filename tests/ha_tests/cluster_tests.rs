@@ -11,8 +11,10 @@ use heliosdb_nano::replication::{
     streaming::{StreamingClient, StreamingClientConfig, StreamingClientState, StreamingServer, StreamingServerConfig},
     transport::{NodeRole, SyncModeConfig},
     wal_replicator::{WalEntry, WalEntryType},
-    wal_store::{WalStore, WalStoreConfig},
+    wal_store::WalStore,
 };
+
+use super::wal_test_support;
 
 /// Test cluster configuration with default settings
 fn test_server_config() -> StreamingServerConfig {
@@ -39,11 +41,8 @@ fn make_test_entry(lsn: u64, data: &str) -> WalEntry {
 
 #[tokio::test]
 async fn test_wal_store_basic_operations() {
-    let config = WalStoreConfig {
-        wal_dir: std::path::PathBuf::from("/tmp/test_wal_store"),
-        cache_size: 100,
-        ..Default::default()
-    };
+    let (_wal_tmp, mut config) = wal_test_support::isolated_wal_config();
+    config.cache_size = 100;
 
     let store = WalStore::new(config);
     store.init().await.expect("Failed to initialize WAL store");
@@ -90,7 +89,8 @@ async fn test_wal_store_basic_operations() {
 
 #[tokio::test]
 async fn test_wal_store_batch_streaming() {
-    let store = WalStore::new(WalStoreConfig::default());
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let store = WalStore::new(wal_config);
     store.init().await.expect("Failed to initialize");
 
     // Append 100 entries
@@ -122,7 +122,8 @@ async fn test_wal_store_batch_streaming() {
 async fn test_streaming_server_creation() {
     let node_id = Uuid::new_v4();
     let config = test_server_config();
-    let wal_store = Arc::new(WalStore::new(WalStoreConfig::default()));
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let wal_store = Arc::new(WalStore::new(wal_config));
     wal_store.init().await.expect("Failed to init WAL store");
 
     let server = StreamingServer::new(config, node_id, wal_store);
@@ -154,7 +155,8 @@ async fn test_streaming_client_creation() {
 async fn test_wal_entry_broadcasting() {
     let node_id = Uuid::new_v4();
     let config = test_server_config();
-    let wal_store = Arc::new(WalStore::new(WalStoreConfig::default()));
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let wal_store = Arc::new(WalStore::new(wal_config));
     wal_store.init().await.expect("Failed to init WAL store");
 
     let server = StreamingServer::new(config, node_id, wal_store);

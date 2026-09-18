@@ -392,6 +392,15 @@ impl ScopeStack {
         self.levels.get(level).and_then(|scope| scope.entries.get(position))
     }
 
+    /// The INNERMOST level's range entries, in FROM order — the range table a
+    /// bare `*` of the SELECT being planned expands over (sprinter
+    /// a50328143c63, `Planner::expand_bare_wildcard`). `None` when no scope is
+    /// pushed at all (the catalog-less planner), which is distinct from a
+    /// level with no entries (`SELECT 1`, no FROM).
+    pub(crate) fn top_entries(&self) -> Option<&[RangeEntry]> {
+        self.levels.last().map(|scope| scope.entries.as_slice())
+    }
+
     /// Resolve a qualifier, innermost level first, walking outward for
     /// correlated references. Within one level an entry's own names win; the
     /// lenient real-table names are consulted only when no own name matched.

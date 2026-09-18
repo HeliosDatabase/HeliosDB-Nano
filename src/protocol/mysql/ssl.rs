@@ -100,7 +100,10 @@ impl MysqlSslConfig {
         }
         if let Some(ref ca_path) = self.ca_cert_path {
             if !ca_path.exists() {
-                return Err(Error::io(format!("MySQL TLS CA certificate not found: {}", ca_path.display())));
+                return Err(Error::io(format!(
+                    "MySQL TLS CA certificate not found: {}",
+                    ca_path.display()
+                )));
             }
         } else if self.require_client_cert {
             return Err(Error::io(

@@ -712,10 +712,26 @@ impl PredicatePushdownManager {
         self.zone_maps.write().insert(table_name, zone_map);
     }
 
-    /// Remove bloom filters and zone maps for a dropped table
+    /// Remove bloom filters and zone maps for a dropped table.
+    ///
+    /// sprinter 29ecb34e3245: this had NO callers, so a `DROP TABLE` left both
+    /// structures behind. That is a leak, and — because a bloom filter answers
+    /// "this table has no row with that value" — a WRONG-ANSWER hazard the
+    /// moment the name is reused by a `CREATE TABLE` with different data: the
+    /// stale filter would prune rows the new table really does contain. Called
+    /// from `sql::executor::ddl::drop_table_and_partition_children` (for the
+    /// target table AND every cascaded partition child) and from
+    /// `handle_truncate`, which deletes every row these structures summarise.
     pub fn remove_table(&self, table_name: &str) {
         self.bloom_filters.write().remove(table_name);
         self.zone_maps.write().remove(table_name);
+    }
+
+    /// Does this manager still hold a bloom filter or a zone map for
+    /// `table_name`? Observability for the `DROP TABLE` purge above — nothing
+    /// in the engine gates on it.
+    pub fn has_structures_for_table(&self, table_name: &str) -> bool {
+        self.bloom_filters.read().contains_key(table_name) || self.zone_maps.read().contains_key(table_name)
     }
 }
 

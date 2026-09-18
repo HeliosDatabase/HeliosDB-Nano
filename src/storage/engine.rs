@@ -4128,8 +4128,11 @@ impl StorageEngine {
                 "UNIQUE/PRIMARY KEY constraint refused row {} of table '{}', which is stored anyway: {} — \
                  the table now holds a duplicate that this index cannot find (the refusal arrived after \
                  the row was written, or on a path that writes it regardless). The row keeps its other \
-                 index entries, its primary key included, on purpose, so it stays reachable; resolve the \
-                 duplicate and reopen the database to rebuild the ART from `data:`.",
+                 index entries, its primary key included, on purpose, so it stays reachable. Reopening \
+                 alone does NOT clear this: the ART is rebuilt from `data:` at open, the rebuild meets \
+                 the same two rows and refuses the same key again. The duplicate persists until one of \
+                 the rows is explicitly removed (or rolled back); rebuild the index after that to \
+                 restore agreement.",
                 row_id,
                 table_name,
                 err
@@ -4139,7 +4142,9 @@ impl StorageEngine {
         tracing::warn!(
             "ART index maintenance failed for table '{}' row {}: {} — the row is already durable, so an \
              indexed lookup may now disagree with a full scan for this table. The ART is rebuilt from \
-             `data:` when the database is next opened; reopen to restore agreement.",
+             `data:` when the database is next opened, which restores agreement for a transient \
+             failure; a refusal the rebuild meets again does not clear, and persists until the \
+             offending row is explicitly removed and the index rebuilt.",
             table_name,
             row_id,
             err
@@ -4156,8 +4161,11 @@ impl StorageEngine {
         if matches!(err, ArtIndexError::DuplicateKey(_)) {
             tracing::error!(
                 "UNIQUE/PRIMARY KEY constraint refused at least one row of the committed COPY batch for \
-                 table '{}': {} — those rows are stored and keep their other index entries; resolve the \
-                 duplicates and reopen the database to rebuild the ART from `data:`.",
+                 table '{}': {} — those rows are stored and keep their other index entries. Reopening \
+                 alone does NOT clear this: the ART rebuild from `data:` at open meets the same rows \
+                 and refuses the same keys again. Each duplicate persists until one of its rows is \
+                 explicitly removed (or rolled back); rebuild the index after that to restore \
+                 agreement.",
                 table_name,
                 err
             );
@@ -4166,7 +4174,9 @@ impl StorageEngine {
         tracing::warn!(
             "ART index maintenance failed for at least one row of the committed COPY batch for table \
              '{}': {} — an indexed lookup may now disagree with a full scan for this table. The ART is \
-             rebuilt from `data:` when the database is next opened; reopen to restore agreement.",
+             rebuilt from `data:` when the database is next opened, which restores agreement for a \
+             transient failure; a refusal the rebuild meets again does not clear, and persists until \
+             the offending row is explicitly removed and the index rebuilt.",
             table_name,
             err
         );
@@ -11637,15 +11647,29 @@ impl StorageEngine {
 
         // ART index update (constraint already verified above).
         //
-        // The row is STORED by now — `put()` (or the batched `data:` write) and
-        // the logical-WAL record are both above this line — so `on_insert_tuple`
-        // is a `RowState::Stored` funnel: a refusal here cannot unmake the row,
-        // and must not take the row's PRIMARY KEY entry away either (that would
-        // hide a durable row from `WHERE pk = …` and free its key for the next
-        // INSERT). It keeps every entry the row owns and reports the refusal,
-        // which `note_index_maintenance_failure` logs at ERROR: a duplicate got
-        // past the pre-check (a concurrent writer between
-        // `check_insert_constraints` and here) and is now stored.
+        // The row is written whatever this answers, so `on_insert_tuple` is a
+        // `RowState::Stored` funnel on BOTH branches — but they get there
+        // differently, and the old wording described only one of them
+        // (sprinter fa2d11f140fe):
+        //
+        // * non-batched — `self.put(&key, &value)` above has already written
+        //   the `data:` row, and the logical-WAL record with it. Stored, past
+        //   tense.
+        // * `data_and_version_batched` — the branch above writes NOTHING; it
+        //   only mirrors `put()`'s disk-space and memory-limit checks. The row
+        //   goes down BELOW this line, in
+        //   `write_data_version_and_register_snapshot`, which is unconditional:
+        //   no `return` sits between here and it, so an index refusal cannot
+        //   stop it either. Stored, future tense — same rule, not the same
+        //   sentence.
+        //
+        // A refusal here therefore cannot unmake the row, and must not take the
+        // row's PRIMARY KEY entry away either (that would hide a durable row
+        // from `WHERE pk = …` and free its key for the next INSERT). It keeps
+        // every entry the row owns and reports the refusal, which
+        // `note_index_maintenance_failure` logs at ERROR: a duplicate got past
+        // the pre-check (a concurrent writer between `check_insert_constraints`
+        // and here) and is now stored.
         if let Err(e) = self
             .art_index_manager
             .on_insert_tuple(table_name, row_id, schema, &tuple)

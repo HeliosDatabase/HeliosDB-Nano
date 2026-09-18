@@ -732,6 +732,13 @@ fn default_guc_duration_off() -> String {
     "0".to_string() // 0 = disabled / OS default (PostgreSQL semantics)
 }
 
+/// Default `[server] close_timeout` (sprinter 263befdf85ca): long enough for a
+/// live peer to read one FATAL, short enough that a peer which has stopped
+/// reading cannot hold its connection slot.
+fn default_close_timeout() -> String {
+    "5s".to_string()
+}
+
 fn default_max_connections_warn_percent() -> u8 {
     80
 }
@@ -1268,6 +1275,16 @@ pub struct ServerConfig {
     /// above 100 are a configuration error.
     #[serde(default = "default_max_connections_warn_percent")]
     pub max_connections_warn_percent: u8,
+    /// sprinter 263befdf85ca — how long a TEARDOWN write may block: the FATAL
+    /// the server owes a client it is about to disconnect (idle-session and
+    /// idle-in-transaction timeouts). SHORT and independent of the timeout that
+    /// fired — bounding that write by the idle budget that just expired let a
+    /// peer which stops reading hold its connection slot for another full
+    /// `idle_session_timeout`. PostgreSQL GUC syntax; a bare integer is
+    /// SECONDS. Default "5s". Listener-scoped: there is no `SET close_timeout`,
+    /// and "0" is not "wait forever" — it falls back to a 1 s floor.
+    #[serde(default = "default_close_timeout")]
+    pub close_timeout: String,
     /// Maximum number of rows buffered in memory while decoding a single
     /// `COPY … FROM STDIN` stream before the server aborts the copy with a clean
     /// error and zero rows applied (0 = unlimited). Bounds peak RSS on very large
@@ -1327,6 +1344,7 @@ impl Default for ServerConfig {
             tcp_keepalives_interval: default_guc_duration_off(),
             tcp_keepalives_count: 0,
             max_connections_warn_percent: default_max_connections_warn_percent(),
+            close_timeout: default_close_timeout(),
             copy_max_buffered_rows: default_copy_max_buffered_rows(),
             copy_max_record_bytes: default_copy_max_record_bytes(),
             tls_enabled: false,
@@ -1358,6 +1376,7 @@ impl ServerConfig {
             ),
             ("tcp_keepalives_idle", &self.tcp_keepalives_idle, 1_000),
             ("tcp_keepalives_interval", &self.tcp_keepalives_interval, 1_000),
+            ("close_timeout", &self.close_timeout, 1_000),
         ] {
             if parse_guc_duration_ms(raw, bare_unit_ms).is_err() {
                 return Err(crate::Error::config(format!(

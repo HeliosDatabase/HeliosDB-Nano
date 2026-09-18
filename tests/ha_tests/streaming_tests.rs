@@ -11,8 +11,10 @@ use heliosdb_nano::replication::{
     streaming::{StreamingClient, StreamingClientConfig, StreamingClientState, StreamingServer, StreamingServerConfig},
     transport::SyncModeConfig,
     wal_replicator::{WalEntry, WalEntryType},
-    wal_store::{BatchRequest, BatchStreamState, WalStore, WalStoreConfig},
+    wal_store::{BatchRequest, BatchStreamState, WalStore},
 };
+
+use super::wal_test_support;
 
 /// Create a test WAL entry
 fn make_test_entry(lsn: u64, data: &str) -> WalEntry {
@@ -28,7 +30,8 @@ fn make_test_entry(lsn: u64, data: &str) -> WalEntry {
 
 #[tokio::test]
 async fn test_batch_streaming_with_limits() {
-    let store = WalStore::new(WalStoreConfig::default());
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let store = WalStore::new(wal_config);
     store.init().await.expect("Failed to initialize");
 
     // Append entries with varying sizes
@@ -57,7 +60,8 @@ async fn test_batch_streaming_with_limits() {
 
 #[tokio::test]
 async fn test_batch_streaming_with_byte_limit() {
-    let store = WalStore::new(WalStoreConfig::default());
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let store = WalStore::new(wal_config);
     store.init().await.expect("Failed to initialize");
 
     // Append entries with known sizes
@@ -85,7 +89,8 @@ async fn test_batch_streaming_with_byte_limit() {
 
 #[tokio::test]
 async fn test_batch_stream_state_iteration() {
-    let store = WalStore::new(WalStoreConfig::default());
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let store = WalStore::new(wal_config);
     store.init().await.expect("Failed to initialize");
 
     // Append 75 entries
@@ -113,7 +118,8 @@ async fn test_batch_stream_state_iteration() {
 
 #[tokio::test]
 async fn test_wal_store_concurrent_access() {
-    let store = Arc::new(WalStore::new(WalStoreConfig::default()));
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let store = Arc::new(WalStore::new(wal_config));
     store.init().await.expect("Failed to initialize");
 
     // Spawn multiple writers
@@ -140,7 +146,8 @@ async fn test_wal_store_concurrent_access() {
 
 #[tokio::test]
 async fn test_wal_store_entry_retrieval() {
-    let store = WalStore::new(WalStoreConfig::default());
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let store = WalStore::new(wal_config);
     store.init().await.expect("Failed to initialize");
 
     // Append specific entries
@@ -170,7 +177,8 @@ async fn test_wal_store_entry_retrieval() {
 
 #[tokio::test]
 async fn test_wal_store_range_queries() {
-    let store = WalStore::new(WalStoreConfig::default());
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let store = WalStore::new(wal_config);
     store.init().await.expect("Failed to initialize");
 
     // Append sequential entries
@@ -195,7 +203,8 @@ async fn test_wal_store_range_queries() {
 
 #[tokio::test]
 async fn test_wal_store_truncation() {
-    let store = WalStore::new(WalStoreConfig::default());
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let store = WalStore::new(wal_config);
     store.init().await.expect("Failed to initialize");
 
     // Append entries
@@ -287,7 +296,8 @@ async fn test_sync_mode_behavior() {
 
 #[tokio::test]
 async fn test_wal_entry_types() {
-    let store = WalStore::new(WalStoreConfig::default());
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let store = WalStore::new(wal_config);
     store.init().await.expect("Failed to initialize");
 
     // Test different entry types
@@ -339,7 +349,8 @@ async fn test_streaming_server_creation() {
         heartbeat_interval: Duration::from_secs(1),
         ..Default::default()
     };
-    let wal_store = Arc::new(WalStore::new(WalStoreConfig::default()));
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let wal_store = Arc::new(WalStore::new(wal_config));
     wal_store.init().await.expect("Failed to init WAL store");
 
     let server = StreamingServer::new(config, node_id, wal_store);
@@ -358,7 +369,8 @@ async fn test_streaming_server_broadcast() {
         heartbeat_interval: Duration::from_secs(1),
         ..Default::default()
     };
-    let wal_store = Arc::new(WalStore::new(WalStoreConfig::default()));
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let wal_store = Arc::new(WalStore::new(wal_config));
     wal_store.init().await.expect("Failed to init WAL store");
 
     let server = StreamingServer::new(config, node_id, wal_store);
@@ -373,7 +385,8 @@ async fn test_streaming_server_broadcast() {
 
 #[tokio::test]
 async fn test_wal_checksum_verification() {
-    let store = WalStore::new(WalStoreConfig::default());
+    let (_wal_tmp, wal_config) = wal_test_support::isolated_wal_config();
+    let store = WalStore::new(wal_config);
     store.init().await.expect("Failed to initialize");
 
     let data = b"test_checksum_data";

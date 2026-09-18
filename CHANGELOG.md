@@ -5,6 +5,122 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.37.0] - 2026-09-18
+
+20 low-effort sprinter backlog items, one release: DDL validation gaps, join-semantics regression
+coverage (2 already fixed by GH#29, reinforced here), PostgreSQL wire hygiene, MySQL wire hygiene,
+storage/transaction correctness, and CI execution of the internal-tests tier.
+
+### Fixed — DDL validation gaps
+
+- `FOREIGN KEY (nosuch) REFERENCES p(id)` on a column that does not exist on the child table is now
+  refused at `CREATE TABLE` / `ALTER TABLE ADD FOREIGN KEY` time instead of silently accepted.
+- Table-level `PRIMARY KEY (nosuch)` naming a nonexistent column is now a hard error (`42703`) instead
+  of being silently ignored.
+- `ALTER TABLE ADD FOREIGN KEY` with a constraint name that already exists on the table is refused
+  (`42710 duplicate_object` on the PostgreSQL wire) instead of registering a second constraint under
+  the same name.
+- `UPDATE t SET serial_col = DEFAULT` is refused (`0A000 feature_not_supported`) instead of silently
+  substituting NULL for the column's next sequence value.
+- `stored_duplicate_error` no longer relabels every enforcing-index insert failure as `DuplicateKey`;
+  `NullPrimaryKey` and other internal errors now pass through unchanged, and two `ON CONFLICT DO
+  UPDATE` / bulk-insert swallow sites that logged a stored-row refusal only at `debug` now report it
+  through the same index-maintenance-failure path as every other caller.
+
+### Fixed — join semantics regression coverage
+
+`JOIN ... USING (col)` / `NATURAL JOIN` lowering and outer-join residual-predicate evaluation across
+all three execution pipelines (text-SQL, bound-params, and `query_params_with_schema`) were already
+fixed by the GH#29 campaign (`24e77cf`); this release adds the regression tests these two backlog
+items asked for so the fix cannot regress silently, plus a fix for bare `SELECT *` over a join with
+duplicate column names, which used to read the first matching slot for every occurrence of a
+duplicated name instead of each join side's own column.
+
+### Fixed — PostgreSQL wire hygiene
+
+- The Unix-socket listener — the only listener without a connection-count semaphore — now enforces
+  the same cap as the TCP listener, and the socket file is created `0o700` instead of world-writable
+  `0o777`.
+- Every unimplemented statement kind used to answer the generic `XX000 internal_error`, which poolers
+  (PgBouncer, pgpool) read as "this backend is broken" and may respond to by dropping the backend; it
+  now answers `0A000 feature_not_supported` naming the statement kind (and, where there is exactly
+  one, the object) instead of leaking the raw parser AST into the user-facing message.
+- `SHOW <unknown parameter>` now answers `42704 undefined_object` instead of an empty string.
+- The idle-session deadline used to be armed between pipelined extended-protocol messages before
+  `Sync`; PostgreSQL only arms it after `ReadyForQuery`. A `FATAL` teardown write triggered by an
+  idle-timeout expiry is now bounded by its own write budget instead of the read budget that just
+  expired (which could be hours).
+- `SslMode::VerifyCA` / `VerifyFull` now actually verify the client certificate against the configured
+  CA (`WebPkiClientVerifier`, mirroring the MySQL listener's `feat/pqc-hybrid-tls` implementation)
+  instead of accepting any client certificate as a no-op.
+
+### Fixed — MySQL wire hygiene
+
+- `SHOW VARIABLES` / `@@wait_timeout`, `@@interactive_timeout`, `@@net_read_timeout` and
+  `@@net_write_timeout` used to answer MySQL's stock `28800` / `30` regardless of the server's actual
+  `idle_session_timeout`, and `SHOW VARIABLES` did not list them at all; they now report the
+  configured budget (rounded up to MySQL's minimum of `1` for a sub-second budget, `31536000` when no
+  budget is configured — MySQL has no `0 = disabled` spelling).
+- `query_last_serial_id` — the `SELECT MAX(pk) FROM t` probe behind `LAST_INSERT_ID()` — used to splice
+  the table and PK-column names into its SQL unquoted, so a reserved-word table name or a
+  case-preserving quoted PK column made the probe a parse error on every insert; both identifiers are
+  now quoted. Fixing this surfaced a second, independent bug in the MySQL-to-PostgreSQL translator:
+  `CREATE TABLE t ("Id" INT, ...)` misread the double-quoted column name as a MySQL string literal
+  (the same `(`/`,` heuristic that opens a string after `VALUES(` or `IN (` fired on the CREATE
+  TABLE column list's opening paren too), silently converting it to `'Id'` and producing a parse
+  error; the translator now recognises a CREATE TABLE's top-level column/constraint list and never
+  treats a `"` there as a string delimiter.
+- `COM_RESET_CONNECTION` correctly rolling back the engine transaction (not just the handler's
+  in-memory flag) is now pinned by a regression test so it cannot regress silently.
+
+### Fixed — storage / transaction correctness
+
+- `Transaction::new` and `Transaction::new_with_session` used separate `TXN_COUNTER` statics, both
+  starting at 1 — lock ownership is keyed by transaction id, so an embedded transaction and a session
+  transaction could be assigned the same id. Both constructors now share one counter.
+- `PredicatePushdownManager::remove_table` had zero callers: `DROP TABLE` and `TRUNCATE` never purged
+  a table's bloom filters / zone maps, so a surviving structure could keep pruning rows against
+  pre-drop/pre-truncate contents once the table name was reused or new rows were inserted. Both
+  `DROP TABLE` (including cascaded partition children) and `TRUNCATE` now purge these structures —
+  `TRUNCATE` has two independent code paths (`ddl::handle_truncate` and the in-transaction text arm
+  that every autocommit statement actually routes through) and both are now fixed.
+- `ha_integration`'s streaming tests shared one gitignored relative `./data/wal` directory across
+  parallel test processes, tearing each other's WAL segment metadata (`WalStore::init` panicking with
+  "range start is greater than range end in BTreeMap"). Every WAL-backed HA test now gets its own
+  temp-directory-backed `WalStoreConfig`; proven stable under two consecutive full-suite runs with
+  default parallelism.
+
+### Changed — CI
+
+- The `internal-tests` feature tier (15 gated test targets) was only ever compile-checked in CI
+  (`feature-gated-compile`); a new scheduled/tag-triggered job now executes it, matching the resource
+  shape and empty-suite tripwire already used by the integration-smoke tier.
+- `push:` now triggers on `v*` tags (previously it did not, despite `integration-full`'s own comment
+  claiming it ran on release tags).
+
+### Regression coverage
+
+`tests/ddl_validation_batch_a.rs` (4), `tests/join_semantics_batch_b.rs` (11),
+`tests/pg_wire_hygiene_batch_c.rs` (6), `tests/mysql_wire_hygiene_batch_d.rs` (6),
+`tests/storage_txn_tls_batch_e.rs` (4), plus additions to `tests/postgres_ssl_tests.rs` (4) and
+`tests/kanttban_quirks_v3_28.rs`; `cargo test --lib` 2703 passed / 0 failed.
+
+### Known follow-ups (filed to the backlog)
+
+- Trigger bodies are always empty at creation time (`Planner::create_trigger_to_plan` hardcodes
+  `body = vec![]`), so the destamp-before-persist fix for a trigger's derived-table alias is currently
+  a no-op — the real bug is upstream of it.
+- `PredicatePushdownManager`'s write path (`initialize_table` / `index_row` / `register_bloom_filters`
+  / `register_zone_maps`) has no callers anywhere; the leak fix in this release is correct, but the
+  feature may not be populating structures in production at all.
+- `NATURAL JOIN` / `JOIN ... USING` still does not merge the shared output column into one slot, and
+  a `NATURAL JOIN` with no common column errors instead of degenerating to a cross join (PostgreSQL
+  parity, deliberately out of scope this release).
+- The `ha_integration` streaming-tests CI skip (`--skip ha_tests::streaming_tests`, 4 documented
+  locations) is left in place: this release's fix is proven stable locally under two consecutive
+  full-parallelism runs, but the documented skip exists for a separate filed constrained-CI-runner
+  hang, not verifiable from this host. Candidate for a dedicated controlled removal.
+
 ## [4.36.0] - 2026-09-17
 
 Post-quantum hybrid TLS (X25519MLKEM768) for both wire protocols, and MySQL wire TLS itself — MySQL

@@ -5,6 +5,16 @@
 
 use crate::{EmbeddedDatabase, Error, Result, Schema, Tuple, Value};
 
+/// PostgreSQL's wording for a `SHOW` / `current_setting()` of a parameter this
+/// server does not know (`guc.c`: `unrecognized configuration parameter "x"`).
+///
+/// Marker-const discipline (sprinter 59b989cf7d7e): the single emitter
+/// [`PgConnectionHandler::resolve_show_parameter`] writes it and
+/// [`sqlstate_for_query_execution_message`] maps it to `42704
+/// undefined_object`, so the two cannot drift. Lower-case, because the
+/// classifier matches it against the lower-cased message.
+pub(super) const UNRECOGNIZED_GUC_PREFIX: &str = "unrecognized configuration parameter";
+
 /// Case-insensitive prefix check without allocating a new String.
 #[inline]
 pub(super) fn starts_with_icase(s: &str, prefix: &str) -> bool {
@@ -761,15 +771,50 @@ where
         use crate::network::protocol::sqlstate;
 
         tracing::debug!("Entering main message loop");
+        // sprinter 263befdf85ca (a): is the session IDLE at a ReadyForQuery,
+        // or part-way through a pipelined extended-query batch?
+        //
+        // PostgreSQL arms its idle timers in exactly one place — inside
+        // `if (send_ready_for_query)` in `PostgresMain`, just before it emits
+        // ReadyForQuery and blocks. A backend that has read a `Parse` and is
+        // waiting for the rest of the batch is NOT idle, and no idle timer
+        // runs. Nano armed one before every read, so a pipelining client that
+        // sent `Parse` and paused longer than `idle_session_timeout` before its
+        // `Bind`/`Sync` was disconnected mid-batch — a correct client killed
+        // for a state PostgreSQL does not even measure.
+        //
+        // `startup()` ends with a ReadyForQuery, so the first wait is idle.
+        let mut at_ready_for_query = true;
         loop {
             tracing::trace!("Waiting for next message from client");
-            let activity = match self.transaction_status {
-                TransactionStatus::InTransaction | TransactionStatus::Failed => SessionActivity::IdleInTransaction,
-                TransactionStatus::Idle => SessionActivity::Idle,
+            // `Busy` never arms a deadline (`ConnectionTimeouts::armed_timer`).
+            let activity = match (at_ready_for_query, self.transaction_status) {
+                (false, _) => SessionActivity::Busy,
+                (true, TransactionStatus::InTransaction) | (true, TransactionStatus::Failed) => {
+                    SessionActivity::IdleInTransaction
+                }
+                (true, TransactionStatus::Idle) => SessionActivity::Idle,
             };
             match self.read_message_deadlined(activity).await {
                 Ok(ReadOutcome::Message(msg)) => {
                     tracing::debug!("Received message: {:?}", msg);
+                    // Only the six messages that legitimately precede a `Sync`
+                    // leave the session mid-pipeline. Everything else — `Query`,
+                    // `Sync`, `Terminate`, and any message that has no business
+                    // arriving here at all — ends at a ReadyForQuery (or ends
+                    // the connection), so the next wait is a real idle wait and
+                    // stays bounded. Listing the pipelining half explicitly,
+                    // rather than the idle half, keeps an unexpected message
+                    // from silently buying a peer an unbounded wait.
+                    at_ready_for_query = !matches!(
+                        msg,
+                        FrontendMessage::Parse { .. }
+                            | FrontendMessage::Bind { .. }
+                            | FrontendMessage::Describe { .. }
+                            | FrontendMessage::Execute { .. }
+                            | FrontendMessage::Close { .. }
+                            | FrontendMessage::Flush
+                    );
                     if self.awaiting_sync_after_error {
                         self.handle_message_while_awaiting_sync(msg).await?;
                         continue;
@@ -799,11 +844,18 @@ where
                     };
                     tracing::info!(session_id = ?self.session_id, "{}", message);
                     // Bounded teardown: a peer that stopped reading must not
-                    // become the new immortal await. The bound is the budget
-                    // that just expired — no new key, no magic number.
-                    let budget = self
-                        .effective_read_deadline(expired)
-                        .unwrap_or(std::time::Duration::from_secs(1));
+                    // become the new immortal await.
+                    //
+                    // sprinter 263befdf85ca (b): the bound used to be the
+                    // budget that JUST EXPIRED, which is the one number it
+                    // must not be. With `idle_session_timeout = 1h`, a peer
+                    // that stops reading at expiry holds its connection slot
+                    // for another HOUR while this write blocks — the slot the
+                    // timeout exists to reclaim. `[server] close_timeout`
+                    // (default 5s) is a separate, short budget for teardown
+                    // writes on every forced-disconnect path here; both idle
+                    // timers land on this one site.
+                    let budget = self.teardown_write_budget();
                     let _ = tokio::time::timeout(budget, async {
                         // ErrorResponse only — `send_error` would append a
                         // ReadyForQuery to a connection that is closing.
@@ -841,11 +893,27 @@ where
         timeouts
     }
 
-    /// GH#28: how long the next wait on the peer may take in `activity`
-    /// (`None` = unbounded). Mirrors `effective_statement_timeout_ms`:
-    /// session override > listener policy.
-    fn effective_read_deadline(&self, activity: SessionActivity) -> Option<std::time::Duration> {
-        self.effective_armed_timer(activity).map(|(_, budget)| budget)
+    /// sprinter 263befdf85ca (b): how long a TEARDOWN write may block.
+    ///
+    /// The FATAL this server owes a client it is about to disconnect is
+    /// written to a peer that may have stopped reading — so the write is
+    /// bounded, and the bound must be SHORT and independent of the timeout
+    /// that fired. It used to be the expired idle budget itself
+    /// (`effective_read_deadline`, removed with this), which meant
+    /// `idle_session_timeout = 1h` let a peer hold its connection slot for
+    /// another hour after the timeout that exists to reclaim that slot.
+    ///
+    /// `[server] close_timeout`, listener-scoped (never `SET`-able: a session
+    /// must not be able to lengthen its own teardown). `ZERO` is not
+    /// "unbounded" — there is deliberately no unbounded setting here — it
+    /// falls back to the 1 s floor this path already used.
+    fn teardown_write_budget(&self) -> std::time::Duration {
+        let configured = self.policy.timeouts.close_timeout;
+        if configured.is_zero() {
+            std::time::Duration::from_secs(1)
+        } else {
+            configured
+        }
     }
 
     /// GH#28 (c2): which timer the next wait in `activity` arms, and its
@@ -1787,7 +1855,14 @@ where
                 };
                 ("search_path".to_string(), val)
             } else {
-                self.resolve_session_show_parameter(param)
+                // `?`: an unknown parameter name is PostgreSQL's `42704
+                // unrecognized configuration parameter "x"` (sprinter
+                // 59b989cf7d7e), not a DataRow holding an empty string. The
+                // error propagates to `dispatch_message`, which renders it as
+                // the ErrorResponse + ReadyForQuery the client expects — and,
+                // inside a multi-statement simple query, stops the batch at the
+                // first failure like every other failing statement.
+                self.resolve_session_show_parameter(param)?
             };
             let schema = Schema::new(vec![crate::Column::new(&col_name, crate::DataType::Text)]);
             let row = Tuple::new(vec![Value::String(value)]);
@@ -3476,8 +3551,18 @@ where
     // ("ISOLATION LEVEL" is exactly 15 chars).
     #[allow(clippy::indexing_slicing)]
     /// Resolve a SHOW parameter name to (column_name, value).
-    /// Returns PostgreSQL-compatible values for common parameters.
-    fn resolve_show_parameter(param: &str) -> (String, String) {
+    ///
+    /// Returns PostgreSQL-compatible values for the parameters this server
+    /// knows, and `Err` — PostgreSQL's own `42704 unrecognized configuration
+    /// parameter "x"` — for one it does not (sprinter 59b989cf7d7e). The
+    /// catch-all used to answer an EMPTY STRING, which is strictly worse than
+    /// an error: a client cannot tell "this server has no such setting" from
+    /// "the setting is set to nothing", and a pooler or ORM probing an optional
+    /// GUC silently reads the empty string as a value. `SHOW` names answered
+    /// per connection are intercepted before this by
+    /// [`Self::resolve_session_show_parameter`]; every name IN the table below
+    /// keeps answering exactly as it did.
+    fn resolve_show_parameter(param: &str) -> Result<(String, String)> {
         let param_lower = param.to_lowercase();
         let col = param_lower.clone();
         let val = match param_lower.as_str() {
@@ -3496,9 +3581,30 @@ where
             "search_path" => "\"$user\", public".to_string(),
             "default_transaction_isolation" => "read committed".to_string(),
             "is_superuser" => "on".to_string(),
-            _ => String::new(),
+            // Answered because the ERROR below would otherwise BREAK a
+            // connection: libpq's `target_session_attrs=read-write` (and
+            // tokio-postgres' / JDBC's equivalents) probe exactly this name
+            // while choosing a host, and treat a failed probe as a failed
+            // connection. "off" is the truth, not a placeholder: nothing in
+            // this engine makes a session read-only — `BEGIN READ ONLY` is
+            // classified as a plain `BEGIN` and no write path consults a
+            // read-only flag. It used to answer the empty string, which libpq
+            // happened to read as "not read-only" by accident.
+            "transaction_read_only" | "default_transaction_read_only" => "off".to_string(),
+            // PostgreSQL's wording, verbatim (guc.c), so a client's own error
+            // matching keeps working. `sqlstate_for_query_execution_message`
+            // maps it to 42704 undefined_object.
+            _ => {
+                // Truncated like PostgreSQL truncates an identifier
+                // (NAMEDATALEN-1), so the echo of a client-chosen name is
+                // bounded. The name came from this connection's own SQL, so it
+                // discloses nothing the peer did not already know.
+                let shown: String = param_lower.chars().take(63).collect();
+                let message = format!("{UNRECOGNIZED_GUC_PREFIX} \"{shown}\"");
+                return Err(Error::query_execution(message));
+            }
         };
-        (col, val)
+        Ok((col, val))
     }
 
     /// The `SHOW` names answered per CONNECTION rather than from the static
@@ -3537,8 +3643,12 @@ where
     /// `SET` override, else the listener's) rendered like PostgreSQL
     /// (`0`, `30s`, `10min`), `authentication_timeout` from the listener
     /// policy and `max_connections` from the limit the listener enforces.
-    /// Everything else falls through to [`Self::resolve_show_parameter`].
-    pub(super) fn resolve_session_show_parameter(&self, param: &str) -> (String, String) {
+    /// Everything else falls through to [`Self::resolve_show_parameter`],
+    /// which is where an unknown name becomes `42704 unrecognized
+    /// configuration parameter "x"` (sprinter 59b989cf7d7e) — the `Err` this
+    /// returns is rendered as an ErrorResponse by the caller, never as a row
+    /// containing an empty string.
+    pub(super) fn resolve_session_show_parameter(&self, param: &str) -> Result<(String, String)> {
         let lower = param.trim().to_ascii_lowercase();
         let value = match lower.as_str() {
             "idle_session_timeout" => {
@@ -3571,7 +3681,7 @@ where
             "ssl_key_exchange" => self.tls_kx_group.clone().unwrap_or_default(),
             _ => return Self::resolve_show_parameter(param),
         };
-        (lower, value)
+        Ok((lower, value))
     }
 
     /// This connection's SQL identity for the reporting surfaces (HDB-009): the
@@ -5126,6 +5236,27 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
     }
 
+    // Batch C (sprinter e143ae12ea2d): a statement kind the planner has no arm
+    // for (`Planner::statement_to_plan`'s final arm). Parsed fine, simply not
+    // implemented — PostgreSQL's own class for that is 0A000, NOT the XX000
+    // internal_error this used to report, which PgBouncer / pgpool and HA
+    // proxies read as a broken backend. Marker const owned by the single
+    // emitter; the MySQL wire's `map_error_code` anchors on the same one.
+    if message.contains(crate::error::UNSUPPORTED_STATEMENT_KIND_MARKER) {
+        return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
+    }
+
+    // Batch C (sprinter 59b989cf7d7e): `SHOW <name>` for a GUC this server does
+    // not know, and `current_setting('<name>')` for the same (the evaluator
+    // spells it with single quotes; both start with PostgreSQL's own wording).
+    // PostgreSQL reports 42704 undefined_object — `guc.c`'s
+    // `unrecognized configuration parameter "x"` — and psql, JDBC and every
+    // pooler that probes optional GUCs branch on it. Anchored on the shared
+    // prefix const; without this arm the refusal degraded to XX000.
+    if lower.starts_with(UNRECOGNIZED_GUC_PREFIX) {
+        return sqlstate::UNDEFINED_OBJECT; // 42704
+    }
+
     // Spec 03: the advisory family refuses the session-scope half on a
     // session-less execution path (REST/BaaS, MCP, the embedded funnel, the
     // REPL) because there is no connection to own or release the lock. That is
@@ -5223,6 +5354,18 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         || lower.contains("because constraint")
     {
         sqlstate::DEPENDENT_OBJECTS_STILL_EXIST // 2BP01
+    } else if lower.starts_with("constraint \"") && lower.contains("already exists") {
+        // `constraint "x" for relation "t" already exists` (ALTER TABLE ADD
+        // CONSTRAINT, src/lib.rs) — PostgreSQL's own 42710, not the generic
+        // 42P07 the `(table||relation) && already exists` arm below would
+        // give it (the message also contains "relation"). Checked ahead of
+        // every other arm in this function for that reason.
+        sqlstate::DUPLICATE_OBJECT // 42710
+    } else if lower.starts_with("set ") && lower.contains("= default on a serial column is not supported") {
+        // `SET <col> = DEFAULT on a serial column is not supported`
+        // (column_default_for_update, src/sql/planner.rs) — a deliberate
+        // refusal, not an internal fault.
+        sqlstate::FEATURE_NOT_SUPPORTED // 0A000
     } else if message_names_a_role(&lower) && (lower.contains("is reserved") || lower.contains("built-in role")) {
         sqlstate::INSUFFICIENT_PRIVILEGE // 42501
     } else if message_names_a_role(&lower) && lower.contains("already exists") {
@@ -5497,7 +5640,7 @@ mod failed_transaction_state_tests {
                 stream,
                 policy: ConnectionPolicy::embedded_default(&db),
                 idle_guc_overridden: false,
-            tls_kx_group: None,
+                tls_kx_group: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),
@@ -5592,7 +5735,7 @@ mod show_branches_wire_tests {
                 stream,
                 policy: ConnectionPolicy::embedded_default(&db),
                 idle_guc_overridden: false,
-            tls_kx_group: None,
+                tls_kx_group: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),
@@ -6226,7 +6369,7 @@ mod md5_auth_wire_tests {
                 stream,
                 policy: ConnectionPolicy::embedded_default(&db),
                 idle_guc_overridden: false,
-            tls_kx_group: None,
+                tls_kx_group: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),

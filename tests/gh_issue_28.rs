@@ -117,6 +117,10 @@ fn all_disabled() -> ConnectionTimeouts {
         idle_in_transaction_session_timeout: Duration::ZERO,
         tcp_keepalive: None,
         connection_warn_threshold_percent: 0,
+        // Batch C (sprinter 263befdf85ca): the teardown-write budget. ZERO
+        // keeps the handler's 1s floor, which is what this path used before
+        // the key existed.
+        close_timeout: Duration::ZERO,
     }
 }
 

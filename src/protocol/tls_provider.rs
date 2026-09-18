@@ -68,8 +68,14 @@ pub fn load_cert_and_key(
     label: &str,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     // Load server certificate chain.
-    let cert_file = File::open(cert_path)
-        .map_err(|e| Error::io(format!("Failed to open {} certificate {}: {}", label, cert_path.display(), e)))?;
+    let cert_file = File::open(cert_path).map_err(|e| {
+        Error::io(format!(
+            "Failed to open {} certificate {}: {}",
+            label,
+            cert_path.display(),
+            e
+        ))
+    })?;
     let mut cert_reader = BufReader::new(cert_file);
     let certs_iter = certs(&mut cert_reader);
     let certs: Vec<CertificateDer<'static>> = certs_iter
@@ -77,12 +83,21 @@ pub fn load_cert_and_key(
         .map_err(|e| Error::io(format!("Failed to parse {} certificate: {}", label, e)))?;
 
     if certs.is_empty() {
-        return Err(Error::io(format!("No certificates found in {} certificate file", label)));
+        return Err(Error::io(format!(
+            "No certificates found in {} certificate file",
+            label
+        )));
     }
 
     // Load private key — PKCS#8 first, then RSA.
-    let key_file = File::open(key_path)
-        .map_err(|e| Error::io(format!("Failed to open {} private key {}: {}", label, key_path.display(), e)))?;
+    let key_file = File::open(key_path).map_err(|e| {
+        Error::io(format!(
+            "Failed to open {} private key {}: {}",
+            label,
+            key_path.display(),
+            e
+        ))
+    })?;
     let mut key_reader = BufReader::new(key_file);
 
     let private_key = {
@@ -96,7 +111,12 @@ pub fn load_cert_and_key(
         } else {
             // Reopen: `pkcs8_private_keys` may have consumed the reader.
             let key_file = File::open(key_path).map_err(|e| {
-                Error::io(format!("Failed to open {} private key {}: {}", label, key_path.display(), e))
+                Error::io(format!(
+                    "Failed to open {} private key {}: {}",
+                    label,
+                    key_path.display(),
+                    e
+                ))
             })?;
             let mut key_reader = BufReader::new(key_file);
             let rsa_keys_iter = rsa_private_keys(&mut key_reader);
@@ -119,15 +139,24 @@ pub fn load_cert_and_key(
 /// [`rustls::RootCertStore`] used by a mutual-TLS client-certificate
 /// verifier. Shared by any listener that wants to verify client certs.
 pub fn load_ca_certs(ca_path: &Path, label: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let ca_file = File::open(ca_path)
-        .map_err(|e| Error::io(format!("Failed to open {} CA certificate {}: {}", label, ca_path.display(), e)))?;
+    let ca_file = File::open(ca_path).map_err(|e| {
+        Error::io(format!(
+            "Failed to open {} CA certificate {}: {}",
+            label,
+            ca_path.display(),
+            e
+        ))
+    })?;
     let mut ca_reader = BufReader::new(ca_file);
     let ca_certs: Vec<CertificateDer<'static>> = certs(&mut ca_reader)
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::io(format!("Failed to parse {} CA certificate: {}", label, e)))?;
 
     if ca_certs.is_empty() {
-        return Err(Error::io(format!("No certificates found in {} CA certificate file", label)));
+        return Err(Error::io(format!(
+            "No certificates found in {} CA certificate file",
+            label
+        )));
     }
 
     Ok(ca_certs)
@@ -159,6 +188,9 @@ mod tests {
                 .any(|g| g.name() == rustls::NamedGroup::X25519MLKEM768),
             "classical-only provider must not offer X25519MLKEM768"
         );
-        assert!(!provider.kx_groups.is_empty(), "classical provider must still offer classical groups");
+        assert!(
+            !provider.kx_groups.is_empty(),
+            "classical provider must still offer classical groups"
+        );
     }
 }

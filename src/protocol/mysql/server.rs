@@ -28,11 +28,11 @@ use super::handler::{
     build_handshake_v10, read_packet, write_packet, CapabilityFlags, HandshakeResponse, MySqlHandler, StatusFlags,
     UTF8MB4_GENERAL_CI,
 };
-use bytes::{BufMut, BytesMut};
 use super::ssl::{MysqlSslConfig, MysqlSslNegotiator};
 use crate::protocol::postgres::timeouts::ConnectionTimeouts;
 use crate::protocol::tls_stream::SecureConnection;
 use crate::{EmbeddedDatabase, Error, Result};
+use bytes::{BufMut, BytesMut};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -156,7 +156,11 @@ impl MysqlServer {
         tracing::info!(
             "MySQL server listening on {} (tls: {})",
             self.config.address,
-            if self.ssl_negotiator.is_some() { "enabled" } else { "disabled" }
+            if self.ssl_negotiator.is_some() {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
 
         loop {
@@ -228,7 +232,9 @@ impl MysqlServer {
         let negotiate = Self::negotiate(stream, database, ssl_negotiator, connection_id);
         let mut handler = match auth_deadline {
             Some(at) => match tokio::time::timeout_at(at, negotiate).await {
-                Ok(negotiated) => negotiated.map_err(|e| Error::network(format!("MySQL TLS negotiation failed: {}", e)))?,
+                Ok(negotiated) => {
+                    negotiated.map_err(|e| Error::network(format!("MySQL TLS negotiation failed: {}", e)))?
+                }
                 Err(_elapsed) => {
                     tracing::debug!(
                         "MySQL connection {}: authentication_timeout expired during handshake; closing",
@@ -274,7 +280,14 @@ impl MysqlServer {
         let character_set = UTF8MB4_GENERAL_CI;
         let auth_plugin = "mysql_native_password".to_string();
 
-        let greeting = build_handshake_v10(connection_id, &auth_seed, &capabilities, character_set, &status_flags, &auth_plugin);
+        let greeting = build_handshake_v10(
+            connection_id,
+            &auth_seed,
+            &capabilities,
+            character_set,
+            &status_flags,
+            &auth_plugin,
+        );
 
         let mut stream = stream;
         write_packet(&mut stream, 0, &greeting).await?;
@@ -293,9 +306,10 @@ impl MysqlServer {
             match ssl_negotiator.as_ref() {
                 Some(negotiator) => {
                     tracing::debug!("MySQL connection {}: upgrading to TLS", connection_id);
-                    let tls_stream = negotiator.acceptor().accept(stream).await.map_err(|e| {
-                        super::handler::MySqlError::Protocol(format!("TLS handshake failed: {}", e))
-                    })?;
+                    let tls_stream =
+                        negotiator.acceptor().accept(stream).await.map_err(|e| {
+                            super::handler::MySqlError::Protocol(format!("TLS handshake failed: {}", e))
+                        })?;
                     // Capture the negotiated key-exchange group (PQ hybrid
                     // `X25519MLKEM768` vs classical `X25519`/etc.) before the
                     // stream is wrapped — `.get_ref().1` is the
@@ -333,11 +347,7 @@ impl MysqlServer {
             // Client didn't set CLIENT_SSL. If this listener requires TLS
             // for every connection, reject rather than silently accepting
             // cleartext — `require_tls` must not be a no-op.
-            if ssl_negotiator
-                .as_ref()
-                .map(|n| n.config().require_tls)
-                .unwrap_or(false)
-            {
+            if ssl_negotiator.as_ref().map(|n| n.config().require_tls).unwrap_or(false) {
                 let mut stream = stream;
                 let err = build_access_denied_packet(&capabilities, "TLS is required by this server");
                 // Best-effort: the client is being rejected either way, and

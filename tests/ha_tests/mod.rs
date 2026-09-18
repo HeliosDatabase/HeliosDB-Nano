@@ -17,3 +17,5 @@ mod cluster_tests;
 mod failover_tests;
 mod split_brain_tests;
 mod streaming_tests;
+// Per-test isolated `wal_dir`s. See the module's own docs for the race it removes.
+mod wal_test_support;

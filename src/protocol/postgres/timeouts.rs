@@ -67,11 +67,20 @@ pub struct ConnectionTimeouts {
     /// Log a WARN when in-use connections reach this percentage of
     /// `max_connections`. `0` disables the warning.
     pub connection_warn_threshold_percent: u8,
+    /// Bound on a TEARDOWN write — the FATAL a listener owes a client it is
+    /// about to disconnect (sprinter 263befdf85ca). Short and INDEPENDENT of
+    /// the timeout that fired: bounding that write by the idle budget that
+    /// just expired let a peer which stops reading hold its connection slot
+    /// for another full `idle_session_timeout`. `ZERO` is not "unbounded" —
+    /// the handler falls back to a 1 s floor.
+    pub close_timeout: Duration,
 }
 
 impl Default for ConnectionTimeouts {
     /// PostgreSQL defaults: `authentication_timeout` 60 s, both idle timeouts
-    /// disabled, keepalive on with OS timers, warn at 80 %.
+    /// disabled, keepalive on with OS timers, warn at 80 %. `close_timeout`
+    /// has no PostgreSQL counterpart; 5 s is long enough for a live peer to
+    /// read one FATAL and short enough that a dead one costs nothing.
     fn default() -> Self {
         Self {
             authentication_timeout: Duration::from_secs(60),
@@ -79,6 +88,7 @@ impl Default for ConnectionTimeouts {
             idle_in_transaction_session_timeout: Duration::ZERO,
             tcp_keepalive: Some(TcpKeepaliveSettings::default()),
             connection_warn_threshold_percent: 80,
+            close_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -102,6 +112,10 @@ impl ConnectionTimeouts {
             idle_in_transaction_session_timeout: Duration::ZERO,
             tcp_keepalive: None,
             connection_warn_threshold_percent: 0,
+            // No idle timer is armed here, so nothing reaches the teardown
+            // write; `ZERO` keeps the handler's 1 s floor if anything ever
+            // does.
+            close_timeout: Duration::ZERO,
         }
     }
 
@@ -124,6 +138,10 @@ impl ConnectionTimeouts {
         let in_txn_ms = parse_guc_duration_ms(&cfg.idle_in_transaction_session_timeout, 1).unwrap_or(0);
         let ka_idle = parse_guc_duration_ms(&cfg.tcp_keepalives_idle, 1_000).unwrap_or(0);
         let ka_interval = parse_guc_duration_ms(&cfg.tcp_keepalives_interval, 1_000).unwrap_or(0);
+        // Bare integer = SECONDS, like `authentication_timeout` (the other
+        // key here that is measured in whole seconds).
+        let close_ms =
+            parse_guc_duration_ms(&cfg.close_timeout, 1_000).unwrap_or(defaults.close_timeout.as_millis() as u64);
         Self {
             authentication_timeout: Duration::from_millis(auth_ms),
             idle_session_timeout: Duration::from_millis(idle_ms),
@@ -134,6 +152,7 @@ impl ConnectionTimeouts {
                 retries: cfg.tcp_keepalives_count,
             }),
             connection_warn_threshold_percent: cfg.max_connections_warn_percent,
+            close_timeout: Duration::from_millis(close_ms),
         }
     }
 

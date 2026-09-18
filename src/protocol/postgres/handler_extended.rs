@@ -268,7 +268,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // directly under the portal's wire plan — the catalog fast-path shape,
         // never `send_query_result` (which would repeat the RowDescription).
         if let Some(param) = Self::session_show_parameter_name(trimmed_query) {
-            let (col, val) = self.resolve_session_show_parameter(&param);
+            // `?` cannot fire here — `session_show_parameter_name` already
+            // narrowed `param` to the six names this function answers itself —
+            // but it keeps the two paths on ONE definition of "unknown GUC"
+            // (42704, sprinter 59b989cf7d7e) rather than a second copy.
+            let (col, val) = self.resolve_session_show_parameter(&param)?;
             let schema = crate::Schema::new(vec![crate::Column::new(col, crate::DataType::Text)]);
             let rows = vec![crate::Tuple::new(vec![Value::String(val)])];
             self.prepared_statements

@@ -22,7 +22,8 @@
 #![allow(elided_lifetimes_in_paths)]
 
 use crate::{Error, Result};
-use rustls::ServerConfig;
+use rustls::server::WebPkiClientVerifier;
+use rustls::{RootCertStore, ServerConfig};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -147,6 +148,18 @@ impl SslConfig {
                     ca_path.display()
                 )));
             }
+        } else if self.mode.requires_client_verification() {
+            // sprinter 0fd0449e8466, fail closed: `verify-ca` / `verify-full`
+            // cannot verify anything without a CA, and silently degrading to
+            // "no client authentication" is precisely the bug this change
+            // fixes. Refuse the configuration instead of starting a listener
+            // that does not do what it says. Mirrors
+            // `MysqlSslConfig::validate`'s `require_client_cert` check.
+            return Err(Error::io(format!(
+                "SSL mode {:?} requires client-certificate verification but no CA certificate \
+                 (ca_cert_path) is configured",
+                self.mode
+            )));
         }
 
         Ok(())
@@ -187,12 +200,58 @@ impl SslNegotiator {
         // CryptoProvider (aws-lc-rs-backed) instead of the implicit
         // process-wide default — see `crate::protocol::tls_provider`.
         let provider = crate::protocol::tls_provider::pq_capable_provider(config.post_quantum);
-        let mut tls_config = ServerConfig::builder_with_provider(provider)
+        let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
-            .map_err(|e| Error::io(format!("Failed to select TLS protocol versions: {}", e)))?
-            .with_no_client_auth()
-            .with_single_cert(certs, private_key)
-            .map_err(|e| Error::io(format!("Failed to build TLS config: {}", e)))?;
+            .map_err(|e| Error::io(format!("Failed to select TLS protocol versions: {}", e)))?;
+
+        // sprinter 0fd0449e8466: `verify-ca` / `verify-full` are documented as
+        // "require SSL and verify the CLIENT certificate", but this builder
+        // called `.with_no_client_auth()` for EVERY mode — so an operator who
+        // configured mutual TLS got a server that accepted any client
+        // certificate, or none at all, with no error and no log line. The
+        // `ca_cert_path` they configured was accepted, stored, and used for
+        // nothing.
+        //
+        // Ported verbatim from the working reference on this same tree,
+        // `crate::protocol::mysql::ssl::MysqlSslNegotiator::load_tls_config`:
+        // `RootCertStore` from the CA PEM → `WebPkiClientVerifier` →
+        // `.with_client_cert_verifier(...)`. `builder_with_provider`, NOT the
+        // plain `WebPkiClientVerifier::builder()`: that one reaches for the
+        // process-wide default `CryptoProvider`, which this crate deliberately
+        // never installs (see `crate::protocol::tls_provider`), and would panic
+        // here. `.allow_unauthenticated()` is deliberately NOT used — a client
+        // with no certificate at all must be refused by rustls itself.
+        //
+        // Every other `SslMode` keeps `.with_no_client_auth()` byte-for-byte as
+        // before: this changes behaviour ONLY for the two modes that until now
+        // did nothing.
+        let mut tls_config = if config.mode.requires_client_verification() {
+            let ca_path = config.ca_cert_path.as_ref().ok_or_else(|| {
+                Error::io(format!(
+                    "SSL mode {:?} requires client-certificate verification but no CA certificate \
+                     (ca_cert_path) is configured",
+                    config.mode
+                ))
+            })?;
+            let mut roots = RootCertStore::empty();
+            for cert in crate::protocol::tls_provider::load_ca_certs(ca_path, "PostgreSQL TLS")? {
+                roots
+                    .add(cert)
+                    .map_err(|e| Error::io(format!("Failed to add PostgreSQL TLS CA certificate: {}", e)))?;
+            }
+            let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                .build()
+                .map_err(|e| Error::io(format!("Failed to build PostgreSQL TLS client verifier: {}", e)))?;
+            builder
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, private_key)
+                .map_err(|e| Error::io(format!("Failed to build TLS config: {}", e)))?
+        } else {
+            builder
+                .with_no_client_auth()
+                .with_single_cert(certs, private_key)
+                .map_err(|e| Error::io(format!("Failed to build TLS config: {}", e)))?
+        };
 
         // Enable ALPN for PostgreSQL (optional but good practice)
         tls_config.alpn_protocols = vec![b"postgresql".to_vec()];
@@ -299,6 +358,7 @@ impl SslNegotiator {
 pub use crate::protocol::tls_stream::SecureConnection;
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -338,5 +398,33 @@ mod tests {
     #[test]
     fn test_ssl_request_code() {
         assert_eq!(SSL_REQUEST_CODE, 80877103);
+    }
+
+    /// sprinter 0fd0449e8466: `verify-ca` / `verify-full` with no
+    /// `ca_cert_path` must be REFUSED, not silently degraded to
+    /// "no client authentication".
+    #[test]
+    fn verify_modes_without_a_ca_certificate_are_refused() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let cert = dir.path().join("server.crt");
+        let key = dir.path().join("server.key");
+        std::fs::write(&cert, b"").expect("write cert");
+        std::fs::write(&key, b"").expect("write key");
+
+        for mode in [SslMode::VerifyCA, SslMode::VerifyFull] {
+            let err = SslConfig::new(mode, &cert, &key)
+                .validate()
+                .expect_err("a verify mode with no CA must not validate");
+            assert!(
+                err.to_string().contains("ca_cert_path"),
+                "error must name the missing setting, got: {err}"
+            );
+        }
+
+        // Every non-verifying mode is unaffected.
+        for mode in [SslMode::Allow, SslMode::Prefer, SslMode::Require] {
+            let ok = SslConfig::new(mode, &cert, &key).validate();
+            assert!(ok.is_ok(), "non-verifying modes never need a CA: {mode:?}");
+        }
     }
 }

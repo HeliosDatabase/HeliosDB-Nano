@@ -429,8 +429,7 @@ mod pq_hybrid {
         // (`cargo test` runs tests in one binary concurrently) raced and
         // intermittently produced a mismatched cert/key pair
         // ("keys may not be consistent: KeyMismatch").
-        let temp_dir =
-            tempfile::TempDir::new().map_err(|e| heliosdb_nano::Error::io(format!("temp dir: {}", e)))?;
+        let temp_dir = tempfile::TempDir::new().map_err(|e| heliosdb_nano::Error::io(format!("temp dir: {}", e)))?;
         let cert_path = temp_dir.path().join("server.crt");
         let key_path = temp_dir.path().join("server.key");
         // `generate_test_cert()`'s hardcoded fallback PEM template doesn't
@@ -440,8 +439,7 @@ mod pq_hybrid {
         CertificateManager::generate_self_signed(&cert_path, &key_path, "localhost")?;
 
         let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
-        let ssl_config =
-            SslConfig::new(SslMode::Require, &cert_path, &key_path).with_post_quantum(server_post_quantum);
+        let ssl_config = SslConfig::new(SslMode::Require, &cert_path, &key_path).with_post_quantum(server_post_quantum);
         let addr: SocketAddr = format!("127.0.0.1:{}", free_loopback_port())
             .parse()
             .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
@@ -577,15 +575,13 @@ mod pq_hybrid {
         client_cfg: StdArc<ClientConfig>,
     ) -> Result<(rustls::NamedGroup, String)> {
         let _ = tracing_subscriber::fmt().with_env_filter("debug").try_init();
-        let temp_dir =
-            tempfile::TempDir::new().map_err(|e| heliosdb_nano::Error::io(format!("temp dir: {}", e)))?;
+        let temp_dir = tempfile::TempDir::new().map_err(|e| heliosdb_nano::Error::io(format!("temp dir: {}", e)))?;
         let cert_path = temp_dir.path().join("server.crt");
         let key_path = temp_dir.path().join("server.key");
         CertificateManager::generate_self_signed(&cert_path, &key_path, "localhost")?;
 
         let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
-        let ssl_config =
-            SslConfig::new(SslMode::Require, &cert_path, &key_path).with_post_quantum(server_post_quantum);
+        let ssl_config = SslConfig::new(SslMode::Require, &cert_path, &key_path).with_post_quantum(server_post_quantum);
         let addr: SocketAddr = format!("127.0.0.1:{}", free_loopback_port())
             .parse()
             .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
@@ -701,6 +697,400 @@ mod pq_hybrid {
             format!("{:?}", group),
             "SHOW ssl_key_exchange must report the group the client actually negotiated"
         );
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Mutual TLS: `ssl_mode = verify-ca` / `verify-full` must actually verify the
+// CLIENT certificate (sprinter 0fd0449e8466).
+// ============================================================================
+//
+// `SslNegotiator::load_tls_config` used to call `.with_no_client_auth()` for
+// EVERY `SslMode`, so an operator who configured `verify-ca` (and a
+// `ca_cert_path`) got a listener that accepted any client certificate or none
+// at all — mutual TLS silently not enforced, no error, no log line. The wiring
+// is ported from the working reference on this tree,
+// `src/protocol/mysql/ssl.rs`, and these tests mirror
+// `tests/mysql_ssl_tests.rs`'s `mtls_*` cases (including its
+// `generate_ca_and_signed_cert` helper) against the PostgreSQL listener.
+
+mod mtls {
+    use super::*;
+    use heliosdb_nano::protocol::tls_provider::pq_capable_provider;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+    use std::sync::Arc as StdArc;
+    use tokio_rustls::TlsConnector;
+
+    /// Accepts any SERVER certificate — these tests are about the CLIENT
+    /// certificate the server does or does not demand, not about chain
+    /// validation of the self-signed test server cert.
+    #[derive(Debug)]
+    struct AcceptAnyCert;
+
+    impl ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA384,
+                SignatureScheme::RSA_PKCS1_SHA512,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    /// Generate a self-signed CA and a leaf certificate signed by it, via the
+    /// `openssl` CLI — the same tool `CertificateManager::generate_self_signed`
+    /// shells out to. Copied from `tests/mysql_ssl_tests.rs`
+    /// (`generate_ca_and_signed_cert`), including the X.509v3 `-extfile`
+    /// workaround: `openssl x509 -req` without it emits a v1 certificate on
+    /// some OpenSSL builds, which rustls's webpki verifier refuses with
+    /// `UnsupportedCertVersion`.
+    ///
+    /// Returns `(ca_cert, ca_key, leaf_cert, leaf_key)`, all inside `dir` and
+    /// namespaced by `leaf_cn` so two calls into the same directory do not
+    /// overwrite each other's CA.
+    fn generate_ca_and_signed_cert(
+        dir: &std::path::Path,
+        leaf_cn: &str,
+    ) -> Result<(
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    )> {
+        let run = |args: &[&str]| -> Result<()> {
+            let output = std::process::Command::new("openssl")
+                .args(args)
+                .output()
+                .map_err(|e| heliosdb_nano::Error::io(format!("failed to execute openssl: {}", e)))?;
+            if !output.status.success() {
+                return Err(heliosdb_nano::Error::io(format!(
+                    "openssl {:?} failed: {}",
+                    args,
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            Ok(())
+        };
+
+        let ca_key = dir.join(format!("{leaf_cn}-ca.key"));
+        let ca_cert = dir.join(format!("{leaf_cn}-ca.crt"));
+        let leaf_key = dir.join(format!("{leaf_cn}.key"));
+        let leaf_csr = dir.join(format!("{leaf_cn}.csr"));
+        let leaf_cert = dir.join(format!("{leaf_cn}.crt"));
+
+        run(&[
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            ca_key.to_str().expect("path"),
+            "-out",
+            ca_cert.to_str().expect("path"),
+            "-days",
+            "365",
+            "-subj",
+            "/CN=Test CA",
+        ])?;
+
+        run(&[
+            "req",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            leaf_key.to_str().expect("path"),
+            "-out",
+            leaf_csr.to_str().expect("path"),
+            "-subj",
+            &format!("/CN={leaf_cn}"),
+        ])?;
+
+        let extfile = dir.join(format!("{leaf_cn}.ext"));
+        std::fs::write(
+            &extfile,
+            "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n",
+        )
+        .map_err(|e| heliosdb_nano::Error::io(format!("failed to write {extfile:?}: {e}")))?;
+        run(&[
+            "x509",
+            "-req",
+            "-in",
+            leaf_csr.to_str().expect("path"),
+            "-CA",
+            ca_cert.to_str().expect("path"),
+            "-CAkey",
+            ca_key.to_str().expect("path"),
+            "-CAcreateserial",
+            "-out",
+            leaf_cert.to_str().expect("path"),
+            "-days",
+            "365",
+            "-extfile",
+            extfile.to_str().expect("path"),
+        ])?;
+
+        Ok((ca_cert, ca_key, leaf_cert, leaf_key))
+    }
+
+    /// A client that verifies nothing about the server and presents NO
+    /// certificate of its own.
+    fn client_without_certificate() -> StdArc<ClientConfig> {
+        let provider = pq_capable_provider(true);
+        StdArc::new(
+            ClientConfig::builder_with_provider(provider)
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .expect("TLS 1.3")
+                .dangerous()
+                .with_custom_certificate_verifier(StdArc::new(AcceptAnyCert))
+                .with_no_client_auth(),
+        )
+    }
+
+    /// A client that presents `cert`/`key` for mutual TLS.
+    fn client_with_certificate(cert: &std::path::Path, key: &std::path::Path) -> Result<StdArc<ClientConfig>> {
+        use rustls_pemfile::{certs, pkcs8_private_keys};
+        use std::fs::File;
+        use std::io::BufReader;
+
+        let chain: Vec<_> =
+            certs(&mut BufReader::new(File::open(cert).map_err(|e| {
+                heliosdb_nano::Error::io(format!("open client cert: {}", e))
+            })?))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| heliosdb_nano::Error::io(format!("parse client cert: {}", e)))?;
+        let mut keys: Vec<_> = pkcs8_private_keys(&mut BufReader::new(
+            File::open(key).map_err(|e| heliosdb_nano::Error::io(format!("open client key: {}", e)))?,
+        ))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| heliosdb_nano::Error::io(format!("parse client key: {}", e)))?;
+        let private_key = rustls::pki_types::PrivateKeyDer::Pkcs8(keys.remove(0));
+
+        let provider = pq_capable_provider(true);
+        let config = ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("TLS 1.3")
+            .dangerous()
+            .with_custom_certificate_verifier(StdArc::new(AcceptAnyCert))
+            .with_client_auth_cert(chain, private_key)
+            .map_err(|e| heliosdb_nano::Error::network(format!("client auth cert config: {}", e)))?;
+        Ok(StdArc::new(config))
+    }
+
+    /// Minimal protocol-3.0 `StartupMessage` with only a `user` parameter —
+    /// the database name defaults to the user, so `postgres` is used (it always
+    /// exists). Same shape as `pq_hybrid::build_startup_message`.
+    fn build_startup_message(user: &str) -> Vec<u8> {
+        let mut params = Vec::new();
+        params.extend_from_slice(b"user\0");
+        params.extend_from_slice(user.as_bytes());
+        params.push(0);
+        params.push(0);
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&(196_608i32).to_be_bytes());
+        msg.extend_from_slice(&params);
+
+        let mut framed = Vec::with_capacity(4 + msg.len());
+        framed.extend_from_slice(&((msg.len() + 4) as i32).to_be_bytes());
+        framed.extend_from_slice(&msg);
+        framed
+    }
+
+    /// Start a PostgreSQL listener in `verify-ca` mode trusting `ca_cert`.
+    /// Returns its bound address; the server's own certificate is a fresh
+    /// self-signed pair in `dir` (per-test, never the shared `certs/server.*`
+    /// pair — two tests regenerating that in parallel race, see
+    /// `pq_hybrid::handshake_and_get_group`).
+    async fn start_verify_ca_server(dir: &std::path::Path, ca_cert: &std::path::Path) -> Result<SocketAddr> {
+        let cert_path = dir.join("server.crt");
+        let key_path = dir.join("server.key");
+        CertificateManager::generate_self_signed(&cert_path, &key_path, "localhost")?;
+
+        let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
+        let ssl_config = SslConfig::new(SslMode::VerifyCA, &cert_path, &key_path).with_ca_cert(ca_cert);
+        let addr: SocketAddr = format!("127.0.0.1:{}", free_loopback_port())
+            .parse()
+            .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
+        let server = PgServerBuilder::new()
+            .address(addr)
+            .auth_method(AuthMethod::Trust)
+            .ssl_config(ssl_config)
+            .build(db)?;
+        let server_addr = server.config().address;
+        tokio::spawn(async move {
+            let _ = server.serve().await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Ok(server_addr)
+    }
+
+    /// SSLRequest → TLS handshake → trust-auth startup → ReadyForQuery.
+    ///
+    /// The startup round-trip is load-bearing for the NEGATIVE case: under
+    /// TLS 1.3 the server sends its `Finished` before it has seen the client's
+    /// `Certificate`, so `connect()` itself can return `Ok` even when the
+    /// server is about to refuse. The rejection surfaces on the first read
+    /// after that.
+    async fn login_over_tls(addr: SocketAddr, client_cfg: StdArc<ClientConfig>) -> Result<()> {
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
+        let ssl_accepted = send_ssl_request(&mut stream).await?;
+        assert!(
+            ssl_accepted,
+            "a verify-ca server must still answer the SSLRequest with 'S'"
+        );
+
+        let connector = TlsConnector::from(client_cfg);
+        let server_name = ServerName::try_from("localhost")
+            .map_err(|e| heliosdb_nano::Error::network(format!("Invalid server name: {}", e)))?
+            .to_owned();
+        let mut tls_stream = connector
+            .connect(server_name, stream)
+            .await
+            .map_err(|e| heliosdb_nano::Error::network(format!("TLS handshake failed: {}", e)))?;
+
+        tls_stream
+            .write_all(&build_startup_message("postgres"))
+            .await
+            .map_err(|e| heliosdb_nano::Error::network(format!("startup write failed: {}", e)))?;
+        tls_stream
+            .flush()
+            .await
+            .map_err(|e| heliosdb_nano::Error::network(format!("startup flush failed: {}", e)))?;
+
+        loop {
+            let mut tag = [0u8; 1];
+            tls_stream
+                .read_exact(&mut tag)
+                .await
+                .map_err(|e| heliosdb_nano::Error::network(format!("tag read failed: {}", e)))?;
+            let mut len_buf = [0u8; 4];
+            tls_stream
+                .read_exact(&mut len_buf)
+                .await
+                .map_err(|e| heliosdb_nano::Error::network(format!("length read failed: {}", e)))?;
+            let len = i32::from_be_bytes(len_buf) as usize;
+            let mut payload = vec![0u8; len.saturating_sub(4)];
+            tls_stream
+                .read_exact(&mut payload)
+                .await
+                .map_err(|e| heliosdb_nano::Error::network(format!("payload read failed: {}", e)))?;
+            if tag[0] == b'Z' {
+                return Ok(()); // ReadyForQuery
+            }
+            if tag[0] == b'E' {
+                return Err(heliosdb_nano::Error::network(
+                    "server returned ErrorResponse".to_string(),
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_verify_ca_accepts_a_client_with_a_ca_signed_certificate() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let (ca_cert, _ca_key, client_cert, client_key) = generate_ca_and_signed_cert(temp_dir.path(), "pg-client")?;
+        let addr = start_verify_ca_server(temp_dir.path(), &ca_cert).await?;
+
+        let client = client_with_certificate(&client_cert, &client_key)?;
+        tokio::time::timeout(Duration::from_secs(10), login_over_tls(addr, client))
+            .await
+            .expect("mTLS login timed out")
+    }
+
+    #[tokio::test]
+    async fn postgres_verify_ca_rejects_a_client_with_no_certificate() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let (ca_cert, _ca_key, _client_cert, _client_key) = generate_ca_and_signed_cert(temp_dir.path(), "unused")?;
+        let addr = start_verify_ca_server(temp_dir.path(), &ca_cert).await?;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            login_over_tls(addr, client_without_certificate()),
+        )
+        .await;
+        match result {
+            Ok(Ok(())) => panic!(
+                "verify-ca accepted a client that presented NO certificate — \
+                 mutual TLS is not being enforced (sprinter 0fd0449e8466)"
+            ),
+            Ok(Err(_)) | Err(_) => Ok(()), // handshake/IO failure or timeout: both are a rejection
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_verify_ca_rejects_a_certificate_from_another_ca() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let (ca_cert, _ca_key, _client_cert, _client_key) =
+            generate_ca_and_signed_cert(temp_dir.path(), "pg-server-ca")?;
+        // A second, unrelated CA signs this client's certificate.
+        let (_other_ca, _other_key, wrong_cert, wrong_key) =
+            generate_ca_and_signed_cert(temp_dir.path(), "pg-wrong-ca-client")?;
+        let addr = start_verify_ca_server(temp_dir.path(), &ca_cert).await?;
+
+        let client = client_with_certificate(&wrong_cert, &wrong_key)?;
+        let result = tokio::time::timeout(Duration::from_secs(10), login_over_tls(addr, client)).await;
+        match result {
+            Ok(Ok(())) => panic!("a certificate signed by an untrusted CA must not be accepted"),
+            Ok(Err(_)) | Err(_) => Ok(()),
+        }
+    }
+
+    /// Fail closed: `verify-ca` with no `ca_cert_path` must be REFUSED at
+    /// configuration time rather than silently degrading to "no client
+    /// authentication" — which is precisely the bug.
+    #[tokio::test]
+    async fn verify_ca_without_a_configured_ca_is_refused() -> Result<()> {
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let cert_path = temp_dir.path().join("server.crt");
+        let key_path = temp_dir.path().join("server.key");
+        CertificateManager::generate_self_signed(&cert_path, &key_path, "localhost")?;
+
+        let err = SslConfig::new(SslMode::VerifyCA, &cert_path, &key_path)
+            .validate()
+            .expect_err("verify-ca with no CA must not validate");
+        assert!(err.to_string().contains("ca_cert_path"), "got: {err}");
         Ok(())
     }
 }

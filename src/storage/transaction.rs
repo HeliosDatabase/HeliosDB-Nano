@@ -21,6 +21,26 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
+/// THE process-global transaction-id counter. ONE atomic, shared by EVERY
+/// `Transaction` constructor in this module.
+///
+/// sprinter 1b7141f517ce: this used to be TWO function-local statics — one
+/// inside [`Transaction::new`] (the embedded/global-slot path) and one inside
+/// [`Transaction::new_with_session`] (the per-session path) — each starting at
+/// 1. The very first embedded transaction and the very first session
+/// transaction in a process therefore both got `transaction_id = 1`, and every
+/// consumer that keys on this id treats them as ONE transaction:
+///
+/// * [`super::lock_manager::LockManager`] grants re-entrant access to the sole
+///   holder BY ID (`LockEntry::can_acquire`), so a session transaction could
+///   take a write lock a live embedded transaction was already holding;
+/// * the deadlock wait-for graph and every `txn_id = …` diagnostic conflate the
+///   two.
+///
+/// NEVER reintroduce a per-constructor counter. Any new constructor must draw
+/// from this static.
+static TXN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Transaction state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransactionState {
@@ -624,7 +644,8 @@ pub struct TransactionSavepointSnapshot {
 impl Transaction {
     /// Create a new transaction (backwards compatible)
     pub fn new(db: Arc<DB>, snapshot_id: SnapshotId, snapshot_manager: Arc<SnapshotManager>) -> Result<Self> {
-        static TXN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        // Module-scope [`TXN_COUNTER`] — shared with `new_with_session`. Read
+        // its doc comment before touching this.
         let transaction_id = TXN_COUNTER.fetch_add(1, Ordering::SeqCst);
 
         debug!(
@@ -689,6 +710,16 @@ impl Transaction {
     /// HDB-008: is this transaction in the aborted (failed) SQL state?
     pub fn is_sql_aborted(&self) -> bool {
         self.sql_aborted.load(Ordering::Acquire)
+    }
+
+    /// This transaction's process-global id — the key the lock manager, the
+    /// deadlock wait-for graph and every `txn_id = …` diagnostic use.
+    ///
+    /// Drawn from the single module-scope [`TXN_COUNTER`], so it is unique
+    /// across EVERY constructor for the life of the process (sprinter
+    /// 1b7141f517ce).
+    pub fn transaction_id(&self) -> u64 {
+        self.transaction_id
     }
 
     /// Attach the engine's TDE key manager so the commit batch seals the row
@@ -844,7 +875,9 @@ impl Transaction {
         lock_manager: Arc<LockManager>,
         dirty_tracker: Arc<DirtyTracker>,
     ) -> Result<Self> {
-        static TXN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        // Module-scope [`TXN_COUNTER`] — THE SAME atomic `Transaction::new`
+        // draws from, so an embedded and a session transaction can never share
+        // an id. Read its doc comment before touching this.
         let transaction_id = TXN_COUNTER.fetch_add(1, Ordering::SeqCst);
 
         debug!(
@@ -2640,5 +2673,70 @@ mod tests {
         let invalid_key = b"data:invalid".to_vec();
         let result = tx.get(&invalid_key);
         assert!(result.is_ok(), "Should handle invalid key format");
+    }
+
+    /// sprinter 1b7141f517ce: an embedded (global-slot) transaction and a
+    /// session transaction must never share a `transaction_id`.
+    ///
+    /// Lives here rather than in `tests/` because `Transaction::new_with_session`
+    /// needs `StorageEngine::db` (`pub(crate)`), which no integration test can
+    /// reach.
+    ///
+    /// Alternating the two constructors is what makes the pre-fix failure
+    /// DETERMINISTIC: with two independent per-constructor counters the
+    /// sequence is (E, 1, E+1, 2, …), so the strict-increase assertion fails on
+    /// the very first session id regardless of how many transactions other
+    /// tests in this binary have already created.
+    #[test]
+    fn embedded_and_session_transaction_ids_never_collide() {
+        // `IsolationLevel`, `SessionId`, `LockManager` and `DirtyTracker` all
+        // arrive through this module's `use super::*`.
+        use std::collections::HashSet;
+
+        let config = Config::in_memory();
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
+        let lock_manager = Arc::new(LockManager::new(5_000));
+        let dirty_tracker = Arc::new(DirtyTracker::new());
+
+        let mut ids: Vec<u64> = Vec::with_capacity(40);
+        for i in 0..20u64 {
+            let embedded = Transaction::new(
+                Arc::clone(&engine.db),
+                engine.next_timestamp(),
+                engine.snapshot_manager_arc(),
+            )
+            .expect("embedded transaction");
+            ids.push(embedded.transaction_id());
+
+            let session = Transaction::new_with_session(
+                Arc::clone(&engine.db),
+                engine.next_timestamp(),
+                engine.snapshot_manager_arc(),
+                SessionId(i + 1),
+                IsolationLevel::ReadCommitted,
+                Arc::clone(&lock_manager),
+                Arc::clone(&dirty_tracker),
+            )
+            .expect("session transaction");
+            ids.push(session.transaction_id());
+        }
+
+        // Pairwise distinct across BOTH constructors.
+        let unique: HashSet<u64> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "embedded and session transaction ids collided: {:?}",
+            ids
+        );
+
+        // One monotonic process-global sequence: the alternating draw can only
+        // be strictly increasing if BOTH constructors share the same atomic.
+        for (prev, next) in ids.iter().zip(ids.iter().skip(1)) {
+            assert!(
+                next > prev,
+                "transaction ids must come from ONE monotonic counter, saw {prev} then {next} in {ids:?}"
+            );
+        }
     }
 }

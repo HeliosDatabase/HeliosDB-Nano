@@ -10,7 +10,12 @@
 //! - Bug #7  psql \d <table> col-count (DEFERRED in v3.28, fixed here)
 //! - Bug #16 pg_database lists user-created tenants (\l shows them)
 
+use heliosdb_nano::protocol::postgres::server::{PgServer, PgServerConfig};
 use heliosdb_nano::{EmbeddedDatabase, Value};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::timeout;
+use tokio_postgres::{Client, NoTls};
 
 // ---------- Bug #13: schema-qualified "public"."tbl" -----------------------
 
@@ -88,18 +93,109 @@ fn extended_query_update_enforces_fk() {
 }
 
 // ---------- Bug #14: DO $$ ... EXCEPTION WHEN duplicate_object ... END $$ ---
-// (PG-wire only; embedded API doesn't have a DO-block surface, so we
-//  test the parser/handler logic indirectly via two scenarios that
-//  actually hit the helpers.)
+// DO blocks are a PG-WIRE surface — `handle_do_block` strips the `$$` wrapper
+// and runs the body statement-by-statement, and the EXCEPTION clause is what
+// makes drizzle-kit's idempotent migrations re-runnable. The embedded API has
+// no DO surface and the MySQL listener has none either (its translator strips
+// backticks and has no DO branch), so the only honest test is over the
+// PostgreSQL wire. This used to be a `let _ = body;` smoke stub that asserted
+// nothing at all.
 
-#[test]
-fn do_block_exception_split_helper() {
-    use heliosdb_nano::sql::Parser;
-    // Smoke-check that the parser at least doesn't choke on the bare
-    // DO body (the PL/pgSQL scaffolding is handled at the wire layer).
-    let body = "ALTER TABLE x ADD COLUMN y INT;";
-    let _ = Parser::new();
-    let _ = body;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A PostgreSQL wire listener over an in-memory database, plus the `Arc` the
+/// test reads the committed state back through.
+async fn pg_wire_server() -> (String, Arc<EmbeddedDatabase>, tokio::task::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test port");
+    let addr = listener.local_addr().expect("test addr");
+    drop(listener);
+
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let config = PgServerConfig::with_address(addr);
+    let server = PgServer::new(config, Arc::clone(&db)).expect("server");
+    let handle = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let conn = format!("host=127.0.0.1 port={} user=postgres dbname=postgres", addr.port());
+    (conn, db, handle)
+}
+
+async fn connect(conn_string: &str) -> Client {
+    let (client, connection) = timeout(CONNECT_TIMEOUT, tokio_postgres::connect(conn_string, NoTls))
+        .await
+        .expect("connect timeout")
+        .expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+}
+
+async fn simple_ok(client: &Client, sql: &str) {
+    timeout(QUERY_TIMEOUT, client.simple_query(sql))
+        .await
+        .unwrap_or_else(|_| panic!("query timeout: {sql}"))
+        .unwrap_or_else(|e| panic!("query failed: {sql}: {e}"));
+}
+
+async fn simple_err(client: &Client, sql: &str) -> tokio_postgres::Error {
+    timeout(QUERY_TIMEOUT, client.simple_query(sql))
+        .await
+        .unwrap_or_else(|_| panic!("query timeout: {sql}"))
+        .err()
+        .unwrap_or_else(|| panic!("expected an error from: {sql}"))
+}
+
+/// Bug #14, the shape drizzle-kit actually emits: every `ALTER` is wrapped so
+/// a second run of the same migration is a no-op.
+///
+/// ```sql
+/// DO $$ BEGIN
+///   ALTER TABLE "tasks" ADD CONSTRAINT "tasks_slug_uq" UNIQUE (slug);
+/// EXCEPTION WHEN duplicate_object THEN null;
+/// END $$;
+/// ```
+///
+/// The inner `ALTER` fails on the re-run (`constraint … already exists`) and
+/// the EXCEPTION clause swallows it, so the client must be told the block
+/// completed and the session must stay usable — the constraint is still there,
+/// still enforcing exactly once.
+#[tokio::test]
+async fn do_block_exception_when_duplicate_object_is_caught() {
+    let (conn_string, db, server_handle) = pg_wire_server().await;
+    let client = connect(&conn_string).await;
+
+    let create = r#"CREATE TABLE "tasks" (id integer PRIMARY KEY, slug text)"#;
+    let add_unique = r#"ALTER TABLE "tasks" ADD CONSTRAINT "tasks_slug_uq" UNIQUE (slug)"#;
+    let caught = r#"DO $$ BEGIN ALTER TABLE "tasks" ADD CONSTRAINT "tasks_slug_uq" UNIQUE (slug); EXCEPTION WHEN duplicate_object THEN null; END $$;"#;
+    let uncaught = r#"DO $$ BEGIN ALTER TABLE "tasks" ADD CONSTRAINT "tasks_slug_uq" UNIQUE (slug); EXCEPTION WHEN undefined_table THEN null; END $$;"#;
+
+    simple_ok(&client, create).await;
+    simple_ok(&client, add_unique).await;
+
+    // The re-run: the ALTER fails "already exists", `duplicate_object` names
+    // that condition, so the block itself must SUCCEED.
+    simple_ok(&client, caught).await;
+
+    // CONTROL: the clause is really consulted, not a blanket swallow — an
+    // exception name that does not cover "already exists" still reaches the
+    // client as an error.
+    let err = simple_err(&client, uncaught).await;
+    assert!(err.code().is_some(), "an unmatched exception must reach the client");
+
+    // The session is still usable, and the constraint the caught block tried
+    // to re-add is still installed exactly once.
+    simple_ok(&client, r#"INSERT INTO "tasks" VALUES (1, 'a')"#).await;
+    let dup = simple_err(&client, r#"INSERT INTO "tasks" VALUES (2, 'a')"#).await;
+    assert!(dup.code().is_some(), "the UNIQUE constraint must still reject a dup");
+
+    let rows = db.query(r#"SELECT slug FROM "tasks""#, &[]).expect("select slug");
+    assert_eq!(rows.len(), 1, "the rejected duplicate must not be stored");
+
+    server_handle.abort();
 }
 
 // ---------- Bug #16: pg_database catalog lists user-created tenants -------

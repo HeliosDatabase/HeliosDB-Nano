@@ -26,6 +26,11 @@ on:
   pull_request:
   push:
     branches: [main]
+    # Release tags. `integration-full` has always CLAIMED to run "on release tags"
+    # and never could: without this line no `v*` push ever reached this workflow, so
+    # its `github.event_name != 'pull_request'` guard only ever saw main-pushes,
+    # nightlies and manual runs. `internal-tests-execute` needs the same trigger.
+    tags: ['v*']
   schedule:
     - cron: '0 3 * * *'
   workflow_dispatch:
@@ -191,3 +196,78 @@ jobs:
         run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
       - name: internal-tests must compile
         run: cargo build --locked --features internal-tests --tests
+
+  # ---------------------------------------------------------------------------
+  # Tier 3b — EXECUTE the feature-gated suites. Nightly + `v*` tags + manual.
+  #
+  # Tier 3 proves those 15 files still COMPILE. It does not prove they still
+  # CONTAIN anything: a file whose `#[test]` functions disappear compiles cleanly
+  # and reports `ok. 0 passed`, which is precisely the rot docs/GATES.md §3b
+  # exists to catch and precisely what happened here before (six months of an
+  # unobserved tier). Until this job, the only thing that ever ran these ~206
+  # tests was a human's local gate.
+  #
+  # WHY NAMED TARGETS, NOT `--tests`. `internal-tests` appears nowhere under
+  # `src/` — it gates test FILES only — so running the other ~260 targets again
+  # under the feature reproduces `integration-full` exactly, for six more sharded
+  # jobs' worth of runner time and no additional signal. The list is derived from
+  # the source at run time, so a newly gated file is picked up without editing
+  # this workflow.
+  #
+  # The two `--skip`s are the same two documented pre-existing flakes the shard
+  # tier skips, kept so this command stays identical to the local gate command in
+  # docs/GATES.md §3b. Neither target is in the list below, so they are inert here.
+  # ---------------------------------------------------------------------------
+  internal-tests-execute:
+    name: internal-tests execute (nightly + tags)
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests-internal
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Run internal-tests suites
+        run: |
+          set -o pipefail
+          # `|| true` so a no-match grep (exit 1) cannot abort the step under
+          # `bash -e` + pipefail with no output at all: the floor check below is the
+          # diagnostic, and it can only speak if it is reached.
+          targets=$(grep -lE '^#!\[cfg\(.*internal-tests' tests/*.rs \
+                    | sed 's|^tests/||; s|\.rs$||' | sort || true)
+          n=$(echo "$targets" | wc -w)
+          echo "internal-tests targets ($n): $(echo $targets | tr '\n' ' ')"
+          # A floor, not an equality: adding a gated file must not red-light CI, but a
+          # broken glob quietly shrinking the set to nothing must — "a tier reported
+          # green having run almost nothing" is the exact failure this job prevents.
+          if [ "$n" -lt 15 ]; then
+            echo "::error::expected at least 15 internal-tests targets, found $n"
+            exit 1
+          fi
+          args=$(echo "$targets" | awk '{printf "--test %s ", $0}')
+          cargo test --locked --no-fail-fast --features internal-tests $args -- \
+            --skip ha_tests::streaming_tests --skip lock_management 2>&1 | tee internal.log
+      # The STRICT check from the smoke tier, not the shard tier's allowlist. Every
+      # target above is gated on the feature this job turns ON, so each one is
+      # supposed to run tests here; `.github/expected-empty-suites.txt` lists them
+      # only because they are empty under the DEFAULT feature set, and consulting it
+      # here would suppress the one signal this job exists to produce.
+      - name: No empty suites
+        run: |
+          if awk '/^     Running/{s=$2}
+                  /^test result: ok\. 0 passed; 0 failed; 0 ignored/{print "EMPTY:", s; f=1}
+                  END{exit f}' internal.log; then
+            echo "no empty suites"
+          else
+            echo "::error::a named suite executed zero tests — see EMPTY: lines above"
+            exit 1
+          fi

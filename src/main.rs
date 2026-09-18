@@ -310,13 +310,15 @@ enum Commands {
         pg_socket_dir: Option<PathBuf>,
 
         /// Maximum concurrent client connections PER LISTENER (the PostgreSQL
-        /// TCP, MySQL TCP and MySQL Unix-socket listeners each get their own
-        /// limit of this size). Default 100 (`[server] max_connections`; this
-        /// flag wins over the config file). When the limit is reached the
-        /// server ACCEPTS the TCP connection and closes it immediately without
-        /// a PostgreSQL error packet, logging `Connection limit reached (N),
-        /// rejecting <addr>` at WARN. Raise it for fleets that pool many
-        /// connections; `SHOW max_connections` reports the effective value.
+        /// TCP, PostgreSQL Unix-socket, MySQL TCP and MySQL Unix-socket
+        /// listeners each get their own limit of this size). Default 100
+        /// (`[server] max_connections`; this flag wins over the config file).
+        /// When the limit is reached the server ACCEPTS the connection and
+        /// closes it immediately without a PostgreSQL error packet, logging
+        /// `Connection limit reached (N), rejecting <addr>` at WARN (the
+        /// Unix-socket loops name the listener instead of an address). Raise it
+        /// for fleets that pool many connections; `SHOW max_connections`
+        /// reports the effective value.
         #[arg(long)]
         max_connections: Option<usize>,
 
@@ -585,8 +587,7 @@ async fn main() -> Result<()> {
             }
             if mysql_tls_cert.is_some() != mysql_tls_key.is_some() {
                 return Err(Error::config(
-                    "Both --mysql-tls-cert and --mysql-tls-key must be specified together for MySQL TLS."
-                        .to_string(),
+                    "Both --mysql-tls-cert and --mysql-tls-key must be specified together for MySQL TLS.".to_string(),
                 ));
             }
 
@@ -1172,10 +1173,9 @@ async fn start_server(
             .map_err(|e| Error::config(format!("Invalid MySQL listen address '{}': {}", mysql_listen, e)))?;
 
         let mysql_tls_enabled = mysql_tls_cert.is_some();
-        let mut mysql_server_config =
-            heliosdb_nano::protocol::mysql::MysqlServerConfig::with_address(mysql_addr)
-                .with_max_connections(max_connections)
-                .with_timeouts(connection_policy.clone());
+        let mut mysql_server_config = heliosdb_nano::protocol::mysql::MysqlServerConfig::with_address(mysql_addr)
+            .with_max_connections(max_connections)
+            .with_timeouts(connection_policy.clone());
         if let (Some(cert_path), Some(key_path)) = (&mysql_tls_cert, &mysql_tls_key) {
             let mysql_ssl_config = heliosdb_nano::protocol::mysql::MysqlSslConfig::new(cert_path, key_path)
                 .with_post_quantum(mysql_tls_post_quantum);
@@ -1287,6 +1287,15 @@ async fn start_server(
         let _ = std::fs::remove_file(&sock_path);
         let pg_db = Arc::clone(&db);
         let policy = connection_policy.clone();
+        // sprinter dfc3d6f2c341: the same `max_connections` cap the TCP
+        // listener enforces (`PgServer::serve`) and the MySQL UDS loop above
+        // already had. Without it a local client could open connections
+        // without limit on this listener — past `max_connections`, and on to
+        // file-descriptor and memory exhaustion — while `SHOW max_connections`
+        // still reported the limit. Per-listener, like every other limiter
+        // here (`--max-connections` documents that).
+        let pg_uds_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(max_connections));
+        let pg_uds_warned = std::sync::atomic::AtomicBool::new(false);
         info!("PostgreSQL Unix socket listening on {}", sock_path.display());
         println!("    psql (UDS):  psql -h {} -p {}", sock_dir.display(), port);
         Some(tokio::spawn(async move {
@@ -1297,15 +1306,46 @@ async fn start_server(
                     return;
                 }
             };
+            // EXPLICIT mode rather than whatever the process umask happens to
+            // be (sprinter dfc3d6f2c341). 0o777 is PostgreSQL's own default
+            // for `unix_socket_permissions` — the socket is the local
+            // equivalent of a listening port and authentication still applies —
+            // so this pins the documented default in place, it does not
+            // tighten or loosen anything. There is no config knob for it yet;
+            // add one here if a deployment needs 0o770 with a socket group.
             let _ = std::fs::set_permissions(&sock_path, std::os::unix::fs::PermissionsExt::from_mode(0o777));
             let conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2_000_000));
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
+                        // Acquire BEFORE spawning, and close the socket when
+                        // the limit is reached — the exact shape (and the
+                        // same WARN) as the TCP accept loop in
+                        // `PgServer::serve` and the MySQL UDS loop above.
+                        let permit = match Arc::clone(&pg_uds_limiter).try_acquire_owned() {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                tracing::warn!("PG UDS connection limit reached ({}), rejecting", max_connections);
+                                drop(stream);
+                                continue;
+                            }
+                        };
+                        warn_listener_utilisation(
+                            "PostgreSQL UDS",
+                            &pg_uds_warned,
+                            &pg_uds_limiter,
+                            max_connections,
+                            &policy,
+                        );
                         let db_clone = Arc::clone(&pg_db);
                         let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let conn_policy = policy.clone();
+                        // `_permit` is declared FIRST so it drops LAST — after
+                        // the handler's `Drop` has rolled back and released the
+                        // session — and it is never cloned: the slot is
+                        // released exactly once.
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) =
                                 heliosdb_nano::protocol::postgres::handler::handle_connection_unix_with_timeouts(
                                     db_clone,

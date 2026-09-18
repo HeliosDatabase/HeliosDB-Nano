@@ -4343,6 +4343,32 @@ impl EmbeddedDatabase {
             return Err(Error::query_execution(msg));
         }
 
+        // sprinter 4c1cf9054f0f: the definition below is bincode-persisted by
+        // `Catalog::save_trigger` (and WAL-logged), and bincode CANNOT carry
+        // `Project::source_alias` — the derived-table/view alias stamp a
+        // qualified reference like `s.id` resolves through at runtime is
+        // `#[serde(skip)]`. A body plan that still needed the stamp would work
+        // in-process and then fail with "Column s.id not found" against the
+        // record reloaded by `Catalog::load_all_triggers` after a restart.
+        //
+        // CREATE MATERIALIZED VIEW already solves exactly this, one line, on
+        // the plan it is about to serialize (`sql/executor/phase3.rs`):
+        //
+        //     let optimized_query = optimized_query.destamp_source_aliases()?;
+        //
+        // Same transform here, once per statement in the body, BEFORE the
+        // definition is built — so the stored bytes are self-sufficient and no
+        // reload-time re-stamping step is needed (the MV reload path has none
+        // either). The shadowed shape the rewrite cannot express is refused
+        // here with 0A000 and the workaround named, exactly as at CREATE
+        // MATERIALIZED VIEW: a body this gets wrong fails at CREATE TRIGGER,
+        // never at a later restart.
+        let body: Vec<sql::LogicalPlan> = body
+            .iter()
+            .cloned()
+            .map(|plan| plan.destamp_source_aliases())
+            .collect::<Result<Vec<_>>>()?;
+
         let definition = sql::triggers::TriggerDefinition {
             name: name.to_string(),
             table_name: table_name.to_string(),
@@ -4350,7 +4376,7 @@ impl EmbeddedDatabase {
             events: events.to_vec(),
             for_each: for_each.clone(),
             when_condition: when_condition.clone(),
-            body: body.to_vec(),
+            body,
             enabled: true,
             created_at: Self::routine_created_at_millis(),
             referencing: referencing.to_vec(),
@@ -6553,10 +6579,20 @@ impl EmbeddedDatabase {
                                                 existing_row_id,
                                                 &new_col_values,
                                             ) {
-                                                tracing::debug!(
-                                                    "ART index on-conflict/insert-new for '{}': {}",
+                                                // sprinter fa2d11f140fe: the
+                                                // updated row was written by
+                                                // the `txn.put` above, so a
+                                                // refusal on the re-insert half
+                                                // means a STORED row that this
+                                                // index can no longer find (its
+                                                // old entry was just removed) —
+                                                // the documented stored-despite-
+                                                // a-refused-index contract, not
+                                                // a `debug!` nobody enables.
+                                                storage::StorageEngine::note_index_maintenance_failure(
                                                     table_name,
-                                                    e
+                                                    existing_row_id,
+                                                    &e,
                                                 );
                                             }
                                             self.push_art_undo(
@@ -8215,6 +8251,13 @@ impl EmbeddedDatabase {
                 }
                 // Clear ART indexes for this table (will be rebuilt if transaction commits)
                 self.storage.art_indexes().clear_table_indexes(table_name);
+                // sprinter 29ecb34e3245 (same hazard as the DROP TABLE purge in
+                // ddl.rs): the rows these bloom filters / zone maps summarise are
+                // gone, and nothing rebuilds them incrementally, so a surviving
+                // structure would keep pruning against the PRE-truncate contents
+                // once rows are re-inserted. This inlined text arm is a separate
+                // TRUNCATE path from `ddl::handle_truncate` and needs its own purge.
+                self.storage.predicate_pushdown().remove_table(table_name);
                 // DDL-like contract (PostgreSQL parity): TRUNCATE reports no
                 // affected-row count, in or out of a transaction.
                 tracing::debug!(
@@ -12027,8 +12070,58 @@ impl EmbeddedDatabase {
         // parent TABLE but never its COLUMNS, so `REFERENCES parent(no_such_col)`
         // was accepted and enforced nothing).
         let catalog = self.storage.catalog();
-        catalog.get_table_schema(table_name)?;
+        let child_schema = catalog.get_table_schema(table_name)?;
         Self::validate_fk_reference(&catalog, references_table, columns, references_columns)?;
+        // sprinter ad6a982e16d5: the REFERENCING (child) columns, checked
+        // against the child's own schema. The parent side has been validated
+        // since GH#27; this side never was, so `ALTER TABLE c ADD FOREIGN KEY
+        // (nosuch) REFERENCES p(id)` was accepted and persisted a constraint
+        // that enforces nothing (the write path resolves the referencing
+        // column by name and finds none). PostgreSQL's message and SQLSTATE
+        // (42703), the same one the referenced side reports.
+        //
+        // AFTER `validate_fk_reference`, so a statement wrong on both sides
+        // keeps GH#27's parent-first ordering. Note the ADD COLUMN shorthand
+        // (`ADD COLUMN p INT REFERENCES parent(id)`, planned as `[AddColumn,
+        // AddForeignKey]`) is safe: the sub-plans run in order, so the column
+        // exists in `child_schema` by the time this runs. That is also why
+        // `execute_alter_table_multi`'s pre-pass stays PARENT-side only.
+        for col in columns {
+            if !child_schema.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
+                return Err(Self::fk_column_does_not_exist(col));
+            }
+        }
+        // sprinter 7a0a2ba2c8c3: an EXPLICIT constraint name must not collide
+        // with a constraint the table already has. PostgreSQL keeps ONE
+        // namespace per relation for FK / CHECK / UNIQUE / PRIMARY KEY names
+        // and reports `constraint "x" for relation "t" already exists` (42710
+        // duplicate_object); this accepted the duplicate and appended a second
+        // constraint under the same name, after which `ALTER TABLE … DROP
+        // CONSTRAINT x` (which matches by name) removed BOTH, and
+        // `information_schema.table_constraints` listed one name twice.
+        //
+        // Only an explicit name is checked. An OMITTED name is minted by
+        // `generate_unique_name` below, which already dedups against the FKs
+        // on this table.
+        if let Some(name) = constraint_name {
+            let existing = catalog.load_table_constraints(table_name)?;
+            let collides = existing
+                .foreign_keys
+                .iter()
+                .map(|c| c.name.as_str())
+                .chain(existing.check_constraints.iter().map(|c| c.name.as_str()))
+                .chain(existing.unique_constraints.iter().map(|c| c.name.as_str()))
+                // Case-insensitive, like `alter_table_drop_constraint`'s
+                // lookup: a name that DROP CONSTRAINT would match is a name
+                // this table already has.
+                .any(|existing_name| existing_name.eq_ignore_ascii_case(name));
+            if collides {
+                return Err(Error::query_execution(format!(
+                    "constraint \"{}\" for relation \"{}\" already exists",
+                    name, table_name
+                )));
+            }
+        }
 
         let fk_name = constraint_name.clone().unwrap_or_else(|| {
             // Dedup the auto-name against the FKs already on this table:
@@ -21096,7 +21189,17 @@ impl EmbeddedDatabase {
         if self.storage.get_current_branch_id().is_none() {
             for (row_id, col_values) in art_updates {
                 if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
-                    tracing::debug!("ART on_insert {}: {}", table_name, e);
+                    // sprinter fa2d11f140fe: every row of this bulk path was
+                    // `put()` unconditionally in the loop above, so a refusal
+                    // here is the documented stored-despite-a-refused-index
+                    // contract — a duplicate the constraint did not stop, or a
+                    // row an index cannot find. It cannot be turned into an
+                    // error (the rows are written), so the ONE thing it must be
+                    // is visible: this was `tracing::debug!`, off in every
+                    // shipped configuration, which made a silently unindexed
+                    // row indistinguishable from a healthy insert. Same
+                    // ERROR/WARN helper the other stored-row funnels use.
+                    storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
                 }
             }
         }
@@ -21985,10 +22088,7 @@ impl EmbeddedDatabase {
             .map_err(|_| Error::query_execution(format!("relation \"{}\" does not exist", references_table)))?;
         for col in referenced_columns {
             if !parent.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
-                return Err(Error::query_execution(format!(
-                    "column \"{}\" referenced in foreign key constraint does not exist",
-                    col
-                )));
+                return Err(Self::fk_column_does_not_exist(col));
             }
         }
         let referenced_count = if referenced_columns.is_empty() {
@@ -22004,6 +22104,19 @@ impl EmbeddedDatabase {
             return Err(Self::fk_arity_error());
         }
         Ok(())
+    }
+
+    /// PostgreSQL's wording for a foreign-key column — on EITHER side — that
+    /// the relation it is supposed to live on does not have. `tablecmds.c`
+    /// uses this one message for the referencing list and the referenced list
+    /// alike, and so do we. SQLSTATE 42703 undefined_column on the wire: the
+    /// `column "` shape is what `sqlstate_for_query_execution_message` anchors
+    /// the column arms on.
+    fn fk_column_does_not_exist(column: &str) -> Error {
+        Error::query_execution(format!(
+            "column \"{}\" referenced in foreign key constraint does not exist",
+            column
+        ))
     }
 
     /// PostgreSQL's `transformFkeyGetPrimaryKey` diagnostic: a list-less
@@ -22068,10 +22181,7 @@ impl EmbeddedDatabase {
             if Self::fk_targets_self(table_name, references_table) {
                 for col in references_columns {
                     if !columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
-                        return Err(Error::query_execution(format!(
-                            "column \"{}\" referenced in foreign key constraint does not exist",
-                            col
-                        )));
+                        return Err(Self::fk_column_does_not_exist(col));
                     }
                 }
                 let referenced_count = if references_columns.is_empty() {
@@ -22086,9 +22196,26 @@ impl EmbeddedDatabase {
                 if fk_columns.len() != referenced_count {
                     return Err(Self::fk_arity_error());
                 }
-                continue;
+            } else {
+                Self::validate_fk_reference(catalog, references_table, fk_columns, references_columns)?;
             }
-            Self::validate_fk_reference(catalog, references_table, fk_columns, references_columns)?;
+            // sprinter ad6a982e16d5: the REFERENCING (child) columns, checked
+            // against the columns this CREATE TABLE declares. NOTHING checked
+            // them before — `validate_fk_reference` only ever looked at the
+            // parent — so `FOREIGN KEY (nosuch) REFERENCES p(id)` was accepted
+            // and PERSISTED, and the constraint it left behind enforced
+            // nothing: the write path resolves the referencing column by name,
+            // finds none, and has no value to probe the parent with. PostgreSQL
+            // refuses it at DDL time with this same message (42703).
+            //
+            // Deliberately AFTER the parent side, so the orders GH#27 pinned
+            // are untouched: a statement that is wrong on both sides still
+            // reports 42P01 / 42704 / 42830 first, exactly as before.
+            for col in fk_columns {
+                if !columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)) {
+                    return Err(Self::fk_column_does_not_exist(col));
+                }
+            }
         }
         Ok(())
     }

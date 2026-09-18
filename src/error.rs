@@ -55,6 +55,27 @@ pub const COMMIT_OF_FAILED_TRANSACTION_MESSAGE: &str =
     "current transaction is aborted, COMMIT rolled it back and nothing was committed; \
      issue the transaction again";
 
+/// The marker carried by the planner's "this statement kind has no plan"
+/// refusal (`Planner::statement_to_plan`'s final arm).
+///
+/// Two things anchor on it, which is why it is a shared const rather than a
+/// literal at the raise site:
+///
+/// * the PostgreSQL wire maps it to `0A000 feature_not_supported` in
+///   `sqlstate_for_query_execution_message`, and
+/// * the MySQL wire maps it to ER_NOT_SUPPORTED_YET / SQLSTATE `0A000` in
+///   `map_error_code`,
+///
+/// instead of the generic `XX000 internal_error` / `1105 HY000` both used to
+/// report. XX000 is what PgBouncer, pgpool and HA proxies read as "this
+/// backend is broken", and they may answer it by dropping the backend — for a
+/// statement the server merely has not implemented yet.
+///
+/// The message that carries it names only the statement KIND (and, for the
+/// kinds that carry exactly one, the object the user wrote); the sqlparser AST
+/// it used to interpolate with `{:?}` stays at DEBUG level.
+pub const UNSUPPORTED_STATEMENT_KIND_MARKER: &str = "is not supported by HeliosDB Nano";
+
 /// Database error type
 ///
 /// All errors from HeliosDB Lite operations are represented by this enum.

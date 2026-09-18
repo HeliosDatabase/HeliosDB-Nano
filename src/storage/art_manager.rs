@@ -1837,14 +1837,36 @@ impl ArtIndexManager {
     }
 
     /// The error a [`RowState::Stored`] refusal reports: the constraint, the
-    /// row, and the original refusal in ONE message.
+    /// row, and the original refusal in ONE message — for a GENUINE duplicate
+    /// key, and for nothing else.
     ///
     /// Its caller can only LOG this (the row is already stored, or is stored
     /// regardless), so everything an operator needs to find the stored duplicate
     /// has to be inside the message — which index refused, which row, and that
     /// the row is there anyway. Kept a `DuplicateKey` so that a path which does
     /// convert it still maps to SQLSTATE 23505.
+    ///
+    /// # Every other kind passes through unchanged (sprinter fa2d11f140fe)
+    ///
+    /// This used to wrap the LOT — [`ArtIndexError::NullPrimaryKey`],
+    /// [`ArtIndexError::Internal`] (a corrupt tree), anything an enforcing
+    /// index can answer — in `DuplicateKey` carrying the "the table now holds a
+    /// duplicate" label. Two things went wrong with that. The operator was told
+    /// a duplicate exists when none does (and the real fault — a NULL primary
+    /// key, a broken node — was buried inside the wrapper's text); and
+    /// `StorageEngine::note_index_maintenance_failure`, which branches on
+    /// `DuplicateKey` to choose ERROR-with-duplicate-advice over
+    /// WARN-with-rebuild-advice, took that branch for every one of them. A
+    /// caller that converts the error instead of logging it had the same
+    /// problem one layer up: 23505 unique_violation for a refusal that is not
+    /// one.
+    ///
+    /// Nothing is lost by keeping the original kind: every caller's log line
+    /// already carries the table and the row id.
     fn stored_duplicate_error(index_name: &str, row_id: RowId, err: &ArtIndexError) -> ArtIndexError {
+        if !matches!(err, ArtIndexError::DuplicateKey(_)) {
+            return err.clone();
+        }
         ArtIndexError::DuplicateKey(format!(
             "index \"{index_name}\" refused the key of row {row_id}, which is stored anyway ({err}) — \
              that index cannot find this row, and its entry belongs to the row that claimed the value first"
@@ -2744,7 +2766,10 @@ impl ArtIndexManager {
                 tracing::error!(
                     "ART index maintenance refused a committed row of table '{}': {} — the row stays in \
                      the heap, so a full scan and an indexed lookup now disagree for it. The ART is \
-                     rebuilt from `data:` when the database is next opened; reopen to restore agreement.",
+                     rebuilt from `data:` when the database is next opened, which restores agreement \
+                     for a transient failure; a refusal the rebuild meets again — a stored duplicate \
+                     above all — does not clear, and persists until one of the rows is explicitly \
+                     removed and the index rebuilt.",
                     table,
                     e
                 );
@@ -4570,5 +4595,44 @@ mod tests {
                 "*** ROW UNINDEXED *** batch NULL row {id} lost its PRIMARY KEY entry"
             );
         }
+    }
+
+    /// sprinter fa2d11f140fe: `stored_duplicate_error` labels a stored
+    /// DUPLICATE, and must relabel nothing else. A NULL primary key and a
+    /// corrupt-tree `Internal` are not duplicates, and
+    /// `StorageEngine::note_index_maintenance_failure` picks both its severity
+    /// and its recovery advice off exactly this variant.
+    ///
+    /// FAILS on the pre-fix tree: every kind came back as `DuplicateKey`
+    /// carrying the "the table now holds a duplicate" label.
+    #[test]
+    fn stored_duplicate_error_relabels_only_a_duplicate_key() {
+        let null_pk = ArtIndexManager::stored_duplicate_error("t_pkey", 7, &ArtIndexError::NullPrimaryKey);
+        assert_eq!(
+            null_pk,
+            ArtIndexError::NullPrimaryKey,
+            "*** RELABELLED *** a NULL primary key was reported as a stored duplicate"
+        );
+
+        let corrupt = ArtIndexError::Internal("corrupt node".to_string());
+        let internal = ArtIndexManager::stored_duplicate_error("t_pkey", 7, &corrupt);
+        assert_eq!(
+            internal, corrupt,
+            "*** RELABELLED *** a corrupt-tree error was reported as a stored duplicate"
+        );
+
+        // Control: a genuine duplicate still gets the stored-duplicate label,
+        // with the index, the row and the "stored anyway" fact in the message.
+        let refusal = ArtIndexError::DuplicateKey("v = 1".to_string());
+        let dup = ArtIndexManager::stored_duplicate_error("t_v_unique", 9, &refusal);
+        assert!(
+            matches!(dup, ArtIndexError::DuplicateKey(_)),
+            "a genuine duplicate lost its DuplicateKey kind"
+        );
+        let message = dup.to_string();
+        assert!(message.contains("t_v_unique"), "{message}");
+        assert!(message.contains("row 9"), "{message}");
+        assert!(message.contains("stored anyway"), "{message}");
+        assert!(message.contains("v = 1"), "{message}");
     }
 }

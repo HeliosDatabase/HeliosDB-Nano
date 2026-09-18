@@ -203,7 +203,12 @@ async fn plaintext_login(addr: SocketAddr) -> Result<()> {
     let (_seq, ok_payload) = read_packet(&mut stream)
         .await
         .map_err(|e| heliosdb_nano::Error::network(format!("OK read failed: {}", e)))?;
-    assert_eq!(ok_payload.first().copied(), Some(0x00), "expected an OK packet (0x00), got {:?}", ok_payload);
+    assert_eq!(
+        ok_payload.first().copied(),
+        Some(0x00),
+        "expected an OK packet (0x00), got {:?}",
+        ok_payload
+    );
     Ok(())
 }
 
@@ -239,10 +244,7 @@ async fn tls_login(addr: SocketAddr, cfg: Arc<ClientConfig>) -> Result<rustls::N
         .ok_or_else(|| heliosdb_nano::Error::network("no key-exchange group negotiated".to_string()))?
         .name();
 
-    let response = build_handshake_response(
-        CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_SSL,
-        "test_user",
-    );
+    let response = build_handshake_response(CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_SSL, "test_user");
     write_packet(&mut tls_stream, 2, &response)
         .await
         .map_err(|e| heliosdb_nano::Error::network(format!("handshake response write failed: {}", e)))?;
@@ -250,7 +252,12 @@ async fn tls_login(addr: SocketAddr, cfg: Arc<ClientConfig>) -> Result<rustls::N
     let (_seq, ok_payload) = read_packet(&mut tls_stream)
         .await
         .map_err(|e| heliosdb_nano::Error::network(format!("OK read failed: {}", e)))?;
-    assert_eq!(ok_payload.first().copied(), Some(0x00), "expected an OK packet (0x00), got {:?}", ok_payload);
+    assert_eq!(
+        ok_payload.first().copied(),
+        Some(0x00),
+        "expected an OK packet (0x00), got {:?}",
+        ok_payload
+    );
 
     Ok(group)
 }
@@ -336,7 +343,10 @@ async fn query_ssl_kx_group<S: AsyncRead + AsyncWrite + Unpin>(stream: &mut S) -
 /// TLS client that logs in AND reports the SQL-visible `@@ssl_kx_group`
 /// value, so a test can assert it agrees with what the client itself
 /// negotiated (`tls_stream`'s own `negotiated_key_exchange_group()`).
-async fn tls_login_and_query_kx_group(addr: SocketAddr, cfg: Arc<ClientConfig>) -> Result<(rustls::NamedGroup, String)> {
+async fn tls_login_and_query_kx_group(
+    addr: SocketAddr,
+    cfg: Arc<ClientConfig>,
+) -> Result<(rustls::NamedGroup, String)> {
     let mut stream = TcpStream::connect(addr)
         .await
         .map_err(|e| heliosdb_nano::Error::network(format!("connect failed: {}", e)))?;
@@ -365,10 +375,7 @@ async fn tls_login_and_query_kx_group(addr: SocketAddr, cfg: Arc<ClientConfig>) 
         .ok_or_else(|| heliosdb_nano::Error::network("no key-exchange group negotiated".to_string()))?
         .name();
 
-    let response = build_handshake_response(
-        CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_SSL,
-        "test_user",
-    );
+    let response = build_handshake_response(CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_SSL, "test_user");
     write_packet(&mut tls_stream, 2, &response)
         .await
         .map_err(|e| heliosdb_nano::Error::network(format!("handshake response write failed: {}", e)))?;
@@ -376,7 +383,12 @@ async fn tls_login_and_query_kx_group(addr: SocketAddr, cfg: Arc<ClientConfig>) 
     let (_seq, ok_payload) = read_packet(&mut tls_stream)
         .await
         .map_err(|e| heliosdb_nano::Error::network(format!("OK read failed: {}", e)))?;
-    assert_eq!(ok_payload.first().copied(), Some(0x00), "expected an OK packet (0x00), got {:?}", ok_payload);
+    assert_eq!(
+        ok_payload.first().copied(),
+        Some(0x00),
+        "expected an OK packet (0x00), got {:?}",
+        ok_payload
+    );
 
     let reported = query_ssl_kx_group(&mut tls_stream).await?;
     Ok((group, reported))
@@ -461,7 +473,12 @@ async fn plaintext_connection_reports_empty_ssl_kx_group() -> Result<()> {
 fn generate_ca_and_signed_cert(
     dir: &std::path::Path,
     leaf_cn: &str,
-) -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+) -> Result<(
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    std::path::PathBuf,
+)> {
     let run = |args: &[&str]| -> Result<()> {
         let output = std::process::Command::new("openssl")
             .args(args)
@@ -550,20 +567,17 @@ fn generate_ca_and_signed_cert(
 
 /// TLS client that, in addition to verifying the server cert, presents its
 /// OWN certificate/key for mutual TLS.
-async fn mtls_login(
-    addr: SocketAddr,
-    client_cert: &std::path::Path,
-    client_key: &std::path::Path,
-) -> Result<()> {
+async fn mtls_login(addr: SocketAddr, client_cert: &std::path::Path, client_key: &std::path::Path) -> Result<()> {
     use rustls_pemfile::{certs, pkcs8_private_keys};
     use std::fs::File;
     use std::io::BufReader;
 
-    let cert_chain: Vec<_> = certs(&mut BufReader::new(
-        File::open(client_cert).map_err(|e| heliosdb_nano::Error::io(format!("open client cert: {}", e)))?,
-    ))
-    .collect::<std::result::Result<Vec<_>, _>>()
-    .map_err(|e| heliosdb_nano::Error::io(format!("parse client cert: {}", e)))?;
+    let cert_chain: Vec<_> =
+        certs(&mut BufReader::new(File::open(client_cert).map_err(|e| {
+            heliosdb_nano::Error::io(format!("open client cert: {}", e))
+        })?))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| heliosdb_nano::Error::io(format!("parse client cert: {}", e)))?;
     let mut keys: Vec<_> = pkcs8_private_keys(&mut BufReader::new(
         File::open(client_key).map_err(|e| heliosdb_nano::Error::io(format!("open client key: {}", e)))?,
     ))
@@ -589,8 +603,7 @@ async fn mtls_login(
 async fn mtls_client_with_ca_signed_cert_succeeds() -> Result<()> {
     let temp_dir = tempfile::TempDir::new().expect("temp dir");
     let (_certs_dir, cert_path, key_path) = setup_test_certs()?;
-    let (ca_cert, _ca_key, client_cert, client_key) =
-        generate_ca_and_signed_cert(temp_dir.path(), "test-client")?;
+    let (ca_cert, _ca_key, client_cert, client_key) = generate_ca_and_signed_cert(temp_dir.path(), "test-client")?;
 
     let ssl = MysqlSslConfig::new(&cert_path, &key_path).with_client_cert_verification(&ca_cert);
     let addr = start_mysql_server(Some(ssl)).await?;

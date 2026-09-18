@@ -198,6 +198,16 @@ fn process_string_interior(out: &mut String, rest: &str, quote_char: char) -> us
 /// Returns true after: VALUES (, SET x =, DEFAULT ', etc.
 /// Returns false after: FROM, TABLE, INTO, JOIN (where " would be an identifier quote).
 fn looks_like_mysql_string_context(out: &str) -> bool {
+    // sprinter 57416d9c follow-up: `CREATE TABLE t ("Id" INT, ...)` was
+    // misread as a string context — `(` and `,` are ALSO how a VALUES/IN
+    // list starts a string, and the check below has no other way to tell
+    // them apart. Inside a CREATE TABLE's column/constraint list, `"` is
+    // always a quoted identifier, never a MySQL string literal, regardless
+    // of what immediately precedes it.
+    if in_create_table_column_list(out) {
+        return false;
+    }
+
     let trimmed = out.trim_end();
     // After these, double-quoted value is a string literal
     trimmed.ends_with('(')
@@ -210,6 +220,35 @@ fn looks_like_mysql_string_context(out: &str) -> bool {
         || trimmed.to_uppercase().ends_with("WHERE")
         || trimmed.to_uppercase().ends_with("AND")
         || trimmed.to_uppercase().ends_with("OR")
+}
+
+/// Are we currently inside a `CREATE [TEMPORARY] TABLE name (...)` statement's
+/// top-level column/constraint list?
+///
+/// Tracks paren depth from the first `(` that opens the list. A `DEFAULT
+/// '(literal)'` inside an already-processed (and already single-quoted)
+/// string can throw the count off by whatever parens it happens to contain,
+/// but that does not matter here: the only thing this gates is whether a
+/// following `"` is a string delimiter, and nothing in a CREATE TABLE
+/// statement needs that treatment inside the list either way.
+fn in_create_table_column_list(out: &str) -> bool {
+    static PREAMBLE_RE: OnceLock<Regex> = OnceLock::new();
+    let re = PREAMBLE_RE.get_or_init(|| {
+        Regex::new(r#"(?is)^\s*CREATE\s+(TEMPORARY\s+)?TABLE\s+(IF\s+NOT\s+EXISTS\s+)?[^\s(]+\s*\("#)
+            .unwrap_or_else(|_| Regex::new("^$").expect("static regex"))
+    });
+    let Some(m) = re.find(out) else {
+        return false;
+    };
+    let mut depth = 1i32;
+    for ch in out[m.end()..].chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth >= 1
 }
 
 // ---------------------------------------------------------------------------
