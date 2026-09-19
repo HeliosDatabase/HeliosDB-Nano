@@ -28,13 +28,33 @@ thread_local! {
     static CURRENT_USER_ID: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Get current tenant ID from thread-local storage (for SQL functions)
+/// The tenant id `current_tenant()` / `current_tenant_id()` answers — the
+/// functions an RLS policy is normally written against (`tenant_id =
+/// current_tenant_id()`).
+///
+/// sprinter d03de7fc3b22: the SESSION's binding first, the thread-local second.
+/// The thread-local is written only by [`TenantManager::set_current_context`],
+/// i.e. by the REPL's `\tenant use` and by embedded callers, so on its own it
+/// answers `NULL` for every wire connection. That failed CLOSED (`tenant_id =
+/// NULL` is NULL, and the row is filtered out) rather than open, but "a bound
+/// connection sees none of its own rows" is not enforcement either — and it
+/// would have made the session binding and the policy predicate disagree about
+/// which tenant the connection is.
 pub fn get_current_tenant_id() -> Option<Uuid> {
+    if let Some(bound) = crate::session_tenant_id_tls() {
+        return Some(bound);
+    }
     CURRENT_TENANT_ID.with(|id| *id.borrow())
 }
 
-/// Get current user ID from thread-local storage (for SQL functions)
+/// The user id `current_tenant_user()` answers. Same two layers, same order and
+/// the same reason as [`get_current_tenant_id`] — a policy that mixes the two
+/// (`tenant_id = current_tenant_id() AND owner = current_tenant_user()`) must
+/// not resolve one from the connection and the other from a global.
 pub fn get_current_user_id() -> Option<String> {
+    if let Some(bound) = crate::session_tenant_binding_tls() {
+        return Some(bound.user_id);
+    }
     CURRENT_USER_ID.with(|id| id.borrow().clone())
 }
 
@@ -897,9 +917,26 @@ impl TenantManager {
             .store((qps_window.as_millis() as u64).max(1), Ordering::Relaxed);
     }
 
-    /// Register a new tenant with a plan
+    /// Register a new tenant on the DEFAULT plan.
+    ///
+    /// sprinter d03de7fc3b22: this used to hard-code `"free"`, whose limits are
+    /// `max_qps: 10` and `max_connections: 5`. That contradicted the rest of
+    /// this type — `PlanManager` models a default plan explicitly (`is_default`
+    /// / [`PlanManager::get_default_plan`]) and
+    /// [`Self::register_tenant_with_plan`] already resolves an unknown or
+    /// disabled plan id to it — so the overload that takes NO plan argument was
+    /// the only place where "no plan specified" silently meant a specific
+    /// commercial tier rather than the default.
+    ///
+    /// It was invisible while nothing enforced either number (`record_query` had
+    /// one caller on one funnel; `add_connection` had none at all). This item
+    /// makes both bite, and a caller who never chose a plan must not discover
+    /// that they were put on a ten-queries-per-second budget. Picking a tier is
+    /// an explicit act: [`Self::register_tenant_with_plan`], `\tenant create
+    /// … PLAN free` in the REPL, or `update_resource_limits`.
     pub fn register_tenant(&self, name: String, isolation_mode: IsolationMode) -> Tenant {
-        self.register_tenant_with_plan(name, isolation_mode, "free")
+        let default_plan = self.plan_manager.get_default_plan();
+        self.register_tenant_with_plan(name, isolation_mode, &default_plan.id)
     }
 
     /// Register a new tenant with a specific plan
@@ -999,6 +1036,25 @@ impl TenantManager {
         Ok((deleted_plan, fallback_id, downgraded))
     }
 
+    /// Is ANY tenant registered? — sprinter d03de7fc3b22's hot-path gate.
+    ///
+    /// The QPS meter runs on every statement of every execution family, and on
+    /// the `_for_session` families resolving the tenant means a session lookup
+    /// (`SessionId` -> `Session` -> its `SessionScopedState`) that the statement
+    /// guard is about to perform again one line later. On a deployment with no
+    /// tenants at all — which is most of them, and every single-tenant embedded
+    /// user — there is nothing to charge and that lookup is pure cost. One
+    /// uncontended `RwLock` read answers it, and derives the answer from the map
+    /// itself rather than a counter that could drift out of step with it.
+    ///
+    /// A context referencing no registered tenant is not chargeable either
+    /// (`record_query` fails "Tenant not found"), so `false` here is a complete
+    /// answer, not an approximation.
+    #[inline]
+    pub fn has_any_tenant(&self) -> bool {
+        !self.tenants.read().is_empty()
+    }
+
     /// Get a tenant by ID
     pub fn get_tenant(&self, tenant_id: TenantId) -> Option<Tenant> {
         self.tenants.read().get(&tenant_id).cloned()
@@ -1050,6 +1106,20 @@ impl TenantManager {
     /// funnel and is not when it exists on all of them.
     pub fn active_tenant_id(&self) -> Option<TenantId> {
         self.current_context.read().as_ref().map(|c| c.tenant_id)
+    }
+
+    /// sprinter d03de7fc3b22 (the KEYSTONE): the tenant context in force for the
+    /// statement running on this thread — the `TenantManager`-side spelling of
+    /// [`crate::EmbeddedDatabase::effective_tenant_context`], for the RLS
+    /// deciders that live on this type and hold no `EmbeddedDatabase` handle.
+    ///
+    /// The SESSION's binding first, [`Self::get_current_context`] second. The
+    /// fallback is load-bearing, not a convenience: the embedded API and the
+    /// REPL have no session, so the process-global slot is the only place they
+    /// can express a tenant at all, and `\tenant use` must keep working exactly
+    /// as it does.
+    pub fn effective_context(&self) -> Option<TenantContext> {
+        crate::session_tenant_binding_tls().or_else(|| self.get_current_context())
     }
 
     /// Clear current tenant context
@@ -1135,13 +1205,35 @@ impl TenantManager {
         }
     }
 
-    /// Increment active connection count for tenant
+    /// Admit one connection against the tenant's `max_connections` budget.
+    ///
+    /// sprinter d03de7fc3b22: this had ZERO production callers anywhere in the
+    /// tree — and so, transitively, did `check_quota(_, "connections")`, whose
+    /// only caller it was. `max_connections` was configured, stored, displayed
+    /// by the tenant admin surface and completely unenforced. It is now called
+    /// from `EmbeddedDatabase::bind_session_tenant`, at the point a connection
+    /// first becomes attributable to a tenant, and released from
+    /// `EmbeddedDatabase::destroy_session`.
+    ///
+    /// CHECK AND INCREMENT HAPPEN UNDER ONE WRITE LOCK, for exactly the reason
+    /// [`Self::record_query`] does it: with the check in `check_quota` and the
+    /// increment behind a second lock, two connections arriving together both
+    /// passed at `max_connections - 1` and both incremented, so the limit could
+    /// be exceeded by however many handshakes were in flight — which on a
+    /// connection limit is precisely the case it exists to stop. `check_quota`
+    /// is not called from here (`parking_lot::RwLock` is not reentrant, and
+    /// re-locking inside the guard would deadlock); it survives as the public
+    /// read-only predicate, the same relationship it has to `record_query` for
+    /// `"qps"`.
     pub fn add_connection(&self, tenant_id: TenantId) -> Result<(), String> {
-        if !self.check_quota(tenant_id, "connections") {
-            return Err(format!("Connection limit exceeded for tenant {}", tenant_id));
-        }
+        let Some(tenant) = self.get_tenant(tenant_id) else {
+            return Err(format!("Tenant {} not found", tenant_id));
+        };
 
         if let Some(tracking) = self.quota_tracking.write().get_mut(&tenant_id) {
+            if tracking.active_connections >= tenant.limits.max_connections {
+                return Err(format!("Connection limit exceeded for tenant {}", tenant_id));
+            }
             tracking.active_connections += 1;
 
             // Update connection HWM
@@ -1269,7 +1361,7 @@ impl TenantManager {
     pub fn apply_rls_to_query(&self, query: &str, table_name: &str) -> String {
         // Note: This is a text-based query rewriting approach
         // For production, consider using the logical plan-based approach
-        if let Some(context) = self.get_current_context() {
+        if let Some(context) = self.effective_context() {
             if let Some(tenant) = self.get_tenant(context.tenant_id) {
                 if tenant.rls_enabled {
                     let policies = self.get_rls_policies(table_name);
@@ -1287,8 +1379,13 @@ impl TenantManager {
     }
 
     /// Check if RLS is enabled and applicable for current context
+    /// sprinter d03de7fc3b22: resolved through [`Self::effective_context`], so a
+    /// WIRE connection bound to an RLS-enabled tenant is gated by that tenant's
+    /// policies. Before the binding existed this asked the process-global slot,
+    /// which no wire handler ever wrote — so RLS was silently inert on every
+    /// connection that was not the REPL's own.
     pub fn should_apply_rls(&self, table_name: &str, cmd: &str) -> bool {
-        if let Some(context) = self.get_current_context() {
+        if let Some(context) = self.effective_context() {
             if let Some(tenant) = self.get_tenant(context.tenant_id) {
                 if !tenant.rls_enabled {
                     return false;

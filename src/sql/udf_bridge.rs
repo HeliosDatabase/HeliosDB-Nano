@@ -41,12 +41,14 @@
 //!
 //! # Several databases in one process
 //!
-//! `sequences::PERSIST` keeps a single last-open-wins slot, which is fine there
-//! because sequence state is durable and keyed by name. It is NOT fine here:
-//! `cargo test` opens dozens of `EmbeddedDatabase`s concurrently in one process,
-//! and a single slot would let database B's open silently steal resolution from
-//! a query still running against database A — a flaky "Unknown scalar function"
-//! for a function that plainly exists.
+//! `sequences` used to keep a single last-open-wins slot; sprinter d15933f528b0
+//! established that this was NOT fine there either (a live database's `setval`
+//! landed in another database's store) and replaced it with one namespace per
+//! `StorageEngine`, selected by a per-statement thread-local. It has never been
+//! fine here: `cargo test` opens dozens of `EmbeddedDatabase`s concurrently in
+//! one process, and a single slot would let database B's open silently steal
+//! resolution from a query still running against database A — a flaky "Unknown
+//! scalar function" for a function that plainly exists.
 //!
 //! So this module keeps a pruned list of installed bridges and resolves BY
 //! FUNCTION NAME, newest first: [`resolve`] hands back the most recently
@@ -56,9 +58,11 @@
 //!
 //! Residual, documented: if TWO live databases in one process define the same
 //! function name, the more recently opened one wins, and the body then runs
-//! against THAT database. Same class of process-global caveat `sequences`
-//! carries; resolving per calling handle needs a database reference inside
-//! `Evaluator`, which is the invasive change this design exists to avoid.
+//! against THAT database. `sequences` closed its version of this by having the
+//! executor publish the calling database on a per-statement thread-local
+//! (`sequences::EngineScope`) — the same trick would work here, and is the
+//! obvious follow-up; resolving per calling handle from a database reference
+//! inside `Evaluator` remains the invasive change this design exists to avoid.
 
 use std::cell::Cell;
 use std::sync::{Arc, OnceLock, Weak};

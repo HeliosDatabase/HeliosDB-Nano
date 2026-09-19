@@ -452,6 +452,68 @@ fn new_cache_admission() -> std::sync::Arc<[[std::sync::atomic::AtomicU64; CACHE
     }))
 }
 
+// =============================================================================
+// DESIGN RULE — what a process-global `static` may hold
+// =============================================================================
+//
+// A `static` may hold PROCESS-WIDE state only when the value is genuinely
+// process-wide. In practice that is a short list:
+//
+//   * compiled regexes and other immutable tables built once
+//     (`sql::phase3::system_views::SystemViewRegistry::shared`);
+//   * CPU feature detection (`storage::simd_filter`, `vector::simd`);
+//   * env-var kill switches read once (`query_normalization_enabled`,
+//     `storage::engine`'s `ZONE_MAP_OFF` / `COLP_OFF` family);
+//   * monotonic id generators, where the only requirement is "never hand the
+//     same value out twice in this process" (`storage::transaction`'s
+//     `TXN_COUNTER`, `session::SessionId::new`,
+//     `storage::engine`'s `NEXT_STORAGE_INSTANCE_ID`);
+//   * state that describes the OS PROCESS itself — this node's HA role and
+//     cluster membership (`replication::ha_state`, `replication::topology`),
+//     which exist because one process is one node.
+//
+// Anything scoped to a SESSION or to an ENGINE belongs on that session or on
+// that engine, never in a `static`. Two facts make this non-negotiable:
+// several connections share one process (every wire session, plus the
+// engine's own re-entrant execution on pooled Tokio workers), and several
+// open databases share one process (any library caller holding two
+// `EmbeddedDatabase` handles; `cargo test` opens dozens).
+//
+// This is not a style preference. The same shape has shipped six defects:
+//
+//   1. `SessionSettings` — one GUC set served every connection, so one
+//      client's `SET` changed every other client's session.
+//   2. `art_undo_log` — one undo log shared by every concurrent autocommit
+//      statement, which corrupted a UNIQUE index.
+//   3. `currval` — one slot for every connection, so `currval('s')` answered
+//      with another connection's sequence value.
+//   4. `TenantManager::current_context` — one tenant context for every
+//      session.
+//   5. `sequences::PERSIST` — a last-open-wins durable-storage handle.
+//   6. `sequences::STORE` — one sequence runtime map for every open database.
+//
+// The mechanisms this file already uses instead, in preference order:
+//
+//   * put the state on the type that owns it — a field on `EmbeddedDatabase`
+//     (per engine) or on `session::scoped::SessionScopedState` (per
+//     connection, shared with the statement running on its behalf);
+//   * when the consumer is session-less and storage-less by design (the
+//     expression evaluator is built at dozens of sites with no handle at
+//     all), install the value for the duration of ONE synchronous statement
+//     in a thread-local with an RAII guard — the block below, and
+//     `advisory_lock::AdvisoryContext`. A thread-local is per-STATEMENT, not
+//     per-session: a session's statements hop Tokio workers, so the guard
+//     must install and clear around each one;
+//   * when a process-global table is genuinely unavoidable, key it by the
+//     owner — `StorageEngine::instance_id()` for an engine, `SessionId` for a
+//     connection — so a lookup can never answer with someone else's state
+//     (`mcp::result_cache`, `code_graph::storage`'s AST-index registry,
+//     `sql::udf_bridge`'s per-registry resolution).
+//
+// Before adding a `static`, write down who WRITES it and who READS it. If
+// the two can be different sessions, or different databases, it is the wrong
+// place for the value.
+
 thread_local! {
     /// Per-thread `search_path` override a wire session installs for the
     /// duration of ONE synchronous statement that routes through the global
@@ -699,6 +761,12 @@ impl Drop for SessionScopedStateGuard {
 struct SessionStatementGuard {
     _identity: Option<SessionLoginUserOverrideGuard>,
     _scoped: SessionScopedStateGuard,
+    /// sprinter d15933f528b0: which DATABASE this session's statement runs
+    /// against, for the storage-less evaluator's `nextval`/`currval`/`setval`.
+    /// A wire session belongs to exactly one `EmbeddedDatabase`, so this is
+    /// simply `self.storage` — installed here as well as in the embedded
+    /// funnels so a session path that never reaches one still carries it.
+    _seq_ns: sql::sequences::EngineScope,
 }
 
 /// The calling thread's per-connection backend state — what `lastval()`,
@@ -794,6 +862,36 @@ pub(crate) fn session_guc_tls(name: &str) -> Option<sql::SettingValue> {
 /// closed there is right for the same reason it is right for `lastval()`.
 pub(crate) fn session_currval(name: &str) -> Option<i64> {
     SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().and_then(|s| s.currval(name)))
+}
+
+/// sprinter d03de7fc3b22 (the KEYSTONE): the TENANT the connection running a
+/// statement on THIS thread is bound to.
+///
+/// `None` means the statement's connection made no tenant decision — an
+/// embedded caller, the REPL, a wire connection to a reserved database name, or
+/// engine-internal evaluation with no backend installed at all. Every caller
+/// then falls back to the process-global `TenantManager::current_context`; the
+/// two halves are joined in exactly one place,
+/// [`EmbeddedDatabase::effective_tenant_context`] (and its `TenantManager`
+/// twin for the readers that have no `EmbeddedDatabase` handle).
+///
+/// Borrow-and-read rather than cloning the `Arc`: this sits on the per-statement
+/// RLS gates, and an unbound session answers with one relaxed atomic load.
+pub(crate) fn session_tenant_binding_tls() -> Option<crate::tenant::TenantContext> {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().and_then(|s| s.tenant_context()))
+}
+
+/// The bound tenant's id for the statement running on this thread, without the
+/// `TenantContext` clone [`session_tenant_binding_tls`] pays — the spelling the
+/// QPS meter uses.
+pub(crate) fn session_tenant_id_tls() -> Option<crate::tenant::TenantId> {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().and_then(|s| s.tenant_id()))
+}
+
+/// Is the connection running a statement on this thread bound to a tenant?
+/// One relaxed atomic load behind one `RefCell` borrow.
+pub(crate) fn session_has_tenant_tls() -> bool {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().is_some_and(|s| s.has_tenant()))
 }
 
 /// The declared column types a SERIAL / IDENTITY primary key can be
@@ -3233,39 +3331,267 @@ impl EmbeddedDatabase {
             .or(self.config.storage.query_timeout_ms)
     }
 
-    /// Charge one client statement against the active tenant's QPS budget.
+    // =====================================================================
+    // sprinter d03de7fc3b22 — THE ONE TENANT RESOLVER
+    // =====================================================================
+
+    /// THE resolver: the tenant context that applies to the statement running
+    /// on this thread. Every RLS gate, every metering charge and every
+    /// `current_tenant()` evaluation in the engine goes through this (or one of
+    /// its two cheaper spellings below); nothing reads
+    /// `TenantManager::current_context` directly any more except the REPL, which
+    /// owns it.
     ///
-    /// SCOPE, deliberately: this is called from `execute_in_transaction_inner`
-    /// ONLY — the simple-query / MySQL / embedded `execute()` family — which is
-    /// exactly where it was called before. Sprinter d03de7fc3b22 is about the
-    /// params/extended-protocol family never being metered, and the call sites
-    /// that close that gap were written, ran, and were then REMOVED again
-    /// before release. Why, so nobody re-adds them without reading this:
+    /// Two layers, in this order:
     ///
-    ///   * `active_tenant_id()` reads `TenantManager::current_context`, ONE
-    ///     process-global slot shared by every connection and thread. Its only
-    ///     production writer is the REPL's `\tenant use`; no wire handler sets
-    ///     it at all. Metering every family against that charges a connection's
-    ///     statements to whichever tenant some OTHER connection last selected,
-    ///     and lets one tenant's exhausted budget refuse another's queries.
-    ///   * The default "free" plan is `max_qps: 10`. Before the expansion an
-    ///     embedded caller's `query()` was never charged, so switching it on
-    ///     makes working applications start failing at ten statements a second.
-    ///   * Both were observed, not predicted: with the expansion in place, 7
-    ///     pre-existing RLS tests went red purely because a test binary's
-    ///     parallel tests share that one global context.
+    /// 1. **The SESSION binding** ([`crate::session_tenant_binding_tls`]) — the
+    ///    tenant this CONNECTION resolved at startup from the database name it
+    ///    asked for. This is the layer that did not exist, and its absence is
+    ///    why `max_qps` and the RLS gates were dead on every wire path.
+    /// 2. **The process-global `TenantManager::current_context`** — the legacy
+    ///    slot. The fallback is NOT optional and must never be removed: the
+    ///    embedded library API (`EmbeddedDatabase::query` / `execute`) and the
+    ///    REPL have no session and no database name, so the global is the only
+    ///    place they can express a tenant, and `\tenant use` plus every
+    ///    embedded `set_current_context` caller must keep behaving exactly as
+    ///    before.
     ///
-    /// The prerequisite is a `SessionId -> TenantId` binding, which exists
-    /// nowhere today. Until it does, widening this makes enforcement WRONG
-    /// rather than merely absent, which is the worse of the two. The item stays
-    /// open with that as its blocker.
+    /// A session binding therefore SHADOWS the global rather than merging with
+    /// it: a connection bound to tenant A is charged and filtered as A even
+    /// while an embedded caller in the same process has selected B. That is the
+    /// whole point of the item.
+    pub(crate) fn effective_tenant_context(&self) -> Option<tenant::TenantContext> {
+        crate::session_tenant_binding_tls().or_else(|| self.tenant_manager.get_current_context())
+    }
+
+    /// [`Self::effective_tenant_context`] without the `TenantContext` clone (a
+    /// `String` `user_id` plus a `Vec<String>` of roles, allocated and dropped
+    /// again) — the spelling the QPS meter uses, on every statement of every
+    /// execution family.
+    pub(crate) fn effective_tenant_id(&self) -> Option<tenant::TenantId> {
+        crate::session_tenant_id_tls().or_else(|| self.tenant_manager.active_tenant_id())
+    }
+
+    /// "Is any tenant context in force?" — the spelling the RLS fast-path gates
+    /// use, several times per statement.
     ///
-    /// What did ship from d03de7fc3b22: quota refusals are now classified
-    /// 53400 `configuration_limit_exceeded` (MySQL 1226) instead of XX000
-    /// `internal_error`, which connection poolers read as a broken backend and
-    /// evict a healthy connection over.
+    /// Strictly cheaper than what it replaced: the gates used to spell this
+    /// `get_current_context().is_some()`, which cloned a whole `TenantContext`
+    /// only to drop it.
+    #[inline]
+    pub(crate) fn has_effective_tenant_context(&self) -> bool {
+        crate::session_has_tenant_tls() || self.tenant_manager.has_current_context()
+    }
+
+    /// The tenant charged for a statement arriving on `session_id`.
+    ///
+    /// THE TRAP THIS EXISTS FOR (it cost this repo two gate cycles, once on
+    /// `application_name` — sprinter f4f5d450e816 — and once here): the
+    /// per-statement thread-local is installed by
+    /// [`Self::session_statement_context_guard`], and every `_for_session` entry
+    /// point charges the tenant BEFORE it installs that guard (the charge has to
+    /// happen before any work, including the guard's own session lookup, can
+    /// fail). At the charge line the thread-local is therefore still the
+    /// PREVIOUS statement's — empty on a fresh worker thread, and somebody
+    /// else's on a pooled one. Resolving from the `SessionId` the entry point
+    /// was handed is the only correct route, exactly as
+    /// `try_handle_session_application_name` and `try_handle_session_guc` do.
+    ///
+    /// Falls back to the process global for a session that made no tenant
+    /// decision, so an embedded caller driving `execute_in_session` keeps the
+    /// behaviour it has today.
+    fn effective_tenant_id_for_session(&self, session_id: crate::session::SessionId) -> Option<tenant::TenantId> {
+        // PERF GATE. This runs on every statement of every `_for_session`
+        // family, and the lookup below is the SAME `SessionId` -> `Session`
+        // traffic `session_statement_context_guard` is about to pay one line
+        // later. With no tenant registered there is nothing chargeable at all
+        // (a dangling context fails `record_query` anyway), so a single-tenant
+        // or tenant-less deployment — which is most of them — pays one
+        // uncontended read instead of doubling the wire hot path's session
+        // traffic.
+        if !self.tenant_manager.has_any_tenant() {
+            return None;
+        }
+        let bound = self.session_manager.get_session(session_id).ok().and_then(|lock| {
+            let scoped = std::sync::Arc::clone(&lock.read().scoped);
+            scoped.tenant_id()
+        });
+        bound.or_else(|| self.tenant_manager.active_tenant_id())
+    }
+
+    /// Bind `session_id` to the tenant named by the database the client asked
+    /// for — sprinter d03de7fc3b22, and the point the whole item turns on.
+    ///
+    /// THE KEYSTONE, verified rather than invented: `database_name_is_valid`
+    /// already resolves a requested database name against TENANT NAMES, and
+    /// sprinter c5afe5e41eac already moved that validation to just AFTER
+    /// authentication in the PostgreSQL startup path. So "database name ==
+    /// tenant name" is this server's existing, shipped definition, and the
+    /// moment a session's tenant becomes knowable already exists and already
+    /// runs. This function does not add a resolution rule; it records the answer
+    /// the existing rule produces.
+    ///
+    /// RESERVED DATABASE NAMES (`heliosdb`, `postgres` — see
+    /// `RESERVED_DATABASE_NAMES`) bind NOTHING, and that is a deliberate
+    /// decision rather than an omission. They are not tenants, so there is no
+    /// tenant to bind; and "no binding" is not the same as "bound to no tenant",
+    /// because an unbound session falls through to the process-global context.
+    /// That fall-through is what must be preserved: `postgres` is the name libpq
+    /// probes when the client names no database at all, it is what the
+    /// `dbname` -> `user` fallback produces for a user with no matching tenant,
+    /// and it is the database every existing wire test connects to. Binding it
+    /// to "definitely no tenant" would silently cut those connections off from a
+    /// context an embedded caller in the same process had set — a behaviour
+    /// CHANGE for the default connection string, in a change whose whole purpose
+    /// is to stop guessing which tenant a connection belongs to. Unbound
+    /// reserved names leave today's behaviour byte-for-byte intact and confine
+    /// every new binding to a connection that named a real tenant.
+    ///
+    /// Also charges the tenant's `max_connections` budget. `check_quota(_,
+    /// "connections")`'s only caller is `TenantManager::add_connection`, and
+    /// `add_connection` had ZERO production callers anywhere in the tree, so
+    /// `max_connections` was configured, displayed and completely unenforced.
+    /// Here is the first place a connection can be attributed to a tenant at
+    /// all, so here is where it is counted; the matching release is in
+    /// [`Self::destroy_session`], the one funnel every disconnect reaches.
+    ///
+    /// Returns the bound tenant id, or `None` when the name is reserved, empty
+    /// or names no tenant. `Err` is a REFUSED connection: the tenant is at its
+    /// `max_connections` limit.
+    pub(crate) fn bind_session_tenant(
+        &self,
+        session_id: crate::session::SessionId,
+        database_name: &str,
+        user_id: &str,
+    ) -> Result<Option<tenant::TenantId>> {
+        let trimmed = database_name.trim();
+        if trimmed.is_empty() || Self::database_name_is_reserved(trimmed) {
+            return Ok(None);
+        }
+        // The SAME lookup `database_name_is_valid` performs, and deliberately so
+        // — one definition of "this name is that tenant", not two that can drift.
+        let Some(target) = self
+            .tenant_manager
+            .list_tenants()
+            .into_iter()
+            .find(|t| t.name.eq_ignore_ascii_case(trimmed))
+        else {
+            return Ok(None);
+        };
+
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+
+        // Already bound to this very tenant — a MySQL `COM_INIT_DB` naming the
+        // database the connection is already on. Idempotent: counting the
+        // connection a second time here would leak a `max_connections` slot on
+        // every repeat, because the release below only fires for a DIFFERENT
+        // displaced tenant.
+        if scoped.tenant_id() == Some(target.id) {
+            return Ok(Some(target.id));
+        }
+
+        // Count the connection BEFORE publishing the binding: a refusal must
+        // leave the session exactly as it was, with nothing for
+        // `destroy_session` to release.
+        self.tenant_manager
+            .add_connection(target.id)
+            .map_err(Error::query_execution)?;
+
+        let displaced = scoped.bind_tenant(tenant::TenantContext {
+            tenant_id: target.id,
+            user_id: user_id.to_string(),
+            roles: Vec::new(),
+            isolation_mode: target.isolation_mode,
+        });
+        // A rebind (`COM_INIT_DB` to a different database) must hand the tenant
+        // it left its connection slot back, or the count ratchets upward until
+        // that tenant's limit refuses everybody. The equal-id case returned
+        // above, so this is always a different tenant.
+        if let Some(previous) = displaced {
+            let _ = self.tenant_manager.remove_connection(previous);
+        }
+        Ok(Some(target.id))
+    }
+
+    /// Release `session_id`'s tenant binding and the `max_connections` slot it
+    /// held. Idempotent (`unbind_tenant` reports `None` the second time), so a
+    /// disconnect path that runs twice cannot double-decrement.
+    fn release_session_tenant(&self, session_id: crate::session::SessionId) {
+        let Ok(session_lock) = self.session_manager.get_session(session_id) else {
+            return;
+        };
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        if let Some(tenant_id) = scoped.unbind_tenant() {
+            let _ = self.tenant_manager.remove_connection(tenant_id);
+        }
+    }
+
+    /// Charge one client statement against the bound tenant's QPS budget.
+    ///
+    /// SCOPE: every execution family's entry point charges — eighteen call
+    /// sites — because there is NO funnel all of them pass through (the params
+    /// family and the read funnel are each disjoint from
+    /// `execute_in_transaction_inner`, which was the single pre-existing charge
+    /// site and therefore the reason `max_qps` applied only to simple text
+    /// writes: not to psycopg3, JDBC, sqlx, node-postgres, Prisma or Drizzle,
+    /// and not to any read at all). [`TENANT_QUERY_METERED`] is what makes
+    /// eighteen sites safe: one client statement is charged ONCE however many
+    /// layers it traverses, and the nested executions the engine performs on its
+    /// own behalf (a `CALL` body, a SQL UDF, a text entry point delegating into
+    /// the params funnel) are never charged at all.
+    ///
+    /// THIS WAS WRITTEN, TESTED AND THEN REMOVED ONCE, in v4.39.0. The call
+    /// sites were never the problem; what `active_tenant_id()` resolved against
+    /// was. It read `TenantManager::current_context`, ONE process-global slot
+    /// shared by every connection and thread, whose only production writer was
+    /// the REPL's `\tenant use` — so metering every family against it charged a
+    /// connection's statements to whichever tenant some OTHER connection last
+    /// selected, and let one tenant's exhausted budget refuse another's queries.
+    /// Enforcement that is WRONG rather than merely absent is the worse of the
+    /// two, so it came out and the item was parked on its real blocker: a
+    /// `SessionId -> TenantId` binding.
+    ///
+    /// That binding now exists ([`Self::bind_session_tenant`]), so this resolves
+    /// through [`Self::effective_tenant_id`] — the session's own tenant first,
+    /// the process global only for the session-less embedded and REPL callers
+    /// that have nowhere else to put one.
     #[inline]
     fn charge_tenant_query(&self) -> Result<TenantQueryMeter> {
+        self.charge_tenant_query_against(|| self.effective_tenant_id())
+    }
+
+    /// The `_for_session` spelling: resolve the tenant from the `SessionId` the
+    /// entry point was handed, NOT from the per-statement thread-local.
+    ///
+    /// THE TRAP, stated once more because it is the single thing most likely to
+    /// be "simplified" away: every `_for_session` entry point charges at its
+    /// very first line, BEFORE `session_statement_context_guard` installs the
+    /// thread-local. A charge that read the thread-local there would read the
+    /// previous statement's backend — empty on a fresh worker thread, and
+    /// another connection's on a pooled one — so a wire session would be
+    /// metered against nothing, or against somebody else. The identical mistake
+    /// shipped once in `application_name` (sprinter f4f5d450e816) and was caught
+    /// only by a gate run. See [`Self::effective_tenant_id_for_session`].
+    ///
+    /// The session lookup is paid only when no outer charge is already live and
+    /// a tenant is actually in play, because the re-entrancy check runs first.
+    #[inline]
+    fn charge_tenant_query_for_session(&self, session_id: crate::session::SessionId) -> Result<TenantQueryMeter> {
+        self.charge_tenant_query_against(|| self.effective_tenant_id_for_session(session_id))
+    }
+
+    /// The shared body of the two spellings above: arm the re-entrancy marker,
+    /// and charge only if this is the OUTERMOST traversal of a client statement.
+    ///
+    /// `resolve` is a closure rather than a `TenantId` argument so that neither
+    /// the session lookup nor the global read happens on a nested execution,
+    /// which is the common case inside a `CALL` or a trigger-bearing write.
+    #[inline]
+    fn charge_tenant_query_against(
+        &self,
+        resolve: impl FnOnce() -> Option<tenant::TenantId>,
+    ) -> Result<TenantQueryMeter> {
         let previous = TENANT_QUERY_METERED.with(|c| c.replace(true));
         let meter = TenantQueryMeter(previous);
         if previous {
@@ -3273,7 +3599,7 @@ impl EmbeddedDatabase {
             // nested execution, not a new client statement.
             return Ok(meter);
         }
-        if let Some(tenant_id) = self.tenant_manager.active_tenant_id() {
+        if let Some(tenant_id) = resolve() {
             // The guard is already live, so an over-quota refusal still restores
             // the flag on the way out (its `Drop` runs as `meter` is dropped).
             self.tenant_manager
@@ -3387,7 +3713,7 @@ impl EmbeddedDatabase {
     /// was ever set (the poisoned-pre-existing-entry case) need no migration or
     /// epoch bump for the same reason: the read gate makes them inert.
     fn cache_query_result(&self, sql: &str, results: &[Tuple], cache_epoch: u64) {
-        if self.tenant_manager.has_current_context() {
+        if self.has_effective_tenant_context() {
             return;
         }
         // Refuse to publish a result that was computed before an invalidation
@@ -3417,7 +3743,7 @@ impl EmbeddedDatabase {
     /// before this gate existed, by a different tenant's context. See
     /// `cache_query_result` for why this is context-presence and not tenant-keyed.
     fn cached_query_result(&self, sql: &str) -> Option<std::sync::Arc<Vec<Tuple>>> {
-        if self.tenant_manager.has_current_context() {
+        if self.has_effective_tenant_context() {
             return None;
         }
         if let Some(cached) = self.hot_cached_query_result(sql) {
@@ -3443,7 +3769,7 @@ impl EmbeddedDatabase {
     /// "preserve the v3.37 hot-result-cache behavior" block calls this
     /// directly, not through `cached_query_result`.
     fn hot_cached_query_result(&self, sql: &str) -> Option<std::sync::Arc<Vec<Tuple>>> {
-        if self.tenant_manager.has_current_context() {
+        if self.has_effective_tenant_context() {
             return None;
         }
         self.reconcile_result_cache_with_storage();
@@ -5739,7 +6065,7 @@ impl EmbeddedDatabase {
     /// only ever a session or explicit global transaction, because its
     /// autocommit entry passes `None` and CTAS population passes `None`.
     fn insert_select_should_stage(&self) -> bool {
-        self.tenant_manager.get_current_context().is_none() && self.storage.get_current_branch_id().is_none()
+        !self.has_effective_tenant_context() && self.storage.get_current_branch_id().is_none()
     }
 
     fn insert_select_txn_batch_rows(&self) -> usize {
@@ -7976,7 +8302,7 @@ impl EmbeddedDatabase {
                         }
 
                         // Update storage quota tracking
-                        if let Some(context) = self.tenant_manager.get_current_context() {
+                        if let Some(context) = self.effective_tenant_context() {
                             // Use already-serialized val length (avoid double serialization)
                             let tuple_size = val.len() as u64;
 
@@ -8061,7 +8387,7 @@ impl EmbeddedDatabase {
                 // drained wholesale through `INSERT INTO t2 SELECT * FROM t1`. The
                 // plan is only cloned when a tenant context exists — `apply_rls_to_plan`
                 // is a no-op otherwise and the clone would be pure cost.
-                let rls_filtered_source = if self.tenant_manager.get_current_context().is_some() {
+                let rls_filtered_source = if self.has_effective_tenant_context() {
                     Some(self.apply_rls_to_plan((**source).clone())?)
                 } else {
                     None
@@ -8518,7 +8844,7 @@ impl EmbeddedDatabase {
                         updates.push((row_id, old_tuple.clone(), new_tuple.clone()));
 
                         // Record CDC event for UPDATE
-                        if let Some(context) = self.tenant_manager.get_current_context() {
+                        if let Some(context) = self.effective_tenant_context() {
                             let old_values =
                                 serde_json::to_string(&old_tuple.values).unwrap_or_else(|_| "[]".to_string());
                             let new_values =
@@ -8669,7 +8995,7 @@ impl EmbeddedDatabase {
                 }
 
                 // Update storage quota tracking (UPDATEs may change storage size)
-                if let Some(context) = self.tenant_manager.get_current_context() {
+                if let Some(context) = self.effective_tenant_context() {
                     // Calculate storage change from updates
                     let mut storage_delta: i64 = 0;
                     for (_row_id, _old_tuple, new_tuple) in &updates {
@@ -8836,7 +9162,7 @@ impl EmbeddedDatabase {
                             }
 
                             // Record CDC event for DELETE
-                            if let Some(context) = self.tenant_manager.get_current_context() {
+                            if let Some(context) = self.effective_tenant_context() {
                                 let old_values =
                                     serde_json::to_string(&tuple.values).unwrap_or_else(|_| "[]".to_string());
 
@@ -8883,7 +9209,7 @@ impl EmbeddedDatabase {
                 }
 
                 // Calculate storage to reclaim before deleting
-                let storage_reclaimed: u64 = if self.tenant_manager.get_current_context().is_some() {
+                let storage_reclaimed: u64 = if self.has_effective_tenant_context() {
                     (row_ids_to_delete.len() as u64) * 256
                 } else {
                     0
@@ -8936,7 +9262,7 @@ impl EmbeddedDatabase {
                 }
 
                 // Update storage quota tracking (reclaim deleted storage)
-                if let Some(context) = self.tenant_manager.get_current_context() {
+                if let Some(context) = self.effective_tenant_context() {
                     if let Some(current_quota) = self.tenant_manager.get_quota_tracking(context.tenant_id) {
                         let new_storage = current_quota.storage_bytes_used.saturating_sub(storage_reclaimed);
                         // Ignore errors here since we're freeing storage, not adding
@@ -9435,11 +9761,13 @@ impl EmbeddedDatabase {
             tracing::warn!("ART rebuild on open failed: {} — falling back to scan paths", e);
         }
 
-        // v3.60.0: install the process-global sequence persistence handle once,
-        // here at DB-open (a `Weak<StorageEngine>` downgrade — does not affect
-        // the move of `storage` into `Self` below). nextval/setval upgrade the
-        // Weak only when a sequence function actually runs, so NOTHING is added
-        // to the per-statement hot path.
+        // v3.60.0: register THIS database's sequence namespace once, here at
+        // DB-open (a `Weak<StorageEngine>` downgrade — does not affect the move
+        // of `storage` into `Self` below). nextval/setval upgrade the Weak only
+        // when a sequence function actually runs, so NOTHING is added to the
+        // per-statement hot path. sprinter d15933f528b0: this APPENDS to a
+        // registry; it no longer overwrites a single process-wide slot, so a
+        // second `EmbeddedDatabase` cannot steal this one's sequence state.
         crate::sql::sequences::install_persistence(&storage);
 
         // Seed the result-cache marker from storage rather than 0: reopening an
@@ -9570,7 +9898,7 @@ impl EmbeddedDatabase {
         let lock_manager = std::sync::Arc::new(storage::LockManager::from_lock_config(&config.locks));
         let dirty_tracker = std::sync::Arc::new(storage::DirtyTracker::new());
 
-        // Install the durable sequence persistence handle (mirrors `new` /
+        // Register this database's sequence namespace (mirrors `new` /
         // `open_with_config`). For an in-memory DB `flush_sequence_state` skips
         // the fsync (no WAL / no crash recovery), but the handle still lets
         // `nextval` lazy-load the real persisted CREATE SEQUENCE definition
@@ -9725,7 +10053,7 @@ impl EmbeddedDatabase {
             }
         }
 
-        // v3.60.0: install the process-global sequence persistence handle once
+        // v3.60.0: register this database's sequence namespace once
         // (UNCONDITIONALLY — for memory-only the handle still installs but
         // flush_sequence_state skips the fsync, keeping :memory: nextval
         // volatile-but-working). Weak downgrade, zero per-statement cost.
@@ -10273,11 +10601,14 @@ impl EmbeddedDatabase {
     }
 
     /// Run a `CREATE AST INDEX …` declaration. Registers the index
-    /// in the process-local AST-index registry, then does an initial
-    /// `code_index` pass so every existing source row is indexed.
+    /// in the process-local AST-index registry — under THIS database's
+    /// identity, so a second open database's index of the same name is a
+    /// different index — then does an initial `code_index` pass so every
+    /// existing source row is indexed.
     #[cfg(feature = "code-graph")]
     fn handle_create_ast_index(&self, ddl: code_graph::AstIndexDdl) -> Result<u64> {
-        let existing = code_graph::storage::get_ast_index(&ddl.index_name);
+        let database = self.storage.instance_id();
+        let existing = code_graph::storage::get_ast_index(database, &ddl.index_name);
         if existing.is_some() && !ddl.if_not_exists {
             return Err(Error::query_execution(format!(
                 "AST index '{}' already exists",
@@ -10296,7 +10627,7 @@ impl EmbeddedDatabase {
             resolve_cross_file: ddl.resolve_cross_file,
             paused: false,
         };
-        code_graph::register_ast_index(meta.clone());
+        code_graph::register_ast_index(database, meta.clone());
         // Initial full parse of the current table contents.
         let opts = code_graph::CodeIndexOptions {
             source_table: ddl.table,
@@ -10347,7 +10678,7 @@ impl EmbeddedDatabase {
             code_graph::PauseResume::Pause(n) => (n, true),
             code_graph::PauseResume::Resume(n) => (n, false),
         };
-        if !code_graph::storage::set_ast_index_paused(&name, paused) {
+        if !code_graph::storage::set_ast_index_paused(self.storage.instance_id(), &name, paused) {
             return Err(Error::query_execution(format!("AST index '{name}' is not registered")));
         }
         Ok(0)
@@ -10361,7 +10692,7 @@ impl EmbeddedDatabase {
     #[cfg(feature = "code-graph")]
     fn maybe_auto_reparse(&self, touched_table: Option<&str>) {
         let Some(tbl) = touched_table else { return };
-        for idx in code_graph::storage::ast_indexes_for_table(tbl) {
+        for idx in code_graph::storage::ast_indexes_for_table(self.storage.instance_id(), tbl) {
             if !idx.auto_reparse {
                 continue;
             }
@@ -10541,6 +10872,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query()?;
         // Reflect an embedded `SET search_path` into the evaluator's thread-local
         // so a DML statement evaluating `current_schema()` sees the right schema
         // (see `embedded_current_schema_guard`). Free on the default path.
@@ -10554,6 +10886,17 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // sprinter d15933f528b0: and THIS is the database that statement runs
+        // against. Sequence state is per-engine now, so `nextval`/`setval`/
+        // `currval` — evaluated inside the storage-less, session-less
+        // `sql::evaluator` — resolve it from here instead of from "whichever
+        // `EmbeddedDatabase` opened last". `Executor::execute` installs the same
+        // scope; this funnel-level guard additionally covers the INSERT/PK fast
+        // paths that evaluate a `DEFAULT nextval(...)` expression with their own
+        // `Evaluator` and never build an executor. Unlike the backend above this
+        // is an unconditional install with save-and-restore: a nested body that
+        // runs against a DIFFERENT database must win for its own duration only.
+        let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
         // SQLite-compat: PRAGMA without a result-set (assignments / no-op
         // tunables) — `execute()` callers don't expect rows back.
         if let Some((_, _)) = crate::sql::sqlite_compat::parse_pragma(sql) {
@@ -10719,7 +11062,7 @@ impl EmbeddedDatabase {
     fn try_autocommit_fast_insert(&self, sql: &str) -> Option<Result<u64>> {
         if !self.savepoints.read().is_empty()
             || self.session_txns_block_fast_inserts()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             // Under a non-`public` `search_path`, bare names resolve via the
             // planner two-probe; this fast path resolves bare names directly, so
             // yield to the full planner path to stay schema-correct.
@@ -10751,7 +11094,7 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || !self.savepoints.read().is_empty()
             || self.session_txns_block_fast_inserts()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
         {
             return None;
@@ -10788,7 +11131,7 @@ impl EmbeddedDatabase {
         if !self.in_transaction()
             || !self.savepoints.read().is_empty()
             || self.any_session_txns()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
         {
             return None;
         }
@@ -10824,7 +11167,7 @@ impl EmbeddedDatabase {
         let _wv = write_volume::stmt_scope(write_volume::StmtClass::InsertMulti);
         if !self.savepoints.read().is_empty()
             || self.session_txns_block_fast_inserts()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
         {
             return None;
@@ -11014,7 +11357,7 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || self.session_txns_block_fast_inserts()
             || !self.savepoints.read().is_empty()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
             || self.trigger_registry.has_triggers_for_table(table_name)
             || self.storage.fast_dml_requires_logical_wal()
@@ -11820,7 +12163,7 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || !self.savepoints.read().is_empty()
             || self.any_session_txns()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
         {
             return None;
@@ -11854,7 +12197,7 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || !self.savepoints.read().is_empty()
             || self.any_session_txns()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
         {
             return None;
@@ -11963,7 +12306,7 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || !self.savepoints.read().is_empty()
             || self.any_session_txns()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
         {
             return None;
@@ -12458,7 +12801,7 @@ impl EmbeddedDatabase {
     ) -> Option<Result<std::sync::Arc<FastParamDeleteSpec>>> {
         if returning.is_some()
             || self.tenant_manager.should_apply_rls(table_name, "DELETE")
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             || self.trigger_registry.has_triggers_for_table(table_name)
         {
             return None;
@@ -12491,7 +12834,7 @@ impl EmbeddedDatabase {
     ) -> Option<Result<FastParamDeleteSpec>> {
         if returning.is_some()
             || self.tenant_manager.should_apply_rls(table_name, "DELETE")
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             || self.trigger_registry.has_triggers_for_table(table_name)
         {
             return None;
@@ -12787,7 +13130,7 @@ impl EmbeddedDatabase {
     fn try_autocommit_fast_update_delete(&self, sql: &str) -> Option<Result<u64>> {
         if !self.savepoints.read().is_empty()
             || self.any_session_txns()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             // Non-`public` `search_path`: resolve bare names via the planner.
             || self.current_schema_is_set()
         {
@@ -14092,7 +14435,7 @@ impl EmbeddedDatabase {
         if trimmed.len() < 20 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"INSERT") {
             return None;
         }
-        if self.tenant_manager.get_current_context().is_some() {
+        if self.has_effective_tenant_context() {
             return None;
         }
 
@@ -14692,7 +15035,7 @@ impl EmbeddedDatabase {
         fk_source: FkValidationSource,
     ) -> Option<Result<std::sync::Arc<FastLiteralDeleteSpec>>> {
         if self.tenant_manager.should_apply_rls(table_name, "DELETE")
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             || self.trigger_registry.has_triggers_for_table(table_name)
         {
             return None;
@@ -15075,9 +15418,7 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        if self.tenant_manager.should_apply_rls(table_name, "DELETE")
-            || self.tenant_manager.get_current_context().is_some()
-        {
+        if self.tenant_manager.should_apply_rls(table_name, "DELETE") || self.has_effective_tenant_context() {
             return None;
         }
         if self.trigger_registry.has_triggers_for_table(table_name) {
@@ -15555,7 +15896,7 @@ impl EmbeddedDatabase {
     fn try_fast_count_pk_query(&self, sql: &str) -> Option<Result<Vec<Tuple>>> {
         if self.in_transaction()
             || self.storage.is_branch_active()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             // Non-`public` `search_path`: resolve bare names via the planner.
             || self.current_schema_is_set()
         {
@@ -15908,7 +16249,7 @@ impl EmbeddedDatabase {
     }
 
     fn try_direct_projected_filtered_scan(&self, plan: &sql::LogicalPlan) -> Option<Result<Vec<Tuple>>> {
-        if self.in_transaction() || self.tenant_manager.get_current_context().is_some() {
+        if self.in_transaction() || self.has_effective_tenant_context() {
             return None;
         }
 
@@ -16934,6 +17275,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query()?;
         // HDB-008: the params family resolves the GLOBAL `current_transaction`
         // slot deep inside `execute_plan_with_params_inner`'s DML arms, so the
         // failed-transaction boundary is applied here, at the entry point,
@@ -16963,6 +17305,17 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // sprinter d15933f528b0: and THIS is the database that statement runs
+        // against. Sequence state is per-engine now, so `nextval`/`setval`/
+        // `currval` — evaluated inside the storage-less, session-less
+        // `sql::evaluator` — resolve it from here instead of from "whichever
+        // `EmbeddedDatabase` opened last". `Executor::execute` installs the same
+        // scope; this funnel-level guard additionally covers the INSERT/PK fast
+        // paths that evaluate a `DEFAULT nextval(...)` expression with their own
+        // `Evaluator` and never build an executor. Unlike the backend above this
+        // is an unconditional install with save-and-restore: a nested body that
+        // runs against a DIFFERENT database must win for its own duration only.
+        let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
         // GH#28 + sprinter a3077a3f68d8: the params family answers
         // `SHOW <setting>`, `SET`/`RESET` of the three connection-lifetime GUCs,
         // and `SET`/`RESET` of every USER-SETTABLE GUC — which now land on the
@@ -17041,6 +17394,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query()?;
         if rows.is_empty() {
             return Ok(0);
         }
@@ -17120,6 +17474,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query()?;
         // Reflect an embedded `SET search_path` into the evaluator's thread-local
         // so RETURNING `current_schema()` sees the right schema (see
         // `embedded_current_schema_guard`). Free on the default path.
@@ -17133,6 +17488,17 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // sprinter d15933f528b0: and THIS is the database that statement runs
+        // against. Sequence state is per-engine now, so `nextval`/`setval`/
+        // `currval` — evaluated inside the storage-less, session-less
+        // `sql::evaluator` — resolve it from here instead of from "whichever
+        // `EmbeddedDatabase` opened last". `Executor::execute` installs the same
+        // scope; this funnel-level guard additionally covers the INSERT/PK fast
+        // paths that evaluate a `DEFAULT nextval(...)` expression with their own
+        // `Evaluator` and never build an executor. Unlike the backend above this
+        // is an unconditional install with save-and-restore: a nested body that
+        // runs against a DIFFERENT database must win for its own duration only.
+        let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
         let plan = self.parameterized_plan_cached(sql)?;
 
         let out = self.execute_plan_with_params(&plan, params, None);
@@ -18120,7 +18486,7 @@ impl EmbeddedDatabase {
                 // RLS on the SOURCE read (see the text family's InsertSelect arm):
                 // rows hidden from this session must not be copyable into another
                 // table. Cloned only when a tenant context exists.
-                let rls_filtered_source = if self.tenant_manager.get_current_context().is_some() {
+                let rls_filtered_source = if self.has_effective_tenant_context() {
                     Some(self.apply_rls_to_plan((**source).clone())?)
                 } else {
                     None
@@ -19083,6 +19449,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query()?;
         // Snapshot the result-cache invalidation epoch BEFORE reading any
         // data. Every `cache_query_result` below publishes only if nothing
         // invalidated the cache in between (see `result_cache_epoch`).
@@ -19100,6 +19467,17 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // sprinter d15933f528b0: and THIS is the database that statement runs
+        // against. Sequence state is per-engine now, so `nextval`/`setval`/
+        // `currval` — evaluated inside the storage-less, session-less
+        // `sql::evaluator` — resolve it from here instead of from "whichever
+        // `EmbeddedDatabase` opened last". `Executor::execute` installs the same
+        // scope; this funnel-level guard additionally covers the INSERT/PK fast
+        // paths that evaluate a `DEFAULT nextval(...)` expression with their own
+        // `Evaluator` and never build an executor. Unlike the backend above this
+        // is an unconditional install with save-and-restore: a nested body that
+        // runs against a DIFFERENT database must win for its own duration only.
+        let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
         // SQLite-compat: PRAGMA short-circuit. `table_info(t)` returns
         // SQLite-shaped rows; everything else returns an empty result so
         // sqlite3-driven apps can issue PRAGMAs without parser errors.
@@ -19360,7 +19738,7 @@ impl EmbeddedDatabase {
             }
 
             // Fast path: no RLS context → execute directly from Arc (no deep clone)
-            if self.tenant_manager.get_current_context().is_none() {
+            if !self.has_effective_tenant_context() {
                 if let Some(result) = self.try_direct_projected_filtered_scan(&arc_plan) {
                     let results = result?;
                     tracing::debug!(
@@ -19521,7 +19899,7 @@ impl EmbeddedDatabase {
         let exec_start = std::time::Instant::now();
         let mut executor =
             sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
-        let results = if self.tenant_manager.get_current_context().is_none() {
+        let results = if !self.has_effective_tenant_context() {
             executor.execute(&plan_arc)?
         } else {
             // RLS active → need an owned plan to rewrite. Clone out of the
@@ -19609,6 +19987,25 @@ impl EmbeddedDatabase {
         sql: &str,
     ) -> Option<(std::sync::Arc<Vec<Tuple>>, std::sync::Arc<Schema>)> {
         let _identity_override = self.session_statement_context_guard(session_id).ok()?;
+        // sprinter d03de7fc3b22: this fast path answers the PostgreSQL
+        // simple-query handler WITHOUT entering `query_with_schema_for_session`,
+        // so it is the one read route that reaches no `max_qps` charge site —
+        // and it deliberately stays that way, because it can never serve a
+        // statement there is a tenant to charge.
+        //
+        // R1.1 gates BOTH the result-cache write (`cache_query_result`) and the
+        // result-cache read (`cached_query_result`) on `has_effective_tenant_context()`:
+        // the cache is keyed on SQL + login and carries no tenant component, so
+        // no context-active caller may write to it or read from it. A HIT here
+        // therefore PROVES no tenant context is in force, which makes a charge
+        // provably a no-op. Adding one would put a thread-local read and an
+        // atomic on the hottest wire read path to resolve `None` every time.
+        //
+        // The invariant is load-bearing, so state the consequence: if that gate
+        // is ever narrowed to let a bound session use the cache, a charge must
+        // be added HERE (after the probe, never before — a charge ahead of it
+        // would bill every MISS twice, since a miss falls through to
+        // `query_with_schema_for_session`, which charges there).
         self.try_cached_query_with_schema(sql)
     }
 
@@ -19663,7 +20060,7 @@ impl EmbeddedDatabase {
         //     deliberately does not populate the result cache (see below), and
         //     the plan cache is invalidated on DDL for every path alike.
         if self.in_transaction()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
         {
             return None;
@@ -19750,6 +20147,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query()?;
         // Snapshot the result-cache invalidation epoch BEFORE reading any
         // data. Every `cache_query_result` below publishes only if nothing
         // invalidated the cache in between (see `result_cache_epoch`).
@@ -19768,6 +20166,17 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // sprinter d15933f528b0: and THIS is the database that statement runs
+        // against. Sequence state is per-engine now, so `nextval`/`setval`/
+        // `currval` — evaluated inside the storage-less, session-less
+        // `sql::evaluator` — resolve it from here instead of from "whichever
+        // `EmbeddedDatabase` opened last". `Executor::execute` installs the same
+        // scope; this funnel-level guard additionally covers the INSERT/PK fast
+        // paths that evaluate a `DEFAULT nextval(...)` expression with their own
+        // `Evaluator` and never build an executor. Unlike the backend above this
+        // is an unconditional install with save-and-restore: a nested body that
+        // runs against a DIFFERENT database must win for its own duration only.
+        let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
         if let Some(result) = self.try_fast_select_with_schema(sql) {
             return result;
         }
@@ -19854,7 +20263,7 @@ impl EmbeddedDatabase {
             // template and saves a pointless lock acquisition.
             let mut executor =
                 sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
-            if self.tenant_manager.has_current_context() {
+            if self.has_effective_tenant_context() {
                 let plan = self.apply_rls_to_plan_recursive((*arc_plan).clone())?;
                 return executor.execute_with_schema(&plan);
             }
@@ -19903,7 +20312,7 @@ impl EmbeddedDatabase {
         // the PRE-RLS plan (the rewrite runs on a clone and never mutates the
         // cached entry), so a context-active read still gets the parse+plan
         // saving — only the rewrite-and-execute step re-runs per call.
-        if self.tenant_manager.has_current_context() {
+        if self.has_effective_tenant_context() {
             let plan = self.apply_rls_to_plan_recursive((*plan_arc).clone())?;
             return executor.execute_with_schema(&plan);
         }
@@ -20281,6 +20690,16 @@ impl EmbeddedDatabase {
         if advisory_lock::manager().has_locks() {
             advisory_lock::manager().release_session(session_id);
         }
+        // sprinter d03de7fc3b22: give this connection's `max_connections` slot
+        // back to its tenant. THE SAME funnel argument the advisory locks above
+        // rely on is why the release lives here and nowhere else: the PG
+        // handler's `Drop` and the MySQL handler's `Drop` both call this, so a
+        // clean Terminate, a dropped socket and an error-path teardown all
+        // release, and a tenant's connection count can never ratchet upward
+        // until the limit refuses everybody. A session that never bound a tenant
+        // (every embedded caller, every connection to a reserved database name)
+        // pays one relaxed atomic load.
+        self.release_session_tenant(session_id);
         self.session_manager.destroy_session(session_id)
     }
 
@@ -20745,6 +21164,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query_for_session(session_id)?;
         // Spec 03: this session owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: this session's login identity answers `current_user` and
@@ -20905,6 +21325,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query_for_session(session_id)?;
         // Spec 03: this session owns any advisory lock the statement takes —
         // installed before the `self.query(...)` delegate below so the shared
         // funnel does not re-attribute the lock to the embedded handle.
@@ -21467,6 +21888,7 @@ impl EmbeddedDatabase {
             // with no login name still has its own backend, and `lastval()` on
             // it must never fall through to the handle-wide embedded one.
             _scoped: SessionScopedStateGuard::install(scoped),
+            _seq_ns: sql::sequences::EngineScope::enter(&self.storage),
         })
     }
 
@@ -21869,6 +22291,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query_for_session(session_id)?;
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
@@ -21990,6 +22413,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query_for_session(session_id)?;
         // Spec 03: this connection owns any advisory lock the statement takes.
         // Installed before the autocommit delegate below, so the shared funnel
         // does not re-attribute the lock to the embedded handle.
@@ -22076,6 +22500,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query_for_session(session_id)?;
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
@@ -22195,6 +22620,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query_for_session(session_id)?;
         // Installed BEFORE the delegate, so the session-less guard inside
         // `execute_params_returning` finds a context already present and keeps
         // this connection as the owner.
@@ -22311,6 +22737,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query_for_session(session_id)?;
         // Spec 03: this connection owns any advisory lock the statement takes
         // (extended protocol / params family).
         let _advisory = self.advisory_context_guard(session_id, sql);
@@ -22421,6 +22848,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query_for_session(session_id)?;
         // Spec 03: this connection owns any advisory lock the statement takes
         // (extended protocol / params family — the shape Prisma's psycopg3-style
         // clients send).
@@ -22518,6 +22946,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query_for_session(session_id)?;
         // Spec 03: this connection owns any advisory lock the statement takes.
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
@@ -22616,7 +23045,7 @@ impl EmbeddedDatabase {
         txn: &storage::Transaction,
     ) -> Option<Result<u64>> {
         if !self.savepoints.read().is_empty()
-            || self.tenant_manager.get_current_context().is_some()
+            || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
             || !(self.storage.time_travel_enabled()
                 || self.session_txn_count.load(std::sync::atomic::Ordering::Acquire) <= 1)
@@ -22735,6 +23164,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query()?;
         // HDB-008: see `execute_params_inner` — the read half of the same
         // boundary. `query_plan_with_params` attaches the global transaction
         // itself, so the statement genuinely runs inside it and its failure
@@ -22759,6 +23189,17 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // sprinter d15933f528b0: and THIS is the database that statement runs
+        // against. Sequence state is per-engine now, so `nextval`/`setval`/
+        // `currval` — evaluated inside the storage-less, session-less
+        // `sql::evaluator` — resolve it from here instead of from "whichever
+        // `EmbeddedDatabase` opened last". `Executor::execute` installs the same
+        // scope; this funnel-level guard additionally covers the INSERT/PK fast
+        // paths that evaluate a `DEFAULT nextval(...)` expression with their own
+        // `Evaluator` and never build an executor. Unlike the backend above this
+        // is an unconditional install with save-and-restore: a nested body that
+        // runs against a DIFFERENT database must win for its own duration only.
+        let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
         // Code-graph pre-parser: see `maybe_rewrite_code_graph`.
         // `ON BRANCH '…'` directives swap the active branch via a
         // Drop guard for the duration of this query.
@@ -22870,7 +23311,7 @@ impl EmbeddedDatabase {
     /// the unfiltered table. Pinned by `rls_parse_error_on_read_fails_closed`
     /// in `tests/rls_read_parity_tests.rs`.
     fn rls_filtered_plan<'p>(&self, plan: &'p sql::LogicalPlan) -> Result<std::borrow::Cow<'p, sql::LogicalPlan>> {
-        if !self.tenant_manager.has_current_context() {
+        if !self.has_effective_tenant_context() {
             return Ok(std::borrow::Cow::Borrowed(plan));
         }
         Ok(std::borrow::Cow::Owned(self.apply_rls_to_plan_recursive(plan.clone())?))
@@ -22995,6 +23436,7 @@ impl EmbeddedDatabase {
         // funnel all of them pass through — and the returned guard makes every
         // nested execution inside this one free, so a statement is counted
         // exactly once. See `charge_tenant_query`.
+        let _qps = self.charge_tenant_query()?;
         // Spec 03: advisory-lock owner for a params-family statement with no
         // session. A no-op under `query_params_with_columns_for_session`.
         let _advisory = self.embedded_advisory_context_guard(sql);
@@ -23004,6 +23446,17 @@ impl EmbeddedDatabase {
         // for the autocommit case — it has already installed ITS session's backend,
         // and overwriting it here would make every connection share one `lastval()`.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        // sprinter d15933f528b0: and THIS is the database that statement runs
+        // against. Sequence state is per-engine now, so `nextval`/`setval`/
+        // `currval` — evaluated inside the storage-less, session-less
+        // `sql::evaluator` — resolve it from here instead of from "whichever
+        // `EmbeddedDatabase` opened last". `Executor::execute` installs the same
+        // scope; this funnel-level guard additionally covers the INSERT/PK fast
+        // paths that evaluate a `DEFAULT nextval(...)` expression with their own
+        // `Evaluator` and never build an executor. Unlike the backend above this
+        // is an unconditional install with save-and-restore: a nested body that
+        // runs against a DIFFERENT database must win for its own duration only.
+        let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
         #[cfg(feature = "code-graph")]
         let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
         #[cfg(feature = "code-graph")]
@@ -24971,7 +25424,7 @@ impl EmbeddedDatabase {
             return Ok(None);
         };
 
-        let tenant_context = self.tenant_manager.get_current_context();
+        let tenant_context = self.effective_tenant_context();
         let evaluator = tenant::RLSExpressionEvaluator::new(std::sync::Arc::new(schema.clone()), tenant_context);
 
         // `get_rls_conditions` already applied PG's per-policy
@@ -26086,10 +26539,26 @@ impl EmbeddedDatabase {
             }
             return Err(Error::query_execution(format!("database \"{trimmed}\" already exists")));
         }
+        // sprinter d03de7fc3b22: the DEFAULT plan, not `"free"`.
+        //
+        // This used to say `"free"`, whose limits are `max_qps: 10` and
+        // `max_connections: 5`. That was inert while nothing enforced either
+        // number — `record_query` had one caller on one funnel and
+        // `add_connection` had no production callers at all — but this item
+        // makes both bite, and a connection to a database created by plain
+        // `CREATE DATABASE` would then have been capped at ten statements a
+        // second and five concurrent connections. `CREATE DATABASE foo` is a
+        // PostgreSQL-compatibility statement (Bug 1, the dashboard migration);
+        // nobody issuing it is asking to be put on a free SaaS tier, and no
+        // documentation ever said it did. A PLAN is an explicit choice, made
+        // through `register_tenant_with_plan` / the tenant admin surface, so
+        // the implicit path takes the default plan (`unlimited`) exactly as an
+        // unknown plan id already would.
+        let default_plan = self.tenant_manager.plan_manager.get_default_plan();
         self.tenant_manager.register_tenant_with_plan(
             trimmed.to_string(),
             crate::tenant::IsolationMode::DatabasePerTenant,
-            "free",
+            &default_plan.id,
         );
         Ok((0, vec![]))
     }
@@ -26513,7 +26982,7 @@ impl EmbeddedDatabase {
     /// Apply RLS policies to a query plan by injecting Filter operators
     fn apply_rls_to_plan(&self, plan: sql::LogicalPlan) -> Result<sql::LogicalPlan> {
         // Early exit: skip RLS tree walk when no tenant context is set (common case)
-        if self.tenant_manager.get_current_context().is_none() {
+        if !self.has_effective_tenant_context() {
             return Ok(plan);
         }
         self.apply_rls_to_plan_recursive(plan)
@@ -26554,7 +27023,7 @@ impl EmbeddedDatabase {
         let Some((using_expr, _)) = self.tenant_manager.get_rls_conditions(table_name, "SELECT") else {
             return Ok(None);
         };
-        let tenant_context = self.tenant_manager.get_current_context();
+        let tenant_context = self.effective_tenant_context();
         let rls_evaluator = tenant::RLSExpressionEvaluator::new(schema.clone(), tenant_context);
         Ok(Some(rls_evaluator.parse(&using_expr)?))
     }

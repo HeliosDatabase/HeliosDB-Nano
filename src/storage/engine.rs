@@ -1898,10 +1898,18 @@ pub enum TableKind {
     Missing,
 }
 
+/// Source of [`StorageEngine::instance_id`]. Monotonic, never reused, never
+/// persisted — a counter is exactly the kind of value a `static` may hold (see
+/// the "process-global `static`s" design rule in `src/lib.rs`).
+static NEXT_STORAGE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Storage engine
 pub struct StorageEngine {
     /// RocksDB instance
     pub(crate) db: Arc<DB>,
+    /// Identity of THIS open database within this process — see
+    /// [`StorageEngine::instance_id`].
+    instance_id: u64,
     /// Configuration
     config: Config,
     /// Current timestamp (for MVCC)
@@ -2062,6 +2070,24 @@ pub struct StorageEngine {
 const MIN_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024;
 
 impl StorageEngine {
+    /// Process-unique identity for ONE open database.
+    ///
+    /// Minted per `StorageEngine` construction from [`NEXT_STORAGE_INSTANCE_ID`]
+    /// and never reused, so — unlike a pointer address — it cannot be recycled
+    /// by a later engine that happens to land on the same allocation.
+    ///
+    /// This exists because a process may hold SEVERAL open databases at once
+    /// (any library caller with two `EmbeddedDatabase` handles; `cargo test`
+    /// opens dozens), and anything a process-global keeps on a database's
+    /// behalf has to say WHICH database it belongs to or it answers one
+    /// database's question with another's state. `EmbeddedDatabase` shares its
+    /// `Arc<StorageEngine>` with every `clone_for_trigger()` handle, so the
+    /// clones report the same id as the database they were minted from —
+    /// which is what callers want: they are the same database.
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
     fn memory_only_write_options() -> WriteOptions {
         let mut opts = WriteOptions::default();
         opts.set_sync(false);
@@ -2489,6 +2515,7 @@ impl StorageEngine {
         )?;
 
         let engine = Self {
+            instance_id: NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             db: Arc::clone(&db),
             config: config.clone(),
             timestamp,
@@ -2857,6 +2884,7 @@ impl StorageEngine {
         )?;
 
         Ok(Self {
+            instance_id: NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             db: Arc::clone(&db),
             config: config.clone(),
             timestamp,

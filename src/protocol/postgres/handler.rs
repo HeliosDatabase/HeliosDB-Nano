@@ -357,6 +357,15 @@ enum StartupError {
     /// violation gets. Like `InvalidPassword` it holds the BARE wire message,
     /// so no `Protocol error: ` wrapper prefix reaches libpq.
     UndefinedDatabase(String),
+    /// The tenant named by the requested database is already at its
+    /// `max_connections` limit — sprinter d03de7fc3b22.
+    ///
+    /// Raised at the same post-authentication point as `UndefinedDatabase`, and
+    /// for the same disclosure reason: a limit is a fact about a tenant the peer
+    /// has just proved it may use. PostgreSQL answers ERRCODE_TOO_MANY_CONNECTIONS
+    /// / 53300 here (`InitProcess`), which every pooler understands as "retry
+    /// later" rather than "this backend is broken".
+    TooManyConnections(String),
 }
 
 impl StartupError {
@@ -385,6 +394,11 @@ impl StartupError {
                 // peer HAS authenticated. The catalogue lookup is what failed.
                 Error::query_execution(wire_message.clone()),
                 crate::network::protocol::sqlstate::INVALID_CATALOG_NAME,
+                wire_message,
+            ),
+            Self::TooManyConnections(wire_message) => (
+                Error::query_execution(wire_message.clone()),
+                crate::network::protocol::sqlstate::TOO_MANY_CONNECTIONS,
                 wire_message,
             ),
         }
@@ -1230,6 +1244,50 @@ where
                 if !self.database.database_name_is_valid(&requested) {
                     return Err(StartupError::UndefinedDatabase(format!(
                         "database \"{requested}\" does not exist"
+                    )));
+                }
+
+                // sprinter d03de7fc3b22 — THE KEYSTONE, and the whole reason
+                // this item was unblockable before v4.38.0.
+                //
+                // The line above already resolves the requested name against
+                // TENANT NAMES (`EmbeddedDatabase::database_name_is_valid` ->
+                // `tenant_manager.list_tenants()`), and sprinter c5afe5e41eac
+                // already moved that resolution to HERE, after every
+                // authentication arm. So "database name == tenant name" is this
+                // server's shipped definition and this is already the first
+                // point at which a connection's tenant is knowable: nothing had
+                // to be invented, only recorded.
+                //
+                // Recording it is what turns `max_qps` and every RLS gate from
+                // dead code into per-connection enforcement — until now they
+                // resolved through `TenantManager::current_context`, one
+                // process-global slot no wire handler has ever written.
+                //
+                // `self.username` is the identity the arms above just
+                // AUTHENTICATED, so the bound context's `user_id` (what
+                // `current_tenant_user()` answers, and what a policy such as
+                // `owner = current_tenant_user()` is evaluated against) is a
+                // proved name on a password/SCRAM listener — never the
+                // `database` parameter, which is client-asserted.
+                //
+                // A reserved name (`heliosdb`, `postgres`) binds nothing and
+                // keeps today's behaviour exactly; see `bind_session_tenant`
+                // for why "no binding" rather than "bound to no tenant".
+                let login = self.username.clone().unwrap_or_default();
+                if let Err(e) = self.database.bind_session_tenant(self.session_id, &requested, &login) {
+                    // The only failure `bind_session_tenant` reports is a spent
+                    // `max_connections` budget. FATAL, raised before the
+                    // ParameterStatus burst — which is where PostgreSQL refuses
+                    // one too (`InitProcess`).
+                    //
+                    // The WIRE message is PostgreSQL's own wording and nothing
+                    // more: the internal text names the tenant's UUID, which the
+                    // peer has no business learning from a refusal. It goes to
+                    // the log instead.
+                    tracing::warn!(database = %requested, error = %e, "refusing connection: tenant connection limit");
+                    return Err(StartupError::TooManyConnections(format!(
+                        "too many connections for database \"{requested}\""
                     )));
                 }
             }

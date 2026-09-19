@@ -855,6 +855,14 @@ impl<'a> Executor<'a> {
 
     /// Execute a logical plan and return all results
     pub fn execute(&mut self, plan: &LogicalPlan) -> Result<Vec<Tuple>> {
+        // sprinter d15933f528b0: publish WHICH database this statement runs
+        // against for its whole duration. `nextval`/`currval`/`setval` are
+        // evaluated inside `sql::evaluator`, which holds no engine, so this
+        // thread-local is the only thing that can point them at THIS database's
+        // sequence namespace instead of whichever `EmbeddedDatabase` happened to
+        // open last. `None` (a storage-less executor) leaves any outer scope in
+        // place, which is what a nested storage-less evaluation wants.
+        let _seq_ns = self.storage.map(crate::sql::sequences::EngineScope::enter);
         let build_start = Instant::now();
         self.scan_decode_hints = scan::compute_scan_decode_hints(plan);
         let mut operator = self.plan_to_operator(plan)?;
@@ -888,6 +896,14 @@ impl<'a> Executor<'a> {
     /// the extended protocol's Describe already reads through
     /// `LogicalPlan::schema()`.
     pub fn execute_with_schema(&mut self, plan: &LogicalPlan) -> Result<(Vec<Tuple>, Arc<Schema>)> {
+        // sprinter d15933f528b0: publish WHICH database this statement runs
+        // against for its whole duration. `nextval`/`currval`/`setval` are
+        // evaluated inside `sql::evaluator`, which holds no engine, so this
+        // thread-local is the only thing that can point them at THIS database's
+        // sequence namespace instead of whichever `EmbeddedDatabase` happened to
+        // open last. `None` (a storage-less executor) leaves any outer scope in
+        // place, which is what a nested storage-less evaluation wants.
+        let _seq_ns = self.storage.map(crate::sql::sequences::EngineScope::enter);
         self.scan_decode_hints = scan::compute_scan_decode_hints(plan);
         let mut operator = self.plan_to_operator(plan)?;
         let schema = operator.schema();
@@ -4236,8 +4252,10 @@ impl<'a> Executor<'a> {
                 // Evict any cached runtime so the next nextval lazy-loads the
                 // new durable def (and, on re-create, the PRESERVED durable
                 // state). The post-statement durability barrier fsyncs the def +
-                // seed-state puts.
-                crate::sql::sequences::invalidate_cache(name);
+                // seed-state puts. sprinter d15933f528b0: `_on(storage, ..)` so
+                // the eviction is bound to the database we just wrote, not to a
+                // thread-local that must merely happen to be installed.
+                crate::sql::sequences::invalidate_cache_on(storage, name);
 
                 Ok(Box::new(
                     ScanOperator::new(
@@ -4390,7 +4408,8 @@ impl<'a> Executor<'a> {
                 // Evict the cached runtime so the lock-free counter discards any
                 // in-flight cached block (RESTART correctness) and the next
                 // nextval rebuilds from the freshly written def + state.
-                crate::sql::sequences::invalidate_cache(&action.name);
+                // sprinter d15933f528b0: bound to THIS database's namespace.
+                crate::sql::sequences::invalidate_cache_on(storage, &action.name);
 
                 Ok(Box::new(
                     ScanOperator::new(
@@ -4416,7 +4435,8 @@ impl<'a> Executor<'a> {
                 if let Err(e) = storage.log_drop_sequence(name) {
                     tracing::warn!("Failed to log DROP SEQUENCE '{}' to WAL: {}", name, e);
                 }
-                crate::sql::sequences::invalidate_cache(name);
+                // sprinter d15933f528b0: bound to THIS database's namespace.
+                crate::sql::sequences::invalidate_cache_on(storage, name);
                 Ok(Box::new(
                     ScanOperator::new(
                         String::new(),

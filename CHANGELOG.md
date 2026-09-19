@@ -5,6 +5,121 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.40.0] - 2026-09-19
+
+One architectural theme rather than a list of items: **state belonging to a single
+session or a single database was being kept in process-global `static`s.** That
+shape had already produced six defects across v4.37–v4.39, each found and fixed
+individually. This release treats it as one piece of work — a census of all 118
+statics in `src/`, a fix for the ones that matter, and the rule written down.
+
+### Fixed — per-session state
+
+- **A connection's tenant is now bound to its session.** `TenantManager::current_context`
+  was one `RwLock<Option<TenantContext>>` shared by every connection and thread, and no
+  wire handler ever wrote it — its only production writer was the REPL. The tenant is now
+  resolved at authentication and bound to the session, with a single resolver
+  (session first, process global second) behind all 39 read sites so the embedded API
+  and the REPL are unchanged. The binding needed no invention: `database_name_is_valid`
+  already resolved a requested database name against tenant names, and v4.38.0 had
+  already moved that check to just after authentication. (sprinter 98c88a573a7d)
+- **Tenant `max_qps` is now enforced for every execution family.** It previously had one
+  charge site, on the simple-query path, so clients that bind parameters — psycopg3,
+  JDBC, sqlx, node-postgres, Prisma, Drizzle — were never counted, and neither was any
+  READ: the limit was a write limit wearing a query limit's name. The call sites were
+  written for v4.39.0 and deliberately **removed before release**, because metering
+  against a process-global tenant charges a connection's statements to whichever tenant
+  another connection last selected. With the binding in place they are correct, and are
+  back. (sprinter d03de7fc3b22)
+- **`max_connections` is enforced for the first time.** Its quota check had no production
+  caller at all. A session over the limit is now refused with PostgreSQL's own
+  **53300 `too_many_connections`** before the ParameterStatus burst, and
+  **1040 `ER_CON_COUNT_ERROR`** on MySQL. The check-and-increment is now one locked
+  operation — the previous split let N in-flight handshakes all pass at
+  `max_connections - 1`, which on a connection limit is precisely the case it exists to
+  stop.
+
+### Fixed — per-engine state
+
+- **Sequence state is now per database.** `STORE` (keyed by bare sequence name) and
+  `PERSIST` (one `Weak<StorageEngine>`, unconditionally overwritten) were process-global,
+  so two `EmbeddedDatabase` instances in one process shared sequence runtimes and a
+  persistence handle. A live database's `setval` could resolve to a different database's
+  engine, or fail outright with "setval requires storage context". `nextval`'s refill path
+  had the same dependency. Both are now scoped per engine. (sprinter d15933f528b0)
+- **`CREATE SEQUENCE … START WITH n` returning 1 instead of n is explained and fixed.** It
+  was not a `START WITH` defect: the clause parsed correctly all along. The `CREATE` wrote
+  to one database's catalog while the following `nextval` resolved against another,
+  found no such sequence, and **auto-vivified a fresh start-1 sequence there** — returning
+  1 and silently creating a sequence in a database nobody asked about.
+  (sprinter 064a59d8fb7c, closed as a duplicate cause of the above)
+- **The MCP result cache no longer serves one database's answer to another.** It was keyed
+  on `(tool, args)` with the database passed as a parameter, so `heliosdb_list_tables`
+  answered for database A returned A's tables to a caller asking about B for the next five
+  minutes.
+- **The code-graph AST-index registry is keyed per database.** Same-name declarations
+  silently overwrote each other, and a database that had declared no index could start
+  materialising `_hdb_code_*` tables because an unrelated database declared one on a
+  same-named table.
+- **`UserId` is unique across both constructors.** `User::new` and `User::new_passwordless`
+  each had their own function-scope counter, so the first user from each minted `UserId(1)` —
+  and session lookup and quota enforcement key on that id. Latent only because one
+  constructor has no production caller.
+
+### Added
+
+- `StorageEngine::instance_id()` — a per-construction `u64`, never reused. Deliberately a
+  counter rather than a pointer address: a recycled allocation would let a new engine
+  inherit a dead one's entries.
+
+### Changed — behaviour
+
+- **A wire connection to a `SharedSchema` tenant with row-level security policies is now
+  filtered.** It was not before, because the RLS gate consulted a slot no wire handler
+  wrote. This is the intended effect and the largest behaviour change in the release.
+  Databases created by `CREATE DATABASE` use `DatabasePerTenant` and are unaffected.
+- **`register_tenant` and `CREATE DATABASE` no longer assign the `"free"` plan**
+  (`max_qps: 10`, 5 connections). With metering live that cap would have applied silently
+  to every database created without an explicit plan. They now use the default plan, which
+  is what the rest of the type already means by "no plan specified".
+- A tenant-bound connection gives up the autocommit fast paths and the result cache, both
+  of which are gated on the absence of a tenant context. Connections to the reserved
+  `heliosdb` / `postgres` names are unaffected.
+
+### Documented
+
+- The rule, stated where the next author writing per-statement state will actually read it —
+  directly above the `thread_local!` block in `src/lib.rs`, on top of the canonical correct
+  examples. A `static` may hold process-wide state only when the value is genuinely
+  process-wide: compiled regexes, CPU feature detection, env-var kill switches read once,
+  monotonic counters. Anything scoped to a session or an engine belongs on that session or
+  that engine. It cites all six defects this shape has already produced, lists the three
+  sanctioned mechanisms in preference order, and ends with the operational test — *write down
+  who writes it and who reads it; if those can be different sessions or different databases,
+  it is the wrong place.*
+- Six of thirteen audited statics were classified **legitimately process-wide** and left
+  alone, with the reasoning recorded: the HA state and topology registries describe the node
+  rather than a database, the partition-id allocator is per-thread, and the transaction and
+  backend-pid counters exist precisely to be unique within the process.
+
+### Known follow-ups (filed)
+
+- `564e9ac1d762` — advisory locks are not scoped per database, so two databases share one
+  lock table. Every ORM hardcodes the same migration-lock key (Prisma uses `72707369`), so
+  one database's migration blocks another's indefinitely. The module header also claims
+  PostgreSQL shares advisory locks across databases; it does not — `MyDatabaseId` is part of
+  the lock tag.
+- `32ed4b9e0002` — `pg_stat_activity` lists every database's backends, disclosing usename,
+  application_name and client_addr across databases.
+- `f469f178aa29` — the MCP SSE session namespace is process-global and its session id is
+  client-chosen; per-engine config statics (`join_memory_limit_mb` and family) are
+  last-writer-wins across databases.
+- `0a67a0637345` — `CREATE SEQUENCE … START WITH n` is silently ignored when the sequence
+  already exists, so one stray `nextval` on a not-yet-created name permanently poisons a
+  later explicit `START WITH`.
+- MySQL `USE <db>` is acknowledged but switches nothing; duplicate tenant names are possible;
+  `src/multi_tenant/` is a second, dead tenancy subsystem referenced by nothing outside itself.
+
 ## [4.39.0] - 2026-09-18
 
 Eleven backlog items plus one defect found while gating them. Five close silent

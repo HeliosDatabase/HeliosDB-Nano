@@ -1,4 +1,4 @@
-//! Process-scoped runtime for `CREATE SEQUENCE` / `nextval` / `currval` /
+//! Per-database runtime for `CREATE SEQUENCE` / `nextval` / `currval` /
 //! `setval`, backed by durable catalog records.
 //!
 //! # Durability model (v3.60.0)
@@ -42,9 +42,29 @@
 //! takes the max, so two processes over one data dir never reserve
 //! overlapping ranges).
 //!
+//! ## The store belongs to ONE DATABASE (sprinter d15933f528b0 / 064a59d8fb7c)
+//!
+//! Through v4.39.0 both halves of this module's state were single
+//! process-globals: one `Weak<StorageEngine>` slot that every
+//! `EmbeddedDatabase` open UNCONDITIONALLY overwrote, and one runtime map keyed
+//! by bare sequence name. With more than one database in a process that meant
+//!
+//! * a live database's `setval`/`nextval` refill flushed its durable high-water
+//!   into a DIFFERENT database's store; or, once that other database had been
+//!   dropped, the `Weak` failed to upgrade and a perfectly healthy database
+//!   answered `setval requires storage context`; and
+//! * `CREATE SEQUENCE s START WITH 500` in database B could be answered by
+//!   database A's `s` (or auto-vivified at 1 in A, which is where the "START
+//!   WITH returned 1" report came from — the clause was always parsed and
+//!   persisted correctly).
+//!
+//! Both are gone. Every runtime map and every persistence handle now hangs off
+//! [`SeqNamespace`], one per `StorageEngine`, and is reached THROUGH the engine
+//! that owns it — never through "whoever opened last".
+//!
 //! ## `currval` is SESSION-scoped, this store is not (sprinter 7903b7111cb4)
 //!
-//! "Process-scoped" above describes the STORE — a durability and scalability
+//! "Per-database" above describes the STORE — a durability and scalability
 //! decision. It does NOT describe `currval`'s observable semantics, and for a
 //! while it wrongly did: [`try_currval`] read the shared runtime, so connection
 //! A's `nextval` answered connection B's `currval` (a client recovering the id
@@ -55,7 +75,7 @@
 //! `crate::session::scoped::SessionScopedState`, written by the same
 //! `nextval()` evaluator arm that records `lastval()`, and an undefined
 //! `currval` raises SQLSTATE 55000 with PostgreSQL's wording. [`try_currval`] /
-//! [`currval`] below remain as the PROCESS-wide primitive — they are what the
+//! [`currval`] below remain as the DATABASE-wide primitive — they are what the
 //! module's own unit tests exercise (no session exists there) and they never
 //! answer a SQL `currval()` call any more.
 //!
@@ -67,12 +87,16 @@
 //!   re-runs migrations); IF NOT EXISTS is honoured as a no-op.
 //!
 //! ## Memory-only / storage-absent fallback
-//! When no persistence handle is installed (pure in-memory evaluation) or the
-//! database is `:memory:`, sequences run volatile: state lives only in the
-//! in-process atomics and no fsync is attempted. `nextval` still works and
-//! never panics.
+//! When NO database exists in this process (pure in-memory expression
+//! evaluation) sequences run volatile: state lives only in the in-process
+//! atomics and no fsync is attempted. `nextval` still works and never panics.
+//! That is the ONLY path to the volatile branch — a registered database always
+//! resolves a namespace with a live engine, so opening a database can never
+//! silently turn its sequences volatile.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -129,34 +153,238 @@ struct SeqRuntime {
     volatile: bool,
 }
 
-/// `name -> Arc<SeqRuntime>`. The map is read-locked only briefly to fetch
-/// (or lazily build) the `Arc`; all hot work runs on the `Arc`'s atomics, so
-/// distinct sequences never contend. An inner `HashMap` under one
-/// `parking_lot::Mutex` is used rather than a new `DashMap` dependency.
-static STORE: OnceLock<Mutex<HashMap<String, Arc<SeqRuntime>>>> = OnceLock::new();
+// ============================================================
+// PER-DATABASE SEQUENCE NAMESPACES (sprinter d15933f528b0 / 064a59d8fb7c)
+// ============================================================
 
-/// Process-global persistence handle (D1). Installed ONCE at DB-open via
-/// [`install_persistence`]; `nextval`/`setval`/introspection upgrade the
-/// `Weak` only when they actually run, so NOTHING is added to the
-/// per-statement hot path.
-static PERSIST: OnceLock<Mutex<Option<Weak<StorageEngine>>>> = OnceLock::new();
+/// Identity of the database that owns a sequence namespace:
+/// [`StorageEngine::instance_id`], minted once per engine construction and
+/// NEVER reused.
+///
+/// This was originally the address of the `StorageEngine` allocation, which was
+/// defensible — [`namespaces`] holds a `Weak` for every id it records, and a
+/// live `Weak` keeps the allocation alive, so a recorded address could not be
+/// handed to a second engine. But that is a property you have to re-derive
+/// every time you read the code, and it stops holding the moment anything
+/// stores an id without retaining the matching `Weak`. A never-reused counter
+/// is correct by construction instead, and it is the identifier the rest of the
+/// engine now uses for exactly this purpose (see `StorageEngine::instance_id`,
+/// added under the same sweep for the MCP result cache and the code-graph AST
+/// index registry). One primitive, one rule, no ABA argument to maintain.
+type EngineId = u64;
 
-fn store() -> &'static Mutex<HashMap<String, Arc<SeqRuntime>>> {
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+/// One database's sequence world: the handle to the engine that owns it, and
+/// that database's OWN `name -> Arc<SeqRuntime>` map.
+struct SeqNamespace {
+    /// Upgradeable handle to the owning engine. `None` ONLY for the engine-less
+    /// namespace ([`volatile_namespace`]), which serves pure in-memory
+    /// evaluation in a process with no database at all.
+    handle: Option<Weak<StorageEngine>>,
+    /// `name -> Arc<SeqRuntime>` for THIS database. Locked only briefly to
+    /// fetch (or lazily build) the `Arc`; all hot work runs on the `Arc`'s
+    /// atomics, so distinct sequences never contend. An inner `HashMap` under
+    /// one `parking_lot::Mutex` is used rather than a new `DashMap` dependency.
+    store: Mutex<HashMap<String, Arc<SeqRuntime>>>,
 }
 
-/// Install the durable persistence handle. Called once per `EmbeddedDatabase`
+impl SeqNamespace {
+    fn new(engine: &Arc<StorageEngine>) -> Self {
+        SeqNamespace {
+            handle: Some(Arc::downgrade(engine)),
+            store: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The owning engine, or `None` when this namespace is engine-less. That
+    /// `None` is exactly the "run volatile" signal every caller below reads.
+    fn engine(&self) -> Option<Arc<StorageEngine>> {
+        self.handle.as_ref().and_then(|w| w.upgrade())
+    }
+
+    /// Cheaper than [`Self::engine`] for the registry scan: no refcount traffic.
+    fn is_live(&self) -> bool {
+        self.handle.as_ref().is_some_and(|w| w.strong_count() > 0)
+    }
+}
+
+/// Every database that has installed a persistence handle in this process,
+/// OLDEST FIRST. A `Vec`, not a map: it holds exactly one entry in every
+/// production configuration, it is scanned newest-first, and that ordering IS
+/// the documented fallback policy (see [`namespace_for_id`]).
+static NAMESPACES: OnceLock<Mutex<Vec<(EngineId, Arc<SeqNamespace>)>>> = OnceLock::new();
+
+/// The engine-less namespace. Reached only when NO database is registered in
+/// this process, which is the single route to the `volatile` runtime branch.
+static VOLATILE_NS: OnceLock<Arc<SeqNamespace>> = OnceLock::new();
+
+thread_local! {
+    /// The sequence namespace of the database whose statement is running on
+    /// THIS thread, installed for the statement's duration by [`EngineScope`].
+    ///
+    /// `nextval`/`currval`/`setval` are evaluated deep inside `sql::evaluator`,
+    /// which is storage-less AND session-less by design (71 `Evaluator`
+    /// construction sites, several of them — `sql::functions`,
+    /// `tenant::expression` — with no engine anywhere in reach), so the only
+    /// thing that can tell it WHICH database it is serving is a per-statement
+    /// thread-local: the same mechanism `current_user`, the `search_path`
+    /// override and the advisory-lock owner already use. That the `nextval`
+    /// evaluator arm ALREADY writes `lastval()`/`currval()` into the
+    /// thread-local `SESSION_SCOPED_STATE` is the standing proof that this
+    /// evaluation happens on the statement's own thread.
+    /// The [`EngineId`] is carried alongside the namespace purely so
+    /// [`EngineScope::enter`] can recognise "already this database" with an
+    /// integer compare: every statement installs the scope TWICE (the embedded
+    /// funnel, then `Executor::execute` nested inside it), and the second one
+    /// must not pay a registry lock. `0` is the engine-less namespace — never a
+    /// real engine address.
+    static CURRENT_NS: RefCell<Option<(EngineId, Arc<SeqNamespace>)>> = const { RefCell::new(None) };
+}
+
+fn namespaces() -> &'static Mutex<Vec<(EngineId, Arc<SeqNamespace>)>> {
+    NAMESPACES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn volatile_namespace() -> Arc<SeqNamespace> {
+    Arc::clone(VOLATILE_NS.get_or_init(|| {
+        Arc::new(SeqNamespace {
+            handle: None,
+            store: Mutex::new(HashMap::new()),
+        })
+    }))
+}
+
+/// Resolve the namespace for an engine address.
+///
+/// `Some(addr)` — from [`EngineScope`], or from a caller holding the engine
+/// outright — selects exactly that database's namespace. The fallback, NEWEST
+/// LIVE registered database, is what direct-API callers with no executor around
+/// them get: `install_persistence(&engine)` immediately followed by
+/// `try_nextval(name)` is the "last open wins" contract the durability suites
+/// are written against, and it is what the pre-namespace code did for everyone.
+/// From SQL it is reachable only if a statement somehow ran without an
+/// [`EngineScope`]; with two live databases that is the one residual ambiguity
+/// this item could not remove without an engine handle inside `Evaluator`.
+fn namespace_for_id(id: Option<EngineId>) -> Arc<SeqNamespace> {
+    let guard = namespaces().lock();
+    if let Some(id) = id {
+        if let Some((_, ns)) = guard.iter().rev().find(|(k, ns)| *k == id && ns.is_live()) {
+            return Arc::clone(ns);
+        }
+    }
+    if let Some((_, ns)) = guard.iter().rev().find(|(_, ns)| ns.is_live()) {
+        return Arc::clone(ns);
+    }
+    drop(guard);
+    volatile_namespace()
+}
+
+/// The namespace every entry point below works against: the one [`EngineScope`]
+/// installed for this statement, else the registry fallback. Reading the
+/// thread-local costs a `RefCell` borrow and an `Arc` clone and does NOT take
+/// the registry lock — that lookup happens once per statement, in `enter`.
+fn namespace() -> Arc<SeqNamespace> {
+    match CURRENT_NS.with(|c| c.borrow().as_ref().map(|(_, ns)| Arc::clone(ns))) {
+        Some(ns) => ns,
+        None => namespace_for_id(None),
+    }
+}
+
+/// The namespace owned by `engine`, for callers that hold the engine outright
+/// (the CREATE/ALTER/DROP SEQUENCE executor arms, [`warm_load`]) and therefore
+/// need not depend on an [`EngineScope`] being installed at all.
+fn namespace_of(engine: &StorageEngine) -> Arc<SeqNamespace> {
+    namespace_for_id(Some(engine.instance_id()))
+}
+
+/// Publishes "the statement on this thread is running against THIS database"
+/// for the guard's lifetime, restoring the previous value on `Drop` — including
+/// on an unwinding panic, and including the nested case, where a SQL UDF or
+/// trigger body re-enters `Executor::execute` on the same thread, possibly
+/// against a DIFFERENT database (`udf_bridge::resolve` can hand back another
+/// open database's bridge). Hence save-and-restore rather than
+/// install-if-absent: the inner database must win for its own duration, and
+/// only for that.
+///
+/// The `PhantomData<*const ()>` makes "never held across an `.await`" structural
+/// rather than a comment, exactly as `SessionScopedStateGuard` in `crate::lib`
+/// does: the guard is not `Send`, so no `async fn` can carry one across a yield
+/// point and leave one database's namespace published on a worker thread it has
+/// since migrated off.
+pub struct EngineScope(Option<(EngineId, Arc<SeqNamespace>)>, PhantomData<*const ()>);
+
+impl EngineScope {
+    /// Enter `engine`'s sequence namespace for the duration of the returned
+    /// guard. The registry lookup happens at most ONCE per statement, so the hot
+    /// `nextval` path itself never touches the registry lock.
+    pub fn enter(engine: &StorageEngine) -> Self {
+        let id = engine.instance_id();
+        // Fast path: this database's scope is ALREADY the one installed on this
+        // thread. That is the normal case for the inner of the two installs
+        // every statement performs (the embedded funnel, then
+        // `Executor::execute` nested inside it), and for every nested
+        // re-entry — trigger bodies, `CALL`, SQL UDF bodies — against the same
+        // database. An integer compare instead of a registry lock.
+        let same = CURRENT_NS.with(|c| match c.borrow().as_ref() {
+            Some((k, ns)) if *k == id => Some((*k, Arc::clone(ns))),
+            _ => None,
+        });
+        let entry = match same {
+            Some(entry) => entry,
+            None => (id, namespace_of(engine)),
+        };
+        EngineScope(CURRENT_NS.with(|c| c.borrow_mut().replace(entry)), PhantomData)
+    }
+
+    /// Enter the engine-less (volatile) namespace. Test-only: it is what makes
+    /// this module's own unit tests deterministic in a lib-test binary where
+    /// OTHER tests have live `EmbeddedDatabase`s registered — without it they
+    /// would resolve the newest such database and try to persist into it.
+    #[cfg(test)]
+    fn volatile() -> Self {
+        EngineScope(
+            CURRENT_NS.with(|c| c.borrow_mut().replace((0, volatile_namespace()))),
+            PhantomData,
+        )
+    }
+}
+
+impl Drop for EngineScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        CURRENT_NS.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
+/// Register `engine`'s sequence namespace. Called once per `EmbeddedDatabase`
 /// open, right after `rebuild_all_indexes`. Takes `&Arc` and downgrades, so
 /// the caller's subsequent move of the `Arc` into `Self` is unaffected, and
 /// the `Weak` never keeps the engine alive.
+///
+/// sprinter d15933f528b0: this used to be `*PERSIST.lock() = Some(weak)` — an
+/// UNCONDITIONAL overwrite, so the most recently constructed database won a
+/// single process-wide slot and every older database's `nextval`/`setval`
+/// resolved to it. It now APPENDS, and re-installing an engine that is already
+/// registered is a no-op, so a second database can never displace the first.
 pub fn install_persistence(engine: &Arc<StorageEngine>) {
-    *PERSIST.get_or_init(|| Mutex::new(None)).lock() = Some(Arc::downgrade(engine));
+    let id = engine.instance_id();
+    let mut guard = namespaces().lock();
+    // Drop namespaces whose database is gone, so a long-lived process does not
+    // accumulate one entry per database it has ever opened. With an id that is
+    // never reused (see [`EngineId`]) this prune is pure housekeeping — it is
+    // not load-bearing for correctness the way it had to be when the key was an
+    // allocation address that could be recycled.
+    guard.retain(|(_, ns)| ns.is_live());
+    if guard.iter().any(|(k, _)| *k == id) {
+        return;
+    }
+    guard.push((id, Arc::new(SeqNamespace::new(engine))));
 }
 
-/// Upgrade the persistence handle, if installed and still live. `None` means
-/// pure in-memory evaluation (no DB) — callers fall back to volatile mode.
+/// The storage engine backing the sequences of the database whose statement is
+/// running on this thread. `None` means pure in-memory evaluation with no
+/// database in the process — callers fall back to volatile mode.
 pub fn persist_handle() -> Option<Arc<StorageEngine>> {
-    PERSIST.get().and_then(|m| m.lock().clone()).and_then(|w| w.upgrade())
+    namespace().engine()
 }
 
 /// Evict a sequence's cached runtime so the next `nextval` rebuilds it from
@@ -164,18 +392,25 @@ pub fn persist_handle() -> Option<Arc<StorageEngine>> {
 /// after CREATE / ALTER (incl. RESTART) / DROP, which is what makes RESTART
 /// discard any in-flight cached block.
 pub fn invalidate_cache(name: &str) {
-    if let Some(m) = STORE.get() {
-        m.lock().remove(name);
-    }
+    namespace().store.lock().remove(name);
 }
 
-/// Eagerly load every persisted sequence into the runtime map. Optional —
+/// [`invalidate_cache`] for a caller that holds the owning engine, so the
+/// eviction lands on that database's namespace whether or not an
+/// [`EngineScope`] is installed. The DDL executor arms use this: they have
+/// `storage` in hand at the point they evict.
+pub fn invalidate_cache_on(engine: &StorageEngine, name: &str) {
+    namespace_of(engine).store.lock().remove(name);
+}
+
+/// Eagerly load every persisted sequence into `engine`'s runtime map. Optional —
 /// `nextval` lazy-loads on demand, so this is NOT required for correctness and
 /// is NOT wired into the startup hot path. Provided for callers (tests /
 /// future warm-start) that want the map prepopulated.
 pub fn warm_load(engine: &StorageEngine) -> Result<()> {
     let defs = engine.catalog().list_sequences()?;
-    let mut guard = store().lock();
+    let ns = namespace_of(engine);
+    let mut guard = ns.store.lock();
     for def in defs {
         let st = engine.catalog().get_sequence_state(&def.name)?;
         let rt = SeqRuntime::from_persisted(&def, st, false);
@@ -317,18 +552,18 @@ fn clamp_block_end(first: i64, incr: i64, cache: i64, min: i64, max: i64) -> i64
     clamped as i64
 }
 
-/// Fetch (or lazily build) the runtime `Arc` for `name`.
+/// Fetch (or lazily build) the runtime `Arc` for `name` IN `ns`.
 ///
 /// Lazy-load order:
-/// 1. present in the map -> clone the `Arc`.
-/// 2. storage handle + persisted def -> build from def + durable state.
-/// 3. storage handle + NO def -> D7 auto-vivify: persist a default durable
-///    def + seed state, then build (so it is discoverable).
-/// 4. no storage handle -> volatile default runtime (no regression for pure
+/// 1. present in this database's map -> clone the `Arc`.
+/// 2. this database's engine + persisted def -> build from def + durable state.
+/// 3. this database's engine + NO def -> D7 auto-vivify: persist a default
+///    durable def + seed state, then build (so it is discoverable).
+/// 4. engine-less namespace -> volatile default runtime (no regression for pure
 ///    in-memory evaluation).
-fn runtime_for(name: &str) -> Result<Arc<SeqRuntime>> {
+fn runtime_for(ns: &SeqNamespace, name: &str) -> Result<Arc<SeqRuntime>> {
     {
-        let guard = store().lock();
+        let guard = ns.store.lock();
         if let Some(rt) = guard.get(name) {
             return Ok(Arc::clone(rt));
         }
@@ -338,7 +573,7 @@ fn runtime_for(name: &str) -> Result<Arc<SeqRuntime>> {
     // across catalog I/O, then insert-or-take-existing (another thread may have
     // raced us). For the AUTO-VIVIFY path we must serialize the durable seed
     // with claiming the map entry (see below), so it is handled separately.
-    let rt = match persist_handle() {
+    let rt = match ns.engine() {
         Some(engine) => match engine.catalog().get_sequence(name)? {
             Some(def) => {
                 let st = engine.catalog().get_sequence_state(name)?;
@@ -352,15 +587,15 @@ fn runtime_for(name: &str) -> Result<Arc<SeqRuntime>> {
                 // would clobber a durable high-water back to the start and
                 // re-serve already-handed-out values across a crash.
                 //
-                // We serialize on the STORE map lock: only the thread that wins
-                // the map entry performs the durable seed, and it does so while
+                // We serialize on THIS namespace's map lock: only the thread that
+                // wins the map entry performs the durable seed, and it does so while
                 // holding the lock and ONLY when no state record already exists
                 // (so a surviving fsynced high-water is never lowered). Losing
                 // threads adopt the winner's `Arc` and never touch durable
                 // state. Holding the lock across this catalog I/O is acceptable:
                 // auto-vivify of an unknown name is rare and off the hot path.
                 let def = PersistedSequence::default_named(name);
-                let mut guard = store().lock();
+                let mut guard = ns.store.lock();
                 if let Some(existing) = guard.get(name) {
                     return Ok(Arc::clone(existing));
                 }
@@ -388,18 +623,24 @@ fn runtime_for(name: &str) -> Result<Arc<SeqRuntime>> {
         }
     };
 
-    let mut guard = store().lock();
+    let mut guard = ns.store.lock();
     let entry = guard.entry(name.to_string()).or_insert_with(|| Arc::clone(&rt));
     Ok(Arc::clone(entry))
 }
 
 /// Persist + fsync the high-water mark for `name`, upholding the no-duplicate
 /// invariant. Volatile runtimes (memory-only / no handle) skip persistence.
-fn persist_high_water(rt: &SeqRuntime, name: &str, last_reserved: i64) -> Result<()> {
+fn persist_high_water(ns: &SeqNamespace, rt: &SeqRuntime, name: &str, last_reserved: i64) -> Result<()> {
     if rt.volatile {
         return Ok(());
     }
-    let engine = persist_handle().ok_or_else(|| Error::query_execution("nextval requires storage context"))?;
+    // sprinter d15933f528b0: `ns` is THIS database's namespace, so the
+    // high-water can no longer be fsynced into another database's store — nor
+    // can a healthy database fail here because some OTHER database (the one
+    // that happened to win the old single global slot) has since been dropped.
+    let engine = ns
+        .engine()
+        .ok_or_else(|| Error::query_execution("nextval requires storage context"))?;
     engine.flush_sequence_state(
         name,
         PersistedSeqState {
@@ -418,7 +659,15 @@ fn persist_high_water(rt: &SeqRuntime, name: &str, last_reserved: i64) -> Result
 /// cached-block reservation. Returns `Err` on NO-CYCLE overflow / out-of-range
 /// (with the PostgreSQL message) and consumes/advances no value in that case.
 pub fn try_nextval(name: &str) -> Result<i64> {
-    let rt = runtime_for(name)?;
+    let ns = namespace();
+    try_nextval_in(&ns, name)
+}
+
+/// [`try_nextval`] against an explicit namespace. Split out so the refill
+/// retry below re-enters the SAME database rather than re-resolving the
+/// thread-local (which a nested guard could have moved out from under it).
+fn try_nextval_in(ns: &SeqNamespace, name: &str) -> Result<i64> {
+    let rt = runtime_for(ns, name)?;
 
     // ---- FAST PATH: lock-free CAS within the reserved durable window ----
     //
@@ -476,7 +725,7 @@ pub fn try_nextval(name: &str) -> Result<i64> {
         let end = rt.block_end.load(Ordering::Acquire);
         if rt.in_block(cur, end) {
             drop(_g);
-            return try_nextval(name);
+            return try_nextval_in(ns, name);
         }
     }
 
@@ -491,7 +740,7 @@ pub fn try_nextval(name: &str) -> Result<i64> {
     let durable: Option<PersistedSeqState> = if rt.volatile {
         None
     } else {
-        match persist_handle() {
+        match ns.engine() {
             Some(engine) => engine.catalog().get_sequence_state(name)?,
             None => None,
         }
@@ -502,8 +751,8 @@ pub fn try_nextval(name: &str) -> Result<i64> {
     // First value of the new block.
     //
     // Cross-instance/cross-process note: within ONE process all refills for a
-    // sequence serialize through this `rt.refill` mutex (the process-global
-    // STORE hands every opener of the same dir the SAME `Arc<SeqRuntime>`), so
+    // sequence serialize through this `rt.refill` mutex (one namespace hands
+    // every caller of the same database the SAME `Arc<SeqRuntime>`), so
     // the in-memory `is_called` flag is authoritative and two in-process
     // refillers can NEVER both take the `!base_called` arm — the first sets
     // `is_called=true` while holding the lock, so the second re-reads it as
@@ -540,7 +789,7 @@ pub fn try_nextval(name: &str) -> Result<i64> {
 
     // *** DURABILITY BARRIER — persist+fsync the high-water BEFORE publishing
     //     the window. After this returns, `first` is durably reserved. ***
-    persist_high_water(&rt, name, last)?;
+    persist_high_water(ns, &rt, name, last)?;
 
     // `first` is consumed by THIS call; the next value to hand out is the plain
     // step past `first`. We must NOT apply bound/cycle logic here (that belongs
@@ -595,7 +844,7 @@ pub fn try_nextval(name: &str) -> Result<i64> {
     Ok(first)
 }
 
-/// PROCESS-wide "last value served for `name`", or 0 if never served.
+/// DATABASE-wide "last value served for `name`", or 0 if never served.
 ///
 /// sprinter 7903b7111cb4: this is NOT what SQL `currval('s')` evaluates to any
 /// more — that is session state (see the module docs and
@@ -608,8 +857,8 @@ pub fn try_nextval(name: &str) -> Result<i64> {
 /// read-only function must not conjure a durable catalog object). Only `nextval`
 /// auto-vivifies (D7).
 pub fn try_currval(name: &str) -> Result<i64> {
-    // Peek the map without building/persisting anything.
-    let rt = match STORE.get().and_then(|m| m.lock().get(name).cloned()) {
+    // Peek THIS database's map without building/persisting anything.
+    let rt = match namespace().store.lock().get(name).cloned() {
         Some(rt) => rt,
         None => return Ok(0),
     };
@@ -644,7 +893,19 @@ pub fn try_currval(name: &str) -> Result<i64> {
 /// which is the documented cached-sequence gap behavior; within the live
 /// session the reported value is exact.
 pub fn peek_last_served(name: &str) -> Option<i64> {
-    let guard = STORE.get()?.lock();
+    peek_in(&namespace(), name)
+}
+
+/// [`peek_last_served`] for a caller that holds the owning engine. The
+/// `pg_sequences` view uses this: it already has `storage`, and reporting
+/// another database's counter as this one's `last_value` is exactly the class of
+/// leak sprinter d15933f528b0 exists to close.
+pub fn peek_last_served_on(engine: &StorageEngine, name: &str) -> Option<i64> {
+    peek_in(&namespace_of(engine), name)
+}
+
+fn peek_in(ns: &SeqNamespace, name: &str) -> Option<i64> {
+    let guard = ns.store.lock();
     let rt = guard.get(name)?;
     let v = rt.last_served.load(Ordering::Relaxed);
     if v == i64::MIN {
@@ -659,7 +920,8 @@ pub fn peek_last_served(name: &str) -> Option<i64> {
 /// on the next `nextval`, and fsyncs the new high-water so it survives restart
 /// (pg_dump emits setval at restore).
 pub fn try_setval(name: &str, value: i64, is_called: bool) -> Result<i64> {
-    let rt = runtime_for(name)?;
+    let ns = namespace();
+    let rt = runtime_for(&ns, name)?;
     if value < rt.min_value || value > rt.max_value {
         return Err(Error::query_execution(format!(
             "setval: value {} is out of bounds for sequence \"{}\" (min {}, max {})",
@@ -672,7 +934,13 @@ pub fn try_setval(name: &str, value: i64, is_called: bool) -> Result<i64> {
     // Durably persist FIRST (skipped for volatile runtimes), so the new
     // high-water is on disk before any in-memory window change is observable.
     if !rt.volatile {
-        let engine = persist_handle().ok_or_else(|| Error::query_execution("setval requires storage context"))?;
+        // sprinter d15933f528b0: resolved from THIS statement's database. The
+        // observed flake — `setval requires storage context` raised on a
+        // perfectly healthy database — was this `ok_or_else` firing because a
+        // DIFFERENT, since-dropped database had overwritten the one global slot.
+        let engine = ns
+            .engine()
+            .ok_or_else(|| Error::query_execution("setval requires storage context"))?;
         engine.flush_sequence_state(
             name,
             PersistedSeqState {
@@ -687,7 +955,9 @@ pub fn try_setval(name: &str, value: i64, is_called: bool) -> Result<i64> {
         // in-memory window — preserving the no-duplicate invariant across a
         // crash right after `setval` (pg_dump restore emits setval).
         drop(_g);
-        invalidate_cache(name);
+        // Evict from the SAME namespace we just persisted into — never
+        // `invalidate_cache`, which would re-resolve the thread-local.
+        ns.store.lock().remove(name);
         return Ok(value);
     }
 
@@ -718,8 +988,13 @@ pub fn try_setval(name: &str, value: i64, is_called: bool) -> Result<i64> {
 /// it without a catalog round-trip. (Equivalent to `invalidate_cache` followed
 /// by a lazy load, but avoids the extra read.)
 pub fn install_runtime(def: &PersistedSequence, state: Option<PersistedSeqState>) {
-    let rt = Arc::new(SeqRuntime::from_persisted(def, state, persist_handle().is_none()));
-    store().lock().insert(def.name.clone(), rt);
+    install_runtime_in(&namespace(), def, state);
+}
+
+/// [`install_runtime`] against an explicit namespace.
+fn install_runtime_in(ns: &SeqNamespace, def: &PersistedSequence, state: Option<PersistedSeqState>) {
+    let rt = Arc::new(SeqRuntime::from_persisted(def, state, ns.engine().is_none()));
+    ns.store.lock().insert(def.name.clone(), rt);
 }
 
 // ============================================================
@@ -741,14 +1016,17 @@ pub fn create_sequence(name: &str, if_not_exists: bool, start: Option<i64>, incr
         n => n,
     };
     let start = start.unwrap_or(1);
+    // One resolution for the whole function: every probe and every write below
+    // must land on the SAME database (sprinter d15933f528b0).
+    let ns = namespace();
 
     if if_not_exists {
         // Honour IF NOT EXISTS: if a runtime or durable def already exists,
         // leave it untouched.
-        if store().lock().contains_key(name) {
+        if ns.store.lock().contains_key(name) {
             return;
         }
-        if let Some(engine) = persist_handle() {
+        if let Some(engine) = ns.engine() {
             if engine.catalog().sequence_exists(name).unwrap_or(false) {
                 return;
             }
@@ -779,7 +1057,7 @@ pub fn create_sequence(name: &str, if_not_exists: bool, start: Option<i64>, incr
         owned_by_column: None,
     };
 
-    if let Some(engine) = persist_handle() {
+    if let Some(engine) = ns.engine() {
         // Best-effort durable persist; ignore errors here to preserve the
         // infallible legacy signature (the executor path surfaces errors).
         let _ = engine.catalog().save_sequence(&def);
@@ -787,7 +1065,7 @@ pub fn create_sequence(name: &str, if_not_exists: bool, start: Option<i64>, incr
             .catalog()
             .save_sequence_state(name, &SeqRuntime::seed_state(&def));
     }
-    install_runtime(&def, None);
+    install_runtime_in(&ns, &def, None);
 }
 
 /// `nextval(name)` — infallible legacy wrapper. On a NO-CYCLE overflow /
@@ -796,12 +1074,13 @@ pub fn create_sequence(name: &str, if_not_exists: bool, start: Option<i64>, incr
 /// fallible [`try_nextval`] carries the real error for the executor and the
 /// later evaluator wiring (SEQ-5).
 pub fn nextval(name: &str) -> i64 {
-    match try_nextval(name) {
+    let ns = namespace();
+    match try_nextval_in(&ns, name) {
         Ok(v) => v,
         Err(_) => {
             // Best-effort sentinel: the bound the sequence was trying to pass.
             // Reading the runtime is cheap and avoids a panic.
-            match runtime_for(name) {
+            match runtime_for(&ns, name) {
                 Ok(rt) => {
                     if rt.increment >= 0 {
                         rt.max_value
@@ -815,7 +1094,7 @@ pub fn nextval(name: &str) -> i64 {
     }
 }
 
-/// Infallible wrapper over [`try_currval`] — the PROCESS-wide primitive, not
+/// Infallible wrapper over [`try_currval`] — the DATABASE-wide primitive, not
 /// SQL `currval()` (sprinter 7903b7111cb4; see the module docs).
 pub fn currval(name: &str) -> i64 {
     try_currval(name).unwrap_or(0)
@@ -833,13 +1112,21 @@ pub fn setval(name: &str, value: i64, is_called: bool) -> i64 {
 mod tests {
     use super::*;
 
-    // These tests run WITHOUT a persistence handle installed, so the runtime
-    // is volatile (in-memory). That exercises the full arithmetic / cache /
-    // cycle / overflow logic without touching disk. Durable reopen behaviour
-    // is covered by the integration suite (SEQ-1's reopen test).
+    // These tests run against the ENGINE-LESS namespace, so the runtime is
+    // volatile (in-memory). That exercises the full arithmetic / cache / cycle
+    // / overflow logic without touching disk. Durable reopen behaviour is
+    // covered by the integration suite (SEQ-1's reopen test).
+    //
+    // sprinter d15933f528b0: each test opens `EngineScope::volatile()` FIRST.
+    // The header used to claim volatility followed from "no persistence handle
+    // installed", which was only true until some other test in this lib-test
+    // binary opened an `EmbeddedDatabase` — after that these tests silently
+    // resolved that database and tried to persist into it. Pinning the scope
+    // makes the documented intent actually hold, whatever else the binary runs.
 
     #[test]
     fn default_sequence_starts_at_one() {
+        let _ns = EngineScope::volatile();
         create_sequence("seq_default", false, None, None);
         assert_eq!(nextval("seq_default"), 1);
         assert_eq!(nextval("seq_default"), 2);
@@ -848,6 +1135,7 @@ mod tests {
 
     #[test]
     fn honors_start_and_increment() {
+        let _ns = EngineScope::volatile();
         create_sequence("seq_si", false, Some(100), Some(10));
         assert_eq!(nextval("seq_si"), 100);
         assert_eq!(nextval("seq_si"), 110);
@@ -856,6 +1144,7 @@ mod tests {
 
     #[test]
     fn setval_preserves_increment() {
+        let _ns = EngineScope::volatile();
         create_sequence("seq_sv", false, Some(1), Some(5));
         assert_eq!(nextval("seq_sv"), 1);
         // Two-arg form == is_called=true: next nextval is value + increment.
@@ -865,6 +1154,7 @@ mod tests {
 
     #[test]
     fn setval_is_called_false_makes_next_nextval_equal_value() {
+        let _ns = EngineScope::volatile();
         create_sequence("seq_sv_false", false, Some(1), Some(5));
         assert_eq!(nextval("seq_sv_false"), 1);
         // is_called=false: the next nextval returns exactly `value`.
@@ -876,12 +1166,14 @@ mod tests {
 
     #[test]
     fn unknown_sequence_auto_vivifies_at_one() {
+        let _ns = EngineScope::volatile();
         // Preserves the lenient pre-existing behaviour SERIAL internals rely on.
         assert_eq!(nextval("seq_never_created_xyz"), 1);
     }
 
     #[test]
     fn cache_serves_contiguous_values_in_one_window() {
+        let _ns = EngineScope::volatile();
         // CACHE > 1: the volatile window serves several values before refill.
         let def = PersistedSequence {
             name: "seq_cache".into(),
@@ -903,6 +1195,7 @@ mod tests {
 
     #[test]
     fn ascending_maxvalue_no_cycle_errors() {
+        let _ns = EngineScope::volatile();
         let def = PersistedSequence {
             name: "seq_maxnc".into(),
             data_type: "bigint".into(),
@@ -925,6 +1218,7 @@ mod tests {
 
     #[test]
     fn ascending_maxvalue_cycle_wraps_to_min() {
+        let _ns = EngineScope::volatile();
         let def = PersistedSequence {
             name: "seq_maxcy".into(),
             data_type: "bigint".into(),
@@ -947,6 +1241,7 @@ mod tests {
 
     #[test]
     fn descending_minvalue_no_cycle_errors() {
+        let _ns = EngineScope::volatile();
         let def = PersistedSequence {
             name: "seq_desc".into(),
             data_type: "bigint".into(),
@@ -969,6 +1264,7 @@ mod tests {
 
     #[test]
     fn overflow_near_i64_max_errors_not_panics() {
+        let _ns = EngineScope::volatile();
         let def = PersistedSequence {
             name: "seq_ovf".into(),
             data_type: "bigint".into(),
@@ -991,6 +1287,7 @@ mod tests {
 
     #[test]
     fn setval_out_of_bounds_errors() {
+        let _ns = EngineScope::volatile();
         let def = PersistedSequence {
             name: "seq_svb".into(),
             data_type: "bigint".into(),
@@ -1010,6 +1307,7 @@ mod tests {
 
     #[test]
     fn cache_never_exceeds_max_bound() {
+        let _ns = EngineScope::volatile();
         // CACHE wide enough to overshoot the bound; the last block must clamp.
         let def = PersistedSequence {
             name: "seq_clamp".into(),
@@ -1036,6 +1334,7 @@ mod tests {
 
     #[test]
     fn clamp_block_end_stays_in_range() {
+        let _ns = EngineScope::volatile();
         // Pure-function check on the i128 clamp.
         assert_eq!(clamp_block_end(1, 1, 100, 1, 5), 5);
         assert_eq!(clamp_block_end(1, 1, 8, 1, i64::MAX), 8);

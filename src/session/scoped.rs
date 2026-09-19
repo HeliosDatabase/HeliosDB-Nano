@@ -46,6 +46,17 @@
 //!   connection's queries. They are per-session in PostgreSQL and they are
 //!   per-session here now; the registry keeps only genuine SERVER-level
 //!   parameters (`sql::settings::is_server_level`).
+//! * sprinter d03de7fc3b22 (the KEYSTONE) — the session's TENANT. `max_qps`
+//!   metering and every RLS gate resolved their tenant from
+//!   `TenantManager::current_context`, ONE `RwLock<Option<TenantContext>>`
+//!   shared by every connection and thread in the process, whose only
+//!   production writer was the REPL's `\tenant use`. So on a wire path the
+//!   answer was always "no tenant" (nothing metered, nothing gated), and on the
+//!   paths that DID set it the answer was one value for every concurrent
+//!   connection. A tenant is a property of the CONNECTION — PostgreSQL resolves
+//!   the database in `InitPostgres`, once, per backend — so it belongs here,
+//!   next to `application_name` and the GUC overlay, for exactly the reasons
+//!   above. See [`SessionScopedState::bind_tenant`].
 //!
 //! The one deliberately process-wide structure here is [`live_backends`] — the
 //! registry `pg_stat_activity` scans. Listing every live connection IS that
@@ -228,6 +239,23 @@ pub struct SessionScopedState {
     /// `StorageEngine::is_bulk_load_mode` on per-row insert paths, so it has to
     /// be exactly this cheap.
     bulk_load_mode: AtomicI8,
+    /// sprinter d03de7fc3b22 (the KEYSTONE): the tenant THIS connection is
+    /// bound to, resolved once from the database name the client asked for (see
+    /// `EmbeddedDatabase::bind_session_tenant`).
+    ///
+    /// `None` is "this session made no tenant decision", NOT "this session has
+    /// no tenant": the reader (`EmbeddedDatabase::effective_tenant_context`)
+    /// falls back to the process-global `TenantManager::current_context` on
+    /// `None`, which is what keeps the embedded library API and the REPL — both
+    /// of which have no session at all and set the global directly — working
+    /// exactly as they did. Only a WIRE connection ever binds one.
+    tenant: parking_lot::RwLock<Option<crate::tenant::TenantContext>>,
+    /// Lock-free mirror of `tenant.is_some()`. Every RLS gate in the engine and
+    /// the QPS meter read the binding on the per-statement hot path, and the
+    /// overwhelming majority of sessions never bind one, so the common answer
+    /// has to cost one relaxed load rather than an `RwLock` read — the same
+    /// discipline `guc_overrides_present` follows above.
+    tenant_bound: AtomicBool,
     /// `SET LOCAL` support for the overlay: `name -> the value to restore when
     /// the current transaction block ends` (`None` = the name had no override,
     /// so restoring means REMOVING it). Armed on the first `SET LOCAL` of a
@@ -258,6 +286,8 @@ impl SessionScopedState {
             statement_timeout_ms: AtomicI64::new(GUC_TIMEOUT_UNSET),
             bulk_load_mode: AtomicI8::new(GUC_TRISTATE_UNSET),
             gucs_saved: parking_lot::Mutex::new(None),
+            tenant: parking_lot::RwLock::new(None),
+            tenant_bound: AtomicBool::new(false),
         });
         live_backends().insert(state.backend_pid, Arc::downgrade(&state));
         state
@@ -299,7 +329,7 @@ impl SessionScopedState {
     /// still reading the process-wide sequence runtime).
     ///
     /// `name` is stored exactly as the caller spelled it, because that is how
-    /// `crate::sql::sequences::STORE` keys the runtime too — `nextval('s')` and
+    /// `crate::sql::sequences`' per-database store keys the runtime too — `nextval('s')` and
     /// `nextval('public.s')` are already two different sequences to this engine,
     /// and a normalization here would make `currval` disagree with `nextval`.
     pub fn note_nextval(&self, name: &str, value: i64) {
@@ -506,6 +536,69 @@ impl SessionScopedState {
         self.client_port.store(port, Ordering::Relaxed);
     }
 
+    // ---- sprinter d03de7fc3b22: the per-session TENANT binding ----
+
+    /// Bind this connection to `context`, returning the tenant it was bound to
+    /// BEFORE (so the caller can release that tenant's connection slot).
+    ///
+    /// Called once per connection, from the point the requested database name
+    /// is resolved post-authentication — `EmbeddedDatabase::bind_session_tenant`
+    /// is the only caller, and it is what keeps "database name == tenant name"
+    /// (`EmbeddedDatabase::database_name_is_valid`) the single definition of
+    /// which tenant a connection belongs to. MySQL's `COM_INIT_DB` can call it a
+    /// second time, which is why it reports the displaced binding rather than
+    /// asserting there was none.
+    pub fn bind_tenant(&self, context: crate::tenant::TenantContext) -> Option<crate::tenant::TenantId> {
+        let mut slot = self.tenant.write();
+        let previous = slot.as_ref().map(|c| c.tenant_id);
+        *slot = Some(context);
+        drop(slot);
+        self.tenant_bound.store(true, Ordering::Relaxed);
+        previous
+    }
+
+    /// Drop this connection's tenant binding, returning the tenant it held.
+    ///
+    /// The mirror is cleared BEFORE the slot, never after: a reader that sees
+    /// the mirror still set only takes the lock and finds `None`, which is the
+    /// same answer; the reverse order would let a reader skip the lock while the
+    /// slot still held a binding it was entitled to see.
+    pub fn unbind_tenant(&self) -> Option<crate::tenant::TenantId> {
+        if !self.tenant_bound.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.tenant_bound.store(false, Ordering::Relaxed);
+        self.tenant.write().take().map(|c| c.tenant_id)
+    }
+
+    /// This connection's bound tenant context, or `None` when it made no tenant
+    /// decision (every embedded caller, and every wire connection to a reserved
+    /// database name).
+    pub fn tenant_context(&self) -> Option<crate::tenant::TenantContext> {
+        if !self.tenant_bound.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.tenant.read().clone()
+    }
+
+    /// This connection's bound tenant id, without the `TenantContext` clone
+    /// [`Self::tenant_context`] pays (a `String` `user_id` plus a `Vec<String>`
+    /// of roles) — the spelling the QPS meter uses, on every statement of every
+    /// execution family.
+    pub fn tenant_id(&self) -> Option<crate::tenant::TenantId> {
+        if !self.tenant_bound.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.tenant.read().as_ref().map(|c| c.tenant_id)
+    }
+
+    /// Is this connection bound to a tenant? One relaxed atomic load — the
+    /// spelling the RLS fast-path gates use.
+    #[inline]
+    pub fn has_tenant(&self) -> bool {
+        self.tenant_bound.load(Ordering::Relaxed)
+    }
+
     /// One row of `pg_stat_activity`.
     pub fn snapshot(&self) -> BackendSnapshot {
         let port = self.client_port.load(Ordering::Relaxed);
@@ -681,6 +774,54 @@ mod tests {
         s.set_guc("statement_timeout", SettingValue::Duration(1));
         s.end_transaction();
         assert_eq!(s.statement_timeout_ms(), Some(1));
+    }
+
+    /// sprinter d03de7fc3b22: the KEYSTONE invariant — a tenant binding is
+    /// PER CONNECTION. On the pre-fix tree there was nowhere to put one at all:
+    /// every reader went to `TenantManager::current_context`, one slot for the
+    /// whole process.
+    #[test]
+    fn the_tenant_binding_never_crosses_sessions() {
+        use crate::tenant::{IsolationMode, TenantContext};
+        let a = SessionScopedState::new();
+        let b = SessionScopedState::new();
+        assert!(!a.has_tenant(), "a fresh session must make no tenant decision");
+        assert!(a.tenant_context().is_none());
+        assert!(a.tenant_id().is_none());
+
+        let tenant_id = uuid::Uuid::new_v4();
+        let previous = a.bind_tenant(TenantContext {
+            tenant_id,
+            user_id: "alice".to_string(),
+            roles: vec![],
+            isolation_mode: IsolationMode::SharedSchema,
+        });
+        assert!(previous.is_none(), "a first bind displaces nothing");
+        assert!(a.has_tenant());
+        assert_eq!(a.tenant_id(), Some(tenant_id));
+        assert_eq!(a.tenant_context().map(|c| c.user_id), Some("alice".to_string()));
+        assert!(!b.has_tenant(), "session B saw session A's tenant");
+        assert!(b.tenant_id().is_none(), "session B saw session A's tenant");
+
+        // Rebinding (MySQL `COM_INIT_DB`) reports the displaced tenant, so the
+        // caller can release its connection slot.
+        let other = uuid::Uuid::new_v4();
+        let displaced = a.bind_tenant(TenantContext {
+            tenant_id: other,
+            user_id: "alice".to_string(),
+            roles: vec![],
+            isolation_mode: IsolationMode::DatabasePerTenant,
+        });
+        assert_eq!(displaced, Some(tenant_id));
+        assert_eq!(a.tenant_id(), Some(other));
+
+        assert_eq!(a.unbind_tenant(), Some(other));
+        assert!(!a.has_tenant());
+        assert!(a.tenant_context().is_none());
+        // Idempotent: a second unbind has nothing to release, so a disconnect
+        // path that runs twice cannot double-decrement the tenant's connection
+        // count.
+        assert_eq!(a.unbind_tenant(), None);
     }
 
     #[test]

@@ -9,8 +9,18 @@
 //!
 //! ## Design
 //!
-//! - **Per-process LRU** keyed by `(tool_name, canonicalised_args)`,
-//!   bounded at [`CACHE_CAPACITY`] entries.
+//! - **Per-process LRU** keyed by
+//!   `(database, tool_name, canonicalised_args)`, bounded at
+//!   [`CACHE_CAPACITY`] entries. The `database` component is
+//!   `StorageEngine::instance_id` and is NOT decoration: `call_tool`
+//!   takes the `EmbeddedDatabase` as a PARAMETER, so one process can
+//!   and does serve several databases through this one table (two
+//!   `McpServer`s, or an `McpServer` beside an HTTP route bound to a
+//!   different handle). Without it, `heliosdb_list_tables` answered for
+//!   database A returned A's tables to a caller asking about B for the
+//!   next [`CACHE_TTL`]. Tools that take no database (the in-process
+//!   BM25/graph family) share one `nodb` scope, which is correct: their
+//!   state is genuinely process-wide.
 //! - **TTL** of [`CACHE_TTL`]. Entries past their TTL are dropped on
 //!   read.
 //! - **Generation counter** bumped on every call to a tool listed in
@@ -151,18 +161,25 @@ fn canonicalise(v: &JsonValue) -> JsonValue {
     }
 }
 
-fn cache_key(tool_name: &str, args: &JsonValue) -> String {
-    format!("{tool_name}::{}", canonicalise(args))
+/// `database` is `StorageEngine::instance_id` for a DB-backed tool and `None`
+/// for an in-process one. Ids are never reused within a process, so an entry
+/// cached for a database that has since been dropped can never be handed to a
+/// later database — see `StorageEngine::instance_id`.
+fn cache_key(database: Option<u64>, tool_name: &str, args: &JsonValue) -> String {
+    match database {
+        Some(id) => format!("db{id}::{tool_name}::{}", canonicalise(args)),
+        None => format!("nodb::{tool_name}::{}", canonicalise(args)),
+    }
 }
 
-/// Look up `(tool_name, args)` in the cache. Returns `None` for
+/// Look up `(database, tool_name, args)` in the cache. Returns `None` for
 /// non-read-only tools, on miss, on TTL expiry, or on
 /// generation-mismatch.
-pub fn try_get(tool_name: &str, args: &JsonValue) -> Option<ToolOutcome> {
+pub fn try_get(database: Option<u64>, tool_name: &str, args: &JsonValue) -> Option<ToolOutcome> {
     if !read_only(tool_name) {
         return None;
     }
-    let key = cache_key(tool_name, args);
+    let key = cache_key(database, tool_name, args);
     let mut guard = CACHE.lock().ok()?;
     let current_gen = guard.generation;
     let entry = match guard.lru.get(&key) {
@@ -188,14 +205,14 @@ pub fn try_get(tool_name: &str, args: &JsonValue) -> Option<ToolOutcome> {
     Some(entry.outcome)
 }
 
-/// Insert `(tool_name, args, outcome)` into the cache. No-op for
+/// Insert `(database, tool_name, args, outcome)` into the cache. No-op for
 /// non-read-only tools or for error outcomes (transient errors
 /// shouldn't poison-pill the cache).
-pub fn insert(tool_name: &str, args: &JsonValue, outcome: &ToolOutcome) {
+pub fn insert(database: Option<u64>, tool_name: &str, args: &JsonValue, outcome: &ToolOutcome) {
     if !read_only(tool_name) || outcome.is_error {
         return;
     }
-    let key = cache_key(tool_name, args);
+    let key = cache_key(database, tool_name, args);
     let mut guard = match CACHE.lock() {
         Ok(g) => g,
         Err(_) => return,
@@ -302,30 +319,67 @@ mod tests {
         _clear_for_tests();
         let args = json!({ "name": "foo" });
         // Miss
-        assert!(try_get("helios_lsp_definition", &args).is_none());
+        assert!(try_get(Some(1), "helios_lsp_definition", &args).is_none());
         // Insert
-        insert("helios_lsp_definition", &args, &ok_outcome(json!({ "rows": [] })));
+        insert(
+            Some(1),
+            "helios_lsp_definition",
+            &args,
+            &ok_outcome(json!({ "rows": [] })),
+        );
         // Hit
-        let hit = try_get("helios_lsp_definition", &args).expect("expected cache hit");
+        let hit = try_get(Some(1), "helios_lsp_definition", &args).expect("expected cache hit");
         assert_eq!(hit.payload, json!({ "rows": [] }));
         // Invalidate via write
         invalidate_for_writes();
-        assert!(try_get("helios_lsp_definition", &args).is_none());
+        assert!(try_get(Some(1), "helios_lsp_definition", &args).is_none());
     }
 
     #[test]
     fn errors_not_cached() {
         _clear_for_tests();
         let args = json!({ "name": "foo" });
-        insert("helios_lsp_definition", &args, &ToolOutcome::err("boom"));
-        assert!(try_get("helios_lsp_definition", &args).is_none());
+        insert(Some(1), "helios_lsp_definition", &args, &ToolOutcome::err("boom"));
+        assert!(try_get(Some(1), "helios_lsp_definition", &args).is_none());
     }
 
     #[test]
     fn non_readonly_tools_bypass_cache() {
         _clear_for_tests();
         let args = json!({});
-        insert("heliosdb_insert", &args, &ok_outcome(json!({})));
-        assert!(try_get("heliosdb_insert", &args).is_none());
+        insert(Some(1), "heliosdb_insert", &args, &ok_outcome(json!({})));
+        assert!(try_get(Some(1), "heliosdb_insert", &args).is_none());
+    }
+
+    /// The same tool, the same arguments, two DIFFERENT databases: the second
+    /// database must not be served the first one's answer. Before the
+    /// `database` key component this asserted-hit was the shipped behaviour.
+    #[test]
+    fn entries_do_not_cross_databases() {
+        _clear_for_tests();
+        let args = json!({ "branch": "main" });
+        insert(
+            Some(7),
+            "heliosdb_list_tables",
+            &args,
+            &ok_outcome(json!({ "tables": ["a"] })),
+        );
+        assert!(
+            try_get(Some(8), "heliosdb_list_tables", &args).is_none(),
+            "database 8 must not read database 7's cached tool result"
+        );
+        let own = try_get(Some(7), "heliosdb_list_tables", &args).expect("database 7 still hits its own entry");
+        assert_eq!(own.payload, json!({ "tables": ["a"] }));
+    }
+
+    /// An in-process tool has no database, and its `None` scope must not
+    /// collide with any database's scope.
+    #[test]
+    fn nodb_scope_is_distinct() {
+        _clear_for_tests();
+        let args = json!({});
+        insert(None, "heliosdb_hybrid_search", &args, &ok_outcome(json!({ "hits": 0 })));
+        assert!(try_get(Some(1), "heliosdb_hybrid_search", &args).is_none());
+        assert!(try_get(None, "heliosdb_hybrid_search", &args).is_some());
     }
 }
