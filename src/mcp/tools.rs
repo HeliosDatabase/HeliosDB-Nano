@@ -340,18 +340,28 @@ fn in_process_tools() -> Vec<ToolDescriptor> {
 /// agentic-coding session return the cached `ToolOutcome` without
 /// re-running the handler. Cache invalidates on any mutating tool call
 /// (`super::result_cache::writes`) and on TTL expiry.
+///
+/// The cache is keyed by the DATABASE as well as by the tool and its
+/// arguments. `db` is a parameter, not a process-wide fact: a process can
+/// hold several `EmbeddedDatabase` handles, and a cache that ignored which
+/// one was asked answered `heliosdb_list_tables` for database B with
+/// database A's tables.
 pub fn call_tool(db: Option<&EmbeddedDatabase>, name: &str, args: JsonValue) -> ToolOutcome {
     use super::result_cache;
 
+    // Which database is being asked. `None` = an in-process tool with no
+    // database at all, which gets its own scope.
+    let database = db.map(|d| d.storage.instance_id());
+
     // Cache-hit short-circuit. Read-only tools only.
-    if let Some(cached) = result_cache::try_get(name, &args) {
+    if let Some(cached) = result_cache::try_get(database, name, &args) {
         return cached;
     }
 
     let outcome = call_tool_inner(db, name, args.clone());
 
     // Populate cache (no-op for non-read-only tools or error outcomes).
-    result_cache::insert(name, &args, &outcome);
+    result_cache::insert(database, name, &args, &outcome);
 
     // Bump generation on writes — invalidates everything cached so far.
     if !outcome.is_error && result_cache::writes(name) {

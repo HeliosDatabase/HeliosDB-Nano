@@ -1212,8 +1212,46 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         self.authenticate(&hs)?;
         self.database
             .set_session_login_user(self.session_id, self.username.clone())?;
+        // sprinter d03de7fc3b22: the MySQL listener's equivalent of the
+        // PostgreSQL startup binding. `CLIENT_CONNECT_WITH_DB` carries the
+        // database name in the handshake response, and `authenticate` above has
+        // just published it as `self.current_database`; that name is resolved
+        // against TENANT NAMES by the same rule the PG path uses, so a MySQL
+        // client gets the same per-connection metering and RLS gating.
+        //
+        // NOT a validity check. This listener never refused an unknown database
+        // name and still does not — adding that here would break every existing
+        // client that connects with a name this server does not model. An
+        // unrecognised or reserved name simply binds nothing and falls through
+        // to the process-global context exactly as before.
+        self.bind_current_database_tenant().await?;
         self.send_ok(0, 0).await?;
         Ok(())
+    }
+
+    /// Bind (or rebind) this connection to the tenant named by
+    /// `self.current_database` — sprinter d03de7fc3b22.
+    ///
+    /// Called from the handshake and from `COM_INIT_DB`, the two places MySQL
+    /// names a database. A refusal is a spent `max_connections` budget, reported
+    /// as ER_CON_COUNT_ERROR (1040 / 08004), which is MySQL's own answer for it.
+    async fn bind_current_database_tenant(&mut self) -> Result<()> {
+        let Some(db_name) = self.current_database.clone() else {
+            return Ok(());
+        };
+        let login = self.username.clone().unwrap_or_default();
+        match self.database.bind_session_tenant(self.session_id, &db_name, &login) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // The wire message is MySQL's own wording and nothing more: the
+                // internal text names the tenant's UUID, which the peer has no
+                // business learning from a refusal. It goes to the log instead.
+                warn!(database = %db_name, error = %e, "refusing connection: tenant connection limit");
+                let message = format!("Too many connections for database '{db_name}'");
+                self.send_error(1040, "08004", &message).await?;
+                Err(MySqlError::Db(crate::Error::query_execution(message)))
+            }
+        }
     }
 
     /// `have_ssl` / `have_openssl` `SHOW VARIABLES` answer — `YES` only when
@@ -1579,6 +1617,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let db_name = String::from_utf8_lossy(&payload).to_string();
         debug!("COM_INIT_DB: {}", db_name);
         self.current_database = Some(db_name);
+        // sprinter d03de7fc3b22: `COM_INIT_DB` is the MySQL wire's "switch
+        // database", so it re-resolves this connection's tenant. `bind_tenant`
+        // reports the tenant it displaced and `bind_session_tenant` returns that
+        // one's connection slot, so a client that switches databases repeatedly
+        // cannot ratchet a tenant's connection count upward.
+        //
+        // The SQL-level `USE <db>` is NOT routed here, deliberately: it is a
+        // bare `send_ok` today and switches nothing at all, so making it move
+        // the tenant binding while it still moves nothing else would be the only
+        // half-applied switch in the server. Recorded as a pre-existing gap.
+        self.bind_current_database_tenant().await?;
         self.send_ok(0, 0).await
     }
 

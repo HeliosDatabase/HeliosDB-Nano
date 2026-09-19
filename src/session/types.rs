@@ -54,6 +54,21 @@ impl Default for SessionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UserId(pub u64);
 
+/// The ONE source of [`UserId`]s.
+///
+/// Module-scope, shared by every `User` constructor, for the same reason
+/// `storage::transaction`'s `TXN_COUNTER` is: each constructor used to declare
+/// its own function-scope `static COUNTER`, so the first `User::new` and the
+/// first `User::new_passwordless` in a process both minted `UserId(1)` — and
+/// [`super::manager::SessionManager`] keys `get_user_sessions` and
+/// `enforce_quota` by that id, so two distinct users would have shared one
+/// session list and one resource quota. Only `new_passwordless` has production
+/// callers today, which is the only reason that has not been observed.
+///
+/// NEVER reintroduce a per-constructor counter. Any new constructor must draw
+/// from this static.
+static USER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 /// User credentials
 #[derive(Debug, Clone)]
 pub struct User {
@@ -65,7 +80,6 @@ pub struct User {
 impl User {
     /// Create a new user with Argon2-hashed password
     pub fn new(name: impl Into<String>, password: impl Into<String>) -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
         let password_str = password.into();
 
         // Hash password with Argon2id (recommended variant)
@@ -81,7 +95,8 @@ impl User {
         };
 
         Self {
-            id: UserId(COUNTER.fetch_add(1, Ordering::SeqCst)),
+            // Module-scope [`USER_ID_COUNTER`] — shared with `new_passwordless`.
+            id: UserId(USER_ID_COUNTER.fetch_add(1, Ordering::SeqCst)),
             name: name.into(),
             password_hash,
         }
@@ -89,9 +104,10 @@ impl User {
 
     /// Create a user without a password (for internal/system use)
     pub fn new_passwordless(name: impl Into<String>) -> Self {
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
         Self {
-            id: UserId(COUNTER.fetch_add(1, Ordering::SeqCst)),
+            // Module-scope [`USER_ID_COUNTER`] — THE SAME atomic `User::new`
+            // draws from, so the two constructors can never mint the same id.
+            id: UserId(USER_ID_COUNTER.fetch_add(1, Ordering::SeqCst)),
             name: name.into(),
             password_hash: None,
         }

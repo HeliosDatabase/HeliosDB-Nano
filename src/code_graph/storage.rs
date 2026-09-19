@@ -233,46 +233,62 @@ pub struct AstIndexMeta {
     pub paused: bool,
 }
 
-static AST_INDEXES: std::sync::OnceLock<std::sync::RwLock<HashMap<String, AstIndexMeta>>> = std::sync::OnceLock::new();
+/// Declared AST indexes, keyed by `(database, index name)`.
+///
+/// The `database` component is `StorageEngine::instance_id` — the open
+/// database that ran the `CREATE AST INDEX`. An AST index names a TABLE in
+/// one database, so its declaration belongs to that database and not to the
+/// process. Keyed by name alone (as it was) a process holding two
+/// `EmbeddedDatabase`s got two wrong behaviours: a second database declaring
+/// the same index name silently replaced the first one's settings, and the
+/// auto-reparse hook fired for EVERY open database that wrote to a
+/// same-named table — so a database that had declared no index at all would
+/// start materialising `_hdb_code_*` tables of its own because an unrelated
+/// database had declared one.
+///
+/// Still process-local rather than durable: a restart forgets every
+/// declaration, which is a separate, pre-existing gap.
+static AST_INDEXES: std::sync::OnceLock<std::sync::RwLock<HashMap<(u64, String), AstIndexMeta>>> =
+    std::sync::OnceLock::new();
 
-fn ast_registry() -> &'static std::sync::RwLock<HashMap<String, AstIndexMeta>> {
+fn ast_registry() -> &'static std::sync::RwLock<HashMap<(u64, String), AstIndexMeta>> {
     AST_INDEXES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
 }
 
-/// Register (or replace) an AST index declaration.  Called by the
-/// CREATE AST INDEX dispatcher.
-pub fn register_ast_index(meta: AstIndexMeta) {
+/// Register (or replace) an AST index declaration for one database.  Called
+/// by the CREATE AST INDEX dispatcher.
+pub fn register_ast_index(database: u64, meta: AstIndexMeta) {
     let mut reg = ast_registry().write().unwrap_or_else(|p| p.into_inner());
-    reg.insert(meta.index_name.clone(), meta);
+    reg.insert((database, meta.index_name.clone()), meta);
 }
 
-/// Look up an AST index by name.
-pub fn get_ast_index(name: &str) -> Option<AstIndexMeta> {
+/// Look up one database's AST index by name.
+pub fn get_ast_index(database: u64, name: &str) -> Option<AstIndexMeta> {
     ast_registry()
         .read()
         .unwrap_or_else(|p| p.into_inner())
-        .get(name)
+        .get(&(database, name.to_string()))
         .cloned()
 }
 
-/// Return all indexes whose `table == table_name`.  Used by the
+/// Return this database's indexes whose `table == table_name`.  Used by the
 /// auto_reparse hook to know which indexes to refresh when a
 /// source table is mutated.
-pub fn ast_indexes_for_table(table_name: &str) -> Vec<AstIndexMeta> {
+pub fn ast_indexes_for_table(database: u64, table_name: &str) -> Vec<AstIndexMeta> {
     ast_registry()
         .read()
         .unwrap_or_else(|p| p.into_inner())
-        .values()
-        .filter(|m| m.table == table_name && !m.paused)
-        .cloned()
+        .iter()
+        .filter(|((db, _), m)| *db == database && m.table == table_name && !m.paused)
+        .map(|(_, m)| m.clone())
         .collect()
 }
 
-/// Flip the `paused` flag on the named index.  Returns `false` if
-/// there is no index by that name.
-pub fn set_ast_index_paused(name: &str, paused: bool) -> bool {
+/// Flip the `paused` flag on one database's named index.  Returns `false` if
+/// that database has no index by that name.
+pub fn set_ast_index_paused(database: u64, name: &str, paused: bool) -> bool {
     let mut reg = ast_registry().write().unwrap_or_else(|p| p.into_inner());
-    match reg.get_mut(name) {
+    match reg.get_mut(&(database, name.to_string())) {
         Some(m) => {
             m.paused = paused;
             true

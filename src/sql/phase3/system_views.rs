@@ -4544,7 +4544,9 @@ impl SystemViewRegistry {
             // fall back to the durable high-water only when this session has not
             // advanced the sequence (e.g. just after a reopen) — the documented
             // cached-sequence gap. NULL until the first nextval (is_called).
-            let last_value = match crate::sql::sequences::peek_last_served(&def.name) {
+            // sprinter d15933f528b0: `_on(storage, ..)` — the runtime map is
+            // per-database, and this view must report THIS database's counter.
+            let last_value = match crate::sql::sequences::peek_last_served_on(storage, &def.name) {
                 Some(v) => Value::Int8(v),
                 None => match catalog.get_sequence_state(&def.name)? {
                     Some(st) if st.is_called => Value::Int8(st.last_reserved),

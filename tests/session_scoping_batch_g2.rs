@@ -19,19 +19,25 @@
 //!   session-scoped in v4.38.0, so the two functions disagreed about what "this
 //!   session" means.
 //!
-//! * **sprinter d03de7fc3b22 (HIGH) — PARKED, recorded here rather than fixed.**
-//!   `TenantManager::record_query` has exactly ONE production caller, on the
-//!   simple-query / embedded `execute()` funnel. Statements that bind parameters
-//!   — psycopg3, JDBC, sqlx, node-postgres, Prisma, Drizzle, i.e. most real
-//!   traffic — are never counted, so `max_qps` is unenforced for them while the
-//!   operator believes a limit is in force. The call sites that close that gap
-//!   were written and then backed out: `TenantManager::current_context` is one
-//!   process-global slot with no `SessionId -> TenantId` binding behind it, so
-//!   metering every family charges a connection's statements to whichever tenant
-//!   another connection last selected — enforcement that is WRONG rather than
-//!   merely absent. The `max_qps_is_not_*` cases below are TRIPWIRES on the
-//!   shipped state; what did ship is the 53400 classification
-//!   (`a_spent_quota_reaches_the_client_as_53400_not_an_internal_error`).
+//! * **sprinter d03de7fc3b22 (HIGH) — SHIPPED; the two tripwires below are
+//!   FLIPPED.** `TenantManager::record_query` had exactly ONE production
+//!   caller, on the simple-query / embedded `execute()` funnel. Statements that
+//!   bind parameters — psycopg3, JDBC, sqlx, node-postgres, Prisma, Drizzle,
+//!   i.e. most real traffic — were never counted, and neither was any READ, so
+//!   `max_qps` was unenforced for them while the operator believed a limit was
+//!   in force. The call sites that close that gap were written and then backed
+//!   out of v4.39.0, because `TenantManager::current_context` was one
+//!   process-global slot with no `SessionId -> TenantId` binding behind it:
+//!   metering every family against it charged a connection's statements to
+//!   whichever tenant another connection last selected — enforcement that is
+//!   WRONG rather than merely absent. The binding now exists
+//!   (`SessionScopedState::bind_tenant`, populated from the database name at
+//!   startup — see `tests/tenant_session_binding_h1.rs`), so the charge sites
+//!   are back and the `max_qps_is_not_*` cases have become
+//!   `max_qps_is_enforced_*`. The two cases here exercise the resolver's
+//!   FALLBACK layer (a session-less embedded caller, and a wire connection to
+//!   the reserved `postgres` database); the per-connection layer is proved in
+//!   the H1 file.
 //!
 //! # What these tests pin that a "global" implementation would fail
 //!
@@ -784,76 +790,89 @@ fn activate_tenant(db: &EmbeddedDatabase, max_qps: usize) -> TenantId {
     tenant_id
 }
 
-/// NOT-SHIPPED RECORD for sprinter d03de7fc3b22 — the params family is still
-/// UNMETERED, and this pins that so the day it changes somebody notices.
+/// BLOCKER LIFTED (sprinter d03de7fc3b22) — the params family IS metered.
 ///
-/// The call sites that close the gap were written, ran green, and were then
-/// REMOVED again before release. The blocker is not the limiter and not the
-/// call sites: `TenantManager::current_context` is ONE process-global slot
-/// shared by every connection and thread (its only production writer is the
-/// REPL's `\tenant use`; no wire handler sets it at all). Metering every family
-/// against that charges a connection's statements to whichever tenant some
-/// OTHER connection last selected, and lets one tenant's spent budget refuse
-/// another's queries — enforcement that is WRONG rather than merely absent,
-/// which is the worse of the two. It was observed, not predicted: with the
-/// expansion in place seven pre-existing RLS tests went red purely because a
-/// test binary's parallel tests share that one slot, against a default "free"
-/// plan of `max_qps: 10`. The prerequisite is a `SessionId -> TenantId`
-/// binding, which exists nowhere today. See `EmbeddedDatabase::charge_tenant_query`.
+/// This was a NOT-SHIPPED tripwire, written to be flipped: it asserted that
+/// bound-parameter statements were never counted, and said in its own message
+/// what to do the day they were. This is that day, and the two assertions are
+/// turned round.
 ///
-/// The setup below is deliberately the shape the eventual proof needs, so the
-/// day the binding lands this flips by swapping the two assertions.
+/// What unblocked it was NOT the call sites — those were written, ran green and
+/// were backed out of v4.39.0 intact. It was what `active_tenant_id()` resolved
+/// against: `TenantManager::current_context`, ONE process-global slot shared by
+/// every connection and thread, whose only production writer was the REPL's
+/// `\tenant use`. Metering every family against that charged a connection's
+/// statements to whichever tenant another connection last selected. A
+/// connection now carries its OWN tenant
+/// (`SessionScopedState::bind_tenant`, resolved from the database name at
+/// startup), and the process-global slot survives only as the fallback for the
+/// session-LESS callers that have nowhere else to put a context — the embedded
+/// API this test drives, and the REPL.
+///
+/// So this case exercises the FALLBACK layer of the resolver on purpose: there
+/// is no session here, `set_current_context` is the only way to express a
+/// tenant, and the statements must still be counted against it.
 #[test]
-fn max_qps_is_not_enforced_for_bound_parameter_statements() {
+fn max_qps_is_enforced_for_bound_parameter_statements() {
     let db = db();
     db.execute("CREATE TABLE g2_qps (id INT PRIMARY KEY, v TEXT)").unwrap();
     // Set the context AFTER the DDL, so the setup statements are not charged.
     let tenant_id = activate_tenant(&db, 4);
 
-    // Twice the budget, entirely in bound-parameter statements.
+    // Twice the budget, entirely in bound-parameter statements: the first four
+    // land, the fifth is refused.
+    let mut landed = 0usize;
+    let mut refusal: Option<String> = None;
     for i in 1..=8i32 {
-        db.execute_params(
+        match db.execute_params(
             "INSERT INTO g2_qps VALUES ($1, $2)",
             &[Value::Int4(i), Value::String("v".into())],
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "BLOCKER LIFTED: bound-parameter statement {i} of 8 was THROTTLED against a \
-                 max_qps of 4 — the params family is metered again. Re-check sprinter \
-                 d03de7fc3b22 and its `SessionId -> TenantId` blocker, then turn this test \
-                 back into the enforcement proof it was written as. Error: {e}"
-            )
-        });
+        ) {
+            Ok(_) => landed += 1,
+            Err(e) => {
+                refusal = Some(e.to_string());
+                break;
+            }
+        }
     }
 
     assert_eq!(
+        landed, 4,
+        "*** the params family is unmetered again — {landed} of 8 bound-parameter statements ran \
+         against a max_qps of 4. The charge sites live at every execution family's entry point; \
+         see `EmbeddedDatabase::charge_tenant_query`. ***"
+    );
+    let refusal = refusal.expect("statement 5 of 8 must be refused: the budget is 4");
+    assert!(
+        refusal.to_lowercase().contains("quota exceeded"),
+        "the refusal must name the quota, got: {refusal}"
+    );
+    assert_eq!(
         charged(&db, tenant_id),
-        0,
-        "BLOCKER LIFTED: bound-parameter statements are being COUNTED now (max_qps is \
-         {} and the window shows {}). Re-check sprinter d03de7fc3b22.",
         4,
-        charged(&db, tenant_id)
+        "the refused statement must not consume budget"
     );
 
     db.tenant_manager.clear_current_context();
-    // Non-vacuity: the eight statements really ran, so the zero above is "not
-    // counted", not "not executed".
+    // Non-vacuity: the four that were NOT refused really ran, so "4" is
+    // "counted and admitted", not "never executed".
     let rows = db.query("SELECT count(*) FROM g2_qps", &[]).unwrap();
-    assert_eq!(rows[0].values[0], Value::Int8(8));
+    assert_eq!(rows[0].values[0], Value::Int8(4));
 }
 
-/// The control, and the reason the expansion was backed out site-by-site rather
-/// than by gating the helper: the family that WAS metered before sprinter
-/// d03de7fc3b22 still is.
+/// The control: the family that WAS metered before sprinter d03de7fc3b22 still
+/// is — and READS are now counted too.
 ///
-/// Note the `SELECT`: reads never reached `execute_in_transaction_inner`, the
-/// one charge site, so they are not counted either. That is the same gap as the
-/// params family above, recorded here rather than in a second tripwire.
+/// The second half of this case used to be a tripwire in its own right. Reads
+/// never reached `execute_in_transaction_inner`, the single pre-existing charge
+/// site, so `SELECT` consumed no budget at all and `max_qps` was a write limit
+/// wearing a query limit's name. `query()` is one of the eighteen entry points
+/// that charge now.
 #[test]
-fn max_qps_is_still_enforced_for_simple_text_statements() {
+fn max_qps_counts_reads_and_writes_on_the_simple_text_family() {
     let db = db();
     db.execute("CREATE TABLE g2_qps_text (id INT PRIMARY KEY)").unwrap();
-    let tenant_id = activate_tenant(&db, 2);
+    let tenant_id = activate_tenant(&db, 3);
 
     db.execute("INSERT INTO g2_qps_text VALUES (1)").unwrap();
     assert_eq!(charged(&db, tenant_id), 1, "a text write must still be counted");
@@ -861,9 +880,9 @@ fn max_qps_is_still_enforced_for_simple_text_statements() {
     db.query("SELECT count(*) FROM g2_qps_text", &[]).unwrap();
     assert_eq!(
         charged(&db, tenant_id),
-        1,
-        "BLOCKER LIFTED: a read is being counted now — the read path reaches the charge site. \
-         Re-check sprinter d03de7fc3b22."
+        2,
+        "*** a read is not being counted — `query()` no longer reaches a charge site, so \
+         `max_qps` is a write-only limit again (sprinter d03de7fc3b22) ***"
     );
 
     db.execute("INSERT INTO g2_qps_text VALUES (2)").unwrap();
@@ -876,7 +895,7 @@ fn max_qps_is_still_enforced_for_simple_text_statements() {
     );
     assert_eq!(
         charged(&db, tenant_id),
-        2,
+        3,
         "the refused statement must not consume budget"
     );
 
@@ -942,16 +961,26 @@ fn a_nested_execution_inside_one_statement_is_not_charged_again() {
     assert_eq!(rows[0].values[0], Value::String("from-body".to_string()));
 }
 
-/// NOT-SHIPPED RECORD for sprinter d03de7fc3b22, over a real socket: the
-/// PostgreSQL EXTENDED protocol — the psycopg3 / JDBC / sqlx / node-postgres /
-/// Prisma path, i.e. most real traffic — is still unmetered.
+/// BLOCKER LIFTED (sprinter d03de7fc3b22), over a real socket: the PostgreSQL
+/// EXTENDED protocol — the psycopg3 / JDBC / sqlx / node-postgres / Prisma path,
+/// i.e. most real traffic — is metered.
 ///
-/// Same blocker as the embedded twin above (`TenantManager::current_context` is
-/// one process-global slot; there is no `SessionId -> TenantId` binding), and
-/// the same flip when it lands: turn the two assertions round. The server, the
-/// tenant and the budget are already the ones the proof needs.
+/// The twin of the embedded case above, and it exercises the same FALLBACK layer
+/// deliberately: the connection string says `dbname=postgres`, a RESERVED
+/// database name, which binds no tenant (`heliosdb` / `postgres` are system
+/// keyspaces, not tenants — see `EmbeddedDatabase::bind_session_tenant`). So
+/// this connection resolves through to the process-global context the test sets,
+/// exactly as it did before the binding existed, and the charge still lands.
+/// `tests/tenant_session_binding_h1.rs` covers the other half — a connection
+/// that names a TENANT and is metered against that tenant rather than against
+/// whatever another connection selected.
+///
+/// The assertions are deliberately about the SHAPE of enforcement rather than
+/// about statement number four exactly: a driver is free to add round trips
+/// (tokio-postgres issues Parse/Describe before Bind/Execute), and the proof is
+/// that the budget is finite, spent, and refused with a retryable code.
 #[tokio::test]
-async fn max_qps_is_not_enforced_over_the_postgres_extended_protocol() {
+async fn max_qps_is_enforced_over_the_postgres_extended_protocol() {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = probe.local_addr().unwrap();
     drop(probe);
@@ -978,32 +1007,51 @@ async fn max_qps_is_not_enforced_over_the_postgres_extended_protocol() {
 
     // Twice the budget, all of it bound-parameter. `client.execute` is
     // Parse/Bind/Execute, so every one of these reaches
-    // `execute_params_for_session` and none of them reaches the charge site.
+    // `execute_params_for_session` — the family that reached NO charge site
+    // before this item.
+    let mut landed = 0usize;
+    let mut refusal: Option<tokio_postgres::Error> = None;
     for i in 1..=6i32 {
-        client
+        match client
             .execute("INSERT INTO g2_wire_qps VALUES ($1, $2)", &[&i, &"v"])
             .await
-            .unwrap_or_else(|e| {
-                panic!(
-                    "BLOCKER LIFTED: extended-protocol statement {i} of 6 was THROTTLED against a \
-                     max_qps of 3 — the params family is metered again. Re-check sprinter \
-                     d03de7fc3b22 and its `SessionId -> TenantId` blocker, then turn this test \
-                     back into the enforcement proof it was written as. Error: {e}"
-                )
-            });
+        {
+            Ok(_) => landed += 1,
+            Err(e) => {
+                refusal = Some(e);
+                break;
+            }
+        }
     }
 
+    let refusal = refusal.unwrap_or_else(|| {
+        panic!(
+            "*** the extended protocol is unmetered again: all 6 statements ran against a \
+             max_qps of 3 ({landed} landed). This is the psycopg3 / JDBC / sqlx / Prisma path; \
+             see `EmbeddedDatabase::charge_tenant_query`. ***"
+        )
+    });
+    assert!(landed >= 1, "the budget refused even the first statement");
+    assert!(landed < 6, "nothing was refused");
+    // `tokio_postgres::Error`'s own `Display` is just "db error" — the server's
+    // SQLSTATE lives in the `DbError`, which is also the only place a real
+    // client looks.
+    let db_err = refusal.as_db_error().expect("a DbError, not a transport failure");
     assert_eq!(
-        charged(&db, tenant_id),
-        0,
-        "BLOCKER LIFTED: extended-protocol statements are being COUNTED now. Re-check \
-         sprinter d03de7fc3b22."
+        db_err.code().code(),
+        "53400",
+        "a spent quota must reach the client as 53400 configuration_limit_exceeded — XX000 is \
+         what a pooler reads as a BROKEN BACKEND and evicts a healthy connection over; got {} / {:?}",
+        db_err.code().code(),
+        db_err.message()
     );
+    assert_eq!(charged(&db, tenant_id), 3, "the window counter must stop at the budget");
 
-    // Non-vacuity: the six statements really ran.
+    // Non-vacuity: the statements that were NOT refused really ran, so `landed`
+    // is "admitted", not "never executed".
     db.tenant_manager.clear_current_context();
     let rows = db.query("SELECT count(*) FROM g2_wire_qps", &[]).unwrap();
-    assert_eq!(rows[0].values[0], Value::Int8(6));
+    assert_eq!(rows[0].values[0], Value::Int8(landed as i64));
 
     drop(client);
     task.abort();
@@ -1014,17 +1062,17 @@ async fn max_qps_is_not_enforced_over_the_postgres_extended_protocol() {
 /// spent tenant quota reaches the client as SQLSTATE 53400
 /// `configuration_limit_exceeded`, not `XX000 internal_error`.
 ///
-/// This is independent of WHERE metering runs, which is why it survives the item
-/// being parked. XX000 is what PgBouncer, pgpool and every HA proxy read as a
-/// BROKEN BACKEND, so a perfectly healthy connection that merely hit its own
-/// rate limit risked being evicted from the pool; 53400 is class 53
+/// This is independent of WHERE metering runs, which is why it survived the item
+/// being parked for a release. XX000 is what PgBouncer, pgpool and every HA
+/// proxy read as a BROKEN BACKEND, so a perfectly healthy connection that merely
+/// hit its own rate limit risked being evicted from the pool; 53400 is class 53
 /// `insufficient_resources`, which a client can back off and retry on.
 /// `sqlstate::CONFIGURATION_LIMIT_EXCEEDED` had existed with zero callers.
 ///
-/// Driven over the SIMPLE protocol because that is the family the surviving
-/// charge site serves (`execute_for_session` -> `execute` ->
-/// `execute_in_transaction_inner`); the extended protocol cannot produce a quota
-/// refusal at all today, which is precisely what the tripwire above records.
+/// Driven over the SIMPLE protocol, which was the only family that could produce
+/// a quota refusal when this was written. The extended protocol can now too —
+/// `max_qps_is_enforced_over_the_postgres_extended_protocol` above asserts the
+/// same code on that path — and this case stays as the simple-family twin.
 #[tokio::test]
 async fn a_spent_quota_reaches_the_client_as_53400_not_an_internal_error() {
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

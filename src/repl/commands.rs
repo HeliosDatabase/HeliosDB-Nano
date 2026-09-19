@@ -3446,7 +3446,26 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                 match tenant {
                     Some(t) => {
-                        // Set tenant context
+                        // sprinter d03de7fc3b22: `\tenant use` keeps writing the
+                        // PROCESS-GLOBAL `TenantManager::current_context`, and
+                        // every `\tenant`/`\rls` reader below keeps reading it
+                        // — deliberately, and it is the reason the resolver
+                        // ([`EmbeddedDatabase::effective_tenant_context`]) has a
+                        // fallback layer at all.
+                        //
+                        // The REPL is a session-LESS caller: it drives the
+                        // embedded `execute()` / `query()` funnels, which have no
+                        // `SessionId` and no database name, so there is no
+                        // per-connection slot for it to write and nothing to
+                        // resolve a binding from. The global IS this caller's
+                        // session. Routing these reads through the resolver would
+                        // also be actively wrong for the STATUS commands: they
+                        // must report what `\tenant use` set, not what some
+                        // statement's thread happens to have installed.
+                        //
+                        // A wire connection now shadows this rather than sharing
+                        // it, which is the whole point — one REPL's `\tenant use`
+                        // can no longer re-tenant every connection in the process.
                         let context = crate::tenant::TenantContext {
                             tenant_id: t.id,
                             user_id: "repl_user".to_string(),
