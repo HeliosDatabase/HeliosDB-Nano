@@ -240,6 +240,14 @@ pub struct Transaction {
     /// within the statement that made them and which would otherwise hold the
     /// census non-zero for the whole of any write workload.
     write_census: Option<WriteCensusGate>,
+    /// sprinter 37a5968e7698: THIS transaction's savepoint stack — innermost
+    /// last. Read [`SavepointEntry`] for why it is here and not on the engine
+    /// handle or the session.
+    ///
+    /// Not an `Arc`: nothing outside this transaction may reach it, which is
+    /// the whole point. Destroyed with the transaction, which is exactly
+    /// PostgreSQL's "savepoints are destroyed at COMMIT and ROLLBACK".
+    savepoints: RwLock<Vec<SavepointEntry>>,
 }
 
 impl Drop for Transaction {
@@ -641,6 +649,38 @@ pub struct TransactionSavepointSnapshot {
     insert_log_len: usize,
 }
 
+/// One entry of a transaction's savepoint stack.
+///
+/// # Why the stack lives on the TRANSACTION
+///
+/// sprinter 37a5968e7698 / afed6c8e8d1d. It used to be ONE
+/// `Arc<RwLock<Vec<..>>>` on `EmbeddedDatabase`, shared by the global `BEGIN`
+/// slot, the RAII `begin_transaction()` handle and every wire session at once,
+/// and cleared only by the handle's `Drop`. Two consequences, both reported:
+/// one connection could `RELEASE` or `ROLLBACK TO` another's savepoint, and a
+/// savepoint outlived the transaction that established it, so
+/// `BEGIN; SAVEPOINT s; ROLLBACK; BEGIN; ROLLBACK TO SAVEPOINT s` restored a
+/// DEAD transaction's write set into a live one.
+///
+/// PostgreSQL destroys savepoints at COMMIT and at ROLLBACK, so the transaction
+/// — not the session, and not the engine handle — is the correct owner: a
+/// session-scoped stack would still have to be cleared by hand at every
+/// transaction exit, and the state an entry carries is meaningful against no
+/// other transaction anyway. A snapshot of THIS transaction's write set, and a
+/// length into the owning engine's ART/vector undo log for THIS transaction,
+/// cannot be applied to any other. Living here means `Transaction::drop` — the
+/// one exit every path shares (see the `write_census` field, which makes the
+/// same argument) — destroys them, with no clear-site census to keep in sync.
+#[derive(Clone)]
+struct SavepointEntry {
+    /// The savepoint's name exactly as the planner produced it.
+    name: String,
+    /// The write set / `insert_log` position at establishment time.
+    snapshot: TransactionSavepointSnapshot,
+    /// The owning engine's ART/vector undo-log length at establishment time.
+    art_undo_len: usize,
+}
+
 impl Transaction {
     /// Create a new transaction (backwards compatible)
     pub fn new(db: Arc<DB>, snapshot_id: SnapshotId, snapshot_manager: Arc<SnapshotManager>) -> Result<Self> {
@@ -685,6 +725,7 @@ impl Transaction {
             key_manager: None,
             sql_aborted: AtomicBool::new(false),
             write_census: None,
+            savepoints: RwLock::new(Vec::new()),
         })
     }
 
@@ -919,6 +960,7 @@ impl Transaction {
             key_manager: None,
             sql_aborted: AtomicBool::new(false),
             write_census: None,
+            savepoints: RwLock::new(Vec::new()),
         })
     }
 
@@ -2245,6 +2287,66 @@ impl Transaction {
         }
 
         self.insert_log.write().truncate(snapshot.insert_log_len);
+    }
+
+    /// Does THIS transaction have at least one live savepoint?
+    ///
+    /// sprinter 37a5968e7698: the fast-path gates that used to ask the
+    /// process-wide stack "is anything anywhere non-empty?" ask this instead,
+    /// which is both the correct question and a narrower one — another
+    /// connection's savepoint can no longer demote this statement.
+    #[inline]
+    pub fn has_savepoints(&self) -> bool {
+        !self.savepoints.read().is_empty()
+    }
+
+    /// `SAVEPOINT name` — establish a savepoint in this transaction.
+    ///
+    /// A repeated name is PUSHED again rather than replacing the earlier entry:
+    /// PostgreSQL keeps both, and `RELEASE` / `ROLLBACK TO` resolve the most
+    /// recent (the `rposition` searches below).
+    pub fn push_savepoint(&self, name: String, snapshot: TransactionSavepointSnapshot, art_undo_len: usize) {
+        self.savepoints.write().push(SavepointEntry {
+            name,
+            snapshot,
+            art_undo_len,
+        });
+    }
+
+    /// `RELEASE SAVEPOINT name` — destroy the most recent savepoint with this
+    /// name AND every savepoint established after it, keeping all their work.
+    ///
+    /// `false` when no savepoint of that name exists in THIS transaction, which
+    /// the caller reports as `3B001 invalid_savepoint_specification`.
+    pub fn release_savepoint(&self, name: &str) -> bool {
+        let mut stack = self.savepoints.write();
+        match stack.iter().rposition(|s| s.name == name) {
+            Some(pos) => {
+                stack.truncate(pos);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `ROLLBACK TO SAVEPOINT name` — resolve the most recent savepoint with
+    /// this name, destroy every savepoint established after it (the target
+    /// itself STAYS established, as in PostgreSQL) and hand back the two pieces
+    /// of state the caller must undo with: the write-set snapshot for
+    /// [`rollback_to_savepoint`](Self::rollback_to_savepoint) and the ART/vector
+    /// undo-log length for the engine's replay.
+    ///
+    /// The search and the truncation happen under ONE lock acquisition, so a
+    /// concurrent statement on this same transaction cannot slip a push between
+    /// them.
+    ///
+    /// `None` when no savepoint of that name exists in THIS transaction.
+    pub fn resolve_savepoint_target(&self, name: &str) -> Option<(TransactionSavepointSnapshot, usize)> {
+        let mut stack = self.savepoints.write();
+        let pos = stack.iter().rposition(|s| s.name == name)?;
+        let restore = stack.get(pos).map(|s| (s.snapshot.clone(), s.art_undo_len))?;
+        stack.truncate(pos + 1);
+        Some(restore)
     }
 
     /// Merge a set of tuples with the transaction's write set

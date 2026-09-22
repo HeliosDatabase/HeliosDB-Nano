@@ -290,8 +290,23 @@ pub struct Session {
 }
 
 impl Session {
-    /// Create a new session
+    /// Create a new session that belongs to no open database.
+    ///
+    /// Kept for the engine-less unit tests; every production path reaches
+    /// [`Self::new_for_engine`] through
+    /// [`SessionManager`](super::SessionManager), which carries the engine id.
+    /// See `scoped::UNATTACHED_ENGINE` for what an unattached backend is
+    /// visible to (nothing — fail closed).
     pub fn new(user_id: UserId, isolation_level: IsolationLevel) -> Self {
+        Self::new_for_engine(user_id, isolation_level, super::scoped::UNATTACHED_ENGINE)
+    }
+
+    /// Create a new session on the open database `engine_instance`
+    /// (`StorageEngine::instance_id()`) — sprinter 32ed4b9e0002.
+    ///
+    /// The id is stamped onto the session's backend at construction, which is
+    /// what scopes `pg_stat_activity` to the database that is asking.
+    pub fn new_for_engine(user_id: UserId, isolation_level: IsolationLevel, engine_instance: u64) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -311,8 +326,11 @@ impl Session {
             idle_in_transaction_session_timeout_ms: None,
             // Minting this registers a live backend in
             // `scoped::live_backends()` (the `pg_stat_activity` source) and
-            // deregisters it when the last handle drops.
-            scoped: super::scoped::SessionScopedState::new(),
+            // deregisters it when the last handle drops. It is stamped with the
+            // open database it belongs to, so the view a DIFFERENT
+            // `EmbeddedDatabase` in this process scans cannot list it
+            // (sprinter 32ed4b9e0002).
+            scoped: super::scoped::SessionScopedState::new_for_engine(engine_instance),
             active_txn: None,
             created_at: now,
             last_activity: now,

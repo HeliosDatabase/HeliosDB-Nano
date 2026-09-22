@@ -3821,28 +3821,86 @@ fn push_pg_constraint_row(
 }
 
 impl SystemViewRegistry {
-    /// sprinter f4f5d450e816: the `pg_stat_activity` rows — one per backend
-    /// currently registered in `session::scoped::live_backends()`.
+    /// sprinter f4f5d450e816: the `pg_stat_activity` rows — one per backend of
+    /// THIS open database registered in `session::scoped::live_backends()`.
     ///
     /// `pid` here is the SAME number `pg_backend_pid()` returns, because both
     /// read the one `SessionScopedState` the connection owns; a catalog that
     /// disagreed with the function would be worse than no catalog at all, since
     /// the join a client writes would silently return zero rows.
     ///
-    /// Divergences, all deliberate and cheap-by-design:
+    /// # Scope — sprinter 32ed4b9e0002
+    ///
+    /// This used to scan the registry with NO filter, under a doc comment that
+    /// stated the false premise out loud ("Nano has one database"). It does
+    /// not: any library caller may hold two `EmbeddedDatabase` handles, and
+    /// `cargo test` opens dozens. So database A's `pg_stat_activity` listed
+    /// database B's backends — pid, `usename`, `application_name`,
+    /// `client_addr`, `client_port` — to a principal with no connection to B.
+    ///
+    /// The answer is TWO mechanisms on two different axes, and the split is
+    /// deliberate:
+    ///
+    /// * **Rows are scoped to the open database**, by
+    ///   `StorageEngine::instance_id()` of the engine serving this very query.
+    ///   This is NOT "filtering the view by database" in PostgreSQL's sense.
+    ///   PostgreSQL's view is cluster-wide because one postmaster owns one
+    ///   shared-memory backend array; it has no view into a SECOND postmaster,
+    ///   and two open `EmbeddedDatabase`s in one process are two servers that
+    ///   happen to share an address space, not two databases of one cluster.
+    ///   Scoping here restores the view's real extent rather than narrowing it.
+    /// * **Within this database every backend is still listed**, and what is
+    ///   withheld is COLUMNS, exactly as `pg_stat_get_activity` withholds them:
+    ///   a backend owned by a different login role reports NULL for
+    ///   `client_addr`, `client_port`, `state`, the timestamps and `query`,
+    ///   while `datid`, `datname`, `pid`, `usesysid`, `usename` and
+    ///   `application_name` stay visible to everyone — PostgreSQL's own split.
+    ///
+    /// Masking is by ROLE and never by the database/tenant the connection
+    /// named, and that is the whole reason PostgreSQL does it this way: the
+    /// database in a startup packet is chosen by the CLIENT, and this server
+    /// accepts the reserved names (`postgres`, `heliosdb`) from everyone
+    /// without binding a tenant at all (`EmbeddedDatabase::bind_session_tenant`).
+    /// A per-tenant row filter would therefore be bypassed by reconnecting with
+    /// `dbname=postgres` — security theatre. The login identity is the only
+    /// principal this server actually authenticates, so it is the only one the
+    /// masking may turn on.
+    ///
+    /// Divergences from PostgreSQL, all deliberate and cheap-by-design:
     /// * `state` is `active` for the backend running THIS scan and `idle` for
-    ///   every other — true at the instant of the scan for the row that matters
-    ///   (your own), and not worth a per-statement write to make exact for the
-    ///   others.
-    /// * `query` is always NULL, for the same reason.
-    /// * `datid` / `usesysid` are constants: Nano has one database and reports
-    ///   no role OIDs.
-    fn execute_pg_stat_activity() -> Vec<Tuple> {
-        let self_pid = crate::session_scoped_state_tls().map(|s| s.backend_pid());
-        crate::session::scoped::snapshot_live_backends()
+    ///   every other one it may see — true at the instant of the scan for the
+    ///   row that matters (your own), and not worth a per-statement write to
+    ///   make exact for the others.
+    /// * `query` is always NULL, for the same reason; PostgreSQL substitutes the
+    ///   literal `<insufficient privilege>` when masking, which would imply a
+    ///   query text is being withheld when there is none to withhold.
+    /// * `datid` / `usesysid` are constants: this build reports no database or
+    ///   role OIDs.
+    fn execute_pg_stat_activity(storage: &StorageEngine) -> Vec<Tuple> {
+        // The backend performing this scan. `session_scoped_state_tls` is the
+        // per-statement handle the engine's `_for_session` entry points AND the
+        // embedded funnels install (`SessionScopedStateGuard::install_if_absent`),
+        // and reading it here is sound for the same reason the `state` column
+        // already does: a system view is only ever executed from INSIDE
+        // statement execution. There is no pre-parse wire interceptor for
+        // `pg_stat_activity` (the PostgreSQL catalog handler deliberately
+        // intercepts nothing here), so no caller reaches this ahead of the
+        // guard.
+        let viewer = crate::session_scoped_state_tls();
+        let self_pid = viewer.as_ref().map(|s| s.backend_pid());
+        // Compared RAW, before the `heliosdb` display fallback below: two
+        // backends that have published no identity are the same principal (the
+        // service user), which is what the fallback already tells the client.
+        // `None` — a scan with no session context at all — matches no backend,
+        // so every row masks. Fail closed.
+        let viewer_role = viewer.as_ref().map(|s| s.username());
+        crate::session::scoped::snapshot_live_backends(storage.instance_id())
             .into_iter()
             .map(|b| {
                 let start = chrono::DateTime::from_timestamp(b.backend_start, 0).unwrap_or_default();
+                // PostgreSQL's `HasPrivsOfRole(GetUserId(), beentry->st_userid)`:
+                // your own backends, and every other backend of your own role.
+                let own = self_pid == Some(b.pid) || viewer_role.as_deref() == Some(b.username.as_str());
                 Tuple::new(vec![
                     Value::Int4(1),                        // datid
                     Value::String("heliosdb".to_string()), // datname
@@ -3859,11 +3917,24 @@ impl SystemViewRegistry {
                         b.username
                     }), // usename
                     Value::String(b.application_name), // application_name
-                    b.client_addr.map(Value::String).unwrap_or(Value::Null),
-                    b.client_port.map(Value::Int4).unwrap_or(Value::Null),
-                    Value::Timestamp(start), // backend_start
-                    Value::Timestamp(start), // state_change
-                    Value::String(if self_pid == Some(b.pid) { "active" } else { "idle" }.to_string()),
+                    // --- masked for another role, exactly as pg_stat_get_activity does ---
+                    if own {
+                        b.client_addr.map(Value::String).unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    },
+                    if own {
+                        b.client_port.map(Value::Int4).unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    },
+                    if own { Value::Timestamp(start) } else { Value::Null }, // backend_start
+                    if own { Value::Timestamp(start) } else { Value::Null }, // state_change
+                    if own {
+                        Value::String(if self_pid == Some(b.pid) { "active" } else { "idle" }.to_string())
+                    } else {
+                        Value::Null
+                    },
                     Value::Null, // query
                 ])
             })
@@ -3895,9 +3966,11 @@ impl SystemViewRegistry {
 
         match view_name {
             "pg_database_branches" => Self::execute_pg_database_branches(storage),
-            // sprinter f4f5d450e816: storage-independent — live connections are
-            // process state, not catalog state.
-            "pg_stat_activity" => Ok(Self::execute_pg_stat_activity()),
+            // sprinter f4f5d450e816: not catalog state — live connections are
+            // process state. It takes `storage` all the same (sprinter
+            // 32ed4b9e0002): the engine serving this query is what says WHICH
+            // open database's backends the scan may see.
+            "pg_stat_activity" => Ok(Self::execute_pg_stat_activity(storage)),
             "pg_mv_staleness" => Self::execute_pg_mv_staleness(storage),
             "pg_vector_index_stats" => Self::execute_pg_vector_index_stats(storage),
             "pg_compare_branches" => {
@@ -3989,8 +4062,9 @@ impl SystemViewRegistry {
             "heliosdb_row_cache_stats" => Self::execute_heliosdb_row_cache_stats(storage),
             // Read-hot-path lock-contention census (W3.1)
             "heliosdb_lock_census" => Self::execute_heliosdb_lock_census(),
-            // Advisory locks currently held (spec 03)
-            "pg_advisory_locks" => Self::execute_pg_advisory_locks(),
+            // Advisory locks currently held (spec 03), scoped to the open
+            // database serving this query (sprinter 564e9ac1d762).
+            "pg_advisory_locks" => Self::execute_pg_advisory_locks(storage),
             // Per-statement-class write-volume census (W3.2)
             "heliosdb_write_volume" => Self::execute_heliosdb_write_volume(),
             // COPY fast-path phase-timing census (W3.4)
@@ -6163,12 +6237,21 @@ impl SystemViewRegistry {
 
     /// Execute the `pg_advisory_locks` view (spec 03).
     ///
-    /// Reads the process-global advisory-lock table, so it answers "who holds
-    /// 72707369?" for EVERY connection on this server, not just the caller's.
+    /// Answers "who holds 72707369?" for every connection to THIS open
+    /// database, not just the caller's — and not another open database's
+    /// (sprinter 564e9ac1d762). The lock table is one process-global structure,
+    /// but every key in it carries the `StorageEngine::instance_id()` it was
+    /// taken under, and the engine serving this query is the one that may be
+    /// reported. Listing a second `EmbeddedDatabase`'s holder session ids was
+    /// the observability half of the unscoped-lock-table defect; an operator
+    /// chasing a stuck migration needs the holder in the database they are
+    /// connected to, and a session id from another one is worse than no row at
+    /// all.
+    ///
     /// Locks are exclusive-only in this build, so `mode` is a constant.
-    fn execute_pg_advisory_locks() -> Result<Vec<Tuple>> {
+    fn execute_pg_advisory_locks(storage: &StorageEngine) -> Result<Vec<Tuple>> {
         let results = crate::advisory_lock::manager()
-            .snapshot()
+            .snapshot_for_database(storage.instance_id())
             .into_iter()
             .map(|lock| {
                 Tuple::new(vec![

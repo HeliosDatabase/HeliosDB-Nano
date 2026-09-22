@@ -12696,3 +12696,118 @@ async fn gh29_c12_a_select_list_mixing_a_wildcard_with_written_items_stays_ambig
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// sprinter afed6c8e8d1d + 37a5968e7698 — the savepoint family over the wire.
+// ---------------------------------------------------------------------------
+
+/// `handle_execute_extended` must let the whole savepoint family through to the
+/// engine, with PostgreSQL's command tags.
+///
+/// Before the fix the extended path forwarded these to
+/// `EmbeddedDatabase::execute_params_for_session`, which refused them at
+/// `src/lib.rs:18010` ("transaction control statements must go through the
+/// session API") for every statement sent inside an open session transaction —
+/// i.e. every savepoint a driver that binds server-side (Prisma nested
+/// transactions, JDBC `Connection::setSavepoint`) has ever sent.
+#[tokio::test]
+async fn wire_extended_savepoint_family_is_reachable_inside_a_transaction() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+    wire_setup(&mut h, &mut c, "INSERT INTO t VALUES (1, 'keep')").await;
+
+    let out = wire_extended(&mut h, &mut c, "sp", "SAVEPOINT sp1", vec![], vec![]).await;
+    assert_extended_ok(&out, "SAVEPOINT sp1");
+    assert_eq!(
+        command_tags(&out),
+        vec!["SAVEPOINT".to_string()],
+        "PostgreSQL tags a savepoint `SAVEPOINT`"
+    );
+
+    // A bound-parameter write after the savepoint, then undo it from the same
+    // protocol.
+    let ins = "INSERT INTO t (id, v) VALUES ($1, $2)";
+    let out = wire_extended(
+        &mut h,
+        &mut c,
+        "ins",
+        ins,
+        vec![23, 25],
+        vec![Some(b"2".to_vec()), Some(b"discard".to_vec())],
+    )
+    .await;
+    assert_extended_ok(&out, ins);
+
+    let out = wire_extended(&mut h, &mut c, "rb", "ROLLBACK TO SAVEPOINT sp1", vec![], vec![]).await;
+    assert_extended_ok(&out, "ROLLBACK TO SAVEPOINT sp1");
+    assert_eq!(
+        command_tags(&out),
+        vec!["ROLLBACK".to_string()],
+        "PostgreSQL tags `ROLLBACK TO SAVEPOINT n` as `ROLLBACK`"
+    );
+
+    let out = wire_extended(&mut h, &mut c, "rel", "RELEASE SAVEPOINT sp1", vec![], vec![]).await;
+    assert_extended_ok(&out, "RELEASE SAVEPOINT sp1");
+    assert_eq!(
+        command_tags(&out),
+        vec!["RELEASE".to_string()],
+        "PostgreSQL tags a release `RELEASE`"
+    );
+
+    wire_setup(&mut h, &mut c, "COMMIT").await;
+    assert_eq!(
+        wire_ids(&mut h, &mut c).await,
+        ids(&["1"]),
+        "the post-savepoint bound-parameter insert must have been undone"
+    );
+}
+
+/// A savepoint name that does not exist in the CURRENT transaction is
+/// `3B001 invalid_savepoint_specification`, on both protocols.
+///
+/// Before the fix the message was `Savepoint 'nope' does not exist`, which
+/// `sqlstate_for_query_execution_message` read as a generic "does not exist"
+/// and reported as an undefined TABLE.
+#[tokio::test]
+async fn wire_unknown_savepoint_name_is_3b001() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut h, mut c) = test_handler(db);
+    wire_setup(&mut h, &mut c, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+
+    assert_wire_sqlstate(&mut h, &mut c, "ROLLBACK TO SAVEPOINT nope", "3B001").await;
+    // The failed statement aborts the block (HDB-008), so reopen it before the
+    // RELEASE half.
+    wire_setup(&mut h, &mut c, "ROLLBACK").await;
+    wire_setup(&mut h, &mut c, "BEGIN").await;
+    assert_wire_sqlstate(&mut h, &mut c, "RELEASE SAVEPOINT nope", "3B001").await;
+    wire_setup(&mut h, &mut c, "ROLLBACK").await;
+}
+
+/// A savepoint established on one connection must be invisible to another,
+/// over the wire, with `3B001` rather than someone else's snapshot.
+#[tokio::test]
+async fn wire_savepoints_do_not_leak_between_connections() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut a, mut ca) = test_handler(Arc::clone(&db));
+    let (mut b, mut cb) = test_handler(Arc::clone(&db));
+    wire_setup(&mut a, &mut ca, "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)").await;
+
+    wire_setup(&mut a, &mut ca, "BEGIN").await;
+    wire_setup(&mut a, &mut ca, "INSERT INTO t VALUES (1, 'a')").await;
+    wire_setup(&mut a, &mut ca, "SAVEPOINT sp_a").await;
+
+    wire_setup(&mut b, &mut cb, "BEGIN").await;
+    wire_setup(&mut b, &mut cb, "INSERT INTO t VALUES (2, 'b')").await;
+    assert_wire_sqlstate(&mut b, &mut cb, "ROLLBACK TO SAVEPOINT sp_a", "3B001").await;
+    wire_setup(&mut b, &mut cb, "ROLLBACK").await;
+
+    wire_setup(&mut a, &mut ca, "COMMIT").await;
+    assert_eq!(
+        wire_ids(&mut a, &mut ca).await,
+        ids(&["1"]),
+        "A's row committed; B's was rolled back and never reachable from A's savepoint"
+    );
+}

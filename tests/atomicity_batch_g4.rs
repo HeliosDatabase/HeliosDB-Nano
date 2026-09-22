@@ -873,8 +873,10 @@ fn g4_item2_embedded_block_still_aborts_on_statement_error() {
 
 /// A user's own `SAVEPOINT` must still work on the MySQL listener — the implicit
 /// per-statement savepoint deliberately does NOT push onto the named savepoint
-/// stack (that stack is process-wide and gates ten fast paths on being empty),
-/// so the two must not interfere.
+/// stack, so the two must not interfere. (sprinter 37a5968e7698 moved that stack
+/// onto `storage::Transaction`; it is no longer process-wide, but a nameless push
+/// would still demote THIS transaction's fast paths for the rest of the block and
+/// would change what a `RELEASE` truncates.)
 ///
 /// Tolerant of the listener not accepting `SAVEPOINT` at all: named savepoints
 /// over the MySQL wire are not what this item changed, and a pre-existing gap

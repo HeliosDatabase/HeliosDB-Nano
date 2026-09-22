@@ -422,10 +422,8 @@ fn test_delete_after_savepoint_rollback_to_stub() {
 
 #[test]
 fn test_multiple_dml_between_savepoints() {
-    // Multiple DML operations between two savepoints.
-    // NOTE: Within an explicit transaction, DELETE WHERE cannot see rows inserted
-    // in the same transaction (no read-your-own-writes). The DELETE effectively
-    // matches 0 rows, so all 3 inserts persist.
+    // Multiple DML operations between two savepoints. The DELETE matches the
+    // row an INSERT staged earlier in the SAME transaction, so two rows survive.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -439,11 +437,20 @@ fn test_multiple_dml_between_savepoints() {
     db.execute_returning("RELEASE SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 
-    // SQL standard: 2 rows (DELETE removes row 2). Actual: 3 rows (no read-your-own-writes).
+    // GH#41 / sprinter 27bf8d819c52 — THIS ASSERTION USED TO ENCODE THE BUG.
+    // It read `3` with the message "KNOWN LIMITATION: DELETE in explicit
+    // transaction cannot see own inserts (no RYOW)", and a note above the body
+    // said the DELETE "effectively matches 0 rows, so all 3 inserts persist".
+    // That was not a limitation, it was a silent wrong answer: the DELETE
+    // reported rowcount 0 and threw the statement away. The text-family
+    // `Update`/`Delete` arms now merge the transaction's write set
+    // (`src/lib.rs`, the `merge_txn_writes` gate), so the SQL-standard answer
+    // is 2. Inverted, not deleted — per the house rule, a test that encoded a
+    // defect is flipped and says so.
     assert_eq!(
         count_rows(&db),
-        3,
-        "KNOWN LIMITATION: DELETE in explicit transaction cannot see own inserts (no RYOW)"
+        2,
+        "DELETE in an explicit transaction must match the row that transaction inserted"
     );
 }
 
@@ -486,12 +493,15 @@ fn test_dml_before_savepoint_preserved_on_rollback_to() {
 
 #[test]
 fn test_dml_visibility_within_transaction_after_savepoint() {
-    // NOTE: Read-your-own-writes is NOT supported in explicit transactions.
-    // Queries within the transaction do not see uncommitted inserts from the
-    // same transaction. Additionally, issuing a query() during an explicit
-    // transaction can interfere with the transaction state (the inserts may
-    // be lost on COMMIT). This test verifies post-commit visibility WITHOUT
-    // querying mid-transaction.
+    // This test verifies post-commit visibility WITHOUT querying
+    // mid-transaction.
+    //
+    // The note that used to stand here — "Read-your-own-writes is NOT supported
+    // in explicit transactions" — was already false when it was written: the
+    // very next test in this file,
+    // `test_query_within_explicit_transaction_reads_own_writes`, asserts the
+    // opposite and passes. As of v4.41.0 (GH#41 / sprinter 27bf8d819c52) the
+    // WRITE path reads its own writes too.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -865,11 +875,29 @@ fn test_savepoint_after_failed_dml() {
     assert_eq!(count_rows(&db), 1);
 }
 
+/// sprinter 37a5968e7698: INVERTED. This test used to assert the bug —
+///
+/// ```text
+/// // KNOWN LIMITATION: rollback_internal() does NOT clear the savepoints Vec.
+/// // Savepoint names from a rolled-back transaction leak into the next transaction.
+/// // This is a bug: ideally ROLLBACK should clear the savepoint stack.
+/// let result = db.execute_returning("RELEASE SAVEPOINT sp1");
+/// // BUG: This succeeds because savepoints were not cleared by ROLLBACK
+/// assert!(
+///     result.is_ok(),
+///     "KNOWN BUG: savepoint stack not cleared on ROLLBACK; old savepoints leak"
+/// );
+/// ```
+///
+/// — and it was right about the behaviour: the stack lived on the
+/// `EmbeddedDatabase` handle and only `Drop` ever emptied it. PostgreSQL
+/// destroys savepoints at ROLLBACK (and at COMMIT), and a leaked one is not
+/// merely untidy: `ROLLBACK TO` it restored the DEAD transaction's write-set
+/// snapshot into the live one. The stack now lives on `storage::Transaction`,
+/// so it dies with the transaction. The cross-connection and
+/// write-set-injection halves are covered in `tests/savepoint_scoping_i5.rs`.
 #[test]
-fn test_full_rollback_does_not_clear_savepoint_stack() {
-    // KNOWN LIMITATION: rollback_internal() does NOT clear the savepoints Vec.
-    // Savepoint names from a rolled-back transaction leak into the next transaction.
-    // This is a bug: ideally ROLLBACK should clear the savepoint stack.
+fn test_full_rollback_clears_the_savepoint_stack() {
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -877,13 +905,19 @@ fn test_full_rollback_does_not_clear_savepoint_stack() {
     db.execute_returning("SAVEPOINT sp2").unwrap();
     db.execute("ROLLBACK").unwrap();
 
-    // Start a new transaction - savepoint names LEAK from previous transaction
+    // A new transaction must NOT see the previous transaction's savepoint names.
     db.execute("BEGIN").unwrap();
-    let result = db.execute_returning("RELEASE SAVEPOINT sp1");
-    // BUG: This succeeds because savepoints were not cleared by ROLLBACK
+    let released = db.execute_returning("RELEASE SAVEPOINT sp1");
     assert!(
-        result.is_ok(),
-        "KNOWN BUG: savepoint stack not cleared on ROLLBACK; old savepoints leak"
+        released.is_err(),
+        "a savepoint from a rolled-back transaction must not leak into the next one, got {:?}",
+        released.map(|(n, _)| n)
+    );
+    let rolled = db.execute_returning("ROLLBACK TO SAVEPOINT sp2");
+    assert!(
+        rolled.is_err(),
+        "a savepoint from a rolled-back transaction must not be a rollback target, got {:?}",
+        rolled.map(|(n, _)| n)
     );
     db.execute("ROLLBACK").unwrap();
 }
@@ -1031,9 +1065,8 @@ fn test_rollback_to_savepoint_via_execute_works() {
 
 #[test]
 fn test_savepoint_survives_successful_dml() {
-    // A savepoint should remain valid after successful DML.
-    // NOTE: DELETE WHERE cannot see rows inserted in the same explicit transaction
-    // (no read-your-own-writes), so all 3 inserts persist.
+    // A savepoint should remain valid after successful DML. The DELETE matches
+    // the row an INSERT staged earlier in the SAME transaction.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -1049,11 +1082,20 @@ fn test_savepoint_survives_successful_dml() {
     db.execute_returning("RELEASE SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 
-    // SQL standard: 2 rows (DELETE removes row 2). Actual: 3 rows (no RYOW).
+    // GH#41 / sprinter 27bf8d819c52 — THIS ASSERTION USED TO ENCODE THE BUG.
+    // It read `3` with the message "KNOWN LIMITATION: DELETE in explicit
+    // transaction cannot see own inserts (no RYOW)", and a note above the body
+    // said the DELETE "effectively matches 0 rows, so all 3 inserts persist".
+    // That was not a limitation, it was a silent wrong answer: the DELETE
+    // reported rowcount 0 and threw the statement away. The text-family
+    // `Update`/`Delete` arms now merge the transaction's write set
+    // (`src/lib.rs`, the `merge_txn_writes` gate), so the SQL-standard answer
+    // is 2. Inverted, not deleted — per the house rule, a test that encoded a
+    // defect is flipped and says so.
     assert_eq!(
         count_rows(&db),
-        3,
-        "KNOWN LIMITATION: DELETE in explicit transaction cannot see own inserts (no RYOW)"
+        2,
+        "DELETE in an explicit transaction must match the row that transaction inserted"
     );
 }
 

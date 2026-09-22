@@ -1980,6 +1980,21 @@ pub struct StorageEngine {
     /// Bulk load mode flag - when enabled, skips per-row metrics and tracking
     /// for improved INSERT performance. Enable with SET bulk_load_mode = true;
     bulk_load_mode: Arc<AtomicBool>,
+    /// sprinter 1703dba8e82d: "a session-private (`pg_temp_*`) table MAY exist
+    /// in THIS database". Per-ENGINE, never a process global, for the reason
+    /// the design rule above `crate::SESSION_SCHEMA_OVERRIDE` states: two open
+    /// `EmbeddedDatabase`s are two databases, and one of them holding a temp
+    /// table must not make the other pay for the check.
+    ///
+    /// It is a HINT, and only ever a fast-out: `false` means *definitely none*,
+    /// so [`Catalog::list_tables`](super::Catalog::list_tables) can return the
+    /// raw scan and `Planner::resolve_table_ref` can skip its temp probe; `true`
+    /// means *maybe*, and costs one extra probe. It is therefore armed
+    /// conservatively — by the first temp CREATE, and at open by anything the
+    /// reclaim sweep could not remove — and never disarmed, because a stale
+    /// `true` costs a probe while a stale `false` would expose another
+    /// session's table.
+    temp_tables_present: Arc<AtomicBool>,
     /// Lock-free ingestion engine for high-performance bulk loading
     /// When enabled, provides lock-free data ingestion with configurable ACID guarantees
     lockfree_engine: Arc<RwLock<Option<super::lockfree::LockFreeIngestionEngine>>>,
@@ -2548,6 +2563,7 @@ impl StorageEngine {
             _temp_dir: None,
             row_counters,
             bulk_load_mode: Arc::new(AtomicBool::new(false)),
+            temp_tables_present: Arc::new(AtomicBool::new(false)),
             lockfree_engine: Arc::new(RwLock::new(None)),
             dict_manager: Arc::new(DictionaryManager::new()),
             art_index_manager: Arc::new(ArtIndexManager::new()),
@@ -2586,6 +2602,36 @@ impl StorageEngine {
             if let Err(e) = engine.recover_wal_at_open() {
                 warn!("WAL recovery failed (data may be incomplete): {}", e);
             }
+        }
+
+        // sprinter 1703dba8e82d: reclaim session-private (`pg_temp_*`) tables
+        // left behind by a process that died without running any `Drop`.
+        //
+        // The session-teardown hook in `EmbeddedDatabase::destroy_session`
+        // cannot cover this case, and leaving the survivors would be strictly
+        // worse than never having implemented temp tables: the backend-pid
+        // counter restarts at 1 in a new process, so the seventh connection of
+        // the next run would silently ADOPT a dead session's `pg_temp_7` table,
+        // and until it did, the table would read as an ordinary permanent
+        // relation to everybody. Fail closed — run AFTER WAL recovery so a
+        // replayed temp table is swept too.
+        //
+        // Costs one prefix scan of a key range that is empty on every clean
+        // start, once per open.
+        if read_only {
+            // A read-only handle must not write, so it cannot reclaim. Arm the
+            // visibility filter instead: a leftover stays hidden rather than
+            // resurfacing as a permanent, globally-visible table.
+            let leftovers = engine
+                .catalog()
+                .list_tables_including_temp()
+                .is_ok_and(|t| t.iter().any(|k| crate::sql::temp_tables::is_temp_key(k)));
+            if leftovers {
+                engine.note_temp_table_present();
+            }
+        } else if crate::sql::temp_tables::sweep_orphaned_temp_tables(&engine) > 0 {
+            // Anything the sweep could NOT drop must still be hidden.
+            engine.note_temp_table_present();
         }
 
         Ok(engine)
@@ -2917,6 +2963,7 @@ impl StorageEngine {
             _temp_dir: Some(temp_dir),
             row_counters: Arc::new(dashmap::DashMap::new()),
             bulk_load_mode: Arc::new(AtomicBool::new(false)),
+            temp_tables_present: Arc::new(AtomicBool::new(false)),
             lockfree_engine: Arc::new(RwLock::new(None)),
             dict_manager: Arc::new(DictionaryManager::new()),
             art_index_manager: Arc::new(ArtIndexManager::new()),
@@ -3176,6 +3223,28 @@ impl StorageEngine {
             return on;
         }
         self.bulk_load_mode.load(Ordering::Acquire)
+    }
+
+    /// sprinter 1703dba8e82d: may a session-private (`pg_temp_*`) table exist in
+    /// this database?
+    ///
+    /// One relaxed load, and `false` on every deployment that never creates a
+    /// temp table — which is what lets the visibility filter in
+    /// [`Catalog::list_tables`](super::Catalog::list_tables) and the temp probe
+    /// in `Planner::resolve_table_ref` cost literally nothing until somebody
+    /// uses the feature. See the field for why a stale `true` is harmless and a
+    /// stale `false` would not be.
+    #[inline]
+    pub fn temp_tables_present(&self) -> bool {
+        self.temp_tables_present.load(Ordering::Relaxed)
+    }
+
+    /// Arm [`Self::temp_tables_present`]. Called by the catalog when a
+    /// `pg_temp_*` table is registered, and at open when the reclaim sweep
+    /// leaves anything behind.
+    #[inline]
+    pub fn note_temp_table_present(&self) {
+        self.temp_tables_present.store(true, Ordering::Relaxed);
     }
 
     /// Enable or disable bulk load mode

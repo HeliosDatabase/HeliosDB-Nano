@@ -71,16 +71,41 @@ pub struct SessionManager {
     quota: ResourceQuota,
     /// Last cleanup timestamp
     last_cleanup: Arc<Mutex<Instant>>,
+    /// sprinter 32ed4b9e0002: the OPEN DATABASE whose sessions this manager
+    /// mints — `StorageEngine::instance_id()` of the owning
+    /// `EmbeddedDatabase`, or `scoped::UNATTACHED_ENGINE`.
+    ///
+    /// One manager belongs to exactly one `EmbeddedDatabase`, so this is the
+    /// natural place to record which database a session is on: every session
+    /// the manager creates is stamped with it, and `pg_stat_activity` scoped by
+    /// it can never list a different open database's backends. A plain `u64`,
+    /// not an `Arc<StorageEngine>`: a manager that held the engine would be a
+    /// reference cycle (`EmbeddedDatabase` -> manager -> engine) and the engine
+    /// would never be dropped.
+    engine_instance: u64,
 }
 
 impl SessionManager {
-    /// Create a new SessionManager with default settings
+    /// Create a new SessionManager with default settings, belonging to no open
+    /// database.
+    ///
+    /// Sessions it mints are stamped `scoped::UNATTACHED_ENGINE` and therefore
+    /// appear in NO database's `pg_stat_activity`. Every production manager is
+    /// built by [`Self::new_for_engine`]; this spelling is for the unit tests
+    /// below, which exercise quotas and cleanup with no engine at all.
     pub fn new() -> Self {
+        Self::new_for_engine(crate::session::scoped::UNATTACHED_ENGINE)
+    }
+
+    /// Create a SessionManager for the open database `engine_instance`
+    /// (`StorageEngine::instance_id()`) — sprinter 32ed4b9e0002.
+    pub fn new_for_engine(engine_instance: u64) -> Self {
         Self {
             sessions: Arc::new(DashMap::new()),
             session_timeout_secs: 3600,
             quota: ResourceQuota::default(),
             last_cleanup: Arc::new(Mutex::new(Instant::now())),
+            engine_instance,
         }
     }
 
@@ -94,7 +119,13 @@ impl SessionManager {
                 ..Default::default()
             },
             last_cleanup: Arc::new(Mutex::new(Instant::now())),
+            engine_instance: crate::session::scoped::UNATTACHED_ENGINE,
         }
+    }
+
+    /// The open database this manager's sessions belong to.
+    pub fn engine_instance(&self) -> u64 {
+        self.engine_instance
     }
 
     /// Create a new session for a user
@@ -112,7 +143,7 @@ impl SessionManager {
         self.enforce_quota(&user.id, &self.quota)?;
 
         // Create new session
-        let mut session = Session::new(user.id, isolation);
+        let mut session = Session::new_for_engine(user.id, isolation, self.engine_instance);
         // HDB-009: the name this session was opened under IS its SQL identity —
         // what `current_user` / `session_user` / `current_role` and
         // `current_setting('session_authorization')` report, and what a
@@ -154,7 +185,7 @@ impl SessionManager {
     /// (`EmbeddedDatabase::set_session_login_user`). A connection that never
     /// gets that far must never acquire a SQL identity.
     pub fn create_session_unchecked(&self, user: &User, isolation: IsolationLevel) -> Result<SessionId> {
-        let session = Session::new(user.id, isolation);
+        let session = Session::new_for_engine(user.id, isolation, self.engine_instance);
         let session_id = session.id;
         self.sessions
             .insert(session_id, Arc::new(parking_lot::RwLock::new(session)));

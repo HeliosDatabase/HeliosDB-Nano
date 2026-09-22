@@ -9,9 +9,27 @@
 //!
 //! # Model
 //!
-//! * The lock table is **process-global** ([`manager`]), matching PostgreSQL's
-//!   shared-memory `LOCKTAG_ADVISORY`: keys are shared by every connection and
-//!   every database served by this process.
+//! * The lock table is **process-global** ([`manager`]) but every key is
+//!   **scoped to ONE open database** ([`AdvisoryKey::database`]), matching
+//!   PostgreSQL's shared-memory `LOCKTAG_ADVISORY` — which is
+//!   `SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, …)`, i.e. keyed by the database
+//!   the backend is connected to. Keys are shared by every connection to the
+//!   SAME database and by none to another.
+//!
+//!   This header used to assert the opposite — that PostgreSQL "shares advisory
+//!   keys across every database served by the process" — and the code matched
+//!   the claim rather than PostgreSQL (sprinter 564e9ac1d762). The consequence
+//!   was not theoretical: every ORM hardcodes ONE migration key (Prisma's is
+//!   `72707369`, and Rails, Flyway, Liquibase and Atlas each have their own
+//!   constant), so with two `EmbeddedDatabase` handles open in one process,
+//!   database A's migration lock blocked database B's — on a condvar wait with
+//!   no bound unless `statement_timeout` was set. Tellingly, this repo's own
+//!   wire tests had been hand-picking disjoint key constants to dodge it.
+//!
+//!   The scope is `StorageEngine::instance_id()`: a per-construction counter,
+//!   never reused, deliberately NOT the engine's address (an address is subject
+//!   to ABA reuse, and a recycled one would let a newly opened database inherit
+//!   a closed one's locks).
 //! * Locks are **exclusive** only. The `_shared` variants are deliberately NOT
 //!   implemented — they fall through to the evaluator's `Unknown scalar
 //!   function` arm (SQLSTATE 42883) rather than being silently served as
@@ -95,42 +113,84 @@ use std::time::{Duration, Instant};
 use crate::session::SessionId;
 use crate::{Error, Result, Value};
 
-/// An advisory-lock key.
+/// The client-supplied half of an advisory-lock key: the integer(s), in the
+/// overload they were spelled with.
 ///
 /// PostgreSQL exposes two overloads and keeps them in separate namespaces (the
 /// lock tag's `objsubid` is 1 for the `bigint` form and 2 for the `(int, int)`
 /// form). The enum discriminant models that, so a key acquired through one
 /// overload can never be released through the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum AdvisoryKey {
+pub enum AdvisoryKeyId {
     /// `pg_advisory_lock(key bigint)`.
     BigInt(i64),
     /// `pg_advisory_lock(key1 int, key2 int)`.
     Pair(i32, i32),
 }
 
+/// An advisory-lock key: the client's integer(s) **and the open database they
+/// were taken in** — sprinter 564e9ac1d762.
+///
+/// The database is INSIDE the key rather than beside it in the map's key type
+/// on purpose: [`AdvisoryLockManager`] treats the key as opaque, so scoping
+/// every operation — acquire, re-entrant bump, unlock, quota, the view — is
+/// this one type change and nothing else. Nothing can scope one operation and
+/// forget another.
+///
+/// `database` is `StorageEngine::instance_id()`, which mirrors PostgreSQL
+/// putting `MyDatabaseId` in `LOCKTAG_ADVISORY`. Ordering puts `database`
+/// first so the `pg_advisory_locks` snapshot groups by database.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AdvisoryKey {
+    /// The open database this key lives in (`StorageEngine::instance_id()`).
+    database: u64,
+    /// The integer key the client named.
+    id: AdvisoryKeyId,
+}
+
 impl AdvisoryKey {
+    /// `pg_advisory_lock(key bigint)` in `database`.
+    pub fn bigint(database: u64, key: i64) -> Self {
+        Self {
+            database,
+            id: AdvisoryKeyId::BigInt(key),
+        }
+    }
+
+    /// `pg_advisory_lock(key1 int, key2 int)` in `database`.
+    pub fn pair(database: u64, key1: i32, key2: i32) -> Self {
+        Self {
+            database,
+            id: AdvisoryKeyId::Pair(key1, key2),
+        }
+    }
+
+    /// The open database this key belongs to — `StorageEngine::instance_id()`.
+    pub fn database(&self) -> u64 {
+        self.database
+    }
+
     /// `"bigint"` or `"int_pair"` — the `key_kind` column of `pg_advisory_locks`.
     pub fn kind(&self) -> &'static str {
-        match self {
-            Self::BigInt(_) => "bigint",
-            Self::Pair(_, _) => "int_pair",
+        match self.id {
+            AdvisoryKeyId::BigInt(_) => "bigint",
+            AdvisoryKeyId::Pair(_, _) => "int_pair",
         }
     }
 
     /// First key component of the `(int, int)` form; `None` for the `bigint` form.
     pub fn classid(&self) -> Option<i32> {
-        match self {
-            Self::BigInt(_) => None,
-            Self::Pair(a, _) => Some(*a),
+        match self.id {
+            AdvisoryKeyId::BigInt(_) => None,
+            AdvisoryKeyId::Pair(a, _) => Some(a),
         }
     }
 
     /// The `bigint` key, or the second component of the `(int, int)` form.
     pub fn objid(&self) -> i64 {
-        match self {
-            Self::BigInt(k) => *k,
-            Self::Pair(_, b) => i64::from(*b),
+        match self.id {
+            AdvisoryKeyId::BigInt(k) => k,
+            AdvisoryKeyId::Pair(_, b) => i64::from(b),
         }
     }
 }
@@ -521,12 +581,19 @@ impl AdvisoryLockManager {
         freed
     }
 
-    /// Rows for the `pg_advisory_locks` system view, in a stable order.
-    pub fn snapshot(&self) -> Vec<AdvisoryLockInfo> {
+    /// Rows for the `pg_advisory_locks` system view, in a stable order —
+    /// **only the locks held in `database`** (sprinter 564e9ac1d762).
+    ///
+    /// The view is the answer to "the migration is stuck on 72707369 — who has
+    /// it?", and that answer must name a session of the database the operator
+    /// is connected to. Listing another open database's holder session ids was
+    /// the observability half of the same unscoped-table defect.
+    pub fn snapshot_for_database(&self, database: u64) -> Vec<AdvisoryLockInfo> {
         let mut rows: Vec<AdvisoryLockInfo> = self
             .locks
             .lock()
             .iter()
+            .filter(|(key, _)| key.database() == database)
             .map(|(key, holder)| AdvisoryLockInfo {
                 key: *key,
                 owner: holder.owner,
@@ -570,6 +637,19 @@ pub struct AdvisoryContext {
     pub statement_timeout: Option<Duration>,
     /// `[locks] max_advisory_locks_per_session` (0 = unlimited).
     pub max_locks_per_session: u32,
+    /// The OPEN DATABASE this statement is running against —
+    /// `StorageEngine::instance_id()` of the engine serving it (sprinter
+    /// 564e9ac1d762).
+    ///
+    /// Every key [`evaluate`] builds is scoped to it, which is what stops two
+    /// `EmbeddedDatabase`s in one process from contending on the single
+    /// migration key every ORM hardcodes. It is carried HERE, on the context
+    /// the entry point already builds, rather than read back out of some other
+    /// thread-local at use time: the evaluator is session-less and
+    /// storage-less, and a scope that could silently resolve to "no database"
+    /// when an unrelated guard happened not to be installed would fail OPEN —
+    /// straight back to one shared lock table.
+    pub database: u64,
     /// Was an explicit transaction already open when this statement started?
     ///
     /// When it was not, the statement runs in its own implicit transaction and
@@ -786,14 +866,14 @@ fn key_component(value: &Value, function: &str) -> Result<i64> {
 /// is rejected rather than treated as a key: PostgreSQL's advisory functions are
 /// STRICT, and silently locking key 0 for a NULL would hand out a lock the
 /// caller never asked for.
-fn key_from_args(function: &str, args: &[Value]) -> Result<AdvisoryKey> {
+fn key_from_args(function: &str, database: u64, args: &[Value]) -> Result<AdvisoryKey> {
     if args.iter().any(|a| matches!(a, Value::Null)) {
         return Err(Error::query_execution(format!(
             "{function}() does not accept NULL key arguments"
         )));
     }
     match args {
-        [single] => Ok(AdvisoryKey::BigInt(key_component(single, function)?)),
+        [single] => Ok(AdvisoryKey::bigint(database, key_component(single, function)?)),
         [first, second] => {
             let to_i32 = |v: &Value| -> Result<i32> {
                 let raw = key_component(v, function)?;
@@ -803,7 +883,7 @@ fn key_from_args(function: &str, args: &[Value]) -> Result<AdvisoryKey> {
                     ))
                 })
             };
-            Ok(AdvisoryKey::Pair(to_i32(first)?, to_i32(second)?))
+            Ok(AdvisoryKey::pair(database, to_i32(first)?, to_i32(second)?))
         }
         _ => Err(Error::query_execution(format!(
             "{function}() takes one bigint key or two integer keys, got {} arguments",
@@ -868,11 +948,11 @@ pub fn evaluate(function: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Null)
         }
         "pg_advisory_unlock" => {
-            let key = key_from_args(function, args)?;
+            let key = key_from_args(function, ctx.database, args)?;
             Ok(Value::Boolean(mgr.unlock(key, owner)))
         }
         "pg_try_advisory_lock" | "pg_try_advisory_xact_lock" => {
-            let key = key_from_args(function, args)?;
+            let key = key_from_args(function, ctx.database, args)?;
             let scope = if function == "pg_try_advisory_xact_lock" {
                 AdvisoryScope::Transaction
             } else {
@@ -889,7 +969,7 @@ pub fn evaluate(function: &str, args: &[Value]) -> Result<Value> {
             Ok(Value::Boolean(acquired))
         }
         "pg_advisory_lock" | "pg_advisory_xact_lock" => {
-            let key = key_from_args(function, args)?;
+            let key = key_from_args(function, ctx.database, args)?;
             let scope = if function == "pg_advisory_xact_lock" {
                 AdvisoryScope::Transaction
             } else {
@@ -916,6 +996,13 @@ pub fn evaluate(function: &str, args: &[Value]) -> Result<Value> {
 mod tests {
     use super::*;
 
+    /// The open database the unit tests below run "in". Any non-zero value
+    /// works: `try_acquire`/`unlock` treat the key opaquely, and the scoping
+    /// they exercise is between DIFFERENT values (see [`TEST_DB_B`]).
+    const TEST_DB_A: u64 = 9_001;
+    /// A second open database, for the cross-database scoping tests.
+    const TEST_DB_B: u64 = 9_002;
+
     /// A wire/embedded SESSION context — the connection-owned case.
     fn ctx(owner: SessionId) -> AdvisoryContext {
         AdvisoryContext {
@@ -923,6 +1010,7 @@ mod tests {
             ownership: AdvisoryOwnership::Connection,
             statement_timeout: None,
             max_locks_per_session: 0,
+            database: TEST_DB_A,
             in_explicit_transaction: true,
             took_transaction_lock: false,
             took_session_lock: false,
@@ -937,6 +1025,7 @@ mod tests {
             ownership: AdvisoryOwnership::Statement,
             statement_timeout: None,
             max_locks_per_session: 0,
+            database: TEST_DB_A,
             // A statement-scoped owner is never inside anybody's explicit
             // transaction: its locks end with the statement, whatever some
             // unrelated caller of the same handle is doing.
@@ -949,7 +1038,63 @@ mod tests {
     /// Distinct keys per test: the table is process-global by design, and the
     /// unit tests in this binary run concurrently.
     fn key(n: i64) -> AdvisoryKey {
-        AdvisoryKey::BigInt(-900_000_000_000 - n)
+        AdvisoryKey::bigint(TEST_DB_A, -900_000_000_000 - n)
+    }
+
+    /// The SAME client integer as [`key`], in a different open database.
+    fn key_in_b(n: i64) -> AdvisoryKey {
+        AdvisoryKey::bigint(TEST_DB_B, -900_000_000_000 - n)
+    }
+
+    /// sprinter 564e9ac1d762: the same client integer in two open databases is
+    /// two different locks. Before the scope was part of the key, database B
+    /// waited on database A's ORM migration key indefinitely.
+    #[test]
+    fn the_same_key_in_two_databases_is_two_locks() {
+        let mgr = manager();
+        let a = SessionId::new();
+        let b = SessionId::new();
+        let in_a = key(40);
+        let in_b = key_in_b(40);
+        assert_ne!(in_a, in_b, "the database must be part of the key identity");
+
+        assert!(mgr.try_acquire(in_a, a, AdvisoryScope::Session, 0).unwrap());
+        assert!(
+            mgr.try_acquire(in_b, b, AdvisoryScope::Session, 0).unwrap(),
+            "database B was blocked by database A's hold on the same integer"
+        );
+        // …and the control: within ONE database it still excludes.
+        let c = SessionId::new();
+        assert!(!mgr.try_acquire(in_a, c, AdvisoryScope::Session, 0).unwrap());
+
+        assert!(mgr.unlock(in_a, a));
+        assert!(
+            !mgr.try_acquire(in_b, c, AdvisoryScope::Session, 0).unwrap(),
+            "unlocking in database A released database B's hold"
+        );
+        mgr.release_session(b);
+    }
+
+    /// The view is scoped too: an operator on database B must not be shown
+    /// database A's holder sessions.
+    #[test]
+    fn the_snapshot_reports_only_one_databases_locks() {
+        let mgr = manager();
+        let a = SessionId::new();
+        let in_a = key(41);
+        assert!(mgr.try_acquire(in_a, a, AdvisoryScope::Session, 0).unwrap());
+
+        let from_a = mgr.snapshot_for_database(TEST_DB_A);
+        assert!(
+            from_a.iter().any(|row| row.key == in_a),
+            "the holding database cannot see its own lock"
+        );
+        let from_b = mgr.snapshot_for_database(TEST_DB_B);
+        assert!(
+            !from_b.iter().any(|row| row.key == in_a),
+            "database B's pg_advisory_locks lists database A's holder"
+        );
+        mgr.release_session(a);
     }
 
     #[test]
@@ -1018,11 +1163,21 @@ mod tests {
         let a = SessionId::new();
         let b = SessionId::new();
         assert!(mgr
-            .try_acquire(AdvisoryKey::BigInt(-777_000_001), a, AdvisoryScope::Session, 0)
+            .try_acquire(
+                AdvisoryKey::bigint(TEST_DB_A, -777_000_001),
+                a,
+                AdvisoryScope::Session,
+                0
+            )
             .unwrap());
         // (0, k) is a different lock tag even though the numbers line up.
         assert!(mgr
-            .try_acquire(AdvisoryKey::Pair(0, -777_000_001), b, AdvisoryScope::Session, 0)
+            .try_acquire(
+                AdvisoryKey::pair(TEST_DB_A, 0, -777_000_001),
+                b,
+                AdvisoryScope::Session,
+                0
+            )
             .unwrap());
         mgr.release_session(a);
         mgr.release_session(b);
@@ -1074,16 +1229,21 @@ mod tests {
 
     #[test]
     fn key_parsing_rejects_null_and_wrong_arity() {
-        assert!(key_from_args("pg_advisory_lock", &[Value::Null]).is_err());
-        assert!(key_from_args("pg_advisory_lock", &[]).is_err());
-        assert!(key_from_args("pg_advisory_lock", &[Value::Int4(1), Value::Int4(2), Value::Int4(3)]).is_err());
+        assert!(key_from_args("pg_advisory_lock", TEST_DB_A, &[Value::Null]).is_err());
+        assert!(key_from_args("pg_advisory_lock", TEST_DB_A, &[]).is_err());
+        assert!(key_from_args(
+            "pg_advisory_lock",
+            TEST_DB_A,
+            &[Value::Int4(1), Value::Int4(2), Value::Int4(3)]
+        )
+        .is_err());
         assert_eq!(
-            key_from_args("pg_advisory_lock", &[Value::Int8(72_707_369)]).unwrap(),
-            AdvisoryKey::BigInt(72_707_369)
+            key_from_args("pg_advisory_lock", TEST_DB_A, &[Value::Int8(72_707_369)]).unwrap(),
+            AdvisoryKey::bigint(TEST_DB_A, 72_707_369)
         );
         assert_eq!(
-            key_from_args("pg_advisory_lock", &[Value::Int4(1), Value::Int4(2)]).unwrap(),
-            AdvisoryKey::Pair(1, 2)
+            key_from_args("pg_advisory_lock", TEST_DB_A, &[Value::Int4(1), Value::Int4(2)]).unwrap(),
+            AdvisoryKey::pair(TEST_DB_A, 1, 2)
         );
     }
 

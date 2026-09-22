@@ -37,10 +37,16 @@
 //! PostgreSQL's command tag is a bare `CALL` with no count. The text family always returned 0;
 //! the params family's 1 was the stub's own status *message* counted as a row. Pinned below.
 //!
+//! **The transaction half (sprinter e4bb83a1afa0, v4.41.0).** This file used to end with two
+//! `known_gap_*` tests pinning the fact that a procedure body did NOT join its caller's
+//! transaction — refused outright on the text family, autocommitted on the params family. That
+//! is fixed: `execute_call_plan` now takes the caller's `&storage::Transaction` and runs body
+//! statements on it. The two tests at the bottom are the replacements its own maintenance note
+//! called for. The full cross-surface matrix lives in `tests/txn_membership_i6.rs`.
+//!
 //! HOW TO MAINTAIN THIS FILE. Every test asserts unconditionally — never introduce an `is_ok()`
 //! guard, and never assert on a row count read back through `SELECT COUNT(*)` (that returns one
-//! row whether the count is 0 or 10,000). Two tests at the bottom pin a KNOWN GAP rather than
-//! desired behaviour; they say so, in the style of `tests/function_unimplemented_tests.rs`.
+//! row whether the count is 0 or 10,000).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -309,67 +315,61 @@ fn the_query_path_refuses_call_instead_of_faking_a_status_row() {
 }
 
 // ===========================================================================
-// KNOWN GAP — pinned deliberately. This is NOT the desired end state.
+// TRANSACTION MEMBERSHIP — sprinter e4bb83a1afa0 / ROADMAP_V5 §2.11's residual.
 //
-// A procedure body is run by re-entering `execute()`/`query()` on a `clone_for_trigger()`
-// handle (the mechanism the text family has always used, unchanged by this fix). Both of
-// those re-take the global `current_transaction` mutex when a global transaction is open,
-// and `parking_lot::Mutex` is not reentrant — so a `CALL` issued while `execute()` already
-// holds that guard would HANG the thread. It did hang, before this fix, on the text family.
+// These two tests replace the KNOWN-GAP pair this file used to carry, exactly as
+// its own maintenance note instructed: "When that lands, DELETE these two tests
+// and assert the body runs and joins the caller's transaction in BOTH families."
 //
-// `GLOBAL_TXN_LOCK_HELD` (src/lib.rs) marks that window and `execute_call_plan` refuses
-// loudly instead. A loud error beats a hang; it is still an error where PostgreSQL would
-// have run the procedure.
+// The gap was that `execute_call_plan` ignored the `&storage::Transaction` its
+// caller already held and ran body statements by re-entering `execute()` /
+// `query()`. Consequences: the text family HUNG (and was then refused loudly by
+// the `GLOBAL_TXN_LOCK_HELD` gate, because `execute()` holds the non-reentrant
+// global mutex across the statement), while the params family ran the body in a
+// transaction of its own — so `BEGIN; CALL p(); ROLLBACK;` kept the procedure's
+// writes. `execute_call_plan` now takes the caller's transaction and runs the
+// body on it directly, which removes the re-entrancy and gives `CALL`
+// PostgreSQL's atomicity.
 //
-// SCOPE: only the embedded API and the REPL can reach this. A `BEGIN` over the PG or MySQL
-// wire creates a per-SESSION transaction (`handle_transaction_control_for_session`), which
-// never populates the global slot, so `CALL` inside a wire transaction is unaffected.
-//
-// The real fix is to run body statements against the caller's transaction rather than
-// through a fresh `execute()` — filed as ROADMAP_V5 §2.11, deliberately out of scope here
-// (this change is about parity between the families). When that lands, DELETE these two
-// tests and assert the body runs and joins the caller's transaction in BOTH families.
+// The full matrix (RAII handle, wire session, both wires, bound arguments,
+// read-your-own-writes inside the body) lives in `tests/txn_membership_i6.rs`.
+// What belongs HERE is only the part this file is for: the two families agreeing.
 // ===========================================================================
 
 #[test]
-fn known_gap_call_inside_a_global_text_transaction_is_refused() {
+fn call_inside_a_global_text_transaction_runs_and_joins_it_in_both_families() {
     let db = db();
     setup(&db);
 
     db.execute("BEGIN").expect("BEGIN");
-    let err = db
-        .execute("CALL p_zero()")
-        .expect_err("KNOWN GAP: refused rather than run — see the section comment")
-        .to_string();
-    db.execute("ROLLBACK").expect("ROLLBACK");
-
-    assert!(err.contains("p_zero"), "the error must name the procedure, got: {err}");
-    assert!(
-        err.contains("NOT executed"),
-        "the error must make clear the body did NOT run, got: {err}"
+    assert_eq!(db.execute("CALL p_zero()").expect("text family CALL"), 0);
+    assert_eq!(
+        db.execute_params("CALL p_one($1)", &[Value::Int4(1)])
+            .expect("params family CALL"),
+        0
     );
-    assert!(audit(&db).is_empty(), "the body must not have run");
+    db.execute("COMMIT").expect("COMMIT");
+
+    assert_eq!(
+        audit(&db),
+        vec![(0, "zero".to_string()), (1, "one".to_string())],
+        "both families must have run their body exactly once inside the block"
+    );
 }
 
 #[test]
-fn known_gap_the_params_family_does_run_inside_a_global_text_transaction() {
-    // The counterpart asymmetry, pinned so it is not mistaken for a bug report. The params
-    // family does NOT hold the global mutex across the statement, so re-entry succeeds and
-    // the body joins the open global transaction. Same statement, different family,
-    // different answer — which is exactly why §2.11 exists.
+fn call_inside_a_global_text_transaction_is_undone_by_rollback_in_both_families() {
     let db = db();
     setup(&db);
 
     db.execute("BEGIN").expect("BEGIN");
-    let affected = db
-        .execute_params("CALL p_zero()", &[])
-        .expect("KNOWN GAP: this one runs — see the section comment");
-    db.execute("COMMIT").expect("COMMIT");
+    db.execute("CALL p_zero()").expect("text family CALL");
+    db.execute_params("CALL p_one($1)", &[Value::Int4(1)])
+        .expect("params family CALL");
+    db.execute("ROLLBACK").expect("ROLLBACK");
 
-    assert_eq!(affected, 0);
-    assert_eq!(
-        only_row(&db),
-        (0, "zero".to_string()),
-        "the body ran and its write committed with the enclosing transaction"
+    assert!(
+        audit(&db).is_empty(),
+        "*** a procedure body's writes survived the ROLLBACK of the calling transaction ***"
     );
 }

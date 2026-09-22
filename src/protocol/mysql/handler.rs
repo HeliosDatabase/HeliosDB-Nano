@@ -1084,6 +1084,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Drop for MySqlHandler<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
+    /// sprinter 1703dba8e82d: publish THIS connection's session-private table
+    /// namespace around a piece of work that lists tables AHEAD of the engine.
+    ///
+    /// `SHOW TABLES`, `SHOW TABLE STATUS` and the `information_schema` route
+    /// (which delegates to the PostgreSQL catalog interceptor) all read
+    /// `Catalog::list_tables()` directly, without entering an
+    /// `EmbeddedDatabase` `_for_session` funnel — so the per-statement
+    /// scoped-state thread-local is not installed and the filter would treat
+    /// this connection as having no session, hiding its OWN temp tables. The
+    /// `SessionId` is the answer on this path; see
+    /// `crate::protocol::postgres::handler::PgConnectionHandler::temp_namespace_guard`.
+    ///
+    /// `None` until some connection to this database creates a temp table. The
+    /// guard is `!Send`; keep it inside the synchronous call it wraps.
+    fn temp_namespace_guard(&self) -> Option<crate::sql::temp_tables::TempNamespaceGuard> {
+        if !self.database.storage.temp_tables_present() {
+            return None;
+        }
+        self.database
+            .session_backend_pid(self.session_id)
+            .ok()
+            .map(crate::sql::temp_tables::TempNamespaceGuard::install)
+    }
+
     // ------------------------------------------------------------------
     // Construction
     // ------------------------------------------------------------------
@@ -2092,7 +2116,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
         if upper.contains("TABLES") {
             // Query actual tables from the catalog.
-            let mut tables = self.database.storage.catalog().list_tables().unwrap_or_default();
+            //
+            // sprinter 1703dba8e82d: `list_tables` filters session-private
+            // (`pg_temp_*`) tables against the caller's namespace, and this
+            // path never enters an engine `_for_session` funnel — so publish
+            // the namespace from the `SessionId` first or this connection's
+            // SHOW TABLES would be filtered as if it had no session at all.
+            let mut tables = {
+                let _temp_ns = self.temp_namespace_guard();
+                self.database.storage.catalog().list_tables().unwrap_or_default()
+            };
 
             // SHOW TABLES LIKE 'pattern' — apply LIKE filter
             if let Some(like_pattern) = extract_like_pattern(trimmed) {
@@ -2868,7 +2901,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         use crate::protocol::postgres::catalog::PgCatalog;
 
         let catalog = PgCatalog::with_database(Arc::clone(&self.database));
-        match catalog.handle_query(sql) {
+        // sprinter 1703dba8e82d: the PG interceptor lists tables without
+        // entering any engine funnel; publish this connection's temp namespace
+        // around the SYNCHRONOUS call (the guard is `!Send`).
+        let intercepted = {
+            let _temp_ns = self.temp_namespace_guard();
+            catalog.handle_query(sql)
+        };
+        match intercepted {
             Ok(Some((schema, rows))) => {
                 let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                 self.send_result_set(&col_names, &rows).await
@@ -2891,7 +2931,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
     /// Handle `SHOW TABLE STATUS` — returns table metadata in MySQL format.
     async fn handle_show_table_status(&mut self, sql: &str) -> Result<()> {
-        let tables = self.database.storage.catalog().list_tables().unwrap_or_default();
+        // sprinter 1703dba8e82d: see `handle_show` — the namespace must come
+        // from the `SessionId` on this path.
+        let tables = {
+            let _temp_ns = self.temp_namespace_guard();
+            self.database.storage.catalog().list_tables().unwrap_or_default()
+        };
 
         let like_pattern = extract_like_pattern(sql);
 
@@ -3683,6 +3728,17 @@ fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     // client a FOREIGN KEY failed when no foreign key is involved.
     if err_msg.contains(crate::error::NOT_NULL_VIOLATION_MARKER) {
         return (1048, "23000"); // ER_BAD_NULL_ERROR
+    }
+    // sprinter 37a5968e7698: a savepoint name not established in the CURRENT
+    // transaction. MySQL's own error for it is ER_SP_DOES_NOT_EXIST
+    // (`SAVEPOINT x does not exist`); the PostgreSQL wire reports 3B001 for the
+    // same refusal. Anchored on the ONE emitter's marker consts
+    // (`EmbeddedDatabase::savepoint_not_found`), and checked BEFORE the wording
+    // arms below — the message ends in "does not exist", which the generic
+    // not-found arm would otherwise report as ER_NO_SUCH_TABLE, telling a client
+    // its TABLE is missing when the savepoint is.
+    if crate::EmbeddedDatabase::is_savepoint_not_found(err_msg) {
+        return (1305, "42000"); // ER_SP_DOES_NOT_EXIST
     }
     // HDB-008: the engine's aborted-transaction refusals — the 25P02 statement
     // refusal and the embedded COMMIT refusal — share this prefix (the two

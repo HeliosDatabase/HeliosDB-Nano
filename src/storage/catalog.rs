@@ -530,6 +530,19 @@ impl<'a> Catalog<'a> {
             unique_index_plan.push(unique_columns);
         }
 
+        // sprinter 1703dba8e82d: arm the per-engine temp-table hint BEFORE the
+        // first durable write, never after.
+        //
+        // Order matters and is not arbitrary: the flag is what turns on the
+        // visibility filter in `list_tables`. Arming it after the `meta:table:`
+        // key landed would leave a window in which a concurrent
+        // `information_schema.tables` scan on another connection saw the row
+        // with filtering still off — i.e. saw a session-private table as a
+        // permanent one. Arming first can only cost an extra probe.
+        if crate::sql::temp_tables::is_temp_key(table_name) {
+            crate::sql::temp_tables::note_temp_table_created(self.storage);
+        }
+
         // Log CreateTable to WAL first (for replication to standbys)
         // This must happen before the actual table creation so standbys
         // receive and apply the operation in the correct order.
@@ -1139,6 +1152,34 @@ impl<'a> Catalog<'a> {
     /// If not found, it checks if it exists as a materialized view and
     /// returns the MV's schema if found.
     pub fn get_table_schema(&self, table_name: &str) -> Result<Schema> {
+        // sprinter 1703dba8e82d: a session-private (`pg_temp_*`) relation
+        // resolves ONLY for the backend that owns it.
+        //
+        // `list_tables` hides other sessions' temp tables from every LISTING
+        // surface, but a listing is not the only way to name a relation: a
+        // client can spell the key out — `SELECT * FROM pg_temp_9.scratch` —
+        // and `Planner::resolve_table_ref` passes an explicit qualifier through
+        // exactly as written, by design. This is the single resolver every read
+        // and every DML target funnels through (`table_factor_to_plan_inner`,
+        // the executor's scan and DDL arms, `PRAGMA table_info`, `SHOW COLUMNS`,
+        // `DESCRIBE`, every catalog view's column expansion), so refusing here
+        // closes the spelled-out path once instead of at each of them.
+        //
+        // The refusal is the ORDINARY not-found error, deliberately: PostgreSQL
+        // answers `42P01 undefined_table` for another backend's temp relation,
+        // and an error that distinguished "exists but is not yours" from "does
+        // not exist" would confirm the table's existence to the caller it is
+        // being hidden from. Fail closed — a caller with no session identity
+        // (`None`) is refused too.
+        //
+        // One relaxed atomic load on every deployment that never creates a temp
+        // table, which is the only cost on the default path.
+        if self.storage.temp_tables_present() && crate::sql::temp_tables::is_temp_key(table_name) {
+            let mine = crate::sql::temp_tables::current_temp_namespace();
+            if !crate::sql::temp_tables::key_is_visible(table_name, mine.as_deref()) {
+                return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
+            }
+        }
         // Resolve the raw schema (in-memory cache -> on-disk metadata -> materialized view).
         let mut schema = if let Some(schema) = self.storage.get_cached_schema(table_name) {
             schema
@@ -1448,7 +1489,63 @@ impl<'a> Catalog<'a> {
     }
 
     /// List all tables in the database
+    /// List every catalogued table VISIBLE to the caller.
+    ///
+    /// sprinter 1703dba8e82d: this is the ONE primitive every table-listing
+    /// surface in the tree bottoms out on — `information_schema.tables`,
+    /// `pg_class`, `pg_tables`, `pg_namespace`, `sqlite_master`, `SHOW TABLES`,
+    /// `\dt` (wire interceptor AND REPL), the REST `GET /:branch/tables`, the
+    /// MCP `heliosdb_list_tables` tool, the SQL and binary dump writers and the
+    /// git schema-diff — forty-odd call sites. Filtering HERE is what makes all
+    /// of them agree about session-private tables; filtering at any one of them
+    /// would have left the other thirty-nine leaking, which is the recurring
+    /// defect in this codebase (one catalog surface, two implementations).
+    ///
+    /// The rule is [`crate::sql::temp_tables::key_is_visible`]: a permanent
+    /// table is visible to everyone, a `pg_temp_<pid>.t` table only to the
+    /// backend that owns the namespace — and a caller with NO namespace (a
+    /// dump, a checkpoint, a background sweep, a REST request) sees no temp
+    /// tables at all rather than everyone's.
+    ///
+    /// Callers that must genuinely see every row — the two reclaim paths —
+    /// use [`Self::list_tables_including_temp`].
+    ///
+    /// # Ordering
+    ///
+    /// Permanent tables keep their exact previous lexicographic order and temp
+    /// tables are appended AFTER them, so a session holding a temp table sees
+    /// the permanent ones at the same indices every other session does. That is
+    /// load-bearing rather than cosmetic: `phase3::system_views::pg_table_oid`
+    /// derives a relation's `pg_class.oid` from its POSITION in this list, and
+    /// interleaving a session-private table would have renumbered every later
+    /// table's OID for that one session — a moving OID under any ORM that
+    /// caches them.
     pub fn list_tables(&self) -> Result<Vec<String>> {
+        let tables = self.list_tables_including_temp()?;
+        // Hot path: no temp table has ever existed in this database, so there
+        // is nothing to filter and nothing to reorder. One relaxed load.
+        if !self.storage.temp_tables_present() {
+            return Ok(tables);
+        }
+        let mine = crate::sql::temp_tables::current_temp_namespace();
+        let (permanent, temp): (Vec<String>, Vec<String>) = tables
+            .into_iter()
+            .partition(|k| !crate::sql::temp_tables::is_temp_key(k));
+        let mut out = permanent;
+        out.extend(
+            temp.into_iter()
+                .filter(|k| crate::sql::temp_tables::key_is_visible(k, mine.as_deref())),
+        );
+        Ok(out)
+    }
+
+    /// Every catalogued table, session-private ones included.
+    ///
+    /// The raw `meta:table:` scan [`Self::list_tables`] used to be. Only the
+    /// temp-table reclaim paths (`sql::temp_tables`) may use it: they run with
+    /// no session identity and would otherwise be filtered away from the very
+    /// rows they exist to delete.
+    pub fn list_tables_including_temp(&self) -> Result<Vec<String>> {
         let prefix = b"meta:table:";
         let mut tables = Vec::new();
 

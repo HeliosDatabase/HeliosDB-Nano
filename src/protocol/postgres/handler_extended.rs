@@ -87,12 +87,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // unsubstituted text is safer, since a parameter *value* containing
         // "pg_catalog." can no longer flip an engine query into the
         // catalog dispatcher.
-        let (is_catalog, catalog_schema) = match self.catalog.handle_query(&query) {
-            Ok(Some((schema, _rows))) => (Some(true), Some(schema)),
-            Ok(None) => (Some(false), None),
-            // Probe failed — leave the decision open; Execute keeps the
-            // legacy per-Execute scan for this statement.
-            Err(_) => (None, None),
+        //
+        // sprinter 1703dba8e82d: publish this connection's temp namespace
+        // around the SYNCHRONOUS probe, for the reason
+        // `PgConnectionHandler::temp_namespace_guard` documents — the
+        // interceptor lists tables without entering any engine funnel, so the
+        // per-statement scoped state is not installed yet.
+        let (is_catalog, catalog_schema) = {
+            let _temp_ns = self.temp_namespace_guard();
+            match self.catalog.handle_query(&query) {
+                Ok(Some((schema, _rows))) => (Some(true), Some(schema)),
+                Ok(None) => (Some(false), None),
+                // Probe failed — leave the decision open; Execute keeps the
+                // legacy per-Execute scan for this statement.
+                Err(_) => (None, None),
+            }
         };
         // W2.3: for a plain row-returning query, take the Describe schema from
         // the SHARED parameterized plan cache — the very `Arc<LogicalPlan>` the
@@ -260,6 +269,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // `ROLLBACK TO [SAVEPOINT] n` is deliberately NOT intercepted — it is a
         // partial rollback owned by the executor's savepoint stack, and routing
         // it here would turn it into a full rollback.
+        //
+        // sprinter afed6c8e8d1d: the whole savepoint family (`SAVEPOINT`,
+        // `RELEASE`, `ROLLBACK TO`) therefore executes as an ORDINARY statement
+        // below, through `execute_params_for_session`, which resolves it against
+        // THIS session's transaction and tags it `SAVEPOINT` / `RELEASE` /
+        // `ROLLBACK` via `get_command_tag`. That used to error
+        // ("transaction control statements must go through the session API") for
+        // every driver that binds server-side; the fix is in the engine, not a
+        // second interception here, because a savepoint is not a boundary and
+        // this handler's `transaction_status` must not change across one.
         let trimmed_query = statement.query.trim();
         let is_transaction_control = super::handler::classify_transaction_control(trimmed_query)
             .is_some_and(super::handler::TxnControl::is_boundary);
@@ -425,7 +444,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 } else {
                     substitute_parameters(&statement.query, &param_values)?
                 };
-                if let Some(catalog_result) = self.catalog.handle_query(&substituted_for_catalog)? {
+                // sprinter 1703dba8e82d: same namespace publication as Parse
+                // above, scoped to the synchronous interception only (the
+                // guard is `!Send` and must not cross the `.await`s below).
+                let catalog_result = {
+                    let _temp_ns = self.temp_namespace_guard();
+                    self.catalog.handle_query(&substituted_for_catalog)?
+                };
+                if let Some(catalog_result) = catalog_result {
                     // Mark the portal complete and emit DataRows + CommandComplete
                     // directly against the catalog-emulated result.
                     self.prepared_statements
