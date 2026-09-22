@@ -127,7 +127,13 @@ pub async fn handle_post(
             .map(str::to_string);
         let token = extract_progress_token(&req.params);
         if let (Some(sid), Some(tok)) = (session_id, token) {
-            if let Some(sse_tx) = super::session::sender_for(&sid) {
+            // The lookup is scoped to THIS mount's database (sprinter
+            // `f469f178aa29`). The session id is client-supplied, so an
+            // unscoped lookup resolved a session another `mcp_router()` in
+            // this process had opened on a DIFFERENT database, and this
+            // dispatch then streamed that tool call's progress — query text
+            // and hit counts included — into the other router's client.
+            if let Some(sse_tx) = super::session::sender_for(state.db.storage.instance_id(), &sid) {
                 let resp = dispatch_streaming_post(state.db.clone(), req, tok, sse_tx).await;
                 return Json(resp).into_response();
             }
@@ -379,16 +385,15 @@ pub async fn handle_sse(
         return (e.status(), e.message()).into_response();
     }
 
-    // Resolve the session id: prefer the client's `?session=<id>`
-    // query param, otherwise mint a fresh UUID. We announce the
-    // session id via the spec-defined `endpoint` event so the
-    // client knows what `Mcp-Session-Id` header to set on the
-    // paired POST /mcp.
-    let session_id = params
-        .get("session")
-        .cloned()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let rx = super::session::register(session_id.clone());
+    // Resolve the session id: the client's `?session=<id>` query param is
+    // a REQUEST, not a claim. `register` grants it only when no live session
+    // in this database's namespace already holds it, and otherwise mints a
+    // fresh UUID — so one `Scope::Read` client can no longer seize (and, by
+    // the old bare `insert`, tear down) another client's stream. Either way
+    // the id we announce below is the one we were GRANTED, via the
+    // spec-defined `endpoint` event, so the client knows what
+    // `Mcp-Session-Id` header to set on the paired POST /mcp.
+    let (session_id, rx) = super::session::register(state.db.storage.instance_id(), params.get("session").cloned());
 
     // The endpoint event payload mirrors the MCP HTTP+SSE handshake
     // shape: a URL the client should POST to.  We include the

@@ -468,6 +468,16 @@ pub fn code_index_with_embedder(
     // accidentally commit the caller's pending work. The MCP plugin
     // commits its file-upsert txn before calling code_index, so this
     // path takes the self-managed branch.
+    // sprinter 0d6695bf8a86: the per-chunk `db.begin()` / `db.commit()` below is
+    // ENGINE-INTERNAL work on this handle, not the work of whatever connection
+    // asked for the index. The process-global transaction slot is now owned by
+    // the caller that opened it, and a statement arriving through a wire session
+    // never sees it — so without this detach a `CREATE AST INDEX` sent over the
+    // wire would open a transaction its own `drain_chunk` writes cannot see, and
+    // every row would pay a WAL fsync: exactly the regression the Tier 1.1
+    // prelude above exists to prevent. Restores the previous marker on Drop, so
+    // the caller's own statement scope is untouched after this call returns.
+    let _detached = crate::SessionBoundStatementGuard::detach();
     let manage_txn = !db.in_transaction();
 
     // Tier 1.3 correctness guard: `skip_delete_stale` (set when we

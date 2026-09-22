@@ -1534,7 +1534,50 @@ impl<'a> Planner<'a> {
         // public, so it must NOT be re-scoped to the current schema. Detect the
         // explicit qualifier from the parsed part count, not the collapsed key.
         if name.0.len() >= 2 {
+            // sprinter 1703dba8e82d: `pg_temp.t` is PostgreSQL's alias for "the
+            // temp schema of the session asking", so it must resolve to THIS
+            // backend's namespace rather than to a literal schema called
+            // `pg_temp` that nothing ever creates. An explicit
+            // `pg_temp_<n>.t` naming somebody else's namespace is left exactly
+            // as written and is refused one layer down, by
+            // `Catalog::get_table_schema` — one refusal site for every way of
+            // spelling the key, rather than one per planner arm.
+            if let Some(bare) = base.strip_prefix("pg_temp.") {
+                return match super::temp_tables::current_temp_namespace() {
+                    Some(namespace) => format!("{namespace}.{bare}"),
+                    None => base,
+                };
+            }
             return base;
+        }
+        // sprinter 1703dba8e82d: `pg_temp` is implicitly FIRST in PostgreSQL's
+        // search path, ahead of everything the user declared. So a bare name
+        // resolves to THIS session's temp table when it has one — which is what
+        // makes `CREATE TEMPORARY TABLE t` followed by `SELECT * FROM t` reach
+        // the private table, and what makes that same statement in another
+        // session find nothing and report 42P01.
+        //
+        // The probe is for the CALLING session's namespace only, so it can
+        // never resolve onto somebody else's `pg_temp_*` key.
+        //
+        // Gated on `caller_holds_temp_tables()` rather than on the per-engine
+        // hint, and that is a CORRECTNESS gate, not only a cheap one: it is the
+        // same predicate `EmbeddedDatabase::current_schema_is_set` uses to
+        // bypass the shared, SQL-text-keyed plan and result caches. A session
+        // that resolved a bare name into its private namespace while still
+        // writing the shared plan cache would publish that plan to every other
+        // connection — this item's leak reached through the cache. One
+        // predicate for both, so they cannot drift. A session that has never
+        // created a temp table pays one relaxed atomic load and no probe.
+        if super::temp_tables::caller_holds_temp_tables() {
+            if let Some(catalog) = self.catalog {
+                if let Some(namespace) = super::temp_tables::current_temp_namespace() {
+                    let private = format!("{namespace}.{base}");
+                    if catalog.table_exists(&private).unwrap_or(false) {
+                        return private;
+                    }
+                }
+            }
         }
         // I-SP: with a multi-entry `search_path` threaded in, walk it IN ORDER
         // and return the first schema whose `<schema>.t` (bare `t` for `public`)
@@ -1582,6 +1625,71 @@ impl<'a> Planner<'a> {
             Some(cs) if name.0.len() < 2 => format!("{cs}.{base}"),
             _ => base,
         }
+    }
+
+    /// sprinter 1703dba8e82d: resolve the target of a CREATE, honouring the
+    /// `TEMPORARY` modifier that used to be parsed and thrown away.
+    ///
+    /// `temporary` routes the table into THIS session's private `pg_temp_<pid>`
+    /// namespace instead of the session `search_path`'s current schema — see
+    /// [`crate::sql::temp_tables`] for why the namespace is the backend pid and
+    /// what the lifetime rules are.
+    ///
+    /// Three refusals, each of which would otherwise be a silent hole:
+    ///
+    /// * `CREATE TEMPORARY TABLE s.t` — PostgreSQL rejects a temp relation
+    ///   named into a non-temporary schema (`42P16`), because the qualifier and
+    ///   the modifier ask for contradictory things. Accepting it and honouring
+    ///   whichever one happened to win is how "accepted and ignored" defects
+    ///   start.
+    /// * `CREATE TABLE pg_temp_9.t` — a plain create reaching INTO another live
+    ///   backend's private namespace. That is this item's leak re-opened from
+    ///   the other direction, so it is refused as a reserved name.
+    /// * `CREATE TEMPORARY TABLE t` with no session backend installed at all —
+    ///   engine-internal evaluation with no connection to own the table.
+    ///   Refused rather than quietly demoted to a permanent table, which is the
+    ///   exact behaviour this item exists to remove.
+    fn resolve_create_target(&self, name: &sqlparser::ast::ObjectName, temporary: bool) -> Result<String> {
+        let qualified = name.0.len() >= 2;
+        let base = Self::normalize_object_name(name);
+        if temporary {
+            // PostgreSQL accepts the explicit `pg_temp.t` spelling as a synonym
+            // for "my temp schema"; anything else qualified is the 42P16 above.
+            let bare = if qualified {
+                let (schema, bare) = Self::split_key_by_name(&base, name);
+                if schema != "pg_temp" && !super::temp_tables::is_temp_schema(&schema) {
+                    return Err(Error::query_execution(super::temp_tables::TEMP_IN_NON_TEMP_SCHEMA));
+                }
+                bare
+            } else {
+                base
+            };
+            let Some(namespace) = super::temp_tables::current_temp_namespace() else {
+                return Err(Error::query_execution(
+                    "CREATE TEMPORARY TABLE requires a database session; \
+                     this statement is running with no connection to own the table",
+                ));
+            };
+            // Arm the per-session flag HERE, at PLAN time, not at the catalog
+            // write. This is the one statement of a session's temp life for
+            // which the ordering matters: the plan about to be returned names
+            // THIS connection's private namespace, and the shared,
+            // SQL-text-keyed plan cache must not be allowed to hand it to the
+            // next connection that sends the same statement text. Arming before
+            // the plan is returned is what lets
+            // `EmbeddedDatabase::parameterized_plan_cached` re-read the gate
+            // after planning and decline to admit. Arming only at
+            // `Catalog::create_table` would be one step too late.
+            super::temp_tables::note_temp_table_planned(self.catalog.map(|c| c.storage()));
+            return Ok(format!("{namespace}.{bare}"));
+        }
+        let key = self.resolve_table_create(name);
+        if super::temp_tables::is_temp_key(&key) {
+            return Err(Error::query_execution(
+                super::temp_tables::reserved_temp_schema_message(&key),
+            ));
+        }
+        Ok(key)
     }
 
     /// Compose the storage key for `bare` living in `schema`.
@@ -1802,7 +1910,14 @@ impl<'a> Planner<'a> {
                 // Extract fields from CreateTable struct for v0.53 API
                 // A bare CREATE under a non-`public` `search_path` targets the
                 // current schema (`cs.<table>`); a qualified name is exact.
-                let name = self.resolve_table_create(&create_table.name);
+                //
+                // sprinter 1703dba8e82d: `create_table.temporary` is READ here
+                // now. It used to be the one field of this struct the arm never
+                // looked at, which is why `CREATE TEMPORARY TABLE t (…)` took
+                // the byte-identical path a plain `CREATE TABLE t (…)` takes
+                // and produced a durable, globally-visible table — a statement
+                // returning success for a promise it did not keep.
+                let name = self.resolve_create_target(&create_table.name, create_table.temporary)?;
                 // CTAS branches FIRST. `create_table.columns` is EMPTY for
                 // `CREATE TABLE t AS SELECT …`, so the ordinary path below
                 // would build a zero-column table and drop `create_table.query`
@@ -3081,9 +3196,21 @@ impl<'a> Planner<'a> {
     /// there would turn a nested `INTO` into a stray `CREATE TABLE`.
     fn top_level_query_to_plan(&self, mut query: Query) -> Result<LogicalPlan> {
         // `SelectInto` also carries `temporary` / `unlogged` / `table`
-        // (`SELECT … INTO TEMP t`, `… INTO TABLE t`). Those modifiers are
-        // accepted and ignored, matching how the plain `CREATE TABLE` path
-        // already ignores TEMPORARY / UNLOGGED — deliberately consistent.
+        // (`SELECT … INTO TEMP t`, `… INTO TABLE t`).
+        //
+        // sprinter 1703dba8e82d: `temporary` is HONOURED here now, on exactly
+        // the same path `CREATE TEMPORARY TABLE` takes — the two spellings are
+        // the same statement and must not disagree about who can see the
+        // result.
+        //
+        // `unlogged` stays accepted-and-ignored, and that is deliberate rather
+        // than an oversight: an unlogged table in PostgreSQL is a PERMANENT,
+        // globally-visible table that merely is not crash-safe and is not
+        // replicated, so treating it as durable hands the caller a table that
+        // is *more* durable than asked for. Nothing leaks and nothing is lost.
+        // That is the opposite of the `TEMPORARY` case, where the table was
+        // more VISIBLE and more PERSISTENT than asked for. See
+        // `crate::sql::temp_tables`' module docs.
         let into = match &mut *query.body {
             SetExpr::Select(select) => select.into.take(),
             _ => None,
@@ -3092,7 +3219,7 @@ impl<'a> Planner<'a> {
             return self.query_to_plan(query);
         };
 
-        let name = self.resolve_table_create(&into.name);
+        let name = self.resolve_create_target(&into.name, into.temporary)?;
         let query_plan = self.query_to_plan(query)?;
         Ok(LogicalPlan::CreateTableAs {
             name,
@@ -6522,9 +6649,13 @@ impl<'a> Planner<'a> {
             ));
         }
 
-        // TEMPORARY / UNLOGGED / WITH (…) reach here already parsed and are
-        // accepted-and-ignored, exactly as the plain `CREATE TABLE` path
-        // ignores them — deliberately consistent, not an oversight.
+        // `name` has ALREADY been through `resolve_create_target`, so a
+        // `CREATE TEMPORARY TABLE t AS SELECT …` arrives here keyed into this
+        // session's private namespace — CTAS is not a second code path with its
+        // own opinion about TEMPORARY (sprinter 1703dba8e82d). UNLOGGED / WITH
+        // (…) do still reach here accepted-and-ignored; see
+        // `crate::sql::temp_tables` for why UNLOGGED is safe to ignore and
+        // TEMPORARY was not.
         let query_plan = self.query_to_plan(query)?;
 
         // `WITH [NO] DATA` has no sqlparser 0.53 grammar, so

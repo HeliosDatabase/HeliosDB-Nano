@@ -1450,8 +1450,12 @@ pub struct PerformanceConfig {
     /// RESULT with no cap and no accounting, so an index-eligible join with a
     /// large output can still grow unbounded whatever this key says.
     ///
-    /// Process-global (last config wins), applied by `EmbeddedDatabase` at
-    /// startup. `--join-memory-limit-mb` wins over this; the
+    /// PER DATABASE (sprinter `f469f178aa29`): every join is capped by the
+    /// configuration of the engine it runs against, so two `EmbeddedDatabase`
+    /// handles open in one process do not re-cap each other. It used to be a
+    /// process-global with last-config-wins semantics, which meant opening a
+    /// second database silently changed the first's cap.
+    /// `--join-memory-limit-mb` wins over this; the
     /// `HELIOSDB_HASH_JOIN_MEM_MB` environment variable wins over both.
     /// `0` = use the built-in default. Default 1024 (1 GB).
     #[serde(default = "default_join_memory_limit_mb")]

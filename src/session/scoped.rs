@@ -63,6 +63,18 @@
 //! view's purpose, and each entry is a `Weak` handle on the very state the
 //! session holds, so the catalog can never disagree with what the connection
 //! itself reports — and a closed connection drops out of it automatically.
+//!
+//! It is process-wide but it is NOT unscoped — sprinter 32ed4b9e0002. Every
+//! entry carries the [`SessionScopedState::engine_instance`] it was minted for,
+//! and [`snapshot_live_backends`] takes the scanning engine's id and returns
+//! only ITS backends. Without that, the registry read like the module doc it
+//! used to carry ("Nano has one database"): two open `EmbeddedDatabase`
+//! handles in one process are two SERVERS, and database A's
+//! `pg_stat_activity` listed database B's `usename`, `application_name`,
+//! `client_addr` and `client_port` to a principal with no connection to B at
+//! all. The id is `StorageEngine::instance_id()` — a per-construction counter,
+//! never reused, deliberately not a pointer address (a recycled address would
+//! let a new engine inherit a dead one's backends).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicI8, Ordering};
@@ -131,6 +143,20 @@ fn next_backend_pid() -> i32 {
     pid
 }
 
+/// `engine_instance` for a backend that belongs to no open database — sprinter
+/// 32ed4b9e0002.
+///
+/// `StorageEngine::instance_id()` is minted from a counter that starts at 1, so
+/// `0` can never name a real engine. It is what [`SessionScopedState::new`]
+/// records, and it is reachable only from a [`super::SessionManager`] that was
+/// built with [`super::SessionManager::new`] rather than
+/// `new_for_engine` — i.e. from unit tests that exercise the manager without an
+/// engine at all. Such a backend is visible to NOBODY's `pg_stat_activity`
+/// (`0` matches no scanning engine), which is the fail-closed direction: a
+/// backend whose database cannot be established must not be attributed to an
+/// arbitrary one.
+pub const UNATTACHED_ENGINE: u64 = 0;
+
 /// The process-wide registry of LIVE backends, keyed by backend pid.
 ///
 /// Populated by [`SessionScopedState::new`] and emptied by its `Drop`, so a
@@ -159,11 +185,29 @@ pub struct BackendSnapshot {
     pub backend_start: i64,
 }
 
-/// Snapshot every live backend, ordered by pid so the view is deterministic.
-pub fn snapshot_live_backends() -> Vec<BackendSnapshot> {
+/// Snapshot the live backends of ONE open database, ordered by pid so the view
+/// is deterministic — sprinter 32ed4b9e0002.
+///
+/// `engine_instance` is the scanning engine's `StorageEngine::instance_id()`.
+/// Backends minted for any other engine are not rows: they belong to a
+/// different open database, which in this process is a different SERVER, not a
+/// different database of one cluster. PostgreSQL's `pg_stat_activity` is
+/// cluster-wide precisely because one postmaster owns one shared-memory
+/// backend array; it has no view into a second postmaster either, and neither
+/// does this.
+///
+/// Within the returned set, every backend of the engine IS listed — PostgreSQL
+/// does not filter the view by database, and hiding rows would break the
+/// operator's whole use for it. What the caller does about the columns that
+/// disclose another ROLE's activity is decided at the view
+/// (`sql::phase3::system_views::execute_pg_stat_activity`), exactly as
+/// `pg_stat_get_activity` decides it.
+pub fn snapshot_live_backends(engine_instance: u64) -> Vec<BackendSnapshot> {
     let mut out: Vec<BackendSnapshot> = live_backends()
         .iter()
-        .filter_map(|e| e.value().upgrade().map(|s| s.snapshot()))
+        .filter_map(|e| e.value().upgrade())
+        .filter(|s| s.engine_instance() == engine_instance)
+        .map(|s| s.snapshot())
         .collect();
     out.sort_by_key(|b| b.pid);
     out
@@ -176,6 +220,17 @@ pub fn snapshot_live_backends() -> Vec<BackendSnapshot> {
 pub struct SessionScopedState {
     /// `pg_backend_pid()`. Immutable for the life of the connection.
     backend_pid: i32,
+    /// sprinter 32ed4b9e0002: the OPEN DATABASE this backend belongs to —
+    /// `StorageEngine::instance_id()` of the engine whose `EmbeddedDatabase`
+    /// minted it, or [`UNATTACHED_ENGINE`].
+    ///
+    /// Immutable, and set at construction rather than on first use on purpose:
+    /// a backend that has authenticated but not yet run a statement is exactly
+    /// the one `pg_stat_activity` is read to find, so it must already know
+    /// which database it is on. It is a `u64` counter and NOT the engine's
+    /// address — an `Arc` address is subject to ABA reuse, and a recycled one
+    /// would let a new engine inherit a dead engine's backends.
+    engine_instance: u64,
     /// Unix seconds at which this backend was created (`pg_stat_activity.backend_start`).
     backend_start: i64,
     /// The value most recently RETURNED by `nextval` in this session — whether
@@ -256,6 +311,29 @@ pub struct SessionScopedState {
     /// has to cost one relaxed load rather than an `RwLock` read — the same
     /// discipline `guc_overrides_present` follows above.
     tenant_bound: AtomicBool,
+    /// sprinter 1703dba8e82d: has THIS connection created a `CREATE TEMPORARY
+    /// TABLE`? Set by the catalog when a `pg_temp_<backend_pid>` key is
+    /// registered, and never cleared for the life of the connection.
+    ///
+    /// It is not a convenience. Two things key off it, and both would be
+    /// WRONG if it were engine-wide rather than per-connection:
+    ///
+    /// * `Planner::resolve_table_ref`'s implicit `pg_temp`-first probe — a
+    ///   session with no temp table of its own must not pay a catalog probe on
+    ///   every bare name just because some other connection has one;
+    /// * the bypass of the SHARED, SQL-text-keyed plan and result caches
+    ///   (`EmbeddedDatabase::current_schema_is_set`). Those caches are keyed by
+    ///   statement text and shared across every session, so a plan built for
+    ///   `SELECT * FROM t` by a session whose `t` is `pg_temp_7.t` must never
+    ///   be served to a session whose `t` is `public.t` — the exact leak this
+    ///   item closes, reached through the cache instead of the catalog. The
+    ///   `search_path` overlay bypasses them for the identical reason, and this
+    ///   flag is what keeps the bypass narrow: only the connections that
+    ///   actually own a temp table pay it.
+    ///
+    /// Relaxed ordering throughout, like every other mirror on this type: a
+    /// session is single-threaded with respect to its own statements.
+    holds_temp_tables: AtomicBool,
     /// `SET LOCAL` support for the overlay: `name -> the value to restore when
     /// the current transaction block ends` (`None` = the name had no override,
     /// so restoring means REMOVING it). Armed on the first `SET LOCAL` of a
@@ -265,10 +343,27 @@ pub struct SessionScopedState {
 }
 
 impl SessionScopedState {
-    /// Mint a fresh backend and register it in [`live_backends`].
+    /// Mint a fresh backend that belongs to NO open database and register it in
+    /// [`live_backends`].
+    ///
+    /// Kept for the manager's engine-less unit tests. Every production caller
+    /// goes through [`Self::new_for_engine`]: a backend that cannot name its
+    /// database appears in nobody's `pg_stat_activity` (see
+    /// [`UNATTACHED_ENGINE`]).
     pub fn new() -> Arc<Self> {
+        Self::new_for_engine(UNATTACHED_ENGINE)
+    }
+
+    /// Mint a fresh backend OWNED BY `engine_instance` and register it in
+    /// [`live_backends`] — sprinter 32ed4b9e0002.
+    ///
+    /// `engine_instance` is `StorageEngine::instance_id()` of the engine this
+    /// connection (or, for the handle's own session-less funnel backend, this
+    /// `EmbeddedDatabase`) is served by.
+    pub fn new_for_engine(engine_instance: u64) -> Arc<Self> {
         let state = Arc::new(Self {
             backend_pid: next_backend_pid(),
+            engine_instance,
             backend_start: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -288,6 +383,7 @@ impl SessionScopedState {
             gucs_saved: parking_lot::Mutex::new(None),
             tenant: parking_lot::RwLock::new(None),
             tenant_bound: AtomicBool::new(false),
+            holds_temp_tables: AtomicBool::new(false),
         });
         live_backends().insert(state.backend_pid, Arc::downgrade(&state));
         state
@@ -296,6 +392,44 @@ impl SessionScopedState {
     /// `pg_backend_pid()`.
     pub fn backend_pid(&self) -> i32 {
         self.backend_pid
+    }
+
+    /// sprinter 1703dba8e82d: record that this connection has created a
+    /// session-private temp table. Called once per `CREATE TEMPORARY TABLE`
+    /// from `storage::Catalog::create_table`, the single registration site.
+    ///
+    /// Deliberately never cleared, not even when the session drops its last
+    /// temp table: the flag guards CORRECTNESS decisions (which plan cache a
+    /// statement may use), and re-enabling a shared cache mid-session on the
+    /// strength of a count would be one off-by-one away from serving this
+    /// session's private plan to another. Paying an extra probe for the rest of
+    /// a connection that used a temp table once is the cheap side of that
+    /// trade.
+    pub fn note_temp_table(&self) {
+        self.holds_temp_tables.store(true, Ordering::Relaxed);
+    }
+
+    /// Has this connection created a temp table? One relaxed load — this is
+    /// read per bare table reference and per cache probe.
+    #[inline]
+    pub fn holds_temp_tables(&self) -> bool {
+        self.holds_temp_tables.load(Ordering::Relaxed)
+    }
+
+    /// The open database this backend belongs to — `StorageEngine::instance_id()`
+    /// of the engine that minted it, or [`UNATTACHED_ENGINE`].
+    pub fn engine_instance(&self) -> u64 {
+        self.engine_instance
+    }
+
+    /// The login identity this backend published (`pg_stat_activity.usename`),
+    /// empty for a connection that has published none.
+    ///
+    /// This is the principal `pg_stat_activity`'s column masking compares — the
+    /// role, authenticated by the listener, never the client-chosen database
+    /// name. See `sql::phase3::system_views::execute_pg_stat_activity`.
+    pub fn username(&self) -> String {
+        self.username.read().clone()
     }
 
     /// Record the value `nextval` (or a SERIAL/IDENTITY fill) just produced.

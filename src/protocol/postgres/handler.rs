@@ -126,6 +126,51 @@ impl TxnControl {
 /// Tokens are split on ASCII whitespace **and `;`**, which preserves the
 /// pre-existing behaviour of the callers' `trim_end_matches(';')` — including
 /// the historical quirk that `BEGIN; …` classifies as `BEGIN`.
+/// Does `tail` — the whitespace/`;`-separated tokens that follow
+/// `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT]` — spell exactly ONE savepoint
+/// name?
+///
+/// One bare token is the ordinary case. More than one is accepted only for a
+/// DOUBLE-QUOTED identifier, which may legally contain whitespace
+/// (`ROLLBACK TO SAVEPOINT "my sp"`). This classifier never returns the name —
+/// the executor's real parser does that — so rejoining the tokens with single
+/// spaces is enough to decide well-formedness.
+fn is_one_savepoint_name(tail: &[&str]) -> bool {
+    let Some(first) = tail.first() else {
+        // No name at all: `ROLLBACK TO` / `ROLLBACK TO SAVEPOINT`.
+        return false;
+    };
+    if !first.starts_with('"') {
+        return tail.len() == 1;
+    }
+    is_quoted_identifier(&tail.join(" "))
+}
+
+/// A complete PostgreSQL double-quoted identifier and NOTHING else: an opening
+/// `"`, a body in which `""` is an escaped quote, and a closing `"` at the very
+/// end. An unterminated quote, or anything after the closing one, is not
+/// something this classifier should guess at.
+fn is_quoted_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    if chars.next() != Some('"') {
+        return false;
+    }
+    let mut closed = false;
+    while let Some(c) = chars.next() {
+        if c != '"' {
+            continue;
+        }
+        if chars.clone().next() == Some('"') {
+            // `""` inside the body is an escaped quote, not the terminator.
+            chars.next();
+            continue;
+        }
+        closed = true;
+        break;
+    }
+    closed && chars.next().is_none()
+}
+
 pub(crate) fn classify_transaction_control(sql: &str) -> Option<TxnControl> {
     let mut words = sql
         .split(|c: char| c.is_ascii_whitespace() || c == ';')
@@ -175,17 +220,23 @@ pub(crate) fn classify_transaction_control(sql: &str) -> Option<TxnControl> {
         // `ROLLBACK [WORK|TRANSACTION] TO [SAVEPOINT] <name>` — a savepoint
         // operation. `COMMIT TO …` is not SQL, so this arm is rollback-only.
         Some(w) if is_rollback && w.eq_ignore_ascii_case("TO") => {
-            let name = match words.next() {
-                Some(n) if n.eq_ignore_ascii_case("SAVEPOINT") => words.next(),
-                other => other,
-            };
-            // A missing name, or trailing junk (e.g. a quoted identifier that
-            // contains a space), is not something this classifier should be
-            // guessing at — hand it to the executor's real parser.
-            if name.is_none() || words.next().is_some() {
-                return None;
+            let mut tail: Vec<&str> = words.by_ref().collect();
+            if tail.first().is_some_and(|w| w.eq_ignore_ascii_case("SAVEPOINT")) {
+                tail.remove(0);
             }
-            Some(TxnControl::RollbackToSavepoint)
+            // sprinter 37a5968e7698 (HDB-008 NIT 8): the tail used to have to be
+            // exactly ONE whitespace token, so a DOUBLE-QUOTED savepoint name
+            // containing a space — `ROLLBACK TO SAVEPOINT "my sp"`, which
+            // tokenizes as `"my` + `sp"` — was rejected as trailing junk. An
+            // unclassified statement is not recognised as the sanctioned way out
+            // of an aborted block (`handle_single_query`'s savepoint-recovery
+            // arm keys on this classification), so such a savepoint could not
+            // recover one, and it was tagged `OK 0` instead of `ROLLBACK`.
+            if is_one_savepoint_name(&tail) {
+                Some(TxnControl::RollbackToSavepoint)
+            } else {
+                None
+            }
         }
         // `AND [ NO ] CHAIN`.
         Some(w) if w.eq_ignore_ascii_case("AND") => {
@@ -294,6 +345,41 @@ mod txn_control_classifier_tests {
                 !classify(sql).expect("classified").is_boundary(),
                 "`{sql}` must NOT be a boundary: intercepting it turns a partial rollback into a full one"
             );
+        }
+    }
+
+    /// sprinter 37a5968e7698 (HDB-008 NIT 8): a DOUBLE-QUOTED savepoint name may
+    /// contain whitespace, and the classifier used to reject every such
+    /// statement as trailing junk — so `ROLLBACK TO SAVEPOINT "my sp"` was not
+    /// recognised as the sanctioned way out of an aborted block and got the
+    /// `OK 0` command tag instead of `ROLLBACK`.
+    #[test]
+    fn a_quoted_savepoint_name_with_a_space_still_classifies() {
+        for sql in [
+            r#"ROLLBACK TO SAVEPOINT "my sp""#,
+            r#"ROLLBACK TO "my sp""#,
+            r#"rollback work to savepoint "my sp";"#,
+            r#"ROLLBACK TO SAVEPOINT "sp1""#,
+            // `""` inside the body is an escaped quote, not the terminator.
+            r#"ROLLBACK TO SAVEPOINT "a""b c""#,
+        ] {
+            assert_eq!(
+                classify(sql),
+                Some(TxnControl::RollbackToSavepoint),
+                "`{sql}` must classify as a savepoint rollback"
+            );
+        }
+
+        // Still not guessed at: no name, an unterminated quote, or junk after
+        // the closing quote.
+        for sql in [
+            "ROLLBACK TO",
+            "ROLLBACK TO SAVEPOINT",
+            r#"ROLLBACK TO SAVEPOINT "my sp"#,
+            r#"ROLLBACK TO SAVEPOINT "my sp" extra"#,
+            "ROLLBACK TO SAVEPOINT sp1 extra",
+        ] {
+            assert_eq!(classify(sql), None, "`{sql}` must be left to the executor's parser");
         }
     }
 
@@ -720,6 +806,34 @@ where
             implicit_transaction: false,
             awaiting_sync_after_error: false,
         }
+    }
+
+    /// sprinter 1703dba8e82d: publish THIS connection's session-private table
+    /// namespace for the duration of one piece of work that runs AHEAD of the
+    /// engine.
+    ///
+    /// The catalog interceptors (`PgCatalog::handle_query`, and the
+    /// extended-protocol Parse/Execute fast paths) answer `pg_class` /
+    /// `pg_tables` / `pg_attribute` / `\dt` straight from
+    /// `Catalog::list_tables()` without ever entering an `EmbeddedDatabase`
+    /// `_for_session` funnel — so the per-statement scoped-state thread-local
+    /// those funnels install is not there. That is the standing trap in this
+    /// codebase: a protocol-layer caller must resolve session state from the
+    /// `SessionId` it holds, never from a thread-local the engine has not had
+    /// the chance to install. This does exactly that.
+    ///
+    /// Returns `None` — no session lookup, no thread-local traffic — until some
+    /// connection to this database actually creates a temp table, so the
+    /// default path is byte-identical to before. The guard is `!Send` on
+    /// purpose; keep it inside the SYNCHRONOUS call it wraps.
+    pub(super) fn temp_namespace_guard(&self) -> Option<crate::sql::temp_tables::TempNamespaceGuard> {
+        if !self.database.storage.temp_tables_present() {
+            return None;
+        }
+        self.database
+            .session_backend_pid(self.session_id)
+            .ok()
+            .map(crate::sql::temp_tables::TempNamespaceGuard::install)
     }
 
     /// GH#28: install the listener's connection-lifetime policy. Keeps every
@@ -2299,12 +2413,19 @@ where
             let affected = self.database.execute_for_session(self.session_id, trimmed)?;
             // Ask the ENGINE whether a transaction survived, never assume it.
             // `execute_for_session` falls through to the session-less
-            // `execute()` when this session has no transaction, and that path
-            // resolves the PROCESS-WIDE savepoint stack — so an `Ok` here is
-            // not by itself proof that this connection is back inside a block.
-            // Believing it marked the connection `InTransaction` with no
+            // `execute()` when this session has no transaction, so an `Ok` here
+            // is not by itself proof that this connection is back inside a
+            // block. Believing it marked the connection `InTransaction` with no
             // engine transaction behind it, and every later write silently
             // autocommitted while the client was told it was in a transaction.
+            //
+            // sprinter 37a5968e7698: that fall-through used to resolve the
+            // PROCESS-WIDE savepoint stack and could therefore succeed against a
+            // savepoint belonging to some other connection (or to a transaction
+            // that had already ended). Savepoints are now per-transaction, so
+            // the session-less leg resolves an implicit statement transaction's
+            // empty stack and reports 3B001 instead. The check below stays
+            // regardless: it asks the engine rather than trusting the result.
             self.transaction_status = if self.database.session_in_transaction(self.session_id) {
                 TransactionStatus::InTransaction
             } else {
@@ -2410,7 +2531,24 @@ where
         }
 
         // Check for pg_catalog queries
-        if let Some(result) = self.catalog.handle_query(query)? {
+        //
+        // sprinter 1703dba8e82d: this interceptor answers `pg_class` /
+        // `pg_tables` / `\dt` from `Catalog::list_tables()` WITHOUT entering
+        // any `_for_session` engine funnel, so the per-statement scoped-state
+        // thread-local those funnels install is not there. Publish the
+        // namespace from the `SessionId` first, or this connection's `\dt`
+        // would be filtered as if it had no session — hiding its OWN temp
+        // tables. Costs nothing until some connection creates one.
+        //
+        // Scoped to the SYNCHRONOUS interception alone, never across the
+        // `.await`s below: the guard is deliberately `!Send` so it cannot be
+        // carried over a yield point onto a worker thread this connection has
+        // since migrated away from.
+        let intercepted = {
+            let _temp_ns = self.temp_namespace_guard();
+            self.catalog.handle_query(query)?
+        };
+        if let Some(result) = intercepted {
             let (schema, rows) = result;
             self.send_query_result(&schema, &rows).await?;
             self.send_ready_for_query().await?;
@@ -5702,6 +5840,20 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         || lower.contains("because constraint")
     {
         sqlstate::DEPENDENT_OBJECTS_STILL_EXIST // 2BP01
+    } else if crate::EmbeddedDatabase::is_savepoint_not_found(message) {
+        // sprinter 37a5968e7698: `savepoint "s1" does not exist` — PostgreSQL's
+        // own wording AND its own class for `RELEASE` / `ROLLBACK TO` on a name
+        // that is not established in the CURRENT transaction. Checked ahead of
+        // every `not_found` arm below, which would otherwise read the trailing
+        // "does not exist" as an undefined table. Anchored on the emitter's
+        // marker consts (marker-const discipline): ONE emitter,
+        // `EmbeddedDatabase::savepoint_not_found`.
+        //
+        // Before this item the message was `Savepoint 'x' does not exist` and a
+        // driver saw an undefined-relation class for a savepoint mistake — and
+        // JDBC / Prisma branch on 3B001 to decide whether a nested transaction
+        // can still be retried.
+        sqlstate::INVALID_SAVEPOINT_SPECIFICATION // 3B001
     } else if lower.starts_with("constraint \"") && lower.contains("already exists") {
         // `constraint "x" for relation "t" already exists` (ALTER TABLE ADD
         // CONSTRAINT, src/lib.rs) — PostgreSQL's own 42710, not the generic
@@ -5747,6 +5899,20 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         // rules because a message naming both is better classified by the
         // column it names.
         sqlstate::UNDEFINED_OBJECT // 42704
+    } else if lower.contains(crate::sql::temp_tables::TEMP_IN_NON_TEMP_SCHEMA) {
+        // sprinter 1703dba8e82d: `CREATE TEMPORARY TABLE s.t` — the qualifier
+        // and the modifier ask for contradictory things. PostgreSQL's own
+        // answer, and the message is PostgreSQL's own wording, anchored on the
+        // marker const the single emitter owns so the two cannot drift.
+        //
+        // Placed AHEAD of the generic table/relation arms below: the message
+        // names a "relation" and would otherwise be classified by whichever of
+        // them matched first.
+        sqlstate::INVALID_TABLE_DEFINITION // 42P16
+    } else if lower.contains("is reserved for session-private temporary tables") {
+        // sprinter 1703dba8e82d: a plain `CREATE TABLE pg_temp_9.t` reaching
+        // into another live backend's private namespace.
+        sqlstate::RESERVED_NAME // 42939
     } else if (lower.contains("table") || lower.contains("relation")) && lower.contains("already exists") {
         sqlstate::DUPLICATE_TABLE // 42P07
     } else if (lower.contains("table") || lower.contains("relation")) && not_found {

@@ -120,6 +120,22 @@ Full recipes: `.claude/skills/heliosdb-nano-mcp/SKILL.md`.
   transaction; take a dump or a branch before a destructive migration.
 - Introspection: `information_schema.*`, `pg_class`, `sqlite_master`,
   `PRAGMA table_info(t)`, REPL `\d [table]` / `\dt`.
+- `CREATE TEMPORARY TABLE` (also `TEMP`, and `SELECT … INTO TEMP t`) is
+  **session-private**: the table lives in a per-connection `pg_temp_<backend>`
+  schema, so two connections may each hold their own `tmp_foo`, neither can
+  read, write or list the other's, and it is dropped when the connection ends
+  (abrupt disconnect included). It is not replicated, not included in a dump,
+  and any survivor of a crash is reclaimed at the next open. A bare name
+  resolves to your own temp table first (PostgreSQL's implicit `pg_temp`-first
+  search path); `public.t` still reaches a permanent table of the same name.
+  Naming another backend's schema (`pg_temp_9.t`) is refused — `42939` for a
+  plain `CREATE`, `42P01` for a read — and `CREATE TEMPORARY TABLE s.t` is
+  `42P16`.
+- `UNLOGGED` is NOT implemented. `CREATE UNLOGGED TABLE …` is a parse error;
+  `SELECT … INTO UNLOGGED t` is accepted and creates an ordinary durable table.
+  That is safe by construction — an unlogged table in PostgreSQL is a
+  permanent, globally-visible table that is merely not crash-safe — so you get
+  a table that is more durable than you asked for, never less.
 - Text collation is **C (byte order)** on every surface — the engine compares
   `TEXT` values as raw UTF-8 bytes (`Value` comparison in `src/sql/evaluator.rs`),
   and no surface applies a locale: `ORDER BY`,

@@ -470,7 +470,17 @@ fn new_cache_admission() -> std::sync::Arc<[[std::sync::atomic::AtomicU64; CACHE
 //     `storage::engine`'s `NEXT_STORAGE_INSTANCE_ID`);
 //   * state that describes the OS PROCESS itself — this node's HA role and
 //     cluster membership (`replication::ha_state`, `replication::topology`),
-//     which exist because one process is one node.
+//     which exist because one process is one node;
+//   * diagnostic aggregates over the PROCESS's work, in the sense a metrics
+//     registry is one — `write_volume`, `copy_phase_stats`, `lock_census`,
+//     `storage::tde`'s plaintext-passthrough counter. Their counters are
+//     accumulated at sites with no engine identity in reach and are read back
+//     by views that take no `StorageEngine` at all
+//     (`execute_heliosdb_write_volume`), and their enable flags change only
+//     whether a counter moves, never a query's result. Scoping the FLAG per
+//     engine while the counters stayed shared would produce a partially
+//     attributed aggregate — strictly worse. Pinned by
+//     `tests/process_global_residue_i4.rs` (sprinter `f469f178aa29`).
 //
 // Anything scoped to a SESSION or to an ENGINE belongs on that session or on
 // that engine, never in a `static`. Two facts make this non-negotiable:
@@ -605,6 +615,23 @@ thread_local! {
     /// delegating into the params funnel — are never charged at all, because
     /// they re-enter on this same thread inside the outer statement's guard.
     static TENANT_QUERY_METERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// sprinter 0d6695bf8a86: true while a statement that entered through one of
+    /// the `*_for_session` funnels is running on this thread.
+    ///
+    /// A wire/session statement with NO open session transaction delegates into
+    /// the session-LESS funnels (`execute()`, `execute_params_inner`,
+    /// `query_params_inner`), and those resolve the process-global
+    /// `current_transaction` slot — the embedded handle's implicit connection.
+    /// So an embedded `BEGIN` silently adopted every wire autocommit statement.
+    ///
+    /// This is the SECOND half of the ownership rule; the first is
+    /// `global_txn_owner`, which is per-THREAD. Both are needed: a
+    /// `current_thread` async runtime runs the wire handler on the very thread
+    /// that opened the embedded `BEGIN`, where thread ownership alone cannot help.
+    ///
+    /// Set by `charge_tenant_query_for_session` and RESTORED, not cleared, on
+    /// drop, exactly like `TENANT_QUERY_METERED` beside it.
+    static SESSION_BOUND_STATEMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// RAII marker for `TENANT_QUERY_METERED` (sprinter d03de7fc3b22).
@@ -614,11 +641,50 @@ thread_local! {
 /// the engine re-enters itself on the same worker thread, and a nested guard
 /// that cleared the flag would let the REST of the outer statement's nested
 /// executions each charge the tenant again.
-struct TenantQueryMeter(bool);
+struct TenantQueryMeter {
+    previous_metered: bool,
+    previous_session_bound: bool,
+}
 
 impl Drop for TenantQueryMeter {
     fn drop(&mut self) {
-        TENANT_QUERY_METERED.with(|c| c.set(self.0));
+        TENANT_QUERY_METERED.with(|c| c.set(self.previous_metered));
+        SESSION_BOUND_STATEMENT.with(|c| c.set(self.previous_session_bound));
+    }
+}
+
+/// A process-unique token for the calling thread (sprinter 0d6695bf8a86).
+///
+/// `std::thread::ThreadId` exposes no stable integer projection, so this mints
+/// one per thread from a global counter. Tokens are NEVER reused: a thread that
+/// exits does not return its token, so a later thread can never inherit
+/// ownership of a transaction the dead one opened. `0` means "no owner" and is
+/// therefore never handed out.
+fn caller_thread_token() -> u64 {
+    static NEXT_THREAD_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    thread_local! {
+        static THREAD_TOKEN: u64 = NEXT_THREAD_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    THREAD_TOKEN.with(|token| *token)
+}
+
+/// RAII marker for [`SESSION_BOUND_STATEMENT`], for the two callers that need to
+/// set or clear it outside `charge_tenant_query_for_session`.
+pub(crate) struct SessionBoundStatementGuard(bool);
+
+impl SessionBoundStatementGuard {
+    fn bind() -> Self {
+        Self(SESSION_BOUND_STATEMENT.with(|c| c.replace(true)))
+    }
+
+    pub(crate) fn detach() -> Self {
+        Self(SESSION_BOUND_STATEMENT.with(|c| c.replace(false)))
+    }
+}
+
+impl Drop for SessionBoundStatementGuard {
+    fn drop(&mut self) {
+        SESSION_BOUND_STATEMENT.with(|c| c.set(self.0));
     }
 }
 
@@ -1092,6 +1158,18 @@ pub struct EmbeddedDatabase {
     /// query/execute entry skip the mutex entirely in autocommit mode —
     /// the same pattern as `result_cache_nonempty`.
     global_txn_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Owner of the global transaction slot: the [`caller_thread_token`] of the
+    /// thread that ran `BEGIN`, or `0` when the slot is empty (sprinter
+    /// 0d6695bf8a86).
+    ///
+    /// The slot is the EMBEDDED HANDLE'S implicit connection, but one
+    /// `EmbeddedDatabase` serves every REST request, every MCP tool call, every
+    /// wire connection and the embedded application at once — so before this
+    /// field existed, an embedded `BEGIN` adopted all of them.
+    ///
+    /// Written only under the `current_transaction` mutex, exactly like
+    /// `global_txn_active`, and read lock-free by [`Self::owns_global_txn`].
+    global_txn_owner: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Tenant manager for multi-tenancy and RLS (optional)
     pub tenant_manager: std::sync::Arc<crate::tenant::TenantManager>,
     /// Trigger registry — THE LIVE ONE. This is the registry the DML paths and
@@ -1176,8 +1254,14 @@ pub struct EmbeddedDatabase {
     /// `current_schema` embedded shared field above, which a wire session's
     /// per-statement thread-local override wins over.
     embedded_scoped: std::sync::Arc<crate::session::scoped::SessionScopedState>,
-    /// Active savepoints stack (name -> transaction state)
-    savepoints: std::sync::Arc<parking_lot::RwLock<Vec<SavepointState>>>,
+    // sprinter 37a5968e7698: there is deliberately NO `savepoints` field here
+    // any more. The savepoint stack lives on `storage::Transaction` — see
+    // `storage::transaction::SavepointEntry`. It used to be ONE
+    // `Arc<RwLock<Vec<SavepointState>>>` on this struct, shared by the global
+    // `BEGIN` slot, the RAII `begin_transaction()` handle and every wire
+    // session, and cleared only by this handle's `Drop`, so a savepoint was
+    // reachable from another connection AND outlived the transaction that
+    // established it. Do not reintroduce a handle-level stack.
     /// Plan cache: SQL string → `Arc<LogicalPlan>` (sharded LRU, skips parse+plan for repeated queries)
     plan_cache: std::sync::Arc<sharded_lru::ShardedLruCache<String, std::sync::Arc<sql::LogicalPlan>>>,
     /// Parse cache: SQL string → AST Statement (sharded LRU, skips SQL parsing for repeated queries)
@@ -1472,39 +1556,38 @@ impl Drop for EmbeddedDatabase {
         // Clear parse cache
         self.parse_cache.clear();
 
-        // Clear savepoints
-        self.savepoints.write().clear();
-
         tracing::debug!("EmbeddedDatabase dropped, resources cleaned up");
     }
 }
 
-/// Savepoint state for nested transaction support
-#[derive(Clone)]
-struct SavepointState {
-    /// Savepoint name
-    name: String,
-    /// Snapshot of transaction staged writes at savepoint creation time.
-    /// Used by ROLLBACK TO SAVEPOINT to undo data changes made after the savepoint.
-    write_set_snapshot: storage::TransactionSavepointSnapshot,
-    /// Length of the transaction's ART/vector-index undo log at savepoint
-    /// creation time. Eager index maintenance (INSERT/UPDATE/DELETE) appends
-    /// undo ops to this log; ROLLBACK TO SAVEPOINT replays and drops exactly
-    /// the ops staged after the savepoint so the in-memory indexes match the
-    /// rolled-back write set (without it, a post-savepoint INSERT leaves a
-    /// ghost index entry that survives COMMIT — see the savepoint regression
-    /// tests).
-    art_undo_len: usize,
-}
-
-/// sprinter 5b70b7ac5513: a [`SavepointState`] with no name and no stack entry —
-/// the IMPLICIT savepoint the MySQL listener takes around each statement inside
-/// an open transaction.
+/// PostgreSQL's wording and anchor for `3B001 invalid_savepoint_specification`
+/// — `savepoint "sp1" does not exist`.
 ///
-/// Same two pieces of state, captured the same way and undone by the same two
-/// primitives; see [`EmbeddedDatabase::statement_savepoint_for_session`] for why
-/// it is deliberately NOT a `SavepointState` pushed onto `savepoints` (that
-/// stack is process-wide and gates ten fast paths on being empty).
+/// sprinter 37a5968e7698. Marker-const discipline (the same as
+/// [`TENANT_QUOTA_EXCEEDED_MARKER`] and friends): ONE emitter,
+/// [`EmbeddedDatabase::savepoint_not_found`], and ONE consumer,
+/// `protocol::postgres::handler::sqlstate_for_query_execution_message`, so the
+/// message and the SQLSTATE cannot drift. The old wording,
+/// `Savepoint 'x' does not exist`, carried no anchor at all and was classified
+/// by the generic "does not exist" arms as an undefined TABLE.
+pub(crate) const SAVEPOINT_NOT_FOUND_PREFIX: &str = "savepoint \"";
+/// The tail half of [`SAVEPOINT_NOT_FOUND_PREFIX`]'s message. Both halves are
+/// required by the classifier so that an unrelated message merely mentioning a
+/// savepoint cannot be reclassified as 3B001.
+pub(crate) const SAVEPOINT_NOT_FOUND_SUFFIX: &str = "\" does not exist";
+
+/// sprinter 5b70b7ac5513: a savepoint with no name and no stack entry — the
+/// IMPLICIT savepoint the MySQL listener takes around each statement inside an
+/// open transaction.
+///
+/// Same two pieces of state as a named savepoint
+/// (`storage::transaction::SavepointEntry`), captured the same way and undone by
+/// the same two primitives; see
+/// [`EmbeddedDatabase::statement_savepoint_for_session`] for why it is
+/// deliberately NOT pushed onto the transaction's named stack — a per-statement
+/// push would demote that transaction's INSERT/UPDATE/DELETE fast paths for the
+/// rest of the block (`Transaction::has_savepoints`) and would interleave with
+/// the user's own names.
 pub(crate) struct ImplicitStatementSavepoint {
     /// Staged writes as of just before the statement — the write set plus the
     /// append-only `insert_log` length, which is what the multi-row INSERT
@@ -2263,6 +2346,16 @@ impl EmbeddedDatabase {
     fn current_schema_is_set(&self) -> bool {
         self.current_schema_set.load(std::sync::atomic::Ordering::Relaxed)
             || SESSION_SCHEMA_OVERRIDE_ACTIVE.with(|c| c.get())
+            // sprinter 1703dba8e82d: a connection holding a temp table resolves
+            // bare names against its OWN `pg_temp_<pid>` namespace, so the
+            // argument the `search_path` branch above makes applies verbatim —
+            // the shared, SQL-text-keyed plan and result caches, and the literal
+            // fast paths that resolve bare names directly, must stay
+            // public-schema-only. Otherwise one session's plan for
+            // `SELECT … FROM t` is served to a session whose `t` is a different
+            // table. Narrow by construction: the predicate is per CONNECTION,
+            // so only the connections that actually own a temp table pay it.
+            || sql::temp_tables::caller_holds_temp_tables()
     }
 
     /// Update the embedded session's current schema and the hot-path atomic
@@ -3558,7 +3651,7 @@ impl EmbeddedDatabase {
     /// that have nowhere else to put one.
     #[inline]
     fn charge_tenant_query(&self) -> Result<TenantQueryMeter> {
-        self.charge_tenant_query_against(|| self.effective_tenant_id())
+        self.charge_tenant_query_against(false, || self.effective_tenant_id())
     }
 
     /// The `_for_session` spelling: resolve the tenant from the `SessionId` the
@@ -3578,7 +3671,7 @@ impl EmbeddedDatabase {
     /// a tenant is actually in play, because the re-entrancy check runs first.
     #[inline]
     fn charge_tenant_query_for_session(&self, session_id: crate::session::SessionId) -> Result<TenantQueryMeter> {
-        self.charge_tenant_query_against(|| self.effective_tenant_id_for_session(session_id))
+        self.charge_tenant_query_against(true, || self.effective_tenant_id_for_session(session_id))
     }
 
     /// The shared body of the two spellings above: arm the re-entrancy marker,
@@ -3590,10 +3683,23 @@ impl EmbeddedDatabase {
     #[inline]
     fn charge_tenant_query_against(
         &self,
+        session_bound: bool,
         resolve: impl FnOnce() -> Option<tenant::TenantId>,
     ) -> Result<TenantQueryMeter> {
         let previous = TENANT_QUERY_METERED.with(|c| c.replace(true));
-        let meter = TenantQueryMeter(previous);
+        // sprinter 0d6695bf8a86: this guard is the per-statement CLIENT-CONTEXT
+        // marker, not only the QPS one — it is the single line every one of the
+        // `*_for_session` entry points already runs first.
+        //
+        // `session_bound || c.get()`, never a plain store: a `_for_session`
+        // entry point delegates into the session-LESS funnel for its autocommit
+        // case, and that funnel charges again with `session_bound = false`. An
+        // unconditional store there would clear the outer session's marker.
+        let previous_session_bound = SESSION_BOUND_STATEMENT.with(|c| c.replace(session_bound || c.get()));
+        let meter = TenantQueryMeter {
+            previous_metered: previous,
+            previous_session_bound,
+        };
         if previous {
             // Already inside a charged statement on this thread: this is a
             // nested execution, not a new client statement.
@@ -3979,9 +4085,11 @@ impl EmbeddedDatabase {
     /// inside `execute()`'s in-transaction branch — that branch already owns
     /// the boundary for its statement, and locking here would deadlock.
     fn run_global_statement<T>(&self, sql: &str, body: impl FnOnce() -> Result<T>) -> Result<T> {
-        if !self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
-            || GLOBAL_TXN_LOCK_HELD.with(|held| held.get())
-        {
+        // sprinter 0d6695bf8a86: `global_txn_visible`, not the bare flag. A
+        // session-less statement that does not OWN the global transaction never
+        // runs inside it, so it must neither be refused by its 25P02 state nor
+        // be able to abort it.
+        if !self.global_txn_visible() || GLOBAL_TXN_LOCK_HELD.with(|held| held.get()) {
             return body();
         }
         {
@@ -4735,6 +4843,57 @@ impl EmbeddedDatabase {
         }))
     }
 
+    /// Empty the global slot's ownership state (sprinter 0d6695bf8a86).
+    ///
+    /// Flag first, deliberately: [`Self::global_txn_visible`] reads the flag
+    /// before the token, so a racing reader sees "no transaction", never
+    /// "somebody else's transaction".
+    #[inline]
+    fn clear_global_txn_owner(&self) {
+        self.global_txn_active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.global_txn_owner.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Did THIS thread open the global (embedded) transaction slot?
+    ///
+    /// Ownership of the SLOT, which is what `COMMIT` / `ROLLBACK` need.
+    /// Deliberately does NOT consult `SESSION_BOUND_STATEMENT` — the code-graph
+    /// indexer opens its own per-chunk transaction on this handle from inside
+    /// whatever statement asked for the index, and must be able to close it.
+    #[inline]
+    fn owns_global_txn(&self) -> bool {
+        self.global_txn_owner.load(std::sync::atomic::Ordering::Acquire) == caller_thread_token()
+    }
+
+    /// Is the global (embedded) transaction slot VISIBLE to the statement
+    /// running on this thread? (sprinter 0d6695bf8a86.)
+    ///
+    /// Three lock-free loads, and the first short-circuits the other two on
+    /// every autocommit statement, so this costs what `global_txn_active` alone
+    /// used to. NOT the same question as [`Self::in_transaction`], which stays
+    /// PROCESS-WIDE on purpose: ~20 fast paths use that one as an ISOLATION gate.
+    #[inline]
+    fn global_txn_visible(&self) -> bool {
+        self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
+            && !SESSION_BOUND_STATEMENT.with(|bound| bound.get())
+            && self.owns_global_txn()
+    }
+
+    /// THE one way a session-less statement resolves the global transaction
+    /// slot: `None` — never a lock — unless this caller owns it.
+    ///
+    /// Deliberately does NOT test `GLOBAL_TXN_LOCK_HELD`: adding it here would
+    /// silently change what those arms attach to. The one caller that needs that
+    /// term (the `Call` arm) spells it out itself.
+    #[inline]
+    fn lock_owned_global_txn(&self) -> Option<parking_lot::MutexGuard<'_, Option<storage::Transaction>>> {
+        if !self.global_txn_visible() {
+            return None;
+        }
+        Some(self.current_transaction.lock())
+    }
+
     /// Internal method to begin a transaction
     fn begin_transaction_internal(&self) -> Result<()> {
         let mut txn_ref = self.current_transaction.lock();
@@ -4743,6 +4902,10 @@ impl EmbeddedDatabase {
         }
         let txn = self.storage.begin_transaction()?;
         *txn_ref = Some(txn);
+        // sprinter 0d6695bf8a86: stamp the OWNER before the flag goes up, so a
+        // reader that sees `global_txn_active` can never read a stale token.
+        self.global_txn_owner
+            .store(caller_thread_token(), std::sync::atomic::Ordering::Release);
         // Updated under the mutex: readers that skip the lock on a `false`
         // load behave exactly as if they had locked before this BEGIN.
         self.global_txn_active.store(true, std::sync::atomic::Ordering::Release);
@@ -4754,6 +4917,12 @@ impl EmbeddedDatabase {
 
     /// Internal method to commit the current transaction
     fn commit_internal(&self) -> Result<()> {
+        // sprinter 0d6695bf8a86: a caller may only end a transaction it opened.
+        // Before this, any thread — a REST worker, an MCP tool, the next HTTP
+        // request — could commit the embedded application's in-flight block.
+        if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) && !self.owns_global_txn() {
+            return Err(Error::transaction("No active transaction to commit"));
+        }
         // Spec 03: nothing to release here. The global transaction slot is
         // shared by every thread and every HTTP/MCP caller of this handle, so
         // no advisory lock is ever attributed to it — a session-less statement
@@ -4798,8 +4967,7 @@ impl EmbeddedDatabase {
                     // fast-out below, and this transaction's census slot, which
                     // its `Drop` clears).
                     self.rollback_art_undo_log();
-                    self.global_txn_active
-                        .store(false, std::sync::atomic::Ordering::Release);
+                    self.clear_global_txn_owner();
                     let _ = txn.rollback();
                 }
                 self.deferred_fk_checks.lock().clear();
@@ -4811,8 +4979,7 @@ impl EmbeddedDatabase {
         if let Some(txn) = txn_ref.take() {
             // The slot is empty from here on (even if the commit below
             // errors, `txn` is consumed) — clear the fast-out immediately.
-            self.global_txn_active
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.clear_global_txn_owner();
             // R0.2: commit at a FRESH timestamp — committing at the BEGIN
             // snapshot timestamp recorded wrong version ordering for any
             // transaction that overlapped other commits.
@@ -4847,6 +5014,11 @@ impl EmbeddedDatabase {
 
     /// Internal method to rollback the current transaction
     fn rollback_internal(&self) -> Result<()> {
+        // sprinter 0d6695bf8a86: see `commit_internal`. The sharper half — a
+        // stolen ROLLBACK destroys work the owner believes is still in flight.
+        if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) && !self.owns_global_txn() {
+            return Err(Error::transaction("No active transaction to rollback"));
+        }
         // Spec 03: nothing to release here, for the same reason as
         // `commit_internal`.
         self.rollback_internal_locked()
@@ -4863,10 +5035,15 @@ impl EmbeddedDatabase {
     /// Factored out of `rollback_internal_locked` (its only behaviour) so that
     /// HDB-008's `COMMIT`-of-an-aborted-transaction path in
     /// `commit_internal_locked` performs EXACTLY the same steps in exactly the
-    /// same order rather than a hand-copied approximation of them. ROLLBACK
-    /// deliberately does not clear `self.savepoints` — the savepoint stack is
-    /// process-wide, a pre-existing limitation documented in the README — so
-    /// neither does this.
+    /// same order rather than a hand-copied approximation of them.
+    ///
+    /// sprinter 37a5968e7698: this used to say that ROLLBACK "deliberately does
+    /// not clear `self.savepoints` — the savepoint stack is process-wide". It no
+    /// longer has to clear anything: the stack lives on the transaction
+    /// (`storage::transaction::SavepointEntry`), and `txn` is consumed here, so
+    /// the savepoints of the block being aborted are destroyed with it —
+    /// PostgreSQL's "savepoints are destroyed at ROLLBACK", for free and with no
+    /// clear site to forget.
     fn abort_global_slot_locked(&self, txn_ref: &mut Option<storage::Transaction>) -> Result<()> {
         if let Some(txn) = txn_ref.take() {
             // ORDER: replay the eager ART index undo BEFORE the fast-out is
@@ -4880,8 +5057,7 @@ impl EmbeddedDatabase {
             self.rollback_art_undo_log();
             // Slot emptied (the transaction is consumed even if rollback
             // errors) — clear the fast-out.
-            self.global_txn_active
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.clear_global_txn_owner();
             // sprinter f4f5d450e816: revert a `SET LOCAL application_name`
             // BEFORE the `?` below, so a rollback that itself errors still ends
             // the block's transaction-scoped state. PostgreSQL reverts SET LOCAL
@@ -5059,6 +5235,77 @@ impl EmbeddedDatabase {
             },
         };
         self.replay_art_undo(drained);
+    }
+
+    /// PostgreSQL's `3B001 invalid_savepoint_specification` error for a name
+    /// that does not exist in the CURRENT transaction.
+    ///
+    /// sprinter 37a5968e7698 — THE single emitter, so every route (text family,
+    /// params family, both wire protocols, the embedded API and the REPL)
+    /// reports the same wording and the same SQLSTATE. See
+    /// [`SAVEPOINT_NOT_FOUND_PREFIX`].
+    pub(crate) fn savepoint_not_found(name: &str) -> Error {
+        Error::query_execution(format!(
+            "{}{}{}",
+            SAVEPOINT_NOT_FOUND_PREFIX, name, SAVEPOINT_NOT_FOUND_SUFFIX
+        ))
+    }
+
+    /// Does `message` come from [`Self::savepoint_not_found`]?
+    ///
+    /// BOTH halves are required, so a message that merely ends in
+    /// `" does not exist` (an undefined relation) or merely mentions a savepoint
+    /// is not reclassified as 3B001.
+    ///
+    /// `contains` for the opening half rather than `starts_with`, deliberately:
+    /// the PostgreSQL wire hands this the RAW message, but the MySQL listener
+    /// hands it the `Error` Display form (`Query execution error: …`) — as
+    /// `map_error_code`'s own comments record — and a `starts_with` would silently
+    /// stop matching on that wire only.
+    pub(crate) fn is_savepoint_not_found(message: &str) -> bool {
+        message.ends_with(SAVEPOINT_NOT_FOUND_SUFFIX) && message.contains(SAVEPOINT_NOT_FOUND_PREFIX)
+    }
+
+    /// `SAVEPOINT name` — the ONE body both statement families run.
+    ///
+    /// sprinter 37a5968e7698: the stack it pushes onto belongs to `txn`, not to
+    /// this handle, so it is destroyed with the transaction (PostgreSQL destroys
+    /// savepoints at COMMIT and ROLLBACK) and no other connection can reach it.
+    /// The ART/vector undo-log length is measured through
+    /// [`Self::art_undo_len_for`], which already routes per session / per RAII
+    /// transaction / global slot, so the two halves of a savepoint are captured
+    /// against the same owner.
+    fn savepoint_establish(&self, txn: &storage::Transaction, name: &str) {
+        let snapshot = txn.savepoint_snapshot();
+        let art_undo_len = self.art_undo_len_for(txn);
+        txn.push_savepoint(name.to_string(), snapshot, art_undo_len);
+    }
+
+    /// `RELEASE SAVEPOINT name` — the ONE body both statement families run.
+    fn savepoint_release(txn: &storage::Transaction, name: &str) -> Result<()> {
+        if txn.release_savepoint(name) {
+            Ok(())
+        } else {
+            Err(Self::savepoint_not_found(name))
+        }
+    }
+
+    /// `ROLLBACK TO SAVEPOINT name` — the ONE body both statement families run.
+    ///
+    /// Order matters and matches every other rollback site in this file: restore
+    /// the write set first (which also truncates the append-only `insert_log`),
+    /// then replay the ART/vector undo entries staged after the savepoint, so
+    /// the in-memory indexes match the rolled-back write set rather than keeping
+    /// ghost entries that would survive COMMIT.
+    fn savepoint_rollback_to(&self, txn: &storage::Transaction, name: &str) -> Result<()> {
+        match txn.resolve_savepoint_target(name) {
+            Some((snapshot, art_undo_len)) => {
+                txn.rollback_to_savepoint(&snapshot);
+                self.rollback_art_undo_to(txn, art_undo_len);
+                Ok(())
+            }
+            None => Err(Self::savepoint_not_found(name)),
+        }
     }
 
     /// Drop a session's ART undo log, replaying it first on rollback
@@ -5332,78 +5579,53 @@ impl EmbeddedDatabase {
         f()
     }
 
-    /// Execute a `CALL <procedure>(<args>)` plan.
+    /// Execute a `CALL <procedure>(<args>)` plan **inside `txn`**.
     ///
     /// **This is the ONE implementation of `CALL`, shared by both DML executor
     /// families.** It is called from `execute_in_transaction_inner`'s
     /// `LogicalPlan::Call` arm (the text family: psql simple-query, all of the
     /// MySQL wire, the REPL, `db.execute()`) and from
     /// `execute_plan_with_params_inner`'s `LogicalPlan::Call` arm (the params
-    /// family: the PG extended protocol, every REST/BaaS write, `db.execute_params()`).
-    /// Until this helper existed the params family had no arm at all and fell to a
-    /// `StatusMessageOperator` stub in `src/sql/executor/mod.rs` that returned
-    /// success without running the body and without checking that the procedure
-    /// existed. Keep it a single choke point: "one rule, several implementations"
-    /// is this codebase's most expensive recurring defect class.
+    /// family: the PG extended protocol, every REST/BaaS write,
+    /// `db.execute_params()`). Keep it a single choke point: "one rule, several
+    /// implementations" is this codebase's most expensive recurring defect class.
     ///
     /// `params` are the statement's bound values, so `CALL p($1)` binds its
-    /// argument on the params family. The text family passes an empty slice, which
-    /// makes the evaluator here byte-for-byte the `Evaluator::new(schema)` its arm
-    /// used before.
+    /// argument on the params family. The text family passes an empty slice.
     ///
-    /// ## Observed transaction behaviour — deliberately NOT changed here
+    /// ## Transaction semantics (sprinter e4bb83a1afa0 — ROADMAP_V5 §2.11's residual)
     ///
-    /// The body does not join the caller's transaction. Both families reach this
-    /// helper while holding a `&storage::Transaction` (`txn` in the text family,
-    /// `session_txn` in the params family), and this helper ignores both: it runs
-    /// body statements on a `clone_for_trigger()` handle through `execute()` /
-    /// `query()`, which resolve their own transaction from scratch. Observed
-    /// consequences, worth knowing before relying on it:
+    /// **The body runs in the caller's transaction.** `txn` is whatever the
+    /// calling statement is already running in: the wire session's, the embedded
+    /// global slot's, the RAII `begin_transaction()` handle's, or — in
+    /// autocommit — the implicit per-statement transaction both families now
+    /// open. Body statements go straight to `execute_in_transaction_no_fast_path`
+    /// / `query_in_transaction` with that transaction attached.
     ///
-    /// * Under a wire **session** transaction (`BEGIN` over PG/MySQL) or the RAII
-    ///   `db.begin_transaction()` handle, `global_txn_active` is false — neither
-    ///   populates the global slot — so body writes autocommit *outside* the
-    ///   caller's transaction and survive its `ROLLBACK`.
-    /// * Under a **global** text `BEGIN` (`db.execute("BEGIN")`) the body does pick
-    ///   that transaction up, because `execute()` resolves the global slot. Only
-    ///   the params family gets there; the text family is refused by the gate below.
+    /// This replaces re-entering `execute()` / `query()` on a
+    /// `clone_for_trigger()` handle, which had two consequences, both now gone:
     ///
-    /// That inconsistency is a separate filed item (ROADMAP_V5 §2.11). This
-    /// helper's job is parity between the two families, and it is faithful to the
-    /// behaviour the text family already shipped.
+    /// * the body did NOT join the caller's transaction, so
+    ///   `BEGIN; CALL p(); ROLLBACK;` left the procedure's writes committed
+    ///   while the client was told the block rolled back — over the wire, on the
+    ///   RAII handle, and inside the HDB-004 implicit block a multi-statement
+    ///   simple query opens; and
+    /// * on the text family the re-entry re-took the NON-reentrant global
+    ///   `current_transaction` mutex, which hung the thread until
+    ///   `GLOBAL_TXN_LOCK_HELD` turned it into a refusal. Running on `txn`
+    ///   touches that mutex not at all, so the hazard is structurally gone.
     ///
-    /// ## Deadlock gate
-    ///
-    /// Running the body re-enters `execute()`/`query()`, which take the global
-    /// `current_transaction` mutex whenever `global_txn_active` is set. That mutex
-    /// is NOT reentrant, so if THIS thread already holds it across the statement
-    /// the re-entry blocks forever. `GLOBAL_TXN_LOCK_HELD` marks exactly that
-    /// window (`execute()`'s in-transaction branch) and we refuse loudly instead.
-    /// Two cases hit it:
-    ///
-    /// * `BEGIN; CALL p();` through `db.execute()` — a PRE-EXISTING hang, now an error.
-    /// * A trigger body containing `CALL`, under a global transaction: trigger
-    ///   bodies reach the params family via `execute_plan_internal` while
-    ///   `execute()` holds the mutex. That route only became live with this fix,
-    ///   so the gate is what keeps it from being a new hang.
-    ///
-    /// Autocommit — every measured working `CALL` — never sets the flag. Neither
-    /// does a WIRE `BEGIN`: `execute_for_session` / `execute_params_for_session`
-    /// route transaction control to the per-session slot
-    /// (`handle_transaction_control_for_session`), leaving `global_txn_active`
-    /// false. So the gate is reachable only from the embedded API and the REPL,
-    /// which are the two callers that use the process-wide global transaction.
-    fn execute_call_plan(&self, name: &str, args: &[sql::LogicalExpr], params: &[Value]) -> Result<u64> {
-        if GLOBAL_TXN_LOCK_HELD.with(|held| held.get()) {
-            return Err(Error::query_execution(format!(
-                "Procedure '{}' was NOT executed: CALL is not supported inside an explicit \
-                 transaction statement on this path. The procedure body re-enters the executor, \
-                 which would deadlock on the global transaction lock. Issue the CALL outside the \
-                 transaction, or inline the procedure body as ordinary statements.",
-                name
-            )));
-        }
-
+    /// Read-your-own-writes inside the body follows for free: the executor gets
+    /// the caller's transaction, so a body `SELECT` sees rows the caller staged
+    /// and has not committed. `tests/txn_membership_i6.rs` pins that, because it
+    /// is the only observation that distinguishes "joined" from "ran anyway".
+    fn execute_call_plan(
+        &self,
+        name: &str,
+        args: &[sql::LogicalExpr],
+        params: &[Value],
+        txn: &storage::Transaction,
+    ) -> Result<u64> {
         let schema = std::sync::Arc::new(Schema { columns: vec![] });
         let evaluator = sql::Evaluator::with_parameters(schema, params.to_vec());
 
@@ -5413,30 +5635,47 @@ impl EmbeddedDatabase {
             .map(|expr| evaluator.evaluate(expr, &Tuple::new(vec![])))
             .collect::<Result<Vec<_>>>()?;
 
-        // Clone self for SQL execution within procedure
-        let db_clone = self.clone_for_trigger();
-        let sql_executor = |sql: &str| -> Result<Vec<Vec<Value>>> {
-            // Detect if this is a SELECT query or DML
-            let sql_trimmed = sql.trim();
-            if starts_with_icase(sql_trimmed, "SELECT") || starts_with_icase(sql_trimmed, "WITH") {
-                let tuples = db_clone.query(sql, &[])?;
+        // Body statements run on the CALLER's transaction. Neither branch takes
+        // the global `current_transaction` mutex, so this is safe to reach from
+        // `execute()`'s in-transaction branch, which holds it across the call.
+        let sql_executor = |body_sql: &str| -> Result<Vec<Vec<Value>>> {
+            let trimmed = body_sql.trim();
+            if starts_with_icase(trimmed, "SELECT") || starts_with_icase(trimmed, "WITH") {
+                let tuples = self.query_in_transaction(trimmed, txn)?;
                 Ok(tuples.iter().map(|t| t.values.clone()).collect())
             } else {
-                // For INSERT, UPDATE, DELETE, etc., use execute
-                db_clone.execute(sql)?;
+                self.execute_in_transaction_no_fast_path(trimmed, txn)?;
                 Ok(vec![])
             }
         };
 
         // Errors here include `Procedure '<name>' does not exist` — the existence
-        // check both families now share.
+        // check both families share.
         self.function_registry
             .execute_procedure(name, &arg_values, sql_executor)?;
         // `CALL` affects no rows of its own. PostgreSQL's command tag is a bare
-        // `CALL` with no count; 0 is the honest answer and the text family has
-        // always returned it. (The params family used to return 1, counting the
-        // stub's status *message* as a row.)
+        // `CALL` with no count; 0 is what both families return.
         Ok(0)
+    }
+
+    /// Read one statement inside an explicit transaction, without going near the
+    /// global `current_transaction` mutex.
+    ///
+    /// The engine-level twin of `Transaction::query_inner` (the RAII handle's
+    /// read half), extracted for `execute_call_plan`: a procedure body's
+    /// `SELECT` must see the calling transaction's own uncommitted rows, and
+    /// re-entering `query()` to get that would re-take a mutex the caller may
+    /// already hold. Same parse cache, same planner configuration, same
+    /// `query_plan_with_params` (so the same RLS gate) as every other read.
+    fn query_in_transaction(&self, sql: &str, txn: &storage::Transaction) -> Result<Vec<Tuple>> {
+        let (statement, _) = self.parse_cached(sql)?;
+        let catalog = self.storage.catalog();
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string())
+            .with_current_schema(self.current_schema())
+            .with_search_path(self.current_search_path());
+        let plan = planner.statement_to_plan(statement)?;
+        self.query_plan_with_params(&plan, &[], Some(txn))
     }
 
     // ============ Routine DDL — ONE implementation, BOTH executor families ============
@@ -7224,7 +7463,17 @@ impl EmbeddedDatabase {
         // 2. Explicit/session transactions (fast paths bypass write set, breaking commit/rollback)
         // 3. Active session transactions exist (fast paths skip MVCC versioning,
         //    breaking snapshot isolation for other sessions)
-        let has_savepoints = !self.savepoints.read().is_empty();
+        //
+        // sprinter 37a5968e7698: (1) asks THIS transaction, not the process. It
+        // used to read the one handle-level stack, so any connection's open
+        // savepoint demoted every other connection's statements. The property
+        // being protected is "a write this transaction stages must be undoable
+        // by ITS OWN `ROLLBACK TO SAVEPOINT`", and both undo primitives
+        // (`Transaction::rollback_to_savepoint`, `rollback_art_undo_to`) act
+        // only on the transaction that captured the savepoint — so another
+        // transaction's savepoint was never able to undo a write made here, and
+        // the process-wide term was pure over-approximation.
+        let has_savepoints = txn.has_savepoints();
         let has_session_txns = self.any_session_txns();
         // These literal/param fast paths parse the target table name straight
         // out of the SQL text (bare) and never apply the session `search_path`,
@@ -8662,18 +8911,86 @@ impl EmbeddedDatabase {
                 // that is not representable in the column's type — comes back `None` and
                 // takes the scan branch, where the predicate is evaluated per row exactly
                 // as SELECT does it.
+                //
+                // GH#41 CORRECTION: "a miss really does mean `no such row`" held
+                // only for rows this transaction did not stage itself. A row
+                // INSERTed earlier in the SAME transaction is not in `data:` at
+                // all, so the probe missed and `None => vec![]` silently dropped
+                // the statement. The `merge_txn_writes` gate below is what makes
+                // the sentence above true again: the point lookup now runs only
+                // when this transaction has staged nothing for the table.
                 let on_branch = self.storage.get_current_branch().is_some();
-                let tuples = if !on_branch {
-                    if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema) {
-                        match self
-                            .storage
-                            .get_row_by_typed_pk_with_schema(table_name, &pk_value, &schema)?
-                        {
-                            Some(tuple) => vec![tuple],
-                            None => vec![],
-                        }
-                    } else {
-                        self.storage.scan_table_branch_aware(table_name)?
+                // GH#41 (sprinter 27bf8d819c52): READ-YOUR-OWN-WRITES ON THE
+                // WRITE PATH. Both row sources below read committed state only —
+                // the point lookup probes `data:` and `scan_table_branch_aware`
+                // scans it — and an INSERT made EARLIER IN THIS TRANSACTION has
+                // not reached `data:` yet: it stages its ART index key eagerly
+                // but stages the ROW in `write_set` / `insert_log` until COMMIT
+                // (`storage/transaction.rs`, the `UncommittedWriteCensus` doc
+                // block). So `BEGIN; INSERT …; UPDATE … WHERE pk = …` matched
+                // ZERO rows and silently discarded the update — the
+                // create-then-patch shape every ORM emits. The SELECT path
+                // never had this: it merges the write set (`executor/scan.rs`
+                // `txn_base_tuples`), which is why an in-transaction SELECT saw
+                // rows this UPDATE could not.
+                //
+                // THE GATE. `Transaction::has_writes_for_table` — the SAME
+                // predicate the SELECT overlay gates on, so the two paths agree
+                // by construction. Deliberately NOT the alternatives:
+                //   * `StorageEngine::has_uncommitted_writes_for_table` (the
+                //     engine census) is PROCESS-WIDE: it declines whenever ANY
+                //     open transaction has staged a write to this table, which
+                //     would hand one connection the power to demote every other
+                //     connection's UPDATE to a full scan (sprinter 0823e2fe7603
+                //     is that exact defect class). It also under-reports here:
+                //     an autocommit transaction is `write_census: None`, so it
+                //     answers `false` while `execute_batch`'s own staged rows
+                //     sit in the write set.
+                //   * `Executor::txn_forces_slow_reads_for_table` additionally
+                //     declines on snapshot freshness, which is a READ-visibility
+                //     question. An UPDATE resolves its targets against current
+                //     storage in both families; borrowing the read gate would
+                //     change which rows this statement writes.
+                // `has_writes_for_table` is O(1) (a `DashSet` probe on the
+                // per-transaction `written_tables`), over-approximates in both
+                // of its imprecise directions (monotonic across
+                // ROLLBACK TO SAVEPOINT; `true` for every table once a
+                // non-`data:` key is staged), and every staging entry point
+                // (`put`, `put_insert_fast`, `delete`, `stage_row_counter`)
+                // feeds it — so `false` PROVES there is no `data:{table}:` key
+                // in `write_set` or `insert_log`, which makes both the merge and
+                // the point-lookup decline provably free when nothing is staged.
+                //
+                // WHY THE POINT LOOKUP MUST DECLINE RATHER THAN MERGE. Merging
+                // into the `vec![]` a missed point lookup produces still cannot
+                // find a staged row: the probe reads the ART index and
+                // materialises from `data:`, and the staged row is in neither.
+                // The decline is safe in the cardinality sense the census
+                // documents — a staged write can only ADD or REMOVE keys for
+                // this table, and either way the scan below is the correct
+                // answer.
+                //
+                // BRANCHES ARE UNCHANGED. `merge_with_write_set` keys off
+                // `data:{table}:`, while a branch write is staged under
+                // `bdata:`, so a merge on a branch could only ever splice in a
+                // MAIN-branch staged row — never the branch row the statement
+                // is looking for. Read-your-own-writes inside a branch
+                // transaction is a separate, pre-existing gap (the params
+                // family has it too); this gate leaves the branch row source
+                // byte-identical to what it was.
+                let merge_txn_writes = !on_branch && txn.has_writes_for_table(table_name);
+                let tuples = if on_branch {
+                    self.storage.scan_table_branch_aware(table_name)?
+                } else if merge_txn_writes {
+                    let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
+                    txn.merge_with_write_set(table_name, base_tuples)?
+                } else if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema) {
+                    match self
+                        .storage
+                        .get_row_by_typed_pk_with_schema(table_name, &pk_value, &schema)?
+                    {
+                        Some(tuple) => vec![tuple],
+                        None => vec![],
                     }
                 } else {
                     self.storage.scan_table_branch_aware(table_name)?
@@ -9059,18 +9376,33 @@ impl EmbeddedDatabase {
                 // column's type, so `None => vec![]` only ever means "genuinely absent";
                 // an uncoercible literal declines the point lookup and falls back to the
                 // scan branch. `DELETE … RETURNING` by PK reaches exactly this code.
+                //
+                // GH#41 CORRECTION: same as the UPDATE arm — `None => vec![]`
+                // meant "genuinely absent" only for rows this transaction had
+                // not staged itself; the `merge_txn_writes` gate below restores
+                // that contract by standing the point lookup down whenever it
+                // has.
                 let on_branch = self.storage.get_current_branch().is_some();
-                let tuples = if !on_branch {
-                    if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema_arc) {
-                        match self
-                            .storage
-                            .get_row_by_typed_pk_with_schema(table_name, &pk_value, &schema_arc)?
-                        {
-                            Some(tuple) => vec![tuple],
-                            None => vec![],
-                        }
-                    } else {
-                        self.storage.scan_table_branch_aware(table_name)?
+                // GH#41 (sprinter 27bf8d819c52): identical shape and identical
+                // reasoning to the UPDATE arm above — read that comment, which
+                // records why `Transaction::has_writes_for_table` is the gate,
+                // why the point lookup must DECLINE instead of merging into a
+                // `vec![]` it cannot repair, and why branches are left alone.
+                // `DELETE … WHERE pk = …` against a row this transaction had
+                // just inserted reported 0 rows and discarded the delete.
+                let merge_txn_writes = !on_branch && txn.has_writes_for_table(table_name);
+                let tuples = if on_branch {
+                    self.storage.scan_table_branch_aware(table_name)?
+                } else if merge_txn_writes {
+                    let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
+                    txn.merge_with_write_set(table_name, base_tuples)?
+                } else if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema_arc) {
+                    match self
+                        .storage
+                        .get_row_by_typed_pk_with_schema(table_name, &pk_value, &schema_arc)?
+                    {
+                        Some(tuple) => vec![tuple],
+                        None => vec![],
                     }
                 } else {
                     self.storage.scan_table_branch_aware(table_name)?
@@ -9382,9 +9714,10 @@ impl EmbeddedDatabase {
                 // `execute_call_plan`. This arm has no bound parameters (the text
                 // family carries literals only), hence the empty slice.
                 //
-                // NOTE: `txn` is deliberately not forwarded; `execute_call_plan`
-                // documents the transaction behaviour this preserves.
-                self.execute_call_plan(name, args, &[])
+                // sprinter e4bb83a1afa0: `txn` IS forwarded now — it is the
+                // transaction this statement is already running in, and the body
+                // runs on it.
+                self.execute_call_plan(name, args, &[], txn)
             }
             sql::LogicalPlan::AlterColumnStorage {
                 table_name,
@@ -9550,44 +9883,16 @@ impl EmbeddedDatabase {
                 if_exists,
             } => self.alter_table_drop_constraint(table_name, constraint_name, *if_exists),
             sql::LogicalPlan::AlterTableMulti { operations } => self.execute_alter_table_multi(operations),
+            // sprinter 37a5968e7698: the savepoint family, resolved against THIS
+            // transaction's own stack (`txn`), which is the transaction the
+            // caller is actually inside on every route into this function. The
+            // params family runs the SAME three bodies against ITS transaction.
             sql::LogicalPlan::Savepoint { ref name } => {
-                let write_set_snapshot = txn.savepoint_snapshot();
-                let art_undo_len = self.art_undo_len_for(txn);
-                let savepoint = SavepointState {
-                    name: name.clone(),
-                    write_set_snapshot,
-                    art_undo_len,
-                };
-                self.savepoints.write().push(savepoint);
+                self.savepoint_establish(txn, name);
                 Ok(0)
             }
-            sql::LogicalPlan::ReleaseSavepoint { ref name } => {
-                let mut savepoints = self.savepoints.write();
-                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    savepoints.truncate(pos);
-                    Ok(0)
-                } else {
-                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
-                }
-            }
-            sql::LogicalPlan::RollbackToSavepoint { ref name } => {
-                let savepoints = self.savepoints.read();
-                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    let restore = savepoints
-                        .get(pos)
-                        .map(|s| (s.write_set_snapshot.clone(), s.art_undo_len));
-                    drop(savepoints);
-                    if let Some((snapshot, art_undo_len)) = restore {
-                        txn.rollback_to_savepoint(&snapshot);
-                        self.rollback_art_undo_to(txn, art_undo_len);
-                    }
-                    let mut savepoints = self.savepoints.write();
-                    savepoints.truncate(pos + 1);
-                    Ok(0)
-                } else {
-                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
-                }
-            }
+            sql::LogicalPlan::ReleaseSavepoint { ref name } => Self::savepoint_release(txn, name).map(|()| 0),
+            sql::LogicalPlan::RollbackToSavepoint { ref name } => self.savepoint_rollback_to(txn, name).map(|()| 0),
             sql::LogicalPlan::Truncate { ref table_name } => {
                 // TRUNCATE within a transaction: buffer all row deletes in write set
                 // so they can be rolled back if the transaction is aborted
@@ -9744,7 +10049,8 @@ impl EmbeddedDatabase {
             storage::DumpCompressionType::Zstd,
         ));
 
-        let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
+        let engine_instance = storage.instance_id();
+        let session_manager = std::sync::Arc::new(crate::session::SessionManager::new_for_engine(engine_instance));
         // W3.3: wire the `[locks]` spin timeout AND statement-retry policy from
         // config (env `NANO_LOCK_TIMEOUT_MS` still overrides the timeout).
         let lock_manager = std::sync::Arc::new(storage::LockManager::from_lock_config(&config.locks));
@@ -9795,6 +10101,7 @@ impl EmbeddedDatabase {
             config,
             current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            global_txn_owner: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tenant_manager,
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
             function_registry: std::sync::Arc::new(sql::FunctionRegistry::new()),
@@ -9812,9 +10119,8 @@ impl EmbeddedDatabase {
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            embedded_scoped: crate::session::scoped::SessionScopedState::new(),
+            embedded_scoped: crate::session::scoped::SessionScopedState::new_for_engine(engine_instance),
             any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
                     .with_site(lock_census::Site::PlanCache),
@@ -9892,7 +10198,8 @@ impl EmbeddedDatabase {
         let dump_manager =
             std::sync::Arc::new(storage::DumpManager::new(dump_path, storage::DumpCompressionType::Zstd));
 
-        let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
+        let engine_instance = storage.instance_id();
+        let session_manager = std::sync::Arc::new(crate::session::SessionManager::new_for_engine(engine_instance));
         // W3.3: wire the `[locks]` spin timeout AND statement-retry policy from
         // config (env `NANO_LOCK_TIMEOUT_MS` still overrides the timeout).
         let lock_manager = std::sync::Arc::new(storage::LockManager::from_lock_config(&config.locks));
@@ -9927,6 +10234,7 @@ impl EmbeddedDatabase {
             config,
             current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            global_txn_owner: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tenant_manager,
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
             function_registry: std::sync::Arc::new(sql::FunctionRegistry::new()),
@@ -9944,9 +10252,8 @@ impl EmbeddedDatabase {
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            embedded_scoped: crate::session::scoped::SessionScopedState::new(),
+            embedded_scoped: crate::session::scoped::SessionScopedState::new_for_engine(engine_instance),
             any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
                     .with_site(lock_census::Site::PlanCache),
@@ -10037,7 +10344,8 @@ impl EmbeddedDatabase {
         let dump_manager =
             std::sync::Arc::new(storage::DumpManager::new(dump_path, storage::DumpCompressionType::Zstd));
 
-        let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
+        let engine_instance = storage.instance_id();
+        let session_manager = std::sync::Arc::new(crate::session::SessionManager::new_for_engine(engine_instance));
         // W3.3: wire the `[locks]` spin timeout AND statement-retry policy from
         // config (env `NANO_LOCK_TIMEOUT_MS` still overrides the timeout).
         let lock_manager = std::sync::Arc::new(storage::LockManager::from_lock_config(&config.locks));
@@ -10073,10 +10381,13 @@ impl EmbeddedDatabase {
         // phase boundary — see `copy_phase_stats`).
         copy_phase_stats::set_enabled(config.performance.copy_phase_stats);
 
-        // GH#29 (c7, M3): apply the join materialization cap. Process-global
-        // (last config wins); read once per join operator construction, never
-        // per tuple. `HELIOSDB_HASH_JOIN_MEM_MB` still overrides it at
-        // runtime — see `sql::executor::join::join_memory_limit`.
+        // GH#29 (c7, M3): the join materialization cap. sprinter
+        // `f469f178aa29`: a join now reads it from the ENGINE it runs against
+        // (`sql::executor::join::join_memory_limit_for`, via
+        // `StorageEngine::config`), so this call no longer decides anything for
+        // a database with storage — it seeds only the storage-less `Executor`
+        // fallback, which has no engine to ask. `HELIOSDB_HASH_JOIN_MEM_MB`
+        // still overrides both at runtime.
         crate::sql::executor::join::set_join_memory_limit_mb(config.performance.join_memory_limit_mb);
 
         // See `new_with_config`: seed from storage, not 0.
@@ -10101,6 +10412,7 @@ impl EmbeddedDatabase {
             config,
             current_transaction: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             global_txn_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            global_txn_owner: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tenant_manager,
             trigger_registry: std::sync::Arc::new(sql::TriggerRegistry::new()),
             function_registry: std::sync::Arc::new(sql::FunctionRegistry::new()),
@@ -10118,9 +10430,8 @@ impl EmbeddedDatabase {
             current_schema: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             search_path: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             current_schema_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            embedded_scoped: crate::session::scoped::SessionScopedState::new(),
+            embedded_scoped: crate::session::scoped::SessionScopedState::new_for_engine(engine_instance),
             any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
                     .with_site(lock_census::Site::PlanCache),
@@ -10948,11 +11259,10 @@ impl EmbeddedDatabase {
             // fast-out flag says a transaction is open (flag transitions
             // happen under that mutex, so a `false` load is exactly the
             // "locked and found None" outcome without the lock).
-            let txn_lock = if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
-                Some(self.current_transaction.lock())
-            } else {
-                None
-            };
+            // sprinter 0d6695bf8a86: `lock_owned_global_txn` keeps the R2.1
+            // fast-out AND adds the ownership test. This is the funnel a wire
+            // AUTOCOMMIT statement reaches.
+            let txn_lock = self.lock_owned_global_txn();
             if let Some(txn_ref) = txn_lock.as_ref().and_then(|guard| guard.as_ref()) {
                 // Execute within existing transaction context.
                 //
@@ -11051,7 +11361,43 @@ impl EmbeddedDatabase {
         self.any_session_txns() && !self.storage.time_travel_enabled()
     }
 
-    /// Lock-free "any session transaction open?" check for hot-path gates.
+    /// Lock-free "any session transaction open ANYWHERE IN THE PROCESS?" check
+    /// for hot-path gates.
+    ///
+    /// PROCESS-WIDE BY CONSTRUCTION — that is the whole point, and also the
+    /// whole hazard: one connection sitting in `BEGIN` answers `true` for every
+    /// other connection. sprinter 0823e2fe7603 asked whether each consumer
+    /// could be narrowed to the calling session. The census, so nobody has to
+    /// re-derive it:
+    ///
+    /// * `Drop` (index-snapshot + logical-WAL checkpoint at close) — MUST stay
+    ///   process-wide. It is asking "is any transaction's uncommitted state
+    ///   still in flight?", and any session's is disqualifying.
+    /// * The autocommit **UPDATE / DELETE** fast paths
+    ///   (`execute_in_transaction_inner`'s `has_session_txns`,
+    ///   `try_autocommit_fast_update_delete`, `…_params`, `…_many_params`,
+    ///   `…_params_cached`) — MUST stay process-wide. These are
+    ///   VERSION-SKIPPING writes: `update_tuple_fast_with_index_hint` /
+    ///   `update_tuple_fast_no_index` overwrite `data:` with no `v:`/`v_idx:`
+    ///   pair (they say so themselves in `storage/engine.rs`), so another
+    ///   session's OPEN snapshot has no pre-image to resolve back to. The
+    ///   property protected is OTHER sessions' snapshot isolation, so narrowing
+    ///   the gate to "this session" would delete it outright. Fixing this for
+    ///   real means making those paths write version history, not moving the
+    ///   gate.
+    /// * The **INSERT** fast paths and the COPY fast batch go through
+    ///   [`session_txns_block_fast_inserts`](Self::session_txns_block_fast_inserts)
+    ///   instead (task #87), which adds `&& !time_travel_enabled()`: with
+    ///   versioning ON those paths DO write the version gate, so an unrelated
+    ///   open transaction no longer demotes them. Since `time_travel_enabled`
+    ///   defaults to `true`, in the default configuration they are not demoted
+    ///   at all — the part of 0823e2fe7603 that named
+    ///   `try_autocommit_fast_insert` and `copy_bulk_insert` was already closed
+    ///   there.
+    /// * `session_has_open_transaction` uses this only as the cheap fast-out in
+    ///   front of a per-session `DashMap` probe; it is already per-session.
+    /// * `try_session_txn_fast_insert_params` reads the raw counter for
+    ///   `<= 1` ("this is the only session transaction"), not this predicate.
     #[inline]
     fn any_session_txns(&self) -> bool {
         self.session_txn_count.load(std::sync::atomic::Ordering::Acquire) > 0
@@ -11060,7 +11406,17 @@ impl EmbeddedDatabase {
     /// Execute eligible autocommit INSERTs without creating an empty implicit
     /// transaction around a direct fast-path storage write.
     fn try_autocommit_fast_insert(&self, sql: &str) -> Option<Result<u64>> {
-        if !self.savepoints.read().is_empty()
+        // sprinter 37a5968e7698: the `!savepoints.is_empty()` term that used to
+        // stand here read the ONE handle-level stack, so ANY connection's open
+        // savepoint demoted this path. Savepoints now live on the transaction
+        // that established them, and this path runs with no transaction at all
+        // (the `in_transaction()` bail above/below is what makes that an
+        // invariant rather than an assumption), so the term is vacuously false.
+        // The undo primitives a `ROLLBACK TO SAVEPOINT` runs
+        // (`Transaction::rollback_to_savepoint`, `rollback_art_undo_to`) touch
+        // only the transaction that captured the savepoint, so no other
+        // session's savepoint could ever have undone a write made here.
+        if self.in_transaction()
             || self.session_txns_block_fast_inserts()
             || self.has_effective_tenant_context()
             // Under a non-`public` `search_path`, bare names resolve via the
@@ -11091,8 +11447,17 @@ impl EmbeddedDatabase {
         plan: &sql::LogicalPlan,
         params: &[Value],
     ) -> Option<Result<u64>> {
+        // sprinter 37a5968e7698: the `!savepoints.is_empty()` term that used to
+        // stand here read the ONE handle-level stack, so ANY connection's open
+        // savepoint demoted this path. Savepoints now live on the transaction
+        // that established them, and this path runs with no transaction at all
+        // (the `in_transaction()` bail above/below is what makes that an
+        // invariant rather than an assumption), so the term is vacuously false.
+        // The undo primitives a `ROLLBACK TO SAVEPOINT` runs
+        // (`Transaction::rollback_to_savepoint`, `rollback_art_undo_to`) touch
+        // only the transaction that captured the savepoint, so no other
+        // session's savepoint could ever have undone a write made here.
         if self.in_transaction()
-            || !self.savepoints.read().is_empty()
             || self.session_txns_block_fast_inserts()
             || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
@@ -11128,11 +11493,26 @@ impl EmbeddedDatabase {
         plan: &sql::LogicalPlan,
         params: &[Value],
     ) -> Option<Result<u64>> {
-        if !self.in_transaction()
-            || !self.savepoints.read().is_empty()
-            || self.any_session_txns()
-            || self.has_effective_tenant_context()
-        {
+        // sprinter 0823e2fe7603: the session-transaction term is
+        // `session_txns_block_fast_inserts` (an open session transaction AND
+        // time-travel OFF), NOT the raw process-wide `any_session_txns()` it
+        // used to be — the same correction task #87 made to the three sibling
+        // INSERT fast paths and to the COPY fast batch, for the same reason.
+        //
+        // This path writes NOTHING to storage. It stages the row in the
+        // caller's own global-slot transaction (`insert_validated_tuple_in_transaction`
+        // -> `Transaction::put_insert_fast` -> `insert_log`), and the only point
+        // those rows become visible to any other session is that transaction's
+        // ordinary `commit()`, which runs `put_versioned_batch` over
+        // `insert_log` and `write_set` alike and therefore writes the same
+        // `v:`/`v_idx:` history the slow path would. Its session-scoped twin
+        // `try_session_txn_fast_insert_params` already states exactly this
+        // ("commit writes MVCC versions") and gates on
+        // `time_travel_enabled() || session_txn_count <= 1`; this is the same
+        // statement for the global slot. With time-travel OFF the process-wide
+        // bail is unchanged, so nothing is widened in the configuration where
+        // the version gate does not exist.
+        if !self.in_transaction() || self.session_txns_block_fast_inserts() || self.has_effective_tenant_context() {
             return None;
         }
 
@@ -11145,8 +11525,17 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
 
-        let txn_guard = self.current_transaction.lock();
-        let txn = txn_guard.as_ref()?;
+        // sprinter 0d6695bf8a86: `None` here means "fast path not applicable" and
+        // the caller falls through to the generic path.
+        let txn_guard = self.lock_owned_global_txn();
+        let txn = txn_guard.as_ref().and_then(|slot| slot.as_ref())?;
+        // sprinter 37a5968e7698: the savepoint bail, asked of THIS transaction
+        // rather than of the (removed) handle-level stack. It has to be here
+        // rather than in the guard above because the stack now belongs to the
+        // transaction, which is only in hand once the slot is locked.
+        if txn.has_savepoints() {
+            return None;
+        }
         Some(self.insert_validated_tuple_in_transaction(&spec.table_name, tuple, &spec.schema, txn))
     }
 
@@ -11165,8 +11554,7 @@ impl EmbeddedDatabase {
         // under HA/logical-WAL those rows attribute to `insert_single`
         // (`W3_2_DESIGN.md` §2.3 note 4), not `insert_multi`.
         let _wv = write_volume::stmt_scope(write_volume::StmtClass::InsertMulti);
-        if !self.savepoints.read().is_empty()
-            || self.session_txns_block_fast_inserts()
+        if self.session_txns_block_fast_inserts()
             || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
         {
@@ -11186,8 +11574,19 @@ impl EmbeddedDatabase {
             }
         }
 
-        let txn_guard = self.current_transaction.lock();
-        if let Some(txn) = txn_guard.as_ref() {
+        // sprinter 0d6695bf8a86: stage into the global slot only when this caller
+        // owns it; otherwise fall through to the direct batch below.
+        let txn_guard = self.lock_owned_global_txn();
+        if let Some(txn) = txn_guard.as_ref().and_then(|slot| slot.as_ref()) {
+            // sprinter 37a5968e7698: this function has no `in_transaction()`
+            // bail — it STAGES into the global slot when one is open — so the
+            // savepoint bail moves here, where that transaction is in hand.
+            // (Staging goes through the write set, which a savepoint rollback
+            // does restore, so this stays the same conservative bail it was
+            // rather than a widened one.)
+            if txn.has_savepoints() {
+                return None;
+            }
             return Some(self.insert_validated_tuples_in_transaction(&spec.table_name, tuples, &spec.schema, txn));
         }
         drop(txn_guard);
@@ -11322,6 +11721,10 @@ impl EmbeddedDatabase {
             Ok(guard) => guard,
             Err(e) => return Some(Err(e)),
         };
+        // sprinter 0d6695bf8a86: the one `*_for_session` entry point that does
+        // not charge a tenant query, and therefore the one that does not get the
+        // session marker from `charge_tenant_query_for_session`.
+        let _session_bound = SessionBoundStatementGuard::bind();
         self.copy_bulk_insert(table_name, columns, rows)
     }
 
@@ -11354,9 +11757,18 @@ impl EmbeddedDatabase {
         // the ~10x-slower render-to-SQL path. With time-travel OFF there is no
         // version gate, so the process-wide bail still applies — narrowing it
         // there WOULD be a correctness bug.
+        // sprinter 37a5968e7698: the `!savepoints.is_empty()` term that used to
+        // stand here read the ONE handle-level stack, so ANY connection's open
+        // savepoint demoted this path. Savepoints now live on the transaction
+        // that established them, and the `in_transaction()` bail in this same
+        // condition makes "this handle has no transaction, therefore no
+        // savepoint" an invariant of this function, so the term is vacuously
+        // false. A SESSION transaction's savepoint could never undo a write
+        // made here either: both undo primitives
+        // (`Transaction::rollback_to_savepoint`, `rollback_art_undo_to`) act
+        // only on the transaction that captured it.
         if self.in_transaction()
             || self.session_txns_block_fast_inserts()
-            || !self.savepoints.read().is_empty()
             || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
             || self.trigger_registry.has_triggers_for_table(table_name)
@@ -12160,8 +12572,17 @@ impl EmbeddedDatabase {
         plan: &sql::LogicalPlan,
         params: &[Value],
     ) -> Option<Result<u64>> {
+        // sprinter 37a5968e7698: the `!savepoints.is_empty()` term that used to
+        // stand here read the ONE handle-level stack, so ANY connection's open
+        // savepoint demoted this path. Savepoints now live on the transaction
+        // that established them, and the `in_transaction()` bail in this same
+        // condition makes "this handle has no transaction, therefore no
+        // savepoint" an invariant of this function, so the term is vacuously
+        // false. A SESSION transaction's savepoint could never undo a write
+        // made here either: both undo primitives
+        // (`Transaction::rollback_to_savepoint`, `rollback_art_undo_to`) act
+        // only on the transaction that captured it.
         if self.in_transaction()
-            || !self.savepoints.read().is_empty()
             || self.any_session_txns()
             || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
@@ -12194,8 +12615,17 @@ impl EmbeddedDatabase {
         if rows.is_empty() {
             return Some(Ok(0));
         }
+        // sprinter 37a5968e7698: the `!savepoints.is_empty()` term that used to
+        // stand here read the ONE handle-level stack, so ANY connection's open
+        // savepoint demoted this path. Savepoints now live on the transaction
+        // that established them, and the `in_transaction()` bail in this same
+        // condition makes "this handle has no transaction, therefore no
+        // savepoint" an invariant of this function, so the term is vacuously
+        // false. A SESSION transaction's savepoint could never undo a write
+        // made here either: both undo primitives
+        // (`Transaction::rollback_to_savepoint`, `rollback_art_undo_to`) act
+        // only on the transaction that captured it.
         if self.in_transaction()
-            || !self.savepoints.read().is_empty()
             || self.any_session_txns()
             || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
@@ -12303,8 +12733,17 @@ impl EmbeddedDatabase {
     }
 
     fn try_autocommit_fast_update_delete_params_cached(&self, sql: &str, params: &[Value]) -> Option<Result<u64>> {
+        // sprinter 37a5968e7698: the `!savepoints.is_empty()` term that used to
+        // stand here read the ONE handle-level stack, so ANY connection's open
+        // savepoint demoted this path. Savepoints now live on the transaction
+        // that established them, and the `in_transaction()` bail in this same
+        // condition makes "this handle has no transaction, therefore no
+        // savepoint" an invariant of this function, so the term is vacuously
+        // false. A SESSION transaction's savepoint could never undo a write
+        // made here either: both undo primitives
+        // (`Transaction::rollback_to_savepoint`, `rollback_art_undo_to`) act
+        // only on the transaction that captured it.
         if self.in_transaction()
-            || !self.savepoints.read().is_empty()
             || self.any_session_txns()
             || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
@@ -13128,7 +13567,17 @@ impl EmbeddedDatabase {
     /// Execute eligible autocommit UPDATE/DELETE fast paths without creating an
     /// otherwise-empty transaction wrapper.
     fn try_autocommit_fast_update_delete(&self, sql: &str) -> Option<Result<u64>> {
-        if !self.savepoints.read().is_empty()
+        // sprinter 37a5968e7698: the `!savepoints.is_empty()` term that used to
+        // stand here read the ONE handle-level stack, so ANY connection's open
+        // savepoint demoted this path. Savepoints now live on the transaction
+        // that established them, and the `in_transaction()` bail in this same
+        // condition makes "this handle has no transaction, therefore no
+        // savepoint" an invariant of this function, so the term is vacuously
+        // false. A SESSION transaction's savepoint could never undo a write
+        // made here either: both undo primitives
+        // (`Transaction::rollback_to_savepoint`, `rollback_art_undo_to`) act
+        // only on the transaction that captured it.
+        if self.in_transaction()
             || self.any_session_txns()
             || self.has_effective_tenant_context()
             // Non-`public` `search_path`: resolve bare names via the planner.
@@ -17175,7 +17624,15 @@ impl EmbeddedDatabase {
             .with_current_schema(self.current_schema())
             .with_search_path(self.current_search_path());
         let plan = std::sync::Arc::new(planner.statement_to_plan(statement)?);
-        if !schema_active {
+        // sprinter 1703dba8e82d: RE-READ the gate after planning, never only
+        // before it. `CREATE TEMPORARY TABLE t` is the first statement of a
+        // connection's temp life — the gate is necessarily false when it is
+        // sampled at the top of this function, and PLANNING is what resolves
+        // `t` into this connection's `pg_temp_<pid>` namespace and arms it
+        // (`Planner::resolve_create_target`). Admitting on the stale sample
+        // would publish one connection's private target to every other
+        // connection that sends the same statement text.
+        if !schema_active && !self.current_schema_is_set() {
             self.plan_cache.put(cache_key, std::sync::Arc::clone(&plan));
         }
         Ok(plan)
@@ -17714,7 +18171,9 @@ impl EmbeddedDatabase {
         // extended protocol's autocommit path (`execute_params_for_session_inner`
         // delegates to `execute_params_inner` when the session holds no
         // transaction) — so one gate covers them all and none of them can drift.
-        let result = if self.params_insert_needs_implicit_transaction(plan, session_txn) {
+        let result = if self.params_insert_needs_implicit_transaction(plan, session_txn)
+            || self.params_call_needs_implicit_transaction(plan, session_txn)
+        {
             self.execute_plan_with_params_in_implicit_transaction(plan, params, original_sql)
         } else {
             self.execute_plan_with_params_inner(plan, params, session_txn, original_sql)
@@ -17736,6 +18195,12 @@ impl EmbeddedDatabase {
                     // (`SELECT … INTO t`): it must be delegated to the write
                     // executor, never to the read path.
                     | sql::LogicalPlan::CreateTableAs { .. }
+                    // sprinter e4bb83a1afa0: a CALL is a write — its body is
+                    // arbitrary DML. This used to ride, incidentally, on the
+                    // body's own nested `execute()` invalidating here; the body
+                    // now runs on the caller's transaction and never re-enters
+                    // that funnel, so the CALL itself has to say so.
+                    | sql::LogicalPlan::Call { .. }
             )
         {
             self.invalidate_result_cache();
@@ -17794,7 +18259,28 @@ impl EmbeddedDatabase {
         if on_conflict.is_some() {
             return false;
         }
-        !self.in_transaction() && self.savepoints.read().is_empty() && self.storage.get_current_branch_id().is_none()
+        // sprinter 37a5968e7698: no savepoint term. `session_txn` was already
+        // ruled out at the top of this function and `in_transaction()` rules out
+        // the global slot, so there is no transaction in scope here and
+        // therefore no savepoint stack to consult.
+        // sprinter 0d6695bf8a86: `global_txn_visible`, not `in_transaction()`.
+        // The Insert arm below only picks up a transaction this caller OWNS.
+        !self.global_txn_visible() && self.storage.get_current_branch_id().is_none()
+    }
+
+    /// sprinter e4bb83a1afa0: does this params-family `CALL` need an implicit
+    /// statement transaction of its own?
+    ///
+    /// A procedure body now runs in its CALLER's transaction. The text family
+    /// always has one, so without this gate an autocommit `CALL` would be ATOMIC
+    /// on one family and not the other — precisely the drift
+    /// `tests/call_parity_tests.rs` exists to catch.
+    fn params_call_needs_implicit_transaction(
+        &self,
+        plan: &sql::LogicalPlan,
+        session_txn: Option<&storage::Transaction>,
+    ) -> bool {
+        matches!(plan, sql::LogicalPlan::Call { .. }) && session_txn.is_none() && !self.global_txn_visible()
     }
 
     /// Run one params-family plan inside an implicit statement transaction —
@@ -17869,15 +18355,21 @@ impl EmbeddedDatabase {
         // Session transactions manage their lifecycle through the session
         // API; routing plan-level transaction control at the global slot
         // from inside a session would corrupt both.
+        //
+        // sprinter afed6c8e8d1d: the three transaction BOUNDARIES only. The
+        // savepoint family was lumped in here, and that is why extended-protocol
+        // `SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` errored for every
+        // driver that binds server-side (Prisma nested transactions, JDBC
+        // `setSavepoint`): a savepoint statement sent inside `BEGIN` reaches this
+        // function with `session_txn = Some(..)`, which is precisely the case
+        // this guard refused. A savepoint is NOT a boundary — it neither opens
+        // nor closes the block, so there is no session lifecycle to corrupt — and
+        // the arms below now resolve it against `session_txn` itself, which is
+        // the transaction that owns the stack.
         if session_txn.is_some()
             && matches!(
                 plan,
-                sql::LogicalPlan::StartTransaction
-                    | sql::LogicalPlan::Commit
-                    | sql::LogicalPlan::Rollback
-                    | sql::LogicalPlan::Savepoint { .. }
-                    | sql::LogicalPlan::ReleaseSavepoint { .. }
-                    | sql::LogicalPlan::RollbackToSavepoint { .. }
+                sql::LogicalPlan::StartTransaction | sql::LogicalPlan::Commit | sql::LogicalPlan::Rollback
             )
         {
             return Err(Error::transaction(
@@ -17967,7 +18459,11 @@ impl EmbeddedDatabase {
                 let active_txn: Option<&storage::Transaction> = match session_txn {
                     Some(txn) => Some(txn),
                     None => {
-                        _txn_guard = Some(self.current_transaction.lock());
+                        // sprinter 0d6695bf8a86: the global slot only when this
+                        // caller owns it. These arms used to lock and attach it
+                        // unconditionally, so every session-less params write
+                        // staged into whatever embedded `BEGIN` was open.
+                        _txn_guard = self.lock_owned_global_txn();
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
                 };
@@ -18536,13 +19032,18 @@ impl EmbeddedDatabase {
                 // #100: the transaction is now needed for the WRITE (staging), not
                 // only for the FK probe, so it is taken whenever one is open — the
                 // same unconditional hold the Insert/Update/Delete arms use.
-                let can_read_global_txn = self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
-                    && !GLOBAL_TXN_LOCK_HELD.with(|held| held.get());
+                // sprinter 0d6695bf8a86: `global_txn_visible` adds the ownership
+                // term to the flag; the re-entrancy term stays as it was.
+                let can_read_global_txn = self.global_txn_visible() && !GLOBAL_TXN_LOCK_HELD.with(|held| held.get());
                 let mut _txn_guard = None;
                 let active_txn: Option<&storage::Transaction> = match session_txn {
                     Some(txn) => Some(txn),
                     None if can_read_global_txn => {
-                        _txn_guard = Some(self.current_transaction.lock());
+                        // sprinter 0d6695bf8a86: the global slot only when this
+                        // caller owns it. These arms used to lock and attach it
+                        // unconditionally, so every session-less params write
+                        // staged into whatever embedded `BEGIN` was open.
+                        _txn_guard = self.lock_owned_global_txn();
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
                     None => None,
@@ -18680,14 +19181,33 @@ impl EmbeddedDatabase {
                 let active_txn: Option<&storage::Transaction> = match session_txn {
                     Some(txn) => Some(txn),
                     None => {
-                        _txn_guard = Some(self.current_transaction.lock());
+                        // sprinter 0d6695bf8a86: the global slot only when this
+                        // caller owns it. These arms used to lock and attach it
+                        // unconditionally, so every session-less params write
+                        // staged into whatever embedded `BEGIN` was open.
+                        _txn_guard = self.lock_owned_global_txn();
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
                 };
 
                 // Use branch-aware scan to read tuples, then merge any active
-                // transaction writes so parameterized UPDATE has the same
-                // read-your-own-writes behavior as the simple-query path.
+                // transaction writes, so an UPDATE inside a transaction matches
+                // the rows that transaction has already inserted or changed.
+                //
+                // AN EARLIER REVISION OF THIS COMMENT WAS FALSE, and the lie is
+                // why GH#41 survived. It read: "…so parameterized UPDATE has the
+                // same read-your-own-writes behavior as the simple-query path."
+                // The simple-query path NEVER had it. Its `Update` arm read
+                // `data:` directly — a PK point lookup, else a bare
+                // `scan_table_branch_aware` — and a row staged by an INSERT
+                // earlier in the SAME transaction is in neither, so
+                // `BEGIN; INSERT …; UPDATE … WHERE pk = …` matched zero rows and
+                // threw the write away silently. This family was repaired on the
+                // belief that the other one was already correct and nothing
+                // checked. The text family was repaired in v4.41.0 (sprinter
+                // 27bf8d819c52) and now routes through this same merge; its arm
+                // carries the full analysis and the `merge_txn_writes` gate that
+                // also makes its PK point-lookup shortcut stand down.
                 let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
                 let tuples = if let Some(txn) = active_txn {
                     txn.merge_with_write_set(table_name, base_tuples)?
@@ -19002,14 +19522,24 @@ impl EmbeddedDatabase {
                 let active_txn: Option<&storage::Transaction> = match session_txn {
                     Some(txn) => Some(txn),
                     None => {
-                        _txn_guard = Some(self.current_transaction.lock());
+                        // sprinter 0d6695bf8a86: the global slot only when this
+                        // caller owns it. These arms used to lock and attach it
+                        // unconditionally, so every session-less params write
+                        // staged into whatever embedded `BEGIN` was open.
+                        _txn_guard = self.lock_owned_global_txn();
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
                 };
 
                 // Use branch-aware scan to read tuples, then merge any active
-                // transaction writes so parameterized DELETE has the same
-                // read-your-own-writes behavior as the simple-query path.
+                // transaction writes, so a DELETE inside a transaction matches
+                // the rows that transaction has already inserted or changed.
+                //
+                // The same FALSE comment stood here — "the same
+                // read-your-own-writes behavior as the simple-query path" — and
+                // the same correction applies: the simple-query path had no such
+                // behaviour until v4.41.0 (GH#41 / sprinter 27bf8d819c52). See
+                // the params `Update` arm above for the full record.
                 let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
                 let tuples = if let Some(txn) = active_txn {
                     txn.merge_with_write_set(table_name, base_tuples)?
@@ -19153,64 +19683,74 @@ impl EmbeddedDatabase {
                 self.rollback_internal()?;
                 Ok((0, Vec::new()))
             }
-            // Savepoint support for nested transactions
+            // Savepoint support for nested transactions.
+            //
+            // sprinter 37a5968e7698 + afed6c8e8d1d. Two things changed here:
+            //
+            // 1. The stack these resolve against belongs to a TRANSACTION, so
+            //    the arms have to name which one. It is the SESSION's whenever
+            //    one is attached — every Parse/Bind/Execute a driver sends
+            //    inside `BEGIN` arrives that way, and before this item the guard
+            //    above refused those outright — and otherwise the embedded
+            //    global `BEGIN` slot, exactly as before.
+            // 2. All three bodies are the SAME ones the text family runs
+            //    (`savepoint_establish` / `savepoint_release` /
+            //    `savepoint_rollback_to`), so the two families cannot drift and
+            //    a savepoint taken on one is a valid target on the other.
+            //
+            // The `current_transaction` mutex is taken only on the session-less
+            // leg, which is where these arms already took it.
             sql::LogicalPlan::Savepoint { name } => {
-                // Check if we're in a transaction and snapshot the write set
-                let txn = self.current_transaction.lock();
-                let (write_set_snapshot, art_undo_len) = match txn.as_ref() {
-                    Some(t) => (t.savepoint_snapshot(), self.art_undo_len_for(t)),
+                match session_txn {
+                    Some(txn) => self.savepoint_establish(txn, name),
                     None => {
-                        return Err(Error::query_execution(
-                            "SAVEPOINT can only be used within a transaction",
-                        ))
+                        // sprinter 0d6695bf8a86: a savepoint belongs to a
+                        // TRANSACTION, so a caller that does not own the global
+                        // one has no stack here.
+                        let guard = self.lock_owned_global_txn();
+                        let txn = guard
+                            .as_ref()
+                            .and_then(|slot| slot.as_ref())
+                            .ok_or_else(|| Error::query_execution("SAVEPOINT can only be used within a transaction"))?;
+                        self.savepoint_establish(txn, name);
                     }
-                };
-                drop(txn);
-
-                let savepoint = SavepointState {
-                    name: name.clone(),
-                    write_set_snapshot,
-                    art_undo_len,
-                };
-                self.savepoints.write().push(savepoint);
+                }
                 Ok((0, Vec::new()))
             }
             sql::LogicalPlan::ReleaseSavepoint { name } => {
-                let mut savepoints = self.savepoints.write();
-                // Find and remove the savepoint (and all savepoints created after it)
-                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    savepoints.truncate(pos);
-                    Ok((0, Vec::new()))
-                } else {
-                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
+                match session_txn {
+                    Some(txn) => Self::savepoint_release(txn, name)?,
+                    None => {
+                        let guard = self.lock_owned_global_txn();
+                        // No transaction OF THIS CALLER'S ⇒ no savepoint stack ⇒
+                        // the name cannot exist. 3B001, not a silent success.
+                        let txn = guard
+                            .as_ref()
+                            .and_then(|slot| slot.as_ref())
+                            .ok_or_else(|| Self::savepoint_not_found(name))?;
+                        Self::savepoint_release(txn, name)?;
+                    }
                 }
+                Ok((0, Vec::new()))
             }
             sql::LogicalPlan::RollbackToSavepoint { name } => {
-                let savepoints = self.savepoints.read();
-                // Find the savepoint
-                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    let restore = savepoints
-                        .get(pos)
-                        .map(|s| (s.write_set_snapshot.clone(), s.art_undo_len));
-                    drop(savepoints);
-
-                    // Rollback the transaction write set to the savepoint state
-                    if let Some((snapshot, art_undo_len)) = restore {
-                        let txn = self.current_transaction.lock();
-                        if let Some(t) = txn.as_ref() {
-                            t.rollback_to_savepoint(&snapshot);
-                            self.rollback_art_undo_to(t, art_undo_len);
-                        }
-                        drop(txn);
+                match session_txn {
+                    Some(txn) => self.savepoint_rollback_to(txn, name)?,
+                    None => {
+                        // sprinter 0d6695bf8a86: `ROLLBACK TO SAVEPOINT` is
+                        // deliberately EXCLUDED from `is_transaction_control`, so
+                        // it is one of the few statements a wire session still
+                        // delegates session-lessly — and it used to unwind an
+                        // unrelated caller's transaction. Owner-only now.
+                        let guard = self.lock_owned_global_txn();
+                        let txn = guard
+                            .as_ref()
+                            .and_then(|slot| slot.as_ref())
+                            .ok_or_else(|| Self::savepoint_not_found(name))?;
+                        self.savepoint_rollback_to(txn, name)?;
                     }
-
-                    // Keep savepoints up to and including this one
-                    let mut savepoints = self.savepoints.write();
-                    savepoints.truncate(pos + 1);
-                    Ok((0, Vec::new()))
-                } else {
-                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
                 }
+                Ok((0, Vec::new()))
             }
             // Prepared statement support
             sql::LogicalPlan::Prepare { name, statement, .. } => {
@@ -19265,7 +19805,33 @@ impl EmbeddedDatabase {
                 // Same helper, same behaviour, same errors as the text family.
                 // `session_txn` is not forwarded — see `execute_call_plan` for the
                 // transaction behaviour that preserves.
-                let count = self.execute_call_plan(name, args, params)?;
+                // sprinter e4bb83a1afa0: resolve the caller's transaction — the
+                // session's first, then the global slot IF this caller owns it.
+                // `GLOBAL_TXN_LOCK_HELD` is the one case that yields neither:
+                // `execute()`'s in-transaction branch holds the non-reentrant
+                // `current_transaction` mutex across the statement, so a trigger
+                // body that CALLs cannot re-lock it. Refused loudly below — a
+                // loud error beats a hang.
+                let mut _call_txn_guard = None;
+                let caller_txn: Option<&storage::Transaction> = match session_txn {
+                    Some(txn) => Some(txn),
+                    None if !GLOBAL_TXN_LOCK_HELD.with(|held| held.get()) => {
+                        _call_txn_guard = self.lock_owned_global_txn();
+                        _call_txn_guard.as_ref().and_then(|guard| guard.as_ref())
+                    }
+                    None => None,
+                };
+                let Some(caller_txn) = caller_txn else {
+                    return Err(Error::query_execution(format!(
+                        "Procedure '{}' was NOT executed: CALL is not supported on this path. The \
+                         procedure body must run inside the calling transaction, and this caller \
+                         is already holding the global transaction lock across its statement \
+                         (a trigger body, or a re-entrant call). Issue the CALL outside the \
+                         transaction, or inline the procedure body as ordinary statements.",
+                        name
+                    )));
+                };
+                let count = self.execute_call_plan(name, args, params, caller_txn)?;
                 Ok((count, Vec::new()))
             }
             // ---- Routine DDL, params family ----
@@ -19619,8 +20185,8 @@ impl EmbeddedDatabase {
         // transaction ends between the flag load and the lock, we simply
         // fall through to the autocommit path — same outcome as locking
         // after that commit/rollback.
-        if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
-            let txn_lock = self.current_transaction.lock();
+        // sprinter 0d6695bf8a86: owner-only — the read half of the same leak.
+        if let Some(txn_lock) = self.lock_owned_global_txn() {
             if let Some(txn_ref) = txn_lock.as_ref() {
                 // HDB-008: parse + plan + execute inside the failed-transaction
                 // boundary, so a read issued after an earlier failure in this
@@ -20700,6 +21266,18 @@ impl EmbeddedDatabase {
         // (every embedded caller, every connection to a reserved database name)
         // pays one relaxed atomic load.
         self.release_session_tenant(session_id);
+        // sprinter 1703dba8e82d: a session-private (`pg_temp_*`) table dies with
+        // its connection. Same funnel argument as the advisory-lock release and
+        // the tenant slot above: both wire handlers call this from `Drop`, so a
+        // clean Terminate, a dropped socket and an error-path teardown all
+        // reclaim — a temp table that outlived its session would become a
+        // permanent, globally-visible relation, which is the defect this item
+        // closes. BEFORE `session_manager.destroy_session`, which is what the
+        // backend-pid lookup needs. One relaxed atomic load on every disconnect
+        // that never created a temp table.
+        if let Ok(backend_pid) = self.session_backend_pid(session_id) {
+            sql::temp_tables::drop_backend_temp_tables(&self.storage, backend_pid);
+        }
         self.session_manager.destroy_session(session_id)
     }
 
@@ -21465,17 +22043,24 @@ impl EmbeddedDatabase {
     ///
     /// # Reuses the SAVEPOINT machinery, deliberately without its stack
     ///
-    /// The captured state is exactly what `SavepointState` captures — the
-    /// write-set snapshot (`Transaction::savepoint_snapshot`, which also records
-    /// the append-only `insert_log` length) plus the ART/vector undo-log length
-    /// — and the undo is the same pair of primitives a real
-    /// `ROLLBACK TO SAVEPOINT` runs. What it does NOT do is push onto
-    /// `self.savepoints`: that stack is process-wide rather than per-session, and
-    /// a non-empty stack disables ten INSERT/UPDATE/DELETE fast paths for every
-    /// caller (`let has_savepoints = !self.savepoints.read().is_empty()`), so an
-    /// implicit per-statement push would be both a cross-session hazard and a
-    /// throughput cliff. A named savepoint the user creates is unaffected and
-    /// still nests normally around this.
+    /// The captured state is exactly what a named savepoint captures
+    /// (`storage::transaction::SavepointEntry`) — the write-set snapshot
+    /// (`Transaction::savepoint_snapshot`, which also records the append-only
+    /// `insert_log` length) plus the ART/vector undo-log length — and the undo is
+    /// the same pair of primitives a real `ROLLBACK TO SAVEPOINT` runs. What it
+    /// does NOT do is push onto the transaction's named stack
+    /// (`Transaction::push_savepoint`).
+    ///
+    /// sprinter 37a5968e7698 changed HALF of why. The cross-session hazard is
+    /// gone — that stack is per-transaction now, so a push here could not be
+    /// seen by another connection. The throughput reason stands: a non-empty
+    /// stack disables this transaction's INSERT/UPDATE/DELETE fast paths for the
+    /// rest of the block (`Transaction::has_savepoints`), so a per-statement push
+    /// would be a throughput cliff for exactly the `BEGIN; N × INSERT; COMMIT`
+    /// shape this listener runs. And it would interleave with the user's own
+    /// names: a nameless entry between two named ones changes what `RELEASE`
+    /// truncates. A named savepoint the user creates is unaffected and still
+    /// nests normally around this.
     ///
     /// Cost: one `DashMap` iteration over the transaction's write set. The
     /// transactional INSERT funnel stages through the append-only `insert_log`
@@ -21945,6 +22530,7 @@ impl EmbeddedDatabase {
             ownership: advisory_lock::AdvisoryOwnership::Connection,
             statement_timeout: self.advisory_statement_timeout(sql),
             max_locks_per_session: self.config.locks.max_advisory_locks_per_session,
+            database: self.storage.instance_id(),
             in_explicit_transaction: self.session_has_open_transaction(session_id),
             took_transaction_lock: false,
             took_session_lock: false,
@@ -21994,6 +22580,7 @@ impl EmbeddedDatabase {
                     None
                 },
                 max_locks_per_session: self.config.locks.max_advisory_locks_per_session,
+                database: self.storage.instance_id(),
                 // A statement-scoped owner is inside nobody's transaction: its
                 // locks end with the statement whatever some other caller of
                 // this handle is doing. Reading the handle-global
@@ -23044,7 +23631,11 @@ impl EmbeddedDatabase {
         params: &[Value],
         txn: &storage::Transaction,
     ) -> Option<Result<u64>> {
-        if !self.savepoints.read().is_empty()
+        // sprinter 37a5968e7698: THIS session transaction's savepoints, not
+        // the (removed) process-wide stack. `txn` is the session transaction the
+        // row would stage into, which is exactly the one whose
+        // `ROLLBACK TO SAVEPOINT` would have to undo it.
+        if txn.has_savepoints()
             || self.has_effective_tenant_context()
             || self.storage.get_current_branch_id().is_some()
             || !(self.storage.time_travel_enabled()
@@ -23344,11 +23935,13 @@ impl EmbeddedDatabase {
             // `false` load is exactly the "locked, found None" autocommit outcome
             // without serializing every parameterized/extended-protocol read on
             // one global lock.
-            None if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) => {
-                _txn_guard = Some(self.current_transaction.lock());
+            // sprinter 0d6695bf8a86: owner-only (the flag test is now inside
+            // `lock_owned_global_txn`, so this arm yields `None` for a caller
+            // that does not own the transaction).
+            None => {
+                _txn_guard = self.lock_owned_global_txn();
                 _txn_guard.as_ref().and_then(|guard| guard.as_ref())
             }
-            None => None,
         };
 
         let mut executor = sql::Executor::with_storage(&self.storage)
@@ -23375,11 +23968,13 @@ impl EmbeddedDatabase {
         let mut _txn_guard = None;
         let active_txn: Option<&storage::Transaction> = match session_txn {
             Some(txn) => Some(txn),
-            None if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) => {
-                _txn_guard = Some(self.current_transaction.lock());
+            // sprinter 0d6695bf8a86: owner-only (the flag test is now inside
+            // `lock_owned_global_txn`, so this arm yields `None` for a caller
+            // that does not own the transaction).
+            None => {
+                _txn_guard = self.lock_owned_global_txn();
                 _txn_guard.as_ref().and_then(|guard| guard.as_ref())
             }
-            None => None,
         };
 
         let mut executor = sql::Executor::with_storage(&self.storage)
@@ -23539,11 +24134,7 @@ impl EmbeddedDatabase {
         // — the extended/prepared protocol path every driver uses — don't
         // serialize on one global lock. Flag transitions happen under this mutex,
         // so a `false` load is the "locked, found None" outcome without locking.
-        let txn_lock = if self.global_txn_active.load(std::sync::atomic::Ordering::Acquire) {
-            Some(self.current_transaction.lock())
-        } else {
-            None
-        };
+        let txn_lock = self.lock_owned_global_txn();
         let mut executor = sql::Executor::with_storage(&self.storage)
             .with_timeout(self.effective_statement_timeout_ms())
             .with_parameters(params.to_vec());
@@ -24618,6 +25209,9 @@ impl EmbeddedDatabase {
             config: self.config.clone(),
             current_transaction: self.current_transaction.clone(),
             global_txn_active: self.global_txn_active.clone(),
+            // Shared, not reset: a trigger / `CALL` / UDF body re-enters the
+            // engine synchronously on the SAME thread and is the same caller.
+            global_txn_owner: self.global_txn_owner.clone(),
             constraints_all_deferred: self.constraints_all_deferred.clone(),
             tenant_manager: self.tenant_manager.clone(),
             trigger_registry: self.trigger_registry.clone(),
@@ -24641,7 +25235,6 @@ impl EmbeddedDatabase {
             // scoped state rather than minting a second pid.
             embedded_scoped: std::sync::Arc::clone(&self.embedded_scoped),
             any_session_schema_active: self.any_session_schema_active.clone(),
-            savepoints: self.savepoints.clone(),
             plan_cache: self.plan_cache.clone(),
             parse_cache: self.parse_cache.clone(),
             result_cache: self.result_cache.clone(),
@@ -40195,5 +40788,61 @@ mod tests {
         db.execute("INSERT INTO k VALUES (1,10),(2,20)").unwrap();
         let (rows, _c) = db.query_with_columns("SELECT v FROM k WHERE id = 2").unwrap();
         assert_eq!(rows[0].values[0], Value::Int4(20));
+    }
+
+    /// sprinter 37a5968e7698: the 3B001 marker must survive the form each wire
+    /// actually hands its classifier.
+    ///
+    /// The PostgreSQL wire passes the RAW `Error::QueryExecution` message; the
+    /// MySQL listener passes the `Error` DISPLAY form
+    /// (`Query execution error: …`, per `map_error_code`'s own comments). A
+    /// `starts_with` anchor would have matched the first and silently stopped
+    /// matching the second, so the savepoint refusal would have kept reporting
+    /// ER_NO_SUCH_TABLE on MySQL — a client told its TABLE is missing when the
+    /// savepoint is.
+    #[test]
+    fn savepoint_not_found_marker_survives_both_wire_forms() {
+        let err = EmbeddedDatabase::savepoint_not_found("sp1");
+        let raw = match &err {
+            Error::QueryExecution(m) => m.clone(),
+            other => panic!("savepoint_not_found must be a QueryExecution error, got {other:?}"),
+        };
+        assert_eq!(raw, r#"savepoint "sp1" does not exist"#, "PostgreSQL's own wording");
+        assert!(
+            EmbeddedDatabase::is_savepoint_not_found(&raw),
+            "the raw message (PostgreSQL wire) must be recognised"
+        );
+        assert!(
+            EmbeddedDatabase::is_savepoint_not_found(&err.to_string()),
+            "the Display form (MySQL listener) must be recognised too, got `{}`",
+            err
+        );
+        assert_eq!(
+            crate::protocol::postgres::handler::sqlstate_for_error(&err),
+            crate::network::protocol::sqlstate::INVALID_SAVEPOINT_SPECIFICATION,
+            "3B001, not the undefined-relation class the trailing `does not exist` would otherwise earn"
+        );
+
+        // A name containing a quote is escaped the way PostgreSQL escapes it in
+        // an identifier, and must still classify.
+        for name in ["my sp", "a\"\"b"] {
+            let e = EmbeddedDatabase::savepoint_not_found(name);
+            assert!(
+                EmbeddedDatabase::is_savepoint_not_found(&e.to_string()),
+                "`{name}` must classify, got `{e}`"
+            );
+        }
+
+        // Control: a genuine undefined relation must NOT be reclassified.
+        for message in [
+            r#"relation "t" does not exist"#,
+            "Table 't' does not exist",
+            r#"column "savepoint" does not exist"#,
+        ] {
+            assert!(
+                !EmbeddedDatabase::is_savepoint_not_found(message),
+                "`{message}` must not be read as a savepoint refusal"
+            );
+        }
     }
 }

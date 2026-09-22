@@ -434,6 +434,10 @@ insert_select_txn_batch_rows = 1000
 # bound: the INDEX nested loop buffers its entire join RESULT with no cap and
 # no accounting, so an index-eligible join with a large output can still grow
 # until the host runs out of memory regardless of this setting.
+# PER DATABASE: every join is capped by the configuration of the engine it runs
+# against, so two EmbeddedDatabase handles open in one process do not re-cap
+# each other (this was a process-global with last-config-wins semantics before
+# v4.41.0).
 # CLI --join-memory-limit-mb wins over this; the HELIOSDB_HASH_JOIN_MEM_MB
 # environment variable wins over both. 0 = use the default. Default 1024 (1 GB).
 join_memory_limit_mb = 1024

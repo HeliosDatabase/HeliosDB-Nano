@@ -227,6 +227,30 @@ pub async fn execute_statement(
     // Determine statement type from SQL
     let statement_type = determine_statement_type(&request.sql);
 
+    // sprinter 0d6695bf8a86: transaction control is REFUSED here, not executed.
+    //
+    // This endpoint runs session-less `execute()` / `execute_params()` on the
+    // process-wide handle, and an HTTP request carries no connection identity,
+    // so the statements of a transaction cannot be tied to each other. What it
+    // used to do instead was worse than not working: `BEGIN` opened the ONE
+    // global transaction slot, every *other* caller of this handle — embedded,
+    // REPL, MCP, and the next HTTP request, whichever worker thread it landed
+    // on — was silently enlisted in it, and the `COMMIT` that was supposed to
+    // close it usually arrived on a different worker. Now that the global slot
+    // belongs to the thread that opened it, such a `BEGIN` could only strand an
+    // open transaction in the slot and wedge every later one with "Transaction
+    // already active". A client that needs a transaction must use the
+    // PostgreSQL or MySQL wire, which has a real per-connection session.
+    if matches!(statement_type.as_str(), "BEGIN" | "COMMIT" | "ROLLBACK") {
+        state.query_registry.fail_query(query_id);
+        return Err(ApiError::from(Error::query_execution(
+            "Transaction control (BEGIN / COMMIT / ROLLBACK) is not supported on the REST \
+             execute endpoint: an HTTP request carries no connection identity, so the \
+             statements of a transaction cannot be tied together. Use the PostgreSQL or \
+             MySQL wire protocol, which gives each connection its own session.",
+        )));
+    }
+
     // Convert parameters if provided
     let params: Vec<Value> = request
         .params

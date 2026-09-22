@@ -5,6 +5,289 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.41.0] - 2026-09-22
+
+Two themes, both finishing work v4.40.0 started. The first is **what a transaction
+can see, and who is allowed inside it** — an `UPDATE` that could not read rows its
+own transaction had just inserted, a `CALL` whose body ran outside the block that
+invoked it, savepoints that outlived the transaction that established them, and
+session-less callers that silently joined a transaction belonging to someone else.
+The second is the last of v4.40.0's own theme: process-global state read back with
+no notion of **which open database is asking**, closed with the primitives v4.40.0
+added rather than a new mechanism — `StorageEngine::instance_id()` (a
+per-construction counter, never reused) and `session::scoped::SessionScopedState`.
+
+Two items are censuses as much as fixes. Three statics in the "runtime toggle
+applied at open" family were examined and **deliberately left process-wide**, with a
+test that pins that verdict; and the `session_txn_count` consumers were enumerated
+one by one, with four of six shown to be correct as they stand.
+
+### Fixed — a transaction can read its own writes from UPDATE and DELETE
+
+- **`BEGIN; INSERT …; UPDATE …` no longer misses the row it just inserted.** Inside an
+  explicit transaction the text-family `UPDATE` and `DELETE` resolved their targets against
+  committed storage only, while `SELECT` merged the transaction's write set
+  (`executor/scan.rs`, `txn_base_tuples`). The create-then-patch shape every ORM emits —
+  insert a row, then modify it before committing — therefore reported 0 rows affected for a
+  row the same transaction could see with a `SELECT` one statement earlier. Both statements
+  now merge the write set through the SAME predicate the read overlay gates on
+  (`Transaction::has_writes_for_table`), so the two paths agree by construction rather than
+  by parallel maintenance. (sprinter 27bf8d819c52, GH#41)
+- **The gate is per transaction, not per process.** The engine-wide census
+  (`StorageEngine::has_uncommitted_writes_for_table`) was rejected for it: that predicate is
+  true when ANY open transaction has staged a write to the table, which would let one
+  connection demote every other connection's `UPDATE` to a full scan — the exact defect
+  class of sprinter 0823e2fe7603, also in this release. It under-reports here as well, since
+  an autocommit transaction carries `write_census: None` and so answers `false` while its
+  own staged rows sit in the write set.
+- **Branches are deliberately unchanged.** A branch write stages under `bdata:` while the
+  merge keys on `data:`, so a merge on a branch could only ever splice in a main-branch row,
+  never the branch row the statement is looking for. Read-your-own-writes inside a branch
+  transaction is a separate pre-existing gap that the params family shares.
+
+### Fixed — advisory locks are scoped per database
+
+- **`pg_advisory_lock(72707369)` in one database no longer blocks another.** The lock
+  table is still one process-global structure, but the open database is now part of the
+  key (`AdvisoryKey { database, id }`), exactly as PostgreSQL puts `MyDatabaseId` in
+  `LOCKTAG_ADVISORY`. Every ORM hardcodes ONE migration key — Prisma's is `72707369`,
+  and Rails, Flyway, Liquibase and Atlas each have their own constant — so with two
+  `EmbeddedDatabase` handles open in one process, database A's `prisma migrate` blocked
+  database B's on an unbounded condvar wait unless `statement_timeout` was set.
+  Releasing in A no longer releases B, and `pg_advisory_locks` reports only the holders
+  in the database the operator is connected to. Mutual exclusion WITHIN one database is
+  unchanged and pinned by a control test. (sprinter 564e9ac1d762)
+- **The module header no longer states the opposite of PostgreSQL's behaviour.** It
+  claimed advisory keys are "shared by every database served by this process, matching
+  PostgreSQL"; PostgreSQL's advisory locks are per-database. The code had been written to
+  the claim rather than to PostgreSQL, and the repo's own wire tests were already
+  hand-picking disjoint key constants to work around the result.
+
+### Fixed — `pg_stat_activity` no longer discloses another database's backends
+
+- **The view is scoped to the open database serving the query.** `live_backends()` is one
+  process-global registry of every live `SessionScopedState`, and the view scanned it with
+  no filter under a doc comment asserting the false premise out loud ("Nano has one
+  database"). Two `EmbeddedDatabase` handles in one process therefore listed each other's
+  backends — pid, `usename`, `application_name`, `client_addr`, `client_port` — to a
+  principal with no connection to the other database at all. Each backend now records the
+  `StorageEngine::instance_id()` that minted it, at construction, and the scan returns
+  only that engine's. This is not "filtering the view by database" in PostgreSQL's sense:
+  PostgreSQL's view is cluster-wide because one postmaster owns one shared-memory backend
+  array, and it has no view into a second postmaster either. (sprinter 32ed4b9e0002)
+- **Within one database, PostgreSQL's own column masking now applies.** Every backend of
+  the database is still listed — PostgreSQL does not filter the view by database and
+  neither does this — but a backend owned by a different login role reports NULL for
+  `client_addr`, `client_port`, `state`, `backend_start` and `state_change`, exactly as
+  `pg_stat_get_activity` withholds them from a non-superuser; `datid`, `datname`, `pid`,
+  `usesysid`, `usename` and `application_name` stay visible to everyone, also as
+  PostgreSQL does. Masking follows the authenticated ROLE and never the database name,
+  and deliberately so: the database in a startup packet is chosen by the client, and the
+  reserved names (`postgres`, `heliosdb`) are accepted from everyone and bind no tenant,
+  so a per-tenant row filter would be bypassed by reconnecting with `dbname=postgres`.
+- A session still sees its own row in full, including the
+  `... WHERE pid = pg_backend_pid()` self-join every pool, health check and test suite
+  writes, and a destroyed session still leaves the view immediately.
+
+### Fixed — the MCP SSE session table is per database, and a live session id cannot be seized
+
+- **One MCP mount's client could terminate another mount's client's SSE stream.** The
+  HTTP+SSE transport kept one `static SESSIONS: DashMap<String, Session>` keyed by the
+  session id ALONE, and that id is client-supplied (`GET /mcp/sse?session=<id>`).
+  Registration was a bare `insert`, so the second use of an id dropped the incumbent
+  `Session` — and with it the only `UnboundedSender` feeding that client's response body,
+  which ended the stream. With two `mcp_router()`s in one process, on different databases
+  and possibly different authenticators, a client of either could do that to a client of
+  the other. The table is now keyed by `(StorageEngine::instance_id, session id)`, the
+  same per-engine identity `mcp::result_cache` already uses. (sprinter f469f178aa29)
+- **Progress notifications no longer cross databases.** While the namespace was shared,
+  `POST /mcp` on one mount resolved the other mount's session and streamed its
+  `notifications/progress` there. That payload is not row data, but `helios_graphrag_search`
+  puts the caller's own query text and its hit count in the event's `message` field — query
+  text and result cardinality, delivered to an unrelated client on an unrelated database.
+- **A client-chosen session id is a request, not a claim.** The SSE handshake is only
+  `Scope::Read`-gated, so within one mount any authenticated reader could name another
+  client's id and take its stream over by the same `insert`. A requested id is now granted
+  only when no LIVE session holds it; otherwise a fresh UUID is minted and announced in the
+  `endpoint` event, exactly as for a client that sent no `?session=` at all. Liveness, not
+  prior use, is the test — a client reconnecting after its stream died still gets its id back.
+
+### Fixed — `join_memory_limit_mb` is per database
+
+- **Opening a second database no longer re-caps the first one's joins.**
+  `[performance] join_memory_limit_mb` has exactly one writer (the `EmbeddedDatabase` open
+  path) and no `SET`, so it is engine configuration — but it lived in a process-global
+  `static` that every open overwrote. Open A with 4096 MB, then B with the 1024 default, and
+  A's large analytic join started failing `Join exceeds memory limit (1024 MB)` for no
+  reason A's operator could see. The cap now comes from the engine the query runs against
+  (`StorageEngine::config`, which already carried the same `[performance]` section); the
+  global remains only as the fallback for a storage-less `Executor`. The
+  `HELIOSDB_HASH_JOIN_MEM_MB` override and the error text are unchanged.
+  (sprinter f469f178aa29)
+
+### Unchanged by design — the diagnostic census toggles stay process-wide
+
+- `[performance] lock_census`, `write_volume_stats` and `copy_phase_stats` were examined
+  under the same item and **deliberately left as process-globals**. Their counters are
+  process-wide aggregates by construction — `heliosdb_write_volume` and
+  `heliosdb_copy_phase_stats` are served by executors that take no `StorageEngine` at all,
+  because the recording sites are storage funnels with no engine identity in reach — and the
+  flag decides only whether a diagnostic counter moves, never a query's result. Scoping the
+  flag per engine while the counters stayed shared would yield a partially attributed
+  aggregate, strictly worse than the documented last-config-wins.
+  `tests/process_global_residue_i4.rs` pins that verdict so a later sweep does not "fix" it
+  for symmetry with the join cap.
+
+### Fixed — savepoints belong to their transaction, and reach the extended protocol
+
+- **One connection can no longer `RELEASE` or `ROLLBACK TO` another connection's
+  savepoint.** `EmbeddedDatabase.savepoints` was ONE `Arc<RwLock<Vec<SavepointState>>>` per
+  database handle, shared by the global `BEGIN` slot, the RAII `begin_transaction()` handle
+  and every wire session at once, and both `RELEASE` arms and both `ROLLBACK TO` arms
+  resolved the name with an `rposition` over it. Connection B rolling back to a name only
+  connection A had established restored **B's write set from A's snapshot**, discarding B's
+  own staged rows. The stack now lives on `storage::Transaction`
+  (`SavepointEntry`), so two sessions may hold savepoints with the same name at the same
+  time and neither can see the other's. (sprinter 37a5968e7698)
+- **A savepoint no longer survives its transaction.** Nothing cleared the stack at COMMIT or
+  ROLLBACK — only the handle's `Drop` did, and `abort_global_slot_locked` said so in as many
+  words. So `BEGIN; SAVEPOINT s; ROLLBACK; BEGIN; ROLLBACK TO SAVEPOINT s` succeeded and
+  injected the **dead** transaction's write-set snapshot into the live one. PostgreSQL
+  destroys savepoints at COMMIT and at ROLLBACK; living on the transaction makes that
+  automatic, with no clear site to forget. An existing test asserted the old behaviour
+  ("KNOWN BUG: savepoint stack not cleared on ROLLBACK; old savepoints leak") and has been
+  inverted.
+- **A name that is not established in the CURRENT transaction is `3B001
+  invalid_savepoint_specification`**, with PostgreSQL's own wording
+  (`savepoint "s1" does not exist`). It used to be `Savepoint 's1' does not exist`, which the
+  wire's classifier read as a generic "does not exist" and reported as an **undefined table**
+  — JDBC and Prisma branch on 3B001 to decide whether a nested transaction is still
+  retryable.
+- **`SAVEPOINT` / `RELEASE` / `ROLLBACK TO SAVEPOINT` work over the extended query
+  protocol.** `execute_plan_with_params_inner` lumped the savepoint family in with
+  BEGIN/COMMIT/ROLLBACK and refused all six with "transaction control statements must go
+  through the session API" whenever a session transaction was attached — which is every
+  Parse/Bind/Execute a driver sends inside `BEGIN`. Prisma nested transactions and JDBC
+  `Connection::setSavepoint` could not run at all. A savepoint is not a transaction
+  *boundary*, so it is now resolved against the session's own transaction; the three
+  boundaries are still refused. Both families run the SAME three bodies, so a savepoint taken
+  on the simple-query path is a valid target on the extended path and vice versa.
+  (sprinter afed6c8e8d1d)
+- **`ROLLBACK TO SAVEPOINT "my sp"` is classified again.** A double-quoted savepoint name
+  containing whitespace tokenizes as `"my` + `sp"`, and `classify_transaction_control`
+  rejected it as trailing junk — so such a savepoint was not recognised as the sanctioned way
+  out of an aborted block (HDB-008) and was tagged `OK 0` instead of `ROLLBACK`.
+
+### Fixed — `CREATE TEMPORARY TABLE` no longer creates a permanent, globally visible table
+
+- **`TEMPORARY` was parsed and then discarded.** The table landed in the shared catalog:
+  visible to every other connection, and surviving the session that created it. Two
+  connections running the same `CREATE TEMPORARY TABLE tmp_work (…)` collided on the second,
+  and a disconnect leaked the table permanently. Temporary tables are now owned by the
+  backend that creates them — registered against the creating backend's pid, resolved ahead
+  of a permanent table of the same name for that backend alone, invisible to every other
+  session, and dropped when the session ends. (sprinter 1703dba8e82d)
+- **They are dropped through the documented funnel.** `EmbeddedDatabase::destroy_session` —
+  the single path both wire handlers already call from `Drop` to release per-connection
+  resources — now also drops that backend's temporary tables, so no new teardown census was
+  created for a future change to miss.
+- **`UNLOGGED` is untouched, and the item's premise was wrong.** The item paired `TEMPORARY`
+  with `UNLOGGED`, but `CREATE UNLOGGED TABLE` does not parse at all in sqlparser 0.53, so
+  there was no silently-discarded modifier to fix. It is filed separately as an
+  error-quality gap: a generic parse error where PostgreSQL would report
+  `0A000 feature_not_supported`.
+
+### Fixed — session-less statements no longer join someone else's transaction
+
+- **A params or prepared statement with no session could commit an embedded application's
+  open block.** Wire, REST and MCP callers that execute without a session id fall back to
+  the process-global transaction slot, so any of them could run inside — and `COMMIT` or
+  `ROLLBACK` — a transaction begun by the embedded application or by another listener. The
+  slot now records its owner, and only the owner can see or end it; a non-owner is refused
+  with `No active transaction to commit` rather than silently ending work it does not own.
+  (sprinter 0d6695bf8a86)
+- **Ownership needs two clauses, not just the thread.** Under a `current_thread` async
+  runtime — which `#[tokio::test]` is, and which a single-threaded server is — the wire
+  handler runs on the very thread that opened the embedded `BEGIN`, so a thread-identity
+  check alone would have handed the block straight back. A statement must also be marked
+  session-bound.
+- **`POST /v1/branches/:name/execute` refuses transaction control.** That endpoint takes
+  arbitrary client SQL with no session, which made it both the worst instance of the leak
+  and the thing a naive fix would have broken: a REST `BEGIN` would have stranded an
+  un-closable transaction in the slot and wedged every later one.
+
+### Fixed — `CALL` runs its procedure body inside the enclosing transaction
+
+- **A `CALL` inside `BEGIN` autocommitted its body.** The body re-entered the engine through
+  the top-level `execute()`, outside the caller's transaction, so its writes committed
+  immediately and survived a `ROLLBACK` of the very block that invoked it.
+  `execute_call_plan` now takes the transaction in hand and runs the body against it.
+  (sprinter e4bb83a1afa0)
+- **Removing that re-entry would have introduced a staleness bug, and did not.** Result-cache
+  invalidation for a `CALL` had been riding incidentally on the re-entry into `execute()`;
+  with the body no longer taking that path, `LogicalPlan::Call` is now an explicit
+  cache-invalidating plan. The defect was introduced and closed inside the same change,
+  found by census rather than by a failing test.
+
+### Unchanged by design — the `session_txn_count` consumers, enumerated
+
+`session_txn_count` is process-wide by construction: one connection sitting in `BEGIN`
+answers `true` for every other. The item asked whether each consumer could be narrowed to
+the calling session. Four of six are correct as they stand, and the census is recorded on
+the predicate itself so nobody has to re-derive it. (sprinter 0823e2fe7603)
+
+- `Drop` (index snapshot + logical-WAL checkpoint at close) **must** stay process-wide: it
+  asks "is any transaction's uncommitted state still in flight?", and any session's is
+  disqualifying.
+- The autocommit **UPDATE / DELETE** fast paths **must** stay process-wide. These are
+  version-skipping writes — `update_tuple_fast_with_index_hint` / `…_no_index` overwrite
+  `data:` with no `v:`/`v_idx:` pair — so another session's open snapshot has no pre-image
+  to resolve back to. The property being protected is OTHER sessions' snapshot isolation,
+  so narrowing the gate to "this session" would delete it outright. Fixing this properly
+  means making those paths write version history, not moving the gate.
+- The **INSERT** fast paths and the COPY fast batch were already closed by task #87 via
+  `session_txns_block_fast_inserts`, which adds `&& !time_travel_enabled()`. With
+  versioning on, those paths do write the version gate; since `time_travel_enabled`
+  defaults to `true`, they are not demoted at all in the default configuration.
+- `session_has_open_transaction` uses the counter only as a cheap fast-out in front of a
+  per-session probe, and is already per-session.
+
+**The one real change:** `try_transaction_fast_insert_params` was a fourth INSERT sibling
+that task #87 missed, still reading the raw process-wide `any_session_txns()`. It now uses
+`session_txns_block_fast_inserts` like the other three, for the same reason — the path
+stages into the caller's own transaction and writes nothing to storage until that
+transaction commits.
+
+### Changed — behaviour (savepoints)
+
+- The ten INSERT/UPDATE/DELETE/COPY fast-path gates that read
+  `!self.savepoints.read().is_empty()` now ask the transaction in hand
+  (`Transaction::has_savepoints()`), or drop the term where the path provably runs with no
+  transaction at all. Any connection's open savepoint used to demote every other
+  connection's statements to the slow path; a savepoint can only ever undo writes made by
+  the transaction that established it, so the process-wide term was pure
+  over-approximation.
+
+### Changed — internal API
+
+- `session::scoped::snapshot_live_backends` now takes the scanning engine's instance id;
+  `SessionScopedState::new_for_engine`, `Session::new_for_engine` and
+  `SessionManager::new_for_engine` carry it from the `EmbeddedDatabase` that owns them.
+  The engine-less `new()` spellings remain for unit tests and stamp
+  `scoped::UNATTACHED_ENGINE`, a backend visible in NO database's `pg_stat_activity` —
+  the fail-closed direction.
+- `AdvisoryLockManager::snapshot` is now `snapshot_for_database(instance_id)`, and
+  `AdvisoryContext` carries the database the statement runs against. The scope is passed
+  on the context the entry point already builds rather than read back out of an unrelated
+  thread-local at use time, so it cannot silently resolve to "no database" and fail open.
+- `mcp::session::{register, sender_for, drop_session}` take the mount's namespace
+  (`StorageEngine::instance_id`) as their first argument, and `register` now takes the
+  client's requested id as an `Option<String>` and RETURNS the id it granted — callers must
+  announce the returned id, not the requested one. `session_count_in(namespace)` is added
+  beside the process-wide `session_count()`. The public mount API (`McpState`,
+  `mcp_router`, `attach`) is unchanged: scoping by the router's database rather than moving
+  the table onto the public `McpState` avoided that break.
+
 ## [4.40.0] - 2026-09-19
 
 One architectural theme rather than a list of items: **state belonging to a single

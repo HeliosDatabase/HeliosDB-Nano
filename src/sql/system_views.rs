@@ -1336,6 +1336,22 @@ impl SystemViewRegistry {
 
     // === Session/Activity View Executors ===
 
+    /// NOT the `pg_stat_activity` SQL resolves to — see
+    /// `sql::phase3::system_views::execute_pg_stat_activity`, which is the one
+    /// the planner and executor scan, and the one that carries the
+    /// per-open-database scoping and the PostgreSQL role masking (sprinter
+    /// 32ed4b9e0002).
+    ///
+    /// This executor reads [`SessionRegistry`], a registry with no notion of
+    /// which open database a session belongs to, and `with_session_registry` —
+    /// its only way to be populated — has NO production caller, so in every
+    /// shipped path `self.session_registry` is `None` and this returns zero
+    /// rows. It is exercised only by `tests/system_views_tests.rs`, which
+    /// builds the registry by hand.
+    ///
+    /// If this ever becomes reachable from SQL, it must be scoped the same way
+    /// the phase-3 one is BEFORE it is wired up: it would otherwise reintroduce
+    /// exactly the cross-database disclosure that item closed.
     fn execute_pg_stat_activity(&self, _storage: &StorageEngine) -> Result<Vec<Tuple>> {
         let sessions = match &self.session_registry {
             Some(registry) => registry.get_all_sessions()?,

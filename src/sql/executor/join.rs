@@ -1732,37 +1732,73 @@ enum JoinState {
 /// 1 GB.
 const DEFAULT_JOIN_MEMORY_LIMIT_MB: usize = 1024;
 
-/// `[performance] join_memory_limit_mb` / `--join-memory-limit-mb`, applied by
-/// `EmbeddedDatabase` at startup. `0` = not configured (use the default).
-/// Process-global, last config wins — the same shape as the other runtime
-/// toggles applied there (`lock_census`, `write_volume`, `copy_phase_stats`).
+/// `[performance] join_memory_limit_mb` / `--join-memory-limit-mb` as applied
+/// by `EmbeddedDatabase` at startup — for ENGINE-LESS execution only.
+///
+/// sprinter `f469f178aa29`: this used to be the single source of the cap, read
+/// at every join construction in the process. But the value is per-ENGINE
+/// configuration — one writer (`EmbeddedDatabase::with_config`), no `SET`, no
+/// session dimension — so "last config wins" meant opening a second database
+/// silently re-capped the FIRST one's joins: open A with 4096 MB, then B with
+/// the 1024 default, and A's large analytic join starts failing
+/// `Join exceeds memory limit (1024 MB)` for no reason A's operator can see.
+///
+/// The cap now comes from the engine that owns the query
+/// ([`join_memory_limit_for`], reading `StorageEngine::config`, which already
+/// carries the very `[performance]` section this global was copied from). This
+/// static survives only for the storage-less `Executor` (`Executor::new`,
+/// used by expression-level and unit-test paths), which has no engine to ask.
+/// Reading the engine also closes a second hole: `EmbeddedDatabase::new` and
+/// `new_in_memory` never called the setter at all, so a database opened either
+/// of those ways ran under whichever cap the last `with_config` open had
+/// stored. `0` = not configured (use the default).
 static JOIN_MEMORY_LIMIT_MB: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Apply the configured join materialization limit (MB). `0` clears it back
-/// to the built-in default. See [`join_memory_limit`].
+/// Apply the configured join materialization limit (MB) for engine-less
+/// execution. `0` clears it back to the built-in default. See
+/// [`join_memory_limit_for`].
 pub(crate) fn set_join_memory_limit_mb(mb: usize) {
     JOIN_MEMORY_LIMIT_MB.store(mb, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The cap, in BYTES, on how much a join may materialize before it is
-/// refused: the hash join's build side and — since GH#29 (c7, M3) — the
-/// nested loop's right input, which candidate 6 made reachable for every
-/// RIGHT / FULL join carrying a residual ON term and which had no cap at all.
+/// The cap, in BYTES, on how much a join built for `storage`'s database may
+/// materialize before it is refused: the hash join's build side and — since
+/// GH#29 (c7, M3) — the nested loop's right input, which candidate 6 made
+/// reachable for every RIGHT / FULL join carrying a residual ON term and which
+/// had no cap at all.
 ///
 /// Resolution order: the `HELIOSDB_HASH_JOIN_MEM_MB` environment variable
-/// (the documented runtime override, kept for compatibility), then
-/// `[performance] join_memory_limit_mb` / `--join-memory-limit-mb`, then
-/// [`DEFAULT_JOIN_MEMORY_LIMIT_MB`]. One knob, one error, both operators.
-fn join_memory_limit() -> usize {
+/// (the documented runtime override, kept for compatibility), then THAT
+/// DATABASE's own `[performance] join_memory_limit_mb` /
+/// `--join-memory-limit-mb`, then [`DEFAULT_JOIN_MEMORY_LIMIT_MB`]. One knob,
+/// one error, both operators.
+///
+/// `None` is a storage-less `Executor`, which falls back to
+/// [`JOIN_MEMORY_LIMIT_MB`] — the only remaining reader of that global.
+fn join_memory_limit_for(storage: Option<&crate::storage::StorageEngine>) -> usize {
+    let configured_mb = match storage {
+        Some(engine) => engine.config().performance.join_memory_limit_mb,
+        None => JOIN_MEMORY_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed),
+    };
     resolve_join_memory_limit(
         std::env::var("HELIOSDB_HASH_JOIN_MEM_MB").ok().as_deref(),
-        JOIN_MEMORY_LIMIT_MB.load(std::sync::atomic::Ordering::Relaxed),
+        configured_mb,
     )
 }
 
-/// [`join_memory_limit`] without the two global reads, so the precedence is
-/// pinned without mutating process state a concurrently running test could
-/// observe.
+/// [`join_memory_limit_for`] for a construction site with no engine in reach:
+/// the PUBLIC `HashJoinOperator::new` / `new_build_left` /
+/// `NestedLoopJoinOperator::new` constructors, which take no storage. The
+/// planner never routes through these — `handle_join` and
+/// `handle_projected_join` resolve the cap from the executor's own engine —
+/// so this is the engine-less fallback, not the normal path.
+fn join_memory_limit() -> usize {
+    join_memory_limit_for(None)
+}
+
+/// [`join_memory_limit_for`] without the env read and without the engine (or
+/// global) lookup, so the precedence is pinned without mutating process state
+/// a concurrently running test could observe.
 fn resolve_join_memory_limit(env_mb: Option<&str>, configured_mb: usize) -> usize {
     env_mb
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -1885,6 +1921,7 @@ impl HashJoinOperator {
         parameters: Vec<crate::Value>,
         keys: PreboundJoinKeys,
         build_side: HashJoinBuildSide,
+        memory_limit: usize,
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
         Self::with_memory_limit_projected(
@@ -1894,7 +1931,7 @@ impl HashJoinOperator {
             on_condition,
             parameters,
             build_side,
-            Self::default_memory_limit(),
+            memory_limit,
             timeout_ctx,
             None,
             None,
@@ -1919,6 +1956,7 @@ impl HashJoinOperator {
         projection: Vec<usize>,
         output_schema: Arc<Schema>,
         build_side: HashJoinBuildSide,
+        memory_limit: usize,
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
         Self::with_memory_limit_projected(
@@ -1928,7 +1966,7 @@ impl HashJoinOperator {
             on_condition,
             parameters,
             build_side,
-            Self::default_memory_limit(),
+            memory_limit,
             timeout_ctx,
             Some(projection),
             Some(output_schema),
@@ -2563,18 +2601,26 @@ pub(super) fn handle_join(
     on: &Option<crate::sql::LogicalExpr>,
     lateral: bool,
 ) -> Result<Box<dyn PhysicalOperator>> {
+    // sprinter `f469f178aa29`: the materialization cap belongs to the DATABASE
+    // this statement is running against, not to whichever database opened last
+    // in this process. Resolved once per join, from the executor's own engine;
+    // the borrow ends with this statement, so the `&mut executor` calls below
+    // are unaffected.
+    let memory_limit = join_memory_limit_for(executor.storage());
+
     // LATERAL joins require nested loop join (right side depends on left row)
     if lateral {
         let left_op = executor.plan_to_operator(left)?;
         let right_op = executor.plan_to_operator(right)?;
         let timeout_ctx = executor.timeout_ctx();
         let parameters = executor.parameters().to_vec();
-        return Ok(Box::new(NestedLoopJoinOperator::new(
+        return Ok(Box::new(NestedLoopJoinOperator::with_memory_limit(
             left_op,
             right_op,
             join_type.clone(),
             on.clone(),
             parameters,
+            memory_limit,
             timeout_ctx,
         )?));
     }
@@ -2623,12 +2669,14 @@ pub(super) fn handle_join(
     match on {
         None => {
             // Cross join — use hash join with empty key
-            Ok(Box::new(HashJoinOperator::new(
+            Ok(Box::new(HashJoinOperator::with_memory_limit(
                 left_op,
                 right_op,
                 join_type.clone(),
                 None,
                 executor.parameters().to_vec(),
+                HashJoinBuildSide::Right,
+                memory_limit,
                 timeout_ctx,
             )?))
         }
@@ -2649,12 +2697,13 @@ pub(super) fn handle_join(
                 // Nothing bound, or a residual under RIGHT / FULL — the whole
                 // (materialized) condition on a nested-loop join, which keeps
                 // a per-TUPLE matched bitmap.
-                return Ok(Box::new(NestedLoopJoinOperator::new(
+                return Ok(Box::new(NestedLoopJoinOperator::with_memory_limit(
                     left_op,
                     right_op,
                     join_type.clone(),
                     Some(condition),
                     executor.parameters().to_vec(),
+                    memory_limit,
                     timeout_ctx,
                 )?));
             }
@@ -2705,6 +2754,7 @@ pub(super) fn handle_join(
                 } else {
                     HashJoinBuildSide::Right
                 },
+                memory_limit,
                 timeout_ctx,
             )?);
 
@@ -2827,6 +2877,9 @@ pub(super) fn handle_projected_join(
     // post-join predicate; those take the generic shape below, projected the
     // same way the index-nested-loop branch above is.
     let timeout_ctx = executor.timeout_ctx();
+    // sprinter `f469f178aa29`: this database's cap, not the process's. Same
+    // resolution as `handle_join` — see [`join_memory_limit_for`].
+    let memory_limit = join_memory_limit_for(executor.storage());
     let materialized = executor.materialize_join_subqueries(condition)?;
     let JoinConditionPlan {
         equi,
@@ -2846,12 +2899,13 @@ pub(super) fn handle_projected_join(
         // [`post_join_residual_filter`].
         let residual_to_filter = post_join_residual_filter(equi.is_none(), residual);
         let mut join_op: Box<dyn PhysicalOperator> = match equi {
-            None => Box::new(NestedLoopJoinOperator::new(
+            None => Box::new(NestedLoopJoinOperator::with_memory_limit(
                 left_op,
                 right_op,
                 crate::sql::JoinType::Inner,
                 Some(materialized),
                 executor.parameters().to_vec(),
+                memory_limit,
                 timeout_ctx.clone(),
             )?),
             Some(equi) => Box::new(HashJoinOperator::new_with_keys(
@@ -2867,6 +2921,7 @@ pub(super) fn handle_projected_join(
                     keys_cover_condition: true,
                 },
                 build_side,
+                memory_limit,
                 timeout_ctx.clone(),
             )?),
         };
@@ -2929,6 +2984,7 @@ pub(super) fn handle_projected_join(
         projection,
         output_schema,
         build_side,
+        memory_limit,
         timeout_ctx,
     )?;
     Ok(Some(Box::new(op)))
@@ -3949,21 +4005,26 @@ mod gh29_c7_operator_tests {
             "an empty override is not a value"
         );
         // GH#29 (c9, m4): this test asserts the PURE resolver and nothing
-        // else. Candidate 8 parked `JOIN_MEMORY_LIMIT_MB` — a process-global
-        // (`set_join_memory_limit_mb`) read at every join construction — at
-        // 48 MB for the duration of the test, while `cargo test --lib` runs
-        // the whole binary's tests on parallel threads and every
-        // `EmbeddedDatabase` open in it stores 1024 over that global
-        // (`src/lib.rs`, `set_join_memory_limit_mb(config.performance
-        // .join_memory_limit_mb)`). That can redden this test AND, for the
-        // window it is held, any join elsewhere in the binary that
-        // materializes more than 48 MB. A concurrent unit test may not mutate
-        // a process-global other tests read — the precedent this repo already
-        // states for its own flags (`src/copy_phase_stats.rs`,
-        // `src/write_volume.rs`). The setter/reader wiring is covered where it
-        // is owned: the operators below take an EXPLICIT limit, and the
-        // configuration key reaches the global through `EmbeddedDatabase`'s
-        // own open path.
+        // else. Candidate 8 parked `JOIN_MEMORY_LIMIT_MB` — then a
+        // process-global (`set_join_memory_limit_mb`) read at EVERY join
+        // construction — at 48 MB for the duration of the test, while
+        // `cargo test --lib` runs the whole binary's tests on parallel
+        // threads and every `EmbeddedDatabase` open in it stored 1024 over
+        // that global. That could redden this test AND, for the window it was
+        // held, any join elsewhere in the binary that materialized more than
+        // 48 MB. A concurrent unit test may not mutate a process-global other
+        // tests read — the precedent this repo already states for its own
+        // flags (`src/copy_phase_stats.rs`, `src/write_volume.rs`).
+        //
+        // sprinter `f469f178aa29` removed the shared-global hazard for engine
+        // joins: the cap now comes from the OWNING engine's
+        // `StorageEngine::config` (`join_memory_limit_for`), so two databases
+        // in one process no longer re-cap each other. The global remains only
+        // as the storage-less fallback, and this test still refuses to touch
+        // it. The setter/reader wiring is covered where it is owned: the
+        // operators below take an EXPLICIT limit, and the per-engine
+        // resolution is pinned end-to-end by
+        // `tests/process_global_residue_i4.rs`.
     }
 
     /// M3 scope (GH#29 c8, m3a). The cap is charged on EVERY nested-loop
@@ -4087,6 +4148,7 @@ mod gh29_c7_operator_tests {
                 keys_cover_condition: true,
             },
             HashJoinBuildSide::Right,
+            DEFAULT_JOIN_MEMORY_LIMIT_MB * 1024 * 1024,
             None,
         )
         .expect("hash join builds");
@@ -4161,6 +4223,7 @@ mod gh29_c7_operator_tests {
             Vec::new(),
             keys(),
             HashJoinBuildSide::Right,
+            DEFAULT_JOIN_MEMORY_LIMIT_MB * 1024 * 1024,
             None,
         )
         .expect("hash join builds");
@@ -4195,6 +4258,7 @@ mod gh29_c7_operator_tests {
             vec![Value::Int4(2)],
             keys(),
             HashJoinBuildSide::Right,
+            DEFAULT_JOIN_MEMORY_LIMIT_MB * 1024 * 1024,
             None,
         )
         .expect("hash join builds");

@@ -563,6 +563,18 @@ impl LogicalReplicationPipeline {
 
     /// Check if table should be replicated
     fn should_replicate_table(&self, table: &str) -> bool {
+        // sprinter 1703dba8e82d: a session-private (`pg_temp_*`) table is never
+        // replicated, whatever the filters say — PostgreSQL does not replicate
+        // temp relations either, and a standby has no session to own one, so a
+        // replicated temp table would land there as an ordinary permanent,
+        // globally-visible relation. That is the exact defect this item closes,
+        // reached through the replication stream instead of the catalog.
+        //
+        // Checked AHEAD of the "no filters = replicate all" default, because
+        // that default is what every unconfigured deployment takes.
+        if crate::sql::temp_tables::is_temp_key(table) {
+            return false;
+        }
         if self.config.table_filters.is_empty() {
             return true; // No filters = replicate all
         }
