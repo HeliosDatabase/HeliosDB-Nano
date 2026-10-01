@@ -26,6 +26,92 @@ use std::sync::{Arc, RwLock, RwLockReadGuard};
 /// follow the locking rules documented on [`ArtIndexManager`].
 pub type SharedArtIndex = Arc<RwLock<AdaptiveRadixTree>>;
 
+/// Reversible live-replay index changes. The storage engine commits this only
+/// after the corresponding RocksDB row/counter batch succeeds. No tree lock is
+/// held across another tree lock or the storage write.
+pub(crate) struct ReplicatedIndexChange {
+    undo: Vec<ReplicatedIndexUndo>,
+}
+
+struct ReplicatedIndexUndo {
+    tree: SharedArtIndex,
+    key: Vec<u8>,
+    row_id: RowId,
+    unique: bool,
+    dense_int: Option<(i64, usize)>,
+    /// Restore a removed membership; otherwise remove an added membership.
+    restore: bool,
+}
+
+impl ReplicatedIndexChange {
+    pub(crate) fn commit(mut self) {
+        self.undo.clear();
+    }
+
+    pub(crate) fn rollback(&mut self) -> ArtResult<()> {
+        let mut first_error = None;
+        while let Some(change) = self.undo.pop() {
+            let mut tree = change.tree.write().unwrap_or_else(|e| e.into_inner());
+            let result = if change.restore {
+                let present = if change.unique {
+                    match tree.get(&change.key) {
+                        Some(owner) if owner != change.row_id => {
+                            if first_error.is_none() {
+                                first_error = Some(ArtIndexError::Internal(
+                                    "live replay rollback encountered a different index owner".into(),
+                                ));
+                            }
+                            continue;
+                        }
+                        Some(_) => true,
+                        None => false,
+                    }
+                } else {
+                    tree.get_all(&change.key).contains(&change.row_id)
+                };
+                if present {
+                    Ok(())
+                } else {
+                    tree.insert(&change.key, change.row_id).map(|()| {
+                        if let Some((value, width)) = change.dense_int {
+                            tree.record_dense_int_insert(width, value);
+                        }
+                    })
+                }
+            } else if change.unique {
+                // Never remove a different row's claim during rollback.
+                if tree.get(&change.key) == Some(change.row_id) {
+                    tree.remove(&change.key).map(|removed| {
+                        if removed.is_some() {
+                            if let Some((value, _)) = change.dense_int {
+                                tree.record_dense_int_delete(value);
+                            }
+                        }
+                    })
+                } else {
+                    Ok(())
+                }
+            } else {
+                tree.remove_value(&change.key, change.row_id).map(|_| ())
+            };
+            if let Err(error) = result {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for ReplicatedIndexChange {
+    fn drop(&mut self) {
+        if let Err(error) = self.rollback() {
+            tracing::error!("Failed to roll back live replication index changes: {}", error);
+        }
+    }
+}
+
 /// What [`ArtIndexManager::register_index_entry`] does when the key it is asked
 /// for is already held by another index (sprinter 3f8e05a39baf).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3303,6 +3389,127 @@ impl ArtIndexManager {
         }
     }
 
+    /// Stage one live-replicated row's index memberships, preserving its row ID.
+    /// Duplicate delivery is a no-op for memberships already owned by this row;
+    /// a different PK/UNIQUE owner is refused before the durable row is changed.
+    /// Missing memberships are repaired without rebuilding any table's indexes.
+    pub(crate) fn stage_replicated_row(
+        &self,
+        table: &str,
+        row_id: RowId,
+        schema: &Schema,
+        old: Option<&Tuple>,
+        new: Option<&Tuple>,
+    ) -> ArtResult<ReplicatedIndexChange> {
+        self.note_mutation();
+        let names = self
+            .table_indexes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(table)
+            .cloned()
+            .unwrap_or_default();
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let mut changes = ReplicatedIndexChange { undo: Vec::new() };
+        let result = (|| {
+            for name in names {
+                let entry = indexes
+                    .get(&name)
+                    .ok_or_else(|| ArtIndexError::IndexNotFound(name.clone()))?;
+                let encode = |tuple: Option<&Tuple>| -> ArtResult<Option<(Vec<u8>, Option<(i64, usize)>)>> {
+                    let Some(tuple) = tuple else {
+                        return Ok(None);
+                    };
+                    let values: Vec<&Value> = entry
+                        .columns
+                        .iter()
+                        .map(|column| {
+                            schema
+                                .get_column_index(column)
+                                .and_then(|i| tuple.values.get(i))
+                                .ok_or_else(|| ArtIndexError::Internal(format!("missing replay index column {column}")))
+                        })
+                        .collect::<ArtResult<_>>()?;
+                    if Self::key_is_null_distinct(entry.index_type, values.iter().copied()) {
+                        return Ok(None);
+                    }
+                    let dense = if entry.index_type == ArtIndexType::PrimaryKey && values.len() == 1 {
+                        Self::int_value_width(values[0])
+                    } else {
+                        None
+                    };
+                    Ok(Some((Self::encode_key_from_values(values.into_iter()), dense)))
+                };
+                let old_key = encode(old)?;
+                let new_key = encode(new)?;
+                let unique = matches!(entry.index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique);
+                let mut tree = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+                // Check both keys while holding this tree's write lock. In
+                // particular, never remove an old unique key owned by someone else.
+                for (key, _) in old_key.iter().chain(new_key.iter()) {
+                    if unique && tree.get(key).is_some_and(|owner| owner != row_id) {
+                        return Err(ArtIndexError::DuplicateKey(format!(
+                            "live replication index {name} key belongs to a different row"
+                        )));
+                    }
+                }
+                if old_key.as_ref().map(|(key, _)| key) != new_key.as_ref().map(|(key, _)| key) {
+                    if let Some((key, dense_int)) = old_key {
+                        let removed = if unique {
+                            tree.remove(&key)?.is_some()
+                        } else {
+                            tree.remove_value(&key, row_id)?
+                        };
+                        if removed {
+                            if let Some((value, _)) = dense_int {
+                                tree.record_dense_int_delete(value);
+                            }
+                            changes.undo.push(ReplicatedIndexUndo {
+                                tree: Arc::clone(&entry.tree),
+                                key,
+                                row_id,
+                                unique,
+                                dense_int,
+                                restore: true,
+                            });
+                        }
+                    }
+                }
+                if let Some((key, dense_int)) = new_key {
+                    let present = if unique {
+                        tree.get(&key) == Some(row_id)
+                    } else {
+                        tree.get_all(&key).contains(&row_id)
+                    };
+                    if !present {
+                        tree.insert(&key, row_id)?;
+                        if let Some((value, width)) = dense_int {
+                            tree.record_dense_int_insert(width, value);
+                        }
+                        changes.undo.push(ReplicatedIndexUndo {
+                            tree: Arc::clone(&entry.tree),
+                            key,
+                            row_id,
+                            unique,
+                            dense_int,
+                            restore: false,
+                        });
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if let Err(rollback) = changes.rollback() {
+                return Err(ArtIndexError::Internal(format!(
+                    "{error}; index rollback failed: {rollback}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(changes)
+    }
+
     /// Update indexes after DELETE using the already-materialized tuple.
     pub fn on_delete_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
         self.note_mutation();
@@ -3585,6 +3792,109 @@ impl ArtIndexManager {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_replay_memberships_are_idempotent_and_reversible() {
+        use crate::Column;
+        let manager = ArtIndexManager::new();
+        manager.create_pk_index("replay", &["id".into()]).unwrap();
+        manager
+            .create_manual_index("replay_v", "replay", &["v".into()])
+            .unwrap();
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int4).primary_key(),
+            Column::new("v", DataType::Int4),
+        ]);
+        let old = Tuple::new(vec![Value::Int4(1), Value::Int4(10)]);
+        let new = Tuple::new(vec![Value::Int4(2), Value::Int4(20)]);
+        for _ in 0..2 {
+            manager
+                .stage_replicated_row("replay", 7, &schema, None, Some(&old))
+                .unwrap()
+                .commit();
+        }
+        assert_eq!(manager.pk_index_len("replay"), Some(1));
+        assert_eq!(manager.index_entry_count("replay_v"), Some(1));
+        // Simulate a storage write failure: dropping the staged update must
+        // restore both old memberships and remove the new ones.
+        drop(
+            manager
+                .stage_replicated_row("replay", 7, &schema, Some(&old), Some(&new))
+                .unwrap(),
+        );
+        assert_eq!(
+            manager.pk_index_lookup("replay", &ArtIndexManager::encode_key(&[Value::Int4(1)])),
+            Some(7)
+        );
+        assert_eq!(
+            manager.pk_index_lookup("replay", &ArtIndexManager::encode_key(&[Value::Int4(2)])),
+            None
+        );
+        assert_eq!(manager.index_entry_count("replay_v"), Some(1));
+        drop(
+            manager
+                .stage_replicated_row("replay", 7, &schema, Some(&old), None)
+                .unwrap(),
+        );
+        assert_eq!(manager.pk_index_len("replay"), Some(1));
+        manager
+            .stage_replicated_row("replay", 7, &schema, Some(&old), None)
+            .unwrap()
+            .commit();
+        manager
+            .stage_replicated_row("replay", 7, &schema, None, None)
+            .unwrap()
+            .commit();
+        assert_eq!(manager.pk_index_len("replay"), Some(0));
+        assert_eq!(manager.index_entry_count("replay_v"), Some(0));
+    }
+
+    #[test]
+    fn live_replay_unique_conflict_preserves_every_existing_owner() {
+        use crate::Column;
+        let manager = ArtIndexManager::new();
+        manager.create_pk_index("replay", &["id".into()]).unwrap();
+        manager.create_unique_index("replay", &["v".into()], None).unwrap();
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int4).primary_key(),
+            Column::new("v", DataType::Int4).unique(),
+        ]);
+        let first = Tuple::new(vec![Value::Int4(1), Value::Int4(10)]);
+        let second = Tuple::new(vec![Value::Int4(2), Value::Int4(20)]);
+        manager
+            .stage_replicated_row("replay", 7, &schema, None, Some(&first))
+            .unwrap()
+            .commit();
+        manager
+            .stage_replicated_row("replay", 8, &schema, None, Some(&second))
+            .unwrap()
+            .commit();
+        // PK can be staged first; UNIQUE then refuses. Both old owners survive,
+        // and the partially claimed new PK is returned to the tree.
+        let conflict = Tuple::new(vec![Value::Int4(3), Value::Int4(20)]);
+        assert!(manager
+            .stage_replicated_row("replay", 7, &schema, Some(&first), Some(&conflict))
+            .is_err());
+        // A purported old key owned by row 8 must never be removed for row 7.
+        assert!(manager
+            .stage_replicated_row("replay", 7, &schema, Some(&second), None)
+            .is_err());
+        assert_eq!(
+            manager.pk_index_lookup("replay", &ArtIndexManager::encode_key(&[Value::Int4(1)])),
+            Some(7)
+        );
+        assert_eq!(
+            manager.pk_index_lookup("replay", &ArtIndexManager::encode_key(&[Value::Int4(2)])),
+            Some(8)
+        );
+        assert_eq!(
+            manager.pk_index_lookup("replay", &ArtIndexManager::encode_key(&[Value::Int4(3)])),
+            None
+        );
+        assert!(manager.unique_key_exists("replay", &["v".into()], &[Value::Int4(10)]));
+        assert!(manager.unique_key_exists("replay", &["v".into()], &[Value::Int4(20)]));
+        assert_eq!(manager.pk_index_len("replay"), Some(2));
+    }
 
     #[test]
     fn test_create_pk_index() {

@@ -221,9 +221,15 @@ impl MessageHeader {
 
         let magic = buf.get_u32();
         if magic != PROTOCOL_MAGIC {
+            let hint = if magic >> 24 == u32::from(b'E') {
+                " Peer response resembles a PostgreSQL ErrorResponse; check that --primary-host \
+                 points to the primary's native --replication-port, not its PostgreSQL --port."
+            } else {
+                " Check that the peer endpoint serves the native HELI replication protocol."
+            };
             return Err(ReplicationError::Transport(format!(
-                "Invalid magic: expected {:08X}, got {:08X}",
-                PROTOCOL_MAGIC, magic
+                "Invalid magic: expected {:08X}, got {:08X}.{}",
+                PROTOCOL_MAGIC, magic, hint
             )));
         }
 

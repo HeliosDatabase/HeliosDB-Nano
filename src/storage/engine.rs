@@ -1944,6 +1944,8 @@ pub struct StorageEngine {
     statistics_cache: Arc<crate::storage::StatisticsCache>,
     /// Replay flag to skip WAL logging during recovery
     is_replaying: Arc<AtomicBool>,
+    /// Serialize live replay, including its row/index/counter publication.
+    live_replay_lock: parking_lot::Mutex<()>,
     /// GH#35: true ONLY while `replay_wal_after` re-executes the retained log
     /// at OPEN. Distinct from `is_replaying`, which `apply_replicated_operation`
     /// also sets: a standby applying the primary's DROP of a populated table is
@@ -2546,6 +2548,7 @@ impl StorageEngine {
             stats,
             statistics_cache,
             is_replaying: Arc::new(AtomicBool::new(false)),
+            live_replay_lock: parking_lot::Mutex::new(()),
             is_open_recovery: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "sync-experimental")]
             change_log,
@@ -2946,6 +2949,7 @@ impl StorageEngine {
             stats,
             statistics_cache,
             is_replaying: Arc::new(AtomicBool::new(false)),
+            live_replay_lock: parking_lot::Mutex::new(()),
             is_open_recovery: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "sync-experimental")]
             change_log,
@@ -8269,6 +8273,9 @@ impl StorageEngine {
             return Ok(Some(cached));
         }
 
+        // Capture before reading storage: live replay publishes its generation
+        // under the row-cache shard lock, so an old in-flight read cannot refill it.
+        let cache_generation = self.schema_generation();
         // Construct the storage key and fetch directly
         let storage_key = self.branch_aware_data_key(table_name, row_id);
         let raw_value = match self.get(&storage_key)? {
@@ -8321,8 +8328,13 @@ impl StorageEngine {
 
         // Populate the row cache and return the shared handle (no deep copy).
         let tuple = std::sync::Arc::new(tuple);
-        self.row_cache
-            .put_arc(table_name, row_id, std::sync::Arc::clone(&tuple));
+        self.row_cache.put_arc_if_generation(
+            table_name,
+            row_id,
+            std::sync::Arc::clone(&tuple),
+            &self.schema_generation,
+            cache_generation,
+        );
 
         Ok(Some(tuple))
     }
@@ -8396,6 +8408,9 @@ impl StorageEngine {
             return Ok(Some(cached));
         }
 
+        // Capture before reading storage: live replay publishes its generation
+        // under the row-cache shard lock, so an old in-flight read cannot refill it.
+        let cache_generation = self.schema_generation();
         // Construct the storage key and fetch directly
         let storage_key = self.branch_aware_data_key(table_name, row_id);
         let raw_value = match self.get(&storage_key)? {
@@ -8458,7 +8473,13 @@ impl StorageEngine {
         // Populate row cache with resolved tuple for read lookups. Write paths
         // skip this because they immediately invalidate the same row.
         if populate_cache_on_miss {
-            self.row_cache.put(table_name, row_id, tuple.clone());
+            self.row_cache.put_if_generation(
+                table_name,
+                row_id,
+                tuple.clone(),
+                &self.schema_generation,
+                cache_generation,
+            );
         }
 
         if trace_lookup {
@@ -10845,11 +10866,204 @@ impl StorageEngine {
     /// Unlike local WAL operations, these are NOT logged to the local WAL
     /// since they are already replicated from the primary.
     pub fn apply_replicated_operation(&self, operation: WalOperation) -> Result<()> {
-        // Set replaying flag to prevent re-logging to local WAL
-        self.is_replaying.store(true, std::sync::atomic::Ordering::Release);
-        let result = self.apply_wal_operation(operation);
-        self.is_replaying.store(false, std::sync::atomic::Ordering::Release);
+        let _replay_guard = self.live_replay_lock.lock();
+        // Startup recovery still uses apply_wal_operation directly: its indexes
+        // are rebuilt after replay. Live standbys need each successful operation
+        // published to the already-serving read paths before acknowledging it.
+        self.is_replaying.store(true, Ordering::Release);
+        let result = match operation {
+            WalOperation::Insert { table, key, tuple } | WalOperation::Update { table, key, tuple } => {
+                self.apply_live_replicated_row(&table, &key, Some(&tuple))
+            }
+            WalOperation::Delete { table, key } => self.apply_live_replicated_row(&table, &key, None),
+            WalOperation::UpdateCounter { table_name, new_value } => {
+                self.apply_live_replicated_counter(&table_name, new_value)
+            }
+            other => self.apply_wal_operation(other),
+        };
+        self.is_replaying.store(false, Ordering::Release);
         result
+    }
+
+    /// Read the durable and in-memory allocation high-water marks without
+    /// trusting the row cache. The durable value also matters after reopen.
+    fn live_replay_counter(&self, table: &str, minimum: u64) -> Result<(Vec<u8>, u64, u64)> {
+        if minimum == u64::MAX {
+            return Err(Error::storage("live replication row counter exhausted"));
+        }
+        let key = format!("counter:{table}").into_bytes();
+        let durable = match self.get(&key)? {
+            Some(bytes) => bincode::deserialize::<u64>(&bytes)
+                .map_err(|error| Error::storage(format!("invalid replicated row counter: {error}")))?,
+            None => 0,
+        };
+        let memory = self
+            .row_counters
+            .get(table)
+            .map(|counter| counter.load(Ordering::Acquire))
+            .unwrap_or(0);
+        let target = minimum.max(durable).max(memory);
+        if target == u64::MAX {
+            return Err(Error::storage("live replication row counter exhausted"));
+        }
+        Ok((key, durable, target))
+    }
+
+    fn publish_live_replay_counter(&self, table: &str, value: u64) {
+        self.row_counters
+            .entry(table.to_string())
+            .or_insert_with(|| AtomicU64::new(value))
+            .fetch_max(value, Ordering::Release);
+    }
+
+    fn apply_live_replicated_counter(&self, table: &str, value: u64) -> Result<()> {
+        let (key, durable, target) = self.live_replay_counter(table, value)?;
+        if target > durable {
+            let bytes = bincode::serialize(&target)
+                .map_err(|error| Error::storage(format!("serialize replicated row counter: {error}")))?;
+            self.put_internal(&key, &bytes)?;
+        }
+        self.publish_live_replay_counter(table, target);
+        Ok(())
+    }
+
+    fn apply_live_replicated_row(&self, table: &str, key: &Key, bytes: Option<&Vec<u8>>) -> Result<()> {
+        let prefix = format!("data:{table}:");
+        let row_id = key
+            .strip_prefix(prefix.as_bytes())
+            .and_then(|_| Self::parse_row_id_after_prefix(key, prefix.len()))
+            .filter(|row_id| *row_id != 0 && *row_id != u64::MAX)
+            .ok_or_else(|| Error::storage("invalid live replication data key or row ID"))?;
+        if *key != Self::build_data_key(table, row_id) {
+            return Err(Error::storage("live replication requires a canonical data key"));
+        }
+        let schema = Catalog::new(self).get_table_schema(table)?;
+        // Transaction WAL currently carries only data:/counter: keys, not the
+        // dictionary/CAS/columnar sidecars required to resolve stored references.
+        // Refuse these tables instead of indexing unresolved reference values.
+        if schema_uses_column_storage(&schema) {
+            return Err(Error::storage(format!(
+                "live replication for table '{table}' requires default row storage; column-storage sidecars are not replicated"
+            )));
+        }
+        let decode = |bytes: &[u8]| -> Result<Tuple> {
+            let mut tuple: Tuple = bincode::deserialize(bytes)
+                .map_err(|error| Error::storage(format!("invalid live replication tuple: {error}")))?;
+            if tuple.row_id.is_some_and(|id| id != row_id) || tuple.values.len() != schema.columns.len() {
+                return Err(Error::storage(
+                    "live replication tuple does not match its row ID or schema",
+                ));
+            }
+            if tuple
+                .values
+                .iter()
+                .any(|value| matches!(value, Value::DictRef { .. } | Value::CasRef { .. } | Value::ColumnarRef))
+            {
+                return Err(Error::storage(
+                    "live replication tuple contains an unresolved storage reference",
+                ));
+            }
+            tuple.row_id = Some(row_id);
+            Ok(tuple)
+        };
+        let new = bytes.map(|bytes| decode(bytes)).transpose()?;
+        // get() decrypts but never consults/populates row caches: index removal
+        // must describe the actual stored row, even after a previous delivery.
+        let old = self.get(key)?.map(|bytes| decode(&bytes)).transpose()?;
+        let counter = if new.is_some() {
+            Some(self.live_replay_counter(table, row_id)?)
+        } else {
+            None
+        };
+        let mut batch = WriteBatch::default();
+        if let Some(bytes) = bytes {
+            let stored = self.seal_stored(bytes)?;
+            batch.put(key, stored.as_ref());
+        } else {
+            batch.delete(key);
+        }
+        if let Some((key, durable, target)) = &counter {
+            if target > durable {
+                let value = bincode::serialize(target)
+                    .map_err(|error| Error::storage(format!("serialize replicated row counter: {error}")))?;
+                let stored = self.seal_stored(&value)?;
+                batch.put(key, stored.as_ref());
+            }
+        }
+        // Preserve the raw put path's resource checks before claiming indexes.
+        if let Some(path) = &self.db_path {
+            if self.write_counter.fetch_add(1, Ordering::Relaxed) % 1000 == 0 {
+                Self::check_disk_space(path)?;
+            }
+        }
+        let write_size = bytes.map_or(0, |bytes| (key.len() + bytes.len()) as u64);
+        let accounted = self.memory_limit_bytes > 0 && write_size > 0;
+        if accounted {
+            let previous = self.data_bytes_written.fetch_add(write_size, Ordering::Relaxed);
+            if previous.saturating_add(write_size) > self.memory_limit_bytes {
+                self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
+                return Err(Error::storage("memory limit exceeded during live replication"));
+            }
+        }
+        let mut indexes =
+            match self
+                .art_index_manager
+                .stage_replicated_row(table, row_id, &schema, old.as_ref(), new.as_ref())
+            {
+                Ok(indexes) => indexes,
+                Err(error) => {
+                    if accounted {
+                        self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
+                    }
+                    // Readers may have observed a transient earlier index claim
+                    // before a later index refused and the claims were rolled back.
+                    self.publish_live_replay_visibility(table, row_id);
+                    return Err(Error::storage(format!("live replication index claim failed: {error}")));
+                }
+            };
+        // Invalidate BEFORE the row becomes visible, including versionless DELETE.
+        self.invalidate_write_watermark(table);
+        let written = if let Some(options) = &self.memory_write_options {
+            self.db.write_opt(batch, options)
+        } else {
+            self.db.write(batch)
+        };
+        if let Err(error) = written {
+            if accounted {
+                self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
+            }
+            let rollback = indexes.rollback();
+            self.publish_live_replay_visibility(table, row_id);
+            return Err(Error::storage(format!(
+                "live replication storage write failed: {error}; index rollback: {rollback:?}"
+            )));
+        }
+        indexes.commit();
+        if let Some((_, _, target)) = counter {
+            self.publish_live_replay_counter(table, target);
+        }
+        match &new {
+            Some(tuple) => {
+                let _ = self
+                    .vector_indexes
+                    .on_row_update(table, row_id, &schema, old.as_ref(), tuple);
+            }
+            None => {
+                let _ = self
+                    .vector_indexes
+                    .on_row_delete(table, row_id, Some(&schema), old.as_ref());
+            }
+        }
+        self.publish_live_replay_visibility(table, row_id);
+        Ok(())
+    }
+
+    fn publish_live_replay_visibility(&self, table: &str, row_id: u64) {
+        // Row-cache publication must share the shard lock with guarded fills.
+        // Advancing this existing generation also invalidates SQL result caches,
+        // without clearing unrelated tables' committed-write watermarks.
+        self.row_cache
+            .invalidate_with_generation(table, row_id, &self.schema_generation);
     }
 
     /// Apply a single WAL operation to restore database state

@@ -25,6 +25,9 @@ pub struct PgServerConfig {
     pub address: SocketAddr,
     /// Authentication method
     pub auth_method: AuthMethod,
+    /// Explicit development-only opt-in to unauthenticated non-loopback access.
+    /// Defaults to false; enabling this exposes the database to any reachable client.
+    pub allow_insecure_trust: bool,
     /// Maximum concurrent connections
     pub max_connections: usize,
     /// SSL/TLS configuration (optional)
@@ -40,6 +43,7 @@ impl Default for PgServerConfig {
         Self {
             address: DEFAULT_PG_ADDRESS,
             auth_method: AuthMethod::Trust,
+            allow_insecure_trust: false,
             max_connections: 100,
             ssl_config: None,
             timeouts: ConnectionTimeouts::default(),
@@ -59,6 +63,13 @@ impl PgServerConfig {
     /// Set authentication method
     pub fn with_auth_method(mut self, method: AuthMethod) -> Self {
         self.auth_method = method;
+        self
+    }
+
+    /// Permit trust authentication on non-loopback interfaces for isolated development.
+    /// The server emits a warning when this override actually permits remote trust.
+    pub fn with_allow_insecure_trust(mut self, allow: bool) -> Self {
+        self.allow_insecure_trust = allow;
         self
     }
 
@@ -107,12 +118,18 @@ impl PgServer {
     /// is a footgun, so the server refuses to start in that
     /// configuration. SCRAM-SHA-256 and CleartextPassword stay available
     /// for non-loopback deployments.
-    fn enforce_trust_loopback_only(config: &PgServerConfig) -> Result<()> {
-        if matches!(config.auth_method, AuthMethod::Trust) && !config.address.ip().is_loopback() {
+    fn enforce_trust_loopback_only(config: &PgServerConfig, effective_method: AuthMethod) -> Result<()> {
+        if matches!(effective_method, AuthMethod::Trust) && !config.address.ip().is_loopback() {
+            if config.allow_insecure_trust {
+                tracing::warn!(address = %config.address,
+                    "INSECURE DEVELOPMENT OVERRIDE: trust authentication on a non-loopback listener permits unauthenticated database access. Do not use in production.");
+                return Ok(());
+            }
             return Err(Error::authentication(format!(
                 "AuthMethod::Trust is only permitted on loopback (127.0.0.1, ::1) listeners; \
                  binding to {} requires a non-trust auth method (password, scram-sha-256). \
-                 To start anyway on a non-loopback address, switch the auth method or bind to 127.0.0.1.",
+                 Switch the auth method or bind to 127.0.0.1. For isolated development only, \
+                 explicitly opt in with --allow-insecure-trust.",
                 config.address
             )));
         }
@@ -121,7 +138,7 @@ impl PgServer {
 
     /// Create a new PostgreSQL server
     pub fn new(config: PgServerConfig, database: Arc<EmbeddedDatabase>) -> Result<Self> {
-        Self::enforce_trust_loopback_only(&config)?;
+        Self::enforce_trust_loopback_only(&config, config.auth_method)?;
 
         let auth_manager = Arc::new(AuthManager::new(config.auth_method).with_default_users());
 
@@ -154,13 +171,7 @@ impl PgServer {
         // (the user may have constructed it with a different method
         // than `config.auth_method`).
         let effective_method = auth_manager.method();
-        if matches!(effective_method, AuthMethod::Trust) && !config.address.ip().is_loopback() {
-            return Err(Error::authentication(format!(
-                "AuthMethod::Trust is only permitted on loopback (127.0.0.1, ::1) listeners; \
-                 binding to {} requires a non-trust auth method (password, scram-sha-256).",
-                config.address
-            )));
-        }
+        Self::enforce_trust_loopback_only(&config, effective_method)?;
 
         // Initialize SSL negotiator if SSL is configured
         let ssl_negotiator = if let Some(ref ssl_config) = config.ssl_config {
@@ -203,11 +214,21 @@ impl PgServer {
             .await
             .map_err(|e| Error::network(format!("Failed to bind to {}: {}", self.config.address, e)))?;
 
+        self.serve_with_listener(listener).await
+    }
+
+    /// Serve an already-bound listener, allowing startup to fail before readiness.
+    pub async fn serve_with_listener(&self, listener: TcpListener) -> Result<()> {
+        let mut effective_config = self.config.clone();
+        effective_config.address = listener
+            .local_addr()
+            .map_err(|e| Error::network(format!("Cannot inspect PostgreSQL listener: {e}")))?;
+        Self::enforce_trust_loopback_only(&effective_config, self.auth_manager.method())?;
         let ssl_enabled = self.ssl_negotiator.is_some();
         tracing::info!(
             "PostgreSQL server listening on {} (auth: {:?}, ssl: {})",
-            self.config.address,
-            self.config.auth_method,
+            effective_config.address,
+            self.auth_manager.method(),
             if ssl_enabled { "enabled" } else { "disabled" }
         );
 
@@ -522,6 +543,50 @@ mod tests {
 
         assert_eq!(server.config().address, addr);
         assert_eq!(server.config().max_connections, 25);
+    }
+
+    #[tokio::test]
+    async fn prebound_listener_cannot_bypass_trust_guard() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        let server = PgServer::new(PgServerConfig::with_address("127.0.0.1:0".parse().unwrap()), db).unwrap();
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(1), server.serve_with_listener(listener)).await;
+        assert!(result.expect("guard must fail before accepting clients").is_err());
+    }
+
+    #[test]
+    fn remote_trust_requires_explicit_opt_in_for_both_constructors() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        for address in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0"] {
+            let config = PgServerConfig::with_address(address.parse().unwrap());
+            assert!(!config.allow_insecure_trust);
+            assert!(PgServer::new(config.clone(), Arc::clone(&db)).is_err());
+            let misleading = config.clone().with_auth_method(AuthMethod::ScramSha256);
+            assert!(PgServer::with_auth_manager(
+                misleading.clone(),
+                Arc::clone(&db),
+                AuthManager::new(AuthMethod::Trust)
+            )
+            .is_err());
+            assert!(PgServer::new(config.with_allow_insecure_trust(true), Arc::clone(&db)).is_ok());
+            assert!(PgServer::with_auth_manager(
+                misleading.with_allow_insecure_trust(true),
+                Arc::clone(&db),
+                AuthManager::new(AuthMethod::Trust)
+            )
+            .is_ok());
+            // A non-trust manager must not be rejected because the config says trust.
+            assert!(PgServer::with_auth_manager(
+                PgServerConfig::with_address(address.parse().unwrap()),
+                Arc::clone(&db),
+                AuthManager::new(AuthMethod::ScramSha256)
+            )
+            .is_ok());
+        }
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            assert!(PgServer::new(PgServerConfig::with_address(address.parse().unwrap()), Arc::clone(&db)).is_ok());
+        }
     }
 
     #[test]

@@ -152,17 +152,31 @@ impl StreamingServer {
         }
     }
 
-    /// Start the streaming server
-    pub async fn start(&self) -> Result<()> {
-        let listener = TcpListener::bind(&self.config.listen_addr)
-            .await
-            .map_err(|e| ReplicationError::Network(format!("Bind failed: {}", e)))?;
+    /// Reserve the native replication endpoint before reporting startup success.
+    /// Keep the returned listener open and pass it to [`Self::start_with_listener`]
+    /// so another process cannot claim the endpoint between validation and serving.
+    pub async fn bind_listener(&self) -> Result<TcpListener> {
+        TcpListener::bind(self.config.listen_addr).await.map_err(|e| {
+            ReplicationError::Network(format!(
+                "Failed to bind native replication listener at {}: {}. \
+                     Set --replication-port to a free port distinct from the PostgreSQL --port",
+                self.config.listen_addr, e
+            ))
+        })
+    }
 
-        tracing::info!(
-            "Streaming server listening on {} (node: {})",
-            self.config.listen_addr,
-            self.node_id
-        );
+    /// Start the streaming server, binding its configured address first.
+    pub async fn start(&self) -> Result<()> {
+        self.start_with_listener(self.bind_listener().await?).await
+    }
+
+    /// Serve native replication on an already-bound listener.
+    pub async fn start_with_listener(&self, listener: TcpListener) -> Result<()> {
+        let listen_addr = listener
+            .local_addr()
+            .map_err(|e| ReplicationError::Network(format!("Cannot inspect replication listener: {}", e)))?;
+
+        tracing::info!("Streaming server listening on {} (node: {})", listen_addr, self.node_id);
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
