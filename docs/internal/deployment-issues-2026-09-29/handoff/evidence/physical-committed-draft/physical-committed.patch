@@ -1,0 +1,445 @@
+--- a/src/replication/physical.rs
++++ b/src/replication/physical.rs
+@@ -203,10 +203,41 @@
+     pub durable_barrier: u64,
+ }
+ 
+-/// Poll committed physical changes. The owner must ensure all source writes
+-/// retain the RocksDB WAL; this function detects gaps but cannot manufacture a
+-/// retention lease. Only use cursors from a completed checkpoint or full batch.
++/// Poll raw RocksDB changes through a newly sampled durable sequence. This does
++/// NOT certify a Nano SQL transaction/DDL boundary. The owner must retain WAL;
++/// this function detects gaps but cannot manufacture a retention lease.
+ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Result<PhysicalPoll> {
++    let barrier = db.latest_sequence_number();
++    poll_source_to_sequence(db, history, after, barrier, byte_limit)
++}
++
++/// Poll only through an opaque, source-bound committed-operation certificate.
++/// Newer source writes may be present in RocksDB/WAL but cannot widen this cap.
++/// A byte-limited prefix remains non-serving until its advertised cap is reached
++/// and the separate strict hydration/publication contract has been satisfied.
++/// Certification is valid only when all mutators participate in the coordinator.
++pub fn poll_source_through(
++    db: &DB,
++    history: Uuid,
++    after: u64,
++    committed_barrier: &super::physical_source_coordinator::CommittedPhysicalBarrier,
++    byte_limit: usize,
++) -> Result<PhysicalPoll> {
++    let barrier = committed_barrier
++        .checked_sequence(db, history)
++        .map_err(|error| invalid(format!("committed source certificate: {error}")))?;
++    poll_source_to_sequence(db, history, after, barrier, byte_limit)
++}
++
++// A numeric cap is intentionally private: external callers cannot turn an
++// arbitrary latest_sequence_number into the public committed-certificate API.
++fn poll_source_to_sequence(
++    db: &DB,
++    history: Uuid,
++    after: u64,
++    barrier: u64,
++    byte_limit: usize,
++) -> Result<PhysicalPoll> {
+     check_history(history)?;
+     if byte_limit == 0 || byte_limit > MAX_BATCH_BYTES {
+         return Err(invalid("invalid poll byte limit"));
+@@ -214,11 +245,13 @@
+     if db.get(CURSOR_KEY)?.is_some() {
+         return Err(invalid("a physical receiver cannot be exported as a primary"));
+     }
+-    let barrier = db.latest_sequence_number();
+-    if after > barrier || barrier > MAX_SEQUENCE {
+-        return Err(invalid("source is behind receiver or sequence overflow"));
+-    }
+-    // Sample the barrier first; fsync subsequently covers every sampled write.
++    if after > barrier || barrier > MAX_SEQUENCE || barrier > db.latest_sequence_number() {
++        return Err(invalid(
++            "source is behind requested certified interval or sequence overflow",
++        ));
++    }
++    // Fsync includes at least the supplied cap. It may also persist later writes,
++    // which remain excluded from both the returned interval and advertised cap.
+     db.flush_wal(true)?;
+     let mut result = PhysicalPoll {
+         batches: Vec::new(),
+@@ -662,4 +695,113 @@
+         assert!(receiver.db.get(b"key").unwrap().is_none());
+         assert!(matches!(receiver.close(), Err(PhysicalError::Poisoned)));
+     }
+-}
++    #[test]
++    fn capped_poll_excludes_newer_batches_and_reports_only_its_fixed_barrier() {
++        let root = TempDir::new().unwrap();
++        let source = open(root.path());
++        let history = Uuid::new_v4();
++        let mut first = WriteBatch::default();
++        first.put(b"a", b"committed-a");
++        first.put(b"b", b"committed-b");
++        source.write(first).unwrap();
++        let cap = source.latest_sequence_number();
++        let mut later = WriteBatch::default();
++        later.put(b"c", b"later-c");
++        later.put(b"d", b"later-d");
++        source.write(later).unwrap();
++        assert_eq!(cap, 2);
++        assert_eq!(source.latest_sequence_number(), 4);
++        let poll = poll_source_to_sequence(&source, history, 0, cap, MAX_BATCH_BYTES).unwrap();
++        assert_eq!(poll.through, cap);
++        assert_eq!(poll.durable_barrier, cap);
++        assert_eq!(poll.batches.len(), 1);
++        assert_eq!(poll.batches[0].last_sequence(), cap);
++        let caught_up = poll_source_to_sequence(&source, history, cap, cap, MAX_BATCH_BYTES).unwrap();
++        assert!(caught_up.batches.is_empty());
++        assert_eq!(caught_up.through, cap);
++        assert_eq!(caught_up.durable_barrier, cap);
++        let latest = poll_source(&source, history, cap, MAX_BATCH_BYTES).unwrap();
++        assert_eq!(latest.through, 4);
++        assert_eq!(latest.batches.len(), 1);
++    }
++    #[test]
++    fn capped_poll_keeps_partial_prefix_nonserving_and_rejects_cut_batch_or_future_cap() {
++        let root = TempDir::new().unwrap();
++        let source = open(root.path());
++        let history = Uuid::new_v4();
++        for index in 0..3 {
++            let mut batch = WriteBatch::default();
++            batch.put(format!("a{index}"), b"one");
++            batch.put(format!("b{index}"), b"two");
++            source.write(batch).unwrap();
++        }
++        let prefix = poll_source_to_sequence(&source, history, 0, 4, 30).unwrap();
++        assert_eq!(prefix.through, 2);
++        assert_eq!(prefix.durable_barrier, 4);
++        assert_eq!(prefix.batches.len(), 1);
++        let tail = poll_source_to_sequence(&source, history, 2, 4, MAX_BATCH_BYTES).unwrap();
++        assert_eq!(tail.through, 4);
++        assert_eq!(tail.durable_barrier, 4);
++        assert_eq!(tail.batches.len(), 1);
++        assert!(poll_source_to_sequence(&source, history, 0, 3, MAX_BATCH_BYTES).is_err());
++        assert!(poll_source_to_sequence(&source, history, 0, 7, MAX_BATCH_BYTES).is_err());
++        assert!(poll_source_to_sequence(&source, history, 5, 4, MAX_BATCH_BYTES).is_err());
++        assert!(matches!(
++            poll_source_to_sequence(&source, history, 1, 4, MAX_BATCH_BYTES),
++            Err(PhysicalError::Gap { .. })
++        ));
++    }
++    #[test]
++    fn capped_poll_detects_missing_wal_inside_cap_but_ignores_gap_beyond_it() {
++        let root = TempDir::new().unwrap();
++        let source = open(root.path());
++        let history = Uuid::new_v4();
++        source.put(b"durable", b"included").unwrap();
++        let mut options = rocksdb::WriteOptions::default();
++        options.disable_wal(true);
++        source.put_opt(b"no-wal", b"gap", &options).unwrap();
++        source.put(b"later", b"must-not-bridge-gap").unwrap();
++        let prefix = poll_source_to_sequence(&source, history, 0, 1, MAX_BATCH_BYTES).unwrap();
++        assert_eq!(prefix.through, 1);
++        assert_eq!(prefix.durable_barrier, 1);
++        assert!(matches!(
++            poll_source_to_sequence(&source, history, 1, 2, MAX_BATCH_BYTES),
++            Err(PhysicalError::Gap { .. })
++        ));
++        assert!(matches!(
++            poll_source_to_sequence(&source, history, 1, 3, MAX_BATCH_BYTES),
++            Err(PhysicalError::Gap { .. })
++        ));
++    }
++    #[test]
++    fn committed_poll_accepts_only_its_source_capability_and_never_widens_it() {
++        use super::super::history::load_or_create_primary_history;
++        use super::super::physical_source_coordinator::PhysicalSourceCoordinator;
++        use std::{sync::Arc, time::Duration};
++
++        let root = TempDir::new().unwrap();
++        let source = Arc::new(open(root.path()));
++        let history = load_or_create_primary_history(source.path()).unwrap();
++        let coordinator = PhysicalSourceCoordinator::new(source.clone());
++        {
++            let _operation = coordinator.operation().unwrap();
++            source.put(b"certified", b"one").unwrap();
++        }
++        let cap = coordinator.capture_barrier(history, Duration::from_secs(1)).unwrap();
++        {
++            let _operation = coordinator.operation().unwrap();
++            source.put(b"later", b"two").unwrap();
++        }
++        let poll = poll_source_through(&source, history, 0, &cap, MAX_BATCH_BYTES).unwrap();
++        assert_eq!(poll.through, 1);
++        assert_eq!(poll.durable_barrier, 1);
++        assert_eq!(poll.batches.len(), 1);
++        assert_eq!(source.latest_sequence_number(), 2);
++        assert!(poll_source_through(&source, Uuid::new_v4(), 0, &cap, MAX_BATCH_BYTES).is_err());
++        let other_root = TempDir::new().unwrap();
++        let other = open(other_root.path());
++        other.put(b"unrelated", b"one").unwrap();
++        assert!(poll_source_through(&other, history, 0, &cap, MAX_BATCH_BYTES).is_err());
++        assert!(poll_source_through(&source, history, 2, &cap, MAX_BATCH_BYTES).is_err());
++    }
++}
+--- a/src/replication/checkpoint_transfer.rs
++++ b/src/replication/checkpoint_transfer.rs
+@@ -346,10 +346,15 @@
+     storage_identity: String,
+ }
+ fn source_identity(db: &DB, expected_history: Uuid) -> Result<(OwnedDirectory, String)> {
++    let directory = OwnedDirectory::capture(db.path())?;
++    let storage_identity = source_identity_in(&directory, expected_history)?;
++    Ok((directory, storage_identity))
++}
++fn source_identity_in(directory: &OwnedDirectory, expected_history: Uuid) -> Result<String> {
+     if expected_history.is_nil() {
+         return Err(invalid("nil expected source history"));
+     }
+-    let directory = OwnedDirectory::capture(db.path())?;
++    directory.verify()?;
+     absent(&directory.path.join(STANDBY_MARKER))?;
+     absent(&directory.path.join(PHYSICAL_MARKER_FILE))?;
+     let record: PrimaryMarker = serde_json::from_slice(&read_small(&directory.path.join(PRIMARY_MARKER), 4096)?)
+@@ -359,7 +364,7 @@
+         return Err(invalid("source primary marker/history/storage identity mismatch"));
+     }
+     directory.verify()?;
+-    Ok((directory, storage_identity))
++    Ok(storage_identity)
+ }
+ 
+ /// Revalidate an already initialized primary; never creates or adopts metadata.
+@@ -411,36 +416,50 @@
+     fingerprints: Vec<Metadata>,
+     limits: TransferLimits,
+ }
+-impl OnlineCheckpointExport {
+-    /// `db` must be the exclusively opened live primary. Bind caller history to
+-    /// its actual, pre-existing primary marker and RocksDB IDENTITY first.
+-    pub fn create(db: &DB, expected_history: Uuid, export_parent: &Path, limits: TransferLimits) -> Result<Self> {
+-        limits.validate()?;
+-        let (source, storage_identity) = source_identity(db, expected_history)?;
+-        let parent = OwnedDirectory::capture(export_parent)?;
+-        if fs::canonicalize(&parent.path)?.starts_with(fs::canonicalize(&source.path)?) {
+-            return Err(invalid("checkpoint export parent is inside source DB"));
+-        }
+-        let lease = tempfile::Builder::new()
+-            .prefix("nano-checkpoint-")
+-            .tempdir_in(&parent.path)?;
+-        let path = lease.path().join("checkpoint");
+-        Checkpoint::new(db)?.create_checkpoint(&path)?;
+-        // The pinned Checkpoint API omits external IDENTITY and Nano markers.
+-        match fs::symlink_metadata(path.join("IDENTITY")) {
+-            Ok(_) => (),
+-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+-                create_file(&path.join("IDENTITY"), format!("{storage_identity}\n").as_bytes())?;
+-            }
+-            Err(error) => return Err(error.into()),
+-        }
+-        if identity(&path)? != storage_identity {
+-            return Err(invalid("checkpoint IDENTITY differs from source"));
+-        }
+-        let checkpoint = DB::open_for_read_only(&Options::default(), &path, false)?;
+-        let cut = checkpoint.latest_sequence_number();
+-        drop(checkpoint);
+-        let directory = OwnedDirectory::capture(&path)?;
++/// An owned immutable raw checkpoint and its exact cut, before whole-file
++/// census/hashing. Capturing under a source-coordinator fence does not require
++/// holding that fence while hashing immutable checkpoint files.
++/// This value alone is not a committed-operation certificate or SQL readiness.
++pub struct CapturedCheckpoint {
++    lease: tempfile::TempDir,
++    source: OwnedDirectory,
++    parent: OwnedDirectory,
++    directory: OwnedDirectory,
++    history: Uuid,
++    checkpoint_sequence: u64,
++    storage_identity: String,
++    limits: TransferLimits,
++}
++impl CapturedCheckpoint {
++    pub fn history(&self) -> Uuid {
++        self.history
++    }
++    pub fn checkpoint_sequence(&self) -> u64 {
++        self.checkpoint_sequence
++    }
++    pub fn storage_identity(&self) -> &str {
++        &self.storage_identity
++    }
++    /// Hash only after the coordinator releases the exclusive source fence.
++    /// Source ordinary writes may continue; they cannot change the captured cut.
++    pub fn finish(self) -> Result<OnlineCheckpointExport> {
++        let Self {
++            lease,
++            source,
++            parent,
++            directory,
++            history,
++            checkpoint_sequence,
++            storage_identity,
++            limits,
++        } = self;
++        source.verify()?;
++        parent.verify()?;
++        directory.verify()?;
++        let path = &directory.path;
++        if source_identity_in(&source, history)? != storage_identity || identity(path)? != storage_identity {
++            return Err(invalid("source or captured checkpoint identity changed before hashing"));
++        }
+         let mut files = Vec::new();
+         let mut total_bytes = 0_u64;
+         for entry in fs::read_dir(&path)? {
+@@ -478,8 +497,8 @@
+         let mut manifest = CheckpointManifest {
+             format: 1,
+             snapshot_id: Uuid::new_v4(),
+-            history: expected_history,
+-            checkpoint_sequence: cut,
++            history,
++            checkpoint_sequence,
+             storage_identity,
+             files,
+             total_bytes,
+@@ -493,18 +512,80 @@
+         }
+         manifest.encoded()?;
+         // History metadata must not have changed during snapshot creation.
+-        let (_, current_identity) = source_identity(db, expected_history)?;
++        let current_identity = source_identity_in(&source, history)?;
+         if current_identity != manifest.storage_identity {
+             return Err(invalid("source identity changed"));
+         }
+         directory.verify()?;
+         parent.verify()?;
+         sync_dir(&path)?;
+-        Ok(Self {
++        Ok(OnlineCheckpointExport {
+             _lease: lease,
+             directory,
+             manifest,
+             fingerprints,
++            limits,
++        })
++    }
++}
++impl OnlineCheckpointExport {
++    /// Compatibility raw export path; this does not acquire the SQL mutation
++    /// coordinator. Certified callers use capture inside that coordinator and
++    /// then finish after its exclusive guard has been released.
++    pub fn create(db: &DB, expected_history: Uuid, export_parent: &Path, limits: TransferLimits) -> Result<Self> {
++        Self::capture(db, expected_history, export_parent, limits)?.finish()
++    }
++    pub fn capture(
++        db: &DB,
++        expected_history: Uuid,
++        export_parent: &Path,
++        limits: TransferLimits,
++    ) -> Result<CapturedCheckpoint> {
++        limits.validate()?;
++        let (source, storage_identity) = source_identity(db, expected_history)?;
++        let parent = OwnedDirectory::capture(export_parent)?;
++        if fs::canonicalize(&parent.path)?.starts_with(fs::canonicalize(&source.path)?) {
++            return Err(invalid("checkpoint export parent is inside source DB"));
++        }
++        let lease = tempfile::Builder::new()
++            .prefix("nano-checkpoint-")
++            .tempdir_in(&parent.path)?;
++        let path = lease.path().join("checkpoint");
++        Checkpoint::new(db)?.create_checkpoint(&path)?;
++        // The pinned Checkpoint API omits external IDENTITY and Nano markers.
++        match fs::symlink_metadata(path.join("IDENTITY")) {
++            Ok(_) => (),
++            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++                create_file(&path.join("IDENTITY"), format!("{storage_identity}\n").as_bytes())?;
++            }
++            Err(error) => return Err(error.into()),
++        }
++        if identity(&path)? != storage_identity {
++            return Err(invalid("checkpoint IDENTITY differs from source"));
++        }
++        let checkpoint = DB::open_for_read_only(&Options::default(), &path, false)?;
++        let cut = checkpoint.latest_sequence_number();
++        drop(checkpoint);
++        let directory = OwnedDirectory::capture(&path)?;
++        if cut > MAX_SEQUENCE {
++            return Err(invalid("checkpoint sequence overflow"));
++        }
++        // Only checkpoint/cut and bounded identity/ownership work is performed
++        // here. Directory census, whole-file hashing and manifest publication
++        // are deferred to CapturedCheckpoint::finish after the source fence.
++        if source_identity_in(&source, expected_history)? != storage_identity {
++            return Err(invalid("source identity changed during checkpoint capture"));
++        }
++        directory.verify()?;
++        parent.verify()?;
++        Ok(CapturedCheckpoint {
++            lease,
++            source,
++            parent,
++            directory,
++            history: expected_history,
++            checkpoint_sequence: cut,
++            storage_identity,
+             limits,
+         })
+     }
+@@ -1389,4 +1470,59 @@
+         assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default()).is_err());
+         assert!(other.path().join("aliased-current").is_file());
+     }
+-}
++    #[test]
++    fn captured_checkpoint_hashing_can_follow_new_source_writes_without_changing_cut() {
++        let root = tempfile::tempdir().unwrap();
++        let (source, history) = primary(root.path());
++        let captured =
++            OnlineCheckpointExport::capture(&source, history, root.path(), TransferLimits::default()).unwrap();
++        assert_eq!(captured.history(), history);
++        assert_eq!(captured.checkpoint_sequence(), 1);
++        let cut = captured.checkpoint_sequence();
++        source.put(b"after-capture", b"continuation-only").unwrap();
++        let export = captured.finish().unwrap();
++        assert_eq!(export.manifest().checkpoint_sequence, cut);
++        let target = root.path().join("split-installed");
++        let mut stage = download(&export, &target).finish_download().unwrap().open().unwrap();
++        assert_eq!(stage.cursor().source_sequence(), cut);
++        let checkpoint_db =
++            DB::open_for_read_only(&Options::default(), export.directory.path.as_path(), false).unwrap();
++        assert_eq!(checkpoint_db.get(b"seed").unwrap(), Some(b"old".to_vec()));
++        assert!(checkpoint_db.get(b"after-capture").unwrap().is_none());
++        drop(checkpoint_db);
++        for batch in poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap().batches {
++            stage.apply(&batch).unwrap();
++        }
++        let installed = stage.publish().unwrap();
++        let final_db = DB::open_for_read_only(&Options::default(), &installed.path, false).unwrap();
++        assert_eq!(
++            final_db.get(b"after-capture").unwrap(),
++            Some(b"continuation-only".to_vec())
++        );
++    }
++    #[test]
++    fn unfinished_capture_owns_only_its_lease_and_revalidates_history_before_hashing() {
++        let root = tempfile::tempdir().unwrap();
++        let (source, history) = primary(root.path());
++        let original = fs::read(source.path().join(PRIMARY_MARKER)).unwrap();
++        let sentinel = root.path().join("unrelated-owner-file");
++        fs::write(&sentinel, b"preserve").unwrap();
++        let captured =
++            OnlineCheckpointExport::capture(&source, history, root.path(), TransferLimits::default()).unwrap();
++        let lease = captured.lease.path().to_path_buf();
++        drop(captured);
++        assert!(!lease.exists());
++        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
++        let captured =
++            OnlineCheckpointExport::capture(&source, history, root.path(), TransferLimits::default()).unwrap();
++        let lease = captured.lease.path().to_path_buf();
++        fs::write(source.path().join(PRIMARY_MARKER), b"{}").unwrap();
++        assert!(captured.finish().is_err());
++        assert!(!lease.exists());
++        assert_eq!(source.get(b"seed").unwrap(), Some(b"old".to_vec()));
++        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve");
++        // Private fixture only: show the source marker was not silently repaired.
++        assert_eq!(fs::read(source.path().join(PRIMARY_MARKER)).unwrap(), b"{}");
++        assert_ne!(original, b"{}");
++    }
++}

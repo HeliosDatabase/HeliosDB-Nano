@@ -1,0 +1,78 @@
+--- a/src/storage/engine.rs
++++ b/src/storage/engine.rs
+@@ -2489,6 +2489,8 @@
+                 // It writes branch rows against the same `Arc<DB>`, including
+                 // copies between keys, so it applies the same rule.
+                 manager.set_key_manager(key_manager.clone());
++                #[cfg(feature = "ha-tier1")]
++                manager.set_physical_source_coordinator(physical_source_coordinator.clone());
+                 info!("BranchManager initialized successfully");
+                 Arc::new(RwLock::new(Some(Arc::new(manager))))
+             }
+@@ -10011,6 +10013,7 @@
+         snapshot_id: Option<u64>,
+         options: BranchOptions,
+     ) -> Result<BranchId> {
++        let _physical_operation = self.physical_source_operation()?;
+         let manager_lock = self.get_or_init_branch_manager()?;
+         let manager = manager_lock.read();
+         let mgr = manager
+@@ -10028,6 +10031,7 @@
+     /// Soft-deletes a branch, marking it for garbage collection.
+     /// Cannot drop the main branch or branches with children.
+     pub fn drop_branch(&self, name: &str, if_exists: bool) -> Result<()> {
++        let _physical_operation = self.physical_source_operation()?;
+         let manager_lock = self.get_or_init_branch_manager()?;
+         let manager = manager_lock.read();
+         let mgr = manager
+@@ -10086,6 +10090,7 @@
+         target_name: &str,
+         _strategy: super::MergeStrategy,
+     ) -> Result<super::MergeResult> {
++        let _physical_operation = self.physical_source_operation()?;
+         use std::collections::HashSet;
+ 
+         // Get branch metadata
+@@ -10175,6 +10180,12 @@
+             self.bump_schema_generation();
+         }
+ 
++        #[cfg(feature = "ha-tier1")]
++        let durable_phase = self.physical_source_coordinator.as_ref()
++            .map(|coordinator| coordinator.begin_durable_phase("engine branch merge did not complete rows and metadata")
++                .map_err(|error| Error::storage(error.to_string())))
++            .transpose()?;
++
+         // Step 2: Copy data from source branch to target
+         for table_name in &tables {
+             let branch_prefix = format!("bdata:{}:{}:", source_id, table_name);
+@@ -10295,6 +10306,8 @@
+             merged_keys
+         );
+ 
++        #[cfg(feature = "ha-tier1")]
++        if let Some(phase) = durable_phase { phase.complete(); }
+         Ok(super::MergeResult {
+             merge_timestamp,
+             merged_keys,
+@@ -10324,7 +10337,7 @@
+         let snapshot_id = self.next_timestamp();
+ 
+         // Create branch transaction
+-        BranchTransaction::new(
++        let mut transaction = BranchTransaction::new(
+             Arc::clone(&self.db),
+             branch.branch_id,
+             branch,
+@@ -10332,7 +10345,10 @@
+             snapshot_id,
+             Arc::clone(&self.snapshot_manager),
+             self.key_manager.clone(),
+-        )
++        )?;
++        #[cfg(feature = "ha-tier1")]
++        transaction.set_physical_source_coordinator(self.physical_source_coordinator());
++        Ok(transaction)
+     }
+ 
+     /// Get branch metadata by name (alias for get_branch)

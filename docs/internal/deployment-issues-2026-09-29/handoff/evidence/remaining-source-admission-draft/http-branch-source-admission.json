@@ -1,0 +1,22 @@
+[
+  {
+    "file": "src/api/handlers/data_handler.rs",
+    "base_sha256": "05e00bafb975503ebf0c01556c7128fe94bb592748c5fbcb78364ab2f431a540",
+    "draft_sha256": "455f3b0b88c196caa9bb00129d73985c86f4f2af6b7853137e50199b3763b60a"
+  },
+  {
+    "file": "src/api/handlers/branch_handler.rs",
+    "base_sha256": "d6a6daa56553e9dbce247c2992dba8fbe9c7af2aab0d88a0e23865b8db4f7d0c",
+    "draft_sha256": "737130573b2ba24681825910255062d70d882b240a33ba04719bbd56bc831f59"
+  },
+  {
+    "file": "src/api/routes/webhooks.rs",
+    "base_sha256": "a0e06d7df2b658c085f19330808310995968352d31b84ed28831a8a494aaccda",
+    "draft_sha256": "b961ec84d2da40f13682cdeb00efd14d27f1c12e90add17638491cb7003b5955"
+  },
+  {
+    "file": "src/storage/branch.rs",
+    "base_sha256": "f4aea3502251eccb611eb3aae4b2534ade7ee8e172802978fd55ae8b5befded0",
+    "draft_sha256": "5cc02a5dd4249cfaa0bd2f7d122471d874f1ce29843c62b6a95b8f733d58c39d"
+  }
+]

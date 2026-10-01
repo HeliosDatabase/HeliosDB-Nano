@@ -1,0 +1,162 @@
+--- a/src/session/scoped.rs
++++ b/src/session/scoped.rs
+@@ -77,7 +77,7 @@
+ //! let a new engine inherit a dead one's backends).
+ 
+ use std::collections::HashMap;
+-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicI8, Ordering};
++use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicI8, AtomicU64, Ordering};
+ use std::sync::{Arc, Weak};
+ 
+ use dashmap::DashMap;
+@@ -230,7 +230,7 @@
+     /// which database it is on. It is a `u64` counter and NOT the engine's
+     /// address — an `Arc` address is subject to ABA reuse, and a recycled one
+     /// would let a new engine inherit a dead engine's backends.
+-    engine_instance: u64,
++    engine_instance: AtomicU64,
+     /// Unix seconds at which this backend was created (`pg_stat_activity.backend_start`).
+     backend_start: i64,
+     /// The value most recently RETURNED by `nextval` in this session — whether
+@@ -363,7 +363,7 @@
+     pub fn new_for_engine(engine_instance: u64) -> Arc<Self> {
+         let state = Arc::new(Self {
+             backend_pid: next_backend_pid(),
+-            engine_instance,
++            engine_instance: AtomicU64::new(engine_instance),
+             backend_start: std::time::SystemTime::now()
+                 .duration_since(std::time::UNIX_EPOCH)
+                 .unwrap_or_default()
+@@ -419,7 +419,18 @@
+     /// The open database this backend belongs to — `StorageEngine::instance_id()`
+     /// of the engine that minted it, or [`UNATTACHED_ENGINE`].
+     pub fn engine_instance(&self) -> u64 {
+-        self.engine_instance
++        self.engine_instance.load(Ordering::Acquire)
++    }
++
++    /// Only the idle physical-generation session transfer may move a backend.
++    /// Its PID, GUCs, identity and cancellation state stay connection-owned.
++    pub(crate) fn rebind_idle_engine(&self, expected: u64, next: u64) -> bool {
++        expected != UNATTACHED_ENGINE
++            && next != UNATTACHED_ENGINE
++            && self
++                .engine_instance
++                .compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire)
++                .is_ok()
+     }
+ 
+     /// The login identity this backend published (`pg_stat_activity.usename`),
+--- a/src/session/manager.rs
++++ b/src/session/manager.rs
+@@ -192,6 +192,50 @@
+         Ok(session_id)
+     }
+ 
++    /// Transfer one exclusively owned idle wire session between immutable
++    /// physical generations. Caller must rule out active statements, transaction
++    /// slots, tenant bindings, temporary relations and engine-owned notices.
++    /// Keeps the session/backend identity and every session setting intact.
++    /// Never hold two managers' DashMap shard locks at the same time.
++    pub(crate) fn transfer_idle_generation_session(&self, target: &Self, id: SessionId) -> Result<()> {
++        if std::ptr::eq(self, target) {
++            return Ok(());
++        }
++        let (_, session) = self
++            .sessions
++            .remove(&id)
++            .ok_or_else(|| Error::Generic(format!("Session {:?} not found", id)))?;
++        let result = (|| {
++            let state = session.write();
++            if state.active_txn.is_some() {
++                return Err(Error::transaction(
++                    "cannot move an active transaction between physical generations",
++                ));
++            }
++            match target.sessions.entry(id) {
++                dashmap::mapref::entry::Entry::Occupied(_) => {
++                    Err(Error::Generic("target generation already owns session identity".into()))
++                }
++                dashmap::mapref::entry::Entry::Vacant(entry) => {
++                    if !state
++                        .scoped
++                        .rebind_idle_engine(self.engine_instance, target.engine_instance)
++                    {
++                        return Err(Error::Generic(
++                            "physical generation session has a different engine owner".into(),
++                        ));
++                    }
++                    entry.insert(Arc::clone(&session));
++                    Ok(())
++                }
++            }
++        })();
++        if result.is_err() {
++            self.sessions.insert(id, session);
++        }
++        result
++    }
++
+     /// Destroy a session
+     pub fn destroy_session(&self, session_id: SessionId) -> Result<()> {
+         self.sessions
+@@ -634,3 +678,59 @@
+         assert_eq!(session3.isolation_level, IsolationLevel::Serializable);
+     }
+ }
++
++#[cfg(test)]
++mod physical_generation_transfer_tests {
++    use super::*;
++    #[test]
++    fn idle_transfer_preserves_identity_settings_and_rebinds_activity_owner() {
++        let first = SessionManager::new_for_engine(91001);
++        let next = SessionManager::new_for_engine(91002);
++        let user = User::new_passwordless("generation-reader");
++        let id = first.create_session(&user, IsolationLevel::RepeatableRead).unwrap();
++        let session = first.get_session(id).unwrap();
++        let scoped = session.read().scoped.clone();
++        {
++            let mut state = session.write();
++            state.current_schema = Some("reader_schema".into());
++            state.search_path = vec!["reader_schema".into(), "public".into()];
++            state.idle_session_timeout_ms = Some(1234);
++            state.scoped.set_application_name("same connection");
++            state.scoped.note_lastval(42);
++        }
++        first.transfer_idle_generation_session(&next, id).unwrap();
++        assert!(first.get_session(id).is_err());
++        let moved = next.get_session(id).unwrap();
++        assert!(Arc::ptr_eq(&session, &moved));
++        let state = moved.read();
++        assert_eq!(state.login_user.as_deref(), Some("generation-reader"));
++        assert_eq!(state.current_schema.as_deref(), Some("reader_schema"));
++        assert_eq!(state.search_path, ["reader_schema", "public"]);
++        assert_eq!(state.idle_session_timeout_ms, Some(1234));
++        assert!(Arc::ptr_eq(&scoped, &state.scoped));
++        assert_eq!(state.scoped.engine_instance(), 91002);
++        assert_eq!(state.scoped.application_name(), "same connection");
++        assert_eq!(state.scoped.lastval(), Some(42));
++    }
++    #[test]
++    fn active_or_conflicting_session_transfer_preserves_original_owner() {
++        let first = SessionManager::new_for_engine(92001);
++        let next = SessionManager::new_for_engine(92002);
++        let user = User::new_passwordless("reader");
++        let id = first.create_session(&user, IsolationLevel::ReadCommitted).unwrap();
++        let session = first.get_session(id).unwrap();
++        session.write().active_txn = Some(7);
++        assert!(first.transfer_idle_generation_session(&next, id).is_err());
++        assert!(first.get_session(id).is_ok() && next.get_session(id).is_err());
++        assert_eq!(session.read().scoped.engine_instance(), 92001);
++        session.write().active_txn = None;
++        // A corrupt target collision must not overwrite either registered handle.
++        let target_id = next.create_session(&user, IsolationLevel::ReadCommitted).unwrap();
++        let target_handle = next.get_session(target_id).unwrap();
++        next.sessions.insert(id, target_handle.clone());
++        assert!(first.transfer_idle_generation_session(&next, id).is_err());
++        assert!(Arc::ptr_eq(&next.get_session(id).unwrap(), &target_handle));
++        assert!(Arc::ptr_eq(&first.get_session(id).unwrap(), &session));
++        assert_eq!(session.read().scoped.engine_instance(), 92001);
++    }
++}

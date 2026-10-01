@@ -1,0 +1,20 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -21596,6 +21596,8 @@
+         // The commit batch writes `data:`/`v:`/`counter:` straight to RocksDB,
+         // so it seals them itself (see `Transaction::key_manager`).
+         txn.set_key_manager(self.storage.key_manager_arc());
++        #[cfg(feature = "ha-tier1")]
++        txn.set_physical_source_coordinator(self.storage.physical_source_coordinator());
+         // Session transactions are built here rather than by
+         // `StorageEngine::begin_transaction`, so they enroll in the
+         // uncommitted-write census here. Without it, a `COUNT(*)` on ANOTHER
+@@ -22013,6 +22015,8 @@
+             // The commit batch writes `data:`/`v:`/`counter:` straight to
+             // RocksDB, so it seals them itself (see `Transaction::key_manager`).
+             txn.set_key_manager(self.storage.key_manager_arc());
++            #[cfg(feature = "ha-tier1")]
++            txn.set_physical_source_coordinator(self.storage.physical_source_coordinator());
+             // P0#1: session transactions must honor time_travel_enabled too.
+             txn.set_versioning_enabled(self.storage.time_travel_enabled());
+             txn.set_rocksdb_wal_enabled(!self.storage.config().storage.memory_only);

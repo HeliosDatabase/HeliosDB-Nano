@@ -1,0 +1,44 @@
+{
+  "utc": "2026-09-30T20:57:44.250440+00:00",
+  "reviewer": "Astra root",
+  "scope": "status and evidence identity audit, not source acceptance",
+  "verified_completeness": {
+    "admission-wide-default-r2-completeness.json": {
+      "ok": true,
+      "expected_targets": 353,
+      "summarized_targets": 353,
+      "sha256": "8fa22d3f1303d3d704ee5a45960aadcf59fbb326be177e65e60a3a42003325db"
+    },
+    "admission-wide-internal-r2-completeness.json": {
+      "ok": true,
+      "expected_targets": 353,
+      "summarized_targets": 353,
+      "sha256": "6045973ef1f4156af2c544f785157abee04eb99ad7f2583d655101d0f68e2279"
+    },
+    "physical-wide-rerun-default-r2-completeness.json": {
+      "ok": true,
+      "expected_targets": 356,
+      "summarized_targets": 356,
+      "sha256": "47b0d8fb9906cc80725cb888e4c60dab3dd13d3a0676e0023f4f15bedc890035"
+    },
+    "physical-wide-rerun-internal-r2-completeness.json": {
+      "ok": true,
+      "expected_targets": 356,
+      "summarized_targets": 356,
+      "sha256": "2c72620e6a421e5f1c9c8e3f96718c89b3aa1718cda0de0c3302f7efa6677bdb"
+    }
+  },
+  "native_live_prior_binary": "77d6a7e32b4ff5a208746d6fb9d094e6dda2f31adaf48dd493e436dd392f6bb7",
+  "review_feedback_delivered": "2026-09-30T14:29:36Z",
+  "deepseek_review_turn_finished": "2026-09-30T14:52:58Z",
+  "no_issue_accepted": true,
+  "pending": [
+    "post-review native auth exact-binary live rerun and missing protocol/credential controls",
+    "raw resync CLI+inspector live fixture",
+    "new lint findings and remaining performance gates",
+    "source certification and online serving",
+    "fenced promotion"
+  ],
+  "current_native_binary_sha256": "8e46aff9c718d4a6f118a60d702b0ca2061783ad50a7de96f5fd7a35a7b6ea77",
+  "native_live_matches_current_binary": false
+}
