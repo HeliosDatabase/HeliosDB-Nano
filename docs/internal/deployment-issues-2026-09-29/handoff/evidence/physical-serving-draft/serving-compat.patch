@@ -1,0 +1,21 @@
+--- a/src/replication/mod.rs
++++ b/src/replication/mod.rs
+@@ -30,6 +30,8 @@
+ pub mod physical;
+ #[cfg(feature = "ha-tier1")]
+ pub mod physical_receiver;
++#[cfg(feature = "ha-tier1")]
++pub mod physical_generations;
+ #[cfg(feature = "ha-tier1")]
+ pub mod physical_source;
+ #[cfg(feature = "ha-tier1")]
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3452,6 +3452,7 @@
+             reconnect_delay: Duration::from_millis(args.reconnect_delay_ms),
+             max_reconnects: args.max_reconnects,
+             require_committed: false, // Existing CLI remains explicitly raw/non-serving.
++            serving: None,
+         };
+         let (stop, shutdown) = tokio::sync::watch::channel(false);
+         let (progress, mut statuses) = tokio::sync::watch::channel(ReceiverStatus::Connecting {

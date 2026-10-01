@@ -1,0 +1,211 @@
+--- a/src/storage/wal.rs
++++ b/src/storage/wal.rs
+@@ -261,6 +261,58 @@
+ struct PendingWrite {
+     entry: WalEntry,
+     result_tx: crossbeam::channel::Sender<Result<u64>>,
++}
++
++/// A caller's source-operation permit covers this worker until its one final
++/// notification. Never release a failed encoder's waiter and then perform DB
++/// writes or broadcasts on its behalf. Encoding failure aborts the whole group
++/// before any I/O; other callers can safely retry their ordinary operation.
++fn flush_group_commit_batch(
++    db: &DB,
++    pending: Vec<PendingWrite>,
++    mut encode: impl FnMut(&WalEntry) -> Result<Vec<u8>>,
++    committed: impl FnOnce(&[PendingWrite]),
++) {
++    if pending.is_empty() {
++        return;
++    }
++    let prepared = (|| -> Result<(WriteBatch, u64)> {
++        let mut batch = WriteBatch::default();
++        let mut last_lsn = 0u64;
++        for write in &pending {
++            let data = encode(&write.entry)?;
++            let key = format!("wal:entries:{:020}", write.entry.lsn);
++            batch.put(key.as_bytes(), &data);
++            last_lsn = last_lsn.max(write.entry.lsn);
++        }
++        batch.put(b"wal:last_lsn", last_lsn.to_le_bytes());
++        Ok((batch, last_lsn))
++    })();
++    let result = prepared.and_then(|(batch, last_lsn)| {
++        let mut options = WriteOptions::default();
++        options.set_sync(true);
++        db.write_opt(batch, &options)
++            .map_err(|error| Error::storage(format!("Group commit batch write failed: {error}")))?;
++        committed(&pending);
++        Ok(last_lsn)
++    });
++    match result {
++        Ok(last_lsn) => {
++            // All durable work and replication publication completed before
++            // the first waiter can release its foreground admission.
++            for write in pending {
++                let _ = write.result_tx.send(Ok(write.entry.lsn));
++            }
++            debug!("Group commit: successfully flushed through LSN {}", last_lsn);
++        }
++        Err(error) => {
++            let message = error.to_string();
++            for write in pending {
++                let _ = write.result_tx.send(Err(Error::storage(message.clone())));
++            }
++            error!("Group commit failed: {}", message);
++        }
++    }
+ }
+ 
+ /// WAL integrity report
+@@ -1221,58 +1273,14 @@
+ 
+             debug!("Group commit: processing {} pending writes", pending.len());
+ 
+-            // Build batch
+-            let mut batch = WriteBatch::default();
+-            let mut last_lsn = 0u64;
+-
+-            for write in &pending {
+-                let lsn = write.entry.lsn;
+-                last_lsn = last_lsn.max(lsn);
+-
+-                // Serialize and seal the entry — the same codec every other
+-                // append path uses, so a group-committed entry lands in the
+-                // same stored form as a directly appended one.
+-                match stored_entry_bytes(key_manager.as_deref(), &write.entry) {
+-                    Ok(data) => {
+-                        let key = format!("wal:entries:{:020}", lsn);
+-                        batch.put(key.as_bytes(), &data);
+-                    }
+-                    Err(e) => {
+-                        // Send error to waiter
+-                        let _ = write.result_tx.send(Err(e));
+-                        continue;
+-                    }
+-                }
+-            }
+-
+-            // Update last LSN marker
+-            batch.put(b"wal:last_lsn", last_lsn.to_le_bytes());
+-
+-            // Flush batch with fsync
+-            let mut write_opts = WriteOptions::default();
+-            write_opts.set_sync(true);
+-
+-            match db.write_opt(batch, &write_opts) {
+-                Ok(()) => {
+-                    // Broadcast to standbys for replication and, in sync/semi-sync
+-                    // mode, wait for the highest batch LSN before reporting success.
+-                    Self::broadcast_after_batch(pending.iter().map(|write| (write.entry.lsn, &write.entry.operation)));
+-
+-                    // Notify all waiters of success
+-                    for write in pending {
+-                        let _ = write.result_tx.send(Ok(write.entry.lsn));
+-                    }
+-                    debug!("Group commit: successfully flushed {} writes", last_lsn);
+-                }
+-                Err(e) => {
+-                    let err_msg = format!("Group commit batch write failed: {}", e);
+-                    // Notify all waiters of failure
+-                    for write in pending {
+-                        let _ = write.result_tx.send(Err(Error::storage(err_msg.clone())));
+-                    }
+-                    error!("Group commit failed: {}", e);
+-                }
+-            }
++            flush_group_commit_batch(
++                &db,
++                pending,
++                |entry| stored_entry_bytes(key_manager.as_deref(), entry),
++                |pending| {
++                    Self::broadcast_after_batch(pending.iter().map(|write| (write.entry.lsn, &write.entry.operation)))
++                },
++            );
+         }
+     }
+ 
+@@ -1649,6 +1657,82 @@
+         opts.create_if_missing(true);
+         let db = DB::open(&opts, temp_dir.path()).unwrap();
+         (temp_dir, Arc::new(db))
++    }
++
++    #[test]
++    fn group_commit_encoding_failure_has_no_tail_write_or_broadcast() {
++        let (_root, db) = create_test_db();
++        db.put(b"wal:last_lsn", 3u64.to_le_bytes()).unwrap();
++        let sequence = db.latest_sequence_number();
++        let mut receivers = Vec::new();
++        let pending = [4, 5, 6]
++            .into_iter()
++            .map(|lsn| {
++                let (result_tx, result_rx) = crossbeam::channel::bounded(1);
++                receivers.push(result_rx);
++                PendingWrite {
++                    entry: WalEntry::new(lsn, WalOperation::Truncate { table: "probe".into() }),
++                    result_tx,
++                }
++            })
++            .collect();
++        let mut encoded = Vec::new();
++        flush_group_commit_batch(
++            &db,
++            pending,
++            |entry| {
++                encoded.push(entry.lsn);
++                if entry.lsn == 5 {
++                    Err(Error::storage("injected sealing failure"))
++                } else {
++                    entry.serialize()
++                }
++            },
++            |_| panic!("failed group was broadcast"),
++        );
++        assert_eq!(encoded, [4, 5]);
++        for receiver in receivers {
++            assert!(receiver
++                .recv()
++                .unwrap()
++                .unwrap_err()
++                .to_string()
++                .contains("injected sealing failure"));
++            assert!(matches!(
++                receiver.try_recv(),
++                Err(crossbeam::channel::TryRecvError::Disconnected)
++            ));
++        }
++        assert_eq!(db.latest_sequence_number(), sequence);
++        assert_eq!(db.get(b"wal:last_lsn").unwrap().unwrap(), 3u64.to_le_bytes());
++        for lsn in [4, 5, 6] {
++            assert!(db.get(format!("wal:entries:{lsn:020}")).unwrap().is_none());
++        }
++    }
++
++    #[test]
++    fn group_commit_success_is_durable_before_publication_and_one_notification() {
++        let (_root, db) = create_test_db();
++        let (tx, rx) = crossbeam::channel::bounded(1);
++        let pending = vec![PendingWrite {
++            entry: WalEntry::new(7, WalOperation::Truncate { table: "probe".into() }),
++            result_tx: tx,
++        }];
++        let mut broadcast = false;
++        flush_group_commit_batch(&db, pending, WalEntry::serialize, |pending| {
++            broadcast = true;
++            assert_eq!(pending.len(), 1);
++            assert_eq!(db.get(b"wal:last_lsn").unwrap().unwrap(), 7u64.to_le_bytes());
++            let raw = db.get(b"wal:entries:00000000000000000007").unwrap().unwrap();
++            assert_eq!(WalEntry::deserialize(&raw).unwrap().lsn, 7);
++            assert!(matches!(rx.try_recv(), Err(crossbeam::channel::TryRecvError::Empty)));
++        });
++        assert!(broadcast);
++        assert_eq!(rx.recv().unwrap().unwrap(), 7);
++        assert!(matches!(
++            rx.try_recv(),
++            Err(crossbeam::channel::TryRecvError::Disconnected)
++        ));
+     }
+ 
+     #[test]

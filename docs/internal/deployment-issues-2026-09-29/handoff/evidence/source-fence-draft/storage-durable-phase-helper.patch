@@ -1,0 +1,45 @@
+--- a/src/storage/engine.rs
++++ b/src/storage/engine.rs
+@@ -1902,6 +1902,21 @@
+ /// persisted — a counter is exactly the kind of value a `static` may hold (see
+ /// the "process-global `static`s" design rule in `src/lib.rs`).
+ static NEXT_STORAGE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
++
++/// Optional complete durable-operation phase. In ordinary builds this is a
++/// no-op; an enabled source disables certification if an armed phase fails.
++pub(crate) struct PhysicalStoragePhase {
++    #[cfg(feature = "ha-tier1")]
++    phase: Option<crate::replication::physical_source_coordinator::PhysicalDurablePhase>,
++}
++impl PhysicalStoragePhase {
++    pub(crate) fn complete(mut self) {
++        #[cfg(feature = "ha-tier1")]
++        if let Some(phase) = self.phase.take() { phase.complete(); }
++        #[cfg(not(feature = "ha-tier1"))]
++        let _ = &mut self;
++    }
++}
+ 
+ /// Storage engine
+ pub struct StorageEngine {
+@@ -4216,6 +4231,20 @@
+         self.physical_source_coordinator.clone()
+     }
+ 
++    /// Arm only after ordinary validation, immediately before the first
++    /// semantic durable write. Complete after every related write/metadata step.
++    pub(crate) fn physical_durable_phase(&self, reason: &'static str) -> Result<PhysicalStoragePhase> {
++        #[cfg(not(feature = "ha-tier1"))]
++        let _ = reason;
++        Ok(PhysicalStoragePhase {
++            #[cfg(feature = "ha-tier1")]
++            phase: self.physical_source_coordinator.as_ref()
++                .map(|coordinator| coordinator.begin_durable_phase(reason)
++                    .map_err(|error| Error::storage(error.to_string())))
++                .transpose()?,
++        })
++    }
++
+     /// Begin a transaction
+     pub fn begin_transaction(&self) -> Result<Transaction> {
+         let snapshot_id = self.next_timestamp();

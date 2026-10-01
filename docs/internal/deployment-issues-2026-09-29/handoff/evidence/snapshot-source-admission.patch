@@ -1,0 +1,475 @@
+--- a/src/storage/time_travel.rs
++++ b/src/storage/time_travel.rs
+@@ -198,6 +198,9 @@
+ ///
+ /// Manages historical snapshots for time-travel queries.
+ pub struct SnapshotManager {
++    #[cfg(feature = "ha-tier1")]
++    physical_source_coordinator:
++        Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>>,
+     /// Database handle
+     db: Arc<DB>,
+     /// In-memory snapshot registry for fast lookups
+@@ -312,7 +315,66 @@
+     }
+ }
+ 
++// No-op in ordinary builds; enabled source phases retain their own !Send permit.
++struct SnapshotDurablePhase {
++    #[cfg(feature = "ha-tier1")]
++    inner: Option<crate::replication::physical_source_coordinator::PhysicalDurablePhase>,
++}
++impl SnapshotDurablePhase {
++    fn complete(mut self) {
++        #[cfg(feature = "ha-tier1")]
++        if let Some(phase) = self.inner.take() {
++            phase.complete();
++        }
++        #[cfg(not(feature = "ha-tier1"))]
++        let _ = &mut self;
++    }
++}
++
+ impl SnapshotManager {
++    /// Engine construction only, before publishing this manager or transactions.
++    #[cfg(feature = "ha-tier1")]
++    pub(crate) fn set_physical_source_coordinator(
++        &mut self,
++        coordinator: Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>>,
++    ) {
++        self.physical_source_coordinator = coordinator;
++    }
++    #[cfg(feature = "ha-tier1")]
++    fn physical_source_operation(
++        &self,
++    ) -> Result<Option<crate::replication::physical_source_coordinator::PhysicalOperationPermit>> {
++        self.physical_source_coordinator
++            .as_ref()
++            .map(|coordinator| {
++                coordinator
++                    .operation()
++                    .map_err(|error| Error::storage(error.to_string()))
++            })
++            .transpose()
++    }
++    #[cfg(not(feature = "ha-tier1"))]
++    fn physical_source_operation(&self) -> Result<Option<()>> {
++        Ok(None)
++    }
++
++    fn begin_durable_phase(&self, reason: &'static str) -> Result<SnapshotDurablePhase> {
++        #[cfg(not(feature = "ha-tier1"))]
++        let _ = reason;
++        Ok(SnapshotDurablePhase {
++            #[cfg(feature = "ha-tier1")]
++            inner: self
++                .physical_source_coordinator
++                .as_ref()
++                .map(|coordinator| {
++                    coordinator
++                        .begin_durable_phase(reason)
++                        .map_err(|error| Error::storage(error.to_string()))
++                })
++                .transpose()?,
++        })
++    }
++
+     /// Create a new snapshot manager
+     pub fn new(db: Arc<DB>) -> Self {
+         let cache_config = CacheConfig::default();
+@@ -337,6 +399,8 @@
+             elide_latest_version: AtomicBool::new(false),
+             maybe_elided_rows: AtomicBool::new(false),
+             key_manager: None,
++            #[cfg(feature = "ha-tier1")]
++            physical_source_coordinator: None,
+         }
+     }
+ 
+@@ -372,6 +436,8 @@
+             elide_latest_version: AtomicBool::new(false),
+             maybe_elided_rows: AtomicBool::new(false),
+             key_manager: None,
++            #[cfg(feature = "ha-tier1")]
++            physical_source_coordinator: None,
+         }
+     }
+ 
+@@ -398,6 +464,8 @@
+             elide_latest_version: AtomicBool::new(false),
+             maybe_elided_rows: AtomicBool::new(false),
+             key_manager: None,
++            #[cfg(feature = "ha-tier1")]
++            physical_source_coordinator: None,
+         }
+     }
+ 
+@@ -462,6 +530,13 @@
+     }
+ 
+     pub fn configure_elision(&self, elide_latest_version: bool) {
++        let _physical_operation = match self.physical_source_operation() {
++            Ok(permit) => permit,
++            Err(error) => {
++                eprintln!("Warning: refusing elision configuration: {error}");
++                return;
++            }
++        };
+         self.elide_latest_version.store(elide_latest_version, Ordering::Relaxed);
+ 
+         let sentinel_present = matches!(self.db.get(ELIDE_SENTINEL_KEY), Ok(Some(_)));
+@@ -476,8 +551,19 @@
+             let sentinel_durable = if sentinel_present || !self.persist_metadata {
+                 true
+             } else {
++                let phase = match self.begin_durable_phase("elision sentinel write did not complete") {
++                    Ok(phase) => phase,
++                    Err(error) => {
++                        self.elide_latest_version.store(false, Ordering::Relaxed);
++                        eprintln!("Warning: refusing elision sentinel write: {error}");
++                        return;
++                    }
++                };
+                 match self.db.put(ELIDE_SENTINEL_KEY, [1u8]) {
+-                    Ok(()) => true,
++                    Ok(()) => {
++                        phase.complete();
++                        true
++                    }
+                     Err(e) => {
+                         eprintln!(
+                             "Warning: W3.2 failed to persist elision sentinel; disabling elision \
+@@ -529,6 +615,7 @@
+     /// This should be called every time a transaction commits to track
+     /// the snapshot state at that point in time.
+     pub fn register_snapshot(&self, timestamp: u64) -> Result<SnapshotMetadata> {
++        let _physical_operation = self.physical_source_operation()?;
+         let txn_id = self.next_transaction_id();
+         self.register_snapshot_internal(timestamp, txn_id)
+     }
+@@ -539,6 +626,7 @@
+     /// which enables AS OF TRANSACTION queries to use the same IDs that
+     /// users see in the REPL.
+     pub fn register_snapshot_with_lsn(&self, timestamp: u64, lsn: u64) -> Result<SnapshotMetadata> {
++        let _physical_operation = self.physical_source_operation()?;
+         // Update our internal counter to stay ahead of externally provided LSNs.
+         // W2.2(d): fetch_max is the atomic equivalent of the former
+         // `if lsn >= *txn_id { *txn_id = lsn + 1 }` guarded assignment.
+@@ -557,6 +645,11 @@
+         self.txn_to_timestamp.write().insert(txn_id, timestamp);
+         self.scn_to_timestamp.write().insert(scn, timestamp);
+ 
++        let phase = if self.persist_metadata {
++            Some(self.begin_durable_phase("snapshot registration did not complete")?)
++        } else {
++            None
++        };
+         if self.persist_metadata {
+             self.persist_snapshot_metadata(&metadata)?;
+         }
+@@ -568,6 +661,9 @@
+             }
+         }
+ 
++        if let Some(phase) = phase {
++            phase.complete();
++        }
+         Ok(metadata)
+     }
+ 
+@@ -1088,11 +1184,13 @@
+     /// Also creates a reverse timestamp index entry for efficient lookups.
+     /// Invalidates cache entries for this row.
+     pub fn write_version(&self, table_name: &str, row_id: u64, timestamp: u64, value: &[u8]) -> Result<()> {
++        let _physical_operation = self.physical_source_operation()?;
+         // Write the actual versioned data. `v:` holds a copy of the row image,
+         // so it is sealed exactly like the `data:` row it mirrors — a plaintext
+         // version chain beside a ciphertext row would defeat the whole point.
+         let key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
+         let stored = self.seal_stored(value)?;
++        let phase = self.begin_durable_phase("version and reverse index write did not complete")?;
+         self.db
+             .put(key.as_bytes(), stored.as_ref())
+             .map_err(|e| Error::storage(format!("Failed to write version: {}", e)))?;
+@@ -1107,6 +1205,7 @@
+         // since a new version may affect reads at different snapshot timestamps
+         self.invalidate_cache_for_row(table_name, row_id);
+ 
++        phase.complete();
+         Ok(())
+     }
+ 
+@@ -1130,6 +1229,7 @@
+         lsn: Option<u64>,
+         allow_elide: bool,
+     ) -> Result<SnapshotMetadata> {
++        let _physical_operation = self.physical_source_operation()?;
+         let (metadata, txn_id, scn) = self.allocate_snapshot_metadata(timestamp, lsn);
+         let mut batch = WriteBatch::default();
+         self.append_version_snapshot_to_batch(
+@@ -1144,8 +1244,11 @@
+             &metadata,
+             allow_elide,
+         )?;
++        let phase = self.begin_durable_phase("version snapshot batch did not complete")?;
+         self.write_batch(batch, "Failed to write version snapshot batch")?;
+-        self.finish_version_snapshot(table_name, row_id, timestamp, txn_id, scn, metadata)
++        let metadata = self.finish_version_snapshot(table_name, row_id, timestamp, txn_id, scn, metadata)?;
++        phase.complete();
++        Ok(metadata)
+     }
+ 
+     /// Write current row data plus its time-travel version/snapshot metadata in
+@@ -1168,6 +1271,7 @@
+         write_options: Option<&WriteOptions>,
+         allow_elide: bool,
+     ) -> Result<SnapshotMetadata> {
++        let _physical_operation = self.physical_source_operation()?;
+         let (metadata, txn_id, scn) = self.allocate_snapshot_metadata(timestamp, lsn);
+         let mut batch = WriteBatch::default();
+         // THE DEFAULT AUTOCOMMIT INSERT'S ONLY `data:` WRITE. `insert_tuple_fast`
+@@ -1205,6 +1309,7 @@
+             allow_elide,
+         )?;
+ 
++        let phase = self.begin_durable_phase("data/version snapshot batch did not complete")?;
+         if let Some(opts) = write_options {
+             self.db
+                 .write_opt(batch, opts)
+@@ -1213,7 +1318,9 @@
+             self.write_batch(batch, "Failed to write data/version snapshot batch")?;
+         }
+ 
+-        self.finish_version_snapshot(table_name, row_id, timestamp, txn_id, scn, metadata)
++        let metadata = self.finish_version_snapshot(table_name, row_id, timestamp, txn_id, scn, metadata)?;
++        phase.complete();
++        Ok(metadata)
+     }
+ 
+     fn allocate_snapshot_metadata(&self, timestamp: u64, lsn: Option<u64>) -> (SnapshotMetadata, TransactionId, Scn) {
+@@ -1302,6 +1409,7 @@
+     /// cleared BEFORE `data:` changes. Gated by `maybe_elided_rows` (one relaxed
+     /// load) so non-elision databases pay nothing.
+     pub(crate) fn materialize_copy_marker_row_durable(&self, table_name: &str, row_id: u64) -> Result<()> {
++        let _physical_operation = self.physical_source_operation()?;
+         if !self.copy_markers.is_empty() {
+             self.materialize_copy_marker_row_durable_inner(table_name, row_id)?;
+         }
+@@ -1338,7 +1446,9 @@
+             let reverse_ts = u64::MAX - marker_ts;
+             let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
+             batch.put(index_key.as_bytes(), marker_ts.to_be_bytes());
++            let phase = self.begin_durable_phase("copy marker materialize write did not complete")?;
+             self.write_batch(batch, "copy marker materialize")?;
++            phase.complete();
+         }
+         Ok(())
+     }
+@@ -1390,7 +1500,9 @@
+             let version_key = format!("v:{}:{}:{}", table_name, row_id, event_ts);
+             batch.put(version_key.as_bytes(), &old_value);
+             batch.put(&index_key, encode_version_index_value(event_ts, false));
++            let phase = self.begin_durable_phase("elided version materialize write did not complete")?;
+             self.write_batch(batch, "elided version materialize")?;
++            phase.complete();
+         }
+         Ok(())
+     }
+@@ -1636,6 +1748,7 @@
+     /// - Beyond max_snapshots limit
+     /// - Marked as gc_eligible
+     pub fn gc_old_snapshots(&self) -> Result<usize> {
++        let _physical_operation = self.physical_source_operation()?;
+         let now = Utc::now().timestamp() as u64;
+         let min_retention = self.gc_config.min_retention_seconds;
+ 
+@@ -1673,6 +1786,11 @@
+ 
+         // Remove snapshots
+         let count = to_remove.len();
++        let phase = if count > 0 && self.persist_metadata {
++            Some(self.begin_durable_phase("snapshot GC did not complete")?)
++        } else {
++            None
++        };
+         let mut delete_batch = WriteBatch::default();
+         for ts in &to_remove {
+             if let Some(metadata) = snapshots.remove(ts) {
+@@ -1700,6 +1818,9 @@
+             self.write_batch(delete_batch, "Failed to delete old snapshots")?;
+         }
+ 
++        if let Some(phase) = phase {
++            phase.complete();
++        }
+         Ok(count)
+     }
+ 
+@@ -2327,3 +2448,167 @@
+         }
+     }
+ }
++
++#[cfg(all(test, feature = "ha-tier1"))]
++#[allow(clippy::unwrap_used, clippy::expect_used)]
++mod physical_source_admission_tests {
++    use super::*;
++    use crate::replication::physical_source_coordinator::{CoordinatorError, PhysicalSourceCoordinator};
++    use std::{sync::mpsc, thread, time::Duration};
++
++    struct JoinedThread<T>(Option<thread::JoinHandle<T>>);
++    impl<T> JoinedThread<T> {
++        fn join(mut self) -> thread::Result<T> {
++            self.0.take().unwrap().join()
++        }
++    }
++    impl<T> Drop for JoinedThread<T> {
++        fn drop(&mut self) {
++            if let Some(handle) = self.0.take() {
++                let _ = handle.join();
++            }
++        }
++    }
++    fn manager(db: Arc<DB>, gc: GcConfig) -> (SnapshotManager, Arc<PhysicalSourceCoordinator>) {
++        let coordinator = Arc::new(PhysicalSourceCoordinator::new(db.clone()));
++        let mut manager = SnapshotManager::with_gc_config(db, gc);
++        manager.set_physical_source_coordinator(Some(coordinator.clone()));
++        (manager, coordinator)
++    }
++    fn writable(path: &std::path::Path) -> Arc<DB> {
++        let mut options = rocksdb::Options::default();
++        options.create_if_missing(true);
++        Arc::new(DB::open(&options, path).unwrap())
++    }
++
++    #[test]
++    fn snapshot_registration_waits_for_capture_and_publishes_complete_metadata() {
++        let root = tempfile::tempdir().unwrap();
++        let db = writable(&root.path().join("db"));
++        let (manager, coordinator) = manager(
++            db.clone(),
++            GcConfig {
++                auto_gc_enabled: false,
++                ..GcConfig::default()
++            },
++        );
++        let (entered_tx, entered_rx) = mpsc::channel();
++        let (done_tx, done_rx) = mpsc::channel();
++        // Declare the fence after the joining owner so unwind releases it before join.
++        let mut worker = JoinedThread(None);
++        let fence = coordinator.fence(Duration::from_secs(1)).unwrap();
++        worker.0 = Some(thread::spawn(move || {
++            entered_tx.send(()).unwrap();
++            let result = manager.register_snapshot_with_lsn(71, 91);
++            done_tx.send(result).unwrap();
++        }));
++        let entered = entered_rx.recv_timeout(Duration::from_secs(2));
++        let early = done_rx.recv_timeout(Duration::from_millis(40));
++        let during = db.get(b"snapshot:71").unwrap();
++        drop(fence);
++        let completed = done_rx.recv_timeout(Duration::from_secs(2));
++        let joined = worker.join();
++        assert!(entered.is_ok() && matches!(early, Err(mpsc::RecvTimeoutError::Timeout)));
++        assert!(during.is_none());
++        let metadata = completed.unwrap().unwrap();
++        assert_eq!(metadata.transaction_id, 91);
++        let stored = deserialize_snapshot_metadata(&db.get(b"snapshot:71").unwrap().unwrap()).unwrap();
++        assert_eq!((stored.timestamp, stored.transaction_id), (71, 91));
++        assert!(joined.is_ok());
++        assert!(coordinator.fence(Duration::from_secs(1)).is_ok());
++    }
++
++    #[test]
++    fn successful_versions_and_noop_materialization_leave_certification_available() {
++        let root = tempfile::tempdir().unwrap();
++        let db = writable(&root.path().join("db"));
++        let (manager, coordinator) = manager(
++            db.clone(),
++            GcConfig {
++                auto_gc_enabled: false,
++                ..GcConfig::default()
++            },
++        );
++        manager.materialize_copy_marker_row_durable("absent", 1).unwrap();
++        assert_eq!(db.latest_sequence_number(), 0);
++        manager.write_version("probe", 7, 31, b"original").unwrap();
++        let index = format!("v_idx:probe:7:{:020}", u64::MAX - 31);
++        assert_eq!(
++            db.get(b"v:probe:7:31").unwrap().as_deref(),
++            Some(b"original".as_slice())
++        );
++        assert_eq!(db.get(index).unwrap().as_deref(), Some(31u64.to_be_bytes().as_slice()));
++        manager
++            .write_data_version_and_register_snapshot(
++                b"data:probe:7",
++                b"new",
++                "probe",
++                7,
++                32,
++                b"new",
++                Some(101),
++                None,
++                false,
++            )
++            .unwrap();
++        assert_eq!(
++            manager.read_at_snapshot("probe", 7, 31).unwrap().as_deref(),
++            Some(b"original".as_slice())
++        );
++        assert_eq!(db.get(b"data:probe:7").unwrap().as_deref(), Some(b"new".as_slice()));
++        assert_eq!(manager.get_snapshot_metadata(32).unwrap().transaction_id, 101);
++        assert!(coordinator.fence(Duration::from_secs(1)).is_ok());
++    }
++
++    #[test]
++    fn swallowed_auto_gc_storage_error_revokes_certification_but_keeps_primary_admission() {
++        let root = tempfile::tempdir().unwrap();
++        let path = root.path().join("db");
++        {
++            let db = writable(&path);
++            let manager = SnapshotManager::with_gc_config(
++                db,
++                GcConfig {
++                    auto_gc_enabled: false,
++                    ..GcConfig::default()
++                },
++            );
++            manager.register_snapshot(1).unwrap();
++            manager.register_snapshot(2).unwrap();
++        }
++        // A real RocksDB read-only write failure exercises the swallowed GC path
++        // without changing permissions or injecting failures into production code.
++        let db = Arc::new(DB::open_for_read_only(&rocksdb::Options::default(), &path, false).unwrap());
++        let (manager, coordinator) = manager(
++            db.clone(),
++            GcConfig {
++                max_snapshots: 0,
++                auto_gc_enabled: true,
++                ..GcConfig::default()
++            },
++        );
++        manager.recover_snapshots().unwrap();
++        let sequence = db.latest_sequence_number();
++        let original = db.get(b"snapshot:1").unwrap();
++        let operation = coordinator.operation().unwrap();
++        let result = manager.finish_version_snapshot("probe", 7, 3, 3, 3, SnapshotMetadata::new(3, 3, 3));
++        drop(operation);
++        assert!(result.is_ok(), "legacy SQL-facing GC suppression stays unchanged");
++        assert_eq!(db.latest_sequence_number(), sequence);
++        assert_eq!(db.get(b"snapshot:1").unwrap(), original);
++        assert!(original.is_some());
++        assert_eq!(
++            manager.snapshot_count(),
++            0,
++            "GC reached its removal phase before the real storage failure"
++        );
++        assert!(matches!(
++            coordinator.fence(Duration::from_secs(1)),
++            Err(CoordinatorError::Poisoned(_))
++        ));
++        assert!(
++            coordinator.operation().is_ok(),
++            "certification poison must not disable ordinary primary admission"
++        );
++    }
++}

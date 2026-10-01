@@ -1,0 +1,157 @@
+{
+  "identities_before": {
+    "/home/gpc/HDB/worktrees/nano-resync-fix-20260929/target-campaign/debug/heliosdb-nano": "bd936b9119acd847e579684cc0252cfeb4e0d62fd7a21cd328ee3ba18251d87d",
+    "/home/gpc/HDB/worktrees/nano-resync-fix-20260929/target-campaign/debug/examples/inspect_physical_fixture": "d69bc47a0c34e998cdfb3d500d29734322cb17e03dcd62d991825731e495c961",
+    "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/probe_standby_wire_writes.py": "5cb0fae61a7687154a00c4cdb7adf5f0fbb0b5edc42124ab0e71071173e84138",
+    "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/cli-resync-regression/run_cli_resync_regression.py": "a3d92ab3aab9d87a032f9aac6d4b8e4f58c5c486df895c4fb8e45c69bf52d3c6"
+  },
+  "fixture_root": "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/cli-resync-regression-result-final/cli-raw-resync-sudkqcei",
+  "scope": "NON-SERVING raw CLI transfer only",
+  "regression": {
+    "status": "pass",
+    "checks": [
+      "bad-auth: nonzero exit, no destination adoption",
+      "bad-history: nonzero exit, no destination adoption",
+      "fresh existing destination refused byte-for-byte",
+      "snapshot-only seed plus later committed UPDATE/INSERT match closed raw prefix",
+      "restart Resume preserves history/snapshot, advances cursor, copies committed DELETE/INSERT",
+      "normal SQL start refuses physical receiver without mutation/readiness"
+    ],
+    "scope": "NON-SERVING closed raw row-prefix/history/cursor proof only",
+    "phase1": {
+      "cursor": {
+        "format": 1,
+        "history": "3945a9fd-7b92-4114-b970-847d31892b2a",
+        "last_digest": [
+          193,
+          20,
+          139,
+          16,
+          158,
+          254,
+          60,
+          241,
+          211,
+          0,
+          210,
+          106,
+          32,
+          184,
+          204,
+          94,
+          165,
+          83,
+          241,
+          194,
+          226,
+          176,
+          255,
+          108,
+          82,
+          234,
+          50,
+          241,
+          100,
+          111,
+          143,
+          121
+        ],
+        "last_first_sequence": 36,
+        "local_sequence": 40,
+        "snapshot_sequence": 24,
+        "source_sequence": 36
+      },
+      "history": "3945a9fd-7b92-4114-b970-847d31892b2a",
+      "latest_sequence": 40,
+      "path": "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/cli-resync-regression-result-final/cli-raw-resync-sudkqcei/fixture/destinations/receiver",
+      "record_digest": "17ec3e31808ff4ac43dae98ef350ef480c398cf025e3737e994fc0d2429703ab",
+      "records": [
+        {
+          "key_hex": "646174613a726573796e635f636c695f70726f62653a31",
+          "value_hex": "02000000000000000300000001000000080000000800000000000000666f6c6c6f776564010100000000000000"
+        },
+        {
+          "key_hex": "646174613a726573796e635f636c695f70726f62653a32",
+          "value_hex": "0200000000000000030000000a000000080000000d00000000000000736e617073686f742d6f6e6c7900"
+        },
+        {
+          "key_hex": "646174613a726573796e635f636c695f70726f62653a33",
+          "value_hex": "02000000000000000300000002000000080000000b0000000000000073747265616d2d6f6e6c7900"
+        }
+      ],
+      "scope": "closed raw row-prefix/cursor evidence only; no SQL hydration or serving readiness",
+      "snapshot_id": "30e70fcc-ed10-4ac3-8fd5-362e0217991a"
+    },
+    "phase2": {
+      "cursor": {
+        "format": 1,
+        "history": "3945a9fd-7b92-4114-b970-847d31892b2a",
+        "last_digest": [
+          243,
+          210,
+          252,
+          255,
+          213,
+          246,
+          249,
+          181,
+          71,
+          82,
+          213,
+          10,
+          28,
+          3,
+          16,
+          208,
+          173,
+          249,
+          100,
+          22,
+          165,
+          224,
+          56,
+          189,
+          160,
+          234,
+          177,
+          190,
+          122,
+          179,
+          33,
+          124
+        ],
+        "last_first_sequence": 64,
+        "local_sequence": 79,
+        "snapshot_sequence": 24,
+        "source_sequence": 64
+      },
+      "history": "3945a9fd-7b92-4114-b970-847d31892b2a",
+      "latest_sequence": 79,
+      "path": "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/cli-resync-regression-result-final/cli-raw-resync-sudkqcei/fixture/destinations/receiver",
+      "record_digest": "9952769e4a9f85db14cc78d59d7f22b12fd6b4d51d7570cd5f14044f19ccb289",
+      "records": [
+        {
+          "key_hex": "646174613a726573796e635f636c695f70726f62653a32",
+          "value_hex": "0200000000000000030000000a000000080000000d00000000000000736e617073686f742d6f6e6c7900"
+        },
+        {
+          "key_hex": "646174613a726573796e635f636c695f70726f62653a33",
+          "value_hex": "02000000000000000300000002000000080000000b0000000000000073747265616d2d6f6e6c7900"
+        },
+        {
+          "key_hex": "646174613a726573796e635f636c695f70726f62653a34",
+          "value_hex": "02000000000000000300000003000000080000000c00000000000000726573756d65642d6f6e6c7900"
+        }
+      ],
+      "scope": "closed raw row-prefix/cursor evidence only; no SQL hydration or serving readiness",
+      "snapshot_id": "30e70fcc-ed10-4ac3-8fd5-362e0217991a"
+    }
+  },
+  "identities_after": {
+    "/home/gpc/HDB/worktrees/nano-resync-fix-20260929/target-campaign/debug/heliosdb-nano": "bd936b9119acd847e579684cc0252cfeb4e0d62fd7a21cd328ee3ba18251d87d",
+    "/home/gpc/HDB/worktrees/nano-resync-fix-20260929/target-campaign/debug/examples/inspect_physical_fixture": "d69bc47a0c34e998cdfb3d500d29734322cb17e03dcd62d991825731e495c961",
+    "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/probe_standby_wire_writes.py": "5cb0fae61a7687154a00c4cdb7adf5f0fbb0b5edc42124ab0e71071173e84138",
+    "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/cli-resync-regression/run_cli_resync_regression.py": "a3d92ab3aab9d87a032f9aac6d4b8e4f58c5c486df895c4fb8e45c69bf52d3c6"
+  },
+  "identity_unchanged": true
+}

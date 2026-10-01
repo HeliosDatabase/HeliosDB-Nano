@@ -1,0 +1,18 @@
+{
+  "patch_apply_at_base": {
+    "admission.patch": {
+      "exit": 0,
+      "stderr": ""
+    },
+    "native-auth.patch": {
+      "exit": 0,
+      "stderr": ""
+    },
+    "physical-resync.patch": {
+      "exit": 0,
+      "stderr": ""
+    }
+  },
+  "python_ast": "pass",
+  "runtime_gates": "historical exact candidates only; no production changes during packaging"
+}
