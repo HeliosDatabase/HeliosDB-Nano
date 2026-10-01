@@ -1140,6 +1140,16 @@ struct CachedRows {
     login: Option<std::sync::Arc<str>>,
     /// The rows themselves, shared with every reader that hits this entry.
     rows: std::sync::Arc<Vec<Tuple>>,
+    /// The visibility state captured before the query read any rows. An older
+    /// in-flight query may publish after replay invalidates the caches; its
+    /// entry must remain a miss even after another reader reconciles the cache.
+    epoch: ResultCacheEpoch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResultCacheEpoch {
+    local: u64,
+    storage: u64,
 }
 
 pub struct EmbeddedDatabase {
@@ -1302,7 +1312,7 @@ pub struct EmbeddedDatabase {
     /// performs — so comparing it before serving cached rows closes the hole for ANY
     /// out-of-handle catalog change, not just MV refresh.
     seen_schema_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Last result-cache entry served: `(principal, SQL text, rows)`, carrying
+    /// Last result-cache entry served: `(SQL text, cached rows)`, carrying
     /// its principal exactly like `result_cache` (HDB-009). Hot repeated
     /// SELECTs avoid touching the sharded LRU on every call; cleared by the same
     /// invalidation gate. Probing it is allocation-free — the SQL is compared by
@@ -1314,10 +1324,9 @@ pub struct EmbeddedDatabase {
     /// only — an entry belonging to another principal is a miss and the query
     /// is recomputed, never answered wrongly — and it is the price of the
     /// alternative being an owned cache key built on every probe. A
-    /// single-principal workload (which is every measured benchmark, and most
-    /// deployments) is byte-identical to before.
-    hot_result_cache_entry:
-        std::sync::Arc<parking_lot::RwLock<Option<(Option<std::sync::Arc<str>>, String, std::sync::Arc<Vec<Tuple>>)>>>,
+    /// single-principal workload keeps the same cache admission behavior;
+    /// each hit also checks the entry's local and storage generations.
+    hot_result_cache_entry: std::sync::Arc<parking_lot::RwLock<Option<(String, std::sync::Arc<CachedRows>)>>>,
     /// Fingerprint of the most recent literal fast PK lookup. Used to avoid
     /// filling the result cache with one-off point lookups while still caching
     /// repeated hot-key queries after the second consecutive hit.
@@ -3775,7 +3784,7 @@ impl EmbeddedDatabase {
         })
     }
 
-    fn maybe_cache_repeated_fast_select(&self, sql: &str, results: &[Tuple], cache_epoch: u64) {
+    fn maybe_cache_repeated_fast_select(&self, sql: &str, results: &[Tuple], cache_epoch: ResultCacheEpoch) {
         let fingerprint = Self::fast_select_fingerprint(sql);
         let previous = self
             .last_fast_select_fingerprint
@@ -3791,8 +3800,11 @@ impl EmbeddedDatabase {
     /// BEFORE it reads any data; passed back to `cache_query_result`, which
     /// refuses to publish if anything invalidated the cache in between.
     #[inline]
-    fn result_cache_epoch(&self) -> u64 {
-        self.result_cache_epoch.load(std::sync::atomic::Ordering::Acquire)
+    fn result_cache_epoch(&self) -> ResultCacheEpoch {
+        ResultCacheEpoch {
+            local: self.result_cache_epoch.load(std::sync::atomic::Ordering::Acquire),
+            storage: self.storage.schema_generation(),
+        }
     }
 
     /// R1.1 (ROADMAP_V5 §1.1 Residual, "the result cache is not tenant-keyed"):
@@ -3818,7 +3830,7 @@ impl EmbeddedDatabase {
     /// context-active reader can reach it. Entries cached *before* a context
     /// was ever set (the poisoned-pre-existing-entry case) need no migration or
     /// epoch bump for the same reason: the read gate makes them inert.
-    fn cache_query_result(&self, sql: &str, results: &[Tuple], cache_epoch: u64) {
+    fn cache_query_result(&self, sql: &str, results: &[Tuple], cache_epoch: ResultCacheEpoch) {
         if self.has_effective_tenant_context() {
             return;
         }
@@ -3830,16 +3842,13 @@ impl EmbeddedDatabase {
         if self.result_cache_epoch() != cache_epoch {
             return;
         }
-        let login = session_login_user_tls();
-        let cached = std::sync::Arc::new(results.to_vec());
-        self.result_cache.put(
-            sql.to_string(),
-            std::sync::Arc::new(CachedRows {
-                login: login.clone(),
-                rows: std::sync::Arc::clone(&cached),
-            }),
-        );
-        *self.hot_result_cache_entry.write() = Some((login, sql.to_string(), cached));
+        let cached = std::sync::Arc::new(CachedRows {
+            login: session_login_user_tls(),
+            rows: std::sync::Arc::new(results.to_vec()),
+            epoch: cache_epoch,
+        });
+        self.result_cache.put(sql.to_string(), std::sync::Arc::clone(&cached));
+        *self.hot_result_cache_entry.write() = Some((sql.to_string(), cached));
         self.result_cache_nonempty
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -3861,12 +3870,11 @@ impl EmbeddedDatabase {
         // removed, so two principals alternating on the same SQL each keep
         // re-publishing rather than serving each other's rows.
         let entry = self.result_cache.get(sql)?;
-        if !session_login_user_is(entry.login.as_deref()) {
+        if entry.epoch != self.result_cache_epoch() || !session_login_user_is(entry.login.as_deref()) {
             return None;
         }
         let rows = std::sync::Arc::clone(&entry.rows);
-        *self.hot_result_cache_entry.write() =
-            Some((entry.login.clone(), sql.to_string(), std::sync::Arc::clone(&rows)));
+        *self.hot_result_cache_entry.write() = Some((sql.to_string(), entry));
         Some(rows)
     }
 
@@ -3885,8 +3893,11 @@ impl EmbeddedDatabase {
         self.hot_result_cache_entry
             .read()
             .as_ref()
-            .and_then(|(login, hot_sql, rows)| {
-                (hot_sql == sql && session_login_user_is(login.as_deref())).then(|| std::sync::Arc::clone(rows))
+            .and_then(|(hot_sql, entry)| {
+                (hot_sql == sql
+                    && entry.epoch == self.result_cache_epoch()
+                    && session_login_user_is(entry.login.as_deref()))
+                .then(|| std::sync::Arc::clone(&entry.rows))
             })
     }
 
@@ -3901,11 +3912,12 @@ impl EmbeddedDatabase {
     /// pre-refresh rows indefinitely while `pg_matviews.last_refresh` advanced —
     /// exactly the staleness lie auto-refresh is supposed to eliminate.
     ///
-    /// Cost on the hot path is one `Acquire` load and a compare, paid only when a
-    /// cached read is actually attempted (which already takes an `RwLock` read or an
-    /// LRU lookup). `schema_generation` is bumped only by catalog-existence changes
-    /// (CREATE / ALTER / DROP / RENAME / branch switch / merge-to-main), never by
-    /// per-row DML, so this adds no invalidations to the write path.
+    /// Reconciliation compares the storage and last-seen generations when a
+    /// cached read is attempted. Entry probes additionally compare their local
+    /// and storage epochs. The storage generation also changes after live WAL replay,
+    /// whose writes bypass this handle. Normal local DML uses the existing local
+    /// invalidation epoch. Each cached entry is additionally generation-tagged:
+    /// clearing alone cannot stop an older in-flight reader publishing later.
     #[inline]
     fn reconcile_result_cache_with_storage(&self) {
         let current = self.storage.schema_generation();
@@ -29279,6 +29291,64 @@ mod tests {
             db.try_cached_query_with_schema(sql).is_none(),
             "an out-of-band schema-generation bump must invalidate cached results"
         );
+    }
+
+    // Model an in-flight publisher which passed its early epoch check before
+    // invalidation, then resumes after the clearing reader has already run.
+    // Retaining the original entry is essential: relabeling old rows with the
+    // current epoch would make a sequential test miss this publication race.
+    fn assert_late_result_cache_publication_is_rejected(storage_invalidation: bool) {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE late_cache (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        db.execute("INSERT INTO late_cache VALUES (1, 10)").unwrap();
+        let sql = "SELECT id, val FROM late_cache WHERE val IS NOT NULL";
+        db.query_with_columns(sql).unwrap();
+        db.query_with_columns(sql).unwrap();
+        let old = db.result_cache.get(sql).expect("warm shared cache");
+        assert!(db.hot_cached_query_result(sql).is_some());
+
+        if storage_invalidation {
+            db.storage.bump_schema_generation();
+            db.reconcile_result_cache_with_storage();
+        } else {
+            db.execute("UPDATE late_cache SET val = 20 WHERE id = 1").unwrap();
+        }
+        assert_ne!(old.epoch, db.result_cache_epoch());
+        assert_eq!(
+            db.seen_schema_generation.load(std::sync::atomic::Ordering::Acquire),
+            db.storage.schema_generation(),
+            "the clearing reader has already consumed the generation change"
+        );
+
+        // Force late publication into both independently accessible cache paths.
+        db.result_cache.put(sql.to_string(), std::sync::Arc::clone(&old));
+        *db.hot_result_cache_entry.write() = Some((sql.to_string(), old));
+        db.result_cache_nonempty
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(db.hot_cached_query_result(sql).is_none(), "late hot entry must miss");
+        *db.hot_result_cache_entry.write() = None;
+        assert!(db.cached_query_result(sql).is_none(), "late shared entry must miss");
+
+        // Current entries must remain useful, including shared-to-hot promotion.
+        let fresh = db.query(sql, &[]).unwrap();
+        let expected = if storage_invalidation { 10 } else { 20 };
+        assert_eq!(fresh[0].get(1), Some(&Value::Int4(expected)));
+        db.cache_query_result(sql, &fresh, db.result_cache_epoch());
+        *db.hot_result_cache_entry.write() = None;
+        let shared = db.cached_query_result(sql).expect("current shared entry");
+        let hot = db.hot_cached_query_result(sql).expect("current promoted entry");
+        assert!(std::sync::Arc::ptr_eq(&shared, &hot));
+    }
+
+    #[test]
+    fn late_result_cache_publication_after_local_invalidation_is_rejected() {
+        assert_late_result_cache_publication_is_rejected(false);
+    }
+
+    #[test]
+    fn late_result_cache_publication_after_storage_invalidation_is_rejected() {
+        assert_late_result_cache_publication_is_rejected(true);
     }
 
     #[test]

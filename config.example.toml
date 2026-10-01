@@ -401,6 +401,29 @@ mysql_tls_enabled = false
 mysql_tls_post_quantum = true
 
 # ============================================================================
+# NATIVE WAL REPLICATION CONFIGURATION
+# ============================================================================
+[replication]
+# Explicit start-command CLI flags override individual values below, including
+# values equal to CLI defaults. Unspecified fields retain these file values.
+# Unknown keys in this section are rejected to catch configuration mistakes.
+role = "standalone" # standalone | primary | standby | observer
+
+# Native WAL protocol port, NOT the PostgreSQL, MySQL, or HTTP listener port.
+# "port" is accepted as an alias; do not specify both names.
+replication_port = 5433
+
+# Required when the effective role is standby. Use a native WAL
+# endpoint: DNS:port, IPv4:port, or [IPv6]:port; ports must be nonzero.
+# primary_host = "primary.example:5433"
+# Peer lists are retained like the equivalent CLI flags; this build's tier-1
+# streaming server accepts connecting standbys and does not dial these lists.
+standby_hosts = [] # e.g. ["standby.example:5433", "[2001:db8::2]:5433"]
+observer_hosts = [] # e.g. ["observer.example:5433"]
+sync_mode = "async" # async | semi-sync (alias semisync) | sync
+# node_id = "550e8400-e29b-41d4-a716-446655440000" # UUID; generated if omitted
+
+# ============================================================================
 # PERFORMANCE CONFIGURATION
 # ============================================================================
 [performance]

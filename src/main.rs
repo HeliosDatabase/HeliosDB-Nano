@@ -27,7 +27,49 @@ struct HAConfig {
     http_listen: Option<String>,
     mcp_token: Option<String>,
     allow_remote_mcp: bool,
+    allow_insecure_trust: bool,
     node_id: Option<String>,
+}
+
+/// Literal addresses only, with explicit port taking precedence over socket suffix.
+fn parse_listen_address(value: &str, explicit_port: Option<u16>, default_port: u16) -> Result<std::net::SocketAddr> {
+    use std::net::{IpAddr, SocketAddr};
+    if let Ok(mut address) = value.parse::<SocketAddr>() {
+        if let Some(port) = explicit_port {
+            address.set_port(port);
+        }
+        return Ok(address);
+    }
+    let bare = value
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(value);
+    let ip = bare.parse::<IpAddr>().map_err(|_| {
+        Error::config(format!(
+        "Invalid listen address '{value}': use an IPv4/IPv6 address or IP:port (bracket IPv6 sockets, e.g. [::1]:8080)"
+    ))
+    })?;
+    Ok(SocketAddr::new(ip, explicit_port.unwrap_or(default_port)))
+}
+
+fn resolve_http_address(value: &str, port: Option<u16>) -> Result<Option<std::net::SocketAddr>> {
+    // Explicit disable wins even over an invalid or port-bearing address.
+    if port == Some(0) {
+        return Ok(None);
+    }
+    let address = parse_listen_address(value, port, 8080)?;
+    if address.port() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(address))
+}
+
+fn split_hosts(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        value.split(',').map(|s| s.trim().to_string()).collect()
+    }
 }
 
 /// GH#28: CLI overrides for the `[server]` connection-lifetime keys. Every
@@ -217,12 +259,16 @@ enum Commands {
         /// PostgreSQL TLS listener, in addition to a classical fallback for
         /// clients that don't support it. Only meaningful with --tls-cert /
         /// --tls-key. Default: on.
-        #[arg(long, default_value = "true")]
+        #[arg(long, default_value = "true", default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set)]
         tls_post_quantum: bool,
 
         /// Authentication method: trust, password, md5, scram-sha-256
         #[arg(long, default_value = "trust")]
         auth: String,
+
+        /// Permit unauthenticated non-loopback PostgreSQL access for isolated development only.
+        #[arg(long)]
+        allow_insecure_trust: bool,
 
         /// Password for authentication (required for password/md5/scram-sha-256 auth)
         #[arg(long)]
@@ -230,12 +276,12 @@ enum Commands {
 
         // ========== HA Replication Options ==========
         /// Replication role: standalone, primary, standby, observer
-        #[arg(long, default_value = "standalone")]
-        replication_role: String,
+        #[arg(long)]
+        replication_role: Option<String>,
 
         /// Replication port for WAL streaming (default: 5433)
-        #[arg(long, default_value = "5433")]
-        replication_port: u16,
+        #[arg(long)]
+        replication_port: Option<u16>,
 
         /// Primary host for standbys to connect to (host:port)
         #[arg(long)]
@@ -250,12 +296,12 @@ enum Commands {
         observer_hosts: Option<String>,
 
         /// Sync mode: async, semi-sync, sync
-        #[arg(long, default_value = "async")]
-        sync_mode: String,
+        #[arg(long)]
+        sync_mode: Option<String>,
 
         /// HTTP API port for health checks and MCP-over-HTTP (default: 8080, 0 disables HTTP)
-        #[arg(long, default_value = "8080")]
-        http_port: u16,
+        #[arg(long)]
+        http_port: Option<u16>,
 
         /// HTTP API listen address. Defaults to --listen; use 127.0.0.1 for local MCP while PG listens remotely.
         #[arg(long)]
@@ -301,7 +347,7 @@ enum Commands {
         /// Offer the X25519MLKEM768 hybrid post-quantum key-exchange group on
         /// the MySQL TLS listener, same as --tls-post-quantum for PostgreSQL.
         /// Only meaningful with --mysql-tls-cert / --mysql-tls-key. Default: on.
-        #[arg(long, default_value = "true")]
+        #[arg(long, default_value = "true", default_missing_value = "true", num_args = 0..=1, action = clap::ArgAction::Set)]
         mysql_tls_post_quantum: bool,
 
         /// PostgreSQL Unix domain socket directory. If set, listens at
@@ -543,6 +589,7 @@ async fn main() -> Result<()> {
             tls_key,
             tls_post_quantum,
             auth,
+            allow_insecure_trust,
             password,
             replication_role,
             replication_port,
@@ -611,19 +658,63 @@ async fn main() -> Result<()> {
 
             let resolved_data_dir = data_dir.unwrap_or_else(|| PathBuf::from("./heliosdb-data"));
 
+            // Resolve replication once: explicit CLI values > TOML > defaults.
+            // Forward the resolved values through daemon re-exec as well.
+            let mut replication = if let Some(path) = &config {
+                Config::from_file(path.clone())?.replication
+            } else {
+                heliosdb_nano::config::ReplicationConfig::default()
+            };
+            if let Some(value) = replication_role {
+                replication.role = value;
+            }
+            if let Some(value) = replication_port {
+                replication.replication_port = value;
+            }
+            if let Some(value) = primary_host {
+                replication.primary_host = Some(value);
+            }
+            if let Some(value) = standby_hosts {
+                replication.standby_hosts = split_hosts(&value);
+            }
+            if let Some(value) = observer_hosts {
+                replication.observer_hosts = split_hosts(&value);
+            }
+            if let Some(value) = sync_mode {
+                replication.sync_mode = value;
+            }
+            if let Some(value) = node_id {
+                replication.node_id = Some(value);
+            }
+            replication.role = replication.role.to_ascii_lowercase();
+            replication.sync_mode = replication.sync_mode.to_ascii_lowercase();
+            replication.validate()?;
+            if replication.role == "standby" && replication.primary_host.is_none() {
+                return Err(Error::config(
+                    "standby role requires --primary-host or [replication] primary_host".to_string(),
+                ));
+            }
+            #[cfg(not(feature = "ha-tier1"))]
+            if replication.role != "standalone" {
+                return Err(Error::config(
+                    "replication requires a build with the ha-tier1 feature".to_string(),
+                ));
+            }
+            let http_address = resolve_http_address(http_listen.as_deref().unwrap_or(&listen), http_port)?;
             // Build HA configuration
             let ha_config = HAConfig {
-                role: replication_role,
-                replication_port,
-                primary_host,
-                standby_hosts,
-                observer_hosts,
-                sync_mode,
-                http_port,
-                http_listen,
+                role: replication.role,
+                replication_port: replication.replication_port,
+                primary_host: replication.primary_host,
+                standby_hosts: Some(replication.standby_hosts.join(",")),
+                observer_hosts: Some(replication.observer_hosts.join(",")),
+                sync_mode: replication.sync_mode,
+                http_port: http_address.map_or(0, |address| address.port()),
+                http_listen: http_address.map(|address| address.ip().to_string()),
                 mcp_token,
                 allow_remote_mcp,
-                node_id,
+                allow_insecure_trust,
+                node_id: replication.node_id,
             };
 
             // GH#28: connection-lifetime overrides (CLI > config file > default).
@@ -853,6 +944,16 @@ async fn start_server(
         Config::default()
     };
 
+    db_config.replication = heliosdb_nano::config::ReplicationConfig {
+        role: ha_config.role.clone(),
+        replication_port: ha_config.replication_port,
+        primary_host: ha_config.primary_host.clone(),
+        standby_hosts: split_hosts(ha_config.standby_hosts.as_deref().unwrap_or("")),
+        observer_hosts: split_hosts(ha_config.observer_hosts.as_deref().unwrap_or("")),
+        sync_mode: ha_config.sync_mode.clone(),
+        node_id: ha_config.node_id.clone(),
+    };
+
     // CLI flags win over the config file for storage location/mode.
     if memory_mode {
         db_config.storage.memory_only = true;
@@ -905,9 +1006,7 @@ async fn start_server(
     println!("      Database initialized successfully");
 
     // Configure PostgreSQL server
-    let pg_addr: SocketAddr = format!("{listen}:{port}")
-        .parse()
-        .map_err(|e| Error::config(format!("Invalid listen address: {e}")))?;
+    let pg_addr = parse_listen_address(&listen, Some(port), port)?;
 
     // Parse authentication method
     let auth_method = match auth.to_lowercase().as_str() {
@@ -932,6 +1031,7 @@ async fn start_server(
     // Build server config
     let mut pg_config = PgServerConfig::with_address(pg_addr)
         .with_auth_method(auth_method)
+        .with_allow_insecure_trust(ha_config.allow_insecure_trust)
         .with_max_connections(max_connections)
         .with_timeouts(connection_policy.clone());
 
@@ -1046,56 +1146,22 @@ async fn start_server(
         PgServer::new(pg_config, Arc::clone(&db))?
     };
 
-    println!("[4/4] Starting server...");
-    println!();
-    println!("════════════════════════════════════════════════════════════════");
-    println!(
-        "  Server ready! Started in {:.2}s",
-        startup_time.elapsed().as_secs_f64()
-    );
-    println!("════════════════════════════════════════════════════════════════");
-    println!();
-    println!("  Connect using:");
-    println!();
-    println!("    psql:       psql -h {listen} -p {port}");
-    println!("    Python:     psycopg2.connect(host='{listen}', port={port})");
-    println!("    Node.js:    pg.connect({{ host: '{listen}', port: {port} }})");
-    println!("    JDBC:       jdbc:postgresql://{listen}:{port}/heliosdb");
-    println!();
-    println!("    Compatibility notes:");
-    println!("      FTS:         docs/compatibility/fts.md");
-    println!("      ORM matrix:  https://github.com/HeliosDatabase/HeliosDB-Nano/blob/main/docs/compatibility/orm.md");
-    println!("      Known gaps:  SELECT heliosdb_capability_report();");
-    if mysql_enabled {
-        println!();
-        println!(
-            "    mysql:      mysql -h {} -P {}",
-            mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
-            mysql_listen.split(':').nth(1).unwrap_or("3306")
-        );
-        println!(
-            "    PyMySQL:    pymysql.connect(host='{}', port={})",
-            mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
-            mysql_listen.split(':').nth(1).unwrap_or("3306")
-        );
-    }
-    println!();
-    println!(
-        "  For REPL mode (single-user):  heliosdb-nano repl -d {}",
-        data_dir.display()
-    );
-    println!();
-    println!("  Press Ctrl+C to shut down");
-    println!("────────────────────────────────────────────────────────────────");
-    println!();
-
-    // Log for tracing subscribers
-    info!("HeliosDB Nano server listening on {}", pg_addr);
+    // Bind PostgreSQL before HA: an overlapping replication endpoint now fails
+    // synchronously instead of reporting readiness with one listener missing.
+    let pg_listener = tokio::net::TcpListener::bind(pg_addr)
+        .await
+        .map_err(|e| Error::network(format!("Failed to bind PostgreSQL listener {pg_addr}: {e}")))?;
 
     // Start HA components if enabled
     #[cfg(feature = "ha-tier1")]
     let _ha_handles = if ha_role != "standalone" {
-        start_ha_components(&ha_config, &listen, port, db.storage.clone()).await?
+        start_ha_components(
+            &ha_config,
+            &pg_addr.ip().to_string(),
+            pg_addr.port(),
+            db.storage.clone(),
+        )
+        .await?
     } else {
         HAHandles::default()
     };
@@ -1124,9 +1190,7 @@ async fn start_server(
     // cannot tear the database listener down.
     let http_handle: Option<tokio::task::JoinHandle<()>> = if !http_health_disabled {
         let http_listen = ha_config.http_listen.as_deref().unwrap_or(&listen);
-        let http_addr: SocketAddr = format!("{}:{}", http_listen, ha_config.http_port)
-            .parse()
-            .map_err(|e| Error::config(format!("Invalid HTTP address: {e}")))?;
+        let http_addr = parse_listen_address(http_listen, Some(ha_config.http_port), 8080)?;
         match tokio::net::TcpListener::bind(http_addr).await {
             Ok(listener) => {
                 info!(
@@ -1378,11 +1442,69 @@ async fn start_server(
         ));
     }
 
+    // Daemon parents must observe completion of this child's startup, not
+    // merely a successful TCP connect to a prebound socket or another process.
+    if let Some(path) = std::env::var_os("HELIOSDB_NANO_READY_FILE") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| Error::io(format!("Cannot acknowledge daemon readiness: {e}")))?;
+        write!(file, "{}", std::process::id()).map_err(|e| Error::io(format!("Cannot write daemon readiness: {e}")))?;
+    }
+
+    println!("[4/4] Starting server...");
+    println!();
+    println!("════════════════════════════════════════════════════════════════");
+    println!(
+        "  Server ready! Started in {:.2}s",
+        startup_time.elapsed().as_secs_f64()
+    );
+    println!("════════════════════════════════════════════════════════════════");
+    println!();
+    println!("  Connect using:");
+    println!();
+    println!("    psql:       psql -h {listen} -p {port}");
+    println!("    Python:     psycopg2.connect(host='{listen}', port={port})");
+    println!("    Node.js:    pg.connect({{ host: '{listen}', port: {port} }})");
+    println!("    JDBC:       jdbc:postgresql://{listen}:{port}/heliosdb");
+    println!();
+    println!("    Compatibility notes:");
+    println!("      FTS:         docs/compatibility/fts.md");
+    println!("      ORM matrix:  https://github.com/HeliosDatabase/HeliosDB-Nano/blob/main/docs/compatibility/orm.md");
+    println!("      Known gaps:  SELECT heliosdb_capability_report();");
+    if mysql_enabled {
+        println!();
+        println!(
+            "    mysql:      mysql -h {} -P {}",
+            mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
+            mysql_listen.split(':').nth(1).unwrap_or("3306")
+        );
+        println!(
+            "    PyMySQL:    pymysql.connect(host='{}', port={})",
+            mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
+            mysql_listen.split(':').nth(1).unwrap_or("3306")
+        );
+    }
+    println!();
+    println!(
+        "  For REPL mode (single-user):  heliosdb-nano repl -d {}",
+        data_dir.display()
+    );
+    println!();
+    println!("  Press Ctrl+C to shut down");
+    println!("────────────────────────────────────────────────────────────────");
+    println!();
+
+    // Log for tracing subscribers
+    info!("HeliosDB Nano server listening on {}", pg_addr);
+
     // Start server with graceful shutdown handling. The health
     // server runs in its own detached task (see above) so a failure
     // there cannot tear the database listener down.
     tokio::select! {
-        result = pg_server.serve() => {
+        result = pg_server.serve_with_listener(pg_listener) => {
             // Server stopped (error or normal shutdown)
             if let Err(ref e) = result {
                 tracing::error!("Server error: {e}");
@@ -1678,8 +1800,11 @@ async fn start_server_daemon(
     args.push(mysql_tls_post_quantum.to_string());
 
     // Add auth options
+    if ha_config.allow_insecure_trust {
+        args.push("--allow-insecure-trust".to_string());
+    }
     args.push("--auth".to_string());
-    args.push(auth);
+    args.push(auth.clone());
     if let Some(pwd) = password {
         args.push("--password".to_string());
         args.push(pwd);
@@ -1727,8 +1852,12 @@ async fn start_server_daemon(
     {
         let exe = std::env::current_exe().map_err(|e| Error::io(format!("Failed to get current executable: {e}")))?;
 
+        let ready_dir =
+            tempfile::tempdir().map_err(|e| Error::io(format!("Cannot create daemon readiness directory: {e}")))?;
+        let ready_file = ready_dir.path().join("ready");
         let mut child = Command::new(&exe)
             .args(&args)
+            .env("HELIOSDB_NANO_READY_FILE", &ready_file)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1737,23 +1866,12 @@ async fn start_server_daemon(
 
         let pid = child.id();
 
-        // KanttBan bug #1 (v3.27.0): the parent used to print the
-        // "Daemon Started" banner unconditionally and return 0 before
-        // the child had bound its port — even when the worker died at
-        // startup (e.g. http-port collision, see #2). Now: poll the
-        // child's PG port for up to 5 s waiting for it to be
-        // accepting connections, OR observe the child's exit status
-        // first. If neither happens within the deadline we fail with
-        // a non-zero exit so caller scripts (`scripts/heliosdb.sh`)
-        // can detect failure without polling `ss` themselves.
-        let target = format!("{}:{}", listen, port);
+        // Only this child's explicit acknowledgment establishes readiness.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut child_dead = false;
         loop {
             // Did the child exit prematurely?
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    child_dead = true;
                     let _ = std::fs::remove_file(&pid_file);
                     return Err(Error::io(format!(
                         "Daemon worker exited at startup (status: {status}). \
@@ -1765,40 +1883,32 @@ async fn start_server_daemon(
                     tracing::warn!("Failed to poll daemon child: {e}");
                 }
             }
-            // Try connecting to the PG port.
-            if std::net::TcpStream::connect_timeout(
-                &target.parse::<std::net::SocketAddr>().unwrap_or_else(|_| {
-                    // listen may be 0.0.0.0; probe 127.0.0.1 instead.
-                    format!("127.0.0.1:{port}").parse().expect("valid loopback addr")
-                }),
-                std::time::Duration::from_millis(200),
-            )
-            .is_ok()
-            {
+            if std::fs::read_to_string(&ready_file).is_ok_and(|value| value == pid.to_string()) {
                 break;
             }
             if std::time::Instant::now() >= deadline {
                 // Don't leave a zombie if we time out — kill the child
                 // and fail loudly. Caller can retry.
                 let _ = child.kill();
+                let _ = child.wait();
                 let _ = std::fs::remove_file(&pid_file);
                 return Err(Error::io(format!(
-                    "Daemon did not become ready on {target} within 5s. \
-                     Most common cause: another listener already on this port \
-                     (or on the HTTP health port, see #2 in BUGS_HELIOSDB.md). \
-                     Pass --port and --http-port to non-conflicting values."
+                    "Daemon did not acknowledge listener readiness within 5s. Run in the foreground to inspect configuration and listener errors."
                 )));
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let _ = child_dead;
 
-        // Detach so the daemon outlives the launching shell.
-        // `child.id()` is preserved in the PID file even after we drop.
-        std::mem::forget(child);
-
-        // Write PID file (we already verified the worker is up).
-        std::fs::write(&pid_file, pid.to_string()).map_err(|e| Error::io(format!("Failed to write PID file: {e}")))?;
+        // Do not leave an untracked daemon behind if its PID cannot be recorded.
+        if let Err(error) = std::fs::write(&pid_file, pid.to_string()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::io(format!("Failed to write PID file: {error}")));
+        }
+        drop(child);
+        if ha_config.allow_insecure_trust && auth.eq_ignore_ascii_case("trust") {
+            eprintln!("INSECURE DEVELOPMENT OVERRIDE: daemon may permit unauthenticated non-loopback database access (--allow-insecure-trust).");
+        }
 
         println!();
         println!("╔═══════════════════════════════════════════════════════════════╗");
@@ -1972,6 +2082,7 @@ fn check_server_status(pid_file: &PathBuf) -> Result<()> {
 struct HAHandles {
     #[allow(dead_code)]
     replication_handle: Option<tokio::task::JoinHandle<()>>,
+    ephemeral_wal: Option<tempfile::TempDir>,
 }
 
 /// Start HA replication components based on role
@@ -2044,11 +2155,33 @@ async fn start_ha_components(
     match role.as_str() {
         "primary" => {
             // Start streaming server for primary
-            let repl_addr = format!("{}:{}", listen, ha_config.replication_port)
-                .parse()
-                .map_err(|e| Error::config(format!("Invalid replication address: {e}")))?;
+            let repl_addr = parse_listen_address(listen, Some(ha_config.replication_port), 5433)?;
 
-            let wal_store = Arc::new(WalStore::new(WalStoreConfig::default()));
+            // Never let unrelated nodes share the process working directory's
+            // default WAL path. In-memory nodes get an owned temporary lifetime.
+            let ephemeral_wal = if storage.config().storage.memory_only {
+                Some(
+                    tempfile::tempdir()
+                        .map_err(|e| Error::io(format!("Cannot create ephemeral replication WAL: {e}")))?,
+                )
+            } else {
+                None
+            };
+            let wal_dir = if let Some(directory) = &ephemeral_wal {
+                directory.path().to_path_buf()
+            } else {
+                storage
+                    .config()
+                    .storage
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| Error::config("persistent replication requires a data directory"))?
+                    .join("replication_wal")
+            };
+            let wal_store = Arc::new(WalStore::new(WalStoreConfig {
+                wal_dir,
+                ..Default::default()
+            }));
             wal_store
                 .init()
                 .await
@@ -2071,15 +2204,19 @@ async fn start_ha_components(
             let server = StreamingServer::new(server_config, node_id, wal_store);
             info!("Streaming replication server starting on {}", repl_addr);
 
-            // Spawn server task
+            let listener = server.bind_listener().await.map_err(|e| Error::network(format!(
+                "Cannot bind native replication listener {repl_addr}: {e}. Use distinct PostgreSQL --port and --replication-port endpoints; --primary-host must point to the primary native replication port."
+            )))?;
+            // Only detach after binding has succeeded.
             let handle = tokio::spawn(async move {
-                if let Err(e) = server.start().await {
+                if let Err(e) = server.start_with_listener(listener).await {
                     tracing::error!("Streaming server error: {}", e);
                 }
             });
 
             Ok(HAHandles {
                 replication_handle: Some(handle),
+                ephemeral_wal,
             })
         }
         "standby" => {
@@ -2101,7 +2238,10 @@ async fn start_ha_components(
             // Query forwarding connects to primary's postgres port, not replication port
             {
                 use heliosdb_nano::replication::query_forwarder::init_query_forwarder;
-                let primary_hostname = primary_host.split(':').next().unwrap_or(primary_host);
+                let primary_hostname = primary_host
+                    .rsplit_once(':')
+                    .map(|(host, _)| host.trim_start_matches('[').trim_end_matches(']'))
+                    .unwrap_or(primary_host);
                 // Primary's postgres port - use environment variable or default to 5432
                 let primary_pg_port = std::env::var("HELIOSDB_PRIMARY_PG_PORT")
                     .ok()
@@ -2127,7 +2267,10 @@ async fn start_ha_components(
             info!("Streaming client connecting to primary at {}", primary_host);
 
             // Create WAL Applicator for applying replicated entries
-            let primary_hostname = primary_host.split(':').next().unwrap_or(primary_host);
+            let primary_hostname = primary_host
+                .rsplit_once(':')
+                .map(|(host, _)| host.trim_start_matches('[').trim_end_matches(']'))
+                .unwrap_or(primary_host);
             let primary_pg_port = std::env::var("HELIOSDB_PRIMARY_PG_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
@@ -2179,6 +2322,7 @@ async fn start_ha_components(
 
             Ok(HAHandles {
                 replication_handle: Some(client_handle),
+                ephemeral_wal: None,
             })
         }
         "observer" => {
@@ -2283,6 +2427,31 @@ async fn run_http_listener(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn http_listen_literals_ports_and_disable() {
+        for (input, port, expected) in [
+            ("127.0.0.1", None, "127.0.0.1:8080"),
+            ("0.0.0.0:9010", None, "0.0.0.0:9010"),
+            ("0.0.0.0:9010", Some(9020), "0.0.0.0:9020"),
+            ("::1", None, "[::1]:8080"),
+            ("[::1]", Some(9010), "[::1]:9010"),
+            ("[::1]:9010", None, "[::1]:9010"),
+            ("[::]:9010", Some(9020), "[::]:9020"),
+        ] {
+            assert_eq!(
+                resolve_http_address(input, port).unwrap().unwrap().to_string(),
+                expected
+            );
+        }
+        for input in ["127.0.0.1:9010", "invalid", "[::1]:9010"] {
+            assert_eq!(resolve_http_address(input, Some(0)).unwrap(), None);
+        }
+        assert_eq!(resolve_http_address("127.0.0.1:0", None).unwrap(), None);
+        for input in ["localhost", "127.0.0.1:80:90", "[::1]:bad", "127.0.0.1:65536", ""] {
+            assert!(resolve_http_address(input, None).is_err(), "{input}");
+        }
+    }
+
     use super::*;
     #[cfg(feature = "mcp-endpoint")]
     use serde_json::json;
