@@ -9,9 +9,12 @@
 #   * Data directory and listen address. Unless `--data-dir`/`--memory` or
 #     `--listen` are given, `start` gets `--data-dir $HELIOSDB_DATA_DIR`
 #     (default /data) and `--listen $HELIOSDB_LISTEN` (default 0.0.0.0). Mount
-#     your volume at that path. The directory must be writable by the
-#     container user (uid 999 by default); if it is not, the container exits
-#     with an explanation instead of failing inside RocksDB.
+#     your volume at /data (the only mount point the image pre-creates for
+#     uid 999 — a named volume mounted at any other new path is root-owned);
+#     a HELIOSDB_DATA_DIR below /data is created on start. The directory
+#     must be writable by the container user (uid 999 by default); if it is
+#     not, the container exits with an explanation instead of failing inside
+#     RocksDB.
 #
 #   * Authentication. Nano refuses `trust` auth on a non-loopback listener, and
 #     a container must listen on 0.0.0.0 to be reachable. When no `--auth` flag
@@ -107,6 +110,11 @@ Common causes and fixes:
     the container user first:  sudo chown -R $uid:$gid ./data
   * Kubernetes: set securityContext runAsUser/runAsGroup/fsGroup to 999 so
     the volume is writable, and mount it at the data directory.
+  * A named volume mounted somewhere other than /data. Docker creates the
+    mount point root-owned when it does not exist in the image, and only
+    /data is pre-created for uid 999. Mount the volume at /data and, if you
+    want a subdirectory, set HELIOSDB_DATA_DIR=/data/<name> (it is created
+    on start): -v heliosdb_data:/data -e HELIOSDB_DATA_DIR=/data/heliosdb
   * HELIOSDB_DATA_DIR points at a path that is not a writable volume.
 EOF
     exit 1
