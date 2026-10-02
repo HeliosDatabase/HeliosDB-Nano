@@ -17,6 +17,7 @@ use tracing::info;
 /// HA Replication Configuration
 #[derive(Debug, Clone)]
 struct HAConfig {
+    physical: heliosdb_nano::config::PhysicalReplicationConfig,
     role: String,
     replication_port: u16,
     startup_timeout_secs: u64,
@@ -218,6 +219,8 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// Install/follow a closed physical receiver; never exposes SQL or serving readiness.
+    Resync(ResyncArgs),
     /// Start the database server
     Start {
         /// Data directory (required unless --memory is used)
@@ -283,6 +286,9 @@ enum Commands {
         /// Password for authentication (required for password/md5/scram-sha-256 auth)
         #[arg(long)]
         password: Option<String>,
+
+        #[command(flatten)]
+        physical: PhysicalSourceArgs,
 
         // ========== HA Replication Options ==========
         /// Replication role: standalone, primary, standby, observer
@@ -605,6 +611,7 @@ async fn main() -> Result<()> {
             auth,
             allow_insecure_trust,
             password,
+            physical,
             replication_role,
             replication_port,
             replication_startup_timeout_secs,
@@ -704,9 +711,11 @@ async fn main() -> Result<()> {
             if let Some(value) = node_id {
                 replication.node_id = Some(value);
             }
+            physical.apply(&mut replication.physical);
             replication.role = replication.role.to_ascii_lowercase();
             replication.sync_mode = replication.sync_mode.to_ascii_lowercase();
             replication.validate()?;
+            validate_physical_source(&replication.physical, &replication.role, memory, &resolved_data_dir)?;
             if replication.role == "standby" && replication.primary_host.is_none() {
                 return Err(Error::config(
                     "standby role requires --primary-host or [replication] primary_host".to_string(),
@@ -721,6 +730,7 @@ async fn main() -> Result<()> {
             let http_address = resolve_http_address(http_listen.as_deref().unwrap_or(&listen), http_port)?;
             // Build HA configuration
             let ha_config = HAConfig {
+                physical: replication.physical,
                 role: replication.role,
                 replication_port: replication.replication_port,
                 startup_timeout_secs: replication.startup_timeout_secs,
@@ -803,6 +813,7 @@ async fn main() -> Result<()> {
                 .await
             }
         }
+        Commands::Resync(args) => run_physical_resync(args).await,
         Commands::Stop { ref pid_file } => stop_server(pid_file),
         Commands::Status { ref pid_file } => check_server_status(pid_file),
         Commands::Init { ref data_dir } => init_database(data_dir),
@@ -944,6 +955,7 @@ async fn start_server(
     use std::sync::Arc;
     use std::time::Instant;
 
+    validate_physical_source(&ha_config.physical, &ha_config.role, memory_mode, &data_dir)?;
     let startup_time = Instant::now();
     let guarded_standby = ha_config.role.eq_ignore_ascii_case("standby");
     if guarded_standby && (mysql_enabled || mysql_socket.is_some()) {
@@ -970,6 +982,7 @@ async fn start_server(
     };
 
     db_config.replication = heliosdb_nano::config::ReplicationConfig {
+        physical: ha_config.physical.clone(),
         role: ha_config.role.clone(),
         replication_port: ha_config.replication_port,
         startup_timeout_secs: ha_config.startup_timeout_secs,
@@ -1209,6 +1222,11 @@ async fn start_server(
     } else {
         HAHandles::default()
     };
+
+    // Bind physical source before publishing any readiness. Its directly owned
+    // future is polled alongside PostgreSQL only after startup succeeds.
+    #[cfg(feature = "ha-tier1")]
+    let physical_source = prepare_physical_source(&ha_config.physical, &db.storage).await?;
 
     // Start HTTP endpoint (health checks, plus MCP routes when compiled in).
     //
@@ -1564,6 +1582,15 @@ async fn start_server(
     // Start server with graceful shutdown handling. The health
     // server runs in its own detached task (see above) so a failure
     // there cannot tear the database listener down.
+    #[cfg(feature = "ha-tier1")]
+    let (physical_stop, physical_shutdown) = tokio::sync::watch::channel(false);
+    #[cfg(feature = "ha-tier1")]
+    let physical_service = serve_physical_source(physical_source, physical_shutdown);
+    #[cfg(feature = "ha-tier1")]
+    tokio::pin!(physical_service);
+    #[cfg(feature = "ha-tier1")]
+    let mut physical_finished = false;
+
     let server_result: Result<()> = tokio::select! {
         biased;
         error = async {
@@ -1575,6 +1602,16 @@ async fn start_server(
             tracing::error!("Replication stopped; closing database listeners: {error}");
             Err(error)
         }
+        result = async {
+            #[cfg(feature = "ha-tier1")]
+            { (&mut physical_service).await }
+            #[cfg(not(feature = "ha-tier1"))]
+            { std::future::pending::<Result<()>>().await }
+        } => {
+            #[cfg(feature = "ha-tier1")]
+            { physical_finished = true; }
+            result.and_then(|()| Err(Error::network("physical source stopped unexpectedly")))
+        },
         result = pg_server.serve_with_listener(pg_listener) => result,
         signal = heliosdb_nano::wait_for_shutdown_signal() => {
             println!();
@@ -1595,7 +1632,19 @@ async fn start_server(
         let _ = handle.await;
     }
     #[cfg(feature = "ha-tier1")]
-    ha_handles.shutdown().await;
+    let server_result = {
+        let _ = physical_stop.send(true);
+        let cleanup = if !physical_finished {
+            (&mut physical_service).await
+        } else {
+            Ok(())
+        };
+        ha_handles.shutdown().await;
+        match server_result {
+            Err(error) => Err(error),
+            Ok(()) => cleanup,
+        }
+    };
     #[cfg(unix)]
     {
         if let Some(ref path) = mysql_socket {
@@ -1869,6 +1918,8 @@ async fn start_server_daemon(
         args.push("--password".to_string());
         args.push(pwd);
     }
+
+    append_physical_daemon_args(&mut args, &ha_config.physical);
 
     // Add HA options
     args.push("--replication-role".to_string());
@@ -2907,5 +2958,646 @@ mod tests {
         assert_eq!(info["serverInfo"]["name"], "heliosdb-nano");
 
         handle.abort();
+    }
+}
+
+/// Transfer bounds and authentication shared by source and receiver.
+#[derive(clap::Args, Debug, Default)]
+struct PhysicalTransferArgs {
+    #[arg(long)]
+    physical_replication_token_file: Option<PathBuf>,
+    #[arg(long)]
+    physical_max_files: Option<usize>,
+    #[arg(long)]
+    physical_max_file_bytes: Option<u64>,
+    #[arg(long)]
+    physical_max_total_bytes: Option<u64>,
+    #[arg(long)]
+    physical_max_chunk_bytes: Option<usize>,
+    #[arg(long)]
+    physical_frame_timeout_secs: Option<u64>,
+    #[arg(long)]
+    physical_operation_timeout_secs: Option<u64>,
+}
+
+impl PhysicalTransferArgs {
+    fn apply(self, config: &mut heliosdb_nano::config::PhysicalReplicationConfig) {
+        if let Some(value) = self.physical_replication_token_file {
+            config.token_file = Some(value);
+        }
+        if let Some(value) = self.physical_max_files {
+            config.max_files = value;
+        }
+        if let Some(value) = self.physical_max_file_bytes {
+            config.max_file_bytes = value;
+        }
+        if let Some(value) = self.physical_max_total_bytes {
+            config.max_total_bytes = value;
+        }
+        if let Some(value) = self.physical_max_chunk_bytes {
+            config.max_chunk_bytes = value;
+        }
+        if let Some(value) = self.physical_frame_timeout_secs {
+            config.frame_timeout_secs = value;
+        }
+        if let Some(value) = self.physical_operation_timeout_secs {
+            config.operation_timeout_secs = value;
+        }
+    }
+}
+
+/// CLI overrides are optional so explicit defaults still override the file.
+#[derive(clap::Args, Debug, Default)]
+struct PhysicalSourceArgs {
+    #[command(flatten)]
+    transfer: PhysicalTransferArgs,
+    /// Enable default-off loopback physical transfer source (persistent primary only).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    physical_replication: Option<bool>,
+    #[arg(long)]
+    physical_replication_listen: Option<String>,
+    #[arg(long)]
+    physical_export_dir: Option<PathBuf>,
+    #[arg(long)]
+    physical_wal_retention_secs: Option<u64>,
+    #[arg(long)]
+    physical_wal_retention_size_mb: Option<u64>,
+    #[arg(long)]
+    physical_max_sessions: Option<usize>,
+}
+
+impl PhysicalSourceArgs {
+    fn apply(self, config: &mut heliosdb_nano::config::PhysicalReplicationConfig) {
+        self.transfer.apply(config);
+        if let Some(value) = self.physical_replication {
+            config.enabled = value;
+        }
+        if let Some(value) = self.physical_replication_listen {
+            config.listen = value;
+        }
+        if let Some(value) = self.physical_export_dir {
+            config.export_dir = Some(value);
+        }
+        if let Some(value) = self.physical_wal_retention_secs {
+            config.wal_retention_secs = value;
+        }
+        if let Some(value) = self.physical_wal_retention_size_mb {
+            config.wal_retention_size_mb = value;
+        }
+        if let Some(value) = self.physical_max_sessions {
+            config.max_sessions = value;
+        }
+    }
+}
+
+#[derive(clap::Args, Debug)]
+struct ResyncArgs {
+    /// Physical source endpoint, reached through loopback or an authenticated tunnel.
+    #[arg(long)]
+    primary_host: String,
+    /// Absent destination for a fresh snapshot. Existing data is never overwritten.
+    #[arg(short, long)]
+    data_dir: PathBuf,
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    #[command(flatten)]
+    physical: PhysicalTransferArgs,
+    /// Pin source dataset UUID; mandatory when resuming an installed physical replica.
+    #[arg(long)]
+    expected_history: Option<uuid::Uuid>,
+    /// Resume ONLY an already installed, marked physical replica at its durable cursor.
+    #[arg(long, requires = "expected_history")]
+    resume_existing: bool,
+    /// Install/close once instead of continuously following the source.
+    #[arg(long)]
+    once: bool,
+    #[arg(long, default_value_t = 100)]
+    poll_interval_ms: u64,
+    #[arg(long, default_value_t = 1000)]
+    reconnect_delay_ms: u64,
+    #[arg(long, default_value_t = 5)]
+    max_reconnects: u32,
+    #[arg(long, default_value_t = 8_388_608)]
+    poll_byte_limit: usize,
+}
+
+fn append_physical_daemon_args(args: &mut Vec<String>, config: &heliosdb_nano::config::PhysicalReplicationConfig) {
+    for (name, value) in [
+        ("--physical-replication", config.enabled.to_string()),
+        ("--physical-replication-listen", config.listen.clone()),
+        ("--physical-wal-retention-secs", config.wal_retention_secs.to_string()),
+        (
+            "--physical-wal-retention-size-mb",
+            config.wal_retention_size_mb.to_string(),
+        ),
+        ("--physical-max-sessions", config.max_sessions.to_string()),
+        ("--physical-max-files", config.max_files.to_string()),
+        ("--physical-max-file-bytes", config.max_file_bytes.to_string()),
+        ("--physical-max-total-bytes", config.max_total_bytes.to_string()),
+        ("--physical-max-chunk-bytes", config.max_chunk_bytes.to_string()),
+        ("--physical-frame-timeout-secs", config.frame_timeout_secs.to_string()),
+        (
+            "--physical-operation-timeout-secs",
+            config.operation_timeout_secs.to_string(),
+        ),
+    ] {
+        args.extend([name.into(), value]);
+    }
+    for (name, path) in [
+        ("--physical-replication-token-file", &config.token_file),
+        ("--physical-export-dir", &config.export_dir),
+    ] {
+        if let Some(path) = path {
+            args.extend([name.into(), path.display().to_string()]);
+        }
+    }
+}
+
+/// Validate before any persistent database is opened or receiver leaf is claimed.
+fn validate_physical_source(
+    config: &heliosdb_nano::config::PhysicalReplicationConfig,
+    role: &str,
+    memory: bool,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    config.validate()?;
+    if !config.enabled {
+        return Ok(());
+    }
+    if role != "primary" || memory {
+        return Err(Error::config(
+            "physical source requires --replication-role primary and persistent storage",
+        ));
+    }
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        let _ = data_dir;
+        return Err(Error::config("physical transfer requires the ha-tier1 feature"));
+    }
+    #[cfg(feature = "ha-tier1")]
+    {
+        let token_path = config
+            .token_file
+            .as_ref()
+            .ok_or_else(|| Error::config("physical source requires a token_file"))?;
+        let _token = read_physical_token(token_path)?;
+        let export = config
+            .export_dir
+            .as_ref()
+            .ok_or_else(|| Error::config("physical source requires an existing private export_dir"))?;
+        validate_private_export(export)?;
+        let export = export.canonicalize().map_err(|e| Error::io(e.to_string()))?;
+        let source = if data_dir.exists() {
+            data_dir.canonicalize()
+        } else {
+            let parent = data_dir
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            parent
+                .canonicalize()
+                .map(|p| p.join(data_dir.file_name().unwrap_or_default()))
+        }
+        .map_err(|e| Error::config(format!("physical source data directory parent must exist: {e}")))?;
+        if export.starts_with(&source) || source.starts_with(&export) {
+            return Err(Error::config(
+                "physical export_dir and source data directory must be disjoint",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+fn read_physical_token(path: &std::path::Path) -> Result<heliosdb_nano::replication::physical_wire::TransferToken> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|e| Error::config(format!("cannot open physical token file: {e}")))?;
+        let metadata = file.metadata().map_err(|e| Error::io(e.to_string()))?;
+        // SAFETY: geteuid takes no pointers and has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.is_file()
+            || metadata.uid() != uid
+            || metadata.mode() & 0o077 != 0
+            || metadata.nlink() != 1
+            || metadata.len() != 32
+        {
+            return Err(Error::config("physical token must be an owned, nonsymlink, single-link regular file, mode 0600 or stricter, containing exactly 32 raw bytes"));
+        }
+        let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
+        file.read_exact(&mut *bytes).map_err(|e| Error::io(e.to_string()))?;
+        let mut extra = [0u8; 1];
+        if file.read(&mut extra).map_err(|e| Error::io(e.to_string()))? != 0 {
+            return Err(Error::config("physical token file changed size while reading"));
+        }
+        heliosdb_nano::replication::physical_wire::TransferToken::new(*bytes).map_err(|e| Error::config(e.to_string()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(Error::config(
+            "physical transfer token ownership validation currently requires Unix",
+        ))
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+fn validate_private_export(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|e| Error::config(format!("cannot inspect physical export_dir: {e}")))?;
+        // SAFETY: geteuid takes no pointers and has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+            return Err(Error::config(
+                "physical export_dir must be an existing owned nonsymlink directory, mode 0700 or stricter",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(Error::config("physical checkpoint export currently requires Unix"))
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+fn physical_wire_limits(
+    config: &heliosdb_nano::config::PhysicalReplicationConfig,
+) -> heliosdb_nano::replication::physical_wire::WireLimits {
+    heliosdb_nano::replication::physical_wire::WireLimits {
+        frame_timeout: std::time::Duration::from_secs(config.frame_timeout_secs),
+        operation_timeout: std::time::Duration::from_secs(config.operation_timeout_secs),
+        transfer: heliosdb_nano::replication::checkpoint_transfer::TransferLimits {
+            max_files: config.max_files,
+            max_file_bytes: config.max_file_bytes,
+            max_total_bytes: config.max_total_bytes,
+            max_chunk_bytes: config.max_chunk_bytes,
+        },
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+struct PreparedPhysicalSource {
+    listener: tokio::net::TcpListener,
+    token: heliosdb_nano::replication::physical_wire::TransferToken,
+    db: std::sync::Arc<rocksdb::DB>,
+    history: uuid::Uuid,
+    export_dir: PathBuf,
+    config: heliosdb_nano::config::PhysicalReplicationConfig,
+    work: heliosdb_nano::replication::physical_source::SourceWorkLimiter,
+}
+
+#[cfg(feature = "ha-tier1")]
+async fn prepare_physical_source(
+    config: &heliosdb_nano::config::PhysicalReplicationConfig,
+    storage: &heliosdb_nano::storage::StorageEngine,
+) -> Result<Option<PreparedPhysicalSource>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let directory = storage
+        .config()
+        .storage
+        .path
+        .as_ref()
+        .ok_or_else(|| Error::config("physical source requires persistent data"))?;
+    validate_physical_source(config, "primary", storage.config().storage.memory_only, directory)?;
+    // Native primary startup has already opened/locked the DB and established this marker.
+    let history = heliosdb_nano::replication::history::load_or_create_primary_history(directory)
+        .map_err(|e| Error::config(e.to_string()))?;
+    let token = read_physical_token(config.token_file.as_ref().expect("validated token path"))?;
+    let listener = heliosdb_nano::replication::physical_wire::bind_loopback(
+        config
+            .listen
+            .parse()
+            .map_err(|e| Error::config(format!("physical listen: {e}")))?,
+    )
+    .await
+    .map_err(|e| Error::network(format!("physical source bind failed: {e}")))?;
+    Ok(Some(PreparedPhysicalSource {
+        listener,
+        token,
+        db: storage.db(),
+        history,
+        export_dir: config.export_dir.clone().expect("validated export path"),
+        config: config.clone(),
+        work: heliosdb_nano::replication::physical_source::SourceWorkLimiter::new(config.max_sessions)
+            .map_err(|e| Error::config(e.to_string()))?,
+    }))
+}
+
+/// Directly owned by main, never detached. The listener is bound before readiness;
+/// every authenticated session is joined after shutdown before source DB close.
+#[cfg(feature = "ha-tier1")]
+async fn serve_physical_source(
+    source: Option<PreparedPhysicalSource>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let Some(source) = source else {
+        while !*shutdown.borrow() {
+            if shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+        return Ok(());
+    };
+    let token = std::sync::Arc::new(source.token);
+    let (session_stop, session_shutdown) = tokio::sync::watch::channel(false);
+    let mut sessions = tokio::task::JoinSet::new();
+    let limits = physical_wire_limits(&source.config);
+    let result = loop {
+        if *shutdown.borrow() {
+            break Ok(());
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => { break Ok(()); }
+            completed = sessions.join_next(), if !sessions.is_empty() => {
+                if let Some(Err(error)) = completed { tracing::warn!("physical session task failed: {error}"); }
+            }
+            accepted = source.listener.accept(), if sessions.len() < source.config.max_sessions => {
+                let (stream, peer) = match accepted { Ok(value) => value, Err(error) => break Err(Error::network(format!("physical accept failed: {error}"))) };
+                if !peer.ip().is_loopback() { continue; }
+                let db = source.db.clone();
+                let export = source.export_dir.clone();
+                let history = source.history;
+                let work = source.work.clone();
+                let token = token.clone();
+                let stop = session_shutdown.clone();
+                sessions.spawn(async move {
+                    let result = heliosdb_nano::replication::physical_wire::serve_session(stream, &token, limits, stop,
+                        move |request| heliosdb_nano::replication::physical_source::open_primary_session(db, history, export, limits.transfer, request, work)
+                    ).await;
+                    if let Err(error) = result { tracing::warn!("physical transfer session ended: {error}"); }
+                });
+            }
+        }
+    };
+    let _ = session_stop.send(true);
+    while let Some(completed) = sessions.join_next().await {
+        if let Err(error) = completed {
+            tracing::warn!("physical session cleanup failed: {error}");
+        }
+    }
+    let drained = source
+        .work
+        .drain()
+        .await
+        .map_err(|e| Error::network(format!("physical source work drain failed: {e}")));
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => drained,
+    }
+}
+
+async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        let _ = args;
+        return Err(Error::config("resync requires the ha-tier1 feature"));
+    }
+    #[cfg(feature = "ha-tier1")]
+    {
+        use heliosdb_nano::replication::physical_receiver::{
+            run_receiver, ReceiverMode, ReceiverOptions, ReceiverStart, ReceiverStatus,
+        };
+        use std::time::Duration;
+        let mut physical = if let Some(path) = args.config {
+            Config::from_file(path)?.replication.physical
+        } else {
+            Default::default()
+        };
+        args.physical.apply(&mut physical);
+        physical.validate()?;
+        if !(1..=60_000).contains(&args.poll_interval_ms)
+            || !(1..=60_000).contains(&args.reconnect_delay_ms)
+            || args.max_reconnects > 1000
+            || !(1..=67_108_864).contains(&args.poll_byte_limit)
+        {
+            return Err(Error::config(
+                "resync requires poll/reconnect intervals 1..=60000 ms, retries 0..=1000, and poll bytes 1..=67108864",
+            ));
+        }
+        if args.expected_history.is_some_and(|id| id.is_nil()) {
+            return Err(Error::config("expected history must not be nil"));
+        }
+        if !args.resume_existing {
+            match std::fs::symlink_metadata(&args.data_dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(Error::io(error.to_string())),
+                Ok(_) => return Err(Error::config("fresh resync requires an absent destination; preserve existing data and choose a new path, or explicitly resume an installed physical receiver")),
+            }
+        }
+        heliosdb_nano::config::validate_replication_endpoint(&args.primary_host)?;
+        let resolved = tokio::time::timeout(
+            Duration::from_secs(physical.operation_timeout_secs),
+            tokio::net::lookup_host(&args.primary_host),
+        )
+        .await
+        .map_err(|_| Error::network("physical source DNS lookup timed out"))?
+        .map_err(|e| Error::network(e.to_string()))?
+        .collect::<Vec<_>>();
+        if resolved.is_empty() || resolved.iter().any(|address| !address.ip().is_loopback()) {
+            return Err(Error::config("initial physical transfer supports loopback only; use an authenticated tunnel to the remote primary, not plaintext over a remote network"));
+        }
+        let mut sources = Vec::new();
+        for address in resolved {
+            if !sources.contains(&address) {
+                sources.push(address);
+            }
+        }
+        if sources.len() > 16 {
+            return Err(Error::config(
+                "physical source hostname resolves to more than 16 addresses",
+            ));
+        }
+        let token = read_physical_token(physical.token_file.as_ref().ok_or_else(|| {
+            Error::config("resync requires --physical-replication-token-file or [replication.physical] token_file")
+        })?)?;
+        let start = if args.resume_existing {
+            ReceiverStart::Resume {
+                path: args.data_dir,
+                history: args
+                    .expected_history
+                    .ok_or_else(|| Error::config("--resume-existing requires --expected-history"))?,
+            }
+        } else {
+            ReceiverStart::Snapshot {
+                target: args.data_dir,
+                expected_history: args.expected_history,
+            }
+        };
+        let options = ReceiverOptions {
+            sources,
+            token,
+            start,
+            mode: if args.once {
+                ReceiverMode::InstallOnce
+            } else {
+                ReceiverMode::Follow
+            },
+            wire: physical_wire_limits(&physical),
+            poll_byte_limit: args.poll_byte_limit,
+            poll_interval: Duration::from_millis(args.poll_interval_ms),
+            reconnect_delay: Duration::from_millis(args.reconnect_delay_ms),
+            max_reconnects: args.max_reconnects,
+        };
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let (progress, mut statuses) = tokio::sync::watch::channel(ReceiverStatus::Connecting {
+            history: None,
+            after: None,
+        });
+        println!("Physical receiver only: no SQL listener or serving-readiness publication. Strict hydration/publication is a separate prerequisite.");
+        let receiver = run_receiver(options, shutdown, progress);
+        tokio::pin!(receiver);
+        let signal = heliosdb_nano::wait_for_shutdown_signal();
+        tokio::pin!(signal);
+        let mut status_open = true;
+        let result = loop {
+            tokio::select! {
+                biased;
+                value = &mut receiver => break value,
+                _ = &mut signal => {
+                    let _ = stop.send(true);
+                    // Owned worker closes at a command boundary and joins. An OS fsync
+                    // cannot safely be force-cancelled; do not abort this future.
+                    break (&mut receiver).await;
+                }
+                changed = statuses.changed(), if status_open => {
+                    if changed.is_err() { status_open = false; }
+                    else { eprintln!("Physical transfer: {:?}", &*statuses.borrow_and_update()); }
+                }
+            }
+        };
+        let closed = result.map_err(|e| {
+            Error::network(format!(
+                "physical resync stopped: {e}; retained files were not overwritten or auto-reseeded"
+            ))
+        })?;
+        println!("Physical state retained closed at {} (snapshot {}, history {}, source sequence {}). This is not SQL readiness.",
+            closed.path.display(), closed.snapshot_id, closed.cursor.history(), closed.cursor.source_sequence());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod physical_cli_tests {
+    use super::*;
+    #[test]
+    fn explicit_defaults_override_file_and_survive_daemon_reexec() {
+        let cli = Cli::try_parse_from([
+            "nano",
+            "start",
+            "--physical-replication=false",
+            "--physical-wal-retention-secs",
+            "3600",
+            "--physical-wal-retention-size-mb",
+            "1024",
+            "--physical-max-files",
+            "10",
+            "--physical-max-file-bytes",
+            "4096",
+            "--physical-max-total-bytes",
+            "8192",
+            "--physical-max-chunk-bytes",
+            "1024",
+        ])
+        .unwrap();
+        let Commands::Start { physical, .. } = cli.command else {
+            panic!("wrong command")
+        };
+        let mut config = heliosdb_nano::config::PhysicalReplicationConfig {
+            enabled: true,
+            wal_retention_secs: 60,
+            wal_retention_size_mb: 64,
+            ..Default::default()
+        };
+        physical.apply(&mut config);
+        assert!(!config.enabled);
+        assert_eq!(config.wal_retention_secs, 3600);
+        assert_eq!(config.wal_retention_size_mb, 1024);
+        let mut argv = vec!["nano".into(), "start".into()];
+        append_physical_daemon_args(&mut argv, &config);
+        let Commands::Start { physical, .. } = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("wrong command")
+        };
+        let mut child = heliosdb_nano::config::PhysicalReplicationConfig {
+            enabled: true,
+            wal_retention_secs: 60,
+            ..Default::default()
+        };
+        physical.apply(&mut child);
+        assert!(!child.enabled);
+        assert_eq!(child.wal_retention_secs, 3600);
+        assert_eq!(child.wal_retention_size_mb, 1024);
+        assert_eq!(child.max_files, 10);
+        assert_eq!(child.max_file_bytes, 4096);
+        assert_eq!(child.max_total_bytes, 8192);
+        assert_eq!(child.max_chunk_bytes, 1024);
+    }
+    #[test]
+    fn source_requires_persistent_primary_and_resume_requires_history() {
+        let config = heliosdb_nano::config::PhysicalReplicationConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(validate_physical_source(&config, "standalone", false, std::path::Path::new("missing")).is_err());
+        assert!(validate_physical_source(&config, "primary", true, std::path::Path::new("missing")).is_err());
+        assert!(Cli::try_parse_from([
+            "nano",
+            "resync",
+            "--primary-host",
+            "127.0.0.1:5440",
+            "--data-dir",
+            "new",
+            "--resume-existing"
+        ])
+        .is_err());
+        let Commands::Resync(args) = Cli::try_parse_from([
+            "nano",
+            "resync",
+            "--primary-host",
+            "127.0.0.1:5440",
+            "--data-dir",
+            "new",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("wrong command")
+        };
+        assert!(!args.once && !args.resume_existing);
+    }
+    #[cfg(all(feature = "ha-tier1", unix))]
+    #[test]
+    fn token_file_rejects_world_readable_links_and_wrong_length() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        std::fs::write(&path, [9u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_physical_token(&path).is_ok());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_physical_token(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = directory.path().join("link");
+        symlink(&path, &link).unwrap();
+        assert!(read_physical_token(&link).is_err());
+        let hard = directory.path().join("hard");
+        std::fs::hard_link(&path, &hard).unwrap();
+        assert!(read_physical_token(&path).is_err());
+        std::fs::remove_file(hard).unwrap();
+        std::fs::write(&path, [9u8; 31]).unwrap();
+        assert!(read_physical_token(&path).is_err());
     }
 }

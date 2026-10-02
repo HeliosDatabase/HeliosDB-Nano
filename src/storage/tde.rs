@@ -550,6 +550,20 @@ fn probe_key_against_existing_data(db: &DB, km: &KeyManager) -> Result<KeyEviden
 ///    three admissible outcomes and the one refusal are enumerated on that
 ///    function. A read-only handle must not write, so it verifies when it can
 ///    and installs nothing.
+pub(crate) fn verify_physical_snapshot_key(db: &DB, key_manager: Option<&KeyManager>) -> Result<()> {
+    if key_manager.is_some()
+        && db
+            .get(KEY_CHECK_KEY)
+            .map_err(|e| Error::storage(format!("encryption sentinel read failed: {e}")))?
+            .is_none()
+    {
+        return Err(Error::encryption(
+            "physical snapshot has no encryption key-check sentinel",
+        ));
+    }
+    verify_or_install_key_check(db, key_manager, true)
+}
+
 pub(crate) fn verify_or_install_key_check(db: &DB, key_manager: Option<&KeyManager>, read_only: bool) -> Result<()> {
     let stored = db
         .get(KEY_CHECK_KEY)

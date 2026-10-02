@@ -1993,6 +1993,7 @@ dependencies = [
  "sha2 0.10.9",
  "socket2",
  "sqlparser",
+ "subtle",
  "sysinfo",
  "tempfile",
  "terminal_size",

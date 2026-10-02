@@ -1452,6 +1452,23 @@ pub struct EmbeddedDatabase {
     udf_bridge: std::sync::OnceLock<std::sync::Arc<sql::udf_bridge::UdfBridge>>,
 }
 
+/// A sealed physical checkpoint whose durable metadata and serving runtime
+/// have passed strict hydration. This is not an online publication token:
+/// source-history binding, activation and admission fencing are separate.
+pub struct PhysicalSnapshotHydration {
+    pub database: EmbeddedDatabase,
+    pub report: PhysicalSnapshotHydrationReport,
+}
+
+/// Counts are diagnostics, not a substitute for the strict loader contract.
+#[derive(Debug, Clone)]
+pub struct PhysicalSnapshotHydrationReport {
+    pub indexes: storage::index_snapshot::IndexOpenReport,
+    pub functions: usize,
+    pub procedures: usize,
+    pub triggers: usize,
+}
+
 impl Drop for EmbeddedDatabase {
     fn drop(&mut self) {
         // Persist row counters at clean shutdown. The fast INSERT path only
@@ -6630,6 +6647,38 @@ impl EmbeddedDatabase {
         Ok(self)
     }
 
+    fn finish_trigger_runtime(self, strict: bool) -> Result<Self> {
+        if strict {
+            self.install_trigger_runtime_strict()
+        } else {
+            self.install_trigger_runtime()
+        }
+    }
+
+    // Only used on a fresh, unpublished physical-snapshot handle. The strict
+    // catalog readers must propagate iterator, key-format and decoding errors.
+    fn install_trigger_runtime_strict(self) -> Result<Self> {
+        let catalog = self.storage.catalog();
+        for trigger in catalog.load_all_triggers_strict()? {
+            let table = trigger.table_name.clone();
+            let name = trigger.name.clone();
+            self.trigger_registry.register_trigger(trigger).map_err(|e| {
+                Error::storage(format!(
+                    "physical snapshot trigger '{table}.{name}' failed to register: {e}"
+                ))
+            })?;
+        }
+        for (table, name, mutation) in catalog.load_all_trigger_row_mutations_strict()? {
+            if self.trigger_registry.get_trigger(&table, &name)?.is_none() {
+                return Err(Error::storage(format!(
+                    "physical snapshot trigger recipe '{table}.{name}' has no definition"
+                )));
+            }
+            self.trigger_registry.register_row_mutation(&table, &name, mutation);
+        }
+        Ok(self)
+    }
+
     /// Plan a PostgreSQL-spelled `CREATE [OR REPLACE] PROCEDURE name(args)
     /// LANGUAGE lang AS $$body$$`, or `Ok(None)` if `sql` is not that form.
     ///
@@ -6688,24 +6737,83 @@ impl EmbeddedDatabase {
     /// not stop the database from opening. The affected routine then reports
     /// `does not exist` when called, which is loud at the point of use.
     fn install_routine_runtime(self) -> Result<Self> {
-        for (name, blob) in self.storage.meta_blobs_with_prefix(Self::FUNCTION_META_PREFIX)? {
+        self.install_routine_runtime_with_policy(false)
+    }
+
+    fn install_routine_runtime_with_policy(self, strict: bool) -> Result<Self> {
+        let records = |prefix: &str| {
+            if strict {
+                self.storage.meta_blobs_with_prefix_strict(prefix)
+            } else {
+                self.storage.meta_blobs_with_prefix(prefix)
+            }
+        };
+        let mut function_names = std::collections::HashSet::new();
+        for (name, blob) in records(Self::FUNCTION_META_PREFIX)? {
+            if strict && !function_names.insert(name.to_lowercase()) {
+                return Err(Error::storage(format!(
+                    "physical snapshot function '{name}' duplicates a normalized routine name"
+                )));
+            }
             match bincode::deserialize::<sql::StoredFunction>(&blob) {
                 Ok(func) => {
+                    if strict && name.to_lowercase() != func.name.to_lowercase() {
+                        return Err(Error::storage(format!(
+                            "physical snapshot function key '{name}' disagrees with definition '{}'",
+                            func.name
+                        )));
+                    }
                     if let Err(e) = self.function_registry.load_function(func) {
+                        if strict {
+                            return Err(Error::storage(format!(
+                                "physical snapshot function '{name}' failed to load: {e}"
+                            )));
+                        }
                         tracing::warn!("failed to load persisted function '{}': {}", name, e);
                     }
                 }
-                Err(e) => tracing::warn!("persisted function '{}' is unreadable and was skipped: {}", name, e),
+                Err(e) => {
+                    if strict {
+                        return Err(Error::storage(format!(
+                            "physical snapshot function '{name}' is unreadable: {e}"
+                        )));
+                    }
+                    tracing::warn!("persisted function '{}' is unreadable and was skipped: {}", name, e);
+                }
             }
         }
-        for (name, blob) in self.storage.meta_blobs_with_prefix(Self::PROCEDURE_META_PREFIX)? {
+        let mut procedure_names = std::collections::HashSet::new();
+        for (name, blob) in records(Self::PROCEDURE_META_PREFIX)? {
+            if strict && !procedure_names.insert(name.to_lowercase()) {
+                return Err(Error::storage(format!(
+                    "physical snapshot procedure '{name}' duplicates a normalized routine name"
+                )));
+            }
             match bincode::deserialize::<sql::StoredProcedure>(&blob) {
                 Ok(proc) => {
+                    if strict && name.to_lowercase() != proc.name.to_lowercase() {
+                        return Err(Error::storage(format!(
+                            "physical snapshot procedure key '{name}' disagrees with definition '{}'",
+                            proc.name
+                        )));
+                    }
                     if let Err(e) = self.function_registry.load_procedure(proc) {
+                        if strict {
+                            return Err(Error::storage(format!(
+                                "physical snapshot procedure '{name}' failed to load: {e}"
+                            )));
+                        }
                         tracing::warn!("failed to load persisted procedure '{}': {}", name, e);
                     }
                 }
-                Err(e) => tracing::warn!("persisted procedure '{}' is unreadable and was skipped: {}", name, e),
+                Err(e) => {
+                    if strict {
+                        return Err(Error::storage(format!(
+                            "physical snapshot procedure '{name}' is unreadable: {e}"
+                        )));
+                    }
+                    tracing::warn!("persisted procedure '{}' is unreadable and was skipped: {}", name, e);
+                }
             }
         }
 
@@ -10331,6 +10439,44 @@ impl EmbeddedDatabase {
     /// ```
     #[allow(clippy::expect_used)] // Safety: cache sizes are non-zero compile-time constants
     pub fn with_config(config: Config) -> Result<Self> {
+        Self::with_config_open_policy(config, false)
+    }
+
+    /// Hydrate an existing sealed physical checkpoint without logical replay,
+    /// orphan cleanup, background writers, or close-time persistence.
+    ///
+    /// The path must be immutable and exclusively owned by the caller for the
+    /// lifetime of the result. This does not bind source history, make the
+    /// handle safe for concurrent physical apply, or publish it to a server.
+    /// It also does not install source process-only tenant/auth configuration.
+    pub fn open_physical_snapshot(config: Config) -> Result<PhysicalSnapshotHydration> {
+        if config.storage.memory_only || config.storage.path.is_none() {
+            return Err(Error::config(
+                "physical snapshot hydration requires an existing persistent storage path".to_string(),
+            ));
+        }
+        let database = Self::with_config_open_policy(config, true)?;
+        let indexes = database
+            .storage
+            .last_index_open_report()
+            .ok_or_else(|| Error::storage("physical snapshot hydration produced no index completeness report"))?;
+        if indexes.vector_degraded != 0 {
+            return Err(Error::storage(format!(
+                "physical snapshot hydration left {} degraded vector indexes",
+                indexes.vector_degraded
+            )));
+        }
+        let report = PhysicalSnapshotHydrationReport {
+            indexes,
+            functions: database.function_registry.list_functions().len(),
+            procedures: database.function_registry.list_procedures().len(),
+            triggers: database.trigger_registry.list_all_triggers()?.len(),
+        };
+        Ok(PhysicalSnapshotHydration { database, report })
+    }
+
+    #[allow(clippy::expect_used)]
+    fn with_config_open_policy(config: Config, physical_snapshot: bool) -> Result<Self> {
         let memory_only = config.storage.memory_only;
         let storage = std::sync::Arc::new(if memory_only {
             storage::StorageEngine::open_in_memory(&config)?
@@ -10340,7 +10486,11 @@ impl EmbeddedDatabase {
                 .path
                 .as_ref()
                 .ok_or_else(|| Error::config("Storage path not specified for non-memory database".to_string()))?;
-            storage::StorageEngine::open(path, &config)?
+            if physical_snapshot {
+                storage::StorageEngine::open_physical_snapshot(path, &config)?
+            } else {
+                storage::StorageEngine::open(path, &config)?
+            }
         });
         let mv_scheduler = std::sync::Arc::new(storage::MVScheduler::new(
             Self::scheduler_config_from(&config),
@@ -10368,7 +10518,10 @@ impl EmbeddedDatabase {
         // PK/UNIQUE/FK indexes. In-memory mode never has prior state.
         if !memory_only {
             let catalog = storage::Catalog::new(&storage);
-            if let Err(e) = catalog.rebuild_all_indexes() {
+            if physical_snapshot {
+                catalog.rebuild_all_indexes_for_physical_snapshot()?;
+                catalog.validate_lazy_physical_catalog()?;
+            } else if let Err(e) = catalog.rebuild_all_indexes() {
                 tracing::warn!("ART rebuild on open failed: {} — falling back to scan paths", e);
             }
         }
@@ -10485,12 +10638,8 @@ impl EmbeddedDatabase {
             cold_optimizer: std::sync::OnceLock::new(),
             udf_bridge: std::sync::OnceLock::new(),
         }
-        .install_routine_runtime()?
-        // Trigger definitions and their BEFORE-row rewrite recipes are restored
-        // from the catalog here. Before this call existed, the LIVE trigger
-        // registry started empty at every open and nothing ever repopulated it,
-        // so triggers did not survive a restart at all.
-        .install_trigger_runtime()
+        .install_routine_runtime_with_policy(physical_snapshot)?
+        .finish_trigger_runtime(physical_snapshot)
     }
 
     /// Execute a SQL statement (POTENTIALLY UNSAFE - use execute_params for user input)

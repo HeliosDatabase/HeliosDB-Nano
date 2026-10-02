@@ -56,6 +56,7 @@ name = "heliosdb-nano"
 path = "src/main.rs"
 
 [dependencies]
+subtle = "2"
 # Storage (Direct RocksDB, no wrapper)
 rocksdb = { version = "0.22", default-features = false, features = ["snappy", "zstd", "lz4"] }
 

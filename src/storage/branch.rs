@@ -338,6 +338,46 @@ impl BranchManager {
         Self::with_gc_config(db, timestamp, BranchGcConfig::default())
     }
 
+    /// Load a complete existing branch registry without creating metadata.
+    pub(crate) fn open_existing(db: Arc<DB>, timestamp: Arc<RwLock<u64>>) -> Result<Self> {
+        let bytes = db
+            .get(BRANCH_REGISTRY_KEY)
+            .map_err(|e| Error::storage(format!("branch registry read failed: {e}")))?
+            .ok_or_else(|| Error::storage("physical snapshot has no branch registry"))?;
+        let registry: BranchRegistry =
+            bincode::deserialize(&bytes).map_err(|e| Error::storage(format!("branch registry decode failed: {e}")))?;
+        if registry.branches.get(&registry.main_branch).map(String::as_str) != Some("main") {
+            return Err(Error::storage("physical snapshot has no registered main branch"));
+        }
+        let mut names = std::collections::HashSet::new();
+        let mut metadata_cache = HashMap::new();
+        for (id, name) in &registry.branches {
+            if *id == 0 || *id >= registry.next_branch_id || !names.insert(name.clone()) {
+                return Err(Error::storage("invalid branch registry identity"));
+            }
+            let bytes = db
+                .get(encode_branch_meta_key(name))
+                .map_err(|e| Error::storage(format!("branch metadata read failed: {e}")))?
+                .ok_or_else(|| Error::storage(format!("missing branch metadata for {name}")))?;
+            let metadata: BranchMetadata = bincode::deserialize(&bytes)
+                .map_err(|e| Error::storage(format!("branch metadata decode failed: {e}")))?;
+            if metadata.branch_id != *id || metadata.name != *name {
+                return Err(Error::storage("branch metadata identity mismatch"));
+            }
+            metadata_cache.insert(*id, metadata);
+        }
+        let pending_gc = Self::load_pending_gc(&db)?;
+        Ok(Self {
+            db,
+            registry: Arc::new(RwLock::new(registry)),
+            metadata_cache: Arc::new(RwLock::new(metadata_cache)),
+            timestamp,
+            gc_config: BranchGcConfig::default(),
+            pending_gc: Arc::new(RwLock::new(pending_gc)),
+            key_manager: None,
+        })
+    }
+
     /// Give this manager the engine's key manager.
     ///
     /// It builds writes against the same `Arc<DB>` the engine does, so it must

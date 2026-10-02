@@ -170,6 +170,28 @@ impl<'a> ViewCatalog<'a> {
         }
     }
 
+    /// Exact current or legacy layout: corrupt current tails must not silently
+    /// erase creator_schema by falling back to a valid legacy prefix.
+    pub(crate) fn get_view_for_physical_snapshot(&self, name: &str) -> Result<ViewMetadata> {
+        use bincode::Options as _;
+        let bytes = self
+            .storage
+            .get(&Self::view_key(name))?
+            .ok_or_else(|| Error::storage(format!("physical snapshot view '{name}' disappeared")))?;
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes()
+            .deserialize::<ViewMetadata>(&bytes)
+            .or_else(|_| {
+                bincode::DefaultOptions::new()
+                    .with_fixint_encoding()
+                    .reject_trailing_bytes()
+                    .deserialize::<LegacyViewMetadata>(&bytes)
+                    .map(ViewMetadata::from)
+            })
+            .map_err(|e| Error::storage(format!("physical snapshot view '{name}' cannot be decoded: {e}")))
+    }
+
     /// Drop a view
     pub fn drop_view(&self, view_name: &str, if_exists: bool) -> Result<()> {
         let key = Self::view_key(view_name);

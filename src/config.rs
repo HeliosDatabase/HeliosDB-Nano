@@ -362,6 +362,8 @@ pub struct ReplicationConfig {
     pub observer_hosts: Vec<String>,
     /// async, semi-sync (alias semisync), or sync (case-insensitive).
     pub sync_mode: String,
+    /// Default-off authenticated physical transfer endpoint and bounded RocksDB WAL retention.
+    pub physical: PhysicalReplicationConfig,
     /// Stable node UUID; generated at startup if absent.
     pub node_id: Option<String>,
 }
@@ -370,6 +372,7 @@ impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
             role: "standalone".to_string(),
+            physical: PhysicalReplicationConfig::default(),
             replication_port: 5433,
             startup_timeout_secs: 30,
             primary_host: None,
@@ -420,6 +423,7 @@ impl ReplicationConfig {
                     .map_err(|error| crate::Error::config(format!("replication.{key}: {error}")))?;
             }
         }
+        self.physical.validate()?;
         if let Some(node_id) = &self.node_id {
             uuid::Uuid::parse_str(node_id)
                 .map_err(|error| crate::Error::config(format!("replication.node_id must be a UUID: {error}")))?;
@@ -3070,5 +3074,132 @@ redirect_uri = "http://localhost:8080/auth/v1/callback"
         assert!(DumpConfig::validate_cron_schedule("0 * * *").is_err()); // Only 4 fields
         assert!(DumpConfig::validate_cron_schedule("0 * * * * *").is_err()); // 6 fields
         assert!(DumpConfig::validate_cron_schedule("").is_err()); // Empty
+    }
+}
+
+/// Explicit, default-off physical transfer source. The initial transport is
+/// authenticated plaintext on loopback only; use an authenticated tunnel for peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PhysicalReplicationConfig {
+    pub enabled: bool,
+    pub listen: String,
+    /// Exactly 32 raw random bytes in an owner-only regular file; never inline TOML.
+    pub token_file: Option<std::path::PathBuf>,
+    /// Existing private directory, disjoint from the live source database.
+    pub export_dir: Option<std::path::PathBuf>,
+    pub wal_retention_secs: u64,
+    pub wal_retention_size_mb: u64,
+    pub max_sessions: usize,
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
+    pub max_chunk_bytes: usize,
+    pub frame_timeout_secs: u64,
+    pub operation_timeout_secs: u64,
+}
+
+impl Default for PhysicalReplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:5440".into(),
+            token_file: None,
+            export_dir: None,
+            wal_retention_secs: 3600,
+            wal_retention_size_mb: 1024,
+            max_sessions: 2,
+            max_files: 2048,
+            max_file_bytes: 32 * 1024 * 1024 * 1024,
+            max_total_bytes: 64 * 1024 * 1024 * 1024,
+            max_chunk_bytes: 1024 * 1024,
+            frame_timeout_secs: 30,
+            operation_timeout_secs: 120,
+        }
+    }
+}
+
+impl PhysicalReplicationConfig {
+    /// Pure validation permits CLI overrides to supply paths after file loading.
+    /// Enabled-role, persistent-storage and file ownership checks run before open.
+    pub fn validate(&self) -> crate::Result<()> {
+        let address: std::net::SocketAddr = self
+            .listen
+            .parse()
+            .map_err(|_| crate::Error::config("replication.physical.listen must be a literal loopback IP:port"))?;
+        if !address.ip().is_loopback() || address.port() == 0 {
+            return Err(crate::Error::config("replication.physical.listen requires loopback and a nonzero port; remote transfer requires an authenticated tunnel"));
+        }
+        for (name, value, minimum, maximum) in [
+            ("wal_retention_secs", self.wal_retention_secs, 60, 86400),
+            ("wal_retention_size_mb", self.wal_retention_size_mb, 64, 65536),
+            ("max_sessions", self.max_sessions as u64, 1, 64),
+            ("max_files", self.max_files as u64, 1, 2048),
+            ("max_file_bytes", self.max_file_bytes, 1, 1_u64 << 40),
+            ("max_total_bytes", self.max_total_bytes, 1, 1_u64 << 40),
+            ("max_chunk_bytes", self.max_chunk_bytes as u64, 1, 1024 * 1024),
+            ("frame_timeout_secs", self.frame_timeout_secs, 1, 3600),
+            ("operation_timeout_secs", self.operation_timeout_secs, 1, 3600),
+        ] {
+            if !(minimum..=maximum).contains(&value) {
+                return Err(crate::Error::config(format!(
+                    "replication.physical.{name} must be between {minimum} and {maximum}"
+                )));
+            }
+        }
+        if self.max_file_bytes > self.max_total_bytes {
+            return Err(crate::Error::config(
+                "replication.physical.max_file_bytes must not exceed max_total_bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod physical_config_tests {
+    use super::*;
+    #[test]
+    fn physical_defaults_are_disabled_and_bounded() {
+        let config = ReplicationConfig::default();
+        assert!(!config.physical.enabled);
+        assert_eq!(config.physical.wal_retention_secs, 3600);
+        assert_eq!(config.physical.wal_retention_size_mb, 1024);
+        config.validate().unwrap();
+    }
+    #[test]
+    fn physical_config_is_strict_and_loopback_only() {
+        let config: ReplicationConfig = toml::from_str(
+            "[physical]\nenabled=true\nwal_retention_secs=60\nwal_retention_size_mb=64\nlisten='[::1]:5440'",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        for text in [
+            "[physical]\nunknown=true",
+            "[physical]\nwal_retention_secs=-1",
+            "[physical]\nenabled='yes'",
+        ] {
+            assert!(toml::from_str::<ReplicationConfig>(text).is_err(), "{text}");
+        }
+        for (field, value) in [
+            ("wal_retention_secs", "0"),
+            ("wal_retention_secs", "86401"),
+            ("wal_retention_size_mb", "63"),
+            ("wal_retention_size_mb", "65537"),
+            ("max_sessions", "0"),
+            ("max_sessions", "65"),
+            ("max_files", "2049"),
+            ("max_chunk_bytes", "1048577"),
+            ("max_total_bytes", "1099511627777"),
+            ("max_file_bytes", "68719476737"),
+            ("frame_timeout_secs", "0"),
+            ("operation_timeout_secs", "3601"),
+            ("listen", "'0.0.0.0:5440'"),
+            ("listen", "'127.0.0.1:0'"),
+            ("listen", "'localhost:5440'"),
+        ] {
+            let config: ReplicationConfig = toml::from_str(&format!("[physical]\n{field}={value}")).unwrap();
+            assert!(config.validate().is_err(), "{field}={value}");
+        }
     }
 }

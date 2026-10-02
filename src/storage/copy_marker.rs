@@ -117,6 +117,17 @@ impl CopyMarkers {
         }
     }
 
+    /// Strict physical-image hydration cannot skip corrupt visibility markers.
+    pub(crate) fn load_record_strict(&self, key: &[u8], value: &[u8]) -> crate::Result<()> {
+        let (table, first, last, ts) =
+            Self::parse_marker(key, value).ok_or_else(|| crate::Error::storage("malformed COPY visibility marker"))?;
+        if value.len() != 8 || first > last || table.is_empty() {
+            return Err(crate::Error::storage("invalid COPY visibility marker interval"));
+        }
+        self.insert(&table, first, last, ts);
+        Ok(())
+    }
+
     /// Whether `table` has at least one live marker. Used by TRUNCATE to skip
     /// the per-row materialization walk on unmarked tables.
     pub(crate) fn table_has_markers(&self, table: &str) -> bool {
