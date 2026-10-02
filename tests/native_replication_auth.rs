@@ -472,3 +472,44 @@ async fn health_probe_presents_the_configured_token() {
 
     stop(h).await;
 }
+
+/// C1: an authentication rejection is not a primary failure. The primary is
+/// alive (it answered), so the probe must not increment the failure count, emit
+/// PrimaryUnhealthy, or reach failover_threshold — even after many rounds.
+#[tokio::test]
+async fn auth_rejection_is_not_a_primary_failure() {
+    let _serial = SERIAL.lock().await;
+    let h = start_server(Some(token())).await;
+
+    let primary_id = Uuid::new_v4();
+    let mut config = FailoverConfig::default();
+    config.auto_failover = true;
+    config.health_check_interval = Duration::from_millis(20);
+    config.failover_threshold = 2;
+
+    let mut watcher = FailoverWatcher::new(config, Uuid::new_v4(), primary_id, Some(h.addr), vec![]);
+    watcher.set_auth(Some(TransferToken::new([0x22; 32]).unwrap()));
+    let mut events = watcher.take_event_receiver().expect("event receiver");
+    watcher.start().await.unwrap();
+
+    // Well past failover_threshold rounds of `health_check_interval`.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        !watcher.should_failover().await,
+        "an authentication rejection must never count toward failover"
+    );
+    let states = watcher.health_states().await;
+    let primary = states.get(&primary_id).expect("primary must have been probed");
+    assert_ne!(primary.health, NodeHealth::Failed, "auth rejection is not a primary failure");
+    assert_ne!(primary.health, NodeHealth::Unreachable);
+
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        seen.push(format!("{event:?}"));
+    }
+    assert!(seen.is_empty(), "auth rejection must not emit failover events: {seen:?}");
+
+    watcher.stop().await.unwrap();
+    stop(h).await;
+}

@@ -18,6 +18,7 @@
 
 use super::config::{FailoverConfig, NodeHealth, StandbyConfig};
 use super::physical_wire::TransferToken;
+use super::streaming::{AUTH_FAILED_MESSAGE, AUTH_REQUIRED_MESSAGE};
 use super::transport::{
     Capabilities, HandshakeRequest, HealthStatus, HeartbeatPayload, MessageType, NodeRole as TransportNodeRole,
     ReplicationConnection, SyncModeConfig,
@@ -453,7 +454,27 @@ impl FailoverWatcher {
             auth,
         };
 
-        let handshake_response = conn.handshake_client(handshake_req).await?;
+        let handshake_response = match conn.handshake_client(handshake_req).await {
+            Ok(response) => response,
+            Err(error) => {
+                let text = error.to_string();
+                // An authentication rejection proves the primary is ALIVE: it
+                // answered the probe. It is a local configuration error, never a
+                // primary failure — it must not raise a failure count, emit
+                // PrimaryUnhealthy, or count toward failover_threshold. Markers
+                // come from `streaming` (single definition, matched here).
+                if text.contains(AUTH_FAILED_MESSAGE) || text.contains(AUTH_REQUIRED_MESSAGE) {
+                    tracing::error!(
+                        "Replication probe to {} was rejected for authentication; the configured probe \
+                         token does not match the primary's token. This is a configuration error, not a \
+                         primary failure, and will not trigger failover.",
+                        addr
+                    );
+                    return Ok((NodeHealth::Recovering, None));
+                }
+                return Err(error);
+            }
+        };
 
         if !handshake_response.accepted {
             return Err(ReplicationError::Failover(

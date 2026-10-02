@@ -48,6 +48,14 @@ use uuid::Uuid;
 // STREAMING SERVER (PRIMARY SIDE)
 // =============================================================================
 
+/// Server-side marker: the peer presented a token that does not match the
+/// configured replication token. This is the single definition of the text;
+/// the failover watcher matches it client-side.
+pub const AUTH_FAILED_MESSAGE: &str = "native replication authentication failed";
+/// Server-side marker: the primary requires a token and the peer presented none.
+/// Matched client-side by the failover watcher.
+pub const AUTH_REQUIRED_MESSAGE: &str = "native replication authentication required";
+
 /// Streaming server configuration
 #[derive(Debug, Clone)]
 pub struct StreamingServerConfig {
@@ -354,9 +362,9 @@ impl StreamingServer {
                 .unwrap_or(false);
             if !accepted {
                 let message = if request.auth.is_some() {
-                    "native replication authentication failed"
+                    AUTH_FAILED_MESSAGE
                 } else {
-                    "native replication authentication required"
+                    AUTH_REQUIRED_MESSAGE
                 };
                 // R5: an unauthenticated peer must learn nothing about server state.
                 let rejected = HandshakeResponse {
