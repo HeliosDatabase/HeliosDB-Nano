@@ -76,22 +76,35 @@ def run(root, binary, helper):
         token_valid = write_token(root / "token_valid")
         token_wrong = write_token(root / "token_wrong")
         token_world = write_token(root / "token_world", mode=0o644)
+        token_short = root / "token_short"
+        token_short.write_bytes(os.urandom(31))
+        os.chmod(token_short, 0o600)
+        token_link_target = write_token(root / "token_link_target")
+        token_link = root / "token_link"
+        os.symlink(token_link_target, token_link)
 
-        # --- a group/other-readable token file must be refused, never downgraded ---
-        primary_empty, plog_empty = fixture.start(
-            "primary_sloppy_token", epg, eprepl, "primary", token_file=token_world)
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline and primary_empty.poll() is None:
-            time.sleep(0.2)
-        check(primary_empty.poll() is not None, "primary with a 0644 token file did not refuse to start")
-        empty_log = log_text(plog_empty)
-        check("replication token" in empty_log, f"missing token-file diagnostic: {empty_log[-400:]}")
-        check("Server ready!" not in empty_log, "a sloppy token file must not start a ready server")
-        result["checks"].append("world-readable token file: primary refuses to start (no downgrade)")
-        # Reap the intentionally-exited child so the fixture's alive() check does
-        # not flag it for the remaining controls.
-        primary_empty.wait(timeout=5)
-        fixture.children.remove(primary_empty)
+        # --- malformed/untrusted token files must be refused, never downgraded ---
+        sloppy_cases = [
+            ("0644 mode", token_world),
+            ("symlink", token_link),
+            ("31-byte length", token_short),
+        ]
+        sloppy_ports = [(epg, eprepl)] + [tuple(fixture.ports(2)) for _ in sloppy_cases[1:]]
+        for (label, token_path), (g, r) in zip(sloppy_cases, sloppy_ports):
+            child, log = fixture.start(
+                f"primary_sloppy_{label.replace(' ', '_')}", g, r, "primary", token_file=token_path)
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline and child.poll() is None:
+                time.sleep(0.2)
+            check(child.poll() is not None, f"primary with a {label} token file did not refuse to start")
+            text = log_text(log)
+            check("replication token" in text, f"missing token-file diagnostic for {label}: {text[-400:]}")
+            check("Server ready!" not in text, f"a {label} token file must not start a ready server")
+            result["checks"].append(f"{label} token file: primary refuses to start (no downgrade)")
+            # Reap the intentionally-exited child so the fixture's alive() check does
+            # not flag it for the remaining controls.
+            child.wait(timeout=5)
+            fixture.children.remove(child)
 
         # --- valid ---
         primary, plog = fixture.start("primary", ppg, prepl, "primary", token_file=token_valid)

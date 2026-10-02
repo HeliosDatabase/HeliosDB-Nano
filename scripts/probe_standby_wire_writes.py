@@ -61,21 +61,30 @@ class Fixture:
             result.append(s.getsockname()[1])
         return result
 
-    def start(self, name, pg, native, role, source_native=None, source_pg=None, token_file=None):
+    def release_port(self, port):
+        for s in list(self.reserved):
+            if s.getsockname()[1] == port:
+                s.close()
+                self.reserved.remove(s)
+
+    def start(self, name, pg, native, role, source_native=None, source_pg=None, token_file=None,
+              listen="127.0.0.1", node_id=None, extra_args=None):
         cwd = self.root / name
         cwd.mkdir()
         output = self.root / f"{name}.log"
         log = output.open("wb")
         self.logs.append(log)
         command = [str(self.binary), "start", "--data-dir", str(cwd / "data"),
-                   "--listen", "127.0.0.1", "--port", str(pg), "--http-port", "0",
+                   "--listen", listen, "--port", str(pg), "--http-port", "0",
                    "--auth", "password", "--password", PASSWORD,
                    "--replication-role", role, "--replication-port", str(native),
-                   "--sync-mode", "async", "--node-id", str(uuid.uuid4())]
+                   "--sync-mode", "async", "--node-id", node_id or str(uuid.uuid4())]
         if token_file is not None:
             command += ["--replication-token-file", str(token_file)]
         if source_native is not None:
             command += ["--primary-host", f"127.0.0.1:{source_native}"]
+        if extra_args:
+            command += list(extra_args)
         env = os.environ.copy()
         env.pop("HELIOSDB_NANO_READY_FILE", None)
         env.pop("HELIOSDB_PRIMARY_PG_PORT", None)
