@@ -1,27 +1,67 @@
+# syntax=docker/dockerfile:1
+#
+# Runtime image around a prebuilt heliosdb-nano release binary — this is the
+# image published by release CI as ghcr.io/heliosdatabase/heliosdb-nano
+# (linux/amd64 + linux/arm64). No Rust toolchain, no in-container compile.
+#
+# The release binaries are built on ubuntu-24.04 and need glibc >= 2.39,
+# hence debian:trixie-slim (glibc 2.41).
+#
+# CI layout (multi-arch, one binary per Docker TARGETARCH):
+#   target/docker/amd64/heliosdb-nano
+#   target/docker/arm64/heliosdb-nano
+# Local single-arch build from your own `cargo build --release`:
+#   docker build -f Dockerfile.binary \
+#     --build-arg BINARY=target/release/heliosdb-nano -t heliosdb-nano:dev .
+
 FROM debian:trixie-slim
 
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    curl \
-    libssl3 \
+ARG TARGETARCH
+ARG BINARY=target/docker/${TARGETARCH}/heliosdb-nano
+ARG VERSION=dev
+ARG REVISION=unknown
+ARG CREATED=unknown
+
+LABEL org.opencontainers.image.title="HeliosDB Nano" \
+      org.opencontainers.image.description="Embedded-or-server SQL database with PostgreSQL and MySQL wire protocols, vector search and MVCC" \
+      org.opencontainers.image.source="https://github.com/HeliosDatabase/HeliosDB-Nano" \
+      org.opencontainers.image.url="https://heliosdb.com" \
+      org.opencontainers.image.documentation="https://docs.heliosdb.com/nano/" \
+      org.opencontainers.image.vendor="HeliosDB" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.created="${CREATED}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        libssl3t64 \
+        openssl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -r -s /bin/false heliosdb
-RUN mkdir -p /data && chown heliosdb:heliosdb /data
+# Fixed uid/gid 999 so volume ownership is predictable across image versions.
+RUN groupadd -r -g 999 heliosdb \
+    && useradd -r -u 999 -g heliosdb -d /data -s /usr/sbin/nologin heliosdb \
+    && mkdir -p /data \
+    && chown heliosdb:heliosdb /data
 
-COPY target/release/heliosdb-nano /usr/local/bin/heliosdb-nano
-RUN chmod +x /usr/local/bin/heliosdb-nano
+COPY --chmod=755 ${BINARY} /usr/local/bin/heliosdb-nano
+COPY --chmod=755 deployment/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 USER heliosdb
+WORKDIR /data
+VOLUME ["/data"]
 
-ENV HELIOSDB_DATA_DIR=/data
-ENV HELIOSDB_LOG_LEVEL=info
-ENV RUST_BACKTRACE=1
+ENV HELIOSDB_DATA_DIR=/data \
+    HELIOSDB_LOG_LEVEL=info
 
-EXPOSE 5432 8080
+# 5432 PostgreSQL wire protocol, 8080 HTTP API (/health, REST),
+# 3306 MySQL wire protocol (only when started with --mysql).
+EXPOSE 5432 8080 3306
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1
 
-ENTRYPOINT ["heliosdb-nano"]
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["start", "--data-dir", "/data", "--listen", "0.0.0.0", "--port", "5432"]

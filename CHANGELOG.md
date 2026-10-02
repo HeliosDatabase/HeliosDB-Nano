@@ -5,6 +5,20 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Distribution
+- **Official container image on GHCR, multi-arch.** Release CI now publishes
+  `ghcr.io/heliosdatabase/heliosdb-nano:X.Y.Z` (plus `:X.Y`, `:vX.Y.Z` and
+  `:latest`) for linux/amd64 and linux/arm64, built from the release's own
+  checksum-verified binaries on `debian:trixie-slim`. A `workflow_dispatch`
+  trigger (`version` input) publishes the image for an existing release.
+- **Container entrypoint.** `HELIOSDB_PASSWORD` / `HELIOSDB_PASSWORD_FILE`
+  enable scram-sha-256 auth (trust is loopback-only, so the old image exited at
+  start); a self-signed TLS certificate is generated in `/data/tls` on first
+  start so `sslmode=require` works; fixed uid/gid 999; OCI labels link the
+  package to this repository.
+
 ## [4.41.0] - 2026-09-22
 
 Two themes, both finishing work v4.40.0 started. The first is **what a transaction

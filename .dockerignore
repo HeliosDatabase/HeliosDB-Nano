@@ -8,6 +8,7 @@ target/
 # …but Dockerfile.binary copies the prebuilt release binary from the host
 # (release CI drops the GitHub-Release artifact there), so re-include it:
 !target/release/heliosdb-nano
+!target/docker/*/heliosdb-nano
 **/*.rs.bk
 *.pdb
 

@@ -18,7 +18,7 @@ allowed-tools: Bash(docker *), Bash(docker compose *), Bash(flyctl *), Bash(syst
 
 | Verb | Surface | One-liner |
 |------|---------|-----------|
-| docker build (binary image) | shell | `docker build -f Dockerfile.binary -t heliosdb-nano:local .` |
+| docker build (binary image) | shell | `docker build -f Dockerfile.binary --build-arg BINARY=target/release/heliosdb-nano -t heliosdb-nano:local .` |
 | docker compose up | shell | `cd deployment/docker && docker compose up -d` |
 | fly deploy | shell | `cd deployment/flyio && flyctl deploy` |
 | railway link | shell | `railway link` (uses `deployment/railway/railway.toml`) |
@@ -34,9 +34,9 @@ The repo ships `Dockerfile.binary` — a minimal runtime image around the releas
 ```bash
 # from repo root
 cargo build --release                      # produces target/release/heliosdb-nano
-docker build -f Dockerfile.binary -t heliosdb-nano:dev .
+docker build -f Dockerfile.binary --build-arg BINARY=target/release/heliosdb-nano -t heliosdb-nano:dev .
 
-docker run --rm -p 5432:5432 \
+docker run --rm -p 5432:5432 -e HELIOSDB_PASSWORD=change-me \
     -v $(pwd)/mydata:/var/lib/heliosdb \
     heliosdb-nano:dev start \
         --data-dir /var/lib/heliosdb \

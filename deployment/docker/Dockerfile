@@ -31,42 +31,40 @@ COPY bindings ./bindings
 # Build final binary with needed features
 RUN cargo build --release --locked --features "encryption,vector-search,ha-tier1"
 
-# Runtime stage
+# Runtime stage — same layout as Dockerfile.binary (the published GHCR image)
 FROM debian:trixie-slim AS runtime
 
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    libssl3t64 \
+    openssl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -r -s /bin/false heliosdb
+# Non-root user with a fixed uid/gid (999) and the data directory
+RUN groupadd -r -g 999 heliosdb \
+    && useradd -r -u 999 -g heliosdb -d /data -s /usr/sbin/nologin heliosdb \
+    && mkdir -p /data && chown heliosdb:heliosdb /data
 
-# Create data directory
-RUN mkdir -p /data && chown heliosdb:heliosdb /data
-
-# Copy binary from builder
 COPY --from=builder /build/target/release/heliosdb-nano /usr/local/bin/heliosdb-nano
+COPY deployment/docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 755 /usr/local/bin/heliosdb-nano /usr/local/bin/docker-entrypoint.sh
 
-# Set permissions
-RUN chmod +x /usr/local/bin/heliosdb-nano
-
-# Switch to non-root user
 USER heliosdb
+WORKDIR /data
+VOLUME ["/data"]
 
-# Set environment
 ENV HELIOSDB_DATA_DIR=/data
 ENV HELIOSDB_LOG_LEVEL=info
 ENV RUST_BACKTRACE=1
 
-# Expose ports
-EXPOSE 5432 8080
+# 5432 PostgreSQL, 8080 HTTP API (/health), 3306 MySQL (with --mysql)
+EXPOSE 5432 8080 3306
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1
 
-# Default command - start server listening on all interfaces
-ENTRYPOINT ["heliosdb-nano"]
+# The entrypoint wires HELIOSDB_PASSWORD(_FILE) into scram-sha-256 auth and
+# generates a self-signed TLS certificate on first start — see the script.
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["start", "--data-dir", "/data", "--listen", "0.0.0.0", "--port", "5432"]

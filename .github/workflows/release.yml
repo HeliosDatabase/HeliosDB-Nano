@@ -4,6 +4,21 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual run: (re)publish the container image for an EXISTING release from
+  # its attached binaries. Only the docker-image job runs; nothing is
+  # rebuilt, published to crates.io or attached to the release.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing release tag to publish as a container image (e.g. v4.41.0)'
+        required: true
+        type: string
+      latest:
+        description: 'Also move :latest (auto = only if this is the newest non-prerelease release)'
+        required: false
+        default: auto
+        type: choice
+        options: [auto, 'true', 'false']
 
 permissions:
   contents: write       # needed to create the GitHub Release
@@ -11,6 +26,7 @@ permissions:
 jobs:
   publish:
     name: Test, verify tag, publish, release
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -126,6 +142,7 @@ jobs:
   build-binaries:
     name: Binary (${{ matrix.target }})
     needs: publish
+    if: github.event_name == 'push'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     strategy:
@@ -225,7 +242,7 @@ jobs:
   attach-binaries:
     name: Attach binaries to GitHub Release
     needs: [publish, build-binaries]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.publish.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -254,54 +271,137 @@ jobs:
             dist/SHA256SUMS
 
   # ═══════════════════════════════════════════════════════════════════════
-  # Docker image from the prebuilt linux/amd64 binary (Dockerfile.binary —
-  # no 20-40 min in-container compile). Pushed to GHCR as
-  #   ghcr.io/heliosdatabase/heliosdb-nano:vX.Y.Z  and  :latest
+  # Official container image, multi-arch (linux/amd64 + linux/arm64), built
+  # from the release's own prebuilt Linux binaries (Dockerfile.binary — no
+  # in-container compile) and pushed to GHCR:
   #
-  # continue-on-error: GHCR pushes need the `packages: write` permission AND
-  # the package to be linked/visible for the repo; if the org hasn't granted
-  # that yet, this job must not fail the whole release — binaries and the
-  # crates.io publish above are the primary channels.
+  #   ghcr.io/heliosdatabase/heliosdb-nano:X.Y.Z   (also :vX.Y.Z and :X.Y)
+  #   ghcr.io/heliosdatabase/heliosdb-nano:latest  (newest stable release only)
+  #
+  # The binaries are downloaded from the GitHub Release and checked against
+  # its SHA256SUMS, so a tag push and a manual workflow_dispatch for an older
+  # release produce the image the same way. The OCI `source` label links the
+  # GHCR package to this repository.
   # ═══════════════════════════════════════════════════════════════════════
   docker-image:
     name: Docker image → ghcr.io
-    needs: [publish, build-binaries]
-    if: ${{ !cancelled() && needs.publish.result == 'success' }}
-    continue-on-error: true
+    needs: [publish, attach-binaries]
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'workflow_dispatch'
+          || (needs.publish.result == 'success' && needs.attach-binaries.result == 'success')) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
+    env:
+      IMAGE: ghcr.io/heliosdatabase/heliosdb-nano
+      GH_TOKEN: ${{ github.token }}
     steps:
+      - name: Resolve version
+        id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_LATEST: ${{ inputs.latest }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_VERSION"
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+          case "$tag" in v*) ;; *) tag="v$tag" ;; esac
+          if ! echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::not a release tag: $tag"; exit 1
+          fi
+          version="${tag#v}"
+          minor="$(echo "$version" | cut -d. -f1,2)"
+          newest="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          latest="${INPUT_LATEST:-auto}"
+          if [ "$latest" = "auto" ] || [ -z "$latest" ]; then
+            if [ "$tag" = "$newest" ] && [ "$version" = "${version%%-*}" ]; then latest=true; else latest=false; fi
+          fi
+          tags="${IMAGE}:${version},${IMAGE}:${tag}"
+          # Floating X.Y tag only for stable releases
+          if [ "$version" = "${version%%-*}" ]; then tags="${tags},${IMAGE}:${minor}"; fi
+          if [ "$latest" = "true" ]; then tags="${tags},${IMAGE}:latest"; fi
+          echo "tag=$tag"           >> "$GITHUB_OUTPUT"
+          echo "version=$version"   >> "$GITHUB_OUTPUT"
+          echo "tags=$tags"         >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag version=$version newest=$newest latest=$latest"
+          echo "tags=$tags"
+
+      # Tag push: the tagged tree. Manual run: the dispatched branch (main),
+      # so older releases get the current Dockerfile + entrypoint.
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Download linux x86_64 artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: x86_64-unknown-linux-gnu
-          path: dist
-
-      - name: Unpack binary where Dockerfile.binary expects it
+      - name: Download + verify release binaries
+        id: bins
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          mkdir -p target/release
-          tar -xzf "dist/heliosdb-nano-v${version}-x86_64-unknown-linux-gnu.tar.gz" \
-              -C target/release heliosdb-nano
+          tag="${{ steps.v.outputs.tag }}"
+          mkdir -p dl
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir dl \
+            --pattern "heliosdb-nano-${tag}-x86_64-unknown-linux-gnu.tar.gz" \
+            --pattern "heliosdb-nano-${tag}-aarch64-unknown-linux-gnu.tar.gz" \
+            --pattern SHA256SUMS
+          (cd dl && grep -E "linux-gnu\.tar\.gz$" SHA256SUMS | sha256sum -c -)
+          platforms=""
+          for pair in amd64:x86_64-unknown-linux-gnu arm64:aarch64-unknown-linux-gnu; do
+            arch="${pair%%:*}"; target="${pair#*:}"
+            archive="dl/heliosdb-nano-${tag}-${target}.tar.gz"
+            [ -f "$archive" ] || { echo "::error::missing $archive"; exit 1; }
+            mkdir -p "target/docker/${arch}"
+            tar -xzf "$archive" -C "target/docker/${arch}" heliosdb-nano
+            platforms="${platforms:+$platforms,}linux/${arch}"
+          done
+          ls -l target/docker/*/
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (arm64 apt layer)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" \
-            | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.binary
+          platforms: ${{ steps.bins.outputs.platforms }}
+          push: true
+          provenance: false
+          tags: ${{ steps.v.outputs.tags }}
+          build-args: |
+            VERSION=${{ steps.v.outputs.version }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ steps.v.outputs.created }}
+          annotations: |
+            index:org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            index:org.opencontainers.image.description=HeliosDB Nano — embedded-or-server SQL database (PostgreSQL + MySQL wire protocols)
+            index:org.opencontainers.image.licenses=Apache-2.0
+            index:org.opencontainers.image.version=${{ steps.v.outputs.version }}
+
+      - name: Smoke test the pushed image
         run: |
           set -euo pipefail
-          image="ghcr.io/heliosdatabase/heliosdb-nano"
-          docker build -f Dockerfile.binary \
-            -t "${image}:${GITHUB_REF_NAME}" \
-            -t "${image}:latest" .
-          docker push "${image}:${GITHUB_REF_NAME}"
-          docker push "${image}:latest"
+          ref="${IMAGE}:${{ steps.v.outputs.version }}"
+          docker run --rm "$ref" --version | grep -F "${{ steps.v.outputs.version }}"
+          docker run -d --name nano-smoke -e HELIOSDB_PASSWORD=smoke-test -p 127.0.0.1:55432:5432 "$ref"
+          for _ in $(seq 1 30); do
+            if PGPASSWORD=smoke-test psql "host=127.0.0.1 port=55432 user=postgres sslmode=require" -tAc 'SELECT 1' 2>/dev/null | grep -qx 1; then
+              echo "SELECT 1 over TLS + scram: ok"; docker rm -f nano-smoke; exit 0
+            fi
+            sleep 2
+          done
+          docker logs nano-smoke; exit 1
