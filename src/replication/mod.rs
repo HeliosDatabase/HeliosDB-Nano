@@ -17,6 +17,8 @@ pub use ha_state::{ha_state, HARole, HAStateRegistry, NodeConfig, PrimaryInfo, S
 
 // Tier 1: Warm Standby (ha-tier1)
 #[cfg(feature = "ha-tier1")]
+pub mod checkpoint_transfer;
+#[cfg(feature = "ha-tier1")]
 pub mod failover_watcher;
 #[cfg(feature = "ha-tier1")]
 pub mod history;
@@ -24,6 +26,14 @@ pub mod history;
 pub mod logical_replication;
 #[cfg(feature = "ha-tier1")]
 pub mod lsn_manager;
+#[cfg(feature = "ha-tier1")]
+pub mod physical;
+#[cfg(feature = "ha-tier1")]
+pub mod physical_receiver;
+#[cfg(feature = "ha-tier1")]
+pub mod physical_source;
+#[cfg(feature = "ha-tier1")]
+pub mod physical_wire;
 #[cfg(feature = "ha-tier1")]
 pub mod query_forwarder;
 #[cfg(feature = "ha-tier1")]
