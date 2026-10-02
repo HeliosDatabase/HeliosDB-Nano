@@ -306,14 +306,15 @@ impl StreamingServer {
         // `HandshakeRequest.auth` broke bincode layout compatibility with v1, so
         // this is the gate that prevents a silent mis-decode or downgrade.
         if msg.header.version != PROTOCOL_VERSION {
+            // R5: an unauthenticated peer must learn nothing about server state.
             let rejected = HandshakeResponse {
                 history_id: Uuid::nil(),
                 accepted: false,
-                server_node_id,
+                server_node_id: Uuid::nil(),
                 sync_mode: SyncModeConfig::Async,
-                primary_lsn: current_lsn,
+                primary_lsn: 0,
                 slot_name: None,
-                fencing_token,
+                fencing_token: 0,
                 capabilities: Capabilities::all(),
                 error: Some(format!(
                     "native protocol version mismatch: server v{}, peer v{}",
@@ -359,14 +360,15 @@ impl StreamingServer {
                 } else {
                     "native replication authentication required"
                 };
+                // R5: an unauthenticated peer must learn nothing about server state.
                 let rejected = HandshakeResponse {
                     history_id: Uuid::nil(),
                     accepted: false,
-                    server_node_id,
+                    server_node_id: Uuid::nil(),
                     sync_mode: request.sync_mode,
-                    primary_lsn: current_lsn,
+                    primary_lsn: 0,
                     slot_name: None,
-                    fencing_token,
+                    fencing_token: 0,
                     capabilities: Capabilities::all(),
                     error: Some(message.to_string()),
                 };
