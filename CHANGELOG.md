@@ -19,6 +19,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   start so `sslmode=require` works; the unauthenticated HTTP API is bound to
   127.0.0.1 unless `HELIOSDB_HTTP_LISTEN` says otherwise; fixed uid/gid 999; OCI labels link the
   package to this repository.
+- **Image honours `HELIOSDB_DATA_DIR`.** The default command is now plain
+  `start`; the entrypoint adds `--data-dir $HELIOSDB_DATA_DIR` (default `/data`)
+  and `--listen 0.0.0.0`. Before, the hard-coded `--data-dir /data` meant a
+  volume mounted at another path stayed empty and the data lived in an
+  anonymous volume. An unwritable data directory (e.g. a root-owned bind mount)
+  now stops the container with an explanation.
+- **`:X.Y` only follows the newest patch.** Rebuilding an older patch with
+  `workflow_dispatch` no longer moves the floating minor tag backwards.
+
+### Security
+- **Password off the command line.** `heliosdb-nano start` accepts
+  `--password-file <path>` and, when neither `--password` nor
+  `--password-file` is given for a password auth method, reads
+  `HELIOSDB_PASSWORD` from the environment. The container entrypoint uses
+  these, so the password no longer shows up in the host's process table
+  (`ps`, `docker top`). `--password` still works but is visible to every
+  local user.
 
 ## [4.41.0] - 2026-09-22
 

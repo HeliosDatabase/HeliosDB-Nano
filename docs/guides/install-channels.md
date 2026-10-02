@@ -84,10 +84,18 @@ psql "postgresql://postgres:change-me@localhost:5432/postgres?sslmode=require" -
 
 The entrypoint (`deployment/docker/docker-entrypoint.sh`):
 
+- starts the server with `--data-dir $HELIOSDB_DATA_DIR` (default `/data`) and
+  `--listen 0.0.0.0` unless you pass those flags yourself — mount your volume
+  at that path. The directory must be writable by uid 999 (a named volume is;
+  a fresh host bind mount usually is not — `chown -R 999:999` it first), and
+  the container exits with an explanation if it is not;
 - turns `HELIOSDB_PASSWORD` (or `HELIOSDB_PASSWORD_FILE`, for Docker/Kubernetes
   secrets) into `--auth scram-sha-256` — trust auth is refused on a container's
   `0.0.0.0` listener, so without a password the container exits with an
-  explanation;
+  explanation. In releases after 4.41.0 the password reaches the server through the
+  environment or `--password-file`, so it never appears in the host's process
+  table; 4.41.0 only has `--password`, so its image puts the password on the
+  command line and logs a warning;
 - generates a self-signed TLS certificate in `/data/tls` on first start, so
   `sslmode=require` works; supply your own with `HELIOSDB_TLS_CERT` +
   `HELIOSDB_TLS_KEY`, or disable with `HELIOSDB_TLS=off`;
