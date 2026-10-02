@@ -152,8 +152,8 @@ impl OpenRequest {
         let value = match bytes {
             [0] => Self::Snapshot,
             [1, ..] if bytes.len() == 25 => Self::Resume {
-                history: uuid_at(bytes, 1),
-                after: u64_at(bytes, 17),
+                history: uuid_at(bytes, 1)?,
+                after: u64_at(bytes, 17)?,
             },
             _ => return Err(invalid("invalid session open request")),
         };
@@ -345,7 +345,7 @@ async fn bounded<T>(
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     tokio::select! { biased;
-        _=cancelled(shutdown)=>Err(WireError::Shutdown),
+        ()=cancelled(shutdown)=>Err(WireError::Shutdown),
         result=tokio::time::timeout(duration,future)=>result.map_err(|_|WireError::Timeout)?,
     }
 }
@@ -358,11 +358,11 @@ async fn read_frame<R: AsyncRead + Unpin>(
     bounded(shutdown, limits.frame_timeout, async {
         let mut header = [0u8; HEADER_BYTES];
         io.read_exact(&mut header).await?;
-        if header[..8] != MAGIC || u16::from_be_bytes(header[8..10].try_into().unwrap()) != VERSION {
+        if header[..8] != MAGIC || u16::from_be_bytes([header[8], header[9]]) != VERSION {
             return Err(invalid("wrong physical transfer magic/version"));
         }
-        let kind = Kind::decode(u16::from_be_bytes(header[10..12].try_into().unwrap()))?;
-        let length = u32::from_be_bytes(header[12..16].try_into().unwrap()) as usize;
+        let kind = Kind::decode(u16::from_be_bytes([header[10], header[11]]))?;
+        let length = u32::from_be_bytes([header[12], header[13], header[14], header[15]]) as usize;
         // Both state and per-kind bounds checked BEFORE any payload allocation.
         if !allowed.contains(&kind) || !kind.valid_size(length) {
             return Err(invalid("unexpected frame or invalid length"));
@@ -396,14 +396,32 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     })
     .await
 }
-fn u32_at(bytes: &[u8], offset: usize) -> u32 {
-    u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap())
+fn u32_at(bytes: &[u8], offset: usize) -> Result<u32> {
+    let end = offset.checked_add(4).ok_or_else(|| invalid("frame offset overflow"))?;
+    let raw: [u8; 4] = bytes
+        .get(offset..end)
+        .ok_or_else(|| invalid("frame truncated"))?
+        .try_into()
+        .map_err(|_| invalid("frame truncated"))?;
+    Ok(u32::from_be_bytes(raw))
 }
-fn u64_at(bytes: &[u8], offset: usize) -> u64 {
-    u64::from_be_bytes(bytes[offset..offset + 8].try_into().unwrap())
+fn u64_at(bytes: &[u8], offset: usize) -> Result<u64> {
+    let end = offset.checked_add(8).ok_or_else(|| invalid("frame offset overflow"))?;
+    let raw: [u8; 8] = bytes
+        .get(offset..end)
+        .ok_or_else(|| invalid("frame truncated"))?
+        .try_into()
+        .map_err(|_| invalid("frame truncated"))?;
+    Ok(u64::from_be_bytes(raw))
 }
-fn uuid_at(bytes: &[u8], offset: usize) -> Uuid {
-    Uuid::from_bytes(bytes[offset..offset + 16].try_into().unwrap())
+fn uuid_at(bytes: &[u8], offset: usize) -> Result<Uuid> {
+    let end = offset.checked_add(16).ok_or_else(|| invalid("frame offset overflow"))?;
+    let raw: [u8; 16] = bytes
+        .get(offset..end)
+        .ok_or_else(|| invalid("frame truncated"))?
+        .try_into()
+        .map_err(|_| invalid("frame truncated"))?;
+    Ok(Uuid::from_bytes(raw))
 }
 fn chunk_bounds(
     manifest: &CheckpointManifest,
@@ -438,12 +456,12 @@ impl PollSummary {
         bytes.extend(self.batches.to_be_bytes());
         bytes
     }
-    fn decode(bytes: &[u8]) -> Self {
-        Self {
-            through: u64_at(bytes, 0),
-            durable_barrier: u64_at(bytes, 8),
-            batches: u32_at(bytes, 16),
-        }
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        Ok(Self {
+            through: u64_at(bytes, 0)?,
+            durable_barrier: u64_at(bytes, 8)?,
+            batches: u32_at(bytes, 16)?,
+        })
     }
     fn validate_since(self, after: u64, byte_limit: usize, known_barrier: u64) -> Result<()> {
         self.validate(after, byte_limit)?;
@@ -529,12 +547,12 @@ where
         match request.kind {
             Kind::ChunkRequest => {
                 let manifest = info.manifest().ok_or_else(|| invalid("chunks require snapshot mode"))?;
-                if uuid_at(&request.payload, 0) != manifest.snapshot_id {
+                if uuid_at(&request.payload, 0)? != manifest.snapshot_id {
                     return Err(invalid("chunk snapshot/session mismatch"));
                 }
-                let index = u32_at(&request.payload, 16);
-                let offset = u64_at(&request.payload, 20);
-                let length = u32_at(&request.payload, 28);
+                let index = u32_at(&request.payload, 16)?;
+                let offset = u64_at(&request.payload, 20)?;
+                let length = u32_at(&request.payload, 28)?;
                 chunk_bounds(manifest, index, offset, length, &limits)?;
                 let bytes = bounded(
                     &mut shutdown,
@@ -554,11 +572,11 @@ where
                 write_frame(&mut io, Kind::Chunk, &payload, &limits, &mut shutdown).await?;
             }
             Kind::PollRequest => {
-                if uuid_at(&request.payload, 0) != info.session_id() {
+                if uuid_at(&request.payload, 0)? != info.session_id() {
                     return Err(invalid("poll snapshot/session mismatch"));
                 }
-                let after = u64_at(&request.payload, 16);
-                let byte_limit = u32_at(&request.payload, 24) as usize;
+                let after = u64_at(&request.payload, 16)?;
+                let byte_limit = u32_at(&request.payload, 24)? as usize;
                 if after < info.initial_after()
                     || after > MAX_SOURCE_SEQUENCE
                     || byte_limit == 0
@@ -742,10 +760,10 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             )
             .await?;
             let info = SourceSessionInfo::Resume {
-                session_id: uuid_at(&frame.payload, 0),
-                history: uuid_at(&frame.payload, 16),
-                initial_after: u64_at(&frame.payload, 32),
-                durable_barrier: u64_at(&frame.payload, 40),
+                session_id: uuid_at(&frame.payload, 0)?,
+                history: uuid_at(&frame.payload, 16)?,
+                initial_after: u64_at(&frame.payload, 32)?,
+                durable_barrier: u64_at(&frame.payload, 40)?,
             };
             info.validate(request, &self.limits)?;
             self.known_barrier = info.initial_barrier();
@@ -795,12 +813,19 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             )
             .await?;
             let mut frame = read_frame(&mut self.io, &[Kind::Chunk], &self.limits, &mut self.shutdown).await?;
-            if uuid_at(&frame.payload, 0) != manifest.snapshot_id
-                || u32_at(&frame.payload, 16) != index
-                || u64_at(&frame.payload, 20) != offset
-                || frame.payload.len() != CHUNK_META + length as usize
-                || Sha256::digest(&frame.payload[CHUNK_META..]).as_slice() != &frame.payload[28..60]
-            {
+            let identity_ok = uuid_at(&frame.payload, 0)? == manifest.snapshot_id
+                && u32_at(&frame.payload, 16)? == index
+                && u64_at(&frame.payload, 20)? == offset
+                && frame.payload.len() == CHUNK_META + length as usize;
+            let body = frame
+                .payload
+                .get(CHUNK_META..)
+                .ok_or_else(|| invalid("chunk response truncated"))?;
+            let expected = frame
+                .payload
+                .get(28..60)
+                .ok_or_else(|| invalid("chunk response truncated"))?;
+            if !identity_ok || Sha256::digest(body).as_slice() != expected {
                 return Err(invalid("chunk response identity/length/digest mismatch"));
             }
             frame.payload.drain(..CHUNK_META);
@@ -843,15 +868,19 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             )
             .await?;
             let frame = read_frame(&mut self.io, &[Kind::PollStart], &self.limits, &mut self.shutdown).await?;
-            let summary = PollSummary::decode(&frame.payload);
+            let summary = PollSummary::decode(&frame.payload)?;
             summary.validate_since(after, byte_limit, self.known_barrier)?;
             let mut cursor = after;
             let mut bytes = 0usize;
             for _ in 0..summary.batches {
                 let mut frame = read_frame(&mut self.io, &[Kind::Batch], &self.limits, &mut self.shutdown).await?;
-                let history = uuid_at(&frame.payload, 0);
-                let first = u64_at(&frame.payload, 16);
-                let digest: [u8; 32] = frame.payload[24..56].try_into().unwrap();
+                let history = uuid_at(&frame.payload, 0)?;
+                let first = u64_at(&frame.payload, 16)?;
+                let digest: [u8; 32] = frame
+                    .payload
+                    .get(24..56)
+                    .and_then(|slice| slice.try_into().ok())
+                    .ok_or_else(|| invalid("batch payload truncated"))?;
                 frame.payload.drain(..BATCH_META);
                 bytes = bytes
                     .checked_add(frame.payload.len())
@@ -868,7 +897,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
                 bounded(&mut self.shutdown, self.limits.operation_timeout, sink.apply(batch)).await?;
             }
             let end = read_frame(&mut self.io, &[Kind::PollEnd], &self.limits, &mut self.shutdown).await?;
-            if PollSummary::decode(&end.payload) != summary || cursor != summary.through {
+            if PollSummary::decode(&end.payload)? != summary || cursor != summary.through {
                 return Err(invalid("incomplete physical poll response"));
             }
             self.known_barrier = summary.durable_barrier;
@@ -923,6 +952,7 @@ impl PhysicalClient<TcpStream> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::ignored_unit_patterns)]
 mod tests {
     use super::super::checkpoint_transfer::CheckpointFile;
     use super::*;
