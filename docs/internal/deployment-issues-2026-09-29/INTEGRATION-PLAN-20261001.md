@@ -169,7 +169,15 @@ compare, and the Astra response replaced it with `ring` behind a feature gate.
 **Resolved by R6:** the native channel adopts `TransferToken::accepts` (`subtle`, fixed 32 bytes) and
 `constant_time_eq` is deleted, so no build has an `a == b` path. The requirement still stands as a check:
 `grep` the integrated tree for any token comparison not routed through `TransferToken::accepts`, and test
-the native channel under `--no-default-features --features fips,encryption,vector-search`.
+the native channel under `--no-default-features --features fips,encryption,vector-search,ha-tier1`.
+
+**Correction (2026-10-02): the documented FIPS build was never exposed.** `pub mod replication` is
+compiled only under `any(ha-tier1, ha-tier2, ha-tier3, ha-dedup, ha-branch-replication)` [verified,
+`src/lib.rs`], and the documented FIPS line enables none of them, so it contains no replication at all. The
+`a == b` path was reachable only in a build combining an HA feature with no `ring-crypto` — e.g. FIPS
+**plus** `ha-tier1`, a real configuration for anyone wanting FIPS with replication. The fix (R6) is
+unchanged; the headline above overstated who was affected, and the FIPS gate check now uses
+`fips,…,ha-tier1`, the combination where the risk actually existed.
 
 ### R5. Rejections disclose server state to unauthenticated peers [static]
 
