@@ -395,10 +395,12 @@ impl std::fmt::Debug for ReplicationConfig {
         f.debug_struct("ReplicationConfig")
             .field("role", &self.role)
             .field("replication_port", &self.replication_port)
+            .field("startup_timeout_secs", &self.startup_timeout_secs)
             .field("primary_host", &self.primary_host)
             .field("standby_hosts", &self.standby_hosts)
             .field("observer_hosts", &self.observer_hosts)
             .field("sync_mode", &self.sync_mode)
+            .field("physical", &self.physical)
             .field("node_id", &self.node_id)
             .field("token_file", &self.token_file)
             .field("allow_insecure_remote", &self.allow_insecure_remote)
@@ -2374,6 +2376,7 @@ fn generate_random_secret() -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -3211,6 +3214,7 @@ impl PhysicalReplicationConfig {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod physical_config_tests {
     use super::*;
     #[test]
