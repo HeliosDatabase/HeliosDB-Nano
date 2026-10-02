@@ -200,6 +200,7 @@ impl PhysicalSource for PrimarySession {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
     use crate::replication::history::{load_or_create_primary_history, PRIMARY_HISTORY_FILE};
