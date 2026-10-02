@@ -16,7 +16,7 @@ heliosdb-nano start --data-dir /srv/nano-standby --listen 127.0.0.1 \
   --port 5442 --replication-role standby --primary-host 127.0.0.1:5433 --http-port 0
 ```
 
-Both peers require native protocol v2. A standby verifies dataset history before
+Both peers require native protocol v3. A standby verifies dataset history before
 readiness and refuses a replacement history. First startup needs a new, nonexistent
 standby data-directory leaf; do not pre-create it. A successful native connection
 does not prove catchup across a restart or a recreated primary. See the
@@ -42,6 +42,41 @@ Explicit `--replication-role standalone` overrides a configured primary; explici
 names, IPv4, or bracketed IPv6 with a nonzero port. Unknown replication keys and
 invalid values are errors. `standby_hosts` and `observer_hosts` are arrays; as with
 the existing CLI, these lists do not make tier-1 actively dial those peers.
+
+## One replication secret (native and physical)
+
+One owner-only 32-byte token file authenticates **both** replication channels —
+the native logical channel on `--replication-port` and the physical transfer
+channel. Use the identical file on the primary and every standby:
+
+```bash
+head -c 32 /dev/urandom > replication.token
+chmod 600 replication.token
+```
+
+Configure the path; the token bytes are never read from TOML or the environment:
+
+```toml
+[replication]
+token_file = "/etc/heliosdb/replication.token"
+```
+
+`--replication-token-file` overrides the file value. The file must be an owned,
+non-symlink, single-link regular file, mode `0600` or stricter, containing exactly
+32 raw bytes; anything else is refused before the server starts. When a token is
+configured, the primary requires every standby — and the failover health probe —
+to present it before any registration or WAL streaming. A probe that the primary
+answers with an authentication rejection is a local configuration error, not a
+primary failure, and does not count toward failover.
+
+## Plaintext remote opt-in
+
+The native channel is plaintext. With a token configured, a **non-loopback**
+listener would send the token in clear, so that is refused by default. For
+isolated development, `--allow-insecure-replication-remote` (or
+`[replication] allow_insecure_remote = true`) explicitly acknowledges the risk
+and emits a startup warning; the option is preserved in daemon mode. Prefer a
+loopback listener or an authenticated tunnel for ordinary deployments.
 
 HTTP accepts a literal IPv4/IPv6 address or an IP:port socket:
 
