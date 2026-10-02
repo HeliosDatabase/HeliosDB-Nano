@@ -64,4 +64,6 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1
 
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["start", "--data-dir", "/data", "--listen", "0.0.0.0", "--port", "5432"]
+# Plain `start`: the entrypoint adds --data-dir $HELIOSDB_DATA_DIR (default
+# /data) and --listen 0.0.0.0, so HELIOSDB_DATA_DIR really moves the database.
+CMD ["start"]

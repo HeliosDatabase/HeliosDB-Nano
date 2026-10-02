@@ -3,15 +3,26 @@
 # docker-entrypoint.sh — container entrypoint for the official
 # ghcr.io/heliosdatabase/heliosdb-nano image.
 #
-# Passes every argument straight to `heliosdb-nano`, with two conveniences for
-# `start` (the default command):
+# Passes every argument straight to `heliosdb-nano`, with these conveniences
+# for `start` (the default command):
+#
+#   * Data directory and listen address. Unless `--data-dir`/`--memory` or
+#     `--listen` are given, `start` gets `--data-dir $HELIOSDB_DATA_DIR`
+#     (default /data) and `--listen $HELIOSDB_LISTEN` (default 0.0.0.0). Mount
+#     your volume at that path. The directory must be writable by the
+#     container user (uid 999 by default); if it is not, the container exits
+#     with an explanation instead of failing inside RocksDB.
 #
 #   * Authentication. Nano refuses `trust` auth on a non-loopback listener, and
 #     a container must listen on 0.0.0.0 to be reachable. When no `--auth` flag
 #     is given, the password comes from HELIOSDB_PASSWORD or from the file named
 #     by HELIOSDB_PASSWORD_FILE (Docker/Kubernetes secrets), and the server
 #     starts with `--auth scram-sha-256`. With neither set the container exits
-#     with an explanation instead of crash-looping.
+#     with an explanation instead of crash-looping. The password is handed to
+#     the server through the environment or `--password-file`, never on the
+#     command line, so it does not show up in the host's process table (`ps`).
+#     (Release binaries up to 4.41.0 lack that support; with those the
+#     entrypoint falls back to `--password` and prints a warning.)
 #
 #   * HTTP API. The HTTP listener (port 8080: /health, REST, branches, vector
 #     stores) does NOT use the PostgreSQL password, so it is bound to
@@ -39,7 +50,7 @@ fi
 if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ]; then
   if [ "$#" -eq 0 ] || { [ "$1" != "--version" ] && [ "$1" != "-V" ] \
                          && [ "$1" != "--help" ] && [ "$1" != "-h" ]; }; then
-    set -- start --data-dir "${HELIOSDB_DATA_DIR:-/data}" --listen 0.0.0.0 "$@"
+    set -- start "$@"
   fi
 fi
 
@@ -48,7 +59,8 @@ if [ "${1:-}" != "start" ]; then
 fi
 
 # ── inspect the `start` arguments ─────────────────────────────────────────
-has_auth=0; has_tls=0; has_http_listen=0; listen="127.0.0.1"; memory=0; data_dir=""
+has_auth=0; has_password=0; has_tls=0; has_http_listen=0; has_listen=0
+listen=""; memory=0; data_dir=""
 prev=""
 for arg in "$@"; do
   case "$prev" in
@@ -57,14 +69,45 @@ for arg in "$@"; do
   esac
   case "$arg" in
     --auth|--auth=*) has_auth=1 ;;
+    --password|--password=*|--password-file|--password-file=*) has_password=1 ;;
     --tls-cert|--tls-cert=*) has_tls=1 ;;
     --http-listen|--http-listen=*) has_http_listen=1 ;;
-    --listen=*) listen="${arg#--listen=}" ;;
+    --listen) has_listen=1 ;;
+    --listen=*) has_listen=1; listen="${arg#--listen=}" ;;
     --data-dir=*) data_dir="${arg#--data-dir=}" ;;
     -m|--memory) memory=1 ;;
   esac
   prev="$arg"
 done
+
+# ── data directory + listen address (honour HELIOSDB_DATA_DIR / _LISTEN) ──
+if [ "$memory" -eq 0 ] && [ -z "$data_dir" ]; then
+  data_dir="${HELIOSDB_DATA_DIR:-/data}"
+  set -- "$@" --data-dir "$data_dir"
+fi
+if [ "$has_listen" -eq 0 ]; then
+  listen="${HELIOSDB_LISTEN:-0.0.0.0}"
+  set -- "$@" --listen "$listen"
+fi
+
+if [ "$memory" -eq 0 ]; then
+  mkdir -p "$data_dir" 2>/dev/null || true
+  if [ ! -d "$data_dir" ] || [ ! -w "$data_dir" ]; then
+    uid="$(id -u)"; gid="$(id -g)"
+    cat >&2 <<EOF
+error: the data directory $data_dir is not writable by the container user (uid $uid, gid $gid).
+
+Common causes and fixes:
+  * A host bind mount (-v ./data:/data) that Docker created as root. Use a
+    named volume instead (-v heliosdb_data:/data), or hand the directory to
+    the container user first:  sudo chown -R $uid:$gid ./data
+  * Kubernetes: set securityContext runAsUser/runAsGroup/fsGroup to 999 so
+    the volume is writable, and mount it at the data directory.
+  * HELIOSDB_DATA_DIR points at a path that is not a writable volume.
+EOF
+    exit 1
+  fi
+fi
 
 # ── HTTP API listener (unauthenticated — loopback unless asked) ───────────
 if [ "$has_http_listen" -eq 0 ]; then
@@ -72,17 +115,41 @@ if [ "$has_http_listen" -eq 0 ]; then
 fi
 
 # ── authentication ───────────────────────────────────────────────────────
-if [ "$has_auth" -eq 0 ]; then
-  password="${HELIOSDB_PASSWORD:-}"
-  if [ -z "$password" ] && [ -n "${HELIOSDB_PASSWORD_FILE:-}" ]; then
-    [ -r "$HELIOSDB_PASSWORD_FILE" ] \
-      || { echo "error: HELIOSDB_PASSWORD_FILE=$HELIOSDB_PASSWORD_FILE is not readable" >&2; exit 1; }
-    password="$(cat "$HELIOSDB_PASSWORD_FILE")"
-  fi
-  if [ -n "$password" ]; then
-    set -- "$@" --auth scram-sha-256 --password "$password"
-    unset password
-  else
+# The password never goes on the command line, where every local user could
+# read it with `ps`: HELIOSDB_PASSWORD stays in the environment (the server
+# reads it itself) and a secret file is passed with --password-file.
+if "$BIN" start --help 2>/dev/null | grep -q -- '--password-file'; then
+  pw_off_argv=1
+else
+  pw_off_argv=0
+fi
+pw_file=""
+if [ -z "${HELIOSDB_PASSWORD:-}" ] && [ -n "${HELIOSDB_PASSWORD_FILE:-}" ]; then
+  [ -r "$HELIOSDB_PASSWORD_FILE" ] && [ -s "$HELIOSDB_PASSWORD_FILE" ] \
+    || { echo "error: HELIOSDB_PASSWORD_FILE=$HELIOSDB_PASSWORD_FILE is not a readable, non-empty file" >&2; exit 1; }
+  pw_file="$HELIOSDB_PASSWORD_FILE"
+fi
+if [ "$has_password" -eq 0 ]; then
+  if [ -n "${HELIOSDB_PASSWORD:-}" ] || [ -n "$pw_file" ]; then
+    [ "$has_auth" -eq 1 ] || set -- "$@" --auth scram-sha-256
+    if [ "$pw_off_argv" -eq 1 ]; then
+      if [ -n "$pw_file" ]; then
+        set -- "$@" --password-file "$pw_file"
+      else
+        export HELIOSDB_PASSWORD
+      fi
+    else
+      # Older release binary: --password is the only way in.
+      echo "entrypoint: warning: this heliosdb-nano build only accepts the password on the command line, where other local users can see it with ps. Use an image of a release newer than 4.41.0." >&2
+      if [ -n "$pw_file" ]; then
+        password="$(head -n 1 "$pw_file")"
+      else
+        password="$HELIOSDB_PASSWORD"
+      fi
+      set -- "$@" --password "$password"
+      unset password
+    fi
+  elif [ "$has_auth" -eq 0 ]; then
     case "$listen" in
       127.0.0.1|::1|localhost) : ;;
       *)

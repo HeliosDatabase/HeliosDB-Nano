@@ -67,4 +67,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 # The entrypoint wires HELIOSDB_PASSWORD(_FILE) into scram-sha-256 auth and
 # generates a self-signed TLS certificate on first start — see the script.
 ENTRYPOINT ["docker-entrypoint.sh"]
-CMD ["start", "--data-dir", "/data", "--listen", "0.0.0.0", "--port", "5432"]
+CMD ["start"]

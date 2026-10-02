@@ -322,8 +322,20 @@ jobs:
             if [ "$tag" = "$newest" ] && [ "$version" = "${version%%-*}" ]; then latest=true; else latest=false; fi
           fi
           tags="${IMAGE}:${version},${IMAGE}:${tag}"
-          # Floating X.Y tag only for stable releases
-          if [ "$version" = "${version%%-*}" ]; then tags="${tags},${IMAGE}:${minor}"; fi
+          # Floating X.Y tag: stable releases only, and only for the highest
+          # published patch of that minor, so rebuilding an older patch via
+          # workflow_dispatch never moves :X.Y backwards.
+          if [ "$version" = "${version%%-*}" ]; then
+            newest_patch="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1000 \
+                              --exclude-drafts --exclude-pre-releases \
+                              --json tagName -q '.[].tagName' \
+                            | grep -E "^v${minor//./\\.}\.[0-9]+$" | sort -V | tail -n 1 || true)"
+            if [ -z "$newest_patch" ] || [ "$tag" = "$newest_patch" ]; then
+              tags="${tags},${IMAGE}:${minor}"
+            else
+              echo "not moving :${minor} — newest ${minor} patch is ${newest_patch}"
+            fi
+          fi
           if [ "$latest" = "true" ]; then tags="${tags},${IMAGE}:latest"; fi
           echo "tag=$tag"           >> "$GITHUB_OUTPUT"
           echo "version=$version"   >> "$GITHUB_OUTPUT"
