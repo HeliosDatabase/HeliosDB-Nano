@@ -64,6 +64,7 @@ async fn start_server(auth: Option<&str>) -> Harness {
 
 fn request(auth: Option<&str>) -> HandshakeRequest {
     HandshakeRequest {
+        expected_history: None,
         node_id: Uuid::new_v4(),
         role: NodeRole::Standby,
         sync_mode: SyncModeConfig::Async,
@@ -332,6 +333,7 @@ async fn new_client_refuses_an_old_version_server() {
         let (mut stream, _) = listener.accept().await.unwrap();
         let _request = Message::read_from(&mut stream).await.unwrap();
         let response = HandshakeResponse {
+            history_id: Uuid::nil(),
             accepted: true,
             server_node_id: Uuid::new_v4(),
             sync_mode: SyncModeConfig::Async,

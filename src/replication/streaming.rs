@@ -307,6 +307,7 @@ impl StreamingServer {
         // this is the gate that prevents a silent mis-decode or downgrade.
         if msg.header.version != PROTOCOL_VERSION {
             let rejected = HandshakeResponse {
+                history_id: Uuid::nil(),
                 accepted: false,
                 server_node_id,
                 sync_mode: SyncModeConfig::Async,
@@ -359,6 +360,7 @@ impl StreamingServer {
                     "native replication authentication required"
                 };
                 let rejected = HandshakeResponse {
+                    history_id: Uuid::nil(),
                     accepted: false,
                     server_node_id,
                     sync_mode: request.sync_mode,

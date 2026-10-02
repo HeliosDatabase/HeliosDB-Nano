@@ -1428,6 +1428,7 @@ mod tests {
                 current_lsn: Some(0),
                 slot_name: None,
                 capabilities: Capabilities::all(),
+                auth: None,
             }),
         )
         .await;

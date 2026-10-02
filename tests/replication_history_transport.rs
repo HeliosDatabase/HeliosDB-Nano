@@ -32,6 +32,7 @@ fn config(addr: SocketAddr) -> StreamingClientConfig {
         connect_timeout: Duration::from_secs(2),
         reconnect_delay: Duration::from_millis(10),
         max_reconnect_attempts: 0,
+        auth: None,
     }
 }
 
@@ -44,6 +45,7 @@ fn request(expected: Option<Uuid>) -> HandshakeRequest {
         current_lsn: Some(0),
         slot_name: None,
         capabilities: Capabilities::all(),
+        auth: None,
     }
 }
 
