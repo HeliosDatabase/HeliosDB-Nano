@@ -477,7 +477,7 @@ async fn wait_or_stop(delay: Duration, shutdown: &mut watch::Receiver<bool>) -> 
         }
         tokio::select! {biased;
             result=shutdown.changed()=>if result.is_err() {return true;},
-            _=tokio::time::sleep_until(deadline)=>return false,
+            ()=tokio::time::sleep_until(deadline)=>return false,
         }
     }
 }
@@ -792,6 +792,7 @@ async fn run_inner(
 }
 
 #[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::ignored_unit_patterns)]
 mod tests {
     use super::super::{
         history::load_or_create_primary_history,
