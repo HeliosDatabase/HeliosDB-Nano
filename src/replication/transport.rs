@@ -54,7 +54,7 @@ pub const PROTOCOL_MAGIC: u32 = 0x48454C49;
 /// binary-backward-compatible with an older peer: a v1 or v2 payload lacks the
 /// field and will not decode. Both peers must present this exact version; any
 /// mismatch is refused explicitly rather than guessed.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Header size in bytes
 pub const HEADER_SIZE: usize = 24;
@@ -1254,6 +1254,38 @@ mod tests {
         assert_eq!(decoded.msg_type, MessageType::WalEntry);
         assert_eq!(decoded.length, 100);
         assert_eq!(decoded.sequence, 42);
+    }
+
+    #[test]
+    fn test_protocol_version_is_three() {
+        assert_eq!(PROTOCOL_VERSION, 3);
+    }
+
+    /// R1: a v1 (original), guard-v2 or auth-v2 peer is refused at the header,
+    /// before any bincode payload decode. The merged layout gained
+    /// `expected_history` and `auth`, so two peers that only agree on the old
+    /// number must never be allowed to reach the positional payload decoder.
+    #[test]
+    fn test_older_protocol_versions_refused_before_decode() {
+        for peer_version in [1u16, 2u16] {
+            let mut buf = BytesMut::new();
+            buf.put_u32(PROTOCOL_MAGIC);
+            buf.put_u16(peer_version);
+            buf.put_u16(MessageType::HandshakeRequest as u16);
+            buf.put_u32(0);
+            buf.put_u32(0);
+            buf.put_u64(0);
+            assert_eq!(buf.len(), HEADER_SIZE);
+
+            let error = MessageHeader::decode(&mut buf.freeze()).unwrap_err();
+            match error {
+                ReplicationError::ProtocolVersion { expected, actual } => {
+                    assert_eq!(expected, PROTOCOL_VERSION);
+                    assert_eq!(actual, peer_version);
+                }
+                other => panic!("v{peer_version} peer was not refused at the header: {other:?}"),
+            }
+        }
     }
 
     #[test]
