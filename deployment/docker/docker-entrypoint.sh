@@ -57,6 +57,10 @@ fi
 if [ "${1:-}" != "start" ]; then
   exec "$BIN" "$@"
 fi
+# `start --help` / `start -h`: nothing to set up.
+for arg in "$@"; do
+  case "$arg" in --help|-h) exec "$BIN" "$@" ;; esac
+done
 
 # ── inspect the `start` arguments ─────────────────────────────────────────
 has_auth=0; has_password=0; has_tls=0; has_http_listen=0; has_listen=0
