@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Container entrypoint.** `HELIOSDB_PASSWORD` / `HELIOSDB_PASSWORD_FILE`
   enable scram-sha-256 auth (trust is loopback-only, so the old image exited at
   start); a self-signed TLS certificate is generated in `/data/tls` on first
-  start so `sslmode=require` works; fixed uid/gid 999; OCI labels link the
+  start so `sslmode=require` works; the unauthenticated HTTP API is bound to
+  127.0.0.1 unless `HELIOSDB_HTTP_LISTEN` says otherwise; fixed uid/gid 999; OCI labels link the
   package to this repository.
 
 ## [4.41.0] - 2026-09-22

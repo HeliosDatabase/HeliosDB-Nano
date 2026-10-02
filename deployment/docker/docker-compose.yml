@@ -7,7 +7,10 @@ services:
     #   dockerfile: deployment/docker/Dockerfile
     ports:
       - "5432:5432"  # PostgreSQL protocol
-      - "8080:8080"  # REST API
+      # HTTP API (REST, branches, vectors) is unauthenticated and bound to
+      # 127.0.0.1 in the container; to expose it on a trusted network set
+      # HELIOSDB_HTTP_LISTEN=0.0.0.0 and uncomment:
+      # - "8080:8080"
       - "3306:3306"  # MySQL protocol
     volumes:
       - heliosdb_data:/data
