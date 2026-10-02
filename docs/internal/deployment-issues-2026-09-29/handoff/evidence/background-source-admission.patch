@@ -1,0 +1,107 @@
+--- a/src/storage/version_gc.rs
++++ b/src/storage/version_gc.rs
+@@ -112,6 +112,9 @@
+ 
+ /// Shared version-GC state and collector. One per `StorageEngine`.
+ pub struct VersionGc {
++    #[cfg(feature = "ha-tier1")]
++    physical_source_coordinator:
++        Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>>,
+     db: Arc<DB>,
+     snapshot_manager: Arc<SnapshotManager>,
+     conflict_registry: Arc<WriteConflictRegistry>,
+@@ -151,6 +154,8 @@
+         }
+ 
+         Self {
++            #[cfg(feature = "ha-tier1")]
++            physical_source_coordinator: None,
+             db,
+             snapshot_manager,
+             conflict_registry,
+@@ -163,12 +168,35 @@
+         }
+     }
+ 
++    /// Called at engine construction before the collector is shared or started.
++    #[cfg(feature = "ha-tier1")]
++    pub(crate) fn with_physical_source_coordinator(
++        mut self,
++        coordinator: Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>>,
++    ) -> Self {
++        self.physical_source_coordinator = coordinator;
++        self
++    }
++
+     pub fn config(&self) -> &VersionGcConfig {
+         &self.config
+     }
+ 
+     /// Record a wallclock→logical-ts anchor (in memory + persisted).
+     pub fn record_time_anchor(&self) {
++        #[cfg(feature = "ha-tier1")]
++        let _physical_operation = match self
++            .physical_source_coordinator
++            .as_ref()
++            .map(|coordinator| coordinator.operation())
++            .transpose()
++        {
++            Ok(permit) => permit,
++            Err(error) => {
++                warn!("version-gc: source admission refused time anchor: {error}");
++                return;
++            }
++        };
+         let now_secs = chrono::Utc::now().timestamp();
+         let ts = *self.timestamp.read();
+ 
+@@ -190,6 +218,18 @@
+     /// One bounded GC cycle. Returns what it did; safe to call anytime
+     /// (no-op when retention is infinite or not yet resolvable).
+     pub fn run_cycle(&self) -> Result<VersionGcCycleStats> {
++        // Admission precedes gc_lock to avoid a paused collector holding a
++        // lock needed by an already admitted foreground operation.
++        #[cfg(feature = "ha-tier1")]
++        let _physical_operation = self
++            .physical_source_coordinator
++            .as_ref()
++            .map(|coordinator| {
++                coordinator
++                    .operation()
++                    .map_err(|error| crate::Error::storage(error.to_string()))
++            })
++            .transpose()?;
+         let _guard = self.gc_lock.lock();
+         self.record_time_anchor();
+         self.run_cycle_locked()
+@@ -199,6 +239,18 @@
+     /// keyspace and loop bounded cycles until a full pass completes.
+     /// Returns the total number of version values reclaimed.
+     pub fn vacuum(&self) -> Result<u64> {
++        // Admission precedes gc_lock to avoid a paused collector holding a
++        // lock needed by an already admitted foreground operation.
++        #[cfg(feature = "ha-tier1")]
++        let _physical_operation = self
++            .physical_source_coordinator
++            .as_ref()
++            .map(|coordinator| {
++                coordinator
++                    .operation()
++                    .map_err(|error| crate::Error::storage(error.to_string()))
++            })
++            .transpose()?;
+         let _guard = self.gc_lock.lock();
+         self.record_time_anchor();
+         *self.cursor.lock() = None;
+--- a/src/storage/mv_scheduler.rs
++++ b/src/storage/mv_scheduler.rs
+@@ -559,6 +559,9 @@
+         // runtime's worker threads (the previous body called a blocking refresher
+         // directly from this async fn).
+         let rows_affected = tokio::task::spawn_blocking(move || -> Result<u64> {
++            // Keep the synchronous operation permit in the worker itself; a
++            // canceled async waiter must not release it while writes continue.
++            let _physical_operation = storage.physical_source_operation()?;
+             let plan = crate::sql::LogicalPlan::RefreshMaterializedView {
+                 name: name.clone(),
+                 // Zero-downtime atomic swap, as this module's docs promise. It also

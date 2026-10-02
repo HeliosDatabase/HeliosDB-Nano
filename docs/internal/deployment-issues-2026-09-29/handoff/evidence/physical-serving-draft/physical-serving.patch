@@ -1,0 +1,983 @@
+--- a/src/replication/physical.rs
++++ b/src/replication/physical.rs
+@@ -458,6 +458,24 @@
+         Ok(true)
+     }
+ 
++    /// Private immutable-image primitive. The receiver owner serializes this
++    /// with apply; no live DB handle escapes and no logical loader is invoked.
++    pub(crate) fn checkpoint_for_generation(&mut self, path: &std::path::Path) -> Result<()> {
++        if self.poisoned {
++            return Err(PhysicalError::Poisoned);
++        }
++        if read_cursor(&self.db)? != self.cursor {
++            self.poisoned = true;
++            return Err(invalid("receiver changed before generation capture"));
++        }
++        rocksdb::checkpoint::Checkpoint::new(&self.db)?.create_checkpoint(path)?;
++        if read_cursor(&self.db)? != self.cursor {
++            self.poisoned = true;
++            return Err(invalid("receiver changed during generation capture"));
++        }
++        Ok(())
++    }
++
+     /// Close staging before installation. Serving requires its own validated
+     /// physical-replica open path, not ordinary logical-recovery startup.
+     pub fn close(self) -> Result<PhysicalCursor> {
+--- a/src/replication/checkpoint_transfer.rs
++++ b/src/replication/checkpoint_transfer.rs
+@@ -865,6 +865,11 @@
+     replica: StagedPhysicalReplica,
+ }
+ impl PhysicalStage {
++    pub(crate) fn copy_serving_image(&mut self, parent: &Path, limits: TransferLimits) -> Result<SealedPhysicalImage> {
++        verify_existing_stage(&self.owner)?;
++        copy_serving_image(&self.owner, &mut self.replica, parent, limits)
++    }
++
+     pub fn staging_path(&self) -> &Path {
+         &self.owner.directory.path
+     }
+@@ -1009,6 +1014,11 @@
+     replica: StagedPhysicalReplica,
+ }
+ impl ReopenedPhysicalStage {
++    pub(crate) fn copy_serving_image(&mut self, parent: &Path, limits: TransferLimits) -> Result<SealedPhysicalImage> {
++        verify_existing_stage(&self.owner)?;
++        copy_serving_image(&self.owner, &mut self.replica, parent, limits)
++    }
++
+     pub fn open(path: &Path, expected_history: Uuid, limits: TransferLimits) -> Result<Self> {
+         let owner = load_existing_stage(path, expected_history, &limits)?;
+         // Raw read-only RocksDB replays its own WAL into an immutable view. No
+@@ -1043,6 +1053,122 @@
+     pub fn close(self) -> Result<ClosedPhysicalStage> {
+         close_owned_stage(self.owner, self.replica)
+     }
++}
++
++/// A private independent-inode image. Only the receiver worker can create one;
++/// certification eligibility is checked by that worker before and after copy.
++/// No ordinary startup/reopen may adopt it as a writable physical stage.
++pub(crate) struct SealedPhysicalImage {
++    pub(crate) lease: tempfile::TempDir,
++    pub(crate) path: PathBuf,
++    pub(crate) cursor: PhysicalCursor,
++    pub(crate) total_bytes: u64,
++}
++fn copy_serving_image(
++    owner: &StageOwner,
++    replica: &mut StagedPhysicalReplica,
++    parent: &Path,
++    limits: TransferLimits,
++) -> Result<SealedPhysicalImage> {
++    limits.validate()?;
++    let parent = OwnedDirectory::capture(parent)?;
++    refuse_database_ancestors(&parent.path)?;
++    let scratch = tempfile::Builder::new()
++        .prefix("nano-generation-cut-")
++        .tempdir_in(&parent.path)?;
++    let checkpoint = scratch.path().join("checkpoint");
++    let expected = replica.cursor().clone();
++    replica.checkpoint_for_generation(&checkpoint)?;
++    let checkpoint_owner = OwnedDirectory::capture(&checkpoint)?;
++    let lease = tempfile::Builder::new()
++        .prefix("nano-serving-generation-")
++        .tempdir_in(&parent.path)?;
++    let path = lease.path().join("database");
++    fs::create_dir(&path)?;
++    let mut total_bytes = 0_u64;
++    let mut files = 0_usize;
++    for entry in fs::read_dir(&checkpoint)? {
++        let entry = entry?;
++        let name = entry
++            .file_name()
++            .into_string()
++            .map_err(|_| invalid("non-UTF8 serving checkpoint file"))?;
++        if name == "LOCK" || name == "LOG" || name.starts_with("LOG.old.") {
++            continue;
++        }
++        if !valid_file_name(&name) {
++            return Err(invalid("unexpected serving checkpoint file"));
++        }
++        let metadata = fs::symlink_metadata(entry.path())?;
++        valid_regular(&metadata, limits.max_file_bytes, false)?;
++        files += 1;
++        total_bytes = total_bytes
++            .checked_add(metadata.len())
++            .ok_or_else(|| invalid("serving image size overflow"))?;
++        if files > limits.max_files || total_bytes > limits.max_total_bytes {
++            return Err(invalid("serving image exceeds transfer limits"));
++        }
++        let (before_hash, before) = fingerprint_file(&entry.path(), metadata.len(), false)?;
++        let mut input = open_regular(&entry.path(), metadata.len(), false, false)?;
++        let mut output = fs::OpenOptions::new()
++            .create_new(true)
++            .write(true)
++            .open(path.join(&name))?;
++        let copied = std::io::copy(&mut input.take(metadata.len() + 1), &mut output)?;
++        if copied != metadata.len() {
++            return Err(invalid("serving file changed while copying"));
++        }
++        output.sync_all()?;
++        drop(output);
++        let (copy_hash, _) = fingerprint_file(&path.join(&name), copied, true)?;
++        let after = fs::symlink_metadata(entry.path())?;
++        if before_hash != copy_hash
++            || !same_file(&before, &after)
++            || before.len() != after.len()
++            || before.modified()? != after.modified()?
++        {
++            return Err(invalid("serving file changed during independent copy"));
++        }
++    }
++    // Pinned RocksDB checkpoint omits IDENTITY. The raw owner binds it exactly.
++    if !path.join("IDENTITY").exists() {
++        let bytes = format!("{}\n", owner.manifest.storage_identity).into_bytes();
++        files += 1;
++        total_bytes = total_bytes
++            .checked_add(bytes.len() as u64)
++            .ok_or_else(|| invalid("serving identity size overflow"))?;
++        if files > limits.max_files
++            || bytes.len() as u64 > limits.max_file_bytes
++            || total_bytes > limits.max_total_bytes
++        {
++            return Err(invalid("serving identity exceeds image limits"));
++        }
++        create_file(&path.join("IDENTITY"), &bytes)?;
++    }
++    if identity(&path)? != owner.manifest.storage_identity {
++        return Err(invalid("serving copy identity mismatch"));
++    }
++    checkpoint_owner.verify()?;
++    parent.verify()?;
++    let raw = DB::open_for_read_only(&Options::default(), &path, false)?;
++    let cursor = StagedPhysicalReplica::resume(raw, expected.history())?.close()?;
++    if cursor != expected {
++        return Err(invalid("serving copy durable cursor differs from captured cut"));
++    }
++    let marker=serde_json::to_vec(&serde_json::json!({"format":1,"mode":"physical-serving-generation","history":cursor.history(),"source_sequence":cursor.source_sequence()})).map_err(|e|invalid(e.to_string()))?;
++    create_file(&path.join(PHYSICAL_MARKER_FILE), &marker)?;
++    sync_dir(&path)?;
++    // Remove all temporary RocksDB hardlinks before any new apply/reopen can
++    // be acknowledged. The retained serving image has independently owned files.
++    scratch.close()?;
++    verify_existing_stage(owner)?;
++    parent.verify()?;
++    Ok(SealedPhysicalImage {
++        lease,
++        path,
++        cursor,
++        total_bytes,
++    })
+ }
+ 
+ fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
+--- a/src/replication/physical_receiver.rs
++++ b/src/replication/physical_receiver.rs
+@@ -10,6 +10,7 @@
+     ClosedPhysicalStage, PhysicalStage, ReceiverStaging, ReopenedPhysicalStage, TransferLimits,
+ };
+ use super::physical::{PhysicalBatch, PhysicalCursor, MAX_BATCH_BYTES};
++use super::physical_generations::{GenerationReservation, PreparedGeneration, ServingGenerations};
+ use super::physical_wire::{
+     BatchSink, PhysicalClient, PollSummary, SourceSessionInfo, TransferToken, WireError, WireLimits,
+ };
+@@ -77,9 +78,16 @@
+     pub max_reconnects: u32,
+     /// Explicit opt-in; raw sessions can never mint a committed-cut capability.
+     pub require_committed: bool,
++    /// Optional copied/strictly hydrated generations. Does not start a SQL server.
++    pub serving: Option<Arc<ServingGenerations>>,
+ }
+ impl ReceiverOptions {
+     fn validate(&self) -> Result<()> {
++        if self.serving.is_some() && !self.require_committed {
++            return Err(ReceiverError::Invalid(
++                "serving images require explicit certified source mode".into(),
++            ));
++        }
+         if self.sources.is_empty()
+             || self.sources.len() > 16
+             || self
+@@ -270,6 +278,12 @@
+     Publish {
+         reply: Reply<ClosedPhysicalStage>,
+     },
++    PrepareGeneration {
++        reservation: GenerationReservation,
++        parent: PathBuf,
++        limits: TransferLimits,
++        reply: Reply<PreparedGeneration>,
++    },
+     Close {
+         reply: Reply<ClosedPhysicalStage>,
+     },
+@@ -327,16 +341,17 @@
+ impl Worker {
+     fn spawn() -> Result<Self> {
+         let (tx, rx) = mpsc::channel(1);
++        let owner_id = Uuid::new_v4();
+         let cancel = Arc::new(AtomicBool::new(false));
+         let last = Arc::new(Mutex::new(Position::default()));
+         let worker_cancel = cancel.clone();
+         let worker_last = last.clone();
+         let thread = thread::Builder::new()
+             .name("nano-physical-receiver".into())
+-            .spawn(move || worker_loop(rx, worker_cancel, worker_last))
++            .spawn(move || worker_loop(rx, worker_cancel, worker_last, owner_id))
+             .map_err(storage)?;
+         Ok(Self {
+-            owner_id: Uuid::new_v4(),
++            owner_id,
+             tx: Some(tx),
+             cancel,
+             last,
+@@ -384,7 +399,7 @@
+         *last.lock().unwrap_or_else(|poison| poison.into_inner()) = position;
+     }
+ }
+-fn worker_loop(mut rx: mpsc::Receiver<Command>, cancel: Arc<AtomicBool>, last: Arc<Mutex<Position>>) {
++fn worker_loop(mut rx: mpsc::Receiver<Command>, cancel: Arc<AtomicBool>, last: Arc<Mutex<Position>>, owner_id: Uuid) {
+     let mut state = State::Empty;
+     while !cancel.load(Ordering::Acquire) {
+         let Some(command) = rx.blocking_recv() else {
+@@ -470,6 +485,32 @@
+                 };
+                 stop = result.is_err();
+                 record_position(&state, &last);
++                let _ = reply.send(result);
++            }
++            Command::PrepareGeneration {
++                reservation,
++                parent,
++                limits,
++                reply,
++            } => {
++                let result = (|| {
++                    let cut = reservation.cut().clone();
++                    let (_, cursor) = state.position().initialized()?;
++                    if !cut.matches_position(owner_id, &cursor) {
++                        return Err(storage("serving cut stale or belongs to another receiver owner"));
++                    }
++                    let image = match &mut state {
++                        State::Initial(stage) => stage.copy_serving_image(&parent, limits).map_err(storage)?,
++                        State::Reopened(stage) => stage.copy_serving_image(&parent, limits).map_err(storage)?,
++                        _ => return Err(storage("serving image requires live physical stage")),
++                    };
++                    if !cut.matches_position(owner_id, &image.cursor) {
++                        return Err(storage("copied image differs from certified owner/cursor"));
++                    }
++                    Ok(PreparedGeneration { image, reservation })
++                })();
++                // A failed independent image build does not adopt/reset raw
++                // stage state. Next apply still checks its cursor/poison state.
+                 let _ = reply.send(result);
+             }
+             Command::Position { reply } => {
+@@ -819,6 +860,30 @@
+                 .session_info()
+                 .ok_or_else(|| storage("certified source session disappeared"))?;
+             let cut = verified_committed_cut(worker.owner_id, info, summary, &durable)?;
++            if let Some(serving) = &options.serving {
++                match serving.reserve(&cut) {
++                    Ok(Some(reservation)) => {
++                        let result = worker
++                            .request(|reply| Command::PrepareGeneration {
++                                reservation,
++                                parent: serving.parent().to_path_buf(),
++                                limits: serving.limits(),
++                                reply,
++                            })
++                            .await;
++                        match result {
++                            Ok(prepared) => {
++                                if let Err(error) = serving.submit(prepared) {
++                                    serving.note_failure(error);
++                                }
++                            }
++                            Err(error) => serving.note_failure(error.to_string()),
++                        }
++                    }
++                    Ok(None) => {} // Resident/build budget full: raw Follow continues.
++                    Err(error) => serving.note_failure(error),
++                }
++            }
+             progress.send_replace(ReceiverStatus::CommittedCut { path, cut });
+         } else {
+             progress.send_replace(ReceiverStatus::CaughtUp {
+@@ -1036,6 +1101,7 @@
+             reconnect_delay: Duration::from_millis(10),
+             max_reconnects: 3,
+             require_committed: false,
++            serving: None,
+         }
+     }
+     fn status() -> (watch::Sender<ReceiverStatus>, watch::Receiver<ReceiverStatus>) {
+@@ -1531,4 +1597,195 @@
+             ReceiverStatus::CommittedCut { .. }
+         ));
+     }
+-}
++    async fn wait_serving(
++        run: &mut Running<'_>,
++        generations: &ServingGenerations,
++        sequence: u64,
++    ) -> super::super::physical_generations::ServingLease {
++        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
++        loop {
++            if let Some(lease) = generations.lease() {
++                if lease.source_sequence() >= sequence {
++                    return lease;
++                }
++            }
++            tokio::select! {
++                result=run.as_mut()=>panic!("receiver stopped before serving build: {result:?}"),
++                _=tokio::time::sleep(Duration::from_millis(10))=>{},
++                _=tokio::time::sleep_until(deadline)=>panic!("serving build deadline: {:?}",generations.last_error()),
++            }
++        }
++    }
++    fn generation_rows(lease: &super::super::physical_generations::ServingLease) -> Vec<Vec<String>> {
++        lease
++            .database()
++            .query("SELECT id, note FROM generation_rows ORDER BY id", &[])
++            .unwrap()
++            .into_iter()
++            .map(|row| {
++                row.values
++                    .iter()
++                    .map(|value| match value {
++                        crate::Value::String(text) => text.clone(),
++                        other => other.to_string(),
++                    })
++                    .collect()
++            })
++            .collect()
++    }
++    #[tokio::test]
++    async fn copied_generations_pin_coherent_reads_bound_resources_and_retain_escaped_db_until_reaped() {
++        let root = tempfile::tempdir().unwrap();
++        let parent = root.path().join("generations");
++        std::fs::create_dir(&parent).unwrap();
++        let mut config = crate::Config::default();
++        config.storage.memory_only = false;
++        config.storage.path = Some(root.path().join("sql-source"));
++        let source_db = crate::EmbeddedDatabase::with_config(config.clone()).unwrap();
++        source_db
++            .execute("CREATE TABLE generation_rows (id INT PRIMARY KEY, note TEXT)")
++            .unwrap();
++        source_db
++            .execute("INSERT INTO generation_rows VALUES (1, 'one')")
++            .unwrap();
++        let raw = source_db.storage.db();
++        let history = load_or_create_primary_history(raw.path()).unwrap();
++        let coordinator = Arc::new(PhysicalSourceCoordinator::new(raw.clone()));
++        let source = SourceHarness::start_mode(
++            raw.clone(),
++            history,
++            root.path().to_path_buf(),
++            false,
++            false,
++            Some(coordinator.clone()),
++        );
++        let generations = ServingGenerations::new(parent.clone(), config, TransferLimits::default(), 2).unwrap();
++        let target = root.path().join("served-raw-receiver");
++        let (stop, shutdown) = watch::channel(false);
++        let (progress, mut observed) = status();
++        let mut opts = options(
++            &source,
++            ReceiverStart::Snapshot {
++                target: target.clone(),
++                expected_history: Some(history),
++            },
++            ReceiverMode::Follow,
++        );
++        opts.require_committed = true;
++        opts.serving = Some(generations.clone());
++        let initial = raw.latest_sequence_number();
++        let mut run: Running<'_> = Box::pin(run_receiver(opts, shutdown, progress));
++        let first = wait_serving(&mut run, &generations, initial).await;
++        assert_eq!(generation_rows(&first), vec![vec!["1".to_string(), "one".to_string()]]);
++        {
++            let _operation = coordinator.operation().unwrap();
++            source_db
++                .execute("INSERT INTO generation_rows VALUES (2, 'two')")
++                .unwrap();
++        }
++        let second_cut = raw.latest_sequence_number();
++        let second = wait_serving(&mut run, &generations, second_cut).await;
++        assert_eq!(generation_rows(&first).len(), 1);
++        assert_eq!(generation_rows(&second).len(), 2);
++        {
++            let _operation = coordinator.operation().unwrap();
++            source_db
++                .execute("INSERT INTO generation_rows VALUES (3, 'three')")
++                .unwrap();
++        }
++        let third_cut = raw.latest_sequence_number();
++        wait_committed(&mut run, &mut observed, &target, third_cut).await;
++        assert_eq!(
++            generations.lease().unwrap().source_sequence(),
++            second.source_sequence(),
++            "two resident slots must not evict a pinned request"
++        );
++        assert_eq!(generation_rows(&first).len(), 1);
++        assert_eq!(generation_rows(&second).len(), 2);
++        drop(first);
++        let third = wait_serving(&mut run, &generations, third_cut).await;
++        assert_eq!(generation_rows(&third).len(), 3);
++        assert_eq!(generation_rows(&second).len(), 2);
++        drop(second);
++        stop.send_replace(true);
++        let closed = complete(run).await;
++        // The copied serving image must not leave SST hardlinks preventing raw
++        // stage reopening while generation leases are still alive.
++        let reopened = ReopenedPhysicalStage::open(&target, history, TransferLimits::default()).unwrap();
++        assert_eq!(reopened.cursor(), &closed.cursor);
++        reopened.close().unwrap();
++        let escaped = third.database().storage.db();
++        drop(third);
++        assert!(
++            generations.close_and_join().is_err(),
++            "escaped raw DB must retain its directory/budget"
++        );
++        assert!(std::fs::read_dir(&parent).unwrap().next().is_some());
++        drop(escaped);
++        generations.reap_retired().unwrap();
++        assert!(std::fs::read_dir(&parent).unwrap().next().is_none());
++    }
++    #[tokio::test]
++    async fn failed_strict_generation_hydration_preserves_previous_reads_and_raw_progress() {
++        let root = tempfile::tempdir().unwrap();
++        let parent = root.path().join("generations");
++        std::fs::create_dir(&parent).unwrap();
++        let mut config = crate::Config::default();
++        config.storage.memory_only = false;
++        config.storage.path = Some(root.path().join("sql-source"));
++        let source_db = crate::EmbeddedDatabase::with_config(config.clone()).unwrap();
++        source_db
++            .execute("CREATE TABLE generation_rows (id INT PRIMARY KEY, note TEXT)")
++            .unwrap();
++        source_db
++            .execute("INSERT INTO generation_rows VALUES (1, 'one')")
++            .unwrap();
++        let raw = source_db.storage.db();
++        let history = load_or_create_primary_history(raw.path()).unwrap();
++        let coordinator = Arc::new(PhysicalSourceCoordinator::new(raw.clone()));
++        let source = SourceHarness::start_mode(
++            raw.clone(),
++            history,
++            root.path().to_path_buf(),
++            false,
++            false,
++            Some(coordinator.clone()),
++        );
++        let generations = ServingGenerations::new(parent, config, TransferLimits::default(), 2).unwrap();
++        let target = root.path().join("failed-generation-receiver");
++        let (stop, shutdown) = watch::channel(false);
++        let (progress, mut observed) = status();
++        let mut opts = options(
++            &source,
++            ReceiverStart::Snapshot {
++                target: target.clone(),
++                expected_history: Some(history),
++            },
++            ReceiverMode::Follow,
++        );
++        opts.require_committed = true;
++        opts.serving = Some(generations.clone());
++        let initial = raw.latest_sequence_number();
++        let mut run: Running<'_> = Box::pin(run_receiver(opts, shutdown, progress));
++        let first = wait_serving(&mut run, &generations, initial).await;
++        // Deliberate corrupt source fixture: physical/certified admission is not
++        // a substitute for strict semantic hydration of copied catalog values.
++        {
++            let _operation = coordinator.operation().unwrap();
++            raw.put(b"meta:function:broken", b"invalid routine metadata").unwrap();
++        }
++        let corrupt_cut = raw.latest_sequence_number();
++        wait_committed(&mut run, &mut observed, &target, corrupt_cut).await;
++        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
++        while generations.last_error().is_none() {
++            tokio::select! { result=run.as_mut()=>panic!("raw receiver stopped: {result:?}"),_ =tokio::time::sleep(Duration::from_millis(10))=>{},_=tokio::time::sleep_until(deadline)=>panic!("missing strict hydration failure") }
++        }
++        assert_eq!(generations.lease().unwrap().source_sequence(), first.source_sequence());
++        assert_eq!(generation_rows(&first).len(), 1);
++        stop.send_replace(true);
++        let closed = complete(run).await;
++        assert_eq!(closed.cursor.source_sequence(), corrupt_cut);
++        drop(first);
++        generations.close_and_join().unwrap();
++    }
++}
+--- /dev/null
++++ b/src/replication/physical_generations.rs
+@@ -0,0 +1,466 @@
++//! Owned immutable serving generations. A published handle is coherent for one
++//! caller-held lease; protocol read-only admission/session migration is separate.
++//! No PG listener or SQL-ready notification is opened by this module.
++use super::{
++    checkpoint_transfer::{SealedPhysicalImage, TransferLimits},
++    physical_receiver::VerifiedCommittedCut,
++};
++use crate::{Config, EmbeddedDatabase, PhysicalSnapshotHydrationReport};
++use std::{
++    path::{Path, PathBuf},
++    sync::{
++        atomic::{AtomicBool, Ordering},
++        mpsc, Arc, Mutex, Weak,
++    },
++    thread,
++    time::Duration,
++};
++use tokio::sync::{OwnedSemaphorePermit, Semaphore};
++use uuid::Uuid;
++
++type Result<T> = std::result::Result<T, String>;
++fn lock<T>(value: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
++    value.lock().unwrap_or_else(|p| p.into_inner())
++}
++
++/// Always drop database owners before attempting to reclaim their directory.
++/// A raw/storage Arc escape pins both the directory and its resident budget.
++struct Retired {
++    database: Option<Arc<EmbeddedDatabase>>,
++    raw: Option<Arc<rocksdb::DB>>,
++    directory: Option<tempfile::TempDir>,
++    budget: Option<OwnedSemaphorePermit>,
++}
++impl Retired {
++    fn ready(&mut self) -> bool {
++        // Atomically exclude Weak upgrades. A count-then-drop check can race an
++        // escaped Weak<DB>, deleting files behind a newly upgraded live owner.
++        if let Some(database) = self.database.take() {
++            match Arc::try_unwrap(database) {
++                Ok(database) => drop(database),
++                Err(database) => {
++                    self.database = Some(database);
++                    return false;
++                }
++            }
++        }
++        if let Some(raw) = self.raw.take() {
++            match Arc::try_unwrap(raw) {
++                Ok(raw) => drop(raw),
++                Err(raw) => {
++                    self.raw = Some(raw);
++                    return false;
++                }
++            }
++        }
++        true
++    }
++    fn reclaim(mut self) {
++        self.raw.take();
++        self.directory.take();
++        self.budget.take();
++    }
++}
++impl Drop for Retired {
++    fn drop(&mut self) {
++        // Even an unexpected owner unwind cannot delete behind a live DB Arc.
++        if !self.ready() {
++            if let Some(directory) = self.directory.take() {
++                let path = directory.keep();
++                tracing::error!(path=%path.display(),"retaining serving generation directory behind escaped database references");
++            }
++        }
++        self.database.take();
++        self.raw.take();
++    }
++}
++struct Inner {
++    current: Mutex<Option<Arc<Generation>>>,
++    retired: Mutex<Vec<Retired>>,
++    closed: AtomicBool,
++    last_error: Mutex<Option<String>>,
++    resident: Arc<Semaphore>,
++    building: Arc<Semaphore>,
++    capacity: usize,
++}
++impl Inner {
++    fn error(&self, error: impl Into<String>) {
++        *lock(&self.last_error) = Some(error.into());
++    }
++    fn reap(&self) {
++        // Potential DB/ART destruction and unlink happen without holding any
++        // publication/retirement lock. No request can acquire a retired handle.
++        let mut pending = std::mem::take(&mut *lock(&self.retired));
++        let mut pinned = Vec::new();
++        for mut retired in pending.drain(..) {
++            if retired.ready() {
++                retired.reclaim();
++            } else {
++                pinned.push(retired);
++            }
++        }
++        lock(&self.retired).extend(pinned);
++    }
++}
++struct Generation {
++    database: Option<Arc<EmbeddedDatabase>>,
++    raw: Option<Arc<rocksdb::DB>>,
++    directory: Option<tempfile::TempDir>,
++    budget: Option<OwnedSemaphorePermit>,
++    owner: Weak<Inner>,
++    cut: VerifiedCommittedCut,
++    report: PhysicalSnapshotHydrationReport,
++    bytes: u64,
++}
++impl Drop for Generation {
++    fn drop(&mut self) {
++        let retired = Retired {
++            database: self.database.take(),
++            raw: self.raw.take(),
++            directory: self.directory.take(),
++            budget: self.budget.take(),
++        };
++        if let Some(owner) = self.owner.upgrade() {
++            lock(&owner.retired).push(retired);
++        }
++        // Otherwise Retired::drop either safely destroys or conservatively
++        // retains the directory; it never blindly runs TempDir behind an Arc.
++    }
++}
++#[derive(Clone)]
++pub struct ServingLease {
++    generation: Arc<Generation>,
++}
++impl ServingLease {
++    pub fn database(&self) -> &EmbeddedDatabase {
++        self.generation.database.as_ref().expect("live generation database")
++    }
++    /// Internal PG integration must retain this lease through every clone/use.
++    /// An accidental escape is still safe: retirement detects and pins it.
++    pub(crate) fn database_arc(&self) -> Arc<EmbeddedDatabase> {
++        self.generation
++            .database
++            .as_ref()
++            .expect("live generation database")
++            .clone()
++    }
++    pub fn history(&self) -> Uuid {
++        self.generation.cut.history()
++    }
++    pub fn source_sequence(&self) -> u64 {
++        self.generation.cut.source_sequence()
++    }
++    pub fn report(&self) -> &PhysicalSnapshotHydrationReport {
++        &self.generation.report
++    }
++    pub fn image_bytes(&self) -> u64 {
++        self.generation.bytes
++    }
++}
++pub(crate) struct GenerationReservation {
++    owner: Arc<Inner>,
++    budget: OwnedSemaphorePermit,
++    _building: OwnedSemaphorePermit,
++    cut: VerifiedCommittedCut,
++}
++impl GenerationReservation {
++    pub(crate) fn cut(&self) -> &VerifiedCommittedCut {
++        &self.cut
++    }
++}
++// Field order is deliberate: canceled/unobserved replies destroy the copied
++// directory before returning its resident/build capacity to the shared budget.
++pub(crate) struct PreparedGeneration {
++    pub(crate) image: SealedPhysicalImage,
++    pub(crate) reservation: GenerationReservation,
++}
++type Job = PreparedGeneration;
++
++/// One joined hydration/reclamation worker. Resident capacity includes current,
++/// in-progress, retired request leases and escaped DB/storage references.
++pub struct ServingGenerations {
++    inner: Arc<Inner>,
++    parent: PathBuf,
++    limits: TransferLimits,
++    sender: Mutex<Option<mpsc::SyncSender<Job>>>,
++    worker: Mutex<Option<thread::JoinHandle<()>>>,
++}
++impl ServingGenerations {
++    pub fn new(parent: PathBuf, config: Config, limits: TransferLimits, max_resident: usize) -> Result<Arc<Self>> {
++        if !(2..=16).contains(&max_resident) || config.storage.memory_only {
++            return Err("serving generation requires persistent config and 2..=16 resident slots".into());
++        }
++        let metadata = std::fs::symlink_metadata(&parent).map_err(|e| e.to_string())?;
++        if !metadata.is_dir() || metadata.file_type().is_symlink() {
++            return Err("generation parent must be an existing real directory".into());
++        }
++        let inner = Arc::new(Inner {
++            current: Mutex::new(None),
++            retired: Mutex::new(Vec::new()),
++            closed: AtomicBool::new(false),
++            last_error: Mutex::new(None),
++            resident: Arc::new(Semaphore::new(max_resident)),
++            building: Arc::new(Semaphore::new(1)),
++            capacity: max_resident,
++        });
++        let (tx, rx) = mpsc::sync_channel::<Job>(1);
++        let state = inner.clone();
++        let worker = thread::Builder::new()
++            .name("nano-serving-generation".into())
++            .spawn(move || {
++                loop {
++                    state.reap();
++                    match rx.recv_timeout(Duration::from_millis(100)) {
++                        Ok(job) => {
++                            if state.closed.load(Ordering::Acquire) {
++                                drop(job);
++                                continue;
++                            }
++                            match hydrate(job, &config, limits) {
++                                Ok(generation) => {
++                                    let mut current = lock(&state.current);
++                                    if state.closed.load(Ordering::Acquire) {
++                                        drop(current);
++                                        drop(generation);
++                                        continue;
++                                    }
++                                    if current.as_ref().is_some_and(|old| {
++                                        old.cut.history() != generation.cut.history()
++                                            || old.cut.source_sequence() >= generation.cut.source_sequence()
++                                    }) {
++                                        drop(current);
++                                        state.error("refused regressing or different-history serving generation");
++                                        drop(generation);
++                                        continue;
++                                    }
++                                    let old = current.replace(Arc::new(generation));
++                                    drop(current);
++                                    drop(old);
++                                }
++                                Err(error) => state.error(error),
++                            }
++                        }
++                        Err(mpsc::RecvTimeoutError::Timeout) => {}
++                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
++                    }
++                }
++                state.reap();
++            })
++            .map_err(|e| e.to_string())?;
++        Ok(Arc::new(Self {
++            inner,
++            parent,
++            limits,
++            sender: Mutex::new(Some(tx)),
++            worker: Mutex::new(Some(worker)),
++        }))
++    }
++    pub fn lease(&self) -> Option<ServingLease> {
++        let current = lock(&self.inner.current);
++        if self.inner.closed.load(Ordering::Acquire) {
++            return None;
++        }
++        current.as_ref().map(|generation| ServingLease {
++            generation: generation.clone(),
++        })
++    }
++    pub fn last_error(&self) -> Option<String> {
++        lock(&self.inner.last_error).clone()
++    }
++    pub(crate) fn parent(&self) -> &Path {
++        &self.parent
++    }
++    pub(crate) fn limits(&self) -> TransferLimits {
++        self.limits
++    }
++    pub(crate) fn note_failure(&self, error: impl Into<String>) {
++        self.inner.error(error);
++    }
++    pub(crate) fn reserve(&self, cut: &VerifiedCommittedCut) -> Result<Option<GenerationReservation>> {
++        if self.inner.closed.load(Ordering::Acquire) {
++            return Err("serving generation owner closed".into());
++        }
++        let current = lock(&self.inner.current);
++        if let Some(current) = current.as_ref() {
++            if current.cut.history() != cut.history() {
++                return Err("serving history cannot change".into());
++            }
++            if current.cut.source_sequence() >= cut.source_sequence() {
++                return Ok(None);
++            }
++        }
++        drop(current);
++        let Ok(building) = self.inner.building.clone().try_acquire_owned() else {
++            return Ok(None);
++        };
++        let Ok(budget) = self.inner.resident.clone().try_acquire_owned() else {
++            return Ok(None);
++        };
++        Ok(Some(GenerationReservation {
++            owner: self.inner.clone(),
++            budget,
++            _building: building,
++            cut: cut.clone(),
++        }))
++    }
++    pub(crate) fn submit(&self, prepared: PreparedGeneration) -> Result<()> {
++        if !Arc::ptr_eq(&prepared.reservation.owner, &self.inner) {
++            return Err("generation reservation belongs to another owner".into());
++        }
++        let sender = lock(&self.sender);
++        if self.inner.closed.load(Ordering::Acquire) {
++            return Err("serving generation owner closed".into());
++        }
++        sender
++            .as_ref()
++            .ok_or("serving generation worker closed")?
++            .try_send(prepared)
++            .map_err(|e| e.to_string())
++    }
++    /// Stop publication and join the actual worker. Caller first stops/joins PG
++    /// requests. Pinned references cause an explicit error and retained images;
++    /// reap_retired can finish cleanup after those references have been released.
++    pub fn close_and_join(&self) -> Result<()> {
++        self.inner.closed.store(true, Ordering::Release);
++        lock(&self.sender).take();
++        if let Some(worker) = lock(&self.worker).take() {
++            worker
++                .join()
++                .map_err(|_| "serving generation worker panicked".to_string())?;
++        }
++        let current = lock(&self.inner.current).take();
++        drop(current);
++        self.reap_retired()
++    }
++    pub fn reap_retired(&self) -> Result<()> {
++        self.inner.reap();
++        if !lock(&self.inner.retired).is_empty() || self.inner.resident.available_permits() != self.inner.capacity {
++            return Err(
++                "serving generations remain pinned by request/database references; directories retained".into(),
++            );
++        }
++        Ok(())
++    }
++}
++impl Drop for ServingGenerations {
++    fn drop(&mut self) {
++        if let Err(error) = self.close_and_join() {
++            tracing::error!(%error,"serving generation shutdown retained resources");
++        }
++    }
++}
++fn hydrate(job: Job, config: &Config, limits: TransferLimits) -> Result<Generation> {
++    // Keep image-before-reservation field ordering intact across every fallible
++    // operation. Failed image cleanup must finish before capacity is released.
++    if job.image.cursor.history() != job.reservation.cut.history()
++        || job.image.cursor.source_sequence() != job.reservation.cut.source_sequence()
++    {
++        return Err("copied serving image differs from certified cut".into());
++    }
++    let mut config = config.clone();
++    config.storage.path = Some(job.image.path.clone());
++    config.storage.memory_only = false;
++    let hydrated = EmbeddedDatabase::open_physical_snapshot(config).map_err(|e| e.to_string())?;
++    let raw = hydrated.database.storage.db();
++    // All fallible validation/hydration has succeeded. Transfer ownership into
++    // the retired-reference-aware generation without an intervening await.
++    let PreparedGeneration { image, reservation } = job;
++    let GenerationReservation {
++        owner,
++        budget,
++        _building,
++        cut,
++    } = reservation;
++    let mut generation = Generation {
++        database: Some(Arc::new(hydrated.database)),
++        raw: Some(raw),
++        directory: Some(image.lease),
++        budget: Some(budget),
++        owner: Arc::downgrade(&owner),
++        cut,
++        report: hydrated.report,
++        bytes: image.total_bytes,
++    };
++    // The sentinel-aware owner is installed before this fallible final census:
++    // an error queues DB closure/image cleanup while retaining resident capacity.
++    generation.bytes = census_image(
++        generation
++            .directory
++            .as_ref()
++            .expect("owned generation directory")
++            .path()
++            .join("database")
++            .as_path(),
++        limits,
++    )?;
++    drop(_building);
++    Ok(generation)
++}
++
++fn census_image(path: &Path, limits: TransferLimits) -> Result<u64> {
++    let mut count = 0_usize;
++    let mut bytes = 0_u64;
++    for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
++        let entry = entry.map_err(|e| e.to_string())?;
++        let metadata = std::fs::symlink_metadata(entry.path()).map_err(|e| e.to_string())?;
++        if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > limits.max_file_bytes {
++            return Err("serving generation contains unsupported/oversized file".into());
++        }
++        count += 1;
++        bytes = bytes
++            .checked_add(metadata.len())
++            .ok_or("serving generation size overflow")?;
++        if count > limits.max_files || bytes > limits.max_total_bytes {
++            return Err("hydrated serving generation exceeds file/byte limits, including diagnostics".into());
++        }
++    }
++    Ok(bytes)
++}
++
++#[cfg(test)]
++mod retirement_tests {
++    use super::*;
++    #[test]
++    fn retirement_atomically_excludes_weak_upgrade_before_directory_cleanup() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().to_path_buf();
++        let mut options = rocksdb::Options::default();
++        options.create_if_missing(true);
++        let raw = Arc::new(rocksdb::DB::open(&options, path.join("database")).unwrap());
++        let weak = Arc::downgrade(&raw);
++        let escaped = weak.upgrade().unwrap();
++        let capacity = Arc::new(Semaphore::new(1));
++        let budget = capacity.clone().try_acquire_owned().unwrap();
++        let mut retired = Retired {
++            database: None,
++            raw: Some(raw),
++            directory: Some(directory),
++            budget: Some(budget),
++        };
++        assert!(!retired.ready());
++        assert!(path.exists());
++        assert_eq!(capacity.available_permits(), 0);
++        drop(escaped);
++        assert!(retired.ready());
++        assert!(weak.upgrade().is_none());
++        retired.reclaim();
++        assert!(!path.exists());
++        assert_eq!(capacity.available_permits(), 1);
++    }
++    #[test]
++    fn publication_census_counts_marker_and_diagnostic_files() {
++        let root = tempfile::tempdir().unwrap();
++        std::fs::write(root.path().join("000001.sst"), b"data").unwrap();
++        std::fs::write(root.path().join("NANO-PHYSICAL-REPLICA.json"), b"marker").unwrap();
++        std::fs::write(root.path().join("LOG"), b"diagnostic").unwrap();
++        let mut limits = TransferLimits::default();
++        limits.max_total_bytes = 20;
++        limits.max_file_bytes = 20;
++        assert_eq!(census_image(root.path(), limits).unwrap(), 20);
++        limits.max_total_bytes = 19;
++        assert!(census_image(root.path(), limits).is_err());
++        limits.max_total_bytes = 20;
++        limits.max_files = 2;
++        assert!(census_image(root.path(), limits).is_err());
++    }
++}

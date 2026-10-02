@@ -370,8 +370,48 @@ impl RowCache {
     /// Insert an already-shared row into the cache without a deep copy (used by
     /// the `Arc`-returning point/INLJ fetch path).
     pub fn put_arc(&self, table: &str, row_id: u64, tuple: Arc<Tuple>) {
+        self.put_arc_checked(table, row_id, tuple, None);
+    }
+
+    /// Publish a fetched row only if its storage generation is still current.
+    /// Capture `expected_generation` BEFORE reading the row from storage.
+    /// Writers call [`Self::invalidate_with_generation`] AFTER their mutation.
+    /// The generation check and insertion
+    /// share the invalidator's shard lock: an earlier publication is removed;
+    /// a publication after invalidation sees the new generation and is refused.
+    /// Returns whether the row was inserted; cache hits remain unchanged.
+    pub fn put_if_generation(
+        &self,
+        table: &str,
+        row_id: u64,
+        tuple: Tuple,
+        generation: &AtomicU64,
+        expected_generation: u64,
+    ) -> bool {
+        self.put_arc_if_generation(table, row_id, Arc::new(tuple), generation, expected_generation)
+    }
+
+    /// Shared-tuple variant of [`Self::put_if_generation`].
+    pub fn put_arc_if_generation(
+        &self,
+        table: &str,
+        row_id: u64,
+        tuple: Arc<Tuple>,
+        generation: &AtomicU64,
+        expected_generation: u64,
+    ) -> bool {
+        self.put_arc_checked(table, row_id, tuple, Some((generation, expected_generation)))
+    }
+
+    fn put_arc_checked(
+        &self,
+        table: &str,
+        row_id: u64,
+        tuple: Arc<Tuple>,
+        generation: Option<(&AtomicU64, u64)>,
+    ) -> bool {
         if !self.config.enabled {
-            return;
+            return false;
         }
 
         let key = RowCacheKey::new(table, row_id);
@@ -383,6 +423,14 @@ impl RowCache {
         let shard = self.shard_for(&key);
         let was_full = {
             let mut cache = shard.write();
+            // Keep this load UNDER the shard lock. Checking before taking it
+            // allows an invalidation to finish while an old reader waits here,
+            // after which that reader could resurrect the invalidated value.
+            if let Some((current, expected)) = generation {
+                if current.load(Ordering::Acquire) != expected {
+                    return false;
+                }
+            }
             let full = cache.len() >= per_shard_cap;
             cache.put(key, CachedRow::from_arc(tuple, ttl));
             full
@@ -393,17 +441,40 @@ impl RowCache {
             self.stat_evictions.fetch_add(1, Ordering::Relaxed);
         }
         self.record_peak();
+        true
     }
 
     /// Invalidate a specific row
     pub fn invalidate(&self, table: &str, row_id: u64) {
+        self.invalidate_inner(table, row_id, None);
+    }
+
+    /// Announce an external storage mutation and remove its cached row in one
+    /// critical section. This must follow the storage/index mutation. Readers
+    /// that observe the new generation cannot acquire this shard's read lock
+    /// until the old cached row is gone; old readers cannot republish it through
+    /// the guarded insertion APIs. The generation advances even with caching off.
+    pub fn invalidate_with_generation(&self, table: &str, row_id: u64, generation: &AtomicU64) {
+        self.invalidate_inner(table, row_id, Some(generation));
+    }
+
+    fn invalidate_inner(&self, table: &str, row_id: u64, generation: Option<&AtomicU64>) {
         if !self.config.enabled {
+            if let Some(generation) = generation {
+                generation.fetch_add(1, Ordering::Release);
+            }
             return;
         }
 
         let key = RowCacheKey::new(table, row_id);
 
-        let removed = self.shard_for(&key).write().pop(&key).is_some();
+        let removed = {
+            let mut cache = self.shard_for(&key).write();
+            if let Some(generation) = generation {
+                generation.fetch_add(1, Ordering::Release);
+            }
+            cache.pop(&key).is_some()
+        };
         if removed {
             self.stat_invalidations.fetch_add(1, Ordering::Relaxed);
         }
@@ -597,6 +668,77 @@ mod tests {
         cache.invalidate_table("users");
         assert!(cache.get("users", 2).is_none());
         assert!(cache.get("orders", 1).is_some());
+    }
+
+    #[test]
+    fn guarded_fill_rejects_old_reader_after_external_invalidation() {
+        use std::sync::mpsc;
+
+        let cache = Arc::new(RowCache::new());
+        let generation = Arc::new(AtomicU64::new(7));
+        let (captured_tx, captured_rx) = mpsc::channel();
+        let (publish_tx, publish_rx) = mpsc::channel();
+        let reader = {
+            let cache = Arc::clone(&cache);
+            let generation = Arc::clone(&generation);
+            std::thread::spawn(move || {
+                let expected = generation.load(Ordering::Acquire);
+                let old_row = make_tuple(1, "before replay");
+                captured_tx.send(()).unwrap();
+                publish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                cache.put_if_generation("users", 1, old_row, &generation, expected)
+            })
+        };
+        captured_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cache.invalidate_with_generation("users", 1, &generation);
+        publish_tx.send(()).unwrap();
+        assert!(!reader.join().unwrap(), "old read must not resurrect stale cache data");
+        assert!(cache.get("users", 1).is_none());
+        assert_eq!(generation.load(Ordering::Acquire), 8);
+        assert_eq!(cache.stats().inserts, 0);
+    }
+
+    #[test]
+    fn external_invalidation_removes_a_publication_that_won_the_race() {
+        let cache = RowCache::new();
+        let generation = AtomicU64::new(9);
+        let old_row = Arc::new(make_tuple(1, "before replay"));
+        assert!(cache.put_arc_if_generation("users", 1, old_row, &generation, 9));
+        cache.invalidate_with_generation("users", 1, &generation);
+        assert_eq!(generation.load(Ordering::Acquire), 10);
+        assert!(cache.get_arc("users", 1).is_none());
+
+        let new_row = Arc::new(make_tuple(1, "after replay"));
+        assert!(cache.put_arc_if_generation("users", 1, Arc::clone(&new_row), &generation, 10));
+        let cached = cache.get_arc("users", 1).unwrap();
+        assert!(Arc::ptr_eq(&new_row, &cached), "guarded Arc fill preserves sharing");
+        assert_eq!(cache.stats().inserts, 2);
+        assert_eq!(cache.stats().invalidations, 1);
+    }
+
+    #[test]
+    fn stale_fill_cannot_replace_a_new_generation_value() {
+        let cache = RowCache::new();
+        let generation = AtomicU64::new(0);
+        cache.invalidate_with_generation("users", 1, &generation);
+        let current = make_tuple(1, "current");
+        assert!(cache.put_if_generation("users", 1, current.clone(), &generation, 1));
+        assert!(!cache.put_if_generation("users", 1, make_tuple(1, "stale"), &generation, 0));
+        assert_eq!(cache.get("users", 1), Some(current));
+        assert_eq!(cache.stats().inserts, 1);
+    }
+
+    #[test]
+    fn external_generation_advances_with_disabled_row_cache() {
+        let cache = RowCache::with_config(RowCacheConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let generation = AtomicU64::new(2);
+        cache.invalidate_with_generation("users", 1, &generation);
+        assert_eq!(generation.load(Ordering::Acquire), 3);
+        assert!(!cache.put_if_generation("users", 1, make_tuple(1, "uncached"), &generation, 3));
+        assert_eq!(cache.stats().inserts, 0);
     }
 
     #[test]

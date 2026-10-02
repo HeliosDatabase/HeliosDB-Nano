@@ -1,0 +1,421 @@
+--- a/src/api/handlers/data_handler.rs
++++ b/src/api/handlers/data_handler.rs
+@@ -287,6 +287,7 @@
+     Path((branch_name, table_name)): Path<(String, String)>,
+     Json(request): Json<InsertDataRequest>,
+ ) -> Result<(StatusCode, Json<InsertDataResponse>), ApiError> {
++    let _physical_operation = state.db.storage.physical_source_operation()?;
+     info!(
+         "Inserting {} rows into table '{}' in branch '{}'",
+         request.rows.len(),
+@@ -308,6 +309,7 @@
+         ApiError::from(e)
+     })?;
+ 
++    let mut durable_phase = None;
+     let mut inserted_count = 0u64;
+     let mut row_ids = Vec::new();
+ 
+@@ -335,6 +337,15 @@
+ 
+         let tuple = Tuple::new(tuple_values);
+ 
++        // First-row validation must not disable source certification. Once a
++        // row/counter may persist, a later bad row or storage error can leave
++        // this multirow request partial, so retain the phase through the loop.
++        if durable_phase.is_none() {
++            durable_phase = Some(state.db.storage.physical_durable_phase(
++                "HTTP insert request did not complete all rows",
++            )?);
++        }
++
+         // Get next row ID before insertion if needed
+         let row_id = if request.return_ids {
+             Some(catalog.next_row_id(&table_name).map_err(|e| {
+@@ -357,6 +368,8 @@
+             row_ids.push(id);
+         }
+     }
++
++    if let Some(phase) = durable_phase { phase.complete(); }
+ 
+     let response = InsertDataResponse {
+         inserted: inserted_count,
+@@ -702,3 +715,57 @@
+         assert_eq!(response.0.deleted, 1);
+     }
+ }
++
++#[cfg(all(test, feature = "ha-tier1", target_os = "linux"))]
++mod physical_http_insert_tests {
++    use super::*;
++    use crate::replication::{
++        history::load_or_create_primary_history,
++        physical_source_coordinator::CoordinatorError,
++    };
++    use std::{sync::Arc, time::Duration};
++
++    #[tokio::test]
++    async fn first_bad_row_keeps_certification_but_later_bad_row_marks_partial_request() {
++        let root = tempfile::tempdir().unwrap();
++        let path = root.path().join("source");
++        let mut config = crate::Config::default();
++        config.storage.path = Some(path.clone());
++        config.replication.physical.enabled = true;
++        let db = Arc::new(crate::EmbeddedDatabase::with_config(config).unwrap());
++        db.execute("CREATE TABLE phase_rows (id INT NOT NULL)").unwrap();
++        let history = load_or_create_primary_history(&path).unwrap();
++        let coordinator = db.storage.physical_source_coordinator().unwrap();
++        let state = AppState {
++            db: db.clone(),
++            query_registry: Arc::new(crate::compute::QueryRegistry::new()),
++            auth_bridge: None,
++            oauth_registry: None,
++            change_notifier: None,
++        };
++        let row = |value| std::collections::HashMap::from([("id".to_string(), value)]);
++        let bad = row(serde_json::json!(["not-an-integer"]));
++        let before = db.storage.db().latest_sequence_number();
++        let result = insert_data(
++            State(state.clone()),
++            Path(("main".into(), "phase_rows".into())),
++            Json(InsertDataRequest { rows: vec![bad.clone()], return_ids: true }),
++        ).await;
++        assert!(result.is_err());
++        assert_eq!(db.storage.db().latest_sequence_number(), before);
++        assert!(coordinator.capture_barrier(history, Duration::from_secs(1)).is_ok());
++        let result = insert_data(
++            State(state),
++            Path(("main".into(), "phase_rows".into())),
++            Json(InsertDataRequest { rows: vec![row(serde_json::json!(1)), bad], return_ids: true }),
++        ).await;
++        assert!(result.is_err());
++        assert!(db.storage.db().latest_sequence_number() > before);
++        let rows = db.query("SELECT id FROM phase_rows", &[]).unwrap();
++        assert_eq!(rows.len(), 1, "first row must have persisted before later coercion failed");
++        assert_eq!(rows[0].values[0], crate::Value::Int4(1));
++        assert!(matches!(coordinator.capture_barrier(history, Duration::from_secs(1)), Err(CoordinatorError::Poisoned(_))));
++        db.execute("INSERT INTO phase_rows VALUES (2)").unwrap();
++        assert_eq!(db.query("SELECT id FROM phase_rows", &[]).unwrap().len(), 2);
++    }
++}
+--- a/src/api/handlers/branch_handler.rs
++++ b/src/api/handlers/branch_handler.rs
+@@ -79,6 +79,7 @@
+     State(state): State<AppState>,
+     Json(request): Json<CreateBranchRequest>,
+ ) -> Result<(StatusCode, Json<BranchResponse>), ApiError> {
++    let _physical_operation = state.db.storage.physical_source_operation()?;
+     info!("Creating branch: {}", request.name);
+ 
+     // Validate branch name
+@@ -187,6 +188,7 @@
+ /// - 500 Internal Server Error: Database error
+ /// - 501 Not Implemented: Branching not enabled
+ pub async fn delete_branch(State(state): State<AppState>, Path(name): Path<String>) -> Result<StatusCode, ApiError> {
++    let _physical_operation = state.db.storage.physical_source_operation()?;
+     info!("Deleting branch: {}", name);
+ 
+     // Access the branch manager from storage
+@@ -238,6 +240,7 @@
+     Path(source_name): Path<String>,
+     Json(request): Json<MergeBranchRequest>,
+ ) -> Result<Json<MergeBranchResponse>, ApiError> {
++    let _physical_operation = state.db.storage.physical_source_operation()?;
+     info!("Merging branch '{}' into '{}'", source_name, request.target);
+ 
+     // Access the branch manager from storage
+--- a/src/api/routes/webhooks.rs
++++ b/src/api/routes/webhooks.rs
+@@ -357,6 +357,7 @@
+ /// to actually create/merge/drop branches. Otherwise falls back to
+ /// the basic WebhookHandler that just logs events.
+ fn handle_event_with_storage(state: &AppState, event: &WebhookEvent) -> Result<WebhookResult, crate::Error> {
++    let _physical_operation = state.db.storage.physical_source_operation()?;
+     let config = get_webhook_config(state);
+ 
+     // Try to use storage-aware handler if branching is enabled
+--- a/src/storage/branch.rs
++++ b/src/storage/branch.rs
+@@ -308,6 +308,8 @@
+ 
+ /// Branch manager - coordinates all branch operations
+ pub struct BranchManager {
++    #[cfg(feature = "ha-tier1")]
++    physical_source_coordinator: Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>>,
+     /// Storage engine reference
+     db: Arc<DB>,
+ 
+@@ -332,7 +334,48 @@
+     key_manager: Option<Arc<crate::crypto::KeyManager>>,
+ }
+ 
++// No-op in ordinary builds; enabled source phases retain their own !Send permit.
++struct BranchDurablePhase {
++    #[cfg(feature = "ha-tier1")]
++    inner: Option<crate::replication::physical_source_coordinator::PhysicalDurablePhase>,
++}
++impl BranchDurablePhase {
++    fn complete(mut self) {
++        #[cfg(feature = "ha-tier1")]
++        if let Some(phase) = self.inner.take() { phase.complete(); }
++        #[cfg(not(feature = "ha-tier1"))]
++        let _ = &mut self;
++    }
++}
++
+ impl BranchManager {
++    /// Engine construction only, before publishing this manager or transactions.
++    #[cfg(feature = "ha-tier1")]
++    pub(crate) fn set_physical_source_coordinator(
++        &mut self,
++        coordinator: Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>>,
++    ) {
++        self.physical_source_coordinator = coordinator;
++    }
++    #[cfg(feature = "ha-tier1")]
++    fn physical_source_operation(&self) -> Result<Option<crate::replication::physical_source_coordinator::PhysicalOperationPermit>> {
++        self.physical_source_coordinator.as_ref()
++            .map(|coordinator| coordinator.operation().map_err(|error| Error::storage(error.to_string())))
++            .transpose()
++    }
++    #[cfg(not(feature = "ha-tier1"))]
++    fn physical_source_operation(&self) -> Result<Option<()>> { Ok(None) }
++
++    fn begin_durable_phase(&self, reason: &'static str) -> Result<BranchDurablePhase> {
++        #[cfg(not(feature = "ha-tier1"))]
++        let _ = reason;
++        Ok(BranchDurablePhase {
++            #[cfg(feature = "ha-tier1")]
++            inner: self.physical_source_coordinator.as_ref()
++                .map(|coordinator| coordinator.begin_durable_phase(reason).map_err(|error| Error::storage(error.to_string())))
++                .transpose()?,
++        })
++    }
+     /// Create new branch manager with default GC configuration
+     pub fn new(db: Arc<DB>, timestamp: Arc<RwLock<u64>>) -> Result<Self> {
+         Self::with_gc_config(db, timestamp, BranchGcConfig::default())
+@@ -368,6 +411,8 @@
+         }
+         let pending_gc = Self::load_pending_gc(&db)?;
+         Ok(Self {
++            #[cfg(feature = "ha-tier1")]
++            physical_source_coordinator: None,
+             db,
+             registry: Arc::new(RwLock::new(registry)),
+             metadata_cache: Arc::new(RwLock::new(metadata_cache)),
+@@ -397,6 +442,8 @@
+         let pending_gc = Self::load_pending_gc(&db)?;
+ 
+         Ok(Self {
++            #[cfg(feature = "ha-tier1")]
++            physical_source_coordinator: None,
+             db,
+             registry: Arc::new(RwLock::new(registry)),
+             metadata_cache: Arc::new(RwLock::new(HashMap::new())),
+@@ -490,6 +537,7 @@
+         snapshot_id: SnapshotId,
+         options: BranchOptions,
+     ) -> Result<BranchId> {
++        let _physical_operation = self.physical_source_operation()?;
+         // Validate branch name doesn't already exist
+         if self.get_branch_by_name(name).is_ok() {
+             return Err(Error::storage(format!("Branch '{}' already exists", name)));
+@@ -529,6 +577,7 @@
+         let meta_key = encode_branch_meta_key(name);
+         let meta_value = bincode::serialize(&metadata)
+             .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
++        let durable_phase = self.begin_durable_phase("branch create did not complete durable metadata")?;
+         self.db
+             .put(&meta_key, &meta_value)
+             .map_err(|e| Error::storage(format!("Failed to save branch metadata: {}", e)))?;
+@@ -548,11 +597,13 @@
+         // Cache metadata
+         self.metadata_cache.write().insert(branch_id, metadata);
+ 
++        durable_phase.complete();
+         Ok(branch_id)
+     }
+ 
+     /// Drop a branch
+     pub fn drop_branch(&self, name: &str, if_exists: bool) -> Result<()> {
++        let _physical_operation = self.physical_source_operation()?;
+         // Get branch metadata
+         let metadata = match self.get_branch_by_name(name) {
+             Ok(meta) => meta,
+@@ -585,6 +636,7 @@
+         let meta_key = encode_branch_meta_key(name);
+         let meta_value = bincode::serialize(&updated_meta)
+             .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
++        let durable_phase = self.begin_durable_phase("branch drop did not complete durable metadata and GC")?;
+         self.db
+             .put(&meta_key, &meta_value)
+             .map_err(|e| Error::storage(format!("Failed to save updated metadata: {}", e)))?;
+@@ -610,6 +662,7 @@
+         // Schedule GC for branch data
+         self.schedule_branch_gc(metadata.branch_id, metadata.name.clone())?;
+ 
++        durable_phase.complete();
+         Ok(())
+     }
+ 
+@@ -674,6 +727,8 @@
+             keys_to_delete.push(key.to_vec());
+         }
+ 
++        let durable_phase = self.begin_durable_phase("branch GC did not complete deletion")?;
++
+         // Delete collected keys
+         for key in keys_to_delete {
+             self.db
+@@ -688,6 +743,7 @@
+             branch_id
+         );
+ 
++        durable_phase.complete();
+         Ok(())
+     }
+ 
+@@ -696,6 +752,7 @@
+     /// Processes branches that have been in the queue longer than min_retention_seconds.
+     /// Returns the number of branches garbage collected.
+     pub fn gc_eligible_branches(&self) -> Result<usize> {
++        let _physical_operation = self.physical_source_operation()?;
+         let current_ts = self.current_timestamp();
+         let min_retention = self.gc_config.min_retention_seconds;
+ 
+@@ -717,6 +774,8 @@
+                 to_remove.push(*branch_id);
+             }
+         }
++
++        let durable_phase = self.begin_durable_phase("branch GC did not persist its completed queue")?;
+ 
+         // Process eligible branches
+         for branch_id in to_remove {
+@@ -741,6 +800,7 @@
+             tracing::info!("Branch GC completed: {} branches cleaned up", gc_count);
+         }
+ 
++        durable_phase.complete();
+         Ok(gc_count)
+     }
+ 
+@@ -949,6 +1009,7 @@
+     /// Performs a three-way merge using the common ancestor as the merge base.
+     /// Supports multiple merge strategies for conflict resolution.
+     pub fn merge_branch(&self, source_name: &str, target_name: &str, strategy: MergeStrategy) -> Result<MergeResult> {
++        let _physical_operation = self.physical_source_operation()?;
+         tracing::info!(
+             "Starting merge: {} -> {} (strategy: {:?})",
+             source_name,
+@@ -1011,6 +1072,7 @@
+ 
+         // Perform merge with selected strategy
+         let merge_timestamp = self.next_timestamp();
++        let durable_phase = self.begin_durable_phase("branch merge did not complete rows and metadata")?;
+         let merged_keys = self.apply_merge(
+             source.branch_id,
+             target.branch_id,
+@@ -1059,6 +1121,7 @@
+             conflicts.len()
+         );
+ 
++        durable_phase.complete();
+         Ok(MergeResult {
+             merge_timestamp,
+             merged_keys,
+@@ -1365,6 +1428,13 @@
+ }
+ 
+ impl BranchTransaction {
++    #[cfg(feature = "ha-tier1")]
++    pub(crate) fn set_physical_source_coordinator(
++        &mut self,
++        coordinator: Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>>,
++    ) {
++        self.tx.set_physical_source_coordinator(coordinator);
++    }
+     /// Create a new branch transaction
+     pub fn new(
+         db: Arc<DB>,
+@@ -2119,3 +2189,79 @@
+         }
+     }
+ }
++
++#[cfg(all(test, feature = "ha-tier1", target_os = "linux"))]
++mod physical_source_admission_tests {
++    use super::*;
++    use crate::replication::{
++        history::load_or_create_primary_history,
++        physical_source_coordinator::{CoordinatorError, PhysicalSourceCoordinator},
++    };
++    use std::{sync::mpsc, thread, time::Duration};
++
++    fn fixture() -> (tempfile::TempDir, Arc<DB>, Arc<BranchManager>, Arc<PhysicalSourceCoordinator>, uuid::Uuid) {
++        let root = tempfile::tempdir().unwrap();
++        let mut options = rocksdb::Options::default();
++        options.create_if_missing(true);
++        let db = Arc::new(DB::open(&options, root.path().join("source")).unwrap());
++        let mut manager = BranchManager::new(db.clone(), Arc::new(RwLock::new(1))).unwrap();
++        let history = load_or_create_primary_history(db.path()).unwrap();
++        let coordinator = Arc::new(PhysicalSourceCoordinator::new(db.clone()));
++        manager.set_physical_source_coordinator(Some(coordinator.clone()));
++        (root, db, Arc::new(manager), coordinator, history)
++    }
++
++    #[test]
++    fn ordinary_branch_validation_errors_leave_source_certifiable() {
++        let (_root, db, manager, coordinator, history) = fixture();
++        manager.create_branch("existing", None, 1, BranchOptions::default()).unwrap();
++        let before = db.latest_sequence_number();
++        assert!(manager.create_branch("existing", None, 1, BranchOptions::default()).is_err());
++        assert!(manager.create_branch("missing-parent", Some("absent"), 1, BranchOptions::default()).is_err());
++        assert!(manager.drop_branch("main", false).is_err());
++        assert!(manager.drop_branch("absent", false).is_err());
++        assert!(manager.merge_branch("absent", "main", MergeStrategy::Manual).is_err());
++        assert_eq!(db.latest_sequence_number(), before);
++        assert_eq!(coordinator.capture_barrier(history, Duration::from_secs(1)).unwrap().source_sequence(), before);
++    }
++
++    #[test]
++    fn failed_branch_create_after_metadata_write_refuses_certification_only() {
++        let (_root, db, manager, coordinator, history) = fixture();
++        let children_key = encode_branch_children_key(1);
++        // Private fixture: force add_child_branch to fail AFTER metadata+registry.
++        db.put(&children_key, b"\xff").unwrap();
++        let before = db.latest_sequence_number();
++        assert!(manager.create_branch("partial", None, 1, BranchOptions::default()).is_err());
++        assert!(db.latest_sequence_number() > before, "fixture must fail after durable writes");
++        assert!(db.get(encode_branch_meta_key("partial")).unwrap().is_some());
++        assert!(matches!(coordinator.capture_barrier(history, Duration::from_secs(1)), Err(CoordinatorError::Poisoned(_))));
++        let permit = coordinator.operation().unwrap();
++        db.put(b"primary-still-writable", b"yes").unwrap();
++        drop(permit);
++        assert_eq!(db.get(&children_key).unwrap(), Some(b"\xff".to_vec()));
++    }
++
++    #[test]
++    fn branch_manager_mutation_waits_behind_a_source_capture_fence() {
++        let (_root, _db, manager, coordinator, history) = fixture();
++        let fence = coordinator.fence(Duration::from_secs(1)).unwrap();
++        let (started_tx, started_rx) = mpsc::channel();
++        let (done_tx, done_rx) = mpsc::channel();
++        let worker = thread::spawn(move || {
++            let _ = started_tx.send(());
++            let result = manager.create_branch("after-fence", None, 1, BranchOptions::default());
++            let _ = done_tx.send(result.is_ok());
++        });
++        // All blocking resources are released/reaped before assertions.
++        let started = started_rx.recv_timeout(Duration::from_secs(2));
++        let early = done_rx.recv_timeout(Duration::from_millis(30));
++        drop(fence);
++        let done = done_rx.recv_timeout(Duration::from_secs(2));
++        let joined = worker.join();
++        assert!(started.is_ok() && early.is_err());
++        assert_eq!(done.unwrap(), true);
++        assert!(joined.is_ok());
++        assert!(coordinator.capture_barrier(history, Duration::from_secs(1)).is_ok());
++    }
++}

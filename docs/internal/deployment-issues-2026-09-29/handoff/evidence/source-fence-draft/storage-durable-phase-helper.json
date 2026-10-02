@@ -1,0 +1,6 @@
+{
+  "base": "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/source-fence-draft/engine-proposal.rs",
+  "base_sha256": "76f058c920b31976411c00290996dcaf10127a3612e730be5fd402be07fe1b3b",
+  "draft_sha256": "99ee37a9e8adff60c13cbef608ae0e1a66758e8ccccc64355578de741a8f739b",
+  "apply_after": "storage-source-admission.patch cbb5cfe4; nonoverlapping with branch-engine-propagation.patch"
+}

@@ -1,0 +1,121 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -21376,6 +21376,49 @@
+         self.session_manager.create_session(&user, isolation)
+     }
+ 
++    /// Move only a connection-owned idle session between immutable generations.
++    /// Caller exclusively owns the connection and must retain both ServingLease
++    /// values through the transfer; no statement/portal may still use the old DB.
++    /// False means engine-owned state pins the old generation; nothing is lost.
++    #[cfg(feature = "ha-tier1")]
++    pub(crate) fn try_transfer_idle_physical_session(
++        &self,
++        target: &Self,
++        session_id: crate::session::SessionId,
++    ) -> Result<bool> {
++        if std::ptr::eq(self, target) {
++            return Ok(true);
++        }
++        if self.session_transactions.contains_key(&session_id)
++            || self.session_art_undo.contains_key(&session_id)
++            || self.session_notices.contains_key(&session_id)
++            || target.session_transactions.contains_key(&session_id)
++            || target.session_art_undo.contains_key(&session_id)
++            || target.session_notices.contains_key(&session_id)
++        {
++            return Ok(false);
++        }
++        let session = self.session_manager.get_session(session_id)?;
++        let needs_schema_hint = {
++            let state = session.read();
++            if state.active_txn.is_some() || state.scoped.has_tenant() || state.scoped.holds_temp_tables() {
++                return Ok(false);
++            }
++            state.current_schema.is_some() || !state.search_path.is_empty()
++        };
++        // Conservative true on a subsequent failed transfer is harmless. Set it
++        // before publishing the session into the target manager: fast paths must
++        // never miss this connection's preserved search_path.
++        if needs_schema_hint {
++            target
++                .any_session_schema_active
++                .store(true, std::sync::atomic::Ordering::Release);
++        }
++        self.session_manager
++            .transfer_idle_generation_session(&target.session_manager, session_id)?;
++        Ok(true)
++    }
++
+     /// Destroy an active session and release all resources
+     ///
+     /// This terminates the session and releases all associated resources including
+@@ -41065,3 +41108,68 @@
+         }
+     }
+ }
++
++#[cfg(all(test, feature = "ha-tier1"))]
++mod physical_session_portability_tests {
++    use super::*;
++    #[test]
++    fn idle_transfer_preserves_backend_and_schema_fast_path_hint() {
++        let source = EmbeddedDatabase::new_in_memory().unwrap();
++        let target = EmbeddedDatabase::new_in_memory().unwrap();
++        let id = source.create_wire_session("reader").unwrap();
++        source.set_session_login_user(id, Some("reader".into())).unwrap();
++        source
++            .set_session_search_path(id, vec!["read_schema".into(), "public".into()])
++            .unwrap();
++        source.set_session_application_name(id, "same backend").unwrap();
++        let old = source.session_manager.get_session(id).unwrap();
++        let pid = source.session_backend_pid(id).unwrap();
++        assert!(!target
++            .any_session_schema_active
++            .load(std::sync::atomic::Ordering::Acquire));
++        assert!(source.try_transfer_idle_physical_session(&target, id).unwrap());
++        assert!(source.session_manager.get_session(id).is_err());
++        assert!(std::sync::Arc::ptr_eq(
++            &old,
++            &target.session_manager.get_session(id).unwrap()
++        ));
++        assert_eq!(target.session_backend_pid(id).unwrap(), pid);
++        assert_eq!(target.session_application_name(id).unwrap(), "same backend");
++        assert!(target.session_schema_active(id));
++        assert_eq!(target.session_search_path(id).unwrap(), ["read_schema", "public"]);
++        target.destroy_session(id).unwrap();
++    }
++    #[test]
++    fn transaction_notice_tenant_and_temp_state_pin_original_owner() {
++        let source = EmbeddedDatabase::new_in_memory().unwrap();
++        let target = EmbeddedDatabase::new_in_memory().unwrap();
++        let id = source.create_wire_session("reader").unwrap();
++        source.begin_transaction_for_session(id).unwrap();
++        assert!(!source.try_transfer_idle_physical_session(&target, id).unwrap());
++        source.rollback_transaction_for_session(id).unwrap();
++        source.push_session_notice(
++            id,
++            SessionNotice {
++                severity: "NOTICE".into(),
++                code: "00000".into(),
++                message: "retained".into(),
++            },
++        );
++        assert!(!source.try_transfer_idle_physical_session(&target, id).unwrap());
++        assert_eq!(source.take_session_notices(id).len(), 1);
++        let state = source.session_manager.get_session(id).unwrap();
++        state.read().scoped.bind_tenant(crate::tenant::TenantContext {
++            tenant_id: uuid::Uuid::new_v4(),
++            user_id: "reader".into(),
++            roles: vec![],
++            isolation_mode: crate::tenant::IsolationMode::SharedSchema,
++        });
++        assert!(!source.try_transfer_idle_physical_session(&target, id).unwrap());
++        state.read().scoped.unbind_tenant();
++        state.read().scoped.note_temp_table();
++        assert!(!source.try_transfer_idle_physical_session(&target, id).unwrap());
++        assert!(source.session_manager.get_session(id).is_ok());
++        assert!(target.session_manager.get_session(id).is_err());
++        source.destroy_session(id).unwrap();
++    }
++}

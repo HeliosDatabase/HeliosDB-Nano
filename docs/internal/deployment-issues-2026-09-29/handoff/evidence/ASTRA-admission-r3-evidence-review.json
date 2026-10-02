@@ -1,0 +1,65 @@
+{
+  "utc": "2026-09-30T14:38Z",
+  "packet_for": "Astra review (admission r3 bounded evidence)",
+  "acceptance_owner": "Astra / authorized Opus only — this is evidence, not acceptance",
+  "issue_scope": "Nano issues 1,5,6,7,8",
+  "candidate_tree": "/home/gpc/HDB/worktrees/nano-admission-fix-20260929",
+  "base_commit": "916138311c69f1cde070fb3d53fc601e22cc0a06",
+  "source_manifest": "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/admission-fix-source.sha256",
+  "source_manifest_files": 869,
+  "source_manifest_verify": "sha256sum -c OK, 0 FAILED",
+  "deltas_vs_frozen_admission_candidate": [
+    "tests/deployment_cli_tests.rs sha256 d9228cebdae1af30b646ea40ce88d1125512ba58510f38aa60c60bb9a0b097ff",
+    "tests/gh_issue_36.rs sha256 2e081d223f0a361c7a489752d43d03b91f67b442467f25103c78efeba9a41c0d",
+    "scripts/nano-offline-reseed.py sha256 ea02612679869c47fb320f9aa95f23e50e7c043474e26547957a7bb78274d0c3 (added; was missing from the candidate)"
+  ],
+  "gh36_fixture_contract": {
+    "autocommit": true,
+    "logical_wal_per_statement": true,
+    "explicit_transaction_used": false,
+    "note": "The corrected test keeps INSERT/DELETE as AUTOCOMMIT statements and enables strict logical WAL via a new emitted_logical() harness, so the fast DELETE reaches log_data_delete. The earlier explicit-transaction workaround is SUPERSEDED and was removed.",
+    "original_rename_regression_retained": "a_replica_follows_alter_table_rename_to (and ..._rename_column) remain present and pass"
+  },
+  "bounded_gate": {
+    "admission-clean-r3": {"exit": 0, "utc": "2026-09-30T06:17:21Z"},
+    "admission-lib-r3": {"exit": 0, "utc": "2026-09-30T06:21:18Z", "result": "2770 passed; 0 failed; 2 ignored"},
+    "admission-lib-r3-coverage": {"admits_read_shapes_and_session_recovery": true, "denies_write_shapes_before_any_fast_path": true},
+    "admission-targeted-r3": {
+      "exit": 0,
+      "utc": "2026-09-30T06:24:42Z",
+      "targets": {
+        "main-bin": "4/0", "a14_postgres_transaction_error_recovery": "7/0",
+        "deployment_cli_tests": "19/0", "extended_query_planner_schema": "4/0",
+        "fk_validation_modes": "5/0", "gh_issue_36": "38/0",
+        "postgres_extended_protocol_tests": "16/0", "replication_history_transport": "7/0",
+        "session_wire_transactions": "12/0"
+      },
+      "key_tests": {
+        "guarded_standby_verifies_history_and_refuses_transparent_forwarding_in_every_mode": "ok",
+        "real_row_delete_still_replicates_while_rename_side_cleanup_is_not_a_row": "ok",
+        "a_replica_follows_alter_table_rename_to": "ok",
+        "low_level_metadata_cleanup_never_emits_a_logical_row_delete": "ok"
+      }
+    },
+    "admission-live-r3": {
+      "exit": 0,
+      "utc": "2026-09-30T06:24:46Z",
+      "modes": {"simple": "pass", "copy": "pass", "extended": "pass"},
+      "result_dir": "admission-live-r3-result"
+    }
+  },
+  "wider_gates": {
+    "admission-wide-default-r2": {"exit": 0, "utc": "2026-09-30T08:50:37Z", "targets": "353/353", "failed": 0, "completeness_exit": 0},
+    "admission-wide-internal-r2": {"exit": 0, "utc": "2026-09-30T09:12:55Z", "targets": "353/353", "failed": 0, "completeness_exit": 0},
+    "passing_stages": ["doc", "mcp-bin", "noHA", "ha-full", "deny"],
+    "declared_reviews": {
+      "msrv": "exit101 declared preexisting failure",
+      "clippy": "exit101; 0 new (file,lint) signatures vs the guard candidate; +2 vs base (unwrap on Result in src/config.rs, src/replication/history.rs) inherited from the guard candidate; see admission-wide-clippy-comparison.txt"
+    }
+  },
+  "open_admission_caveats": [
+    "SQL-shape admission still does not reject every SELECT UDF/sequence side effect.",
+    "A real HA-primary autocommit live control must be added to the final COMBINED candidate before final acceptance; the logical_wal_per_statement test setting alone is not sufficient inference.",
+    "The candidate is not a combined candidate with history-guard protocol v2; no combined acceptance claim."
+  ]
+}

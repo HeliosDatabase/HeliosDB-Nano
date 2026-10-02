@@ -1,0 +1,24 @@
+{
+  "identities_before": {
+    "/home/gpc/HDB/worktrees/nano-native-auth-20260930/target-campaign/debug/heliosdb-nano": "8e46aff9c718d4a6f118a60d702b0ca2061783ad50a7de96f5fd7a35a7b6ea77",
+    "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/native_auth_live.py": "e7bc2f707867ee2b5972704af2f1825edd380603cd00bfa3a32e8c01a2aa081c",
+    "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/probe_standby_wire_writes.py": "5cb0fae61a7687154a00c4cdb7adf5f0fbb0b5edc42124ab0e71071173e84138"
+  },
+  "fixture_root": "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/native-auth-live-result-final3/native-auth-zdohljiy",
+  "control": {
+    "status": "pass",
+    "checks": [
+      "empty env credential: primary refuses to start (no downgrade)",
+      "valid token: standby connected to primary",
+      "valid token: committed row replicated and visible on standby",
+      "missing token: rejected before registration/WAL; standby not connected",
+      "wrong token: rejected before registration/WAL; standby not connected"
+    ]
+  },
+  "identities_after": {
+    "/home/gpc/HDB/worktrees/nano-native-auth-20260930/target-campaign/debug/heliosdb-nano": "8e46aff9c718d4a6f118a60d702b0ca2061783ad50a7de96f5fd7a35a7b6ea77",
+    "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/native_auth_live.py": "e7bc2f707867ee2b5972704af2f1825edd380603cd00bfa3a32e8c01a2aa081c",
+    "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/probe_standby_wire_writes.py": "5cb0fae61a7687154a00c4cdb7adf5f0fbb0b5edc42124ab0e71071173e84138"
+  },
+  "identity_unchanged": true
+}

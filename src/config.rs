@@ -95,6 +95,9 @@ pub struct Config {
     /// Server configuration
     #[serde(default)]
     pub server: ServerConfig,
+    /// Native WAL replication settings (CLI flags override these values).
+    #[serde(default)]
+    pub replication: ReplicationConfig,
     /// Performance configuration
     #[serde(default)]
     pub performance: PerformanceConfig,
@@ -143,6 +146,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             encryption: EncryptionConfig::default(),
             server: ServerConfig::default(),
+            replication: ReplicationConfig::default(),
             performance: PerformanceConfig::default(),
             audit: crate::audit::AuditConfig::default(),
             optimizer: OptimizerConfig::default(),
@@ -240,6 +244,7 @@ impl Config {
             "storage",
             "encryption",
             "server",
+            "replication",
             "performance",
             "audit",
             "optimizer",
@@ -325,11 +330,126 @@ impl Config {
     /// Validate all configuration sections
     pub fn validate(&self) -> crate::Result<()> {
         self.server.validate_connection_policy()?;
+        self.replication.validate()?;
         self.session.validate()?;
         self.locks.validate()?;
         self.dump.validate()?;
         self.resource_quotas.validate()?;
         Ok(())
+    }
+}
+
+/// Native WAL replication configuration for the `start` command.
+///
+/// Explicit CLI arguments override individual fields from this section. Endpoint
+/// validation checks syntax without DNS/network access; connection attempts resolve
+/// hostnames later. Role-dependent requirements are checked after CLI overrides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReplicationConfig {
+    /// standalone, primary, standby, or observer (case-insensitive).
+    pub role: String,
+    /// Native replication listener port, separate from PostgreSQL and HTTP.
+    #[serde(alias = "port")]
+    pub replication_port: u16,
+    /// Primary native replication endpoint, required for standby startup.
+    pub primary_host: Option<String>,
+    /// Standby native replication endpoints.
+    pub standby_hosts: Vec<String>,
+    /// Observer native replication endpoints.
+    pub observer_hosts: Vec<String>,
+    /// async, semi-sync (alias semisync), or sync (case-insensitive).
+    pub sync_mode: String,
+    /// Stable node UUID; generated at startup if absent.
+    pub node_id: Option<String>,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            role: "standalone".to_string(),
+            replication_port: 5433,
+            primary_host: None,
+            standby_hosts: Vec::new(),
+            observer_hosts: Vec::new(),
+            sync_mode: "async".to_string(),
+            node_id: None,
+        }
+    }
+}
+
+impl ReplicationConfig {
+    /// Validate configured values without requiring role-dependent CLI arguments.
+    pub fn validate(&self) -> crate::Result<()> {
+        if !matches!(
+            self.role.to_ascii_lowercase().as_str(),
+            "standalone" | "primary" | "standby" | "observer"
+        ) {
+            return Err(crate::Error::config(
+                "replication.role must be standalone, primary, standby, or observer",
+            ));
+        }
+        if !matches!(
+            self.sync_mode.to_ascii_lowercase().as_str(),
+            "async" | "semi-sync" | "semisync" | "sync"
+        ) {
+            return Err(crate::Error::config(
+                "replication.sync_mode must be async, semi-sync, or sync",
+            ));
+        }
+        if self.replication_port == 0 {
+            return Err(crate::Error::config(
+                "replication.replication_port must be between 1 and 65535",
+            ));
+        }
+        for (key, endpoints) in [
+            ("primary_host", self.primary_host.iter().collect::<Vec<_>>()),
+            ("standby_hosts", self.standby_hosts.iter().collect()),
+            ("observer_hosts", self.observer_hosts.iter().collect()),
+        ] {
+            for endpoint in endpoints {
+                validate_replication_endpoint(endpoint)
+                    .map_err(|error| crate::Error::config(format!("replication.{key}: {error}")))?;
+            }
+        }
+        if let Some(node_id) = &self.node_id {
+            uuid::Uuid::parse_str(node_id)
+                .map_err(|error| crate::Error::config(format!("replication.node_id must be a UUID: {error}")))?;
+        }
+        Ok(())
+    }
+}
+
+/// Validate a native replication endpoint: `host:port`, `IPv4:port`, or `[IPv6]:port`.
+///
+/// This intentionally performs no DNS lookup, allowing configuration checks while
+/// peers are offline. URLs, unbracketed IPv6, missing ports and port zero are errors.
+pub fn validate_replication_endpoint(endpoint: &str) -> crate::Result<()> {
+    let invalid = || {
+        crate::Error::config(format!(
+            "invalid replication endpoint '{endpoint}'; use host:port or [IPv6]:port with a nonzero port"
+        ))
+    };
+    if let Ok(address) = endpoint.parse::<std::net::SocketAddr>() {
+        return if address.port() == 0 { Err(invalid()) } else { Ok(()) };
+    }
+    let (host, port) = endpoint.rsplit_once(':').ok_or_else(invalid)?;
+    let valid_host = !host.is_empty()
+        && host.len() <= 253
+        && !host.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && host.strip_suffix('.').unwrap_or(host).split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    if !valid_host || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    match port.parse::<u16>() {
+        Ok(port) if port > 0 => Ok(()),
+        _ => Err(invalid()),
     }
 }
 
@@ -2204,6 +2324,120 @@ fn generate_random_secret() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replication_defaults_preserve_standalone_startup() {
+        let config = Config::from_toml_str("").unwrap();
+        assert_eq!(config.replication.role, "standalone");
+        assert_eq!(config.replication.replication_port, 5433);
+        assert_eq!(config.replication.sync_mode, "async");
+        assert!(config.replication.primary_host.is_none());
+        assert!(config.replication.standby_hosts.is_empty());
+        assert!(config.replication.observer_hosts.is_empty());
+        assert!(config.replication.node_id.is_none());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn replication_config_round_trips_all_fields() {
+        let config = Config::from_toml_str(
+            r#"
+            [replication]
+            role = "primary"
+            replication_port = 6433
+            primary_host = "primary.example:6433"
+            standby_hosts = ["10.0.0.2:6433", "[::1]:6433"]
+            observer_hosts = ["observer.example:7433"]
+            sync_mode = "semi-sync"
+            node_id = "550e8400-e29b-41d4-a716-446655440000"
+            "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded = Config::from_toml_str(&encoded).unwrap();
+        assert_eq!(decoded.replication.role, "primary");
+        assert_eq!(decoded.replication.replication_port, 6433);
+        assert_eq!(
+            decoded.replication.primary_host.as_deref(),
+            Some("primary.example:6433")
+        );
+        assert_eq!(decoded.replication.standby_hosts, ["10.0.0.2:6433", "[::1]:6433"]);
+        assert_eq!(decoded.replication.observer_hosts, ["observer.example:7433"]);
+        assert_eq!(decoded.replication.sync_mode, "semi-sync");
+        assert_eq!(
+            decoded.replication.node_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    #[test]
+    fn replication_port_alias_and_unknown_fields_are_strict() {
+        let config = Config::from_toml_str("[replication]\nport = 6433").unwrap();
+        assert_eq!(config.replication.replication_port, 6433);
+        for invalid in [
+            "[replication]\nreplicaton_port = 6433",
+            "[replication]\nport = 6433\nreplication_port = 7433",
+            "[replication]\nstandby_hosts = 'localhost:5433'",
+            "[replication]\nreplication_port = 65536",
+        ] {
+            assert!(Config::from_toml_str(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn replication_validation_rejects_invalid_values() {
+        for invalid in [
+            "role = 'primray'",
+            "sync_mode = 'eventual'",
+            "replication_port = 0",
+            "node_id = 'not-a-uuid'",
+            "primary_host = 'localhost'",
+            "standby_hosts = ['localhost:0']",
+            "observer_hosts = ['http://localhost:5433']",
+        ] {
+            let config = Config::from_toml_str(&format!("[replication]\n{invalid}")).unwrap();
+            assert!(config.validate().is_err(), "accepted {invalid}");
+        }
+        // Role requirements apply to the effective configuration, after CLI overrides.
+        let config = Config::from_toml_str("[replication]\nrole = 'standby'\nsync_mode = 'SEMISYNC'").unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn replication_endpoints_accept_dns_ipv4_and_bracketed_ipv6() {
+        for endpoint in [
+            "localhost:5433",
+            "primary.example.:5433",
+            "nano_primary:5433",
+            "127.0.0.1:1",
+            "[::1]:65535",
+            "[2001:db8::1]:5433",
+        ] {
+            validate_replication_endpoint(endpoint).unwrap();
+        }
+        for endpoint in [
+            "",
+            "localhost",
+            ":5433",
+            "localhost:",
+            "localhost:0",
+            "localhost:65536",
+            "localhost:+5433",
+            "localhost:5433:5433",
+            "::1:5433",
+            "[::1]:0",
+            "[::invalid]:5433",
+            "256.1.2.3:5433",
+            "http://localhost:5433",
+            "host name:5433",
+            "-host:5433",
+            "host..example:5433",
+            "localhost:5433 ",
+        ] {
+            assert!(validate_replication_endpoint(endpoint).is_err(), "accepted {endpoint}");
+        }
+    }
 
     // ------------------------------------------------------------------
     // Credential hygiene: `Debug` must not print secrets

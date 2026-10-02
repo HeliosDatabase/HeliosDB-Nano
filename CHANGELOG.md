@@ -5,6 +5,15 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — deployment campaign (draft, acceptance pending)
+
+- Validate native replication endpoints and bind the listener before reporting startup success; support explicit replication configuration and CLI precedence.
+- Normalize HTTP listen addresses and provide a default-false development opt-in for remote PostgreSQL trust authentication.
+- Repair logical replay row/index/cache visibility and fail closed after an apply error; provide an offline reseed helper and regression fixtures.
+- Preserve separately tested admission, native-authentication and raw-resync candidates with exact evidence in the deployment campaign handoff. Online SQL resync and safely fenced promotion remain unfinished.
+
 ## [4.41.0] - 2026-09-22
 
 Two themes, both finishing work v4.40.0 started. The first is **what a transaction
