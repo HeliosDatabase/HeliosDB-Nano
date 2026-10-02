@@ -24,9 +24,10 @@
 use super::config::{FailoverConfig, WalStreamingConfig};
 use super::ha_state::{ha_state, StandbyInfo, StandbyState as HAStandbyState, SyncMode as HASyncMode};
 use super::transport::{
-    AckPayload, AckType, Capabilities, HandshakeRequest, HandshakeResponse, HealthStatus, HeartbeatPayload, Message,
-    MessageType, NodeRole, ReplicationConnection, SyncModeConfig, WalBatchPayload, WalEntryPayload,
-    WalEntryType as TransportWalEntryType, WalRequestPayload, HEARTBEAT_INTERVAL,
+    constant_time_eq, AckPayload, AckType, Capabilities, HandshakeRequest, HandshakeResponse, HealthStatus,
+    HeartbeatPayload, Message, MessageType, NodeRole, ReplicationAuth, ReplicationConnection, SyncModeConfig,
+    WalBatchPayload, WalEntryPayload, WalEntryType as TransportWalEntryType, WalRequestPayload, HEARTBEAT_INTERVAL,
+    PROTOCOL_VERSION,
 };
 use super::wal_replicator::{Lsn, WalEntry, WalEntryType};
 use super::wal_store::{BatchRequest, WalStore};
@@ -66,6 +67,10 @@ pub struct StreamingServerConfig {
     /// no idle deadline ever reaches the replication stream: a standby is
     /// legitimately idle between WAL segments.
     pub tcp_keepalive: Option<TcpKeepaliveSettings>,
+    /// Required native logical replication credential. When `Some`, every
+    /// standby must present a matching credential or the handshake is rejected
+    /// BEFORE any registration/WAL streaming.
+    pub auth: Option<ReplicationAuth>,
 }
 
 impl Default for StreamingServerConfig {
@@ -79,6 +84,7 @@ impl Default for StreamingServerConfig {
             max_standbys: 10,
             heartbeat_interval: HEARTBEAT_INTERVAL,
             tcp_keepalive: Some(TcpKeepaliveSettings::default()),
+            auth: None,
         }
     }
 }
@@ -165,6 +171,13 @@ impl StreamingServer {
         })
     }
 
+    /// Number of standbys currently registered. Only fully authenticated
+    /// handshakes are registered, so a rejected credential never increments
+    /// this count.
+    pub async fn connected_standby_count(&self) -> usize {
+        self.standbys.read().await.len()
+    }
+
     /// Start the streaming server, binding its configured address first.
     pub async fn start(&self) -> Result<()> {
         self.start_with_listener(self.bind_listener().await?).await
@@ -233,6 +246,7 @@ impl StreamingServer {
         let wal_rx = self.wal_broadcast.subscribe();
         let shutdown_rx = self.shutdown_tx.subscribe();
         let wal_store = self.wal_store.clone();
+        let required_auth = self.config.auth.clone();
 
         tokio::spawn(async move {
             if let Err(e) = Self::connection_loop(
@@ -244,6 +258,7 @@ impl StreamingServer {
                 wal_rx,
                 shutdown_rx,
                 wal_store,
+                required_auth,
             )
             .await
             {
@@ -262,12 +277,41 @@ impl StreamingServer {
         mut wal_rx: broadcast::Receiver<WalEntry>,
         mut shutdown_rx: broadcast::Receiver<()>,
         wal_store: Arc<WalStore>,
+        required_auth: Option<ReplicationAuth>,
     ) -> Result<()> {
         let addr = conn.remote_addr();
         tracing::info!("New connection from {}", addr);
 
         // Wait for handshake
         let msg = conn.recv().await?;
+        // Explicit wire-version contract: a peer speaking a different native
+        // protocol version is refused before any decode/registration. Adding
+        // `HandshakeRequest.auth` broke bincode layout compatibility with v1, so
+        // this is the gate that prevents a silent mis-decode or downgrade.
+        if msg.header.version != PROTOCOL_VERSION {
+            let rejected = HandshakeResponse {
+                accepted: false,
+                server_node_id,
+                sync_mode: SyncModeConfig::Async,
+                primary_lsn: current_lsn,
+                slot_name: None,
+                fencing_token,
+                capabilities: Capabilities::all(),
+                error: Some(format!(
+                    "native protocol version mismatch: server v{}, peer v{}",
+                    PROTOCOL_VERSION, msg.header.version
+                )),
+            };
+            if let Ok(payload) = bincode::serialize(&rejected) {
+                let _ = conn.send(MessageType::HandshakeResponse, Bytes::from(payload)).await;
+            }
+            tracing::warn!(
+                "Rejected native handshake from {}: protocol version mismatch (peer v{})",
+                addr,
+                msg.header.version
+            );
+            return Ok(());
+        }
         if msg.header.msg_type != MessageType::HandshakeRequest {
             return Err(ReplicationError::Transport("Expected HandshakeRequest".to_string()));
         }
@@ -276,6 +320,50 @@ impl StreamingServer {
             .map_err(|e| ReplicationError::Transport(format!("Deserialize failed: {}", e)))?;
 
         tracing::info!("Handshake from {:?} node {} at {}", request.role, request.node_id, addr);
+
+        // Native logical credential validation. This runs BEFORE any standby
+        // registration, HA-state publication, or WAL streaming: a rejected peer
+        // never becomes a registered standby and never receives a WAL entry.
+        // Comparison is constant-time; missing and wrong credentials are
+        // distinguished textually but both are rejected.
+        if let Some(expected) = required_auth.as_ref() {
+            let ReplicationAuth::SharedSecret { token: expected_token } = expected;
+            let presented = request.auth.as_ref().map(|auth| {
+                let ReplicationAuth::SharedSecret { token } = auth;
+                token.as_str()
+            });
+            let accepted = presented
+                .map(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()))
+                .unwrap_or(false);
+            if !accepted {
+                let message = if presented.is_some() {
+                    "native replication authentication failed"
+                } else {
+                    "native replication authentication required"
+                };
+                let rejected = HandshakeResponse {
+                    accepted: false,
+                    server_node_id,
+                    sync_mode: request.sync_mode,
+                    primary_lsn: current_lsn,
+                    slot_name: None,
+                    fencing_token,
+                    capabilities: Capabilities::all(),
+                    error: Some(message.to_string()),
+                };
+                let payload = bincode::serialize(&rejected)
+                    .map_err(|e| ReplicationError::Transport(format!("Serialize failed: {}", e)))?;
+                conn.send(MessageType::HandshakeResponse, Bytes::from(payload)).await?;
+                tracing::warn!(
+                    "Rejected native handshake from {:?} node {} at {}: {}",
+                    request.role,
+                    request.node_id,
+                    addr,
+                    message
+                );
+                return Ok(());
+            }
+        }
 
         // Build response - respect the standby's requested sync mode
         // Standby announces its desired mode; primary honors it
@@ -762,6 +850,9 @@ pub struct StreamingClientConfig {
     pub reconnect_delay: Duration,
     /// Max reconnect attempts
     pub max_reconnect_attempts: u32,
+    /// Optional native logical replication credential presented to the primary.
+    /// Required when the primary has a credential configured.
+    pub auth: Option<ReplicationAuth>,
 }
 
 /// Streaming client state
@@ -922,6 +1013,7 @@ impl StreamingClient {
             current_lsn: Some(current_lsn),
             slot_name: None, // Replication slots are not used; LSN-based tracking is sufficient
             capabilities: Capabilities::all(),
+            auth: self.config.auth.clone(),
         };
 
         let response = conn.handshake_client(request).await?;
@@ -1284,6 +1376,7 @@ mod tests {
             connect_timeout: Duration::from_secs(10),
             reconnect_delay: Duration::from_secs(5),
             max_reconnect_attempts: 3,
+            auth: None,
         };
 
         let (client, _rx) = StreamingClient::new(config);

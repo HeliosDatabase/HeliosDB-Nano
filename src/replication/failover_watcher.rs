@@ -428,6 +428,9 @@ impl FailoverWatcher {
             current_lsn: None,
             slot_name: None,
             capabilities: Capabilities::all(),
+            // Health probes are unauthenticated liveness/failover discovery.
+            // They never carry row data or register a replication standby.
+            auth: None,
         };
 
         let handshake_response = conn.handshake_client(handshake_req).await?;

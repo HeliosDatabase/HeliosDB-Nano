@@ -29,6 +29,7 @@ struct HAConfig {
     allow_remote_mcp: bool,
     allow_insecure_trust: bool,
     node_id: Option<String>,
+    auth_token: Option<String>,
 }
 
 /// Literal addresses only, with explicit port taking precedence over socket suffix.
@@ -686,6 +687,12 @@ async fn main() -> Result<()> {
             if let Some(value) = node_id {
                 replication.node_id = Some(value);
             }
+            if let Ok(token) = std::env::var("HELIOSDB_REPLICATION_AUTH_TOKEN") {
+                // An explicitly-set override (even empty) replaces the config
+                // value and is validated below: empty is an error, never a
+                // silent downgrade to unauthenticated.
+                replication.auth_token = Some(token);
+            }
             replication.role = replication.role.to_ascii_lowercase();
             replication.sync_mode = replication.sync_mode.to_ascii_lowercase();
             replication.validate()?;
@@ -715,6 +722,7 @@ async fn main() -> Result<()> {
                 allow_remote_mcp,
                 allow_insecure_trust,
                 node_id: replication.node_id,
+                auth_token: replication.auth_token,
             };
 
             // GH#28: connection-lifetime overrides (CLI > config file > default).
@@ -952,6 +960,7 @@ async fn start_server(
         observer_hosts: split_hosts(ha_config.observer_hosts.as_deref().unwrap_or("")),
         sync_mode: ha_config.sync_mode.clone(),
         node_id: ha_config.node_id.clone(),
+        auth_token: ha_config.auth_token.clone(),
     };
 
     // CLI flags win over the config file for storage location/mode.
@@ -2097,6 +2106,7 @@ async fn start_ha_components(
         config::PrimaryConfig,
         ha_state::{ha_state, HARole, NodeConfig, SyncMode as HASyncMode},
         streaming::{StreamingClient, StreamingClientConfig, StreamingServer, StreamingServerConfig},
+        transport::ReplicationAuth,
         wal_applicator::WalApplicator,
         wal_store::{WalStore, WalStoreConfig},
         SyncModeConfig,
@@ -2198,9 +2208,25 @@ async fn start_ha_components(
                     &storage.config().server,
                 )
                 .tcp_keepalive,
+                auth: ha_config
+                    .auth_token
+                    .as_ref()
+                    .map(|token| ReplicationAuth::SharedSecret { token: token.clone() }),
                 ..Default::default()
             };
 
+            if ha_config.auth_token.is_some() {
+                let allow_remote = std::env::var("HELIOSDB_REPLICATION_AUTH_ALLOW_REMOTE")
+                    .map(|value| value == "1")
+                    .unwrap_or(false);
+                if !repl_addr.ip().is_loopback() && !allow_remote {
+                    return Err(Error::config(
+                        "native replication auth_token is a plaintext bearer; bind --listen to a loopback \
+                         address, or set HELIOSDB_REPLICATION_AUTH_ALLOW_REMOTE=1 to acknowledge the \
+                         documented plaintext risk on a protected tunnel",
+                    ));
+                }
+            }
             let server = StreamingServer::new(server_config, node_id, wal_store);
             info!("Streaming replication server starting on {}", repl_addr);
 
@@ -2261,6 +2287,10 @@ async fn start_ha_components(
                 connect_timeout: Duration::from_secs(30),
                 reconnect_delay: Duration::from_secs(5),
                 max_reconnect_attempts: 0, // Unlimited
+                auth: ha_config
+                    .auth_token
+                    .as_ref()
+                    .map(|token| ReplicationAuth::SharedSecret { token: token.clone() }),
             };
 
             let (client, entry_rx) = StreamingClient::new(client_config);

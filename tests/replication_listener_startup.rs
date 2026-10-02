@@ -64,6 +64,7 @@ async fn occupied_endpoint_fails_before_serving_and_prebound_listener_handshakes
             current_lsn: Some(0),
             slot_name: None,
             capabilities: Capabilities::all(),
+            auth: None,
         }),
     )
     .await

@@ -344,7 +344,7 @@ impl Config {
 /// Explicit CLI arguments override individual fields from this section. Endpoint
 /// validation checks syntax without DNS/network access; connection attempts resolve
 /// hostnames later. Role-dependent requirements are checked after CLI overrides.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReplicationConfig {
     /// standalone, primary, standby, or observer (case-insensitive).
@@ -362,6 +362,36 @@ pub struct ReplicationConfig {
     pub sync_mode: String,
     /// Stable node UUID; generated at startup if absent.
     pub node_id: Option<String>,
+    /// Optional native logical replication credential (shared secret). When set,
+    /// a primary REQUIRES every standby to present this exact token before it is
+    /// registered or receives any WAL; a standby presents it to the primary.
+    /// `HELIOSDB_REPLICATION_AUTH_TOKEN` overrides this value when set.
+    ///
+    /// SECURITY CONTRACT (bounded): the token is sent as a raw bearer over the
+    /// **plaintext** native replication channel (no TLS, no primary-to-standby
+    /// proof). It is only a network-path control for a loopback listener or a
+    /// protected tunnel. A configured empty string is REJECTED (never downgraded
+    /// to unauthenticated), and a non-loopback listener with a configured token
+    /// is refused unless `HELIOSDB_REPLICATION_AUTH_ALLOW_REMOTE=1` explicitly
+    /// acknowledges the plaintext risk.
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+impl std::fmt::Debug for ReplicationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // auth_token is redacted so secrets never reach logs or error text.
+        f.debug_struct("ReplicationConfig")
+            .field("role", &self.role)
+            .field("replication_port", &self.replication_port)
+            .field("primary_host", &self.primary_host)
+            .field("standby_hosts", &self.standby_hosts)
+            .field("observer_hosts", &self.observer_hosts)
+            .field("sync_mode", &self.sync_mode)
+            .field("node_id", &self.node_id)
+            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl Default for ReplicationConfig {
@@ -374,6 +404,7 @@ impl Default for ReplicationConfig {
             observer_hosts: Vec::new(),
             sync_mode: "async".to_string(),
             node_id: None,
+            auth_token: None,
         }
     }
 }
@@ -415,6 +446,14 @@ impl ReplicationConfig {
         if let Some(node_id) = &self.node_id {
             uuid::Uuid::parse_str(node_id)
                 .map_err(|error| crate::Error::config(format!("replication.node_id must be a UUID: {error}")))?;
+        }
+        if let Some(token) = &self.auth_token {
+            if token.is_empty() {
+                return Err(crate::Error::config(
+                    "replication.auth_token must not be empty; omit it to disable native credential auth, \
+                     or set a non-empty secret",
+                ));
+            }
         }
         Ok(())
     }
@@ -2336,6 +2375,28 @@ mod tests {
         assert!(config.replication.observer_hosts.is_empty());
         assert!(config.replication.node_id.is_none());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn replication_config_rejects_empty_auth_token() {
+        // An explicitly configured empty credential is an error, never a silent
+        // downgrade to unauthenticated.
+        let mut config = Config::default();
+        config.replication.auth_token = Some(String::new());
+        assert!(config.validate().is_err(), "empty auth_token must be rejected");
+        config.replication.auth_token = None;
+        config.validate().expect("absent auth_token is allowed (no downgrade)");
+        config.replication.auth_token = Some("native-secret".to_string());
+        config.validate().expect("non-empty auth_token is allowed");
+    }
+
+    #[test]
+    fn replication_config_debug_redacts_auth_token() {
+        let mut config = Config::default();
+        config.replication.auth_token = Some("super-secret-value".to_string());
+        let rendered = format!("{:?}", config.replication);
+        assert!(!rendered.contains("super-secret-value"), "token leaked in Debug: {rendered}");
+        assert!(rendered.contains("redacted"), "expected a redaction marker: {rendered}");
     }
 
     #[test]

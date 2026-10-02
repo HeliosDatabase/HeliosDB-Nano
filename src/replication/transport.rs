@@ -46,8 +46,13 @@ use uuid::Uuid;
 /// Protocol magic number: "HELI" in ASCII
 pub const PROTOCOL_MAGIC: u32 = 0x48454C49;
 
-/// Current protocol version
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Current native protocol version.
+///
+/// Bumped to 2 when `HandshakeRequest` gained the `auth` field: adding an
+/// `Option` field is NOT binary-backward-compatible with bincode (a v1 peer's
+/// payload lacks the field and will not decode). Both peers must present this
+/// exact version; any mismatch is refused explicitly rather than guessed.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Header size in bytes
 pub const HEADER_SIZE: usize = 24;
@@ -339,6 +344,55 @@ impl Message {
 // PAYLOAD TYPES
 // =============================================================================
 
+/// Native logical replication credential presented during the handshake.
+///
+/// The native replication channel is a private, operator-managed network path.
+/// Before this change the server accepted metadata-only registrations with no
+/// credential. A server configured with a credential now REQUIRES a matching one
+/// and rejects the handshake BEFORE any standby registration or WAL streaming.
+/// Comparison is constant-time. When no credential is configured the historical
+/// metadata-only handshake is preserved.
+/// Native logical replication credential.
+///
+/// SECURITY CONTRACT (bounded): this is an operator-configured shared secret sent
+/// as a raw bearer on the native replication channel, which is **plaintext** on
+/// the wire (there is no TLS on this listener and no proof authenticating the
+/// primary to the standby). It is therefore only a network-path control for a
+/// loopback listener or a protected tunnel; it is NOT protected remote peer
+/// authentication. `Debug` is redacted so the token cannot leak into logs or
+/// error text.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplicationAuth {
+    /// Shared secret agreed out of band (config/env on both nodes).
+    SharedSecret { token: String },
+}
+
+impl std::fmt::Debug for ReplicationAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplicationAuth::SharedSecret { .. } => {
+                f.write_str("SharedSecret { token: <redacted> }")
+            }
+        }
+    }
+}
+
+/// Constant-time credential comparison using an established primitive.
+///
+/// Uses `ring::constant_time::verify_slices_are_equal` whenever the crypto
+/// backend is available. When it is not, the comparison is a plain equality and
+/// is NOT advertised as constant-time; in that build the credential path must be
+/// confined to a protected transport (see the security contract above).
+#[cfg(feature = "ring-crypto")]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    ring::constant_time::verify_slices_are_equal(a, b).is_ok()
+}
+
+#[cfg(not(feature = "ring-crypto"))]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a == b
+}
+
 /// Handshake request payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeRequest {
@@ -354,6 +408,9 @@ pub struct HandshakeRequest {
     pub slot_name: Option<String>,
     /// Client capabilities
     pub capabilities: Capabilities,
+    /// Optional native logical replication credential. Required (and validated
+    /// before registration/WAL) when the primary has a credential configured.
+    pub auth: Option<ReplicationAuth>,
 }
 
 /// Handshake response payload
@@ -800,6 +857,12 @@ impl ReplicationConnection {
         if response.header.msg_type != MessageType::HandshakeResponse {
             return Err(ReplicationError::Transport("Expected HandshakeResponse".to_string()));
         }
+        if response.header.version != PROTOCOL_VERSION {
+            return Err(ReplicationError::Transport(format!(
+                "native protocol version mismatch: server speaks v{}, this client speaks v{}",
+                response.header.version, PROTOCOL_VERSION
+            )));
+        }
 
         let handshake: HandshakeResponse = bincode::deserialize(&response.payload)
             .map_err(|e| ReplicationError::Transport(format!("Deserialize failed: {}", e)))?;
@@ -1222,6 +1285,7 @@ mod tests {
             current_lsn: Some(1000),
             slot_name: Some("standby_1".to_string()),
             capabilities: Capabilities::all(),
+            auth: None,
         };
 
         let encoded = bincode::serialize(&request).unwrap();
