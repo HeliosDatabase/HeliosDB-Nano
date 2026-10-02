@@ -13,6 +13,12 @@
 #     starts with `--auth scram-sha-256`. With neither set the container exits
 #     with an explanation instead of crash-looping.
 #
+#   * HTTP API. The HTTP listener (port 8080: /health, REST, branches, vector
+#     stores) does NOT use the PostgreSQL password, so it is bound to
+#     127.0.0.1 inside the container unless you pass `--http-listen` or set
+#     HELIOSDB_HTTP_LISTEN=0.0.0.0. The image HEALTHCHECK works either way.
+#     Only publish 8080 on a trusted network.
+#
 #   * TLS. When no `--tls-cert` flag is given, a self-signed certificate is
 #     generated once under $HELIOSDB_TLS_DIR (default /data/tls) and the server
 #     offers TLS, so `sslmode=require` works out of the box. Bring your own
@@ -42,7 +48,7 @@ if [ "${1:-}" != "start" ]; then
 fi
 
 # ── inspect the `start` arguments ─────────────────────────────────────────
-has_auth=0; has_tls=0; listen="127.0.0.1"; memory=0; data_dir=""
+has_auth=0; has_tls=0; has_http_listen=0; listen="127.0.0.1"; memory=0; data_dir=""
 prev=""
 for arg in "$@"; do
   case "$prev" in
@@ -52,12 +58,18 @@ for arg in "$@"; do
   case "$arg" in
     --auth|--auth=*) has_auth=1 ;;
     --tls-cert|--tls-cert=*) has_tls=1 ;;
+    --http-listen|--http-listen=*) has_http_listen=1 ;;
     --listen=*) listen="${arg#--listen=}" ;;
     --data-dir=*) data_dir="${arg#--data-dir=}" ;;
     -m|--memory) memory=1 ;;
   esac
   prev="$arg"
 done
+
+# ── HTTP API listener (unauthenticated — loopback unless asked) ───────────
+if [ "$has_http_listen" -eq 0 ]; then
+  set -- "$@" --http-listen "${HELIOSDB_HTTP_LISTEN:-127.0.0.1}"
+fi
 
 # ── authentication ───────────────────────────────────────────────────────
 if [ "$has_auth" -eq 0 ]; then

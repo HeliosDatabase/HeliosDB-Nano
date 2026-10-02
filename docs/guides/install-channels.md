@@ -91,6 +91,10 @@ The entrypoint (`deployment/docker/docker-entrypoint.sh`):
 - generates a self-signed TLS certificate in `/data/tls` on first start, so
   `sslmode=require` works; supply your own with `HELIOSDB_TLS_CERT` +
   `HELIOSDB_TLS_KEY`, or disable with `HELIOSDB_TLS=off`;
+- binds the HTTP API (port 8080: REST, branches, vector stores) to
+  `127.0.0.1` inside the container, because it does not use the PostgreSQL
+  password; set `HELIOSDB_HTTP_LISTEN=0.0.0.0` and publish 8080 only on a
+  trusted network;
 - passes any other command through: `docker run --rm -it IMAGE repl --memory`,
   `docker run --rm IMAGE --version`.
 
