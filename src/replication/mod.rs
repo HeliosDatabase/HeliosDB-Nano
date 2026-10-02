@@ -41,6 +41,8 @@ pub mod split_brain;
 #[cfg(feature = "ha-tier1")]
 pub mod streaming;
 #[cfg(feature = "ha-tier1")]
+pub mod token;
+#[cfg(feature = "ha-tier1")]
 pub mod transport;
 #[cfg(feature = "ha-tier1")]
 pub mod wal_applicator;
@@ -102,6 +104,8 @@ pub use transport::{
     ReplicationServer,
     SyncModeConfig,
 };
+#[cfg(feature = "ha-tier1")]
+pub use token::read_replication_token;
 #[cfg(feature = "ha-tier1")]
 pub use wal_applicator::WalApplicator;
 #[cfg(feature = "ha-tier1")]

@@ -366,25 +366,26 @@ pub struct ReplicationConfig {
     pub physical: PhysicalReplicationConfig,
     /// Stable node UUID; generated at startup if absent.
     pub node_id: Option<String>,
-    /// Optional native logical replication credential (shared secret). When set,
-    /// a primary REQUIRES every standby to present this exact token before it is
-    /// registered or receives any WAL; a standby presents it to the primary.
-    /// `HELIOSDB_REPLICATION_AUTH_TOKEN` overrides this value when set.
+    /// Path to the one owner-only 32-byte token file that authenticates BOTH the
+    /// native logical channel and the physical transfer channel. When set, a
+    /// primary REQUIRES every standby to present the same token before it is
+    /// registered or receives any WAL, and a standby presents it to the primary.
+    /// The token bytes are NEVER read from TOML or the environment.
     ///
     /// SECURITY CONTRACT (bounded): the token is sent as a raw bearer over the
     /// **plaintext** native replication channel (no TLS, no primary-to-standby
     /// proof). It is only a network-path control for a loopback listener or a
-    /// protected tunnel. A configured empty string is REJECTED (never downgraded
-    /// to unauthenticated), and a non-loopback listener with a configured token
-    /// is refused unless `HELIOSDB_REPLICATION_AUTH_ALLOW_REMOTE=1` explicitly
+    /// protected tunnel. A non-loopback listener with a configured token is
+    /// refused unless `HELIOSDB_REPLICATION_AUTH_ALLOW_REMOTE=1` explicitly
     /// acknowledges the plaintext risk.
     #[serde(default)]
-    pub auth_token: Option<String>,
+    pub token_file: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for ReplicationConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // auth_token is redacted so secrets never reach logs or error text.
+        // Only the token file PATH is present here; the secret itself never
+        // reaches this struct (it is read from the file on demand).
         f.debug_struct("ReplicationConfig")
             .field("role", &self.role)
             .field("replication_port", &self.replication_port)
@@ -393,7 +394,7 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("observer_hosts", &self.observer_hosts)
             .field("sync_mode", &self.sync_mode)
             .field("node_id", &self.node_id)
-            .field("auth_token", &self.auth_token.as_ref().map(|_| "<redacted>"))
+            .field("token_file", &self.token_file)
             .finish()
     }
 }
@@ -410,7 +411,7 @@ impl Default for ReplicationConfig {
             observer_hosts: Vec::new(),
             sync_mode: "async".to_string(),
             node_id: None,
-            auth_token: None,
+            token_file: None,
         }
     }
 }
@@ -458,14 +459,6 @@ impl ReplicationConfig {
         if let Some(node_id) = &self.node_id {
             uuid::Uuid::parse_str(node_id)
                 .map_err(|error| crate::Error::config(format!("replication.node_id must be a UUID: {error}")))?;
-        }
-        if let Some(token) = &self.auth_token {
-            if token.is_empty() {
-                return Err(crate::Error::config(
-                    "replication.auth_token must not be empty; omit it to disable native credential auth, \
-                     or set a non-empty secret",
-                ));
-            }
         }
         Ok(())
     }
@@ -2391,25 +2384,20 @@ mod tests {
     }
 
     #[test]
-    fn replication_config_rejects_empty_auth_token() {
-        // An explicitly configured empty credential is an error, never a silent
-        // downgrade to unauthenticated.
+    fn replication_config_has_no_inline_secret_and_accepts_a_token_file() {
+        // The secret is never configurable inline; only an owner-only file path is.
+        assert!(
+            Config::from_toml_str("[replication]\nauth_token = 'native-secret'").is_err(),
+            "inline auth_token must be rejected (no secret in TOML)"
+        );
         let mut config = Config::default();
-        config.replication.auth_token = Some(String::new());
-        assert!(config.validate().is_err(), "empty auth_token must be rejected");
-        config.replication.auth_token = None;
-        config.validate().expect("absent auth_token is allowed (no downgrade)");
-        config.replication.auth_token = Some("native-secret".to_string());
-        config.validate().expect("non-empty auth_token is allowed");
-    }
-
-    #[test]
-    fn replication_config_debug_redacts_auth_token() {
-        let mut config = Config::default();
-        config.replication.auth_token = Some("super-secret-value".to_string());
+        config.replication.token_file = Some(std::path::PathBuf::from("/etc/helios/replication.token"));
+        config.validate().expect("a token_file path is valid");
         let rendered = format!("{:?}", config.replication);
-        assert!(!rendered.contains("super-secret-value"), "token leaked in Debug: {rendered}");
-        assert!(rendered.contains("redacted"), "expected a redaction marker: {rendered}");
+        assert!(
+            rendered.contains("/etc/helios/replication.token"),
+            "token_file path should be visible: {rendered}"
+        );
     }
 
     #[test]
@@ -3145,8 +3133,6 @@ redirect_uri = "http://localhost:8080/auth/v1/callback"
 pub struct PhysicalReplicationConfig {
     pub enabled: bool,
     pub listen: String,
-    /// Exactly 32 raw random bytes in an owner-only regular file; never inline TOML.
-    pub token_file: Option<std::path::PathBuf>,
     /// Existing private directory, disjoint from the live source database.
     pub export_dir: Option<std::path::PathBuf>,
     pub wal_retention_secs: u64,
@@ -3165,7 +3151,6 @@ impl Default for PhysicalReplicationConfig {
         Self {
             enabled: false,
             listen: "127.0.0.1:5440".into(),
-            token_file: None,
             export_dir: None,
             wal_retention_secs: 3600,
             wal_retention_size_mb: 1024,

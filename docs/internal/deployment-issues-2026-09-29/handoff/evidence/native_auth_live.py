@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Native logical credential CLI-level live control (archive issue 1).
+"""Native logical replication token CLI-level live control (archive issue 1; R6).
 
 Run only under the shared heavy lock. Uses the reviewed wire fixture read-only and
 preserves all child data/logs.
 
+One owner-only 32-byte token file authenticates both replication channels. The
+token is never read from TOML or the environment.
+
 Controls:
-  * valid   : primary+standby share HELIOSDB_REPLICATION_AUTH_TOKEN -> standby
-              connects and a committed row is visible on the standby.
-  * missing : standby without the token -> primary logs
+  * valid   : primary+standby share one token file -> standby connects and a
+              committed row is visible on the standby.
+  * missing : standby without a token file -> primary logs
               "native replication authentication required"; standby never reaches
               "Connected to primary".
-  * wrong   : standby with a different token -> primary logs
+  * wrong   : standby with a different token file -> primary logs
               "native replication authentication failed"; standby never connects.
+  * sloppy  : primary with a group/other-readable (0644) token file refuses to
+              start rather than downgrading.
 
-Return 0 only when all three controls hold; 1 = observed assertion failure;
+Return 0 only when all controls hold; 1 = observed assertion failure;
 2 = setup/interruption/identity uncertainty.
 """
 import argparse
@@ -25,7 +30,7 @@ import time
 import traceback
 from pathlib import Path
 
-TOKEN_ENV = "HELIOSDB_REPLICATION_AUTH_TOKEN"
+TOKEN_BYTES = 32
 
 
 def load_helper(path):
@@ -56,39 +61,46 @@ def wait_for(path, needle, timeout=15.0):
     return False
 
 
+def write_token(path, mode=0o600):
+    path.write_bytes(os.urandom(TOKEN_BYTES))
+    os.chmod(path, mode)
+    return path
+
+
 def run(root, binary, helper):
     result = {"status": "inconclusive", "checks": []}
     fixture = helper.Fixture(root / "control", binary)
     try:
         ppg, prepl, spg, srepl, spg2, srepl2, spg3, srepl3, epg, eprepl = fixture.ports(10)
 
-        # --- empty env credential must be refused, never downgraded ---
-        os.environ[TOKEN_ENV] = ""
-        primary_empty, plog_empty = fixture.start("primary_empty_token", epg, eprepl, "primary")
+        token_valid = write_token(root / "token_valid")
+        token_wrong = write_token(root / "token_wrong")
+        token_world = write_token(root / "token_world", mode=0o644)
+
+        # --- a group/other-readable token file must be refused, never downgraded ---
+        primary_empty, plog_empty = fixture.start(
+            "primary_sloppy_token", epg, eprepl, "primary", token_file=token_world)
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline and primary_empty.poll() is None:
             time.sleep(0.2)
-        check(primary_empty.poll() is not None, "primary with empty env token did not refuse to start")
+        check(primary_empty.poll() is not None, "primary with a 0644 token file did not refuse to start")
         empty_log = log_text(plog_empty)
-        check(
-            "auth_token" in empty_log and "empty" in empty_log,
-            f"missing empty-credential diagnostic: {empty_log[-400:]}",
-        )
-        check("Server ready!" not in empty_log, "empty credential must not start a ready server")
-        result["checks"].append("empty env credential: primary refuses to start (no downgrade)")
+        check("replication token" in empty_log, f"missing token-file diagnostic: {empty_log[-400:]}")
+        check("Server ready!" not in empty_log, "a sloppy token file must not start a ready server")
+        result["checks"].append("world-readable token file: primary refuses to start (no downgrade)")
         # Reap the intentionally-exited child so the fixture's alive() check does
         # not flag it for the remaining controls.
         primary_empty.wait(timeout=5)
         fixture.children.remove(primary_empty)
 
         # --- valid ---
-        os.environ[TOKEN_ENV] = "native-secret-valid"
-        primary, plog = fixture.start("primary", ppg, prepl, "primary")
+        primary, plog = fixture.start("primary", ppg, prepl, "primary", token_file=token_valid)
         fixture.ready(primary, plog, ppg)
         fixture.wait_native_owner(primary, prepl)
-        standby, slog = fixture.start("standby_ok", spg, srepl, "standby", prepl, ppg)
+        standby, slog = fixture.start(
+            "standby_ok", spg, srepl, "standby", prepl, ppg, token_file=token_valid)
         fixture.ready(standby, slog, spg, standby=True)
-        result["checks"].append("valid token: standby connected to primary")
+        result["checks"].append("valid token file: standby connected to primary")
 
         source = helper.Wire(fixture, primary, ppg, "primary")
         replica = helper.Wire(fixture, standby, spg, "standby")
@@ -102,33 +114,32 @@ def run(root, binary, helper):
             check(not response["errors"], f"setup failed: {response}")
         helper.exact_rows(source, [["1", "ok"]])
         helper.exact_rows(replica, [["1", "ok"]])
-        result["checks"].append("valid token: committed row replicated and visible on standby")
+        result["checks"].append("valid token file: committed row replicated and visible on standby")
 
-        # --- missing credential ---
-        os.environ.pop(TOKEN_ENV, None)
+        # --- missing token file ---
         standby_missing, slog_missing = fixture.start("standby_missing", spg2, srepl2, "standby", prepl, ppg)
         check(
             wait_for(plog, "native replication authentication required"),
-            "primary did not log a missing-credential rejection",
+            "primary did not log a missing-token rejection",
         )
         check(
             "Connected to primary" not in log_text(slog_missing),
-            "standby without token connected to the primary",
+            "standby without a token file connected to the primary",
         )
-        result["checks"].append("missing token: rejected before registration/WAL; standby not connected")
+        result["checks"].append("missing token file: rejected before registration/WAL; standby not connected")
 
-        # --- wrong credential ---
-        os.environ[TOKEN_ENV] = "native-secret-wrong"
-        standby_wrong, slog_wrong = fixture.start("standby_wrong", spg3, srepl3, "standby", prepl, ppg)
+        # --- wrong token file ---
+        standby_wrong, slog_wrong = fixture.start(
+            "standby_wrong", spg3, srepl3, "standby", prepl, ppg, token_file=token_wrong)
         check(
             wait_for(plog, "native replication authentication failed"),
-            "primary did not log a wrong-credential rejection",
+            "primary did not log a wrong-token rejection",
         )
         check(
             "Connected to primary" not in log_text(slog_wrong),
-            "standby with the wrong token connected to the primary",
+            "standby with the wrong token file connected to the primary",
         )
-        result["checks"].append("wrong token: rejected before registration/WAL; standby not connected")
+        result["checks"].append("wrong token file: rejected before registration/WAL; standby not connected")
 
         fixture.alive()
         result["status"] = "pass"

@@ -61,7 +61,7 @@ class Fixture:
             result.append(s.getsockname()[1])
         return result
 
-    def start(self, name, pg, native, role, source_native=None, source_pg=None):
+    def start(self, name, pg, native, role, source_native=None, source_pg=None, token_file=None):
         cwd = self.root / name
         cwd.mkdir()
         output = self.root / f"{name}.log"
@@ -72,6 +72,8 @@ class Fixture:
                    "--auth", "password", "--password", PASSWORD,
                    "--replication-role", role, "--replication-port", str(native),
                    "--sync-mode", "async", "--node-id", str(uuid.uuid4())]
+        if token_file is not None:
+            command += ["--replication-token-file", str(token_file)]
         if source_native is not None:
             command += ["--primary-host", f"127.0.0.1:{source_native}"]
         env = os.environ.copy()

@@ -352,57 +352,8 @@ impl Message {
 // PAYLOAD TYPES
 // =============================================================================
 
-/// Native logical replication credential presented during the handshake.
-///
-/// The native replication channel is a private, operator-managed network path.
-/// Before this change the server accepted metadata-only registrations with no
-/// credential. A server configured with a credential now REQUIRES a matching one
-/// and rejects the handshake BEFORE any standby registration or WAL streaming.
-/// Comparison is constant-time. When no credential is configured the historical
-/// metadata-only handshake is preserved.
-/// Native logical replication credential.
-///
-/// SECURITY CONTRACT (bounded): this is an operator-configured shared secret sent
-/// as a raw bearer on the native replication channel, which is **plaintext** on
-/// the wire (there is no TLS on this listener and no proof authenticating the
-/// primary to the standby). It is therefore only a network-path control for a
-/// loopback listener or a protected tunnel; it is NOT protected remote peer
-/// authentication. `Debug` is redacted so the token cannot leak into logs or
-/// error text.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ReplicationAuth {
-    /// Shared secret agreed out of band (config/env on both nodes).
-    SharedSecret { token: String },
-}
-
-impl std::fmt::Debug for ReplicationAuth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ReplicationAuth::SharedSecret { .. } => {
-                f.write_str("SharedSecret { token: <redacted> }")
-            }
-        }
-    }
-}
-
-/// Constant-time credential comparison using an established primitive.
-///
-/// Uses `ring::constant_time::verify_slices_are_equal` whenever the crypto
-/// backend is available. When it is not, the comparison is a plain equality and
-/// is NOT advertised as constant-time; in that build the credential path must be
-/// confined to a protected transport (see the security contract above).
-#[cfg(feature = "ring-crypto")]
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    ring::constant_time::verify_slices_are_equal(a, b).is_ok()
-}
-
-#[cfg(not(feature = "ring-crypto"))]
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a == b
-}
-
 /// Handshake request payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HandshakeRequest {
     /// Receiver's durable dataset identity, or None for a provably fresh receiver.
     pub expected_history: Option<Uuid>,
@@ -418,9 +369,27 @@ pub struct HandshakeRequest {
     pub slot_name: Option<String>,
     /// Client capabilities
     pub capabilities: Capabilities,
-    /// Optional native logical replication credential. Required (and validated
-    /// before registration/WAL) when the primary has a credential configured.
-    pub auth: Option<ReplicationAuth>,
+    /// Optional native logical replication credential: the 32 raw token bytes
+    /// shared with the physical channel. Required (and validated before
+    /// registration/WAL) when the primary has a token file configured. The
+    /// primary checks it with `TransferToken::accepts` (constant-time).
+    pub auth: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for HandshakeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `auth` is a bearer secret: never print the raw bytes.
+        f.debug_struct("HandshakeRequest")
+            .field("expected_history", &self.expected_history)
+            .field("node_id", &self.node_id)
+            .field("role", &self.role)
+            .field("sync_mode", &self.sync_mode)
+            .field("current_lsn", &self.current_lsn)
+            .field("slot_name", &self.slot_name)
+            .field("capabilities", &self.capabilities)
+            .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Handshake response payload

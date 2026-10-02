@@ -29,6 +29,8 @@ const VERSION: u16 = 1;
 const MAX_SOURCE_SEQUENCE: u64 = (1_u64 << 56) - 1;
 const HEADER_BYTES: usize = 16;
 const TOKEN_BYTES: usize = 32;
+/// Length in bytes of a replication token: 32 raw random bytes.
+pub const REPLICATION_TOKEN_BYTES: usize = TOKEN_BYTES;
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_CHUNK_BYTES: usize = 1024 * 1024;
 const CHUNK_META: usize = 16 + 4 + 8 + 32;
@@ -67,8 +69,24 @@ impl TransferToken {
         }
         Ok(Self(Zeroizing::new(bytes)))
     }
-    fn accepts(&self, supplied: &[u8]) -> bool {
+    /// Constant-time check of a supplied token. The length must match exactly;
+    /// the comparison itself is `subtle::ConstantTimeEq` in every feature
+    /// combination (no crypto feature selection can downgrade it).
+    pub fn accepts(&self, supplied: &[u8]) -> bool {
         supplied.len() == TOKEN_BYTES && bool::from(self.0[..].ct_eq(supplied))
+    }
+
+    /// The raw 32 token bytes, for presenting the token in a handshake payload.
+    /// Never log or Debug these bytes.
+    pub fn wire_bytes(&self) -> [u8; TOKEN_BYTES] {
+        *self.0
+    }
+}
+
+impl std::fmt::Debug for TransferToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately redacted: the token is a bearer secret.
+        f.write_str("TransferToken(<redacted>)")
     }
 }
 

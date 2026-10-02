@@ -428,6 +428,14 @@ observer_hosts = [] # e.g. ["observer.example:5433"]
 sync_mode = "async" # async | semi-sync (alias semisync) | sync
 # node_id = "550e8400-e29b-41d4-a716-446655440000" # UUID; generated if omitted
 
+# One owner-only 32-byte token file authenticating BOTH the native logical
+# channel and the physical transfer channel. Put the identical file on the
+# primary and every standby. The token bytes are never read from TOML or the
+# environment — only this path is:
+#   head -c 32 /dev/urandom > replication.token && chmod 600 replication.token
+# CLI --replication-token-file overrides this value.
+# token_file = "/etc/heliosdb/replication.token"
+
 # ============================================================================
 # PERFORMANCE CONFIGURATION
 # ============================================================================

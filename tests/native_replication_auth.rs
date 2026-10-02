@@ -1,27 +1,35 @@
-//! Native logical replication credential validation (archive issue 1).
+//! Native logical replication token validation (archive issue 1; one-secret R6).
 //!
-//! A primary configured with a credential MUST reject a standby handshake
-//! BEFORE any registration or WAL streaming:
-//!   * valid token   -> accepted and registered
+//! One owner-only 32-byte token file authenticates BOTH replication channels.
+//! A primary configured with a token MUST reject a standby handshake BEFORE any
+//! registration or WAL streaming:
+//!   * correct token  -> accepted and registered
 //!   * wrong token    -> rejected (`authentication failed`), nothing registered
 //!   * missing token  -> rejected (`authentication required`), nothing registered
-//! With no credential configured, the historical metadata-only handshake is
-//! preserved.
+//! With no token configured, the metadata-only handshake is preserved.
 
 #![cfg(feature = "ha-tier1")]
 
 use heliosdb_nano::replication::{
+    physical_wire::TransferToken,
     streaming::{StreamingServer, StreamingServerConfig},
-    transport::{Capabilities, HandshakeRequest, NodeRole, ReplicationAuth, ReplicationConnection, SyncModeConfig},
+    transport::{Capabilities, HandshakeRequest, NodeRole, ReplicationConnection, SyncModeConfig},
     wal_store::{WalStore, WalStoreConfig},
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::time::timeout;
 use uuid::Uuid;
 
+/// The one token used on both channels in these tests.
+const TOKEN: [u8; 32] = [0x5A; 32];
+
 /// The HA broadcast channel is process-global; tests that create a server or
 /// broadcast WAL must not overlap.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn token() -> TransferToken {
+    TransferToken::new(TOKEN).unwrap()
+}
 
 struct Harness {
     addr: SocketAddr,
@@ -31,22 +39,26 @@ struct Harness {
     _dir: tempfile::TempDir,
 }
 
-async fn start_server(auth: Option<&str>) -> Harness {
+async fn start_server_with(auth: Option<TransferToken>) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let wal_store = Arc::new(WalStore::new(WalStoreConfig {
         wal_dir: dir.path().join("wal"),
         ..Default::default()
     }));
     wal_store.init().await.unwrap();
-    let server = Arc::new(StreamingServer::new(
-        StreamingServerConfig {
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
-            auth: auth.map(|token| ReplicationAuth::SharedSecret { token: token.to_string() }),
-            ..Default::default()
-        },
-        Uuid::new_v4(),
-        wal_store.clone(),
-    ));
+    let server = Arc::new(
+        StreamingServer::new(
+            StreamingServerConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                auth,
+                ..Default::default()
+            },
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            wal_store.clone(),
+        )
+        .unwrap(),
+    );
     let listener = server.bind_listener().await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = {
@@ -62,7 +74,11 @@ async fn start_server(auth: Option<&str>) -> Harness {
     }
 }
 
-fn request(auth: Option<&str>) -> HandshakeRequest {
+async fn start_server(auth: Option<TransferToken>) -> Harness {
+    start_server_with(auth).await
+}
+
+fn request(auth: Option<[u8; 32]>) -> HandshakeRequest {
     HandshakeRequest {
         expected_history: None,
         node_id: Uuid::new_v4(),
@@ -71,7 +87,7 @@ fn request(auth: Option<&str>) -> HandshakeRequest {
         current_lsn: Some(0),
         slot_name: None,
         capabilities: Capabilities::all(),
-        auth: auth.map(|token| ReplicationAuth::SharedSecret { token: token.to_string() }),
+        auth,
     }
 }
 
@@ -116,18 +132,18 @@ async fn stop(h: Harness) {
 }
 
 #[tokio::test]
-async fn configured_credential_accepts_correct_token_and_registers() {
+async fn configured_token_accepts_correct_token_and_registers() {
     let _serial = SERIAL.lock().await;
-    let h = start_server(Some("s3cret-token")).await;
+    let h = start_server(Some(token())).await;
     let mut conn = connect(h.addr).await;
     let response = timeout(
         Duration::from_secs(3),
-        conn.handshake_client(request(Some("s3cret-token"))),
+        conn.handshake_client(request(Some(TOKEN))),
     )
     .await
     .unwrap()
     .unwrap();
-    assert!(response.accepted, "correct credential must be accepted");
+    assert!(response.accepted, "correct token must be accepted");
     assert_eq!(
         standby_count_settled(&h.server, 1).await,
         1,
@@ -138,13 +154,13 @@ async fn configured_credential_accepts_correct_token_and_registers() {
 }
 
 #[tokio::test]
-async fn configured_credential_rejects_wrong_token_before_registration() {
+async fn configured_token_rejects_wrong_token_before_registration() {
     let _serial = SERIAL.lock().await;
-    let h = start_server(Some("s3cret-token")).await;
+    let h = start_server(Some(token())).await;
     let mut conn = connect(h.addr).await;
     let error = timeout(
         Duration::from_secs(3),
-        conn.handshake_client(request(Some("not-the-token"))),
+        conn.handshake_client(request(Some([0x11; 32]))),
     )
     .await
     .unwrap()
@@ -164,7 +180,7 @@ async fn assert_never_registered_and_closed(server: &StreamingServer, mut conn: 
         max_seen = max_seen.max(server.connected_standby_count().await);
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(max_seen, 0, "a rejected credential must never register a standby");
+    assert_eq!(max_seen, 0, "a rejected token must never register a standby");
     let closed = match timeout(Duration::from_secs(2), conn.recv()).await {
         Ok(Ok(_)) => false,  // server kept serving native frames after rejection
         Ok(Err(_)) => true,  // socket closed/reset
@@ -174,9 +190,9 @@ async fn assert_never_registered_and_closed(server: &StreamingServer, mut conn: 
 }
 
 #[tokio::test]
-async fn configured_credential_rejects_missing_token_before_registration() {
+async fn configured_token_rejects_missing_token_before_registration() {
     let _serial = SERIAL.lock().await;
-    let h = start_server(Some("s3cret-token")).await;
+    let h = start_server(Some(token())).await;
     let mut conn = connect(h.addr).await;
     let error = timeout(Duration::from_secs(3), conn.handshake_client(request(None)))
         .await
@@ -188,11 +204,12 @@ async fn configured_credential_rejects_missing_token_before_registration() {
     stop(h).await;
 }
 
+/// R1: an older-layout peer (v1/v2) is refused at the header, before any payload
+/// decode or registration. The server closes the socket rather than serving a
+/// frame to a peer whose positional bincode layout it cannot trust.
 #[tokio::test]
 async fn old_protocol_version_is_refused_before_registration() {
     let _serial = SERIAL.lock().await;
-    // A raw OLD-layout peer (native protocol v1) must be refused explicitly by
-    // the version gate BEFORE any decode/registration, never silently accepted.
     use heliosdb_nano::replication::transport::{Message, MessageType};
     let h = start_server(None).await;
     let payload = bincode::serialize(&request(None)).expect("serialize handshake");
@@ -200,18 +217,19 @@ async fn old_protocol_version_is_refused_before_registration() {
     msg.header.version = 1; // simulate a v1 peer
     let mut stream = tokio::net::TcpStream::connect(h.addr).await.expect("connect");
     msg.write_to(&mut stream).await.expect("write v1 handshake");
-    let response = timeout(Duration::from_secs(3), Message::read_from(&mut stream))
-        .await
-        .expect("response timeout")
-        .expect("read response");
-    assert_eq!(response.header.msg_type, MessageType::HandshakeResponse);
-    let rejected: heliosdb_nano::replication::transport::HandshakeResponse =
-        bincode::deserialize(&response.payload).expect("decode response");
-    assert!(!rejected.accepted, "v1 handshake must be refused");
-    assert!(
-        rejected.error.unwrap_or_default().contains("version mismatch"),
-        "refusal must name the version mismatch"
-    );
+    // The merged server refuses at MessageHeader::decode, so the connection is
+    // closed with no decodable response. Accept either an EOF/reset or an
+    // explicit rejection, but never an accepted handshake.
+    let served = match timeout(Duration::from_secs(2), Message::read_from(&mut stream)).await {
+        Ok(Ok(response)) => {
+            let decoded: heliosdb_nano::replication::transport::HandshakeResponse =
+                bincode::deserialize(&response.payload).expect("decode response");
+            decoded.accepted
+        }
+        Ok(Err(_)) => false,
+        Err(_) => false,
+    };
+    assert!(!served, "v1 handshake must be refused before decode/registration");
     let mut max_seen = 0;
     for _ in 0..20 {
         max_seen = max_seen.max(h.server.connected_standby_count().await);
@@ -230,7 +248,7 @@ async fn unconfigured_primary_preserves_metadata_only_handshake() {
         .await
         .unwrap()
         .unwrap();
-    assert!(response.accepted, "no configured credential preserves legacy handshake");
+    assert!(response.accepted, "no configured token preserves the legacy handshake");
     let _ = conn.close().await;
     stop(h).await;
 }
@@ -241,9 +259,9 @@ async fn authenticated_connection_receives_broadcast_wal_entry() {
     use heliosdb_nano::replication::transport::{MessageType, WalEntryPayload};
     use heliosdb_nano::replication::wal_replicator::{WalEntry, WalEntryType};
     let _serial = SERIAL.lock().await;
-    let h = start_server(Some("s3cret-token")).await;
+    let h = start_server(Some(token())).await;
     let mut conn = connect(h.addr).await;
-    let response = timeout(Duration::from_secs(3), conn.handshake_client(request(Some("s3cret-token"))))
+    let response = timeout(Duration::from_secs(3), conn.handshake_client(request(Some(TOKEN))))
         .await
         .unwrap()
         .unwrap();
@@ -285,16 +303,16 @@ async fn authenticated_connection_receives_broadcast_wal_entry() {
 }
 
 #[tokio::test]
-async fn reconnect_with_the_same_credential_is_accepted() {
+async fn reconnect_with_the_same_token_is_accepted() {
     let _serial = SERIAL.lock().await;
-    let h = start_server(Some("s3cret-token")).await;
+    let h = start_server(Some(token())).await;
     for attempt in 0..2 {
         let mut conn = connect(h.addr).await;
-        let response = timeout(Duration::from_secs(3), conn.handshake_client(request(Some("s3cret-token"))))
+        let response = timeout(Duration::from_secs(3), conn.handshake_client(request(Some(TOKEN))))
             .await
             .unwrap()
             .unwrap();
-        assert!(response.accepted, "reconnect {attempt} with the same credential must be accepted");
+        assert!(response.accepted, "reconnect {attempt} with the same token must be accepted");
         let _ = conn.close().await;
     }
     stop(h).await;
@@ -305,7 +323,11 @@ async fn malformed_handshake_frame_is_refused_without_registration() {
     use heliosdb_nano::replication::transport::{Message, MessageType};
     let _serial = SERIAL.lock().await;
     let h = start_server(None).await;
-    let msg = Message::new(MessageType::HandshakeRequest, bytes::Bytes::from_static(b"not-a-bincode-handshake"), 1);
+    let msg = Message::new(
+        MessageType::HandshakeRequest,
+        bytes::Bytes::from_static(b"not-a-bincode-handshake"),
+        1,
+    );
     let mut stream = tokio::net::TcpStream::connect(h.addr).await.expect("connect");
     msg.write_to(&mut stream).await.expect("write malformed frame");
     let closed = match timeout(Duration::from_secs(2), Message::read_from(&mut stream)).await {
@@ -354,6 +376,41 @@ async fn new_client_refuses_an_old_version_server() {
         .unwrap()
         .unwrap_err()
         .to_string();
-    assert!(error.contains("version mismatch"), "new client must refuse an old server: {error}");
+    // R1: the client refuses at the header, before decoding the old layout.
+    assert!(
+        error.contains("Unsupported native replication protocol version"),
+        "new client must refuse an old server: {error}"
+    );
     server.await.unwrap();
+}
+
+/// R6: the same token file authenticates the native channel and the physical
+/// channel. Loading once yields a `TransferToken`; the native handshake presents
+/// `wire_bytes()` and the physical wire verifies the same bytes with `accepts`.
+#[tokio::test]
+async fn one_token_file_authenticates_native_and_physical_channels() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = SERIAL.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replication.token");
+    std::fs::write(&path, TOKEN).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let loaded = heliosdb_nano::replication::read_replication_token(&path).unwrap();
+
+    // Physical channel consumes the same loaded token.
+    assert!(loaded.accepts(&TOKEN), "physical wire must accept the token file bytes");
+
+    // Native channel presents the same bytes and is accepted.
+    let h = start_server(Some(loaded.clone())).await;
+    let mut conn = connect(h.addr).await;
+    let response = timeout(
+        Duration::from_secs(3),
+        conn.handshake_client(request(Some(loaded.wire_bytes()))),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.accepted, "native handshake must accept the token file bytes");
+    let _ = conn.close().await;
+    stop(h).await;
 }

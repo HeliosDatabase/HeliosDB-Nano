@@ -24,11 +24,11 @@
 use super::config::{FailoverConfig, WalStreamingConfig};
 use super::ha_state::{ha_state, StandbyInfo, StandbyState as HAStandbyState, SyncMode as HASyncMode};
 use super::history::ReceiverHistory;
+use super::physical_wire::TransferToken;
 use super::transport::{
-    constant_time_eq, AckPayload, AckType, Capabilities, HandshakeRequest, HandshakeResponse, HealthStatus,
-    HeartbeatPayload, Message, MessageType, NodeRole, ReplicationAuth, ReplicationConnection, SyncModeConfig,
-    WalBatchPayload, WalEntryPayload, WalEntryType as TransportWalEntryType, WalRequestPayload, HEARTBEAT_INTERVAL,
-    PROTOCOL_VERSION,
+    AckPayload, AckType, Capabilities, HandshakeRequest, HandshakeResponse, HealthStatus, HeartbeatPayload, Message,
+    MessageType, NodeRole, ReplicationConnection, SyncModeConfig, WalBatchPayload, WalEntryPayload,
+    WalEntryType as TransportWalEntryType, WalRequestPayload, HEARTBEAT_INTERVAL, PROTOCOL_VERSION,
 };
 use super::wal_replicator::{Lsn, WalEntry, WalEntryType};
 use super::wal_store::{BatchRequest, WalStore};
@@ -68,10 +68,11 @@ pub struct StreamingServerConfig {
     /// no idle deadline ever reaches the replication stream: a standby is
     /// legitimately idle between WAL segments.
     pub tcp_keepalive: Option<TcpKeepaliveSettings>,
-    /// Required native logical replication credential. When `Some`, every
-    /// standby must present a matching credential or the handshake is rejected
-    /// BEFORE any registration/WAL streaming.
-    pub auth: Option<ReplicationAuth>,
+    /// Required native logical replication token (the same file that
+    /// authenticates the physical channel). When `Some`, every standby must
+    /// present matching raw bytes or the handshake is rejected BEFORE any
+    /// registration/WAL streaming.
+    pub auth: Option<TransferToken>,
 }
 
 impl Default for StreamingServerConfig {
@@ -294,7 +295,7 @@ impl StreamingServer {
         mut wal_rx: broadcast::Receiver<WalEntry>,
         mut shutdown_rx: broadcast::Receiver<()>,
         wal_store: Arc<WalStore>,
-        required_auth: Option<ReplicationAuth>,
+        required_auth: Option<TransferToken>,
     ) -> Result<()> {
         let addr = conn.remote_addr();
         tracing::info!("New connection from {}", addr);
@@ -340,22 +341,19 @@ impl StreamingServer {
 
         tracing::info!("Handshake from {:?} node {} at {}", request.role, request.node_id, addr);
 
-        // Native logical credential validation. This runs BEFORE any standby
+        // Native logical token validation. This runs BEFORE any standby
         // registration, HA-state publication, or WAL streaming: a rejected peer
         // never becomes a registered standby and never receives a WAL entry.
-        // Comparison is constant-time; missing and wrong credentials are
-        // distinguished textually but both are rejected.
+        // Comparison is constant-time (`TransferToken::accepts`); missing and
+        // wrong tokens are distinguished textually but both are rejected.
         if let Some(expected) = required_auth.as_ref() {
-            let ReplicationAuth::SharedSecret { token: expected_token } = expected;
-            let presented = request.auth.as_ref().map(|auth| {
-                let ReplicationAuth::SharedSecret { token } = auth;
-                token.as_str()
-            });
-            let accepted = presented
-                .map(|token| constant_time_eq(token.as_bytes(), expected_token.as_bytes()))
+            let accepted = request
+                .auth
+                .as_ref()
+                .map(|presented| expected.accepts(presented))
                 .unwrap_or(false);
             if !accepted {
-                let message = if presented.is_some() {
+                let message = if request.auth.is_some() {
                     "native replication authentication failed"
                 } else {
                     "native replication authentication required"
@@ -879,9 +877,10 @@ pub struct StreamingClientConfig {
     pub reconnect_delay: Duration,
     /// Max reconnect attempts
     pub max_reconnect_attempts: u32,
-    /// Optional native logical replication credential presented to the primary.
-    /// Required when the primary has a credential configured.
-    pub auth: Option<ReplicationAuth>,
+    /// Optional native logical replication token (the same file that
+    /// authenticates the physical channel) presented to the primary. Required
+    /// when the primary has a token configured.
+    pub auth: Option<TransferToken>,
 }
 
 /// Streaming client state
@@ -1089,7 +1088,7 @@ impl StreamingClient {
             current_lsn: Some(current_lsn),
             slot_name: None, // Replication slots are not used; LSN-based tracking is sufficient
             capabilities: Capabilities::all(),
-            auth: self.config.auth.clone(),
+            auth: self.config.auth.as_ref().map(TransferToken::wire_bytes),
         };
 
         let response = tokio::time::timeout(self.config.connect_timeout, conn.handshake_client(request))
