@@ -31,6 +31,7 @@ struct HAConfig {
     allow_remote_mcp: bool,
     allow_insecure_trust: bool,
     node_id: Option<String>,
+    auth_token: Option<String>,
 }
 
 /// Standbys receive their full verification window plus the ordinary startup allowance.
@@ -744,6 +745,7 @@ async fn main() -> Result<()> {
                 allow_remote_mcp,
                 allow_insecure_trust,
                 node_id: replication.node_id,
+                auth_token: replication.auth_token,
             };
 
             // GH#28: connection-lifetime overrides (CLI > config file > default).
@@ -991,6 +993,7 @@ async fn start_server(
         observer_hosts: split_hosts(ha_config.observer_hosts.as_deref().unwrap_or("")),
         sync_mode: ha_config.sync_mode.clone(),
         node_id: ha_config.node_id.clone(),
+        auth_token: ha_config.auth_token.clone(),
     };
 
     // CLI flags win over the config file for storage location/mode.
@@ -2326,6 +2329,7 @@ async fn start_ha_components(
         streaming::{
             StreamingClient, StreamingClientConfig, StreamingClientStatus, StreamingServer, StreamingServerConfig,
         },
+        transport::ReplicationAuth,
         wal_applicator::WalApplicator,
         wal_store::{WalStore, WalStoreConfig},
         SyncModeConfig,
@@ -2441,9 +2445,25 @@ async fn start_ha_components(
                     &storage.config().server,
                 )
                 .tcp_keepalive,
+                auth: ha_config
+                    .auth_token
+                    .as_ref()
+                    .map(|token| ReplicationAuth::SharedSecret { token: token.clone() }),
                 ..Default::default()
             };
 
+            if ha_config.auth_token.is_some() {
+                let allow_remote = std::env::var("HELIOSDB_REPLICATION_AUTH_ALLOW_REMOTE")
+                    .map(|value| value == "1")
+                    .unwrap_or(false);
+                if !repl_addr.ip().is_loopback() && !allow_remote {
+                    return Err(Error::config(
+                        "native replication auth_token is a plaintext bearer; bind --listen to a loopback \
+                         address, or set HELIOSDB_REPLICATION_AUTH_ALLOW_REMOTE=1 to acknowledge the \
+                         documented plaintext risk on a protected tunnel",
+                    ));
+                }
+            }
             let server = StreamingServer::new(server_config, node_id, history_id, wal_store)
                 .map_err(|error| Error::config(format!("Cannot configure replication history: {error}")))?;
             info!("Streaming replication server starting on {}", repl_addr);
@@ -2502,6 +2522,10 @@ async fn start_ha_components(
                 connect_timeout: startup_timeout,
                 reconnect_delay: Duration::from_secs(5),
                 max_reconnect_attempts: 0, // Unlimited
+                auth: ha_config
+                    .auth_token
+                    .as_ref()
+                    .map(|token| ReplicationAuth::SharedSecret { token: token.clone() }),
             };
 
             let (client, entry_rx) = StreamingClient::new(client_config, receiver_history);

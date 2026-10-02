@@ -232,6 +232,7 @@ async fn test_streaming_client_initial_state() {
         connect_timeout: Duration::from_secs(5),
         reconnect_delay: Duration::from_secs(1),
         max_reconnect_attempts: 3,
+        auth: None,
     };
 
     let (client, _rx) = StreamingClient::new(
@@ -254,6 +255,7 @@ async fn test_streaming_client_report_applied() {
         connect_timeout: Duration::from_secs(5),
         reconnect_delay: Duration::from_secs(1),
         max_reconnect_attempts: 3,
+        auth: None,
     };
 
     let (client, _rx) = StreamingClient::new(
