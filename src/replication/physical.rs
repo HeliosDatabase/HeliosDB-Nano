@@ -67,7 +67,11 @@ impl PhysicalBatch {
     pub fn decode(history: Uuid, first: u64, raw: Vec<u8>, expected_digest: [u8; 32]) -> Result<Self> {
         check_history(history)?;
         let count = validate_raw_batch(&raw)?;
-        let encoded_first = u64::from_le_bytes(raw[..8].try_into().expect("validated header"));
+        let encoded_first = u64::from_le_bytes(
+            raw.get(..8)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or_else(|| invalid("batch header too short"))?,
+        );
         if first == 0 || first != encoded_first {
             return Err(invalid("batch source sequence disagrees with its header"));
         }
@@ -116,11 +120,15 @@ fn validate_raw_batch(raw: &[u8]) -> Result<u32> {
     if !(12..=MAX_BATCH_BYTES).contains(&raw.len()) {
         return Err(invalid("batch byte limit/header"));
     }
-    let count = u32::from_le_bytes(raw[8..12].try_into().expect("validated header"));
+    let count = u32::from_le_bytes(
+        raw.get(8..12)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| invalid("batch header too short"))?,
+    );
     if count == 0 || count > MAX_BATCH_OPERATIONS {
         return Err(invalid("batch operation limit"));
     }
-    let mut input = &raw[12..];
+    let mut input = raw.get(12..).ok_or_else(|| invalid("batch header too short"))?;
     let mut observed = 0_u32;
     while let Some((&tag, rest)) = input.split_first() {
         input = rest;
@@ -440,6 +448,7 @@ impl StagedPhysicalReplica {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use rocksdb::{checkpoint::Checkpoint, Options};
