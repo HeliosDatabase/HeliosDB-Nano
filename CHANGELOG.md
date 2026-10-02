@@ -24,7 +24,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `--listen 0.0.0.0`. Before, the hard-coded `--data-dir /data` meant a
   volume mounted at another path stayed empty and the data lived in an
   anonymous volume. An unwritable data directory (e.g. a root-owned bind mount)
-  now stops the container with an explanation.
+  now stops the container with an explanation. Mount named volumes at `/data`
+  (the only mount point the image pre-creates for uid 999) and point
+  `HELIOSDB_DATA_DIR` at a subdirectory of it if you want one; a named volume
+  mounted at another new path is created root-owned by Docker, and the error
+  message now says so.
 - **`:X.Y` only follows the newest patch.** Rebuilding an older patch with
   `workflow_dispatch` no longer moves the floating minor tag backwards.
 

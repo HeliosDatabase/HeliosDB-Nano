@@ -85,10 +85,14 @@ psql "postgresql://postgres:change-me@localhost:5432/postgres?sslmode=require" -
 The entrypoint (`deployment/docker/docker-entrypoint.sh`):
 
 - starts the server with `--data-dir $HELIOSDB_DATA_DIR` (default `/data`) and
-  `--listen 0.0.0.0` unless you pass those flags yourself — mount your volume
-  at that path. The directory must be writable by uid 999 (a named volume is;
-  a fresh host bind mount usually is not — `chown -R 999:999` it first), and
-  the container exits with an explanation if it is not;
+  `--listen 0.0.0.0` unless you pass those flags yourself. Mount a named
+  volume at `/data`: it is the only mount point the image pre-creates for
+  uid 999, and Docker makes a named volume mounted at any other new path
+  root-owned. To keep the database in a subdirectory, set
+  `HELIOSDB_DATA_DIR=/data/<name>` and still mount the volume at `/data`; the
+  directory is created on start. A fresh host bind mount is root-owned too —
+  `chown -R 999:999` it first. The container exits with an explanation if the
+  directory is not writable;
 - turns `HELIOSDB_PASSWORD` (or `HELIOSDB_PASSWORD_FILE`, for Docker/Kubernetes
   secrets) into `--auth scram-sha-256` — trust auth is refused on a container's
   `0.0.0.0` listener, so without a password the container exits with an
