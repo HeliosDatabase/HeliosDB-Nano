@@ -947,7 +947,9 @@ mod tests {
         let token = TransferToken::new([0xAB; 32]).unwrap();
         let rendered = format!("{token:?}");
         assert!(!rendered.contains("171"), "decimal token byte leaked: {rendered}");
-        assert!(!rendered.to_lowercase().contains("ab"), "hex token leaked: {rendered}");
+        let lowered = rendered.to_lowercase();
+        assert!(!lowered.contains(&"ab".repeat(32)), "hex token leaked: {rendered}");
+        assert!(!lowered.contains(&vec!["ab"; 32].join(", ")), "hex token leaked: {rendered}");
         assert!(rendered.contains("<redacted>"), "missing redaction marker: {rendered}");
     }
     fn header(kind: Kind, length: u32) -> Vec<u8> {

@@ -1361,7 +1361,12 @@ mod tests {
         };
         let rendered = format!("{request:?}");
         assert!(!rendered.contains("171"), "decimal token byte leaked: {rendered}");
-        assert!(!rendered.to_lowercase().contains("ab"), "hex token leaked: {rendered}");
+        let lowered = rendered.to_lowercase();
+        // A bare "ab" cannot be asserted: ordinary field names such as
+        // "capabilities" contain it. A hex leak of the 32-byte token instead
+        // appears as a long run of "ab" pairs.
+        assert!(!lowered.contains(&"ab".repeat(32)), "hex token leaked: {rendered}");
+        assert!(!lowered.contains(&vec!["ab"; 32].join(", ")), "hex token leaked: {rendered}");
         assert!(rendered.contains("<redacted>"), "missing redaction marker: {rendered}");
     }
 
