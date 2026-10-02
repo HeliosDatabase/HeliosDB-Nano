@@ -377,7 +377,7 @@ fn fingerprint_file(path: &Path, expected_size: u64, single_link: bool) -> Resul
     }
     let mut hash = Sha256::new();
     let mut copied = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
@@ -389,7 +389,8 @@ fn fingerprint_file(path: &Path, expected_size: u64, single_link: bool) -> Resul
         if copied > expected_size {
             return Err(invalid("file grew while hashing"));
         }
-        hash.update(&buffer[..count]);
+        let chunk = buffer.get(..count).ok_or_else(|| invalid("read count exceeds buffer"))?;
+        hash.update(chunk);
     }
     let after = fs::symlink_metadata(path)?;
     if copied != expected_size
@@ -531,7 +532,10 @@ impl OnlineCheckpointExport {
         let path = self.directory.path.join(&file.name);
         let mut input = open_regular(&path, file.size, false, false)?;
         let current = input.metadata()?;
-        let expected = &self.fingerprints[file_index as usize];
+        let expected = self
+            .fingerprints
+            .get(file_index as usize)
+            .ok_or_else(|| invalid("unknown file fingerprint"))?;
         if !same_file(expected, &current) || current.len() != file.size || current.modified()? != expected.modified()? {
             return Err(invalid("export file changed after manifest"));
         }
@@ -701,16 +705,26 @@ impl ReceiverStaging {
             let end = offset
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| invalid("chunk offset overflow"))?;
-            if offset != self.received[index] || end > file.size {
+            let received = *self
+                .received
+                .get(index)
+                .ok_or_else(|| invalid("unknown file progress index"))?;
+            if offset != received || end > file.size {
                 return Err(invalid("chunk out of order or oversized"));
             }
-            let mut output = open_regular(&self.owner.directory.path.join(&file.name), file.size, true, true)?;
+            let name = file.name.clone();
+            let size = file.size;
+            let mut output = open_regular(&self.owner.directory.path.join(&name), size, true, true)?;
             if output.metadata()?.len() != offset {
                 return Err(invalid("staging file changed between chunks"));
             }
             output.seek(SeekFrom::Start(offset))?;
             output.write_all(bytes)?;
-            self.received[index] = end;
+            let slot = self
+                .received
+                .get_mut(index)
+                .ok_or_else(|| invalid("unknown file progress index"))?;
+            *slot = end;
             Ok(())
         })();
         if outcome.is_err() {
@@ -992,6 +1006,7 @@ fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
 }
 
 #[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::replication::{
