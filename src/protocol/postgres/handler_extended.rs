@@ -259,6 +259,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             .get_statement(&portal.statement_name)?
             .ok_or_else(|| Error::query_execution(format!("Statement '{}' not found", portal.statement_name)))?;
 
+        if self.reject_guarded_standby_statement(&statement.query, true).await? {
+            return Ok(());
+        }
+
         // Transaction-control statements need the connection-level state
         // machine from the simple-query path. Letting extended Execute send
         // BEGIN/COMMIT/ROLLBACK straight to the engine leaves the handler's

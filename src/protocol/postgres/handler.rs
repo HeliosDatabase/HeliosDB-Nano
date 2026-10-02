@@ -1784,12 +1784,64 @@ where
         Ok(())
     }
 
+    /// Called before simple-query interception and extended Execute. The
+    /// sticky CLI guard cannot be bypassed by a read-only/role toggle or cache hit.
+    pub(super) async fn reject_guarded_standby_statement(&mut self, query: &str, extended: bool) -> Result<bool> {
+        #[cfg(not(feature = "ha-tier1"))]
+        {
+            let _ = (query, extended);
+            Ok(false)
+        }
+        #[cfg(feature = "ha-tier1")]
+        {
+            if !crate::replication::ha_state::ha_state().forwarding_disabled()
+                || guarded_standby_statement_allowed(query)
+            {
+                return Ok(false);
+            }
+            if self.transaction_status == TransactionStatus::Failed {
+                if extended {
+                    self.send_extended_failed_transaction_error().await?;
+                } else {
+                    self.send_failed_transaction_error().await?;
+                }
+            } else if extended {
+                self.mark_transaction_failed_after_error();
+                self.suppress_ready_for_query = false;
+                self.awaiting_sync_after_error = true;
+                self.send_error_message(
+                    "ERROR",
+                    "25006",
+                    "statement is not permitted on a history-guarded standby",
+                    None,
+                    Some("Connect directly to the primary for writes and unsupported utility statements.".into()),
+                )
+                .await?;
+                // Extended recovery belongs to Sync; never send ReadyForQuery here.
+                self.flush().await?;
+            } else {
+                self.send_error(
+                    "ERROR",
+                    "25006",
+                    "statement is not permitted on a history-guarded standby",
+                    None,
+                    Some("Connect directly to the primary for writes and unsupported utility statements.".into()),
+                )
+                .await?;
+            }
+            Ok(true)
+        }
+    }
+
     /// Handle exactly one statement. All pre-existing `handle_query`
     /// logic lives here so the per-statement response sequence stays
     /// unchanged from v3.12's behaviour.
     // SAFETY: results[0] is guarded by !results.is_empty() check.
     #[allow(clippy::indexing_slicing)]
     pub(super) async fn handle_single_query(&mut self, query: &str) -> Result<()> {
+        if self.reject_guarded_standby_statement(query, false).await? {
+            return Ok(());
+        }
         tracing::debug!("Executing query: {}", query);
 
         // `DO $$ … $$` / `DO LANGUAGE … $$ … $$` blocks. sqlparser
@@ -7221,5 +7273,162 @@ mod md5_auth_wire_tests {
         assert!(result.is_err(), "a wrong SCRAM proof must be rejected");
         assert!(!handler.authenticated, "failed SCRAM must leave authenticated=false");
         let _client = client_task.await.expect("client task");
+    }
+}
+
+/// Bounded SQL-shape admission for a history-guarded CLI standby. This is not
+/// function volatility analysis: SELECT UDF/sequence side effects need a separate
+/// storage/session policy. Unknown utility statements are denied, not guessed.
+#[cfg(any(feature = "ha-tier1", test))]
+fn guarded_standby_statement_allowed(sql: &str) -> bool {
+    use sqlparser::ast::{Query, SetExpr, Statement, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    struct ReadQuery;
+    impl Visitor for ReadQuery {
+        type Break = ();
+        fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
+            // The visitor reaches write statements inside CTEs/subqueries too.
+            if matches!(statement, Statement::Query(_)) {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        }
+        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
+            fn has_into(body: &SetExpr) -> bool {
+                match body {
+                    SetExpr::Select(select) => select.into.is_some(),
+                    SetExpr::SetOperation { left, right, .. } => has_into(left) || has_into(right),
+                    // Nested Query/CTE/subquery nodes are visited independently.
+                    _ => false,
+                }
+            }
+            if !query.locks.is_empty() || has_into(&query.body) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    let statements = pg_split_sql_respecting_quotes(sql);
+    if statements.len() > 1 {
+        return false;
+    }
+    let sql = pg_skip_leading_comments(sql).trim();
+    if sql.trim_end_matches(';').trim().is_empty() {
+        return true;
+    }
+    if classify_transaction_control(sql).is_some() {
+        return true;
+    }
+    if let Some(copy) = super::copy::parse_copy(sql) {
+        return copy.to_stdout;
+    }
+    // These RESET forms have explicit session-only interceptors. The SQL parser
+    // does not support every RESET spelling accepted by the wire layer.
+    if starts_with_icase(sql, "RESET ")
+        && (EmbeddedDatabase::is_session_guc_statement(sql)
+            || EmbeddedDatabase::is_search_path_statement(sql)
+            || EmbeddedDatabase::is_application_name_statement(sql)
+            || EmbeddedDatabase::is_timeout_guc_statement(sql))
+    {
+        return true;
+    }
+    let rewritten = pg_rewrite_empty_projection(sql);
+    let Ok(mut statements) = crate::sql::Parser::new().parse(&rewritten) else {
+        return false;
+    };
+    if statements.len() != 1 {
+        return false;
+    }
+    let statement = statements.remove(0);
+    match &statement {
+        Statement::Query(_) => statement.visit(&mut ReadQuery).is_continue(),
+        // EXPLAIN of an admitted query is allowed; all utility/DML plans are
+        // conservatively denied even without ANALYZE. ANALYZE cannot hide writes.
+        Statement::Explain { statement, .. } => {
+            matches!(statement.as_ref(), Statement::Query(_)) && statement.visit(&mut ReadQuery).is_continue()
+        }
+        Statement::SetVariable { .. }
+        | Statement::SetTimeZone { .. }
+        | Statement::SetRole { .. }
+        | Statement::SetTransaction { .. }
+        | Statement::ShowVariable { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. }
+        | Statement::Deallocate { .. } => true,
+        // Includes SQL EXECUTE/PREPARE, DO/CALL, DDL, COPY FROM, maintenance,
+        // GRANT/REVOKE, branch/HA utilities and unsupported/custom statements.
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod guarded_standby_admission_tests {
+    use super::guarded_standby_statement_allowed as allowed;
+
+    #[test]
+    fn admits_read_shapes_and_session_recovery() {
+        for sql in [
+            "SELECT 1",
+            "/* leading */ SELECT id FROM t WHERE id = $1",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "VALUES (1), (2)",
+            "SELECT (SELECT count(*) FROM t)",
+            "SELECT 'INSERT; DELETE'",
+            "EXPLAIN SELECT * FROM t",
+            "EXPLAIN ANALYZE SELECT * FROM t",
+            "COPY t TO STDOUT",
+            "BEGIN",
+            "COMMIT WORK",
+            "ROLLBACK",
+            "ROLLBACK TO SAVEPOINT s",
+            "SAVEPOINT s",
+            "RELEASE SAVEPOINT s",
+            "SET application_name = 'replica reader'",
+            "SHOW application_name",
+            "RESET application_name",
+            "",
+            "-- only a comment",
+        ] {
+            assert!(allowed(sql), "read/session statement denied: {sql}");
+        }
+    }
+
+    #[test]
+    fn denies_write_shapes_before_any_fast_path() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "/* leading */ INSERT INTO t VALUES ($1)",
+            "UPDATE t SET id = 2",
+            "DELETE FROM t",
+            "TRUNCATE t",
+            "CREATE TABLE t (id INT)",
+            "ALTER TABLE t ADD COLUMN x INT",
+            "DROP TABLE t",
+            "SELECT * INTO copied FROM t",
+            "WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c",
+            "WITH changed AS (DELETE FROM t RETURNING *) SELECT * FROM changed",
+            "WITH changed AS (INSERT INTO t VALUES (1) RETURNING *) SELECT * FROM changed",
+            "SELECT * FROM t FOR UPDATE",
+            "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+            "COPY t FROM STDIN",
+            "/* leading */ COPY t FROM STDIN",
+            "COPY t TO '/tmp/out'",
+            "DO $$ BEGIN INSERT INTO t VALUES (1); END $$",
+            "CALL mutate()",
+            "PREPARE w AS INSERT INTO t VALUES (1)",
+            "EXECUTE w",
+            "VACUUM t",
+            "CHECKPOINT",
+            "GRANT SELECT ON t TO user1",
+            "SELECT 1; INSERT INTO t VALUES (1)",
+            "BEGIN; INSERT INTO t VALUES (1)",
+            "unrecognized utility syntax",
+        ] {
+            assert!(!allowed(sql), "write/unknown statement admitted: {sql}");
+        }
     }
 }

@@ -208,6 +208,56 @@ fn emitted(setup: &[&str], under_test: &[&str], family: Family) -> Vec<WalOperat
     decode_entries(dir)
 }
 
+/// Like [`config_for`], but with strict logical WAL so the AUTOCOMMIT
+/// INSERT / UPDATE / DELETE fast paths actually emit. Those paths deliberately
+/// skip the logical-WAL keyspace in relaxed standalone
+/// (`fast_dml_requires_logical_wal` is false unless `logical_wal_per_statement`
+/// is set or the role is an HA primary), so an autocommit-replication test must
+/// select the strict mode to observe the real contract rather than switching to
+/// an explicit transaction.
+fn config_for_logical(dir: &Path) -> Config {
+    let mut c = config_for(dir);
+    c.storage.logical_wal_per_statement = true;
+    c
+}
+
+fn open_db_logical(dir: &Path) -> EmbeddedDatabase {
+    let mut last = None;
+    for _ in 0..100 {
+        match EmbeddedDatabase::with_config(config_for_logical(dir)) {
+            Ok(db) => return db,
+            Err(e) => {
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+    panic!("embedded (logical) open failed: {last:?}");
+}
+
+/// [`emitted`] under strict logical WAL. The statements under test remain
+/// AUTOCOMMIT; only the configuration is strict, so the fast DELETE really
+/// reaches `log_data_delete`.
+fn emitted_logical(setup: &[&str], under_test: &[&str], family: Family) -> Vec<WalOperation> {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let dir = temp.path();
+
+    {
+        let db = open_db_logical(dir);
+        for sql in setup {
+            run(&db, sql, Family::Text);
+        }
+    }
+    {
+        // This open adopts + truncates the setup log without replaying it.
+        let db = open_db_logical(dir);
+        for sql in under_test {
+            run(&db, sql, family);
+        }
+    }
+    decode_entries(dir)
+}
+
 /// Like [`emitted`], but the statement under test is EXPECTED to be rejected.
 /// Returns the rejection error text and the entries the rejected statement left
 /// behind (which must be none). Used only by the params-family parity control.
@@ -1029,4 +1079,65 @@ fn control_the_primary_itself_is_correct_after_every_ddl_form() {
         "positive control: the added column must read NULL, got {:?}",
         rows[0].values[2]
     );
+}
+
+#[test]
+fn low_level_metadata_cleanup_never_emits_a_logical_row_delete() {
+    let temp = tempfile::tempdir().unwrap();
+    {
+        let db = open_db(temp.path());
+        for key in [
+            b"table_constraints:t".as_slice(),
+            b"counter:t",
+            b"trigger:t:tr",
+            b"meta:table:t",
+            b"__view_metadata__v",
+        ] {
+            db.storage.delete(&key.to_vec()).unwrap();
+        }
+    }
+    let ops = decode_entries(temp.path());
+    assert!(
+        ops.is_empty(),
+        "metadata must not masquerade as row deletion: {}",
+        describe(&ops)
+    );
+}
+
+#[test]
+fn real_row_delete_still_replicates_while_rename_side_cleanup_is_not_a_row() {
+    // AUTOCOMMIT statements under strict logical WAL. The row DELETE must emit a
+    // `data:`-row Delete while the RENAME-side metadata cleanup must not. Using
+    // strict logical WAL (not an explicit transaction) is deliberate: the
+    // autocommit fast DML paths only reach `log_data_delete` when
+    // `fast_dml_requires_logical_wal()` is true, and that is the real
+    // autocommit replication contract under test.
+    let ops = emitted_logical(
+        &[],
+        &[
+            T,
+            "INSERT INTO t VALUES (1, 'row')",
+            "DELETE FROM t WHERE id = 1",
+            "ALTER TABLE t RENAME TO t2",
+        ],
+        Family::Text,
+    );
+    let deletes: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            WalOperation::Delete { table, key } => Some((table, key)),
+            _ => None,
+        })
+        .collect();
+    assert!(!deletes.is_empty(), "real row delete disappeared: {}", describe(&ops));
+    assert!(
+        deletes
+            .iter()
+            .all(|(table, key)| table.as_str() == "t" && key.starts_with(b"data:t:")),
+        "non-row cleanup entered live replication: {}",
+        describe(&ops)
+    );
+    let replica = replica_of(&ops);
+    assert!(replica_columns(&replica, "t2").is_some());
+    assert!(replica_columns(&replica, "t").is_none());
 }

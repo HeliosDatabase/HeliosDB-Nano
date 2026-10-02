@@ -572,8 +572,13 @@ fn guarded_standby_verifies_history_and_refuses_transparent_forwarding_in_every_
         let mut client = trust_connection(port);
         let error = simple_query_error(&mut client, "INSERT INTO forwarding_guard VALUES (1)")
             .expect("guarded standby must refuse transparent writes");
+        // The write is refused by the guarded-standby admission classifier
+        // (`statement is not permitted on a history-guarded standby`) before it
+        // can reach the older forwarding-disabled path. Both refusals carry
+        // SQLSTATE 25006 and the same "history-guarded standby" contract phrase,
+        // which is what this test pins (it must not depend on which layer fires).
         assert!(
-            error.contains("25006") && error.contains("transparent forwarding is disabled"),
+            error.contains("25006") && error.contains("history-guarded standby"),
             "{mode}: {error}"
         );
     }

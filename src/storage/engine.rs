@@ -3750,17 +3750,13 @@ impl StorageEngine {
 
     /// Delete a key
     pub fn delete(&self, key: &Key) -> Result<()> {
-        // Log to WAL first - skip during replay
-        // Also skip for metadata keys (meta:*) since DDL operations handle their own WAL logging
+        // Logical Delete describes a table row, not an arbitrary RocksDB key.
+        // DDL side records (including table_constraints:, counter:, triggers
+        // and other metadata) are represented by their owning DDL operation.
+        // Emitting Delete(table="unknown") for those keys made a real RENAME
+        // stream fail strict live-row replay, which correctly accepts data: only.
         if !self.is_replaying.load(Ordering::Acquire) {
-            let key_str = std::str::from_utf8(key).unwrap_or("");
-            // `meta:` records handle their own logging, and `__`-prefixed
-            // internal keys (`__view_metadata__…`) are catalog records, not
-            // rows: logging them produced a bogus `Delete { table: "unknown" }`
-            // in the CDC stream (GH#36).
-            let is_metadata_key = key_str.starts_with("meta:") || key_str.starts_with("__");
-
-            if !is_metadata_key {
+            if key.starts_with(b"data:") {
                 if let Some(wal) = &self.wal {
                     let wal = wal.read();
                     // Extract table name from key for proper WAL logging
