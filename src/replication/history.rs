@@ -438,6 +438,7 @@ fn sync_directory(path: &Path) -> HistoryResult<()> {
 }
 
 #[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt};

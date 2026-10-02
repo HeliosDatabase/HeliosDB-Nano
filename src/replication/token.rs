@@ -60,6 +60,7 @@ pub fn read_replication_token(path: &Path) -> Result<TransferToken> {
 }
 
 #[cfg(all(test, unix))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
