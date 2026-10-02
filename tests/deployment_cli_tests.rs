@@ -688,3 +688,154 @@ fn standby_small_timeout_bounds_verification_and_survives_daemon_reexec() {
         }
     }
 }
+
+/// C3: an owner-only 32-byte token file for the plaintext-remote opt-in tests.
+#[cfg(feature = "ha-tier1")]
+fn replication_token_file() -> (tempfile::TempDir, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replication.token");
+    fs::write(&path, [0x5Au8; 32]).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    (dir, path)
+}
+
+#[test]
+#[cfg(feature = "ha-tier1")]
+fn remote_replication_token_is_refused_without_opt_in() {
+    let pg = reserve("0.0.0.0");
+    let replication = reserve("127.0.0.1");
+    let pg_port = pg.local_addr().unwrap().port();
+    let replication_port = replication.local_addr().unwrap().port().to_string();
+    let (_token_dir, token) = replication_token_file();
+    let token_arg = token.display().to_string();
+    drop((pg, replication));
+    let mut server = Server::start(
+        pg_port,
+        &[
+            "--http-port",
+            "0",
+            "--listen",
+            "0.0.0.0",
+            "--replication-role",
+            "primary",
+            "--replication-port",
+            &replication_port,
+            "--replication-token-file",
+            &token_arg,
+        ],
+        None,
+    );
+    server.assert_failure();
+    assert!(
+        server.logs().contains("allow-insecure-replication-remote"),
+        "{}",
+        server.logs()
+    );
+}
+
+#[test]
+#[cfg(feature = "ha-tier1")]
+fn remote_replication_token_opt_in_serves_and_warns() {
+    let pg = reserve("0.0.0.0");
+    let replication = reserve("127.0.0.1");
+    let pg_port = pg.local_addr().unwrap().port();
+    let replication_port = replication.local_addr().unwrap().port().to_string();
+    let (_token_dir, token) = replication_token_file();
+    let token_arg = token.display().to_string();
+    drop((pg, replication));
+    let mut server = Server::start(
+        pg_port,
+        &[
+            "--http-port",
+            "0",
+            "--listen",
+            "0.0.0.0",
+            "--replication-role",
+            "primary",
+            "--replication-port",
+            &replication_port,
+            "--replication-token-file",
+            &token_arg,
+            "--allow-insecure-replication-remote",
+        ],
+        None,
+    );
+    server.wait_ready();
+    assert!(
+        server.logs().contains("INSECURE REPLICATION OVERRIDE"),
+        "{}",
+        server.logs()
+    );
+}
+
+#[test]
+#[cfg(feature = "ha-tier1")]
+fn loopback_replication_token_is_unaffected() {
+    let pg = reserve("127.0.0.1");
+    let replication = reserve("127.0.0.1");
+    let pg_port = pg.local_addr().unwrap().port();
+    let replication_port = replication.local_addr().unwrap().port().to_string();
+    let (_token_dir, token) = replication_token_file();
+    let token_arg = token.display().to_string();
+    drop((pg, replication));
+    let mut server = Server::start(
+        pg_port,
+        &[
+            "--http-port",
+            "0",
+            "--listen",
+            "127.0.0.1",
+            "--replication-role",
+            "primary",
+            "--replication-port",
+            &replication_port,
+            "--replication-token-file",
+            &token_arg,
+        ],
+        None,
+    );
+    server.wait_ready();
+    assert!(
+        !server.logs().contains("INSECURE REPLICATION OVERRIDE"),
+        "loopback must not need the opt-in: {}",
+        server.logs()
+    );
+}
+
+#[test]
+#[cfg(feature = "ha-tier1")]
+fn remote_replication_token_opt_in_survives_daemon_reexec() {
+    let pg = reserve("0.0.0.0");
+    let replication = reserve("127.0.0.1");
+    let pg_port = pg.local_addr().unwrap().port();
+    let replication_port = replication.local_addr().unwrap().port().to_string();
+    let (_token_dir, token) = replication_token_file();
+    let token_arg = token.display().to_string();
+    drop((pg, replication));
+    let mut server = Server::start(
+        pg_port,
+        &[
+            "--http-port",
+            "0",
+            "--listen",
+            "0.0.0.0",
+            "--replication-role",
+            "primary",
+            "--replication-port",
+            &replication_port,
+            "--replication-token-file",
+            &token_arg,
+            "--allow-insecure-replication-remote",
+            "--daemon",
+        ],
+        None,
+    );
+    assert!(server.wait_exit().success(), "{}", server.logs());
+    assert!(
+        server.logs().contains("INSECURE REPLICATION OVERRIDE"),
+        "{}",
+        server.logs()
+    );
+    assert!(!server.worker_pids.is_empty(), "daemon PID missing");
+}

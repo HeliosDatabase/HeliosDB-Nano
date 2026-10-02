@@ -436,6 +436,12 @@ sync_mode = "async" # async | semi-sync (alias semisync) | sync
 # CLI --replication-token-file overrides this value.
 # token_file = "/etc/heliosdb/replication.token"
 
+# Acknowledge that the replication token crosses a NON-loopback (plaintext)
+# native listener. Default false: a token on a non-loopback listener is refused.
+# CLI --allow-insecure-replication-remote turns this on; the token is a bearer
+# secret sent in clear, so prefer a loopback listener or an authenticated tunnel.
+# allow_insecure_remote = true
+
 # ============================================================================
 # PERFORMANCE CONFIGURATION
 # ============================================================================

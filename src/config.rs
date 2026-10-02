@@ -376,10 +376,16 @@ pub struct ReplicationConfig {
     /// **plaintext** native replication channel (no TLS, no primary-to-standby
     /// proof). It is only a network-path control for a loopback listener or a
     /// protected tunnel. A non-loopback listener with a configured token is
-    /// refused unless `HELIOSDB_REPLICATION_AUTH_ALLOW_REMOTE=1` explicitly
-    /// acknowledges the plaintext risk.
+    /// refused unless `allow_insecure_remote = true` explicitly acknowledges the
+    /// plaintext risk.
     #[serde(default)]
     pub token_file: Option<std::path::PathBuf>,
+    /// Explicit acknowledgment that the replication token crosses a non-loopback
+    /// (plaintext) network. Default false: a token on a non-loopback listener is
+    /// refused. Modeled on the PostgreSQL `--allow-insecure-trust` opt-in; set
+    /// via `--allow-insecure-replication-remote`.
+    #[serde(default)]
+    pub allow_insecure_remote: bool,
 }
 
 impl std::fmt::Debug for ReplicationConfig {
@@ -395,6 +401,7 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("sync_mode", &self.sync_mode)
             .field("node_id", &self.node_id)
             .field("token_file", &self.token_file)
+            .field("allow_insecure_remote", &self.allow_insecure_remote)
             .finish()
     }
 }
@@ -412,6 +419,7 @@ impl Default for ReplicationConfig {
             sync_mode: "async".to_string(),
             node_id: None,
             token_file: None,
+            allow_insecure_remote: false,
         }
     }
 }

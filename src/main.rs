@@ -33,6 +33,8 @@ struct HAConfig {
     node_id: Option<String>,
     /// One owner-only 32-byte token file authenticating both replication channels.
     token_file: Option<PathBuf>,
+    /// Acknowledge plaintext token transport on a non-loopback replication listener.
+    allow_insecure_remote: bool,
 }
 
 /// Standbys receive their full verification window plus the ordinary startup allowance.
@@ -341,6 +343,11 @@ enum Commands {
         #[arg(long)]
         node_id: Option<String>,
 
+        /// Permit the replication token over a non-loopback plaintext native listener
+        /// (isolated development only; mirrors --allow-insecure-trust).
+        #[arg(long)]
+        allow_insecure_replication_remote: bool,
+
         // ========== MySQL Protocol Options ==========
         /// Enable MySQL protocol listener
         #[arg(long)]
@@ -626,6 +633,7 @@ async fn main() -> Result<()> {
             mcp_token,
             allow_remote_mcp,
             node_id,
+            allow_insecure_replication_remote,
             mysql,
             mysql_listen,
             mysql_socket,
@@ -713,6 +721,10 @@ async fn main() -> Result<()> {
             if let Some(value) = node_id {
                 replication.node_id = Some(value);
             }
+            // CLI flag only turns the opt-in on; a config-file `true` is kept.
+            if allow_insecure_replication_remote {
+                replication.allow_insecure_remote = true;
+            }
             physical.apply(&mut replication);
             replication.role = replication.role.to_ascii_lowercase();
             replication.sync_mode = replication.sync_mode.to_ascii_lowercase();
@@ -753,6 +765,7 @@ async fn main() -> Result<()> {
                 allow_insecure_trust,
                 node_id: replication.node_id,
                 token_file: replication.token_file,
+                allow_insecure_remote: replication.allow_insecure_remote,
             };
 
             // GH#28: connection-lifetime overrides (CLI > config file > default).
@@ -1007,6 +1020,7 @@ async fn start_server(
         sync_mode: ha_config.sync_mode.clone(),
         node_id: ha_config.node_id.clone(),
         token_file: ha_config.token_file.clone(),
+        allow_insecure_remote: ha_config.allow_insecure_remote,
     };
 
     // CLI flags win over the config file for storage location/mode.
@@ -1933,6 +1947,9 @@ async fn start_server_daemon(
     if ha_config.allow_insecure_trust {
         args.push("--allow-insecure-trust".to_string());
     }
+    if ha_config.allow_insecure_remote {
+        args.push("--allow-insecure-replication-remote".to_string());
+    }
     args.push("--auth".to_string());
     args.push(auth.clone());
     if let Some(pwd) = password {
@@ -2474,17 +2491,21 @@ async fn start_ha_components(
                 ..Default::default()
             };
 
-            if ha_config.token_file.is_some() {
-                let allow_remote = std::env::var("HELIOSDB_REPLICATION_AUTH_ALLOW_REMOTE")
-                    .map(|value| value == "1")
-                    .unwrap_or(false);
-                if !repl_addr.ip().is_loopback() && !allow_remote {
+            if ha_config.token_file.is_some() && !repl_addr.ip().is_loopback() {
+                if !ha_config.allow_insecure_remote {
                     return Err(Error::config(
                         "native replication token is a plaintext bearer; bind --listen to a loopback \
-                         address, or set HELIOSDB_REPLICATION_AUTH_ALLOW_REMOTE=1 to acknowledge the \
-                         documented plaintext risk on a protected tunnel",
+                         address, or set --allow-insecure-replication-remote / \
+                         [replication] allow_insecure_remote = true to acknowledge the documented \
+                         plaintext risk on a protected tunnel",
                     ));
                 }
+                tracing::warn!(
+                    "INSECURE REPLICATION OVERRIDE: the replication token crosses the network in \
+                     PLAINTEXT to {} (--allow-insecure-replication-remote); use a loopback listener or \
+                     an authenticated tunnel",
+                    repl_addr
+                );
             }
             let server = StreamingServer::new(server_config, node_id, history_id, wal_store)
                 .map_err(|error| Error::config(format!("Cannot configure replication history: {error}")))?;
