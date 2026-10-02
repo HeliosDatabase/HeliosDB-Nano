@@ -28,7 +28,7 @@ use super::physical_wire::TransferToken;
 use super::transport::{
     AckPayload, AckType, Capabilities, HandshakeRequest, HandshakeResponse, HealthStatus, HeartbeatPayload, Message,
     MessageType, NodeRole, ReplicationConnection, SyncModeConfig, WalBatchPayload, WalEntryPayload,
-    WalEntryType as TransportWalEntryType, WalRequestPayload, HEARTBEAT_INTERVAL, PROTOCOL_VERSION,
+    WalEntryType as TransportWalEntryType, WalRequestPayload, HEARTBEAT_INTERVAL,
 };
 use super::wal_replicator::{Lsn, WalEntry, WalEntryType};
 use super::wal_store::{BatchRequest, WalStore};
@@ -308,38 +308,23 @@ impl StreamingServer {
         let addr = conn.remote_addr();
         tracing::info!("New connection from {}", addr);
 
-        // Wait for handshake
-        let msg = conn.recv().await?;
-        // Explicit wire-version contract: a peer speaking a different native
-        // protocol version is refused before any decode/registration. Adding
-        // `HandshakeRequest.auth` broke bincode layout compatibility with v1, so
-        // this is the gate that prevents a silent mis-decode or downgrade.
-        if msg.header.version != PROTOCOL_VERSION {
-            // R5: an unauthenticated peer must learn nothing about server state.
-            let rejected = HandshakeResponse {
-                history_id: Uuid::nil(),
-                accepted: false,
-                server_node_id: Uuid::nil(),
-                sync_mode: SyncModeConfig::Async,
-                primary_lsn: 0,
-                slot_name: None,
-                fencing_token: 0,
-                capabilities: Capabilities::all(),
-                error: Some(format!(
-                    "native protocol version mismatch: server v{}, peer v{}",
-                    PROTOCOL_VERSION, msg.header.version
-                )),
-            };
-            if let Ok(payload) = bincode::serialize(&rejected) {
-                let _ = conn.send(MessageType::HandshakeResponse, Bytes::from(payload)).await;
+        // C4/R1: a peer speaking a different native protocol version is refused
+        // at `MessageHeader::decode`, before any payload decode, so `recv()`
+        // fails with `ProtocolVersion`. Log it explicitly with the peer address
+        // and both versions; there is no decodable peer to answer.
+        let msg = match conn.recv().await {
+            Ok(msg) => msg,
+            Err(ReplicationError::ProtocolVersion { expected, actual }) => {
+                tracing::warn!(
+                    "Refused native handshake from {}: protocol version mismatch (server v{}, peer v{})",
+                    addr,
+                    expected,
+                    actual
+                );
+                return Err(ReplicationError::ProtocolVersion { expected, actual });
             }
-            tracing::warn!(
-                "Rejected native handshake from {}: protocol version mismatch (peer v{})",
-                addr,
-                msg.header.version
-            );
-            return Ok(());
-        }
+            Err(error) => return Err(error),
+        };
         if msg.header.msg_type != MessageType::HandshakeRequest {
             return Err(ReplicationError::Transport("Expected HandshakeRequest".to_string()));
         }
