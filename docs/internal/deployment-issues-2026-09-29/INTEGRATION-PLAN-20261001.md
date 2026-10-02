@@ -1,6 +1,7 @@
 # Nano deployment campaign — integration review and plan
 
-**Status:** review complete, plan proposed, **not yet implemented**. Author: Opus 5.5, nano session (campaign
+**Status:** review complete, plan approved by the owner 2026-10-02 (R6: one replication secret), **not yet
+implemented**. Author: Opus 5.5, nano session (campaign
 owner since 2026-10-01; evaluation/acceptance with Astra). Implementation: DeepSeek V4.1 Flash under this
 review. Nothing here accepts, closes, merges or releases anything.
 **Scope:** archive issues 1, 5, 6, 7, 8 only (`HANDOFF-TO-NANO-20261001.md`). Proxy stays with `hproxy`.
@@ -146,10 +147,11 @@ The documented FIPS build is `--no-default-features --features fips,encryption,v
 token. This regression was introduced by review: native-auth originally had a hand-written constant-time
 compare, and the Astra response replaced it with `ring` behind a feature gate.
 
-**Required:** constant-time in **every** feature combination, independent of crypto feature selection —
-a portable XOR-accumulate over equal-length inputs, or the `subtle` crate. With a fixed-length token (R6)
-there is no length to leak; otherwise compare SHA-256 digests. Test under
-`--no-default-features --features fips,encryption,vector-search`.
+**Required:** constant-time in **every** feature combination, independent of crypto feature selection.
+**Resolved by R6:** the native channel adopts `TransferToken::accepts` (`subtle`, fixed 32 bytes) and
+`constant_time_eq` is deleted, so no build has an `a == b` path. The requirement still stands as a check:
+`grep` the integrated tree for any token comparison not routed through `TransferToken::accepts`, and test
+the native channel under `--no-default-features --features fips,encryption,vector-search`.
 
 ### R5. Rejections disclose server state to unauthenticated peers [static]
 
@@ -160,19 +162,53 @@ Uuid::nil()` (R2). Only `accepted: false` and the error text are needed. The ord
 is already correct after the merge [verified]: auth (≈347) → history check (≈389) → registration (≈418), so
 an unauthenticated peer cannot probe the dataset identity through the history path.
 
-### R6. Two credentials, two opposite security postures — decision required
+### R6. One replication secret, on the physical model — DECIDED 2026-10-02
 
-| | physical-resync | native-auth |
+| | physical-resync | native-auth (as handed over) |
 | --- | --- | --- |
 | Config | `[replication.physical] token_file` | `[replication] auth_token`, or env `HELIOSDB_REPLICATION_AUTH_TOKEN` |
 | Secret | "Exactly 32 raw random bytes in an owner-only regular file; **never inline TOML**" | any non-empty string (`"password"` passes) |
 | Exposure | file, permission-checked | config files (often committed), `/proc/<pid>/environ`, `docker inspect` |
 
-physical-resync made a deliberate "never inline TOML" decision that native-auth contradicts. **Recommended:**
-one replication secret for both channels, on the physical model — a single `token_file` (32 random bytes,
-owner-only), read by both the logical native channel and the physical channel; drop inline `auth_token` and
-the secret-in-env override. This changes native-auth's user-facing configuration, so it needs the owner's
-sign-off before implementation. If declined, the minimum is a length/entropy floor on `auth_token`.
+**Decision (owner, 2026-10-02): one secret for both channels, on the physical model.** physical-resync
+already has the right primitives, so this is reuse, not new design:
+
+- `physical_wire::TransferToken` — `Zeroizing<[u8; 32]>`, refuses an all-zero token, and `accepts()` is a
+  length check plus `subtle::ConstantTimeEq`: constant-time in **every** feature combination, no `ring`.
+- `read_physical_token` (`src/main.rs`) — `O_NOFOLLOW`, owner uid, mode `0600` or stricter, single hard
+  link, exactly 32 bytes, zeroized read buffer, size-change check; refuses non-Unix.
+
+Required shape:
+
+1. **Config:** one `[replication] token_file` (path) serves both channels; CLI
+   `--replication-token-file`. It replaces `[replication.physical] token_file` /
+   `--physical-replication-token-file` and native-auth's `auth_token`. Nothing was released, so no aliases
+   or deprecation path.
+2. **Removed:** `ReplicationConfig.auth_token`, the `HELIOSDB_REPLICATION_AUTH_TOKEN` override, its
+   empty-string validation, `ReplicationAuth::SharedSecret { token: String }`, and `constant_time_eq` with
+   both of its arms (the `ring` one and the `a == b` one). No secret is ever read from TOML or the environment.
+3. **Loader:** move `read_physical_token` from `src/main.rs` into the library (e.g. `replication::token`),
+   rename `read_replication_token`, keep every check and error message intent unchanged; both channels and
+   the tests call the one function.
+4. **Native handshake:** `HandshakeRequest.auth` carries the 32 raw token bytes (part of the v3 layout, R1);
+   the server verifies with `TransferToken::accepts`. Missing vs wrong remain distinguished in the error
+   text and both are rejected before registration, exactly as today.
+5. **Health probe (R3):** presents the same token.
+6. **Debug/logging:** `TransferToken` and anything holding it must not print the bytes — confirm its `Debug`
+   is redacting or absent, and keep native-auth's redaction test equivalent.
+7. **Docs:** one procedure for both nodes — `head -c 32 /dev/urandom > replication.token && chmod 600
+   replication.token`, the identical file on primary and standby. Update `config.example.toml`,
+   `docs/guides/deployment-endpoints.md` and the live harness (`native_auth_live.py` moves from the env var
+   to a token file).
+8. **Tests:** valid / wrong / missing token on the native channel; the physical channel's existing token
+   tests unchanged in substance; a token-file permission test (mode `0644` and a symlink are each refused);
+   the same token file authenticates both channels.
+
+One consequence to keep in mind: the token is still a **bearer** secret sent over a plaintext channel, so the
+plaintext-remote opt-in (§5.1) still matters, and a leak compromises both channels at once — intended, since
+they serve one replication relationship. A challenge-response (HMAC over a server nonce) would stop the token
+from ever crossing the wire; it fits naturally on a fixed 32-byte key and is a recommended follow-up alongside
+TLS, **not** part of this integration.
 
 ## 4. Conflict resolutions (5 blocks, all mechanical)
 
@@ -180,7 +216,7 @@ sign-off before implementation. If declined, the minimum is a length/entropy flo
 | --- | --- | --- |
 | `src/replication/transport.rs` | doc comment above `PROTOCOL_VERSION` | replace both with the v3 comment (R1) |
 | `src/replication/failover_watcher.rs` | probe `HandshakeRequest` literal | keep `expected_history: None` **and** `auth: <configured credential>` (R3) |
-| `src/main.rs` #1 | config wiring | keep **both** `physical.apply(&mut replication.physical)` and the auth-token override (or its R6 replacement) |
+| `src/main.rs` #1 | config wiring | keep `physical.apply(&mut replication.physical)`; **drop** native-auth's `HELIOSDB_REPLICATION_AUTH_TOKEN` override (R6) |
 | `src/main.rs` #2 | `use replication::{…}` | union: `StreamingClientStatus` **and** `transport::ReplicationAuth` |
 | `src/main.rs` #3 | streaming server construction | native-auth's loopback/plaintext guard, **then** the guard's fallible 4-argument `StreamingServer::new(server_config, node_id, history_id, wal_store).map_err(…)?`; confirm `server_config.auth` is still set |
 
@@ -198,7 +234,8 @@ validated [verified]), `src/replication/streaming.rs` (R2, R5), `tests/ha_tests/
    blocking):** put the native replication channel on TLS — Nano already ships TLS and post-quantum hybrid
    TLS for the PostgreSQL and MySQL wires (v4.36.0), so the infrastructure exists. A bearer token in clear
    on an untunneled network is replayable by anyone who sees it.
-2. **No-crypto comparison fallback.** **Reject as shipped** — it is R4.
+2. **No-crypto comparison fallback.** **Reject as shipped** — it is R4, resolved by R6's move to
+   `TransferToken::accepts`.
 3. **Wire-version compatibility with history-guard protocol 2.** **Answered by R1** — they are incompatible
    under the same number; the integrated build must be v3.
 4. **Fixture task ownership.** The Astra response records `stop()` aborting and awaiting on timeout and
@@ -256,7 +293,8 @@ crate (`cargo clean --locked --package heliosdb-nano`) before the first build so
 1. Merge admission + physical-resync. Expect **no conflicts**; stop and report if there are any.
 2. Merge native-auth. Expect exactly the **5 blocks in §4**; resolve as specified. Any other conflict: stop and
    report.
-3. Apply R1, R2, R4, R5 and R3. Apply R6 only if signed off; otherwise its minimum.
+3. Apply R1, R2, R5, R6 (which also resolves R4) and R3, in that order — R6 changes the handshake's
+   `auth` field and the probe's credential, so R3 is written against R6's token type.
 4. `cargo check --all-targets`; report every error with file:line before fixing.
 5. Hand back for review **before** running the full gate. Do not edit sources while any gate runs.
 6. After review: the §6 gates, recorded per issue in Sprinter by appending (never replacing notes).
