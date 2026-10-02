@@ -224,9 +224,18 @@ enum Commands {
         #[arg(long, default_value = "trust")]
         auth: String,
 
-        /// Password for authentication (required for password/md5/scram-sha-256 auth)
+        /// Password for authentication (required for password/md5/scram-sha-256 auth).
+        /// A command-line value is visible to every local user in the process
+        /// table; prefer --password-file or the HELIOSDB_PASSWORD environment
+        /// variable, which is read when neither flag is given.
         #[arg(long)]
         password: Option<String>,
+
+        /// Read the authentication password from this file (first line; the
+        /// trailing newline is ignored). Keeps the password out of the process
+        /// table — use it with Docker/Kubernetes secrets.
+        #[arg(long, conflicts_with = "password")]
+        password_file: Option<PathBuf>,
 
         // ========== HA Replication Options ==========
         /// Replication role: standalone, primary, standby, observer
@@ -544,6 +553,7 @@ async fn main() -> Result<()> {
             tls_post_quantum,
             auth,
             password,
+            password_file,
             replication_role,
             replication_port,
             primary_host,
@@ -591,11 +601,37 @@ async fn main() -> Result<()> {
                 ));
             }
 
-            // Validate auth options
+            // Validate auth options. Password source precedence:
+            // --password > --password-file > $HELIOSDB_PASSWORD (the last two
+            // keep the secret out of the world-readable process table).
             let auth_lower = auth.to_lowercase();
+            let password = match (password, password_file) {
+                (Some(p), _) => Some(p),
+                (None, Some(path)) => {
+                    let raw = std::fs::read_to_string(&path).map_err(|e| {
+                        Error::config(format!(
+                            "Cannot read --password-file {}: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    let first = raw.lines().next().unwrap_or("").to_string();
+                    if first.is_empty() {
+                        return Err(Error::config(format!(
+                            "--password-file {} is empty.",
+                            path.display()
+                        )));
+                    }
+                    Some(first)
+                }
+                (None, None) if auth_lower != "trust" => std::env::var("HELIOSDB_PASSWORD")
+                    .ok()
+                    .filter(|p| !p.is_empty()),
+                (None, None) => None,
+            };
             if auth_lower != "trust" && password.is_none() {
                 return Err(Error::config(format!(
-                    "Authentication method '{}' requires --password to be set.",
+                    "Authentication method '{}' requires a password: set --password-file, \
+                     the HELIOSDB_PASSWORD environment variable, or --password.",
                     auth
                 )));
             }
