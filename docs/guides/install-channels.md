@@ -68,15 +68,35 @@ tar -xzf "heliosdb-nano-$VERSION-$TARGET.tar.gz" heliosdb-nano
 
 ## 4. Docker (GHCR)
 
-Built from the linux/amd64 release binary (`Dockerfile.binary`), pushed by
-release CI:
+Official multi-arch image (linux/amd64 + linux/arm64), built by release CI from
+the release's own Linux binaries (`Dockerfile.binary`) and published as
+`ghcr.io/heliosdatabase/heliosdb-nano:X.Y.Z` (also `:X.Y`, `:vX.Y.Z` and
+`:latest`):
 
 ```sh
-docker run -p 5432:5432 -v heliosdb_data:/data \
+docker run -d --name heliosdb -p 5432:5432 \
+  -e HELIOSDB_PASSWORD=change-me \
+  -v heliosdb_data:/data \
   ghcr.io/heliosdatabase/heliosdb-nano:latest
+
+psql "postgresql://postgres:change-me@localhost:5432/postgres?sslmode=require" -c 'SELECT 1'
 ```
 
-To build locally from source instead (e.g. for custom feature flags):
+The entrypoint (`deployment/docker/docker-entrypoint.sh`):
+
+- turns `HELIOSDB_PASSWORD` (or `HELIOSDB_PASSWORD_FILE`, for Docker/Kubernetes
+  secrets) into `--auth scram-sha-256` — trust auth is refused on a container's
+  `0.0.0.0` listener, so without a password the container exits with an
+  explanation;
+- generates a self-signed TLS certificate in `/data/tls` on first start, so
+  `sslmode=require` works; supply your own with `HELIOSDB_TLS_CERT` +
+  `HELIOSDB_TLS_KEY`, or disable with `HELIOSDB_TLS=off`;
+- passes any other command through: `docker run --rm -it IMAGE repl --memory`,
+  `docker run --rm IMAGE --version`.
+
+The server runs as uid/gid 999; port 8080 serves `/health` (used by the image
+`HEALTHCHECK`). To build locally from source instead (e.g. for custom feature
+flags):
 
 ```sh
 docker build -f deployment/docker/Dockerfile -t heliosdb-nano .

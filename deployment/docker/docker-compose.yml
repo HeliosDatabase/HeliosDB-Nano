@@ -1,11 +1,10 @@
-version: '3.8'
-
+# Uses the published image. To build from source instead, uncomment `build:`.
 services:
   heliosdb:
-    image: heliosdb/nano:3.10
-    build:
-      context: ../..
-      dockerfile: deployment/docker/Dockerfile
+    image: ghcr.io/heliosdatabase/heliosdb-nano:latest
+    # build:
+    #   context: ../..
+    #   dockerfile: deployment/docker/Dockerfile
     ports:
       - "5432:5432"  # PostgreSQL protocol
       - "8080:8080"  # REST API
@@ -13,27 +12,20 @@ services:
     volumes:
       - heliosdb_data:/data
     environment:
-      - HELIOSDB_MODE=server
-      - HELIOSDB_DATA_DIR=/data
       - HELIOSDB_LOG_LEVEL=info
-      - HELIOSDB_REST_PORT=8080
-      - HELIOSDB_PG_PORT=5432
-      # Security (set these in production)
-      - HELIOSDB_API_KEY=${HELIOSDB_API_KEY:-}
+      # Required: password for scram-sha-256 auth (trust auth is loopback-only)
+      - HELIOSDB_PASSWORD=${HELIOSDB_PASSWORD:?set HELIOSDB_PASSWORD}
+      # Optional: at-rest encryption key
       - HELIOSDB_ENCRYPTION_KEY=${HELIOSDB_ENCRYPTION_KEY:-}
-      - HELIOSDB_JWT_SECRET=${HELIOSDB_JWT_SECRET:-}
-      # Performance tuning
-      - HELIOSDB_CACHE_SIZE_MB=512
-      - HELIOSDB_MAX_CONNECTIONS=100
     command: >
-      heliosdb-nano start
+      start
       --data-dir /data
       --listen 0.0.0.0
-      --port 8080
+      --port 5432
       --mysql
       --mysql-listen 0.0.0.0:3306
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
