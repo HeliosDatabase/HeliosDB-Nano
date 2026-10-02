@@ -2061,6 +2061,9 @@ async fn start_server_daemon(
         if ha_config.allow_insecure_trust && auth.eq_ignore_ascii_case("trust") {
             eprintln!("INSECURE DEVELOPMENT OVERRIDE: daemon may permit unauthenticated non-loopback database access (--allow-insecure-trust).");
         }
+        if ha_config.allow_insecure_remote && ha_config.token_file.is_some() {
+            eprintln!("INSECURE REPLICATION OVERRIDE: daemon replication token may cross the network in plaintext (--allow-insecure-replication-remote).");
+        }
 
         println!();
         println!("╔═══════════════════════════════════════════════════════════════╗");
