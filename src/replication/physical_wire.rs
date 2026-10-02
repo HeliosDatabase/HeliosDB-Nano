@@ -939,6 +939,17 @@ mod tests {
     fn token() -> TransferToken {
         TransferToken::new([7; 32]).unwrap()
     }
+
+    /// C2: the token's decimal ("171") and hex ("ab") renderings never appear,
+    /// and the redaction marker does.
+    #[test]
+    fn transfer_token_debug_is_redacted() {
+        let token = TransferToken::new([0xAB; 32]).unwrap();
+        let rendered = format!("{token:?}");
+        assert!(!rendered.contains("171"), "decimal token byte leaked: {rendered}");
+        assert!(!rendered.to_lowercase().contains("ab"), "hex token leaked: {rendered}");
+        assert!(rendered.contains("<redacted>"), "missing redaction marker: {rendered}");
+    }
     fn header(kind: Kind, length: u32) -> Vec<u8> {
         let mut result = MAGIC.to_vec();
         result.extend(VERSION.to_be_bytes());

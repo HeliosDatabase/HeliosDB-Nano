@@ -1344,6 +1344,27 @@ mod tests {
         assert_eq!(decoded.role, NodeRole::Standby);
     }
 
+    /// C2: a token in a HandshakeRequest must never be Debug-printed. Other
+    /// fields are fixed to nil/empty so the only possible source of the token's
+    /// decimal ("171") or hex ("ab") rendering is the token itself.
+    #[test]
+    fn handshake_request_debug_redacts_auth_token() {
+        let request = HandshakeRequest {
+            expected_history: None,
+            node_id: Uuid::nil(),
+            role: NodeRole::Standby,
+            sync_mode: SyncModeConfig::Async,
+            current_lsn: None,
+            slot_name: None,
+            capabilities: Capabilities::default(),
+            auth: Some([0xAB; 32]),
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("171"), "decimal token byte leaked: {rendered}");
+        assert!(!rendered.to_lowercase().contains("ab"), "hex token leaked: {rendered}");
+        assert!(rendered.contains("<redacted>"), "missing redaction marker: {rendered}");
+    }
+
     #[test]
     fn test_wal_entry_payload() {
         let entry = WalEntryPayload {

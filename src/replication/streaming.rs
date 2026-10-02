@@ -1374,6 +1374,31 @@ mod tests {
         matches!(config.sync_mode, SyncModeConfig::Async);
     }
 
+    /// C2: server/client configs hold the token but never Debug-print its
+    /// decimal ("171") or hex ("ab") rendering.
+    #[test]
+    fn server_and_client_configs_redact_auth_token() {
+        let token = TransferToken::new([0xAB; 32]).unwrap();
+        let server = StreamingServerConfig {
+            auth: Some(token.clone()),
+            ..Default::default()
+        };
+        let client = StreamingClientConfig {
+            node_id: Uuid::nil(),
+            primary_addr: "127.0.0.1:5433".parse().unwrap(),
+            sync_mode: SyncModeConfig::Async,
+            connect_timeout: Duration::from_secs(1),
+            reconnect_delay: Duration::from_secs(1),
+            max_reconnect_attempts: 0,
+            auth: Some(token),
+        };
+        for rendered in [format!("{server:?}"), format!("{client:?}")] {
+            assert!(!rendered.contains("171"), "decimal token byte leaked: {rendered}");
+            assert!(!rendered.to_lowercase().contains("ab"), "hex token leaked: {rendered}");
+            assert!(rendered.contains("<redacted>"), "missing redaction marker: {rendered}");
+        }
+    }
+
     #[test]
     fn test_wal_entry_to_payload_conversion() {
         let entry = WalEntry {
