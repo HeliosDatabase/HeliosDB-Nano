@@ -44,6 +44,13 @@ worktree (`nano-history-guard-20260929`):
            └── physical-resync = guard + 21 files  raw checkpoint transfer + strict hydration (NON-SERVING)
 ```
 
+**Correction (2026-10-02):** the table counts only files each candidate *contains*, so it cannot show
+files a candidate *lacks*. `admission.patch` omits 7 files the guard carries (3 docs, 4 scripts — six of
+them also in the original `2f161df`; physical-resync omits one of the same docs). Expressing admission as
+a delta on the guard turned each omission into a deletion and the merge honoured it; the 7 were restored
+on the integration branch (`6d90ffa1`). The scaffold reproduced each patch faithfully, omissions included —
+nothing checked that the patches were complete. Admission is "guard **minus 7** plus 5", not "guard + 5".
+
 **The history guard is a fourth change set with no patch of its own.** It exists only embedded in two
 candidates. A tree built from the guard worktree (19 untracked source files + 20 tracked modifications,
 `docs/internal/` and build output excluded) reproduces every inherited file exactly: **admission 29/29,
@@ -124,10 +131,21 @@ discovery"), but `connection_loop` has **no probe exemption**: with `required_au
    **pre-existing stub** (base `9161383` lines 680/806) that only checks TCP connectivity, yet logs
    **"Standby … promoted successfully"** and emits a promotion event.
 
-No real split brain today — only because promotion is a stub. But an auth-enabled cluster gets continuous
-false alarms and then a **false promotion event**; any consumer that reroutes on it routes writes to a
-standby, the hazard this campaign forbids. native-auth's 9 auth tests never ran a watcher against an
-auth-enabled primary.
+No real split brain today — only because promotion is a stub. native-auth's 9 auth tests never ran a
+watcher against an auth-enabled primary.
+
+**Correction (2026-10-02, review of round 1): narrower than first stated.** `FailoverWatcher` is never
+constructed by the `heliosdb-nano` binary — at `9161383` or in the integration; its only reference outside
+its own file is the `pub use` re-export in `src/replication/mod.rs`, and `initiate_failover` /
+`send_promote_request` are reachable only from inside it [verified]. A cluster run from the CLI is
+therefore **not** affected. The defect is real for **embedders of the published crate** who construct the
+watcher themselves and enable native auth. The original sentence claiming an auth-enabled cluster gets
+false alarms and a false promotion event overstated it.
+
+**Strengthened in round 2 (C1):** presenting the token (`set_auth`) is necessary but not sufficient — an
+embedder who forgets it still gets false failures. A primary that answers "authentication required/failed"
+has proven it is alive, so an authentication rejection must never count as a failure or toward
+`failover_threshold`; it is reported as a configuration error instead.
 
 **Required:** the probe presents the configured credential, exactly like a standby. Not a server-side probe
 exemption — that would add an unauthenticated surface. Remove the misleading comment. Add a test: watcher
@@ -284,7 +302,10 @@ All heavy steps under `flock /home/gpc/HDB/sprint/coordination/build.lock` + `sy
 --collect -p MemoryMax=24G -p MemorySwapMax=0`, `CARGO_BUILD_JOBS=2`, own target directory; clean the local
 crate (`cargo clean --locked --package heliosdb-nano`) before the first build so no stale binary is reused.
 
-0. **Lineage scaffold** (pure history, no code change): new branch from `2f161df`. Commit the guard as its own
+0. **Lineage scaffold** (pure history, no code change; done by the reviewer, `integ-20261002/*`). Lesson
+   recorded for any rebuild: after encoding the ancestry, list every file present in ANY input and absent
+   from the merged result (`git ls-tree` union minus final) — an omission in one patch becomes a silent
+   deletion. Original instruction: new branch from `2f161df`. Commit the guard as its own
    reviewable commit — tracked diff of `nano-history-guard-20260929` against `9161383` plus its 19 untracked
    source files, excluding `docs/internal/` and build output; verify it reproduces admission's 29 and
    physical-resync's 31 inherited files byte-for-byte (§1). Then a commit whose tree is the applied
