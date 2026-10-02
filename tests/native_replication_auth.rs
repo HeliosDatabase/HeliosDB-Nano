@@ -15,6 +15,7 @@ use heliosdb_nano::replication::{
     streaming::{StreamingServer, StreamingServerConfig},
     transport::{Capabilities, HandshakeRequest, NodeRole, ReplicationConnection, SyncModeConfig},
     wal_store::{WalStore, WalStoreConfig},
+    FailoverConfig, FailoverWatcher, NodeHealth,
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::time::timeout;
@@ -412,5 +413,62 @@ async fn one_token_file_authenticates_native_and_physical_channels() {
     .unwrap();
     assert!(response.accepted, "native handshake must accept the token file bytes");
     let _ = conn.close().await;
+    stop(h).await;
+}
+
+/// R3: the failover health probe must present the configured token, exactly as a
+/// standby does. Against an auth-enabled primary it reports Healthy (no false
+/// failure, no false promotion); a wrong token is reported as failed rather than
+/// silently accepted, and a single failure does not reach the failover threshold.
+#[tokio::test]
+async fn health_probe_presents_the_configured_token() {
+    let _serial = SERIAL.lock().await;
+    let h = start_server(Some(token())).await;
+
+    // Correct token: an auth-enabled primary is Healthy, and no failover fires.
+    let primary_id = Uuid::new_v4();
+    let mut watcher = FailoverWatcher::new(
+        FailoverConfig::default(),
+        Uuid::new_v4(),
+        primary_id,
+        None,
+        vec![],
+    );
+    watcher.set_auth(Some(token()));
+    let healthy = watcher.check_health(primary_id, "127.0.0.1", h.addr.port()).await;
+    assert_eq!(
+        healthy.health,
+        NodeHealth::Healthy,
+        "auth-enabled primary must probe Healthy: {:?}",
+        healthy.error
+    );
+    assert!(!watcher.should_failover().await, "a healthy primary must not trigger failover");
+
+    // Wrong token: the probe is rejected and reported, not silently healthy.
+    let mut watcher = FailoverWatcher::new(
+        FailoverConfig::default(),
+        Uuid::new_v4(),
+        primary_id,
+        None,
+        vec![],
+    );
+    watcher.set_auth(Some(TransferToken::new([0x22; 32]).unwrap()));
+    let rejected = watcher.check_health(primary_id, "127.0.0.1", h.addr.port()).await;
+    assert_ne!(
+        rejected.health,
+        NodeHealth::Healthy,
+        "a wrong token must not look healthy"
+    );
+    assert!(
+        rejected.error.as_deref().unwrap_or("").contains("authentication failed"),
+        "wrong-token probe must name the rejection: {:?}",
+        rejected.error
+    );
+    watcher.record_failure(primary_id).await;
+    assert!(
+        !watcher.should_failover().await,
+        "one rejected probe is below the failover threshold"
+    );
+
     stop(h).await;
 }

@@ -17,6 +17,7 @@
 //! to perform a controlled promotion of the best standby candidate.
 
 use super::config::{FailoverConfig, NodeHealth, StandbyConfig};
+use super::physical_wire::TransferToken;
 use super::transport::{
     Capabilities, HandshakeRequest, HealthStatus, HeartbeatPayload, MessageType, NodeRole as TransportNodeRole,
     ReplicationConnection, SyncModeConfig,
@@ -116,6 +117,10 @@ pub struct FailoverWatcher {
     shutdown_tx: mpsc::Sender<()>,
     /// Shutdown receiver (for health check task)
     shutdown_rx: Arc<RwLock<Option<mpsc::Receiver<()>>>>,
+    /// Replication token presented on health probes. Must match the primary's
+    /// configured token (the same file as a real standby uses) or an
+    /// auth-enabled primary rejects every probe as unauthenticated.
+    auth: Option<TransferToken>,
 }
 
 impl FailoverWatcher {
@@ -144,12 +149,20 @@ impl FailoverWatcher {
             is_running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
             shutdown_rx: Arc::new(RwLock::new(Some(shutdown_rx))),
+            auth: None,
         }
     }
 
     /// Create a failover watcher with minimal configuration (for backward compatibility)
     pub fn new_simple(config: FailoverConfig, primary_id: Uuid, standbys: Vec<StandbyConfig>) -> Self {
         Self::new(config, Uuid::new_v4(), primary_id, None, standbys)
+    }
+
+    /// Present the configured replication token on health probes, exactly as a
+    /// standby does. Without this an auth-enabled primary rejects every probe
+    /// and the watcher reports a healthy primary as failed.
+    pub fn set_auth(&mut self, auth: Option<TransferToken>) {
+        self.auth = auth;
     }
 
     /// Set the primary address for health checks
@@ -212,6 +225,7 @@ impl FailoverWatcher {
         let is_running = Arc::clone(&self.is_running);
         let event_tx = self.event_tx.clone();
         let standbys = self.standbys.clone();
+        let auth = self.auth.clone();
 
         // Spawn the health check loop
         tokio::spawn(async move {
@@ -234,6 +248,7 @@ impl FailoverWatcher {
                                 primary_id,
                                 addr,
                                 Duration::from_secs(5),
+                                auth.as_ref().map(TransferToken::wire_bytes),
                             ).await;
 
                             // Store result
@@ -321,6 +336,7 @@ impl FailoverWatcher {
                                     standby.node_id,
                                     addr,
                                     Duration::from_secs(5),
+                                    auth.as_ref().map(TransferToken::wire_bytes),
                                 ).await;
                                 health_states.write().await.insert(standby.node_id, result);
                             }
@@ -372,12 +388,13 @@ impl FailoverWatcher {
         target_node_id: Uuid,
         addr: SocketAddr,
         timeout: Duration,
+        auth: Option<[u8; 32]>,
     ) -> HealthCheckResult {
         let start = Instant::now();
 
         // Attempt TCP connection with timeout
         let result = tokio::time::timeout(timeout, async {
-            Self::do_health_check(this_node_id, target_node_id, addr).await
+            Self::do_health_check(this_node_id, target_node_id, addr, auth).await
         })
         .await;
 
@@ -416,11 +433,15 @@ impl FailoverWatcher {
         this_node_id: Uuid,
         target_node_id: Uuid,
         addr: SocketAddr,
+        auth: Option<[u8; 32]>,
     ) -> Result<(NodeHealth, Option<Lsn>)> {
         // Try to connect
         let mut conn = ReplicationConnection::connect(addr, Duration::from_secs(5)).await?;
 
-        // Send handshake request
+        // Send handshake request. The probe presents the configured token exactly
+        // like a standby: an auth-enabled primary answers `accepted: false` to an
+        // unauthenticated probe, which the watcher would otherwise misread as a
+        // failed (or, past the threshold, a promotable) primary.
         let handshake_req = HandshakeRequest {
             node_id: this_node_id,
             role: TransportNodeRole::Standby,
@@ -429,9 +450,7 @@ impl FailoverWatcher {
             slot_name: None,
             capabilities: Capabilities::all(),
             expected_history: None,
-            // Health probes are unauthenticated liveness/failover discovery.
-            // They never carry row data or register a replication standby.
-            auth: None,
+            auth,
         };
 
         let handshake_response = conn.handshake_client(handshake_req).await?;
@@ -526,7 +545,14 @@ impl FailoverWatcher {
             }
         };
 
-        let result = Self::perform_health_check(self.node_id, node_id, addr, Duration::from_secs(5)).await;
+        let result = Self::perform_health_check(
+            self.node_id,
+            node_id,
+            addr,
+            Duration::from_secs(5),
+            self.auth.as_ref().map(TransferToken::wire_bytes),
+        )
+        .await;
 
         // Update stored state
         self.health_states.write().await.insert(node_id, result.clone());
