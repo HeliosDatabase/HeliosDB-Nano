@@ -413,6 +413,11 @@ role = "standalone" # standalone | primary | standby | observer
 # "port" is accepted as an alias; do not specify both names.
 replication_port = 5433
 
+# Standby DNS + initial history verification budget, 1..=3600 seconds.
+# CLI --replication-startup-timeout-secs overrides this value.
+# Daemon parent allows this budget plus its usual 5-second startup allowance.
+startup_timeout_secs = 30
+
 # Required when the effective role is standby. Use a native WAL
 # endpoint: DNS:port, IPv4:port, or [IPv6]:port; ports must be nonzero.
 # primary_host = "primary.example:5433"

@@ -2458,6 +2458,18 @@ where
                     || starts_with_icase(trimmed, "TRUNCATE");
 
                 if is_write {
+                    if ha_state().forwarding_disabled() {
+                        self.send_error(
+                            "ERROR",
+                            "25006",
+                            "transparent forwarding is disabled for a history-guarded standby",
+                            None,
+                            Some("Connect directly to the primary for write operations.".to_string()),
+                        )
+                        .await?;
+                        self.send_ready_for_query().await?;
+                        return Ok(());
+                    }
                     // Check sync mode - only forward in Sync or SemiSync mode
                     let config = ha_state().get_config();
                     let sync_mode = config.as_ref().map(|c| c.sync_mode).unwrap_or(SyncMode::Async);

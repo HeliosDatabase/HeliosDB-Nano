@@ -26,7 +26,15 @@ struct Server {
 
 impl Server {
     fn start(pg_port: u16, args: &[&str], config: Option<&str>) -> Self {
+        Self::start_with_existing_data(pg_port, args, config, false)
+    }
+
+    fn start_with_existing_data(pg_port: u16, args: &[&str], config: Option<&str>, existing: bool) -> Self {
         let fixture = tempfile::tempdir().unwrap();
+        if existing {
+            fs::create_dir(fixture.path().join("data")).unwrap();
+            fs::write(fixture.path().join("data/sentinel"), b"existing unbound state").unwrap();
+        }
         let mut command = Command::new(env!("CARGO_BIN_EXE_heliosdb-nano"));
         command
             .current_dir(fixture.path())
@@ -152,6 +160,10 @@ fn health(address: SocketAddr) {
 }
 
 fn trust_session(port: u16) {
+    let _ = trust_connection(port);
+}
+
+fn trust_connection(port: u16) -> TcpStream {
     let mut stream =
         TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_secs(3)).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -173,7 +185,7 @@ fn trust_session(port: u16) {
             assert_eq!(payload, [0, 0, 0, 0], "trust unexpectedly challenged for credentials");
         }
         if header[0] == b'Z' {
-            return;
+            return stream;
         }
     }
     panic!("no ReadyForQuery received");
@@ -417,4 +429,257 @@ fn unrelated_pg_listener_cannot_satisfy_daemon_readiness() {
     );
     server.assert_failure();
     assert!(!server.fixture.path().join("owned.pid").exists());
+}
+
+#[test]
+#[cfg(feature = "ha-tier1")]
+fn guarded_standby_refuses_existing_unbound_data_before_database_open() {
+    let pg = reserve("127.0.0.1");
+    let port = pg.local_addr().unwrap().port();
+    drop(pg);
+    let mut server = Server::start_with_existing_data(
+        port,
+        &[
+            "--http-port",
+            "0",
+            "--replication-role",
+            "standby",
+            "--primary-host",
+            "127.0.0.1:1",
+        ],
+        None,
+        true,
+    );
+    server.assert_failure();
+    assert!(
+        server.logs().contains("Cannot prepare standby history"),
+        "{}",
+        server.logs()
+    );
+    let data = server.fixture.path().join("data");
+    assert_eq!(fs::read(data.join("sentinel")).unwrap(), b"existing unbound state");
+    assert_eq!(
+        fs::read_dir(data).unwrap().count(),
+        1,
+        "refusal must not open RocksDB or add metadata"
+    );
+}
+
+#[test]
+#[cfg(feature = "ha-tier1")]
+fn guarded_standby_rejects_mysql_before_creating_data() {
+    for extra in [vec!["--mysql"], vec!["--mysql-socket", "owned-mysql.sock"]] {
+        let pg = reserve("127.0.0.1");
+        let port = pg.local_addr().unwrap().port();
+        drop(pg);
+        let mut args = vec![
+            "--http-port",
+            "0",
+            "--replication-role",
+            "standby",
+            "--primary-host",
+            "127.0.0.1:1",
+        ];
+        args.extend(extra);
+        let mut server = Server::start(port, &args, None);
+        server.assert_failure();
+        assert!(
+            server.logs().contains("history-guarded standby does not support MySQL"),
+            "{}",
+            server.logs()
+        );
+        assert!(!server.fixture.path().join("data").exists());
+        assert!(!server.fixture.path().join("owned-mysql.sock").exists());
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+fn simple_query_error(stream: &mut TcpStream, sql: &str) -> Option<String> {
+    let mut query = vec![b'Q'];
+    query.extend_from_slice(&((sql.len() + 5) as u32).to_be_bytes());
+    query.extend_from_slice(sql.as_bytes());
+    query.push(0);
+    stream.write_all(&query).unwrap();
+    let mut error = None;
+    for _ in 0..128 {
+        let mut header = [0u8; 5];
+        stream.read_exact(&mut header).unwrap();
+        let size = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+        assert!((4..=65536).contains(&size));
+        let mut payload = vec![0; size - 4];
+        stream.read_exact(&mut payload).unwrap();
+        if header[0] == b'E' {
+            error = Some(String::from_utf8_lossy(&payload).into_owned());
+        }
+        if header[0] == b'Z' {
+            return error;
+        }
+    }
+    panic!("query did not finish");
+}
+
+#[test]
+#[cfg(feature = "ha-tier1")]
+fn guarded_standby_verifies_history_and_refuses_transparent_forwarding_in_every_mode() {
+    let primary_pg = reserve("127.0.0.1");
+    let primary_repl = reserve("127.0.0.1");
+    let pg_port = primary_pg.local_addr().unwrap().port();
+    let repl_port = primary_repl.local_addr().unwrap().port();
+    drop((primary_pg, primary_repl));
+    let mut primary = Server::start(
+        pg_port,
+        &[
+            "--http-port",
+            "0",
+            "--replication-role",
+            "primary",
+            "--replication-port",
+            &repl_port.to_string(),
+        ],
+        None,
+    );
+    primary.wait_ready();
+    let mut source = trust_connection(pg_port);
+    assert!(simple_query_error(&mut source, "CREATE TABLE forwarding_guard (id INT PRIMARY KEY)").is_none());
+    for mode in ["async", "semi-sync", "sync"] {
+        let standby_pg = reserve("127.0.0.1");
+        let standby_repl = reserve("127.0.0.1");
+        let port = standby_pg.local_addr().unwrap().port();
+        let native_port = standby_repl.local_addr().unwrap().port();
+        drop((standby_pg, standby_repl));
+        let mut standby = Server::start(
+            port,
+            &[
+                "--http-port",
+                "0",
+                "--replication-role",
+                "standby",
+                "--replication-port",
+                &native_port.to_string(),
+                "--primary-host",
+                &format!("127.0.0.1:{repl_port}"),
+                "--sync-mode",
+                mode,
+            ],
+            None,
+        );
+        standby.wait_ready();
+        assert!(
+            standby.logs().contains("Standby dataset history verified"),
+            "{}",
+            standby.logs()
+        );
+        let mut client = trust_connection(port);
+        let error = simple_query_error(&mut client, "INSERT INTO forwarding_guard VALUES (1)")
+            .expect("guarded standby must refuse transparent writes");
+        assert!(
+            error.contains("25006") && error.contains("transparent forwarding is disabled"),
+            "{mode}: {error}"
+        );
+    }
+    // The guarded requests never reached the source PG endpoint.
+    assert!(simple_query_error(&mut source, "INSERT INTO forwarding_guard VALUES (1)").is_none());
+}
+
+#[test]
+#[cfg(feature = "ha-tier1")]
+fn replication_startup_timeout_cli_overrides_file_including_default_value() {
+    for (configured, cli, expected) in [(7, None, 7), (2, Some("30"), 30)] {
+        let pg = reserve("127.0.0.1");
+        let native = reserve("127.0.0.1");
+        let port = pg.local_addr().unwrap().port();
+        let config = format!(
+            "[replication]\nrole='primary'\nreplication_port={}\nstartup_timeout_secs={configured}\n",
+            native.local_addr().unwrap().port()
+        );
+        drop((pg, native));
+        let mut args = vec!["--http-port", "0"];
+        if let Some(value) = cli {
+            args.extend(["--replication-startup-timeout-secs", value]);
+        }
+        let mut server = Server::start(port, &args, Some(&config));
+        server.wait_ready();
+        assert!(
+            server.logs().contains(&format!("History startup timeout: {expected}s")),
+            "{}",
+            server.logs()
+        );
+    }
+}
+
+#[test]
+fn replication_startup_timeout_rejects_out_of_range_before_data_creation() {
+    for value in ["0", "3601"] {
+        for via_cli in [false, true] {
+            let pg = reserve("127.0.0.1");
+            let port = pg.local_addr().unwrap().port();
+            drop(pg);
+            let config = format!("[replication]\nstartup_timeout_secs={value}\n");
+            let mut args = vec!["--http-port", "0"];
+            if via_cli {
+                args.extend(["--replication-startup-timeout-secs", value]);
+            }
+            let mut server = Server::start(port, &args, if via_cli { None } else { Some(&config) });
+            server.assert_failure();
+            assert!(
+                server
+                    .logs()
+                    .contains("startup_timeout_secs must be between 1 and 3600"),
+                "{}",
+                server.logs()
+            );
+            assert!(!server.fixture.path().join("data").exists());
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "ha-tier1")]
+fn standby_small_timeout_bounds_verification_and_survives_daemon_reexec() {
+    for daemon in [false, true] {
+        // Own an idle endpoint that accepts TCP into its backlog but never sends
+        // a handshake. This deterministically exercises the history startup budget.
+        let peer = reserve("127.0.0.1");
+        let pg = reserve("127.0.0.1");
+        let port = pg.local_addr().unwrap().port();
+        let endpoint = peer.local_addr().unwrap().to_string();
+        drop(pg);
+        let mut args = vec![
+            "--http-port",
+            "0",
+            "--replication-role",
+            "standby",
+            "--primary-host",
+            &endpoint,
+            "--replication-startup-timeout-secs",
+            "1",
+        ];
+        if daemon {
+            args.push("--daemon");
+        }
+        // Without forwarding the explicit CLI override, the daemon child would
+        // retain 45s and be killed by its parent, rather than fail its own 1s budget.
+        let mut server = Server::start(port, &args, Some("[replication]\nstartup_timeout_secs=45\n"));
+        server.assert_failure();
+        if daemon {
+            assert!(
+                server.logs().contains("Daemon worker exited at startup"),
+                "{}",
+                server.logs()
+            );
+            assert!(
+                !server.logs().contains("Daemon did not acknowledge"),
+                "{}",
+                server.logs()
+            );
+        } else {
+            assert!(
+                server
+                    .logs()
+                    .contains("did not verify primary dataset history within 1s"),
+                "{}",
+                server.logs()
+            );
+        }
+    }
 }

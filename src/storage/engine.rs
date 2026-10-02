@@ -8353,15 +8353,13 @@ impl StorageEngine {
         // Coerce the PK value to match the actual PK column type so that the ART
         // key encoding is identical to the one produced at INSERT time.  Without
         // this, e.g. Int4(1) encodes as 4 bytes while the stored Int8(1) uses 8.
+        let pk_column =
+            schema.and_then(|schema| schema.columns.iter().enumerate().find(|(_, column)| column.primary_key));
         let coerced: crate::Value;
         let effective_pk = if coerce_pk_value {
-            if let Some(s) = schema {
-                if let Some(pk_col) = s.columns.iter().find(|c| c.primary_key) {
-                    coerced = Self::coerce_pk_value(pk_value, &pk_col.data_type);
-                    &coerced
-                } else {
-                    pk_value
-                }
+            if let Some((_, column)) = pk_column {
+                coerced = Self::coerce_pk_value(pk_value, &column.data_type);
+                &coerced
             } else {
                 pk_value
             }
@@ -8393,6 +8391,11 @@ impl StorageEngine {
 
         // Check row cache before going to storage
         if let Some(cached) = self.row_cache.get(table_name, row_id) {
+            if let (Some(schema), Some((index, _))) = (schema, pk_column) {
+                if self.pk_probe_is_misdirected(&cached, schema, index, effective_pk, &key) {
+                    return self.scan_actual_pk_owner(table_name, schema, index, effective_pk, &key);
+                }
+            }
             if trace_lookup {
                 tracing::debug!(
                     phase = "index_lookup",
@@ -8470,6 +8473,12 @@ impl StorageEngine {
             }
         }
 
+        if let (Some(schema), Some((index, _))) = (schema, pk_column) {
+            if self.pk_probe_is_misdirected(&tuple, schema, index, effective_pk, &key) {
+                return self.scan_actual_pk_owner(table_name, schema, index, effective_pk, &key);
+            }
+        }
+
         // Populate row cache with resolved tuple for read lookups. Write paths
         // skip this because they immediately invalidate the same row.
         if populate_cache_on_miss {
@@ -8496,6 +8505,55 @@ impl StorageEngine {
         }
 
         Ok(Some(tuple))
+    }
+
+    /// A tentative ART claim may resolve to a row with another key until its
+    /// storage batch publishes. Validate the known scalar probe before either
+    /// returning that tuple or admitting it to the row cache. Composite and
+    /// non-main branch lookups retain their existing separate contracts.
+    fn pk_probe_is_misdirected(
+        &self,
+        tuple: &Tuple,
+        schema: &crate::Schema,
+        index: usize,
+        effective_pk: &crate::Value,
+        encoded_key: &[u8],
+    ) -> bool {
+        if Self::tuple_has_probed_pk(tuple, index, effective_pk, encoded_key) {
+            return false;
+        }
+        if schema.columns.iter().skip(index + 1).any(|column| column.primary_key) {
+            return false;
+        }
+        self.current_branch
+            .lock()
+            .as_deref()
+            .is_none_or(|branch| branch == "main")
+    }
+
+    fn tuple_has_probed_pk(tuple: &Tuple, index: usize, effective_pk: &crate::Value, encoded_key: &[u8]) -> bool {
+        tuple.values.get(index).is_some_and(|value| {
+            value == effective_pk
+                || super::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(value)) == encoded_key
+        })
+    }
+
+    /// A mismatch is not proof of absence: another durable row may own the
+    /// requested key. The rare fallback reads canonical row storage and resolves
+    /// side references/TDE through the existing scanner. It neither evicts a
+    /// valid decoy cache entry nor fills the cache from an untrusted index hit.
+    fn scan_actual_pk_owner(
+        &self,
+        table: &str,
+        schema: &crate::Schema,
+        index: usize,
+        effective_pk: &crate::Value,
+        encoded_key: &[u8],
+    ) -> Result<Option<Tuple>> {
+        Ok(self
+            .scan_table_with_schema(table, schema)?
+            .into_iter()
+            .find(|tuple| Self::tuple_has_probed_pk(tuple, index, effective_pk, encoded_key)))
     }
 
     /// Coerce a PK lookup value to the target column type so that the ART key

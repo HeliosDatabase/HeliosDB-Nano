@@ -352,6 +352,8 @@ pub struct ReplicationConfig {
     /// Native replication listener port, separate from PostgreSQL and HTTP.
     #[serde(alias = "port")]
     pub replication_port: u16,
+    /// Initial standby history verification window, including DNS, in seconds (1..=3600).
+    pub startup_timeout_secs: u64,
     /// Primary native replication endpoint, required for standby startup.
     pub primary_host: Option<String>,
     /// Standby native replication endpoints.
@@ -369,6 +371,7 @@ impl Default for ReplicationConfig {
         Self {
             role: "standalone".to_string(),
             replication_port: 5433,
+            startup_timeout_secs: 30,
             primary_host: None,
             standby_hosts: Vec::new(),
             observer_hosts: Vec::new(),
@@ -395,6 +398,11 @@ impl ReplicationConfig {
         ) {
             return Err(crate::Error::config(
                 "replication.sync_mode must be async, semi-sync, or sync",
+            ));
+        }
+        if !(1..=3600).contains(&self.startup_timeout_secs) {
+            return Err(crate::Error::config(
+                "replication.startup_timeout_secs must be between 1 and 3600 seconds",
             ));
         }
         if self.replication_port == 0 {
@@ -2330,6 +2338,7 @@ mod tests {
         let config = Config::from_toml_str("").unwrap();
         assert_eq!(config.replication.role, "standalone");
         assert_eq!(config.replication.replication_port, 5433);
+        assert_eq!(config.replication.startup_timeout_secs, 30);
         assert_eq!(config.replication.sync_mode, "async");
         assert!(config.replication.primary_host.is_none());
         assert!(config.replication.standby_hosts.is_empty());
@@ -2345,6 +2354,7 @@ mod tests {
             [replication]
             role = "primary"
             replication_port = 6433
+            startup_timeout_secs = 17
             primary_host = "primary.example:6433"
             standby_hosts = ["10.0.0.2:6433", "[::1]:6433"]
             observer_hosts = ["observer.example:7433"]
@@ -2358,6 +2368,7 @@ mod tests {
         let decoded = Config::from_toml_str(&encoded).unwrap();
         assert_eq!(decoded.replication.role, "primary");
         assert_eq!(decoded.replication.replication_port, 6433);
+        assert_eq!(decoded.replication.startup_timeout_secs, 17);
         assert_eq!(
             decoded.replication.primary_host.as_deref(),
             Some("primary.example:6433")
@@ -2391,6 +2402,8 @@ mod tests {
             "role = 'primray'",
             "sync_mode = 'eventual'",
             "replication_port = 0",
+            "startup_timeout_secs = 0",
+            "startup_timeout_secs = 3601",
             "node_id = 'not-a-uuid'",
             "primary_host = 'localhost'",
             "standby_hosts = ['localhost:0']",
@@ -2402,6 +2415,17 @@ mod tests {
         // Role requirements apply to the effective configuration, after CLI overrides.
         let config = Config::from_toml_str("[replication]\nrole = 'standby'\nsync_mode = 'SEMISYNC'").unwrap();
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn replication_startup_timeout_accepts_bounds_and_rejects_non_integer_values() {
+        for timeout in [1, 30, 3600] {
+            let config = Config::from_toml_str(&format!("[replication]\nstartup_timeout_secs = {timeout}")).unwrap();
+            config.validate().unwrap();
+        }
+        for timeout in ["-1", "1.5", "nan", "inf", "'30'", "18446744073709551616"] {
+            assert!(Config::from_toml_str(&format!("[replication]\nstartup_timeout_secs = {timeout}")).is_err());
+        }
     }
 
     #[test]

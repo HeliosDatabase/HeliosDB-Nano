@@ -428,6 +428,7 @@ impl FailoverWatcher {
             current_lsn: None,
             slot_name: None,
             capabilities: Capabilities::all(),
+            expected_history: None,
         };
 
         let handshake_response = conn.handshake_client(handshake_req).await?;

@@ -57,6 +57,10 @@ writes on the assumption that this helper made HA safe. A physical copy preserve
 internal row keys, index data, RocksDB WAL and metadata as one stopped state; a
 logical dump is not an interchangeable native replication baseline.
 
+The [native history guard](replication-history-guard.md) now refuses unrelated
+history and unbound pre-existing receiver paths. This helper deliberately does
+not manufacture a receiver binding or authorize its output for streaming.
+
 ## What blocks an online standby rebuild
 
 At the campaign base `916138311c69f1cde070fb3d53fc601e22cc0a06`:

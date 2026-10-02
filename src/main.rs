@@ -19,6 +19,7 @@ use tracing::info;
 struct HAConfig {
     role: String,
     replication_port: u16,
+    startup_timeout_secs: u64,
     primary_host: Option<String>,
     standby_hosts: Option<String>,
     observer_hosts: Option<String>,
@@ -29,6 +30,15 @@ struct HAConfig {
     allow_remote_mcp: bool,
     allow_insecure_trust: bool,
     node_id: Option<String>,
+}
+
+/// Standbys receive their full verification window plus the ordinary startup allowance.
+fn daemon_readiness_timeout(role: &str, replication_startup_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(if role.eq_ignore_ascii_case("standby") {
+        replication_startup_secs.saturating_add(5)
+    } else {
+        5
+    })
 }
 
 /// Literal addresses only, with explicit port taking precedence over socket suffix.
@@ -282,6 +292,10 @@ enum Commands {
         /// Replication port for WAL streaming (default: 5433)
         #[arg(long)]
         replication_port: Option<u16>,
+
+        /// Standby initial history verification timeout in seconds (1..=3600; default: 30)
+        #[arg(long)]
+        replication_startup_timeout_secs: Option<u64>,
 
         /// Primary host for standbys to connect to (host:port)
         #[arg(long)]
@@ -593,6 +607,7 @@ async fn main() -> Result<()> {
             password,
             replication_role,
             replication_port,
+            replication_startup_timeout_secs,
             primary_host,
             standby_hosts,
             observer_hosts,
@@ -671,6 +686,9 @@ async fn main() -> Result<()> {
             if let Some(value) = replication_port {
                 replication.replication_port = value;
             }
+            if let Some(value) = replication_startup_timeout_secs {
+                replication.startup_timeout_secs = value;
+            }
             if let Some(value) = primary_host {
                 replication.primary_host = Some(value);
             }
@@ -705,6 +723,7 @@ async fn main() -> Result<()> {
             let ha_config = HAConfig {
                 role: replication.role,
                 replication_port: replication.replication_port,
+                startup_timeout_secs: replication.startup_timeout_secs,
                 primary_host: replication.primary_host,
                 standby_hosts: Some(replication.standby_hosts.join(",")),
                 observer_hosts: Some(replication.observer_hosts.join(",")),
@@ -926,6 +945,12 @@ async fn start_server(
     use std::time::Instant;
 
     let startup_time = Instant::now();
+    let guarded_standby = ha_config.role.eq_ignore_ascii_case("standby");
+    if guarded_standby && (mysql_enabled || mysql_socket.is_some()) {
+        return Err(Error::config(
+            "history-guarded standby does not support MySQL listeners; remove --mysql/--mysql-socket and connect to the primary for writes",
+        ));
+    }
 
     // Print startup banner
     println!();
@@ -947,6 +972,7 @@ async fn start_server(
     db_config.replication = heliosdb_nano::config::ReplicationConfig {
         role: ha_config.role.clone(),
         replication_port: ha_config.replication_port,
+        startup_timeout_secs: ha_config.startup_timeout_secs,
         primary_host: ha_config.primary_host.clone(),
         standby_hosts: split_hosts(ha_config.standby_hosts.as_deref().unwrap_or("")),
         observer_hosts: split_hosts(ha_config.observer_hosts.as_deref().unwrap_or("")),
@@ -994,6 +1020,22 @@ async fn start_server(
     // have no access to it — which is part of why `[api]` was a dead config
     // section: nothing downstream of this point could read it.
     let api_config = db_config.api.clone();
+
+    // Claim/validate receiver history BEFORE opening RocksDB. Existing unbound
+    // directories are never silently adopted as a live replication receiver.
+    #[cfg(feature = "ha-tier1")]
+    let receiver_history = if ha_config.role.eq_ignore_ascii_case("standby") {
+        use heliosdb_nano::replication::history::{prepare_receiver_history, ReceiverHistory};
+        heliosdb_nano::replication::ha_state::ha_state().disable_forwarding();
+        Some(Arc::new(if memory_mode {
+            ReceiverHistory::in_memory()
+        } else {
+            prepare_receiver_history(&data_dir)
+                .map_err(|error| Error::config(format!("Cannot prepare standby history: {error}")))?
+        }))
+    } else {
+        None
+    };
 
     // Open database (in-memory mode avoids disk I/O for all operations)
     let db = if memory_mode {
@@ -1096,6 +1138,7 @@ async fn start_server(
     if ha_role != "standalone" {
         println!("      - Replication role: {}", ha_config.role);
         println!("      - Replication port: {}", ha_config.replication_port);
+        println!("      - History startup timeout: {}s", ha_config.startup_timeout_secs);
         println!("      - Sync mode: {}", ha_config.sync_mode);
         if let Some(ref primary) = ha_config.primary_host {
             println!("      - Primary host: {primary}");
@@ -1154,12 +1197,13 @@ async fn start_server(
 
     // Start HA components if enabled
     #[cfg(feature = "ha-tier1")]
-    let _ha_handles = if ha_role != "standalone" {
+    let mut ha_handles = if ha_role != "standalone" {
         start_ha_components(
             &ha_config,
             &pg_addr.ip().to_string(),
             pg_addr.port(),
             db.storage.clone(),
+            receiver_history,
         )
         .await?
     } else {
@@ -1193,16 +1237,21 @@ async fn start_server(
         let http_addr = parse_listen_address(http_listen, Some(ha_config.http_port), 8080)?;
         match tokio::net::TcpListener::bind(http_addr).await {
             Ok(listener) => {
-                info!(
-                    "HTTP endpoint at http://{http_addr} (/health, /version, /docs, /rest/v1, /auth/v1, /realtime/v1)"
-                );
+                info!("HTTP endpoint at http://{http_addr} (history-guarded standby health-only: {guarded_standby})");
                 let http_db = Arc::clone(&db);
                 let mcp_token = ha_config.mcp_token.clone();
                 let allow_remote_mcp = ha_config.allow_remote_mcp;
                 let http_api_config = api_config.clone();
                 Some(tokio::spawn(async move {
-                    if let Err(e) =
-                        run_http_listener(listener, http_db, mcp_token, allow_remote_mcp, http_api_config).await
+                    if let Err(e) = run_http_listener(
+                        listener,
+                        http_db,
+                        mcp_token,
+                        allow_remote_mcp,
+                        http_api_config,
+                        guarded_standby,
+                    )
+                    .await
                     {
                         tracing::error!("HTTP server accept loop exited: {e}");
                     }
@@ -1442,6 +1491,18 @@ async fn start_server(
         ));
     }
 
+    #[cfg(feature = "ha-tier1")]
+    if let Err(error) = ha_handles.ensure_running().await {
+        for handle in [&http_handle, &mysql_handle, &mysql_unix_handle, &pg_unix_handle]
+            .into_iter()
+            .flatten()
+        {
+            handle.abort();
+        }
+        ha_handles.shutdown().await;
+        return Err(error);
+    }
+
     // Daemon parents must observe completion of this child's startup, not
     // merely a successful TCP connect to a prebound socket or another process.
     if let Some(path) = std::env::var_os("HELIOSDB_NANO_READY_FILE") {
@@ -1503,50 +1564,49 @@ async fn start_server(
     // Start server with graceful shutdown handling. The health
     // server runs in its own detached task (see above) so a failure
     // there cannot tear the database listener down.
-    tokio::select! {
-        result = pg_server.serve_with_listener(pg_listener) => {
-            // Server stopped (error or normal shutdown)
-            if let Err(ref e) = result {
-                tracing::error!("Server error: {e}");
-            }
-            result?;
+    let server_result: Result<()> = tokio::select! {
+        biased;
+        error = async {
+            #[cfg(feature = "ha-tier1")]
+            { ha_handles.failure().await }
+            #[cfg(not(feature = "ha-tier1"))]
+            { std::future::pending::<Error>().await }
+        } => {
+            tracing::error!("Replication stopped; closing database listeners: {error}");
+            Err(error)
         }
-        // SIGINT *and* SIGTERM. Awaiting only `ctrl_c()` here left SIGTERM on
-        // its default Unix disposition — immediate termination, no `Drop`, so
-        // none of `EmbeddedDatabase::drop`'s ordered close-time work (row
-        // counters, then the R4.2 index-snapshot checkpoint) ran under any
-        // service manager, nor under this binary's own `stop` subcommand,
-        // which sends `kill -TERM`. See `heliosdb_nano::wait_for_shutdown_signal`.
+        result = pg_server.serve_with_listener(pg_listener) => result,
         signal = heliosdb_nano::wait_for_shutdown_signal() => {
             println!();
             println!("{}", "Received shutdown signal...".yellow());
             tracing::info!("{signal} received — running clean shutdown");
-            // Abort the HTTP accept loop first: it is the one listener task
-            // holding an `Arc<EmbeddedDatabase>` clone, so until it is gone
-            // the refcount cannot reach zero and `Drop` cannot run.
-            if let Some(h) = http_handle {
-                h.abort();
-            }
-            if let Some(h) = mysql_handle {
-                h.abort();
-            }
-            if let Some(h) = mysql_unix_handle {
-                h.abort();
-            }
-            if let Some(h) = pg_unix_handle {
-                h.abort();
-            }
-            // Best-effort unlink of Unix socket files on shutdown.
-            #[cfg(unix)]
-            {
-                if let Some(ref p) = mysql_socket { let _ = std::fs::remove_file(p); }
-                if let Some(ref d) = pg_socket_dir {
-                    let p = d.join(format!(".s.PGSQL.{}", port));
-                    let _ = std::fs::remove_file(p);
-                }
-            }
+            Ok(())
+        }
+    };
+
+    // A terminal history failure must leave no detached listener serving this
+    // receiver. The TCP accept future above is dropped by select; auxiliary
+    // accept loops are explicitly aborted on every shutdown/error path.
+    for handle in [http_handle, mysql_handle, mysql_unix_handle, pg_unix_handle]
+        .into_iter()
+        .flatten()
+    {
+        handle.abort();
+        let _ = handle.await;
+    }
+    #[cfg(feature = "ha-tier1")]
+    ha_handles.shutdown().await;
+    #[cfg(unix)]
+    {
+        if let Some(ref path) = mysql_socket {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(ref directory) = pg_socket_dir {
+            let _ = std::fs::remove_file(directory.join(format!(".s.PGSQL.{port}")));
         }
     }
+    // Do not prolong a poisoned receiver's process lifetime with shutdown dumps.
+    server_result?;
 
     // Perform dump on shutdown if enabled
     if dump_on_shutdown {
@@ -1815,6 +1875,8 @@ async fn start_server_daemon(
     args.push(ha_config.role.clone());
     args.push("--replication-port".to_string());
     args.push(ha_config.replication_port.to_string());
+    args.push("--replication-startup-timeout-secs".to_string());
+    args.push(ha_config.startup_timeout_secs.to_string());
     args.push("--sync-mode".to_string());
     args.push(ha_config.sync_mode.clone());
     args.push("--http-port".to_string());
@@ -1867,7 +1929,8 @@ async fn start_server_daemon(
         let pid = child.id();
 
         // Only this child's explicit acknowledgment establishes readiness.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let readiness_timeout = daemon_readiness_timeout(&ha_config.role, ha_config.startup_timeout_secs);
+        let deadline = std::time::Instant::now() + readiness_timeout;
         loop {
             // Did the child exit prematurely?
             match child.try_wait() {
@@ -1893,7 +1956,7 @@ async fn start_server_daemon(
                 let _ = child.wait();
                 let _ = std::fs::remove_file(&pid_file);
                 return Err(Error::io(format!(
-                    "Daemon did not acknowledge listener readiness within 5s. Run in the foreground to inspect configuration and listener errors."
+                    "Daemon did not acknowledge listener readiness within {}s. Run in the foreground to inspect configuration and listener errors.", readiness_timeout.as_secs()
                 )));
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -2076,13 +2139,125 @@ fn check_server_status(pid_file: &PathBuf) -> Result<()> {
 
 // ========== HA Helper Functions ==========
 
-/// Handles for HA components
-#[allow(dead_code)]
+/// Owned HA tasks. A transport or applicator failure ends CLI serving.
+#[cfg(feature = "ha-tier1")]
 #[derive(Default)]
 struct HAHandles {
-    #[allow(dead_code)]
-    replication_handle: Option<tokio::task::JoinHandle<()>>,
-    ephemeral_wal: Option<tempfile::TempDir>,
+    replication_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    forwarding_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    applicator: Option<std::sync::Arc<heliosdb_nano::replication::wal_applicator::WalApplicator>>,
+    client_status: Option<tokio::sync::watch::Receiver<heliosdb_nano::replication::streaming::StreamingClientStatus>>,
+    _ephemeral_wal: Option<tempfile::TempDir>,
+}
+
+#[cfg(feature = "ha-tier1")]
+impl HAHandles {
+    fn status_error(&self) -> Option<Error> {
+        use heliosdb_nano::replication::streaming::StreamingClientStatus;
+        match self.client_status.as_ref().map(|status| status.borrow().clone()) {
+            Some(StreamingClientStatus::Failed { error }) => Some(Error::network(format!(
+                "Replication history verification failed: {error}"
+            ))),
+            Some(StreamingClientStatus::Stopped) => Some(Error::network("Replication client stopped")),
+            _ => None,
+        }
+    }
+
+    async fn ensure_running(&mut self) -> Result<()> {
+        if let Some(error) = self.status_error() {
+            return Err(error);
+        }
+        if self.replication_handle.as_ref().is_some_and(|task| task.is_finished())
+            || self.forwarding_handle.as_ref().is_some_and(|task| task.is_finished())
+        {
+            return Err(self.failure().await);
+        }
+        Ok(())
+    }
+
+    async fn failure(&mut self) -> Error {
+        if let Some(error) = self.status_error() {
+            return error;
+        }
+        async fn terminal_status(
+            status: &mut Option<
+                tokio::sync::watch::Receiver<heliosdb_nano::replication::streaming::StreamingClientStatus>,
+            >,
+        ) -> Error {
+            use heliosdb_nano::replication::streaming::StreamingClientStatus;
+            let Some(status) = status else {
+                return std::future::pending().await;
+            };
+            loop {
+                let current = status.borrow().clone();
+                match current {
+                    StreamingClientStatus::Failed { error } => {
+                        return Error::network(format!("Replication history verification failed: {error}"))
+                    }
+                    StreamingClientStatus::Stopped => return Error::network("Replication client stopped"),
+                    _ => (),
+                }
+                if status.changed().await.is_err() {
+                    return Error::network("Replication client status closed");
+                }
+            }
+        }
+
+        async fn completed(
+            handle: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+        ) -> std::result::Result<Result<()>, tokio::task::JoinError> {
+            match handle.as_mut() {
+                Some(handle) => handle.await,
+                None => std::future::pending().await,
+            }
+        }
+        let (transport, result) = tokio::select! {
+            biased;
+            error = terminal_status(&mut self.client_status) => return error,
+            result = completed(&mut self.replication_handle) => (true, result),
+            result = completed(&mut self.forwarding_handle) => (false, result),
+        };
+        let name = if transport {
+            let _ = self.replication_handle.take();
+            "replication transport"
+        } else {
+            let _ = self.forwarding_handle.take();
+            "replication applicator forwarding"
+        };
+        if let Some(error) = self.status_error() {
+            return error;
+        }
+        match result {
+            Ok(Err(error)) => error,
+            Ok(Ok(())) => Error::network(format!("{name} stopped unexpectedly")),
+            Err(error) => Error::network(format!("{name} task failed: {error}")),
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        for task in [&mut self.replication_handle, &mut self.forwarding_handle] {
+            if let Some(handle) = task.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+        if let Some(applicator) = self.applicator.take() {
+            let _ = applicator.stop().await;
+        }
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+impl Drop for HAHandles {
+    fn drop(&mut self) {
+        // Also cover a later startup validation error before the serving select.
+        if let Some(handle) = &self.replication_handle {
+            handle.abort();
+        }
+        if let Some(handle) = &self.forwarding_handle {
+            handle.abort();
+        }
+    }
 }
 
 /// Start HA replication components based on role
@@ -2092,11 +2267,14 @@ async fn start_ha_components(
     listen: &str,
     port: u16,
     storage: std::sync::Arc<heliosdb_nano::storage::StorageEngine>,
+    receiver_history: Option<std::sync::Arc<heliosdb_nano::replication::history::ReceiverHistory>>,
 ) -> Result<HAHandles> {
     use heliosdb_nano::replication::{
         config::PrimaryConfig,
         ha_state::{ha_state, HARole, NodeConfig, SyncMode as HASyncMode},
-        streaming::{StreamingClient, StreamingClientConfig, StreamingServer, StreamingServerConfig},
+        streaming::{
+            StreamingClient, StreamingClientConfig, StreamingClientStatus, StreamingServer, StreamingServerConfig,
+        },
         wal_applicator::WalApplicator,
         wal_store::{WalStore, WalStoreConfig},
         SyncModeConfig,
@@ -2154,6 +2332,20 @@ async fn start_ha_components(
 
     match role.as_str() {
         "primary" => {
+            // RocksDB is already exclusively opened. Dataset history is durable
+            // and deliberately independent of the configured operational node ID.
+            let history_id = if storage.config().storage.memory_only {
+                Uuid::new_v4()
+            } else {
+                let directory = storage
+                    .config()
+                    .storage
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| Error::config("persistent replication requires a data directory"))?;
+                heliosdb_nano::replication::history::load_or_create_primary_history(directory)
+                    .map_err(|error| Error::config(format!("Cannot load primary history: {error}")))?
+            };
             // Start streaming server for primary
             let repl_addr = parse_listen_address(listen, Some(ha_config.replication_port), 5433)?;
 
@@ -2201,7 +2393,8 @@ async fn start_ha_components(
                 ..Default::default()
             };
 
-            let server = StreamingServer::new(server_config, node_id, wal_store);
+            let server = StreamingServer::new(server_config, node_id, history_id, wal_store)
+                .map_err(|error| Error::config(format!("Cannot configure replication history: {error}")))?;
             info!("Streaming replication server starting on {}", repl_addr);
 
             let listener = server.bind_listener().await.map_err(|e| Error::network(format!(
@@ -2209,14 +2402,18 @@ async fn start_ha_components(
             )))?;
             // Only detach after binding has succeeded.
             let handle = tokio::spawn(async move {
-                if let Err(e) = server.start_with_listener(listener).await {
-                    tracing::error!("Streaming server error: {}", e);
-                }
+                server
+                    .start_with_listener(listener)
+                    .await
+                    .map_err(|error| Error::network(format!("Streaming server failed: {error}")))
             });
 
             Ok(HAHandles {
                 replication_handle: Some(handle),
-                ephemeral_wal,
+                _ephemeral_wal: ephemeral_wal,
+                forwarding_handle: None,
+                applicator: None,
+                client_status: None,
             })
         }
         "standby" => {
@@ -2226,44 +2423,38 @@ async fn start_ha_components(
                 .as_ref()
                 .ok_or_else(|| Error::config("--primary-host required for standby role".to_string()))?;
 
-            // Resolve hostname to IP address (supports Docker DNS)
-            let primary_addr = tokio::net::lookup_host(primary_host)
+            let startup_timeout = Duration::from_secs(ha_config.startup_timeout_secs);
+            let verification_deadline = tokio::time::Instant::now() + startup_timeout;
+            // DNS and initial history verification share the same configured budget.
+            let primary_addr = tokio::time::timeout_at(verification_deadline, tokio::net::lookup_host(primary_host))
                 .await
+                .map_err(|_| {
+                    Error::network(format!(
+                        "Standby primary resolution exceeded replication.startup_timeout_secs={}s",
+                        ha_config.startup_timeout_secs
+                    ))
+                })?
                 .map_err(|e| Error::config(format!("Cannot resolve primary host '{}': {}", primary_host, e)))?
                 .next()
                 .ok_or_else(|| Error::config(format!("No address found for primary host '{}'", primary_host)))?;
 
-            // Initialize query forwarder for transparent write routing (HeliosProxy feature)
-            // Extract hostname from primary_host (format: "host:replication_port")
-            // Query forwarding connects to primary's postgres port, not replication port
-            {
-                use heliosdb_nano::replication::query_forwarder::init_query_forwarder;
-                let primary_hostname = primary_host
-                    .rsplit_once(':')
-                    .map(|(host, _)| host.trim_start_matches('[').trim_end_matches(']'))
-                    .unwrap_or(primary_host);
-                // Primary's postgres port - use environment variable or default to 5432
-                let primary_pg_port = std::env::var("HELIOSDB_PRIMARY_PG_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(5432u16);
-                init_query_forwarder(primary_hostname.to_string(), primary_pg_port);
-                info!(
-                    "Query forwarder initialized for transparent write routing to {}:{}",
-                    primary_hostname, primary_pg_port
-                );
-            }
+            // Native history verification cannot authenticate a separate PG SQL
+            // endpoint. Transparent forwarding remains disabled for every mode.
+            ha_state().disable_forwarding();
+            let receiver_history = receiver_history
+                .ok_or_else(|| Error::config("standby history must be prepared before database open"))?;
 
             let client_config = StreamingClientConfig {
                 node_id,
                 primary_addr,
                 sync_mode,
-                connect_timeout: Duration::from_secs(30),
+                connect_timeout: startup_timeout,
                 reconnect_delay: Duration::from_secs(5),
                 max_reconnect_attempts: 0, // Unlimited
             };
 
-            let (client, entry_rx) = StreamingClient::new(client_config);
+            let (client, entry_rx) = StreamingClient::new(client_config, receiver_history);
+            let mut status = client.subscribe_status();
             info!("Streaming client connecting to primary at {}", primary_host);
 
             // Create WAL Applicator for applying replicated entries
@@ -2279,7 +2470,7 @@ async fn start_ha_components(
             let applicator_config = PrimaryConfig {
                 host: primary_hostname.to_string(),
                 port: primary_pg_port,
-                connect_timeout: Duration::from_secs(30),
+                connect_timeout: startup_timeout,
                 use_tls: false,
             };
 
@@ -2295,36 +2486,74 @@ async fn start_ha_components(
             // Get the applicator's queue sender for forwarding entries
             let queue_tx = applicator.get_queue_sender();
 
-            // Spawn task to forward entries from streaming client to WAL applicator
-            let _forward_handle = tokio::spawn(async move {
-                info!("WAL entry forwarder task started");
+            let forward_handle = tokio::spawn(async move {
                 let mut entry_rx = entry_rx;
-                while let Some(entry) = entry_rx.recv().await {
-                    info!("Forwarder: received entry LSN={}, forwarding to applicator", entry.lsn);
-                    if let Err(e) = queue_tx.send(entry).await {
-                        tracing::error!("Failed to forward WAL entry to applicator: {}", e);
-                        break;
+                loop {
+                    tokio::select! {
+                        _ = queue_tx.closed() => return Err(Error::network(
+                            "WAL applicator stopped or refused an entry; receiver serving is terminated")),
+                        entry = entry_rx.recv() => match entry {
+                            Some(entry) => queue_tx.send(entry).await.map_err(|error|
+                                Error::network(format!("WAL applicator queue closed: {error}")))?,
+                            None => return Err(Error::network("replication entry stream closed")),
+                        }
                     }
-                    info!("Forwarder: entry forwarded successfully");
                 }
-                info!("WAL entry forwarder stopped");
             });
-
-            // Spawn streaming client task
             let client_handle = tokio::spawn(async move {
-                if let Err(e) = client.start().await {
-                    tracing::error!("Streaming client error: {}", e);
-                }
+                client
+                    .start()
+                    .await
+                    .map_err(|error| Error::network(format!("Streaming client failed: {error}")))
             });
-
-            // Keep applicator alive
-            let _applicator_ref = applicator;
-
-            Ok(HAHandles {
+            let mut handles = HAHandles {
                 replication_handle: Some(client_handle),
-                ephemeral_wal: None,
+                forwarding_handle: Some(forward_handle),
+                applicator: Some(applicator),
+                client_status: Some(status.clone()),
+                _ephemeral_wal: None,
+            };
+            // Identity verification is a startup prerequisite, not proof of
+            // catchup. No PG accept task, HTTP/MCP route or daemon ready marker
+            // is started until the transport durably verifies/binds history.
+            let verified = tokio::time::timeout_at(verification_deadline, async {
+                loop {
+                    let current = status.borrow().clone();
+                    match current {
+                        StreamingClientStatus::Verified { history_id } => {
+                            info!("Standby dataset history verified: {history_id}");
+                            return Ok(());
+                        }
+                        StreamingClientStatus::Failed { error } => {
+                            return Err(Error::network(format!("Standby history verification failed: {error}")))
+                        }
+                        StreamingClientStatus::Stopped => {
+                            return Err(Error::network("Streaming client stopped before history verification"))
+                        }
+                        _ => (),
+                    }
+                    tokio::select! {
+                        error = handles.failure() => return Err(error),
+                        changed = status.changed() => changed.map_err(|_| Error::network(
+                            "Streaming client status closed before history verification"))?,
+                    }
+                }
             })
+            .await
+            .map_err(|_| {
+                Error::network(format!(
+                    "Standby did not verify primary dataset history within {}s (replication.startup_timeout_secs)",
+                    ha_config.startup_timeout_secs
+                ))
+            })
+            .and_then(|result| result);
+            if let Err(error) = verified {
+                handles.shutdown().await;
+                return Err(error);
+            }
+            Ok(handles)
         }
+
         "observer" => {
             info!("Starting as observer node");
             Ok(HAHandles::default())
@@ -2347,11 +2576,23 @@ async fn run_http_listener(
     mcp_token: Option<String>,
     allow_remote_mcp: bool,
     api_config: heliosdb_nano::config::ApiConfig,
+    health_only: bool,
 ) -> std::io::Result<()> {
     use axum::{routing::get, Json, Router};
 
     async fn health() -> Json<serde_json::Value> {
         Json(serde_json::json!({ "status": "ok" }))
+    }
+
+    if health_only {
+        async fn version() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
+        }
+        let app = Router::new()
+            .route("/", get(health))
+            .route("/health", get(health))
+            .route("/version", get(version));
+        return axum::serve(listener, app).await;
     }
 
     // The BaaS layer the README advertises as built in — PostgREST-style
@@ -2428,6 +2669,17 @@ async fn run_http_listener(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn daemon_readiness_includes_full_standby_window() {
+        for seconds in [1, 30, 3600] {
+            assert_eq!(daemon_readiness_timeout("standby", seconds).as_secs(), seconds + 5);
+        }
+        assert_eq!(daemon_readiness_timeout("STANDBY", 30).as_secs(), 35);
+        for role in ["standalone", "primary", "observer"] {
+            assert_eq!(daemon_readiness_timeout(role, 30).as_secs(), 5);
+        }
+    }
+
+    #[test]
     fn http_listen_literals_ports_and_disable() {
         for (input, port, expected) in [
             ("127.0.0.1", None, "127.0.0.1:8080"),
@@ -2458,12 +2710,80 @@ mod tests {
     use serde_json::Value;
 
     #[tokio::test]
+    async fn guarded_standby_http_omits_all_writable_api_and_mcp_routes() {
+        let db = std::sync::Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = run_http_listener(
+                listener,
+                db,
+                Some("fixture-token".into()),
+                true,
+                heliosdb_nano::config::ApiConfig::default(),
+                true,
+            )
+            .await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        for path in ["/health", "/version"] {
+            assert_eq!(
+                client
+                    .get(format!("http://{address}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::OK
+            );
+        }
+        for path in [
+            "/rest/v1/test",
+            "/auth/v1/signup",
+            "/realtime/v1/websocket",
+            "/mcp",
+            "/mcp/info",
+            "/mcp/sse",
+            "/docs",
+            "/openapi.json",
+        ] {
+            for method in [reqwest::Method::GET, reqwest::Method::POST] {
+                assert_eq!(
+                    client
+                        .request(method, format!("http://{address}{path}"))
+                        .bearer_auth("fixture-token")
+                        .body("{}")
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    reqwest::StatusCode::NOT_FOUND,
+                    "unexpected guarded standby route {path}"
+                );
+            }
+        }
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
     async fn daemon_http_listener_serves_health() {
         let db = std::sync::Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db, None, false, heliosdb_nano::config::ApiConfig::default()).await;
+            let _ = run_http_listener(
+                listener,
+                db,
+                None,
+                false,
+                heliosdb_nano::config::ApiConfig::default(),
+                false,
+            )
+            .await;
         });
 
         let body: Value = reqwest::get(format!("http://{addr}/health"))
@@ -2484,7 +2804,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db, None, false, heliosdb_nano::config::ApiConfig::default()).await;
+            let _ = run_http_listener(
+                listener,
+                db,
+                None,
+                false,
+                heliosdb_nano::config::ApiConfig::default(),
+                false,
+            )
+            .await;
         });
 
         let resp: Value = reqwest::Client::new()
@@ -2514,7 +2842,15 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{port}");
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db, None, false, heliosdb_nano::config::ApiConfig::default()).await;
+            let _ = run_http_listener(
+                listener,
+                db,
+                None,
+                false,
+                heliosdb_nano::config::ApiConfig::default(),
+                false,
+            )
+            .await;
         });
 
         let health: Value = reqwest::get(format!("http://{addr}/health"))
@@ -2545,6 +2881,7 @@ mod tests {
                 Some("td8-secret".to_string()),
                 false,
                 heliosdb_nano::config::ApiConfig::default(),
+                false,
             )
             .await;
         });

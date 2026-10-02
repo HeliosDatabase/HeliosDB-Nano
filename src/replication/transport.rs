@@ -47,7 +47,7 @@ use uuid::Uuid;
 pub const PROTOCOL_MAGIC: u32 = 0x48454C49;
 
 /// Current protocol version
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Header size in bytes
 pub const HEADER_SIZE: usize = 24;
@@ -234,6 +234,12 @@ impl MessageHeader {
         }
 
         let version = buf.get_u16();
+        if version != PROTOCOL_VERSION {
+            return Err(ReplicationError::ProtocolVersion {
+                expected: PROTOCOL_VERSION,
+                actual: version,
+            });
+        }
         let msg_type = MessageType::from(buf.get_u16());
         let length = buf.get_u32();
         let flags = MessageFlags::new(buf.get_u32());
@@ -342,6 +348,8 @@ impl Message {
 /// Handshake request payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeRequest {
+    /// Receiver's durable dataset identity, or None for a provably fresh receiver.
+    pub expected_history: Option<Uuid>,
     /// Node ID
     pub node_id: Uuid,
     /// Node role (Primary, Standby, Observer)
@@ -359,6 +367,8 @@ pub struct HandshakeRequest {
 /// Handshake response payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeResponse {
+    /// Durable dataset identity; independent of the server process/node identity.
+    pub history_id: Uuid,
     /// Whether handshake was accepted
     pub accepted: bool,
     /// Server node ID
@@ -804,6 +814,19 @@ impl ReplicationConnection {
         let handshake: HandshakeResponse = bincode::deserialize(&response.payload)
             .map_err(|e| ReplicationError::Transport(format!("Deserialize failed: {}", e)))?;
 
+        if handshake.history_id.is_nil() {
+            return Err(ReplicationError::HistoryMetadata(
+                "Primary supplied a nil history identity".into(),
+            ));
+        }
+        if let Some(expected) = request.expected_history {
+            if expected != handshake.history_id {
+                return Err(ReplicationError::HistoryMismatch {
+                    expected,
+                    actual: handshake.history_id,
+                });
+            }
+        }
         if !handshake.accepted {
             return Err(ReplicationError::Transport(format!(
                 "Handshake rejected: {}",
@@ -912,6 +935,7 @@ pub struct ReplicationServer {
 
 /// Server state
 struct ServerState {
+    history_id: Uuid,
     /// This node's ID
     node_id: Uuid,
     /// Connected standbys
@@ -947,13 +971,19 @@ struct ObserverInfo {
 
 impl ReplicationServer {
     /// Create a new replication server
-    pub fn new(listen_addr: SocketAddr) -> Self {
+    pub fn new(listen_addr: SocketAddr, history_id: Uuid) -> Result<Self> {
+        if history_id.is_nil() {
+            return Err(ReplicationError::HistoryMetadata(
+                "Primary history identity must not be nil".into(),
+            ));
+        }
         let (shutdown_tx, _) = broadcast::channel(1);
 
-        Self {
+        Ok(Self {
             listen_addr,
             state: Arc::new(RwLock::new(ServerState {
                 node_id: Uuid::new_v4(),
+                history_id,
                 standbys: HashMap::new(),
                 observers: HashMap::new(),
                 fencing_token: 1,
@@ -962,7 +992,7 @@ impl ReplicationServer {
                 primary_lsn: 0,
             })),
             shutdown_tx,
-        }
+        })
     }
 
     /// Start the server
@@ -1019,15 +1049,21 @@ impl ReplicationServer {
 
         // Build response
         let state_guard = state.read().await;
+        let history_matches = request
+            .expected_history
+            .is_none_or(|expected| expected == state_guard.history_id);
         let response = HandshakeResponse {
-            accepted: state_guard.is_primary,
+            history_id: state_guard.history_id,
+            accepted: state_guard.is_primary && history_matches,
             server_node_id: state_guard.node_id,
             sync_mode: request.sync_mode,
             primary_lsn: state_guard.primary_lsn,
             slot_name: request.slot_name.clone(),
             fencing_token: state_guard.fencing_token,
             capabilities: Capabilities::all(),
-            error: if state_guard.is_primary {
+            error: if !history_matches {
+                Some("Replication history mismatch; preserve this receiver and prepare a new dataset; online resync is not supported".into())
+            } else if state_guard.is_primary {
                 None
             } else {
                 Some("Not primary".to_string())
@@ -1213,6 +1249,7 @@ mod tests {
     #[test]
     fn test_handshake_serialization() {
         let request = HandshakeRequest {
+            expected_history: None,
             node_id: Uuid::new_v4(),
             role: NodeRole::Standby,
             sync_mode: SyncModeConfig::SemiSync {
@@ -1266,5 +1303,44 @@ mod tests {
             // Just check it round-trips
             let _ = decoded;
         }
+    }
+
+    #[tokio::test]
+    async fn basic_server_history_mismatch_never_registers() {
+        let actual = Uuid::new_v4();
+        let expected = Uuid::new_v4();
+        let server = ReplicationServer::new("127.0.0.1:0".parse().unwrap(), actual).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = server.state.clone();
+        let handler = tokio::spawn(async move {
+            let (stream, remote) = listener.accept().await.unwrap();
+            ReplicationServer::handle_connection(stream, remote, state).await
+        });
+        let mut client = ReplicationConnection::connect(addr, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.handshake_client(HandshakeRequest {
+                expected_history: Some(expected),
+                node_id: Uuid::new_v4(),
+                role: NodeRole::Standby,
+                sync_mode: SyncModeConfig::Async,
+                current_lsn: Some(0),
+                slot_name: None,
+                capabilities: Capabilities::all(),
+            }),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), handler)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result.unwrap(), Err(ReplicationError::HistoryMismatch { expected: e, actual: a }) if e == expected && a == actual)
+        );
+        assert!(server.state.read().await.standbys.is_empty());
     }
 }

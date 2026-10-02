@@ -16,8 +16,12 @@ heliosdb-nano start --data-dir /srv/nano-standby --listen 127.0.0.1 \
   --port 5442 --replication-role standby --primary-host 127.0.0.1:5433 --http-port 0
 ```
 
-A successful native connection does not prove catchup across a restart or a
-recreated primary. See [offline recovery limitations](offline-reseed.md).
+Both peers require native protocol v2. A standby verifies dataset history before
+readiness and refuses a replacement history. First startup needs a new, nonexistent
+standby data-directory leaf; do not pre-create it. A successful native connection
+does not prove catchup across a restart or a recreated primary. See the
+[history guard and interface restrictions](replication-history-guard.md) and
+[offline recovery limitations](offline-reseed.md).
 
 The equivalent primary replication configuration is:
 
@@ -26,9 +30,13 @@ The equivalent primary replication configuration is:
 role = "primary"
 replication_port = 5433
 sync_mode = "async"
+startup_timeout_secs = 30 # 1..=3600; standby DNS and initial history verification
 ```
 
 Replication values resolve as explicit CLI flags, then file values, then defaults.
+`--replication-startup-timeout-secs` overrides the standby verification budget,
+including when explicitly set to its 30-second default. Standby daemon readiness
+allows that budget plus 5 seconds.
 Explicit `--replication-role standalone` overrides a configured primary; explicit
 `--standby-hosts ''` clears its configured peer list. Host endpoints accept DNS
 names, IPv4, or bracketed IPv6 with a nonzero port. Unknown replication keys and

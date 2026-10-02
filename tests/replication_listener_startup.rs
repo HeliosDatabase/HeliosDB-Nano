@@ -29,22 +29,28 @@ async fn occupied_endpoint_fails_before_serving_and_prebound_listener_handshakes
             ..Default::default()
         },
         Uuid::new_v4(),
+        Uuid::new_v4(),
         wal_store.clone(),
-    );
+    )
+    .unwrap();
     let error = blocked_server.bind_listener().await.unwrap_err().to_string();
     assert!(error.contains(&occupied_addr.to_string()), "{error}");
     assert!(error.contains("native replication listener"), "{error}");
     assert!(error.contains("--replication-port"), "{error}");
 
     let node_id = Uuid::new_v4();
-    let server = Arc::new(StreamingServer::new(
-        StreamingServerConfig {
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
-            ..Default::default()
-        },
-        node_id,
-        wal_store.clone(),
-    ));
+    let server = Arc::new(
+        StreamingServer::new(
+            StreamingServerConfig {
+                listen_addr: "127.0.0.1:0".parse().unwrap(),
+                ..Default::default()
+            },
+            node_id,
+            Uuid::new_v4(),
+            wal_store.clone(),
+        )
+        .unwrap(),
+    );
     let listener = server.bind_listener().await.unwrap();
     let addr = listener.local_addr().unwrap();
     assert!(TcpListener::bind(addr).await.is_err());
@@ -58,6 +64,7 @@ async fn occupied_endpoint_fails_before_serving_and_prebound_listener_handshakes
     let response = timeout(
         Duration::from_secs(3),
         connection.handshake_client(HandshakeRequest {
+            expected_history: None,
             node_id: Uuid::new_v4(),
             role: NodeRole::Standby,
             sync_mode: SyncModeConfig::Async,

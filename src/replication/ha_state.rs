@@ -10,7 +10,10 @@
 use super::wal_replicator::{Lsn, WalEntry, WalEntryType};
 use crate::storage::WalOperation;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    RwLock,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -206,6 +209,8 @@ pub struct HAStateRegistry {
     metrics: RwLock<ReplicationMetrics>,
     current_lsn: RwLock<u64>,
     is_read_only: RwLock<bool>,
+    /// CLI history guards never authorize SQL forwarding to an unverified PG endpoint.
+    forwarding_disabled: AtomicBool,
     /// WAL broadcast sender for replication (primary only)
     wal_broadcast_tx: RwLock<Option<broadcast::Sender<WalEntry>>>,
 }
@@ -220,6 +225,7 @@ impl HAStateRegistry {
             metrics: RwLock::new(ReplicationMetrics::default()),
             current_lsn: RwLock::new(0),
             is_read_only: RwLock::new(false),
+            forwarding_disabled: AtomicBool::new(false),
             wal_broadcast_tx: RwLock::new(None),
         }
     }
@@ -237,6 +243,17 @@ impl HAStateRegistry {
         if let Ok(mut ro) = self.is_read_only.write() {
             *ro = read_only;
         }
+    }
+
+    /// Permanently disable transparent forwarding for this process. Dataset
+    /// identity is verified on the replication protocol, not PostgreSQL SQL.
+    /// Role/read-only changes must not silently undo this restriction.
+    pub fn disable_forwarding(&self) {
+        self.forwarding_disabled.store(true, Ordering::Release);
+    }
+
+    pub fn forwarding_disabled(&self) -> bool {
+        self.forwarding_disabled.load(Ordering::Acquire)
     }
 
     /// Get node configuration
@@ -669,6 +686,21 @@ mod tests {
         let standbys = registry.get_standbys();
         assert_eq!(standbys.len(), 1);
         assert_eq!(standbys[0].node_id, standby_id);
+    }
+
+    #[test]
+    fn guarded_forwarding_refusal_survives_role_and_read_only_changes() {
+        let registry = HAStateRegistry::new();
+        assert!(!registry.forwarding_disabled());
+        registry.disable_forwarding();
+        for role in [HARole::Standby, HARole::Primary, HARole::Standalone] {
+            registry.set_config(NodeConfig {
+                role,
+                ..Default::default()
+            });
+            registry.set_read_only(false);
+            assert!(registry.forwarding_disabled());
+        }
     }
 
     #[test]

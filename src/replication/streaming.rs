@@ -23,6 +23,7 @@
 
 use super::config::{FailoverConfig, WalStreamingConfig};
 use super::ha_state::{ha_state, StandbyInfo, StandbyState as HAStandbyState, SyncMode as HASyncMode};
+use super::history::ReceiverHistory;
 use super::transport::{
     AckPayload, AckType, Capabilities, HandshakeRequest, HandshakeResponse, HealthStatus, HeartbeatPayload, Message,
     MessageType, NodeRole, ReplicationConnection, SyncModeConfig, WalBatchPayload, WalEntryPayload,
@@ -39,7 +40,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock};
 use uuid::Uuid;
 
 // =============================================================================
@@ -107,6 +108,8 @@ struct ConnectedStandby {
 
 /// Streaming server for primary node
 pub struct StreamingServer {
+    /// Durable dataset identity, distinct from the node identity.
+    history_id: Uuid,
     /// Server configuration
     config: StreamingServerConfig,
     /// This node's ID
@@ -131,16 +134,27 @@ pub struct StreamingServer {
 
 impl StreamingServer {
     /// Create a new streaming server
-    pub fn new(config: StreamingServerConfig, node_id: Uuid, wal_store: Arc<WalStore>) -> Self {
+    pub fn new(
+        config: StreamingServerConfig,
+        node_id: Uuid,
+        history_id: Uuid,
+        wal_store: Arc<WalStore>,
+    ) -> Result<Self> {
+        if history_id.is_nil() {
+            return Err(ReplicationError::HistoryMetadata(
+                "Primary history identity must not be nil".into(),
+            ));
+        }
         let (wal_broadcast, _) = broadcast::channel(config.wal_config.batch_size);
         let (shutdown_tx, _) = broadcast::channel(1);
 
         // Register broadcast sender with global HA state for storage engine access
         ha_state().set_wal_broadcast(wal_broadcast.clone());
 
-        Self {
+        Ok(Self {
             config,
             node_id,
+            history_id,
             current_lsn: Arc::new(AtomicU64::new(0)),
             fencing_token: Arc::new(AtomicU64::new(1)),
             term: Arc::new(AtomicU64::new(1)),
@@ -149,7 +163,7 @@ impl StreamingServer {
             wal_broadcast,
             shutdown_tx,
             wal_store,
-        }
+        })
     }
 
     /// Reserve the native replication endpoint before reporting startup success.
@@ -227,6 +241,7 @@ impl StreamingServer {
     /// Handle a new standby connection
     async fn handle_new_connection(&self, conn: ReplicationConnection) {
         let node_id = self.node_id;
+        let history_id = self.history_id;
         let fencing_token = self.fencing_token.load(Ordering::SeqCst);
         let current_lsn = self.current_lsn.load(Ordering::SeqCst);
         let standbys = self.standbys.clone();
@@ -238,6 +253,7 @@ impl StreamingServer {
             if let Err(e) = Self::connection_loop(
                 conn,
                 node_id,
+                history_id,
                 fencing_token,
                 current_lsn,
                 standbys,
@@ -256,6 +272,7 @@ impl StreamingServer {
     async fn connection_loop(
         mut conn: ReplicationConnection,
         server_node_id: Uuid,
+        history_id: Uuid,
         fencing_token: u64,
         current_lsn: Lsn,
         standbys: Arc<RwLock<HashMap<Uuid, ConnectedStandby>>>,
@@ -281,15 +298,18 @@ impl StreamingServer {
         // Standby announces its desired mode; primary honors it
         let negotiated_sync = request.sync_mode;
 
+        let history_matches = request.expected_history.is_none_or(|expected| expected == history_id);
         let response = HandshakeResponse {
-            accepted: true,
+            history_id,
+            accepted: history_matches,
             server_node_id,
             sync_mode: negotiated_sync,
             primary_lsn: current_lsn,
             slot_name: request.slot_name.clone(),
             fencing_token,
             capabilities: Capabilities::all(),
-            error: None,
+            error: (!history_matches)
+                .then(|| "Replication history mismatch; preserve this receiver and prepare a new dataset; online resync is not supported".into()),
         };
 
         let response_payload = bincode::serialize(&response)
@@ -297,6 +317,11 @@ impl StreamingServer {
 
         conn.send(MessageType::HandshakeResponse, Bytes::from(response_payload))
             .await?;
+
+        if !response.accepted {
+            conn.close().await?;
+            return Ok(());
+        }
 
         // Create message channel for this standby
         let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(1000);
@@ -776,8 +801,22 @@ pub enum StreamingClientState {
     Error,
 }
 
-/// Streaming client for standby nodes
+/// Identity verification status. Verified does not imply WAL catch-up is complete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamingClientStatus {
+    Connecting,
+    Verified { history_id: Uuid },
+    Reconnecting,
+    Failed { error: String },
+    Stopped,
+}
+
+/// Streaming client for standby nodes with a mandatory receiver history binding.
 pub struct StreamingClient {
+    history: Arc<ReceiverHistory>,
+    status_tx: watch::Sender<StreamingClientStatus>,
+    // A terminal identity failure cannot be bypassed by restarting this instance.
+    started: AtomicBool,
     /// Configuration
     config: StreamingClientConfig,
     /// Client state
@@ -798,12 +837,16 @@ pub struct StreamingClient {
 
 impl StreamingClient {
     /// Create a new streaming client
-    pub fn new(config: StreamingClientConfig) -> (Self, mpsc::Receiver<WalEntry>) {
+    pub fn new(config: StreamingClientConfig, history: Arc<ReceiverHistory>) -> (Self, mpsc::Receiver<WalEntry>) {
         let (entry_tx, entry_rx) = mpsc::channel(10000);
         let (shutdown_tx, _) = broadcast::channel(1);
 
+        let (status_tx, _) = watch::channel(StreamingClientStatus::Connecting);
         let client = Self {
             config,
+            history,
+            status_tx,
+            started: AtomicBool::new(false),
             state: Arc::new(RwLock::new(StreamingClientState::Disconnected)),
             applied_lsn: Arc::new(AtomicU64::new(0)),
             flush_lsn: Arc::new(AtomicU64::new(0)),
@@ -816,11 +859,20 @@ impl StreamingClient {
         (client, entry_rx)
     }
 
-    /// Start the streaming client
+    pub fn subscribe_status(&self) -> watch::Receiver<StreamingClientStatus> {
+        self.status_tx.subscribe()
+    }
+
+    /// Start the streaming client. Each instance may be started only once.
     ///
     /// Automatically reconnects to the primary with exponential backoff.
     /// Set `max_reconnect_attempts` to 0 for unlimited reconnection attempts.
     pub async fn start(&self) -> Result<()> {
+        if self.started.swap(true, Ordering::AcqRel) {
+            return Err(ReplicationError::Configuration(
+                "Streaming client has already been started".into(),
+            ));
+        }
         let mut reconnect_attempts: u32 = 0;
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let base_delay = self.config.reconnect_delay;
@@ -828,23 +880,36 @@ impl StreamingClient {
 
         loop {
             *self.state.write().await = StreamingClientState::Connecting;
-
-            // Track state before attempting connection
-            let was_streaming_before = *self.state.read().await == StreamingClientState::Streaming;
-
-            match self.connect_and_stream().await {
+            self.status_tx.send_replace(StreamingClientStatus::Connecting);
+            let outcome = tokio::select! {
+                outcome = self.connect_and_stream() => outcome,
+                _ = shutdown_rx.recv() => break,
+            };
+            match outcome {
                 Ok(()) => {
                     // Clean shutdown
                     break;
                 }
                 Err(e) => {
+                    if matches!(
+                        e,
+                        ReplicationError::HistoryMismatch { .. }
+                            | ReplicationError::HistoryMetadata(_)
+                            | ReplicationError::ProtocolVersion { .. }
+                    ) {
+                        tracing::error!("Terminal native replication history/protocol failure: {}", e);
+                        *self.state.write().await = StreamingClientState::Error;
+                        self.status_tx
+                            .send_replace(StreamingClientStatus::Failed { error: e.to_string() });
+                        return Err(e);
+                    }
                     // Check if we successfully entered streaming state before the error
                     // If we did, reset the counter since the reconnection worked
                     let current_state = *self.state.read().await;
                     let was_streaming = current_state == StreamingClientState::Streaming
                         || current_state == StreamingClientState::CatchingUp;
 
-                    if was_streaming || was_streaming_before {
+                    if was_streaming {
                         tracing::info!("Connection lost after successful streaming - resetting reconnect counter");
                         reconnect_attempts = 0;
                     }
@@ -861,6 +926,8 @@ impl StreamingClient {
                             e
                         );
                         *self.state.write().await = StreamingClientState::Error;
+                        self.status_tx
+                            .send_replace(StreamingClientStatus::Failed { error: e.to_string() });
                         return Err(e);
                     }
 
@@ -887,6 +954,7 @@ impl StreamingClient {
                     }
 
                     *self.state.write().await = StreamingClientState::Reconnecting;
+                    self.status_tx.send_replace(StreamingClientStatus::Reconnecting);
 
                     // Wait before reconnecting with exponential backoff
                     tokio::select! {
@@ -901,6 +969,7 @@ impl StreamingClient {
         }
 
         *self.state.write().await = StreamingClientState::Disconnected;
+        self.status_tx.send_replace(StreamingClientStatus::Stopped);
         Ok(())
     }
 
@@ -908,6 +977,8 @@ impl StreamingClient {
     async fn connect_and_stream(&self) -> Result<()> {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
+        // Revalidate the durable binding on every connection, including reconnects.
+        let expected_history = self.history.expected_history()?;
         // Connect to primary
         let mut conn = ReplicationConnection::connect(self.config.primary_addr, self.config.connect_timeout).await?;
 
@@ -916,6 +987,7 @@ impl StreamingClient {
 
         let current_lsn = self.applied_lsn.load(Ordering::SeqCst);
         let request = HandshakeRequest {
+            expected_history,
             node_id: self.config.node_id,
             role: NodeRole::Standby,
             sync_mode: self.config.sync_mode,
@@ -924,14 +996,15 @@ impl StreamingClient {
             capabilities: Capabilities::all(),
         };
 
-        let response = conn.handshake_client(request).await?;
+        let response = tokio::time::timeout(self.config.connect_timeout, conn.handshake_client(request))
+            .await
+            .map_err(|_| ReplicationError::Timeout("Native replication handshake timed out".into()))??;
 
-        if !response.accepted {
-            return Err(ReplicationError::Transport(format!(
-                "Handshake rejected: {}",
-                response.error.unwrap_or_default()
-            )));
-        }
+        // This persists/fsyncs a first binding before any WAL dispatch or readiness.
+        self.history.verify_or_bind(response.history_id)?;
+        self.status_tx.send_replace(StreamingClientStatus::Verified {
+            history_id: response.history_id,
+        });
 
         self.fencing_token.store(response.fencing_token, Ordering::SeqCst);
         self.primary_lsn.store(response.primary_lsn, Ordering::SeqCst);
@@ -1286,7 +1359,7 @@ mod tests {
             max_reconnect_attempts: 3,
         };
 
-        let (client, _rx) = StreamingClient::new(config);
+        let (client, _rx) = StreamingClient::new(config, Arc::new(ReceiverHistory::in_memory()));
         assert_eq!(client.applied_lsn(), 0);
         assert_eq!(client.lag_bytes(), 0);
     }

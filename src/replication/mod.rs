@@ -19,6 +19,8 @@ pub use ha_state::{ha_state, HARole, HAStateRegistry, NodeConfig, PrimaryInfo, S
 #[cfg(feature = "ha-tier1")]
 pub mod failover_watcher;
 #[cfg(feature = "ha-tier1")]
+pub mod history;
+#[cfg(feature = "ha-tier1")]
 pub mod logical_replication;
 #[cfg(feature = "ha-tier1")]
 pub mod lsn_manager;
@@ -76,7 +78,8 @@ pub use split_brain::{
 };
 #[cfg(feature = "ha-tier1")]
 pub use streaming::{
-    StreamingClient, StreamingClientConfig, StreamingClientState, StreamingServer, StreamingServerConfig,
+    StreamingClient, StreamingClientConfig, StreamingClientState, StreamingClientStatus, StreamingServer,
+    StreamingServerConfig,
 };
 #[cfg(feature = "ha-tier1")]
 pub use transport::{
@@ -101,6 +104,15 @@ use thiserror::Error;
 /// Replication errors
 #[derive(Debug, Error)]
 pub enum ReplicationError {
+    #[error("Replication history mismatch: receiver expects {expected}, primary has {actual}; preserve this receiver and prepare a new dataset; online resync is not supported")]
+    HistoryMismatch { expected: uuid::Uuid, actual: uuid::Uuid },
+
+    #[error("Replication history metadata: {0}")]
+    HistoryMetadata(String),
+
+    #[error("Unsupported native replication protocol version {actual}; required version {expected} includes mandatory history identity")]
+    ProtocolVersion { expected: u16, actual: u16 },
+
     #[error("WAL streaming error: {0}")]
     WalStreaming(String),
 
@@ -130,6 +142,16 @@ pub enum ReplicationError {
 
     #[error("Transport error: {0}")]
     Transport(String),
+}
+
+#[cfg(feature = "ha-tier1")]
+impl From<history::HistoryError> for ReplicationError {
+    fn from(error: history::HistoryError) -> Self {
+        match error {
+            history::HistoryError::Mismatch { expected, actual } => Self::HistoryMismatch { expected, actual },
+            other => Self::HistoryMetadata(other.to_string()),
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ReplicationError>;
