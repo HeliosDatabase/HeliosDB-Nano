@@ -848,6 +848,15 @@ impl ReplicationConnection {
         let handshake: HandshakeResponse = bincode::deserialize(&response.payload)
             .map_err(|e| ReplicationError::Transport(format!("Deserialize failed: {}", e)))?;
 
+        // R5: a pre-acceptance rejection (protocol/auth) carries a nil history id
+        // and no real server state. Surface the server's rejection text rather
+        // than the accepted-only guards below, which would otherwise mask it.
+        if !handshake.accepted && handshake.history_id.is_nil() {
+            return Err(ReplicationError::Transport(format!(
+                "Handshake rejected: {}",
+                handshake.error.as_deref().unwrap_or("unknown")
+            )));
+        }
         if handshake.history_id.is_nil() {
             return Err(ReplicationError::HistoryMetadata(
                 "Primary supplied a nil history identity".into(),
