@@ -416,10 +416,11 @@ async fn one_token_file_authenticates_native_and_physical_channels() {
     stop(h).await;
 }
 
-/// R3: the failover health probe must present the configured token, exactly as a
-/// standby does. Against an auth-enabled primary it reports Healthy (no false
-/// failure, no false promotion); a wrong token is reported as failed rather than
-/// silently accepted, and a single failure does not reach the failover threshold.
+/// R3 (+C1): the failover health probe must present the configured token,
+/// exactly as a standby does. Against an auth-enabled primary it reports Healthy
+/// (no false failure, no false promotion); a wrong token is a local
+/// configuration error (Recovering, reported via tracing::error!), never a
+/// primary failure, and a single rejected probe does not reach the threshold.
 #[tokio::test]
 async fn health_probe_presents_the_configured_token() {
     let _serial = SERIAL.lock().await;
@@ -444,7 +445,7 @@ async fn health_probe_presents_the_configured_token() {
     );
     assert!(!watcher.should_failover().await, "a healthy primary must not trigger failover");
 
-    // Wrong token: the probe is rejected and reported, not silently healthy.
+    // Wrong token: a configuration error, reported loudly, not a primary failure.
     let mut watcher = FailoverWatcher::new(
         FailoverConfig::default(),
         Uuid::new_v4(),
@@ -454,15 +455,10 @@ async fn health_probe_presents_the_configured_token() {
     );
     watcher.set_auth(Some(TransferToken::new([0x22; 32]).unwrap()));
     let rejected = watcher.check_health(primary_id, "127.0.0.1", h.addr.port()).await;
-    assert_ne!(
+    assert_eq!(
         rejected.health,
-        NodeHealth::Healthy,
-        "a wrong token must not look healthy"
-    );
-    assert!(
-        rejected.error.as_deref().unwrap_or("").contains("authentication failed"),
-        "wrong-token probe must name the rejection: {:?}",
-        rejected.error
+        NodeHealth::Recovering,
+        "a wrong token is a configuration error (Recovering), not a primary failure"
     );
     watcher.record_failure(primary_id).await;
     assert!(
