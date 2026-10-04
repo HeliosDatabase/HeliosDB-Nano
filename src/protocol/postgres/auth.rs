@@ -23,10 +23,21 @@
 //! 4. Server verifies proof and sends server-final-message
 
 use crate::{Error, Result};
-#[cfg(feature = "ring-crypto")]
-use ring::hmac;
-#[cfg(feature = "ring-crypto")]
-use ring::pbkdf2;
+// SCRAM's HMAC/PBKDF2 provider selection mirrors `src/crypto/provider.rs`:
+// the FIPS provider (AWS-LC, FIPS 140-3 Certificate #4816) wins when both
+// provider features are enabled; `ring-crypto` is used otherwise. Both
+// backends expose the same `hmac::{Key, HMAC_SHA256, sign}` and
+// `pbkdf2::{derive, PBKDF2_HMAC_SHA256}` shapes, so the call sites in this
+// module are provider-agnostic — no non-FIPS fallback is reachable under
+// `fips`.
+#[cfg(feature = "fips")]
+use aws_lc_rs::{hmac, pbkdf2};
+#[cfg(all(feature = "ring-crypto", not(feature = "fips")))]
+use ring::{hmac, pbkdf2};
+#[cfg(not(any(feature = "fips", feature = "ring-crypto")))]
+compile_error!(
+    "SCRAM-SHA-256 requires a crypto provider: enable the 'fips' or 'ring-crypto' feature (see src/crypto/provider.rs)"
+);
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -786,6 +797,57 @@ mod tests {
 
         let result = scram_hmac_sha256(key, message);
         assert_eq!(result.len(), 32); // SHA-256 output
+    }
+
+    /// Known-answer regression for the PBKDF2-HMAC-SHA256 building block.
+    ///
+    /// `scram_hi` must equal the published PBKDF2 output for fixed inputs,
+    /// independent of which crypto provider the build selected. This test
+    /// compiles and runs unchanged under both the default `ring-crypto` build
+    /// and the `fips` (AWS-LC) build, so a provider that silently derived
+    /// different bytes would fail one of the two builds.
+    ///
+    /// Vectors: P="password", S="salt", dkLen=32, c in {1, 2, 4096}.
+    /// Origin: the c=4096 row is the fixture carried by the `pbkdf2` 0.12.2
+    /// dependency in `tests/simple.rs` (which cites
+    /// <https://stackoverflow.com/a/5136918>); the c=1 and c=2 rows are from
+    /// the same published SHA-256 set and were re-derived independently with
+    /// Python `hashlib.pbkdf2_hmac` on 2026-10-04.
+    #[test]
+    fn scram_hi_matches_pbkdf2_hmac_sha256_known_answers() {
+        let vectors: &[(u32, &str)] = &[
+            (1, "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"),
+            (2, "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"),
+            (4096, "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"),
+        ];
+        for (iterations, expected_hex) in vectors {
+            let derived = scram_hi("password", b"salt", *iterations);
+            assert_eq!(
+                derived,
+                hex::decode(expected_hex).expect("known-answer hex is valid"),
+                "PBKDF2-HMAC-SHA256 mismatch at {iterations} iterations"
+            );
+        }
+    }
+
+    /// Known-answer regression for the HMAC-SHA256 building block, from
+    /// RFC 4231 §4.2 test cases 1 and 2. Runs against whichever provider the
+    /// build selected, so `ring-crypto` and `fips` must produce identical
+    /// tags (both were checked against Python `hmac` on 2026-10-04).
+    #[test]
+    fn scram_hmac_sha256_matches_rfc4231_known_answers() {
+        // RFC 4231 Test Case 1: key = 0x0b x20, data = "Hi There".
+        assert_eq!(
+            scram_hmac_sha256(&[0x0b; 20], b"Hi There"),
+            hex::decode("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")
+                .expect("known-answer hex is valid")
+        );
+        // RFC 4231 Test Case 2: key = "Jefe", data = "what do ya want for nothing?".
+        assert_eq!(
+            scram_hmac_sha256(b"Jefe", b"what do ya want for nothing?"),
+            hex::decode("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+                .expect("known-answer hex is valid")
+        );
     }
 
     #[test]
