@@ -7,10 +7,10 @@
 //! deliberately bounded: the process exits from argument validation, so no
 //! listener is ever bound and no data directory is created.
 //!
-//! The positive path (a completed TLS handshake and refusal of a plaintext
-//! client) is covered by `tests/postgres_ssl_tests.rs` via `SslMode::Require`
-//! and by the `daemon_pg_tls_args` unit tests in `src/main.rs` for re-exec
-//! forwarding.
+//! The positive path (a completed TLS handshake, exact SQL, and refusal of a
+//! plaintext client while the same daemon remains healthy) is intentionally a
+//! separate runtime gate; this file does not claim that the existing
+//! `postgres_ssl_tests.rs` coverage proves it.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
