@@ -35,7 +35,7 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -309,72 +309,423 @@ fn http_request(
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
 
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        match stream.read(&mut chunk) {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
-                    let header_end = pos + 4;
-                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-                    let content_length = parse_content_length(&head).unwrap_or(0);
-                    if buf.len() >= header_end + content_length {
-                        break;
-                    }
-                }
-            }
-            Err(e) => {
-                if buf.is_empty() {
-                    return Err(e);
-                }
-                break;
-            }
-        }
-    }
+    let response = read_response(&mut stream, method)?;
     let _ = stream.shutdown(Shutdown::Both);
-    Ok(parse_response(&buf))
+    Ok(response)
 }
 
-fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+// ---------------------------------------------------------------------------
+// Framing-aware HTTP/1.1 response reader
+//
+// The daemon answers many routes with `Transfer-Encoding: chunked` and no
+// `Content-Length`. A reader that treats a missing length as an empty body
+// therefore stops at the end of the headers and hands the raw chunk framing
+// (`6C\r\n{json}\r\n0\r\n\r\n`) to `serde_json`, which is the exact SCRAM
+// failure this harness logged. The reader below de-frames each supported body
+// kind and rejects malformed or truncated framing instead of silently
+// succeeding on a partial read.
+// ---------------------------------------------------------------------------
+
+/// Bounds on what a single response may consume so a broken or hostile peer
+/// cannot make the harness allocate without limit while reading the body.
+const MAX_HEAD_BYTES: usize = 64 * 1024;
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
-fn parse_content_length(head: &str) -> Option<usize> {
-    for line in head.lines() {
-        if let Some(value) = line.strip_prefix("content-length:") {
-            return value.trim().parse().ok();
+/// A `Transfer-Encoding` value is a comma-separated list whose tokens may carry
+/// `;parameters`; `chunked` matches as a token, case-insensitively.
+fn transfer_encoding_is_chunked(value: &str) -> bool {
+    value.split(',').any(|part| {
+        part.split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("chunked")
+    })
+}
+
+/// Read exactly the response head, terminating at `\r\n\r\n`. The scan is
+/// byte-by-byte, so a fragmented stream is handled; a peer that closes or
+/// overruns before the head completes is a hard error, never a partial success.
+fn read_head<R: Read>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() >= MAX_HEAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HTTP response headers exceed the bounded limit",
+            ));
         }
-        if let Some(value) = line.strip_prefix("Content-Length:") {
-            return value.trim().parse().ok();
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed before the HTTP response headers completed",
+                ))
+            }
+            Ok(_) => head.push(byte[0]),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
-    None
+    Ok(head)
 }
 
-fn parse_response(buf: &[u8]) -> HttpResponse {
-    let text = String::from_utf8_lossy(buf);
-    let header_end = text.find("\r\n\r\n").map(|p| p + 4).unwrap_or(text.len());
-    let head = &text[..header_end];
-    let body = text.get(header_end..).unwrap_or("").to_string();
-
-    let mut lines = head.lines();
+fn parse_head(head: &[u8]) -> (u16, Vec<(String, String)>) {
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.lines();
     let status_line = lines.next().unwrap_or("");
     let status = status_line
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
         .unwrap_or(0);
-
     let headers = lines
         .filter_map(|line| {
             let (name, value) = line.split_once(':')?;
             Some((name.trim().to_string(), value.trim().to_string()))
         })
         .collect();
+    (status, headers)
+}
 
-    HttpResponse { status, headers, body }
+/// Read a CRLF-terminated line, rejecting EOF before the terminator (truncation)
+/// and absurdly long framing lines.
+fn read_crlf_line<R: Read>(reader: &mut R) -> std::io::Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "connection closed within chunked framing",
+                ))
+            }
+            Ok(_) => {
+                line.push(byte[0]);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                if line.len() > MAX_CHUNK_LINE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "chunked framing line exceeds the bounded limit",
+                    ));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    if !line.ends_with(b"\r\n") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "chunked framing line is not CRLF-terminated",
+        ));
+    }
+    line.truncate(line.len() - 2);
+    String::from_utf8(line)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "chunked framing line is not valid UTF-8"))
+}
+
+/// Decode a `Transfer-Encoding: chunked` body: hex sizes (optionally carrying
+/// `;extensions`), a CRLF after each chunk's data, and a zero-size chunk followed
+/// by optional trailer fields and a terminal blank line. Every truncation point
+/// is a typed error so malformed framing cannot be mistaken for a complete body.
+fn read_chunked_body<R: Read>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    loop {
+        let line = read_crlf_line(reader)?;
+        let size_token = line.split(';').next().unwrap_or("").trim();
+        if size_token.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk size is missing before its extension",
+            ));
+        }
+        let size = usize::from_str_radix(size_token, 16).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid hexadecimal chunk size {size_token:?}"),
+            )
+        })?;
+        if size == 0 {
+            // Consume any trailer fields up to the terminating blank line.
+            loop {
+                let trailer = read_crlf_line(reader)?;
+                if trailer.is_empty() {
+                    return Ok(body);
+                }
+            }
+        }
+        if body
+            .len()
+            .checked_add(size)
+            .map_or(true, |total| total > MAX_BODY_BYTES)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunked response body exceeds the bounded limit",
+            ));
+        }
+        let start = body.len();
+        body.resize(start + size, 0);
+        reader.read_exact(&mut body[start..])?;
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf)?;
+        if &crlf != b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "chunk data is not followed by CRLF",
+            ));
+        }
+    }
+}
+
+fn read_body_exact<R: Read>(reader: &mut R, len: usize) -> std::io::Result<Vec<u8>> {
+    if len > MAX_BODY_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "declared Content-Length exceeds the bounded limit",
+        ));
+    }
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn read_body_to_end<R: Read>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    let mut body = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(body),
+            Ok(n) => {
+                if body.len() + n > MAX_BODY_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "response body exceeds the bounded limit",
+                    ));
+                }
+                body.extend_from_slice(&buf[..n]);
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Read one HTTP/1.1 response, de-framing `Content-Length`,
+/// `Transfer-Encoding: chunked`, and close-delimited bodies. Statuses that carry
+/// no body by definition (1xx, 204, 304) and HEAD responses read no body, so the
+/// WebSocket `101` upgrade does not block waiting for bytes that never arrive.
+fn read_response<R: Read>(reader: &mut R, method: &str) -> std::io::Result<HttpResponse> {
+    let head = read_head(reader)?;
+    let (status, headers) = parse_head(&head);
+
+    let body = if method.eq_ignore_ascii_case("HEAD") || (100..200).contains(&status) || status == 204 || status == 304
+    {
+        Vec::new()
+    } else if let Some(encoding) = header_value(&headers, "transfer-encoding") {
+        if transfer_encoding_is_chunked(encoding) {
+            read_chunked_body(reader)?
+        } else {
+            read_body_to_end(reader)?
+        }
+    } else if let Some(len) = header_value(&headers, "content-length") {
+        let len: usize = len.trim().parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid Content-Length value {len:?}"),
+            )
+        })?;
+        read_body_exact(reader, len)?
+    } else {
+        read_body_to_end(reader)?
+    };
+
+    Ok(HttpResponse {
+        status,
+        headers,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Pure framing regressions (no daemon, no sockets)
+// ---------------------------------------------------------------------------
+
+/// The exact chunked-body shape from the logged SCRAM failure: a `200` response
+/// with no `Content-Length`, framed `6C\r\n{json}\r\n0\r\n\r\n`. The de-framer
+/// must strip the framing, not hand `6C\r\n...` to `serde_json`.
+const LOGGED_JSON_BODY: &str =
+    r#"{"rows":[{"column_0":1}],"row_count":1,"command":"SELECT","branch":"main","ok":true,"cached":false,"took":1}"#;
+
+/// Frame `body` as a single chunked response with no `Content-Length`.
+fn chunked_response(body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+        body.len(),
+        body
+    )
+    .into_bytes()
+}
+
+/// Yields its bytes in fixed-size fragments so a single logical frame arrives
+/// split across many `read` calls.
+struct FragmentedReader {
+    data: Vec<u8>,
+    cursor: usize,
+    fragment: usize,
+}
+
+impl Read for FragmentedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.cursor >= self.data.len() || buf.is_empty() {
+            return Ok(0);
+        }
+        let n = self.fragment.min(buf.len()).min(self.data.len() - self.cursor);
+        buf[..n].copy_from_slice(&self.data[self.cursor..self.cursor + n]);
+        self.cursor += n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn chunked_without_content_length_is_decoded_before_json() {
+    assert_eq!(
+        LOGGED_JSON_BODY.len(),
+        0x6C,
+        "fixture must reproduce the logged 0x6C chunk size"
+    );
+    let raw = chunked_response(LOGGED_JSON_BODY);
+    // Sanity: the wire really has no Content-Length and does carry 6C framing.
+    assert!(!raw.windows(7).any(|w| w.eq_ignore_ascii_case(b"content")));
+    assert!(raw.windows(4).any(|w| w == b"6C\r\n"));
+
+    let resp = read_response(&mut &raw[..], "POST").expect("well-formed chunked response must parse");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.body, LOGGED_JSON_BODY,
+        "chunk framing must be stripped and the JSON body preserved"
+    );
+    let json = resp.json();
+    assert_eq!(json["row_count"], 1);
+    assert_eq!(json["rows"][0]["column_0"], 1);
+}
+
+#[test]
+fn chunked_body_decodes_across_fragmented_reads() {
+    for fragment in [1usize, 3, 7, 64] {
+        let mut reader = FragmentedReader {
+            data: chunked_response(LOGGED_JSON_BODY),
+            cursor: 0,
+            fragment,
+        };
+        let resp = read_response(&mut reader, "POST")
+            .unwrap_or_else(|e| panic!("{fragment}-byte fragments must de-frame: {e}"));
+        assert_eq!(resp.body, LOGGED_JSON_BODY, "fragment size {fragment}");
+    }
+}
+
+#[test]
+fn transfer_encoding_match_is_case_insensitive() {
+    let raw = format!(
+        "HTTP/1.1 200 OK\r\ntRaNsFeR-EnCoDiNg: CHUNKED\r\n\r\n{:X}\r\n{}\r\n0\r\n\r\n",
+        LOGGED_JSON_BODY.len(),
+        LOGGED_JSON_BODY
+    );
+    let resp = read_response(&mut raw.as_bytes(), "POST").expect("case-folded header must match");
+    assert_eq!(resp.body, LOGGED_JSON_BODY);
+}
+
+#[test]
+fn chunk_size_extensions_are_ignored() {
+    let raw = format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X};name=value;flag\r\n{}\r\n0\r\n\r\n",
+        LOGGED_JSON_BODY.len(),
+        LOGGED_JSON_BODY
+    );
+    let resp = read_response(&mut raw.as_bytes(), "POST").expect("chunk extensions must be ignored");
+    assert_eq!(resp.body, LOGGED_JSON_BODY);
+}
+
+#[test]
+fn chunked_trailers_are_consumed() {
+    let raw = format!(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:X}\r\n{}\r\n0\r\nX-Checksum: abc123\r\nX-Trailer: done\r\n\r\n",
+        LOGGED_JSON_BODY.len(),
+        LOGGED_JSON_BODY
+    );
+    let resp = read_response(&mut raw.as_bytes(), "POST").expect("trailers must be consumed");
+    assert_eq!(
+        resp.body, LOGGED_JSON_BODY,
+        "trailer fields must not leak into the decoded body"
+    );
+}
+
+#[test]
+fn truncated_and_malformed_chunk_framing_is_rejected() {
+    let len = LOGGED_JSON_BODY.len();
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "chunk-size line never terminated",
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{len:X}"),
+        ),
+        (
+            "chunk data shorter than declared",
+            format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{len:X}\r\n{}",
+                &LOGGED_JSON_BODY[..len - 4]
+            ),
+        ),
+        (
+            "missing CRLF after chunk data",
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{len:X}\r\n{LOGGED_JSON_BODY}"),
+        ),
+        (
+            "zero chunk without terminal blank line",
+            format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{len:X}\r\n{LOGGED_JSON_BODY}\r\n0\r\n"),
+        ),
+        (
+            "non-hexadecimal chunk size",
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\nbogus\r\n0\r\n\r\n".to_string(),
+        ),
+    ];
+    for (label, raw) in cases {
+        assert!(
+            read_response(&mut raw.as_bytes(), "POST").is_err(),
+            "truncated/malformed framing must be rejected: {label}"
+        );
+    }
+}
+
+#[test]
+fn content_length_body_is_read_exactly() {
+    let raw = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+        LOGGED_JSON_BODY.len(),
+        LOGGED_JSON_BODY
+    );
+    let resp = read_response(&mut raw.as_bytes(), "POST").expect("content-length body must parse");
+    assert_eq!(resp.body, LOGGED_JSON_BODY);
+}
+
+#[test]
+fn bodiless_status_does_not_wait_for_a_body() {
+    let raw = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    let resp = read_response(&mut &raw[..], "GET").expect("101 must parse with no body");
+    assert_eq!(resp.status, 101);
+    assert!(resp.body.is_empty(), "101 must not consume a body");
 }
 
 fn basic(username: &str, password: &str) -> String {
