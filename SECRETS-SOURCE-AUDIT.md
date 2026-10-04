@@ -157,20 +157,31 @@ forces it) and never inherits `--listen`. A non-loopback plaintext bind is
 refused at startup: **always** for an authenticated bind (Basic credentials would
 cross the network in the clear — `--allow-insecure-http` does not cover them),
 and for a trust-mode bind unless `--allow-insecure-http` is passed. The listener
-never terminates TLS, so a wire `--tls-cert` does not make it HTTPS; requiring
-TLS from plaintext clients (`--require-tls` / `hostssl`) remains the deferred
-gap #53 and is not implemented. This track contributes the password source below;
-the HTTP policy itself is the separate HTTP track's source.
+never terminates TLS, so a wire `--tls-cert` does not make it HTTPS, and
+`--require-tls` does not govern it. `--require-tls` (gap #53) is now implemented
+for the **PostgreSQL TCP** listener only: it selects `SslMode::Require` there,
+fails startup unless `--tls-cert` and `--tls-key` are both given, and refuses a
+client that does not complete a TLS handshake instead of falling back to
+plaintext. It does not enable HTTPS; does not require TLS on the MySQL wire
+listeners (`--mysql` / `--mysql-socket` keep their independent `--mysql-tls-*`
+options); and does not apply to the PostgreSQL Unix-socket listener
+(`--pg-socket-dir`), a local authenticated transport that stays plaintext. This
+track contributes the password source below; the HTTP policy itself is the
+separate HTTP track's source.
 
 ## `start`: TLS private key
 
 Flags: `--tls-cert` / `--tls-key` (PostgreSQL listener) and
 `--mysql-tls-cert` / `--mysql-tls-key` (MySQL listener), each pair required
-together (`src/main.rs:790`, `src/main.rs:795`). The values are file **paths**
-and appear on argv; the private-key **bytes** are read by the server from the
-file. Protection is the key file's permissions, not argv hygiene. The Docker
-entrypoint, when no cert is supplied, generates a self-signed pair under
-`$HELIOSDB_TLS_DIR` with `umask 077`.
+together. The values are file **paths** and appear on argv; the private-key
+**bytes** are read by the server from the file. Protection is the key file's
+permissions, not argv hygiene. The Docker entrypoint, when no cert is supplied,
+generates a self-signed pair under `$HELIOSDB_TLS_DIR` with `umask 077`.
+`--require-tls` changes only the **PostgreSQL TCP** listener's `SslMode`
+(`Prefer` by default, `Require` when set); it does not add HTTPS to the HTTP
+API, does not TLS-wrap the PostgreSQL Unix-socket listener, and does not govern
+the MySQL wire listeners. The daemon re-exec forwards `--require-tls` and the
+explicit post-quantum value through the extracted `daemon_pg_tls_args` helper.
 
 ## `start`: at-rest encryption key
 
@@ -279,9 +290,17 @@ environment source.
   rejection for split/equals password and MCP options, the daemon PID-file
   handoff, and that an invalid credential leaves no residual listener after it
   exits.
-- The existing `scripts/test_server_secret_argv.sh` real-daemon harness is
-  unchanged and still covers listener ownership, SQLSTATE-28, and binary
-  hash-binding.
+- The `scripts/test_server_secret_argv.sh` real-daemon secrets harness is
+  unchanged in scope and still covers listener ownership, SQLSTATE-28, and
+  binary hash-binding. Required TLS adds its own bounded runtime harness,
+  `scripts/test_require_tls_runtime.py` plus
+  the mocked companion `scripts/test_require_tls_runtime_harness.py`, with CLI
+  and parse coverage in `tests/require_tls_cli_tests.rs`. The harness is bounded
+  (per-probe subprocess timeouts, capped log output, and explicit
+  socket/`AF_UNIX`-inode and PID-file classification instead of `st_ino`
+  equality). **Status: not run** — the live require-TLS gate and the
+  `HELIOSDB_PROC_REGRESSION` live gates remain unrun; this audit contributes no
+  live evidence for them.
 - `cargo test --bin heliosdb-nano` would cover the `resolve_password` /
   `resolve_mcp_token` / `daemon_password_handoff` / redacted-`Debug` unit tests,
   the Unix non-UTF8 regressions, the new `Cli::try_parse_from` secret-source
