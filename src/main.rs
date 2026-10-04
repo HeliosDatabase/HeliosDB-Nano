@@ -464,7 +464,8 @@ enum Commands {
         #[arg(long, default_value = "8080")]
         http_port: u16,
 
-        /// HTTP API listen address. Defaults to --listen; use 127.0.0.1 for local MCP while PG listens remotely.
+        /// HTTP API listen address. Defaults to loopback; use an explicit non-loopback
+        /// address only with the applicable authentication/TLS policy.
         #[arg(long)]
         http_listen: Option<String>,
 
@@ -479,10 +480,10 @@ enum Commands {
         #[arg(long)]
         allow_remote_mcp: bool,
 
-        /// Permit a non-loopback plaintext HTTP API bind. Without this, `start`
-        /// refuses `--http-listen` on a non-loopback address when the wire protocol
-        /// is in trust mode (unauthenticated SQL) or when HTTP auth would cross the
-        /// network in the clear. Unsafe; document the compensating controls.
+        /// Permit a non-loopback plaintext HTTP API bind only for an unauthenticated
+        /// trust-mode listener. Authenticated HTTP remains refused over plaintext,
+        /// even with this override, because Basic credentials would cross the network
+        /// in the clear.
         #[arg(long)]
         allow_insecure_http: bool,
 
