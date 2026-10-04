@@ -57,7 +57,7 @@ struct Daemon {
     http_port: u16,
     pg_port: u16,
     sock_dir: Option<TempDir>,
-    config_dir: TempDir,
+    _config_dir: TempDir,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     args: Vec<String>,
@@ -206,7 +206,7 @@ fn spawn_with_failure_limit(
         http_port,
         pg_port,
         sock_dir,
-        config_dir,
+        _config_dir: config_dir,
         stdout_path,
         stderr_path,
         args,
@@ -283,7 +283,15 @@ fn http_request(
     stream.set_read_timeout(Some(IO_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
 
-    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\n");
+    // Default to `Connection: close` unless the caller supplied a Connection
+    // header (e.g. `Upgrade` for the WebSocket handshake), which must win.
+    if !extra_headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("connection"))
+    {
+        request.push_str("Connection: close\r\n");
+    }
     if let Some(auth) = auth {
         request.push_str(&format!("Authorization: {auth}\r\n"));
     }
