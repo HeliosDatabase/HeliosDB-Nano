@@ -736,8 +736,15 @@ enum Commands {
         /// (draft-ietf-tls-ecdhe-mlkem) alongside classical groups on the
         /// PostgreSQL TLS listener, in addition to a classical fallback for
         /// clients that don't support it. Only meaningful with --tls-cert /
-        /// --tls-key. Default: on.
-        #[arg(long, default_value = "true")]
+        /// --tls-key. Default: on. Accepts a bare flag or an explicit
+        /// true/false value (`--tls-post-quantum[=true|false]`).
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            default_value = "true"
+        )]
         tls_post_quantum: bool,
 
         /// Authentication method: trust, password, md5, scram-sha-256
@@ -843,7 +850,15 @@ enum Commands {
         /// Offer the X25519MLKEM768 hybrid post-quantum key-exchange group on
         /// the MySQL TLS listener, same as --tls-post-quantum for PostgreSQL.
         /// Only meaningful with --mysql-tls-cert / --mysql-tls-key. Default: on.
-        #[arg(long, default_value = "true")]
+        /// Accepts a bare flag or an explicit true/false value
+        /// (`--mysql-tls-post-quantum[=true|false]`).
+        #[arg(
+            long,
+            action = clap::ArgAction::Set,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            default_value = "true"
+        )]
         mysql_tls_post_quantum: bool,
 
         /// PostgreSQL Unix domain socket directory. If set, listens at
@@ -3869,5 +3884,68 @@ mod tests {
             !preferred.iter().any(|a| a == "--require-tls"),
             "require-tls must not be forwarded when off, got {preferred:?}"
         );
+    }
+
+    fn start_cli(extra: &[&str]) -> Commands {
+        let argv: Vec<String> = std::iter::once("heliosdb-nano".to_string())
+            .chain(std::iter::once("start".to_string()))
+            .chain(std::iter::once("--memory".to_string()))
+            .chain(extra.iter().map(|s| (*s).to_string()))
+            .collect();
+        Cli::try_parse_from(argv)
+            .unwrap_or_else(|e| panic!("failed to parse {extra:?}: {e}"))
+            .command
+    }
+
+    fn post_quantum_flags(command: &Commands) -> (bool, bool) {
+        match command {
+            Commands::Start {
+                tls_post_quantum,
+                mysql_tls_post_quantum,
+                ..
+            } => (*tls_post_quantum, *mysql_tls_post_quantum),
+            _ => unreachable!("expected start subcommand"),
+        }
+    }
+
+    #[test]
+    fn post_quantum_flags_accept_legacy_bare_flag_and_explicit_values() {
+        let cases: &[(&[&str], bool, bool)] = &[
+            (&[], true, true),
+            (&["--tls-post-quantum"], true, true),
+            (&["--tls-post-quantum=true"], true, true),
+            (&["--tls-post-quantum=false"], false, true),
+            (&["--mysql-tls-post-quantum"], true, true),
+            (&["--mysql-tls-post-quantum=true"], true, true),
+            (&["--mysql-tls-post-quantum=false"], true, false),
+            (&["--tls-post-quantum", "true"], true, true),
+            (&["--mysql-tls-post-quantum", "false"], true, false),
+        ];
+        for (extra, want_pg, want_mysql) in cases {
+            let command = start_cli(extra);
+            let (pg, mysql) = post_quantum_flags(&command);
+            assert_eq!(pg, *want_pg, "postgres flag for {extra:?}");
+            assert_eq!(mysql, *want_mysql, "mysql flag for {extra:?}");
+        }
+    }
+
+    #[test]
+    fn daemon_pg_tls_args_forwarding_parses_for_both_post_quantum_values() {
+        let cert = Some(PathBuf::from("/etc/helios/cert.pem"));
+        let key = Some(PathBuf::from("/etc/helios/key.pem"));
+
+        for pq in [true, false] {
+            let forwarded = daemon_pg_tls_args(&cert, &key, false, pq);
+            let argv: Vec<String> = std::iter::once("heliosdb-nano".to_string())
+                .chain(std::iter::once("start".to_string()))
+                .chain(std::iter::once("--memory".to_string()))
+                .chain(forwarded)
+                .collect();
+            let command = Cli::try_parse_from(argv)
+                .unwrap_or_else(|e| panic!("daemon forwarding rejected for pq={pq}: {e}"))
+                .command;
+            let (pg, _) = post_quantum_flags(&command);
+            assert_eq!(pg, pq, "daemon must forward post-quantum value {pq}");
+        }
     }
 }
