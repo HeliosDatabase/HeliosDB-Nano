@@ -75,30 +75,56 @@ falling back to the default database.
 See [`database_management.md`](database_management.md) for the
 `CREATE DATABASE` / `DROP DATABASE` SQL surface that backs this.
 
-## Password file and user catalog
+## Password sources
 
-`--password` on the command line sets the password for the default
-user. For multi-user setups, use `--password-file` (TOML format):
+`--auth password`, `--auth md5` and `--auth scram-sha-256` require a
+password for the built-in `postgres` and `helios` users. Nano resolves it
+from the first source below that is present:
 
-```toml
-# users.toml
-[postgres]
-password = "s3cret"
-[gitea]
-password = "gitea"
-[readonly]
-password = "ro"
-```
+| # | Source | Notes |
+|---|--------|-------|
+| 1 | `--password <value>` | **Deprecated.** The value is visible to every local user in the process table (`ps`, `/proc/<pid>/cmdline`). Nano prints a warning when it is used. |
+| 2 | `--password-file <path>` | The first line of the file; a trailing newline is ignored. Only the (non-secret) path appears on the command line. |
+| 3 | `$HELIOSDB_PASSWORD_FILE` | Same file format. Docker/Kubernetes-secret friendly. |
+| 4 | `$HELIOSDB_PASSWORD` | The value in the environment; `/proc/<pid>/environ` is owner-readable only. |
+
+An empty password file is a **startup error** (fail closed), and when a
+non-`trust` method is selected with none of the sources set, startup fails with
+a message naming them.
+
+The file holds a **single** password (its first line); it is not a TOML
+multi-user catalog. Every source above seeds the same `postgres` and `helios`
+accounts. The stored credentials include a SHA-256-derived `StoredKey` +
+`ServerKey` per user, and SCRAM-SHA-256 verifies the client proof against
+`StoredKey` without ever transmitting the password.
 
 ```bash
+# Preferred: the password never appears on the command line.
+printf '%s' "$DB_PASSWORD" > /run/secrets/heliosdb_password
+chmod 600 /run/secrets/heliosdb_password
 heliosdb-nano start --data-dir ./mydata \
-  --auth scram-sha-256 --password-file users.toml
+  --auth scram-sha-256 --password-file /run/secrets/heliosdb_password
+
+# Or via the environment / Docker secret indirection:
+HELIOSDB_PASSWORD_FILE=/run/secrets/heliosdb_password \
+  heliosdb-nano start --data-dir ./mydata --auth scram-sha-256
 ```
 
-The password file is read at startup and the stored credentials
-include a SHA-256-derived `StoredKey` + `ServerKey` per user.
-SCRAM-SHA-256 verifies the client proof against `StoredKey` without
-ever transmitting the password.
+### Keeping secrets off the process table
+
+`heliosdb-nano start --daemon` re-execs itself. The re-exec **never** places the
+password on the child's command line: a file source forwards only
+`--password-file <path>`, and an argv/env source is handed to the child through
+its environment (`HELIOSDB_PASSWORD`). The MCP-over-HTTP bearer token is handled
+the same way: pass `$HELIOSDB_MCP_TOKEN` (or `--mcp-token`, which Nano forwards
+through the child's environment) rather than a literal on the command line.
+
+Launch-time exposure of a legacy literal `--password` cannot be removed
+portably once the shell has started the process — the value was already on
+`argv`. Migrate to `--password-file` / `HELIOSDB_PASSWORD_FILE`. The Docker
+Compose example in `deployment/docker/docker-compose.yml` mounts the password
+as a Docker secret and sets `HELIOSDB_PASSWORD_FILE`, so `docker inspect` shows
+only the file path.
 
 ### Custom password stores
 

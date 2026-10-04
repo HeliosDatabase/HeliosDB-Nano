@@ -1,4 +1,19 @@
 # Uses the published image. To build from source instead, uncomment `build:`.
+#
+# SECRETS
+# -------
+# The database password is supplied as a Docker secret and handed to the
+# server through HELIOSDB_PASSWORD_FILE, so it never appears on the container's
+# command line: `docker inspect` shows the file path, `ps` shows nothing. Create
+# the secret file before `docker compose up` (the `secrets*` pattern in
+# .gitignore keeps it out of git):
+#
+#   mkdir -p secrets
+#   printf '%s' 'change-me' > secrets/heliosdb_password.txt
+#   chmod 600 secrets/heliosdb_password.txt
+#
+# Using Kubernetes? Mount the Secret at /run/secrets/heliosdb_password and keep
+# the HELIOSDB_PASSWORD_FILE environment variable below.
 services:
   heliosdb:
     image: ghcr.io/heliosdatabase/heliosdb-nano:latest
@@ -16,10 +31,19 @@ services:
       - heliosdb_data:/data
     environment:
       - HELIOSDB_LOG_LEVEL=info
-      # Required: password for scram-sha-256 auth (trust auth is loopback-only)
-      - HELIOSDB_PASSWORD=${HELIOSDB_PASSWORD:?set HELIOSDB_PASSWORD}
-      # Optional: at-rest encryption key
-      - HELIOSDB_ENCRYPTION_KEY=${HELIOSDB_ENCRYPTION_KEY:-}
+      # Password read from the mounted secret below; the entrypoint passes
+      # --password-file to the server (never --password on argv).
+      - HELIOSDB_PASSWORD_FILE=/run/secrets/heliosdb_password
+      # Optional: at-rest encryption key. The server reads this variable by
+      # default; it is not a command-line argument. For a file source instead,
+      # mount a config with:
+      #   [encryption]
+      #   enabled = true
+      #   key_source = { File = "/run/secrets/heliosdb_encryption_key" }
+      # and add that file under `secrets:` below.
+      # - HELIOSDB_ENCRYPTION_KEY=${HELIOSDB_ENCRYPTION_KEY:-}
+    secrets:
+      - heliosdb_password
     command: >
       start
       --data-dir /data
@@ -42,6 +66,10 @@ services:
         reservations:
           cpus: '0.5'
           memory: 512M
+
+secrets:
+  heliosdb_password:
+    file: ./secrets/heliosdb_password.txt
 
 volumes:
   heliosdb_data:

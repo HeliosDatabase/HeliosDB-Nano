@@ -129,6 +129,100 @@ impl PerformanceArgs {
     }
 }
 
+/// Where the server password came from. The plaintext is secret; a file
+/// *path* is not. This distinction lets the daemon re-exec hand the secret to
+/// the child without ever placing it on the child's command line.
+#[derive(Clone, PartialEq, Eq)]
+enum PasswordSource {
+    /// No password configured (`--auth trust`).
+    Absent,
+    /// Legacy `--password <value>` on the command line.
+    Argv(String),
+    /// `--password-file <path>` or `$HELIOSDB_PASSWORD_FILE`. `value` is the
+    /// resolved first line; `path` is what the daemon child receives.
+    File { path: PathBuf, value: String },
+    /// `$HELIOSDB_PASSWORD`.
+    Env(String),
+}
+
+impl PasswordSource {
+    fn is_absent(&self) -> bool {
+        matches!(self, PasswordSource::Absent)
+    }
+
+    /// Consume the source and yield the plaintext for the foreground server.
+    fn into_value(self) -> Option<String> {
+        match self {
+            PasswordSource::Absent => None,
+            PasswordSource::Argv(v) | PasswordSource::Env(v) => Some(v),
+            PasswordSource::File { value, .. } => Some(value),
+        }
+    }
+}
+
+/// Read a single-line password file: the first line, trailing newline ignored.
+/// An empty file is a configuration error, not an empty password — fail closed.
+fn read_password_file(path: &std::path::Path) -> Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| Error::config(format!("Cannot read --password-file {}: {e}", path.display())))?;
+    let first = raw.lines().next().unwrap_or("").to_string();
+    if first.is_empty() {
+        return Err(Error::config(format!("--password-file {} is empty.", path.display())));
+    }
+    Ok(first)
+}
+
+/// Resolve the password from every supported source, in precedence order:
+/// `--password` > `--password-file` > `$HELIOSDB_PASSWORD_FILE` >
+/// `$HELIOSDB_PASSWORD`. Pure (the environment is passed in) so the
+/// precedence table can be unit-tested. Sources are resolved even for
+/// `trust`: an explicitly configured password still seeds the auth manager
+/// and tells HTTP/MCP policy that credentials exist.
+fn resolve_password(
+    auth_lower: &str,
+    password: Option<String>,
+    password_file: Option<PathBuf>,
+    env_password_file: Option<PathBuf>,
+    env_password: Option<String>,
+) -> Result<PasswordSource> {
+    match (password, password_file) {
+        (Some(v), _) => Ok(PasswordSource::Argv(v)),
+        (None, Some(path)) => {
+            let value = read_password_file(&path)?;
+            Ok(PasswordSource::File { path, value })
+        }
+        (None, None) => {
+            if let Some(path) = env_password_file.filter(|p| !p.as_os_str().is_empty()) {
+                let value = read_password_file(&path)?;
+                Ok(PasswordSource::File { path, value })
+            } else {
+                match env_password.filter(|p| !p.is_empty()) {
+                    Some(v) => Ok(PasswordSource::Env(v)),
+                    None => Ok(PasswordSource::Absent),
+                }
+            }
+        }
+    }
+}
+
+/// Append the daemon re-exec's password handoff to `args` and return a value
+/// the caller must place in the CHILD'S environment (never its argv).
+///
+/// * A file source forwards only the (non-secret) path: `--password-file`.
+/// * An argv/env source is returned for `Command::env("HELIOSDB_PASSWORD", …)`.
+/// * The plaintext is never pushed onto `args`.
+fn daemon_password_handoff(source: &PasswordSource, args: &mut Vec<String>) -> Option<String> {
+    match source {
+        PasswordSource::Absent => None,
+        PasswordSource::File { path, .. } => {
+            args.push("--password-file".to_string());
+            args.push(path.display().to_string());
+            None
+        }
+        PasswordSource::Argv(v) | PasswordSource::Env(v) => Some(v.clone()),
+    }
+}
+
 /// GH#28: one WARN per crossing of `[server] max_connections_warn_percent`
 /// on a listener (edge-triggered via `swap`; re-arms when utilisation drops
 /// back below the threshold). `Semaphore::available_permits()` is the single
@@ -226,15 +320,17 @@ enum Commands {
         auth: String,
 
         /// Password for authentication (required for password/md5/scram-sha-256 auth).
-        /// A command-line value is visible to every local user in the process
-        /// table; prefer --password-file or the HELIOSDB_PASSWORD environment
-        /// variable, which is read when neither flag is given.
+        /// DEPRECATED: a command-line value is visible to every local user in
+        /// the process table. Prefer --password-file, the HELIOSDB_PASSWORD_FILE
+        /// environment variable, or HELIOSDB_PASSWORD — read when no flag is
+        /// given. A warning is printed when this flag is used.
         #[arg(long)]
         password: Option<String>,
 
         /// Read the authentication password from this file (first line; the
         /// trailing newline is ignored). Keeps the password out of the process
-        /// table — use it with Docker/Kubernetes secrets.
+        /// table — use it with Docker/Kubernetes secrets. May also be supplied
+        /// through the HELIOSDB_PASSWORD_FILE environment variable.
         #[arg(long, conflicts_with = "password")]
         password_file: Option<PathBuf>,
 
@@ -271,7 +367,10 @@ enum Commands {
         #[arg(long)]
         http_listen: Option<String>,
 
-        /// Bearer token required for MCP-over-HTTP routes. Requires the mcp-endpoint feature.
+        /// Bearer token required for MCP-over-HTTP routes. Requires the
+        /// mcp-endpoint feature. Read from $HELIOSDB_MCP_TOKEN when omitted.
+        /// A command-line value is visible to every local user in the process
+        /// table; prefer the environment variable.
         #[arg(long)]
         mcp_token: Option<String>,
 
@@ -611,32 +710,42 @@ async fn main() -> Result<()> {
             }
 
             // Validate auth options. Password source precedence:
-            // --password > --password-file > $HELIOSDB_PASSWORD (the last two
-            // keep the secret out of the world-readable process table).
+            // --password > --password-file > $HELIOSDB_PASSWORD_FILE
+            // > $HELIOSDB_PASSWORD. The last three keep the secret out of the
+            // world-readable process table; --password is deprecated.
             let auth_lower = auth.to_lowercase();
-            let password = match (password, password_file) {
-                (Some(p), _) => Some(p),
-                (None, Some(path)) => {
-                    let raw = std::fs::read_to_string(&path)
-                        .map_err(|e| Error::config(format!("Cannot read --password-file {}: {e}", path.display())))?;
-                    let first = raw.lines().next().unwrap_or("").to_string();
-                    if first.is_empty() {
-                        return Err(Error::config(format!("--password-file {} is empty.", path.display())));
-                    }
-                    Some(first)
-                }
-                (None, None) if auth_lower != "trust" => {
-                    std::env::var("HELIOSDB_PASSWORD").ok().filter(|p| !p.is_empty())
-                }
-                (None, None) => None,
-            };
-            if auth_lower != "trust" && password.is_none() {
+            if password.is_some() {
+                // Best-effort only: Rust std does not expose the raw argv
+                // buffer, and in-place rewrite (as PostgreSQL's setproctitle
+                // does) needs libc plus unsafe pointer arithmetic whose
+                // correctness cannot be verified statically. Warn, and point
+                // at the off-argv sources instead of risking UB.
+                tracing::warn!(
+                    "--password exposes the secret in the process table (visible to every \
+                     local user via `ps`); prefer --password-file, HELIOSDB_PASSWORD_FILE \
+                     or HELIOSDB_PASSWORD"
+                );
+            }
+            let password_source = resolve_password(
+                &auth_lower,
+                password,
+                password_file,
+                std::env::var("HELIOSDB_PASSWORD_FILE").ok().map(PathBuf::from),
+                std::env::var("HELIOSDB_PASSWORD").ok(),
+            )?;
+            if auth_lower != "trust" && password_source.is_absent() {
                 return Err(Error::config(format!(
                     "Authentication method '{}' requires a password: set --password-file, \
-                     the HELIOSDB_PASSWORD environment variable, or --password.",
+                     the HELIOSDB_PASSWORD_FILE or HELIOSDB_PASSWORD environment variable, \
+                     or the (deprecated) --password.",
                     auth
                 )));
             }
+
+            // MCP-over-HTTP bearer token: same hygiene as the password. It is
+            // read from $HELIOSDB_MCP_TOKEN when --mcp-token is absent, and the
+            // daemon re-exec hands it to the child through the environment.
+            let mcp_token = mcp_token.or_else(|| std::env::var("HELIOSDB_MCP_TOKEN").ok().filter(|t| !t.is_empty()));
 
             // Scheduled dumps are not implemented. Fail hard instead of
             // silently accepting the flag — a no-op here means an operator
@@ -692,7 +801,7 @@ async fn main() -> Result<()> {
                     tls_key,
                     tls_post_quantum,
                     auth,
-                    password,
+                    password_source,
                     ha_config,
                     mysql,
                     mysql_listen,
@@ -717,7 +826,7 @@ async fn main() -> Result<()> {
                     tls_key,
                     tls_post_quantum,
                     auth,
-                    password,
+                    password_source.into_value(),
                     ha_config,
                     mysql,
                     mysql_listen,
@@ -1709,7 +1818,7 @@ async fn start_server_daemon(
     tls_key: Option<PathBuf>,
     tls_post_quantum: bool,
     auth: String,
-    password: Option<String>,
+    password: PasswordSource,
     ha_config: HAConfig,
     mysql: bool,
     mysql_listen: String,
@@ -1820,13 +1929,14 @@ async fn start_server_daemon(
     args.push("--mysql-tls-post-quantum".to_string());
     args.push(mysql_tls_post_quantum.to_string());
 
-    // Add auth options
+    // Add auth options. The password is NEVER placed on the child's argv:
+    // a file-backed source forwards only the path (--password-file), and an
+    // argv/env source is returned for the CHILD'S environment below. This is
+    // the P0-2 fix — the old code did `args.push("--password")` and leaked the
+    // secret into `ps` / `/proc/<pid>/cmdline` for every daemon child.
     args.push("--auth".to_string());
     args.push(auth);
-    if let Some(pwd) = password {
-        args.push("--password".to_string());
-        args.push(pwd);
-    }
+    let child_password: Option<String> = daemon_password_handoff(&password, &mut args);
 
     // Add HA options
     args.push("--replication-role".to_string());
@@ -1841,10 +1951,9 @@ async fn start_server_daemon(
         args.push("--http-listen".to_string());
         args.push(http_listen);
     }
-    if let Some(mcp_token) = ha_config.mcp_token {
-        args.push("--mcp-token".to_string());
-        args.push(mcp_token);
-    }
+    // The MCP bearer token is a secret too: hand it to the child through the
+    // environment (same reason as the password), never its argv.
+    let child_mcp_token: Option<String> = ha_config.mcp_token.clone();
     if ha_config.allow_remote_mcp {
         args.push("--allow-remote-mcp".to_string());
     }
@@ -1873,11 +1982,25 @@ async fn start_server_daemon(
     {
         let exe = std::env::current_exe().map_err(|e| Error::io(format!("Failed to get current executable: {e}")))?;
 
-        let mut child = Command::new(&exe)
+        let mut command = Command::new(&exe);
+        command
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::null());
+        // Secrets travel in the child's environment (owner-readable
+        // /proc/<pid>/environ) or as a file path — never as an argument.
+        if let Some(secret) = child_password.as_deref() {
+            command.env("HELIOSDB_PASSWORD", secret);
+            // A file source outranks the value source, so drop any inherited
+            // HELIOSDB_PASSWORD_FILE: the value we resolved must stay
+            // authoritative (e.g. explicit --password with a stale env file).
+            command.env_remove("HELIOSDB_PASSWORD_FILE");
+        }
+        if let Some(token) = child_mcp_token.as_deref() {
+            command.env("HELIOSDB_MCP_TOKEN", token);
+        }
+        let mut child = command
             .spawn()
             .map_err(|e| Error::io(format!("Failed to spawn daemon process: {e}")))?;
 
@@ -1972,7 +2095,8 @@ async fn start_server_daemon(
     // foreground or wrap the process in a service manager.
     #[cfg(not(unix))]
     {
-        let _ = &pid_file; // only the unix path reads/writes the PID file
+        // only the unix path reads/writes the PID file or builds the re-exec
+        let _ = (&pid_file, &args, &child_password, &child_mcp_token);
         Err(Error::io(
             "daemon mode is not available on this platform; run 'heliosdb-nano start' in the \
              foreground or use a service wrapper (e.g. a Windows service / NSSM)",
@@ -2444,11 +2568,132 @@ async fn run_http_listener(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     #[cfg(feature = "mcp-endpoint")]
     use serde_json::json;
     use serde_json::Value;
+
+    /// Unique scratch dir for password-file tests.
+    fn pw_scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hdb-pwtest-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn password_argv_beats_file_and_env() {
+        // A missing file path proves the argv arm short-circuits before I/O.
+        let got = resolve_password(
+            "scram-sha-256",
+            Some("argv-pw".to_string()),
+            Some(PathBuf::from("/no/such/password-file")),
+            Some(PathBuf::from("/no/such/env-file")),
+            Some("env-pw".to_string()),
+        )
+        .unwrap();
+        assert_eq!(got, PasswordSource::Argv("argv-pw".to_string()));
+        assert_eq!(got.into_value().as_deref(), Some("argv-pw"));
+    }
+
+    #[test]
+    fn password_file_reads_first_line_and_rejects_empty() {
+        let dir = pw_scratch_dir("file");
+        let path = dir.join("pw");
+        std::fs::write(&path, "s3cret\nextra line ignored\n").unwrap();
+        let got = resolve_password("scram-sha-256", None, Some(path.clone()), None, None).unwrap();
+        assert_eq!(
+            got,
+            PasswordSource::File {
+                path: path.clone(),
+                value: "s3cret".to_string()
+            }
+        );
+
+        std::fs::write(&path, "\n").unwrap();
+        assert!(
+            resolve_password("scram-sha-256", None, Some(path.clone()), None, None).is_err(),
+            "an empty password file must fail closed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn password_file_env_beats_env_value() {
+        let dir = pw_scratch_dir("envfile");
+        let path = dir.join("pw");
+        std::fs::write(&path, "from-file\n").unwrap();
+        let got = resolve_password(
+            "scram-sha-256",
+            None,
+            None,
+            Some(path.clone()),
+            Some("from-value".to_string()),
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            PasswordSource::File {
+                path,
+                value: "from-file".to_string()
+            }
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn password_env_value_used_as_last_resort() {
+        let got = resolve_password("scram-sha-256", None, None, None, Some("env-pw".to_string())).unwrap();
+        assert_eq!(got, PasswordSource::Env("env-pw".to_string()));
+    }
+
+    #[test]
+    fn trust_auth_needs_no_password() {
+        let got = resolve_password("trust", None, None, None, None).unwrap();
+        assert!(got.is_absent());
+        assert_eq!(got.into_value(), None);
+    }
+
+    #[test]
+    fn trust_auth_keeps_explicit_environment_password() {
+        let got = resolve_password("trust", None, None, None, Some("env-pw".to_string())).unwrap();
+        assert_eq!(got, PasswordSource::Env("env-pw".to_string()));
+    }
+
+    /// The core P0-2 invariant: the daemon re-exec must never place the
+    /// plaintext on the child's argv. A file source forwards only the path;
+    /// every other source is returned for the child's environment.
+    #[test]
+    fn daemon_never_puts_a_secret_on_child_argv() {
+        let mut args = vec!["start".to_string()];
+        let env = daemon_password_handoff(&PasswordSource::Argv("hunter2".to_string()), &mut args);
+        assert_eq!(env.as_deref(), Some("hunter2"));
+        assert!(!args.iter().any(|a| a == "hunter2"), "argv leaked the secret");
+        assert!(!args.iter().any(|a| a == "--password"), "argv used --password");
+
+        let mut args = vec!["start".to_string()];
+        let env = daemon_password_handoff(&PasswordSource::Env("env-secret".to_string()), &mut args);
+        assert_eq!(env.as_deref(), Some("env-secret"));
+        assert!(!args.iter().any(|a| a == "env-secret" || a == "--password"));
+
+        let mut args = vec!["start".to_string()];
+        let env = daemon_password_handoff(
+            &PasswordSource::File {
+                path: PathBuf::from("/run/secrets/heliosdb_password"),
+                value: "file-secret".to_string(),
+            },
+            &mut args,
+        );
+        assert!(env.is_none(), "a file source must not copy the value into env");
+        assert!(args.iter().any(|a| a == "--password-file"));
+        assert!(args.iter().any(|a| a == "/run/secrets/heliosdb_password"));
+        assert!(
+            !args.iter().any(|a| a == "file-secret" || a == "--password"),
+            "argv leaked the secret"
+        );
+    }
 
     #[tokio::test]
     async fn daemon_http_listener_serves_health() {

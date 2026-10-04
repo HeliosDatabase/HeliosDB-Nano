@@ -199,18 +199,23 @@ isolation.
 For production, use SCRAM-SHA-256 and TLS instead of `trust`:
 
 ```bash
+# Preferred: the password is not on the command line.
+printf '%s' "$HELIOSDB_PWD" > /run/secrets/heliosdb_password
+chmod 600 /run/secrets/heliosdb_password
 heliosdb-nano start \
   --data-dir /var/lib/heliosdb/appdb \
   --auth scram-sha-256 \
-  --password "$HELIOSDB_PWD" \
+  --password-file /run/secrets/heliosdb_password \
   --tls-cert /etc/heliosdb/tls.crt \
   --tls-key /etc/heliosdb/tls.key
 ```
 
-Provide the password through `--password` (there is no `--password-file` flag);
-source it from an environment variable or secrets manager — e.g.
-`export HELIOSDB_PWD=...` — rather than hard-coding it in scripts or shell
-history.
+Provide the password through `--password-file` (or `HELIOSDB_PASSWORD_FILE` /
+`HELIOSDB_PASSWORD`); source it from an environment variable or secrets manager
+— e.g. `export HELIOSDB_PWD=...` — rather than hard-coding it in scripts or
+shell history. `--password <value>` still works but is deprecated: the value is
+visible to every local user in the process table (`ps`). See
+[`authentication.md`](authentication.md#password-sources).
 
 ## Export and review schema
 

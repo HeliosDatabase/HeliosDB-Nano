@@ -66,7 +66,7 @@ for arg in "$@"; do
 done
 
 # ── inspect the `start` arguments ─────────────────────────────────────────
-has_auth=0; has_password=0; has_tls=0; has_http_listen=0; has_listen=0
+has_auth=0; has_password=0; has_literal_password=0; has_tls=0; has_http_listen=0; has_listen=0
 listen=""; memory=0; data_dir=""
 prev=""
 for arg in "$@"; do
@@ -76,7 +76,8 @@ for arg in "$@"; do
   esac
   case "$arg" in
     --auth|--auth=*) has_auth=1 ;;
-    --password|--password=*|--password-file|--password-file=*) has_password=1 ;;
+    --password|--password=*) has_literal_password=1; has_password=1 ;;
+    --password-file|--password-file=*) has_password=1 ;;
     --tls-cert|--tls-cert=*) has_tls=1 ;;
     --http-listen|--http-listen=*) has_http_listen=1 ;;
     --listen) has_listen=1 ;;
@@ -86,6 +87,10 @@ for arg in "$@"; do
   esac
   prev="$arg"
 done
+
+if [ "$has_literal_password" -eq 1 ]; then
+  echo "entrypoint: warning: --password puts the value on the command line, where 'ps' and 'docker inspect' can read it. Prefer HELIOSDB_PASSWORD_FILE (a Docker secret) or HELIOSDB_PASSWORD." >&2
+fi
 
 # ── data directory + listen address (honour HELIOSDB_DATA_DIR / _LISTEN) ──
 if [ "$memory" -eq 0 ] && [ -z "$data_dir" ]; then
@@ -136,7 +141,9 @@ else
   pw_off_argv=0
 fi
 pw_file=""
-if [ -z "${HELIOSDB_PASSWORD:-}" ] && [ -n "${HELIOSDB_PASSWORD_FILE:-}" ]; then
+# Prefer the secret file whenever one is named, matching the server's
+# HELIOSDB_PASSWORD_FILE > HELIOSDB_PASSWORD precedence.
+if [ -n "${HELIOSDB_PASSWORD_FILE:-}" ]; then
   [ -r "$HELIOSDB_PASSWORD_FILE" ] && [ -s "$HELIOSDB_PASSWORD_FILE" ] \
     || { echo "error: HELIOSDB_PASSWORD_FILE=$HELIOSDB_PASSWORD_FILE is not a readable, non-empty file" >&2; exit 1; }
   pw_file="$HELIOSDB_PASSWORD_FILE"
