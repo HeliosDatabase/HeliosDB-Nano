@@ -33,7 +33,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -332,6 +332,37 @@ const MAX_HEAD_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
 
+/// Cumulative cap on EVERY byte read for one response — headers, chunk-size
+/// lines, chunk data, the CRLFs between them, and trailers. Per-piece limits
+/// alone are not enough: an endless run of one-byte trailers (or of tiny
+/// chunks) never crosses the head, line, or body bound, so a peer could keep
+/// the reader looping forever. Charging every read against one response-wide
+/// budget makes total framing consumption finite no matter how the bytes split.
+const MAX_RESPONSE_BYTES: usize = MAX_HEAD_BYTES + MAX_BODY_BYTES + MAX_CHUNK_LINE_BYTES;
+
+/// A [`Read`] adapter that charges every byte it yields against one budget, so
+/// no combination of headers, framing lines, data, CRLFs, or trailers can
+/// outrun the cumulative response bound.
+struct BudgetReader<R> {
+    inner: R,
+    remaining: usize,
+}
+
+impl<R: Read> Read for BudgetReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "HTTP response exceeds the cumulative bounded limit",
+            ));
+        }
+        let cap = buf.len().min(self.remaining);
+        let read = self.inner.read(&mut buf[..cap])?;
+        self.remaining -= read;
+        Ok(read)
+    }
+}
+
 fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -340,15 +371,22 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
 }
 
 /// A `Transfer-Encoding` value is a comma-separated list whose tokens may carry
-/// `;parameters`; `chunked` matches as a token, case-insensitively.
+/// `;parameters`. This reader de-frames exactly one codec: a single `chunked`
+/// coding, matched case-insensitively with its parameters ignored. Any other
+/// value — a different coding, or a coding list that merely CONTAINS `chunked`
+/// (`gzip, chunked`, `chunked, gzip`) — is not something this reader can decode,
+/// so it must be rejected rather than de-chunked and mistaken for the body.
 fn transfer_encoding_is_chunked(value: &str) -> bool {
-    value.split(',').any(|part| {
-        part.split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .eq_ignore_ascii_case("chunked")
-    })
+    let mut codings = value.split(',');
+    let only = codings.next().unwrap_or("");
+    if codings.next().is_some() {
+        return false;
+    }
+    only.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .eq_ignore_ascii_case("chunked")
 }
 
 /// Read exactly the response head, terminating at `\r\n\r\n`. The scan is
@@ -529,7 +567,13 @@ fn read_body_to_end<R: Read>(reader: &mut R) -> std::io::Result<Vec<u8>> {
 /// no body by definition (1xx, 204, 304) and HEAD responses read no body, so the
 /// WebSocket `101` upgrade does not block waiting for bytes that never arrive.
 fn read_response<R: Read>(reader: &mut R, method: &str) -> std::io::Result<HttpResponse> {
-    let head = read_head(reader)?;
+    // Every byte of the head, framing, data, and trailers is charged against one
+    // cumulative budget before it reaches the piece-specific readers.
+    let mut reader = BudgetReader {
+        inner: reader,
+        remaining: MAX_RESPONSE_BYTES,
+    };
+    let head = read_head(&mut reader)?;
     let (status, headers) = parse_head(&head);
 
     let body = if method.eq_ignore_ascii_case("HEAD") || (100..200).contains(&status) || status == 204 || status == 304
@@ -537,9 +581,12 @@ fn read_response<R: Read>(reader: &mut R, method: &str) -> std::io::Result<HttpR
         Vec::new()
     } else if let Some(encoding) = header_value(&headers, "transfer-encoding") {
         if transfer_encoding_is_chunked(encoding) {
-            read_chunked_body(reader)?
+            read_chunked_body(&mut reader)?
         } else {
-            read_body_to_end(reader)?
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported Transfer-Encoding {encoding:?}; only a single chunked coding is decoded"),
+            ));
         }
     } else if let Some(len) = header_value(&headers, "content-length") {
         let len: usize = len.trim().parse().map_err(|_| {
@@ -548,9 +595,9 @@ fn read_response<R: Read>(reader: &mut R, method: &str) -> std::io::Result<HttpR
                 format!("invalid Content-Length value {len:?}"),
             )
         })?;
-        read_body_exact(reader, len)?
+        read_body_exact(&mut reader, len)?
     } else {
-        read_body_to_end(reader)?
+        read_body_to_end(&mut reader)?
     };
 
     Ok(HttpResponse {
@@ -670,6 +717,72 @@ fn chunked_trailers_are_consumed() {
     assert_eq!(
         resp.body, LOGGED_JSON_BODY,
         "trailer fields must not leak into the decoded body"
+    );
+}
+
+#[test]
+fn transfer_encoding_must_be_a_single_chunked_coding() {
+    let framing = format!("{:X}\r\n{}\r\n0\r\n\r\n", LOGGED_JSON_BODY.len(), LOGGED_JSON_BODY);
+    for (label, te) in [
+        ("a different coding", "gzip"),
+        ("chunked stacked after another coding", "gzip, chunked"),
+        ("chunked stacked before another coding", "chunked, gzip"),
+        ("chunked listed twice", "chunked, chunked"),
+        ("an empty trailing list element", "chunked,"),
+    ] {
+        let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: {te}\r\n\r\n{framing}");
+        assert!(
+            read_response(&mut raw.as_bytes(), "POST").is_err(),
+            "an unsupported Transfer-Encoding must be rejected, not decoded: {label} ({te:?})"
+        );
+    }
+
+    // Positive control: a lone chunked coding, with optional parameters, decodes.
+    let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED;q=1\r\n\r\n{framing}");
+    let resp = read_response(&mut raw.as_bytes(), "POST").expect("a lone chunked coding must decode");
+    assert_eq!(resp.body, LOGGED_JSON_BODY);
+}
+
+/// A peer that streams endless one-byte trailer fields must never keep the
+/// reader looping; the cumulative response budget has to terminate it.
+#[test]
+fn endless_short_trailers_are_bounded_by_the_cumulative_limit() {
+    struct EndlessTrailers {
+        head: Vec<u8>,
+        cursor: usize,
+        pattern: usize,
+    }
+    impl Read for EndlessTrailers {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            let mut written = 0;
+            while written < buf.len() && self.cursor < self.head.len() {
+                buf[written] = self.head[self.cursor];
+                self.cursor += 1;
+                written += 1;
+            }
+            let pattern = b"x\r\n";
+            while written < buf.len() {
+                buf[written] = pattern[self.pattern];
+                self.pattern = (self.pattern + 1) % pattern.len();
+                written += 1;
+            }
+            Ok(written)
+        }
+    }
+
+    let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n".to_vec();
+    let mut reader = EndlessTrailers {
+        head,
+        cursor: 0,
+        pattern: 0,
+    };
+    let outcome = read_response(&mut reader, "POST");
+    assert!(
+        matches!(outcome, Err(ref e) if e.kind() == io::ErrorKind::InvalidData),
+        "endless one-byte trailers must be stopped by the cumulative budget"
     );
 }
 
