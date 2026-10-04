@@ -24,8 +24,8 @@
 #     with an explanation instead of crash-looping. The password is handed to
 #     the server through the environment or `--password-file`, never on the
 #     command line, so it does not show up in the host's process table (`ps`).
-#     (Release binaries up to 4.41.0 lack that support; with those the
-#     entrypoint falls back to `--password` and prints a warning.)
+#     A binary that predates `--password-file` is refused with an explanation
+#     (upgrade the image); the entrypoint never falls back to `--password`.
 #
 #   * HTTP API. The HTTP listener (port 8080: /health, REST, branches, vector
 #     stores) does NOT use the PostgreSQL password, so it is bound to
@@ -134,7 +134,8 @@ fi
 # ── authentication ───────────────────────────────────────────────────────
 # The password never goes on the command line, where every local user could
 # read it with `ps`: HELIOSDB_PASSWORD stays in the environment (the server
-# reads it itself) and a secret file is passed with --password-file.
+# reads it itself) and a secret file is passed with --password-file. A binary
+# that predates --password-file is refused below rather than leaking the value.
 if "$BIN" start --help 2>/dev/null | grep -q -- '--password-file'; then
   pw_off_argv=1
 else
@@ -158,15 +159,17 @@ if [ "$has_password" -eq 0 ]; then
         export HELIOSDB_PASSWORD
       fi
     else
-      # Older release binary: --password is the only way in.
-      echo "entrypoint: warning: this heliosdb-nano build only accepts the password on the command line, where other local users can see it with ps. Use an image of a release newer than 4.41.0." >&2
-      if [ -n "$pw_file" ]; then
-        password="$(head -n 1 "$pw_file")"
-      else
-        password="$HELIOSDB_PASSWORD"
-      fi
-      set -- "$@" --password "$password"
-      unset password
+      cat >&2 <<'EOF'
+error: this heliosdb-nano image predates --password-file support, so the
+entrypoint cannot hand the password to the server without putting it on the
+command line (where `ps` and `docker inspect` can read it).
+
+Upgrade to an image built from a release newer than 4.41.0, then set
+HELIOSDB_PASSWORD_FILE or HELIOSDB_PASSWORD again. If an upgrade is not
+possible, run the server in the foreground with a wrapper that provides a
+supported secret source; the entrypoint will not fall back to --password.
+EOF
+      exit 1
     fi
   elif [ "$has_auth" -eq 0 ]; then
     case "$listen" in

@@ -96,10 +96,10 @@ The entrypoint (`deployment/docker/docker-entrypoint.sh`):
 - turns `HELIOSDB_PASSWORD` (or `HELIOSDB_PASSWORD_FILE`, for Docker/Kubernetes
   secrets) into `--auth scram-sha-256` — trust auth is refused on a container's
   `0.0.0.0` listener, so without a password the container exits with an
-  explanation. In releases after 4.41.0 the password reaches the server through the
-  environment or `--password-file`, so it never appears in the host's process
-  table; 4.41.0 only has `--password`, so its image puts the password on the
-  command line and logs a warning;
+  explanation. The password reaches the server through the environment or
+  `--password-file`, so it never appears in the host's process table. A binary
+  that predates `--password-file` support (4.41.0 and earlier) is refused with
+  an upgrade message rather than being handed the password on the command line;
 - generates a self-signed TLS certificate in `/data/tls` on first start, so
   `sslmode=require` works; supply your own with `HELIOSDB_TLS_CERT` +
   `HELIOSDB_TLS_KEY`, or disable with `HELIOSDB_TLS=off`;

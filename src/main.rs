@@ -179,7 +179,6 @@ fn read_password_file(path: &std::path::Path) -> Result<String> {
 /// `trust`: an explicitly configured password still seeds the auth manager
 /// and tells HTTP/MCP policy that credentials exist.
 fn resolve_password(
-    auth_lower: &str,
     password: Option<String>,
     password_file: Option<PathBuf>,
     env_password_file: Option<PathBuf>,
@@ -727,7 +726,6 @@ async fn main() -> Result<()> {
                 );
             }
             let password_source = resolve_password(
-                &auth_lower,
                 password,
                 password_file,
                 std::env::var("HELIOSDB_PASSWORD_FILE").ok().map(PathBuf::from),
@@ -2587,7 +2585,6 @@ mod tests {
     fn password_argv_beats_file_and_env() {
         // A missing file path proves the argv arm short-circuits before I/O.
         let got = resolve_password(
-            "scram-sha-256",
             Some("argv-pw".to_string()),
             Some(PathBuf::from("/no/such/password-file")),
             Some(PathBuf::from("/no/such/env-file")),
@@ -2603,7 +2600,7 @@ mod tests {
         let dir = pw_scratch_dir("file");
         let path = dir.join("pw");
         std::fs::write(&path, "s3cret\nextra line ignored\n").unwrap();
-        let got = resolve_password("scram-sha-256", None, Some(path.clone()), None, None).unwrap();
+        let got = resolve_password(None, Some(path.clone()), None, None).unwrap();
         assert_eq!(
             got,
             PasswordSource::File {
@@ -2614,7 +2611,7 @@ mod tests {
 
         std::fs::write(&path, "\n").unwrap();
         assert!(
-            resolve_password("scram-sha-256", None, Some(path.clone()), None, None).is_err(),
+            resolve_password(None, Some(path.clone()), None, None).is_err(),
             "an empty password file must fail closed"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2625,14 +2622,7 @@ mod tests {
         let dir = pw_scratch_dir("envfile");
         let path = dir.join("pw");
         std::fs::write(&path, "from-file\n").unwrap();
-        let got = resolve_password(
-            "scram-sha-256",
-            None,
-            None,
-            Some(path.clone()),
-            Some("from-value".to_string()),
-        )
-        .unwrap();
+        let got = resolve_password(None, None, Some(path.clone()), Some("from-value".to_string())).unwrap();
         assert_eq!(
             got,
             PasswordSource::File {
@@ -2645,20 +2635,20 @@ mod tests {
 
     #[test]
     fn password_env_value_used_as_last_resort() {
-        let got = resolve_password("scram-sha-256", None, None, None, Some("env-pw".to_string())).unwrap();
+        let got = resolve_password(None, None, None, Some("env-pw".to_string())).unwrap();
         assert_eq!(got, PasswordSource::Env("env-pw".to_string()));
     }
 
     #[test]
     fn trust_auth_needs_no_password() {
-        let got = resolve_password("trust", None, None, None, None).unwrap();
+        let got = resolve_password(None, None, None, None).unwrap();
         assert!(got.is_absent());
         assert_eq!(got.into_value(), None);
     }
 
     #[test]
     fn trust_auth_keeps_explicit_environment_password() {
-        let got = resolve_password("trust", None, None, None, Some("env-pw".to_string())).unwrap();
+        let got = resolve_password(None, None, None, Some("env-pw".to_string())).unwrap();
         assert_eq!(got, PasswordSource::Env("env-pw".to_string()));
     }
 
