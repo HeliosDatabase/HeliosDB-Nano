@@ -99,19 +99,31 @@ impl Daemon {
         )
     }
 
-    /// Poll `/health` until it answers the fixed status body, or the child exits.
+    /// Poll `/health` until it answers the fixed status body, then require proof
+    /// that this child owns the HTTP listening socket inode before returning.
+    ///
+    /// The health probe alone only proves *something* answers on the loopback
+    /// address; the `/proc/<pid>/net/tcp*` ownership check proves the socket the
+    /// port maps to is a descriptor held by this child, so every real HTTP test
+    /// starts from owned-listener evidence.
     fn wait_http_ready(&mut self) {
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
             if let Ok(Some(status)) = self.child.try_wait() {
                 panic!("daemon exited during startup with {status}{}", self.diagnostics());
             }
-            match http_request(self.http_addr(), "GET", "/health", None, None, &[]) {
-                Ok(resp) if resp.status == 200 => return,
-                _ => {}
+            let health_ok = matches!(
+                http_request(self.http_addr(), "GET", "/health", None, None, &[]),
+                Ok(resp) if resp.status == 200
+            );
+            if health_ok && !listening_addrs(self.pid(), self.http_port).is_empty() {
+                return;
             }
             if Instant::now() >= deadline {
-                panic!("HTTP listener never became ready{}", self.diagnostics());
+                panic!(
+                    "HTTP listener never became ready with an owned socket inode{}",
+                    self.diagnostics()
+                );
             }
             thread::sleep(Duration::from_millis(100));
         }
@@ -357,6 +369,36 @@ fn body_of(daemon: &Daemon, method: &str, path: &str, auth: Option<&str>, body: 
 // /proc proof that the HTTP listener is bound to loopback
 // ===========================================================================
 
+/// Parse one `/proc/<pid>/net/tcp*` body, returning the local addresses of
+/// LISTEN entries for `port` whose socket inode is in `owned_inodes`.
+///
+/// `/proc/net/tcp` columns after the leading `sl` token are whitespace-separated
+/// and the socket inode is field index 9 (0-based) by the reviewer convention:
+///
+/// ```text
+/// sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+/// 0:  0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4242 ...
+/// ```
+fn parse_listening_addrs(content: &str, port: u16, owned_inodes: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in content.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().skip(1).collect();
+        // Need at least through the inode field (index 9); st "0A" == LISTEN.
+        if fields.len() < 10 || fields[2] != "0A" || !owned_inodes.contains(fields[9]) {
+            continue;
+        }
+        let local = fields[0];
+        let Some((addr_hex, port_hex)) = local.split_once(':') else {
+            continue;
+        };
+        if u16::from_str_radix(port_hex, 16) != Ok(port) {
+            continue;
+        }
+        found.push(addr_hex.to_string());
+    }
+    found
+}
+
 /// Listening local addresses for `port`, read from the child's own network
 /// namespace via `/proc/<pid>/net/tcp` and `tcp6`. The inode check ties the
 /// entry to a descriptor owned by this child; `/proc/<pid>/net/*` is namespace
@@ -379,23 +421,38 @@ fn listening_addrs(pid: u32, port: u16) -> Vec<String> {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // sl local_address rem_address st ...; st "0A" == LISTEN.
-        for line in content.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 12 || fields[3] != "0A" || !owned_inodes.contains(fields[11]) {
-                continue;
-            }
-            let local = fields[1];
-            let Some((addr_hex, port_hex)) = local.split_once(':') else {
-                continue;
-            };
-            if u16::from_str_radix(port_hex, 16) != Ok(port) {
-                continue;
-            }
-            found.push(addr_hex.to_string());
-        }
+        found.extend(parse_listening_addrs(&content, port, &owned_inodes));
     }
     found
+}
+
+/// Fixture: prove the socket inode is read from field index 9 of a real
+/// `/proc/net/tcp` row, not some other numeric column.
+#[test]
+fn proc_tcp_parser_reads_inode_from_field_nine() {
+    // A real row shape (note `uid` at index 7 and `timeout` at index 8 sit
+    // immediately before the inode at index 9). Local port 0x1F90 == 8080.
+    let row = "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 \
+               00:00000000 00000000  1000        0 4242 1 0000000000000000 100 0 0 10 0";
+    let content = format!(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  \
+         timeout inode\n{row}\n"
+    );
+
+    let mut owned = std::collections::HashSet::new();
+    owned.insert("4242".to_string());
+    assert_eq!(
+        parse_listening_addrs(&content, 8080, &owned),
+        vec!["0100007F".to_string()],
+        "the LISTEN socket inode is field index 9 and its address decodes to loopback"
+    );
+
+    let mut other = std::collections::HashSet::new();
+    other.insert("9999".to_string());
+    assert!(
+        parse_listening_addrs(&content, 8080, &other).is_empty(),
+        "ownership must key on the index-9 inode field, not uid/timeout/other columns"
+    );
 }
 
 /// Decode a little-endian `/proc/net/tcp` IPv4 hex address.
@@ -638,6 +695,53 @@ fn assert_surface_matrix(daemon: &Daemon) {
         200,
         "authenticated signup must return 200: {}{}",
         signup.body,
+        daemon.diagnostics()
+    );
+    let app_token = signup.json()["access_token"]
+        .as_str()
+        .expect("signup must return an access_token")
+        .to_string();
+    let user = http_request(
+        daemon.http_addr(),
+        "GET",
+        "/auth/v1/user",
+        Some(&format!("Bearer {app_token}")),
+        None,
+        &[("X-HeliosDB-Authorization", &format!("Basic {auth}"))],
+    )
+    .unwrap_or_else(|e| panic!("dual-header user lookup failed: {e}{}", daemon.diagnostics()));
+    assert_eq!(
+        user.status,
+        200,
+        "dual-header app JWT flow must return 200{}",
+        daemon.diagnostics()
+    );
+    let app_only = status_of(
+        daemon,
+        "GET",
+        "/auth/v1/user",
+        Some(&format!("Bearer {app_token}")),
+        None,
+    );
+    assert_eq!(
+        app_only,
+        401,
+        "app JWT alone must not bypass outer auth{}",
+        daemon.diagnostics()
+    );
+    let invalid_outer = http_request(
+        daemon.http_addr(),
+        "GET",
+        "/auth/v1/user",
+        Some(&format!("Bearer {app_token}")),
+        None,
+        &[("X-HeliosDB-Authorization", "Basic malformed")],
+    )
+    .unwrap_or_else(|e| panic!("invalid dedicated header request failed: {e}{}", daemon.diagnostics()));
+    assert_eq!(
+        invalid_outer.status,
+        401,
+        "invalid dedicated header must not fall back{}",
         daemon.diagnostics()
     );
 
@@ -1049,18 +1153,24 @@ mod uds_auth {
             .build()
             .expect("tokio runtime");
         runtime.block_on(async move {
-            let connect = tokio_postgres::connect(&conn, tokio_postgres::NoTls).await;
+            let connect = tokio::time::timeout(IO_TIMEOUT, tokio_postgres::connect(&conn, tokio_postgres::NoTls))
+                .await
+                .map_err(|_| "UDS connect timeout".to_string())?;
             match connect {
-                Ok((_client, connection)) => {
-                    // Keep the connection task alive briefly so startup completes.
+                Ok((client, connection)) => {
+                    // Keep the connection task alive while proving an actual query
+                    // succeeds over the authenticated UDS session.
                     let handle = tokio::spawn(async move {
                         let _ = connection.await;
                     });
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    client
+                        .query_one("SELECT 1", &[])
+                        .await
+                        .map_err(|e| format!("query failed: {e}; sqlstate={:?}", e.code().map(|c| c.code())))?;
                     handle.abort();
                     Ok(())
                 }
-                Err(e) => Err(e.to_string()),
+                Err(e) => Err(format!("{e}; sqlstate={:?}", e.code().map(|c| c.code()))),
             }
         })
     }
@@ -1088,20 +1198,17 @@ mod uds_auth {
             "the configured credential must authenticate over the Unix socket{}",
             daemon.diagnostics()
         );
-        assert!(
-            connect_uds(&path, port, "postgres", Some("wrong-password")).is_err(),
-            "a wrong password must be rejected over the Unix socket, not bypassed{}",
-            daemon.diagnostics()
-        );
-        assert!(
-            connect_uds(&path, port, "postgres", None).is_err(),
-            "a missing password must fail closed over the Unix socket{}",
-            daemon.diagnostics()
-        );
-        assert!(
-            connect_uds(&path, port, "nobody", Some(PASSWORD)).is_err(),
-            "an unknown user must fail closed over the Unix socket{}",
-            daemon.diagnostics()
-        );
+        for (user, password, label) in [
+            ("postgres", Some("wrong-password"), "wrong password"),
+            ("postgres", None, "missing password"),
+            ("nobody", Some(PASSWORD), "unknown user"),
+        ] {
+            let error = connect_uds(&path, port, user, password).expect_err("invalid UDS credentials must fail");
+            assert!(
+                error.contains("sqlstate=Some(\"28"),
+                "{label} must return SQLSTATE class 28, got {error}{}",
+                daemon.diagnostics()
+            );
+        }
     }
 }

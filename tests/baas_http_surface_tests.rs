@@ -72,6 +72,7 @@ fn api_config(provider_names: &[&str]) -> ApiConfig {
                 redirect_uri: REDIRECT_URI.to_string(),
             })
             .collect(),
+        ..ApiConfig::default()
     }
 }
 
