@@ -443,6 +443,29 @@ class UdsProofTests(HarnessTestBase):
         self.assertEqual(status, "error")
         self.assertEqual(payload["type"], "RuntimeError")
 
+    def test_query_time_sqlstate_28_is_not_authentication_rejection(self):
+        case = harness.Case("query-auth-error")
+        case.pid = 123
+        case.node_id = "node"
+        with mock.patch.object(
+            self.h,
+            "_run_bounded_sql",
+            return_value=(
+                "error",
+                {
+                    "type": "QueryError",
+                    "msg": "query rejected",
+                    "pgcode": "28000",
+                    "phase": "query",
+                },
+            ),
+        ), mock.patch.object(self.h, "still_ours", return_value=True), mock.patch.object(
+            self.h, "child_owns_port", return_value=True
+        ):
+            self.h.expect_auth_rejected(case, "wrong", "query-phase")
+        self.assertTrue(case.failed())
+        self.assertTrue(any("wrong credentials rejected" in label for ok, label in case.checks if not ok))
+
 
 class AuditAndEnvTests(HarnessTestBase):
     def test_real_source_passes_bounded_path_audit(self):

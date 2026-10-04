@@ -345,8 +345,10 @@ def _child_sql(kwargs: Dict[str, object], send_conn) -> None:
     connection; ``audit_no_blocking_paths`` enforces that.
     """
     conn = None
+    phase = "connect"
     try:
         conn = psycopg2.connect(**kwargs)
+        phase = "query"
         info = getattr(conn, "info", None)
         ssl_in_use = bool(getattr(info, "ssl_in_use", False))
         cur = conn.cursor()
@@ -361,7 +363,15 @@ def _child_sql(kwargs: Dict[str, object], send_conn) -> None:
             pgcode = getattr(diag, "sqlstate", None)
         try:
             send_conn.send(
-                ("error", {"type": type(exc).__name__, "msg": str(exc), "pgcode": pgcode})
+                (
+                    "error",
+                    {
+                        "type": type(exc).__name__,
+                        "msg": str(exc),
+                        "pgcode": pgcode,
+                        "phase": phase,
+                    },
+                )
             )
         except Exception as report_exc:  # noqa: BLE001 - report transport failure to retained stderr
             sys.stderr.write("SQL worker could not report database error: %s\n" % report_exc)
@@ -1236,7 +1246,11 @@ class TlsHarness:
         if status == "error":
             code = payload.get("pgcode")
             message = str(payload.get("msg", "")).lower()
-            auth_rejected = (
+            # An authentication assertion is valid only when the server
+            # rejected the connection itself. A query-time SQLSTATE 28 or
+            # similarly worded error after login must not count as bad
+            # credentials being rejected.
+            auth_rejected = payload.get("phase") == "connect" and (
                 (code is not None and str(code).startswith("28"))
                 or "authentication failed" in message
                 or "password authentication failed" in message
