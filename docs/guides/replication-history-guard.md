@@ -59,6 +59,33 @@ certified by this history guard. The bounded claim is rejection of unrelated
 native history and disabled transparent forwarding, not universal prevention of
 local writes, safe promotion or automatic recovery.
 
+## Promotion is refused
+
+The SQL `SWITCHOVER TO '<node>'` statement is **refused, not initiated**. It
+performs the same checks it always did — the target must resolve, this node must
+be the primary, and the target must be a connected standby — and then returns an
+error. No successful switchover is claimed, because none of the required runtime
+exists.
+
+Native catch-up repair is **not** promotion. Raw physical resync remains
+**NON-SERVING**, and a retained standby binding still refuses an implicit primary
+reopen. A safe promotion needs, at minimum:
+
+- durable fencing **and** write admission of the OLD primary (best-effort
+  connection attempts are not fencing);
+- a complete durable source boundary — a defined cut of the source WAL the
+  promoted node has durably received;
+- an explicit new history/epoch for the promoted dataset; and
+- catalog, auth and session serving publication and routing enabled only after
+  the new primary is proven writable.
+
+None of the in-process helpers meet that bar, and none of them are wired into the
+refusal path: `RoleManager` only mutates an in-memory role, `WalApplicator::promote`
+only stops application/logging, and the legacy failover path continues after a
+failed election and best-effort fencing. They are not a safe promotion
+implementation. Do not wire them, remove the existing guards, redirect writes to a
+standby, speculate an automatic takeover, or treat raw resync as accepted.
+
 The [offline snapshot helper](offline-reseed.md) remains an inspection/recovery
 procedure. Its output is not authorized as a streaming receiver by this guard;
 copying or editing identity records does not create a coherent snapshot-to-WAL

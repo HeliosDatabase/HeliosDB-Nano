@@ -1014,14 +1014,15 @@ pub(super) fn handle_switchover(_executor: &Executor, target_node: &str) -> Resu
         .map(|n| n.display_name())
         .unwrap_or_else(|| target_node.to_string());
 
-    // For now, return a message indicating switchover would be initiated
-    // Full implementation requires async coordination with SwitchoverCoordinator
-    let msg = format!(
-        "Switchover to node {} ({}) initiated. This is a placeholder - full async switchover requires runtime integration.",
+    // Refuse truthfully. The preconditions above pass, but this build has no
+    // runtime promotion/switchover, so a success status here would be a lie.
+    // The detailed requirements are the operator contract in
+    // docs/guides/replication-history-guard.md.
+    Err(Error::switchover(format!(
+        "Switchover refused: runtime switchover/promotion is unsupported, durable old-primary fencing is not \
+         implemented, and no role was changed (target {} / {}).",
         display_name, target_uuid
-    );
-
-    Ok(Box::new(super::StatusMessageOperator::new(msg)))
+    )))
 }
 
 /// Handle SWITCHOVER CHECK to validate preconditions
@@ -1050,17 +1051,19 @@ pub(super) fn handle_switchover_check(_executor: &Executor, target_node: &str) -
     // Get HA state registry
     let ha_registry = ha_state();
 
-    // Build check result
-    let mut can_proceed = true;
+    // Build check result. Runtime switchover/promotion does not exist in this
+    // build, so the check must never report readiness — can_proceed is false for
+    // every call, including a healthy connected standby. The health fields below
+    // are still populated, and the blocker states why.
+    let can_proceed = false;
     let mut target_healthy = false;
     let mut target_lsn: u64 = 0;
     let primary_lsn = ha_registry.get_lsn();
     let mut warnings = Vec::new();
-    let mut blockers = Vec::new();
+    let mut blockers = vec!["Runtime switchover/promotion is unsupported".to_string()];
 
     // Check if this node is primary
     if ha_registry.get_role() != crate::replication::ha_state::HARole::Primary {
-        can_proceed = false;
         blockers.push("This node is not the primary".to_string());
     }
 
@@ -1075,7 +1078,6 @@ pub(super) fn handle_switchover_check(_executor: &Executor, target_node: &str) -
             warnings.push(format!("Target standby is {} LSN behind", lag));
         }
     } else {
-        can_proceed = false;
         blockers.push(format!("Target node {} ({}) not found", target_node, target_uuid));
     }
 
