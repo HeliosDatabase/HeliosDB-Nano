@@ -1256,12 +1256,8 @@ async fn start_server(
     // Bind physical source before publishing any readiness. Its directly owned
     // future is polled alongside PostgreSQL only after startup succeeds.
     #[cfg(feature = "ha-tier1")]
-    let physical_source = prepare_physical_source(
-        &ha_config.physical,
-        ha_config.token_file.as_deref(),
-        &db.storage,
-    )
-    .await?;
+    let physical_source =
+        prepare_physical_source(&ha_config.physical, ha_config.token_file.as_deref(), &db.storage).await?;
 
     // Start HTTP endpoint (health checks, plus MCP routes when compiled in).
     //
@@ -3157,10 +3153,7 @@ fn append_physical_daemon_args(
     replication_token_file: Option<&std::path::Path>,
 ) {
     if let Some(path) = replication_token_file {
-        args.extend([
-            "--replication-token-file".into(),
-            path.display().to_string(),
-        ]);
+        args.extend(["--replication-token-file".into(), path.display().to_string()]);
     }
     for (name, value) in [
         ("--physical-replication", config.enabled.to_string()),
@@ -3318,8 +3311,9 @@ async fn prepare_physical_source(
     // Native primary startup has already opened/locked the DB and established this marker.
     let history = heliosdb_nano::replication::history::load_or_create_primary_history(directory)
         .map_err(|e| Error::config(e.to_string()))?;
-    let token_path = token_file
-        .ok_or_else(|| Error::config("physical source requires --replication-token-file or [replication] token_file"))?;
+    let token_path = token_file.ok_or_else(|| {
+        Error::config("physical source requires --replication-token-file or [replication] token_file")
+    })?;
     let token = heliosdb_nano::replication::read_replication_token(token_path)?;
     let listener = heliosdb_nano::replication::physical_wire::bind_loopback(
         config
@@ -3467,11 +3461,10 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
                 "physical source hostname resolves to more than 16 addresses",
             ));
         }
-        let token = heliosdb_nano::replication::read_replication_token(
-            replication.token_file.as_ref().ok_or_else(|| {
+        let token =
+            heliosdb_nano::replication::read_replication_token(replication.token_file.as_ref().ok_or_else(|| {
                 Error::config("resync requires --replication-token-file or [replication] token_file")
-            })?,
-        )?;
+            })?)?;
         let start = if args.resume_existing {
             ReceiverStart::Resume {
                 path: args.data_dir,

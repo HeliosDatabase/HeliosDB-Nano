@@ -1367,7 +1367,10 @@ mod tests {
         // "capabilities" contain it. A hex leak of the 32-byte token instead
         // appears as a long run of "ab" pairs.
         assert!(!lowered.contains(&"ab".repeat(32)), "hex token leaked: {rendered}");
-        assert!(!lowered.contains(&vec!["ab"; 32].join(", ")), "hex token leaked: {rendered}");
+        assert!(
+            !lowered.contains(&vec!["ab"; 32].join(", ")),
+            "hex token leaked: {rendered}"
+        );
         assert!(rendered.contains("<redacted>"), "missing redaction marker: {rendered}");
     }
 

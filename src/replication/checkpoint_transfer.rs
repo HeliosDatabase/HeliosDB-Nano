@@ -389,7 +389,9 @@ fn fingerprint_file(path: &Path, expected_size: u64, single_link: bool) -> Resul
         if copied > expected_size {
             return Err(invalid("file grew while hashing"));
         }
-        let chunk = buffer.get(..count).ok_or_else(|| invalid("read count exceeds buffer"))?;
+        let chunk = buffer
+            .get(..count)
+            .ok_or_else(|| invalid("read count exceeds buffer"))?;
         hash.update(chunk);
     }
     let after = fs::symlink_metadata(path)?;

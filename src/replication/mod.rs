@@ -94,6 +94,8 @@ pub use streaming::{
     StreamingServerConfig,
 };
 #[cfg(feature = "ha-tier1")]
+pub use token::read_replication_token;
+#[cfg(feature = "ha-tier1")]
 pub use transport::{
     AckType,
     Capabilities,
@@ -104,8 +106,6 @@ pub use transport::{
     ReplicationServer,
     SyncModeConfig,
 };
-#[cfg(feature = "ha-tier1")]
-pub use token::read_replication_token;
 #[cfg(feature = "ha-tier1")]
 pub use wal_applicator::WalApplicator;
 #[cfg(feature = "ha-tier1")]

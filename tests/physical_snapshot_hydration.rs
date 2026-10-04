@@ -261,8 +261,7 @@ fn sealed_views_materialized_views_and_sequences_match_the_source() {
     let raw = rocksdb::DB::open(&rocksdb::Options::default(), &snapshot).unwrap();
     let bytes = raw.get(b"meta:mv:lazy_mv").unwrap().unwrap();
     drop(raw);
-    let mut metadata: heliosdb_nano::storage::MaterializedViewMetadata =
-        bincode::deserialize(&bytes).unwrap();
+    let mut metadata: heliosdb_nano::storage::MaterializedViewMetadata = bincode::deserialize(&bytes).unwrap();
     metadata.query_plan_bytes.push(0);
     raw_put(&snapshot, b"meta:mv:lazy_mv", &bincode::serialize(&metadata).unwrap());
     let before = raw_records(&snapshot);

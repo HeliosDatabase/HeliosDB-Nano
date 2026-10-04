@@ -792,7 +792,13 @@ async fn run_inner(
 }
 
 #[cfg(all(test, target_os = "linux"))]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::ignored_unit_patterns)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::ignored_unit_patterns
+)]
 mod tests {
     use super::super::{
         history::load_or_create_primary_history,

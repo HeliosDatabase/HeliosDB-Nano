@@ -137,13 +137,10 @@ async fn configured_token_accepts_correct_token_and_registers() {
     let _serial = SERIAL.lock().await;
     let h = start_server(Some(token())).await;
     let mut conn = connect(h.addr).await;
-    let response = timeout(
-        Duration::from_secs(3),
-        conn.handshake_client(request(Some(TOKEN))),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    let response = timeout(Duration::from_secs(3), conn.handshake_client(request(Some(TOKEN))))
+        .await
+        .unwrap()
+        .unwrap();
     assert!(response.accepted, "correct token must be accepted");
     assert_eq!(
         standby_count_settled(&h.server, 1).await,
@@ -159,14 +156,11 @@ async fn configured_token_rejects_wrong_token_before_registration() {
     let _serial = SERIAL.lock().await;
     let h = start_server(Some(token())).await;
     let mut conn = connect(h.addr).await;
-    let error = timeout(
-        Duration::from_secs(3),
-        conn.handshake_client(request(Some([0x11; 32]))),
-    )
-    .await
-    .unwrap()
-    .unwrap_err()
-    .to_string();
+    let error = timeout(Duration::from_secs(3), conn.handshake_client(request(Some([0x11; 32]))))
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("authentication failed"), "{error}");
     assert_never_registered_and_closed(&h.server, conn).await;
     stop(h).await;
@@ -183,9 +177,9 @@ async fn assert_never_registered_and_closed(server: &StreamingServer, mut conn: 
     }
     assert_eq!(max_seen, 0, "a rejected token must never register a standby");
     let closed = match timeout(Duration::from_secs(2), conn.recv()).await {
-        Ok(Ok(_)) => false,  // server kept serving native frames after rejection
-        Ok(Err(_)) => true,  // socket closed/reset
-        Err(_) => false,     // still open and silently waiting
+        Ok(Ok(_)) => false, // server kept serving native frames after rejection
+        Ok(Err(_)) => true, // socket closed/reset
+        Err(_) => false,    // still open and silently waiting
     };
     assert!(closed, "rejected connection was not closed by the server");
 }
@@ -313,7 +307,10 @@ async fn reconnect_with_the_same_token_is_accepted() {
             .await
             .unwrap()
             .unwrap();
-        assert!(response.accepted, "reconnect {attempt} with the same token must be accepted");
+        assert!(
+            response.accepted,
+            "reconnect {attempt} with the same token must be accepted"
+        );
         let _ = conn.close().await;
     }
     stop(h).await;
@@ -428,13 +425,7 @@ async fn health_probe_presents_the_configured_token() {
 
     // Correct token: an auth-enabled primary is Healthy, and no failover fires.
     let primary_id = Uuid::new_v4();
-    let mut watcher = FailoverWatcher::new(
-        FailoverConfig::default(),
-        Uuid::new_v4(),
-        primary_id,
-        None,
-        vec![],
-    );
+    let mut watcher = FailoverWatcher::new(FailoverConfig::default(), Uuid::new_v4(), primary_id, None, vec![]);
     watcher.set_auth(Some(token()));
     let healthy = watcher.check_health(primary_id, "127.0.0.1", h.addr.port()).await;
     assert_eq!(
@@ -443,16 +434,13 @@ async fn health_probe_presents_the_configured_token() {
         "auth-enabled primary must probe Healthy: {:?}",
         healthy.error
     );
-    assert!(!watcher.should_failover().await, "a healthy primary must not trigger failover");
+    assert!(
+        !watcher.should_failover().await,
+        "a healthy primary must not trigger failover"
+    );
 
     // Wrong token: a configuration error, reported loudly, not a primary failure.
-    let mut watcher = FailoverWatcher::new(
-        FailoverConfig::default(),
-        Uuid::new_v4(),
-        primary_id,
-        None,
-        vec![],
-    );
+    let mut watcher = FailoverWatcher::new(FailoverConfig::default(), Uuid::new_v4(), primary_id, None, vec![]);
     watcher.set_auth(Some(TransferToken::new([0x22; 32]).unwrap()));
     let rejected = watcher.check_health(primary_id, "127.0.0.1", h.addr.port()).await;
     assert_eq!(
@@ -497,14 +485,21 @@ async fn auth_rejection_is_not_a_primary_failure() {
     );
     let states = watcher.health_states().await;
     let primary = states.get(&primary_id).expect("primary must have been probed");
-    assert_ne!(primary.health, NodeHealth::Failed, "auth rejection is not a primary failure");
+    assert_ne!(
+        primary.health,
+        NodeHealth::Failed,
+        "auth rejection is not a primary failure"
+    );
     assert_ne!(primary.health, NodeHealth::Unreachable);
 
     let mut seen = Vec::new();
     while let Ok(event) = events.try_recv() {
         seen.push(format!("{event:?}"));
     }
-    assert!(seen.is_empty(), "auth rejection must not emit failover events: {seen:?}");
+    assert!(
+        seen.is_empty(),
+        "auth rejection must not emit failover events: {seen:?}"
+    );
 
     watcher.stop().await.unwrap();
     stop(h).await;

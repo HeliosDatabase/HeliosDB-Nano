@@ -952,7 +952,13 @@ impl PhysicalClient<TcpStream> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::ignored_unit_patterns)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::ignored_unit_patterns
+)]
 mod tests {
     use super::super::checkpoint_transfer::CheckpointFile;
     use super::*;
@@ -979,7 +985,10 @@ mod tests {
         assert!(!rendered.contains("171"), "decimal token byte leaked: {rendered}");
         let lowered = rendered.to_lowercase();
         assert!(!lowered.contains(&"ab".repeat(32)), "hex token leaked: {rendered}");
-        assert!(!lowered.contains(&vec!["ab"; 32].join(", ")), "hex token leaked: {rendered}");
+        assert!(
+            !lowered.contains(&vec!["ab"; 32].join(", ")),
+            "hex token leaked: {rendered}"
+        );
         assert!(rendered.contains("<redacted>"), "missing redaction marker: {rendered}");
     }
     fn header(kind: Kind, length: u32) -> Vec<u8> {
