@@ -372,8 +372,8 @@ fn body_of(daemon: &Daemon, method: &str, path: &str, auth: Option<&str>, body: 
 /// Parse one `/proc/<pid>/net/tcp*` body, returning the local addresses of
 /// LISTEN entries for `port` whose socket inode is in `owned_inodes`.
 ///
-/// `/proc/net/tcp` columns after the leading `sl` token are whitespace-separated
-/// and the socket inode is field index 9 (0-based) by the reviewer convention:
+/// `/proc/net/tcp` columns are whitespace-separated and the socket inode is
+/// field index 9 (0-based) by the reviewer convention:
 ///
 /// ```text
 /// sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
@@ -382,12 +382,12 @@ fn body_of(daemon: &Daemon, method: &str, path: &str, auth: Option<&str>, body: 
 fn parse_listening_addrs(content: &str, port: u16, owned_inodes: &std::collections::HashSet<String>) -> Vec<String> {
     let mut found = Vec::new();
     for line in content.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().skip(1).collect();
+        let fields: Vec<&str> = line.split_whitespace().collect();
         // Need at least through the inode field (index 9); st "0A" == LISTEN.
-        if fields.len() < 10 || fields[2] != "0A" || !owned_inodes.contains(fields[9]) {
+        if fields.len() < 10 || fields[3] != "0A" || !owned_inodes.contains(fields[9]) {
             continue;
         }
-        let local = fields[0];
+        let local = fields[1];
         let Some((addr_hex, port_hex)) = local.split_once(':') else {
             continue;
         };
@@ -430,10 +430,10 @@ fn listening_addrs(pid: u32, port: u16) -> Vec<String> {
 /// `/proc/net/tcp` row, not some other numeric column.
 #[test]
 fn proc_tcp_parser_reads_inode_from_field_nine() {
-    // A real row shape (note `uid` at index 7 and `timeout` at index 8 sit
-    // immediately before the inode at index 9). Local port 0x1F90 == 8080.
+    // A real row shape with the kernel's inode field at index 9. Local port
+    // 0x1F90 == 8080.
     let row = "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 \
-               00:00000000 00000000  1000        0 4242 1 0000000000000000 100 0 0 10 0";
+               00:00000000 00000000  1000 4242 1 0000000000000000 100 0 0 10 0";
     let content = format!(
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  \
          timeout inode\n{row}\n"
@@ -697,7 +697,16 @@ fn assert_surface_matrix(daemon: &Daemon) {
         signup.body,
         daemon.diagnostics()
     );
-    let app_token = signup.json()["access_token"]
+    let signup_json = signup.json();
+    assert_eq!(
+        signup_json["user"]["email"], email,
+        "signup must return the created email"
+    );
+    let signup_id = signup_json["user"]["id"]
+        .as_str()
+        .expect("signup must return a user id")
+        .to_string();
+    let app_token = signup_json["access_token"]
         .as_str()
         .expect("signup must return an access_token")
         .to_string();
@@ -707,7 +716,7 @@ fn assert_surface_matrix(daemon: &Daemon) {
         "/auth/v1/user",
         Some(&format!("Bearer {app_token}")),
         None,
-        &[("X-HeliosDB-Authorization", &format!("Basic {auth}"))],
+        &[("X-HeliosDB-Authorization", &auth)],
     )
     .unwrap_or_else(|e| panic!("dual-header user lookup failed: {e}{}", daemon.diagnostics()));
     assert_eq!(
@@ -716,6 +725,9 @@ fn assert_surface_matrix(daemon: &Daemon) {
         "dual-header app JWT flow must return 200{}",
         daemon.diagnostics()
     );
+    let user_json = user.json();
+    assert_eq!(user_json["email"], email, "user lookup must return signup email");
+    assert_eq!(user_json["id"], signup_id, "user lookup must return signup id");
     let app_only = status_of(
         daemon,
         "GET",
@@ -727,6 +739,21 @@ fn assert_surface_matrix(daemon: &Daemon) {
         app_only,
         401,
         "app JWT alone must not bypass outer auth{}",
+        daemon.diagnostics()
+    );
+    let wrong_app = http_request(
+        daemon.http_addr(),
+        "GET",
+        "/auth/v1/user",
+        Some("Bearer definitely-not-a-valid-app-jwt"),
+        None,
+        &[("X-HeliosDB-Authorization", &auth)],
+    )
+    .unwrap_or_else(|e| panic!("wrong app JWT request failed: {e}{}", daemon.diagnostics()));
+    assert_eq!(
+        wrong_app.status,
+        401,
+        "valid outer auth must not accept a wrong app JWT{}",
         daemon.diagnostics()
     );
     let invalid_outer = http_request(
@@ -1166,10 +1193,11 @@ mod uds_auth {
                     let handle = tokio::spawn(async move {
                         let _ = connection.await;
                     });
-                    client
+                    let row = client
                         .query_one("SELECT 1", &[])
                         .await
                         .map_err(|e| format!("query failed: {e}; sqlstate={:?}", e.code().map(|c| c.code())))?;
+                    assert_eq!(row.get::<_, i32>(0), 1, "authenticated UDS SELECT 1 result");
                     handle.abort();
                     Ok(())
                 }
@@ -1203,7 +1231,6 @@ mod uds_auth {
         );
         for (user, password, label) in [
             ("postgres", Some("wrong-password"), "wrong password"),
-            ("postgres", None, "missing password"),
             ("nobody", Some(PASSWORD), "unknown user"),
         ] {
             let error = connect_uds(&path, port, user, password).expect_err("invalid UDS credentials must fail");
@@ -1213,5 +1240,11 @@ mod uds_auth {
                 daemon.diagnostics()
             );
         }
+        let missing = connect_uds(&path, port, "postgres", None).expect_err("missing UDS password must fail");
+        assert!(
+            missing.to_ascii_lowercase().contains("password"),
+            "missing password must be rejected specifically, got {missing}{}",
+            daemon.diagnostics()
+        );
     }
 }
