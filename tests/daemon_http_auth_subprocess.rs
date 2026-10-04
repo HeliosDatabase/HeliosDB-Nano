@@ -140,6 +140,16 @@ impl Daemon {
 /// Spawn the daemon. `extra` is appended after the fixed port/HTTP args;
 /// `with_socket_dir` adds a managed `--pg-socket-dir`.
 fn spawn(extra: &[&str], http_port: u16, pg_port: u16, with_socket_dir: bool) -> Daemon {
+    spawn_with_failure_limit(extra, http_port, pg_port, with_socket_dir, 100)
+}
+
+fn spawn_with_failure_limit(
+    extra: &[&str],
+    http_port: u16,
+    pg_port: u16,
+    with_socket_dir: bool,
+    max_failures: u32,
+) -> Daemon {
     let sock_dir = if with_socket_dir {
         Some(TempDir::new().expect("socket tempdir"))
     } else {
@@ -149,7 +159,9 @@ fn spawn(extra: &[&str], http_port: u16, pg_port: u16, with_socket_dir: bool) ->
     let config_path = config_dir.path().join("nano-http-test.toml");
     std::fs::write(
         &config_path,
-        "[api]\nhttp_auth_max_failures = 100\nhttp_auth_failure_window_secs = 60\nhttp_auth_max_tracked_peers = 4096\nhttp_auth_max_in_flight = 64\n",
+        &format!(
+            "[api]\nhttp_auth_max_failures = {max_failures}\nhttp_auth_failure_window_secs = 60\nhttp_auth_max_tracked_peers = 4096\nhttp_auth_max_in_flight = 64\n"
+        ),
     )
     .expect("HTTP test config");
 
@@ -384,7 +396,7 @@ fn body_of(daemon: &Daemon, method: &str, path: &str, auth: Option<&str>, body: 
 /// LISTEN entries for `port` whose socket inode is in `owned_inodes`.
 ///
 /// `/proc/net/tcp` columns are whitespace-separated and the socket inode is
-/// field index 9 (0-based) by the reviewer convention:
+/// matched against the child-owned descriptor set:
 ///
 /// ```text
 /// sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
@@ -437,8 +449,8 @@ fn listening_addrs(pid: u32, port: u16) -> Vec<String> {
     found
 }
 
-/// Fixture: prove the socket inode is read from field index 9 of a real
-/// `/proc/net/tcp` row, not some other numeric column.
+/// Fixture: prove the socket inode is read from the expected `/proc/net/tcp`
+/// column, not some other numeric field.
 #[test]
 fn proc_tcp_parser_reads_inode_from_field_nine() {
     // A real row shape with the kernel's inode field at index 9. Local port
@@ -455,7 +467,7 @@ fn proc_tcp_parser_reads_inode_from_field_nine() {
     assert_eq!(
         parse_listening_addrs(&content, 8080, &owned),
         vec!["0100007F".to_string()],
-        "the LISTEN socket inode is field index 9 and its address decodes to loopback"
+        "the LISTEN socket inode and loopback address are parsed together"
     );
 
     let mut other = std::collections::HashSet::new();
@@ -1013,6 +1025,41 @@ fn default_http_bind_is_loopback_read_from_proc() {
     }
 }
 
+#[test]
+fn default_live_failure_budget_returns_retry_after_without_blocking_health() {
+    let daemon = spawn_with_failure_limit(
+        &["--auth", "scram-sha-256", "--password", PASSWORD],
+        free_port(),
+        free_port(),
+        false,
+        10,
+    );
+    for _ in 0..10 {
+        assert_eq!(
+            status_of(
+                &daemon,
+                "GET",
+                "/version",
+                Some(&basic("postgres", "wrong-password")),
+                None,
+            ),
+            401,
+            "the first ten failed attempts should be unauthorized{}",
+            daemon.diagnostics()
+        );
+    }
+    let locked = body_of(
+        &daemon,
+        "GET",
+        "/version",
+        Some(&basic("postgres", "wrong-password")),
+        None,
+    );
+    assert_eq!(locked.status, 429, "the next attempt must be rate limited{}");
+    assert_eq!(locked.header("retry-after"), Some("60"));
+    assert_eq!(status_of(&daemon, "GET", "/health", None, None), 200);
+}
+
 // ===========================================================================
 // 3. Fail-closed startup cases
 // ===========================================================================
@@ -1204,9 +1251,9 @@ mod uds_auth {
                     let handle = tokio::spawn(async move {
                         let _ = connection.await;
                     });
-                    let row = client
-                        .query_one("SELECT 1", &[])
+                    let row = tokio::time::timeout(IO_TIMEOUT, client.query_one("SELECT 1", &[]))
                         .await
+                        .map_err(|_| "UDS query timeout".to_string())?
                         .map_err(|e| format_pg_error("query failed", &e))?;
                     assert_eq!(row.get::<_, i32>(0), 1, "authenticated UDS SELECT 1 result");
                     handle.abort();
