@@ -30,6 +30,7 @@ use ring::pbkdf2;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use subtle::ConstantTimeEq;
 
 use super::password_store::{InMemoryPasswordStore, SharedPasswordStore};
 
@@ -245,6 +246,39 @@ impl AuthManager {
             // User not found - still do hash to prevent timing attacks
             let _ = Self::hash_password(password);
             Ok(false)
+        }
+    }
+
+    /// Verify a cleartext password presented off the wire (HTTP Basic), dispatching
+    /// on the configured method.
+    ///
+    /// The MD5 method stores only the PostgreSQL shadow
+    /// `md5` + hex(md5(password || username)) in the legacy users map, which
+    /// [`Self::verify_cleartext`] cannot check. This recomputes that shadow for the
+    /// supplied username and compares the hex bodies in constant time. Every other
+    /// method delegates to [`Self::verify_cleartext`], so SCRAM-store, cleartext and
+    /// legacy users keep exactly their wire semantics. Unknown users fail closed;
+    /// the MD5 arm still pays the dummy recomputation that the other arms get from
+    /// their hash.
+    pub fn verify_basic(&self, username: &str, password: &str) -> bool {
+        if self.method == AuthMethod::Md5 {
+            // Fixed dummy body used to equalize the MD5 work on the unknown-user /
+            // malformed-shadow paths; `is_real` gates the result.
+            const DUMMY_BODY: &[u8; 32] = b"00000000000000000000000000000000";
+            let (body, is_real): (&[u8], bool) = match self.users.get(username) {
+                Some(user) => match user.password_hash.strip_prefix("md5") {
+                    Some(stripped) => (stripped.as_bytes(), true),
+                    None => (DUMMY_BODY, false),
+                },
+                None => (DUMMY_BODY, false),
+            };
+            let computed = format!(
+                "{:x}",
+                md5::compute([password.as_bytes(), username.as_bytes()].concat())
+            );
+            is_real && constant_time_compare(computed.as_bytes(), body)
+        } else {
+            self.verify_cleartext(username, password).unwrap_or(false)
         }
     }
 
@@ -579,16 +613,7 @@ pub fn scram_server_key(salted_password: &[u8]) -> Vec<u8> {
 /// This is critical for security - comparing secrets byte-by-byte
 /// with early exit would leak information about the secret.
 fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-
-    result == 0
+    bool::from(a.ct_eq(b))
 }
 
 /// Prepare SCRAM credentials for storage

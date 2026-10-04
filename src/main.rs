@@ -940,22 +940,15 @@ async fn start_server(
     // section: nothing downstream of this point could read it.
     let api_config = db_config.api.clone();
 
-    // Open database (in-memory mode avoids disk I/O for all operations)
-    let db = if memory_mode {
-        println!("[2/4] Initializing in-memory database...");
-        Arc::new(EmbeddedDatabase::with_config(db_config)?)
-    } else {
-        println!("[2/4] Initializing database at {}...", data_dir.display());
-        Arc::new(EmbeddedDatabase::with_config(db_config)?)
-    };
-    println!("      Database initialized successfully");
-
-    // Configure PostgreSQL server
-    let pg_addr: SocketAddr = format!("{listen}:{port}")
-        .parse()
-        .map_err(|e| Error::config(format!("Invalid listen address: {e}")))?;
-
-    // Parse authentication method
+    // ------------------------------------------------------------------
+    // P0: resolve the HTTP exposure policy BEFORE any service starts.
+    //
+    // The HTTP listener shares the PostgreSQL wire's AuthManager, so both
+    // agree on which users/credentials are valid. The bind policy is
+    // enforced here, before the database is opened or HA starts, and the
+    // HTTP address is computed now so the HTTP surface cannot start on a
+    // wider interface by accident.
+    // ------------------------------------------------------------------
     let auth_method = match auth.to_lowercase().as_str() {
         "trust" => AuthMethod::Trust,
         "password" => AuthMethod::CleartextPassword,
@@ -975,6 +968,102 @@ async fn start_server(
         AuthMethod::ScramSha256 => "SCRAM-SHA-256",
     };
 
+    // ONE AuthManager, shared by the PostgreSQL wire listener and the HTTP
+    // auth policy. Construction mirrors what `PgServer::new` used to do per
+    // method: default users under MD5; a seeded SCRAM/cleartext store when a
+    // password is configured.
+    let auth_manager: Arc<AuthManager> = if auth_method == AuthMethod::Md5 {
+        if let Some(ref pwd) = password {
+            let mut mgr = AuthManager::new(AuthMethod::Md5);
+            mgr.add_user("postgres".to_string(), pwd.clone());
+            mgr.add_user("helios".to_string(), pwd.clone());
+            Arc::new(mgr)
+        } else {
+            Arc::new(AuthManager::new(AuthMethod::Md5).with_default_users())
+        }
+    } else if matches!(auth_method, AuthMethod::CleartextPassword | AuthMethod::ScramSha256) {
+        if let Some(ref pwd) = password {
+            let mut store = InMemoryPasswordStore::new();
+            store
+                .add_user("postgres", pwd)
+                .map_err(|e| Error::config(format!("Failed to add user: {e}")))?;
+            store
+                .add_user("helios", pwd)
+                .map_err(|e| Error::config(format!("Failed to add user: {e}")))?;
+            let shared_store = SharedPasswordStore::new(store);
+            Arc::new(AuthManager::with_password_store(auth_method, shared_store))
+        } else {
+            Arc::new(AuthManager::new(auth_method).with_default_users())
+        }
+    } else {
+        Arc::new(AuthManager::new(AuthMethod::Trust).with_default_users())
+    };
+
+    // P0-1: HTTP Basic authenticates against the wire AuthManager when, and
+    // only when, the wire has a credential (any non-trust method).
+    // A trust wire listener can still carry an explicit password for HTTP
+    // protection. Keep that password out of the wire AuthManager (trust means
+    // the wire accepts anyone), but require it on every HTTP route.
+    let http_auth_policy = if matches!(auth_method, AuthMethod::Trust) && password.is_some() {
+        std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::from_wire(
+            password.clone(),
+            ha_config.mcp_token.clone().map(std::sync::Arc::from),
+            ha_config.allow_insecure_http,
+        ))
+    } else {
+        std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::from_auth_manager(
+            Some(std::sync::Arc::clone(&auth_manager)),
+            ha_config.mcp_token.clone().map(std::sync::Arc::from),
+            ha_config.allow_insecure_http,
+        ))
+    };
+
+    let tls_enabled = tls_cert.is_some();
+    let http_health_disabled = ha_config.http_port == 0;
+    // P0-3: HTTP defaults to loopback, never to `--listen`.
+    let http_addr: Option<SocketAddr> = if http_health_disabled {
+        None
+    } else {
+        let http_bind = heliosdb_nano::api::resolve_http_listen(ha_config.http_listen.as_deref());
+        let addr: SocketAddr = format!("{}:{}", http_bind, ha_config.http_port)
+            .parse()
+            .map_err(|e| Error::config(format!("Invalid HTTP address: {e}")))?;
+        // The HTTP listener never terminates TLS, so a wire `--tls-cert` does
+        // not make it HTTPS. `http_bind_safety_check` fails closed on any
+        // non-loopback plaintext bind.
+        if let Err(reason) = heliosdb_nano::api::http_bind_safety_check(addr, &http_auth_policy, false) {
+            return Err(Error::config(reason));
+        }
+        Some(addr)
+    };
+
+    // P0-8: the MySQL wire listener is trust-only. Enabling it while the
+    // PostgreSQL wire requires a credential silently bypasses that credential
+    // for any MySQL client, so fail closed at startup rather than warn.
+    if mysql_enabled && (password.is_some() || !matches!(auth_method, AuthMethod::Trust)) {
+        return Err(Error::config(format!(
+            "MySQL authentication is not implemented: the MySQL listener accepts any username, so \
+             --mysql alongside the PostgreSQL {auth_display} method would let any MySQL client run \
+             SQL without the configured password. Disable --mysql, or use --auth trust for an \
+             explicit local/dev deployment."
+        )));
+    }
+
+    // Open database (in-memory mode avoids disk I/O for all operations)
+    let db = if memory_mode {
+        println!("[2/4] Initializing in-memory database...");
+        Arc::new(EmbeddedDatabase::with_config(db_config)?)
+    } else {
+        println!("[2/4] Initializing database at {}...", data_dir.display());
+        Arc::new(EmbeddedDatabase::with_config(db_config)?)
+    };
+    println!("      Database initialized successfully");
+
+    // Configure PostgreSQL server
+    let pg_addr: SocketAddr = format!("{listen}:{port}")
+        .parse()
+        .map_err(|e| Error::config(format!("Invalid listen address: {e}")))?;
+
     // Build server config
     let mut pg_config = PgServerConfig::with_address(pg_addr)
         .with_auth_method(auth_method)
@@ -982,7 +1071,6 @@ async fn start_server(
         .with_timeouts(connection_policy.clone());
 
     // Configure TLS if specified
-    let tls_enabled = tls_cert.is_some();
     if let (Some(cert_path), Some(key_path)) = (&tls_cert, &tls_key) {
         let ssl_config = SslConfig::new(SslMode::Prefer, cert_path, key_path).with_post_quantum(tls_post_quantum);
         pg_config = pg_config.with_ssl(ssl_config);
@@ -990,9 +1078,8 @@ async fn start_server(
 
     println!("[3/4] Configuring server...");
     println!("      - Listen address: {pg_addr}");
-    if ha_config.http_port != 0 {
-        let http_listen = ha_config.http_listen.as_deref().unwrap_or(&listen);
-        println!("      - HTTP address: {http_listen}:{}", ha_config.http_port);
+    if let Some(addr) = http_addr {
+        println!("      - HTTP address: {addr}");
     }
     println!("      - Max connections: {max_connections} (per listener)");
     println!(
@@ -1056,41 +1143,8 @@ async fn start_server(
     }
 
     // Create PostgreSQL server with appropriate auth configuration
-    let pg_server = if auth_method == AuthMethod::Md5 {
-        // MD5 uses the legacy `AuthManager` users map, which stores the
-        // PostgreSQL md5 shadow — NOT the SCRAM password store, which cannot
-        // serve an md5 challenge. With a --password, seed the default users
-        // (their shadows are computed by `add_user` under AuthMethod::Md5);
-        // without one, fall back to PgServer::new, which provisions md5-shadow
-        // default users. Both paths are fail-closed: the correct password is
-        // always required.
-        if let Some(ref pwd) = password {
-            let mut mgr = AuthManager::new(AuthMethod::Md5);
-            mgr.add_user("postgres".to_string(), pwd.clone());
-            mgr.add_user("helios".to_string(), pwd.clone());
-            PgServer::with_auth_manager(pg_config, Arc::clone(&db), mgr)?
-        } else {
-            PgServer::new(pg_config, Arc::clone(&db))?
-        }
-    } else if matches!(auth_method, AuthMethod::CleartextPassword | AuthMethod::ScramSha256) {
-        if let Some(ref pwd) = password {
-            // Create password store with default users
-            let mut store = InMemoryPasswordStore::new();
-            store
-                .add_user("postgres", pwd)
-                .map_err(|e| Error::config(format!("Failed to add user: {e}")))?;
-            store
-                .add_user("helios", pwd)
-                .map_err(|e| Error::config(format!("Failed to add user: {e}")))?;
-            let shared_store = SharedPasswordStore::new(store);
-            let auth_manager = AuthManager::with_password_store(auth_method, shared_store);
-            PgServer::with_auth_manager(pg_config, Arc::clone(&db), auth_manager)?
-        } else {
-            PgServer::new(pg_config, Arc::clone(&db))?
-        }
-    } else {
-        PgServer::new(pg_config, Arc::clone(&db))?
-    };
+    // Share the single AuthManager built before startup with the wire listener.
+    let pg_server = PgServer::with_shared_auth_manager(pg_config, Arc::clone(&db), Arc::clone(&auth_manager))?;
 
     println!("[4/4] Starting server...");
     println!();
@@ -1157,7 +1211,7 @@ async fn start_server(
     // detached task that the main `select!` never observes — so a
     // late-life health failure cannot tear down the database listener.
     // `--http-port 0` opts out (no HTTP endpoint, no listener).
-    let http_health_disabled = ha_config.http_port == 0;
+    //
     // The join handle is kept (rather than fully detaching the task) so the
     // shutdown arm can abort it alongside the MySQL/Unix-socket listeners.
     // This task holds an `Arc::clone(&db)`; leaving it running past shutdown
@@ -1165,28 +1219,12 @@ async fn start_server(
     // the ordered close-time row-counter flush and R4.2 snapshot checkpoint —
     // never runs at all under the default `--http-port 8080`. Aborting it is
     // what lets that work happen on the default `start` invocation, not just
-    // under `--http-port 0`. The comment above still holds: the main
-    // `select!` never *observes* this task, so a late-life HTTP failure
-    // cannot tear the database listener down.
-    // P0-1: the daemon HTTP listener serves the whole BaaS surface (and, when
-    // compiled in, MCP). It now shares the wire credential: when a password is
-    // configured, every non-health route requires it (Basic, or the MCP bearer
-    // token), and a non-loopback plaintext bind is refused unless the operator
-    // explicitly passed --allow-insecure-http. A trust-mode listener still binds,
-    // but only loopback unless overridden.
-    let http_auth_policy = std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::from_wire(
-        password.clone(),
-        ha_config.mcp_token.clone().map(std::sync::Arc::from),
-        ha_config.allow_insecure_http,
-    ));
-    let http_handle: Option<tokio::task::JoinHandle<()>> = if !http_health_disabled {
-        let http_listen = ha_config.http_listen.as_deref().unwrap_or(&listen);
-        let http_addr: SocketAddr = format!("{}:{}", http_listen, ha_config.http_port)
-            .parse()
-            .map_err(|e| Error::config(format!("Invalid HTTP address: {e}")))?;
-        if let Err(reason) = heliosdb_nano::api::http_bind_safety_check(http_addr, &http_auth_policy, tls_enabled) {
-            return Err(Error::config(reason));
-        }
+    // under `--http-port 0`. The main `select!` never *observes* this task, so
+    // a late-life HTTP failure cannot tear the database listener down.
+    //
+    // The address and the exposure policy were resolved before the database
+    // opened (P0-3/P0-4); only the bind happens here.
+    let http_handle: Option<tokio::task::JoinHandle<()>> = if let Some(http_addr) = http_addr {
         match tokio::net::TcpListener::bind(http_addr).await {
             Ok(listener) => {
                 info!(
@@ -1195,7 +1233,7 @@ async fn start_server(
                 if http_auth_policy.is_required() {
                     info!(
                         "HTTP API authentication is required on {http_addr} \
-                         (HTTP Basic with the wire password, or the MCP bearer token when configured)"
+                         (HTTP Basic with the wire credential, or the MCP bearer token when configured)"
                     );
                 } else {
                     tracing::warn!(
@@ -1246,18 +1284,15 @@ async fn start_server(
             .parse()
             .map_err(|e| Error::config(format!("Invalid MySQL listen address '{}': {}", mysql_listen, e)))?;
 
-        // P0-1 audit: the MySQL wire listener is trust-only — `authenticate()`
-        // accepts any username and never checks `--password`. Unlike the HTTP API
-        // this is NOT closed here (credential verification is a larger feature),
-        // but exposing it off loopback while the PostgreSQL wire is authenticated
-        // silently bypasses that authentication. Refuse to let that pass without a
-        // loud report.
-        if !mysql_addr.ip().is_loopback() && !matches!(auth_method, AuthMethod::Trust) {
-            tracing::error!(
-                "MySQL listener on {mysql_addr} does NOT verify credentials (trust-only), while the \
-                 PostgreSQL wire protocol uses {auth_display}: any MySQL client can run SQL without \
-                 the configured password. Bind --mysql-listen 127.0.0.1 or leave --mysql disabled \
-                 until MySQL authentication is implemented."
+        // P0-8: a non-trust PostgreSQL method with --mysql already failed closed
+        // before the database opened. Reaching here means the wire is in trust
+        // mode, so the trust-only MySQL listener is consistent with an explicit
+        // local/dev deployment — but say so loudly if it is exposed off loopback.
+        if !mysql_addr.ip().is_loopback() {
+            tracing::warn!(
+                "MySQL listener on {mysql_addr} is trust-only and the PostgreSQL wire is also in \
+                 trust mode; both accept any client. Use --mysql-listen 127.0.0.1 unless this is a \
+                 deliberate local/dev deployment."
             );
         }
 
@@ -2381,7 +2416,12 @@ async fn run_http_listener(
     // the wire policy, and a real request still passes MCP's own bearer check.
     let app = heliosdb_nano::api::attach_http_auth(app, http_auth);
 
-    axum::serve(listener, app).await
+    // Attach peer connection info so the auth layer can rate-limit per peer.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
 }
 
 #[cfg(test)]

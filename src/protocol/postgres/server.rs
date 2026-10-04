@@ -150,6 +150,19 @@ impl PgServer {
         database: Arc<EmbeddedDatabase>,
         auth_manager: AuthManager,
     ) -> Result<Self> {
+        Self::with_shared_auth_manager(config, database, Arc::new(auth_manager))
+    }
+
+    /// Create server sharing an already-built authentication manager.
+    ///
+    /// The daemon builds ONE [`AuthManager`] and hands the same `Arc` to both this
+    /// listener and the HTTP auth policy, so the wire protocol and the HTTP API can
+    /// never disagree about which users/credentials are valid.
+    pub fn with_shared_auth_manager(
+        config: PgServerConfig,
+        database: Arc<EmbeddedDatabase>,
+        auth_manager: Arc<AuthManager>,
+    ) -> Result<Self> {
         // Apply the trust-loopback gate using the AuthManager's method
         // (the user may have constructed it with a different method
         // than `config.auth_method`).
@@ -174,7 +187,7 @@ impl PgServer {
         Ok(Self {
             config,
             database,
-            auth_manager: Arc::new(auth_manager),
+            auth_manager,
             ssl_negotiator,
             connection_limiter,
             utilisation_warned: AtomicBool::new(false),

@@ -109,6 +109,7 @@ sha2 = "0.10"
 argon2 = "0.5"  # Non-FIPS KDF (Argon2id)
 pbkdf2 = { version = "0.12", features = ["simple"] }  # FIPS-approved KDF
 zeroize = "1.8"
+subtle = "2"  # Constant-time comparison (secrets, TLS/bearer tokens)
 hex = "0.4"
 # "prefer-post-quantum": without it, rustls's aws-lc-rs backend still lists
 # X25519MLKEM768 in DEFAULT_KX_GROUPS but LAST (least preferred) — a client

@@ -31,6 +31,7 @@ use parking_lot::RwLock;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use super::auth::{prepare_scram_credentials, scram_client_key, scram_salted_password, scram_stored_key};
@@ -104,16 +105,7 @@ impl ScramCredentials {
 
 /// Constant-time comparison to prevent timing attacks
 fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-
-    result == 0
+    bool::from(a.ct_eq(b))
 }
 
 /// Password storage trait

@@ -182,6 +182,25 @@ async fn the_mcp_bearer_token_is_scoped_to_mcp_routes() {
     );
 }
 
+#[tokio::test]
+async fn basic_auth_rejects_unknown_usernames() {
+    use base64::Engine as _;
+    // Right password, unknown user: the wire AuthManager owns the user set, so
+    // this must fail closed rather than accepting "any username".
+    let encoded = base64::engine::general_purpose::STANDARD.encode(format!("nobody:{PASSWORD}"));
+    assert_eq!(
+        status(
+            &protected_router(),
+            "GET",
+            "/version",
+            None,
+            Some(&format!("Basic {encoded}"))
+        )
+        .await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 #[cfg(feature = "mcp-endpoint")]
 #[tokio::test]
 async fn mcp_remains_authenticated_under_the_wire_policy() {
