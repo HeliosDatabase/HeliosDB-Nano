@@ -2103,6 +2103,19 @@ pub struct ApiConfig {
     /// ```
     #[serde(default)]
     pub oauth_providers: Vec<OAuthProviderConfig>,
+    /// HTTP credential-limiter: failed credential attempts tolerated per peer
+    /// before its requests are answered 429. Zero is rejected at startup.
+    pub http_auth_max_failures: u32,
+    /// HTTP credential-limiter: window, in seconds, over which per-peer failures
+    /// are counted and the `Retry-After` value advertised. Zero is rejected.
+    pub http_auth_failure_window_secs: u64,
+    /// HTTP credential-limiter: hard cap on the number of distinct peers tracked
+    /// at once. Zero is rejected.
+    pub http_auth_max_tracked_peers: usize,
+    /// HTTP credential-limiter: hard cap on simultaneous credential verifications
+    /// across all peers. Bounds CPU an unauthenticated peer can occupy. Zero is
+    /// rejected.
+    pub http_auth_max_in_flight: usize,
 }
 
 /// Configuration for a single OAuth2 provider.
@@ -2146,6 +2159,10 @@ impl std::fmt::Debug for ApiConfig {
             .field("service_role_key", &redacted_opt(&self.service_role_key))
             // `OAuthProviderConfig` redacts its own secret, so nesting is safe.
             .field("oauth_providers", &self.oauth_providers)
+            .field("http_auth_max_failures", &self.http_auth_max_failures)
+            .field("http_auth_failure_window_secs", &self.http_auth_failure_window_secs)
+            .field("http_auth_max_tracked_peers", &self.http_auth_max_tracked_peers)
+            .field("http_auth_max_in_flight", &self.http_auth_max_in_flight)
             .finish()
     }
 }
@@ -2172,6 +2189,10 @@ impl Default for ApiConfig {
             anon_key: None,
             service_role_key: None,
             oauth_providers: Vec::new(),
+            http_auth_max_failures: crate::api::http_auth::MAX_FAILURES,
+            http_auth_failure_window_secs: crate::api::http_auth::FAILURE_WINDOW.as_secs(),
+            http_auth_max_tracked_peers: crate::api::http_auth::MAX_TRACKED_PEERS,
+            http_auth_max_in_flight: crate::api::http_auth::MAX_IN_FLIGHT_VERIFICATIONS,
         }
     }
 }
@@ -2227,6 +2248,7 @@ mod tests {
                 client_secret: "client-secret-value".to_string(),
                 redirect_uri: "http://localhost:8080/auth/v1/callback".to_string(),
             }],
+            ..Default::default()
         };
 
         let rendered = format!("{config:?}");
@@ -2257,6 +2279,7 @@ mod tests {
             anon_key: None,
             service_role_key: None,
             oauth_providers: Vec::new(),
+            ..Default::default()
         };
         let rendered = format!("{unset:?}");
         assert!(rendered.contains("anon_key: None"), "{rendered}");
@@ -2286,6 +2309,7 @@ mod tests {
                 client_secret: "client-secret-value".to_string(),
                 redirect_uri: "http://localhost:8080/auth/v1/callback".to_string(),
             }],
+            ..Default::default()
         };
 
         let toml_text = toml::to_string(&config).expect("serialize");

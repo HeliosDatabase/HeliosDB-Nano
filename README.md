@@ -107,11 +107,13 @@ heliosdb-nano start --data-dir ./mydata --mysql
 heliosdb-nano start --memory --mysql
 
 # With auth and TLS
-heliosdb-nano start --data-dir ./mydata --mysql \
+heliosdb-nano start --data-dir ./mydata \
   --auth scram-sha-256 --password s3cret \
   --tls-cert cert.pem --tls-key key.pem
 
 # Same-host / embedded mode — Unix sockets (no TCP)
+# (PostgreSQL UDS authenticates with the same credential; MySQL is trust-only,
+#  so --mysql / --mysql-socket are refused while a PostgreSQL credential is set)
 heliosdb-nano start --memory \
   --pg-socket-dir /tmp \
   --mysql --mysql-socket /tmp/heliosdb-mysql.sock
@@ -450,6 +452,56 @@ wscat -c ws://localhost:8080/realtime/v1/websocket
 
 RLS is automatic on REST endpoints via JWT claims. See [vs-supabase](https://heliosdb.com/vs-supabase.html).
 
+### HTTP API authentication and exposure
+
+The HTTP listener is the whole BaaS surface **and** `POST /v1/branches/main/query`,
+which executes SQL. It shares the PostgreSQL wire `AuthManager`, so it can never
+disagree with the wire about which users/credentials are valid.
+
+* **Default bind is loopback.** `--http-listen` defaults to `127.0.0.1` and does
+  **not** inherit `--listen`; binding the database on `0.0.0.0` never silently
+  publishes the HTTP surface. Pass `--http-listen 0.0.0.0` to opt out.
+* **A configured wire credential protects every HTTP route.** With `--auth
+  password|md5|scram-sha-256` (or `--auth trust --password …`, which protects HTTP
+  but leaves the wire open), every route except `/health` and CORS preflight
+  requires `Authorization: Basic <base64(user:password)>`. The username is
+  significant and unknown users fail closed. `/health` is always the fixed
+  status-only `{"status":"ok"}` and never leaks a version or branch.
+  BaaS requests that also carry an application JWT use
+  `X-HeliosDB-Authorization: Basic <base64(user:password)>` for this outer
+  check while retaining `Authorization: Bearer <app-jwt>` for the BaaS handler.
+  When the dedicated header is present it is authoritative; malformed or wrong
+  values never fall back to `Authorization`. MCP bearer tokens remain scoped to
+  `/mcp`.
+* **Non-loopback plaintext is refused at startup.** Authenticated HTTP over a
+  non-loopback plaintext bind is *always* refused because Basic credentials would
+  cross the network in the clear; `--allow-insecure-http` only ever applies to a
+  trust-mode bind. Front the listener with a TLS terminator if you must expose it.
+  Note the HTTP listener itself does **not** terminate TLS — a wire `--tls-cert`
+  does not make it HTTPS. (This is tracked as the deferred TLS-require gap #53;
+  the `--tls-require` enforcement in the Full product has no Nano HTTP equivalent.)
+* **The credential limiter counts only failed attempts.** Per peer, `--auth` failures
+  are bounded by `[api] http_auth_max_failures` (default 10) inside
+  `http_auth_failure_window_secs` (default 60); once spent the peer gets HTTP 429
+  with `Retry-After` set to the configured window. A bounded number of simultaneous
+  verifications (`http_auth_max_in_flight`, default 64) caps the CPU an
+  unauthenticated peer can occupy, and distinct peers are capped by
+  `http_auth_max_tracked_peers` (default 4096). All four keys reject `0` at startup.
+
+### MySQL and Unix-socket authentication
+
+Authentication is implemented on the PostgreSQL wire (and the HTTP API above), not
+on MySQL. Therefore:
+
+* `--mysql` (TCP) and `--mysql-socket <path>` (Unix domain socket) are **trust-only**.
+  Starting either while the PostgreSQL wire has a configured credential (or a
+  password) **fails closed at startup** rather than quietly offering an
+  unauthenticated SQL path; use `--auth trust` for an explicit local/dev deployment.
+* The PostgreSQL Unix socket (`--pg-socket-dir`) is **not** an auth bypass: it uses
+  the same `Arc<AuthManager>` as the TCP listener, so missing / wrong / unknown-user
+  credentials fail there exactly as they do on `127.0.0.1:5432`. With `--auth trust`
+  it remains credential-free, as before.
+
 ## ORM & Driver Compatibility
 
 | Language | PostgreSQL driver | MySQL driver | Tested ORMs |
@@ -509,7 +561,7 @@ reports `C.UTF-8`). See the SQL dialect notes in `docs/llms.txt`.
 - **Import/Export**: CSV, JSON, JSONL, Parquet, Arrow, SQL
 - **Audit logging**: Tamper-proof trail (SHA-256 checksums)
 - **Encryption**: AES-256-GCM at rest, FIPS 140-3 mode — see [what is and isn't encrypted](#encryption-at-rest) before relying on it
-- **Unix domain socket listeners** for both PostgreSQL (`--pg-socket-dir /tmp`) and MySQL (`--mysql-socket /tmp/heliosdb.sock`) — PHP `mysqli` / WordPress embedded-mode and libpq defaults work out of the box
+- **Unix domain socket listeners** for both PostgreSQL (`--pg-socket-dir /tmp`) and MySQL (`--mysql-socket /tmp/heliosdb.sock`) — PHP `mysqli` / WordPress embedded-mode and libpq defaults work out of the box. The PostgreSQL UDS enforces the same `AuthManager` as the TCP listener; the MySQL UDS is trust-only and, like `--mysql`, refuses to start when a PostgreSQL credential is configured (see [MySQL and Unix-socket authentication](#mysql-and-unix-socket-authentication))
 
 ## Architecture
 

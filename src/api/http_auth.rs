@@ -16,6 +16,10 @@
 //!   username is checked, unknown users fail closed, and SCRAM / cleartext / MD5
 //!   semantics are not re-implemented here. No credential comparison lives in this
 //!   file: the bearer-token check uses `subtle`'s constant-time primitive.
+//! * `X-HeliosDB-Authorization: Basic <base64(user:password)>` — an explicit
+//!   outer-auth header for BaaS JWT requests. When present it is authoritative;
+//!   an invalid value never falls back to the ordinary `Authorization` header,
+//!   which remains available for the downstream app JWT.
 //! * `Authorization: Bearer <token>` — where `<token>` is the MCP bearer token
 //!   (`--mcp-token`), accepted only on MCP routes.
 //!
@@ -49,22 +53,100 @@ use axum::{
 };
 use base64::Engine as _;
 use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 
 use crate::protocol::postgres::{AuthManager, AuthMethod, InMemoryPasswordStore, PasswordStore, SharedPasswordStore};
 
-/// Failed authentications tolerated for ONE peer in one [`FAILURE_WINDOW`] before
-/// the policy refuses further attempts from that peer. Ten is small enough to blunt
+const OUTER_AUTHORIZATION_HEADER: &str = "x-heliosdb-authorization";
+
+/// Failed authentications tolerated for ONE peer in one failure window before the
+/// policy refuses further attempts from that peer. Ten is small enough to blunt
 /// online guessing and large enough not to bite a human who mistypes twice.
 pub const MAX_FAILURES: u32 = 10;
 
-/// Window over which failures are counted.
+/// Default window over which failures are counted.
 pub const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
-/// Upper bound on the number of distinct peers tracked at once. Without it, a peer
-/// rotating source addresses could grow the limiter map without bound. When full,
-/// the entry with the oldest window is evicted; entries are also dropped once their
-/// window expires, so the steady-state size is bounded by the attacker's rate.
+/// Default upper bound on the number of distinct peers tracked at once. Without it,
+/// a peer rotating source addresses could grow the limiter map without bound. When
+/// full, the entry with the oldest window is evicted; entries are also dropped once
+/// their window expires, so the steady-state size is bounded by the attacker's rate.
 pub const MAX_TRACKED_PEERS: usize = 4096;
+
+/// Default upper bound on credential verifications running at the same time ACROSS
+/// all peers. Password verification (PBKDF2 for SCRAM, an MD5 recomputation for MD5)
+/// is deliberately CPU-bound to blunt offline and online guessing, so an unbounded
+/// number of concurrent verifications is a trivial CPU-exhaustion vector. Admission
+/// is a separate axis from per-peer failure counting: a legitimate burst of VALID
+/// requests must not be mistaken for an attack, but the verifier still needs a hard
+/// ceiling. A permit is held for the duration of one verification and released by
+/// RAII, so a panic in the comparison cannot leak a slot.
+pub const MAX_IN_FLIGHT_VERIFICATIONS: usize = 64;
+
+/// Bounded, operator-tunable knobs for the HTTP credential limiter.
+///
+/// Every field maps to an `[api]` key (see [`crate::config::ApiConfig`]). The
+/// defaults are the compile-time constants above; zero is never a valid value and
+/// [`HttpRateLimits::validate`] rejects it, because a zero window/count would
+/// either disable the limiter silently or lock every peer out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpRateLimits {
+    /// Failed credential attempts tolerated for one peer inside `failure_window`.
+    pub max_failures: u32,
+    /// Sliding window over which failures are counted.
+    pub failure_window: Duration,
+    /// Cap on the number of distinct peers tracked at once.
+    pub max_tracked_peers: usize,
+    /// Cap on simultaneous credential verifications across all peers.
+    pub max_in_flight: usize,
+}
+
+impl Default for HttpRateLimits {
+    fn default() -> Self {
+        Self {
+            max_failures: MAX_FAILURES,
+            failure_window: FAILURE_WINDOW,
+            max_tracked_peers: MAX_TRACKED_PEERS,
+            max_in_flight: MAX_IN_FLIGHT_VERIFICATIONS,
+        }
+    }
+}
+
+impl HttpRateLimits {
+    /// Reject the configurations that would make the limiter meaningless or
+    /// universally fatal. Zero is the only value that is always wrong: a zero
+    /// failure count locks every peer out after the first attempt, a zero window
+    /// makes the expiry arithmetic nonsensical, a zero peer cap evicts every entry
+    /// immediately, and a zero concurrency cap refuses every verification.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_failures == 0 {
+            return Err("[api] http_auth_max_failures must be greater than 0".to_string());
+        }
+        if self.failure_window.is_zero() {
+            return Err("[api] http_auth_failure_window_secs must be greater than 0".to_string());
+        }
+        if self.max_tracked_peers == 0 {
+            return Err("[api] http_auth_max_tracked_peers must be greater than 0".to_string());
+        }
+        if self.max_in_flight == 0 {
+            return Err("[api] http_auth_max_in_flight must be greater than 0".to_string());
+        }
+        if self.max_in_flight > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(format!(
+                "[api] http_auth_max_in_flight must be <= {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            ));
+        }
+        Ok(())
+    }
+
+    /// Seconds to advertise in `Retry-After` when a peer is over the limit. Derived
+    /// from the CONFIGURED window, never a hard-coded constant, so an operator who
+    /// shortens the window is not told to wait longer than that window.
+    pub fn retry_after_secs(&self) -> u64 {
+        self.failure_window.as_secs().max(1)
+    }
+}
 
 /// Default HTTP listener bind address.
 ///
@@ -92,8 +174,14 @@ pub struct HttpAuthPolicy {
     bearer_token: Option<Arc<str>>,
     /// `--allow-insecure-http`: permit a non-loopback plaintext bind in trust mode.
     allow_insecure_http: bool,
+    /// Operator-tunable bounds (peer failures, tracked peers, in-flight verifications).
+    limits: HttpRateLimits,
     /// Bounded per-peer failure state.
     peers: Mutex<PeerFailures>,
+    /// Separate bounded admission for credential verification. Holding a permit
+    /// across the comparison bounds CPU an unauthenticated peer can occupy; the
+    /// permit is RAII so it is released on normal return and on unwind.
+    in_flight: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for HttpAuthPolicy {
@@ -110,23 +198,38 @@ impl std::fmt::Debug for HttpAuthPolicy {
             )
             .field("bearer_token", &self.bearer_token.as_ref().map(|_| "<redacted>"))
             .field("allow_insecure_http", &self.allow_insecure_http)
+            .field("limits", &self.limits)
             .finish()
     }
 }
 
 impl HttpAuthPolicy {
-    /// The trust-mode policy: no route authentication. Used for loopback/dev binds
-    /// and by tests that exercise the router without credentials.
-    pub fn disabled() -> Self {
+    /// Shared builder. Collapses a trust verifier to `None` (no HTTP credential)
+    /// and materialises the in-flight semaphore from the configured bound.
+    fn build(
+        verifier: Option<Arc<AuthManager>>,
+        bearer_token: Option<Arc<str>>,
+        allow_insecure_http: bool,
+        limits: HttpRateLimits,
+    ) -> Self {
+        let verifier = verifier.filter(|manager| !matches!(manager.method(), AuthMethod::Trust));
         Self {
-            verifier: None,
-            bearer_token: None,
-            allow_insecure_http: false,
+            verifier,
+            bearer_token,
+            allow_insecure_http,
+            in_flight: Arc::new(Semaphore::new(limits.max_in_flight)),
             peers: Mutex::new(PeerFailures::default()),
+            limits,
         }
     }
 
-    /// Build the policy around the live wire [`AuthManager`].
+    /// The trust-mode policy: no route authentication. Used for loopback/dev binds
+    /// and by tests that exercise the router without credentials.
+    pub fn disabled() -> Self {
+        Self::build(None, None, false, HttpRateLimits::default())
+    }
+
+    /// Build the policy around the live wire [`AuthManager`] with the default limits.
     ///
     /// A verifier whose method is [`AuthMethod::Trust`] carries no credential and is
     /// collapsed to `None`, so a trust-mode daemon does not accidentally require
@@ -137,13 +240,22 @@ impl HttpAuthPolicy {
         bearer_token: Option<Arc<str>>,
         allow_insecure_http: bool,
     ) -> Self {
-        let verifier = verifier.filter(|manager| !matches!(manager.method(), AuthMethod::Trust));
-        Self {
-            verifier,
-            bearer_token,
-            allow_insecure_http,
-            peers: Mutex::new(PeerFailures::default()),
-        }
+        Self::build(verifier, bearer_token, allow_insecure_http, HttpRateLimits::default())
+    }
+
+    /// As [`HttpAuthPolicy::from_auth_manager`], but with operator-configured limits.
+    ///
+    /// Fails (rather than silently clamping) when a limit is zero, so a typo in
+    /// `[api]` cannot quietly disable the limiter. Callers map the error to a
+    /// startup configuration failure.
+    pub fn from_auth_manager_with_limits(
+        verifier: Option<Arc<AuthManager>>,
+        bearer_token: Option<Arc<str>>,
+        allow_insecure_http: bool,
+        limits: HttpRateLimits,
+    ) -> Result<Self, String> {
+        limits.validate()?;
+        Ok(Self::build(verifier, bearer_token, allow_insecure_http, limits))
     }
 
     /// Convenience constructor for tests and embedders: build a policy from a single
@@ -152,7 +264,32 @@ impl HttpAuthPolicy {
     /// The wire listener always resolves to a real [`AuthManager`]; prefer
     /// [`HttpAuthPolicy::from_auth_manager`] so the two share one user set.
     pub fn from_wire(password: Option<String>, bearer_token: Option<Arc<str>>, allow_insecure_http: bool) -> Self {
-        let verifier = password.map(|password| {
+        Self::build(
+            Self::verifier_from_password(password),
+            bearer_token,
+            allow_insecure_http,
+            HttpRateLimits::default(),
+        )
+    }
+
+    /// As [`HttpAuthPolicy::from_wire`], but with operator-configured limits.
+    pub fn from_wire_with_limits(
+        password: Option<String>,
+        bearer_token: Option<Arc<str>>,
+        allow_insecure_http: bool,
+        limits: HttpRateLimits,
+    ) -> Result<Self, String> {
+        limits.validate()?;
+        Ok(Self::build(
+            Self::verifier_from_password(password),
+            bearer_token,
+            allow_insecure_http,
+            limits,
+        ))
+    }
+
+    fn verifier_from_password(password: Option<String>) -> Option<Arc<AuthManager>> {
+        password.map(|password| {
             let mut store = InMemoryPasswordStore::new();
             let _ = store.add_user("postgres", &password);
             let _ = store.add_user("helios", &password);
@@ -160,8 +297,12 @@ impl HttpAuthPolicy {
                 AuthMethod::ScramSha256,
                 SharedPasswordStore::new(store),
             ))
-        });
-        Self::from_auth_manager(verifier, bearer_token, allow_insecure_http)
+        })
+    }
+
+    /// The effective limiter limits (operator config or defaults).
+    pub fn limits(&self) -> HttpRateLimits {
+        self.limits
     }
 
     /// Whether every non-health route must authenticate.
@@ -182,8 +323,16 @@ impl HttpAuthPolicy {
 
     /// Validate a request's `Authorization` header for a specific peer.
     ///
-    /// Admission (the rate-limit check + the attempt record) happens in one critical
-    /// section before the credential comparison; a success resets only this peer.
+    /// Order is deliberate:
+    /// 1. a peer already over its failure budget is refused without spending a
+    ///    verification (the cheapest possible rejection);
+    /// 2. a bounded in-flight permit is acquired for the comparison, so concurrent
+    ///    unauthenticated verifications cannot exhaust CPU;
+    /// 3. the credential is checked;
+    /// 4. ONLY a failed check is recorded against the peer — a valid request never
+    ///    counts toward the failure budget, and it does NOT clear failures already
+    ///    recorded in the window (so a valid request cannot restore an attacker's
+    ///    budget mid-window).
     fn verify_peer(&self, peer: PeerKey, headers: &HeaderMap, path: &str) -> Result<(), HttpAuthRejection> {
         // Trust mode has no credential to check; the layer still answers health and
         // preflight, but everything else is passed through.
@@ -191,31 +340,47 @@ impl HttpAuthPolicy {
             return Ok(());
         }
 
-        if !self.admit(peer) {
-            return Err(HttpAuthRejection::TooManyAttempts);
+        if self.peer_over_limit(peer) {
+            return Err(HttpAuthRejection::TooManyAttempts {
+                retry_after_secs: self.limits.retry_after_secs(),
+            });
         }
 
+        // Bounded in-flight verification admission. RAII: the permit drops at the
+        // end of this scope (including on panic), releasing exactly one slot.
+        let _permit = match self.in_flight.try_acquire() {
+            Ok(permit) => permit,
+            // The verifier is saturated. Fail closed with the same 429 shape rather
+            // than run an unbounded number of CPU-bound comparisons.
+            Err(_) => {
+                return Err(HttpAuthRejection::TooManyAttempts {
+                    retry_after_secs: self.limits.retry_after_secs(),
+                })
+            }
+        };
+
         if self.credentials_ok(headers, path) {
-            self.reset(peer);
             Ok(())
         } else {
+            self.record_failure(peer);
             Err(HttpAuthRejection::Unauthorized)
         }
     }
 
-    /// Atomically check the peer's window and record this attempt. `false` means the
-    /// peer is over the limit (or the lock is poisoned — fail closed).
-    fn admit(&self, peer: PeerKey) -> bool {
+    /// Whether the peer is currently over its failure budget (lock poisoned => fail
+    /// closed by treating the peer as over the limit).
+    fn peer_over_limit(&self, peer: PeerKey) -> bool {
         match self.peers.lock() {
-            Ok(mut peers) => peers.admit(peer),
-            Err(_) => false,
+            Ok(mut peers) => peers.over_limit(peer, &self.limits),
+            Err(_) => true,
         }
     }
 
-    /// Reset only the named peer's window after a successful authentication.
-    fn reset(&self, peer: PeerKey) {
+    /// Record ONE failed credential attempt for the peer. Only called after a
+    /// comparison actually failed, so valid traffic never inflates the counter.
+    fn record_failure(&self, peer: PeerKey) {
         if let Ok(mut peers) = self.peers.lock() {
-            peers.reset(peer);
+            peers.record_failure(peer, &self.limits);
         }
     }
 
@@ -228,7 +393,14 @@ impl HttpAuthPolicy {
         let Some(verifier) = &self.verifier else {
             return false;
         };
-        let Some(raw) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
+        // BaaS auth uses Authorization: Bearer for the application JWT. A
+        // dedicated outer header lets both credentials travel on one request.
+        // Presence is authoritative, including malformed values: never fall
+        // back to a weaker or unrelated header after an explicit failure.
+        let raw_value = headers
+            .get(OUTER_AUTHORIZATION_HEADER)
+            .or_else(|| headers.get(header::AUTHORIZATION));
+        let Some(raw) = raw_value.and_then(|v| v.to_str().ok()) else {
             return false;
         };
 
@@ -279,15 +451,17 @@ fn constant_time_bytes_eq(a: &[u8], b: &[u8]) -> bool {
 pub enum HttpAuthRejection {
     /// No credentials, or credentials that did not match.
     Unauthorized,
-    /// Too many failed attempts inside [`FAILURE_WINDOW`].
-    TooManyAttempts,
+    /// Too many failed attempts inside the configured failure window (or the
+    /// verifier is saturated). `retry_after_secs` is the configured window, not a
+    /// hard-coded constant.
+    TooManyAttempts { retry_after_secs: u64 },
 }
 
 impl HttpAuthRejection {
     fn status(self) -> StatusCode {
         match self {
             HttpAuthRejection::Unauthorized => StatusCode::UNAUTHORIZED,
-            HttpAuthRejection::TooManyAttempts => StatusCode::TOO_MANY_REQUESTS,
+            HttpAuthRejection::TooManyAttempts { .. } => StatusCode::TOO_MANY_REQUESTS,
         }
     }
 }
@@ -296,22 +470,27 @@ impl IntoResponse for HttpAuthRejection {
     fn into_response(self) -> Response {
         let message = match self {
             HttpAuthRejection::Unauthorized => "authentication required",
-            HttpAuthRejection::TooManyAttempts => "too many failed authentication attempts; try again later",
+            HttpAuthRejection::TooManyAttempts { .. } => "too many failed authentication attempts; try again later",
         };
         let body = axum::Json(serde_json::json!({
             "error": "Unauthorized",
             "message": message,
         }));
         let mut response = (self.status(), body).into_response();
-        if self == HttpAuthRejection::Unauthorized {
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                HeaderValue::from_static("Basic realm=\"heliosdb-nano\""),
-            );
-        } else {
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        match self {
+            HttpAuthRejection::Unauthorized => {
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Basic realm=\"heliosdb-nano\""),
+                );
+            }
+            HttpAuthRejection::TooManyAttempts { retry_after_secs } => {
+                // `Retry-After` is derived from the configured failure window, so a
+                // client is never told to wait longer than the operator configured.
+                if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                    response.headers_mut().insert(header::RETRY_AFTER, value);
+                }
+            }
         }
         response
     }
@@ -351,7 +530,7 @@ fn fixed_preflight_response() -> Response {
     );
     headers.insert(
         header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("authorization, content-type"),
+        HeaderValue::from_static("authorization, x-heliosdb-authorization, content-type"),
     );
     headers.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("600"));
     response
@@ -421,40 +600,49 @@ struct PeerFailures {
 }
 
 impl PeerFailures {
-    /// Atomically check the peer's window and record this attempt.
-    fn admit(&mut self, peer: PeerKey) -> bool {
-        let now = Instant::now();
+    /// Drop every window that has fully expired. Called under the lock before any
+    /// read or write so the map cannot grow with stale entries.
+    fn purge(&mut self, window: Duration, now: Instant) {
         self.peers
-            .retain(|_, window| now.duration_since(window.window_start) < FAILURE_WINDOW);
+            .retain(|_, state| now.duration_since(state.window_start) < window);
+    }
 
-        if self.peers.len() >= MAX_TRACKED_PEERS && !self.peers.contains_key(&peer) {
+    /// Whether the peer has spent its failure budget inside the current window.
+    /// This never mutates state, so a legitimate request cannot be counted as a
+    /// failure just by being checked.
+    fn over_limit(&mut self, peer: PeerKey, limits: &HttpRateLimits) -> bool {
+        let now = Instant::now();
+        self.purge(limits.failure_window, now);
+        self.peers
+            .get(&peer)
+            .is_some_and(|state| state.over_limit(limits.max_failures, limits.failure_window, now))
+    }
+
+    /// Record exactly one failed credential comparison for the peer, bounding the
+    /// number of tracked peers first.
+    fn record_failure(&mut self, peer: PeerKey, limits: &HttpRateLimits) {
+        let now = Instant::now();
+        self.purge(limits.failure_window, now);
+
+        if self.peers.len() >= limits.max_tracked_peers && !self.peers.contains_key(&peer) {
             if let Some(oldest) = self
                 .peers
                 .iter()
-                .min_by_key(|(_, window)| window.window_start)
+                .min_by_key(|(_, state)| state.window_start)
                 .map(|(key, _)| *key)
             {
                 self.peers.remove(&oldest);
             }
         }
 
-        let window = self.peers.entry(peer).or_default();
-        if window.over_limit() {
-            return false;
-        }
-        window.record_failure();
-        true
-    }
-
-    /// Reset only the named peer.
-    fn reset(&mut self, peer: PeerKey) {
-        if let Some(window) = self.peers.get_mut(&peer) {
-            window.reset();
-        }
+        self.peers
+            .entry(peer)
+            .or_default()
+            .record_failure(limits.max_failures, limits.failure_window, now);
     }
 }
 
-/// Bounded failure counter: at most [`MAX_FAILURES`] inside [`FAILURE_WINDOW`].
+/// Bounded failure counter: at most `max_failures` inside `window`.
 #[derive(Debug)]
 struct FailureWindow {
     count: u32,
@@ -471,21 +659,16 @@ impl Default for FailureWindow {
 }
 
 impl FailureWindow {
-    fn over_limit(&self) -> bool {
-        self.count >= MAX_FAILURES && self.window_start.elapsed() < FAILURE_WINDOW
+    fn over_limit(&self, max_failures: u32, window: Duration, now: Instant) -> bool {
+        self.count >= max_failures && now.duration_since(self.window_start) < window
     }
 
-    fn record_failure(&mut self) {
-        if self.window_start.elapsed() >= FAILURE_WINDOW {
-            self.window_start = Instant::now();
+    fn record_failure(&mut self, _max_failures: u32, window: Duration, now: Instant) {
+        if now.duration_since(self.window_start) >= window {
+            self.window_start = now;
             self.count = 0;
         }
         self.count = self.count.saturating_add(1);
-    }
-
-    fn reset(&mut self) {
-        self.count = 0;
-        self.window_start = Instant::now();
     }
 }
 
@@ -658,13 +841,148 @@ mod tests {
         }
         assert_eq!(
             policy.verify(&headers, "/version"),
-            Err(HttpAuthRejection::TooManyAttempts),
+            Err(HttpAuthRejection::TooManyAttempts {
+                retry_after_secs: FAILURE_WINDOW.as_secs()
+            }),
             "the {MAX_FAILURES}th failure must arm the limiter"
         );
     }
 
+    /// The limiter must count FAILURES, not attempts: a burst of valid requests
+    /// followed by one wrong password must still be a 401, not a 429. Before this,
+    /// every attempt (success or failure) was recorded, so a busy legitimate client
+    /// could lock itself out.
     #[test]
-    fn failure_limiter_is_per_peer_and_success_resets_only_that_peer() {
+    fn valid_attempts_are_not_counted_as_failures() {
+        let policy = required_policy();
+        let right = {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Basic {}", basic("postgres", "correct-horse"))).unwrap(),
+            );
+            headers
+        };
+        let wrong = {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Basic {}", basic("postgres", "wrong"))).unwrap(),
+            );
+            headers
+        };
+
+        for _ in 0..(MAX_FAILURES * 4) {
+            assert!(policy.verify_peer(PeerKey::Unknown, &right, "/version").is_ok());
+        }
+        assert_eq!(
+            policy.verify_peer(PeerKey::Unknown, &wrong, "/version"),
+            Err(HttpAuthRejection::Unauthorized),
+            "a failure after many valid requests must not have armed the limiter"
+        );
+    }
+
+    /// A freshly-armed peer reports the CONFIGURED window in `Retry-After`, not the
+    /// compile-time default. An operator who shortens the window must be obeyed.
+    #[test]
+    fn retry_after_reflects_the_configured_window() {
+        let limits = HttpRateLimits {
+            max_failures: 1,
+            failure_window: Duration::from_secs(7),
+            ..HttpRateLimits::default()
+        };
+        let policy = Arc::new(
+            HttpAuthPolicy::from_wire_with_limits(Some("correct-horse".to_string()), None, false, limits).unwrap(),
+        );
+        let wrong = {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::AUTHORIZATION,
+                HeaderValue::from_str(&format!("Basic {}", basic("postgres", "wrong"))).unwrap(),
+            );
+            headers
+        };
+        assert_eq!(policy.verify(&wrong, "/version"), Err(HttpAuthRejection::Unauthorized));
+        assert_eq!(
+            policy.verify(&wrong, "/version"),
+            Err(HttpAuthRejection::TooManyAttempts { retry_after_secs: 7 })
+        );
+    }
+
+    /// Zero limits are invalid and must be rejected at construction (the daemon
+    /// turns this into a startup config error instead of silently disarming).
+    #[test]
+    fn zero_rate_limit_knobs_are_rejected() {
+        for limits in [
+            HttpRateLimits {
+                max_failures: 0,
+                ..HttpRateLimits::default()
+            },
+            HttpRateLimits {
+                failure_window: Duration::ZERO,
+                ..HttpRateLimits::default()
+            },
+            HttpRateLimits {
+                max_tracked_peers: 0,
+                ..HttpRateLimits::default()
+            },
+            HttpRateLimits {
+                max_in_flight: 0,
+                ..HttpRateLimits::default()
+            },
+        ] {
+            assert!(limits.validate().is_err(), "zero must be rejected: {limits:?}");
+            assert!(
+                HttpAuthPolicy::from_wire_with_limits(Some("correct-horse".to_string()), None, false, limits).is_err()
+            );
+        }
+    }
+
+    /// The tracked-peer map is bounded: feeding more distinct peers than the cap
+    /// never grows it past the cap.
+    #[test]
+    fn tracked_peers_are_bounded() {
+        let limits = HttpRateLimits {
+            max_tracked_peers: 8,
+            ..HttpRateLimits::default()
+        };
+        let mut failures = PeerFailures::default();
+        let wrong_limits = limits;
+        for octet in 0u8..64 {
+            let peer = PeerKey::Addr(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, octet)));
+            failures.record_failure(peer, &wrong_limits);
+        }
+        assert!(
+            failures.peers.len() <= limits.max_tracked_peers,
+            "peer map must stay bounded, got {}",
+            failures.peers.len()
+        );
+    }
+
+    /// Concurrent valid credentials must all pass: the in-flight verifier bound is
+    /// generous enough for a legitimate burst and must not reject valid traffic.
+    #[test]
+    fn concurrent_valid_credentials_are_controlled_not_blocked() {
+        let policy = required_policy();
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let policy = Arc::clone(&policy);
+            handles.push(std::thread::spawn(move || {
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_str(&format!("Basic {}", basic("postgres", "correct-horse"))).unwrap(),
+                );
+                policy.verify_peer(PeerKey::Unknown, &headers, "/version")
+            }));
+        }
+        for handle in handles {
+            assert_eq!(handle.join().expect("thread"), Ok(()));
+        }
+    }
+
+    #[test]
+    fn failure_limiter_is_per_peer_and_success_does_not_erase_failures() {
         let policy = required_policy();
         let attacker: PeerKey = PeerKey::Addr("203.0.113.7".parse().unwrap());
         let legit: PeerKey = PeerKey::Addr("127.0.0.1".parse().unwrap());
@@ -690,13 +1008,19 @@ mod tests {
         }
         // The legitimate peer is untouched by the attacker's failures.
         assert!(policy.verify_peer(legit, &right, "/version").is_ok());
-        // A success resets only the attacker's own window.
+        // A success must not erase completed failed attempts from the same
+        // window; otherwise a valid request could restore an attacker's budget.
         assert!(policy.verify_peer(attacker, &right, "/version").is_ok());
-        // Still well under the limit after the reset.
-        assert_eq!(
+        for _ in 0..7 {
+            assert_eq!(
+                policy.verify_peer(attacker, &wrong, "/version"),
+                Err(HttpAuthRejection::Unauthorized)
+            );
+        }
+        assert!(matches!(
             policy.verify_peer(attacker, &wrong, "/version"),
-            Err(HttpAuthRejection::Unauthorized)
-        );
+            Err(HttpAuthRejection::TooManyAttempts { .. })
+        ));
     }
 
     #[test]
@@ -801,5 +1125,45 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert!(resp.headers().contains_key(header::ACCESS_CONTROL_ALLOW_METHODS));
+    }
+
+    #[tokio::test]
+    async fn dedicated_outer_header_composes_with_baas_bearer_and_is_authoritative() {
+        let app = attach_http_auth(
+            Router::new().route("/auth/v1/user", get(|| async { "user" })),
+            required_policy(),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/v1/user")
+                    .header(header::AUTHORIZATION, "Bearer app-jwt")
+                    .header(
+                        OUTER_AUTHORIZATION_HEADER,
+                        format!("Basic {}", basic("postgres", "correct-horse")),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/auth/v1/user")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Basic {}", basic("postgres", "correct-horse")),
+                    )
+                    .header(OUTER_AUTHORIZATION_HEADER, "Basic malformed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

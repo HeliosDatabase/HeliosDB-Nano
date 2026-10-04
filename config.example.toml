@@ -610,6 +610,16 @@ password_hash_algorithm = "argon2"
 #
 # Service-role API key. BYPASSES ROW-LEVEL SECURITY. Never ship it to a client.
 # service_role_key = "..."
+#
+# HTTP credential limiter (only active when the wire has a credential). It counts
+# FAILED Basic attempts per peer; valid requests never consume the budget, and a
+# peer over the limit gets HTTP 429 with Retry-After set to the window below.
+# All four values reject 0 at startup (0 would disarm the limiter or lock every
+# peer out). Bounds, not targets.
+# http_auth_max_failures = 10          # failed attempts per peer per window
+# http_auth_failure_window_secs = 60   # window (and Retry-After value), seconds
+# http_auth_max_tracked_peers = 4096   # distinct peers tracked at once
+# http_auth_max_in_flight = 64         # simultaneous credential verifications
 
 # ----------------------------------------------------------------------------
 # OAuth2 sign-in providers

@@ -1,78 +1,930 @@
-//! P0: real-daemon subprocess matrix for the HTTP auth / bind policy.
+//! Real-binary acceptance matrix for the daemon HTTP authentication / bind policy.
 //!
-//! These tests invoke the actual `heliosdb-nano` binary (`CARGO_BIN_EXE_…`) rather
-//! than an in-process router, so they exercise `start_server`'s ordering: the HTTP
-//! address is resolved and the exposure policy enforced BEFORE the database or HA
-//! services start.
+//! Every case here launches the ACTUAL `heliosdb-nano` binary and drives it over a
+//! real loopback socket, so what is asserted is the assembled product — `start`'s
+//! ordering, `run_http_listener`'s router, the wire [`AuthManager`] and the HTTP
+//! layer — not a hand-built `tower::oneshot` router. That distinction matters:
+//! router-only tests passed while `POST /v1/branches/main/query` was unauthenticated
+//! on the daemon.
 //!
-//! The fail-fast cases each exit non-zero with a specific reason and never bind a
-//! listener, so they are cheap and deterministic. The one positive case starts the
-//! daemon with an authenticated PostgreSQL wire on `0.0.0.0` and proves the HTTP
-//! listener still defaults to loopback by reaching `/health` on `127.0.0.1` — then
-//! kills it.
+//! Coverage:
+//! * the exact bypass route, `POST /v1/branches/main/query`, with absent / wrong /
+//!   unknown-user / valid Basic credentials, asserting the EXACT `SELECT` payload;
+//! * a real write-then-read side effect through `POST /v1/branches/main/execute`
+//!   and `POST /v1/branches/main/query`;
+//! * REST (`/rest/v1/*`), auth (`/auth/v1/signup`), docs (`/docs`,
+//!   `/openapi.json`), the realtime WebSocket upgrade, and MCP (only when the
+//!   `mcp-endpoint` feature is compiled in), each with a concrete expected status
+//!   rather than a bare `!= 401`;
+//! * all three password methods (`password`, `md5`, `scram-sha-256`) plus the
+//!   `trust --password` HTTP-only override;
+//! * `/health` is reachable unauthenticated and is status-ONLY;
+//! * the default HTTP bind is proven loopback by reading the child's listening
+//!   socket local address out of `/proc/<pid>/net/tcp*` (connecting to 127.0.0.1
+//!   alone would also succeed against an `0.0.0.0` bind, so it proves nothing),
+//!   with a non-loopback connection-refusal check when a routable address exists;
+//! * fail-closed startup cases for remote binds and for MySQL (TCP and UDS) with a
+//!   configured credential.
 //!
-//! This file deliberately does not depend on any feature flag: every case uses the
-//! `start` CLI surface that is always compiled.
+//! The harness owns the child through `Daemon`, whose `Drop` kills and reaps it on
+//! every path including a panic, forwards no inherited `HELIOSDB_PASSWORD`, and
+//! captures stdout/stderr plus a binary/source identity string into every assertion
+//! message.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use tempfile::TempDir;
+
 const BIN: &str = env!("CARGO_BIN_EXE_heliosdb-nano");
 
-/// Reserve a free localhost port by binding and immediately releasing it.
+/// Generous: a debug build has to create a RocksDB-style data directory.
+const START_TIMEOUT: Duration = Duration::from_secs(90);
+const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+// ===========================================================================
+// Daemon harness (RAII: kill + reap on every path, including panic)
+// ===========================================================================
+
+struct Daemon {
+    child: Child,
+    http_port: u16,
+    pg_port: u16,
+    sock_dir: Option<TempDir>,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    args: Vec<String>,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // Kill and reap unconditionally, even while unwinding from a failed
+        // assertion, so no orphaned daemon survives a test run.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Daemon {
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn http_addr(&self) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.http_port)
+    }
+
+    fn log_stdout(&self) -> String {
+        std::fs::read_to_string(&self.stdout_path).unwrap_or_default()
+    }
+
+    fn log_stderr(&self) -> String {
+        std::fs::read_to_string(&self.stderr_path).unwrap_or_default()
+    }
+
+    fn diagnostics(&self) -> String {
+        format!(
+            "\n--- daemon diagnostics [{}] ---\nargs: {:?}\nhttp: {}\nstdout:\n{}\nstderr:\n{}\n--- end ---",
+            identity(),
+            self.args,
+            self.http_addr(),
+            self.log_stdout(),
+            self.log_stderr(),
+        )
+    }
+
+    /// Poll `/health` until it answers the fixed status body, or the child exits.
+    fn wait_http_ready(&mut self) {
+        let deadline = Instant::now() + START_TIMEOUT;
+        loop {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                panic!("daemon exited during startup with {status}{}", self.diagnostics());
+            }
+            match http_request(self.http_addr(), "GET", "/health", None, None, &[]) {
+                Ok(resp) if resp.status == 200 => return,
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                panic!("HTTP listener never became ready{}", self.diagnostics());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn pg_socket_path(&self) -> Option<PathBuf> {
+        self.sock_dir
+            .as_ref()
+            .map(|dir| dir.path().join(format!(".s.PGSQL.{}", self.pg_port)))
+    }
+}
+
+/// Spawn the daemon. `extra` is appended after the fixed port/HTTP args;
+/// `with_socket_dir` adds a managed `--pg-socket-dir`.
+fn spawn(extra: &[&str], http_port: u16, pg_port: u16, with_socket_dir: bool) -> Daemon {
+    let sock_dir = if with_socket_dir {
+        Some(TempDir::new().expect("socket tempdir"))
+    } else {
+        None
+    };
+
+    let mut args: Vec<String> = vec![
+        "start".to_string(),
+        "--memory".to_string(),
+        "--port".to_string(),
+        pg_port.to_string(),
+        "--http-port".to_string(),
+        http_port.to_string(),
+    ];
+    args.extend(extra.iter().map(|s| (*s).to_string()));
+    if let Some(ref dir) = sock_dir {
+        args.push("--pg-socket-dir".to_string());
+        args.push(dir.path().display().to_string());
+    }
+
+    let stdout_path = std::env::temp_dir().join(format!("heliosdb-http-{http_port}-{}.out", std::process::id()));
+    let stderr_path = std::env::temp_dir().join(format!("heliosdb-http-{http_port}-{}.err", std::process::id()));
+    let stdout = std::fs::File::create(&stdout_path).expect("stdout log");
+    let stderr = std::fs::File::create(&stderr_path).expect("stderr log");
+
+    let child = Command::new(BIN)
+        .args(&args)
+        // Clear inherited credentials so a developer's environment cannot change
+        // what these tests exercise (or leak a secret into the child).
+        .env_remove("HELIOSDB_PASSWORD")
+        .env_remove("HELIOSDB_PASSWORD_FILE")
+        .env_remove("HELIOSDB_MCP_TOKEN")
+        .env_remove("MCP_TOKEN")
+        .env_remove("HELIOSDB_PRIMARY_PG_PORT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("the heliosdb-nano binary must be runnable");
+
+    let mut daemon = Daemon {
+        child,
+        http_port,
+        pg_port,
+        sock_dir,
+        stdout_path,
+        stderr_path,
+        args,
+    };
+    daemon.wait_http_ready();
+    daemon
+}
+
+/// Reserve a free loopback TCP port.
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local addr").port()
 }
 
-/// Spawn the daemon with `args`, wait up to `timeout` for it to exit on its own,
-/// then return `(success, combined stdout+stderr)`. A process that does not exit in
-/// time is killed and the test fails — these cases are all supposed to fail closed
-/// at startup.
-fn run_until_exit(args: &[&str], timeout: Duration) -> (bool, String) {
-    let mut child = Command::new(BIN)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn heliosdb-nano");
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(status) => {
-                let output = child.wait_with_output().expect("collect output");
-                let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&output.stderr));
-                return (status.success(), text);
-            }
-            None if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("daemon did not exit within {timeout:?} for args {args:?}");
-            }
-            None => thread::sleep(Duration::from_millis(50)),
+/// Binary + source identity, appended to every failure so a result can be tied to
+/// an exact artifact.
+fn identity() -> String {
+    let mut id = format!("version={} binary={}", env!("CARGO_PKG_VERSION"), BIN);
+    if let Ok(meta) = std::fs::metadata(BIN) {
+        let modified = meta
+            .modified()
+            .map(|t| format!("{t:?}"))
+            .unwrap_or_else(|_| "unknown".to_string());
+        id.push_str(&format!(" len={} mtime={modified}", meta.len()));
+    }
+    if let Ok(out) = Command::new("git")
+        .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+        .output()
+    {
+        if out.status.success() {
+            id.push_str(&format!(" commit={}", String::from_utf8_lossy(&out.stdout).trim()));
         }
+    }
+    id
+}
+
+// ===========================================================================
+// Minimal blocking HTTP/1.1 client (no extra dependency)
+// ===========================================================================
+
+struct HttpResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl HttpResponse {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.body).unwrap_or_else(|e| {
+            panic!(
+                "response was not JSON ({e}): status={} body={:?}",
+                self.status, self.body
+            )
+        })
     }
 }
 
-fn assert_fail_closed(args: &[&str], needle: &str) {
-    let (success, output) = run_until_exit(args, Duration::from_secs(30));
-    assert!(!success, "daemon must exit non-zero for {args:?}; output:\n{output}");
+fn http_request(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    auth: Option<&str>,
+    body: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> std::io::Result<HttpResponse> {
+    let mut stream = TcpStream::connect_timeout(&addr, IO_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+
+    let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n");
+    if let Some(auth) = auth {
+        request.push_str(&format!("Authorization: {auth}\r\n"));
+    }
+    if let Some(body) = body {
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+    for (name, value) in extra_headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    if let Some(body) = body {
+        request.push_str(body);
+    }
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = find_subsequence(&buf, b"\r\n\r\n") {
+                    let header_end = pos + 4;
+                    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+                    let content_length = parse_content_length(&head).unwrap_or(0);
+                    if buf.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                if buf.is_empty() {
+                    return Err(e);
+                }
+                break;
+            }
+        }
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(parse_response(&buf))
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn parse_content_length(head: &str) -> Option<usize> {
+    for line in head.lines() {
+        if let Some(value) = line.strip_prefix("content-length:") {
+            return value.trim().parse().ok();
+        }
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            return value.trim().parse().ok();
+        }
+    }
+    None
+}
+
+fn parse_response(buf: &[u8]) -> HttpResponse {
+    let text = String::from_utf8_lossy(buf);
+    let header_end = text.find("\r\n\r\n").map(|p| p + 4).unwrap_or(text.len());
+    let head = &text[..header_end];
+    let body = text.get(header_end..).unwrap_or("").to_string();
+
+    let mut lines = head.lines();
+    let status_line = lines.next().unwrap_or("");
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    let headers = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect();
+
+    HttpResponse { status, headers, body }
+}
+
+fn basic(username: &str, password: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"))
+    )
+}
+
+fn status_of(daemon: &Daemon, method: &str, path: &str, auth: Option<&str>, body: Option<&str>) -> u16 {
+    http_request(daemon.http_addr(), method, path, auth, body, &[])
+        .unwrap_or_else(|e| panic!("{method} {path} failed: {e}{}", daemon.diagnostics()))
+        .status
+}
+
+fn body_of(daemon: &Daemon, method: &str, path: &str, auth: Option<&str>, body: Option<&str>) -> HttpResponse {
+    http_request(daemon.http_addr(), method, path, auth, body, &[])
+        .unwrap_or_else(|e| panic!("{method} {path} failed: {e}{}", daemon.diagnostics()))
+}
+
+// ===========================================================================
+// /proc proof that the HTTP listener is bound to loopback
+// ===========================================================================
+
+/// Listening local addresses for `port`, read from the child's own network
+/// namespace via `/proc/<pid>/net/tcp` and `tcp6`. The inode check ties the
+/// entry to a descriptor owned by this child; `/proc/<pid>/net/*` is namespace
+/// wide and can otherwise report an unrelated listener.
+fn listening_addrs(pid: u32, port: u16) -> Vec<String> {
+    let mut owned_inodes = std::collections::HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        for entry in entries.flatten() {
+            if let Ok(link) = std::fs::read_link(entry.path()) {
+                let text = link.to_string_lossy();
+                if let Some(inode) = text.strip_prefix("socket:[").and_then(|v| v.strip_suffix(']')) {
+                    owned_inodes.insert(inode.to_string());
+                }
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for file in ["tcp", "tcp6"] {
+        let path = format!("/proc/{pid}/net/{file}");
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        // sl local_address rem_address st ...; st "0A" == LISTEN.
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 12 || fields[3] != "0A" || !owned_inodes.contains(fields[11]) {
+                continue;
+            }
+            let local = fields[1];
+            let Some((addr_hex, port_hex)) = local.split_once(':') else {
+                continue;
+            };
+            if u16::from_str_radix(port_hex, 16) != Ok(port) {
+                continue;
+            }
+            found.push(addr_hex.to_string());
+        }
+    }
+    found
+}
+
+/// Decode a little-endian `/proc/net/tcp` IPv4 hex address.
+fn decode_proc_ipv4(hex: &str) -> Option<Ipv4Addr> {
+    if hex.len() != 8 {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..4)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    Some(Ipv4Addr::new(bytes[3], bytes[2], bytes[1], bytes[0]))
+}
+
+/// The `::1` encoding used by `/proc/net/tcp6`.
+const PROC_IPV6_LOOPBACK: &str = "00000000000000000000000001000000";
+
+fn is_loopback_proc_addr(hex: &str) -> bool {
+    match hex.len() {
+        8 => decode_proc_ipv4(hex).map(|ip| ip.is_loopback()).unwrap_or(false),
+        32 => hex == PROC_IPV6_LOOPBACK,
+        _ => false,
+    }
+}
+
+/// A routable local IPv4, used only for the optional refusal probe.
+fn primary_non_loopback_ip() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    // No packet is sent by `connect` on a UDP socket; it only selects a route.
+    socket.connect("192.0.2.1:9").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+        _ => None,
+    }
+}
+
+// ===========================================================================
+// 1. The exact P0 bypass matrix over all password methods
+// ===========================================================================
+
+const PASSWORD: &str = "subprocess-secret";
+
+/// Drive the full Basic matrix against the exact branch-query route and assert the
+/// exact SELECT payload plus a write/read side effect.
+fn assert_branch_query_matrix(daemon: &Daemon) {
+    let query_path = "/v1/branches/main/query";
+    let select_body = r#"{"sql":"SELECT 1 AS answer"}"#;
+
+    // Absent credentials: 401 with a challenge.
+    {
+        let resp = body_of(daemon, "POST", query_path, None, Some(select_body));
+        assert_eq!(
+            resp.status,
+            401,
+            "absent credentials must be 401{}",
+            daemon.diagnostics()
+        );
+        assert!(
+            resp.header("www-authenticate").is_some(),
+            "401 must carry WWW-Authenticate{}",
+            daemon.diagnostics()
+        );
+    }
+
+    // Wrong password: 401.
+    assert_eq!(
+        status_of(
+            daemon,
+            "POST",
+            query_path,
+            Some(&basic("postgres", "definitely-wrong")),
+            Some(select_body)
+        ),
+        401,
+        "wrong password must be 401{}",
+        daemon.diagnostics()
+    );
+
+    // Unknown user with the right password: 401 (fail closed, no "any username").
+    assert_eq!(
+        status_of(
+            daemon,
+            "POST",
+            query_path,
+            Some(&basic("nobody", PASSWORD)),
+            Some(select_body)
+        ),
+        401,
+        "unknown user must be 401{}",
+        daemon.diagnostics()
+    );
+
+    // Valid credentials: 200 with the EXACT row.
+    let authed = body_of(
+        daemon,
+        "POST",
+        query_path,
+        Some(&basic("postgres", PASSWORD)),
+        Some(select_body),
+    );
+    assert_eq!(
+        authed.status,
+        200,
+        "valid credentials must reach the handler{}",
+        daemon.diagnostics()
+    );
+    let json = authed.json();
+    assert_eq!(json["row_count"], 1, "SELECT 1 AS answer must return one row: {json}");
+    assert_eq!(
+        json["rows"][0]["column_0"], 1,
+        "the exact SELECT result must be column_0 = 1: {json}"
+    );
+
+    // Write then read, through the real endpoints, proving a side effect.
+    let auth = basic("postgres", PASSWORD);
+    for (path, sql) in [
+        (
+            "/v1/branches/main/execute",
+            "CREATE TABLE http_auth_probe (id INT, name TEXT)",
+        ),
+        (
+            "/v1/branches/main/execute",
+            "INSERT INTO http_auth_probe (id, name) VALUES (7, 'alpha')",
+        ),
+    ] {
+        let resp = body_of(
+            daemon,
+            "POST",
+            path,
+            Some(&auth),
+            Some(&format!(r#"{{"sql":"{sql}"}}"#)),
+        );
+        assert_eq!(
+            resp.status,
+            200,
+            "authenticated {} must succeed: {}{}",
+            sql,
+            resp.body,
+            daemon.diagnostics()
+        );
+    }
+
+    let read = body_of(
+        daemon,
+        "POST",
+        query_path,
+        Some(&auth),
+        Some(r#"{"sql":"SELECT id, name FROM http_auth_probe"}"#),
+    );
+    assert_eq!(
+        read.status,
+        200,
+        "reading the probe row must succeed{}",
+        daemon.diagnostics()
+    );
+    let json = read.json();
+    assert_eq!(json["row_count"], 1, "the inserted row must be visible: {json}");
+    assert_eq!(json["rows"][0]["column_0"], 7, "id side effect must round-trip: {json}");
+    assert_eq!(
+        json["rows"][0]["column_1"], "alpha",
+        "name side effect must round-trip: {json}"
+    );
+}
+
+/// Every non-health surface must be closed without credentials and reach its
+/// concrete success state (or a concrete service-level status) with them.
+fn assert_surface_matrix(daemon: &Daemon) {
+    let auth = basic("postgres", PASSWORD);
+
+    // Absent credentials: every listed surface is 401.
+    for (method, path, body) in [
+        ("GET", "/version", None),
+        ("GET", "/docs", None),
+        ("GET", "/openapi.json", None),
+        ("GET", "/rest/v1/http_auth_probe", None),
+        (
+            "POST",
+            "/auth/v1/signup",
+            Some(r#"{"email":"x@example.com","password":"pw"}"#),
+        ),
+    ] {
+        assert_eq!(
+            status_of(daemon, method, path, None, body),
+            401,
+            "{method} {path} must require credentials{}",
+            daemon.diagnostics()
+        );
+    }
+
+    // Health is reachable unauthenticated and is status-ONLY.
+    let health = body_of(daemon, "GET", "/health", None, None);
+    assert_eq!(
+        health.status,
+        200,
+        "health must be a public 200{}",
+        daemon.diagnostics()
+    );
+    let health_json = health.json();
+    assert_eq!(health_json["status"], "ok");
+    assert_eq!(
+        health_json.as_object().map(|o| o.len()),
+        Some(1),
+        "health must be status-only, never version/branch data: {health_json}"
+    );
     assert!(
-        output.contains(needle),
-        "output must contain {needle:?} for {args:?}; output:\n{output}"
+        health_json.get("version").is_none(),
+        "health must not leak a version: {health_json}"
+    );
+
+    // Concrete successes with the wire credential.
+    for path in ["/version", "/docs", "/openapi.json"] {
+        assert_eq!(
+            status_of(daemon, "GET", path, Some(&auth), None),
+            200,
+            "GET {path} must return 200 with the wire credential{}",
+            daemon.diagnostics()
+        );
+    }
+
+    // REST: the table created by the branch-query matrix is listable (200).
+    assert_eq!(
+        status_of(daemon, "GET", "/rest/v1/http_auth_probe", Some(&auth), None),
+        200,
+        "authenticated REST select must return 200{}",
+        daemon.diagnostics()
+    );
+
+    // Auth: a fresh signup authenticates and returns a session (200).
+    let email = format!("http-auth-{}@example.com", std::process::id());
+    let signup = body_of(
+        daemon,
+        "POST",
+        "/auth/v1/signup",
+        Some(&auth),
+        Some(&format!(
+            r#"{{"email":"{email}","password":"correct-horse-battery-staple"}}"#
+        )),
+    );
+    assert_eq!(
+        signup.status,
+        200,
+        "authenticated signup must return 200: {}{}",
+        signup.body,
+        daemon.diagnostics()
+    );
+
+    // Realtime WebSocket: absent credentials 401; valid credentials complete the
+    // real HTTP upgrade (101), proving the route is behind the policy but usable.
+    let ws_path = "/realtime/v1/websocket";
+    assert_eq!(
+        status_of(daemon, "GET", ws_path, None, None),
+        401,
+        "the websocket route must require credentials{}",
+        daemon.diagnostics()
+    );
+    let upgrade_headers: &[(&str, &str)] = &[
+        ("Connection", "Upgrade"),
+        ("Upgrade", "websocket"),
+        ("Sec-WebSocket-Version", "13"),
+        ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+    ];
+    let upgrade = http_request(daemon.http_addr(), "GET", ws_path, Some(&auth), None, upgrade_headers)
+        .unwrap_or_else(|e| panic!("websocket upgrade failed: {e}{}", daemon.diagnostics()));
+    assert_eq!(
+        upgrade.status,
+        101,
+        "authenticated websocket upgrade must be 101{}",
+        daemon.diagnostics()
     );
 }
 
 #[test]
+fn scram_http_matrix_is_authenticated_and_functional() {
+    let http_port = free_port();
+    let pg_port = free_port();
+    let daemon = spawn(
+        &["--auth", "scram-sha-256", "--password", PASSWORD],
+        http_port,
+        pg_port,
+        false,
+    );
+    assert_branch_query_matrix(&daemon);
+    assert_surface_matrix(&daemon);
+}
+
+#[test]
+fn cleartext_password_http_matrix_is_authenticated() {
+    let daemon = spawn(
+        &["--auth", "password", "--password", PASSWORD],
+        free_port(),
+        free_port(),
+        false,
+    );
+    assert_eq!(
+        status_of(
+            &daemon,
+            "POST",
+            "/v1/branches/main/query",
+            None,
+            Some(r#"{"sql":"SELECT 1"}"#)
+        ),
+        401,
+        "cleartext method must still require the wire credential{}",
+        daemon.diagnostics()
+    );
+    assert_eq!(
+        status_of(
+            &daemon,
+            "POST",
+            "/v1/branches/main/query",
+            Some(&basic("postgres", PASSWORD)),
+            Some(r#"{"sql":"SELECT 1 AS answer"}"#)
+        ),
+        200,
+        "cleartext method must accept the wire credential{}",
+        daemon.diagnostics()
+    );
+}
+
+#[test]
+fn md5_http_matrix_is_authenticated() {
+    let daemon = spawn(
+        &["--auth", "md5", "--password", PASSWORD],
+        free_port(),
+        free_port(),
+        false,
+    );
+    assert_eq!(
+        status_of(
+            &daemon,
+            "POST",
+            "/v1/branches/main/query",
+            Some(&basic("postgres", "wrong")),
+            Some(r#"{"sql":"SELECT 1"}"#)
+        ),
+        401,
+        "md5 method must reject a wrong password{}",
+        daemon.diagnostics()
+    );
+    assert_eq!(
+        status_of(
+            &daemon,
+            "POST",
+            "/v1/branches/main/query",
+            Some(&basic("postgres", PASSWORD)),
+            Some(r#"{"sql":"SELECT 1 AS answer"}"#)
+        ),
+        200,
+        "md5 method must accept the wire credential{}",
+        daemon.diagnostics()
+    );
+}
+
+#[test]
+fn trust_wire_with_password_still_protects_http() {
+    // Wire is trust (for local/dev), but an explicit password protects HTTP.
+    let daemon = spawn(
+        &["--auth", "trust", "--password", PASSWORD],
+        free_port(),
+        free_port(),
+        false,
+    );
+    assert_eq!(
+        status_of(&daemon, "GET", "/version", None, None),
+        401,
+        "trust+password must still protect HTTP{}",
+        daemon.diagnostics()
+    );
+    assert_eq!(
+        status_of(&daemon, "GET", "/version", Some(&basic("postgres", PASSWORD)), None),
+        200,
+        "trust+password must accept the explicit HTTP password{}",
+        daemon.diagnostics()
+    );
+}
+
+#[cfg(feature = "mcp-endpoint")]
+#[test]
+fn mcp_http_is_gated_by_the_wire_policy_and_its_own_bearer() {
+    const TOKEN: &str = "td8-mcp-secret";
+    let daemon = spawn(
+        &["--auth", "scram-sha-256", "--password", PASSWORD, "--mcp-token", TOKEN],
+        free_port(),
+        free_port(),
+        false,
+    );
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
+
+    // No credential at all: refused by the wire layer.
+    assert_eq!(
+        status_of(&daemon, "POST", "/mcp", None, Some(body)),
+        401,
+        "MCP without credentials must be 401{}",
+        daemon.diagnostics()
+    );
+
+    // Basic passes the wire layer but not MCP's own bearer check.
+    assert_eq!(
+        status_of(&daemon, "POST", "/mcp", Some(&basic("postgres", PASSWORD)), Some(body)),
+        401,
+        "Basic alone must not satisfy MCP's bearer check{}",
+        daemon.diagnostics()
+    );
+
+    // The shared bearer token satisfies both layers and returns tools.
+    let resp = body_of(&daemon, "POST", "/mcp", Some(&format!("Bearer {TOKEN}")), Some(body));
+    assert_eq!(
+        resp.status,
+        200,
+        "the bearer token must reach MCP{}",
+        daemon.diagnostics()
+    );
+    let json = resp.json();
+    assert!(
+        json["result"]["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "MCP tools/list must return tools: {json}"
+    );
+}
+
+// ===========================================================================
+// 2. Default bind is loopback, proven from the child's own /proc
+// ===========================================================================
+
+#[test]
+fn default_http_bind_is_loopback_read_from_proc() {
+    // The PostgreSQL listener is deliberately on all interfaces while
+    // `--http-listen` is left at its default; the HTTP default must NOT inherit
+    // `--listen`.
+    let daemon = spawn(
+        &["--listen", "0.0.0.0", "--auth", "scram-sha-256", "--password", PASSWORD],
+        free_port(),
+        free_port(),
+        false,
+    );
+
+    let listeners = listening_addrs(daemon.pid(), daemon.http_port);
+    assert!(
+        !listeners.is_empty(),
+        "no LISTEN socket for HTTP port {} in /proc/{}/net/tcp*: {}",
+        daemon.http_port,
+        daemon.pid(),
+        daemon.diagnostics()
+    );
+    for addr in &listeners {
+        assert!(
+            is_loopback_proc_addr(addr),
+            "HTTP port {} is bound to non-loopback /proc address {addr}; the default \
+             --http-listen is loopback and must not follow --listen{}",
+            daemon.http_port,
+            daemon.diagnostics()
+        );
+    }
+
+    // Positive control: a loopback connection actually serves health.
+    assert_eq!(
+        status_of(&daemon, "GET", "/health", None, None),
+        200,
+        "the loopback HTTP listener must serve health{}",
+        daemon.diagnostics()
+    );
+
+    // Optional refusal probe: if this host has a routable address, that address on
+    // the same port must be refused (an `0.0.0.0` bind would accept here).
+    if let Some(ip) = primary_non_loopback_ip() {
+        let target = SocketAddr::new(IpAddr::V4(ip), daemon.http_port);
+        let reached = TcpStream::connect_timeout(&target, Duration::from_secs(1)).is_ok();
+        assert!(
+            !reached,
+            "HTTP listener accepted a connection on non-loopback {target}{}",
+            daemon.diagnostics()
+        );
+    }
+}
+
+// ===========================================================================
+// 3. Fail-closed startup cases
+// ===========================================================================
+
+/// Run the daemon expecting a non-zero exit with `needle` in its output.
+fn assert_startup_refused(args: &[&str], needle: &str) {
+    let stdout_path = std::env::temp_dir().join(format!("heliosdb-refuse-{}-{}.out", std::process::id(), free_port()));
+    let stderr_path = stdout_path.with_extension("err");
+    let stdout = std::fs::File::create(&stdout_path).expect("stdout log");
+    let stderr = std::fs::File::create(&stderr_path).expect("stderr log");
+
+    let mut child = Command::new(BIN)
+        .args(args)
+        .env_remove("HELIOSDB_PASSWORD")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("spawn heliosdb-nano");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("daemon did not exit within 30s for args {args:?}");
+            }
+            None => thread::sleep(Duration::from_millis(50)),
+        }
+    };
+
+    let mut output = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+    output.push_str(&std::fs::read_to_string(&stderr_path).unwrap_or_default());
+    assert!(
+        !status.success(),
+        "daemon must exit non-zero for {args:?}, output:\n{output}"
+    );
+    assert!(
+        output.contains(needle),
+        "output must contain {needle:?} for {args:?}, output:\n{output}"
+    );
+    let _ = std::fs::remove_file(&stdout_path);
+    let _ = std::fs::remove_file(&stderr_path);
+}
+
+fn assert_refused(args: &[&str], needle: &str) {
+    assert_startup_refused(args, needle);
+}
+
+#[test]
 fn trust_mode_remote_http_bind_is_refused_at_startup() {
-    assert_fail_closed(
+    assert_refused(
         &[
             "start",
             "--memory",
@@ -91,14 +943,14 @@ fn trust_mode_remote_http_bind_is_refused_at_startup() {
 
 #[test]
 fn authenticated_remote_http_bind_is_refused_even_with_allow_insecure() {
-    assert_fail_closed(
+    assert_refused(
         &[
             "start",
             "--memory",
             "--auth",
             "scram-sha-256",
             "--password",
-            "subprocess-secret",
+            PASSWORD,
             "--port",
             "0",
             "--http-port",
@@ -112,58 +964,15 @@ fn authenticated_remote_http_bind_is_refused_even_with_allow_insecure() {
 }
 
 #[test]
-fn trust_mode_with_explicit_password_still_refuses_remote_http() {
-    assert_fail_closed(
-        &[
-            "start",
-            "--memory",
-            "--auth",
-            "trust",
-            "--password",
-            "subprocess-secret",
-            "--port",
-            "0",
-            "--http-port",
-            &free_port().to_string(),
-            "--http-listen",
-            "0.0.0.0",
-            "--allow-insecure-http",
-        ],
-        "refusing to expose authenticated HTTP over plaintext",
-    );
-}
-
-#[test]
-fn md5_remote_http_bind_is_refused() {
-    assert_fail_closed(
-        &[
-            "start",
-            "--memory",
-            "--auth",
-            "md5",
-            "--password",
-            "subprocess-secret",
-            "--port",
-            "0",
-            "--http-port",
-            &free_port().to_string(),
-            "--http-listen",
-            "0.0.0.0",
-        ],
-        "refusing to expose authenticated HTTP over plaintext",
-    );
-}
-
-#[test]
-fn mysql_with_authenticated_postgres_fails_closed_at_startup() {
-    assert_fail_closed(
+fn mysql_tcp_with_authenticated_postgres_fails_closed() {
+    assert_refused(
         &[
             "start",
             "--memory",
             "--auth",
             "scram-sha-256",
             "--password",
-            "subprocess-secret",
+            PASSWORD,
             "--port",
             "0",
             "--http-port",
@@ -175,66 +984,124 @@ fn mysql_with_authenticated_postgres_fails_closed_at_startup() {
 }
 
 #[test]
-fn default_http_bind_is_loopback_when_database_listens_on_all_interfaces() {
-    let pg_port = free_port();
-    let http_port = free_port();
-
-    let mut child = Command::new(BIN)
-        .args([
+fn mysql_uds_with_authenticated_postgres_fails_closed() {
+    let sock = std::env::temp_dir().join(format!("heliosdb-mysql-{}.sock", std::process::id()));
+    assert_refused(
+        &[
             "start",
             "--memory",
             "--auth",
             "scram-sha-256",
             "--password",
-            "subprocess-secret",
-            "--listen",
-            "0.0.0.0",
+            PASSWORD,
             "--port",
-            &pg_port.to_string(),
+            "0",
             "--http-port",
-            &http_port.to_string(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn heliosdb-nano");
-
-    // The HTTP listener is expected on loopback, so connecting to 127.0.0.1 is the
-    // proof: a daemon that inherited `--listen 0.0.0.0` would still answer here, but
-    // this is the positive control that the default path starts at all.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut stream = loop {
-        if let Ok(Some(status)) = child.try_wait() {
-            let _ = child.kill();
-            panic!("daemon exited during startup with {status}");
-        }
-        if let Ok(s) = TcpStream::connect(("127.0.0.1", http_port)) {
-            break s;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!("HTTP listener never came up on 127.0.0.1:{http_port}");
-        }
-        thread::sleep(Duration::from_millis(100));
-    };
-
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .expect("read timeout");
-    stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-        .expect("write request");
-    let mut response = String::new();
-    let _ = stream.read_to_string(&mut response);
-    let _ = child.kill();
-    let _ = child.wait();
-
-    assert!(
-        response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200"),
-        "health must answer 200; got:\n{response}"
+            "0",
+            "--mysql-socket",
+            sock.to_str().expect("utf8 socket path"),
+        ],
+        "MySQL authentication is not implemented",
     );
-    assert!(
-        response.contains("\"status\":\"ok\""),
-        "health must be the fixed status-only body; got:\n{response}"
-    );
+}
+
+// ===========================================================================
+// 4. PostgreSQL Unix socket does not bypass the wire credential
+// ===========================================================================
+
+#[cfg(unix)]
+mod uds_auth {
+    use super::*;
+    use std::path::Path;
+
+    /// Wait for the daemon's PostgreSQL Unix socket to appear.
+    fn wait_for_socket(daemon: &mut Daemon, path: &Path) {
+        let deadline = Instant::now() + START_TIMEOUT;
+        loop {
+            if let Ok(Some(status)) = daemon.child.try_wait() {
+                panic!("daemon exited during startup with {status}{}", daemon.diagnostics());
+            }
+            if path.exists() {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!("the PostgreSQL Unix socket never appeared{}", daemon.diagnostics());
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn connect_uds(path: &Path, port: u16, user: &str, password: Option<&str>) -> Result<(), String> {
+        // `tokio-postgres` parses a `host=/dir` connection string into a Unix
+        // socket path (`<dir>/.s.PGSQL.<port>`), which is exactly what the
+        // daemon's `--pg-socket-dir` listener serves.
+        let mut conn = format!(
+            "host={} port={} user={user} dbname=postgres",
+            path.parent().expect("socket parent").display(),
+            port
+        );
+        if let Some(password) = password {
+            conn.push_str(&format!(" password={password}"));
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        runtime.block_on(async move {
+            let connect = tokio_postgres::connect(&conn, tokio_postgres::NoTls).await;
+            match connect {
+                Ok((_client, connection)) => {
+                    // Keep the connection task alive briefly so startup completes.
+                    let handle = tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    handle.abort();
+                    Ok(())
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        })
+    }
+
+    fn start_uds_daemon() -> Daemon {
+        spawn(
+            &["--auth", "scram-sha-256", "--password", PASSWORD],
+            free_port(),
+            free_port(),
+            true,
+        )
+    }
+
+    #[test]
+    fn uds_accepts_valid_and_rejects_missing_wrong_and_unknown_credentials() {
+        let mut daemon = start_uds_daemon();
+        let path = daemon
+            .pg_socket_path()
+            .expect("the daemon was started with a socket dir");
+        wait_for_socket(&mut daemon, &path);
+        let port = daemon.pg_port;
+
+        assert!(
+            connect_uds(&path, port, "postgres", Some(PASSWORD)).is_ok(),
+            "the configured credential must authenticate over the Unix socket{}",
+            daemon.diagnostics()
+        );
+        assert!(
+            connect_uds(&path, port, "postgres", Some("wrong-password")).is_err(),
+            "a wrong password must be rejected over the Unix socket, not bypassed{}",
+            daemon.diagnostics()
+        );
+        assert!(
+            connect_uds(&path, port, "postgres", None).is_err(),
+            "a missing password must fail closed over the Unix socket{}",
+            daemon.diagnostics()
+        );
+        assert!(
+            connect_uds(&path, port, "nobody", Some(PASSWORD)).is_err(),
+            "an unknown user must fail closed over the Unix socket{}",
+            daemon.diagnostics()
+        );
+    }
 }

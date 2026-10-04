@@ -699,19 +699,21 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
     }
 }
 
-/// Accept a PostgreSQL client connection over a Unix domain socket.
+/// Accept a PostgreSQL client connection over a Unix domain socket using an
+/// explicit [`AuthManager`].
 ///
-/// Used for local / embedded deployments where clients expect libpq's
-/// default `/tmp/.s.PGSQL.<port>` socket path.
+/// The daemon passes the SAME `Arc<AuthManager>` the TCP listener serves, so a
+/// `--pg-socket-dir` socket cannot be used to bypass the wire credential: a
+/// configured method authenticates exactly as it does over TCP, and an absent
+/// credential fails closed. Embedded callers that genuinely want the old
+/// "kernel file-permission trust" behaviour pass a trust manager explicitly.
 #[cfg(unix)]
 pub async fn handle_connection_unix(
     database: Arc<EmbeddedDatabase>,
     stream: UnixStream,
+    auth_manager: Arc<AuthManager>,
     _connection_id: u32,
 ) -> Result<()> {
-    // Trust auth over a local socket — the kernel already enforces access
-    // via filesystem permissions on the socket file.
-    let auth_manager = Arc::new(AuthManager::new(AuthMethod::Trust));
     let mut handler = PgConnectionHandler::new_unix(stream, database, auth_manager);
     handler.handle().await
 }
@@ -723,10 +725,10 @@ pub async fn handle_connection_unix(
 pub async fn handle_connection_unix_with_timeouts(
     database: Arc<EmbeddedDatabase>,
     stream: UnixStream,
+    auth_manager: Arc<AuthManager>,
     _connection_id: u32,
     timeouts: ConnectionTimeouts,
 ) -> Result<()> {
-    let auth_manager = Arc::new(AuthManager::new(AuthMethod::Trust));
     let max_connections = database.storage.config().server.max_connections;
     let mut handler = PgConnectionHandler::new_unix(stream, database, auth_manager)
         .with_connection_policy(ConnectionPolicy::at_accept(timeouts, max_connections));

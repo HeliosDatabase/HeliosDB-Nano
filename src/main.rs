@@ -617,24 +617,17 @@ async fn main() -> Result<()> {
             let password = match (password, password_file) {
                 (Some(p), _) => Some(p),
                 (None, Some(path)) => {
-                    let raw = std::fs::read_to_string(&path).map_err(|e| {
-                        Error::config(format!(
-                            "Cannot read --password-file {}: {e}",
-                            path.display()
-                        ))
-                    })?;
+                    let raw = std::fs::read_to_string(&path)
+                        .map_err(|e| Error::config(format!("Cannot read --password-file {}: {e}", path.display())))?;
                     let first = raw.lines().next().unwrap_or("").to_string();
                     if first.is_empty() {
-                        return Err(Error::config(format!(
-                            "--password-file {} is empty.",
-                            path.display()
-                        )));
+                        return Err(Error::config(format!("--password-file {} is empty.", path.display())));
                     }
                     Some(first)
                 }
-                (None, None) if auth_lower != "trust" => std::env::var("HELIOSDB_PASSWORD")
-                    .ok()
-                    .filter(|p| !p.is_empty()),
+                (None, None) if auth_lower != "trust" => {
+                    std::env::var("HELIOSDB_PASSWORD").ok().filter(|p| !p.is_empty())
+                }
                 (None, None) => None,
             };
             if auth_lower != "trust" && password.is_none() {
@@ -1004,19 +997,34 @@ async fn start_server(
     // A trust wire listener can still carry an explicit password for HTTP
     // protection. Keep that password out of the wire AuthManager (trust means
     // the wire accepts anyone), but require it on every HTTP route.
-    let http_auth_policy = if matches!(auth_method, AuthMethod::Trust) && password.is_some() {
-        std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::from_wire(
-            password.clone(),
-            ha_config.mcp_token.clone().map(std::sync::Arc::from),
-            ha_config.allow_insecure_http,
-        ))
-    } else {
-        std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::from_auth_manager(
-            Some(std::sync::Arc::clone(&auth_manager)),
-            ha_config.mcp_token.clone().map(std::sync::Arc::from),
-            ha_config.allow_insecure_http,
-        ))
+    //
+    // P0-4/P0-5: the limiter bounds are operator-tunable through `[api]`. A zero
+    // value is a misconfiguration (it would disarm the limiter or lock everyone
+    // out), so it is rejected at startup rather than silently clamped.
+    let http_rate_limits = heliosdb_nano::api::HttpRateLimits {
+        max_failures: api_config.http_auth_max_failures,
+        failure_window: std::time::Duration::from_secs(api_config.http_auth_failure_window_secs),
+        max_tracked_peers: api_config.http_auth_max_tracked_peers,
+        max_in_flight: api_config.http_auth_max_in_flight,
     };
+    let mcp_bearer: Option<std::sync::Arc<str>> = ha_config.mcp_token.clone().map(std::sync::Arc::from);
+    let http_auth_policy = std::sync::Arc::new(if matches!(auth_method, AuthMethod::Trust) && password.is_some() {
+        heliosdb_nano::api::HttpAuthPolicy::from_wire_with_limits(
+            password.clone(),
+            mcp_bearer,
+            ha_config.allow_insecure_http,
+            http_rate_limits,
+        )
+        .map_err(Error::config)?
+    } else {
+        heliosdb_nano::api::HttpAuthPolicy::from_auth_manager_with_limits(
+            Some(std::sync::Arc::clone(&auth_manager)),
+            mcp_bearer,
+            ha_config.allow_insecure_http,
+            http_rate_limits,
+        )
+        .map_err(Error::config)?
+    });
 
     let tls_enabled = tls_cert.is_some();
     let http_health_disabled = ha_config.http_port == 0;
@@ -1039,12 +1047,16 @@ async fn start_server(
 
     // P0-8: the MySQL wire listener is trust-only. Enabling it while the
     // PostgreSQL wire requires a credential silently bypasses that credential
-    // for any MySQL client, so fail closed at startup rather than warn.
-    if mysql_enabled && (password.is_some() || !matches!(auth_method, AuthMethod::Trust)) {
+    // for any MySQL client, so fail closed at startup rather than warn. This
+    // covers BOTH MySQL transports: the TCP listener (`--mysql`) and the Unix
+    // domain socket (`--mysql-socket`). A UDS is a local credential-free path
+    // into the same SQL engine, so it is not exempt just because it is local.
+    if (mysql_enabled || mysql_socket.is_some()) && (password.is_some() || !matches!(auth_method, AuthMethod::Trust)) {
+        let transport = if mysql_enabled { "--mysql" } else { "--mysql-socket" };
         return Err(Error::config(format!(
             "MySQL authentication is not implemented: the MySQL listener accepts any username, so \
-             --mysql alongside the PostgreSQL {auth_display} method would let any MySQL client run \
-             SQL without the configured password. Disable --mysql, or use --auth trust for an \
+             {transport} alongside the PostgreSQL {auth_display} method would let any MySQL client run \
+             SQL without the configured password. Disable {transport}, or use --auth trust for an \
              explicit local/dev deployment."
         )));
     }
@@ -1411,6 +1423,11 @@ async fn start_server(
         let _ = std::fs::remove_file(&sock_path);
         let pg_db = Arc::clone(&db);
         let policy = connection_policy.clone();
+        // P0-2: the UDS listener authenticates with the SAME credential the TCP
+        // listener serves. A local socket is an alternate transport, not an auth
+        // bypass; with a configured method this now demands the wire credential
+        // exactly like `127.0.0.1:port`.
+        let pg_uds_auth = Arc::clone(&auth_manager);
         // sprinter dfc3d6f2c341: the same `max_connections` cap the TCP
         // listener enforces (`PgServer::serve`) and the MySQL UDS loop above
         // already had. Without it a local client could open connections
@@ -1462,6 +1479,7 @@ async fn start_server(
                             &policy,
                         );
                         let db_clone = Arc::clone(&pg_db);
+                        let auth_clone = Arc::clone(&pg_uds_auth);
                         let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let conn_policy = policy.clone();
                         // `_permit` is declared FIRST so it drops LAST — after
@@ -1474,6 +1492,7 @@ async fn start_server(
                                 heliosdb_nano::protocol::postgres::handler::handle_connection_unix_with_timeouts(
                                     db_clone,
                                     stream,
+                                    auth_clone,
                                     conn_id,
                                     conn_policy,
                                 )

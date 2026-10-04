@@ -276,7 +276,13 @@ impl AuthManager {
                 "{:x}",
                 md5::compute([password.as_bytes(), username.as_bytes()].concat())
             );
-            is_real && constant_time_compare(computed.as_bytes(), body)
+            // Compute the constant-time comparison UNCONDITIONALLY before
+            // consulting `is_real`. `is_real && constant_time_compare(..)` would
+            // short-circuit and skip the comparison on the unknown-user /
+            // malformed-shadow path, so that path would do strictly less work
+            // than a real user — a timing oracle for account existence.
+            let matches = constant_time_compare(computed.as_bytes(), body);
+            is_real && matches
         } else {
             self.verify_cleartext(username, password).unwrap_or(false)
         }
