@@ -11,6 +11,7 @@
 
 use clap::{Parser, Subcommand};
 use heliosdb_nano::{Config, EmbeddedDatabase, Error, Result};
+use std::ffi::OsString;
 use std::path::PathBuf;
 use tracing::info;
 
@@ -160,6 +161,24 @@ impl PasswordSource {
     }
 }
 
+/// Manual (never derived) `Debug`: this type holds plaintext secrets, so a
+/// derived formatter would print them into any `assert_eq!` failure, log line,
+/// or panic backtrace. `Argv`/`Env` values and a file's *contents* are always
+/// redacted; only the non-secret source shape and a file's path are shown —
+/// matching the module's own rule that "a file *path* is not [secret]".
+impl std::fmt::Debug for PasswordSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PasswordSource::Absent => f.write_str("PasswordSource::Absent"),
+            PasswordSource::Argv(_) => f.write_str("PasswordSource::Argv(<redacted>)"),
+            PasswordSource::Env(_) => f.write_str("PasswordSource::Env(<redacted>)"),
+            PasswordSource::File { path, .. } => {
+                write!(f, "PasswordSource::File {{ path: {path:?}, value: <redacted> }}")
+            }
+        }
+    }
+}
+
 /// Read a single-line password file: the first line, trailing newline ignored.
 /// An empty file is a configuration error, not an empty password — fail closed.
 fn read_password_file(path: &std::path::Path) -> Result<String> {
@@ -172,35 +191,115 @@ fn read_password_file(path: &std::path::Path) -> Result<String> {
     Ok(first)
 }
 
+/// Reject a non-UTF8 secret-file path before it is used or forwarded. The
+/// daemon re-exec hands the path to the child as a `String` argv element, and
+/// the rest of this module formats paths with `display()`. Refusing up front
+/// keeps forwarding lossless and, just as importantly, keeps *invalid
+/// configuration* distinct from *no configuration*: silently dropping a
+/// configured source would let a broken secret fall through to `trust`.
+fn reject_non_utf8_path(path: &std::path::Path, source: &str) -> Result<()> {
+    if path.to_str().is_none() {
+        return Err(Error::config(format!(
+            "{source} names a path that is not valid UTF-8; use a UTF-8 path."
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve the password from every supported source, in precedence order:
 /// `--password` > `--password-file` > `$HELIOSDB_PASSWORD_FILE` >
-/// `$HELIOSDB_PASSWORD`. Pure (the environment is passed in) so the
-/// precedence table can be unit-tested. Sources are resolved even for
-/// `trust`: an explicitly configured password still seeds the auth manager
-/// and tells HTTP/MCP policy that credentials exist.
+/// `$HELIOSDB_PASSWORD`. Pure (the environment is passed in as `OsString` so a
+/// non-UTF8 value is *seen*, not dropped) so the precedence table can be
+/// unit-tested.
+///
+/// Sources are resolved even for `--auth trust`, but that does **not** make the
+/// SQL listener authenticate: under `trust` the wire stays trust, and this
+/// module does not seed a wire `AuthManager` from the value. The resolved
+/// source is retained only so the separate HTTP/auth track can tell an
+/// explicitly configured credential from an entirely passwordless server
+/// (a clear cross-track integration dependency, not implemented here).
+///
+/// Absence is distinct from invalid configuration: an empty env value is
+/// "unset", but a *selected* non-UTF8 path/value is an error, never a fallback.
 fn resolve_password(
     password: Option<String>,
     password_file: Option<PathBuf>,
-    env_password_file: Option<PathBuf>,
-    env_password: Option<String>,
+    env_password_file: Option<OsString>,
+    env_password: Option<OsString>,
 ) -> Result<PasswordSource> {
     match (password, password_file) {
-        (Some(v), _) => Ok(PasswordSource::Argv(v)),
+        (Some(v), _) => {
+            if v.is_empty() {
+                // An explicit but empty --password is a configuration mistake,
+                // not a passwordless server: refuse it instead of letting the
+                // empty value survive into the daemon env and be filtered away,
+                // silently turning a configured credential into trust.
+                return Err(Error::config(
+                    "The --password value is empty. Pass a non-empty password, or omit \
+                     --password and use --password-file / HELIOSDB_PASSWORD_FILE / \
+                     HELIOSDB_PASSWORD (or --auth trust for a passwordless server).",
+                ));
+            }
+            Ok(PasswordSource::Argv(v))
+        }
         (None, Some(path)) => {
+            if path.as_os_str().is_empty() {
+                return Err(Error::config(
+                    "--password-file was given an empty path; provide the path to a \
+                     readable, non-empty secret file.",
+                ));
+            }
+            reject_non_utf8_path(&path, "--password-file")?;
             let value = read_password_file(&path)?;
             Ok(PasswordSource::File { path, value })
         }
         (None, None) => {
-            if let Some(path) = env_password_file.filter(|p| !p.as_os_str().is_empty()) {
-                let value = read_password_file(&path)?;
-                Ok(PasswordSource::File { path, value })
-            } else {
-                match env_password.filter(|p| !p.is_empty()) {
-                    Some(v) => Ok(PasswordSource::Env(v)),
-                    None => Ok(PasswordSource::Absent),
+            if let Some(raw) = env_password_file {
+                let path = PathBuf::from(raw);
+                // Set-but-empty means "unset" (matching HELIOSDB_PASSWORD), so
+                // fall through to the value source rather than reading "".
+                if !path.as_os_str().is_empty() {
+                    reject_non_utf8_path(&path, "HELIOSDB_PASSWORD_FILE")?;
+                    let value = read_password_file(&path)?;
+                    return Ok(PasswordSource::File { path, value });
                 }
             }
+            match env_password {
+                Some(raw) if raw.is_empty() => Ok(PasswordSource::Absent),
+                Some(raw) => raw.into_string().map(PasswordSource::Env).map_err(|_| {
+                    Error::config(
+                        "HELIOSDB_PASSWORD is not valid UTF-8; set a UTF-8 password or use \
+                         --password-file / HELIOSDB_PASSWORD_FILE.",
+                    )
+                }),
+                None => Ok(PasswordSource::Absent),
+            }
         }
+    }
+}
+
+/// Resolve the MCP-over-HTTP bearer token, mirroring [`resolve_password`]:
+/// `--mcp-token` outranks `$HELIOSDB_MCP_TOKEN`, and neither is a file source.
+///
+/// An explicitly supplied but **empty** `--mcp-token` is a configuration error:
+/// dropping it would leave a listener that the operator believes is
+/// authenticated serving unauthenticated MCP. An empty `$HELIOSDB_MCP_TOKEN` is
+/// treated as unset, matching the empty-`HELIOSDB_PASSWORD` semantics. A
+/// *selected* non-UTF8 token is an error, not absence.
+fn resolve_mcp_token(cli: Option<String>, env: Option<OsString>) -> Result<Option<String>> {
+    match cli {
+        Some(token) if token.is_empty() => Err(Error::config(
+            "The --mcp-token value is empty. Pass a non-empty bearer token or omit \
+             --mcp-token; an empty token would leave the MCP routes unauthenticated.",
+        )),
+        Some(token) => Ok(Some(token)),
+        None => match env {
+            Some(raw) if raw.is_empty() => Ok(None),
+            Some(raw) => raw.into_string().map(Some).map_err(|_| {
+                Error::config("HELIOSDB_MCP_TOKEN is not valid UTF-8; set a UTF-8 bearer token or pass --mcp-token.")
+            }),
+            None => Ok(None),
+        },
     }
 }
 
@@ -210,6 +309,9 @@ fn resolve_password(
 /// * A file source forwards only the (non-secret) path: `--password-file`.
 /// * An argv/env source is returned for `Command::env("HELIOSDB_PASSWORD", …)`.
 /// * The plaintext is never pushed onto `args`.
+///
+/// `path.display()` is only reached for a path that `resolve_password` already
+/// proved UTF-8 (`reject_non_utf8_path`), so it is lossless here.
 fn daemon_password_handoff(source: &PasswordSource, args: &mut Vec<String>) -> Option<String> {
     match source {
         PasswordSource::Absent => None,
@@ -728,8 +830,8 @@ async fn main() -> Result<()> {
             let password_source = resolve_password(
                 password,
                 password_file,
-                std::env::var("HELIOSDB_PASSWORD_FILE").ok().map(PathBuf::from),
-                std::env::var("HELIOSDB_PASSWORD").ok(),
+                std::env::var_os("HELIOSDB_PASSWORD_FILE"),
+                std::env::var_os("HELIOSDB_PASSWORD"),
             )?;
             if auth_lower != "trust" && password_source.is_absent() {
                 return Err(Error::config(format!(
@@ -743,7 +845,7 @@ async fn main() -> Result<()> {
             // MCP-over-HTTP bearer token: same hygiene as the password. It is
             // read from $HELIOSDB_MCP_TOKEN when --mcp-token is absent, and the
             // daemon re-exec hands it to the child through the environment.
-            let mcp_token = mcp_token.or_else(|| std::env::var("HELIOSDB_MCP_TOKEN").ok().filter(|t| !t.is_empty()));
+            let mcp_token = resolve_mcp_token(mcp_token, std::env::var_os("HELIOSDB_MCP_TOKEN"))?;
 
             // Scheduled dumps are not implemented. Fail hard instead of
             // silently accepting the flag — a no-op here means an operator
@@ -2587,8 +2689,8 @@ mod tests {
         let got = resolve_password(
             Some("argv-pw".to_string()),
             Some(PathBuf::from("/no/such/password-file")),
-            Some(PathBuf::from("/no/such/env-file")),
-            Some("env-pw".to_string()),
+            Some(OsString::from("/no/such/env-file")),
+            Some(OsString::from("env-pw")),
         )
         .unwrap();
         assert_eq!(got, PasswordSource::Argv("argv-pw".to_string()));
@@ -2622,7 +2724,13 @@ mod tests {
         let dir = pw_scratch_dir("envfile");
         let path = dir.join("pw");
         std::fs::write(&path, "from-file\n").unwrap();
-        let got = resolve_password(None, None, Some(path.clone()), Some("from-value".to_string())).unwrap();
+        let got = resolve_password(
+            None,
+            None,
+            Some(path.clone().into_os_string()),
+            Some(OsString::from("from-value")),
+        )
+        .unwrap();
         assert_eq!(
             got,
             PasswordSource::File {
@@ -2635,7 +2743,7 @@ mod tests {
 
     #[test]
     fn password_env_value_used_as_last_resort() {
-        let got = resolve_password(None, None, None, Some("env-pw".to_string())).unwrap();
+        let got = resolve_password(None, None, None, Some(OsString::from("env-pw"))).unwrap();
         assert_eq!(got, PasswordSource::Env("env-pw".to_string()));
     }
 
@@ -2648,8 +2756,116 @@ mod tests {
 
     #[test]
     fn trust_auth_keeps_explicit_environment_password() {
-        let got = resolve_password(None, None, None, Some("env-pw".to_string())).unwrap();
+        let got = resolve_password(None, None, None, Some(OsString::from("env-pw"))).unwrap();
         assert_eq!(got, PasswordSource::Env("env-pw".to_string()));
+    }
+
+    #[test]
+    fn password_rejects_empty_explicit_literal() {
+        // `--password ""` must fail, not resolve to an empty Argv secret that
+        // the daemon handoff would then silently filter away.
+        assert!(resolve_password(Some(String::new()), None, None, None).is_err());
+    }
+
+    #[test]
+    fn password_rejects_empty_explicit_file_path() {
+        assert!(resolve_password(None, Some(PathBuf::new()), None, None).is_err());
+    }
+
+    #[test]
+    fn empty_env_password_file_falls_through_to_env_value() {
+        // An empty HELIOSDB_PASSWORD_FILE is "set but empty" -> treated as
+        // unset, so the value source still applies (consistent with the empty
+        // HELIOSDB_PASSWORD semantics below).
+        let got = resolve_password(None, None, Some(OsString::new()), Some(OsString::from("env-pw"))).unwrap();
+        assert_eq!(got, PasswordSource::Env("env-pw".to_string()));
+    }
+
+    #[test]
+    fn empty_env_password_is_absent() {
+        let got = resolve_password(None, None, None, Some(OsString::new())).unwrap();
+        assert!(got.is_absent());
+        assert_eq!(got.into_value(), None);
+    }
+
+    #[test]
+    fn mcp_token_flag_beats_env_and_rejects_empty() {
+        assert_eq!(
+            resolve_mcp_token(Some("flag-token".to_string()), Some(OsString::from("env-token"))).unwrap(),
+            Some("flag-token".to_string())
+        );
+        assert!(resolve_mcp_token(Some(String::new()), Some(OsString::from("env-token"))).is_err());
+        assert_eq!(
+            resolve_mcp_token(None, Some(OsString::from("env-token"))).unwrap(),
+            Some("env-token".to_string())
+        );
+        assert_eq!(resolve_mcp_token(None, Some(OsString::new())).unwrap(), None);
+        assert_eq!(resolve_mcp_token(None, None).unwrap(), None);
+    }
+
+    /// R3 item 9 (Unix): a *selected* non-UTF8 env source must error, never be
+    /// silently dropped into absence (which would fall through to `trust`).
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_configured_sources_error_not_absent() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad_path = OsString::from_vec(vec![b'/', 0x80, 0xff]);
+        let bad_value = OsString::from_vec(vec![0x80, 0xfe]);
+
+        assert!(resolve_password(None, None, Some(bad_path.clone()), None).is_err());
+        assert!(resolve_password(None, None, None, Some(bad_value.clone())).is_err());
+        assert!(resolve_password(None, Some(PathBuf::from(bad_path)), None, None).is_err());
+        assert!(resolve_mcp_token(None, Some(bad_value)).is_err());
+    }
+
+    /// R3 item 9 (Unix): an env source that is *overridden* by an explicit flag
+    /// must not turn into an unrelated fatal error.
+    #[cfg(unix)]
+    #[test]
+    fn overridden_non_utf8_env_does_not_error() {
+        use std::os::unix::ffi::OsStringExt;
+        let bad = OsString::from_vec(vec![0x80, 0xff]);
+
+        let got = resolve_password(Some("argv-pw".to_string()), None, Some(bad.clone()), Some(bad.clone())).unwrap();
+        assert_eq!(got, PasswordSource::Argv("argv-pw".to_string()));
+
+        let dir = pw_scratch_dir("nonutf8-override");
+        let path = dir.join("pw");
+        std::fs::write(&path, "file-pw\n").unwrap();
+        let got = resolve_password(None, Some(path), Some(bad.clone()), None).unwrap();
+        assert_eq!(got.into_value().as_deref(), Some("file-pw"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            resolve_mcp_token(Some("flag-token".to_string()), Some(bad)).unwrap(),
+            Some("flag-token".to_string())
+        );
+    }
+
+    /// R1 regression: the `assert_eq!` assertions above force `Debug`, so a
+    /// derived formatter on `PasswordSource` would print plaintext. Prove the
+    /// manual impl redacts every secret-bearing arm.
+    #[test]
+    fn password_source_debug_redacts_secrets() {
+        let file_secret = "file-contents-must-not-print";
+        let rendered = [
+            format!("{:?}", PasswordSource::Argv("argv-secret-must-not-print".to_string())),
+            format!("{:?}", PasswordSource::Env("env-secret-must-not-print".to_string())),
+            format!(
+                "{:?}",
+                PasswordSource::File {
+                    path: PathBuf::from("/run/secrets/heliosdb_password"),
+                    value: file_secret.to_string(),
+                }
+            ),
+        ];
+        for shown in &rendered {
+            assert!(shown.contains("<redacted>"), "expected redaction marker in {shown}");
+            assert!(!shown.contains("argv-secret-must-not-print"));
+            assert!(!shown.contains("env-secret-must-not-print"));
+            assert!(!shown.contains(file_secret));
+        }
+        assert_eq!(format!("{:?}", PasswordSource::Absent), "PasswordSource::Absent");
     }
 
     /// The core P0-2 invariant: the daemon re-exec must never place the

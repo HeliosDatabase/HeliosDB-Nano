@@ -24,6 +24,9 @@ pass() { echo "ok: $*"; }
 
 [ -f "$ENTRY" ] || fail "entrypoint not found: $ENTRY"
 
+# Never let an inherited secret environment change the outcome of any case.
+unset HELIOSDB_PASSWORD HELIOSDB_PASSWORD_FILE HELIOSDB_MCP_TOKEN 2>/dev/null || true
+
 # ── 1. static checks ─────────────────────────────────────────────────────
 if grep -nE 'set -- "\$@" --password([ "=]|$)' "$ENTRY" >/dev/null 2>&1; then
   fail "entrypoint still appends literal --password to the command line"
@@ -90,6 +93,28 @@ if grep -qF 'hdb-entrypoint-secret' "$TMP/argv-new"; then
   fail "secret value appears on the forwarded command line"
 fi
 pass "fixed binary receives --password-file <path>, never the secret value"
+
+# 2c. an explicit --password-file outranks a stale/missing inherited env file.
+#     A HELIOSDB_PASSWORD_FILE that does not exist must NOT block the flag.
+writestub '--auth --password-file --data-dir'
+printf '%s' 'explicit-secret' > "$TMP/explicit-pwfile"
+HDB_STUB_ARGV="$TMP/argv-explicit" \
+HELIOSDB_PASSWORD_FILE="$TMP/does-not-exist-envfile" \
+HELIOSDB_DATA_DIR="$TMP/data" \
+HELIOSDB_TLS=off \
+PATH="$TMP/bin:$PATH" \
+  sh "$ENTRY" start --port 6544 --password-file "$TMP/explicit-pwfile" \
+  >"$TMP/out-explicit" 2>"$TMP/err-explicit" \
+  || fail "entrypoint failed although an explicit --password-file was given (missing inherited HELIOSDB_PASSWORD_FILE must not block it); stderr: $(cat "$TMP/err-explicit" 2>/dev/null)"
+grep -qF "$TMP/explicit-pwfile" "$TMP/argv-explicit" \
+  || fail "explicit --password-file path not forwarded"
+if grep -qF 'does-not-exist-envfile' "$TMP/argv-explicit"; then
+  fail "entrypoint forwarded the stale inherited env file instead of the explicit flag"
+fi
+if grep -qF 'explicit-secret' "$TMP/argv-explicit"; then
+  fail "secret value appears on the forwarded command line"
+fi
+pass "explicit --password-file honoured despite a missing inherited HELIOSDB_PASSWORD_FILE"
 
 echo
 echo "RESULT: PASS — entrypoint never reintroduces password argv exposure"

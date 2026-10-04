@@ -29,9 +29,11 @@
 #
 #   * HTTP API. The HTTP listener (port 8080: /health, REST, branches, vector
 #     stores) does NOT use the PostgreSQL password, so it is bound to
-#     127.0.0.1 inside the container unless you pass `--http-listen` or set
+#     127.0.0.1 inside the container unless you pass --http-listen or set
 #     HELIOSDB_HTTP_LISTEN=0.0.0.0. The image HEALTHCHECK works either way.
-#     Only publish 8080 on a trusted network.
+#     Do NOT publish 8080: the HTTP API has no authentication policy yet
+#     (only MCP /mcp can carry a bearer token), so widening it exposes an
+#     unauthenticated surface.
 #
 #   * TLS. When no `--tls-cert` flag is given, a self-signed certificate is
 #     generated once under $HELIOSDB_TLS_DIR (default /data/tls) and the server
@@ -142,9 +144,11 @@ else
   pw_off_argv=0
 fi
 pw_file=""
-# Prefer the secret file whenever one is named, matching the server's
-# HELIOSDB_PASSWORD_FILE > HELIOSDB_PASSWORD precedence.
-if [ -n "${HELIOSDB_PASSWORD_FILE:-}" ]; then
+# Only consult the inherited HELIOSDB_PASSWORD_FILE when the operator did not
+# already give an explicit source. An explicit --password / --password-file
+# outranks the environment — the same precedence the server itself uses — so a
+# stale (or absent) inherited file must not block a valid explicit flag.
+if [ "$has_password" -eq 0 ] && [ -n "${HELIOSDB_PASSWORD_FILE:-}" ]; then
   [ -r "$HELIOSDB_PASSWORD_FILE" ] && [ -s "$HELIOSDB_PASSWORD_FILE" ] \
     || { echo "error: HELIOSDB_PASSWORD_FILE=$HELIOSDB_PASSWORD_FILE is not a readable, non-empty file" >&2; exit 1; }
   pw_file="$HELIOSDB_PASSWORD_FILE"

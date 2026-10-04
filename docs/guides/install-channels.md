@@ -82,6 +82,14 @@ docker run -d --name heliosdb -p 5432:5432 \
 psql "postgresql://postgres:change-me@localhost:5432/postgres?sslmode=require" -c 'SELECT 1'
 ```
 
+When the password comes from a **file** (Docker Compose `secrets:` or a bind
+mount), the image runs as uid/gid 999 (`USER heliosdb` in the Dockerfile), so a
+host file left `0600` and owned by your login is unreadable and the container
+exits. Make it 999-readable: `sudo chown 999:999 <file> && chmod 600 <file>`,
+or `chmod 644` if you cannot change ownership (world-readable on the host).
+Compose file secrets are bind mounts, so host owner/mode carry into the
+container; Kubernetes Secrets mount `0444` by default.
+
 The entrypoint (`deployment/docker/docker-entrypoint.sh`):
 
 - starts the server with `--data-dir $HELIOSDB_DATA_DIR` (default `/data`) and
@@ -104,9 +112,10 @@ The entrypoint (`deployment/docker/docker-entrypoint.sh`):
   `sslmode=require` works; supply your own with `HELIOSDB_TLS_CERT` +
   `HELIOSDB_TLS_KEY`, or disable with `HELIOSDB_TLS=off`;
 - binds the HTTP API (port 8080: REST, branches, vector stores) to
-  `127.0.0.1` inside the container, because it does not use the PostgreSQL
-  password; set `HELIOSDB_HTTP_LISTEN=0.0.0.0` and publish 8080 only on a
-  trusted network;
+  `127.0.0.1` inside the container on purpose: it does not use the PostgreSQL
+  password and has no authenticated-HTTP policy yet. Do not publish 8080 or
+  widen it with `HELIOSDB_HTTP_LISTEN` to expose an unauthenticated surface;
+  only the MCP `/mcp` route accepts a bearer token (`HELIOSDB_MCP_TOKEN`);
 - passes any other command through: `docker run --rm -it IMAGE repl --memory`,
   `docker run --rm IMAGE --version`.
 

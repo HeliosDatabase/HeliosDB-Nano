@@ -10,10 +10,18 @@
 #
 #   mkdir -p secrets
 #   printf '%s' 'change-me' > secrets/heliosdb_password.txt
-#   chmod 600 secrets/heliosdb_password.txt
 #
-# Using Kubernetes? Mount the Secret at /run/secrets/heliosdb_password and keep
-# the HELIOSDB_PASSWORD_FILE environment variable below.
+# Compose implements a file-based secret as a BIND MOUNT of the host file, so
+# the host owner/mode carry into the container. The image runs as uid/gid 999
+# (Dockerfile `USER heliosdb`), so a file left `0600` and owned by your host
+# login is UNREADABLE to the server and it will exit. Make it 999-readable:
+#
+#   sudo chown 999:999 secrets/heliosdb_password.txt && chmod 600 secrets/heliosdb_password.txt
+# or, without ownership changes:
+#   chmod 644 secrets/heliosdb_password.txt   # world-readable on the host
+#
+# Kubernetes mounts its own Secret with mode 0444 by default; keep the
+# HELIOSDB_PASSWORD_FILE environment variable below.
 services:
   heliosdb:
     image: ghcr.io/heliosdatabase/heliosdb-nano:latest
@@ -22,9 +30,10 @@ services:
     #   dockerfile: deployment/docker/Dockerfile
     ports:
       - "5432:5432"  # PostgreSQL protocol
-      # HTTP API (REST, branches, vectors) is unauthenticated and bound to
-      # 127.0.0.1 in the container; to expose it on a trusted network set
-      # HELIOSDB_HTTP_LISTEN=0.0.0.0 and uncomment:
+      # HTTP API (REST, branches, vectors) is unauthenticated and has no
+      # authentication policy yet; it is bound to 127.0.0.1 in the container on
+      # purpose. Do NOT publish 8080 — that would expose the database surface
+      # without auth. (MCP /mcp accepts a bearer token via HELIOSDB_MCP_TOKEN.)
       # - "8080:8080"
       - "3306:3306"  # MySQL protocol
     volumes:

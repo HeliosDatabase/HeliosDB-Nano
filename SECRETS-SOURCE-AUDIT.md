@@ -1,11 +1,11 @@
 # Secret-source audit (P0-2, 2026-10-04)
 
 Static audit of every secret source reachable from the `heliosdb-nano`
-front door, at commit `e8b0461b` plus the second-pass changes on
+front door, at base `6e3204b9` plus the R3 follow-up changes on
 `fix/nano-secrets-20261004`. This is a code-inspection inventory, not a
 runtime claim: no live daemon was exercised for it (the real-process harness
-is `scripts/test_server_secret_argv.sh`, gated behind
-`HELIOSDB_PROC_REGRESSION=1`).
+is `scripts/test_server_secret_argv.sh` -> `test_server_secret_argv.py`, gated
+behind `HELIOSDB_PROC_REGRESSION=1`).
 
 Files inspected: `src/main.rs`, `src/config.rs`,
 `src/crypto/key_manager.rs`, `src/cli/dump.rs`, `src/cli/restore.rs`,
@@ -26,55 +26,102 @@ Files inspected: `src/main.rs`, `src/config.rs`,
 
 ## `start`: password
 
-Precedence, resolved in `resolve_password` (`src/main.rs:180`):
+Precedence, resolved in `resolve_password` (`src/main.rs:218`):
 
-1. `--password <value>` — deprecated; emits a WARN (`src/main.rs:714`).
+1. `--password <value>` — deprecated; emits a WARN (`src/main.rs:810`).
 2. `--password-file <path>` — first line; empty file fails closed
-   (`read_password_file`, `src/main.rs:164`).
+   (`read_password_file`, `src/main.rs:183`).
 3. `$HELIOSDB_PASSWORD_FILE` — same format.
 4. `$HELIOSDB_PASSWORD` — environment value.
 
 `--password` and `--password-file` are `conflicts_with` each other. For
 `--auth password|md5|scram-sha-256`, an absent source is a startup error
-(`src/main.rs:727`). `--auth trust` needs none.
+(`src/main.rs` in the `Start` handler). `--auth trust` needs none.
+
+**Empty values fail closed, never downgrade to trust.** An explicitly supplied
+but empty `--password` (or an empty `--password-file` path) is rejected in
+`resolve_password` with an error that contains no secret material. Empty
+`HELIOSDB_PASSWORD` / `HELIOSDB_PASSWORD_FILE` values are treated as unset —
+consistent with each other, and safe because a non-`trust` method with no
+source then fails startup rather than starting without auth.
+
+**Non-UTF8 is invalid config, not absence.** Env sources are read with
+`var_os` (not `var().ok()`, which silently dropped non-UTF8 bytes). A
+*selected* non-UTF8 `HELIOSDB_PASSWORD`, `HELIOSDB_PASSWORD_FILE`, or
+`HELIOSDB_MCP_TOKEN` is a startup error; a non-UTF8 `--password-file` path is
+refused (`reject_non_utf8_path`) because the daemon forwards the path as a
+`String` argv element (`display()` would be lossy). A higher-precedence
+explicit flag still suppresses an overridden non-UTF8 env value, so an
+unrelated broken env var cannot fail a valid explicit configuration. Unix
+regressions: `non_utf8_configured_sources_error_not_absent`,
+`overridden_non_utf8_env_does_not_error`.
 
 **Daemon re-exec.** `start --daemon` re-execs the binary
-(`start_server_daemon`, `src/main.rs:1693`). The child never receives the
+(`start_server_daemon`, `src/main.rs:1790`). The child never receives the
 plaintext on its command line:
 
 - a file source forwards only `--password-file <path>`;
 - an argv/env source is exported to the child as `HELIOSDB_PASSWORD`
-  (`daemon_password_handoff`, `src/main.rs:212`);
+  (`daemon_password_handoff`, `src/main.rs:309`);
 - `HELIOSDB_PASSWORD_FILE` is removed from the child environment when an
-  explicit value source is authoritative (`src/main.rs:1875`).
+  explicit value source is authoritative (`src/main.rs:1976`).
 
 The foreground (non-daemon) path consumes the plaintext in-process
-(`PasswordSource::into_value`, `src/main.rs:153`).
+(`PasswordSource::into_value`, `src/main.rs:154`). `PasswordSource` has a
+manual, non-derived `Debug` (`src/main.rs:168`) that redacts both
+`Argv`/`Env` values and a file's contents.
 
 **Docker.** `docker-compose.yml` mounts `secrets/heliosdb_password.txt` as a
-Docker secret and sets `HELIOSDB_PASSWORD_FILE`. The entrypoint validates the
-file, then forwards `--password-file` (never `--password`). A binary that
+Docker secret and sets `HELIOSDB_PASSWORD_FILE`. Compose implements a file
+secret as a bind mount, so the host owner/mode carry into the container; the
+image is `USER heliosdb` (uid/gid 999, verified in `Dockerfile.binary:43` and
+`deployment/docker/Dockerfile:44`). A `0600` file owned by the host login is
+therefore unreadable to the server, and the docs now say to
+`chown 999:999` + `chmod 600` (or `chmod 644` when ownership cannot change).
+The entrypoint validates the file, then forwards `--password-file` (never
+`--password`). An explicit `--password` / `--password-file` on the container
+command line outranks the inherited `HELIOSDB_PASSWORD_FILE`, so a stale or
+missing inherited file does not block a valid explicit flag. A binary that
 predates `--password-file` is refused with an upgrade message; the entrypoint
 has no `--password` fallback.
 
 ## `start`: MCP bearer token
 
-Source: `--mcp-token <value>` or `$HELIOSDB_MCP_TOKEN` (read when the flag is
-absent, `src/main.rs:737`). The token guards MCP-over-HTTP routes
-(`run_http_listener`, `src/main.rs:2351`). On daemon re-exec it is handed to
-the child through `HELIOSDB_MCP_TOKEN`, not argv (`src/main.rs:1882`).
+Source: `--mcp-token <value>` or `$HELIOSDB_MCP_TOKEN`, resolved by
+`resolve_mcp_token` (`src/main.rs:283`). `--mcp-token` outranks the environment;
+an empty `--mcp-token` is a startup error and an empty `$HELIOSDB_MCP_TOKEN` is
+treated as unset (`src/main.rs:291`). The token guards MCP-over-HTTP routes
+(`run_http_listener`, `src/main.rs:2448`). On daemon re-exec it is handed to
+the child through `HELIOSDB_MCP_TOKEN`, not argv (`src/main.rs:1937`).
 `--allow-remote-mcp` (a boolean, not a secret) is forwarded on argv.
 
 Status: the token source and daemon handoff are implemented. A literal
-`--mcp-token` on the original command line is still visible in that process's
-argv at launch time (same portable limitation as `--password`); prefer the
-environment variable.
+`--mcp-token` on the original command line stays visible in that process's
+`/proc/<pid>/cmdline` for the process's **entire lifetime**, exactly like
+`--password`; prefer the environment variable. No portable in-place argv scrub
+is implemented — that best-effort requirement is explicitly **unresolved** in
+this track. Whether the token actually *authenticates* depends on the binary
+being built with the `mcp-endpoint` feature; without it the token is resolved
+and handed off but no MCP routes are mounted, so an argv-only check does not
+prove token authentication. The harness exposes `HELIOSDB_PROC_MCP_HTTP=1` to
+require an end-to-end `/mcp` 401/200 check in feature-enabled runs.
+
+## HTTP listener policy (out of scope here)
+
+The HTTP API does not use the PostgreSQL password. Its default is loopback
+(`--http-listen` defaults to the main listen address; the container entrypoint
+forces `127.0.0.1`). Beyond the MCP `/mcp` bearer token there is no
+authenticated-HTTP policy yet: real HTTP authentication is a dependency on the
+separate HTTP track and is **not implemented in this tree**, so this track does
+**not** recommend publishing it, and explicitly does not recommend exposing an
+unauthenticated SQL or HTTP surface on a "trusted" network. HTTP source is
+unchanged by this track.
 
 ## `start`: TLS private key
 
 Flags: `--tls-cert` / `--tls-key` (PostgreSQL listener) and
 `--mysql-tls-cert` / `--mysql-tls-key` (MySQL listener), each pair required
-together (`src/main.rs:691`, `src/main.rs:696`). The values are file **paths**
+together (`src/main.rs:790`, `src/main.rs:795`). The values are file **paths**
 and appear on argv; the private-key **bytes** are read by the server from the
 file. Protection is the key file's permissions, not argv hygiene. The Docker
 entrypoint, when no cert is supplied, generates a self-signed pair under
@@ -105,8 +152,8 @@ never persisted by the server.
 
 ## `dump` / `restore`: connection URI limitation
 
-Both subcommands accept `--connection <string>` (`src/main.rs:552`,
-`src/main.rs:584`), passed to `DumpCommand` / `RestoreCommand`. A connection
+Both subcommands accept `--connection <string>` (`src/main.rs:649`,
+`src/main.rs:681`), passed to `DumpCommand` / `RestoreCommand`. A connection
 URI such as `postgres://user:password@host/db` embeds credentials in a single
 argv token, so the password is visible to any local user via
 `/proc/<pid>/cmdline`. There is no redaction or off-argv form.
@@ -130,28 +177,46 @@ Handing a secret to a child through the environment removes it from
 `/proc/<pid>/cmdline`, but **not** from the host — the process owner and
 privileged users can read `/proc/<pid>/environ`. The P0-2 fix is specifically
 an argv-exposure fix; it makes no claim that environment handoff is secret
-from the same uid. Launch-time argv exposure of a literal `--password` /
-`--mcp-token` cannot be removed portably once the shell has already started
-the process; migrate to a file or environment source.
+from the same uid. A literal `--password` / `--mcp-token` on the original
+command line is visible in `/proc/<pid>/cmdline` for the **whole process
+lifetime**; no portable in-place argv scrub exists here, so that requirement is
+explicitly **unresolved**. Migrate to a file or environment source.
 
 ## Known gaps
 
 - Environment handoff remains readable via `/proc/<pid>/environ`.
+- **No portable in-place argv scrub** for a legacy literal `--password` /
+  `--mcp-token`; the value is world-readable in `/proc/<pid>/cmdline` for the
+  entire process lifetime. Warning + off-argv alternatives only mitigate it.
 - The daemon child re-reads the password **file** named on its command line,
   so deleting or mutating that file between parent resolution and child
   startup can fail or change the credential. An inherited private descriptor
-  would remove the window; it is not implemented.
+  would remove the window; it is not implemented, and the harness does **not**
+  claim to cover this race: its `deleted-before-parent-read` case removes the
+  file before the parent reads it and is therefore equivalent to a missing
+  file. A real fixture would have to interleave the child's startup read.
 - `--connection` connection-URI credentials (above) are on argv if server
   mode is ever wired up.
-- Literal `--password` / `--mcp-token` on the original command line are
-  inherently exposed; only the deprecation warning and off-argv alternatives
-  mitigate this.
+- Docker file-secret ownership (uid/gid 999) is documented, but no container
+  was started to prove the mount is readable; that bind-mount/UID check is
+  pending the scheduler (a YAML parse is not runtime coverage).
 
 ## Verification
 
 - `sh -n deployment/docker/docker-entrypoint.sh`
 - `scripts/test_docker_entrypoint_secret.sh` (static + stub; no build)
-- `HELIOSDB_PROC_REGRESSION=1 scripts/test_server_secret_argv.sh` (real
-  daemon; gated, not run by default)
+- `python3 -c "compile(open('scripts/test_server_secret_argv.py').read(),'x','exec')"` and
+  `bash -n`/`sh -n` on the wrapper (static; avoids writing `__pycache__`)
+- `python3 scripts/test_secret_argv_mocks.py` (mocked-process tests: negative
+  config cases fail on stray child/pidfile; EPERM/changed-identity cleanup is
+  recorded; no signals or process launches)
+- `HELIOSDB_PROC_REGRESSION=1 HELIOSDB_NANO_BIN=<abs> \
+   HELIOSDB_PROC_EVIDENCE_DIR=<abs> scripts/test_server_secret_argv.sh`
+  (real daemons; gated, not run by default; exit 3 = requested-but-unavailable).
+  The harness requires the child to **own** the SQL/HTTP listener (PID fd
+  socket-inode match against `/proc/net/tcp{,6}`), requires an actual
+  SQLSTATE-28 authentication rejection for the wrong-password case, and
+  re-hashes the binary before/after the suite.
 - `cargo test --bin heliosdb-nano` covers the `resolve_password` /
-  `daemon_password_handoff` unit tests in `src/main.rs`.
+  `resolve_mcp_token` / `daemon_password_handoff` / redacted-`Debug` unit tests
+  and the Unix non-UTF8 regressions in `src/main.rs`.

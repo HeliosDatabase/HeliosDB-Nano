@@ -90,7 +90,16 @@ from the first source below that is present:
 
 An empty password file is a **startup error** (fail closed), and when a
 non-`trust` method is selected with none of the sources set, startup fails with
-a message naming them.
+a message naming them. An explicitly configured but **empty** `--password`
+(or an empty `--password-file` path) is likewise a startup error: an empty
+credential is never silently dropped, which would otherwise leave a server the
+operator believes is authenticated running in `trust`. An empty
+`HELIOSDB_PASSWORD` / `HELIOSDB_PASSWORD_FILE` is treated as unset.
+
+The MCP-over-HTTP bearer token uses the same shape: `--mcp-token` outranks
+`HELIOSDB_MCP_TOKEN`, an empty `--mcp-token` is a startup error, and an empty
+`HELIOSDB_MCP_TOKEN` is treated as unset. A configured token must not be
+dropped by omission — that would unmount MCP authentication without saying so.
 
 The file holds a **single** password (its first line); it is not a TOML
 multi-user catalog. Every source above seeds the same `postgres` and `helios`
@@ -119,12 +128,26 @@ its environment (`HELIOSDB_PASSWORD`). The MCP-over-HTTP bearer token is handled
 the same way: pass `$HELIOSDB_MCP_TOKEN` (or `--mcp-token`, which Nano forwards
 through the child's environment) rather than a literal on the command line.
 
-Launch-time exposure of a legacy literal `--password` cannot be removed
-portably once the shell has started the process — the value was already on
-`argv`. Migrate to `--password-file` / `HELIOSDB_PASSWORD_FILE`. The Docker
-Compose example in `deployment/docker/docker-compose.yml` mounts the password
-as a Docker secret and sets `HELIOSDB_PASSWORD_FILE`, so `docker inspect` shows
-only the file path.
+A legacy literal `--password` (and `--mcp-token`) on the command line remains
+visible in `/proc/<pid>/cmdline` for the **entire lifetime of that process**,
+not merely at launch — every local user can read it with `ps` for as long as the
+server runs. There is no portable in-place argv scrub here; that requirement is
+explicitly **unresolved** in this track. Migrate to `--password-file` /
+`HELIOSDB_PASSWORD_FILE`, or to `HELIOSDB_PASSWORD` in the environment. The
+Docker Compose example in `deployment/docker/docker-compose.yml` mounts the
+password as a Docker secret and sets `HELIOSDB_PASSWORD_FILE`, so `docker
+inspect` shows only the file path.
+
+### HTTP listener is loopback + unauthenticated until the HTTP policy lands
+
+The HTTP API is **not** covered by the PostgreSQL password. Its default is
+loopback (`--http-listen 127.0.0.1` in the container), and the only
+credential it understands today is the MCP bearer token for the `/mcp` route —
+so this guide does **not** recommend publishing port 8080 or otherwise exposing
+the HTTP API. Actual authenticated HTTP is a dependency on the separate HTTP
+auth track and is **not implemented in this tree**; until it lands, keep the
+HTTP listener on loopback, and never publish it to expose an unauthenticated
+database surface.
 
 ### Custom password stores
 
