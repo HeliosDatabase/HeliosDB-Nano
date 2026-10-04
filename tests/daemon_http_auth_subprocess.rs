@@ -1059,7 +1059,12 @@ fn default_live_failure_budget_returns_retry_after_without_blocking_health() {
         Some(&basic("postgres", "wrong-password")),
         None,
     );
-    assert_eq!(locked.status, 429, "the next attempt must be rate limited{}");
+    assert_eq!(
+        locked.status,
+        429,
+        "the next attempt must be rate limited{}",
+        daemon.diagnostics()
+    );
     assert_eq!(locked.header("retry-after"), Some("60"));
     assert_eq!(status_of(&daemon, "GET", "/health", None, None), 200);
 }

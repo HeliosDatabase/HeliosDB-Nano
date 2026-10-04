@@ -441,11 +441,9 @@ impl HttpAuthPolicy {
 
 /// Compare two byte strings for equality.
 ///
-/// `subtle`'s `ConstantTimeEq` (`subtle` 2.6.1, `src/lib.rs`) runs in constant
-/// time **only for equal-length inputs**; it returns early when the lengths
-/// differ. The bearer token's length is not a secret — the HTTP header's length
-/// is already observable — so that early return is not a leak here. No broader
-/// audit claim is made beyond this equal-length guarantee.
+/// `subtle`'s `ConstantTimeEq` uses constant-time byte comparison for
+/// equal-length slices and rejects differing lengths early. No broader claim is
+/// made.
 fn constant_time_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     bool::from(a.ct_eq(b))
 }
