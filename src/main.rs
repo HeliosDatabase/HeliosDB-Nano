@@ -722,6 +722,16 @@ enum Commands {
         #[arg(long)]
         tls_key: Option<PathBuf>,
 
+        /// Require TLS on the PostgreSQL TCP listener. Startup fails unless
+        /// both --tls-cert and --tls-key are given; a client that does not
+        /// complete a TLS handshake is refused instead of falling back to
+        /// plaintext. PostgreSQL TCP only: it does not enable HTTPS, require
+        /// MySQL TLS, or apply to the PostgreSQL Unix-socket listener (an
+        /// authenticated local transport that stays plaintext). Default: off
+        /// (TLS offered, plaintext accepted).
+        #[arg(long)]
+        require_tls: bool,
+
         /// Offer the X25519MLKEM768 hybrid post-quantum key-exchange group
         /// (draft-ietf-tls-ecdhe-mlkem) alongside classical groups on the
         /// PostgreSQL TLS listener, in addition to a classical fallback for
@@ -1089,6 +1099,7 @@ async fn run(cli: Cli) -> Result<()> {
             dump_schedule,
             tls_cert,
             tls_key,
+            require_tls,
             tls_post_quantum,
             auth,
             password,
@@ -1133,6 +1144,17 @@ async fn run(cli: Cli) -> Result<()> {
             if tls_cert.is_some() != tls_key.is_some() {
                 return Err(Error::config(
                     "Both --tls-cert and --tls-key must be specified together for TLS.".to_string(),
+                ));
+            }
+            // --require-tls is meaningless without a certificate/key pair, and
+            // silently accepting it would leave an operator believing the
+            // PostgreSQL TCP listener is TLS-only while it still offers
+            // plaintext. Fail before the database is opened or a daemon is
+            // spawned. PostgreSQL TCP only: this does not govern MySQL TLS or
+            // the (authenticated, local) PostgreSQL Unix-socket listener.
+            if require_tls && (tls_cert.is_none() || tls_key.is_none()) {
+                return Err(Error::config(
+                    "--require-tls requires both --tls-cert and --tls-key.".to_string(),
                 ));
             }
             if mysql_tls_cert.is_some() != mysql_tls_key.is_some() {
@@ -1219,6 +1241,7 @@ async fn run(cli: Cli) -> Result<()> {
                     pid_file,
                     tls_cert,
                     tls_key,
+                    require_tls,
                     tls_post_quantum,
                     auth,
                     password_source,
@@ -1244,6 +1267,7 @@ async fn run(cli: Cli) -> Result<()> {
                     dump_on_shutdown,
                     tls_cert,
                     tls_key,
+                    require_tls,
                     tls_post_quantum,
                     auth,
                     password_source.into_value(),
@@ -1367,6 +1391,42 @@ fn durability_contract(config: &Config) -> String {
     }
 }
 
+/// PostgreSQL TCP SSL mode: `Require` when `--require-tls` is set, otherwise
+/// the compatibility default `Prefer` (TLS offered, plaintext accepted).
+fn pg_tcp_ssl_mode(require_tls: bool) -> heliosdb_nano::protocol::postgres::SslMode {
+    if require_tls {
+        heliosdb_nano::protocol::postgres::SslMode::Require
+    } else {
+        heliosdb_nano::protocol::postgres::SslMode::Prefer
+    }
+}
+
+/// Build the `start` argv that `start_server_daemon` re-execs for the
+/// PostgreSQL TLS flags. Split out so `--require-tls` forwarding can be
+/// unit-tested without spawning a child process.
+fn daemon_pg_tls_args(
+    tls_cert: &Option<PathBuf>,
+    tls_key: &Option<PathBuf>,
+    require_tls: bool,
+    tls_post_quantum: bool,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(cert) = tls_cert {
+        args.push("--tls-cert".to_string());
+        args.push(cert.display().to_string());
+    }
+    if let Some(key) = tls_key {
+        args.push("--tls-key".to_string());
+        args.push(key.display().to_string());
+    }
+    args.push("--tls-post-quantum".to_string());
+    args.push(tls_post_quantum.to_string());
+    if require_tls {
+        args.push("--require-tls".to_string());
+    }
+    args
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn start_server(
     data_dir: PathBuf,
@@ -1377,6 +1437,7 @@ async fn start_server(
     dump_on_shutdown: bool,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    require_tls: bool,
     tls_post_quantum: bool,
     auth: String,
     password: Option<String>,
@@ -1394,7 +1455,7 @@ async fn start_server(
     use colored::Colorize;
     use heliosdb_nano::protocol::postgres::auth::{AuthManager, AuthMethod};
     use heliosdb_nano::protocol::postgres::server::{PgServer, PgServerConfig};
-    use heliosdb_nano::protocol::postgres::ssl::{SslConfig, SslMode};
+    use heliosdb_nano::protocol::postgres::ssl::SslConfig;
     use heliosdb_nano::protocol::postgres::timeouts::ConnectionTimeouts;
     use heliosdb_nano::protocol::postgres::{InMemoryPasswordStore, PasswordStore, SharedPasswordStore};
     use heliosdb_nano::storage::{DumpCompressionType, DumpManager, DumpMode, DumpOptions};
@@ -1611,9 +1672,12 @@ async fn start_server(
         .with_max_connections(max_connections)
         .with_timeouts(connection_policy.clone());
 
-    // Configure TLS if specified
+    // Configure TLS if specified. `--require-tls` selects `SslMode::Require`
+    // (no plaintext fallback) for the PostgreSQL TCP listener; the default
+    // remains `SslMode::Prefer` (TLS offered, plaintext accepted).
     if let (Some(cert_path), Some(key_path)) = (&tls_cert, &tls_key) {
-        let ssl_config = SslConfig::new(SslMode::Prefer, cert_path, key_path).with_post_quantum(tls_post_quantum);
+        let ssl_config =
+            SslConfig::new(pg_tcp_ssl_mode(require_tls), cert_path, key_path).with_post_quantum(tls_post_quantum);
         pg_config = pg_config.with_ssl(ssl_config);
     }
 
@@ -2236,6 +2300,7 @@ async fn start_server_daemon(
     pid_file: PathBuf,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
+    require_tls: bool,
     tls_post_quantum: bool,
     auth: String,
     password: PasswordSource,
@@ -2327,16 +2392,7 @@ async fn start_server_daemon(
     }
 
     // Add TLS options
-    if let Some(cert) = tls_cert {
-        args.push("--tls-cert".to_string());
-        args.push(cert.display().to_string());
-    }
-    if let Some(key) = tls_key {
-        args.push("--tls-key".to_string());
-        args.push(key.display().to_string());
-    }
-    args.push("--tls-post-quantum".to_string());
-    args.push(tls_post_quantum.to_string());
+    args.extend(daemon_pg_tls_args(&tls_cert, &tls_key, require_tls, tls_post_quantum));
 
     if let Some(cert) = mysql_tls_cert {
         args.push("--mysql-tls-cert".to_string());
@@ -3782,5 +3838,36 @@ mod tests {
         assert_eq!(info["serverInfo"]["name"], "heliosdb-nano");
 
         handle.abort();
+    }
+
+    // ------------------------------------------------------------------
+    // Issue 53: `--require-tls` is PostgreSQL TCP only.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn pg_tcp_ssl_mode_defaults_to_prefer_and_require_tls_selects_require() {
+        use heliosdb_nano::protocol::postgres::SslMode;
+        assert_eq!(pg_tcp_ssl_mode(false), SslMode::Prefer);
+        assert_eq!(pg_tcp_ssl_mode(true), SslMode::Require);
+    }
+
+    #[test]
+    fn daemon_pg_tls_args_forwards_require_tls_only_when_set() {
+        let cert = Some(PathBuf::from("/etc/helios/cert.pem"));
+        let key = Some(PathBuf::from("/etc/helios/key.pem"));
+
+        let required = daemon_pg_tls_args(&cert, &key, true, true);
+        assert!(required.windows(2).any(|w| w == ["--tls-cert", "/etc/helios/cert.pem"]));
+        assert!(required.windows(2).any(|w| w == ["--tls-key", "/etc/helios/key.pem"]));
+        assert!(
+            required.iter().any(|a| a == "--require-tls"),
+            "require-tls must be forwarded to the daemon child, got {required:?}"
+        );
+
+        let preferred = daemon_pg_tls_args(&cert, &key, false, true);
+        assert!(
+            !preferred.iter().any(|a| a == "--require-tls"),
+            "require-tls must not be forwarded when off, got {preferred:?}"
+        );
     }
 }

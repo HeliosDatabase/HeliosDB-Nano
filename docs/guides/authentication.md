@@ -231,6 +231,32 @@ advertise SSL. Most drivers accept TLS automatically; `psql` requires
 psql "host=127.0.0.1 port=5432 user=postgres dbname=myapp sslmode=require"
 ```
 
+### Requiring TLS on the PostgreSQL TCP listener
+
+By default (`SslMode::Prefer`) the PostgreSQL TCP listener offers TLS but still
+accepts a plaintext client. Pass `--require-tls` to refuse a connection that does
+not complete a TLS handshake:
+
+```bash
+heliosdb-nano start --data-dir ./mydata \
+  --tls-cert cert.pem --tls-key key.pem --require-tls
+```
+
+`--require-tls` fails startup unless **both** `--tls-cert` and `--tls-key` are
+given, so an operator cannot believe the listener is TLS-only while no
+certificate exists; the check runs before the database is opened or a daemon is
+spawned. A client that sends no SSLRequest, or whose TLS handshake fails, is
+refused rather than silently falling back to plaintext.
+
+**Scope.** `--require-tls` applies to the **PostgreSQL TCP** listener only. It
+does **not** enable HTTPS (the HTTP API never terminates TLS), require TLS on
+the MySQL wire listeners (`--mysql` / `--mysql-socket` keep their independent
+`--mysql-tls-*` options), or require client certificates. The PostgreSQL
+Unix-socket listener (`--pg-socket-dir`) is a local, authenticated transport and
+is deliberately **not** subject to `--require-tls`: it still demands the
+configured wire credential, but it is not TLS-wrapped, matching the
+`hostssl`-for-TCP / local-socket exception in PostgreSQL.
+
 The MySQL-wire listener has its own from-scratch TLS support: pass
 `--mysql-tls-cert` + `--mysql-tls-key` (PEM, X.509) alongside `--mysql`.
 MySQL clients request TLS via the `CLIENT_SSL` capability flag rather than
