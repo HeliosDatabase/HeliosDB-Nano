@@ -296,8 +296,8 @@ environment source.
   `scripts/test_require_tls_runtime.py` plus
   the mocked companion `scripts/test_require_tls_runtime_harness.py`, with CLI
   and parse coverage in `tests/require_tls_cli_tests.rs`. The harness is bounded
-  (per-probe subprocess timeouts, capped log output, and explicit
-  socket/`AF_UNIX`-inode and PID-file classification instead of `st_ino`
+  (per-probe subprocess timeouts, controlled `RUST_LOG`, retained per-case logs,
+  and explicit socket/`AF_UNIX`-inode and PID-file classification instead of `st_ino`
   equality). **Status: not run** — the live require-TLS gate and the
   `HELIOSDB_PROC_REGRESSION` live gates remain unrun; this audit contributes no
   live evidence for them.
