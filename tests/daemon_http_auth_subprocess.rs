@@ -395,8 +395,12 @@ fn body_of(daemon: &Daemon, method: &str, path: &str, auth: Option<&str>, body: 
 /// Parse one `/proc/<pid>/net/tcp*` body, returning the local addresses of
 /// LISTEN entries for `port` whose socket inode is in `owned_inodes`.
 ///
-/// `/proc/net/tcp` columns are whitespace-separated and the socket inode is
-/// matched against the child-owned descriptor set:
+/// The kernel writes these columns as whitespace-separated fields, header
+/// `sl local_address rem_address st tx_queue:rx_queue tr:tm->when retrnsmt uid
+/// timeout inode`; after `split_whitespace` (0-based) `fields[7]` is `uid`,
+/// `fields[8]` is `timeout`, and `fields[9]` is the kernel's `inode` column —
+/// the field matched against the child-owned descriptor set. `fields[3]` is the
+/// socket state, `0A` == LISTEN.
 ///
 /// ```text
 /// sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
@@ -406,7 +410,7 @@ fn parse_listening_addrs(content: &str, port: u16, owned_inodes: &std::collectio
     let mut found = Vec::new();
     for line in content.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        // Need at least through the inode field (index 9); st "0A" == LISTEN.
+        // Need at least through the inode column (fields[9]); st "0A" == LISTEN.
         if fields.len() < 10 || fields[3] != "0A" || !owned_inodes.contains(fields[9]) {
             continue;
         }
@@ -453,10 +457,10 @@ fn listening_addrs(pid: u32, port: u16) -> Vec<String> {
 /// column, not some other numeric field.
 #[test]
 fn proc_tcp_parser_reads_inode_from_field_nine() {
-    // A real row shape with the kernel's inode field at index 9. Local port
-    // 0x1F90 == 8080.
+    // A real Linux row shape: fields[7] = uid, fields[8] = timeout (0),
+    // fields[9] = inode. Local port 0x1F90 == 8080.
     let row = "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 \
-               00:00000000 00000000  1000 4242 1 0000000000000000 100 0 0 10 0";
+               00:00000000 00000000  1000 0 4242 1 0000000000000000 100 0 0 10 0";
     let content = format!(
         "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  \
          timeout inode\n{row}\n"

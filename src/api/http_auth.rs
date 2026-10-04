@@ -388,7 +388,8 @@ impl HttpAuthPolicy {
     ///
     /// Basic delegates to the wire [`AuthManager`] (`verify_basic`) so the username
     /// is significant, unknown users fail closed, and no comparison is hand-rolled.
-    /// Bearer uses `subtle`'s constant-time slice comparison.
+    /// Bearer uses `subtle`'s `ConstantTimeEq`, which is constant-time for
+    /// equal-length inputs (see [`constant_time_bytes_eq`]).
     fn credentials_ok(&self, headers: &HeaderMap, path: &str) -> bool {
         let Some(verifier) = &self.verifier else {
             return false;
@@ -438,10 +439,13 @@ impl HttpAuthPolicy {
     }
 }
 
-/// Compare two byte strings in constant time.
+/// Compare two byte strings for equality.
 ///
-/// Uses the `subtle` crate's audited `ConstantTimeEq`; the slice implementation
-/// folds the length difference into the result instead of returning early.
+/// `subtle`'s `ConstantTimeEq` (`subtle` 2.6.1, `src/lib.rs`) runs in constant
+/// time **only for equal-length inputs**; it returns early when the lengths
+/// differ. The bearer token's length is not a secret — the HTTP header's length
+/// is already observable — so that early return is not a leak here. No broader
+/// audit claim is made beyond this equal-length guarantee.
 fn constant_time_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     bool::from(a.ct_eq(b))
 }
