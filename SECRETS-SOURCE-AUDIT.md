@@ -1,8 +1,9 @@
 # Secret-source audit (P0-2, 2026-10-04)
 
 Static audit of every secret source reachable from the `heliosdb-nano`
-front door, at base `6e3204b9` plus the R3 follow-up changes on
-`fix/nano-secrets-20261004`. This is a code-inspection inventory, not a
+front door, at the reviewed secrets tip `099a90f5` as cherry-picked onto the
+integration branch (the HTTP-auth work is already present there; see the
+listener-policy section below). This is a code-inspection inventory, not a
 runtime claim: no live daemon was exercised for it (the real-process harness
 is `scripts/test_server_secret_argv.sh` -> `test_server_secret_argv.py`, gated
 behind `HELIOSDB_PROC_REGRESSION=1`).
@@ -106,16 +107,28 @@ and handed off but no MCP routes are mounted, so an argv-only check does not
 prove token authentication. The harness exposes `HELIOSDB_PROC_MCP_HTTP=1` to
 require an end-to-end `/mcp` 401/200 check in feature-enabled runs.
 
-## HTTP listener policy (out of scope here)
+## HTTP listener policy (combined with the HTTP-auth track)
 
-The HTTP API does not use the PostgreSQL password. Its default is loopback
-(`--http-listen` defaults to the main listen address; the container entrypoint
-forces `127.0.0.1`). Beyond the MCP `/mcp` bearer token there is no
-authenticated-HTTP policy yet: real HTTP authentication is a dependency on the
-separate HTTP track and is **not implemented in this tree**, so this track does
-**not** recommend publishing it, and explicitly does not recommend exposing an
-unauthenticated SQL or HTTP surface on a "trusted" network. HTTP source is
-unchanged by this track.
+The HTTP API now shares the PostgreSQL wire credential, so the two listeners can
+never disagree about users or passwords. When the wire has any credential
+(`--auth password|md5|scram-sha-256`, **or** `--auth trust --password …`, which
+protects HTTP while leaving the wire open), every route except the fixed
+status-only `/health` and CORS preflight requires HTTP Basic verified against the
+same `AuthManager` the wire uses (`src/api/http_auth.rs`, applied in
+`run_http_listener`, `src/main.rs`). BaaS JWT callers pass the outer check with
+the dedicated `X-HeliosDB-Authorization: Basic …` header and keep
+`Authorization: Bearer <app-jwt>` for the handler; the MCP bearer token stays
+scoped to `/mcp`. See README "HTTP API authentication and exposure".
+
+`--http-listen` defaults to loopback (`127.0.0.1`; the container entrypoint also
+forces it) and never inherits `--listen`. A non-loopback plaintext bind is
+refused at startup: **always** for an authenticated bind (Basic credentials would
+cross the network in the clear — `--allow-insecure-http` does not cover them),
+and for a trust-mode bind unless `--allow-insecure-http` is passed. The listener
+never terminates TLS, so a wire `--tls-cert` does not make it HTTPS; requiring
+TLS from plaintext clients (`--require-tls` / `hostssl`) remains the deferred
+gap #53 and is not implemented. This track contributes the password source below;
+the HTTP policy itself is the separate HTTP track's source.
 
 ## `start`: TLS private key
 

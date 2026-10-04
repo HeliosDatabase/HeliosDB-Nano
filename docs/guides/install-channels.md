@@ -111,11 +111,14 @@ The entrypoint (`deployment/docker/docker-entrypoint.sh`):
 - generates a self-signed TLS certificate in `/data/tls` on first start, so
   `sslmode=require` works; supply your own with `HELIOSDB_TLS_CERT` +
   `HELIOSDB_TLS_KEY`, or disable with `HELIOSDB_TLS=off`;
-- binds the HTTP API (port 8080: REST, branches, vector stores) to
-  `127.0.0.1` inside the container on purpose: it does not use the PostgreSQL
-  password and has no authenticated-HTTP policy yet. Do not publish 8080 or
-  widen it with `HELIOSDB_HTTP_LISTEN` to expose an unauthenticated surface;
-  only the MCP `/mcp` route accepts a bearer token (`HELIOSDB_MCP_TOKEN`);
+- binds the HTTP API (port 8080: REST, branches, vector stores) to `127.0.0.1`
+  inside the container by default. The HTTP API shares the PostgreSQL wire
+  credential, so with the container's `--auth scram-sha-256` every route except
+  `/health` requires HTTP Basic (the MCP `/mcp` route also accepts the
+  `HELIOSDB_MCP_TOKEN` bearer token). The listener does not terminate TLS, and
+  authenticated HTTP on a non-loopback plaintext bind is refused at startup, so
+  publishing 8080 or widening `HELIOSDB_HTTP_LISTEN` would fail rather than
+  expose a surface; front it with a TLS terminator instead;
 - passes any other command through: `docker run --rm -it IMAGE repl --memory`,
   `docker run --rm IMAGE --version`.
 

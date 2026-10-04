@@ -28,12 +28,14 @@
 #     (upgrade the image); the entrypoint never falls back to `--password`.
 #
 #   * HTTP API. The HTTP listener (port 8080: /health, REST, branches, vector
-#     stores) does NOT use the PostgreSQL password, so it is bound to
-#     127.0.0.1 inside the container unless you pass --http-listen or set
-#     HELIOSDB_HTTP_LISTEN=0.0.0.0. The image HEALTHCHECK works either way.
-#     Do NOT publish 8080: the HTTP API has no authentication policy yet
-#     (only MCP /mcp can carry a bearer token), so widening it exposes an
-#     unauthenticated surface.
+#     stores) shares the PostgreSQL wire credential, so with the container's
+#     --auth scram-sha-256 every route except /health requires HTTP Basic. It is
+#     bound to 127.0.0.1 inside the container unless you pass --http-listen or
+#     set HELIOSDB_HTTP_LISTEN. The image HEALTHCHECK works either way. Do NOT
+#     publish 8080: the listener does not terminate TLS, and authenticated HTTP
+#     on a non-loopback plaintext bind is refused at startup
+#     (--allow-insecure-http does not cover authenticated traffic), so widen it
+#     only behind a TLS terminator.
 #
 #   * TLS. When no `--tls-cert` flag is given, a self-signed certificate is
 #     generated once under $HELIOSDB_TLS_DIR (default /data/tls) and the server
@@ -128,7 +130,7 @@ EOF
   fi
 fi
 
-# ── HTTP API listener (unauthenticated — loopback unless asked) ───────────
+# ── HTTP API listener (loopback by default; shares the wire credential) ───
 if [ "$has_http_listen" -eq 0 ]; then
   set -- "$@" --http-listen "${HELIOSDB_HTTP_LISTEN:-127.0.0.1}"
 fi

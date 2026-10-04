@@ -138,22 +138,41 @@ Docker Compose example in `deployment/docker/docker-compose.yml` mounts the
 password as a Docker secret and sets `HELIOSDB_PASSWORD_FILE`, so `docker
 inspect` shows only the file path.
 
-### HTTP listener is loopback + unauthenticated until the HTTP policy lands
+### HTTP listener
 
-The HTTP API is **not** covered by the PostgreSQL password. Its default is
-loopback (`--http-listen 127.0.0.1` in the container), and the only
-credential it understands today is the MCP bearer token for the `/mcp` route —
-so this guide does **not** recommend publishing port 8080 or otherwise exposing
-the HTTP API. Actual authenticated HTTP is a dependency on the separate HTTP
-auth track and is **not implemented in this tree**; until it lands, keep the
-HTTP listener on loopback, and never publish it to expose an unauthenticated
-database surface.
+The HTTP API (port 8080: `/health`, REST, branches, vector stores, BaaS) shares
+the PostgreSQL wire credential, so the wire and HTTP can never disagree about
+which users/credentials are valid. With any wire credential configured — `--auth
+password|md5|scram-sha-256`, or `--auth trust --password …`, which protects HTTP
+while leaving the wire open — every route except the fixed status-only `/health`
+and CORS preflight requires HTTP Basic against the same `AuthManager`; the
+username is significant and unknown users fail closed. BaaS requests that also
+carry an application JWT pass the outer check with `X-HeliosDB-Authorization:
+Basic <base64(user:password)>` and keep `Authorization: Bearer <app-jwt>` for the
+BaaS handler; the MCP bearer token (`HELIOSDB_MCP_TOKEN`, `--mcp-token`) remains
+scoped to `/mcp`.
+
+`--http-listen` defaults to `127.0.0.1` and never inherits `--listen`, so binding
+the database on `0.0.0.0` does not publish the HTTP surface. A non-loopback
+plaintext bind is refused at startup: always when HTTP authentication is required
+(Basic credentials must not cross the network in the clear — `--allow-insecure-http`
+does not cover them), and in trust mode unless `--allow-insecure-http` is passed.
+The HTTP listener does not terminate TLS, so a wire `--tls-cert` does not make it
+HTTPS; front it with a TLS terminator to expose it. Requiring TLS from plaintext
+clients (`--require-tls` / `hostssl`) is tracked as deferred gap #53 and is not
+implemented.
+
+The per-peer failure limiter (default 10 failures per 60 s, bounded simultaneous
+verifications, bounded tracked peers) is configured through the `[api]`
+`http_auth_*` keys. See the README's "HTTP API authentication and exposure".
 
 ### Custom password stores
 
-Everything in this subsection is about the PostgreSQL-wire listener; the
-MySQL-wire listener currently accepts any credentials (trust) whatever `--auth`
-says, and is tracked separately.
+Everything in this subsection is about the PostgreSQL-wire listener. The
+MySQL-wire listener (`--mysql` TCP and `--mysql-socket`) is trust-only: starting
+either while the PostgreSQL wire has a configured credential or a password fails
+closed at startup rather than offering an unauthenticated SQL path (see the
+README's "MySQL and Unix-socket authentication").
 
 A name that does not exist completes the *same* SCRAM exchange as one that
 does — challenge, proof, and then the identical `28P01 password
