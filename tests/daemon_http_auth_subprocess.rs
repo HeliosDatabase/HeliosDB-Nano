@@ -309,7 +309,11 @@ fn http_request(
     stream.write_all(request.as_bytes())?;
     stream.flush()?;
 
-    let response = read_response(&mut stream, method)?;
+    let mut deadline_reader = DeadlineReader {
+        stream: &mut stream,
+        deadline: Instant::now() + MAX_RESPONSE_TIME,
+    };
+    let response = read_response(&mut deadline_reader, method)?;
     let _ = stream.shutdown(Shutdown::Both);
     Ok(response)
 }
@@ -331,6 +335,7 @@ fn http_request(
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
+const MAX_RESPONSE_TIME: Duration = Duration::from_secs(30);
 
 /// Cumulative cap on EVERY byte read for one response — headers, chunk-size
 /// lines, chunk data, the CRLFs between them, and trailers. Per-piece limits
@@ -340,16 +345,43 @@ const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
 /// budget makes total framing consumption finite no matter how the bytes split.
 const MAX_RESPONSE_BYTES: usize = MAX_HEAD_BYTES + MAX_BODY_BYTES + MAX_CHUNK_LINE_BYTES;
 
+/// Applies one wall-clock deadline to the real socket. `TcpStream`'s ordinary
+/// read timeout is refreshed for every read; this adapter recomputes the
+/// remaining time before each read so fragmented framing cannot extend the
+/// request forever.
+struct DeadlineReader<'a> {
+    stream: &'a mut TcpStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "HTTP response deadline exceeded"))?;
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buf)
+    }
+}
+
 /// A [`Read`] adapter that charges every byte it yields against one budget, so
 /// no combination of headers, framing lines, data, CRLFs, or trailers can
 /// outrun the cumulative response bound.
 struct BudgetReader<R> {
     inner: R,
     remaining: usize,
+    deadline: Instant,
 }
 
 impl<R: Read> Read for BudgetReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "HTTP response exceeded the cumulative time limit",
+            ));
+        }
         if self.remaining == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -572,9 +604,39 @@ fn read_response<R: Read>(reader: &mut R, method: &str) -> std::io::Result<HttpR
     let mut reader = BudgetReader {
         inner: reader,
         remaining: MAX_RESPONSE_BYTES,
+        deadline: Instant::now() + MAX_RESPONSE_TIME,
     };
     let head = read_head(&mut reader)?;
     let (status, headers) = parse_head(&head);
+
+    let transfer_values: Vec<&str> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("transfer-encoding"))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    let content_lengths: Vec<&str> = headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim())
+        .collect();
+    if transfer_values.len() > 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "duplicate Transfer-Encoding headers are rejected",
+        ));
+    }
+    if transfer_values.len() == 1 && !content_lengths.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Transfer-Encoding and Content-Length cannot both frame a response",
+        ));
+    }
+    if content_lengths.len() > 1 && content_lengths.windows(2).any(|pair| pair[0] != pair[1]) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "conflicting Content-Length headers are rejected",
+        ));
+    }
 
     let body = if method.eq_ignore_ascii_case("HEAD") || (100..200).contains(&status) || status == 204 || status == 304
     {
@@ -615,7 +677,7 @@ fn read_response<R: Read>(reader: &mut R, method: &str) -> std::io::Result<HttpR
 /// with no `Content-Length`, framed `6C\r\n{json}\r\n0\r\n\r\n`. The de-framer
 /// must strip the framing, not hand `6C\r\n...` to `serde_json`.
 const LOGGED_JSON_BODY: &str =
-    r#"{"rows":[{"column_0":1}],"row_count":1,"command":"SELECT","branch":"main","ok":true,"cached":false,"took":1}"#;
+    r#"{"columns":["column_0"],"column_types":["int4"],"rows":[{"column_0":1}],"row_count":1,"execution_time_ms":1}"#;
 
 /// Frame `body` as a single chunked response with no `Content-Length`.
 fn chunked_response(body: &str) -> Vec<u8> {
@@ -741,6 +803,27 @@ fn transfer_encoding_must_be_a_single_chunked_coding() {
     let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED;q=1\r\n\r\n{framing}");
     let resp = read_response(&mut raw.as_bytes(), "POST").expect("a lone chunked coding must decode");
     assert_eq!(resp.body, LOGGED_JSON_BODY);
+}
+
+#[test]
+fn duplicate_or_conflicting_response_framing_is_rejected() {
+    let framing = format!("{:X}\r\n{}\r\n0\r\n\r\n", LOGGED_JSON_BODY.len(), LOGGED_JSON_BODY);
+    for raw in [
+        format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n{framing}"),
+        format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: {}\r\n\r\n{framing}",
+            LOGGED_JSON_BODY.len()
+        ),
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 2\r\n\r\n{}",
+            LOGGED_JSON_BODY
+        ),
+    ] {
+        assert!(
+            read_response(&mut raw.as_bytes(), "POST").is_err(),
+            "ambiguous response framing must be rejected"
+        );
+    }
 }
 
 /// A peer that streams endless one-byte trailer fields must never keep the
