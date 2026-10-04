@@ -20,9 +20,25 @@ path and captures retained stdout/stderr evidence for every case. It covers:
   credential and works, while the TCP listener stays TLS-only.
 * Foreground *and* ``--daemon``/PID-file identity: the worker named by the PID
   file is the process that owns the listener and serves TLS, its argv carries
-  the exact ``--node-id`` UUID, and it is not the launcher PID.
+  the exact ``--node-id`` UUID, and it is not the launcher PID. A launcher that
+  dies without writing a PID file is handled by recovering the orphan worker
+  from the exact ``--node-id`` marker, validating exe/starttime, and only then
+  signalling it.
 * ``--require-tls`` without ``--tls-cert``/``--tls-key`` is refused *before* the
-  data directory is created or any listener is bound.
+  data directory is created or any listener is bound, in foreground **and**
+  ``--daemon`` mode; the daemon refusal writes no PID file and leaves no
+  ``--node-id`` orphan worker behind.
+
+Client deadlines
+----------------
+``psycopg2`` offers no client-side per-statement deadline: ``statement_timeout``
+is a *server* setting, and ``connect_timeout`` bounds only the connect phase.
+Every SQL proof (connect, execute and fetch) is therefore executed inside an
+owned ``multiprocessing`` child bounded by a single ``time.monotonic()``
+deadline. If the child does not produce a result in time it is TERM/KILLed and
+the run fails; no unbounded blocking path into the database remains. The
+harness audits its own AST at runtime so a future edit cannot reintroduce a bare
+``psycopg2.connect`` outside the bounded worker.
 
 Exact invocation
 ----------------
@@ -40,10 +56,13 @@ writable ``HELIOSDB_TLS_EVIDENCE_DIR``.
 Evidence
 --------
 Per-case stdout/stderr is retained as ``<case>.launch.log`` and the run summary
-as ``require-tls-manifest.json`` under the evidence directory. Private fixtures
-(the self-signed cert/key, the SCRAM password file, PID files and the UDS
-directory) live in a ``private/`` subdirectory and are removed after capture;
-only the logs and manifest persist.
+as ``require-tls-manifest.json`` inside a unique ``0700`` run directory created
+under the caller-selected evidence directory. The caller's own files are never
+reused or removed. Private fixtures (the self-signed cert/key, the SCRAM
+password file, PID files and the UDS directory) live in a unique, short ``0700``
+temp directory outside the evidence tree so Unix-socket paths stay under the
+``sun_path`` limit; that directory alone is removed after capture. The manifest
+retains the raw log names and the binary's before/after SHA-256 digests.
 
 Exit codes
 ----------
@@ -59,18 +78,23 @@ Limitation
 ----------
 The daemon worker's own stdout/stderr are ``/dev/null`` (production behaviour in
 ``start_server_daemon``), so the exact refusal log text is asserted on the
-foreground cases; the daemon case proves refusal by the connection failing and
-proves the same PID still serves TLS.
+foreground cases (whose child env forces a controlled ``RUST_LOG``); the daemon
+case proves refusal by the connection failing and proves the same PID still
+serves TLS.
 """
 
+import ast
 import hashlib
 import json
+import multiprocessing
 import os
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from typing import Dict, List, Optional, Tuple
@@ -91,13 +115,23 @@ LAUNCH_TIMEOUT = 30.0
 READY_TIMEOUT = 20.0
 LOG_TIMEOUT = 10.0
 SQL_CONNECT_TIMEOUT = 5
-SQL_STATEMENT_TIMEOUT_MS = 5000
+# One monotonic deadline covers the owned child's connect + execute + fetch.
+SQL_DEADLINE = 15.0
 TERM_WAIT = 5.0
 KILL_WAIT = 5.0
 POLL_INTERVAL = 0.1
 
+# Conservative ceiling for the PostgreSQL `.s.PGSQL.<port>` Unix-socket path
+# (Linux `sun_path` is 108 bytes including the terminating NUL).
+MAX_UDS_PATH = 100
+
 # Credential channels that must not survive into a launched child.
 SECRET_ENV_KEYS = ("HELIOSDB_PASSWORD", "HELIOSDB_PASSWORD_FILE", "HELIOSDB_MCP_TOKEN")
+
+# Force a controlled tracing filter so the refusal diagnostic is never hidden by
+# an operator's ambient RUST_LOG. `error!` (the connection-error log) passes a
+# global `warn` filter.
+CHILD_RUST_LOG = "warn"
 
 # The exact server-side diagnostic emitted when a plaintext client reaches a
 # listener configured with SslMode::Require (src/protocol/postgres/server.rs).
@@ -125,6 +159,7 @@ class Case:
         self.pidfile = ""
         self.logfile = ""
         self.uds_dir = ""
+        self.uds_path = ""
         self.launch_rc: Optional[int] = None
         self.launch_out = b""
         self.timed_out = False
@@ -138,6 +173,7 @@ class Case:
         self.is_daemon = False
         self.launcher_pid = 0
         self.proc: Optional[subprocess.Popen] = None
+        self.stopped = False
 
     def check(self, ok: bool, label: str) -> bool:
         self.checks.append((bool(ok), label))
@@ -195,6 +231,15 @@ def proc_cmdline(pid: int) -> List[str]:
     return [part.decode("utf-8", "replace") for part in proc_cmdline_raw(pid).split(b"\0") if part]
 
 
+def proc_pids() -> List[int]:
+    """Every numeric /proc entry (candidate PIDs) as a sorted list."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    return sorted(int(e) for e in entries if e.isdigit())
+
+
 def is_alive(pid: int) -> bool:
     """True only for a live, non-zombie process we can observe."""
     if pid <= 0:
@@ -214,6 +259,106 @@ def is_alive(pid: int) -> bool:
     return bool(rest) and rest[0] != "Z"
 
 
+def unix_socket_inode(path: str) -> Optional[int]:
+    """The inode of the Unix-socket file at `path`, or None if it is not one.
+
+    For an AF_UNIX socket the filesystem inode of the socket path *is* the
+    socket inode shown in /proc/net/unix and in /proc/<pid>/fd as
+    ``socket:[<inode>]``, which is what lets us prove the exact child fd.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISSOCK(st.st_mode):
+        return None
+    return st.st_ino
+
+
+def audit_no_blocking_paths(source_text: str) -> List[str]:
+    """Structural check that the harness has no unbounded SQL path.
+
+    Every ``psycopg2.connect(...)`` call must live inside ``_child_sql`` (the
+    owned, deadline-bounded worker), and the bounded runner must be present.
+    Returns a list of human-readable violations (empty == clean).
+    """
+    violations: List[str] = []
+    try:
+        tree = ast.parse(source_text)
+    except SyntaxError as exc:
+        return ["could not parse harness source: %s" % exc]
+    if "_run_bounded_sql" not in source_text:
+        violations.append("missing _run_bounded_sql bounded-deadline runner")
+    allowed = {"_child_sql"}
+    stack: List[str] = []
+
+    class Visitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            stack.append(node.name)
+            self.generic_visit(node)
+            stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "connect"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "psycopg2"
+            ):
+                enclosing = stack[-1] if stack else "<module>"
+                if enclosing not in allowed:
+                    violations.append(
+                        "psycopg2.connect called from %s; it must run inside the "
+                        "deadline-bounded _child_sql worker" % enclosing
+                    )
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return violations
+
+
+def _child_sql(kwargs: Dict[str, object], send_conn) -> None:
+    """Owned worker: connect, execute and fetch all under the parent deadline.
+
+    This is the *only* place the harness is permitted to open a PostgreSQL
+    connection; ``audit_no_blocking_paths`` enforces that.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(**kwargs)
+        info = getattr(conn, "info", None)
+        ssl_in_use = bool(getattr(info, "ssl_in_use", False))
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        rows = [tuple(r) for r in cur.fetchall()]
+        cur.close()
+        send_conn.send(("ok", {"rows": rows, "ssl_in_use": ssl_in_use}))
+    except Exception as exc:  # noqa: BLE001 - any failure is reported, never raised
+        pgcode = getattr(exc, "pgcode", None)
+        if pgcode is None:
+            diag = getattr(exc, "diag", None)
+            pgcode = getattr(diag, "sqlstate", None)
+        try:
+            send_conn.send(
+                ("error", {"type": type(exc).__name__, "msg": str(exc), "pgcode": pgcode})
+            )
+        except Exception:
+            pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        try:
+            send_conn.close()
+        except Exception:
+            pass
+
+
 class TlsHarness:
     def __init__(self) -> None:
         self.bin = ""
@@ -223,7 +368,10 @@ class TlsHarness:
         self.binary_hash_ok = True
         self.version_out = ""
         self.evidence_dir = ""
+        self.run_dir = ""
+        self.output_dir = ""
         self.private_dir = ""
+        self.removable_dirs: List[str] = []
         self.cert = ""
         self.key = ""
         self.pw_file = ""
@@ -232,9 +380,16 @@ class TlsHarness:
         self.registry: Dict[int, Case] = {}
         self.redact_values: List[str] = []
         self.cleanup_failures: List[str] = []
+        self.bounded_path_violations: List[str] = []
         self.cases: List[Case] = []
 
     # ── setup ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _mkdtemp_0700(prefix: str, base: str) -> str:
+        path = tempfile.mkdtemp(prefix=prefix, dir=base)
+        os.chmod(path, 0o700)
+        return path
+
     def prepare(self) -> None:
         if os.uname().sysname != "Linux" or not os.access("/proc/self/cmdline", os.R_OK):
             raise Unavailable("requires Linux with /proc mounted")
@@ -258,7 +413,13 @@ class TlsHarness:
         if not os.path.isabs(evidence):
             raise Unavailable("HELIOSDB_TLS_EVIDENCE_DIR must be an absolute path, got %r" % evidence)
         os.makedirs(evidence, exist_ok=True)
+        if not os.access(evidence, os.W_OK):
+            raise Unavailable("HELIOSDB_TLS_EVIDENCE_DIR is not writable: %s" % evidence)
         self.evidence_dir = evidence
+        # Unique run dir for logs + manifest; the caller's own files are never
+        # reused or removed.
+        self.run_dir = self._mkdtemp_0700("hdb-tls-run-", evidence)
+        self.output_dir = self.run_dir
 
         try:
             proc = subprocess.run(
@@ -276,11 +437,11 @@ class TlsHarness:
             )
         self.version_out = proc.stdout.decode("utf-8", "replace").strip()
 
-        # Private fixtures: cert/key, password, PID files and UDS sockets. 0700
-        # and removed after capture so only logs + manifest persist.
-        self.private_dir = os.path.join(self.evidence_dir, "private")
-        os.makedirs(self.private_dir, exist_ok=True)
-        os.chmod(self.private_dir, 0o700)
+        # Private fixtures live in a unique, *short* 0700 temp dir outside the
+        # evidence tree: cert/key, password, PID files and UDS sockets. It alone
+        # is removed after capture so only logs + manifest persist.
+        self.private_dir = self._mkdtemp_0700("hdt-", tempfile.gettempdir())
+        self.removable_dirs.append(self.private_dir)
 
         self.password = "hdb-tls-pw-%d-%s" % (os.getpid(), uuid.uuid4().hex[:12])
         self.wrong_password = self.password + "-wrong"
@@ -330,7 +491,7 @@ class TlsHarness:
         os.chmod(self.key, 0o600)
 
     def _write(self, name: str, text: str) -> str:
-        path = os.path.join(self.evidence_dir, name)
+        path = os.path.join(self.output_dir or self.evidence_dir, name)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
         return path
@@ -374,8 +535,8 @@ class TlsHarness:
         return self._identity_ok(case.pid, case.node_id, case.starttime, case.exe)
 
     def _wait_gone(self, pid: int, seconds: float) -> None:
-        deadline = time.time() + seconds
-        while time.time() < deadline and is_alive(pid):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline and is_alive(pid):
             time.sleep(POLL_INTERVAL)
 
     def _signal_and_wait(self, pid: int, node_id: str, starttime: str, exe: str, label: str) -> None:
@@ -416,37 +577,112 @@ class TlsHarness:
         if is_alive(pid) and self._identity_ok(pid, node_id, starttime, exe):
             self.cleanup_failures.append("%s: pid %d still alive after TERM/KILL waits" % (label, pid))
 
+    def _reap_popen(self, proc: Optional[subprocess.Popen], label: str) -> None:
+        """TERM then KILL an owned Popen, recording every wait/TERM/KILL failure.
+
+        Nothing here is swallowed: an unreaped child is a hard error in the
+        manifest and fails the run.
+        """
+        if proc is None:
+            return
+        try:
+            if proc.poll() is not None:
+                return
+        except Exception as exc:
+            self.cleanup_failures.append("%s: poll failed: %s" % (label, exc))
+            return
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            self.cleanup_failures.append("%s: terminate failed: %s" % (label, exc))
+        try:
+            proc.wait(timeout=TERM_WAIT)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except OSError as exc:
+            self.cleanup_failures.append("%s: wait after TERM failed: %s" % (label, exc))
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        except OSError as exc:
+            self.cleanup_failures.append("%s: kill failed: %s" % (label, exc))
+        try:
+            proc.wait(timeout=KILL_WAIT)
+        except subprocess.TimeoutExpired:
+            self.cleanup_failures.append("%s: still alive after TERM/KILL waits" % label)
+        except OSError as exc:
+            self.cleanup_failures.append("%s: wait after KILL failed: %s" % (label, exc))
+
+    def _terminate_worker(self, proc, label: str) -> None:
+        """Reap an owned multiprocessing child; record every failure (never swallow)."""
+        if proc is None:
+            return
+        try:
+            if proc.is_alive():
+                proc.terminate()
+        except Exception as exc:
+            self.cleanup_failures.append("%s: worker terminate failed: %s" % (label, exc))
+        try:
+            proc.join(TERM_WAIT)
+        except Exception as exc:
+            self.cleanup_failures.append("%s: worker join after TERM failed: %s" % (label, exc))
+        if proc.is_alive():
+            try:
+                proc.kill()
+            except Exception as exc:
+                self.cleanup_failures.append("%s: worker kill failed: %s" % (label, exc))
+            try:
+                proc.join(KILL_WAIT)
+            except Exception as exc:
+                self.cleanup_failures.append("%s: worker join after KILL failed: %s" % (label, exc))
+        if proc.is_alive():
+            self.cleanup_failures.append("%s: worker still alive after TERM/KILL" % label)
+        elif proc.exitcode is None:
+            self.cleanup_failures.append("%s: worker exit status was not reaped" % label)
+
     def stop_case(self, case: Case) -> None:
+        if case.stopped:
+            return
+        case.stopped = True
         self.registry.pop(case.pid, None)
         if case.identity_proven:
             self._signal_and_wait(case.pid, case.node_id, case.starttime, case.exe, "case %s" % case.name)
         elif case.proc is not None and case.proc.pid == case.pid:
             # Foreground child we spawned directly: the live Popen handle is the
             # ownership proof even if /proc identity capture itself failed.
-            try:
-                case.proc.terminate()
-                try:
-                    case.proc.wait(timeout=TERM_WAIT)
-                except subprocess.TimeoutExpired:
-                    case.proc.kill()
-            except Exception:
-                pass
+            self._reap_popen(case.proc, "case %s foreground" % case.name)
         else:
-            # Daemon worker: only an identity-validated signal is ever sent.
+            # Daemon worker or adopted orphan: only an identity-validated signal
+            # is ever sent.
             self._signal_and_wait(case.pid, case.node_id, case.starttime, case.exe, "case %s" % case.name)
+        # Always reap the owned Popen (identity-proven foreground children are
+        # signalled above but still need a wait() to avoid a lingering zombie).
         if case.proc is not None:
-            try:
-                case.proc.wait(timeout=KILL_WAIT)
-            except Exception:
-                pass
+            self._reap_popen(case.proc, "case %s reap" % case.name)
 
     def cleanup(self) -> None:
+        for case in list(self.cases):
+            try:
+                self.stop_case(case)
+            except Exception as exc:  # noqa: BLE001 - cleanup bugs must be visible
+                self.cleanup_failures.append("cleanup for %s raised %s: %s" % (case.name, type(exc).__name__, exc))
         for case in list(self.registry.values()):
-            self.stop_case(case)
-        # Private fixtures (cert/key, password, PID files, UDS sockets) are
-        # removed; retained logs and the manifest are never touched.
-        if self.private_dir:
-            shutil.rmtree(self.private_dir, ignore_errors=True)
+            try:
+                self.stop_case(case)
+            except Exception as exc:  # noqa: BLE001
+                self.cleanup_failures.append("registry cleanup for %s raised %s: %s" % (case.name, type(exc).__name__, exc))
+        # Only directories this harness created are ever removed. Caller content
+        # and the retained evidence run dir are never touched.
+        for path in self.removable_dirs:
+            if path and os.path.isdir(path):
+                try:
+                    shutil.rmtree(path)
+                except OSError as exc:
+                    self.cleanup_failures.append("temp dir removal failed for %s: %s" % (path, exc))
 
     def finalize_binary_binding(self) -> None:
         """Re-hash the exact binary after the suite and assert it is unchanged."""
@@ -460,11 +696,16 @@ class TlsHarness:
         case = Case(name)
         case.pg_port = ephemeral_port()
         case.node_id = str(uuid.uuid4())
-        case.logfile = os.path.join(self.evidence_dir, name + ".launch.log")
+        case.logfile = os.path.join(self.output_dir or self.evidence_dir, name + ".launch.log")
+        self.cases.append(case)
         return case
 
     def _clean_env(self) -> Dict[str, str]:
-        return {k: v for k, v in os.environ.items() if k not in SECRET_ENV_KEYS}
+        env = {k: v for k, v in os.environ.items() if k not in SECRET_ENV_KEYS}
+        # Controlled tracing filter: never let an ambient RUST_LOG suppress the
+        # refusal diagnostic the foreground cases assert on.
+        env["RUST_LOG"] = CHILD_RUST_LOG
+        return env
 
     def _base_argv(self, case: Case) -> List[str]:
         # The SCRAM password reaches the server only through the 0600 password
@@ -492,8 +733,8 @@ class TlsHarness:
         try:
             with open(case.logfile, "w", encoding="utf-8") as fh:
                 fh.write(self.redact(case.launch_out.decode("utf-8", "replace")))
-        except OSError:
-            pass
+        except OSError as exc:
+            self.cleanup_failures.append("could not write launch log %s: %s" % (case.logfile, exc))
 
     def _check_identity(self, case: Case) -> None:
         exe_ok = case.exe == self.bin_real
@@ -506,8 +747,65 @@ class TlsHarness:
         else:
             case.check(False, "%s: identity validation failed; PID not registered for signalling" % case.name)
 
+    def _adopt_worker(self, case: Case, pid: int, starttime: str, exe: str, source: str) -> bool:
+        """Adopt a candidate worker only after exe/starttime/--node-id proof.
+
+        The /proc fields are captured before any signal is ever sent, and an
+        adopted worker is registered for identity-validated cleanup.
+        """
+        case.pid = pid
+        case.starttime = starttime
+        case.exe = exe
+        try:
+            case.raw_cmdline = proc_cmdline_raw(pid)
+        except OSError as exc:
+            case.check(False, "%s: could not read /proc/%d/cmdline for %s worker: %s" % (case.name, pid, source, exc))
+            return False
+        case.argv = [part.decode("utf-8", "replace") for part in case.raw_cmdline.split(b"\0") if part]
+        self._check_identity(case)
+        if case.identity_proven:
+            case.check(True, "%s: adopted %s worker %d with exe/starttime/--node-id proof before signalling" % (case.name, source, pid))
+        return case.identity_proven
+
+    def _find_orphan_worker(
+        self, node_id: str, exclude: Optional[set] = None
+    ) -> Optional[Tuple[int, str, str]]:
+        """A live process whose argv carries the exact ``--node-id`` pair and
+        whose exe is the target binary. Returns ``(pid, starttime, exe)`` only
+        after exe + starttime are read, so callers can validate before signalling.
+
+        `exclude` drops PIDs that must never be mistaken for the worker (the
+        harness itself and the daemon launcher, which also carries --node-id).
+        """
+        if not node_id:
+            return None
+        excluded = set(exclude or ())
+        excluded.add(os.getpid())
+        for pid in proc_pids():
+            if pid in excluded:
+                continue
+            try:
+                if not is_alive(pid):
+                    continue
+                if proc_exe(pid) != self.bin_real:
+                    continue
+                argv = proc_cmdline(pid)
+            except OSError:
+                continue
+            if not self._argv_pair(argv, "--node-id", node_id):
+                continue
+            try:
+                starttime = proc_starttime(pid)
+            except OSError:
+                continue
+            return (pid, starttime, self.bin_real)
+        return None
+
     def launch_foreground(self, name: str, extra_args: List[str]) -> Case:
         case = self._new_case(name)
+        return self._launch_foreground_case(case, extra_args)
+
+    def _launch_foreground_case(self, case: Case, extra_args: List[str]) -> Case:
         argv = self._base_argv(case) + list(extra_args)
         logfh = open(case.logfile, "wb")
         try:
@@ -520,11 +818,18 @@ class TlsHarness:
             )
         finally:
             logfh.close()
+        # Register the live Popen handle on the case *before* touching /proc, so
+        # even an unexpected identity-capture exception can still reap the child.
         case.pid = case.proc.pid
-        if self.capture_identity(case):
+        captured = False
+        try:
+            captured = self.capture_identity(case)
+        except Exception as exc:  # noqa: BLE001 - keep the Popen handle registered
+            case.check(False, "%s: identity capture raised %s: %s" % (case.name, type(exc).__name__, exc))
+        if captured:
             self._check_identity(case)
         else:
-            case.check(False, "%s: could not read /proc/%d identity after launch" % (name, case.pid))
+            case.check(False, "%s: could not read /proc/%d identity after launch" % (case.name, case.pid))
         return case
 
     def launch_daemon(self, name: str, extra_args: List[str]) -> Case:
@@ -537,41 +842,78 @@ class TlsHarness:
             pass
         argv = self._base_argv(case) + ["--daemon", "--pid-file", case.pidfile] + list(extra_args)
 
-        launcher = subprocess.Popen(
-            argv,
-            env=self._clean_env(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+        try:
+            launcher = subprocess.Popen(
+                argv,
+                env=self._clean_env(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+        except OSError as exc:
+            case.check(False, "%s: could not launch daemon process: %s" % (name, exc))
+            return case
         case.launcher_pid = launcher.pid
+        out = b""
         try:
             out, _ = launcher.communicate(timeout=LAUNCH_TIMEOUT)
         except subprocess.TimeoutExpired:
-            launcher.kill()
-            out, _ = launcher.communicate()
             case.timed_out = True
+            try:
+                launcher.kill()
+            except OSError as exc:
+                self.cleanup_failures.append("%s: daemon launcher kill failed: %s" % (name, exc))
+            try:
+                out, _ = launcher.communicate(timeout=TERM_WAIT)
+            except subprocess.TimeoutExpired:
+                self.cleanup_failures.append("%s: daemon launcher did not exit after kill" % name)
+                out = b""
+        if launcher.returncode is None:
+            self._reap_popen(launcher, "%s launcher" % name)
         case.launch_rc = launcher.returncode
         case.launch_out = out or b""
         self._write_launch_log(case)
 
         case.pidfile_seen = os.path.exists(case.pidfile)
+        pidfile_pid = 0
         if case.pidfile_seen:
             try:
                 with open(case.pidfile, "r", encoding="utf-8") as fh:
                     parsed = int(fh.read().strip())
-                case.pid = parsed if parsed > 0 else 0
+                pidfile_pid = parsed if parsed > 0 else 0
             except (OSError, ValueError):
-                case.pid = 0
+                pidfile_pid = 0
 
-        # Capture the worker identity even if the launcher misbehaved, so a
-        # worker that is still running can be cleaned up with proof.
-        if case.pid > 0 and self.capture_identity(case):
-            case.check(
-                case.pid != case.launcher_pid,
-                "%s: PID-file worker %d differs from the launcher PID" % (name, case.pid),
-            )
-            self._check_identity(case)
+        adopted = False
+        if pidfile_pid > 0:
+            try:
+                starttime = proc_starttime(pidfile_pid)
+                exe = proc_exe(pidfile_pid)
+            except OSError:
+                starttime, exe = "", ""
+            if starttime and self._identity_ok(pidfile_pid, case.node_id, starttime, exe):
+                adopted = self._adopt_worker(case, pidfile_pid, starttime, exe, "PID-file")
+                if adopted:
+                    case.check(
+                        pidfile_pid != case.launcher_pid,
+                        "%s: PID-file worker %d differs from the launcher PID" % (name, pidfile_pid),
+                    )
+
+        if not adopted:
+            found = self._find_orphan_worker(case.node_id, exclude={case.launcher_pid})
+            if found is not None:
+                pid, starttime, exe = found
+                adopted = self._adopt_worker(case, pid, starttime, exe, "orphan")
+                if adopted:
+                    case.check(
+                        True,
+                        "%s: recovered orphan worker %d by exact --node-id after PID-file failure" % (name, pid),
+                    )
+            elif pidfile_pid > 0:
+                case.check(
+                    False,
+                    "%s: PID-file worker %d unidentifiable and no --node-id orphan found" % (name, pidfile_pid),
+                )
 
         if case.timed_out:
             case.check(False, "%s: daemon launcher timed out" % name)
@@ -579,7 +921,7 @@ class TlsHarness:
         if case.launch_rc != 0:
             case.check(False, "%s: daemon launcher exited %s" % (name, case.launch_rc))
             return case
-        if not case.pidfile_seen or case.pid <= 0:
+        if not case.pidfile_seen or pidfile_pid <= 0:
             case.check(False, "%s: daemon launcher left no parseable PID file" % name)
             return case
         if not case.identity_proven:
@@ -640,6 +982,30 @@ class TlsHarness:
                     return True
         return False
 
+    def child_owns_unix_socket(self, pid: int, path: str) -> bool:
+        """True iff `pid` holds the exact fd for the Unix socket at `path`.
+
+        We resolve the socket file's inode and require a ``socket:[<inode>]``
+        link in the child's fd table -- an exact inode match, not merely the
+        existence of a directory.
+        """
+        inode = unix_socket_inode(path)
+        if inode is None:
+            return False
+        target = "socket:[%d]" % inode
+        fd_dir = "/proc/%d/fd" % pid
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            return False
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(fd_dir, fd)) == target:
+                    return True
+            except OSError:
+                continue
+        return False
+
     def assert_owns_listener(self, case: Case, port: int, label: str) -> bool:
         if self.child_owns_port(case.pid, port):
             case.check(True, "%s: child owns the listening socket on port %d" % (label, port))
@@ -652,8 +1018,8 @@ class TlsHarness:
 
     # ── readiness + log evidence ────────────────────────────────────────
     def wait_ready(self, case: Case) -> bool:
-        deadline = time.time() + READY_TIMEOUT
-        while time.time() < deadline:
+        deadline = time.monotonic() + READY_TIMEOUT
+        while time.monotonic() < deadline:
             if not is_alive(case.pid):
                 return False
             if self.child_owns_port(case.pid, case.pg_port):
@@ -667,16 +1033,16 @@ class TlsHarness:
         return False
 
     def wait_path(self, path: str, timeout: float = READY_TIMEOUT) -> bool:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             if os.path.exists(path):
                 return True
             time.sleep(POLL_INTERVAL)
         return False
 
     def wait_log_contains(self, case: Case, needle: str, timeout: float = LOG_TIMEOUT) -> bool:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             try:
                 with open(case.logfile, "r", encoding="utf-8", errors="replace") as fh:
                     if needle in fh.read():
@@ -686,53 +1052,136 @@ class TlsHarness:
             time.sleep(POLL_INTERVAL)
         return False
 
-    # ── SQL proofs (bounded) ────────────────────────────────────────────
-    def _connect(
-        self,
-        host: str,
-        port: int,
-        password: str,
-        sslmode: Optional[str],
-    ):
-        kwargs = {
+    # ── SQL proofs (owned subprocess, monotonic deadline) ───────────────
+    def _make_pipe(self):
+        """Injectable pipe factory (tests replace this with a fake)."""
+        ctx = multiprocessing.get_context("fork")
+        return ctx.Pipe(duplex=False)
+
+    def _spawn_worker(self, target, args):
+        """Injectable worker factory (tests replace this with a fake)."""
+        ctx = multiprocessing.get_context("fork")
+        return ctx.Process(target=target, args=args, daemon=True)
+
+    def _run_bounded_sql(self, kwargs: Dict[str, object], label: str):
+        """Run connect+execute+fetch in an owned child under a monotonic deadline.
+
+        Returns ``(status, payload)`` where status is ``"ok"``, ``"error"`` or
+        ``"timeout"``. There is no unbounded blocking path: the parent only ever
+        waits on ``poll`` up to the deadline, then TERM/KILLs the child.
+        """
+        parent_conn, child_conn = self._make_pipe()
+        proc = self._spawn_worker(_child_sql, (kwargs, child_conn))
+        status = "error"
+        payload: Dict[str, object] = {
+            "type": "HarnessError",
+            "msg": "SQL worker never produced a result",
+            "pgcode": None,
+        }
+        timed_out = False
+        started = False
+        try:
+            try:
+                proc.start()
+                started = True
+            except Exception as exc:  # noqa: BLE001 - a failed spawn is a red result
+                status = "error"
+                payload = {"type": type(exc).__name__, "msg": "worker failed to start: %s" % exc, "pgcode": None}
+                return (status, payload)
+            try:
+                child_conn.close()
+            except Exception as exc:  # noqa: BLE001 - never swallow pipe-close failures
+                self.cleanup_failures.append("%s: closing SQL child pipe failed: %s" % (label, exc))
+            deadline = time.monotonic() + SQL_DEADLINE
+            remaining = deadline - time.monotonic()
+            if parent_conn.poll(max(0.0, remaining)):
+                try:
+                    status, payload = parent_conn.recv()
+                except EOFError:
+                    status = "error"
+                    payload = {
+                        "type": "EOFError",
+                        "msg": "SQL worker closed the pipe without a result",
+                        "pgcode": None,
+                    }
+            else:
+                timed_out = True
+        finally:
+            try:
+                parent_conn.close()
+            except Exception as exc:  # noqa: BLE001
+                self.cleanup_failures.append("%s: closing SQL pipe failed: %s" % (label, exc))
+            if started:
+                self._terminate_worker(proc, label)
+            else:
+                try:
+                    child_conn.close()
+                except Exception as exc:  # noqa: BLE001 - never swallow pipe-close failures
+                    self.cleanup_failures.append("%s: closing SQL child pipe after failed spawn failed: %s" % (label, exc))
+            if timed_out:
+                self.cleanup_failures.append(
+                    "%s: SQL client deadline exceeded after %.1fs (connect/execute/fetch bounded)" % (label, SQL_DEADLINE)
+                )
+                return (
+                    "timeout",
+                    {
+                        "type": "DeadlineExceeded",
+                        "msg": "no result within %.1fs" % SQL_DEADLINE,
+                        "pgcode": None,
+                    },
+                )
+        return (status, payload)
+
+    def _sql_kwargs(self, host: str, port: int, password: str, sslmode: Optional[str]) -> Dict[str, object]:
+        # connect_timeout bounds only the TCP connect; the owned-subprocess
+        # deadline bounds connect+execute+fetch. statement_timeout is *not* a
+        # client deadline and is deliberately not used here.
+        kwargs: Dict[str, object] = {
             "host": host,
             "port": port,
             "dbname": SQL_DB,
             "user": SQL_USER,
             "password": password,
             "connect_timeout": SQL_CONNECT_TIMEOUT,
-            "options": "-c statement_timeout=%d" % SQL_STATEMENT_TIMEOUT_MS,
         }
         if sslmode is not None:
             kwargs["sslmode"] = sslmode
-        return psycopg2.connect(**kwargs)
+        return kwargs
 
-    def _select1(self, case: Case, host: str, password: str, sslmode: Optional[str], label: str) -> None:
-        conn = None
-        try:
-            conn = self._connect(host, case.pg_port, password, sslmode)
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            rows = cur.fetchall()
-            cur.close()
+    def _select1(
+        self,
+        case: Case,
+        host: str,
+        password: str,
+        sslmode: Optional[str],
+        label: str,
+        expect_ssl: bool,
+    ) -> None:
+        status, payload = self._run_bounded_sql(self._sql_kwargs(host, case.pg_port, password, sslmode), label)
+        if status == "ok":
+            rows = [tuple(r) for r in payload.get("rows", [])]  # type: ignore[arg-type]
             case.check(rows == [(1,)], "%s: SELECT 1 returned exactly [(1,)] (got %r)" % (label, rows))
-        except Exception as exc:  # noqa: BLE001 - any failure means the query did not work
-            case.check(False, "%s: SELECT 1 failed: %s: %s" % (label, type(exc).__name__, exc))
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            got_ssl = bool(payload.get("ssl_in_use"))
+            case.check(
+                got_ssl == expect_ssl,
+                "%s: conn.info.ssl_in_use == %s (expected %s, got %s)"
+                % (label, expect_ssl, expect_ssl, got_ssl),
+            )
+        else:
+            case.check(
+                False,
+                "%s: SELECT 1 failed [%s]: %s: %s"
+                % (label, status, payload.get("type"), payload.get("msg")),
+            )
 
     def select1_tls(self, case: Case, label: str) -> None:
-        self._select1(case, "127.0.0.1", self.password, "require", label + " [tls]")
+        self._select1(case, "127.0.0.1", self.password, "require", label + " [tls]", expect_ssl=True)
 
     def select1_plaintext(self, case: Case, label: str) -> None:
-        self._select1(case, "127.0.0.1", self.password, "disable", label + " [plaintext]")
+        self._select1(case, "127.0.0.1", self.password, "disable", label + " [plaintext]", expect_ssl=False)
 
     def select1_uds(self, case: Case, label: str) -> None:
-        self._select1(case, case.uds_dir, self.password, None, label + " [uds]")
+        self._select1(case, case.uds_dir, self.password, None, label + " [uds]", expect_ssl=False)
 
     def expect_auth_rejected(
         self,
@@ -742,65 +1191,61 @@ class TlsHarness:
         host: str = "127.0.0.1",
         sslmode: Optional[str] = "require",
         transport: str = "tls",
+        uds_path: Optional[str] = None,
     ) -> None:
         """A wrong password must be rejected by *authentication* (SQLSTATE 28),
         not by a transport error, crash, or timeout; the child/listener must
         survive the attempt."""
-        conn = None
+        status, payload = self._run_bounded_sql(self._sql_kwargs(host, case.pg_port, password, sslmode), label)
         auth_rejected = False
-        detail = "no error"
-        try:
-            conn = self._connect(host, case.pg_port, password, sslmode)
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            rows = cur.fetchall()
-            cur.close()
-            detail = "connection accepted and SELECT 1 returned %r" % (rows,)
-        except psycopg2.Error as exc:
-            code = getattr(exc, "pgcode", None)
-            if code is None:
-                diag = getattr(exc, "diag", None)
-                code = getattr(diag, "sqlstate", None)
-            message = str(exc).lower()
+        if status == "error":
+            code = payload.get("pgcode")
+            message = str(payload.get("msg", "")).lower()
             auth_rejected = (
                 (code is not None and str(code).startswith("28"))
                 or "authentication failed" in message
                 or "password authentication failed" in message
                 or "invalid_password" in message
             )
-            detail = "pgcode=%s exc=%s: %s" % (code, type(exc).__name__, exc)
-        except Exception as exc:  # transport error / timeout / crash
-            detail = "non-auth failure %s: %s" % (type(exc).__name__, exc)
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-        case.check(auth_rejected, "%s: wrong credentials rejected by authentication via %s [%s]" % (label, transport, detail))
-        case.check(self.still_ours(case), "%s: child still alive after the wrong-password attempt" % label)
+            detail = "pgcode=%s type=%s: %s" % (code, payload.get("type"), payload.get("msg"))
+        elif status == "ok":
+            detail = "connection accepted and SELECT 1 returned %r" % (payload.get("rows"),)
+        else:
+            detail = "client deadline exceeded: %s" % payload.get("msg")
         case.check(
-            self.child_owns_port(case.pid, case.pg_port) or bool(case.uds_dir),
-            "%s: listener survived the wrong-password attempt" % label,
+            auth_rejected,
+            "%s: wrong credentials rejected by authentication via %s [%s]" % (label, transport, detail),
         )
+        case.check(self.still_ours(case), "%s: child still alive after the wrong-password attempt" % label)
+        if uds_path is not None:
+            owns = self.child_owns_unix_socket(case.pid, uds_path)
+            case.check(
+                owns,
+                "%s: child still owns the exact UDS inode for %s after the wrong-password attempt (got %s)"
+                % (label, uds_path, owns),
+            )
+        else:
+            owns = self.child_owns_port(case.pid, case.pg_port)
+            case.check(
+                owns,
+                "%s: listener survived the wrong-password attempt (child owns port %d: %s)"
+                % (label, case.pg_port, owns),
+            )
 
     def expect_plaintext_refused(self, case: Case, label: str, expect_log: bool = True) -> None:
         """Under --require-tls a plaintext TCP client (sslmode=disable, so no
         SSLRequest is sent) must be refused with the exact server diagnostic,
         and the SAME PID must remain bound and healthy."""
-        refused = False
-        detail = ""
-        try:
-            conn = self._connect("127.0.0.1", case.pg_port, self.password, "disable")
-            try:
-                cur = conn.cursor()
-                cur.execute("SELECT 1")
-                detail = "plaintext SELECT 1 returned %r" % (cur.fetchall(),)
-            finally:
-                conn.close()
-        except Exception as exc:  # noqa: BLE001 - refusal is the expected outcome
-            refused = True
-            detail = "%s: %s" % (type(exc).__name__, exc)
+        status, payload = self._run_bounded_sql(
+            self._sql_kwargs("127.0.0.1", case.pg_port, self.password, "disable"), label
+        )
+        refused = status == "error"
+        if status == "ok":
+            detail = "plaintext SELECT 1 returned %r" % (payload.get("rows"),)
+        elif status == "timeout":
+            detail = "plaintext connection hung until the client deadline"
+        else:
+            detail = "%s: %s" % (payload.get("type"), payload.get("msg"))
         case.check(refused, "%s: plaintext PostgreSQL connection was refused [%s]" % (label, detail))
         if expect_log:
             if self.wait_log_contains(case, REQUIRE_TLS_REFUSAL):
@@ -808,9 +1253,10 @@ class TlsHarness:
             else:
                 case.check(False, "%s: server log does not contain %r" % (label, REQUIRE_TLS_REFUSAL))
         case.check(self.still_ours(case), "%s: SAME PID is alive after the plaintext refusal" % label)
+        owns = self.child_owns_port(case.pid, case.pg_port)
         case.check(
-            self.child_owns_port(case.pid, case.pg_port),
-            "%s: SAME PID still owns the listener after the plaintext refusal" % label,
+            owns,
+            "%s: SAME PID still owns the listener after the plaintext refusal (got %s)" % (label, owns),
         )
 
     # ── expected startup rejection before any mutation ──────────────────
@@ -820,10 +1266,18 @@ class TlsHarness:
         extra_args: List[str],
         data_dir: str,
         needles: List[str],
+        daemon: bool = False,
+        pid_file: str = "",
+        node_id: str = "",
     ) -> Case:
         """A TLS config error must exit non-zero, say why, and leave no data
-        directory and no listener behind."""
+        directory, no listener, no PID file and no --node-id orphan behind."""
         case = self._new_case(name)
+        if node_id:
+            case.node_id = node_id
+        if daemon:
+            case.is_daemon = True
+            case.pidfile = pid_file
         argv = [
             self.bin,
             "start",
@@ -835,7 +1289,12 @@ class TlsHarness:
             "0",
             "--data-dir",
             data_dir,
-        ] + list(extra_args)
+        ]
+        if daemon:
+            argv += ["--daemon", "--pid-file", pid_file]
+        if node_id:
+            argv += ["--node-id", node_id]
+        argv += list(extra_args)
         try:
             proc = subprocess.run(
                 argv,
@@ -856,6 +1315,14 @@ class TlsHarness:
         case.check(any(needle in out for needle in needles), "%s: rejection message matched (%s)" % (name, " / ".join(needles)))
         case.check(not os.path.exists(data_dir), "%s: data directory was not created/mutated" % name)
         case.check(not self.listening_inodes(case.pg_port), "%s: no listener was bound" % name)
+        if daemon:
+            case.pidfile_seen = os.path.exists(pid_file)
+            case.check(not case.pidfile_seen, "%s: daemon refusal wrote no PID file" % name)
+            orphan = self._find_orphan_worker(node_id)
+            case.check(orphan is None, "%s: daemon refusal left no --node-id orphan worker" % name)
+            if orphan is not None:
+                pid, starttime, exe = orphan
+                self._signal_and_wait(pid, node_id, starttime, exe, "case %s orphan" % name)
         return case
 
 
@@ -878,7 +1345,6 @@ def _started(h: TlsHarness, case: Case, label: str) -> bool:
 def case_foreground_require_tls(h: TlsHarness) -> None:
     name = "01-foreground-require-tls"
     case = h.launch_foreground(name, ["--require-tls", "--tls-cert", h.cert, "--tls-key", h.key])
-    h.cases.append(case)
     if not _started(h, case, name):
         return
     # Plaintext is refused with the exact diagnostic; same PID survives.
@@ -894,7 +1360,6 @@ def case_foreground_require_tls(h: TlsHarness) -> None:
 def case_foreground_prefer(h: TlsHarness) -> None:
     name = "02-foreground-prefer"
     case = h.launch_foreground(name, ["--tls-cert", h.cert, "--tls-key", h.key])
-    h.cases.append(case)
     if not _started(h, case, name):
         return
     # SslMode::Prefer offers TLS and still accepts a plaintext client.
@@ -907,24 +1372,45 @@ def case_foreground_prefer(h: TlsHarness) -> None:
 
 def case_foreground_uds_exception(h: TlsHarness) -> None:
     name = "03-foreground-uds-exception"
-    uds_dir = os.path.join(h.private_dir, name + ".sock")
+    case = h._new_case(name)
+    # A unique, short, 0700 dir under the private temp tree keeps the socket
+    # path well under the Linux sun_path limit.
+    uds_dir = os.path.join(h.private_dir, "u" + case.node_id[:8])
     os.makedirs(uds_dir, exist_ok=True)
-    case = h.launch_foreground(
-        name,
+    os.chmod(uds_dir, 0o700)
+    sock_path = os.path.join(uds_dir, ".s.PGSQL.%d" % case.pg_port)
+    if len(os.fsencode(sock_path)) >= MAX_UDS_PATH:
+        raise Unavailable(
+            "Unix socket path exceeds %d bytes (got %d): %s" % (MAX_UDS_PATH, len(os.fsencode(sock_path)), sock_path)
+        )
+    case.uds_dir = uds_dir
+    case.uds_path = sock_path
+    h._launch_foreground_case(
+        case,
         ["--require-tls", "--tls-cert", h.cert, "--tls-key", h.key, "--pg-socket-dir", uds_dir],
     )
-    case.uds_dir = uds_dir
-    h.cases.append(case)
     if not _started(h, case, name):
         return
-    sock_path = os.path.join(uds_dir, ".s.PGSQL.%d" % case.pg_port)
-    case.check(h.wait_path(sock_path), "%s: PostgreSQL UDS socket was created" % name)
+    case.check(h.wait_path(sock_path), "%s: PostgreSQL UDS socket was created at %s" % (name, sock_path))
+    # Exact inode proof: the child must own the fd for THIS socket path.
+    case.check(
+        h.child_owns_unix_socket(case.pid, sock_path),
+        "%s: child owns the exact UDS inode for %s" % (name, sock_path),
+    )
     # TCP stays TLS-only even though the local socket is plaintext.
     h.expect_plaintext_refused(case, name + " tcp-plaintext", expect_log=True)
     h.select1_tls(case, name + " tcp-tls")
     # The authenticated local exception: plaintext UDS still demands SCRAM.
     h.select1_uds(case, name + " uds")
-    h.expect_auth_rejected(case, h.wrong_password, name + " uds-wrong", host=uds_dir, sslmode=None, transport="uds")
+    h.expect_auth_rejected(
+        case,
+        h.wrong_password,
+        name + " uds-wrong",
+        host=uds_dir,
+        sslmode=None,
+        transport="uds",
+        uds_path=sock_path,
+    )
     case.check(h.still_ours(case), "%s: SAME PID served TCP TLS and plaintext UDS" % name)
     h.stop_case(case)
 
@@ -932,7 +1418,6 @@ def case_foreground_uds_exception(h: TlsHarness) -> None:
 def case_daemon_require_tls(h: TlsHarness) -> None:
     name = "04-daemon-require-tls"
     case = h.launch_daemon(name, ["--require-tls", "--tls-cert", h.cert, "--tls-key", h.key])
-    h.cases.append(case)
     if case.timed_out or case.launch_rc != 0 or not case.identity_proven:
         # launch_daemon already recorded why; never probe or signal an unproven PID.
         return
@@ -974,8 +1459,37 @@ def case_missing_cert_or_key(h: TlsHarness) -> None:
         # A data directory that must never be created by a rejected startup.
         data_dir = os.path.join(h.private_dir, name + ".data")
         if os.path.exists(data_dir):
-            shutil.rmtree(data_dir, ignore_errors=True)
-        h.cases.append(h.expect_refused_before_mutation(name, extra, data_dir, needles))
+            try:
+                shutil.rmtree(data_dir)
+            except OSError as exc:
+                h.cleanup_failures.append("%s: stale data directory removal failed: %s" % (name, exc))
+                continue
+        h.expect_refused_before_mutation(name, extra, data_dir, needles)
+
+        # The same refusal in daemon mode must additionally write no PID file
+        # and spawn no --node-id orphan worker.
+        node_id = str(uuid.uuid4())
+        daemon_data_dir = os.path.join(h.private_dir, name + ".daemon.data")
+        if os.path.exists(daemon_data_dir):
+            try:
+                shutil.rmtree(daemon_data_dir)
+            except OSError as exc:
+                h.cleanup_failures.append("%s: stale daemon data directory removal failed: %s" % (name, exc))
+                continue
+        pid_file = os.path.join(h.private_dir, name + ".daemon.pid")
+        try:
+            os.remove(pid_file)
+        except OSError:
+            pass
+        h.expect_refused_before_mutation(
+            name + "-daemon",
+            extra,
+            daemon_data_dir,
+            needles,
+            daemon=True,
+            pid_file=pid_file,
+            node_id=node_id,
+        )
 
 
 def build_cases(h: TlsHarness) -> None:
@@ -1020,14 +1534,28 @@ def write_manifest(h: TlsHarness, unavailable: Optional[str]) -> None:
         "binary_sha256_after": h.bin_sha_after,
         "binary_hash_ok": h.binary_hash_ok,
         "version": h.version_out,
+        "evidence_run_dir": h.run_dir,
+        "raw_logs": [os.path.basename(c.logfile) for c in h.cases],
         "source_binding": "executable hash only; source manifest produced by root outside this harness",
         "gate": {"HELIOSDB_TLS_REGRESSION": os.environ.get("HELIOSDB_TLS_REGRESSION")},
+        "child_rust_log": CHILD_RUST_LOG,
+        "sql_deadline_seconds": SQL_DEADLINE,
+        "bounded_path_violations": h.bounded_path_violations,
         "unavailable": unavailable,
         "cleanup_failures": h.cleanup_failures,
         "cases": cases,
     }
-    with open(os.path.join(h.evidence_dir, "require-tls-manifest.json"), "w", encoding="utf-8") as fh:
+    path = os.path.join(h.output_dir or h.evidence_dir, "require-tls-manifest.json")
+    with open(path, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
+
+
+def audit_harness_source() -> List[str]:
+    try:
+        with open(__file__, "r", encoding="utf-8") as fh:
+            return audit_no_blocking_paths(fh.read())
+    except Exception as exc:  # noqa: BLE001
+        return ["harness source audit failed: %s: %s" % (type(exc).__name__, exc)]
 
 
 def main() -> int:
@@ -1036,6 +1564,7 @@ def main() -> int:
         return EXIT_OK
 
     h = TlsHarness()
+    h.bounded_path_violations = audit_harness_source()
     unavailable: Optional[str] = None
     try:
         h.prepare()
@@ -1049,7 +1578,7 @@ def main() -> int:
         eprint("unavailable: %s" % unavailable)
     finally:
         h.cleanup()
-        if h.evidence_dir:
+        if h.output_dir or h.evidence_dir:
             write_manifest(h, unavailable)
 
     if unavailable is not None:
@@ -1062,12 +1591,14 @@ def main() -> int:
         "%s binary sha256 unchanged before/after suite (%s)"
         % ("ok  " if h.binary_hash_ok else "FAIL", h.bin_sha[:16])
     )
+    for violation in h.bounded_path_violations:
+        eprint("FAIL bounded-path audit: %s" % violation)
     if h.cleanup_failures:
         for item in h.cleanup_failures:
             eprint("FAIL cleanup: %s" % item)
 
     failures = [c for c in h.cases if c.failed()]
-    if failures or h.cleanup_failures or not h.binary_hash_ok:
+    if failures or h.cleanup_failures or not h.binary_hash_ok or h.bounded_path_violations:
         eprint("RESULT: FAIL (%d case(s) with failures)" % len(failures))
         return EXIT_FAIL
     eprint(
