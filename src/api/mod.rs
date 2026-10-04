@@ -5,6 +5,7 @@
 pub mod auth_bridge;
 pub mod change_notifier;
 pub mod handlers;
+pub mod http_auth;
 pub mod jwt;
 pub mod middleware;
 pub mod models;
@@ -15,6 +16,7 @@ pub mod routes;
 pub mod server;
 
 // Re-exports for convenience
+pub use http_auth::{attach_http_auth, http_bind_safety_check, HttpAuthPolicy, HttpAuthRejection};
 pub use middleware::{AuthMiddleware, RateLimitConfig, RateLimitMiddleware, UserContext};
 pub use models::error::ApiError;
 pub use openapi::OPENAPI_YAML;

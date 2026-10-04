@@ -27,6 +27,7 @@ struct HAConfig {
     http_listen: Option<String>,
     mcp_token: Option<String>,
     allow_remote_mcp: bool,
+    allow_insecure_http: bool,
     node_id: Option<String>,
 }
 
@@ -277,6 +278,13 @@ enum Commands {
         /// Mount MCP-over-HTTP routes on a non-loopback HTTP listener without MCP auth. Requires mcp-endpoint; unsafe.
         #[arg(long)]
         allow_remote_mcp: bool,
+
+        /// Permit a non-loopback plaintext HTTP API bind. Without this, `start`
+        /// refuses `--http-listen` on a non-loopback address when the wire protocol
+        /// is in trust mode (unauthenticated SQL) or when HTTP auth would cross the
+        /// network in the clear. Unsafe; document the compensating controls.
+        #[arg(long)]
+        allow_insecure_http: bool,
 
         /// Node ID (UUID) - auto-generated if not provided
         #[arg(long)]
@@ -564,6 +572,7 @@ async fn main() -> Result<()> {
             http_listen,
             mcp_token,
             allow_remote_mcp,
+            allow_insecure_http,
             node_id,
             mysql,
             mysql_listen,
@@ -659,6 +668,7 @@ async fn main() -> Result<()> {
                 http_listen,
                 mcp_token,
                 allow_remote_mcp,
+                allow_insecure_http,
                 node_id,
             };
 
@@ -1158,23 +1168,51 @@ async fn start_server(
     // under `--http-port 0`. The comment above still holds: the main
     // `select!` never *observes* this task, so a late-life HTTP failure
     // cannot tear the database listener down.
+    // P0-1: the daemon HTTP listener serves the whole BaaS surface (and, when
+    // compiled in, MCP). It now shares the wire credential: when a password is
+    // configured, every non-health route requires it (Basic, or the MCP bearer
+    // token), and a non-loopback plaintext bind is refused unless the operator
+    // explicitly passed --allow-insecure-http. A trust-mode listener still binds,
+    // but only loopback unless overridden.
+    let http_auth_policy = std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::from_wire(
+        password.clone(),
+        ha_config.mcp_token.clone().map(std::sync::Arc::from),
+        ha_config.allow_insecure_http,
+    ));
     let http_handle: Option<tokio::task::JoinHandle<()>> = if !http_health_disabled {
         let http_listen = ha_config.http_listen.as_deref().unwrap_or(&listen);
         let http_addr: SocketAddr = format!("{}:{}", http_listen, ha_config.http_port)
             .parse()
             .map_err(|e| Error::config(format!("Invalid HTTP address: {e}")))?;
+        if let Err(reason) = heliosdb_nano::api::http_bind_safety_check(http_addr, &http_auth_policy, tls_enabled) {
+            return Err(Error::config(reason));
+        }
         match tokio::net::TcpListener::bind(http_addr).await {
             Ok(listener) => {
                 info!(
                     "HTTP endpoint at http://{http_addr} (/health, /version, /docs, /rest/v1, /auth/v1, /realtime/v1)"
                 );
+                if http_auth_policy.is_required() {
+                    info!(
+                        "HTTP API authentication is required on {http_addr} \
+                         (HTTP Basic with the wire password, or the MCP bearer token when configured)"
+                    );
+                } else {
+                    tracing::warn!(
+                        "HTTP API authentication is DISABLED for {} because the wire protocol is in \
+                         trust mode; keep this listener on loopback or pass --allow-insecure-http \
+                         only with compensating controls",
+                        http_addr
+                    );
+                }
                 let http_db = Arc::clone(&db);
                 let mcp_token = ha_config.mcp_token.clone();
                 let allow_remote_mcp = ha_config.allow_remote_mcp;
                 let http_api_config = api_config.clone();
+                let policy = std::sync::Arc::clone(&http_auth_policy);
                 Some(tokio::spawn(async move {
                     if let Err(e) =
-                        run_http_listener(listener, http_db, mcp_token, allow_remote_mcp, http_api_config).await
+                        run_http_listener(listener, http_db, mcp_token, allow_remote_mcp, http_api_config, policy).await
                     {
                         tracing::error!("HTTP server accept loop exited: {e}");
                     }
@@ -1207,6 +1245,21 @@ async fn start_server(
         let mysql_addr: SocketAddr = mysql_listen
             .parse()
             .map_err(|e| Error::config(format!("Invalid MySQL listen address '{}': {}", mysql_listen, e)))?;
+
+        // P0-1 audit: the MySQL wire listener is trust-only — `authenticate()`
+        // accepts any username and never checks `--password`. Unlike the HTTP API
+        // this is NOT closed here (credential verification is a larger feature),
+        // but exposing it off loopback while the PostgreSQL wire is authenticated
+        // silently bypasses that authentication. Refuse to let that pass without a
+        // loud report.
+        if !mysql_addr.ip().is_loopback() && !matches!(auth_method, AuthMethod::Trust) {
+            tracing::error!(
+                "MySQL listener on {mysql_addr} does NOT verify credentials (trust-only), while the \
+                 PostgreSQL wire protocol uses {auth_display}: any MySQL client can run SQL without \
+                 the configured password. Bind --mysql-listen 127.0.0.1 or leave --mysql disabled \
+                 until MySQL authentication is implemented."
+            );
+        }
 
         let mysql_tls_enabled = mysql_tls_cert.is_some();
         let mut mysql_server_config = heliosdb_nano::protocol::mysql::MysqlServerConfig::with_address(mysql_addr)
@@ -1741,6 +1794,9 @@ async fn start_server_daemon(
     if ha_config.allow_remote_mcp {
         args.push("--allow-remote-mcp".to_string());
     }
+    if ha_config.allow_insecure_http {
+        args.push("--allow-insecure-http".to_string());
+    }
     if let Some(primary) = ha_config.primary_host {
         args.push("--primary-host".to_string());
         args.push(primary);
@@ -2228,17 +2284,21 @@ async fn start_ha_components(
     }
 }
 
-/// HTTP listener for Docker health checks and, when compiled with
-/// `mcp-endpoint`, MCP-over-HTTP routes.
-/// Caller owns the
+/// HTTP listener for Docker health checks, the BaaS HTTP surface, and (when
+/// compiled with `mcp-endpoint`) MCP-over-HTTP routes.
+///
+/// P0-1: `http_auth` wraps the entire assembled router, so every non-health route
+/// requires the wire credential when one is configured. The caller owns the
 /// already-bound `TcpListener` so bind failures are reported up front
-/// (see KanttBan bug #2 / v3.28.0 fix).
+/// (see KanttBan bug #2 / v3.28.0 fix); the non-loopback bind *policy* is enforced
+/// in `start_server` before this is reached.
 async fn run_http_listener(
     listener: tokio::net::TcpListener,
     db: std::sync::Arc<EmbeddedDatabase>,
     mcp_token: Option<String>,
     allow_remote_mcp: bool,
     api_config: heliosdb_nano::config::ApiConfig,
+    http_auth: std::sync::Arc<heliosdb_nano::api::HttpAuthPolicy>,
 ) -> std::io::Result<()> {
     use axum::{routing::get, Json, Router};
 
@@ -2314,6 +2374,13 @@ async fn run_http_listener(
         let _ = db;
     }
 
+    // P0-1: wrap the WHOLE assembled surface (BaaS + MCP) with the wire
+    // credential policy. The layer is applied last, so it runs first; it exempts
+    // only the side-effect-free health route and CORS preflight. Because the MCP
+    // mount is inside the same router, `/mcp*` cannot be reached without satisfying
+    // the wire policy, and a real request still passes MCP's own bearer check.
+    let app = heliosdb_nano::api::attach_http_auth(app, http_auth);
+
     axum::serve(listener, app).await
 }
 
@@ -2330,7 +2397,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db, None, false, heliosdb_nano::config::ApiConfig::default()).await;
+            let _ = run_http_listener(
+                listener,
+                db,
+                None,
+                false,
+                heliosdb_nano::config::ApiConfig::default(),
+                std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::disabled()),
+            )
+            .await;
         });
 
         let body: Value = reqwest::get(format!("http://{addr}/health"))
@@ -2351,7 +2426,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db, None, false, heliosdb_nano::config::ApiConfig::default()).await;
+            let _ = run_http_listener(
+                listener,
+                db,
+                None,
+                false,
+                heliosdb_nano::config::ApiConfig::default(),
+                std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::disabled()),
+            )
+            .await;
         });
 
         let resp: Value = reqwest::Client::new()
@@ -2381,7 +2464,15 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let addr = format!("127.0.0.1:{port}");
         let handle = tokio::spawn(async move {
-            let _ = run_http_listener(listener, db, None, false, heliosdb_nano::config::ApiConfig::default()).await;
+            let _ = run_http_listener(
+                listener,
+                db,
+                None,
+                false,
+                heliosdb_nano::config::ApiConfig::default(),
+                std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::disabled()),
+            )
+            .await;
         });
 
         let health: Value = reqwest::get(format!("http://{addr}/health"))
@@ -2412,6 +2503,7 @@ mod tests {
                 Some("td8-secret".to_string()),
                 false,
                 heliosdb_nano::config::ApiConfig::default(),
+                std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::disabled()),
             )
             .await;
         });
