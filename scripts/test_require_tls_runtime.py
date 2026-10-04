@@ -345,18 +345,18 @@ def _child_sql(kwargs: Dict[str, object], send_conn) -> None:
             send_conn.send(
                 ("error", {"type": type(exc).__name__, "msg": str(exc), "pgcode": pgcode})
             )
-        except Exception:
-            pass
+        except Exception as report_exc:  # noqa: BLE001 - report transport failure to retained stderr
+            sys.stderr.write("SQL worker could not report database error: %s\n" % report_exc)
     finally:
         if conn is not None:
             try:
                 conn.close()
-            except Exception:
-                pass
+            except Exception as close_exc:  # noqa: BLE001 - cleanup failures stay visible
+                sys.stderr.write("SQL worker connection close failed: %s\n" % close_exc)
         try:
             send_conn.close()
-        except Exception:
-            pass
+        except Exception as close_exc:  # noqa: BLE001 - cleanup failures stay visible
+            sys.stderr.write("SQL worker pipe close failed: %s\n" % close_exc)
 
 
 class TlsHarness:
