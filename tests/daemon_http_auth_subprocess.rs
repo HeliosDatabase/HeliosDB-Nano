@@ -57,6 +57,7 @@ struct Daemon {
     http_port: u16,
     pg_port: u16,
     sock_dir: Option<TempDir>,
+    config_dir: TempDir,
     stdout_path: PathBuf,
     stderr_path: PathBuf,
     args: Vec<String>,
@@ -144,6 +145,13 @@ fn spawn(extra: &[&str], http_port: u16, pg_port: u16, with_socket_dir: bool) ->
     } else {
         None
     };
+    let config_dir = TempDir::new().expect("config tempdir");
+    let config_path = config_dir.path().join("nano-http-test.toml");
+    std::fs::write(
+        &config_path,
+        "[api]\nhttp_auth_max_failures = 100\nhttp_auth_failure_window_secs = 60\nhttp_auth_max_tracked_peers = 4096\nhttp_auth_max_in_flight = 64\n",
+    )
+    .expect("HTTP test config");
 
     let mut args: Vec<String> = vec![
         "start".to_string(),
@@ -152,6 +160,8 @@ fn spawn(extra: &[&str], http_port: u16, pg_port: u16, with_socket_dir: bool) ->
         pg_port.to_string(),
         "--http-port".to_string(),
         http_port.to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
     ];
     args.extend(extra.iter().map(|s| (*s).to_string()));
     if let Some(ref dir) = sock_dir {
@@ -184,6 +194,7 @@ fn spawn(extra: &[&str], http_port: u16, pg_port: u16, with_socket_dir: bool) ->
         http_port,
         pg_port,
         sock_dir,
+        config_dir,
         stdout_path,
         stderr_path,
         args,
@@ -1196,14 +1207,25 @@ mod uds_auth {
                     let row = client
                         .query_one("SELECT 1", &[])
                         .await
-                        .map_err(|e| format!("query failed: {e}; sqlstate={:?}", e.code().map(|c| c.code())))?;
+                        .map_err(|e| format_pg_error("query failed", &e))?;
                     assert_eq!(row.get::<_, i32>(0), 1, "authenticated UDS SELECT 1 result");
                     handle.abort();
                     Ok(())
                 }
-                Err(e) => Err(format!("{e}; sqlstate={:?}", e.code().map(|c| c.code()))),
+                Err(e) => Err(format_pg_error("connect failed", &e)),
             }
         })
+    }
+
+    fn format_pg_error(context: &str, error: &tokio_postgres::Error) -> String {
+        let mut text = format!("{context}: {error}; sqlstate={:?}", error.code().map(|c| c.code()));
+        let mut source = std::error::Error::source(error);
+        while let Some(cause) = source {
+            text.push_str("; source=");
+            text.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        text
     }
 
     fn start_uds_daemon() -> Daemon {
@@ -1242,8 +1264,15 @@ mod uds_auth {
         }
         let missing = connect_uds(&path, port, "postgres", None).expect_err("missing UDS password must fail");
         assert!(
-            missing.to_ascii_lowercase().contains("password"),
-            "missing password must be rejected specifically, got {missing}{}",
+            missing.to_ascii_lowercase().contains("password")
+                && (missing.to_ascii_lowercase().contains("missing")
+                    || missing.to_ascii_lowercase().contains("required")),
+            "missing password must be rejected specifically through the error source chain, got {missing}{}",
+            daemon.diagnostics()
+        );
+        assert!(
+            connect_uds(&path, port, "postgres", Some(PASSWORD)).is_ok(),
+            "a valid UDS query must still succeed after rejected attempts{}",
             daemon.diagnostics()
         );
     }
