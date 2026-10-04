@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import socket
@@ -47,6 +48,7 @@ EXIT_UNAVAILABLE = 3
 LAUNCH_TIMEOUT = 30.0
 READY_TIMEOUT = 15.0
 SQL_CONNECT_TIMEOUT = 5
+SQL_STATEMENT_TIMEOUT = 5.0
 HTTP_TIMEOUT = 10.0
 TERM_WAIT = 5.0
 KILL_WAIT = 5.0
@@ -60,6 +62,15 @@ SQL_DB = "postgres"
 
 class Unavailable(Exception):
     """A prerequisite is missing; the gated run must fail closed (exit 3)."""
+
+
+class SqlDeadlineExceeded(Exception):
+    """The monotonic client deadline expired mid-connect or mid-statement.
+
+    Deliberately NOT a ``psycopg2.Error`` subclass: callers must classify a
+    client-side timeout as a transport/harness failure, never as an
+    authentication rejection (SQLSTATE 28) or a clean rejection.
+    """
 
 
 class Orphan:
@@ -200,6 +211,54 @@ def is_alive(pid: int) -> bool:
         return True
     rest = data[data.rfind(")") + 1 :].split()
     return bool(rest) and rest[0] != "Z"
+
+
+def poll_async_connection(conn, deadline: float, select_fn=select.select) -> None:
+    """Drive a psycopg2 ``async_=True`` connection until POLL_OK or the deadline.
+
+    This one helper is shared by connection establishment and by every ``SELECT
+    1`` execution, so neither phase can block past its monotonic budget:
+
+    * ``POLL_OK`` returns, but only when the monotonic deadline has not already
+      expired: the clock is checked *before* each ``poll()`` and again *before*
+      accepting ``POLL_OK``, so a select that times out followed by a late
+      ``POLL_OK`` is still rejected.
+    * ``POLL_READ``/``POLL_WRITE`` wait on ``conn.fileno()`` via ``select`` for
+      only the remaining budget.
+    * any other poll state raises ``OperationalError`` (never silently OK).
+    * a ``psycopg2.Error`` raised by ``poll()`` (SQLSTATE 28 auth refusal, etc.)
+      propagates untouched so callers keep their exact classification.
+    * exhausting the deadline raises :class:`SqlDeadlineExceeded`, which is not a
+      ``psycopg2.Error`` and therefore can never be mistaken for auth rejection.
+
+    ``deadline`` is an absolute ``time.monotonic()`` instant. ``select_fn`` is
+    injectable so the real helper is unit-testable without a socket or server.
+    """
+    while True:
+        if time.monotonic() >= deadline:
+            raise SqlDeadlineExceeded(
+                "client deadline expired before polling the connection"
+            )
+        state = conn.poll()
+        if state == psycopg2.extensions.POLL_OK:
+            if time.monotonic() >= deadline:
+                raise SqlDeadlineExceeded(
+                    "client deadline expired before accepting POLL_OK"
+                )
+            return
+        if state not in (psycopg2.extensions.POLL_READ, psycopg2.extensions.POLL_WRITE):
+            raise psycopg2.OperationalError("unexpected async poll state: %r" % (state,))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SqlDeadlineExceeded(
+                "client deadline expired while waiting to %s"
+                % ("read" if state == psycopg2.extensions.POLL_READ else "write")
+            )
+        fileno = conn.fileno()
+        if state == psycopg2.extensions.POLL_READ:
+            select_fn([fileno], [], [], remaining)
+        else:
+            select_fn([], [fileno], [], remaining)
 
 
 class Harness:
@@ -591,7 +650,17 @@ class Harness:
         return False
 
     def _sql_connect(self, case: Case, password: str):
-        return psycopg2.connect(
+        """Open an ``async_=True`` connection, driven to POLL_OK or the deadline.
+
+        Returns only once the server has accepted the connection, so a wrong
+        password surfaces here as a ``psycopg2.Error`` (SQLSTATE 28 / "password
+        authentication failed"), while a slow, black-holed, or hung server
+        surfaces as :class:`SqlDeadlineExceeded` and can never masquerade as an
+        authentication rejection. ``connect_timeout`` is retained as a libpq
+        backstop, but the bounded select/poll loop is what guarantees progress.
+        """
+        deadline = time.monotonic() + SQL_CONNECT_TIMEOUT
+        conn = psycopg2.connect(
             host="127.0.0.1",
             port=case.pg_port,
             dbname=SQL_DB,
@@ -599,16 +668,44 @@ class Harness:
             password=password,
             connect_timeout=SQL_CONNECT_TIMEOUT,
             sslmode="disable",
+            async_=True,
         )
+        try:
+            poll_async_connection(conn, deadline)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+        return conn
+
+    @staticmethod
+    def _sql_select1_rows(conn) -> list:
+        """Run ``SELECT 1`` on an async connection under its own client deadline.
+
+        The statement gets a fresh monotonic budget (measured from just before
+        ``execute``), independent of the server's ``statement_timeout``. Returns
+        the exact fetched rows; a server error propagates as ``psycopg2.Error``
+        and a stalled statement raises :class:`SqlDeadlineExceeded`.
+        """
+        deadline = time.monotonic() + SQL_STATEMENT_TIMEOUT
+        cur = conn.cursor()
+        try:
+            cur.execute("SELECT 1")
+            poll_async_connection(conn, deadline)
+            return cur.fetchall()
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     def sql_expect_ok(self, case: Case, password: str, label: str) -> None:
         conn = None
         try:
             conn = self._sql_connect(case, password)
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            rows = cur.fetchall()
-            cur.close()
+            rows = self._sql_select1_rows(conn)
             case.check(rows == [(1,)], "%s: SELECT 1 returned exactly [(1,)] (got %r)" % (label, rows))
         except Exception as exc:  # noqa: BLE001 - any failure means correct creds did not work
             case.check(False, "%s: correct credentials were not accepted: %s" % (label, exc))
@@ -622,17 +719,18 @@ class Harness:
     def sql_expect_rejected(self, case: Case, password: str, label: str) -> None:
         """A wrong password must be rejected by *authentication* (SQLSTATE 28),
         not by a transport error, crash, or timeout; the child/listener must
-        survive the attempt."""
+        survive the attempt.
+
+        Authentication is classified **only** while establishing the connection.
+        If ``_sql_connect`` returns, the server accepted the connection, so the
+        wrong-password negative must fail regardless of any later query-phase
+        error (including one that happens to carry an auth-flavoured message).
+        """
         conn = None
         auth_rejected = False
         detail = "no error"
         try:
             conn = self._sql_connect(case, password)
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            rows = cur.fetchall()
-            cur.close()
-            detail = "connection accepted and SELECT 1 returned %r" % (rows,)
         except psycopg2.Error as exc:  # server replied with an auth or other error
             code = getattr(exc, "pgcode", None)
             if code is None:
@@ -648,6 +746,16 @@ class Harness:
             detail = "pgcode=%s exc=%s: %s" % (code, type(exc).__name__, exc)
         except Exception as exc:  # transport error / timeout / crash
             detail = "non-auth failure %s: %s" % (type(exc).__name__, exc)
+        else:
+            # The connect completed: authentication succeeded. Everything from
+            # here on is a query-phase outcome and must NEVER be reclassified as
+            # an authentication rejection.
+            detail = "connection accepted (authentication succeeded) with the wrong password"
+            try:
+                rows = self._sql_select1_rows(conn)
+                detail += "; SELECT 1 returned %r" % (rows,)
+            except Exception as exc:  # noqa: BLE001 - query-phase, not auth classification
+                detail += "; later query error %s: %s" % (type(exc).__name__, exc)
         finally:
             if conn is not None:
                 try:

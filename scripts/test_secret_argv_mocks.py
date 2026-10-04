@@ -163,6 +163,166 @@ class SignalCleanupTests(unittest.TestCase):
             self.assertTrue(any("still alive" in f for f in h.cleanup_failures))
 
 
+class _FakeAsyncConn:
+    """Minimal psycopg2-async stand-in: a scripted poll() sequence + fileno()."""
+
+    def __init__(self, states, fileno=41):
+        self._states = list(states)
+        self._fileno = fileno
+
+    def poll(self):
+        return self._states.pop(0)
+
+    def fileno(self):
+        return self._fileno
+
+
+class PollAsyncConnectionTests(unittest.TestCase):
+    """Exercise the REAL shared polling helper (no socket, no server).
+
+    It is used for both connection establishment and each SELECT 1 execution, so
+    its bounded progression and its timeout-vs-auth distinction are the contract
+    the forthcoming argv re-exec harness inherits.
+    """
+
+    def test_readable_then_writable_then_ok_progresses(self):
+        calls = []
+
+        def select_fn(rlist, wlist, xlist, timeout):
+            calls.append((list(rlist), list(wlist), list(xlist), timeout))
+            return ([], [], [])
+
+        conn = _FakeAsyncConn(
+            [
+                m.psycopg2.extensions.POLL_READ,
+                m.psycopg2.extensions.POLL_WRITE,
+                m.psycopg2.extensions.POLL_OK,
+            ],
+            fileno=41,
+        )
+        m.poll_async_connection(conn, m.time.monotonic() + 5.0, select_fn=select_fn)
+
+        self.assertEqual(len(calls), 2, "one wait per non-OK poll, then POLL_OK returns")
+        self.assertEqual(calls[0][:3], ([41], [], []), "POLL_READ waits on the fd for read")
+        self.assertEqual(calls[1][:3], ([], [41], []), "POLL_WRITE waits on the fd for write")
+        self.assertTrue(all(c[3] > 0 for c in calls), "each wait gets a positive remaining budget")
+
+    def test_immediate_ok_does_not_wait(self):
+        def select_fn(*args):
+            raise AssertionError("POLL_OK must return without selecting")
+
+        conn = _FakeAsyncConn([m.psycopg2.extensions.POLL_OK])
+        m.poll_async_connection(conn, m.time.monotonic() + 5.0, select_fn=select_fn)
+
+    def test_expired_deadline_is_a_timeout_not_a_wait(self):
+        def select_fn(*args):
+            raise AssertionError("must not select past an expired deadline")
+
+        conn = _FakeAsyncConn([m.psycopg2.extensions.POLL_READ])
+        with self.assertRaises(m.SqlDeadlineExceeded):
+            m.poll_async_connection(conn, m.time.monotonic() - 1.0, select_fn=select_fn)
+
+    def test_unexpected_poll_state_raises(self):
+        conn = _FakeAsyncConn([999])
+        with self.assertRaises(m.psycopg2.OperationalError):
+            m.poll_async_connection(conn, m.time.monotonic() + 5.0, select_fn=lambda *a: ([], [], []))
+
+    def test_poll_error_propagates_untouched(self):
+        class AuthFailConn:
+            def poll(self):
+                raise m.psycopg2.OperationalError("password authentication failed for user \"postgres\"")
+
+            def fileno(self):
+                return 3
+
+        with self.assertRaises(m.psycopg2.Error):
+            m.poll_async_connection(AuthFailConn(), m.time.monotonic() + 5.0, select_fn=lambda *a: ([], [], []))
+
+    def test_deadline_exceeded_is_not_classified_as_auth(self):
+        self.assertFalse(
+            issubclass(m.SqlDeadlineExceeded, m.psycopg2.Error),
+            "a client timeout must never be catchable as an authentication error",
+        )
+
+    def test_select_timeout_then_late_ok_is_rejected(self):
+        """A read wait that times out, then a late POLL_OK, must not be accepted.
+
+        The clock advances across the ``poll()`` after the timed-out select, so
+        this exercises the second deadline check (before accepting POLL_OK), not
+        just the pre-poll one.
+        """
+        base = m.time.monotonic()
+        deadline = base + 1.0
+        waited = []
+
+        def select_fn(rlist, wlist, xlist, timeout):
+            waited.append((list(rlist), list(wlist), timeout))
+            return ([], [], [])  # poll() never became readable: select timed out
+
+        conn = _FakeAsyncConn(
+            [m.psycopg2.extensions.POLL_READ, m.psycopg2.extensions.POLL_OK], fileno=41
+        )
+        # pre-poll, remaining-budget, pre-poll again, then post-POLL_OK (late).
+        ticks = [base, base, base, base + 2.0]
+        with mock.patch.object(m.time, "monotonic", side_effect=ticks):
+            with self.assertRaises(m.SqlDeadlineExceeded):
+                m.poll_async_connection(conn, deadline, select_fn=select_fn)
+        self.assertEqual(len(waited), 1, "the read wait happened exactly once")
+        self.assertEqual(waited[0][:2], ([41], []), "the wait was a read wait on the fd")
+
+
+class SqlCallerClassificationTests(unittest.TestCase):
+    """Caller-level guarantees of the bounded SQL helpers.
+
+    ``_sql_connect`` returns only after authentication succeeds, so
+    ``sql_expect_rejected`` must fail whenever the connection was accepted, even
+    if the later ``SELECT 1`` raises an auth-shaped error. A connect that hits
+    its deadline must still close the half-open connection.
+    """
+
+    def _mock_identity(self):
+        return (
+            mock.patch.object(m.Harness, "_identity_ok", return_value=True),
+            mock.patch.object(m.Harness, "child_owns_port", return_value=True),
+        )
+
+    def test_accepted_connection_with_query_auth_error_is_not_a_rejection(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _harness(d)
+            case = m.Case("wrong-pw")
+            case.pid = 1234
+            case.node_id = "uuid"
+            case.starttime = "7"
+            case.exe = BIN
+            accepted = mock.Mock()
+            query_auth_error = m.psycopg2.OperationalError(
+                'password authentication failed for user "postgres"'
+            )
+            ident, owns = self._mock_identity()
+            with ident, owns, mock.patch.object(
+                h, "_sql_connect", return_value=accepted
+            ), mock.patch.object(h, "_sql_select1_rows", side_effect=query_auth_error):
+                h.sql_expect_rejected(case, "wrong", "wrong-pw")
+            self.assertTrue(
+                case.failed(),
+                "a connection that authenticated must never count as a wrong-password rejection",
+            )
+            accepted.close.assert_called_once()
+
+    def test_connect_deadline_closes_connection(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _harness(d)
+            case = m.Case("connect-deadline")
+            case.pg_port = 5432
+            half_open = mock.Mock()
+            with mock.patch.object(m.psycopg2, "connect", return_value=half_open), mock.patch.object(
+                m, "poll_async_connection", side_effect=m.SqlDeadlineExceeded("client deadline expired")
+            ):
+                with self.assertRaises(m.SqlDeadlineExceeded):
+                    h._sql_connect(case, "pw")
+            half_open.close.assert_called_once()
+
+
 class LaunchStrayTests(unittest.TestCase):
     """A failing launcher that leaves a daemon must be tracked for cleanup."""
 
