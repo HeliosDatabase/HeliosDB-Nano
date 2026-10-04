@@ -69,7 +69,17 @@ def start(binary, data, port, cert=None, key=None, require=False):
         args += ["--tls-cert", str(cert), "--tls-key", str(key)]
     if require:
         args += ["--require-tls"]
-    return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={k: v for k, v in os.environ.items() if k not in {"HELIOSDB_PASSWORD", "HELIOSDB_PASSWORD_FILE", "HELIOSDB_MCP_TOKEN", "MCP_TOKEN"}})
+    return subprocess.Popen(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={
+            k: v
+            for k, v in os.environ.items()
+            if k not in {"HELIOSDB_PASSWORD", "HELIOSDB_PASSWORD_FILE", "HELIOSDB_MCP_TOKEN", "MCP_TOKEN"}
+        },
+    )
 
 
 def query(port, sslmode):
