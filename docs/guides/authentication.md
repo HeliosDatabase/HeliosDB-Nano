@@ -83,10 +83,17 @@ from the first source below that is present:
 
 | # | Source | Notes |
 |---|--------|-------|
-| 1 | `--password <value>` | **Deprecated.** The value is visible to every local user in the process table (`ps`, `/proc/<pid>/cmdline`). Nano prints a warning when it is used. |
+| 1 | `--password <value>` | **Deprecated.** The value is briefly visible in the process table (`ps`, `/proc/<pid>/cmdline`) at launch; on Linux Nano re-executes with it moved off argv before serving (see below). Nano prints a warning when it is used. |
 | 2 | `--password-file <path>` | The first line of the file; a trailing newline is ignored. Only the (non-secret) path appears on the command line. |
 | 3 | `$HELIOSDB_PASSWORD_FILE` | Same file format. Docker/Kubernetes-secret friendly. |
 | 4 | `$HELIOSDB_PASSWORD` | The value in the environment; `/proc/<pid>/environ` is owner-readable only. |
+
+`--password` and `--password-file` are **mutually exclusive**: passing both is a
+command-line error. So a literal `--password` can outrank only the inherited
+`HELIOSDB_PASSWORD_FILE` / `HELIOSDB_PASSWORD` environment sources, not an
+explicit file flag. When the literal is moved off argv (below), Nano also removes
+an inherited `HELIOSDB_PASSWORD_FILE` from the child environment so that source
+cannot outrank the value the operator selected.
 
 An empty password file is a **startup error** (fail closed), and when a
 non-`trust` method is selected with none of the sources set, startup fails with
@@ -121,22 +128,32 @@ HELIOSDB_PASSWORD_FILE=/run/secrets/heliosdb_password \
 
 ### Keeping secrets off the process table
 
-`heliosdb-nano start --daemon` re-execs itself. The re-exec **never** places the
-password on the child's command line: a file source forwards only
-`--password-file <path>`, and an argv/env source is handed to the child through
-its environment (`HELIOSDB_PASSWORD`). The MCP-over-HTTP bearer token is handled
-the same way: pass `$HELIOSDB_MCP_TOKEN` (or `--mcp-token`, which Nano forwards
-through the child's environment) rather than a literal on the command line.
+On Linux, `heliosdb-nano start` with a literal `--password` or `--mcp-token`
+re-executes itself from `/proc/self/exe` **before** opening the database or any
+listener, replacing its argv with the same arguments minus the parsed secret
+option (both `--flag value` and `--flag=value` work). The value is moved into the
+child's environment (`HELIOSDB_PASSWORD` / `HELIOSDB_MCP_TOKEN`) and the process
+keeps its PID, stdio, argv[0], and every unrelated argument. An empty or invalid
+selected credential is rejected before the re-exec, and a failure to re-exec is a
+fail-closed error that opens no listener. Environment/file-only invocations do
+not re-exec at all.
 
-A legacy literal `--password` (and `--mcp-token`) on the command line remains
-visible in `/proc/<pid>/cmdline` for the **entire lifetime of that process**,
-not merely at launch — every local user can read it with `ps` for as long as the
-server runs. There is no portable in-place argv scrub here; that requirement is
-explicitly **unresolved** in this track. Migrate to `--password-file` /
-`HELIOSDB_PASSWORD_FILE`, or to `HELIOSDB_PASSWORD` in the environment. The
-Docker Compose example in `deployment/docker/docker-compose.yml` mounts the
-password as a Docker secret and sets `HELIOSDB_PASSWORD_FILE`, so `docker
-inspect` shows only the file path.
+`heliosdb-nano start --daemon` then spawns the detached worker, which **never**
+receives the password on its command line either: a file source forwards only
+`--password-file <path>`, and an argv/env source is handed to the worker through
+its environment. The MCP-over-HTTP bearer token is handled the same way.
+
+What this does **not** change: the re-exec is a process-image replacement, not an
+in-place argv rewrite. The initial invocation was still visible to `ps`, shell
+history, and any parent process for the moment before the re-exec; `ps` inside
+the container or the launching shell can have already recorded it. The
+environment alternative is owner-readable via `/proc/<pid>/environ` (not secret
+from the same uid), and on non-Linux platforms the literal secret still remains
+in `/proc/<pid>/cmdline` for the whole process lifetime. For the strongest
+posture, use `--password-file` / `HELIOSDB_PASSWORD_FILE`, or
+`HELIOSDB_PASSWORD` in the environment. The Docker Compose example in
+`deployment/docker/docker-compose.yml` mounts the password as a Docker secret
+and sets `HELIOSDB_PASSWORD_FILE`, so `docker inspect` shows only the file path.
 
 ### HTTP listener
 

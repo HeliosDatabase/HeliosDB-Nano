@@ -324,6 +324,320 @@ fn daemon_password_handoff(source: &PasswordSource, args: &mut Vec<String>) -> O
     }
 }
 
+/// A bounded plan for replacing the current process image so that no literal
+/// credential survives on the new command line. Built by [`plan_start_reexec`]
+/// from already-parsed arguments, so the planner never reads or mutates the
+/// process-wide environment and can be unit-tested in isolation.
+enum ReexecPlan {
+    /// No literal secret flag was present; run in place (file/env sources only).
+    None,
+    /// Re-exec is required. `argv[0]` is retained verbatim; `env_set` carries
+    /// the off-argv credential for the child and `env_unset` removes a
+    /// lower-precedence source that the literal outranked.
+    Exec {
+        argv: Vec<OsString>,
+        env_set: Vec<(OsString, OsString)>,
+        env_unset: Vec<OsString>,
+    },
+}
+
+/// Never derived: `env_set` holds plaintext credentials. The argv itself is
+/// already secret-free, but it is still not worth printing, and every `env_set`
+/// value is redacted.
+impl std::fmt::Debug for ReexecPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReexecPlan::None => f.write_str("ReexecPlan::None"),
+            ReexecPlan::Exec { argv, env_unset, .. } => write!(
+                f,
+                "ReexecPlan::Exec {{ argv_len: {}, env_set: <redacted>, env_unset: {env_unset:?} }}",
+                argv.len()
+            ),
+        }
+    }
+}
+
+/// Drop exactly the parsed secret options from a raw argv, leaving every other
+/// argument — its order and non-UTF8 bytes — untouched.
+///
+/// The caller only reaches this after Clap has accepted the command, which
+/// bounds the scanner: a split option is guaranteed a value token, and neither
+/// `--password` nor `--mcp-token` is ever the value of an unrelated option
+/// (none of the neighboring options accepts hyphen-leading values). Both the
+/// `--flag value` and `--flag=value` syntaxes are handled. Everything after a
+/// bare `--` is positional and is never touched, and a string merely
+/// *containing* `--password` (an unrelated value) is preserved.
+fn strip_secret_options(
+    raw: &[OsString],
+    remove_password: bool,
+    remove_password_file: bool,
+    remove_mcp_token: bool,
+) -> Vec<OsString> {
+    let mut out: Vec<OsString> = Vec::with_capacity(raw.len());
+    let Some((arg0, rest)) = raw.split_first() else {
+        return out;
+    };
+    out.push(arg0.clone());
+
+    let mut end_of_options = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let token = &rest[i];
+        let text = token.to_str();
+        if !end_of_options {
+            if text == Some("--") {
+                end_of_options = true;
+                out.push(token.clone());
+                i += 1;
+                continue;
+            }
+            let consumes_value = |flag: &str, remove: bool| remove && text == Some(flag);
+            if consumes_value("--password", remove_password)
+                || consumes_value("--password-file", remove_password_file)
+                || consumes_value("--mcp-token", remove_mcp_token)
+            {
+                // Skip the flag *and* its value.
+                i += 2;
+                continue;
+            }
+            let is_inline = |flag: &str, remove: bool| remove && text.map_or(false, |t| t.starts_with(flag));
+            if is_inline("--password=", remove_password)
+                || is_inline("--password-file=", remove_password_file)
+                || is_inline("--mcp-token=", remove_mcp_token)
+            {
+                // `--flag=value` is a single token.
+                i += 1;
+                continue;
+            }
+        }
+        out.push(token.clone());
+        i += 1;
+    }
+    out
+}
+
+/// Decide whether a `start` invocation must be re-executed to move a literal
+/// credential off the command line, and build the exact child argv/env if so.
+///
+/// Pure: every environment source is passed in, so precedence is testable
+/// without touching the real environment. An invalid or empty *selected*
+/// credential is returned as an error here — before any `exec`.
+///
+/// Precedence note: a literal `--password` always wins, so the plan both sets
+/// `HELIOSDB_PASSWORD` and drops the `--password-file` flag from argv and
+/// `HELIOSDB_PASSWORD_FILE` from the environment; otherwise the file source
+/// would outrank the value the operator actually selected.
+fn plan_start_reexec(
+    raw_args: Vec<OsString>,
+    password: Option<String>,
+    password_file: Option<PathBuf>,
+    mcp_token: Option<String>,
+    env_password_file: Option<OsString>,
+    env_password: Option<OsString>,
+    env_mcp_token: Option<OsString>,
+) -> Result<ReexecPlan> {
+    let literal_password = password.is_some();
+    let literal_mcp_token = mcp_token.is_some();
+    if !literal_password && !literal_mcp_token {
+        // File/env sources already keep the secret out of argv; do not exec.
+        return Ok(ReexecPlan::None);
+    }
+
+    // Validate and select exactly as the in-process resolver will, so an empty
+    // or non-UTF8 selected source fails closed here rather than after exec.
+    let resolved_password = resolve_password(
+        password.clone(),
+        password_file.clone(),
+        env_password_file.clone(),
+        env_password.clone(),
+    )?;
+    let resolved_mcp_token = resolve_mcp_token(mcp_token.clone(), env_mcp_token.clone())?;
+
+    let mut env_set: Vec<(OsString, OsString)> = Vec::new();
+    let mut env_unset: Vec<OsString> = Vec::new();
+
+    if literal_password {
+        // `resolve_password(Some(_), ..)` only ever yields `Argv`; the guard is
+        // defensive, not a real branch.
+        if let PasswordSource::Argv(value) = &resolved_password {
+            env_set.push((OsString::from("HELIOSDB_PASSWORD"), OsString::from(value.clone())));
+            if env_password_file.is_some() {
+                env_unset.push(OsString::from("HELIOSDB_PASSWORD_FILE"));
+            }
+        }
+    }
+    if literal_mcp_token {
+        if let Some(token) = &resolved_mcp_token {
+            env_set.push((OsString::from("HELIOSDB_MCP_TOKEN"), OsString::from(token.clone())));
+        }
+    }
+
+    // Remove the literal flags in both syntaxes. When the literal password
+    // wins, `--password-file` is removed too so it cannot outrank the new env.
+    let argv = strip_secret_options(&raw_args, literal_password, literal_password, literal_mcp_token);
+
+    Ok(ReexecPlan::Exec {
+        argv,
+        env_set,
+        env_unset,
+    })
+}
+
+/// Replace the current process image from a plan. Split out so the failure path
+/// can be unit-tested with a fake adapter, without a real `exec` or any
+/// process-wide environment mutation.
+trait ExecAdapter {
+    fn exec(&self, plan: &ReexecPlan) -> Result<()>;
+}
+
+/// The real adapter: safe std `CommandExt::exec` on Linux, warning-only on
+/// other platforms.
+struct RealExec;
+
+impl ExecAdapter for RealExec {
+    fn exec(&self, plan: &ReexecPlan) -> Result<()> {
+        match plan {
+            ReexecPlan::None => Ok(()),
+            ReexecPlan::Exec {
+                argv,
+                env_set,
+                env_unset,
+            } => exec_reexec(argv, env_set, env_unset),
+        }
+    }
+}
+
+/// Run the process replacement through `adapter`, propagating its (sanitized)
+/// failure. On success this never returns.
+fn run_reexec<E: ExecAdapter>(plan: &ReexecPlan, adapter: &E) -> Result<()> {
+    adapter.exec(plan)
+}
+
+/// Sanitized, fail-closed error for a failed `exec`. It must never contain the
+/// command, its arguments, or the environment.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn reexec_failure(error: &std::io::Error) -> Error {
+    let detail = match error.raw_os_error() {
+        Some(code) => format!("os error {code}"),
+        None => format!("{:?}", error.kind()),
+    };
+    Error::config(format!(
+        "refusing to start: could not re-execute the server without command-line secrets \
+         ({detail}); no listener was opened"
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn exec_reexec(argv: &[OsString], env_set: &[(OsString, OsString)], env_unset: &[OsString]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    // `/proc/self/exe` resolves to the running binary even if its on-disk path
+    // was replaced; `arg0` keeps the original program name. stdio is inherited
+    // (Command's default), so the replacement keeps the same terminal/pipes.
+    let mut command = std::process::Command::new("/proc/self/exe");
+    let mut args = argv.iter();
+    if let Some(arg0) = args.next() {
+        command.arg0(arg0);
+    }
+    command.args(args);
+    for (key, value) in env_set {
+        command.env(key, value);
+    }
+    for key in env_unset {
+        command.env_remove(key);
+    }
+
+    // Replaces the process image on success; returns only on failure.
+    let error = command.exec();
+    Err(reexec_failure(&error))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn exec_reexec(_argv: &[OsString], _env_set: &[(OsString, OsString)], _env_unset: &[OsString]) -> Result<()> {
+    // The safe std process-replacement path used here is Linux-specific, so
+    // there is nothing to execute and no re-exec occurred. The literal secret
+    // stays on argv for the whole process lifetime; `preflight_argv_reexec`
+    // already emitted the accurate, platform-specific warning. Never claim a
+    // re-exec happened.
+    Ok(())
+}
+
+/// One warning per literal secret option, scoped to whether this platform can
+/// actually move it off argv. Neither branch ever prints the secret itself.
+#[cfg(target_os = "linux")]
+fn warn_literal_secret_options(password: bool, mcp_token: bool) {
+    if password {
+        tracing::warn!(
+            "--password exposes the secret in the process table (visible to every local user via \
+             `ps`) at launch; this process is re-executed with the secret moved off argv before \
+             it serves. Prefer --password-file, HELIOSDB_PASSWORD_FILE or HELIOSDB_PASSWORD"
+        );
+    }
+    if mcp_token {
+        tracing::warn!(
+            "--mcp-token exposes the secret in the process table (visible to every local user via \
+             `ps`) at launch; this process is re-executed with the secret moved off argv before \
+             it serves. Prefer HELIOSDB_MCP_TOKEN"
+        );
+    }
+}
+
+/// One warning per literal secret option. On non-Linux the re-exec cannot run,
+/// so the warning must not claim it did.
+#[cfg(not(target_os = "linux"))]
+fn warn_literal_secret_options(password: bool, mcp_token: bool) {
+    if password {
+        tracing::warn!(
+            "--password exposes the secret in the process table (visible to every local user via \
+             `ps`); moving a literal command-line secret off argv by re-exec is not implemented \
+             on this platform, so it remains visible for the whole process lifetime. Prefer \
+             --password-file, HELIOSDB_PASSWORD_FILE or HELIOSDB_PASSWORD"
+        );
+    }
+    if mcp_token {
+        tracing::warn!(
+            "--mcp-token exposes the secret in the process table (visible to every local user via \
+             `ps`); moving a literal command-line secret off argv by re-exec is not implemented \
+             on this platform, so it remains visible for the whole process lifetime. Prefer \
+             HELIOSDB_MCP_TOKEN"
+        );
+    }
+}
+
+/// Synchronous pre-runtime preflight: if the parsed command is a `start` with a
+/// literal `--password` / `--mcp-token`, replace the process with a secret-free
+/// argv before any Tokio runtime or storage is created.
+fn preflight_argv_reexec(cli: &Cli) -> Result<()> {
+    let Commands::Start {
+        password,
+        password_file,
+        mcp_token,
+        ..
+    } = &cli.command
+    else {
+        return Ok(());
+    };
+
+    let plan = plan_start_reexec(
+        std::env::args_os().collect(),
+        password.clone(),
+        password_file.clone(),
+        mcp_token.clone(),
+        std::env::var_os("HELIOSDB_PASSWORD_FILE"),
+        std::env::var_os("HELIOSDB_PASSWORD"),
+        std::env::var_os("HELIOSDB_MCP_TOKEN"),
+    )?;
+
+    // Warn only for an actual re-exec plan (never for a file/env-only
+    // invocation, and never after a fail-closed validation error). The text is
+    // platform-specific so it never claims a re-exec on a platform that cannot
+    // perform one.
+    if let ReexecPlan::Exec { .. } = &plan {
+        warn_literal_secret_options(password.is_some(), mcp_token.is_some());
+    }
+    run_reexec(&plan, &RealExec)
+}
+
 /// GH#28: one WARN per crossing of `[server] max_connections_warn_percent`
 /// on a listener (edge-triggered via `swap`; re-arms when utilisation drops
 /// back below the threshold). `Semaphore::available_permits()` is the single
@@ -732,8 +1046,7 @@ enum CodeGraphAction {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Initialize tracing. Default to WARN when RUST_LOG is unset so
     // operator-facing diagnostics (e.g. the slow-query log) are visible
     // out of the box instead of silently filtered (D3).
@@ -746,6 +1059,23 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
+    // P0-2: move a literal `start --password` / `--mcp-token` off argv and
+    // replace the process image *before* any Tokio worker, database, or
+    // listener exists. Env/file-only invocations are a no-op.
+    preflight_argv_reexec(&cli)?;
+
+    // Only now build the runtime: a successful re-exec above has already
+    // replaced this image, so no worker thread or resource is ever discarded.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::config(format!("failed to start the async runtime: {e}")))?;
+    runtime.block_on(run(cli))
+}
+
+/// The former `#[tokio::main]` body, reached only after the synchronous
+/// argv-reexec preflight in [`main`].
+async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Start {
             data_dir,
@@ -813,21 +1143,10 @@ async fn main() -> Result<()> {
 
             // Validate auth options. Password source precedence:
             // --password > --password-file > $HELIOSDB_PASSWORD_FILE
-            // > $HELIOSDB_PASSWORD. The last three keep the secret out of the
-            // world-readable process table; --password is deprecated.
+            // > $HELIOSDB_PASSWORD. A literal --password was already moved off
+            // argv by `preflight_argv_reexec` (which owns the deprecation
+            // warning) and reaches this point as the value source.
             let auth_lower = auth.to_lowercase();
-            if password.is_some() {
-                // Best-effort only: Rust std does not expose the raw argv
-                // buffer, and in-place rewrite (as PostgreSQL's setproctitle
-                // does) needs libc plus unsafe pointer arithmetic whose
-                // correctness cannot be verified statically. Warn, and point
-                // at the off-argv sources instead of risking UB.
-                tracing::warn!(
-                    "--password exposes the secret in the process table (visible to every \
-                     local user via `ps`); prefer --password-file, HELIOSDB_PASSWORD_FILE \
-                     or HELIOSDB_PASSWORD"
-                );
-            }
             let password_source = resolve_password(
                 password,
                 password_file,
@@ -2684,6 +3003,135 @@ mod tests {
         dir
     }
 
+    /// Build an argv from UTF-8 literals for the re-exec planner tests.
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    /// Lossy view of an argv for order/absence assertions.
+    fn lossy(argv: &[OsString]) -> Vec<String> {
+        argv.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+    }
+
+    /// Extract the `(password, password_file, mcp_token)` triple from a parsed
+    /// `start` command for the parser-level secret tests.
+    fn start_secret_args(cli: &Cli) -> (Option<String>, Option<PathBuf>, Option<String>) {
+        let Commands::Start {
+            password,
+            password_file,
+            mcp_token,
+            ..
+        } = &cli.command
+        else {
+            panic!("expected a start command");
+        };
+        (password.clone(), password_file.clone(), mcp_token.clone())
+    }
+
+    /// The real parser accepts both secret syntaxes and maps them to the
+    /// literal value the planner receives.
+    #[test]
+    fn cli_parses_split_and_equals_secrets() {
+        let password_cases: &[&[&str]] = &[
+            &["heliosdb-nano", "start", "--password", "pw-1"],
+            &["heliosdb-nano", "start", "--password=pw-1"],
+        ];
+        for args in password_cases {
+            let cli = Cli::try_parse_from(args.iter().copied()).unwrap();
+            let (password, password_file, _) = start_secret_args(&cli);
+            assert_eq!(password.as_deref(), Some("pw-1"), "argv {args:?}");
+            assert!(password_file.is_none(), "argv {args:?}");
+        }
+
+        let token_cases: &[&[&str]] = &[
+            &["heliosdb-nano", "start", "--mcp-token", "tok-1"],
+            &["heliosdb-nano", "start", "--mcp-token=tok-1"],
+        ];
+        for args in token_cases {
+            let cli = Cli::try_parse_from(args.iter().copied()).unwrap();
+            let (_, _, mcp_token) = start_secret_args(&cli);
+            assert_eq!(mcp_token.as_deref(), Some("tok-1"), "argv {args:?}");
+        }
+    }
+
+    /// Two explicit password-source flags are rejected by the CLI: the
+    /// planner's "drop the explicit --password-file flag" arm is defensive,
+    /// not a reachable command.
+    #[test]
+    fn cli_rejects_two_explicit_password_sources() {
+        assert!(Cli::try_parse_from([
+            "heliosdb-nano",
+            "start",
+            "--password",
+            "pw",
+            "--password-file",
+            "/tmp/pw",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "heliosdb-nano",
+            "start",
+            "--password-file",
+            "/tmp/pw",
+            "--password",
+            "pw",
+        ])
+        .is_err());
+    }
+
+    /// A literal CLI password is accepted with no explicit file flag and wins
+    /// over an inherited `HELIOSDB_PASSWORD_FILE`, which the plan removes from
+    /// the child environment.
+    #[test]
+    fn cli_literal_password_beats_inherited_env_file() {
+        let cli = Cli::try_parse_from(["heliosdb-nano", "start", "--password", "pw"]).unwrap();
+        let (password, password_file, mcp_token) = start_secret_args(&cli);
+        assert_eq!(password.as_deref(), Some("pw"));
+        assert!(password_file.is_none());
+
+        let plan = plan_start_reexec(
+            os_args(&["heliosdb-nano", "start", "--password", "pw"]),
+            password,
+            password_file,
+            mcp_token,
+            Some(OsString::from("/env/file")),
+            None,
+            None,
+        )
+        .unwrap();
+        let ReexecPlan::Exec { env_set, env_unset, .. } = plan else {
+            panic!("expected a re-exec plan");
+        };
+        assert_eq!(
+            env_set,
+            vec![(OsString::from("HELIOSDB_PASSWORD"), OsString::from("pw"))]
+        );
+        assert!(env_unset.contains(&OsString::from("HELIOSDB_PASSWORD_FILE")));
+    }
+
+    /// Values that merely *contain* a secret flag name are ordinary values and
+    /// parse unchanged.
+    #[test]
+    fn cli_parses_values_containing_secret_names() {
+        let cli = Cli::try_parse_from([
+            "heliosdb-nano",
+            "start",
+            "--data-dir",
+            "/tmp/--password-not-a-flag",
+            "--node-id",
+            "node--mcp-token-x",
+        ])
+        .unwrap();
+        let Commands::Start { data_dir, node_id, .. } = &cli.command else {
+            panic!("expected a start command");
+        };
+        assert_eq!(
+            data_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/--password-not-a-flag"))
+        );
+        assert_eq!(node_id.as_deref(), Some("node--mcp-token-x"));
+    }
+
     #[test]
     fn password_argv_beats_file_and_env() {
         // A missing file path proves the argv arm short-circuits before I/O.
@@ -2900,6 +3348,300 @@ mod tests {
             !args.iter().any(|a| a == "file-secret" || a == "--password"),
             "argv leaked the secret"
         );
+    }
+
+    /// P0-2 argv re-exec: a file/env-only `start` must not trigger a process
+    /// replacement (there is nothing on argv to remove).
+    #[test]
+    fn reexec_plan_is_none_for_file_and_env_only() {
+        let argv = os_args(&["heliosdb-nano", "start", "--auth", "scram-sha-256"]);
+        assert!(matches!(
+            plan_start_reexec(
+                argv.clone(),
+                None,
+                Some(PathBuf::from("/run/secrets/pw")),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+            ReexecPlan::None
+        ));
+        assert!(matches!(
+            plan_start_reexec(argv, None, None, None, None, Some(OsString::from("env-pw")), None,).unwrap(),
+            ReexecPlan::None
+        ));
+    }
+
+    /// A literal `--password` is removed from argv (both syntaxes), moved to the
+    /// child environment, and argv[0] plus every unrelated argument survives.
+    #[test]
+    fn reexec_password_moves_off_argv_and_preserves_rest() {
+        let argv = os_args(&[
+            "heliosdb-nano",
+            "start",
+            "--data-dir",
+            "/tmp/d",
+            "--password",
+            "hunter2",
+            "--auth",
+            "scram-sha-256",
+        ]);
+        let plan = plan_start_reexec(argv, Some("hunter2".to_string()), None, None, None, None, None).unwrap();
+        let ReexecPlan::Exec {
+            argv,
+            env_set,
+            env_unset,
+        } = plan
+        else {
+            panic!("expected a re-exec plan");
+        };
+        let argv = lossy(&argv);
+        assert_eq!(argv[0], "heliosdb-nano");
+        assert!(!argv.iter().any(|a| a == "hunter2" || a == "--password"));
+        assert!(argv.iter().any(|a| a == "--data-dir"));
+        assert!(argv.iter().any(|a| a == "/tmp/d"));
+        assert!(argv.iter().any(|a| a == "--auth"));
+        assert_eq!(
+            env_set,
+            vec![(OsString::from("HELIOSDB_PASSWORD"), OsString::from("hunter2"))]
+        );
+        assert!(env_unset.is_empty());
+
+        // The equals syntax is a single token and is removed the same way.
+        let argv = os_args(&["heliosdb-nano", "start", "--password=hunter2"]);
+        let plan = plan_start_reexec(argv, Some("hunter2".to_string()), None, None, None, None, None).unwrap();
+        let ReexecPlan::Exec { argv, .. } = plan else {
+            panic!("expected a re-exec plan");
+        };
+        let argv = lossy(&argv);
+        assert!(argv.iter().all(|a| !a.contains("hunter2") && !a.contains("--password")));
+        assert_eq!(argv, vec!["heliosdb-nano".to_string(), "start".to_string()]);
+    }
+
+    /// When the literal password wins, both lower-precedence file sources are
+    /// removed: the `--password-file` flag from argv and the inherited
+    /// `HELIOSDB_PASSWORD_FILE` from the environment.
+    ///
+    /// The explicit `--password-file` arm is **defensive only**: the CLI marks
+    /// `--password` / `--password-file` mutually exclusive, so Clap rejects the
+    /// combination (see `cli_rejects_two_explicit_password_sources`) and the
+    /// only lower source a real invocation can carry alongside `--password` is
+    /// the inherited `HELIOSDB_PASSWORD_FILE`. The planner keeps handling both
+    /// so it stays correct for any caller, not just today's parser.
+    #[test]
+    fn reexec_password_drops_overridden_file_sources() {
+        let argv = os_args(&[
+            "heliosdb-nano",
+            "start",
+            "--password-file",
+            "/run/file",
+            "--password",
+            "argv-pw",
+        ]);
+        let plan = plan_start_reexec(
+            argv,
+            Some("argv-pw".to_string()),
+            Some(PathBuf::from("/run/file")),
+            None,
+            Some(OsString::from("/env/file")),
+            None,
+            None,
+        )
+        .unwrap();
+        let ReexecPlan::Exec {
+            argv,
+            env_set,
+            env_unset,
+        } = plan
+        else {
+            panic!("expected a re-exec plan");
+        };
+        let argv = lossy(&argv);
+        assert!(!argv.iter().any(|a| a == "--password-file" || a == "/run/file"));
+        assert!(env_unset.contains(&OsString::from("HELIOSDB_PASSWORD_FILE")));
+        assert_eq!(
+            env_set,
+            vec![(OsString::from("HELIOSDB_PASSWORD"), OsString::from("argv-pw"))]
+        );
+    }
+
+    /// A literal `--mcp-token` (split and equals) is moved to the MCP env var;
+    /// an unrelated `--password-file` is preserved when the password is not a
+    /// literal.
+    #[test]
+    fn reexec_mcp_token_off_argv_and_keeps_password_file() {
+        // A private scratch file, not a host fixture: the planner validates the
+        // selected file source (it actually reads it) even when the literal is
+        // only the MCP token.
+        let dir = pw_scratch_dir("reexec-mcp-file");
+        let pw_path = dir.join("pw");
+        std::fs::write(&pw_path, "file-pw\n").unwrap();
+        let pw_text = pw_path.to_string_lossy().into_owned();
+        let argv = os_args(&[
+            "heliosdb-nano",
+            "start",
+            "--password-file",
+            pw_text.as_str(),
+            "--mcp-token",
+            "tok-a",
+            "--allow-remote-mcp",
+        ]);
+        let plan = plan_start_reexec(
+            argv,
+            None,
+            Some(pw_path.clone()),
+            Some("tok-a".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let ReexecPlan::Exec { argv, env_set, .. } = plan else {
+            panic!("expected a re-exec plan");
+        };
+        let argv = lossy(&argv);
+        assert!(!argv.iter().any(|a| a == "tok-a" || a == "--mcp-token"));
+        assert!(argv.iter().any(|a| a == "--password-file"));
+        assert!(argv.iter().any(|a| a == &pw_text));
+        assert_eq!(
+            env_set,
+            vec![(OsString::from("HELIOSDB_MCP_TOKEN"), OsString::from("tok-a"))]
+        );
+
+        let argv = os_args(&["heliosdb-nano", "start", "--mcp-token=tok-b"]);
+        let plan = plan_start_reexec(argv, None, None, Some("tok-b".to_string()), None, None, None).unwrap();
+        let ReexecPlan::Exec { argv, env_set, .. } = plan else {
+            panic!("expected a re-exec plan");
+        };
+        assert_eq!(lossy(&argv), vec!["heliosdb-nano".to_string(), "start".to_string()]);
+        assert_eq!(
+            env_set,
+            vec![(OsString::from("HELIOSDB_MCP_TOKEN"), OsString::from("tok-b"))]
+        );
+    }
+
+    /// Unrelated strings that merely contain `--password`, plus all arguments
+    /// after `--`, are preserved exactly.
+    #[test]
+    fn reexec_preserves_unrelated_and_post_terminator_args() {
+        let argv = os_args(&[
+            "heliosdb-nano",
+            "start",
+            "--data-dir",
+            "/tmp/--password-not-a-flag",
+            "--password",
+            "hunter2",
+            "--",
+            "--password",
+            "positional",
+        ]);
+        let plan = plan_start_reexec(argv, Some("hunter2".to_string()), None, None, None, None, None).unwrap();
+        let ReexecPlan::Exec { argv, .. } = plan else {
+            panic!("expected a re-exec plan");
+        };
+        assert_eq!(
+            lossy(&argv),
+            vec![
+                "heliosdb-nano".to_string(),
+                "start".to_string(),
+                "--data-dir".to_string(),
+                "/tmp/--password-not-a-flag".to_string(),
+                "--".to_string(),
+                "--password".to_string(),
+                "positional".to_string(),
+            ]
+        );
+    }
+
+    /// Non-UTF8 arguments that are not one of our flags survive untouched; only
+    /// the valid-UTF8 secret pair is removed.
+    #[cfg(unix)]
+    #[test]
+    fn reexec_preserves_non_utf8_arguments() {
+        use std::os::unix::ffi::OsStringExt;
+        let weird = OsString::from_vec(vec![b'/', 0x80, 0xff]);
+        let argv = vec![
+            OsString::from("heliosdb-nano"),
+            OsString::from("start"),
+            OsString::from("--data-dir"),
+            weird.clone(),
+            OsString::from("--password"),
+            OsString::from("hunter2"),
+        ];
+        let plan = plan_start_reexec(argv, Some("hunter2".to_string()), None, None, None, None, None).unwrap();
+        let ReexecPlan::Exec { argv, .. } = plan else {
+            panic!("expected a re-exec plan");
+        };
+        assert_eq!(argv[3], weird);
+        assert_eq!(argv.len(), 4);
+    }
+
+    /// An explicit but empty secret must fail before any `exec`.
+    #[test]
+    fn reexec_refuses_empty_literal_before_exec() {
+        let argv = os_args(&["heliosdb-nano", "start", "--password", ""]);
+        assert!(plan_start_reexec(argv, Some(String::new()), None, None, None, None, None).is_err());
+
+        let argv = os_args(&["heliosdb-nano", "start", "--mcp-token", ""]);
+        assert!(plan_start_reexec(argv, None, None, Some(String::new()), None, None, None).is_err());
+    }
+
+    /// The replacement argv has no literal flag left, so a second parse sees an
+    /// env-only source and must not re-exec again (no loop).
+    #[test]
+    fn reexec_does_not_loop() {
+        let argv = os_args(&[
+            "heliosdb-nano",
+            "start",
+            "--password",
+            "hunter2",
+            "--auth",
+            "scram-sha-256",
+        ]);
+        let plan = plan_start_reexec(argv, Some("hunter2".to_string()), None, None, None, None, None).unwrap();
+        let ReexecPlan::Exec { argv, .. } = plan else {
+            panic!("expected a re-exec plan");
+        };
+        let second = plan_start_reexec(argv, None, None, None, None, Some(OsString::from("hunter2")), None).unwrap();
+        assert!(matches!(second, ReexecPlan::None));
+    }
+
+    /// The exec failure path is fail-closed and its error names neither the
+    /// command nor any secret.
+    #[test]
+    fn reexec_failure_is_sanitized_and_fails_closed() {
+        let err = reexec_failure(&std::io::Error::from_raw_os_error(13));
+        let shown = format!("{err}");
+        assert!(shown.contains("os error 13"));
+        assert!(!shown.contains("hunter2"));
+        assert!(!shown.contains("/proc/self/exe"));
+    }
+
+    /// A failing adapter propagates an error from `run_reexec` without touching
+    /// the real process environment or image.
+    #[test]
+    fn reexec_adapter_failure_fails_closed() {
+        struct FailingExec;
+        impl ExecAdapter for FailingExec {
+            fn exec(&self, _plan: &ReexecPlan) -> Result<()> {
+                Err(Error::config("simulated exec failure"))
+            }
+        }
+        let argv = os_args(&["heliosdb-nano", "start", "--password", "hunter2"]);
+        let plan = plan_start_reexec(argv, Some("hunter2".to_string()), None, None, None, None, None).unwrap();
+        assert!(run_reexec(&plan, &FailingExec).is_err());
+    }
+
+    /// The plan's `Debug` must not print the credential it carries.
+    #[test]
+    fn reexec_plan_debug_redacts_secrets() {
+        let argv = os_args(&["heliosdb-nano", "start", "--password", "hunter2"]);
+        let plan = plan_start_reexec(argv, Some("hunter2".to_string()), None, None, None, None, None).unwrap();
+        let shown = format!("{plan:?}");
+        assert!(shown.contains("<redacted>"));
+        assert!(!shown.contains("hunter2"));
     }
 
     #[tokio::test]

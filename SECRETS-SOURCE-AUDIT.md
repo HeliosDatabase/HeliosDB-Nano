@@ -17,8 +17,8 @@ Files inspected: `src/main.rs`, `src/config.rs`,
 
 | Command | Secret | Source(s) | Value on argv? |
 |---|---|---|---|
-| `start` | PG auth password | `--password`, `--password-file`, `HELIOSDB_PASSWORD_FILE`, `HELIOSDB_PASSWORD` | only legacy `--password` |
-| `start` | MCP bearer token | `--mcp-token`, `HELIOSDB_MCP_TOKEN` | only literal `--mcp-token` |
+| `start` | PG auth password | `--password`, `--password-file`, `HELIOSDB_PASSWORD_FILE`, `HELIOSDB_PASSWORD` | legacy `--password` only until the Linux re-exec below moves it off argv |
+| `start` | MCP bearer token | `--mcp-token`, `HELIOSDB_MCP_TOKEN` | literal `--mcp-token` only until the Linux re-exec below moves it off argv |
 | `start` | TLS private key | `--tls-key`, `--mysql-tls-key` | path only, not key bytes |
 | `start` | At-rest encryption key | config `[encryption].key_source` (`Environment` / `File` / `Kms`) | never (no CLI flag) |
 | `dump` | Connection URI | `--connection` | yes (path/URI can embed credentials) |
@@ -57,20 +57,49 @@ unrelated broken env var cannot fail a valid explicit configuration. Unix
 regressions: `non_utf8_configured_sources_error_not_absent`,
 `overridden_non_utf8_env_does_not_error`.
 
-**Daemon re-exec.** `start --daemon` re-execs the binary
-(`start_server_daemon`, `src/main.rs:1790`). The child never receives the
-plaintext on its command line:
+**Foreground re-exec to strip argv (Linux).** A `start` that carries a literal
+`--password` (or `--mcp-token`) is re-executed from `/proc/self/exe` with the
+safe standard-library `CommandExt::exec` **before** the Tokio runtime, storage,
+or any listener is created (`plan_start_reexec` / `preflight_argv_reexec`,
+`src/main.rs:430`). The replacement argv is the original argv with exactly the
+parsed secret option removed — both the `--flag value` and `--flag=value`
+syntaxes, and only an option the parser actually consumed — while PID, stdio,
+argv[0], every unrelated argument (including non-UTF8 paths), and credential
+precedence are preserved. The value is carried in the child's
+`HELIOSDB_PASSWORD` / `HELIOSDB_MCP_TOKEN` environment rather than on argv.
+A literal `--password` and an explicit `--password-file` are **mutually
+exclusive** at the CLI (Clap rejects the two-flag command) and a literal
+`--mcp-token` has no file sibling; the only lower-precedence source that can
+accompany a literal `--password` is the inherited `HELIOSDB_PASSWORD_FILE`. When
+the literal wins, the plan removes that inherited `HELIOSDB_PASSWORD_FILE` from
+the child environment so the environment source cannot outrank the
+operator-selected value after the exec. (The planner also strips an explicit
+`--password-file` token defensively, but no reachable CLI invocation combines it
+with `--password`.) A selected
+invalid/empty credential is refused before any `exec`; an `exec` failure is a
+sanitized, fail-closed error that opens no listener. Environment/file-only
+invocations do not re-exec at all, so the change is inert for the recommended
+sources. A re-exec loop marker is unnecessary: the replacement argv has no
+literal secret flag, so the re-parse resolves an environment source and plans
+no second exec. On non-Linux platforms the safe replacement path is not
+implemented; the process keeps the warning-only behavior and the limitation
+below.
+
+**Daemon re-exec.** `start --daemon` then spawns the detached worker
+(`start_server_daemon`). That child never receives the plaintext on its command
+line either:
 
 - a file source forwards only `--password-file <path>`;
 - an argv/env source is exported to the child as `HELIOSDB_PASSWORD`
-  (`daemon_password_handoff`, `src/main.rs:309`);
+  (`daemon_password_handoff`, `src/main.rs:315`);
 - `HELIOSDB_PASSWORD_FILE` is removed from the child environment when an
-  explicit value source is authoritative (`src/main.rs:1976`).
+  explicit value source is authoritative.
 
 The foreground (non-daemon) path consumes the plaintext in-process
-(`PasswordSource::into_value`, `src/main.rs:154`). `PasswordSource` has a
-manual, non-derived `Debug` (`src/main.rs:168`) that redacts both
-`Argv`/`Env` values and a file's contents.
+(`PasswordSource::into_value`, `src/main.rs:155`). `PasswordSource` has a
+manual, non-derived `Debug` (`src/main.rs:169`) that redacts both
+`Argv`/`Env` values and a file's contents; `ReexecPlan` has a parallel
+redacting `Debug`.
 
 **Docker.** `docker-compose.yml` mounts `secrets/heliosdb_password.txt` as a
 Docker secret and sets `HELIOSDB_PASSWORD_FILE`. Compose implements a file
@@ -96,12 +125,15 @@ treated as unset (`src/main.rs:291`). The token guards MCP-over-HTTP routes
 the child through `HELIOSDB_MCP_TOKEN`, not argv (`src/main.rs:1937`).
 `--allow-remote-mcp` (a boolean, not a secret) is forwarded on argv.
 
-Status: the token source and daemon handoff are implemented. A literal
-`--mcp-token` on the original command line stays visible in that process's
-`/proc/<pid>/cmdline` for the process's **entire lifetime**, exactly like
-`--password`; prefer the environment variable. No portable in-place argv scrub
-is implemented — that best-effort requirement is explicitly **unresolved** in
-this track. Whether the token actually *authenticates* depends on the binary
+Status: the token source and handoff are implemented. On Linux a literal
+`--mcp-token` is moved off argv by the same foreground re-exec described above
+(and by the daemon handoff), so it is not visible in `/proc/<pid>/cmdline` after
+the server starts; the initial launch window, shell history, and a parent
+process's argv still saw it, and `/proc/<pid>/environ` remains owner-readable
+(the accepted off-argv model). This is not an in-place argv rewrite. On
+non-Linux platforms the literal token remains visible for the process's
+**entire lifetime** exactly like `--password`; prefer the environment variable.
+Whether the token actually *authenticates* depends on the binary
 being built with the `mcp-endpoint` feature; without it the token is resolved
 and handed off but no MCP routes are mounted, so an argv-only check does not
 prove token authentication. The harness exposes `HELIOSDB_PROC_MCP_HTTP=1` to
@@ -190,17 +222,26 @@ Handing a secret to a child through the environment removes it from
 `/proc/<pid>/cmdline`, but **not** from the host — the process owner and
 privileged users can read `/proc/<pid>/environ`. The P0-2 fix is specifically
 an argv-exposure fix; it makes no claim that environment handoff is secret
-from the same uid. A literal `--password` / `--mcp-token` on the original
-command line is visible in `/proc/<pid>/cmdline` for the **whole process
-lifetime**; no portable in-place argv scrub exists here, so that requirement is
-explicitly **unresolved**. Migrate to a file or environment source.
+from the same uid.
+
+On Linux, a literal `--password` / `--mcp-token` is re-exec'd off the command
+line before the server starts (above), so the long-lived foreground process and
+the daemon worker no longer advertise it in `/proc/<pid>/cmdline`. This is a
+process-image replacement, **not** an in-place argv rewrite; it cannot erase
+what was already observed. The initial launch/shell invocation, shell history,
+any parent process that saw the original argv, and same-uid/privileged access
+to the environment all remain out of scope. On non-Linux platforms the literal
+secret still survives for the **whole process lifetime**. Prefer a file or
+environment source.
 
 ## Known gaps
 
 - Environment handoff remains readable via `/proc/<pid>/environ`.
-- **No portable in-place argv scrub** for a legacy literal `--password` /
-  `--mcp-token`; the value is world-readable in `/proc/<pid>/cmdline` for the
-  entire process lifetime. Warning + off-argv alternatives only mitigate it.
+- **No in-place argv rewrite**: the Linux re-exec removes the literal secret
+  from the new process image, but the initial launch window and any parent
+  process that observed the original argv are not retroactively scrubbed, and
+  non-Linux platforms have no replacement path at all (warning only). This is
+  an argv-*exposure* reduction, not a guarantee for the launching context.
 - The daemon child re-reads the password **file** named on its command line,
   so deleting or mutating that file between parent resolution and child
   startup can fail or change the credential. An inherited private descriptor
@@ -223,13 +264,29 @@ explicitly **unresolved**. Migrate to a file or environment source.
 - `python3 scripts/test_secret_argv_mocks.py` (mocked-process tests: negative
   config cases fail on stray child/pidfile; EPERM/changed-identity cleanup is
   recorded; no signals or process launches)
+- `python3 scripts/test_argv_reexec_mocks.py` (mocked-lifecycle tests for the
+  Python `ReexecHarness` subclass: failed launcher with a live worker, missing
+  pidfile orphan recovery, an exception after a foreground spawn still leaves
+  the child registered for cleanup, an identity mismatch is never signalled,
+  and a failed wait/reap is reported; no processes launched). These exercise
+  the **Python harness**, not the Rust planner; plus
+  `python3 -c "compile(open('scripts/test_argv_reexec.py').read(),'x','exec')"`
 - `HELIOSDB_PROC_REGRESSION=1 HELIOSDB_NANO_BIN=<abs> \
-   HELIOSDB_PROC_EVIDENCE_DIR=<abs> scripts/test_server_secret_argv.sh`
-  (real daemons; gated, not run by default; exit 3 = requested-but-unavailable).
-  The harness requires the child to **own** the SQL/HTTP listener (PID fd
-  socket-inode match against `/proc/net/tcp{,6}`), requires an actual
-  SQLSTATE-28 authentication rejection for the wrong-password case, and
-  re-hashes the binary before/after the suite.
-- `cargo test --bin heliosdb-nano` covers the `resolve_password` /
-  `resolve_mcp_token` / `daemon_password_handoff` / redacted-`Debug` unit tests
-  and the Unix non-UTF8 regressions in `src/main.rs`.
+   HELIOSDB_PROC_EVIDENCE_DIR=<abs> scripts/test_argv_reexec.sh`
+  (real foreground/daemon re-exec evidence; gated, not run by default; exit 3 =
+  requested-but-unavailable). It proves the foreground PID keeps its identity
+  with a secret-free final argv, exact `SELECT 1` auth and wrong-password
+  rejection for split/equals password and MCP options, the daemon PID-file
+  handoff, and that an invalid credential leaves no residual listener after it
+  exits.
+- The existing `scripts/test_server_secret_argv.sh` real-daemon harness is
+  unchanged and still covers listener ownership, SQLSTATE-28, and binary
+  hash-binding.
+- `cargo test --bin heliosdb-nano` would cover the `resolve_password` /
+  `resolve_mcp_token` / `daemon_password_handoff` / redacted-`Debug` unit tests,
+  the Unix non-UTF8 regressions, the new `Cli::try_parse_from` secret-source
+  tests, and the `plan_start_reexec` / `strip_secret_options` / `exec`-adapter
+  tests in `src/main.rs`. **Status: not run in this review round** — no cargo
+  build/test or live process was executed; the Rust unit tests remain unrun
+  until root gates. The Python mocked tests are not a substitute for them and
+  are not claimed as Rust regression evidence.
