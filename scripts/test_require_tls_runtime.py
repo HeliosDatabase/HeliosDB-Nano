@@ -259,12 +259,15 @@ def is_alive(pid: int) -> bool:
     return bool(rest) and rest[0] != "Z"
 
 
-def unix_socket_inode(path: str) -> Optional[int]:
-    """The inode of the Unix-socket file at `path`, or None if it is not one.
+def unix_socket_inode(pid: int, path: str) -> Optional[int]:
+    """Kernel AF_UNIX socket inode bound to `path`, via /proc/<pid>/net/unix.
 
-    For an AF_UNIX socket the filesystem inode of the socket path *is* the
-    socket inode shown in /proc/net/unix and in /proc/<pid>/fd as
-    ``socket:[<inode>]``, which is what lets us prove the exact child fd.
+    ``os.stat`` is used *only* to confirm `path` is a socket: the filesystem
+    ``st_ino`` is a different number from the kernel socket inode shown in
+    ``/proc/net/unix`` and in ``/proc/<pid>/fd`` as ``socket:[<inode>]``, and is
+    never equated with it. The kernel inode is read from field 6 (after
+    ``line.split(maxsplit=7)``) of the row whose path field matches `path`
+    exactly; the value is decimal.
     """
     try:
         st = os.stat(path)
@@ -272,7 +275,22 @@ def unix_socket_inode(path: str) -> Optional[int]:
         return None
     if not stat.S_ISSOCK(st.st_mode):
         return None
-    return st.st_ino
+    try:
+        with open("/proc/%d/net/unix" % pid, "r", encoding="ascii", errors="replace") as fh:
+            next(fh, None)
+            for line in fh:
+                parts = line.rstrip("\n").split(maxsplit=7)
+                if len(parts) < 8:
+                    continue
+                if parts[7] != path:
+                    continue
+                try:
+                    return int(parts[6])
+                except ValueError:
+                    continue
+    except OSError:
+        return None
+    return None
 
 
 def audit_no_blocking_paths(source_text: str) -> List[str]:
@@ -885,6 +903,7 @@ class TlsHarness:
                 pidfile_pid = 0
 
         adopted = False
+        pidfile_wrong_process = False
         if pidfile_pid > 0:
             try:
                 starttime = proc_starttime(pidfile_pid)
@@ -898,6 +917,12 @@ class TlsHarness:
                         pidfile_pid != case.launcher_pid,
                         "%s: PID-file worker %d differs from the launcher PID" % (name, pidfile_pid),
                     )
+            else:
+                # A parseable PID file that names a positive PID which is not the
+                # exact --node-id worker is a hard identity failure. Orphan
+                # recovery below may still adopt the real worker for cleanup, but
+                # it must never clear this or let the daemon case pass.
+                pidfile_wrong_process = True
 
         if not adopted:
             found = self._find_orphan_worker(case.node_id, exclude={case.launcher_pid})
@@ -914,6 +939,14 @@ class TlsHarness:
                     False,
                     "%s: PID-file worker %d unidentifiable and no --node-id orphan found" % (name, pidfile_pid),
                 )
+
+        if pidfile_wrong_process:
+            case.check(
+                False,
+                "%s: parseable PID file named process %d, which is not the exact "
+                "--node-id worker; adopting the orphan does not clear the PID-file identity failure"
+                % (name, pidfile_pid),
+            )
 
         if case.timed_out:
             case.check(False, "%s: daemon launcher timed out" % name)
@@ -985,11 +1018,13 @@ class TlsHarness:
     def child_owns_unix_socket(self, pid: int, path: str) -> bool:
         """True iff `pid` holds the exact fd for the Unix socket at `path`.
 
-        We resolve the socket file's inode and require a ``socket:[<inode>]``
-        link in the child's fd table -- an exact inode match, not merely the
-        existence of a directory.
+        The kernel inode is resolved from /proc/<pid>/net/unix by an exact path
+        match (never from the socket file's filesystem ``st_ino``), then
+        required to appear as a ``socket:[<inode>]`` link in the child's fd
+        table -- an exact kernel-inode match, not merely the existence of a
+        directory.
         """
-        inode = unix_socket_inode(path)
+        inode = unix_socket_inode(pid, path)
         if inode is None:
             return False
         target = "socket:[%d]" % inode

@@ -17,6 +17,7 @@ or::
 """
 
 import importlib.util
+import io
 import os
 import signal
 import sys
@@ -272,27 +273,122 @@ class OrphanRecoveryTests(HarnessTestBase):
         self.assertTrue(any("identity capture raised" in lbl for ok, lbl in returned.checks if not ok))
 
 
+class DaemonPidfileTests(HarnessTestBase):
+    def _launch_with_wrong_live_pidfile_and_orphan(self):
+        name = "04-daemon-wrong-pid"
+        wrong_pid = 31337
+        orphan_pid = 31338
+        launcher_pid = 31339
+        self.h.private_dir = self.tmp
+        pidfile = os.path.join(self.tmp, name + ".pid")
+
+        class LauncherStub:
+            pid = launcher_pid
+            returncode = 0
+
+            def communicate(self, timeout=None):
+                return (b"", None)
+
+        def fake_popen(argv, **_kwargs):
+            with open(pidfile, "w", encoding="utf-8") as fh:
+                fh.write("%d\n" % wrong_pid)
+            return LauncherStub()
+
+        holder = {}
+        real_new_case = self.h._new_case
+
+        def spy_new_case(case_name):
+            case = real_new_case(case_name)
+            holder["case"] = case
+            return case
+
+        def fake_cmdline_raw(pid):
+            if pid == orphan_pid:
+                return b"helios\0--node-id\0" + holder["case"].node_id.encode() + b"\0"
+            raise AssertionError("unexpected proc_cmdline_raw(%d)" % pid)
+
+        with mock.patch.object(harness.subprocess, "Popen", side_effect=fake_popen), mock.patch.object(
+            self.h, "_new_case", side_effect=spy_new_case
+        ), mock.patch.object(
+            harness, "proc_starttime", return_value="42"
+        ), mock.patch.object(
+            harness, "proc_exe", return_value=self.h.bin_real
+        ), mock.patch.object(
+            self.h, "_identity_ok", return_value=False
+        ), mock.patch.object(
+            self.h, "_find_orphan_worker", return_value=(orphan_pid, "99", self.h.bin_real)
+        ) as find, mock.patch.object(
+            harness, "proc_cmdline_raw", side_effect=fake_cmdline_raw
+        ):
+            case = self.h.launch_daemon(name, ["--require-tls"])
+
+        return case, wrong_pid, orphan_pid, find
+
+    def test_wrong_positive_pidfile_stays_failed_despite_orphan_recovery(self):
+        case, wrong_pid, orphan_pid, find = self._launch_with_wrong_live_pidfile_and_orphan()
+
+        # The real worker is still adopted (and registered for cleanup)...
+        find.assert_called_once()
+        self.assertTrue(case.identity_proven)
+        self.assertEqual(case.pid, orphan_pid)
+        self.assertIs(self.h.registry.get(orphan_pid), case)
+        self.assertTrue(any(ok and "recovered orphan worker" in label for ok, label in case.checks))
+        # ...but the wrong positive PID file is a hard failure that is not erased.
+        self.assertTrue(
+            any(
+                (not ok) and ("parseable PID file named process %d" % wrong_pid) in label
+                for ok, label in case.checks
+            ),
+            case.checks,
+        )
+        self.assertTrue(case.failed())
+
+
 class UdsProofTests(HarnessTestBase):
-    def test_child_owns_exact_socket_inode(self):
-        owned_inode = 98765
-        other_inode = 11111
+    @staticmethod
+    def _net_unix_text(rows):
+        lines = ["Num       RefCount Protocol Flags    Type St Inode Path"]
+        for path, inode in rows:
+            lines.append("0000000000000000: 00000002 00000000 00010000 0001 01 %d %s" % (inode, path))
+        return "\n".join(lines) + "\n"
+
+    def test_unix_socket_inode_reads_kernel_inode_not_stat_inode(self):
+        stat_inode = 6923596109
+        kernel_inode = 4027028528
 
         class StatStub:
-            def __init__(self, inode):
-                self.st_mode = 0o140000  # S_IFSOCK
-                self.st_ino = inode
+            st_mode = 0o140000  # S_IFSOCK
+            st_ino = stat_inode
 
-        def stat_for(path):
-            return StatStub(owned_inode if path == "/tmp/x/.s.PGSQL.5432" else other_inode)
+        text = self._net_unix_text([("/tmp/x/.s.PGSQL.5432", kernel_inode)])
+        with mock.patch.object(harness.os, "stat", return_value=StatStub()), mock.patch.object(
+            harness, "open", side_effect=lambda path, *a, **k: io.StringIO(text), create=True
+        ):
+            self.assertEqual(harness.unix_socket_inode(123, "/tmp/x/.s.PGSQL.5432"), kernel_inode)
+            self.assertNotEqual(kernel_inode, stat_inode)
+            # A socket path absent from /proc/<pid>/net/unix resolves to None.
+            self.assertIsNone(harness.unix_socket_inode(123, "/tmp/missing/.s.PGSQL.5432"))
 
-        with mock.patch.object(harness.os, "stat", side_effect=stat_for), mock.patch.object(
+    def test_child_owns_exact_socket_kernel_inode(self):
+        stat_inode = 98765  # deliberately different from the kernel inode
+        kernel_inode = 4027028528
+
+        class StatStub:
+            st_mode = 0o140000  # S_IFSOCK
+            st_ino = stat_inode
+
+        text = self._net_unix_text([("/tmp/x/.s.PGSQL.5432", kernel_inode)])
+        with mock.patch.object(harness.os, "stat", return_value=StatStub()), mock.patch.object(
+            harness, "open", side_effect=lambda path, *a, **k: io.StringIO(text), create=True
+        ), mock.patch.object(
             harness.os, "listdir", return_value=["3", "4"]
         ), mock.patch.object(
             harness.os,
             "readlink",
-            side_effect=lambda p: "socket:[%d]" % owned_inode if p.endswith("/4") else "socket:[1]",
+            side_effect=lambda p: "socket:[%d]" % kernel_inode if p.endswith("/4") else "socket:[1]",
         ):
             self.assertTrue(self.h.child_owns_unix_socket(123, "/tmp/x/.s.PGSQL.5432"))
+            # stat says "socket" but the path is not in /proc/<pid>/net/unix.
             self.assertFalse(self.h.child_owns_unix_socket(123, "/tmp/other/.s.PGSQL.5432"))
 
     def test_source_has_no_uds_dir_shortcut(self):
