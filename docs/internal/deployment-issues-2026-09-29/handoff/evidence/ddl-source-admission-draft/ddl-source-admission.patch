@@ -1,0 +1,303 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -7258,13 +7258,22 @@
+         // here, since the table does not exist yet at this point.
+         Self::validate_create_table_fk_targets(&catalog, name, columns, constraints)?;
+ 
+-        // Log to WAL for replication before creating (schema will be moved)
+-        if let Err(e) = self.storage.log_create_table(name, &schema) {
+-            tracing::warn!("Failed to log CREATE TABLE to WAL: {}", e);
+-        }
+-
+-        catalog.create_table(name, schema)?;
+-
++        // Catalog keeps its phase armed through all SQL-level metadata.
++        // Its own preflight still rejects duplicate names before durable work.
++        catalog.create_table_with_finalize(name, schema, || {
++            self.finalize_create_table_metadata(name, columns, constraints, original_sql)
++        })?;
++        Ok(1)
++    }
++
++    fn finalize_create_table_metadata(
++        &self,
++        name: &str,
++        columns: &[sql::logical_plan::ColumnDef],
++        constraints: &[sql::logical_plan::TableConstraint],
++        original_sql: Option<&str>,
++    ) -> Result<()> {
++        let catalog = self.storage.catalog();
+         // KanttBan #23 (v3.31.1 phase 2): persist the list of
+         // IDENTITY / SERIAL columns to a side-table so
+         // pg_sequences / pg_attrdef / information_schema.columns
+@@ -7366,7 +7375,7 @@
+                         // parent bare (`emp`, not `s.emp`), which the
+                         // catalog cannot look up (see `fk_targets_self`).
+                         let pk_source = if Self::fk_targets_self(name, references_table) {
+-                            name.as_str()
++                            name
+                         } else {
+                             references_table.as_str()
+                         };
+@@ -7381,7 +7390,7 @@
+                                     &existing_fk_names,
+                                 )
+                             }),
+-                            name.clone(),
++                            name.to_string(),
+                             fk_cols.clone(),
+                             references_table.clone(),
+                             references_columns,
+@@ -7410,7 +7419,7 @@
+                     } => {
+                         table_constraints.add_unique(sql::UniqueConstraint::new(
+                             pk_name.clone().unwrap_or_else(|| format!("{}_pkey", name)),
+-                            name.clone(),
++                            name.to_string(),
+                             pk_cols.clone(),
+                             true,
+                         ));
+@@ -7421,7 +7430,7 @@
+                     } => {
+                         table_constraints.add_unique(sql::UniqueConstraint::new(
+                             uq_name.clone().unwrap_or_else(|| format!("{}_unique", name)),
+-                            name.clone(),
++                            name.to_string(),
+                             uq_cols.clone(),
+                             false,
+                         ));
+@@ -7432,7 +7441,7 @@
+                     } => {
+                         table_constraints.add_check(sql::CheckConstraint::new(
+                             ck_name.clone().unwrap_or_else(|| format!("{}_check", name)),
+-                            name.clone(),
++                            name.to_string(),
+                             serde_json::to_string(expression).unwrap_or_default(),
+                         ));
+                     }
+@@ -7493,7 +7502,7 @@
+             if col_def.primary_key {
+                 col_constraints.add_unique(sql::UniqueConstraint::new(
+                     format!("{}_{}_pkey", name, col_def.name),
+-                    name.clone(),
++                    name.to_string(),
+                     vec![col_def.name.clone()],
+                     true, // is_primary_key
+                 ));
+@@ -7534,7 +7543,7 @@
+                 }
+                 col_constraints.add_unique(sql::UniqueConstraint::new(
+                     format!("{}_{}_unique", name, col_def.name),
+-                    name.clone(),
++                    name.to_string(),
+                     vec![col_def.name.clone()],
+                     false, // is_primary_key
+                 ));
+@@ -7558,7 +7567,7 @@
+             catalog.save_table_constraints(name, &col_constraints)?;
+         }
+ 
+-        Ok(1)
++        Ok(())
+     }
+ 
+     fn execute_in_transaction_inner(
+--- a/src/storage/catalog.rs
++++ b/src/storage/catalog.rs
+@@ -776,6 +776,20 @@
+ 
+     /// Create a table with the given schema
+     pub fn create_table(&self, table_name: &str, schema: Schema) -> Result<()> {
++        self.create_table_with_finalize(table_name, schema, || Ok(()))
++    }
++
++    /// Keep the complete CREATE TABLE semantic unit inside one durable phase.
++    /// The callback runs only after this invocation creates the relation. It
++    /// must finish identity, partition, constraint and related metadata before
++    /// returning success; an error disables certification without changing the
++    /// normal SQL error or attempting to invent transactional DDL rollback.
++    pub(crate) fn create_table_with_finalize<F>(&self, table_name: &str, schema: Schema, finalize: F) -> Result<()>
++    where
++        F: FnOnce() -> Result<()>,
++    {
++        let _physical_operation = self.storage.physical_source_operation()?;
++
+         // Check if table already exists
+         if self.table_exists(table_name)? {
+             return Err(Error::query_execution(format!("Table '{}' already exists", table_name)));
+@@ -842,6 +856,10 @@
+             crate::sql::temp_tables::note_temp_table_created(self.storage);
+         }
+ 
++        let durable_phase = self
++            .storage
++            .physical_durable_phase("CREATE TABLE did not complete schema, indexes and SQL metadata")?;
++
+         // Log CreateTable to WAL first (for replication to standbys)
+         // This must happen before the actual table creation so standbys
+         // receive and apply the operation in the correct order.
+@@ -959,6 +977,9 @@
+         // existence cache recomputes (covers wire/REPL/HTTP/embedded/restore/
+         // WAL-recovery, which all funnel through this method).
+         self.storage.bump_schema_generation();
++
++        finalize()?;
++        durable_phase.complete();
+ 
+         Ok(())
+     }
+@@ -6065,3 +6086,154 @@
+         );
+     }
+ }
++
++#[cfg(all(test, feature = "ha-tier1", target_os = "linux"))]
++mod physical_create_table_completion_tests {
++    use super::*;
++    use crate::replication::{
++        history::load_or_create_primary_history,
++        physical_source_coordinator::{CoordinatorError, PhysicalSourceCoordinator},
++    };
++    use crate::{Column, EmbeddedDatabase};
++    use std::{sync::Arc, time::Duration};
++
++    fn fixture() -> (
++        tempfile::TempDir,
++        EmbeddedDatabase,
++        Arc<PhysicalSourceCoordinator>,
++        uuid::Uuid,
++    ) {
++        let root = tempfile::tempdir().unwrap();
++        let path = root.path().join("source");
++        let mut config = crate::Config::default();
++        config.storage.path = Some(path.clone());
++        config.replication.physical.enabled = true;
++        let db = EmbeddedDatabase::with_config(config).unwrap();
++        let history = load_or_create_primary_history(&path).unwrap();
++        let coordinator = db.storage.physical_source_coordinator().unwrap();
++        (root, db, coordinator, history)
++    }
++
++    fn schema() -> Schema {
++        Schema::new(vec![Column::new("id", DataType::Int4)])
++    }
++
++    #[test]
++    fn catalog_late_finalizer_failure_poison_is_sticky_but_ordinary_ddl_still_works() {
++        let (_root, db, coordinator, history) = fixture();
++        let catalog = db.storage.catalog();
++        let before = db.storage.db().latest_sequence_number();
++        let result = catalog.create_table_with_finalize("partial", schema(), || {
++            let mut constraints = crate::sql::TableConstraints::new();
++            constraints.add_unique(crate::sql::UniqueConstraint::new(
++                "partial_unique".into(),
++                "partial".into(),
++                vec!["id".into()],
++                false,
++            ));
++            catalog.save_table_constraints("partial", &constraints)?;
++            Err(Error::storage("owned fixture: final metadata step failed"))
++        });
++        assert!(result.unwrap_err().to_string().contains("final metadata step failed"));
++        assert!(db.storage.db().latest_sequence_number() > before);
++        assert!(db
++            .storage
++            .get(&Catalog::table_metadata_key("partial"))
++            .unwrap()
++            .is_some());
++        assert!(db
++            .storage
++            .get(&Catalog::table_constraints_key("partial"))
++            .unwrap()
++            .is_some());
++        assert!(matches!(
++            coordinator.capture_barrier(history, Duration::from_secs(1)),
++            Err(CoordinatorError::Poisoned(_))
++        ));
++        catalog.create_table("ordinary_still_works", schema()).unwrap();
++        assert!(catalog.table_exists("ordinary_still_works").unwrap());
++        assert!(matches!(
++            coordinator.capture_barrier(history, Duration::from_secs(1)),
++            Err(CoordinatorError::Poisoned(_))
++        ));
++    }
++
++    #[test]
++    fn duplicate_table_never_runs_finalizer_or_poison_certification() {
++        let (_root, db, coordinator, history) = fixture();
++        let catalog = db.storage.catalog();
++        catalog.create_table("existing", schema()).unwrap();
++        let before = db.storage.db().latest_sequence_number();
++        let called = std::cell::Cell::new(false);
++        assert!(catalog
++            .create_table_with_finalize("existing", schema(), || {
++                called.set(true);
++                Ok(())
++            })
++            .is_err());
++        assert!(!called.get());
++        assert_eq!(db.storage.db().latest_sequence_number(), before);
++        assert_eq!(
++            coordinator
++                .capture_barrier(history, Duration::from_secs(1))
++                .unwrap()
++                .source_sequence(),
++            before
++        );
++    }
++
++    #[test]
++    fn sql_partition_metadata_failure_after_schema_creation_refuses_certification() {
++        let (_root, db, coordinator, history) = fixture();
++        db.execute("CREATE TABLE phase_parent (id INT NOT NULL) PARTITION BY RANGE (id)")
++            .unwrap();
++        // Force the real SQL finalizer to fail while decoding the parent's
++        // child registry, after Catalog has persisted the child's schema.
++        db.storage
++            .put(&Catalog::partition_children_key("phase_parent"), b"\xff")
++            .unwrap();
++        let before = db.storage.db().latest_sequence_number();
++        coordinator.capture_barrier(history, Duration::from_secs(1)).unwrap();
++        let error = db
++            .execute("CREATE TABLE phase_child PARTITION OF phase_parent FOR VALUES FROM (0) TO (100)")
++            .unwrap_err();
++        assert!(error.to_string().contains("partition-child deserialize"), "{error}");
++        assert!(db.storage.db().latest_sequence_number() > before);
++        assert!(db
++            .storage
++            .get(&Catalog::table_metadata_key("phase_child"))
++            .unwrap()
++            .is_some());
++        assert!(matches!(
++            coordinator.capture_barrier(history, Duration::from_secs(1)),
++            Err(CoordinatorError::Poisoned(_))
++        ));
++    }
++
++    #[test]
++    fn sql_success_constraints_and_prewrite_refusals_preserve_certification() {
++        let (_root, db, coordinator, history) = fixture();
++        db.execute("CREATE TABLE complete_phase (id INT PRIMARY KEY, code INT UNIQUE)")
++            .unwrap();
++        let constraints = db.storage.catalog().load_table_constraints("complete_phase").unwrap();
++        assert!(constraints
++            .unique_constraints
++            .iter()
++            .any(|constraint| constraint.is_primary_key && constraint.columns == vec!["id".to_string()]));
++        assert!(constraints
++            .unique_constraints
++            .iter()
++            .any(|constraint| !constraint.is_primary_key && constraint.columns == vec!["code".to_string()]));
++        coordinator.capture_barrier(history, Duration::from_secs(1)).unwrap();
++        let before = db.storage.db().latest_sequence_number();
++        assert!(db.execute("CREATE TABLE complete_phase (other INT)").is_err());
++        db.execute("CREATE TABLE IF NOT EXISTS complete_phase (other INT)")
++            .unwrap();
++        assert!(db
++            .execute("CREATE TABLE missing_fk_phase (id INT REFERENCES no_such_parent(id))")
++            .is_err());
++        assert!(!db.storage.catalog().table_exists("missing_fk_phase").unwrap());
++        assert_eq!(db.storage.db().latest_sequence_number(), before);
++        coordinator.capture_barrier(history, Duration::from_secs(1)).unwrap();
++    }
++}

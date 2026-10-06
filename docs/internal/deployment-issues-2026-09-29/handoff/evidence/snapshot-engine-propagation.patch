@@ -1,0 +1,11 @@
+--- a/src/storage/engine.rs
++++ b/src/storage/engine.rs
+@@ -2448,6 +2448,8 @@
+         let snapshot_manager = {
+             let mut sm = SnapshotManager::new(Arc::clone(&db));
+             sm.set_key_manager(key_manager.clone());
++            #[cfg(feature = "ha-tier1")]
++            sm.set_physical_source_coordinator(physical_source_coordinator.clone());
+             Arc::new(sm)
+         };
+ 

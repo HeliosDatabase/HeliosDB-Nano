@@ -1140,6 +1140,16 @@ struct CachedRows {
     login: Option<std::sync::Arc<str>>,
     /// The rows themselves, shared with every reader that hits this entry.
     rows: std::sync::Arc<Vec<Tuple>>,
+    /// The visibility state captured before the query read any rows. An older
+    /// in-flight query may publish after replay invalidates the caches; its
+    /// entry must remain a miss even after another reader reconciles the cache.
+    epoch: ResultCacheEpoch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResultCacheEpoch {
+    local: u64,
+    storage: u64,
 }
 
 pub struct EmbeddedDatabase {
@@ -1302,7 +1312,7 @@ pub struct EmbeddedDatabase {
     /// performs — so comparing it before serving cached rows closes the hole for ANY
     /// out-of-handle catalog change, not just MV refresh.
     seen_schema_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    /// Last result-cache entry served: `(principal, SQL text, rows)`, carrying
+    /// Last result-cache entry served: `(SQL text, cached rows)`, carrying
     /// its principal exactly like `result_cache` (HDB-009). Hot repeated
     /// SELECTs avoid touching the sharded LRU on every call; cleared by the same
     /// invalidation gate. Probing it is allocation-free — the SQL is compared by
@@ -1314,10 +1324,9 @@ pub struct EmbeddedDatabase {
     /// only — an entry belonging to another principal is a miss and the query
     /// is recomputed, never answered wrongly — and it is the price of the
     /// alternative being an owned cache key built on every probe. A
-    /// single-principal workload (which is every measured benchmark, and most
-    /// deployments) is byte-identical to before.
-    hot_result_cache_entry:
-        std::sync::Arc<parking_lot::RwLock<Option<(Option<std::sync::Arc<str>>, String, std::sync::Arc<Vec<Tuple>>)>>>,
+    /// single-principal workload keeps the same cache admission behavior;
+    /// each hit also checks the entry's local and storage generations.
+    hot_result_cache_entry: std::sync::Arc<parking_lot::RwLock<Option<(String, std::sync::Arc<CachedRows>)>>>,
     /// Fingerprint of the most recent literal fast PK lookup. Used to avoid
     /// filling the result cache with one-off point lookups while still caching
     /// repeated hot-key queries after the second consecutive hit.
@@ -1441,6 +1450,23 @@ pub struct EmbeddedDatabase {
     /// Declared LAST so it drops last: the captured clone holds the final
     /// `Arc<StorageEngine>`, and dropping it here is what lets the engine close.
     udf_bridge: std::sync::OnceLock<std::sync::Arc<sql::udf_bridge::UdfBridge>>,
+}
+
+/// A sealed physical checkpoint whose durable metadata and serving runtime
+/// have passed strict hydration. This is not an online publication token:
+/// source-history binding, activation and admission fencing are separate.
+pub struct PhysicalSnapshotHydration {
+    pub database: EmbeddedDatabase,
+    pub report: PhysicalSnapshotHydrationReport,
+}
+
+/// Counts are diagnostics, not a substitute for the strict loader contract.
+#[derive(Debug, Clone)]
+pub struct PhysicalSnapshotHydrationReport {
+    pub indexes: storage::index_snapshot::IndexOpenReport,
+    pub functions: usize,
+    pub procedures: usize,
+    pub triggers: usize,
 }
 
 impl Drop for EmbeddedDatabase {
@@ -3775,7 +3801,7 @@ impl EmbeddedDatabase {
         })
     }
 
-    fn maybe_cache_repeated_fast_select(&self, sql: &str, results: &[Tuple], cache_epoch: u64) {
+    fn maybe_cache_repeated_fast_select(&self, sql: &str, results: &[Tuple], cache_epoch: ResultCacheEpoch) {
         let fingerprint = Self::fast_select_fingerprint(sql);
         let previous = self
             .last_fast_select_fingerprint
@@ -3791,8 +3817,11 @@ impl EmbeddedDatabase {
     /// BEFORE it reads any data; passed back to `cache_query_result`, which
     /// refuses to publish if anything invalidated the cache in between.
     #[inline]
-    fn result_cache_epoch(&self) -> u64 {
-        self.result_cache_epoch.load(std::sync::atomic::Ordering::Acquire)
+    fn result_cache_epoch(&self) -> ResultCacheEpoch {
+        ResultCacheEpoch {
+            local: self.result_cache_epoch.load(std::sync::atomic::Ordering::Acquire),
+            storage: self.storage.schema_generation(),
+        }
     }
 
     /// R1.1 (ROADMAP_V5 §1.1 Residual, "the result cache is not tenant-keyed"):
@@ -3818,7 +3847,7 @@ impl EmbeddedDatabase {
     /// context-active reader can reach it. Entries cached *before* a context
     /// was ever set (the poisoned-pre-existing-entry case) need no migration or
     /// epoch bump for the same reason: the read gate makes them inert.
-    fn cache_query_result(&self, sql: &str, results: &[Tuple], cache_epoch: u64) {
+    fn cache_query_result(&self, sql: &str, results: &[Tuple], cache_epoch: ResultCacheEpoch) {
         if self.has_effective_tenant_context() {
             return;
         }
@@ -3830,16 +3859,13 @@ impl EmbeddedDatabase {
         if self.result_cache_epoch() != cache_epoch {
             return;
         }
-        let login = session_login_user_tls();
-        let cached = std::sync::Arc::new(results.to_vec());
-        self.result_cache.put(
-            sql.to_string(),
-            std::sync::Arc::new(CachedRows {
-                login: login.clone(),
-                rows: std::sync::Arc::clone(&cached),
-            }),
-        );
-        *self.hot_result_cache_entry.write() = Some((login, sql.to_string(), cached));
+        let cached = std::sync::Arc::new(CachedRows {
+            login: session_login_user_tls(),
+            rows: std::sync::Arc::new(results.to_vec()),
+            epoch: cache_epoch,
+        });
+        self.result_cache.put(sql.to_string(), std::sync::Arc::clone(&cached));
+        *self.hot_result_cache_entry.write() = Some((sql.to_string(), cached));
         self.result_cache_nonempty
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -3861,12 +3887,11 @@ impl EmbeddedDatabase {
         // removed, so two principals alternating on the same SQL each keep
         // re-publishing rather than serving each other's rows.
         let entry = self.result_cache.get(sql)?;
-        if !session_login_user_is(entry.login.as_deref()) {
+        if entry.epoch != self.result_cache_epoch() || !session_login_user_is(entry.login.as_deref()) {
             return None;
         }
         let rows = std::sync::Arc::clone(&entry.rows);
-        *self.hot_result_cache_entry.write() =
-            Some((entry.login.clone(), sql.to_string(), std::sync::Arc::clone(&rows)));
+        *self.hot_result_cache_entry.write() = Some((sql.to_string(), entry));
         Some(rows)
     }
 
@@ -3885,8 +3910,11 @@ impl EmbeddedDatabase {
         self.hot_result_cache_entry
             .read()
             .as_ref()
-            .and_then(|(login, hot_sql, rows)| {
-                (hot_sql == sql && session_login_user_is(login.as_deref())).then(|| std::sync::Arc::clone(rows))
+            .and_then(|(hot_sql, entry)| {
+                (hot_sql == sql
+                    && entry.epoch == self.result_cache_epoch()
+                    && session_login_user_is(entry.login.as_deref()))
+                .then(|| std::sync::Arc::clone(&entry.rows))
             })
     }
 
@@ -3901,11 +3929,12 @@ impl EmbeddedDatabase {
     /// pre-refresh rows indefinitely while `pg_matviews.last_refresh` advanced —
     /// exactly the staleness lie auto-refresh is supposed to eliminate.
     ///
-    /// Cost on the hot path is one `Acquire` load and a compare, paid only when a
-    /// cached read is actually attempted (which already takes an `RwLock` read or an
-    /// LRU lookup). `schema_generation` is bumped only by catalog-existence changes
-    /// (CREATE / ALTER / DROP / RENAME / branch switch / merge-to-main), never by
-    /// per-row DML, so this adds no invalidations to the write path.
+    /// Reconciliation compares the storage and last-seen generations when a
+    /// cached read is attempted. Entry probes additionally compare their local
+    /// and storage epochs. The storage generation also changes after live WAL replay,
+    /// whose writes bypass this handle. Normal local DML uses the existing local
+    /// invalidation epoch. Each cached entry is additionally generation-tagged:
+    /// clearing alone cannot stop an older in-flight reader publishing later.
     #[inline]
     fn reconcile_result_cache_with_storage(&self) {
         let current = self.storage.schema_generation();
@@ -6618,6 +6647,38 @@ impl EmbeddedDatabase {
         Ok(self)
     }
 
+    fn finish_trigger_runtime(self, strict: bool) -> Result<Self> {
+        if strict {
+            self.install_trigger_runtime_strict()
+        } else {
+            self.install_trigger_runtime()
+        }
+    }
+
+    // Only used on a fresh, unpublished physical-snapshot handle. The strict
+    // catalog readers must propagate iterator, key-format and decoding errors.
+    fn install_trigger_runtime_strict(self) -> Result<Self> {
+        let catalog = self.storage.catalog();
+        for trigger in catalog.load_all_triggers_strict()? {
+            let table = trigger.table_name.clone();
+            let name = trigger.name.clone();
+            self.trigger_registry.register_trigger(trigger).map_err(|e| {
+                Error::storage(format!(
+                    "physical snapshot trigger '{table}.{name}' failed to register: {e}"
+                ))
+            })?;
+        }
+        for (table, name, mutation) in catalog.load_all_trigger_row_mutations_strict()? {
+            if self.trigger_registry.get_trigger(&table, &name)?.is_none() {
+                return Err(Error::storage(format!(
+                    "physical snapshot trigger recipe '{table}.{name}' has no definition"
+                )));
+            }
+            self.trigger_registry.register_row_mutation(&table, &name, mutation);
+        }
+        Ok(self)
+    }
+
     /// Plan a PostgreSQL-spelled `CREATE [OR REPLACE] PROCEDURE name(args)
     /// LANGUAGE lang AS $$body$$`, or `Ok(None)` if `sql` is not that form.
     ///
@@ -6676,24 +6737,83 @@ impl EmbeddedDatabase {
     /// not stop the database from opening. The affected routine then reports
     /// `does not exist` when called, which is loud at the point of use.
     fn install_routine_runtime(self) -> Result<Self> {
-        for (name, blob) in self.storage.meta_blobs_with_prefix(Self::FUNCTION_META_PREFIX)? {
+        self.install_routine_runtime_with_policy(false)
+    }
+
+    fn install_routine_runtime_with_policy(self, strict: bool) -> Result<Self> {
+        let records = |prefix: &str| {
+            if strict {
+                self.storage.meta_blobs_with_prefix_strict(prefix)
+            } else {
+                self.storage.meta_blobs_with_prefix(prefix)
+            }
+        };
+        let mut function_names = std::collections::HashSet::new();
+        for (name, blob) in records(Self::FUNCTION_META_PREFIX)? {
+            if strict && !function_names.insert(name.to_lowercase()) {
+                return Err(Error::storage(format!(
+                    "physical snapshot function '{name}' duplicates a normalized routine name"
+                )));
+            }
             match bincode::deserialize::<sql::StoredFunction>(&blob) {
                 Ok(func) => {
+                    if strict && name.to_lowercase() != func.name.to_lowercase() {
+                        return Err(Error::storage(format!(
+                            "physical snapshot function key '{name}' disagrees with definition '{}'",
+                            func.name
+                        )));
+                    }
                     if let Err(e) = self.function_registry.load_function(func) {
+                        if strict {
+                            return Err(Error::storage(format!(
+                                "physical snapshot function '{name}' failed to load: {e}"
+                            )));
+                        }
                         tracing::warn!("failed to load persisted function '{}': {}", name, e);
                     }
                 }
-                Err(e) => tracing::warn!("persisted function '{}' is unreadable and was skipped: {}", name, e),
+                Err(e) => {
+                    if strict {
+                        return Err(Error::storage(format!(
+                            "physical snapshot function '{name}' is unreadable: {e}"
+                        )));
+                    }
+                    tracing::warn!("persisted function '{}' is unreadable and was skipped: {}", name, e);
+                }
             }
         }
-        for (name, blob) in self.storage.meta_blobs_with_prefix(Self::PROCEDURE_META_PREFIX)? {
+        let mut procedure_names = std::collections::HashSet::new();
+        for (name, blob) in records(Self::PROCEDURE_META_PREFIX)? {
+            if strict && !procedure_names.insert(name.to_lowercase()) {
+                return Err(Error::storage(format!(
+                    "physical snapshot procedure '{name}' duplicates a normalized routine name"
+                )));
+            }
             match bincode::deserialize::<sql::StoredProcedure>(&blob) {
                 Ok(proc) => {
+                    if strict && name.to_lowercase() != proc.name.to_lowercase() {
+                        return Err(Error::storage(format!(
+                            "physical snapshot procedure key '{name}' disagrees with definition '{}'",
+                            proc.name
+                        )));
+                    }
                     if let Err(e) = self.function_registry.load_procedure(proc) {
+                        if strict {
+                            return Err(Error::storage(format!(
+                                "physical snapshot procedure '{name}' failed to load: {e}"
+                            )));
+                        }
                         tracing::warn!("failed to load persisted procedure '{}': {}", name, e);
                     }
                 }
-                Err(e) => tracing::warn!("persisted procedure '{}' is unreadable and was skipped: {}", name, e),
+                Err(e) => {
+                    if strict {
+                        return Err(Error::storage(format!(
+                            "physical snapshot procedure '{name}' is unreadable: {e}"
+                        )));
+                    }
+                    tracing::warn!("persisted procedure '{}' is unreadable and was skipped: {}", name, e);
+                }
             }
         }
 
@@ -10319,6 +10439,44 @@ impl EmbeddedDatabase {
     /// ```
     #[allow(clippy::expect_used)] // Safety: cache sizes are non-zero compile-time constants
     pub fn with_config(config: Config) -> Result<Self> {
+        Self::with_config_open_policy(config, false)
+    }
+
+    /// Hydrate an existing sealed physical checkpoint without logical replay,
+    /// orphan cleanup, background writers, or close-time persistence.
+    ///
+    /// The path must be immutable and exclusively owned by the caller for the
+    /// lifetime of the result. This does not bind source history, make the
+    /// handle safe for concurrent physical apply, or publish it to a server.
+    /// It also does not install source process-only tenant/auth configuration.
+    pub fn open_physical_snapshot(config: Config) -> Result<PhysicalSnapshotHydration> {
+        if config.storage.memory_only || config.storage.path.is_none() {
+            return Err(Error::config(
+                "physical snapshot hydration requires an existing persistent storage path".to_string(),
+            ));
+        }
+        let database = Self::with_config_open_policy(config, true)?;
+        let indexes = database
+            .storage
+            .last_index_open_report()
+            .ok_or_else(|| Error::storage("physical snapshot hydration produced no index completeness report"))?;
+        if indexes.vector_degraded != 0 {
+            return Err(Error::storage(format!(
+                "physical snapshot hydration left {} degraded vector indexes",
+                indexes.vector_degraded
+            )));
+        }
+        let report = PhysicalSnapshotHydrationReport {
+            indexes,
+            functions: database.function_registry.list_functions().len(),
+            procedures: database.function_registry.list_procedures().len(),
+            triggers: database.trigger_registry.list_all_triggers()?.len(),
+        };
+        Ok(PhysicalSnapshotHydration { database, report })
+    }
+
+    #[allow(clippy::expect_used)]
+    fn with_config_open_policy(config: Config, physical_snapshot: bool) -> Result<Self> {
         let memory_only = config.storage.memory_only;
         let storage = std::sync::Arc::new(if memory_only {
             storage::StorageEngine::open_in_memory(&config)?
@@ -10328,7 +10486,11 @@ impl EmbeddedDatabase {
                 .path
                 .as_ref()
                 .ok_or_else(|| Error::config("Storage path not specified for non-memory database".to_string()))?;
-            storage::StorageEngine::open(path, &config)?
+            if physical_snapshot {
+                storage::StorageEngine::open_physical_snapshot(path, &config)?
+            } else {
+                storage::StorageEngine::open(path, &config)?
+            }
         });
         let mv_scheduler = std::sync::Arc::new(storage::MVScheduler::new(
             Self::scheduler_config_from(&config),
@@ -10356,7 +10518,10 @@ impl EmbeddedDatabase {
         // PK/UNIQUE/FK indexes. In-memory mode never has prior state.
         if !memory_only {
             let catalog = storage::Catalog::new(&storage);
-            if let Err(e) = catalog.rebuild_all_indexes() {
+            if physical_snapshot {
+                catalog.rebuild_all_indexes_for_physical_snapshot()?;
+                catalog.validate_lazy_physical_catalog()?;
+            } else if let Err(e) = catalog.rebuild_all_indexes() {
                 tracing::warn!("ART rebuild on open failed: {} — falling back to scan paths", e);
             }
         }
@@ -10473,12 +10638,8 @@ impl EmbeddedDatabase {
             cold_optimizer: std::sync::OnceLock::new(),
             udf_bridge: std::sync::OnceLock::new(),
         }
-        .install_routine_runtime()?
-        // Trigger definitions and their BEFORE-row rewrite recipes are restored
-        // from the catalog here. Before this call existed, the LIVE trigger
-        // registry started empty at every open and nothing ever repopulated it,
-        // so triggers did not survive a restart at all.
-        .install_trigger_runtime()
+        .install_routine_runtime_with_policy(physical_snapshot)?
+        .finish_trigger_runtime(physical_snapshot)
     }
 
     /// Execute a SQL statement (POTENTIALLY UNSAFE - use execute_params for user input)
@@ -29279,6 +29440,64 @@ mod tests {
             db.try_cached_query_with_schema(sql).is_none(),
             "an out-of-band schema-generation bump must invalidate cached results"
         );
+    }
+
+    // Model an in-flight publisher which passed its early epoch check before
+    // invalidation, then resumes after the clearing reader has already run.
+    // Retaining the original entry is essential: relabeling old rows with the
+    // current epoch would make a sequential test miss this publication race.
+    fn assert_late_result_cache_publication_is_rejected(storage_invalidation: bool) {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE late_cache (id INT PRIMARY KEY, val INT)")
+            .unwrap();
+        db.execute("INSERT INTO late_cache VALUES (1, 10)").unwrap();
+        let sql = "SELECT id, val FROM late_cache WHERE val IS NOT NULL";
+        db.query_with_columns(sql).unwrap();
+        db.query_with_columns(sql).unwrap();
+        let old = db.result_cache.get(sql).expect("warm shared cache");
+        assert!(db.hot_cached_query_result(sql).is_some());
+
+        if storage_invalidation {
+            db.storage.bump_schema_generation();
+            db.reconcile_result_cache_with_storage();
+        } else {
+            db.execute("UPDATE late_cache SET val = 20 WHERE id = 1").unwrap();
+        }
+        assert_ne!(old.epoch, db.result_cache_epoch());
+        assert_eq!(
+            db.seen_schema_generation.load(std::sync::atomic::Ordering::Acquire),
+            db.storage.schema_generation(),
+            "the clearing reader has already consumed the generation change"
+        );
+
+        // Force late publication into both independently accessible cache paths.
+        db.result_cache.put(sql.to_string(), std::sync::Arc::clone(&old));
+        *db.hot_result_cache_entry.write() = Some((sql.to_string(), old));
+        db.result_cache_nonempty
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(db.hot_cached_query_result(sql).is_none(), "late hot entry must miss");
+        *db.hot_result_cache_entry.write() = None;
+        assert!(db.cached_query_result(sql).is_none(), "late shared entry must miss");
+
+        // Current entries must remain useful, including shared-to-hot promotion.
+        let fresh = db.query(sql, &[]).unwrap();
+        let expected = if storage_invalidation { 10 } else { 20 };
+        assert_eq!(fresh[0].get(1), Some(&Value::Int4(expected)));
+        db.cache_query_result(sql, &fresh, db.result_cache_epoch());
+        *db.hot_result_cache_entry.write() = None;
+        let shared = db.cached_query_result(sql).expect("current shared entry");
+        let hot = db.hot_cached_query_result(sql).expect("current promoted entry");
+        assert!(std::sync::Arc::ptr_eq(&shared, &hot));
+    }
+
+    #[test]
+    fn late_result_cache_publication_after_local_invalidation_is_rejected() {
+        assert_late_result_cache_publication_is_rejected(false);
+    }
+
+    #[test]
+    fn late_result_cache_publication_after_storage_invalidation_is_rejected() {
+        assert_late_result_cache_publication_is_rejected(true);
     }
 
     #[test]

@@ -1,0 +1,574 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -4452,6 +4452,7 @@
+     /// R4.3: run a full MVCC version-GC pass (the library twin of the
+     /// `VACUUM VERSIONS` SQL statement). Returns reclaimed version count.
+     pub fn vacuum_versions(&self) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.storage.vacuum_versions()
+     }
+ 
+@@ -10750,6 +10751,7 @@
+     ///
+     /// Total number of rows affected across all statements.
+     pub fn execute_batch(&self, statements: &[&str]) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let start = std::time::Instant::now();
+ 
+         let txn_start = std::time::Instant::now();
+@@ -10907,6 +10909,7 @@
+ 
+     #[cfg(feature = "code-graph")]
+     pub fn code_index(&self, opts: code_graph::CodeIndexOptions) -> Result<code_graph::CodeIndexStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let stats = code_graph::storage::code_index(self, opts)?;
+         // Incremental projection: when graph-rag is enabled, mirror
+         // new code symbols + refs into the universal `_hdb_graph_*`
+@@ -10998,6 +11001,7 @@
+     /// haven't changed keep the same roll-up hash.
+     #[cfg(feature = "code-graph")]
+     pub fn code_graph_merkle_refresh(&self) -> Result<code_graph::MerkleStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         code_graph::merkle_refresh(self)
+     }
+ 
+@@ -11013,6 +11017,7 @@
+         new_name: &str,
+         opts: &code_graph::RenameApplyOptions,
+     ) -> Result<code_graph::RenameApplyStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         code_graph::rename_apply(self, symbol_id, new_name, opts)
+     }
+ 
+@@ -11238,6 +11243,7 @@
+     /// Idempotent. Creates the graph tables on first call.
+     #[cfg(feature = "graph-rag")]
+     pub fn graph_rag_project_symbols(&self) -> Result<graph_rag::GraphRagStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let mut stats = graph_rag::GraphRagStats::default();
+         graph_rag::project_code_symbols(self, &mut stats)?;
+         Ok(stats)
+@@ -11260,6 +11266,7 @@
+     /// text-bearing `node_kind`s to the match set beyond the default.
+     #[cfg(feature = "graph-rag")]
+     pub fn graph_rag_link_exact(&self, extra_kinds: &[&str]) -> Result<graph_rag::LinkerStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         graph_rag::link_exact_qualified(self, extra_kinds)
+     }
+ 
+@@ -11278,6 +11285,7 @@
+         top_k: usize,
+         threshold: f32,
+     ) -> Result<graph_rag::LinkerStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         graph_rag::link_vector_similar(self, text_queries, symbol_targets, top_k, threshold)
+     }
+ 
+@@ -11285,6 +11293,7 @@
+     /// nodes.  See `graph_rag::IngestDocsOptions`.
+     #[cfg(feature = "graph-rag")]
+     pub fn graph_rag_ingest_docs(&self, opts: &graph_rag::IngestDocsOptions) -> Result<graph_rag::IngestStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         graph_rag::ingest_docs(self, opts)
+     }
+ 
+@@ -11292,39 +11301,46 @@
+     /// See `graph_rag::DoclingIngestOptions`.
+     #[cfg(feature = "graph-rag")]
+     pub fn graph_rag_ingest_pdf(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         graph_rag::docling_ingest_pdf(self, opts)
+     }
+ 
+     #[cfg(feature = "graph-rag")]
+     pub fn graph_rag_ingest_office(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         graph_rag::docling_ingest_office(self, opts)
+     }
+ 
+     #[cfg(feature = "graph-rag")]
+     pub fn graph_rag_ingest_audio(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         graph_rag::docling_ingest_audio(self, opts)
+     }
+ 
+     #[cfg(feature = "graph-rag")]
+     pub fn graph_rag_ingest_image(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         graph_rag::docling_ingest_image(self, opts)
+     }
+ 
+     /// Ingest structured email rows into Email + Person nodes.
+     #[cfg(feature = "graph-rag")]
+     pub fn graph_rag_ingest_email(&self, opts: &graph_rag::IngestEmailOptions) -> Result<graph_rag::IngestStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         graph_rag::ingest_email(self, opts)
+     }
+ 
+     /// Ingest structured issue rows into Issue + Comment + Person nodes.
+     #[cfg(feature = "graph-rag")]
+     pub fn graph_rag_ingest_issues(&self, opts: &graph_rag::IngestIssuesOptions) -> Result<graph_rag::IngestStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         graph_rag::ingest_issues(self, opts)
+     }
+ 
+     /// Ingest structured Q&A rows into InvestorQuestion + Answer + Person.
+     #[cfg(feature = "graph-rag")]
+     pub fn graph_rag_ingest_qa(&self, opts: &graph_rag::IngestQaOptions) -> Result<graph_rag::IngestStats> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         graph_rag::ingest_qa(self, opts)
+     }
+ 
+@@ -11339,6 +11355,7 @@
+     }
+ 
+     pub fn execute(&self, sql: &str) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+         // tenant's `max_qps`. Every family's entry point charges — there is no
+         // funnel all of them pass through — and the returned guard makes every
+@@ -11510,6 +11527,7 @@
+     /// # }
+     /// ```
+     pub fn execute_returning(&self, sql: &str) -> Result<(u64, Vec<Tuple>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.execute_params_returning(sql, &[])
+     }
+ 
+@@ -11878,6 +11896,7 @@
+         columns: &[String],
+         rows: &[Vec<Option<String>>],
+     ) -> Option<Result<u64>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let _identity_override = match self.session_statement_context_guard(session_id) {
+             Ok(guard) => guard,
+             Err(e) => return Some(Err(e)),
+@@ -11895,6 +11914,7 @@
+         columns: &[String],
+         rows: &[Vec<Option<String>>],
+     ) -> Option<Result<u64>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         if rows.is_empty() {
+             return Some(Ok(0));
+         }
+@@ -17874,6 +17894,7 @@
+     /// This method prevents SQL injection by treating parameters as data, not code.
+     /// Even malicious input like `"'; DROP TABLE users; --"` is safely handled.
+     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.execute_params_inner(sql, params, None)
+     }
+ 
+@@ -17993,6 +18014,7 @@
+     /// transaction when one exists. Other statements fall back to the exact
+     /// per-row `execute_params` behavior.
+     pub fn execute_many_params(&self, sql: &str, rows: &[Vec<Value>]) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // HDB-008: the batch fast path (`try_fast_insert_many_params`) stages
+         // straight into the GLOBAL `current_transaction` slot, so this is a
+         // full in-transaction execution site and needs the failed-transaction
+@@ -18078,6 +18100,7 @@
+     /// # }
+     /// ```
+     pub fn execute_params_returning(&self, sql: &str, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // HDB-008: the params-family `RETURNING` entry point, inside the
+         // failed-transaction boundary (see `execute_params_inner`).
+         self.run_global_statement(sql, || self.execute_params_returning_inner(sql, params))
+@@ -20171,6 +20194,7 @@
+     /// # }
+     /// ```
+     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+         // tenant's `max_qps`. Every family's entry point charges — there is no
+         // funnel all of them pass through — and the returned guard makes every
+@@ -20845,6 +20869,7 @@
+     /// `sql::normalize::differential` compares against instead.
+     #[cfg(test)]
+     pub(crate) fn query_raw_unnormalized(&self, sql: &str) -> Result<Vec<Tuple>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let (statement, _) = self.parse_cached(sql)?;
+         let catalog = self.storage.catalog();
+         let planner = sql::Planner::with_catalog(&catalog)
+@@ -20859,6 +20884,7 @@
+     }
+ 
+     pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let (rows, schema) = self.query_with_schema(sql)?;
+         Ok((rows, Self::column_names(&schema)))
+     }
+@@ -20869,6 +20895,7 @@
+     /// (GH#23). Every internal fast path answers with a real schema: the
+     /// cached and the uncached branch describe a result identically.
+     pub(crate) fn query_with_schema(&self, sql: &str) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+         // tenant's `max_qps`. Every family's entry point charges — there is no
+         // funnel all of them pass through — and the returned guard makes every
+@@ -21147,6 +21174,7 @@
+     /// yielded). Statements before it have already taken effect — this is not
+     /// a transaction.
+     pub fn execute_sql_script(&self, sql: &str) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let statements = crate::protocol::postgres::handler::pg_split_sql_respecting_quotes(sql);
+         let mut executed = 0u64;
+         for (index, statement) in statements.iter().enumerate() {
+@@ -21232,6 +21260,7 @@
+     ///
+     /// * `path` - Path to the dump file to restore from
+     pub fn restore_from_dump(&mut self, path: &std::path::Path) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let dump_manager = self.dump_manager.clone();
+         dump_manager.restore_from_dump(path, self)
+     }
+@@ -21288,6 +21317,7 @@
+     /// * `path` - Path to the dump file
+     /// * `_tables` - List of table names to restore
+     pub fn restore_tables(&mut self, path: &std::path::Path, _tables: Vec<&str>) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // Stub for test
+         self.restore_from_dump(path)
+     }
+@@ -21386,6 +21416,7 @@
+     ///
+     /// * `session_id` - ID of the session to destroy
+     pub fn destroy_session(&self, session_id: crate::session::SessionId) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // A dropped connection must not leak its open transaction (write-set
+         // buffers, row locks) or its eager ART index mutations. Taking the
+         // slot's write lock waits out any statement still borrowing the
+@@ -21539,6 +21570,7 @@
+     /// `"warn"` policy the transaction runs and a `WARNING` notice is queued for
+     /// the wire instead).
+     pub fn begin_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let session_lock = self.session_manager.get_session(session_id)?;
+         let mut session = session_lock.write();
+ 
+@@ -21673,6 +21705,7 @@
+     }
+ 
+     pub fn commit_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let result = self.commit_transaction_for_session_inner(session_id);
+         // sprinter f4f5d450e816: a `SET LOCAL application_name` reverts at the
+         // END of the transaction block — on COMMIT and ROLLBACK alike, and
+@@ -21824,6 +21857,7 @@
+     ///
+     /// Returns an error if the session has no active transaction.
+     pub fn rollback_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let result = self.rollback_transaction_for_session_inner(session_id);
+         // sprinter f4f5d450e816: see `commit_transaction_for_session`.
+         self.end_session_transaction_scoped_state(session_id);
+@@ -21898,6 +21932,7 @@
+     ///
+     /// Number of rows affected by the statement
+     pub fn execute_in_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+         // tenant's `max_qps`. Every family's entry point charges — there is no
+         // funnel all of them pass through — and the returned guard makes every
+@@ -22059,6 +22094,7 @@
+         sql: &str,
+         _params: &[&dyn std::fmt::Display],
+     ) -> Result<Vec<Tuple>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+         // tenant's `max_qps`. Every family's entry point charges — there is no
+         // funnel all of them pass through — and the returned guard makes every
+@@ -22960,6 +22996,7 @@
+         session_id: crate::session::SessionId,
+         sql: &str,
+     ) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         use crate::protocol::postgres::handler::{classify_transaction_control, TxnControl};
+ 
+         match classify_transaction_control(sql) {
+@@ -23034,6 +23071,7 @@
+ 
+     /// Execute a statement on behalf of a wire-protocol session.
+     pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+         // tenant's `max_qps`. Every family's entry point charges — there is no
+         // funnel all of them pass through — and the returned guard makes every
+@@ -23145,6 +23183,7 @@
+         session_id: crate::session::SessionId,
+         sql: &str,
+     ) -> Result<(Vec<Tuple>, Vec<String>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let (rows, schema) = self.query_with_schema_for_session(session_id, sql)?;
+         Ok((rows, Self::column_names(&schema)))
+     }
+@@ -23156,6 +23195,7 @@
+         session_id: crate::session::SessionId,
+         sql: &str,
+     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+         // tenant's `max_qps`. Every family's entry point charges — there is no
+         // funnel all of them pass through — and the returned guard makes every
+@@ -23243,6 +23283,7 @@
+         session_id: crate::session::SessionId,
+         sql: &str,
+     ) -> Result<(u64, Vec<Tuple>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+         // tenant's `max_qps`. Every family's entry point charges — there is no
+         // funnel all of them pass through — and the returned guard makes every
+@@ -23363,6 +23404,7 @@
+         sql: &str,
+         params: &[Value],
+     ) -> Result<(u64, Vec<Tuple>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+         // tenant's `max_qps`. Every family's entry point charges — there is no
+         // funnel all of them pass through — and the returned guard makes every
+@@ -23458,6 +23500,7 @@
+         sql: &str,
+         params: &[Value],
+     ) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.execute_params_for_session_inner(session_id, sql, params, None)
+     }
+ 
+@@ -23470,6 +23513,7 @@
+         params: &[Value],
+         plan: &std::sync::Arc<sql::LogicalPlan>,
+     ) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.execute_params_for_session_inner(session_id, sql, params, Some(plan))
+     }
+ 
+@@ -23569,6 +23613,7 @@
+         sql: &str,
+         params: &[Value],
+     ) -> Result<Vec<Tuple>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.query_params_for_session_inner(session_id, sql, params, None)
+     }
+ 
+@@ -23581,6 +23626,7 @@
+         params: &[Value],
+         plan: &std::sync::Arc<sql::LogicalPlan>,
+     ) -> Result<Vec<Tuple>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.query_params_for_session_inner(session_id, sql, params, Some(plan))
+     }
+ 
+@@ -23677,6 +23723,7 @@
+         sql: &str,
+         params: &[Value],
+     ) -> Result<(Vec<Tuple>, Vec<String>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let (rows, schema) = self.query_params_with_schema_for_session(session_id, sql, params)?;
+         Ok((rows, Self::column_names(&schema)))
+     }
+@@ -23689,6 +23736,7 @@
+         sql: &str,
+         params: &[Value],
+     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+         // tenant's `max_qps`. Every family's entry point charges — there is no
+         // funnel all of them pass through — and the returned guard makes every
+@@ -23897,6 +23945,7 @@
+     /// This method prevents SQL injection by treating parameters as data, not code.
+     /// Even malicious input is safely handled as a literal value.
+     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Vec<Tuple>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.query_params_inner(sql, params, None)
+     }
+ 
+@@ -24160,6 +24209,7 @@
+     /// `query_with_columns`. Row-level security policies are applied, as in
+     /// `query_params`.
+     pub fn query_params_with_columns(&self, sql: &str, params: &[Value]) -> Result<(Vec<Tuple>, Vec<String>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let (rows, schema) = self.query_params_with_schema(sql, params)?;
+         Ok((rows, Self::column_names(&schema)))
+     }
+@@ -24172,6 +24222,7 @@
+         sql: &str,
+         params: &[Value],
+     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         // HDB-008: column-aware params read, inside the failed-transaction
+         // boundary (see `execute_params_inner`). Its tail attaches the global
+         // `current_transaction` to the executor, so it really does run inside
+@@ -24347,6 +24398,7 @@
+     ///
+     /// Returns an error if a transaction is already active.
+     pub fn begin(&self) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.begin_transaction_internal()
+     }
+ 
+@@ -24384,6 +24436,7 @@
+     ///
+     /// Returns an error if no transaction is active.
+     pub fn commit(&self) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.commit_internal()
+     }
+ 
+@@ -24411,6 +24464,7 @@
+     ///
+     /// Returns an error if no transaction is active.
+     pub fn rollback(&self) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.rollback_internal()
+     }
+ 
+@@ -24479,6 +24533,7 @@
+     /// Returns the allocated `row_id`s in input order.
+     #[allow(dead_code)]
+     pub(crate) fn bulk_insert_tuples(&self, table_name: &str, tuples: Vec<Tuple>) -> Result<Vec<u64>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let catalog = self.storage.catalog();
+         let schema = catalog.get_table_schema(table_name)?;
+ 
+@@ -24643,6 +24698,7 @@
+     /// ```
+     #[deprecated(since = "2.1.0", note = "Use `begin()`, `commit()`, and `rollback()` instead")]
+     pub fn begin_transaction(&self) -> Result<Transaction<'_>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let tx = self.storage.begin_transaction()?;
+         // sprinter 8a9b60eeef87: claim this transaction's own ART undo slot
+         // BEFORE any statement can run on the handle, so `push_art_undo` routes
+@@ -24750,6 +24806,7 @@
+ 
+     /// Create a new vector store
+     pub fn create_vector_store(&self, name: &str, dimensions: u32) -> Result<VectorStoreInfo> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.create_vector_store_with_options(name, dimensions, "cosine", "hnsw")
+     }
+ 
+@@ -24760,6 +24817,7 @@
+         metric: &str,
+         index_type: &str,
+     ) -> Result<VectorStoreInfo> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let vector_mgr = self.storage.vector_indexes();
+         let distance_metric = parse_vector_metric(metric)?;
+         let normalized_index_type = index_type.to_ascii_lowercase();
+@@ -24855,6 +24913,7 @@
+ 
+     /// Delete a vector store
+     pub fn delete_vector_store(&self, name: &str) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let vector_mgr = self.storage.vector_indexes();
+         vector_mgr.drop_index(name)
+     }
+@@ -24863,6 +24922,7 @@
+     ///
+     /// Returns a list of generated vector IDs
+     pub fn insert_vectors(&self, store: &str, vectors: Vec<Vec<f32>>) -> Result<Vec<String>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.insert_vectors_with_options(store, None, vectors, None, None)
+     }
+ 
+@@ -24874,6 +24934,7 @@
+         metadata: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
+         namespace: Option<String>,
+     ) -> Result<Vec<String>> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let vector_mgr = self.storage.vector_indexes();
+ 
+         // Verify store exists
+@@ -24913,6 +24974,7 @@
+ 
+     /// Upsert vectors (insert or update)
+     pub fn upsert_vectors(&self, store: &str, vectors: Vec<(String, Vec<f32>)>) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let ids: Vec<String> = vectors.iter().map(|(id, _)| id.clone()).collect();
+         let values: Vec<Vec<f32>> = vectors.into_iter().map(|(_, vector)| vector).collect();
+         let _ = self.delete_vectors(store, ids.clone());
+@@ -24928,6 +24990,7 @@
+         metadata: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
+         namespace: Option<String>,
+     ) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let _ = self.delete_vectors(store, ids.clone());
+         self.insert_vectors_with_options(store, Some(ids), vectors, metadata, namespace)?;
+         Ok(())
+@@ -25007,11 +25070,13 @@
+ 
+     /// Delete vectors by ID
+     pub fn delete_vectors(&self, store: &str, ids: Vec<String>) -> Result<()> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.delete_vectors_in_namespace(store, ids, None).map(|_| ())
+     }
+ 
+     /// Delete vectors by ID, optionally scoped to namespace. Returns actual deleted count.
+     pub fn delete_vectors_in_namespace(&self, store: &str, ids: Vec<String>, namespace: Option<&str>) -> Result<usize> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let vector_mgr = self.storage.vector_indexes();
+ 
+         // Verify store exists
+@@ -25298,6 +25363,7 @@
+ 
+     /// Create an isolated database branch (copy-on-write).
+     pub fn create_branch(&self, name: &str) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.execute(&format!("CREATE BRANCH {name}"))
+     }
+ 
+@@ -25315,12 +25381,14 @@
+     /// could never succeed. Callers that want an explicit target should switch
+     /// branches first, which is what that tool does.
+     pub fn merge_branch(&self, source: &str) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         let target = self.storage.get_current_branch().unwrap_or_else(|| "main".to_string());
+         self.execute(&format!("MERGE BRANCH {source} INTO {target}"))
+     }
+ 
+     /// Drop a branch.
+     pub fn drop_branch(&self, name: &str) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.execute(&format!("DROP BRANCH {name}"))
+     }
+ 
+@@ -25347,6 +25415,7 @@
+ 
+     /// Refresh a materialized view.
+     pub fn refresh_materialized_view(&self, name: &str) -> Result<u64> {
++        let _physical_operation = self.storage.physical_source_operation()?;
+         self.execute(&format!("REFRESH MATERIALIZED VIEW {name}"))
+     }
+ 
+@@ -28105,6 +28174,7 @@
+     /// failure are refused with SQLSTATE 25P02 until the handle is committed
+     /// or rolled back.
+     pub fn commit(self) -> Result<()> {
++        let _physical_operation = self.db.storage.physical_source_operation()?;
+         // HDB-008: a statement inside this transaction failed, so there is
+         // nothing to commit — roll back and say so. Same contract as
+         // `EmbeddedDatabase::commit`; see `Transaction::mark_sql_aborted`.
+@@ -28182,6 +28252,7 @@
+     /// `art_undo_log.write().clear()` on commit would discard the handle's
+     /// pending entries before it ever reached this point.
+     pub fn rollback(self) -> Result<()> {
++        let _physical_operation = self.db.storage.physical_source_operation()?;
+         // ORDER: replay BEFORE `tx` is consumed. Dropping the transaction also
+         // clears its slot in the storage-level uncommitted-write census, and
+         // that census is what keeps concurrent readers off the index while its
+@@ -28224,6 +28295,7 @@
+     /// # }
+     /// ```
+     pub fn execute(&self, sql: &str) -> Result<u64> {
++        let _physical_operation = self.db.storage.physical_source_operation()?;
+         // Execute within transaction context, skipping fast paths.
+         // Fast paths write directly to storage (bypassing the transaction write set),
+         // which would make rollback impossible and break isolation guarantees.
+@@ -28273,6 +28345,7 @@
+     /// # }
+     /// ```
+     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
++        let _physical_operation = self.db.storage.physical_source_operation()?;
+         // HDB-008: parse, plan and execution all sit inside the
+         // failed-transaction boundary, so a planning error aborts this
+         // transaction exactly as an executor error does — and a query issued

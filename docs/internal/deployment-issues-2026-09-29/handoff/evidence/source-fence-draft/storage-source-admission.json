@@ -1,0 +1,6 @@
+{
+  "base": "/home/gpc/HDB/worktrees/nano-resync-20260929/src/storage/engine.rs",
+  "base_sha256": "00d9b971834229bb1e68097bcfd7a353183e7e432c62a2efcabbc108e02bf5b8",
+  "draft_sha256": "76f058c920b31976411c00290996dcaf10127a3612e730be5fd402be07fe1b3b",
+  "scope": "field, constructor ownership, operation/getter APIs, transaction and VersionGc propagation only; other background/direct mutator coverage incomplete"
+}

@@ -46,8 +46,15 @@ use uuid::Uuid;
 /// Protocol magic number: "HELI" in ASCII
 pub const PROTOCOL_MAGIC: u32 = 0x48454C49;
 
-/// Current protocol version
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Current native protocol version.
+///
+/// v3 = the v1 baseline plus the history-guard identity fields
+/// (`expected_history`) and the native-auth `auth` field. bincode encodes
+/// struct fields by position with no tags, so adding a field is NOT
+/// binary-backward-compatible with an older peer: a v1 or v2 payload lacks the
+/// field and will not decode. Both peers must present this exact version; any
+/// mismatch is refused explicitly rather than guessed.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Header size in bytes
 pub const HEADER_SIZE: usize = 24;
@@ -221,13 +228,25 @@ impl MessageHeader {
 
         let magic = buf.get_u32();
         if magic != PROTOCOL_MAGIC {
+            let hint = if magic >> 24 == u32::from(b'E') {
+                " Peer response resembles a PostgreSQL ErrorResponse; check that --primary-host \
+                 points to the primary's native --replication-port, not its PostgreSQL --port."
+            } else {
+                " Check that the peer endpoint serves the native HELI replication protocol."
+            };
             return Err(ReplicationError::Transport(format!(
-                "Invalid magic: expected {:08X}, got {:08X}",
-                PROTOCOL_MAGIC, magic
+                "Invalid magic: expected {:08X}, got {:08X}.{}",
+                PROTOCOL_MAGIC, magic, hint
             )));
         }
 
         let version = buf.get_u16();
+        if version != PROTOCOL_VERSION {
+            return Err(ReplicationError::ProtocolVersion {
+                expected: PROTOCOL_VERSION,
+                actual: version,
+            });
+        }
         let msg_type = MessageType::from(buf.get_u16());
         let length = buf.get_u32();
         let flags = MessageFlags::new(buf.get_u32());
@@ -334,8 +353,10 @@ impl Message {
 // =============================================================================
 
 /// Handshake request payload
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct HandshakeRequest {
+    /// Receiver's durable dataset identity, or None for a provably fresh receiver.
+    pub expected_history: Option<Uuid>,
     /// Node ID
     pub node_id: Uuid,
     /// Node role (Primary, Standby, Observer)
@@ -348,11 +369,34 @@ pub struct HandshakeRequest {
     pub slot_name: Option<String>,
     /// Client capabilities
     pub capabilities: Capabilities,
+    /// Optional native logical replication credential: the 32 raw token bytes
+    /// shared with the physical channel. Required (and validated before
+    /// registration/WAL) when the primary has a token file configured. The
+    /// primary checks it with `TransferToken::accepts` (constant-time).
+    pub auth: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for HandshakeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `auth` is a bearer secret: never print the raw bytes.
+        f.debug_struct("HandshakeRequest")
+            .field("expected_history", &self.expected_history)
+            .field("node_id", &self.node_id)
+            .field("role", &self.role)
+            .field("sync_mode", &self.sync_mode)
+            .field("current_lsn", &self.current_lsn)
+            .field("slot_name", &self.slot_name)
+            .field("capabilities", &self.capabilities)
+            .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// Handshake response payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeResponse {
+    /// Durable dataset identity; independent of the server process/node identity.
+    pub history_id: Uuid,
     /// Whether handshake was accepted
     pub accepted: bool,
     /// Server node ID
@@ -794,10 +838,38 @@ impl ReplicationConnection {
         if response.header.msg_type != MessageType::HandshakeResponse {
             return Err(ReplicationError::Transport("Expected HandshakeResponse".to_string()));
         }
+        if response.header.version != PROTOCOL_VERSION {
+            return Err(ReplicationError::Transport(format!(
+                "native protocol version mismatch: server speaks v{}, this client speaks v{}",
+                response.header.version, PROTOCOL_VERSION
+            )));
+        }
 
         let handshake: HandshakeResponse = bincode::deserialize(&response.payload)
             .map_err(|e| ReplicationError::Transport(format!("Deserialize failed: {}", e)))?;
 
+        // R5: a pre-acceptance rejection (protocol/auth) carries a nil history id
+        // and no real server state. Surface the server's rejection text rather
+        // than the accepted-only guards below, which would otherwise mask it.
+        if !handshake.accepted && handshake.history_id.is_nil() {
+            return Err(ReplicationError::Transport(format!(
+                "Handshake rejected: {}",
+                handshake.error.as_deref().unwrap_or("unknown")
+            )));
+        }
+        if handshake.history_id.is_nil() {
+            return Err(ReplicationError::HistoryMetadata(
+                "Primary supplied a nil history identity".into(),
+            ));
+        }
+        if let Some(expected) = request.expected_history {
+            if expected != handshake.history_id {
+                return Err(ReplicationError::HistoryMismatch {
+                    expected,
+                    actual: handshake.history_id,
+                });
+            }
+        }
         if !handshake.accepted {
             return Err(ReplicationError::Transport(format!(
                 "Handshake rejected: {}",
@@ -906,6 +978,7 @@ pub struct ReplicationServer {
 
 /// Server state
 struct ServerState {
+    history_id: Uuid,
     /// This node's ID
     node_id: Uuid,
     /// Connected standbys
@@ -941,13 +1014,19 @@ struct ObserverInfo {
 
 impl ReplicationServer {
     /// Create a new replication server
-    pub fn new(listen_addr: SocketAddr) -> Self {
+    pub fn new(listen_addr: SocketAddr, history_id: Uuid) -> Result<Self> {
+        if history_id.is_nil() {
+            return Err(ReplicationError::HistoryMetadata(
+                "Primary history identity must not be nil".into(),
+            ));
+        }
         let (shutdown_tx, _) = broadcast::channel(1);
 
-        Self {
+        Ok(Self {
             listen_addr,
             state: Arc::new(RwLock::new(ServerState {
                 node_id: Uuid::new_v4(),
+                history_id,
                 standbys: HashMap::new(),
                 observers: HashMap::new(),
                 fencing_token: 1,
@@ -956,7 +1035,7 @@ impl ReplicationServer {
                 primary_lsn: 0,
             })),
             shutdown_tx,
-        }
+        })
     }
 
     /// Start the server
@@ -1013,15 +1092,21 @@ impl ReplicationServer {
 
         // Build response
         let state_guard = state.read().await;
+        let history_matches = request
+            .expected_history
+            .is_none_or(|expected| expected == state_guard.history_id);
         let response = HandshakeResponse {
-            accepted: state_guard.is_primary,
+            history_id: state_guard.history_id,
+            accepted: state_guard.is_primary && history_matches,
             server_node_id: state_guard.node_id,
             sync_mode: request.sync_mode,
             primary_lsn: state_guard.primary_lsn,
             slot_name: request.slot_name.clone(),
             fencing_token: state_guard.fencing_token,
             capabilities: Capabilities::all(),
-            error: if state_guard.is_primary {
+            error: if !history_matches {
+                Some("Replication history mismatch; preserve this receiver and prepare a new dataset; online resync is not supported".into())
+            } else if state_guard.is_primary {
                 None
             } else {
                 Some("Not primary".to_string())
@@ -1132,6 +1217,7 @@ impl ReplicationServer {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1147,6 +1233,38 @@ mod tests {
         assert_eq!(decoded.msg_type, MessageType::WalEntry);
         assert_eq!(decoded.length, 100);
         assert_eq!(decoded.sequence, 42);
+    }
+
+    #[test]
+    fn test_protocol_version_is_three() {
+        assert_eq!(PROTOCOL_VERSION, 3);
+    }
+
+    /// R1: a v1 (original), guard-v2 or auth-v2 peer is refused at the header,
+    /// before any bincode payload decode. The merged layout gained
+    /// `expected_history` and `auth`, so two peers that only agree on the old
+    /// number must never be allowed to reach the positional payload decoder.
+    #[test]
+    fn test_older_protocol_versions_refused_before_decode() {
+        for peer_version in [1u16, 2u16] {
+            let mut buf = BytesMut::new();
+            buf.put_u32(PROTOCOL_MAGIC);
+            buf.put_u16(peer_version);
+            buf.put_u16(MessageType::HandshakeRequest as u16);
+            buf.put_u32(0);
+            buf.put_u32(0);
+            buf.put_u64(0);
+            assert_eq!(buf.len(), HEADER_SIZE);
+
+            let error = MessageHeader::decode(&mut buf.freeze()).unwrap_err();
+            match error {
+                ReplicationError::ProtocolVersion { expected, actual } => {
+                    assert_eq!(expected, PROTOCOL_VERSION);
+                    assert_eq!(actual, peer_version);
+                }
+                other => panic!("v{peer_version} peer was not refused at the header: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1207,6 +1325,7 @@ mod tests {
     #[test]
     fn test_handshake_serialization() {
         let request = HandshakeRequest {
+            expected_history: None,
             node_id: Uuid::new_v4(),
             role: NodeRole::Standby,
             sync_mode: SyncModeConfig::SemiSync {
@@ -1216,6 +1335,7 @@ mod tests {
             current_lsn: Some(1000),
             slot_name: Some("standby_1".to_string()),
             capabilities: Capabilities::all(),
+            auth: None,
         };
 
         let encoded = bincode::serialize(&request).unwrap();
@@ -1223,6 +1343,35 @@ mod tests {
 
         assert_eq!(decoded.node_id, request.node_id);
         assert_eq!(decoded.role, NodeRole::Standby);
+    }
+
+    /// C2: a token in a HandshakeRequest must never be Debug-printed. Other
+    /// fields are fixed to nil/empty so the only possible source of the token's
+    /// decimal ("171") or hex ("ab") rendering is the token itself.
+    #[test]
+    fn handshake_request_debug_redacts_auth_token() {
+        let request = HandshakeRequest {
+            expected_history: None,
+            node_id: Uuid::nil(),
+            role: NodeRole::Standby,
+            sync_mode: SyncModeConfig::Async,
+            current_lsn: None,
+            slot_name: None,
+            capabilities: Capabilities::default(),
+            auth: Some([0xAB; 32]),
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("171"), "decimal token byte leaked: {rendered}");
+        let lowered = rendered.to_lowercase();
+        // A bare "ab" cannot be asserted: ordinary field names such as
+        // "capabilities" contain it. A hex leak of the 32-byte token instead
+        // appears as a long run of "ab" pairs.
+        assert!(!lowered.contains(&"ab".repeat(32)), "hex token leaked: {rendered}");
+        assert!(
+            !lowered.contains(&vec!["ab"; 32].join(", ")),
+            "hex token leaked: {rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "missing redaction marker: {rendered}");
     }
 
     #[test]
@@ -1260,5 +1409,45 @@ mod tests {
             // Just check it round-trips
             let _ = decoded;
         }
+    }
+
+    #[tokio::test]
+    async fn basic_server_history_mismatch_never_registers() {
+        let actual = Uuid::new_v4();
+        let expected = Uuid::new_v4();
+        let server = ReplicationServer::new("127.0.0.1:0".parse().unwrap(), actual).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = server.state.clone();
+        let handler = tokio::spawn(async move {
+            let (stream, remote) = listener.accept().await.unwrap();
+            ReplicationServer::handle_connection(stream, remote, state).await
+        });
+        let mut client = ReplicationConnection::connect(addr, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.handshake_client(HandshakeRequest {
+                expected_history: Some(expected),
+                node_id: Uuid::new_v4(),
+                role: NodeRole::Standby,
+                sync_mode: SyncModeConfig::Async,
+                current_lsn: Some(0),
+                slot_name: None,
+                capabilities: Capabilities::all(),
+                auth: None,
+            }),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(3), handler)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result.unwrap(), Err(ReplicationError::HistoryMismatch { expected: e, actual: a }) if e == expected && a == actual)
+        );
+        assert!(server.state.read().await.standbys.is_empty());
     }
 }

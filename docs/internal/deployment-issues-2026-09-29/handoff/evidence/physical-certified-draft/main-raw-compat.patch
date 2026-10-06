@@ -1,0 +1,10 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3451,6 +3451,7 @@
+             poll_interval: Duration::from_millis(args.poll_interval_ms),
+             reconnect_delay: Duration::from_millis(args.reconnect_delay_ms),
+             max_reconnects: args.max_reconnects,
++            require_committed: false, // Existing CLI remains explicitly raw/non-serving.
+         };
+         let (stop, shutdown) = tokio::sync::watch::channel(false);
+         let (progress, mut statuses) = tokio::sync::watch::channel(ReceiverStatus::Connecting {

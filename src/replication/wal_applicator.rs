@@ -40,7 +40,7 @@ pub enum ApplicatorState {
     Streaming,
     /// Paused (manual intervention)
     Paused,
-    /// Error state
+    /// Terminal application failure. Rebuild/reseed before creating a new applicator.
     Error,
 }
 
@@ -88,6 +88,10 @@ impl WalApplicator {
     /// This spawns a background task that processes incoming WAL entries
     /// and applies them to the storage engine.
     pub async fn start_with_storage(&self, storage: Arc<StorageEngine>) -> Result<()> {
+        // The same state guard serializes lifecycle transitions with application.
+        // In particular, a restart cannot clear a failed entry's terminal state.
+        let mut current_state = self.state.write().await;
+        Self::ensure_not_failed(*current_state)?;
         // Take ownership of the receiver
         let queue_rx = {
             let mut rx_guard = self.queue_rx.write().await;
@@ -98,7 +102,7 @@ impl WalApplicator {
             return Err(ReplicationError::WalStreaming("Applicator already started".to_string()));
         };
 
-        *self.state.write().await = ApplicatorState::Streaming;
+        *current_state = ApplicatorState::Streaming;
         info!("WAL Applicator started, ready to receive entries");
 
         let applied_lsn = self.applied_lsn.clone();
@@ -138,10 +142,17 @@ impl WalApplicator {
 
                         info!("WAL Applicator: Received entry LSN={} from queue", entry.lsn);
 
-                        // Check if we're paused
-                        if *state.read().await == ApplicatorState::Paused {
+                        // Hold the lifecycle guard until the operation either
+                        // commits its LSN or poisons this applicator. A concurrent
+                        // promote/resume/legacy apply cannot race past that result.
+                        let mut current_state = state.write().await;
+                        if *current_state == ApplicatorState::Paused {
                             debug!("WAL Applicator paused, skipping entry {}", entry.lsn);
                             continue;
+                        }
+                        if *current_state != ApplicatorState::Streaming {
+                            queue_rx.close();
+                            break;
                         }
 
                         // Apply the entry
@@ -164,14 +175,22 @@ impl WalApplicator {
                             }
                             Err(e) => {
                                 *errors_count.write().await += 1;
-                                error!("Failed to apply WAL entry {}: {}", entry.lsn, e);
+                                *current_state = ApplicatorState::Error;
+                                // A later successful LSN must never conceal this
+                                // gap. Reject senders and discard queued successors.
+                                queue_rx.close();
+                                error!("Failed to apply WAL entry {}: {}. WAL application stopped; repair or reseed is required before restarting replication.", entry.lsn, e);
+                                break;
                             }
                         }
                     }
                 }
             }
 
-            *state.write().await = ApplicatorState::Disconnected;
+            let mut current_state = state.write().await;
+            if *current_state != ApplicatorState::Error {
+                *current_state = ApplicatorState::Disconnected;
+            }
             info!("WAL Applicator background task stopped");
         });
 
@@ -220,39 +239,60 @@ impl WalApplicator {
 
     /// Start the WAL applicator (legacy method - use start_with_storage instead)
     pub async fn start(&self) -> Result<()> {
-        *self.state.write().await = ApplicatorState::Connecting;
+        let mut current_state = self.state.write().await;
+        Self::ensure_not_failed(*current_state)?;
+        if self.queue_rx.read().await.is_none() {
+            return Err(ReplicationError::WalStreaming(
+                "Storage-backed applicator cannot be restarted through legacy start".to_string(),
+            ));
+        }
+        *current_state = ApplicatorState::Connecting;
         info!("WAL Applicator started (no storage engine - entries will be queued only)");
         Ok(())
     }
 
     /// Stop the WAL applicator
     pub async fn stop(&self) -> Result<()> {
+        let mut current_state = self.state.write().await;
         let _ = self.shutdown_tx.send(());
-        *self.state.write().await = ApplicatorState::Disconnected;
+        if *current_state != ApplicatorState::Error {
+            *current_state = ApplicatorState::Disconnected;
+        }
         info!("WAL Applicator stopped");
         Ok(())
     }
 
     /// Pause WAL application
     pub async fn pause(&self) -> Result<()> {
-        *self.state.write().await = ApplicatorState::Paused;
+        let mut current_state = self.state.write().await;
+        Self::ensure_not_failed(*current_state)?;
+        *current_state = ApplicatorState::Paused;
         info!("WAL Applicator paused");
         Ok(())
     }
 
     /// Resume WAL application
     pub async fn resume(&self) -> Result<()> {
-        *self.state.write().await = ApplicatorState::Streaming;
+        let mut current_state = self.state.write().await;
+        Self::ensure_not_failed(*current_state)?;
+        *current_state = ApplicatorState::Streaming;
         info!("WAL Applicator resumed");
         Ok(())
     }
 
     /// Apply a single WAL entry (for direct application without queue)
     pub async fn apply(&self, entry: WalEntry) -> Result<ApplyResult> {
-        let current_lsn = *self.applied_lsn.read().await;
+        let current_state = self.state.write().await;
+        Self::ensure_not_failed(*current_state)?;
+        if self.queue_rx.read().await.is_none() {
+            return Err(ReplicationError::WalStreaming(
+                "Legacy apply cannot advance a storage-backed applicator's LSN".to_string(),
+            ));
+        }
+        let mut current_lsn = self.applied_lsn.write().await;
 
         // Skip already-applied entries (idempotency)
-        if entry.lsn <= current_lsn {
+        if entry.lsn <= *current_lsn {
             return Ok(ApplyResult {
                 lsn: entry.lsn,
                 applied: false,
@@ -262,7 +302,7 @@ impl WalApplicator {
 
         // Without a storage engine, we just update the LSN
         // This is used for testing or when entries are applied externally
-        *self.applied_lsn.write().await = entry.lsn;
+        *current_lsn = entry.lsn;
 
         Ok(ApplyResult {
             lsn: entry.lsn,
@@ -313,15 +353,27 @@ impl WalApplicator {
     ///
     /// Called during failover to make this node the new primary.
     pub async fn promote(&self) -> Result<()> {
+        let mut current_state = self.state.write().await;
+        Self::ensure_not_failed(*current_state)?;
         // Stop accepting WAL from old primary
         let _ = self.shutdown_tx.send(());
 
         // Update state
-        *self.state.write().await = ApplicatorState::Disconnected;
+        *current_state = ApplicatorState::Disconnected;
 
         let final_lsn = self.applied_lsn().await;
         info!("Standby promoted to primary at LSN {}", final_lsn);
 
+        Ok(())
+    }
+
+    fn ensure_not_failed(state: ApplicatorState) -> Result<()> {
+        if state == ApplicatorState::Error {
+            return Err(ReplicationError::WalStreaming(
+                "WAL applicator has failed; repair or reseed and create a new applicator before resuming or promoting"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }

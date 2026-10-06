@@ -1,5 +1,6 @@
 # Build artifacts
 target/
+/target-*/
 
 # Database data
 heliosdb-data/

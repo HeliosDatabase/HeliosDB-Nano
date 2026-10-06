@@ -447,6 +447,20 @@ impl SnapshotManager {
     ///
     /// State is per-`SnapshotManager` (one per engine, published via `Arc` before
     /// any concurrent access, so these Relaxed stores are safe), NOT process-global.
+    /// Recover read-side elision state without installing a sentinel.
+    pub(crate) fn configure_elision_read_only(&self) -> Result<()> {
+        let sentinel = self
+            .db
+            .get(ELIDE_SENTINEL_KEY)
+            .map_err(|e| Error::storage(format!("elision sentinel read failed: {e}")))?;
+        if sentinel.as_deref().is_some_and(|bytes| bytes != [1u8]) {
+            return Err(Error::storage("invalid elision sentinel"));
+        }
+        self.elide_latest_version.store(false, Ordering::Relaxed);
+        self.maybe_elided_rows.store(sentinel.is_some(), Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn configure_elision(&self, elide_latest_version: bool) {
         self.elide_latest_version.store(elide_latest_version, Ordering::Relaxed);
 
@@ -1730,6 +1744,14 @@ impl SnapshotManager {
 
     /// Load existing snapshots from disk (for recovery)
     pub fn recover_snapshots(&self) -> Result<usize> {
+        self.recover_snapshots_with_policy(false)
+    }
+
+    pub(crate) fn recover_snapshots_strict(&self) -> Result<usize> {
+        self.recover_snapshots_with_policy(true)
+    }
+
+    fn recover_snapshots_with_policy(&self, strict: bool) -> Result<usize> {
         let mut count = 0;
         let iter = self.db.iterator(rocksdb::IteratorMode::Start);
 
@@ -1740,14 +1762,36 @@ impl SnapshotManager {
             // `vmeta:` records in the same scan (crash-safe resume — a marker
             // outlives the process, so AS-OF visibility survives restart).
             if key.starts_with(crate::storage::copy_marker::VMETA_PREFIX.as_bytes()) {
-                self.copy_markers.load_record(&key, &value);
+                if strict {
+                    self.copy_markers.load_record_strict(&key, &value)?;
+                } else {
+                    self.copy_markers.load_record(&key, &value);
+                }
                 continue;
             }
 
+            if strict && key.starts_with(b"snapshot:") && std::str::from_utf8(&key).is_err() {
+                return Err(Error::storage("malformed snapshot metadata key"));
+            }
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if key_str.starts_with("snapshot:") {
                     // W2.2(b): tolerate both epoch-micros and legacy RFC3339 layouts.
-                    if let Some(metadata) = deserialize_snapshot_metadata(&value) {
+                    let decoded = deserialize_snapshot_metadata(&value);
+                    if strict && decoded.is_none() {
+                        return Err(Error::storage("malformed snapshot metadata"));
+                    }
+                    if let Some(metadata) = decoded {
+                        if strict {
+                            if metadata.scn == u64::MAX
+                                || metadata.transaction_id == u64::MAX
+                                || metadata.timestamp == u64::MAX
+                            {
+                                return Err(Error::storage("snapshot metadata sequence exhausted"));
+                            }
+                            if key_str != format!("snapshot:{}", metadata.timestamp) {
+                                return Err(Error::storage("snapshot metadata identity mismatch"));
+                            }
+                        }
                         // Restore in-memory state
                         self.snapshots.write().insert(metadata.timestamp, metadata.clone());
                         self.txn_to_timestamp

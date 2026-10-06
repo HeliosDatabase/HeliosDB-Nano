@@ -28,14 +28,15 @@ services:
     # build:
     #   context: ../..
     #   dockerfile: deployment/docker/Dockerfile
+    # The default service uses password-authenticated PostgreSQL.
+    # MySQL is omitted because its listener does not support authentication.
     ports:
       - "5432:5432"  # PostgreSQL protocol
-      # HTTP API (REST, branches, vectors) is unauthenticated and has no
-      # authentication policy yet; it is bound to 127.0.0.1 in the container on
-      # purpose. Do NOT publish 8080 — that would expose the database surface
-      # without auth. (MCP /mcp accepts a bearer token via HELIOSDB_MCP_TOKEN.)
+      # HTTP is plaintext and all routes except /health require the configured
+      # credential; 8080 stays unpublished and is bound to 127.0.0.1 inside the
+      # container on purpose. (MCP /mcp accepts a bearer token via
+      # HELIOSDB_MCP_TOKEN.)
       # - "8080:8080"
-      - "3306:3306"  # MySQL protocol
     volumes:
       - heliosdb_data:/data
     environment:
@@ -58,8 +59,6 @@ services:
       --data-dir /data
       --listen 0.0.0.0
       --port 5432
-      --mysql
-      --mysql-listen 0.0.0.0:3306
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s

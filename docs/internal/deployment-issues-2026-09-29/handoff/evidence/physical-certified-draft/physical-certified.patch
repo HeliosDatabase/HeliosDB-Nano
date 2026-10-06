@@ -1,0 +1,1108 @@
+--- a/src/replication/physical_wire.rs
++++ b/src/replication/physical_wire.rs
+@@ -25,7 +25,7 @@
+ use zeroize::Zeroizing;
+ 
+ const MAGIC: [u8; 8] = *b"NPHYS001";
+-const VERSION: u16 = 1;
++const VERSION: u16 = 2;
+ const MAX_SOURCE_SEQUENCE: u64 = (1_u64 << 56) - 1;
+ const HEADER_BYTES: usize = 16;
+ const TOKEN_BYTES: usize = 32;
+@@ -114,16 +114,22 @@
+ pub enum OpenRequest {
+     Snapshot,
+     Resume { history: Uuid, after: u64 },
++    CertifiedSnapshot,
++    CertifiedResume { history: Uuid, after: u64 },
+ }
+ impl OpenRequest {
++    pub fn certified(self) -> bool {
++        matches!(self, Self::CertifiedSnapshot | Self::CertifiedResume { .. })
++    }
+     fn encode(self) -> Result<Vec<u8>> {
+         match self {
+             Self::Snapshot => Ok(vec![0]),
+-            Self::Resume { history, after } => {
++            Self::CertifiedSnapshot => Ok(vec![2]),
++            Self::Resume { history, after } | Self::CertifiedResume { history, after } => {
+                 if history.is_nil() || after > MAX_SOURCE_SEQUENCE {
+                     return Err(invalid("invalid resume identity/cursor"));
+                 }
+-                let mut bytes = vec![1];
++                let mut bytes = vec![if self.certified() { 3 } else { 1 }];
+                 bytes.extend(history.as_bytes());
+                 bytes.extend(after.to_be_bytes());
+                 Ok(bytes)
+@@ -133,6 +139,11 @@
+     fn decode(bytes: &[u8]) -> Result<Self> {
+         let value = match bytes {
+             [0] => Self::Snapshot,
++            [2] => Self::CertifiedSnapshot,
++            [3, ..] if bytes.len() == 25 => Self::CertifiedResume {
++                history: uuid_at(bytes, 1),
++                after: u64_at(bytes, 17),
++            },
+             [1, ..] if bytes.len() == 25 => Self::Resume {
+                 history: uuid_at(bytes, 1),
+                 after: u64_at(bytes, 17),
+@@ -150,6 +161,13 @@
+ #[derive(Clone, Debug)]
+ pub enum SourceSessionInfo {
+     Snapshot(CheckpointManifest),
++    CertifiedSnapshot(CheckpointManifest),
++    CertifiedResume {
++        session_id: Uuid,
++        history: Uuid,
++        initial_after: u64,
++        durable_barrier: u64,
++    },
+     Resume {
+         session_id: Uuid,
+         history: Uuid,
+@@ -158,39 +176,46 @@
+     },
+ }
+ impl SourceSessionInfo {
++    pub fn certified(&self) -> bool {
++        matches!(self, Self::CertifiedSnapshot(_) | Self::CertifiedResume { .. })
++    }
+     pub fn session_id(&self) -> Uuid {
+         match self {
+-            Self::Snapshot(m) => m.snapshot_id,
+-            Self::Resume { session_id, .. } => *session_id,
++            Self::Snapshot(m) | Self::CertifiedSnapshot(m) => m.snapshot_id,
++            Self::Resume { session_id, .. } | Self::CertifiedResume { session_id, .. } => *session_id,
+         }
+     }
+     pub fn history(&self) -> Uuid {
+         match self {
+-            Self::Snapshot(m) => m.history,
+-            Self::Resume { history, .. } => *history,
++            Self::Snapshot(m) | Self::CertifiedSnapshot(m) => m.history,
++            Self::Resume { history, .. } | Self::CertifiedResume { history, .. } => *history,
+         }
+     }
+     pub fn initial_after(&self) -> u64 {
+         match self {
+-            Self::Snapshot(m) => m.checkpoint_sequence,
+-            Self::Resume { initial_after, .. } => *initial_after,
+-        }
+-    }
+-    fn initial_barrier(&self) -> u64 {
++            Self::Snapshot(m) | Self::CertifiedSnapshot(m) => m.checkpoint_sequence,
++            Self::Resume { initial_after, .. } | Self::CertifiedResume { initial_after, .. } => *initial_after,
++        }
++    }
++    pub fn initial_barrier(&self) -> u64 {
+         match self {
+-            Self::Snapshot(m) => m.checkpoint_sequence,
+-            Self::Resume { durable_barrier, .. } => *durable_barrier,
++            Self::Snapshot(m) | Self::CertifiedSnapshot(m) => m.checkpoint_sequence,
++            Self::Resume { durable_barrier, .. } | Self::CertifiedResume { durable_barrier, .. } => *durable_barrier,
+         }
+     }
+     pub fn manifest(&self) -> Option<&CheckpointManifest> {
+         match self {
+-            Self::Snapshot(m) => Some(m),
+-            Self::Resume { .. } => None,
++            Self::Snapshot(m) | Self::CertifiedSnapshot(m) => Some(m),
++            Self::Resume { .. } | Self::CertifiedResume { .. } => None,
+         }
+     }
+     fn validate(&self, request: OpenRequest, limits: &WireLimits) -> Result<()> {
++        if self.certified() != request.certified() {
++            return Err(invalid("source certification mode mismatch"));
++        }
+         match (self, request) {
+-            (Self::Snapshot(m), OpenRequest::Snapshot) => {
++            (Self::Snapshot(m), OpenRequest::Snapshot)
++            | (Self::CertifiedSnapshot(m), OpenRequest::CertifiedSnapshot) => {
+                 m.validate(&limits.transfer).map_err(|e| invalid(e.to_string()))
+             }
+             (
+@@ -204,6 +229,18 @@
+                     history: expected,
+                     after,
+                 },
++            )
++            | (
++                Self::CertifiedResume {
++                    session_id,
++                    history,
++                    initial_after,
++                    durable_barrier,
++                },
++                OpenRequest::CertifiedResume {
++                    history: expected,
++                    after,
++                },
+             ) if !session_id.is_nil()
+                 && !history.is_nil()
+                 && *history == expected
+@@ -218,11 +255,21 @@
+     }
+     fn response(&self) -> Result<(Kind, Vec<u8>)> {
+         match self {
+-            Self::Snapshot(m) => Ok((
+-                Kind::Manifest,
++            Self::Snapshot(m) | Self::CertifiedSnapshot(m) => Ok((
++                if self.certified() {
++                    Kind::CertifiedManifest
++                } else {
++                    Kind::Manifest
++                },
+                 serde_json::to_vec(m).map_err(|e| invalid(e.to_string()))?,
+             )),
+             Self::Resume {
++                session_id,
++                history,
++                initial_after,
++                durable_barrier,
++            }
++            | Self::CertifiedResume {
+                 session_id,
+                 history,
+                 initial_after,
+@@ -232,7 +279,14 @@
+                 bytes.extend(history.as_bytes());
+                 bytes.extend(initial_after.to_be_bytes());
+                 bytes.extend(durable_barrier.to_be_bytes());
+-                Ok((Kind::ResumeInfo, bytes))
++                Ok((
++                    if self.certified() {
++                        Kind::CertifiedResumeInfo
++                    } else {
++                        Kind::ResumeInfo
++                    },
++                    bytes,
++                ))
+             }
+         }
+     }
+@@ -273,6 +327,8 @@
+     Closed = 12,
+     AuthRejected = 13,
+     ResumeInfo = 14,
++    CertifiedManifest = 15,
++    CertifiedResumeInfo = 16,
+ }
+ impl Kind {
+     fn decode(value: u16) -> Result<Self> {
+@@ -291,6 +347,8 @@
+             12 => Self::Closed,
+             13 => Self::AuthRejected,
+             14 => Self::ResumeInfo,
++            15 => Self::CertifiedManifest,
++            16 => Self::CertifiedResumeInfo,
+             _ => return Err(invalid("unknown frame kind")),
+         })
+     }
+@@ -299,8 +357,8 @@
+             Self::Auth => n == TOKEN_BYTES,
+             Self::AuthOk | Self::Close | Self::Closed | Self::AuthRejected => n == 0,
+             Self::Open => n == 1 || n == 25,
+-            Self::ResumeInfo => n == 48,
+-            Self::Manifest => (1..=MAX_MANIFEST_BYTES).contains(&n),
++            Self::ResumeInfo | Self::CertifiedResumeInfo => n == 48,
++            Self::Manifest | Self::CertifiedManifest => (1..=MAX_MANIFEST_BYTES).contains(&n),
+             Self::ChunkRequest => n == 32,
+             Self::Chunk => (CHUNK_META + 1..=CHUNK_META + MAX_CHUNK_BYTES).contains(&n),
+             Self::PollRequest => n == 28,
+@@ -655,6 +713,16 @@
+         }
+     }
+     pub async fn fetch_manifest(&mut self, expected_history: Option<Uuid>) -> Result<CheckpointManifest> {
++        self.fetch_manifest_mode(expected_history, false).await
++    }
++    pub async fn fetch_certified_manifest(&mut self, expected_history: Option<Uuid>) -> Result<CheckpointManifest> {
++        self.fetch_manifest_mode(expected_history, true).await
++    }
++    async fn fetch_manifest_mode(
++        &mut self,
++        expected_history: Option<Uuid>,
++        certified: bool,
++    ) -> Result<CheckpointManifest> {
+         self.check_live()?;
+         // Arm BEFORE any await: cancellation/drop can leave a partial frame or
+         // durable sink prefix, even when no Result is returned to this caller.
+@@ -666,14 +734,23 @@
+             write_frame(
+                 &mut self.io,
+                 Kind::Open,
+-                &OpenRequest::Snapshot.encode()?,
++                &(if certified {
++                    OpenRequest::CertifiedSnapshot
++                } else {
++                    OpenRequest::Snapshot
++                })
++                .encode()?,
+                 &self.limits,
+                 &mut self.shutdown,
+             )
+             .await?;
+             let frame = read_frame(
+                 &mut self.io,
+-                &[Kind::Manifest],
++                &[if certified {
++                    Kind::CertifiedManifest
++                } else {
++                    Kind::Manifest
++                }],
+                 &WireLimits {
+                     frame_timeout: self.limits.operation_timeout,
+                     ..self.limits
+@@ -687,7 +764,11 @@
+                 return Err(invalid("manifest history mismatch"));
+             }
+             self.known_barrier = manifest.checkpoint_sequence;
+-            self.info = Some(SourceSessionInfo::Snapshot(manifest.clone()));
++            self.info = Some(if certified {
++                SourceSessionInfo::CertifiedSnapshot(manifest.clone())
++            } else {
++                SourceSessionInfo::Snapshot(manifest.clone())
++            });
+             Ok(manifest)
+         }
+         .await;
+@@ -698,13 +779,23 @@
+     }
+     /// Select a new wire session for an existing durable physical receiver.
+     pub async fn resume(&mut self, history: Uuid, after: u64) -> Result<SourceSessionInfo> {
++        self.resume_mode(history, after, false).await
++    }
++    pub async fn resume_certified(&mut self, history: Uuid, after: u64) -> Result<SourceSessionInfo> {
++        self.resume_mode(history, after, true).await
++    }
++    async fn resume_mode(&mut self, history: Uuid, after: u64, certified: bool) -> Result<SourceSessionInfo> {
+         self.check_live()?;
+         self.poisoned = true;
+         let outcome = async {
+             if self.info.is_some() {
+                 return Err(invalid("session already selected"));
+             }
+-            let request = OpenRequest::Resume { history, after };
++            let request = if certified {
++                OpenRequest::CertifiedResume { history, after }
++            } else {
++                OpenRequest::Resume { history, after }
++            };
+             write_frame(
+                 &mut self.io,
+                 Kind::Open,
+@@ -715,7 +806,11 @@
+             .await?;
+             let frame = read_frame(
+                 &mut self.io,
+-                &[Kind::ResumeInfo],
++                &[if certified {
++                    Kind::CertifiedResumeInfo
++                } else {
++                    Kind::ResumeInfo
++                }],
+                 &WireLimits {
+                     frame_timeout: self.limits.operation_timeout,
+                     ..self.limits
+@@ -723,11 +818,24 @@
+                 &mut self.shutdown,
+             )
+             .await?;
+-            let info = SourceSessionInfo::Resume {
+-                session_id: uuid_at(&frame.payload, 0),
+-                history: uuid_at(&frame.payload, 16),
+-                initial_after: u64_at(&frame.payload, 32),
+-                durable_barrier: u64_at(&frame.payload, 40),
++            let session_id = uuid_at(&frame.payload, 0);
++            let history = uuid_at(&frame.payload, 16);
++            let initial_after = u64_at(&frame.payload, 32);
++            let durable_barrier = u64_at(&frame.payload, 40);
++            let info = if certified {
++                SourceSessionInfo::CertifiedResume {
++                    session_id,
++                    history,
++                    initial_after,
++                    durable_barrier,
++                }
++            } else {
++                SourceSessionInfo::Resume {
++                    session_id,
++                    history,
++                    initial_after,
++                    durable_barrier,
++                }
+             };
+             info.validate(request, &self.limits)?;
+             self.known_barrier = info.initial_barrier();
+@@ -1657,4 +1765,79 @@
+         ));
+         run.await.unwrap().unwrap();
+     }
+-}
++    #[tokio::test]
++    async fn certified_snapshot_and_resume_use_explicit_mode_without_raw_downgrade() {
++        for resume in [false, true] {
++            let mut source = MockSource::new();
++            source.info = if resume {
++                SourceSessionInfo::CertifiedResume {
++                    session_id: Uuid::new_v4(),
++                    history: source.manifest.history,
++                    initial_after: 10,
++                    durable_barrier: 11,
++                }
++            } else {
++                SourceSessionInfo::CertifiedSnapshot(source.manifest.clone())
++            };
++            let source = Arc::new(source);
++            let calls = Arc::new(AtomicUsize::new(0));
++            let (_stop, rx) = watch::channel(false);
++            let (client_io, server_io) = duplex(128);
++            let run = tokio::spawn(server(server_io, source.clone(), calls.clone(), rx.clone()));
++            let mut client = PhysicalClient::authenticate(client_io, &token(), limits(), rx)
++                .await
++                .unwrap();
++            if resume {
++                client.resume_certified(source.manifest.history, 10).await.unwrap();
++            } else {
++                client
++                    .fetch_certified_manifest(Some(source.manifest.history))
++                    .await
++                    .unwrap();
++            }
++            assert!(client.session_info().unwrap().certified());
++            let mut sink = Sink::default();
++            assert_eq!(client.poll(10, MAX_BATCH_BYTES, &mut sink).await.unwrap().through, 11);
++            assert_eq!(sink.received.len(), 1);
++            client.close().await.unwrap();
++            run.await.unwrap().unwrap();
++        }
++        for requested_certified in [false, true] {
++            let mut source = MockSource::new();
++            if !requested_certified {
++                source.info = SourceSessionInfo::CertifiedSnapshot(source.manifest.clone());
++            }
++            let (_stop, rx) = watch::channel(false);
++            let (client_io, server_io) = duplex(128);
++            let run = tokio::spawn(server(
++                server_io,
++                Arc::new(source),
++                Arc::new(AtomicUsize::new(0)),
++                rx.clone(),
++            ));
++            let mut client = PhysicalClient::authenticate(client_io, &token(), limits(), rx)
++                .await
++                .unwrap();
++            let outcome = if requested_certified {
++                client.fetch_certified_manifest(None).await
++            } else {
++                client.fetch_manifest(None).await
++            };
++            assert!(outcome.is_err());
++            assert!(matches!(client.fetch_manifest(None).await, Err(WireError::Poisoned)));
++            assert!(run.await.unwrap().is_err());
++        }
++    }
++    #[tokio::test]
++    async fn legacy_version_one_is_refused_before_auth_payload_or_factory() {
++        let (_stop, rx) = watch::channel(false);
++        let (mut peer, server_io) = duplex(128);
++        let calls = Arc::new(AtomicUsize::new(0));
++        let run = tokio::spawn(server(server_io, Arc::new(MockSource::new()), calls.clone(), rx));
++        let mut legacy = header(Kind::Auth, TOKEN_BYTES as u32);
++        legacy[8..10].copy_from_slice(&1_u16.to_be_bytes());
++        peer.write_all(&legacy).await.unwrap();
++        assert!(matches!(run.await.unwrap(), Err(WireError::Protocol(_))));
++        assert_eq!(calls.load(Ordering::SeqCst), 0);
++    }
++}
+--- a/src/replication/physical_source.rs
++++ b/src/replication/physical_source.rs
+@@ -4,7 +4,8 @@
+ //! Cancellation never publishes a receiver or modifies an existing destination.
+ 
+ use super::checkpoint_transfer::{validate_primary_source, OnlineCheckpointExport, TransferLimits};
+-use super::physical::{poll_source, PhysicalPoll, MAX_BATCH_BYTES};
++use super::physical::{poll_source, poll_source_through, PhysicalPoll, MAX_BATCH_BYTES};
++use super::physical_source_coordinator::{CommittedPhysicalBarrier, PhysicalSourceCoordinator};
+ use super::physical_wire::{OpenRequest, PhysicalSource, Result, SourceSessionInfo, WireError};
+ use async_trait::async_trait;
+ use rocksdb::DB;
+@@ -12,8 +13,9 @@
+     path::PathBuf,
+     sync::{
+         atomic::{AtomicBool, Ordering},
+-        Arc,
++        Arc, Mutex,
+     },
++    time::Duration,
+ };
+ use uuid::Uuid;
+ 
+@@ -96,6 +98,11 @@
+     }
+ }
+ 
++struct CommittedSession {
++    coordinator: Arc<PhysicalSourceCoordinator>,
++    barrier: Mutex<CommittedPhysicalBarrier>,
++    fence_timeout: Duration,
++}
+ struct PrimarySession {
+     db: Arc<DB>,
+     history: Uuid,
+@@ -103,6 +110,7 @@
+     info: SourceSessionInfo,
+     export: Option<Arc<OnlineCheckpointExport>>,
+     work: SourceWorkLimiter,
++    committed: Option<Arc<CommittedSession>>,
+ }
+ 
+ /// Open one source session. Resume does not inspect/create `export_parent`,
+@@ -124,6 +132,9 @@
+     work.run(move || {
+         let storage_identity = validate_primary_source(&db, expected_history).map_err(source_error)?;
+         let (info, export) = match request {
++            OpenRequest::CertifiedSnapshot | OpenRequest::CertifiedResume { .. } => {
++                return Err(source_error("raw source cannot certify SQL operation boundaries"))
++            }
+             OpenRequest::Snapshot => {
+                 let export = Arc::new(
+                     OnlineCheckpointExport::create(&db, expected_history, &export_parent, limits)
+@@ -157,6 +168,85 @@
+             info,
+             export,
+             work: session_work,
++            committed: None,
++        }) as Arc<dyn PhysicalSource>)
++    })
++    .await
++}
++
++/// Certified factory: only wire into an engine whose complete semantic mutators
++/// participate in this exact coordinator from construction. A raw factory never
++/// upgrades or accepts these requests. All blocking work retains shared permits.
++pub async fn open_committed_primary_session(
++    db: Arc<DB>,
++    coordinator: Arc<PhysicalSourceCoordinator>,
++    expected_history: Uuid,
++    export_parent: PathBuf,
++    limits: TransferLimits,
++    request: OpenRequest,
++    work: SourceWorkLimiter,
++    fence_timeout: Duration,
++) -> Result<Arc<dyn PhysicalSource>> {
++    if !request.certified() {
++        return Err(source_error("certified endpoint requires certified session mode"));
++    }
++    let session_work = work.clone();
++    work.run(move || {
++        let storage_identity = validate_primary_source(&db, expected_history).map_err(source_error)?;
++        let (info, export, barrier) = match request {
++            OpenRequest::CertifiedSnapshot => {
++                let (capture, barrier) = coordinator
++                    .capture_checkpoint(expected_history, &export_parent, limits, fence_timeout)
++                    .map_err(source_error)?;
++                barrier.checked_sequence(&db, expected_history).map_err(source_error)?;
++                // The coordinator returned, releasing its exclusive fence;
++                // potentially expensive immutable file hashing occurs here.
++                let export = Arc::new(capture.finish().map_err(source_error)?);
++                (
++                    SourceSessionInfo::CertifiedSnapshot(export.manifest().clone()),
++                    Some(export),
++                    barrier,
++                )
++            }
++            OpenRequest::CertifiedResume { history, after } => {
++                if history != expected_history {
++                    return Err(source_error("resume history differs from live primary"));
++                }
++                let barrier = coordinator
++                    .capture_barrier(history, fence_timeout)
++                    .map_err(source_error)?;
++                let initial =
++                    poll_source_through(&db, history, after, &barrier, MAX_BATCH_BYTES).map_err(source_error)?;
++                (
++                    SourceSessionInfo::CertifiedResume {
++                        session_id: Uuid::new_v4(),
++                        history,
++                        initial_after: after,
++                        durable_barrier: initial.durable_barrier,
++                    },
++                    None,
++                    barrier,
++                )
++            }
++            _ => return Err(source_error("certified endpoint requires certified session mode")),
++        };
++        if validate_primary_source(&db, expected_history).map_err(source_error)? != storage_identity {
++            return Err(source_error(
++                "primary storage identity changed during certified session creation",
++            ));
++        }
++        Ok(Arc::new(PrimarySession {
++            db,
++            history: expected_history,
++            storage_identity,
++            info,
++            export,
++            work: session_work,
++            committed: Some(Arc::new(CommittedSession {
++                coordinator,
++                barrier: Mutex::new(barrier),
++                fence_timeout,
++            })),
+         }) as Arc<dyn PhysicalSource>)
+     })
+     .await
+@@ -184,12 +274,32 @@
+         let db = self.db.clone();
+         let history = self.history;
+         let storage_identity = self.storage_identity.clone();
++        let committed = self.committed.clone();
+         self.work
+             .run(move || {
+                 if validate_primary_source(&db, history).map_err(source_error)? != storage_identity {
+                     return Err(source_error("primary storage identity changed before poll"));
+                 }
+-                let poll = poll_source(&db, history, after, byte_limit).map_err(source_error)?;
++                let poll = if let Some(committed) = committed {
++                    let mut barrier = committed
++                        .barrier
++                        .lock()
++                        .map_err(|_| source_error("certified session barrier lock poisoned"))?;
++                    if after > barrier.source_sequence() {
++                        return Err(source_error("receiver cursor exceeds session certified barrier"));
++                    }
++                    // Finish a byte-limited certified interval before minting
++                    // another cap, so concurrent writers cannot move the target.
++                    if after == barrier.source_sequence() {
++                        *barrier = committed
++                            .coordinator
++                            .capture_barrier(history, committed.fence_timeout)
++                            .map_err(source_error)?;
++                    }
++                    poll_source_through(&db, history, after, &barrier, byte_limit).map_err(source_error)?
++                } else {
++                    poll_source(&db, history, after, byte_limit).map_err(source_error)?
++                };
+                 if validate_primary_source(&db, history).map_err(source_error)? != storage_identity {
+                     return Err(source_error("primary storage identity changed during poll"));
+                 }
+@@ -456,4 +566,111 @@
+             .unwrap()
+             .unwrap();
+     }
+-}
++    #[tokio::test]
++    async fn certified_source_keeps_one_cap_through_partial_polls_and_refuses_raw_modes() {
++        let root = tempfile::tempdir().unwrap();
++        let (db, history) = primary(root.path());
++        let coordinator = Arc::new(PhysicalSourceCoordinator::new(db.clone()));
++        {
++            let _permit = coordinator.operation().unwrap();
++            db.put(b"two", b"second").unwrap();
++        }
++        let work = SourceWorkLimiter::new(1).unwrap();
++        let source = open_committed_primary_session(
++            db.clone(),
++            coordinator.clone(),
++            history,
++            root.path().join("absent"),
++            TransferLimits::default(),
++            OpenRequest::CertifiedResume { history, after: 0 },
++            work.clone(),
++            Duration::from_secs(1),
++        )
++        .await
++        .unwrap();
++        {
++            let _permit = coordinator.operation().unwrap();
++            db.put(b"three", b"newer").unwrap();
++        }
++        let first = source.poll(0, 32).await.unwrap();
++        assert_eq!((first.through, first.durable_barrier), (1, 2));
++        let second = source.poll(1, MAX_BATCH_BYTES).await.unwrap();
++        assert_eq!((second.through, second.durable_barrier), (2, 2));
++        let next = source.poll(2, MAX_BATCH_BYTES).await.unwrap();
++        assert_eq!((next.through, next.durable_barrier), (3, 3));
++        assert!(!root.path().join("absent").exists());
++        assert!(open_primary_session(
++            db.clone(),
++            history,
++            root.path().to_path_buf(),
++            TransferLimits::default(),
++            OpenRequest::CertifiedSnapshot,
++            work.clone()
++        )
++        .await
++        .is_err());
++        assert!(open_committed_primary_session(
++            db.clone(),
++            coordinator.clone(),
++            history,
++            root.path().to_path_buf(),
++            TransferLimits::default(),
++            OpenRequest::Snapshot,
++            work.clone(),
++            Duration::from_secs(1)
++        )
++        .await
++        .is_err());
++        coordinator.poison_certification("injected uncertain semantic failure");
++        assert!(source.poll(3, MAX_BATCH_BYTES).await.is_err());
++        {
++            let _permit = coordinator.operation().unwrap();
++            db.put(b"primary", b"still writable").unwrap();
++        }
++        drop(source);
++        work.drain().await.unwrap();
++    }
++    #[tokio::test]
++    async fn certified_snapshot_factory_binds_real_database_and_releases_fence_before_export() {
++        let root = tempfile::tempdir().unwrap();
++        let (db, history) = primary(root.path());
++        let coordinator = Arc::new(PhysicalSourceCoordinator::new(db.clone()));
++        let work = SourceWorkLimiter::new(1).unwrap();
++        let source = open_committed_primary_session(
++            db.clone(),
++            coordinator.clone(),
++            history,
++            root.path().to_path_buf(),
++            TransferLimits::default(),
++            OpenRequest::CertifiedSnapshot,
++            work.clone(),
++            Duration::from_secs(1),
++        )
++        .await
++        .unwrap();
++        assert!(source.session_info().certified());
++        assert_eq!(source.session_info().initial_after(), 1);
++        {
++            let _permit = coordinator.operation().unwrap();
++            db.put(b"later", b"after snapshot").unwrap();
++        }
++        assert_eq!(source.poll(1, MAX_BATCH_BYTES).await.unwrap().through, 2);
++        let other_root = tempfile::tempdir().unwrap();
++        let (other, _) = primary(other_root.path());
++        let wrong = Arc::new(PhysicalSourceCoordinator::new(other));
++        assert!(open_committed_primary_session(
++            db.clone(),
++            wrong,
++            history,
++            root.path().to_path_buf(),
++            TransferLimits::default(),
++            OpenRequest::CertifiedResume { history, after: 1 },
++            work.clone(),
++            Duration::from_secs(1)
++        )
++        .await
++        .is_err());
++        drop(source);
++        work.drain().await.unwrap();
++    }
++}
+--- a/src/replication/physical_receiver.rs
++++ b/src/replication/physical_receiver.rs
+@@ -10,7 +10,9 @@
+     ClosedPhysicalStage, PhysicalStage, ReceiverStaging, ReopenedPhysicalStage, TransferLimits,
+ };
+ use super::physical::{PhysicalBatch, PhysicalCursor, MAX_BATCH_BYTES};
+-use super::physical_wire::{BatchSink, PhysicalClient, SourceSessionInfo, TransferToken, WireError, WireLimits};
++use super::physical_wire::{
++    BatchSink, PhysicalClient, PollSummary, SourceSessionInfo, TransferToken, WireError, WireLimits,
++};
+ use async_trait::async_trait;
+ use std::{
+     net::SocketAddr,
+@@ -73,6 +75,8 @@
+     pub poll_interval: Duration,
+     pub reconnect_delay: Duration,
+     pub max_reconnects: u32,
++    /// Explicit opt-in; raw sessions can never mint a committed-cut capability.
++    pub require_committed: bool,
+ }
+ impl ReceiverOptions {
+     fn validate(&self) -> Result<()> {
+@@ -123,6 +127,56 @@
+     }
+ }
+ 
++/// A completed certified wire interval, bound to the exact live receiver owner
++/// and durable cursor. This is NOT a serving-generation/readiness token. A future
++/// worker-owned snapshot command must recheck matches_position before copying;
++/// later apply makes this cut stale. Private fields prohibit minting from raw
++/// CaughtUp statuses or a caller-provided sequence integer.
++#[derive(Clone, Debug)]
++pub struct VerifiedCommittedCut {
++    receiver_owner: Uuid,
++    source_session: Uuid,
++    cursor: PhysicalCursor,
++}
++impl VerifiedCommittedCut {
++    pub fn history(&self) -> Uuid {
++        self.cursor.history()
++    }
++    pub fn source_sequence(&self) -> u64 {
++        self.cursor.source_sequence()
++    }
++    pub fn source_session(&self) -> Uuid {
++        self.source_session
++    }
++    pub(crate) fn matches_position(&self, receiver_owner: Uuid, cursor: &PhysicalCursor) -> bool {
++        self.receiver_owner == receiver_owner && self.cursor == *cursor
++    }
++}
++fn verified_committed_cut(
++    owner: Uuid,
++    info: &SourceSessionInfo,
++    summary: PollSummary,
++    durable: &PhysicalCursor,
++) -> Result<VerifiedCommittedCut> {
++    if owner.is_nil()
++        || !info.certified()
++        || info.session_id().is_nil()
++        || info.history() != durable.history()
++        || summary.through != summary.durable_barrier
++        || summary.through != durable.source_sequence()
++        || summary.durable_barrier < info.initial_barrier()
++    {
++        return Err(storage(
++            "completed certified source interval does not match durable receiver",
++        ));
++    }
++    Ok(VerifiedCommittedCut {
++        receiver_owner: owner,
++        source_session: info.session_id(),
++        cursor: durable.clone(),
++    })
++}
++
+ #[derive(Clone, Debug)]
+ pub enum ReceiverStatus {
+     Connecting {
+@@ -149,6 +203,12 @@
+         path: PathBuf,
+         cursor: PhysicalCursor,
+         source_barrier: u64,
++    },
++    /// Source admitted-operation cut; still requires immutable copy, strict
++    /// hydration, readonly request policy and atomic serving publication.
++    CommittedCut {
++        path: PathBuf,
++        cut: VerifiedCommittedCut,
+     },
+     Stopped {
+         path: Option<PathBuf>,
+@@ -258,6 +318,7 @@
+ /// Never cloned: its sender and thread have one owner. Drop joins even if the
+ /// caller cancels run_receiver while a wire sink or command acknowledgement waits.
+ struct Worker {
++    owner_id: Uuid,
+     tx: Option<mpsc::Sender<Command>>,
+     cancel: Arc<AtomicBool>,
+     last: Arc<Mutex<Position>>,
+@@ -275,6 +336,7 @@
+             .spawn(move || worker_loop(rx, worker_cancel, worker_last))
+             .map_err(storage)?;
+         Ok(Self {
++            owner_id: Uuid::new_v4(),
+             tx: Some(tx),
+             cancel,
+             last,
+@@ -488,11 +550,9 @@
+     session_barrier(client.session_info(), known_barrier)
+ }
+ fn session_barrier(info: Option<&SourceSessionInfo>, known_barrier: u64) -> Result<u64> {
+-    let barrier = match info {
+-        Some(SourceSessionInfo::Snapshot(manifest)) => manifest.checkpoint_sequence,
+-        Some(SourceSessionInfo::Resume { durable_barrier, .. }) => *durable_barrier,
+-        None => return Err(storage("receiver connection has no selected physical session")),
+-    };
++    let barrier = info
++        .ok_or_else(|| storage("receiver connection has no selected physical session"))?
++        .initial_barrier();
+     if barrier < known_barrier {
+         return Err(ReceiverError::Wire(WireError::Protocol(
+             "source barrier regressed across receiver reconnect".into(),
+@@ -519,19 +579,21 @@
+             let history = cursor.map(PhysicalCursor::history);
+             let after = cursor.map(PhysicalCursor::source_sequence);
+             progress.send_replace(ReceiverStatus::Connecting { history, after });
+-            let result = if let Some(cursor) = cursor {
+-                PhysicalClient::connect_resume_loopback(
+-                    *source,
+-                    &options.token,
+-                    options.wire,
+-                    shutdown.clone(),
+-                    cursor.history(),
+-                    cursor.source_sequence(),
+-                )
+-                .await
+-            } else {
+-                PhysicalClient::connect_loopback(*source, &options.token, options.wire, shutdown.clone()).await
+-            };
++            let result = async {
++                let mut client =
++                    PhysicalClient::connect_loopback(*source, &options.token, options.wire, shutdown.clone()).await?;
++                if let Some(cursor) = cursor {
++                    if options.require_committed {
++                        client
++                            .resume_certified(cursor.history(), cursor.source_sequence())
++                            .await?;
++                    } else {
++                        client.resume(cursor.history(), cursor.source_sequence()).await?;
++                    }
++                }
++                Ok::<_, WireError>(client)
++            }
++            .await;
+             match result {
+                 Ok(client) => return Ok(client),
+                 Err(error) if retryable(&error) => last_error = Some(error),
+@@ -619,7 +681,11 @@
+             expected_history,
+         } => {
+             let mut client = connect(options, shutdown, progress, None, &mut reconnects).await?;
+-            let manifest = client.fetch_manifest(*expected_history).await?;
++            let manifest = if options.require_committed {
++                client.fetch_certified_manifest(*expected_history).await?
++            } else {
++                client.fetch_manifest(*expected_history).await?
++            };
+             let manifest_bytes = serde_json::to_vec(&manifest).map_err(storage)?;
+             worker
+                 .request(|reply| Command::Begin {
+@@ -748,11 +814,19 @@
+             });
+             continue;
+         }
+-        progress.send_replace(ReceiverStatus::CaughtUp {
+-            path,
+-            cursor: durable.clone(),
+-            source_barrier: summary.durable_barrier,
+-        });
++        if options.require_committed {
++            let info = client
++                .session_info()
++                .ok_or_else(|| storage("certified source session disappeared"))?;
++            let cut = verified_committed_cut(worker.owner_id, info, summary, &durable)?;
++            progress.send_replace(ReceiverStatus::CommittedCut { path, cut });
++        } else {
++            progress.send_replace(ReceiverStatus::CaughtUp {
++                path,
++                cursor: durable.clone(),
++                source_barrier: summary.durable_barrier,
++            });
++        }
+         if stopped(shutdown) {
+             return Err(WireError::Shutdown.into());
+         }
+@@ -795,7 +869,8 @@
+ mod tests {
+     use super::super::{
+         history::load_or_create_primary_history,
+-        physical_source::{open_primary_session, SourceWorkLimiter},
++        physical_source::{open_committed_primary_session, open_primary_session, SourceWorkLimiter},
++        physical_source_coordinator::PhysicalSourceCoordinator,
+         physical_wire::{serve_session, OpenRequest, PhysicalSource, SourceSessionInfo},
+     };
+     use super::*;
+@@ -851,6 +926,16 @@
+             Self::start_faults(db, history, parent, corrupt, false)
+         }
+         fn start_faults(db: Arc<DB>, history: Uuid, parent: PathBuf, corrupt: bool, disconnect: bool) -> Self {
++            Self::start_mode(db, history, parent, corrupt, disconnect, None)
++        }
++        fn start_mode(
++            db: Arc<DB>,
++            history: Uuid,
++            parent: PathBuf,
++            corrupt: bool,
++            disconnect: bool,
++            coordinator: Option<Arc<PhysicalSourceCoordinator>>,
++        ) -> Self {
+             let disconnect_once = Arc::new(AtomicBool::new(disconnect));
+             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+             listener.set_nonblocking(true).unwrap();
+@@ -875,20 +960,21 @@
+                             Some(_result)=sessions.join_next(),if !sessions.is_empty()=>{},
+                             accepted=listener.accept()=>{
+                                 let (io,_)=accepted.unwrap();
+-                                let db=db.clone();let parent=parent.clone();let stop=stop.clone();
++                                let db=db.clone();let parent=parent.clone();let stop=stop.clone();let coordinator=coordinator.clone();
+                                 let snapshots=observed_snapshots.clone();let resumes=observed_resumes.clone();
+                                 let disconnect_once=disconnect_once.clone();
+                                 let work=work.clone();
+                                 sessions.spawn(async move {
+                                     serve_session(io,&fixture_token(),wire_limits(),stop,move |request|async move {
+-                                        match request {OpenRequest::Snapshot=>{snapshots.fetch_add(1,Ordering::SeqCst);},OpenRequest::Resume{..}=>{resumes.fetch_add(1,Ordering::SeqCst);}}
+-                                        let source=open_primary_session(db.clone(),history,parent,TransferLimits::default(),request,work).await?;
+-                                        if matches!(request,OpenRequest::Snapshot) {
++                                        match request {OpenRequest::Snapshot|OpenRequest::CertifiedSnapshot=>{snapshots.fetch_add(1,Ordering::SeqCst);},OpenRequest::Resume{..}|OpenRequest::CertifiedResume{..}=>{resumes.fetch_add(1,Ordering::SeqCst);}}
++                                        let source=if let Some(coordinator)=coordinator.clone() {open_committed_primary_session(db.clone(),coordinator,history,parent,TransferLimits::default(),request,work,Duration::from_secs(2)).await?} else {open_primary_session(db.clone(),history,parent,TransferLimits::default(),request,work).await?};
++                                        if matches!(request,OpenRequest::Snapshot|OpenRequest::CertifiedSnapshot) {
+                                             // Write AFTER the checkpoint: receiving this value proves
+                                             // the continuation stream was consumed, not only file copy.
+-                                            tokio::task::spawn_blocking(move ||db.put(b"stream-only",b"after-checkpoint"))
+-                                                .await.map_err(|e|WireError::Source(e.to_string()))?
+-                                                .map_err(|e|WireError::Source(e.to_string()))?;
++                                            tokio::task::spawn_blocking(move || {
++                                                let _permit=coordinator.as_ref().map(|c|c.operation()).transpose().map_err(|e|WireError::Source(e.to_string()))?;
++                                                db.put(b"stream-only",b"after-checkpoint").map_err(|e|WireError::Source(e.to_string()))
++                                            }).await.map_err(|e|WireError::Source(e.to_string()))??;
+                                         }
+                                         Ok(Arc::new(FaultSource{inner:source,corrupt,disconnect_once}) as Arc<dyn PhysicalSource>)
+                                     }).await
+@@ -949,6 +1035,7 @@
+             poll_interval: Duration::from_millis(10),
+             reconnect_delay: Duration::from_millis(10),
+             max_reconnects: 3,
++            require_committed: false,
+         }
+     }
+     fn status() -> (watch::Sender<ReceiverStatus>, watch::Receiver<ReceiverStatus>) {
+@@ -1304,4 +1391,144 @@
+         assert_eq!(installed.cursor.source_sequence(), 2);
+         assert_eq!(source.snapshots.load(Ordering::SeqCst), 1);
+     }
+-}
++    #[test]
++    fn committed_cut_cannot_be_minted_from_raw_partial_or_other_owner_progress() {
++        let root = tempfile::tempdir().unwrap();
++        let (db, history) = primary(root.path());
++        let db = Arc::try_unwrap(db).ok().unwrap();
++        let stage = super::super::physical::StagedPhysicalReplica::from_checkpoint(db, history, 1).unwrap();
++        let cursor = stage.cursor();
++        let owner = Uuid::new_v4();
++        let session_id = Uuid::new_v4();
++        let raw = SourceSessionInfo::Resume {
++            session_id,
++            history,
++            initial_after: 1,
++            durable_barrier: 1,
++        };
++        let certified = SourceSessionInfo::CertifiedResume {
++            session_id,
++            history,
++            initial_after: 1,
++            durable_barrier: 1,
++        };
++        let complete = PollSummary {
++            through: 1,
++            durable_barrier: 1,
++            batches: 0,
++        };
++        assert!(verified_committed_cut(owner, &raw, complete, cursor).is_err());
++        assert!(verified_committed_cut(
++            owner,
++            &certified,
++            PollSummary {
++                through: 1,
++                durable_barrier: 2,
++                batches: 0
++            },
++            cursor
++        )
++        .is_err());
++        assert!(verified_committed_cut(Uuid::nil(), &certified, complete, cursor).is_err());
++        let cut = verified_committed_cut(owner, &certified, complete, cursor).unwrap();
++        assert!(cut.matches_position(owner, cursor));
++        assert!(!cut.matches_position(Uuid::new_v4(), cursor));
++        assert_eq!(cut.history(), history);
++        assert_eq!(cut.source_sequence(), 1);
++        stage.close().unwrap();
++    }
++    async fn wait_committed(
++        run: &mut Running<'_>,
++        progress: &mut watch::Receiver<ReceiverStatus>,
++        path: &std::path::Path,
++        sequence: u64,
++    ) -> VerifiedCommittedCut {
++        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
++        loop {
++            if let ReceiverStatus::CommittedCut { path: actual, cut } = &*progress.borrow_and_update() {
++                if actual == path && cut.source_sequence() >= sequence {
++                    return cut.clone();
++                }
++            }
++            tokio::select! {
++                result=run.as_mut()=>panic!("certified receiver stopped early: {result:?}"),
++                changed=progress.changed()=>changed.expect("certified progress closed"),
++                _=tokio::time::sleep_until(deadline)=>panic!("certified receiver deadline"),
++            }
++        }
++    }
++    #[tokio::test]
++    async fn certified_follow_downloads_resumes_and_only_reports_exact_applied_committed_cuts() {
++        let root = tempfile::tempdir().unwrap();
++        let (db, history) = primary(root.path());
++        let coordinator = Arc::new(PhysicalSourceCoordinator::new(db.clone()));
++        let source = SourceHarness::start_mode(
++            db.clone(),
++            history,
++            root.path().to_path_buf(),
++            false,
++            false,
++            Some(coordinator.clone()),
++        );
++        let target = root.path().join("certified-receiver");
++        let (stop, shutdown) = watch::channel(false);
++        let (progress, mut observed) = status();
++        let mut opts = options(
++            &source,
++            ReceiverStart::Snapshot {
++                target: target.clone(),
++                expected_history: Some(history),
++            },
++            ReceiverMode::Follow,
++        );
++        opts.require_committed = true;
++        let mut run: Running<'_> = Box::pin(run_receiver(opts, shutdown, progress));
++        let first = wait_committed(&mut run, &mut observed, &target, 2).await;
++        {
++            let _permit = coordinator.operation().unwrap();
++            db.put(b"admitted-later", b"continued").unwrap();
++        }
++        let second = wait_committed(&mut run, &mut observed, &target, 3).await;
++        assert_eq!(first.history(), history);
++        assert_eq!(second.history(), history);
++        assert_eq!(second.source_sequence(), 3);
++        stop.send_replace(true);
++        let closed = complete(run).await;
++        assert_eq!(closed.cursor.source_sequence(), 3);
++        assert!(source.resumes.load(Ordering::SeqCst) >= 1);
++        let raw = DB::open_for_read_only(&Options::default(), &target, false).unwrap();
++        assert_eq!(raw.get(b"seed").unwrap(), Some(b"original".to_vec()));
++        assert_eq!(raw.get(b"stream-only").unwrap(), Some(b"after-checkpoint".to_vec()));
++        assert_eq!(raw.get(b"admitted-later").unwrap(), Some(b"continued".to_vec()));
++    }
++    #[tokio::test]
++    async fn requiring_certification_from_raw_source_refuses_before_receiver_creation() {
++        let root = tempfile::tempdir().unwrap();
++        let (db, history) = primary(root.path());
++        let source = SourceHarness::start(db, history, root.path().to_path_buf(), false);
++        let target = root.path().join("must-not-create");
++        let (_stop, shutdown) = watch::channel(false);
++        let (progress, mut observed) = status();
++        let mut opts = options(
++            &source,
++            ReceiverStart::Snapshot {
++                target: target.clone(),
++                expected_history: Some(history),
++            },
++            ReceiverMode::InstallOnce,
++        );
++        opts.require_committed = true;
++        opts.max_reconnects = 0;
++        assert!(
++            tokio::time::timeout(Duration::from_secs(10), run_receiver(opts, shutdown, progress))
++                .await
++                .unwrap()
++                .is_err()
++        );
++        assert!(!target.exists());
++        assert!(!matches!(
++            &*observed.borrow_and_update(),
++            ReceiverStatus::CommittedCut { .. }
++        ));
++    }
++}

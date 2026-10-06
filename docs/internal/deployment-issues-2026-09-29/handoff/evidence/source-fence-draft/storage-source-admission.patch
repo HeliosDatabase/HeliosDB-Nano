@@ -1,0 +1,128 @@
+--- a/src/storage/engine.rs
++++ b/src/storage/engine.rs
+@@ -1907,6 +1907,9 @@
+ pub struct StorageEngine {
+     /// RocksDB instance
+     pub(crate) db: Arc<DB>,
++    /// Immutable opt-in; all source owners must share this exact coordinator.
++    #[cfg(feature = "ha-tier1")]
++    physical_source_coordinator: Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>>,
+     /// Identity of THIS open database within this process — see
+     /// [`StorageEngine::instance_id`].
+     instance_id: u64,
+@@ -2401,6 +2404,11 @@
+         };
+ 
+         let db = Arc::new(db);
++        // Construct before background owners, never late-enable after admission.
++        // Passing this Arc into every such owner is a required follow-on audit.
++        #[cfg(feature = "ha-tier1")]
++        let physical_source_coordinator = (config.replication.physical.enabled && !read_only)
++            .then(|| Arc::new(crate::replication::physical_source_coordinator::PhysicalSourceCoordinator::new(Arc::clone(&db))));
+         // Also protect interrupted staging before its external marker exists.
+         // This key is owned only by replication::physical, never logical WAL.
+         if !physical_snapshot
+@@ -2620,11 +2628,15 @@
+             Arc::clone(&branch_manager),
+             Arc::clone(&timestamp),
+             read_only,
++            #[cfg(feature = "ha-tier1")]
++            physical_source_coordinator.clone(),
+         )?;
+ 
+         let engine = Self {
+             instance_id: NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+             db: Arc::clone(&db),
++            #[cfg(feature = "ha-tier1")]
++            physical_source_coordinator,
+             config: config.clone(),
+             timestamp,
+             key_manager,
+@@ -3024,11 +3036,15 @@
+             Arc::clone(&branch_manager),
+             Arc::clone(&timestamp),
+             false,
++            #[cfg(feature = "ha-tier1")]
++            None,
+         )?;
+ 
+         Ok(Self {
+             instance_id: NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+             db: Arc::clone(&db),
++            #[cfg(feature = "ha-tier1")]
++            physical_source_coordinator: None,
+             config: config.clone(),
+             timestamp,
+             key_manager,
+@@ -4179,10 +4195,33 @@
+         self.write_census.any_uncommitted_writes() && self.write_census.table_has_staged_index_removals(table)
+     }
+ 
++    /// Admission covers one complete synchronous semantic operation. Keep this
++    /// owned !Send permit alive through all durable metadata and error cleanup.
++    #[cfg(feature = "ha-tier1")]
++    pub(crate) fn physical_source_operation(&self) -> Result<Option<crate::replication::physical_source_coordinator::PhysicalOperationPermit>> {
++        self.physical_source_coordinator
++            .as_ref()
++            .map(|coordinator| coordinator.operation().map_err(|error| Error::storage(error.to_string())))
++            .transpose()
++    }
++
++    /// Default feature builds retain zero-lock disabled behavior.
++    #[cfg(not(feature = "ha-tier1"))]
++    pub(crate) fn physical_source_operation(&self) -> Result<Option<()>> {
++        Ok(None)
++    }
++
++    #[cfg(feature = "ha-tier1")]
++    pub fn physical_source_coordinator(&self) -> Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>> {
++        self.physical_source_coordinator.clone()
++    }
++
+     /// Begin a transaction
+     pub fn begin_transaction(&self) -> Result<Transaction> {
+         let snapshot_id = self.next_timestamp();
+         let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
++        #[cfg(feature = "ha-tier1")]
++        txn.set_physical_source_coordinator(self.physical_source_coordinator());
+         // The commit batch writes `data:`/`v:`/`counter:` straight to RocksDB,
+         // bypassing `StorageEngine::put`, so it must carry the key manager and
+         // seal them itself.
+@@ -4226,6 +4265,8 @@
+     pub fn begin_autocommit_transaction(&self) -> Result<Transaction> {
+         let snapshot_id = self.next_timestamp();
+         let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
++        #[cfg(feature = "ha-tier1")]
++        txn.set_physical_source_coordinator(self.physical_source_coordinator());
+         // See `begin_transaction`: the commit batch seals its own row values.
+         txn.set_key_manager(self.key_manager.clone());
+         txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
+@@ -4331,6 +4372,8 @@
+         branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
+         timestamp: Arc<RwLock<u64>>,
+         read_only: bool,
++        #[cfg(feature = "ha-tier1")]
++        physical_source_coordinator: Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>>,
+     ) -> Result<(
+         Arc<super::version_gc::VersionGc>,
+         Option<super::version_gc::VersionGcWorker>,
+@@ -4342,14 +4385,17 @@
+             interval_secs,
+             max_versions_per_cycle: config.storage.version_gc_max_per_cycle,
+         };
+-        let version_gc = Arc::new(super::version_gc::VersionGc::new(
++        let version_gc = super::version_gc::VersionGc::new(
+             db,
+             snapshot_manager,
+             conflict_registry,
+             branch_manager,
+             timestamp,
+             gc_config,
+-        ));
++        );
++        #[cfg(feature = "ha-tier1")]
++        let version_gc = version_gc.with_physical_source_coordinator(physical_source_coordinator);
++        let version_gc = Arc::new(version_gc);
+         // Never start the background collector for a read-only handle — it
+         // deletes superseded versions (a write).
+         let worker = if interval_secs > 0 && !read_only {

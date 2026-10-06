@@ -1,0 +1,497 @@
+--- a/src/storage/engine.rs
++++ b/src/storage/engine.rs
+@@ -4179,6 +4179,19 @@
+         self.write_census.any_uncommitted_writes() && self.write_census.table_has_staged_index_removals(table)
+     }
+ 
++    /// Preserve the existing caller result while refusing to certify a source
++    /// whose required durable metadata failed after a successful row write.
++    pub(crate) fn note_physical_metadata_result<T>(&self, result: Result<T>, reason: &'static str) {
++        #[cfg(feature = "ha-tier1")]
++        if let Err(error) = result {
++            if let Some(coordinator) = &self.physical_source_coordinator {
++                coordinator.poison_certification(format!("{reason}: {error}"));
++            }
++        }
++        #[cfg(not(feature = "ha-tier1"))]
++        let _ = (result, reason);
++    }
++
+     /// Begin a transaction
+     pub fn begin_transaction(&self) -> Result<Transaction> {
+         let snapshot_id = self.next_timestamp();
+@@ -4557,6 +4570,7 @@
+     /// ([`Self::claim_index_entries`]) before anything is written — enforcement
+     /// never depends on `storage.time_travel_enabled`.
+     pub fn insert_tuple(&self, table_name: &str, tuple: Tuple) -> Result<u64> {
++        let _physical_operation = self.physical_source_operation()?;
+         // Check if a non-main branch is active - use branch-aware insertion
+         if self.is_branch_active() {
+             return self.insert_tuple_branch_aware(table_name, tuple);
+@@ -4590,6 +4604,7 @@
+             // Check bulk load mode early - skip some operations if enabled
+             let bulk_mode = self.is_bulk_load_mode();
+ 
++            let physical_phase = self.physical_durable_phase("insert_tuple did not finish durable state")?;
+             let stored_tuple =
+                 self.transform_tuple_for_column_storage_opts(table_name, row_id, &tuple, &schema, true)?;
+ 
+@@ -4630,6 +4645,10 @@
+             if !bulk_mode {
+                 // Record delta for incremental MV refresh
+                 if let Err(e) = self.mv_delta_tracker.record_insert(table_name, row_id, tuple.clone()) {
++                    self.note_physical_metadata_result::<()>(
++                        Err(Error::storage(e.to_string())),
++                        "materialized view delta persistence failed",
++                    );
+                     tracing::warn!("Failed to record insert delta for table '{}': {}", table_name, e);
+                     // Don't fail the insert if delta recording fails
+                 }
+@@ -4645,6 +4664,7 @@
+                 }
+             }
+ 
++            physical_phase.complete();
+             Ok(row_id)
+         }
+     }
+@@ -12056,6 +12076,7 @@
+         tuple: Tuple,
+         schema: &crate::Schema,
+     ) -> Result<u64> {
++        let _physical_operation = self.physical_source_operation()?;
+         let catalog = Catalog::new(self);
+ 
+         // R1.1: allocate the row id from the volatile counter — the durable
+@@ -12118,6 +12139,8 @@
+         // Check bulk load mode early - skip some operations if enabled
+         let bulk_mode = self.is_bulk_load_mode();
+ 
++        let physical_phase =
++            self.physical_durable_phase("insert_tuple_versioned_with_schema did not finish durable state")?;
+         let stored_tuple = self.transform_tuple_for_column_storage_opts(table_name, row_id, &tuple, schema, true)?;
+         // Serialize transformed tuple directly (RocksDB LZ4 handles compression at block level)
+         let value = bincode::serialize(&stored_tuple)
+@@ -12183,10 +12206,16 @@
+             // Register snapshot with WAL LSN for AS OF TRANSACTION queries.
+             // This ensures the transaction ID matches what users see in the REPL.
+             if let Some(lsn) = self.wal_lsn() {
+-                let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
++                self.note_physical_metadata_result(
++                    self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn),
++                    "snapshot metadata failed after row write",
++                );
+             } else {
+                 // Fallback to auto-generated transaction ID if WAL is disabled
+-                let _ = self.snapshot_manager.register_snapshot(timestamp);
++                self.note_physical_metadata_result(
++                    self.snapshot_manager.register_snapshot(timestamp),
++                    "snapshot metadata failed after row write",
++                );
+             }
+         }
+ 
+@@ -12194,6 +12223,10 @@
+         if !bulk_mode {
+             // Record delta for incremental MV refresh
+             if let Err(e) = self.mv_delta_tracker.record_insert(table_name, row_id, tuple.clone()) {
++                self.note_physical_metadata_result::<()>(
++                    Err(Error::storage(e.to_string())),
++                    "materialized view delta persistence failed",
++                );
+                 tracing::warn!("Failed to record insert delta for table '{}': {}", table_name, e);
+                 // Don't fail the insert if delta recording fails
+             }
+@@ -12209,6 +12242,7 @@
+             }
+         }
+ 
++        physical_phase.complete();
+         Ok(row_id)
+     }
+ 
+@@ -12218,6 +12252,7 @@
+     /// Skips delta tracking (MV/SMFI). Used for SQL fast paths where
+     /// parser/planner overhead and per-row counter persistence dominate.
+     pub fn insert_tuple_fast(&self, table_name: &str, tuple: Tuple, schema: &crate::Schema) -> Result<u64> {
++        let _physical_operation = self.physical_source_operation()?;
+         // W3.2: single-row autocommit INSERT class scope. Version bytes are
+         // recorded in `append_version_snapshot_to_batch`, index-key bytes in
+         // `on_insert_tuple`, both of which run inside this scope.
+@@ -12266,6 +12301,7 @@
+         // failure path in between (see `IndexClaim`).
+         let mut claim = IndexClaim::acquire(self, table_name, row_id, schema, &tuple)?;
+ 
++        let physical_phase = self.physical_durable_phase("insert_tuple_fast did not finish durable state")?;
+         let uses_side_storage = schema_uses_column_storage(schema);
+         let value = if uses_side_storage {
+             let stored_tuple =
+@@ -12383,7 +12419,7 @@
+ 
+         // Periodically persist row counter (every 64 inserts) for crash safety
+         if row_id % 64 == 0 {
+-            let _ = self.flush_row_counter(table_name);
++            self.note_physical_metadata_result(self.flush_row_counter(table_name), "row counter persistence failed");
+         }
+ 
+         if let Some(timestamp) = version_timestamp {
+@@ -12441,6 +12477,7 @@
+         // was written rather than stripping it: `Ok` is returned below, so the
+         // caller is about to be told the row exists.
+         claim.row_is_durable();
++        physical_phase.complete();
+         Ok(row_id)
+     }
+ 
+@@ -12466,6 +12503,7 @@
+         prepared: Vec<(u64, Tuple)>,
+         schema: &crate::Schema,
+     ) -> Result<u64> {
++        let _physical_operation = self.physical_source_operation()?;
+         if prepared.is_empty() {
+             return Ok(0);
+         }
+@@ -12755,6 +12793,8 @@
+         drop(_cps_bb);
+         // W3.4: the durable RocksDB write itself (the funnel's I/O phase).
+         let _cps_cm = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::Commit, batch_rows);
++        let physical_phase =
++            self.physical_durable_phase("insert_prepared_tuples_fast_batch did not finish durable state")?;
+         let result = if let Some(opts) = &self.memory_write_options {
+             self.db.write_opt(batch, opts)
+         } else {
+@@ -12769,7 +12809,10 @@
+         drop(_cps_cm);
+ 
+         if let Some(ts) = commit_ts {
+-            let _ = self.snapshot_manager.register_snapshot(ts);
++            self.note_physical_metadata_result(
++                self.snapshot_manager.register_snapshot(ts),
++                "snapshot metadata failed after row write",
++            );
+             // Item #2: publish the just-committed COPY marker into the in-memory
+             // interval index so AS-OF reads + UPDATE/DELETE materialization see
+             // it immediately (the durable `vmeta:` key is already in the batch).
+@@ -12797,6 +12840,7 @@
+         }
+         drop(_cps_am);
+ 
++        physical_phase.complete();
+         Ok(indexed_rows.len() as u64)
+     }
+ 
+@@ -12881,9 +12925,12 @@
+     /// `HELIOS_ZONE_MAP_OFF`) but no backfill ever runs and tables without a
+     /// marker are left alone.
+     fn columnar_presence_writes_active(&self, table_name: &str) -> Result<bool> {
++        let _physical_operation = self.physical_source_operation()?;
+         if columnar_presence_enabled() {
+             if !ColumnarStore::presence_manifest_complete(&self.db, table_name) {
++                let phase = self.physical_durable_phase("columnar presence backfill incomplete")?;
+                 ColumnarStore::backfill_presence(&self.db, table_name)?;
++                phase.complete();
+             }
+             Ok(true)
+         } else {
+@@ -12907,8 +12954,24 @@
+                 return None;
+             }
+         }
++        // This apparent read can lazily persist a presence map. Own its
++        // admission and uncertain error phase just like an explicit mutator.
++        let _physical_operation = self.physical_source_operation().ok()?;
++        let phase = if !ColumnarStore::presence_manifest_complete(&self.db, table_name) {
++            Some(
++                self.physical_durable_phase("read-side columnar presence backfill incomplete")
++                    .ok()?,
++            )
++        } else {
++            None
++        };
+         match ColumnarStore::presence_scan_map(&self.db, table_name) {
+-            Ok(map) => Some(map),
++            Ok(map) => {
++                if let Some(phase) = phase {
++                    phase.complete();
++                }
++                Some(map)
++            }
+             Err(e) => {
+                 tracing::warn!(table = table_name, error = %e, "Columnar presence load failed; using row walk");
+                 None
+@@ -13136,6 +13199,7 @@
+         schema: &crate::Schema,
+         index_update_needed: Option<bool>,
+     ) -> Result<u64> {
++        let _physical_operation = self.physical_source_operation()?;
+         // W3.2: UPDATE class scope. This fast path is version-SKIPPING (no
+         // `v:`/`v_idx:` write), so the census records `data:` bytes only — the
+         // measured absence of version bytes here is itself a W3.2 finding.
+@@ -13143,6 +13207,8 @@
+         // Item #2: preserve a COPY marker-covered row's insert version before
+         // this version-skipping fast UPDATE overwrites `data:` (no-op — one
+         // atomic load — when no COPY markers are live).
++        let physical_phase =
++            self.physical_durable_phase("update_tuple_fast_with_index_hint did not finish durable state")?;
+         self.snapshot_manager
+             .materialize_copy_marker_row_durable(table_name, row_id)?;
+         // Serialize the storage-format tuple; logical WAL is emitted by callers
+@@ -13206,6 +13272,7 @@
+         // Invalidate row cache for this row
+         self.row_cache.invalidate(table_name, row_id);
+ 
++        physical_phase.complete();
+         Ok(1)
+     }
+ 
+@@ -13227,10 +13294,12 @@
+         schema: &crate::Schema,
+         vector_old_tuple: Option<&Tuple>,
+     ) -> Result<u64> {
++        let _physical_operation = self.physical_source_operation()?;
+         // W3.2: UPDATE class scope (version-skipping; `data:` bytes only).
+         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Update);
+         // Item #2: preserve a COPY marker-covered row's insert version before
+         // this version-skipping fast UPDATE overwrites `data:`.
++        let physical_phase = self.physical_durable_phase("update_tuple_fast_no_index did not finish durable state")?;
+         self.snapshot_manager
+             .materialize_copy_marker_row_durable(table_name, row_id)?;
+         let value = if schema_uses_column_storage(schema) {
+@@ -13261,6 +13330,7 @@
+         }
+ 
+         self.row_cache.invalidate(table_name, row_id);
++        physical_phase.complete();
+         Ok(1)
+     }
+ 
+@@ -13273,10 +13343,12 @@
+         old_tuple: &Tuple,
+         schema: &crate::Schema,
+     ) -> Result<u64> {
++        let _physical_operation = self.physical_source_operation()?;
+         // W3.2: DELETE class scope. A tombstone carries the `data:` key only.
+         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Delete);
+         // Item #2: preserve a COPY marker-covered row's insert version before
+         // this version-skipping fast DELETE removes `data:`.
++        let physical_phase = self.physical_durable_phase("delete_tuple_fast did not finish durable state")?;
+         self.snapshot_manager
+             .materialize_copy_marker_row_durable(table_name, row_id)?;
+         let key = Self::build_data_key(table_name, row_id);
+@@ -13311,6 +13383,7 @@
+         self.delete_columnar_rows_grouped(table_name, &[row_id], schema)?;
+ 
+         self.row_cache.invalidate(table_name, row_id);
++        physical_phase.complete();
+         Ok(1)
+     }
+ 
+@@ -13324,10 +13397,12 @@
+         pk_key: &[u8],
+         pk_value: &crate::Value,
+     ) -> Result<u64> {
++        let _physical_operation = self.physical_source_operation()?;
+         // W3.2: DELETE class scope (PK-only tombstone; `data:` key bytes).
+         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Delete);
+         // Item #2: preserve a COPY marker-covered row's insert version before
+         // this version-skipping fast DELETE removes `data:`.
++        let physical_phase = self.physical_durable_phase("delete_tuple_fast_pk_only did not finish durable state")?;
+         self.snapshot_manager
+             .materialize_copy_marker_row_durable(table_name, row_id)?;
+         let key = Self::build_data_key(table_name, row_id);
+@@ -13358,6 +13433,7 @@
+         let _ = self.vector_indexes.on_row_delete(table_name, row_id, None, None);
+ 
+         self.row_cache.invalidate(table_name, row_id);
++        physical_phase.complete();
+         Ok(1)
+     }
+ 
+@@ -15067,6 +15143,7 @@
+         tuple: Tuple,
+         schema: &crate::Schema,
+     ) -> Result<u64> {
++        let _physical_operation = self.physical_source_operation()?;
+         // Get current branch name
+         let branch_name = self.current_branch.lock().clone();
+ 
+@@ -15132,6 +15209,8 @@
+ 
+         // Write to branch-specific key
+         let key = format!("bdata:{}:{}:{}", branch_id, table_name, row_id).into_bytes();
++        let physical_phase =
++            self.physical_durable_phase("insert_tuple_branch_aware_with_schema did not finish durable state")?;
+         self.put(&key, &value)?;
+         self.flush_row_counter(table_name)?;
+ 
+@@ -15144,13 +15223,23 @@
+ 
+         // Register snapshot with WAL LSN
+         if let Some(lsn) = self.wal_lsn() {
+-            let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
++            self.note_physical_metadata_result(
++                self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn),
++                "snapshot metadata failed after row write",
++            );
+         } else {
+-            let _ = self.snapshot_manager.register_snapshot(timestamp);
++            self.note_physical_metadata_result(
++                self.snapshot_manager.register_snapshot(timestamp),
++                "snapshot metadata failed after row write",
++            );
+         }
+ 
+         // Record delta for incremental MV refresh
+         if let Err(e) = self.mv_delta_tracker.record_insert(table_name, row_id, tuple.clone()) {
++            self.note_physical_metadata_result::<()>(
++                Err(Error::storage(e.to_string())),
++                "materialized view delta persistence failed",
++            );
+             tracing::warn!("Failed to record insert delta for table '{}': {}", table_name, e);
+         }
+ 
+@@ -15164,6 +15253,7 @@
+             }
+         }
+ 
++        physical_phase.complete();
+         Ok(row_id)
+     }
+ 
+@@ -15176,6 +15266,7 @@
+         table_name: &str,
+         mut updates: Vec<(u64, Tuple)>, // (row_id, updated_tuple)
+     ) -> Result<u64> {
++        let _physical_operation = self.physical_source_operation()?;
+         // Get current branch name
+         let branch_name = self.current_branch.lock().clone();
+ 
+@@ -15197,6 +15288,7 @@
+         let catalog = Catalog::new(self);
+         let schema = catalog.get_table_schema(table_name)?;
+ 
++        let physical_phase = self.physical_durable_phase("update_tuples_branch_aware did not finish durable state")?;
+         let mut update_count = 0u64;
+ 
+         for (row_id, tuple) in updates {
+@@ -15296,9 +15388,15 @@
+ 
+             // Register snapshot with WAL LSN
+             if let Some(lsn) = self.wal_lsn() {
+-                let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
++                self.note_physical_metadata_result(
++                    self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn),
++                    "snapshot metadata failed after row write",
++                );
+             } else {
+-                let _ = self.snapshot_manager.register_snapshot(timestamp);
++                self.note_physical_metadata_result(
++                    self.snapshot_manager.register_snapshot(timestamp),
++                    "snapshot metadata failed after row write",
++                );
+             }
+ 
+             // Record delta for incremental MV refresh
+@@ -15307,6 +15405,10 @@
+                     self.mv_delta_tracker
+                         .record_update(table_name, row_id, old_tuple.clone(), tuple.clone())
+                 {
++                    self.note_physical_metadata_result::<()>(
++                        Err(Error::storage(e.to_string())),
++                        "materialized view delta persistence failed",
++                    );
+                     tracing::warn!("Failed to record update delta for table '{}': {}", table_name, e);
+                     // Don't fail the update if delta recording fails
+                 }
+@@ -15344,6 +15446,7 @@
+             update_count += 1;
+         }
+ 
++        physical_phase.complete();
+         Ok(update_count)
+     }
+ 
+@@ -15352,6 +15455,7 @@
+     /// When a branch is active, marks tuples as deleted in branch-specific storage.
+     /// Deletions in a branch are isolated from the main branch.
+     pub fn delete_tuples_branch_aware(&self, table_name: &str, row_ids: Vec<u64>) -> Result<u64> {
++        let _physical_operation = self.physical_source_operation()?;
+         tracing::debug!(
+             "delete_tuples_branch_aware: called for table '{}' with row_ids {:?}",
+             table_name,
+@@ -15387,6 +15491,7 @@
+ 
+         tracing::debug!("delete_tuples_branch_aware: resolved branch_id = {:?}", branch_id);
+ 
++        let physical_phase = self.physical_durable_phase("delete_tuples_branch_aware did not finish durable state")?;
+         // Check for branch - main branch vs branch-specific delete
+         let Some(branch_id) = branch_id else {
+             // Main branch delete: preserve old value for time-travel before deleting
+@@ -15434,6 +15539,10 @@
+                         .mv_delta_tracker
+                         .record_delete(table_name, *row_id, deleted_tuple.clone())
+                     {
++                        self.note_physical_metadata_result::<()>(
++                            Err(Error::storage(e.to_string())),
++                            "materialized view delta persistence failed",
++                        );
+                         tracing::warn!("Failed to record delete delta for table '{}': {}", table_name, e);
+                         // Don't fail the delete if delta recording fails
+                     }
+@@ -15470,11 +15579,18 @@
+ 
+             // Register snapshot for main branch delete
+             if let Some(lsn) = self.wal_lsn() {
+-                let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
++                self.note_physical_metadata_result(
++                    self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn),
++                    "snapshot metadata failed after row write",
++                );
+             } else {
+-                let _ = self.snapshot_manager.register_snapshot(timestamp);
+-            }
+-
++                self.note_physical_metadata_result(
++                    self.snapshot_manager.register_snapshot(timestamp),
++                    "snapshot metadata failed after row write",
++                );
++            }
++
++            physical_phase.complete();
+             return Ok(delete_count);
+         };
+ 
+@@ -15523,6 +15639,10 @@
+                     .mv_delta_tracker
+                     .record_delete(table_name, row_id, deleted_tuple.clone())
+                 {
++                    self.note_physical_metadata_result::<()>(
++                        Err(Error::storage(e.to_string())),
++                        "materialized view delta persistence failed",
++                    );
+                     tracing::warn!("Failed to record branch delete delta for table '{}': {}", table_name, e);
+                     // Don't fail the delete if delta recording fails
+                 }
+@@ -15543,11 +15663,18 @@
+ 
+         // Register snapshot for branch delete
+         if let Some(lsn) = self.wal_lsn() {
+-            let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
++            self.note_physical_metadata_result(
++                self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn),
++                "snapshot metadata failed after row write",
++            );
+         } else {
+-            let _ = self.snapshot_manager.register_snapshot(timestamp);
+-        }
+-
++            self.note_physical_metadata_result(
++                self.snapshot_manager.register_snapshot(timestamp),
++                "snapshot metadata failed after row write",
++            );
++        }
++
++        physical_phase.complete();
+         Ok(delete_count)
+     }
+ 

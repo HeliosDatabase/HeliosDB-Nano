@@ -1944,6 +1944,8 @@ pub struct StorageEngine {
     statistics_cache: Arc<crate::storage::StatisticsCache>,
     /// Replay flag to skip WAL logging during recovery
     is_replaying: Arc<AtomicBool>,
+    /// Serialize live replay, including its row/index/counter publication.
+    live_replay_lock: parking_lot::Mutex<()>,
     /// GH#35: true ONLY while `replay_wal_after` re-executes the retained log
     /// at OPEN. Distinct from `is_replaying`, which `apply_replicated_operation`
     /// also sets: a standby applying the primary's DROP of a populated table is
@@ -2076,6 +2078,8 @@ pub struct StorageEngine {
     /// whose ORDER `EmbeddedDatabase::drop` is careful about). Defaults to
     /// `true`; nothing in production ever clears it.
     row_counter_flush_on_close: Arc<AtomicBool>,
+    /// Strict, immutable physical checkpoint hydration only.
+    physical_snapshot_mode: bool,
     /// R4.2: how the last `rebuild_all_indexes` populated the in-memory
     /// indexes (snapshot-loaded vs scanned). Diagnostics + test surface.
     last_index_open_report: Arc<RwLock<Option<super::index_snapshot::IndexOpenReport>>>,
@@ -2269,7 +2273,7 @@ impl StorageEngine {
 
     /// Open a storage engine
     pub fn open(path: impl AsRef<Path>, config: &Config) -> Result<Self> {
-        Self::open_with_mode(path, config, false)
+        Self::open_with_mode(path, config, false, false)
     }
 
     /// Open an EXISTING database read-only (RocksDB open-for-read-only). A
@@ -2280,11 +2284,47 @@ impl StorageEngine {
     /// (Used by `EmbeddedDatabase::open_read_only` for a2h's concurrent manifest
     /// reader: one writer + one or more read-only readers, same file.)
     pub fn open_read_only(path: impl AsRef<Path>, config: &Config) -> Result<Self> {
-        Self::open_with_mode(path, config, true)
+        Self::open_with_mode(path, config, true, false)
     }
 
-    fn open_with_mode(path: impl AsRef<Path>, config: &Config, read_only: bool) -> Result<Self> {
+    /// Hydrate a closed physical checkpoint without logical replay, metadata
+    /// repair or background/close-time writes. Never attach a live raw applier.
+    pub fn open_physical_snapshot(path: impl AsRef<Path>, config: &Config) -> Result<Self> {
+        if config.storage.memory_only {
+            return Err(Error::config("physical snapshots require persistent storage"));
+        }
+        let path = path.as_ref();
+        if !path.is_dir() {
+            return Err(Error::config(format!(
+                "physical snapshot requires an existing storage directory: {}",
+                path.display()
+            )));
+        }
+        Self::open_with_mode(path, config, true, true)
+    }
+
+    pub(crate) fn physical_snapshot_mode(&self) -> bool {
+        self.physical_snapshot_mode
+    }
+
+    fn open_with_mode(
+        path: impl AsRef<Path>,
+        config: &Config,
+        read_only: bool,
+        physical_snapshot: bool,
+    ) -> Result<Self> {
         let db_path = path.as_ref().to_path_buf();
+        if !physical_snapshot {
+            match std::fs::symlink_metadata(db_path.join("NANO-PHYSICAL-REPLICA.json")) {
+                Ok(_) => {
+                    return Err(Error::storage(
+                        "physical replica requires the physical serving startup path",
+                    ))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(Error::storage(format!("physical marker lookup failed: {error}"))),
+            }
+        }
         let mut opts = Options::default();
         opts.create_if_missing(!read_only);
         opts.set_compression_type(match config.storage.compression {
@@ -2340,6 +2380,24 @@ impl StorageEngine {
         opts.set_bytes_per_sync(sc.rocksdb_bytes_per_sync.unwrap_or(1048576)); // sync every 1MB
         opts.set_enable_pipelined_write(true); // Pipeline WAL + memtable writes
 
+        // Online physical replication needs archived RocksDB WAL beyond the
+        // active memtables. This is a bounded retention window, not a lease:
+        // receivers that fall outside it must fail on a gap and resnapshot.
+        // Ordinary configurations keep the previous RocksDB defaults.
+        if config.replication.physical.enabled {
+            let physical = &config.replication.physical;
+            if config.storage.memory_only
+                || !(60..=86_400).contains(&physical.wal_retention_secs)
+                || !(64..=65_536).contains(&physical.wal_retention_size_mb)
+            {
+                return Err(Error::config(
+                    "physical replication requires persistent storage and bounded WAL retention".to_string(),
+                ));
+            }
+            opts.set_wal_ttl_seconds(physical.wal_retention_secs);
+            opts.set_wal_size_limit_mb(physical.wal_retention_size_mb);
+        }
+
         let db = if read_only {
             // No DB lock taken — a second process can open read-only while a
             // primary writes. `false` = tolerate an existing WAL/log file.
@@ -2350,6 +2408,16 @@ impl StorageEngine {
         };
 
         let db = Arc::new(db);
+        // Also protect interrupted staging before its external marker exists.
+        // This key is owned only by replication::physical, never logical WAL.
+        if !physical_snapshot
+            && db
+                .get(b"__nano_physical_replica_cursor_v1")
+                .map_err(|e| Error::storage(format!("physical cursor lookup failed: {e}")))?
+                .is_some()
+        {
+            return Err(Error::storage("physical receiver cannot use logical recovery startup"));
+        }
 
         // Initialize encryption if enabled
         let key_manager = if config.encryption.enabled {
@@ -2366,7 +2434,11 @@ impl StorageEngine {
         // ahead of snapshot recovery, WAL replay and catalog load — all of which
         // read stored values — so a key mismatch is one error at open rather
         // than an unbounded number of unreadable values afterwards.
-        super::tde::verify_or_install_key_check(&db, key_manager.as_deref(), read_only)?;
+        if physical_snapshot {
+            super::tde::verify_physical_snapshot_key(&db, key_manager.as_deref())?;
+        } else {
+            super::tde::verify_or_install_key_check(&db, key_manager.as_deref(), read_only)?;
+        }
 
         // Initialize snapshot manager. It builds its own `WriteBatch`es against
         // the same `Arc<DB>`, so it needs the same key manager the engine uses —
@@ -2379,14 +2451,20 @@ impl StorageEngine {
         };
 
         // Recover existing snapshots
-        if let Err(e) = snapshot_manager.recover_snapshots() {
+        if physical_snapshot {
+            snapshot_manager.recover_snapshots_strict()?;
+        } else if let Err(e) = snapshot_manager.recover_snapshots() {
             warn!("Failed to recover snapshots: {}", e);
         }
 
         // W3.2: wire the single-copy-latest-version knob (after recovery, so the
         // durable elision sentinel is loaded and the materialize gate is armed
         // for any rows a prior session left flagged).
-        snapshot_manager.configure_elision(config.storage.elide_latest_version);
+        if physical_snapshot {
+            snapshot_manager.configure_elision_read_only()?;
+        } else {
+            snapshot_manager.configure_elision(config.storage.elide_latest_version);
+        }
 
         // R4.3: seed the logical MVCC timestamp counter from recovered
         // snapshot metadata so timestamps stay monotonic across reopens.
@@ -2400,7 +2478,12 @@ impl StorageEngine {
 
         // Initialize branch manager
         debug!("Initializing BranchManager");
-        let branch_manager = match BranchManager::new(Arc::clone(&db), Arc::clone(&timestamp)) {
+        let branch_open = if physical_snapshot {
+            BranchManager::open_existing(Arc::clone(&db), Arc::clone(&timestamp))
+        } else {
+            BranchManager::new(Arc::clone(&db), Arc::clone(&timestamp))
+        };
+        let branch_manager = match branch_open {
             Ok(mut manager) => {
                 // It writes branch rows against the same `Arc<DB>`, including
                 // copies between keys, so it applies the same rule.
@@ -2409,6 +2492,9 @@ impl StorageEngine {
                 Arc::new(RwLock::new(Some(Arc::new(manager))))
             }
             Err(e) => {
+                if physical_snapshot {
+                    return Err(e);
+                }
                 warn!(
                     "Failed to initialize BranchManager: {}. Branch operations will be unavailable.",
                     e
@@ -2499,7 +2585,7 @@ impl StorageEngine {
 
         // Initialize sync components if enabled
         #[cfg(feature = "sync-experimental")]
-        let (change_log, node_id) = if config.sync.enabled && config.sync.change_log_enabled {
+        let (change_log, node_id) = if !physical_snapshot && config.sync.enabled && config.sync.change_log_enabled {
             let node_id = if let Some(ref id_str) = config.sync.node_id {
                 uuid::Uuid::parse_str(id_str).map_err(|e| Error::config(format!("Invalid node_id UUID: {}", e)))?
             } else {
@@ -2519,6 +2605,20 @@ impl StorageEngine {
         // collector). Retention parse errors fail the open: a misread
         // retention must not silently disable (or enable) collection.
         let conflict_registry = Arc::new(super::conflict::WriteConflictRegistry::new());
+        if physical_snapshot {
+            if let Some(raw) = db
+                .get(super::version_gc::LOW_WATERMARK_KEY)
+                .map_err(|e| Error::storage(format!("version GC watermark read failed: {e}")))?
+            {
+                let bytes: [u8; 8] = raw
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::storage("invalid version GC watermark"))?;
+                if u64::from_be_bytes(bytes) == u64::MAX {
+                    return Err(Error::storage("version GC watermark exhausted"));
+                }
+            }
+        }
         let (version_gc, version_gc_worker) = Self::init_version_gc(
             &config,
             Arc::clone(&db),
@@ -2546,6 +2646,7 @@ impl StorageEngine {
             stats,
             statistics_cache,
             is_replaying: Arc::new(AtomicBool::new(false)),
+            live_replay_lock: parking_lot::Mutex::new(()),
             is_open_recovery: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "sync-experimental")]
             change_log,
@@ -2583,8 +2684,9 @@ impl StorageEngine {
             write_watermarks: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
-            index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
-            row_counter_flush_on_close: Arc::new(AtomicBool::new(true)),
+            index_snapshots_on_close: Arc::new(AtomicBool::new(!physical_snapshot)),
+            row_counter_flush_on_close: Arc::new(AtomicBool::new(!physical_snapshot)),
+            physical_snapshot_mode: physical_snapshot,
             last_index_open_report: Arc::new(RwLock::new(None)),
         };
 
@@ -2594,7 +2696,9 @@ impl StorageEngine {
         // R4.2: arm the snapshot invalidation hooks BEFORE any mutation can
         // run (WAL replay below included), so post-checkpoint mutations
         // durably invalidate stale index snapshots.
-        engine.wire_index_snapshot_hooks();
+        if !physical_snapshot {
+            engine.wire_index_snapshot_hooks();
+        }
 
         // Replay WAL entries for crash recovery, bounded by the durable
         // checkpoint. See `recover_wal_at_open` for the decision table.
@@ -2946,6 +3050,7 @@ impl StorageEngine {
             stats,
             statistics_cache,
             is_replaying: Arc::new(AtomicBool::new(false)),
+            live_replay_lock: parking_lot::Mutex::new(()),
             is_open_recovery: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "sync-experimental")]
             change_log,
@@ -2986,6 +3091,7 @@ impl StorageEngine {
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
             row_counter_flush_on_close: Arc::new(AtomicBool::new(true)),
+            physical_snapshot_mode: false,
             last_index_open_report: Arc::new(RwLock::new(None)),
         })
     }
@@ -3746,17 +3852,13 @@ impl StorageEngine {
 
     /// Delete a key
     pub fn delete(&self, key: &Key) -> Result<()> {
-        // Log to WAL first - skip during replay
-        // Also skip for metadata keys (meta:*) since DDL operations handle their own WAL logging
+        // Logical Delete describes a table row, not an arbitrary RocksDB key.
+        // DDL side records (including table_constraints:, counter:, triggers
+        // and other metadata) are represented by their owning DDL operation.
+        // Emitting Delete(table="unknown") for those keys made a real RENAME
+        // stream fail strict live-row replay, which correctly accepts data: only.
         if !self.is_replaying.load(Ordering::Acquire) {
-            let key_str = std::str::from_utf8(key).unwrap_or("");
-            // `meta:` records handle their own logging, and `__`-prefixed
-            // internal keys (`__view_metadata__…`) are catalog records, not
-            // rows: logging them produced a bogus `Delete { table: "unknown" }`
-            // in the CDC stream (GH#36).
-            let is_metadata_key = key_str.starts_with("meta:") || key_str.starts_with("__");
-
-            if !is_metadata_key {
+            if key.starts_with(b"data:") {
                 if let Some(wal) = &self.wal {
                     let wal = wal.read();
                     // Extract table name from key for proper WAL logging
@@ -8269,6 +8371,9 @@ impl StorageEngine {
             return Ok(Some(cached));
         }
 
+        // Capture before reading storage: live replay publishes its generation
+        // under the row-cache shard lock, so an old in-flight read cannot refill it.
+        let cache_generation = self.schema_generation();
         // Construct the storage key and fetch directly
         let storage_key = self.branch_aware_data_key(table_name, row_id);
         let raw_value = match self.get(&storage_key)? {
@@ -8321,8 +8426,13 @@ impl StorageEngine {
 
         // Populate the row cache and return the shared handle (no deep copy).
         let tuple = std::sync::Arc::new(tuple);
-        self.row_cache
-            .put_arc(table_name, row_id, std::sync::Arc::clone(&tuple));
+        self.row_cache.put_arc_if_generation(
+            table_name,
+            row_id,
+            std::sync::Arc::clone(&tuple),
+            &self.schema_generation,
+            cache_generation,
+        );
 
         Ok(Some(tuple))
     }
@@ -8341,15 +8451,13 @@ impl StorageEngine {
         // Coerce the PK value to match the actual PK column type so that the ART
         // key encoding is identical to the one produced at INSERT time.  Without
         // this, e.g. Int4(1) encodes as 4 bytes while the stored Int8(1) uses 8.
+        let pk_column =
+            schema.and_then(|schema| schema.columns.iter().enumerate().find(|(_, column)| column.primary_key));
         let coerced: crate::Value;
         let effective_pk = if coerce_pk_value {
-            if let Some(s) = schema {
-                if let Some(pk_col) = s.columns.iter().find(|c| c.primary_key) {
-                    coerced = Self::coerce_pk_value(pk_value, &pk_col.data_type);
-                    &coerced
-                } else {
-                    pk_value
-                }
+            if let Some((_, column)) = pk_column {
+                coerced = Self::coerce_pk_value(pk_value, &column.data_type);
+                &coerced
             } else {
                 pk_value
             }
@@ -8381,6 +8489,11 @@ impl StorageEngine {
 
         // Check row cache before going to storage
         if let Some(cached) = self.row_cache.get(table_name, row_id) {
+            if let (Some(schema), Some((index, _))) = (schema, pk_column) {
+                if self.pk_probe_is_misdirected(&cached, schema, index, effective_pk, &key) {
+                    return self.scan_actual_pk_owner(table_name, schema, index, effective_pk, &key);
+                }
+            }
             if trace_lookup {
                 tracing::debug!(
                     phase = "index_lookup",
@@ -8396,6 +8509,9 @@ impl StorageEngine {
             return Ok(Some(cached));
         }
 
+        // Capture before reading storage: live replay publishes its generation
+        // under the row-cache shard lock, so an old in-flight read cannot refill it.
+        let cache_generation = self.schema_generation();
         // Construct the storage key and fetch directly
         let storage_key = self.branch_aware_data_key(table_name, row_id);
         let raw_value = match self.get(&storage_key)? {
@@ -8455,10 +8571,22 @@ impl StorageEngine {
             }
         }
 
+        if let (Some(schema), Some((index, _))) = (schema, pk_column) {
+            if self.pk_probe_is_misdirected(&tuple, schema, index, effective_pk, &key) {
+                return self.scan_actual_pk_owner(table_name, schema, index, effective_pk, &key);
+            }
+        }
+
         // Populate row cache with resolved tuple for read lookups. Write paths
         // skip this because they immediately invalidate the same row.
         if populate_cache_on_miss {
-            self.row_cache.put(table_name, row_id, tuple.clone());
+            self.row_cache.put_if_generation(
+                table_name,
+                row_id,
+                tuple.clone(),
+                &self.schema_generation,
+                cache_generation,
+            );
         }
 
         if trace_lookup {
@@ -8475,6 +8603,55 @@ impl StorageEngine {
         }
 
         Ok(Some(tuple))
+    }
+
+    /// A tentative ART claim may resolve to a row with another key until its
+    /// storage batch publishes. Validate the known scalar probe before either
+    /// returning that tuple or admitting it to the row cache. Composite and
+    /// non-main branch lookups retain their existing separate contracts.
+    fn pk_probe_is_misdirected(
+        &self,
+        tuple: &Tuple,
+        schema: &crate::Schema,
+        index: usize,
+        effective_pk: &crate::Value,
+        encoded_key: &[u8],
+    ) -> bool {
+        if Self::tuple_has_probed_pk(tuple, index, effective_pk, encoded_key) {
+            return false;
+        }
+        if schema.columns.iter().skip(index + 1).any(|column| column.primary_key) {
+            return false;
+        }
+        self.current_branch
+            .lock()
+            .as_deref()
+            .is_none_or(|branch| branch == "main")
+    }
+
+    fn tuple_has_probed_pk(tuple: &Tuple, index: usize, effective_pk: &crate::Value, encoded_key: &[u8]) -> bool {
+        tuple.values.get(index).is_some_and(|value| {
+            value == effective_pk
+                || super::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(value)) == encoded_key
+        })
+    }
+
+    /// A mismatch is not proof of absence: another durable row may own the
+    /// requested key. The rare fallback reads canonical row storage and resolves
+    /// side references/TDE through the existing scanner. It neither evicts a
+    /// valid decoy cache entry nor fills the cache from an untrusted index hit.
+    fn scan_actual_pk_owner(
+        &self,
+        table: &str,
+        schema: &crate::Schema,
+        index: usize,
+        effective_pk: &crate::Value,
+        encoded_key: &[u8],
+    ) -> Result<Option<Tuple>> {
+        Ok(self
+            .scan_table_with_schema(table, schema)?
+            .into_iter()
+            .find(|tuple| Self::tuple_has_probed_pk(tuple, index, effective_pk, encoded_key)))
     }
 
     /// Coerce a PK lookup value to the target column type so that the ART key
@@ -9692,6 +9869,50 @@ impl StorageEngine {
         Ok(out)
     }
 
+    /// Complete decrypted metadata scan for immutable snapshot validation.
+    /// Iterator failures, malformed names and disappearing keys are errors.
+    pub fn meta_blobs_with_prefix_strict(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut options = ReadOptions::default();
+        options.set_total_order_seek(true);
+        let iterator = self.db.iterator_opt(
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            options,
+        );
+        let mut output = Vec::new();
+        for entry in iterator {
+            let (key, _) = entry.map_err(|e| Error::storage(format!("metadata scan failed: {e}")))?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            let suffix = std::str::from_utf8(&key[prefix.len()..])
+                .map_err(|_| Error::storage("invalid UTF-8 metadata key"))?
+                .to_owned();
+            let value = self
+                .get(&key.to_vec())?
+                .ok_or_else(|| Error::storage("metadata disappeared during strict snapshot load"))?;
+            output.push((suffix, value));
+        }
+        Ok(output)
+    }
+
+    /// Seed allocation state from a strict immutable image without writing it.
+    pub(crate) fn reseed_row_counter_for_physical_snapshot(&self, table_name: &str, max_row_id: u64) -> Result<()> {
+        if !self.physical_snapshot_mode {
+            return Err(Error::storage(
+                "snapshot counter hydration requires immutable snapshot mode",
+            ));
+        }
+        let target = max_row_id
+            .checked_add(1)
+            .ok_or_else(|| Error::storage("row id exhausted"))?;
+        let counter = self
+            .row_counters
+            .entry(table_name.to_owned())
+            .or_insert_with(|| AtomicU64::new(0));
+        counter.fetch_max(target, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Get database statistics
     pub fn get_stats(&self) -> Result<String> {
         self.db
@@ -10632,7 +10853,7 @@ impl StorageEngine {
 
     /// GH#35 (A2): whether a clean close advances the checkpoint.
     pub fn wal_checkpoint_on_close(&self) -> bool {
-        self.config.storage.wal_checkpoint_on_close
+        !self.physical_snapshot_mode && self.config.storage.wal_checkpoint_on_close
     }
 
     /// GH#35 (Half B): should this OPEN-TIME RECOVERY entry be SKIPPED?
@@ -10845,11 +11066,204 @@ impl StorageEngine {
     /// Unlike local WAL operations, these are NOT logged to the local WAL
     /// since they are already replicated from the primary.
     pub fn apply_replicated_operation(&self, operation: WalOperation) -> Result<()> {
-        // Set replaying flag to prevent re-logging to local WAL
-        self.is_replaying.store(true, std::sync::atomic::Ordering::Release);
-        let result = self.apply_wal_operation(operation);
-        self.is_replaying.store(false, std::sync::atomic::Ordering::Release);
+        let _replay_guard = self.live_replay_lock.lock();
+        // Startup recovery still uses apply_wal_operation directly: its indexes
+        // are rebuilt after replay. Live standbys need each successful operation
+        // published to the already-serving read paths before acknowledging it.
+        self.is_replaying.store(true, Ordering::Release);
+        let result = match operation {
+            WalOperation::Insert { table, key, tuple } | WalOperation::Update { table, key, tuple } => {
+                self.apply_live_replicated_row(&table, &key, Some(&tuple))
+            }
+            WalOperation::Delete { table, key } => self.apply_live_replicated_row(&table, &key, None),
+            WalOperation::UpdateCounter { table_name, new_value } => {
+                self.apply_live_replicated_counter(&table_name, new_value)
+            }
+            other => self.apply_wal_operation(other),
+        };
+        self.is_replaying.store(false, Ordering::Release);
         result
+    }
+
+    /// Read the durable and in-memory allocation high-water marks without
+    /// trusting the row cache. The durable value also matters after reopen.
+    fn live_replay_counter(&self, table: &str, minimum: u64) -> Result<(Vec<u8>, u64, u64)> {
+        if minimum == u64::MAX {
+            return Err(Error::storage("live replication row counter exhausted"));
+        }
+        let key = format!("counter:{table}").into_bytes();
+        let durable = match self.get(&key)? {
+            Some(bytes) => bincode::deserialize::<u64>(&bytes)
+                .map_err(|error| Error::storage(format!("invalid replicated row counter: {error}")))?,
+            None => 0,
+        };
+        let memory = self
+            .row_counters
+            .get(table)
+            .map(|counter| counter.load(Ordering::Acquire))
+            .unwrap_or(0);
+        let target = minimum.max(durable).max(memory);
+        if target == u64::MAX {
+            return Err(Error::storage("live replication row counter exhausted"));
+        }
+        Ok((key, durable, target))
+    }
+
+    fn publish_live_replay_counter(&self, table: &str, value: u64) {
+        self.row_counters
+            .entry(table.to_string())
+            .or_insert_with(|| AtomicU64::new(value))
+            .fetch_max(value, Ordering::Release);
+    }
+
+    fn apply_live_replicated_counter(&self, table: &str, value: u64) -> Result<()> {
+        let (key, durable, target) = self.live_replay_counter(table, value)?;
+        if target > durable {
+            let bytes = bincode::serialize(&target)
+                .map_err(|error| Error::storage(format!("serialize replicated row counter: {error}")))?;
+            self.put_internal(&key, &bytes)?;
+        }
+        self.publish_live_replay_counter(table, target);
+        Ok(())
+    }
+
+    fn apply_live_replicated_row(&self, table: &str, key: &Key, bytes: Option<&Vec<u8>>) -> Result<()> {
+        let prefix = format!("data:{table}:");
+        let row_id = key
+            .strip_prefix(prefix.as_bytes())
+            .and_then(|_| Self::parse_row_id_after_prefix(key, prefix.len()))
+            .filter(|row_id| *row_id != 0 && *row_id != u64::MAX)
+            .ok_or_else(|| Error::storage("invalid live replication data key or row ID"))?;
+        if *key != Self::build_data_key(table, row_id) {
+            return Err(Error::storage("live replication requires a canonical data key"));
+        }
+        let schema = Catalog::new(self).get_table_schema(table)?;
+        // Transaction WAL currently carries only data:/counter: keys, not the
+        // dictionary/CAS/columnar sidecars required to resolve stored references.
+        // Refuse these tables instead of indexing unresolved reference values.
+        if schema_uses_column_storage(&schema) {
+            return Err(Error::storage(format!(
+                "live replication for table '{table}' requires default row storage; column-storage sidecars are not replicated"
+            )));
+        }
+        let decode = |bytes: &[u8]| -> Result<Tuple> {
+            let mut tuple: Tuple = bincode::deserialize(bytes)
+                .map_err(|error| Error::storage(format!("invalid live replication tuple: {error}")))?;
+            if tuple.row_id.is_some_and(|id| id != row_id) || tuple.values.len() != schema.columns.len() {
+                return Err(Error::storage(
+                    "live replication tuple does not match its row ID or schema",
+                ));
+            }
+            if tuple
+                .values
+                .iter()
+                .any(|value| matches!(value, Value::DictRef { .. } | Value::CasRef { .. } | Value::ColumnarRef))
+            {
+                return Err(Error::storage(
+                    "live replication tuple contains an unresolved storage reference",
+                ));
+            }
+            tuple.row_id = Some(row_id);
+            Ok(tuple)
+        };
+        let new = bytes.map(|bytes| decode(bytes)).transpose()?;
+        // get() decrypts but never consults/populates row caches: index removal
+        // must describe the actual stored row, even after a previous delivery.
+        let old = self.get(key)?.map(|bytes| decode(&bytes)).transpose()?;
+        let counter = if new.is_some() {
+            Some(self.live_replay_counter(table, row_id)?)
+        } else {
+            None
+        };
+        let mut batch = WriteBatch::default();
+        if let Some(bytes) = bytes {
+            let stored = self.seal_stored(bytes)?;
+            batch.put(key, stored.as_ref());
+        } else {
+            batch.delete(key);
+        }
+        if let Some((key, durable, target)) = &counter {
+            if target > durable {
+                let value = bincode::serialize(target)
+                    .map_err(|error| Error::storage(format!("serialize replicated row counter: {error}")))?;
+                let stored = self.seal_stored(&value)?;
+                batch.put(key, stored.as_ref());
+            }
+        }
+        // Preserve the raw put path's resource checks before claiming indexes.
+        if let Some(path) = &self.db_path {
+            if self.write_counter.fetch_add(1, Ordering::Relaxed) % 1000 == 0 {
+                Self::check_disk_space(path)?;
+            }
+        }
+        let write_size = bytes.map_or(0, |bytes| (key.len() + bytes.len()) as u64);
+        let accounted = self.memory_limit_bytes > 0 && write_size > 0;
+        if accounted {
+            let previous = self.data_bytes_written.fetch_add(write_size, Ordering::Relaxed);
+            if previous.saturating_add(write_size) > self.memory_limit_bytes {
+                self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
+                return Err(Error::storage("memory limit exceeded during live replication"));
+            }
+        }
+        let mut indexes =
+            match self
+                .art_index_manager
+                .stage_replicated_row(table, row_id, &schema, old.as_ref(), new.as_ref())
+            {
+                Ok(indexes) => indexes,
+                Err(error) => {
+                    if accounted {
+                        self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
+                    }
+                    // Readers may have observed a transient earlier index claim
+                    // before a later index refused and the claims were rolled back.
+                    self.publish_live_replay_visibility(table, row_id);
+                    return Err(Error::storage(format!("live replication index claim failed: {error}")));
+                }
+            };
+        // Invalidate BEFORE the row becomes visible, including versionless DELETE.
+        self.invalidate_write_watermark(table);
+        let written = if let Some(options) = &self.memory_write_options {
+            self.db.write_opt(batch, options)
+        } else {
+            self.db.write(batch)
+        };
+        if let Err(error) = written {
+            if accounted {
+                self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
+            }
+            let rollback = indexes.rollback();
+            self.publish_live_replay_visibility(table, row_id);
+            return Err(Error::storage(format!(
+                "live replication storage write failed: {error}; index rollback: {rollback:?}"
+            )));
+        }
+        indexes.commit();
+        if let Some((_, _, target)) = counter {
+            self.publish_live_replay_counter(table, target);
+        }
+        match &new {
+            Some(tuple) => {
+                let _ = self
+                    .vector_indexes
+                    .on_row_update(table, row_id, &schema, old.as_ref(), tuple);
+            }
+            None => {
+                let _ = self
+                    .vector_indexes
+                    .on_row_delete(table, row_id, Some(&schema), old.as_ref());
+            }
+        }
+        self.publish_live_replay_visibility(table, row_id);
+        Ok(())
+    }
+
+    fn publish_live_replay_visibility(&self, table: &str, row_id: u64) {
+        // Row-cache publication must share the shard lock with guarded fills.
+        // Advancing this existing generation also invalidates SQL result caches,
+        // without clearing unrelated tables' committed-write watermarks.
+        self.row_cache
+            .invalidate_with_generation(table, row_id, &self.schema_generation);
     }
 
     /// Apply a single WAL operation to restore database state
@@ -13109,7 +13523,14 @@ impl StorageEngine {
                 // Decrypt value if encryption is enabled
                 let value = self.decrypt_value(&key, &raw_value)?;
 
-                let table_name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
+                let suffix = key.get(prefix.len()..).unwrap_or_default();
+                let table_name = if self.physical_snapshot_mode {
+                    std::str::from_utf8(suffix)
+                        .map_err(|_| Error::storage("invalid UTF-8 row counter table"))?
+                        .to_owned()
+                } else {
+                    String::from_utf8_lossy(suffix).to_string()
+                };
                 let count: u64 = bincode::deserialize(&value)
                     .map_err(|e| Error::storage(format!("Failed to deserialize counter: {}", e)))?;
 

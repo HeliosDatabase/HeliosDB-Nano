@@ -95,6 +95,9 @@ pub struct Config {
     /// Server configuration
     #[serde(default)]
     pub server: ServerConfig,
+    /// Native WAL replication settings (CLI flags override these values).
+    #[serde(default)]
+    pub replication: ReplicationConfig,
     /// Performance configuration
     #[serde(default)]
     pub performance: PerformanceConfig,
@@ -143,6 +146,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             encryption: EncryptionConfig::default(),
             server: ServerConfig::default(),
+            replication: ReplicationConfig::default(),
             performance: PerformanceConfig::default(),
             audit: crate::audit::AuditConfig::default(),
             optimizer: OptimizerConfig::default(),
@@ -240,6 +244,7 @@ impl Config {
             "storage",
             "encryption",
             "server",
+            "replication",
             "performance",
             "audit",
             "optimizer",
@@ -325,11 +330,180 @@ impl Config {
     /// Validate all configuration sections
     pub fn validate(&self) -> crate::Result<()> {
         self.server.validate_connection_policy()?;
+        self.replication.validate()?;
         self.session.validate()?;
         self.locks.validate()?;
         self.dump.validate()?;
         self.resource_quotas.validate()?;
         Ok(())
+    }
+}
+
+/// Native WAL replication configuration for the `start` command.
+///
+/// Explicit CLI arguments override individual fields from this section. Endpoint
+/// validation checks syntax without DNS/network access; connection attempts resolve
+/// hostnames later. Role-dependent requirements are checked after CLI overrides.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReplicationConfig {
+    /// standalone, primary, standby, or observer (case-insensitive).
+    pub role: String,
+    /// Native replication listener port, separate from PostgreSQL and HTTP.
+    #[serde(alias = "port")]
+    pub replication_port: u16,
+    /// Initial standby history verification window, including DNS, in seconds (1..=3600).
+    pub startup_timeout_secs: u64,
+    /// Primary native replication endpoint, required for standby startup.
+    pub primary_host: Option<String>,
+    /// Standby native replication endpoints.
+    pub standby_hosts: Vec<String>,
+    /// Observer native replication endpoints.
+    pub observer_hosts: Vec<String>,
+    /// async, semi-sync (alias semisync), or sync (case-insensitive).
+    pub sync_mode: String,
+    /// Default-off authenticated physical transfer endpoint and bounded RocksDB WAL retention.
+    pub physical: PhysicalReplicationConfig,
+    /// Stable node UUID; generated at startup if absent.
+    pub node_id: Option<String>,
+    /// Path to the one owner-only 32-byte token file that authenticates BOTH the
+    /// native logical channel and the physical transfer channel. When set, a
+    /// primary REQUIRES every standby to present the same token before it is
+    /// registered or receives any WAL, and a standby presents it to the primary.
+    /// The token bytes are NEVER read from TOML or the environment.
+    ///
+    /// SECURITY CONTRACT (bounded): the token is sent as a raw bearer over the
+    /// **plaintext** native replication channel (no TLS, no primary-to-standby
+    /// proof). It is only a network-path control for a loopback listener or a
+    /// protected tunnel. A non-loopback listener with a configured token is
+    /// refused unless `allow_insecure_remote = true` explicitly acknowledges the
+    /// plaintext risk.
+    #[serde(default)]
+    pub token_file: Option<std::path::PathBuf>,
+    /// Explicit acknowledgment that the replication token crosses a non-loopback
+    /// (plaintext) network. Default false: a token on a non-loopback listener is
+    /// refused. Modeled on the PostgreSQL `--allow-insecure-trust` opt-in; set
+    /// via `--allow-insecure-replication-remote`.
+    #[serde(default)]
+    pub allow_insecure_remote: bool,
+}
+
+impl std::fmt::Debug for ReplicationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Only the token file PATH is present here; the secret itself never
+        // reaches this struct (it is read from the file on demand).
+        f.debug_struct("ReplicationConfig")
+            .field("role", &self.role)
+            .field("replication_port", &self.replication_port)
+            .field("startup_timeout_secs", &self.startup_timeout_secs)
+            .field("primary_host", &self.primary_host)
+            .field("standby_hosts", &self.standby_hosts)
+            .field("observer_hosts", &self.observer_hosts)
+            .field("sync_mode", &self.sync_mode)
+            .field("physical", &self.physical)
+            .field("node_id", &self.node_id)
+            .field("token_file", &self.token_file)
+            .field("allow_insecure_remote", &self.allow_insecure_remote)
+            .finish()
+    }
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            role: "standalone".to_string(),
+            physical: PhysicalReplicationConfig::default(),
+            replication_port: 5433,
+            startup_timeout_secs: 30,
+            primary_host: None,
+            standby_hosts: Vec::new(),
+            observer_hosts: Vec::new(),
+            sync_mode: "async".to_string(),
+            node_id: None,
+            token_file: None,
+            allow_insecure_remote: false,
+        }
+    }
+}
+
+impl ReplicationConfig {
+    /// Validate configured values without requiring role-dependent CLI arguments.
+    pub fn validate(&self) -> crate::Result<()> {
+        if !matches!(
+            self.role.to_ascii_lowercase().as_str(),
+            "standalone" | "primary" | "standby" | "observer"
+        ) {
+            return Err(crate::Error::config(
+                "replication.role must be standalone, primary, standby, or observer",
+            ));
+        }
+        if !matches!(
+            self.sync_mode.to_ascii_lowercase().as_str(),
+            "async" | "semi-sync" | "semisync" | "sync"
+        ) {
+            return Err(crate::Error::config(
+                "replication.sync_mode must be async, semi-sync, or sync",
+            ));
+        }
+        if !(1..=3600).contains(&self.startup_timeout_secs) {
+            return Err(crate::Error::config(
+                "replication.startup_timeout_secs must be between 1 and 3600 seconds",
+            ));
+        }
+        if self.replication_port == 0 {
+            return Err(crate::Error::config(
+                "replication.replication_port must be between 1 and 65535",
+            ));
+        }
+        for (key, endpoints) in [
+            ("primary_host", self.primary_host.iter().collect::<Vec<_>>()),
+            ("standby_hosts", self.standby_hosts.iter().collect()),
+            ("observer_hosts", self.observer_hosts.iter().collect()),
+        ] {
+            for endpoint in endpoints {
+                validate_replication_endpoint(endpoint)
+                    .map_err(|error| crate::Error::config(format!("replication.{key}: {error}")))?;
+            }
+        }
+        self.physical.validate()?;
+        if let Some(node_id) = &self.node_id {
+            uuid::Uuid::parse_str(node_id)
+                .map_err(|error| crate::Error::config(format!("replication.node_id must be a UUID: {error}")))?;
+        }
+        Ok(())
+    }
+}
+
+/// Validate a native replication endpoint: `host:port`, `IPv4:port`, or `[IPv6]:port`.
+///
+/// This intentionally performs no DNS lookup, allowing configuration checks while
+/// peers are offline. URLs, unbracketed IPv6, missing ports and port zero are errors.
+pub fn validate_replication_endpoint(endpoint: &str) -> crate::Result<()> {
+    let invalid = || {
+        crate::Error::config(format!(
+            "invalid replication endpoint '{endpoint}'; use host:port or [IPv6]:port with a nonzero port"
+        ))
+    };
+    if let Ok(address) = endpoint.parse::<std::net::SocketAddr>() {
+        return if address.port() == 0 { Err(invalid()) } else { Ok(()) };
+    }
+    let (host, port) = endpoint.rsplit_once(':').ok_or_else(invalid)?;
+    let valid_host = !host.is_empty()
+        && host.len() <= 253
+        && !host.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && host.strip_suffix('.').unwrap_or(host).split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    if !valid_host || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    match port.parse::<u16>() {
+        Ok(port) if port > 0 => Ok(()),
+        _ => Err(invalid()),
     }
 }
 
@@ -2223,8 +2397,156 @@ fn generate_random_secret() -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replication_defaults_preserve_standalone_startup() {
+        let config = Config::from_toml_str("").unwrap();
+        assert_eq!(config.replication.role, "standalone");
+        assert_eq!(config.replication.replication_port, 5433);
+        assert_eq!(config.replication.startup_timeout_secs, 30);
+        assert_eq!(config.replication.sync_mode, "async");
+        assert!(config.replication.primary_host.is_none());
+        assert!(config.replication.standby_hosts.is_empty());
+        assert!(config.replication.observer_hosts.is_empty());
+        assert!(config.replication.node_id.is_none());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn replication_config_has_no_inline_secret_and_accepts_a_token_file() {
+        // The secret is never configurable inline; only an owner-only file path is.
+        assert!(
+            Config::from_toml_str("[replication]\nauth_token = 'native-secret'").is_err(),
+            "inline auth_token must be rejected (no secret in TOML)"
+        );
+        let mut config = Config::default();
+        config.replication.token_file = Some(std::path::PathBuf::from("/etc/helios/replication.token"));
+        config.validate().expect("a token_file path is valid");
+        let rendered = format!("{:?}", config.replication);
+        assert!(
+            rendered.contains("/etc/helios/replication.token"),
+            "token_file path should be visible: {rendered}"
+        );
+    }
+
+    #[test]
+    fn replication_config_round_trips_all_fields() {
+        let config = Config::from_toml_str(
+            r#"
+            [replication]
+            role = "primary"
+            replication_port = 6433
+            startup_timeout_secs = 17
+            primary_host = "primary.example:6433"
+            standby_hosts = ["10.0.0.2:6433", "[::1]:6433"]
+            observer_hosts = ["observer.example:7433"]
+            sync_mode = "semi-sync"
+            node_id = "550e8400-e29b-41d4-a716-446655440000"
+            "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded = Config::from_toml_str(&encoded).unwrap();
+        assert_eq!(decoded.replication.role, "primary");
+        assert_eq!(decoded.replication.replication_port, 6433);
+        assert_eq!(decoded.replication.startup_timeout_secs, 17);
+        assert_eq!(
+            decoded.replication.primary_host.as_deref(),
+            Some("primary.example:6433")
+        );
+        assert_eq!(decoded.replication.standby_hosts, ["10.0.0.2:6433", "[::1]:6433"]);
+        assert_eq!(decoded.replication.observer_hosts, ["observer.example:7433"]);
+        assert_eq!(decoded.replication.sync_mode, "semi-sync");
+        assert_eq!(
+            decoded.replication.node_id.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+    }
+
+    #[test]
+    fn replication_port_alias_and_unknown_fields_are_strict() {
+        let config = Config::from_toml_str("[replication]\nport = 6433").unwrap();
+        assert_eq!(config.replication.replication_port, 6433);
+        for invalid in [
+            "[replication]\nreplicaton_port = 6433",
+            "[replication]\nport = 6433\nreplication_port = 7433",
+            "[replication]\nstandby_hosts = 'localhost:5433'",
+            "[replication]\nreplication_port = 65536",
+        ] {
+            assert!(Config::from_toml_str(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn replication_validation_rejects_invalid_values() {
+        for invalid in [
+            "role = 'primray'",
+            "sync_mode = 'eventual'",
+            "replication_port = 0",
+            "startup_timeout_secs = 0",
+            "startup_timeout_secs = 3601",
+            "node_id = 'not-a-uuid'",
+            "primary_host = 'localhost'",
+            "standby_hosts = ['localhost:0']",
+            "observer_hosts = ['http://localhost:5433']",
+        ] {
+            let config = Config::from_toml_str(&format!("[replication]\n{invalid}")).unwrap();
+            assert!(config.validate().is_err(), "accepted {invalid}");
+        }
+        // Role requirements apply to the effective configuration, after CLI overrides.
+        let config = Config::from_toml_str("[replication]\nrole = 'standby'\nsync_mode = 'SEMISYNC'").unwrap();
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn replication_startup_timeout_accepts_bounds_and_rejects_non_integer_values() {
+        for timeout in [1, 30, 3600] {
+            let config = Config::from_toml_str(&format!("[replication]\nstartup_timeout_secs = {timeout}")).unwrap();
+            config.validate().unwrap();
+        }
+        for timeout in ["-1", "1.5", "nan", "inf", "'30'", "18446744073709551616"] {
+            assert!(Config::from_toml_str(&format!("[replication]\nstartup_timeout_secs = {timeout}")).is_err());
+        }
+    }
+
+    #[test]
+    fn replication_endpoints_accept_dns_ipv4_and_bracketed_ipv6() {
+        for endpoint in [
+            "localhost:5433",
+            "primary.example.:5433",
+            "nano_primary:5433",
+            "127.0.0.1:1",
+            "[::1]:65535",
+            "[2001:db8::1]:5433",
+        ] {
+            validate_replication_endpoint(endpoint).unwrap();
+        }
+        for endpoint in [
+            "",
+            "localhost",
+            ":5433",
+            "localhost:",
+            "localhost:0",
+            "localhost:65536",
+            "localhost:+5433",
+            "localhost:5433:5433",
+            "::1:5433",
+            "[::1]:0",
+            "[::invalid]:5433",
+            "256.1.2.3:5433",
+            "http://localhost:5433",
+            "host name:5433",
+            "-host:5433",
+            "host..example:5433",
+            "localhost:5433 ",
+        ] {
+            assert!(validate_replication_endpoint(endpoint).is_err(), "accepted {endpoint}");
+        }
+    }
 
     // ------------------------------------------------------------------
     // Credential hygiene: `Debug` must not print secrets
@@ -2836,5 +3158,130 @@ redirect_uri = "http://localhost:8080/auth/v1/callback"
         assert!(DumpConfig::validate_cron_schedule("0 * * *").is_err()); // Only 4 fields
         assert!(DumpConfig::validate_cron_schedule("0 * * * * *").is_err()); // 6 fields
         assert!(DumpConfig::validate_cron_schedule("").is_err()); // Empty
+    }
+}
+
+/// Explicit, default-off physical transfer source. The initial transport is
+/// authenticated plaintext on loopback only; use an authenticated tunnel for peers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PhysicalReplicationConfig {
+    pub enabled: bool,
+    pub listen: String,
+    /// Existing private directory, disjoint from the live source database.
+    pub export_dir: Option<std::path::PathBuf>,
+    pub wal_retention_secs: u64,
+    pub wal_retention_size_mb: u64,
+    pub max_sessions: usize,
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
+    pub max_chunk_bytes: usize,
+    pub frame_timeout_secs: u64,
+    pub operation_timeout_secs: u64,
+}
+
+impl Default for PhysicalReplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: "127.0.0.1:5440".into(),
+            export_dir: None,
+            wal_retention_secs: 3600,
+            wal_retention_size_mb: 1024,
+            max_sessions: 2,
+            max_files: 2048,
+            max_file_bytes: 32 * 1024 * 1024 * 1024,
+            max_total_bytes: 64 * 1024 * 1024 * 1024,
+            max_chunk_bytes: 1024 * 1024,
+            frame_timeout_secs: 30,
+            operation_timeout_secs: 120,
+        }
+    }
+}
+
+impl PhysicalReplicationConfig {
+    /// Pure validation permits CLI overrides to supply paths after file loading.
+    /// Enabled-role, persistent-storage and file ownership checks run before open.
+    pub fn validate(&self) -> crate::Result<()> {
+        let address: std::net::SocketAddr = self
+            .listen
+            .parse()
+            .map_err(|_| crate::Error::config("replication.physical.listen must be a literal loopback IP:port"))?;
+        if !address.ip().is_loopback() || address.port() == 0 {
+            return Err(crate::Error::config("replication.physical.listen requires loopback and a nonzero port; remote transfer requires an authenticated tunnel"));
+        }
+        for (name, value, minimum, maximum) in [
+            ("wal_retention_secs", self.wal_retention_secs, 60, 86400),
+            ("wal_retention_size_mb", self.wal_retention_size_mb, 64, 65536),
+            ("max_sessions", self.max_sessions as u64, 1, 64),
+            ("max_files", self.max_files as u64, 1, 2048),
+            ("max_file_bytes", self.max_file_bytes, 1, 1_u64 << 40),
+            ("max_total_bytes", self.max_total_bytes, 1, 1_u64 << 40),
+            ("max_chunk_bytes", self.max_chunk_bytes as u64, 1, 1024 * 1024),
+            ("frame_timeout_secs", self.frame_timeout_secs, 1, 3600),
+            ("operation_timeout_secs", self.operation_timeout_secs, 1, 3600),
+        ] {
+            if !(minimum..=maximum).contains(&value) {
+                return Err(crate::Error::config(format!(
+                    "replication.physical.{name} must be between {minimum} and {maximum}"
+                )));
+            }
+        }
+        if self.max_file_bytes > self.max_total_bytes {
+            return Err(crate::Error::config(
+                "replication.physical.max_file_bytes must not exceed max_total_bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod physical_config_tests {
+    use super::*;
+    #[test]
+    fn physical_defaults_are_disabled_and_bounded() {
+        let config = ReplicationConfig::default();
+        assert!(!config.physical.enabled);
+        assert_eq!(config.physical.wal_retention_secs, 3600);
+        assert_eq!(config.physical.wal_retention_size_mb, 1024);
+        config.validate().unwrap();
+    }
+    #[test]
+    fn physical_config_is_strict_and_loopback_only() {
+        let config: ReplicationConfig = toml::from_str(
+            "[physical]\nenabled=true\nwal_retention_secs=60\nwal_retention_size_mb=64\nlisten='[::1]:5440'",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        for text in [
+            "[physical]\nunknown=true",
+            "[physical]\nwal_retention_secs=-1",
+            "[physical]\nenabled='yes'",
+        ] {
+            assert!(toml::from_str::<ReplicationConfig>(text).is_err(), "{text}");
+        }
+        for (field, value) in [
+            ("wal_retention_secs", "0"),
+            ("wal_retention_secs", "86401"),
+            ("wal_retention_size_mb", "63"),
+            ("wal_retention_size_mb", "65537"),
+            ("max_sessions", "0"),
+            ("max_sessions", "65"),
+            ("max_files", "2049"),
+            ("max_chunk_bytes", "1048577"),
+            ("max_total_bytes", "1099511627777"),
+            ("max_file_bytes", "68719476737"),
+            ("frame_timeout_secs", "0"),
+            ("operation_timeout_secs", "3601"),
+            ("listen", "'0.0.0.0:5440'"),
+            ("listen", "'127.0.0.1:0'"),
+            ("listen", "'localhost:5440'"),
+        ] {
+            let config: ReplicationConfig = toml::from_str(&format!("[physical]\n{field}={value}")).unwrap();
+            assert!(config.validate().is_err(), "{field}={value}");
+        }
     }
 }

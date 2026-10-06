@@ -126,7 +126,7 @@ async fn test_streaming_server_creation() {
     let wal_store = Arc::new(WalStore::new(wal_config));
     wal_store.init().await.expect("Failed to init WAL store");
 
-    let server = StreamingServer::new(config, node_id, wal_store);
+    let server = StreamingServer::new(config, node_id, Uuid::new_v4(), wal_store).unwrap();
 
     // Verify initial state
     assert_eq!(server.standby_count().await, 0);
@@ -141,9 +141,13 @@ async fn test_streaming_client_creation() {
         connect_timeout: Duration::from_secs(5),
         reconnect_delay: Duration::from_secs(1),
         max_reconnect_attempts: 3,
+        auth: None,
     };
 
-    let (client, _rx) = StreamingClient::new(config);
+    let (client, _rx) = StreamingClient::new(
+        config,
+        Arc::new(heliosdb_nano::replication::history::ReceiverHistory::in_memory()),
+    );
 
     // Verify initial state
     assert_eq!(client.applied_lsn(), 0);
@@ -159,7 +163,7 @@ async fn test_wal_entry_broadcasting() {
     let wal_store = Arc::new(WalStore::new(wal_config));
     wal_store.init().await.expect("Failed to init WAL store");
 
-    let server = StreamingServer::new(config, node_id, wal_store);
+    let server = StreamingServer::new(config, node_id, Uuid::new_v4(), wal_store).unwrap();
 
     // Note: Broadcast requires the server to be started with active listeners.
     // Without connected standbys, the broadcast channel may be closed.

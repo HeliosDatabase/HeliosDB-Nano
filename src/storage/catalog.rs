@@ -465,6 +465,305 @@ pub struct Catalog<'a> {
 }
 
 impl<'a> Catalog<'a> {
+    /// Strictly decode every trigger record, preserving key context on failure.
+    pub(crate) fn load_all_triggers_strict(&self) -> Result<Vec<crate::sql::TriggerDefinition>> {
+        self.storage
+            .meta_blobs_with_prefix_strict("trigger:")?
+            .into_iter()
+            .map(|(suffix, bytes)| {
+                let definition: crate::sql::TriggerDefinition = bincode::deserialize(&bytes)
+                    .map_err(|e| Error::storage(format!("physical snapshot trigger:{suffix}: {e}")))?;
+                if suffix != format!("{}:{}", definition.table_name, definition.name) {
+                    return Err(Error::storage(format!(
+                        "physical snapshot trigger:{suffix}: key/definition mismatch"
+                    )));
+                }
+                if self.storage.get_cached_schema(&definition.table_name).is_none() {
+                    return Err(Error::storage(format!(
+                        "physical snapshot trigger:{suffix}: missing owning table"
+                    )));
+                }
+                Ok(definition)
+            })
+            .collect()
+    }
+
+    pub(crate) fn load_all_trigger_row_mutations_strict(
+        &self,
+    ) -> Result<Vec<(String, String, crate::sql::triggers::TriggerRowMutation)>> {
+        self.storage
+            .meta_blobs_with_prefix_strict("trigger_rowmut:")?
+            .into_iter()
+            .map(|(suffix, bytes)| {
+                let (table, name) = suffix
+                    .rsplit_once(':')
+                    .filter(|(t, n)| !t.is_empty() && !n.is_empty())
+                    .ok_or_else(|| {
+                        Error::storage(format!("physical snapshot trigger_rowmut:{suffix}: malformed key"))
+                    })?;
+                let mutation = Self::decode_tagged::<crate::sql::triggers::TriggerRowMutation>(
+                    TRIGGER_ROWMUT_MAGIC,
+                    TRIGGER_ROWMUT_FORMAT_VERSION,
+                    &bytes,
+                    "trigger row mutation",
+                )
+                .map_err(|e| Error::storage(format!("physical snapshot trigger_rowmut:{suffix}: {e}")))?;
+                Ok((table.to_string(), name.to_string(), mutation))
+            })
+            .collect()
+    }
+
+    fn physical_snapshot_index_definitions(&self) -> Result<Vec<(String, PersistedIndexDefinition)>> {
+        let mut definitions = Vec::new();
+        for (name, bytes) in self.storage.meta_blobs_with_prefix_strict("meta:index:")? {
+            let fail = |e: String| Error::storage(format!("physical snapshot index '{name}': {e}"));
+            let definition = if bytes.starts_with(INDEX_DEF_MAGIC) {
+                let version = bytes
+                    .get(INDEX_DEF_MAGIC.len())
+                    .copied()
+                    .ok_or_else(|| fail("missing format version".into()))?;
+                if version != INDEX_DEF_FORMAT_VERSION {
+                    return Err(fail(format!("unsupported format version {version}")));
+                }
+                bincode::deserialize::<PersistedIndexDefinition>(&bytes[INDEX_DEF_MAGIC.len() + 1..])
+                    .map_err(|e| fail(e.to_string()))?
+            } else if let Ok(definition) = bincode::deserialize::<PersistedIndexDefinition>(&bytes) {
+                definition
+            } else {
+                // Preserve the known historical tuple format, but never erase
+                // unreadable options by replacing them with the default.
+                let (table_name, column_name, index_type, options_bytes): (String, String, Option<String>, Vec<u8>) =
+                    bincode::deserialize(&bytes).map_err(|e| fail(e.to_string()))?;
+                let options = if options_bytes.is_empty() {
+                    Vec::new()
+                } else {
+                    bincode::deserialize(&options_bytes).map_err(|e| fail(e.to_string()))?
+                };
+                PersistedIndexDefinition {
+                    table_name,
+                    column_name,
+                    index_type,
+                    options,
+                }
+            };
+            definitions.push((name, definition));
+        }
+        definitions.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(definitions)
+    }
+
+    /// Bootstrap a FRESH sealed physical snapshot, never refresh a live engine.
+    /// No source ART/HNSW snapshot markers or external sidecars are trusted.
+    /// Unsupported physical vector families return an explicit error; they are
+    /// never silently downgraded to ordinary HNSW or advertised as hydrated.
+    pub(crate) fn rebuild_all_indexes_for_physical_snapshot(&self) -> Result<()> {
+        if !self.storage.physical_snapshot_mode() {
+            return Err(Error::storage(
+                "strict physical index hydration requires physical snapshot open mode",
+            ));
+        }
+        let started = std::time::Instant::now();
+        let art = self.storage.art_indexes();
+        if !art.list_indexes().is_empty() {
+            return Err(Error::storage(
+                "strict physical index hydration requires a fresh ART registry",
+            ));
+        }
+        let mut report = super::index_snapshot::IndexOpenReport::default();
+        let mut tables = std::collections::BTreeMap::new();
+        // Read actual durable schemas, including source temporary/internal
+        // relations; neither session visibility nor orphan cleanup may hide a
+        // malformed durable record during sealed-image validation.
+        for (table, bytes) in self.storage.meta_blobs_with_prefix_strict("meta:table:")? {
+            let mut schema: Schema = bincode::deserialize(&bytes)
+                .map_err(|e| Error::storage(format!("physical snapshot schema '{table}': {e}")))?;
+            if table.is_empty() {
+                return Err(Error::storage("physical snapshot has an empty table name"));
+            }
+            let mut columns = std::collections::HashSet::new();
+            for column in &mut schema.columns {
+                if !columns.insert(column.name.clone()) {
+                    return Err(Error::storage(format!(
+                        "physical snapshot table '{table}' has duplicate column '{}'",
+                        column.name
+                    )));
+                }
+                if column.source_table_name.is_none() {
+                    column.source_table_name = Some(table.clone());
+                }
+            }
+            self.storage.cache_schema(&table, schema.clone());
+            tables.insert(table, schema);
+        }
+        // Validate orphan constraint records too; per-table loading alone would
+        // never visit a malformed definition whose table has disappeared.
+        for (table, bytes) in self.storage.meta_blobs_with_prefix_strict("table_constraints:")? {
+            if !tables.contains_key(&table) {
+                return Err(Error::storage(format!(
+                    "physical snapshot constraints reference missing table '{table}'"
+                )));
+            }
+            let constraints: crate::sql::TableConstraints = bincode::deserialize(&bytes)
+                .map_err(|e| Error::storage(format!("physical snapshot constraints '{table}': {e}")))?;
+            self.storage.cache_table_constraints(&table, constraints);
+        }
+        let definitions = self.physical_snapshot_index_definitions()?;
+        let validate_columns = |table: &str, columns: &[String]| -> Result<()> {
+            let schema = tables
+                .get(table)
+                .ok_or_else(|| Error::storage(format!("physical snapshot index references missing table '{table}'")))?;
+            if columns.is_empty() || columns.iter().any(|column| schema.get_column(column).is_none()) {
+                return Err(Error::storage(format!(
+                    "physical snapshot index has invalid columns on '{table}': {columns:?}"
+                )));
+            }
+            Ok(())
+        };
+        // Reserve user-visible index names first, matching ordinary bootstrap's
+        // deterministic order before generated constraint names are allocated.
+        for (name, definition) in &definitions {
+            validate_columns(&definition.table_name, std::slice::from_ref(&definition.column_name))?;
+            match index_family(definition.index_type.as_deref()) {
+                Some(IndexFamily::Art) => {
+                    let columns = crate::sql::executor::ddl::unique_index_columns(&definition.options, &definition.column_name);
+                    if let Some(columns) = columns {
+                        validate_columns(&definition.table_name, &columns)?;
+                        art.create_unique_index(&definition.table_name, &columns, Some(name))
+                            .map_err(|e| Error::storage(format!("physical snapshot index '{name}': {e}")))?;
+                    } else {
+                        art.create_manual_index(name, &definition.table_name, std::slice::from_ref(&definition.column_name))
+                            .map_err(|e| Error::storage(format!("physical snapshot index '{name}': {e}")))?;
+                    }
+                }
+                Some(IndexFamily::Vector) if definition.index_type.as_deref() == Some("hnsw") => {}
+                Some(IndexFamily::DdlOnly) => {} // Same metadata-only contract as normal serving.
+                _ => return Err(Error::storage(format!(
+                    "physical snapshot index '{name}' uses unsupported strict-hydration family {:?}; no downgrade is allowed",
+                    definition.index_type
+                ))),
+            }
+        }
+        for (table, schema) in &tables {
+            let pk: Vec<String> = schema
+                .columns
+                .iter()
+                .filter(|c| c.primary_key)
+                .map(|c| c.name.clone())
+                .collect();
+            if !pk.is_empty() {
+                art.create_pk_index(table, &pk)
+                    .map_err(|e| Error::storage(format!("physical snapshot PK '{table}': {e}")))?;
+            }
+            for column in &schema.columns {
+                if column.unique && !column.primary_key {
+                    let columns = vec![column.name.clone()];
+                    if !self.constraint_owned_unique_index_on(table, &columns)? {
+                        art.create_constraint_unique_index(table, &columns, None).map_err(|e| {
+                            Error::storage(format!("physical snapshot UNIQUE '{table}.{}': {e}", column.name))
+                        })?;
+                    }
+                }
+            }
+            let constraints = self
+                .load_table_constraints(table)
+                .map_err(|e| Error::storage(format!("physical snapshot constraints '{table}': {e}")))?;
+            for unique in &constraints.unique_constraints {
+                validate_columns(table, &unique.columns)?;
+            }
+            self.register_unique_constraint_indexes(table, &constraints)?;
+            for fk in &constraints.foreign_keys {
+                if fk.table_name != *table || fk.columns.len() != fk.references_columns.len() {
+                    return Err(Error::storage(format!(
+                        "physical snapshot FK '{}' has inconsistent owner/arity",
+                        fk.name
+                    )));
+                }
+                validate_columns(table, &fk.columns)?;
+                validate_columns(&fk.references_table, &fk.references_columns)?;
+                art.create_fk_index(
+                    table,
+                    &fk.columns,
+                    &fk.references_table,
+                    &fk.references_columns,
+                    Some(&fk.name),
+                )
+                .map_err(|e| Error::storage(format!("physical snapshot FK '{}': {e}", fk.name)))?;
+            }
+            let rows = self
+                .storage
+                .scan_table_with_schema(table, schema)
+                .map_err(|e| Error::storage(format!("physical snapshot rows '{table}': {e}")))?;
+            let mut maximum = None;
+            for row in rows {
+                let row_id = row.row_id.filter(|id| *id != 0).ok_or_else(|| {
+                    Error::storage(format!("physical snapshot table '{table}' contains an invalid row ID"))
+                })?;
+                if row.values.len() != schema.columns.len()
+                    || row
+                        .values
+                        .iter()
+                        .any(|v| matches!(v, Value::DictRef { .. } | Value::CasRef { .. } | Value::ColumnarRef))
+                {
+                    return Err(Error::storage(format!(
+                        "physical snapshot row '{table}:{row_id}' has invalid arity or unresolved storage references"
+                    )));
+                }
+                maximum = Some(maximum.map_or(row_id, |old: u64| old.max(row_id)));
+                let values = schema
+                    .columns
+                    .iter()
+                    .zip(&row.values)
+                    .map(|(column, value)| (column.name.clone(), value.clone()))
+                    .collect();
+                art.on_insert(table, row_id, &values)
+                    .map_err(|e| Error::storage(format!("physical snapshot index row '{table}:{row_id}': {e}")))?;
+                report.rows_scanned += 1;
+            }
+            if let Some(maximum) = maximum {
+                self.storage.reseed_row_counter_for_physical_snapshot(table, maximum)?;
+            }
+            report.tables_scanned += 1;
+            report.tables_total += 1;
+        }
+        for (name, definition) in &definitions {
+            if definition.index_type.as_deref() != Some("hnsw") {
+                continue;
+            }
+            let schema = &tables[&definition.table_name];
+            let column = schema
+                .get_column(&definition.column_name)
+                .ok_or_else(|| Error::storage(format!("physical snapshot vector '{name}' has no column")))?;
+            let DataType::Vector(dimension) = &column.data_type else {
+                return Err(Error::storage(format!(
+                    "physical snapshot vector '{name}' column is not VECTOR"
+                )));
+            };
+            let vectors =
+                self.collect_existing_vectors(schema, &definition.table_name, &definition.column_name, *dimension)?;
+            let metric = vector_distance_metric(&definition.options);
+            let (m, ef) = hnsw_construction_params(&definition.options, self.storage.config());
+            let manager = self.storage.vector_indexes();
+            manager
+                .create_index_with_params(
+                    name.clone(),
+                    definition.table_name.clone(),
+                    definition.column_name.clone(),
+                    *dimension,
+                    metric,
+                    m,
+                    ef,
+                )
+                .map_err(|e| Error::storage(format!("physical snapshot vector '{name}' create: {e}")))?;
+            manager
+                .insert_vectors_batch(name, &vectors)
+                .map_err(|e| Error::storage(format!("physical snapshot vector '{name}' populate: {e}")))?;
+            report.vector_rebuilt += 1;
+        }
+        report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.storage.set_last_index_open_report(report);
+        Ok(())
+    }
+
     /// Create a new catalog
     pub fn new(storage: &'a StorageEngine) -> Self {
         Self { storage }
@@ -3992,6 +4291,93 @@ impl<'a> Catalog<'a> {
     // and the list scan breaks on the first key outside its exact prefix,
     // so `meta:seqstate:` never bleeds into the `meta:sequence:` scan.
     // -------------------------------------------------------------------
+
+    fn decode_physical_sequence_frame<T: serde::de::DeserializeOwned>(
+        name: &str,
+        bytes: &[u8],
+        magic: &[u8],
+        version: u8,
+    ) -> Result<T> {
+        use bincode::Options as _;
+        let body = if bytes.starts_with(magic) {
+            if bytes.get(magic.len()) != Some(&version) {
+                return Err(Error::storage(format!(
+                    "physical snapshot sequence '{name}' has unsupported/truncated version"
+                )));
+            }
+            &bytes[magic.len() + 1..]
+        } else {
+            bytes
+        };
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes()
+            .deserialize(body)
+            .map_err(|e| Error::storage(format!("physical snapshot sequence '{name}' cannot be decoded: {e}")))
+    }
+    /// Decode durable objects whose ordinary loaders are lazy or tolerant.
+    /// Called only on a sealed, unpublished physical snapshot. Validation does
+    /// not execute view queries, refresh materialized rows or reserve sequences.
+    pub(crate) fn validate_lazy_physical_catalog(&self) -> Result<()> {
+        use bincode::Options as _;
+        let views = super::view_catalog::ViewCatalog::new(self.storage);
+        for (name, _) in self.storage.meta_blobs_with_prefix_strict("__view_metadata__")? {
+            let view = views
+                .get_view_for_physical_snapshot(&name)
+                .map_err(|e| Error::storage(format!("physical snapshot view '{name}': {e}")))?;
+            if name.is_empty() || view.view_name != name {
+                return Err(Error::storage(format!(
+                    "physical snapshot view '{name}' identity mismatch"
+                )));
+            }
+        }
+        for (name, bytes) in self.storage.meta_blobs_with_prefix_strict("meta:mv:")? {
+            let view: super::materialized_view::MaterializedViewMetadata = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .reject_trailing_bytes()
+                .deserialize(&bytes)
+                .map_err(|e| Error::storage(format!("physical snapshot materialized view '{name}': {e}")))?;
+            if name.is_empty() || view.view_name != name {
+                return Err(Error::storage(format!(
+                    "physical snapshot materialized view '{name}' identity mismatch"
+                )));
+            }
+            let _: crate::sql::LogicalPlan = bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .reject_trailing_bytes()
+                .deserialize(&view.query_plan_bytes)
+                .map_err(|e| Error::storage(format!("physical snapshot materialized view '{name}' plan: {e}")))?;
+        }
+        let mut definitions = std::collections::HashSet::new();
+        for (name, bytes) in self.storage.meta_blobs_with_prefix_strict("meta:sequence:")? {
+            let definition: PersistedSequence =
+                Self::decode_physical_sequence_frame(&name, &bytes, SEQ_DEF_MAGIC, SEQ_DEF_FORMAT_VERSION)?;
+            if name.is_empty()
+                || definition.name != name
+                || definition.increment_by == 0
+                || definition.cache < 1
+                || definition.min_value > definition.max_value
+                || !(definition.min_value..=definition.max_value).contains(&definition.start_value)
+            {
+                return Err(Error::storage(format!(
+                    "physical snapshot sequence '{name}' has invalid identity or definition"
+                )));
+            }
+            definitions.insert(name);
+        }
+        for (name, bytes) in self.storage.meta_blobs_with_prefix_strict("meta:seqstate:")? {
+            if !definitions.contains(&name) {
+                return Err(Error::storage(format!(
+                    "physical snapshot sequence state '{name}' has no definition"
+                )));
+            }
+            // Missing state for a NEW definition is valid. A PRESENT malformed
+            // state must never silently become a fresh default reservation.
+            let _: PersistedSeqState =
+                Self::decode_physical_sequence_frame(&name, &bytes, SEQ_STATE_MAGIC, SEQ_STATE_FORMAT_VERSION)?;
+        }
+        Ok(())
+    }
 
     fn sequence_def_key(name: &str) -> Vec<u8> {
         format!("meta:sequence:{}", name).into_bytes()

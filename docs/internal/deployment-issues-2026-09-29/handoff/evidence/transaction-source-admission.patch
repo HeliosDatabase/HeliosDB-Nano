@@ -1,0 +1,140 @@
+--- a/src/storage/transaction.rs
++++ b/src/storage/transaction.rs
+@@ -86,6 +86,10 @@
+ /// - Lock manager integration for deadlock detection
+ /// - Dirty state tracking for dump operations
+ pub struct Transaction {
++    /// Opt-in source operation fence, inherited from the owning engine.
++    #[cfg(feature = "ha-tier1")]
++    physical_source_coordinator:
++        Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>>,
+     /// Database handle
+     db: Arc<DB>,
+     /// Snapshot for reads
+@@ -695,6 +699,8 @@
+         );
+ 
+         Ok(Self {
++            #[cfg(feature = "ha-tier1")]
++            physical_source_coordinator: None,
+             db,
+             snapshot: Snapshot::new(snapshot_id),
+             snapshot_ts: snapshot_id,
+@@ -772,6 +778,16 @@
+     /// five construction sites in the crate (`StorageEngine::begin_transaction`,
+     /// `begin_autocommit_transaction`, the two `new_with_session` sites in
+     /// `lib.rs`, and `BranchTransaction::new`) all call it.
++    /// Attach before the transaction can be exposed or committed. Engine and
++    /// session constructors supply the coordinator for this exact DB handle.
++    #[cfg(feature = "ha-tier1")]
++    pub(crate) fn set_physical_source_coordinator(
++        &mut self,
++        coordinator: Option<Arc<crate::replication::physical_source_coordinator::PhysicalSourceCoordinator>>,
++    ) {
++        self.physical_source_coordinator = coordinator;
++    }
++
+     pub fn set_key_manager(&mut self, key_manager: Option<Arc<KeyManager>>) {
+         self.key_manager = key_manager;
+     }
+@@ -930,6 +946,8 @@
+         );
+ 
+         Ok(Self {
++            #[cfg(feature = "ha-tier1")]
++            physical_source_coordinator: None,
+             db,
+             snapshot: Snapshot::new(snapshot_id),
+             snapshot_ts: snapshot_id,
+@@ -1291,6 +1309,19 @@
+ 
+     /// Commit the transaction with a specific timestamp
+     pub fn commit_with_timestamp(self, commit_ts: u64) -> Result<()> {
++        // Cover the WHOLE semantic commit, including the logical intent batch,
++        // data/version batch, later snapshot metadata and durability barrier.
++        // The owned permit borrows no part of self and is synchronous/reentrant.
++        #[cfg(feature = "ha-tier1")]
++        let _physical_operation = self
++            .physical_source_coordinator
++            .as_ref()
++            .map(|coordinator| {
++                coordinator
++                    .operation()
++                    .map_err(|error| crate::Error::storage(error.to_string()))
++            })
++            .transpose()?;
+         let commit_start = std::time::Instant::now();
+         let insert_count = self.insert_log.read().len();
+         let row_counter_count = self.row_counter_stages.read().len();
+@@ -1447,19 +1478,14 @@
+                         if let Some(pos) = text.rfind(':') {
+                             if let Ok(row_id) = text[pos + 1..].parse::<u64>() {
+                                 if check_copy_markers {
+-                                    self.snapshot_manager.materialize_copy_marker_row(
+-                                        &mut batch,
+-                                        &text[..pos],
+-                                        row_id,
+-                                        commit_ts,
+-                                    )?;
++                                    self.snapshot_manager
++                                        .materialize_copy_marker_row(&mut batch, &text[..pos], row_id, commit_ts)
++                                        .map_err(|error| self.abort_partial_commit(inflight, commit_ts, error))?;
+                                 }
+                                 if check_elided {
+-                                    self.snapshot_manager.materialize_elided_latest_version(
+-                                        &mut batch,
+-                                        &text[..pos],
+-                                        row_id,
+-                                    )?;
++                                    self.snapshot_manager
++                                        .materialize_elided_latest_version(&mut batch, &text[..pos], row_id)
++                                        .map_err(|error| self.abort_partial_commit(inflight, commit_ts, error))?;
+                                 }
+                             }
+                         }
+@@ -1517,6 +1543,14 @@
+             };
+             batch.put(key.as_bytes(), stored.as_ref());
+         }
++
++        #[cfg(feature = "ha-tier1")]
++        let physical_phase = self
++            .physical_source_coordinator
++            .as_ref()
++            .map(|coordinator| coordinator.begin_durable_phase("transaction durable commit incomplete"))
++            .transpose()
++            .map_err(|error| self.abort_partial_commit(inflight, commit_ts, Error::storage(error.to_string())))?;
+ 
+         // P0 (ROADMAP_V5.md §1.8): explicit and session transactions appended
+         // NOTHING to the logical WAL and were never broadcast to an HA standby
+@@ -1681,9 +1715,13 @@
+         self.acquired_locks.write().clear();
+ 
+         // Register the snapshot so it's visible to future queries
+-        if result.is_ok() {
+-            let _ = self.snapshot_manager.register_snapshot(commit_ts);
+-        }
++        let snapshot_metadata_complete = if result.is_ok() {
++            self.snapshot_manager.register_snapshot(commit_ts).is_ok()
++        } else {
++            false
++        };
++        #[cfg(not(feature = "ha-tier1"))]
++        let _ = snapshot_metadata_complete;
+ 
+         result.map_err(|e| {
+             warn!(
+@@ -1713,6 +1751,13 @@
+                         );
+                         Error::transaction(format!("Commit failed: WAL group fsync failed: {}", e))
+                     })?;
++            }
++        }
++
++        #[cfg(feature = "ha-tier1")]
++        if snapshot_metadata_complete {
++            if let Some(phase) = physical_phase {
++                phase.complete();
+             }
+         }
+ 

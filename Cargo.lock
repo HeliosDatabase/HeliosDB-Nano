@@ -1965,6 +1965,7 @@ dependencies = [
  "inventory",
  "itoa",
  "jsonwebtoken",
+ "libc",
  "lru",
  "lz4",
  "md5",

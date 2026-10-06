@@ -84,6 +84,12 @@ impl QueryForwarder {
 
     /// Forward a query to the primary and return the result
     pub fn forward_query(&self, query: &str) -> Result<ForwardedResult, ForwarderError> {
+        if super::ha_state::ha_state().forwarding_disabled() {
+            return Err(ForwarderError::Connection(
+                "transparent forwarding is disabled for a history-guarded standby; connect to the primary for writes"
+                    .into(),
+            ));
+        }
         // Get or create a connection
         let mut conn = self.get_connection()?;
 

@@ -18,8 +18,10 @@ use tracing::info;
 /// HA Replication Configuration
 #[derive(Debug, Clone)]
 struct HAConfig {
+    physical: heliosdb_nano::config::PhysicalReplicationConfig,
     role: String,
     replication_port: u16,
+    startup_timeout_secs: u64,
     primary_host: Option<String>,
     standby_hosts: Option<String>,
     observer_hosts: Option<String>,
@@ -29,7 +31,62 @@ struct HAConfig {
     mcp_token: Option<String>,
     allow_remote_mcp: bool,
     allow_insecure_http: bool,
+    allow_insecure_trust: bool,
     node_id: Option<String>,
+    /// One owner-only 32-byte token file authenticating both replication channels.
+    token_file: Option<PathBuf>,
+    /// Acknowledge plaintext token transport on a non-loopback replication listener.
+    allow_insecure_remote: bool,
+}
+
+/// Standbys receive their full verification window plus the ordinary startup allowance.
+fn daemon_readiness_timeout(role: &str, replication_startup_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(if role.eq_ignore_ascii_case("standby") {
+        replication_startup_secs.saturating_add(5)
+    } else {
+        5
+    })
+}
+
+/// Literal addresses only, with explicit port taking precedence over socket suffix.
+fn parse_listen_address(value: &str, explicit_port: Option<u16>, default_port: u16) -> Result<std::net::SocketAddr> {
+    use std::net::{IpAddr, SocketAddr};
+    if let Ok(mut address) = value.parse::<SocketAddr>() {
+        if let Some(port) = explicit_port {
+            address.set_port(port);
+        }
+        return Ok(address);
+    }
+    let bare = value
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(value);
+    let ip = bare.parse::<IpAddr>().map_err(|_| {
+        Error::config(format!(
+        "Invalid listen address '{value}': use an IPv4/IPv6 address or IP:port (bracket IPv6 sockets, e.g. [::1]:8080)"
+    ))
+    })?;
+    Ok(SocketAddr::new(ip, explicit_port.unwrap_or(default_port)))
+}
+
+fn resolve_http_address(value: &str, port: Option<u16>) -> Result<Option<std::net::SocketAddr>> {
+    // Explicit disable wins even over an invalid or port-bearing address.
+    if port == Some(0) {
+        return Ok(None);
+    }
+    let address = parse_listen_address(value, port, 8080)?;
+    if address.port() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(address))
+}
+
+fn split_hosts(value: &str) -> Vec<String> {
+    if value.is_empty() {
+        Vec::new()
+    } else {
+        value.split(',').map(|s| s.trim().to_string()).collect()
+    }
 }
 
 /// GH#28: CLI overrides for the `[server]` connection-lifetime keys. Every
@@ -676,6 +733,8 @@ struct Cli {
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// Install/follow a closed physical receiver; never exposes SQL or serving readiness.
+    Resync(ResyncArgs),
     /// Start the database server
     Start {
         /// Data directory (required unless --memory is used)
@@ -751,6 +810,10 @@ enum Commands {
         #[arg(long, default_value = "trust")]
         auth: String,
 
+        /// Permit unauthenticated non-loopback PostgreSQL access for isolated development only.
+        #[arg(long)]
+        allow_insecure_trust: bool,
+
         /// Password for authentication (required for password/md5/scram-sha-256 auth).
         /// DEPRECATED: a command-line value is visible to every local user in
         /// the process table. Prefer --password-file, the HELIOSDB_PASSWORD_FILE
@@ -766,14 +829,21 @@ enum Commands {
         #[arg(long, conflicts_with = "password")]
         password_file: Option<PathBuf>,
 
+        #[command(flatten)]
+        physical: PhysicalSourceArgs,
+
         // ========== HA Replication Options ==========
         /// Replication role: standalone, primary, standby, observer
-        #[arg(long, default_value = "standalone")]
-        replication_role: String,
+        #[arg(long)]
+        replication_role: Option<String>,
 
         /// Replication port for WAL streaming (default: 5433)
-        #[arg(long, default_value = "5433")]
-        replication_port: u16,
+        #[arg(long)]
+        replication_port: Option<u16>,
+
+        /// Standby initial history verification timeout in seconds (1..=3600; default: 30)
+        #[arg(long)]
+        replication_startup_timeout_secs: Option<u64>,
 
         /// Primary host for standbys to connect to (host:port)
         #[arg(long)]
@@ -788,12 +858,12 @@ enum Commands {
         observer_hosts: Option<String>,
 
         /// Sync mode: async, semi-sync, sync
-        #[arg(long, default_value = "async")]
-        sync_mode: String,
+        #[arg(long)]
+        sync_mode: Option<String>,
 
         /// HTTP API port for health checks and MCP-over-HTTP (default: 8080, 0 disables HTTP)
-        #[arg(long, default_value = "8080")]
-        http_port: u16,
+        #[arg(long)]
+        http_port: Option<u16>,
 
         /// HTTP API listen address. Defaults to loopback; use an explicit non-loopback
         /// address only with the applicable authentication/TLS policy.
@@ -821,6 +891,11 @@ enum Commands {
         /// Node ID (UUID) - auto-generated if not provided
         #[arg(long)]
         node_id: Option<String>,
+
+        /// Permit the replication token over a non-loopback plaintext native listener
+        /// (isolated development only; mirrors --allow-insecure-trust).
+        #[arg(long)]
+        allow_insecure_replication_remote: bool,
 
         // ========== MySQL Protocol Options ==========
         /// Enable MySQL protocol listener
@@ -1117,10 +1192,13 @@ async fn run(cli: Cli) -> Result<()> {
             require_tls,
             tls_post_quantum,
             auth,
+            allow_insecure_trust,
             password,
             password_file,
+            physical,
             replication_role,
             replication_port,
+            replication_startup_timeout_secs,
             primary_host,
             standby_hosts,
             observer_hosts,
@@ -1131,6 +1209,7 @@ async fn run(cli: Cli) -> Result<()> {
             allow_remote_mcp,
             allow_insecure_http,
             node_id,
+            allow_insecure_replication_remote,
             mysql,
             mysql_listen,
             mysql_socket,
@@ -1215,20 +1294,86 @@ async fn run(cli: Cli) -> Result<()> {
 
             let resolved_data_dir = data_dir.unwrap_or_else(|| PathBuf::from("./heliosdb-data"));
 
+            // Resolve replication once: explicit CLI values > TOML > defaults.
+            // Forward the resolved values through daemon re-exec as well.
+            let mut replication = if let Some(path) = &config {
+                Config::from_file(path.clone())?.replication
+            } else {
+                heliosdb_nano::config::ReplicationConfig::default()
+            };
+            if let Some(value) = replication_role {
+                replication.role = value;
+            }
+            if let Some(value) = replication_port {
+                replication.replication_port = value;
+            }
+            if let Some(value) = replication_startup_timeout_secs {
+                replication.startup_timeout_secs = value;
+            }
+            if let Some(value) = primary_host {
+                replication.primary_host = Some(value);
+            }
+            if let Some(value) = standby_hosts {
+                replication.standby_hosts = split_hosts(&value);
+            }
+            if let Some(value) = observer_hosts {
+                replication.observer_hosts = split_hosts(&value);
+            }
+            if let Some(value) = sync_mode {
+                replication.sync_mode = value;
+            }
+            if let Some(value) = node_id {
+                replication.node_id = Some(value);
+            }
+            // CLI flag only turns the opt-in on; a config-file `true` is kept.
+            if allow_insecure_replication_remote {
+                replication.allow_insecure_remote = true;
+            }
+            physical.apply(&mut replication);
+            replication.role = replication.role.to_ascii_lowercase();
+            replication.sync_mode = replication.sync_mode.to_ascii_lowercase();
+            replication.validate()?;
+            validate_physical_source(
+                &replication.physical,
+                replication.token_file.as_deref(),
+                &replication.role,
+                memory,
+                &resolved_data_dir,
+            )?;
+            if replication.role == "standby" && replication.primary_host.is_none() {
+                return Err(Error::config(
+                    "standby role requires --primary-host or [replication] primary_host".to_string(),
+                ));
+            }
+            #[cfg(not(feature = "ha-tier1"))]
+            if replication.role != "standalone" {
+                return Err(Error::config(
+                    "replication requires a build with the ha-tier1 feature".to_string(),
+                ));
+            }
+            let http_address = resolve_http_address(
+                &heliosdb_nano::api::resolve_http_listen(http_listen.as_deref()),
+                http_port,
+            )?;
             // Build HA configuration
             let ha_config = HAConfig {
-                role: replication_role,
-                replication_port,
-                primary_host,
-                standby_hosts,
-                observer_hosts,
-                sync_mode,
-                http_port,
-                http_listen,
+                physical: replication.physical,
+                role: replication.role,
+                replication_port: replication.replication_port,
+                startup_timeout_secs: replication.startup_timeout_secs,
+                primary_host: replication.primary_host,
+                standby_hosts: Some(replication.standby_hosts.join(",")),
+                observer_hosts: Some(replication.observer_hosts.join(",")),
+                sync_mode: replication.sync_mode,
+                http_port: http_address.map_or(0, |address| address.port()),
+                http_listen: http_address.map(|address| address.ip().to_string()),
                 mcp_token,
                 allow_remote_mcp,
                 allow_insecure_http,
-                node_id,
+                allow_insecure_trust,
+                node_id: replication.node_id,
+                token_file: replication.token_file,
+                allow_insecure_remote: replication.allow_insecure_remote,
             };
 
             // GH#28: connection-lifetime overrides (CLI > config file > default).
@@ -1300,6 +1445,7 @@ async fn run(cli: Cli) -> Result<()> {
                 .await
             }
         }
+        Commands::Resync(args) => run_physical_resync(args).await,
         Commands::Stop { ref pid_file } => stop_server(pid_file),
         Commands::Status { ref pid_file } => check_server_status(pid_file),
         Commands::Init { ref data_dir } => init_database(data_dir),
@@ -1478,7 +1624,20 @@ async fn start_server(
     use std::sync::Arc;
     use std::time::Instant;
 
+    validate_physical_source(
+        &ha_config.physical,
+        ha_config.token_file.as_deref(),
+        &ha_config.role,
+        memory_mode,
+        &data_dir,
+    )?;
     let startup_time = Instant::now();
+    let guarded_standby = ha_config.role.eq_ignore_ascii_case("standby");
+    if guarded_standby && (mysql_enabled || mysql_socket.is_some()) {
+        return Err(Error::config(
+            "history-guarded standby does not support MySQL listeners; remove --mysql/--mysql-socket and connect to the primary for writes",
+        ));
+    }
 
     // Print startup banner
     println!();
@@ -1495,6 +1654,20 @@ async fn start_server(
     } else {
         println!("[1/4] Using default configuration...");
         Config::default()
+    };
+
+    db_config.replication = heliosdb_nano::config::ReplicationConfig {
+        physical: ha_config.physical.clone(),
+        role: ha_config.role.clone(),
+        replication_port: ha_config.replication_port,
+        startup_timeout_secs: ha_config.startup_timeout_secs,
+        primary_host: ha_config.primary_host.clone(),
+        standby_hosts: split_hosts(ha_config.standby_hosts.as_deref().unwrap_or("")),
+        observer_hosts: split_hosts(ha_config.observer_hosts.as_deref().unwrap_or("")),
+        sync_mode: ha_config.sync_mode.clone(),
+        node_id: ha_config.node_id.clone(),
+        token_file: ha_config.token_file.clone(),
+        allow_insecure_remote: ha_config.allow_insecure_remote,
     };
 
     // CLI flags win over the config file for storage location/mode.
@@ -1637,10 +1810,12 @@ async fn start_server(
     let http_addr: Option<SocketAddr> = if http_health_disabled {
         None
     } else {
+        // `http_listen` is stored as a bare IP string (`SocketAddr::ip().to_string()`
+        // drops IPv6 brackets), so recombine it with the explicit port through the
+        // parser rather than `format!("{host}:{port}")` — the latter turns `::1` +
+        // `8080` into the address `::1:8080` instead of a socket.
         let http_bind = heliosdb_nano::api::resolve_http_listen(ha_config.http_listen.as_deref());
-        let addr: SocketAddr = format!("{}:{}", http_bind, ha_config.http_port)
-            .parse()
-            .map_err(|e| Error::config(format!("Invalid HTTP address: {e}")))?;
+        let addr: SocketAddr = parse_listen_address(&http_bind, Some(ha_config.http_port), 8080)?;
         // The HTTP listener never terminates TLS, so a wire `--tls-cert` does
         // not make it HTTPS. `http_bind_safety_check` fails closed on any
         // non-loopback plaintext bind.
@@ -1666,6 +1841,22 @@ async fn start_server(
         )));
     }
 
+    // Claim/validate receiver history BEFORE opening RocksDB. Existing unbound
+    // directories are never silently adopted as a live replication receiver.
+    #[cfg(feature = "ha-tier1")]
+    let receiver_history = if ha_config.role.eq_ignore_ascii_case("standby") {
+        use heliosdb_nano::replication::history::{prepare_receiver_history, ReceiverHistory};
+        heliosdb_nano::replication::ha_state::ha_state().disable_forwarding();
+        Some(Arc::new(if memory_mode {
+            ReceiverHistory::in_memory()
+        } else {
+            prepare_receiver_history(&data_dir)
+                .map_err(|error| Error::config(format!("Cannot prepare standby history: {error}")))?
+        }))
+    } else {
+        None
+    };
+
     // Open database (in-memory mode avoids disk I/O for all operations)
     let db = if memory_mode {
         println!("[2/4] Initializing in-memory database...");
@@ -1684,6 +1875,7 @@ async fn start_server(
     // Build server config
     let mut pg_config = PgServerConfig::with_address(pg_addr)
         .with_auth_method(auth_method)
+        .with_allow_insecure_trust(ha_config.allow_insecure_trust)
         .with_max_connections(max_connections)
         .with_timeouts(connection_policy.clone());
 
@@ -1749,6 +1941,7 @@ async fn start_server(
     if ha_role != "standalone" {
         println!("      - Replication role: {}", ha_config.role);
         println!("      - Replication port: {}", ha_config.replication_port);
+        println!("      - History startup timeout: {}s", ha_config.startup_timeout_secs);
         println!("      - Sync mode: {}", ha_config.sync_mode);
         if let Some(ref primary) = ha_config.primary_host {
             println!("      - Primary host: {primary}");
@@ -1766,59 +1959,32 @@ async fn start_server(
     // Share the single AuthManager built before startup with the wire listener.
     let pg_server = PgServer::with_shared_auth_manager(pg_config, Arc::clone(&db), Arc::clone(&auth_manager))?;
 
-    println!("[4/4] Starting server...");
-    println!();
-    println!("════════════════════════════════════════════════════════════════");
-    println!(
-        "  Server ready! Started in {:.2}s",
-        startup_time.elapsed().as_secs_f64()
-    );
-    println!("════════════════════════════════════════════════════════════════");
-    println!();
-    println!("  Connect using:");
-    println!();
-    println!("    psql:       psql -h {listen} -p {port}");
-    println!("    Python:     psycopg2.connect(host='{listen}', port={port})");
-    println!("    Node.js:    pg.connect({{ host: '{listen}', port: {port} }})");
-    println!("    JDBC:       jdbc:postgresql://{listen}:{port}/heliosdb");
-    println!();
-    println!("    Compatibility notes:");
-    println!("      FTS:         docs/compatibility/fts.md");
-    println!("      ORM matrix:  https://github.com/HeliosDatabase/HeliosDB-Nano/blob/main/docs/compatibility/orm.md");
-    println!("      Known gaps:  SELECT heliosdb_capability_report();");
-    if mysql_enabled {
-        println!();
-        println!(
-            "    mysql:      mysql -h {} -P {}",
-            mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
-            mysql_listen.split(':').nth(1).unwrap_or("3306")
-        );
-        println!(
-            "    PyMySQL:    pymysql.connect(host='{}', port={})",
-            mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
-            mysql_listen.split(':').nth(1).unwrap_or("3306")
-        );
-    }
-    println!();
-    println!(
-        "  For REPL mode (single-user):  heliosdb-nano repl -d {}",
-        data_dir.display()
-    );
-    println!();
-    println!("  Press Ctrl+C to shut down");
-    println!("────────────────────────────────────────────────────────────────");
-    println!();
-
-    // Log for tracing subscribers
-    info!("HeliosDB Nano server listening on {}", pg_addr);
+    // Bind PostgreSQL before HA: an overlapping replication endpoint now fails
+    // synchronously instead of reporting readiness with one listener missing.
+    let pg_listener = tokio::net::TcpListener::bind(pg_addr)
+        .await
+        .map_err(|e| Error::network(format!("Failed to bind PostgreSQL listener {pg_addr}: {e}")))?;
 
     // Start HA components if enabled
     #[cfg(feature = "ha-tier1")]
-    let _ha_handles = if ha_role != "standalone" {
-        start_ha_components(&ha_config, &listen, port, db.storage.clone()).await?
+    let mut ha_handles = if ha_role != "standalone" {
+        start_ha_components(
+            &ha_config,
+            &pg_addr.ip().to_string(),
+            pg_addr.port(),
+            db.storage.clone(),
+            receiver_history,
+        )
+        .await?
     } else {
         HAHandles::default()
     };
+
+    // Bind physical source before publishing any readiness. Its directly owned
+    // future is polled alongside PostgreSQL only after startup succeeds.
+    #[cfg(feature = "ha-tier1")]
+    let physical_source =
+        prepare_physical_source(&ha_config.physical, ha_config.token_file.as_deref(), &db.storage).await?;
 
     // Start HTTP endpoint (health checks, plus MCP routes when compiled in).
     //
@@ -1843,13 +2009,17 @@ async fn start_server(
     // a late-life HTTP failure cannot tear the database listener down.
     //
     // The address and the exposure policy were resolved before the database
-    // opened (P0-3/P0-4); only the bind happens here.
+    // opened (P0-3/P0-4); only the bind happens here. A history-guarded
+    // standby binds the same listener but serves only health/version routes.
     let http_handle: Option<tokio::task::JoinHandle<()>> = if let Some(http_addr) = http_addr {
         match tokio::net::TcpListener::bind(http_addr).await {
             Ok(listener) => {
                 info!(
                     "HTTP endpoint at http://{http_addr} (/health, /version, /docs, /rest/v1, /auth/v1, /realtime/v1)"
                 );
+                if guarded_standby {
+                    info!("HTTP endpoint is history-guarded standby health-only: {guarded_standby}");
+                }
                 if http_auth_policy.is_required() {
                     info!(
                         "HTTP API authentication is required on {http_addr} \
@@ -1869,8 +2039,16 @@ async fn start_server(
                 let http_api_config = api_config.clone();
                 let policy = std::sync::Arc::clone(&http_auth_policy);
                 Some(tokio::spawn(async move {
-                    if let Err(e) =
-                        run_http_listener(listener, http_db, mcp_token, allow_remote_mcp, http_api_config, policy).await
+                    if let Err(e) = run_http_listener(
+                        listener,
+                        http_db,
+                        mcp_token,
+                        allow_remote_mcp,
+                        http_api_config,
+                        policy,
+                        guarded_standby,
+                    )
+                    .await
                     {
                         tracing::error!("HTTP server accept loop exited: {e}");
                     }
@@ -2129,53 +2307,153 @@ async fn start_server(
         ));
     }
 
+    #[cfg(feature = "ha-tier1")]
+    if let Err(error) = ha_handles.ensure_running().await {
+        for handle in [&http_handle, &mysql_handle, &mysql_unix_handle, &pg_unix_handle]
+            .into_iter()
+            .flatten()
+        {
+            handle.abort();
+        }
+        ha_handles.shutdown().await;
+        return Err(error);
+    }
+
+    // Daemon parents must observe completion of this child's startup, not
+    // merely a successful TCP connect to a prebound socket or another process.
+    if let Some(path) = std::env::var_os("HELIOSDB_NANO_READY_FILE") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|e| Error::io(format!("Cannot acknowledge daemon readiness: {e}")))?;
+        write!(file, "{}", std::process::id()).map_err(|e| Error::io(format!("Cannot write daemon readiness: {e}")))?;
+    }
+
+    println!("[4/4] Starting server...");
+    println!();
+    println!("════════════════════════════════════════════════════════════════");
+    println!(
+        "  Server ready! Started in {:.2}s",
+        startup_time.elapsed().as_secs_f64()
+    );
+    println!("════════════════════════════════════════════════════════════════");
+    println!();
+    println!("  Connect using:");
+    println!();
+    println!("    psql:       psql -h {listen} -p {port}");
+    println!("    Python:     psycopg2.connect(host='{listen}', port={port})");
+    println!("    Node.js:    pg.connect({{ host: '{listen}', port: {port} }})");
+    println!("    JDBC:       jdbc:postgresql://{listen}:{port}/heliosdb");
+    println!();
+    println!("    Compatibility notes:");
+    println!("      FTS:         docs/compatibility/fts.md");
+    println!("      ORM matrix:  https://github.com/HeliosDatabase/HeliosDB-Nano/blob/main/docs/compatibility/orm.md");
+    println!("      Known gaps:  SELECT heliosdb_capability_report();");
+    if mysql_enabled {
+        println!();
+        println!(
+            "    mysql:      mysql -h {} -P {}",
+            mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
+            mysql_listen.split(':').nth(1).unwrap_or("3306")
+        );
+        println!(
+            "    PyMySQL:    pymysql.connect(host='{}', port={})",
+            mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
+            mysql_listen.split(':').nth(1).unwrap_or("3306")
+        );
+    }
+    println!();
+    println!(
+        "  For REPL mode (single-user):  heliosdb-nano repl -d {}",
+        data_dir.display()
+    );
+    println!();
+    println!("  Press Ctrl+C to shut down");
+    println!("────────────────────────────────────────────────────────────────");
+    println!();
+
+    // Log for tracing subscribers
+    info!("HeliosDB Nano server listening on {}", pg_addr);
+
     // Start server with graceful shutdown handling. The health
     // server runs in its own detached task (see above) so a failure
     // there cannot tear the database listener down.
-    tokio::select! {
-        result = pg_server.serve() => {
-            // Server stopped (error or normal shutdown)
-            if let Err(ref e) = result {
-                tracing::error!("Server error: {e}");
-            }
-            result?;
+    #[cfg(feature = "ha-tier1")]
+    let (physical_stop, physical_shutdown) = tokio::sync::watch::channel(false);
+    #[cfg(feature = "ha-tier1")]
+    let physical_service = serve_physical_source(physical_source, physical_shutdown);
+    #[cfg(feature = "ha-tier1")]
+    tokio::pin!(physical_service);
+    #[cfg(feature = "ha-tier1")]
+    let mut physical_finished = false;
+
+    let server_result: Result<()> = tokio::select! {
+        biased;
+        error = async {
+            #[cfg(feature = "ha-tier1")]
+            { ha_handles.failure().await }
+            #[cfg(not(feature = "ha-tier1"))]
+            { std::future::pending::<Error>().await }
+        } => {
+            tracing::error!("Replication stopped; closing database listeners: {error}");
+            Err(error)
         }
-        // SIGINT *and* SIGTERM. Awaiting only `ctrl_c()` here left SIGTERM on
-        // its default Unix disposition — immediate termination, no `Drop`, so
-        // none of `EmbeddedDatabase::drop`'s ordered close-time work (row
-        // counters, then the R4.2 index-snapshot checkpoint) ran under any
-        // service manager, nor under this binary's own `stop` subcommand,
-        // which sends `kill -TERM`. See `heliosdb_nano::wait_for_shutdown_signal`.
+        result = async {
+            #[cfg(feature = "ha-tier1")]
+            { (&mut physical_service).await }
+            #[cfg(not(feature = "ha-tier1"))]
+            { std::future::pending::<Result<()>>().await }
+        } => {
+            #[cfg(feature = "ha-tier1")]
+            { physical_finished = true; }
+            result.and_then(|()| Err(Error::network("physical source stopped unexpectedly")))
+        },
+        result = pg_server.serve_with_listener(pg_listener) => result,
         signal = heliosdb_nano::wait_for_shutdown_signal() => {
             println!();
             println!("{}", "Received shutdown signal...".yellow());
             tracing::info!("{signal} received — running clean shutdown");
-            // Abort the HTTP accept loop first: it is the one listener task
-            // holding an `Arc<EmbeddedDatabase>` clone, so until it is gone
-            // the refcount cannot reach zero and `Drop` cannot run.
-            if let Some(h) = http_handle {
-                h.abort();
-            }
-            if let Some(h) = mysql_handle {
-                h.abort();
-            }
-            if let Some(h) = mysql_unix_handle {
-                h.abort();
-            }
-            if let Some(h) = pg_unix_handle {
-                h.abort();
-            }
-            // Best-effort unlink of Unix socket files on shutdown.
-            #[cfg(unix)]
-            {
-                if let Some(ref p) = mysql_socket { let _ = std::fs::remove_file(p); }
-                if let Some(ref d) = pg_socket_dir {
-                    let p = d.join(format!(".s.PGSQL.{}", port));
-                    let _ = std::fs::remove_file(p);
-                }
-            }
+            Ok(())
+        }
+    };
+
+    // A terminal history failure must leave no detached listener serving this
+    // receiver. The TCP accept future above is dropped by select; auxiliary
+    // accept loops are explicitly aborted on every shutdown/error path.
+    for handle in [http_handle, mysql_handle, mysql_unix_handle, pg_unix_handle]
+        .into_iter()
+        .flatten()
+    {
+        handle.abort();
+        let _ = handle.await;
+    }
+    #[cfg(feature = "ha-tier1")]
+    let server_result = {
+        let _ = physical_stop.send(true);
+        let cleanup = if !physical_finished {
+            (&mut physical_service).await
+        } else {
+            Ok(())
+        };
+        ha_handles.shutdown().await;
+        match server_result {
+            Err(error) => Err(error),
+            Ok(()) => cleanup,
+        }
+    };
+    #[cfg(unix)]
+    {
+        if let Some(ref path) = mysql_socket {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(ref directory) = pg_socket_dir {
+            let _ = std::fs::remove_file(directory.join(format!(".s.PGSQL.{port}")));
         }
     }
+    // Do not prolong a poisoned receiver's process lifetime with shutdown dumps.
+    server_result?;
 
     // Perform dump on shutdown if enabled
     if dump_on_shutdown {
@@ -2425,15 +2703,26 @@ async fn start_server_daemon(
     // argv/env source is returned for the CHILD'S environment below. This is
     // the P0-2 fix — the old code did `args.push("--password")` and leaked the
     // secret into `ps` / `/proc/<pid>/cmdline` for every daemon child.
+    // The plaintext-remote opt-ins are not secrets and must reach the child.
+    if ha_config.allow_insecure_trust {
+        args.push("--allow-insecure-trust".to_string());
+    }
+    if ha_config.allow_insecure_remote {
+        args.push("--allow-insecure-replication-remote".to_string());
+    }
     args.push("--auth".to_string());
-    args.push(auth);
+    args.push(auth.clone());
     let child_password: Option<String> = daemon_password_handoff(&password, &mut args);
+
+    append_physical_daemon_args(&mut args, &ha_config.physical, ha_config.token_file.as_deref());
 
     // Add HA options
     args.push("--replication-role".to_string());
     args.push(ha_config.role.clone());
     args.push("--replication-port".to_string());
     args.push(ha_config.replication_port.to_string());
+    args.push("--replication-startup-timeout-secs".to_string());
+    args.push(ha_config.startup_timeout_secs.to_string());
     args.push("--sync-mode".to_string());
     args.push(ha_config.sync_mode.clone());
     args.push("--http-port".to_string());
@@ -2473,9 +2762,13 @@ async fn start_server_daemon(
     {
         let exe = std::env::current_exe().map_err(|e| Error::io(format!("Failed to get current executable: {e}")))?;
 
+        let ready_dir =
+            tempfile::tempdir().map_err(|e| Error::io(format!("Cannot create daemon readiness directory: {e}")))?;
+        let ready_file = ready_dir.path().join("ready");
         let mut command = Command::new(&exe);
         command
             .args(&args)
+            .env("HELIOSDB_NANO_READY_FILE", &ready_file)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -2497,23 +2790,13 @@ async fn start_server_daemon(
 
         let pid = child.id();
 
-        // KanttBan bug #1 (v3.27.0): the parent used to print the
-        // "Daemon Started" banner unconditionally and return 0 before
-        // the child had bound its port — even when the worker died at
-        // startup (e.g. http-port collision, see #2). Now: poll the
-        // child's PG port for up to 5 s waiting for it to be
-        // accepting connections, OR observe the child's exit status
-        // first. If neither happens within the deadline we fail with
-        // a non-zero exit so caller scripts (`scripts/heliosdb.sh`)
-        // can detect failure without polling `ss` themselves.
-        let target = format!("{}:{}", listen, port);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let mut child_dead = false;
+        // Only this child's explicit acknowledgment establishes readiness.
+        let readiness_timeout = daemon_readiness_timeout(&ha_config.role, ha_config.startup_timeout_secs);
+        let deadline = std::time::Instant::now() + readiness_timeout;
         loop {
             // Did the child exit prematurely?
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    child_dead = true;
                     let _ = std::fs::remove_file(&pid_file);
                     return Err(Error::io(format!(
                         "Daemon worker exited at startup (status: {status}). \
@@ -2525,40 +2808,35 @@ async fn start_server_daemon(
                     tracing::warn!("Failed to poll daemon child: {e}");
                 }
             }
-            // Try connecting to the PG port.
-            if std::net::TcpStream::connect_timeout(
-                &target.parse::<std::net::SocketAddr>().unwrap_or_else(|_| {
-                    // listen may be 0.0.0.0; probe 127.0.0.1 instead.
-                    format!("127.0.0.1:{port}").parse().expect("valid loopback addr")
-                }),
-                std::time::Duration::from_millis(200),
-            )
-            .is_ok()
-            {
+            if std::fs::read_to_string(&ready_file).is_ok_and(|value| value == pid.to_string()) {
                 break;
             }
             if std::time::Instant::now() >= deadline {
                 // Don't leave a zombie if we time out — kill the child
                 // and fail loudly. Caller can retry.
                 let _ = child.kill();
+                let _ = child.wait();
                 let _ = std::fs::remove_file(&pid_file);
                 return Err(Error::io(format!(
-                    "Daemon did not become ready on {target} within 5s. \
-                     Most common cause: another listener already on this port \
-                     (or on the HTTP health port, see #2 in BUGS_HELIOSDB.md). \
-                     Pass --port and --http-port to non-conflicting values."
+                    "Daemon did not acknowledge listener readiness within {}s. Run in the foreground to inspect configuration and listener errors.", readiness_timeout.as_secs()
                 )));
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let _ = child_dead;
 
-        // Detach so the daemon outlives the launching shell.
-        // `child.id()` is preserved in the PID file even after we drop.
-        std::mem::forget(child);
-
-        // Write PID file (we already verified the worker is up).
-        std::fs::write(&pid_file, pid.to_string()).map_err(|e| Error::io(format!("Failed to write PID file: {e}")))?;
+        // Do not leave an untracked daemon behind if its PID cannot be recorded.
+        if let Err(error) = std::fs::write(&pid_file, pid.to_string()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Error::io(format!("Failed to write PID file: {error}")));
+        }
+        drop(child);
+        if ha_config.allow_insecure_trust && auth.eq_ignore_ascii_case("trust") {
+            eprintln!("INSECURE DEVELOPMENT OVERRIDE: daemon may permit unauthenticated non-loopback database access (--allow-insecure-trust).");
+        }
+        if ha_config.allow_insecure_remote && ha_config.token_file.is_some() {
+            eprintln!("INSECURE REPLICATION OVERRIDE: daemon replication token may cross the network in plaintext (--allow-insecure-replication-remote).");
+        }
 
         println!();
         println!("╔═══════════════════════════════════════════════════════════════╗");
@@ -2727,12 +3005,125 @@ fn check_server_status(pid_file: &PathBuf) -> Result<()> {
 
 // ========== HA Helper Functions ==========
 
-/// Handles for HA components
-#[allow(dead_code)]
+/// Owned HA tasks. A transport or applicator failure ends CLI serving.
+#[cfg(feature = "ha-tier1")]
 #[derive(Default)]
 struct HAHandles {
-    #[allow(dead_code)]
-    replication_handle: Option<tokio::task::JoinHandle<()>>,
+    replication_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    forwarding_handle: Option<tokio::task::JoinHandle<Result<()>>>,
+    applicator: Option<std::sync::Arc<heliosdb_nano::replication::wal_applicator::WalApplicator>>,
+    client_status: Option<tokio::sync::watch::Receiver<heliosdb_nano::replication::streaming::StreamingClientStatus>>,
+    _ephemeral_wal: Option<tempfile::TempDir>,
+}
+
+#[cfg(feature = "ha-tier1")]
+impl HAHandles {
+    fn status_error(&self) -> Option<Error> {
+        use heliosdb_nano::replication::streaming::StreamingClientStatus;
+        match self.client_status.as_ref().map(|status| status.borrow().clone()) {
+            Some(StreamingClientStatus::Failed { error }) => Some(Error::network(format!(
+                "Replication history verification failed: {error}"
+            ))),
+            Some(StreamingClientStatus::Stopped) => Some(Error::network("Replication client stopped")),
+            _ => None,
+        }
+    }
+
+    async fn ensure_running(&mut self) -> Result<()> {
+        if let Some(error) = self.status_error() {
+            return Err(error);
+        }
+        if self.replication_handle.as_ref().is_some_and(|task| task.is_finished())
+            || self.forwarding_handle.as_ref().is_some_and(|task| task.is_finished())
+        {
+            return Err(self.failure().await);
+        }
+        Ok(())
+    }
+
+    async fn failure(&mut self) -> Error {
+        if let Some(error) = self.status_error() {
+            return error;
+        }
+        async fn terminal_status(
+            status: &mut Option<
+                tokio::sync::watch::Receiver<heliosdb_nano::replication::streaming::StreamingClientStatus>,
+            >,
+        ) -> Error {
+            use heliosdb_nano::replication::streaming::StreamingClientStatus;
+            let Some(status) = status else {
+                return std::future::pending().await;
+            };
+            loop {
+                let current = status.borrow().clone();
+                match current {
+                    StreamingClientStatus::Failed { error } => {
+                        return Error::network(format!("Replication history verification failed: {error}"))
+                    }
+                    StreamingClientStatus::Stopped => return Error::network("Replication client stopped"),
+                    _ => (),
+                }
+                if status.changed().await.is_err() {
+                    return Error::network("Replication client status closed");
+                }
+            }
+        }
+
+        async fn completed(
+            handle: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+        ) -> std::result::Result<Result<()>, tokio::task::JoinError> {
+            match handle.as_mut() {
+                Some(handle) => handle.await,
+                None => std::future::pending().await,
+            }
+        }
+        let (transport, result) = tokio::select! {
+            biased;
+            error = terminal_status(&mut self.client_status) => return error,
+            result = completed(&mut self.replication_handle) => (true, result),
+            result = completed(&mut self.forwarding_handle) => (false, result),
+        };
+        let name = if transport {
+            let _ = self.replication_handle.take();
+            "replication transport"
+        } else {
+            let _ = self.forwarding_handle.take();
+            "replication applicator forwarding"
+        };
+        if let Some(error) = self.status_error() {
+            return error;
+        }
+        match result {
+            Ok(Err(error)) => error,
+            Ok(Ok(())) => Error::network(format!("{name} stopped unexpectedly")),
+            Err(error) => Error::network(format!("{name} task failed: {error}")),
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        for task in [&mut self.replication_handle, &mut self.forwarding_handle] {
+            if let Some(handle) = task.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+        if let Some(applicator) = self.applicator.take() {
+            let _ = applicator.stop().await;
+        }
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+impl Drop for HAHandles {
+    fn drop(&mut self) {
+        // Also cover a later startup validation error before the serving select.
+        if let Some(handle) = &self.replication_handle {
+            handle.abort();
+        }
+        if let Some(handle) = &self.forwarding_handle {
+            handle.abort();
+        }
+    }
 }
 
 /// Start HA replication components based on role
@@ -2742,11 +3133,14 @@ async fn start_ha_components(
     listen: &str,
     port: u16,
     storage: std::sync::Arc<heliosdb_nano::storage::StorageEngine>,
+    receiver_history: Option<std::sync::Arc<heliosdb_nano::replication::history::ReceiverHistory>>,
 ) -> Result<HAHandles> {
     use heliosdb_nano::replication::{
         config::PrimaryConfig,
         ha_state::{ha_state, HARole, NodeConfig, SyncMode as HASyncMode},
-        streaming::{StreamingClient, StreamingClientConfig, StreamingServer, StreamingServerConfig},
+        streaming::{
+            StreamingClient, StreamingClientConfig, StreamingClientStatus, StreamingServer, StreamingServerConfig,
+        },
         wal_applicator::WalApplicator,
         wal_store::{WalStore, WalStoreConfig},
         SyncModeConfig,
@@ -2762,6 +3156,14 @@ async fn start_ha_components(
     };
 
     info!("Starting HA components with node ID: {}", node_id);
+
+    // One token file authenticates both replication channels. Load it once here
+    // (it is validated by the owner-only loader) and present the same bytes on
+    // the native channel as the physical channel.
+    let replication_auth = match &ha_config.token_file {
+        Some(path) => Some(heliosdb_nano::replication::read_replication_token(path)?),
+        None => None,
+    };
 
     // Parse sync mode
     let sync_mode = match ha_config.sync_mode.to_lowercase().as_str() {
@@ -2804,12 +3206,48 @@ async fn start_ha_components(
 
     match role.as_str() {
         "primary" => {
+            // RocksDB is already exclusively opened. Dataset history is durable
+            // and deliberately independent of the configured operational node ID.
+            let history_id = if storage.config().storage.memory_only {
+                Uuid::new_v4()
+            } else {
+                let directory = storage
+                    .config()
+                    .storage
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| Error::config("persistent replication requires a data directory"))?;
+                heliosdb_nano::replication::history::load_or_create_primary_history(directory)
+                    .map_err(|error| Error::config(format!("Cannot load primary history: {error}")))?
+            };
             // Start streaming server for primary
-            let repl_addr = format!("{}:{}", listen, ha_config.replication_port)
-                .parse()
-                .map_err(|e| Error::config(format!("Invalid replication address: {e}")))?;
+            let repl_addr = parse_listen_address(listen, Some(ha_config.replication_port), 5433)?;
 
-            let wal_store = Arc::new(WalStore::new(WalStoreConfig::default()));
+            // Never let unrelated nodes share the process working directory's
+            // default WAL path. In-memory nodes get an owned temporary lifetime.
+            let ephemeral_wal = if storage.config().storage.memory_only {
+                Some(
+                    tempfile::tempdir()
+                        .map_err(|e| Error::io(format!("Cannot create ephemeral replication WAL: {e}")))?,
+                )
+            } else {
+                None
+            };
+            let wal_dir = if let Some(directory) = &ephemeral_wal {
+                directory.path().to_path_buf()
+            } else {
+                storage
+                    .config()
+                    .storage
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| Error::config("persistent replication requires a data directory"))?
+                    .join("replication_wal")
+            };
+            let wal_store = Arc::new(WalStore::new(WalStoreConfig {
+                wal_dir,
+                ..Default::default()
+            }));
             wal_store
                 .init()
                 .await
@@ -2826,21 +3264,47 @@ async fn start_ha_components(
                     &storage.config().server,
                 )
                 .tcp_keepalive,
+                auth: replication_auth,
                 ..Default::default()
             };
 
-            let server = StreamingServer::new(server_config, node_id, wal_store);
+            if ha_config.token_file.is_some() && !repl_addr.ip().is_loopback() {
+                if !ha_config.allow_insecure_remote {
+                    return Err(Error::config(
+                        "native replication token is a plaintext bearer; bind --listen to a loopback \
+                         address, or set --allow-insecure-replication-remote / \
+                         [replication] allow_insecure_remote = true to acknowledge the documented \
+                         plaintext risk on a protected tunnel",
+                    ));
+                }
+                tracing::warn!(
+                    "INSECURE REPLICATION OVERRIDE: the replication token crosses the network in \
+                     PLAINTEXT to {} (--allow-insecure-replication-remote); use a loopback listener or \
+                     an authenticated tunnel",
+                    repl_addr
+                );
+            }
+            let server = StreamingServer::new(server_config, node_id, history_id, wal_store)
+                .map_err(|error| Error::config(format!("Cannot configure replication history: {error}")))?;
             info!("Streaming replication server starting on {}", repl_addr);
 
-            // Spawn server task
+            let listener = server.bind_listener().await.map_err(|e| Error::network(format!(
+                "Cannot bind native replication listener {repl_addr}: {e}. Use distinct PostgreSQL --port and --replication-port endpoints; --primary-host must point to the primary native replication port."
+            )))?;
+            // Only detach after binding has succeeded.
             let handle = tokio::spawn(async move {
-                if let Err(e) = server.start().await {
-                    tracing::error!("Streaming server error: {}", e);
-                }
+                server
+                    .start_with_listener(listener)
+                    .await
+                    .map_err(|error| Error::network(format!("Streaming server failed: {error}")))
             });
 
             Ok(HAHandles {
                 replication_handle: Some(handle),
+                _ephemeral_wal: ephemeral_wal,
+                forwarding_handle: None,
+                applicator: None,
+                client_status: None,
             })
         }
         "standby" => {
@@ -2850,45 +3314,46 @@ async fn start_ha_components(
                 .as_ref()
                 .ok_or_else(|| Error::config("--primary-host required for standby role".to_string()))?;
 
-            // Resolve hostname to IP address (supports Docker DNS)
-            let primary_addr = tokio::net::lookup_host(primary_host)
+            let startup_timeout = Duration::from_secs(ha_config.startup_timeout_secs);
+            let verification_deadline = tokio::time::Instant::now() + startup_timeout;
+            // DNS and initial history verification share the same configured budget.
+            let primary_addr = tokio::time::timeout_at(verification_deadline, tokio::net::lookup_host(primary_host))
                 .await
+                .map_err(|_| {
+                    Error::network(format!(
+                        "Standby primary resolution exceeded replication.startup_timeout_secs={}s",
+                        ha_config.startup_timeout_secs
+                    ))
+                })?
                 .map_err(|e| Error::config(format!("Cannot resolve primary host '{}': {}", primary_host, e)))?
                 .next()
                 .ok_or_else(|| Error::config(format!("No address found for primary host '{}'", primary_host)))?;
 
-            // Initialize query forwarder for transparent write routing (HeliosProxy feature)
-            // Extract hostname from primary_host (format: "host:replication_port")
-            // Query forwarding connects to primary's postgres port, not replication port
-            {
-                use heliosdb_nano::replication::query_forwarder::init_query_forwarder;
-                let primary_hostname = primary_host.split(':').next().unwrap_or(primary_host);
-                // Primary's postgres port - use environment variable or default to 5432
-                let primary_pg_port = std::env::var("HELIOSDB_PRIMARY_PG_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(5432u16);
-                init_query_forwarder(primary_hostname.to_string(), primary_pg_port);
-                info!(
-                    "Query forwarder initialized for transparent write routing to {}:{}",
-                    primary_hostname, primary_pg_port
-                );
-            }
+            // Native history verification cannot authenticate a separate PG SQL
+            // endpoint. Transparent forwarding remains disabled for every mode.
+            ha_state().disable_forwarding();
+            let receiver_history = receiver_history
+                .ok_or_else(|| Error::config("standby history must be prepared before database open"))?;
 
             let client_config = StreamingClientConfig {
                 node_id,
                 primary_addr,
                 sync_mode,
-                connect_timeout: Duration::from_secs(30),
+                connect_timeout: startup_timeout,
                 reconnect_delay: Duration::from_secs(5),
                 max_reconnect_attempts: 0, // Unlimited
+                auth: replication_auth,
             };
 
-            let (client, entry_rx) = StreamingClient::new(client_config);
+            let (client, entry_rx) = StreamingClient::new(client_config, receiver_history);
+            let mut status = client.subscribe_status();
             info!("Streaming client connecting to primary at {}", primary_host);
 
             // Create WAL Applicator for applying replicated entries
-            let primary_hostname = primary_host.split(':').next().unwrap_or(primary_host);
+            let primary_hostname = primary_host
+                .rsplit_once(':')
+                .map(|(host, _)| host.trim_start_matches('[').trim_end_matches(']'))
+                .unwrap_or(primary_host);
             let primary_pg_port = std::env::var("HELIOSDB_PRIMARY_PG_PORT")
                 .ok()
                 .and_then(|p| p.parse().ok())
@@ -2897,7 +3362,7 @@ async fn start_ha_components(
             let applicator_config = PrimaryConfig {
                 host: primary_hostname.to_string(),
                 port: primary_pg_port,
-                connect_timeout: Duration::from_secs(30),
+                connect_timeout: startup_timeout,
                 use_tls: false,
             };
 
@@ -2913,35 +3378,74 @@ async fn start_ha_components(
             // Get the applicator's queue sender for forwarding entries
             let queue_tx = applicator.get_queue_sender();
 
-            // Spawn task to forward entries from streaming client to WAL applicator
-            let _forward_handle = tokio::spawn(async move {
-                info!("WAL entry forwarder task started");
+            let forward_handle = tokio::spawn(async move {
                 let mut entry_rx = entry_rx;
-                while let Some(entry) = entry_rx.recv().await {
-                    info!("Forwarder: received entry LSN={}, forwarding to applicator", entry.lsn);
-                    if let Err(e) = queue_tx.send(entry).await {
-                        tracing::error!("Failed to forward WAL entry to applicator: {}", e);
-                        break;
+                loop {
+                    tokio::select! {
+                        _ = queue_tx.closed() => return Err(Error::network(
+                            "WAL applicator stopped or refused an entry; receiver serving is terminated")),
+                        entry = entry_rx.recv() => match entry {
+                            Some(entry) => queue_tx.send(entry).await.map_err(|error|
+                                Error::network(format!("WAL applicator queue closed: {error}")))?,
+                            None => return Err(Error::network("replication entry stream closed")),
+                        }
                     }
-                    info!("Forwarder: entry forwarded successfully");
                 }
-                info!("WAL entry forwarder stopped");
             });
-
-            // Spawn streaming client task
             let client_handle = tokio::spawn(async move {
-                if let Err(e) = client.start().await {
-                    tracing::error!("Streaming client error: {}", e);
-                }
+                client
+                    .start()
+                    .await
+                    .map_err(|error| Error::network(format!("Streaming client failed: {error}")))
             });
-
-            // Keep applicator alive
-            let _applicator_ref = applicator;
-
-            Ok(HAHandles {
+            let mut handles = HAHandles {
                 replication_handle: Some(client_handle),
+                forwarding_handle: Some(forward_handle),
+                applicator: Some(applicator),
+                client_status: Some(status.clone()),
+                _ephemeral_wal: None,
+            };
+            // Identity verification is a startup prerequisite, not proof of
+            // catchup. No PG accept task, HTTP/MCP route or daemon ready marker
+            // is started until the transport durably verifies/binds history.
+            let verified = tokio::time::timeout_at(verification_deadline, async {
+                loop {
+                    let current = status.borrow().clone();
+                    match current {
+                        StreamingClientStatus::Verified { history_id } => {
+                            info!("Standby dataset history verified: {history_id}");
+                            return Ok(());
+                        }
+                        StreamingClientStatus::Failed { error } => {
+                            return Err(Error::network(format!("Standby history verification failed: {error}")))
+                        }
+                        StreamingClientStatus::Stopped => {
+                            return Err(Error::network("Streaming client stopped before history verification"))
+                        }
+                        _ => (),
+                    }
+                    tokio::select! {
+                        error = handles.failure() => return Err(error),
+                        changed = status.changed() => changed.map_err(|_| Error::network(
+                            "Streaming client status closed before history verification"))?,
+                    }
+                }
             })
+            .await
+            .map_err(|_| {
+                Error::network(format!(
+                    "Standby did not verify primary dataset history within {}s (replication.startup_timeout_secs)",
+                    ha_config.startup_timeout_secs
+                ))
+            })
+            .and_then(|result| result);
+            if let Err(error) = verified {
+                handles.shutdown().await;
+                return Err(error);
+            }
+            Ok(handles)
         }
+
         "observer" => {
             info!("Starting as observer node");
             Ok(HAHandles::default())
@@ -2968,11 +3472,32 @@ async fn run_http_listener(
     allow_remote_mcp: bool,
     api_config: heliosdb_nano::config::ApiConfig,
     http_auth: std::sync::Arc<heliosdb_nano::api::HttpAuthPolicy>,
+    health_only: bool,
 ) -> std::io::Result<()> {
     use axum::{routing::get, Json, Router};
 
     async fn health() -> Json<serde_json::Value> {
         Json(serde_json::json!({ "status": "ok" }))
+    }
+
+    if health_only {
+        async fn version() -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") }))
+        }
+        let app = Router::new()
+            .route("/", get(health))
+            .route("/health", get(health))
+            .route("/version", get(version));
+        // The configured policy still governs `/version` (which reveals the
+        // build); only `/` and `/health` stay public because the middleware
+        // answers them with a fixed status body. REST/BaaS/MCP are never
+        // mounted here, so a valid credential still lands on a 404.
+        let app = heliosdb_nano::api::attach_http_auth(app, http_auth);
+        return axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
     }
 
     // The BaaS layer the README advertises as built in — PostgREST-style
@@ -3061,6 +3586,78 @@ async fn run_http_listener(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[test]
+    fn daemon_readiness_includes_full_standby_window() {
+        for seconds in [1, 30, 3600] {
+            assert_eq!(daemon_readiness_timeout("standby", seconds).as_secs(), seconds + 5);
+        }
+        assert_eq!(daemon_readiness_timeout("STANDBY", 30).as_secs(), 35);
+        for role in ["standalone", "primary", "observer"] {
+            assert_eq!(daemon_readiness_timeout(role, 30).as_secs(), 5);
+        }
+    }
+
+    #[test]
+    fn http_listen_literals_ports_and_disable() {
+        for (input, port, expected) in [
+            ("127.0.0.1", None, "127.0.0.1:8080"),
+            ("0.0.0.0:9010", None, "0.0.0.0:9010"),
+            ("0.0.0.0:9010", Some(9020), "0.0.0.0:9020"),
+            ("::1", None, "[::1]:8080"),
+            ("[::1]", Some(9010), "[::1]:9010"),
+            ("[::1]:9010", None, "[::1]:9010"),
+            ("[::]:9010", Some(9020), "[::]:9020"),
+        ] {
+            assert_eq!(
+                resolve_http_address(input, port).unwrap().unwrap().to_string(),
+                expected
+            );
+        }
+        for input in ["127.0.0.1:9010", "invalid", "[::1]:9010"] {
+            assert_eq!(resolve_http_address(input, Some(0)).unwrap(), None);
+        }
+        assert_eq!(resolve_http_address("127.0.0.1:0", None).unwrap(), None);
+        for input in ["localhost", "127.0.0.1:80:90", "[::1]:bad", "127.0.0.1:65536", ""] {
+            assert!(resolve_http_address(input, None).is_err(), "{input}");
+        }
+    }
+
+    /// `start_server` stores `http_listen` as a bare IP (`SocketAddr::ip()`
+    /// `.to_string()` drops IPv6 brackets) with the port kept separately, then
+    /// reassembles the bind. That reassembly must go through
+    /// `parse_listen_address`, because `format!("{host}:{port}")` turns a bare
+    /// `::1` plus `8080` into the IPv6 address `::1:8080`, not a socket.
+    #[test]
+    fn http_bind_reassembles_stored_ip_and_port_without_string_concatenation() {
+        for (stored, port, expected) in [
+            ("127.0.0.1", 8080, "127.0.0.1:8080"),
+            ("0.0.0.0", 9010, "0.0.0.0:9010"),
+            ("::1", 8080, "[::1]:8080"),
+            ("::", 9010, "[::]:9010"),
+        ] {
+            assert_eq!(
+                parse_listen_address(stored, Some(port), 8080).unwrap().to_string(),
+                expected
+            );
+        }
+        // The string concatenation this seam replaced is wrong for a bare IPv6
+        // host: `::1:8080` is an address with no port, not a socket.
+        assert!("::1:8080".parse::<std::net::SocketAddr>().is_err());
+    }
+
+    /// P0-3: the HTTP default is loopback and is independent of the database
+    /// `--listen`. A deployment that binds PostgreSQL to `0.0.0.0` must not
+    /// silently publish the HTTP surface; only an explicit `--http-listen` moves
+    /// it off loopback.
+    #[test]
+    fn omitted_http_listen_defaults_to_loopback_not_database_listen() {
+        let resolved = resolve_http_address(&heliosdb_nano::api::resolve_http_listen(None), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved, "127.0.0.1:8080".parse().unwrap());
+        assert!(resolved.ip().is_loopback());
+    }
+
     use super::*;
     #[cfg(feature = "mcp-endpoint")]
     use serde_json::json;
@@ -3716,6 +4313,306 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_standby_http_omits_all_writable_api_and_mcp_routes() {
+        let db = std::sync::Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = run_http_listener(
+                listener,
+                db,
+                Some("fixture-token".into()),
+                true,
+                heliosdb_nano::config::ApiConfig::default(),
+                std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::disabled()),
+                true,
+            )
+            .await;
+        });
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        for path in ["/health", "/version"] {
+            assert_eq!(
+                client
+                    .get(format!("http://{address}{path}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                reqwest::StatusCode::OK
+            );
+        }
+        for path in [
+            "/rest/v1/test",
+            "/auth/v1/signup",
+            "/realtime/v1/websocket",
+            "/mcp",
+            "/mcp/info",
+            "/mcp/sse",
+            "/docs",
+            "/openapi.json",
+        ] {
+            for method in [reqwest::Method::GET, reqwest::Method::POST] {
+                assert_eq!(
+                    client
+                        .request(method, format!("http://{address}{path}"))
+                        .bearer_auth("fixture-token")
+                        .body("{}")
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    reqwest::StatusCode::NOT_FOUND,
+                    "unexpected guarded standby route {path}"
+                );
+            }
+        }
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// The security HTTP policy has to survive BOTH daemon compositions at this
+    /// seam: normal mode wraps the assembled REST/query/MCP surface in the wire
+    /// credential middleware, while a history-guarded standby (`health_only`)
+    /// mounts only status/health, so no writable or MCP route exists to reach
+    /// even when the caller holds valid credentials. Unlike the pre-existing
+    /// guarded-standby test, this drives a REQUIRED policy, which is what
+    /// distinguishes "route not mounted" from "route unmounted behind auth".
+    #[tokio::test]
+    async fn required_http_policy_is_composed_into_normal_and_health_only_listeners() {
+        fn required_policy() -> std::sync::Arc<heliosdb_nano::api::HttpAuthPolicy> {
+            std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::from_wire(
+                Some("wire-secret".to_string()),
+                Some(std::sync::Arc::from("mcp-secret")),
+                false,
+            ))
+        }
+
+        async fn serve(
+            db: std::sync::Arc<EmbeddedDatabase>,
+            mcp_token: Option<String>,
+            allow_remote_mcp: bool,
+            health_only: bool,
+        ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let handle = tokio::spawn(async move {
+                let _ = run_http_listener(
+                    listener,
+                    db,
+                    mcp_token,
+                    allow_remote_mcp,
+                    heliosdb_nano::config::ApiConfig::default(),
+                    required_policy(),
+                    health_only,
+                )
+                .await;
+            });
+            (address, handle)
+        }
+
+        let client = || {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap()
+        };
+
+        // Normal mode: `/` and `/health` are the fixed public status body, while
+        // the REST surface sits behind the wire credential. Seed a real table so
+        // a valid Basic request proves the policy clears AND the handler runs
+        // against THIS listener's database (not a missing-table 404).
+        let normal_db = std::sync::Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        normal_db
+            .execute("CREATE TABLE rest_probe (id INT, label TEXT)")
+            .unwrap();
+        normal_db
+            .execute("INSERT INTO rest_probe VALUES (1, 'mounted')")
+            .unwrap();
+        let (address, handle) = serve(
+            std::sync::Arc::clone(&normal_db),
+            Some("mcp-secret".to_string()),
+            false,
+            false,
+        )
+        .await;
+        let normal = client();
+        for path in ["/", "/health"] {
+            let response = normal.get(format!("http://{address}{path}")).send().await.unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::OK,
+                "normal {path} must answer 200"
+            );
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({ "status": "ok" }),
+                "normal {path} must be the fixed public status body"
+            );
+        }
+        assert_eq!(
+            normal
+                .get(format!("http://{address}/rest/v1/rest_probe"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "the normal REST surface must require the wire credential"
+        );
+        let row_response = normal
+            .get(format!("http://{address}/rest/v1/rest_probe"))
+            .basic_auth("postgres", Some("wire-secret"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            row_response.status(),
+            reqwest::StatusCode::OK,
+            "a valid wire credential must clear the HTTP policy layer and reach the REST handler"
+        );
+        let row: Value = row_response.json().await.unwrap();
+        assert_eq!(
+            row,
+            serde_json::json!([{ "id": 1, "label": "mounted" }]),
+            "the REST handler must serve exactly the seeded row off this listener's database"
+        );
+        handle.abort();
+        let _ = handle.await;
+
+        // health_only standby: status/health only. `/` and `/health` stay public
+        // with the fixed body, `/version` sits behind the configured wire policy,
+        // and no writable/MCP route is mounted.
+        let guarded_db = std::sync::Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+        let (address, handle) = serve(
+            std::sync::Arc::clone(&guarded_db),
+            Some("mcp-secret".to_string()),
+            true,
+            true,
+        )
+        .await;
+        let guarded = client();
+        for path in ["/", "/health"] {
+            let response = guarded.get(format!("http://{address}{path}")).send().await.unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::OK,
+                "health_only {path} must answer 200"
+            );
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(
+                body,
+                serde_json::json!({ "status": "ok" }),
+                "health_only {path} must be the fixed public status body"
+            );
+        }
+        let version_url = format!("http://{address}/version");
+        assert_eq!(
+            guarded.get(version_url.as_str()).send().await.unwrap().status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "health_only /version must require the configured credential"
+        );
+        assert_eq!(
+            guarded
+                .get(version_url.as_str())
+                .basic_auth("postgres", Some("wrong-secret"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "health_only /version must reject a wrong wire credential"
+        );
+        assert_eq!(
+            guarded
+                .get(version_url.as_str())
+                .bearer_auth("mcp-secret")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "health_only /version must not accept the MCP bearer token, which is scoped to /mcp*"
+        );
+        assert_eq!(
+            guarded
+                .get(version_url.as_str())
+                .basic_auth("postgres", Some("wire-secret"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::OK,
+            "health_only /version must succeed with the valid wire credential"
+        );
+        // Every writable/MCP/query path is unmounted, so a policy-cleared Basic
+        // request reaches the router and 404s. The query surface is the mounted
+        // `POST /v1/branches/:name/query` route; `/v1/branches/main/query` is the
+        // concrete instance exercised here.
+        for path in [
+            "/rest/v1/test",
+            "/auth/v1/signup",
+            "/realtime/v1/websocket",
+            "/v1/branches/main/query",
+            "/mcp",
+            "/mcp/info",
+            "/mcp/sse",
+            "/docs",
+            "/openapi.json",
+        ] {
+            for method in [reqwest::Method::GET, reqwest::Method::POST] {
+                assert_eq!(
+                    guarded
+                        .request(method, format!("http://{address}{path}"))
+                        .basic_auth("postgres", Some("wire-secret"))
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    reqwest::StatusCode::NOT_FOUND,
+                    "health_only leaked {path} to a valid wire credential"
+                );
+            }
+        }
+        // The MCP bearer clears the policy ONLY on `/mcp*`; those routes are still
+        // unmounted here, so they 404 rather than 401.
+        for path in ["/mcp", "/mcp/info", "/mcp/sse"] {
+            for method in [reqwest::Method::GET, reqwest::Method::POST] {
+                assert_eq!(
+                    guarded
+                        .request(method, format!("http://{address}{path}"))
+                        .bearer_auth("mcp-secret")
+                        .send()
+                        .await
+                        .unwrap()
+                        .status(),
+                    reqwest::StatusCode::NOT_FOUND,
+                    "health_only leaked {path} to the MCP bearer token"
+                );
+            }
+        }
+        // On any non-`/mcp*` path the scoped bearer is refused by the policy
+        // before routing (401). One representative check keeps the per-peer
+        // failure budget (10/window) well clear of the rate limiter.
+        assert_eq!(
+            guarded
+                .get(format!("http://{address}/rest/v1/test"))
+                .bearer_auth("mcp-secret")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "the MCP bearer token must not authenticate a non-MCP route"
+        );
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
     async fn daemon_http_listener_serves_health() {
         let db = std::sync::Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3728,6 +4625,7 @@ mod tests {
                 false,
                 heliosdb_nano::config::ApiConfig::default(),
                 std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::disabled()),
+                false,
             )
             .await;
         });
@@ -3757,6 +4655,7 @@ mod tests {
                 false,
                 heliosdb_nano::config::ApiConfig::default(),
                 std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::disabled()),
+                false,
             )
             .await;
         });
@@ -3795,6 +4694,7 @@ mod tests {
                 false,
                 heliosdb_nano::config::ApiConfig::default(),
                 std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::disabled()),
+                false,
             )
             .await;
         });
@@ -3828,6 +4728,7 @@ mod tests {
                 false,
                 heliosdb_nano::config::ApiConfig::default(),
                 std::sync::Arc::new(heliosdb_nano::api::HttpAuthPolicy::disabled()),
+                false,
             )
             .await;
         });
@@ -3947,5 +4848,630 @@ mod tests {
             let (pg, _) = post_quantum_flags(&command);
             assert_eq!(pg, pq, "daemon must forward post-quantum value {pq}");
         }
+    }
+}
+
+/// Transfer bounds and authentication shared by source and receiver.
+#[derive(clap::Args, Debug, Default)]
+struct PhysicalTransferArgs {
+    /// Owner-only 32-byte token file authenticating both replication channels.
+    #[arg(long)]
+    replication_token_file: Option<PathBuf>,
+    #[arg(long)]
+    physical_max_files: Option<usize>,
+    #[arg(long)]
+    physical_max_file_bytes: Option<u64>,
+    #[arg(long)]
+    physical_max_total_bytes: Option<u64>,
+    #[arg(long)]
+    physical_max_chunk_bytes: Option<usize>,
+    #[arg(long)]
+    physical_frame_timeout_secs: Option<u64>,
+    #[arg(long)]
+    physical_operation_timeout_secs: Option<u64>,
+}
+
+impl PhysicalTransferArgs {
+    fn apply(self, replication: &mut heliosdb_nano::config::ReplicationConfig) {
+        if let Some(value) = self.replication_token_file {
+            replication.token_file = Some(value);
+        }
+        let config = &mut replication.physical;
+        if let Some(value) = self.physical_max_files {
+            config.max_files = value;
+        }
+        if let Some(value) = self.physical_max_file_bytes {
+            config.max_file_bytes = value;
+        }
+        if let Some(value) = self.physical_max_total_bytes {
+            config.max_total_bytes = value;
+        }
+        if let Some(value) = self.physical_max_chunk_bytes {
+            config.max_chunk_bytes = value;
+        }
+        if let Some(value) = self.physical_frame_timeout_secs {
+            config.frame_timeout_secs = value;
+        }
+        if let Some(value) = self.physical_operation_timeout_secs {
+            config.operation_timeout_secs = value;
+        }
+    }
+}
+
+/// CLI overrides are optional so explicit defaults still override the file.
+#[derive(clap::Args, Debug, Default)]
+struct PhysicalSourceArgs {
+    #[command(flatten)]
+    transfer: PhysicalTransferArgs,
+    /// Enable default-off loopback physical transfer source (persistent primary only).
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+    physical_replication: Option<bool>,
+    #[arg(long)]
+    physical_replication_listen: Option<String>,
+    #[arg(long)]
+    physical_export_dir: Option<PathBuf>,
+    #[arg(long)]
+    physical_wal_retention_secs: Option<u64>,
+    #[arg(long)]
+    physical_wal_retention_size_mb: Option<u64>,
+    #[arg(long)]
+    physical_max_sessions: Option<usize>,
+}
+
+impl PhysicalSourceArgs {
+    fn apply(self, replication: &mut heliosdb_nano::config::ReplicationConfig) {
+        self.transfer.apply(replication);
+        let config = &mut replication.physical;
+        if let Some(value) = self.physical_replication {
+            config.enabled = value;
+        }
+        if let Some(value) = self.physical_replication_listen {
+            config.listen = value;
+        }
+        if let Some(value) = self.physical_export_dir {
+            config.export_dir = Some(value);
+        }
+        if let Some(value) = self.physical_wal_retention_secs {
+            config.wal_retention_secs = value;
+        }
+        if let Some(value) = self.physical_wal_retention_size_mb {
+            config.wal_retention_size_mb = value;
+        }
+        if let Some(value) = self.physical_max_sessions {
+            config.max_sessions = value;
+        }
+    }
+}
+
+#[derive(clap::Args, Debug)]
+struct ResyncArgs {
+    /// Physical source endpoint, reached through loopback or an authenticated tunnel.
+    #[arg(long)]
+    primary_host: String,
+    /// Absent destination for a fresh snapshot. Existing data is never overwritten.
+    #[arg(short, long)]
+    data_dir: PathBuf,
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    #[command(flatten)]
+    physical: PhysicalTransferArgs,
+    /// Pin source dataset UUID; mandatory when resuming an installed physical replica.
+    #[arg(long)]
+    expected_history: Option<uuid::Uuid>,
+    /// Resume ONLY an already installed, marked physical replica at its durable cursor.
+    #[arg(long, requires = "expected_history")]
+    resume_existing: bool,
+    /// Install/close once instead of continuously following the source.
+    #[arg(long)]
+    once: bool,
+    #[arg(long, default_value_t = 100)]
+    poll_interval_ms: u64,
+    #[arg(long, default_value_t = 1000)]
+    reconnect_delay_ms: u64,
+    #[arg(long, default_value_t = 5)]
+    max_reconnects: u32,
+    #[arg(long, default_value_t = 8_388_608)]
+    poll_byte_limit: usize,
+}
+
+fn append_physical_daemon_args(
+    args: &mut Vec<String>,
+    config: &heliosdb_nano::config::PhysicalReplicationConfig,
+    replication_token_file: Option<&std::path::Path>,
+) {
+    if let Some(path) = replication_token_file {
+        args.extend(["--replication-token-file".into(), path.display().to_string()]);
+    }
+    for (name, value) in [
+        ("--physical-replication", config.enabled.to_string()),
+        ("--physical-replication-listen", config.listen.clone()),
+        ("--physical-wal-retention-secs", config.wal_retention_secs.to_string()),
+        (
+            "--physical-wal-retention-size-mb",
+            config.wal_retention_size_mb.to_string(),
+        ),
+        ("--physical-max-sessions", config.max_sessions.to_string()),
+        ("--physical-max-files", config.max_files.to_string()),
+        ("--physical-max-file-bytes", config.max_file_bytes.to_string()),
+        ("--physical-max-total-bytes", config.max_total_bytes.to_string()),
+        ("--physical-max-chunk-bytes", config.max_chunk_bytes.to_string()),
+        ("--physical-frame-timeout-secs", config.frame_timeout_secs.to_string()),
+        (
+            "--physical-operation-timeout-secs",
+            config.operation_timeout_secs.to_string(),
+        ),
+    ] {
+        args.extend([name.into(), value]);
+    }
+    if let Some(path) = &config.export_dir {
+        args.extend(["--physical-export-dir".into(), path.display().to_string()]);
+    }
+}
+
+/// Validate before any persistent database is opened or receiver leaf is claimed.
+fn validate_physical_source(
+    config: &heliosdb_nano::config::PhysicalReplicationConfig,
+    token_file: Option<&std::path::Path>,
+    role: &str,
+    memory: bool,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    config.validate()?;
+    if !config.enabled {
+        return Ok(());
+    }
+    if role != "primary" || memory {
+        return Err(Error::config(
+            "physical source requires --replication-role primary and persistent storage",
+        ));
+    }
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        let _ = (token_file, data_dir);
+        return Err(Error::config("physical transfer requires the ha-tier1 feature"));
+    }
+    #[cfg(feature = "ha-tier1")]
+    {
+        let token_path = token_file.ok_or_else(|| {
+            Error::config("physical source requires --replication-token-file or [replication] token_file")
+        })?;
+        let _token = heliosdb_nano::replication::read_replication_token(token_path)?;
+        let export = config
+            .export_dir
+            .as_ref()
+            .ok_or_else(|| Error::config("physical source requires an existing private export_dir"))?;
+        validate_private_export(export)?;
+        let export = export.canonicalize().map_err(|e| Error::io(e.to_string()))?;
+        let source = if data_dir.exists() {
+            data_dir.canonicalize()
+        } else {
+            let parent = data_dir
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            parent
+                .canonicalize()
+                .map(|p| p.join(data_dir.file_name().unwrap_or_default()))
+        }
+        .map_err(|e| Error::config(format!("physical source data directory parent must exist: {e}")))?;
+        if export.starts_with(&source) || source.starts_with(&export) {
+            return Err(Error::config(
+                "physical export_dir and source data directory must be disjoint",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+fn validate_private_export(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|e| Error::config(format!("cannot inspect physical export_dir: {e}")))?;
+        // SAFETY: geteuid takes no pointers and has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+            return Err(Error::config(
+                "physical export_dir must be an existing owned nonsymlink directory, mode 0700 or stricter",
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(Error::config("physical checkpoint export currently requires Unix"))
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+fn physical_wire_limits(
+    config: &heliosdb_nano::config::PhysicalReplicationConfig,
+) -> heliosdb_nano::replication::physical_wire::WireLimits {
+    heliosdb_nano::replication::physical_wire::WireLimits {
+        frame_timeout: std::time::Duration::from_secs(config.frame_timeout_secs),
+        operation_timeout: std::time::Duration::from_secs(config.operation_timeout_secs),
+        transfer: heliosdb_nano::replication::checkpoint_transfer::TransferLimits {
+            max_files: config.max_files,
+            max_file_bytes: config.max_file_bytes,
+            max_total_bytes: config.max_total_bytes,
+            max_chunk_bytes: config.max_chunk_bytes,
+        },
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+struct PreparedPhysicalSource {
+    listener: tokio::net::TcpListener,
+    token: heliosdb_nano::replication::physical_wire::TransferToken,
+    db: std::sync::Arc<rocksdb::DB>,
+    history: uuid::Uuid,
+    export_dir: PathBuf,
+    config: heliosdb_nano::config::PhysicalReplicationConfig,
+    work: heliosdb_nano::replication::physical_source::SourceWorkLimiter,
+}
+
+#[cfg(feature = "ha-tier1")]
+async fn prepare_physical_source(
+    config: &heliosdb_nano::config::PhysicalReplicationConfig,
+    token_file: Option<&std::path::Path>,
+    storage: &heliosdb_nano::storage::StorageEngine,
+) -> Result<Option<PreparedPhysicalSource>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    let directory = storage
+        .config()
+        .storage
+        .path
+        .as_ref()
+        .ok_or_else(|| Error::config("physical source requires persistent data"))?;
+    validate_physical_source(
+        config,
+        token_file,
+        "primary",
+        storage.config().storage.memory_only,
+        directory,
+    )?;
+    // Native primary startup has already opened/locked the DB and established this marker.
+    let history = heliosdb_nano::replication::history::load_or_create_primary_history(directory)
+        .map_err(|e| Error::config(e.to_string()))?;
+    let token_path = token_file.ok_or_else(|| {
+        Error::config("physical source requires --replication-token-file or [replication] token_file")
+    })?;
+    let token = heliosdb_nano::replication::read_replication_token(token_path)?;
+    let listener = heliosdb_nano::replication::physical_wire::bind_loopback(
+        config
+            .listen
+            .parse()
+            .map_err(|e| Error::config(format!("physical listen: {e}")))?,
+    )
+    .await
+    .map_err(|e| Error::network(format!("physical source bind failed: {e}")))?;
+    Ok(Some(PreparedPhysicalSource {
+        listener,
+        token,
+        db: storage.db(),
+        history,
+        export_dir: config.export_dir.clone().expect("validated export path"),
+        config: config.clone(),
+        work: heliosdb_nano::replication::physical_source::SourceWorkLimiter::new(config.max_sessions)
+            .map_err(|e| Error::config(e.to_string()))?,
+    }))
+}
+
+/// Directly owned by main, never detached. The listener is bound before readiness;
+/// every authenticated session is joined after shutdown before source DB close.
+#[cfg(feature = "ha-tier1")]
+async fn serve_physical_source(
+    source: Option<PreparedPhysicalSource>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    let Some(source) = source else {
+        while !*shutdown.borrow() {
+            if shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+        return Ok(());
+    };
+    let token = std::sync::Arc::new(source.token);
+    let (session_stop, session_shutdown) = tokio::sync::watch::channel(false);
+    let mut sessions = tokio::task::JoinSet::new();
+    let limits = physical_wire_limits(&source.config);
+    let result = loop {
+        if *shutdown.borrow() {
+            break Ok(());
+        }
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => { break Ok(()); }
+            completed = sessions.join_next(), if !sessions.is_empty() => {
+                if let Some(Err(error)) = completed { tracing::warn!("physical session task failed: {error}"); }
+            }
+            accepted = source.listener.accept(), if sessions.len() < source.config.max_sessions => {
+                let (stream, peer) = match accepted { Ok(value) => value, Err(error) => break Err(Error::network(format!("physical accept failed: {error}"))) };
+                if !peer.ip().is_loopback() { continue; }
+                let db = source.db.clone();
+                let export = source.export_dir.clone();
+                let history = source.history;
+                let work = source.work.clone();
+                let token = token.clone();
+                let stop = session_shutdown.clone();
+                sessions.spawn(async move {
+                    let result = heliosdb_nano::replication::physical_wire::serve_session(stream, &token, limits, stop,
+                        move |request| heliosdb_nano::replication::physical_source::open_primary_session(db, history, export, limits.transfer, request, work)
+                    ).await;
+                    if let Err(error) = result { tracing::warn!("physical transfer session ended: {error}"); }
+                });
+            }
+        }
+    };
+    let _ = session_stop.send(true);
+    while let Some(completed) = sessions.join_next().await {
+        if let Err(error) = completed {
+            tracing::warn!("physical session cleanup failed: {error}");
+        }
+    }
+    let drained = source
+        .work
+        .drain()
+        .await
+        .map_err(|e| Error::network(format!("physical source work drain failed: {e}")));
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => drained,
+    }
+}
+
+async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        let _ = args;
+        return Err(Error::config("resync requires the ha-tier1 feature"));
+    }
+    #[cfg(feature = "ha-tier1")]
+    {
+        use heliosdb_nano::replication::physical_receiver::{
+            run_receiver, ReceiverMode, ReceiverOptions, ReceiverStart, ReceiverStatus,
+        };
+        use std::time::Duration;
+        let mut replication = if let Some(path) = args.config {
+            Config::from_file(path)?.replication
+        } else {
+            Default::default()
+        };
+        args.physical.apply(&mut replication);
+        let mut physical = replication.physical;
+        physical.validate()?;
+        if !(1..=60_000).contains(&args.poll_interval_ms)
+            || !(1..=60_000).contains(&args.reconnect_delay_ms)
+            || args.max_reconnects > 1000
+            || !(1..=67_108_864).contains(&args.poll_byte_limit)
+        {
+            return Err(Error::config(
+                "resync requires poll/reconnect intervals 1..=60000 ms, retries 0..=1000, and poll bytes 1..=67108864",
+            ));
+        }
+        if args.expected_history.is_some_and(|id| id.is_nil()) {
+            return Err(Error::config("expected history must not be nil"));
+        }
+        if !args.resume_existing {
+            match std::fs::symlink_metadata(&args.data_dir) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(Error::io(error.to_string())),
+                Ok(_) => return Err(Error::config("fresh resync requires an absent destination; preserve existing data and choose a new path, or explicitly resume an installed physical receiver")),
+            }
+        }
+        heliosdb_nano::config::validate_replication_endpoint(&args.primary_host)?;
+        let resolved = tokio::time::timeout(
+            Duration::from_secs(physical.operation_timeout_secs),
+            tokio::net::lookup_host(&args.primary_host),
+        )
+        .await
+        .map_err(|_| Error::network("physical source DNS lookup timed out"))?
+        .map_err(|e| Error::network(e.to_string()))?
+        .collect::<Vec<_>>();
+        if resolved.is_empty() || resolved.iter().any(|address| !address.ip().is_loopback()) {
+            return Err(Error::config("initial physical transfer supports loopback only; use an authenticated tunnel to the remote primary, not plaintext over a remote network"));
+        }
+        let mut sources = Vec::new();
+        for address in resolved {
+            if !sources.contains(&address) {
+                sources.push(address);
+            }
+        }
+        if sources.len() > 16 {
+            return Err(Error::config(
+                "physical source hostname resolves to more than 16 addresses",
+            ));
+        }
+        let token =
+            heliosdb_nano::replication::read_replication_token(replication.token_file.as_ref().ok_or_else(|| {
+                Error::config("resync requires --replication-token-file or [replication] token_file")
+            })?)?;
+        let start = if args.resume_existing {
+            ReceiverStart::Resume {
+                path: args.data_dir,
+                history: args
+                    .expected_history
+                    .ok_or_else(|| Error::config("--resume-existing requires --expected-history"))?,
+            }
+        } else {
+            ReceiverStart::Snapshot {
+                target: args.data_dir,
+                expected_history: args.expected_history,
+            }
+        };
+        let options = ReceiverOptions {
+            sources,
+            token,
+            start,
+            mode: if args.once {
+                ReceiverMode::InstallOnce
+            } else {
+                ReceiverMode::Follow
+            },
+            wire: physical_wire_limits(&physical),
+            poll_byte_limit: args.poll_byte_limit,
+            poll_interval: Duration::from_millis(args.poll_interval_ms),
+            reconnect_delay: Duration::from_millis(args.reconnect_delay_ms),
+            max_reconnects: args.max_reconnects,
+        };
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let (progress, mut statuses) = tokio::sync::watch::channel(ReceiverStatus::Connecting {
+            history: None,
+            after: None,
+        });
+        println!("Physical receiver only: no SQL listener or serving-readiness publication. Strict hydration/publication is a separate prerequisite.");
+        let receiver = run_receiver(options, shutdown, progress);
+        tokio::pin!(receiver);
+        let signal = heliosdb_nano::wait_for_shutdown_signal();
+        tokio::pin!(signal);
+        let mut status_open = true;
+        let result = loop {
+            tokio::select! {
+                biased;
+                value = &mut receiver => break value,
+                _ = &mut signal => {
+                    let _ = stop.send(true);
+                    // Owned worker closes at a command boundary and joins. An OS fsync
+                    // cannot safely be force-cancelled; do not abort this future.
+                    break (&mut receiver).await;
+                }
+                changed = statuses.changed(), if status_open => {
+                    if changed.is_err() { status_open = false; }
+                    else { eprintln!("Physical transfer: {:?}", &*statuses.borrow_and_update()); }
+                }
+            }
+        };
+        let closed = result.map_err(|e| {
+            Error::network(format!(
+                "physical resync stopped: {e}; retained files were not overwritten or auto-reseeded"
+            ))
+        })?;
+        println!("Physical state retained closed at {} (snapshot {}, history {}, source sequence {}). This is not SQL readiness.",
+            closed.path.display(), closed.snapshot_id, closed.cursor.history(), closed.cursor.source_sequence());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod physical_cli_tests {
+    use super::*;
+    #[test]
+    fn explicit_defaults_override_file_and_survive_daemon_reexec() {
+        let cli = Cli::try_parse_from([
+            "nano",
+            "start",
+            "--physical-replication=false",
+            "--physical-wal-retention-secs",
+            "3600",
+            "--physical-wal-retention-size-mb",
+            "1024",
+            "--physical-max-files",
+            "10",
+            "--physical-max-file-bytes",
+            "4096",
+            "--physical-max-total-bytes",
+            "8192",
+            "--physical-max-chunk-bytes",
+            "1024",
+        ])
+        .unwrap();
+        let Commands::Start { physical, .. } = cli.command else {
+            panic!("wrong command")
+        };
+        let mut config = heliosdb_nano::config::ReplicationConfig {
+            physical: heliosdb_nano::config::PhysicalReplicationConfig {
+                enabled: true,
+                wal_retention_secs: 60,
+                wal_retention_size_mb: 64,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        physical.apply(&mut config);
+        assert!(!config.physical.enabled);
+        assert_eq!(config.physical.wal_retention_secs, 3600);
+        assert_eq!(config.physical.wal_retention_size_mb, 1024);
+        let mut argv = vec!["nano".into(), "start".into()];
+        append_physical_daemon_args(&mut argv, &config.physical, config.token_file.as_deref());
+        let Commands::Start { physical, .. } = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("wrong command")
+        };
+        let mut child = heliosdb_nano::config::ReplicationConfig {
+            physical: heliosdb_nano::config::PhysicalReplicationConfig {
+                enabled: true,
+                wal_retention_secs: 60,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        physical.apply(&mut child);
+        assert!(!child.physical.enabled);
+        assert_eq!(child.physical.wal_retention_secs, 3600);
+        assert_eq!(child.physical.wal_retention_size_mb, 1024);
+        assert_eq!(child.physical.max_files, 10);
+        assert_eq!(child.physical.max_file_bytes, 4096);
+        assert_eq!(child.physical.max_total_bytes, 8192);
+        assert_eq!(child.physical.max_chunk_bytes, 1024);
+    }
+    #[test]
+    fn source_requires_persistent_primary_and_resume_requires_history() {
+        let config = heliosdb_nano::config::PhysicalReplicationConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(validate_physical_source(&config, None, "standalone", false, std::path::Path::new("missing")).is_err());
+        assert!(validate_physical_source(&config, None, "primary", true, std::path::Path::new("missing")).is_err());
+        assert!(Cli::try_parse_from([
+            "nano",
+            "resync",
+            "--primary-host",
+            "127.0.0.1:5440",
+            "--data-dir",
+            "new",
+            "--resume-existing"
+        ])
+        .is_err());
+        let Commands::Resync(args) = Cli::try_parse_from([
+            "nano",
+            "resync",
+            "--primary-host",
+            "127.0.0.1:5440",
+            "--data-dir",
+            "new",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("wrong command")
+        };
+        assert!(!args.once && !args.resume_existing);
+    }
+    #[cfg(all(feature = "ha-tier1", unix))]
+    #[test]
+    fn token_file_rejects_world_readable_links_and_wrong_length() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("token");
+        std::fs::write(&path, [9u8; 32]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(heliosdb_nano::replication::read_replication_token(&path).is_ok());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(heliosdb_nano::replication::read_replication_token(&path).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = directory.path().join("link");
+        symlink(&path, &link).unwrap();
+        assert!(heliosdb_nano::replication::read_replication_token(&link).is_err());
+        let hard = directory.path().join("hard");
+        std::fs::hard_link(&path, &hard).unwrap();
+        assert!(heliosdb_nano::replication::read_replication_token(&path).is_err());
+        std::fs::remove_file(hard).unwrap();
+        std::fs::write(&path, [9u8; 31]).unwrap();
+        assert!(heliosdb_nano::replication::read_replication_token(&path).is_err());
     }
 }

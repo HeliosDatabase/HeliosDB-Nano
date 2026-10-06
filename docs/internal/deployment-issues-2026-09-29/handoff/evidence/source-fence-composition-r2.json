@@ -1,0 +1,96 @@
+{
+  "at": "2026-09-29T22:42:22.199290+00:00",
+  "output": "/home/gpc/HDB/sprint/baselines/nano/deployment-20260929/source-fence-composition-r2",
+  "patches": [
+    {
+      "patch": "physical-committed-draft/physical-committed.patch",
+      "sha256": "5b5f577c53c636e57d679e55b348f01b8d2b2e0526951908c1e87ab5648610c6",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "source-fence-draft/storage-source-admission.patch",
+      "sha256": "cbb5cfe4518dbb65b0f4f3a604ebaaa22ce9cc335abcfdb6926d756d154eb779",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "source-fence-draft/storage-durable-phase-helper.patch",
+      "sha256": "fb909db1a62b8b02f930421cf1477c0db3845bd073e6fffa80db8657d90f0528",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "library-source-admission.patch",
+      "sha256": "7fd4fc16307588ff7d1d0ae2ef00cdf5065e414ec7baa60d5215d89b42d602cd",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "transaction-source-admission.patch",
+      "sha256": "82563317355655c174c8979ca8587361b3d08e0d7ecee2927fa016a382e835be",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "library-session-source-admission.patch",
+      "sha256": "370120f259d821bf5bafd8caf0c9d553b9c557473513ee10bdeb22053e3e88fd",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "background-source-admission.patch",
+      "sha256": "94a41adcb5f45aae56c8520c31de05ebb57c447608f4ca784ebf088f532a3ae2",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "wal-group-admission.patch",
+      "sha256": "42a598764a53aea95b5cd7acc347509248d2c46eb2849ebec1dc701c67ec5ab8",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "remaining-source-admission-draft/http-branch-source-admission.patch",
+      "sha256": "c117bb16cc4b26cd300abc2f6ac0554fd5752fc7d11281f7ea76df21612ae05d",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "remaining-source-admission-draft/branch-engine-propagation.patch",
+      "sha256": "526f8b440d5c74b99e51419cbd8f34538634edabcd7928125d2553227c5fd1ab",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "fast-dml-source-phase.patch",
+      "sha256": "06d5c253048f40ecb3c744568ea728d58eb387939982d04de727bbe5c44202b3",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "ddl-source-admission-draft/ddl-source-admission.patch",
+      "sha256": "4b6446165297d2a5c17c8d08f4117dc5a40b6cb374b9dad9f926fc14cb246564",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "physical-certified-draft/physical-certified.patch",
+      "sha256": "503e69c66a68fde0f2904d64079d9074fda6c191a9c92f36c4f91298dc0b76a7",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "physical-certified-draft/main-raw-compat.patch",
+      "sha256": "dbe7e438527ce8f3be1627517b8a95d5b5c0af9102cc4ca26077c034b3b5b975",
+      "exit": 0,
+      "stderr": ""
+    },
+    {
+      "patch": "generation-session-transfer.patch",
+      "sha256": "9235234e791ce6fa1c9eb2b7d9b3c9efde8a91ae870b54da03fd6e11d04fc859",
+      "exit": 0,
+      "stderr": ""
+    }
+  ]
+}

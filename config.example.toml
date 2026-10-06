@@ -401,6 +401,48 @@ mysql_tls_enabled = false
 mysql_tls_post_quantum = true
 
 # ============================================================================
+# NATIVE WAL REPLICATION CONFIGURATION
+# ============================================================================
+[replication]
+# Explicit start-command CLI flags override individual values below, including
+# values equal to CLI defaults. Unspecified fields retain these file values.
+# Unknown keys in this section are rejected to catch configuration mistakes.
+role = "standalone" # standalone | primary | standby | observer
+
+# Native WAL protocol port, NOT the PostgreSQL, MySQL, or HTTP listener port.
+# "port" is accepted as an alias; do not specify both names.
+replication_port = 5433
+
+# Standby DNS + initial history verification budget, 1..=3600 seconds.
+# CLI --replication-startup-timeout-secs overrides this value.
+# Daemon parent allows this budget plus its usual 5-second startup allowance.
+startup_timeout_secs = 30
+
+# Required when the effective role is standby. Use a native WAL
+# endpoint: DNS:port, IPv4:port, or [IPv6]:port; ports must be nonzero.
+# primary_host = "primary.example:5433"
+# Peer lists are retained like the equivalent CLI flags; this build's tier-1
+# streaming server accepts connecting standbys and does not dial these lists.
+standby_hosts = [] # e.g. ["standby.example:5433", "[2001:db8::2]:5433"]
+observer_hosts = [] # e.g. ["observer.example:5433"]
+sync_mode = "async" # async | semi-sync (alias semisync) | sync
+# node_id = "550e8400-e29b-41d4-a716-446655440000" # UUID; generated if omitted
+
+# One owner-only 32-byte token file authenticating BOTH the native logical
+# channel and the physical transfer channel. Put the identical file on the
+# primary and every standby. The token bytes are never read from TOML or the
+# environment — only this path is:
+#   head -c 32 /dev/urandom > replication.token && chmod 600 replication.token
+# CLI --replication-token-file overrides this value.
+# token_file = "/etc/heliosdb/replication.token"
+
+# Acknowledge that the replication token crosses a NON-loopback (plaintext)
+# native listener. Default false: a token on a non-loopback listener is refused.
+# CLI --allow-insecure-replication-remote turns this on; the token is a bearer
+# secret sent in clear, so prefer a loopback listener or an authenticated tunnel.
+# allow_insecure_remote = true
+
+# ============================================================================
 # PERFORMANCE CONFIGURATION
 # ============================================================================
 [performance]
