@@ -97,8 +97,7 @@ fn router() -> axum::Router {
 /// The REST tests need to seed schema and rows and then drive real HTTP requests against
 /// that state, so they cannot use the blank in-memory database `router()` builds.
 fn router_with_db(db: Arc<EmbeddedDatabase>) -> axum::Router {
-    let (server, _warnings) =
-        ApiServer::from_config("127.0.0.1:0".parse().unwrap(), db, &api_config(&[]));
+    let (server, _warnings) = ApiServer::from_config("127.0.0.1:0".parse().unwrap(), db, &api_config(&[]));
     server.into_router()
 }
 
@@ -127,8 +126,7 @@ async fn json_request(
     let json = if bytes.is_empty() {
         serde_json::Value::Null
     } else {
-        serde_json::from_slice(&bytes)
-            .expect("a nonempty response body must be valid JSON")
+        serde_json::from_slice(&bytes).expect("a nonempty response body must be valid JSON")
     };
     (status, json)
 }
@@ -317,8 +315,10 @@ async fn every_documented_baas_endpoint_is_mounted() {
 #[tokio::test]
 async fn rest_table_route_is_mounted_as_a_path_parameter() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
-    db.execute("CREATE TABLE rest_probe (id INT, label TEXT)").expect("create table");
-    db.execute("INSERT INTO rest_probe VALUES (1, 'mounted')").expect("insert row");
+    db.execute("CREATE TABLE rest_probe (id INT, label TEXT)")
+        .expect("create table");
+    db.execute("INSERT INTO rest_probe VALUES (1, 'mounted')")
+        .expect("insert row");
     let router = router_with_db(Arc::clone(&db));
 
     let (status, rows) = json_request(router, "GET", "/rest/v1/rest_probe", None).await;
@@ -329,7 +329,9 @@ async fn rest_table_route_is_mounted_as_a_path_parameter() {
          a literal `{{table}}` path instead of an axum 0.7 `:table` parameter"
     );
 
-    let rows = rows.as_array().expect("GET /rest/v1/:table must return a JSON array of rows");
+    let rows = rows
+        .as_array()
+        .expect("GET /rest/v1/:table must return a JSON array of rows");
     assert_eq!(
         rows.len(),
         1,
@@ -353,7 +355,8 @@ async fn rest_table_route_is_mounted_as_a_path_parameter() {
 #[tokio::test]
 async fn rest_crud_verbs_dispatch_to_their_handlers() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
-    db.execute("CREATE TABLE rest_crud (id INT, label TEXT)").expect("create table");
+    db.execute("CREATE TABLE rest_crud (id INT, label TEXT)")
+        .expect("create table");
     let router = router_with_db(Arc::clone(&db));
 
     // POST -> rest_insert, whose own contract is 201 CREATED.
@@ -400,8 +403,7 @@ async fn rest_crud_verbs_dispatch_to_their_handlers() {
     );
 
     // DELETE -> rest_delete, whose own contract is 200 OK with a count.
-    let (status, body) =
-        json_request(router.clone(), "DELETE", "/rest/v1/rest_crud?id=eq.1", None).await;
+    let (status, body) = json_request(router.clone(), "DELETE", "/rest/v1/rest_crud?id=eq.1", None).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -454,9 +456,7 @@ async fn rest_rpc_route_dispatches_to_the_rpc_handler() {
         "the RPC handler's own contract is 501 NotImplemented (rest_handler::rest_rpc), got {body}"
     );
     assert!(
-        body["message"]
-            .as_str()
-            .is_some_and(|m| m.contains("no_such_function")),
+        body["message"].as_str().is_some_and(|m| m.contains("no_such_function")),
         "the response must come from the RPC handler and name the function, got {body}"
     );
 }
