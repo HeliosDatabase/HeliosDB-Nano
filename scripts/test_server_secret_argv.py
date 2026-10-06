@@ -59,6 +59,14 @@ SECRET_ENV_KEYS = ("HELIOSDB_PASSWORD", "HELIOSDB_PASSWORD_FILE", "HELIOSDB_MCP_
 SQL_USER = "postgres"
 SQL_DB = "postgres"
 
+# The exact expected needle for case 12 (an empty --password-file argument).
+# Clap refuses it before the parent resolves anything, so this is the captured
+# diagnostic verbatim: the single quotes around the flag+value are part of the
+# message. Source fixture:
+#   sprint/baselines/nano/parallel-20261004/security-integration/
+#   attempt4-20261006/secret-argv-evidence/12-empty-password-file-arg.launch.log
+CASE12_DIAGNOSTIC = "a value is required for '--password-file <PASSWORD_FILE>' but none was supplied"
+
 
 class Unavailable(Exception):
     """A prerequisite is missing; the gated run must fail closed (exit 3)."""
@@ -837,6 +845,15 @@ class Harness:
         if case.launch_rc == 0:
             case.check(False, "%s: startup succeeded where a config error was expected" % label)
             return
+        if case.launch_rc is None:
+            case.check(False, "%s: launcher reported no exit code instead of a config error" % label)
+            return
+        if case.launch_rc < 0:
+            case.check(
+                False,
+                "%s: launcher died from signal %d instead of reporting a config error" % (label, -case.launch_rc),
+            )
+            return
         # A rejection must not leave a daemon or a pidfile behind, whether or
         # not the pid could be parsed (checked unconditionally, not only when a
         # pid was read).
@@ -982,7 +999,7 @@ def build_cases(h: Harness) -> None:
     h.cases.append(case)
 
     case = h.launch("12-empty-password-file-arg", "scram-sha-256", ["--password-file", ""], {})
-    h.expect_config_error(case, ["empty path"], case.name)
+    h.expect_config_error(case, [CASE12_DIAGNOSTIC], case.name)
     h.cases.append(case)
 
 

@@ -100,6 +100,111 @@ class ExpectConfigErrorTests(unittest.TestCase):
             self.assertTrue(case.failed(), "a bind failure is not a config rejection")
 
 
+# Verbatim stderr captured from the case-12 launch, including the ``error:``
+# prefix, the single quotes around the flag+value, and Clap's trailing help
+# hint. Fixture:
+#   sprint/baselines/nano/parallel-20261004/security-integration/
+#   attempt4-20261006/secret-argv-evidence/12-empty-password-file-arg.launch.log
+# This is the *actual* output the tests feed the classifier; the expected needle
+# is the production harness constant (``m.CASE12_DIAGNOSTIC``) so the two cannot
+# drift without a failure.
+CASE12_RAW_STDERR = (
+    "error: a value is required for '--password-file <PASSWORD_FILE>' but none was supplied\n"
+    "\n"
+    "For more information, try '--help'.\n"
+)
+
+
+class PasswordFileMissingValueTests(unittest.TestCase):
+    """The exact case-12 needle is accepted; nothing else is broadened.
+
+    ``expect_config_error`` stays a plain substring matcher plus its existing
+    timeout/bind/zero/None/signal/pidfile/stray guards. The tests feed the raw
+    captured stderr and assert against the production ``CASE12_DIAGNOSTIC``
+    constant, so they pin both that acceptance and every guard that must still
+    reject a matching string.
+    """
+
+    def _case(self, out=CASE12_RAW_STDERR, rc=2):
+        case = m.Case("cfg")
+        case.launch_rc = rc
+        case.launch_out = out.encode("utf-8")
+        return case
+
+    def test_exact_case12_diagnostic_is_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _harness(d)
+            case = self._case()
+            h.expect_config_error(case, [m.CASE12_DIAGNOSTIC], case.name)
+            self.assertFalse(
+                case.failed(), "the exact captured case-12 diagnostic is the expected rejection"
+            )
+
+    def test_wrong_flag_diagnostic_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _harness(d)
+            case = self._case(
+                out="error: a value is required for '--password <PASSWORD>' but none was supplied"
+            )
+            h.expect_config_error(case, [m.CASE12_DIAGNOSTIC], case.name)
+            self.assertTrue(case.failed(), "a different flag's diagnostic must not satisfy case 12")
+
+    def test_generic_error_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _harness(d)
+            case = self._case(out="error: unrecognized argument '--nope'")
+            h.expect_config_error(case, [m.CASE12_DIAGNOSTIC], case.name)
+            self.assertTrue(case.failed(), "an unrelated error must never be accepted")
+
+    def test_matching_diagnostic_with_signal_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _harness(d)
+            case = self._case(rc=-9)
+            h.expect_config_error(case, [m.CASE12_DIAGNOSTIC], case.name)
+            self.assertTrue(case.failed(), "a signal death is not a clean config rejection")
+
+    def test_matching_diagnostic_with_none_exit_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _harness(d)
+            case = self._case(rc=None)
+            h.expect_config_error(case, [m.CASE12_DIAGNOSTIC], case.name)
+            self.assertTrue(case.failed(), "an absent exit code is not a clean config rejection")
+
+    def test_matching_diagnostic_with_timeout_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _harness(d)
+            case = self._case()
+            case.timed_out = True
+            h.expect_config_error(case, [m.CASE12_DIAGNOSTIC], case.name)
+            self.assertTrue(case.failed(), "a timeout is not a clean config rejection")
+
+    def test_matching_diagnostic_with_bind_failure_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _harness(d)
+            case = self._case(
+                out="failed to bind 127.0.0.1: Address already in use\n" + CASE12_RAW_STDERR
+            )
+            h.expect_config_error(case, [m.CASE12_DIAGNOSTIC], case.name)
+            self.assertTrue(case.failed(), "a bind failure classification wins over the parser text")
+
+    def test_matching_diagnostic_with_pidfile_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _harness(d)
+            case = self._case()
+            case.pidfile_seen = True
+            h.expect_config_error(case, [m.CASE12_DIAGNOSTIC], case.name)
+            self.assertTrue(case.failed(), "a leftover pidfile must still fail the case")
+
+    def test_matching_diagnostic_with_stray_child_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            h = _harness(d)
+            case = self._case()
+            case.stray = True
+            case.orphans = [m.Orphan(4242, "uuid", "17", BIN)]
+            h.expect_config_error(case, [m.CASE12_DIAGNOSTIC], case.name)
+            self.assertTrue(case.failed(), "a surviving child must still fail the case")
+
+
 class SignalCleanupTests(unittest.TestCase):
     """_signal_and_wait must never silently accept an un-cleanable process."""
 
