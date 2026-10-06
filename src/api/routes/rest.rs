@@ -25,9 +25,9 @@ use crate::api::{handlers::rest_handler, server::AppState};
 pub fn routes() -> Router<AppState> {
     Router::new()
         // RPC must come before the catch-all `:table` routes
-        .route("/rpc/{function}", post(rest_handler::rest_rpc))
+        .route("/rpc/:function", post(rest_handler::rest_rpc))
         .route(
-            "/{table}",
+            "/:table",
             get(rest_handler::rest_select)
                 .post(rest_handler::rest_insert)
                 .patch(rest_handler::rest_update)

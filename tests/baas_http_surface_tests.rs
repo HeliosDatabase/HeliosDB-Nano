@@ -92,6 +92,47 @@ fn router() -> axum::Router {
     router_from(&api_config(&[])).0
 }
 
+/// Boot the SAME production assembly around a caller-provided database.
+///
+/// The REST tests need to seed schema and rows and then drive real HTTP requests against
+/// that state, so they cannot use the blank in-memory database `router()` builds.
+fn router_with_db(db: Arc<EmbeddedDatabase>) -> axum::Router {
+    let (server, _warnings) =
+        ApiServer::from_config("127.0.0.1:0".parse().unwrap(), db, &api_config(&[]));
+    server.into_router()
+}
+
+/// Drive one request through a router and return its status plus decoded JSON body.
+///
+/// An empty body decodes to `Value::Null`. A nonempty body that is NOT valid JSON panics
+/// instead of silently decoding to `Value::Null`, so a malformed response cannot slip past
+/// an assertion as a null.
+async fn json_request(
+    router: axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let builder = Request::builder().method(method).uri(uri);
+    let req = match body {
+        Some(json) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(json.to_string()))
+            .unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    };
+    let resp = router.oneshot(req).await.expect("router response");
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.expect("body");
+    let json = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes)
+            .expect("a nonempty response body must be valid JSON")
+    };
+    (status, json)
+}
+
 /// `GET /auth/v1/authorize?provider=...`, returning the status and the `Location` header.
 async fn authorize(router: axum::Router, provider: &str) -> (StatusCode, Option<String>) {
     let req = Request::builder()
@@ -258,6 +299,166 @@ async fn every_documented_baas_endpoint_is_mounted() {
              which is the state that made every /auth/v1/* call fail before #115."
         );
     }
+}
+
+/// The REST table route must be MOUNTED as a real axum 0.7 path parameter.
+///
+/// `src/api/routes/rest.rs` registered `/{table}` (an axum 0.8-style placeholder)
+/// against axum 0.7, where matchit treats `{`/`}` as ordinary literal bytes. Every
+/// real `/rest/v1/<table>` request therefore 404'd at the router before the handler
+/// ran; no other suite noticed because the mount tests above never touch REST and
+/// the 401 tests are rejected by the auth layer ahead of routing. Asserting 200 for
+/// a table that EXISTS is what distinguishes "mounted" from the handler's own 404
+/// for a genuinely missing table.
+///
+/// This is also a DISPATCH test, not merely a mount test: the response body must
+/// decode to the row that was seeded, proving the request reached `rest_handler::rest_select`
+/// and that the handler executed against the server's database rather than a stray one.
+#[tokio::test]
+async fn rest_table_route_is_mounted_as_a_path_parameter() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE rest_probe (id INT, label TEXT)").expect("create table");
+    db.execute("INSERT INTO rest_probe VALUES (1, 'mounted')").expect("insert row");
+    let router = router_with_db(Arc::clone(&db));
+
+    let (status, rows) = json_request(router, "GET", "/rest/v1/rest_probe", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /rest/v1/:table must reach the handler; a 404 means the route was registered as \
+         a literal `{{table}}` path instead of an axum 0.7 `:table` parameter"
+    );
+
+    let rows = rows.as_array().expect("GET /rest/v1/:table must return a JSON array of rows");
+    assert_eq!(
+        rows.len(),
+        1,
+        "GET /rest/v1/rest_probe must return exactly the one seeded row, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0],
+        serde_json::json!({"id": 1, "label": "mounted"}),
+        "GET /rest/v1/rest_probe must return exactly the seeded row, got {:?}",
+        rows[0]
+    );
+}
+
+/// The three write verbs must reach their exact handlers, not just 404.
+///
+/// The path-parameter bug made EVERY `/rest/v1/:table` request 404, so a mount test
+/// alone would have caught that specific regression. This one pins the dispatch of the
+/// methods that share the route — a router that mounted only GET would slip past the
+/// test above — by asserting the HANDLER's documented success statuses: `rest_insert`
+/// returns 201 CREATED, `rest_update` and `rest_delete` return 200 OK with a row count.
+#[tokio::test]
+async fn rest_crud_verbs_dispatch_to_their_handlers() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE rest_crud (id INT, label TEXT)").expect("create table");
+    let router = router_with_db(Arc::clone(&db));
+
+    // POST -> rest_insert, whose own contract is 201 CREATED.
+    let (status, body) = json_request(
+        router.clone(),
+        "POST",
+        "/rest/v1/rest_crud",
+        Some(serde_json::json!({"id": 1, "label": "a"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "POST /rest/v1/:table must reach rest_insert (201), got body {body}"
+    );
+    assert_eq!(body["count"], 1, "one row must be inserted");
+
+    // PATCH -> rest_update, whose own contract is 200 OK with a count.
+    let (status, body) = json_request(
+        router.clone(),
+        "PATCH",
+        "/rest/v1/rest_crud?id=eq.1",
+        Some(serde_json::json!({"label": "b"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "PATCH /rest/v1/:table must reach rest_update (200), got body {body}"
+    );
+    assert_eq!(body["count"], 1, "one row must be updated");
+
+    // GET on the SAME router/DB must observe the update, proving PATCH and GET share state.
+    let (status, rows) = json_request(router.clone(), "GET", "/rest/v1/rest_crud", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /rest/v1/:table after PATCH must reach rest_select, got {rows}"
+    );
+    assert_eq!(
+        rows,
+        serde_json::json!([{"id": 1, "label": "b"}]),
+        "GET after PATCH must return exactly the updated row, got {rows:?}"
+    );
+
+    // DELETE -> rest_delete, whose own contract is 200 OK with a count.
+    let (status, body) =
+        json_request(router.clone(), "DELETE", "/rest/v1/rest_crud?id=eq.1", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "DELETE /rest/v1/:table must reach rest_delete (200), got body {body}"
+    );
+    assert_eq!(body["count"], 1, "one row must be deleted");
+
+    // GET on the SAME router/DB must observe the delete: the table is now empty.
+    let (status, rows) = json_request(router, "GET", "/rest/v1/rest_crud", None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "GET /rest/v1/:table after DELETE must reach rest_select, got {rows}"
+    );
+    assert_eq!(
+        rows,
+        serde_json::json!([]),
+        "GET after DELETE must return an empty array, got {rows:?}"
+    );
+}
+
+/// `POST /rest/v1/rpc/:function` must reach `rest_handler::rest_rpc`.
+///
+/// The RPC route shares the `/rest/v1` nest with the catch-all `:table` route, so a
+/// mis-ordered or wrongly-syntaxed registration would either 404 (unmatched) or be
+/// swallowed by the table handler and answered as an insert attempt. The RPC handler's
+/// documented contract is 501 NotImplemented; the response body must also name the
+/// function, which only the RPC handler does.
+#[tokio::test]
+async fn rest_rpc_route_dispatches_to_the_rpc_handler() {
+    let router = router_with_db(Arc::new(EmbeddedDatabase::new_in_memory().expect("db")));
+
+    let (status, body) = json_request(
+        router,
+        "POST",
+        "/rest/v1/rpc/no_such_function",
+        Some(serde_json::json!({})),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::NOT_FOUND,
+        "POST /rest/v1/rpc/:function must be mounted; a 404 means the RPC route is shadowed by \
+         the `:table` route or registered with the wrong path syntax"
+    );
+    assert_eq!(
+        status,
+        StatusCode::NOT_IMPLEMENTED,
+        "the RPC handler's own contract is 501 NotImplemented (rest_handler::rest_rpc), got {body}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("no_such_function")),
+        "the response must come from the RPC handler and name the function, got {body}"
+    );
 }
 
 /// `/health` must return `{"status":"ok"}` as JSON, not the plain string "OK".
