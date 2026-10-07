@@ -2093,3 +2093,380 @@ fn renaming_a_table_stores_its_schema_in_the_form_every_other_writer_uses() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// 10. Encrypted-open preflight — a refused open must not mutate the fixture
+// ---------------------------------------------------------------------------
+//
+// The failed `encrypted-upgrade-live-02` cells (`wrong_key_control`,
+// `no_key_control`) failed only because the writable RocksDB open ran BEFORE
+// the key check: a read-write open rewrites `LOG`, `CURRENT`, `MANIFEST-*` and
+// `OPTIONS-*` and may add `*.sst`/`*.log` even when the key is then rejected.
+// These tests pin that a refused open leaves the data directory BYTE-IDENTICAL
+// (excluding mtimes, which are not content).
+//
+// BOUNDED CAVEAT: this is about the mutation caused by THIS process's own open.
+// It does not claim protection against a hostile concurrent writer replacing
+// the store between the read-only preflight and the writable open (TOCTOU).
+
+/// A strict, mtime-insensitive digest of EVERY entry under `dir`, recursively:
+/// one sorted line per entry, `<relative-path>:<type>:<mode>:<len>:<sha256>`.
+///
+/// Unlike the `all_files`-based version it replaces, this:
+///
+///   * walks with `symlink_metadata`, so a directory (including an EMPTY one),
+///     a symlink and a special file each get their own line rather than being
+///     folded into "regular file" or dropped;
+///   * records each entry's explicit type and permission mode;
+///   * hashes file bytes and symlink targets with SHA-256 — a real, stable
+///     content hash, not `DefaultHasher`, whose output is not stable across
+///     builds or processes;
+///   * PANICS on any `symlink_metadata` / `read_dir` / `read` / `read_link`
+///     failure rather than silently skipping an entry, so a snapshot can never
+///     report a directory as unchanged merely by having failed to read part of
+///     it; and
+///   * never opens RocksDB, so taking a snapshot cannot itself mutate the
+///     fixture.
+#[cfg(feature = "encryption")]
+fn manifest_snapshot(dir: &Path) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+
+    fn walk(root: &Path, path: &Path, rows: &mut Vec<String>) {
+        let rel = match path.strip_prefix(root) {
+            Ok(p) if !p.as_os_str().is_empty() => p.display().to_string(),
+            _ => ".".to_string(),
+        };
+        let meta = std::fs::symlink_metadata(path)
+            .unwrap_or_else(|e| panic!("manifest_snapshot: symlink_metadata({}) failed: {e}", path.display()));
+        let file_type = meta.file_type();
+        let kind = if file_type.is_dir() {
+            "dir"
+        } else if file_type.is_file() {
+            "file"
+        } else if file_type.is_symlink() {
+            "symlink"
+        } else {
+            "other"
+        };
+        // Content digest: the file's bytes, the symlink's target bytes, or
+        // nothing at all for a directory / special entry (which have no
+        // content to hash).
+        let (len, digest) = if file_type.is_file() {
+            let bytes = std::fs::read(path)
+                .unwrap_or_else(|e| panic!("manifest_snapshot: read({}) failed: {e}", path.display()));
+            (bytes.len(), hex::encode(Sha256::digest(&bytes)))
+        } else if file_type.is_symlink() {
+            let target = std::fs::read_link(path)
+                .unwrap_or_else(|e| panic!("manifest_snapshot: read_link({}) failed: {e}", path.display()));
+            let bytes = target.as_os_str().as_encoded_bytes();
+            (bytes.len(), hex::encode(Sha256::digest(bytes)))
+        } else {
+            (0, "-".to_string())
+        };
+        rows.push(format!(
+            "{}:{}:{:04o}:{}:{}",
+            rel,
+            kind,
+            permission_bits(&meta),
+            len,
+            digest
+        ));
+
+        if file_type.is_dir() {
+            let mut entries = std::fs::read_dir(path)
+                .unwrap_or_else(|e| panic!("manifest_snapshot: read_dir({}) failed: {e}", path.display()))
+                .collect::<std::io::Result<Vec<_>>>()
+                .unwrap_or_else(|e| panic!("manifest_snapshot: reading an entry of {} failed: {e}", path.display()));
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries {
+                walk(root, &entry.path(), rows);
+            }
+        }
+    }
+
+    let mut rows = Vec::new();
+    walk(dir, dir, &mut rows);
+    rows.sort();
+    rows
+}
+
+/// The permission bits of `meta` (`st_mode & 0o7777`), or `0` on platforms with
+/// no Unix mode.
+#[cfg(feature = "encryption")]
+#[cfg(unix)]
+fn permission_bits(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o7777
+}
+
+#[cfg(feature = "encryption")]
+#[cfg(not(unix))]
+fn permission_bits(_meta: &std::fs::Metadata) -> u32 {
+    0
+}
+
+/// The raw bytes of the key-check sentinel as stored in a CLOSED directory, or
+/// `None` when the database has none. Uses the read-only keyspace walk, so it
+/// takes no writable handle.
+#[cfg(feature = "encryption")]
+fn stored_sentinel(dir: &Path) -> Option<Vec<u8>> {
+    let mut found = None;
+    for_each_stored_pair(dir, |key, value| {
+        if key == b"meta:tde:keycheck".as_slice() {
+            found = Some(value.to_vec());
+        }
+    });
+    found
+}
+
+/// Remove the key-check sentinel through a RAW writable RocksDB handle, leaving
+/// a database whose stored values are sealed but which carries no sentinel — the
+/// state a database created before the sentinel existed is in. Used only to
+/// build a fixture; the manifest is taken after this returns.
+#[cfg(feature = "encryption")]
+fn strip_stored_sentinel(dir: &Path) {
+    let mut opts = rocksdb::Options::default();
+    opts.create_if_missing(false);
+    let db = rocksdb::DB::open(&opts, dir).expect("open the fixture to remove its sentinel");
+    db.delete(b"meta:tde:keycheck".as_slice()).expect("delete the sentinel");
+    db.flush().expect("flush the sentinel deletion");
+}
+
+/// A wrong key is refused at open AND does not touch the data directory. This
+/// is the `wrong_key_control` cell as a source regression.
+#[cfg(feature = "encryption")]
+#[test]
+fn a_wrong_key_refusal_leaves_the_fixture_byte_identical() {
+    const KEY_VAR_RIGHT: &str = "HELIOSDB_TEST_AT_REST_PREFLIGHT_WRONG_RIGHT";
+    const KEY_VAR_WRONG: &str = "HELIOSDB_TEST_AT_REST_PREFLIGHT_WRONG_WRONG";
+    let dir = scratch_dir("preflight_wrong_manifest");
+
+    {
+        let db =
+            EmbeddedDatabase::with_config(encrypted_config(&dir, KEY_VAR_RIGHT, KEY_A)).expect("encrypted database");
+        write_rows_through_every_route(&db);
+    }
+    assert!(stored_sentinel(&dir).is_some(), "the fixture must have a sentinel");
+    let before = manifest_snapshot(&dir);
+
+    let err = EmbeddedDatabase::with_config(encrypted_config(&dir, KEY_VAR_WRONG, KEY_B))
+        .err()
+        .expect("a wrong key must be refused");
+    assert!(err.to_string().contains("does not match this database"), "{err}");
+
+    assert_eq!(
+        manifest_snapshot(&dir),
+        before,
+        "*** FIXTURE MUTATED BY A REFUSED OPEN *** a wrong-key refusal rewrote LOG/CURRENT/MANIFEST/OPTIONS; the \
+         writable open must not precede the key check"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A FOCUSED regression at the `StorageEngine::open` layer, for the state the
+/// sentinel-present tests above cannot reach: a database whose sentinel is
+/// ABSENT while its stored values are sealed under the right key. The plain
+/// read-only verifier warns and passes on a sentinel-absent store, so only the
+/// non-installing preflight's value probe can refuse it before the writable
+/// open — and that refusal must happen at `StorageEngine::open` itself, not
+/// merely through `EmbeddedDatabase`. It also pins that the refused open leaves
+/// the directory byte-identical (no `LOG` written in, no writable handle taken).
+#[cfg(feature = "encryption")]
+#[test]
+fn storage_engine_open_refuses_a_wrong_key_on_a_sentinel_absent_encrypted_store() {
+    const KEY_VAR_RIGHT: &str = "HELIOSDB_TEST_AT_REST_PREFLIGHT_ENGINE_RIGHT";
+    const KEY_VAR_WRONG: &str = "HELIOSDB_TEST_AT_REST_PREFLIGHT_ENGINE_WRONG";
+    let dir = scratch_dir("preflight_engine_wrong_sentinel_absent");
+
+    {
+        let db =
+            EmbeddedDatabase::with_config(encrypted_config(&dir, KEY_VAR_RIGHT, KEY_A)).expect("encrypted fixture");
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, note TEXT)")
+            .expect("create table");
+        db.execute(&format!("INSERT INTO t VALUES (1, '{MARKER}-engine-preflight')"))
+            .expect("insert a row that will be sealed");
+    }
+    strip_stored_sentinel(&dir);
+    assert!(
+        stored_sentinel(&dir).is_none(),
+        "the fixture must be sentinel-absent for this regression"
+    );
+    let before = manifest_snapshot(&dir);
+
+    let err = heliosdb_nano::StorageEngine::open(&dir, &encrypted_config(&dir, KEY_VAR_WRONG, KEY_B))
+        .err()
+        .expect("StorageEngine::open must refuse a wrong key on a sentinel-absent encrypted store");
+    assert!(
+        err.to_string().contains("does not open"),
+        "the sentinel-absent refusal must name the stored values the key could not open, got: {err}"
+    );
+
+    assert_eq!(
+        manifest_snapshot(&dir),
+        before,
+        "*** FIXTURE MUTATED BY A REFUSED OPEN *** StorageEngine::open took a writable handle, or wrote a LOG, on \
+         a sentinel-absent store it then refused; the read-only preflight must run first and redirect its LOG"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A missing key (env var unset) is refused before any RocksDB open and does
+/// not touch the data directory. This is the `no_key_control` cell as a source
+/// regression.
+#[cfg(feature = "encryption")]
+#[test]
+fn a_missing_key_refusal_leaves_the_fixture_byte_identical() {
+    const KEY_VAR_RIGHT: &str = "HELIOSDB_TEST_AT_REST_PREFLIGHT_MISSING_RIGHT";
+    const KEY_VAR_MISSING: &str = "HELIOSDB_TEST_AT_REST_PREFLIGHT_MISSING_KEY";
+    let dir = scratch_dir("preflight_missing_manifest");
+
+    {
+        let db =
+            EmbeddedDatabase::with_config(encrypted_config(&dir, KEY_VAR_RIGHT, KEY_A)).expect("encrypted database");
+        write_rows_through_every_route(&db);
+    }
+    let before = manifest_snapshot(&dir);
+
+    std::env::remove_var(KEY_VAR_MISSING);
+    let mut config = plaintext_config(&dir);
+    config.encryption.enabled = true;
+    config.encryption.key_source = heliosdb_nano::KeySource::Environment(KEY_VAR_MISSING.to_string());
+    let err = EmbeddedDatabase::with_config(config)
+        .err()
+        .expect("a missing key must be refused");
+    assert!(
+        err.to_string().contains("not found"),
+        "the failure must name the missing key source: {err}"
+    );
+
+    assert_eq!(
+        manifest_snapshot(&dir),
+        before,
+        "*** FIXTURE MUTATED BY A REFUSED OPEN *** a missing-key refusal opened RocksDB before loading the key"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An encrypted directory opened with encryption switched OFF is refused by the
+/// preflight before any writable open, leaving the fixture untouched.
+#[cfg(feature = "encryption")]
+#[test]
+fn disabled_encryption_on_an_encrypted_fixture_refuses_byte_identically() {
+    const KEY_VAR: &str = "HELIOSDB_TEST_AT_REST_PREFLIGHT_DISABLED";
+    let dir = scratch_dir("preflight_disabled_manifest");
+
+    {
+        let db = EmbeddedDatabase::with_config(encrypted_config(&dir, KEY_VAR, KEY_A)).expect("encrypted database");
+        write_rows_through_every_route(&db);
+    }
+    let before = manifest_snapshot(&dir);
+
+    let err = EmbeddedDatabase::with_config(plaintext_config(&dir))
+        .err()
+        .expect("an encrypted database must not open with encryption disabled");
+    assert!(err.to_string().contains("written with encryption enabled"), "{err}");
+
+    assert_eq!(
+        manifest_snapshot(&dir),
+        before,
+        "*** FIXTURE MUTATED BY A REFUSED OPEN *** encryption-disabled refusal must happen before the writable open"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The right key still opens the fixture, every row reads back, and the
+/// sentinel is NOT rewritten across reopens (a fresh nonce would change its
+/// bytes).
+#[cfg(feature = "encryption")]
+#[test]
+fn the_right_key_reopens_idempotently_and_keeps_the_sentinel_bytes() {
+    const KEY_VAR: &str = "HELIOSDB_TEST_AT_REST_PREFLIGHT_REOPEN";
+    let dir = scratch_dir("preflight_reopen");
+
+    {
+        let db = EmbeddedDatabase::with_config(encrypted_config(&dir, KEY_VAR, KEY_A)).expect("encrypted database");
+        write_rows_through_every_route(&db);
+    }
+    let sentinel = stored_sentinel(&dir).expect("the fixture must have a sentinel");
+
+    {
+        let db = EmbeddedDatabase::with_config(encrypted_config(&dir, KEY_VAR, KEY_A)).expect("reopen, right key");
+        assert_eq!(
+            canary_notes(&db),
+            expected_canary_notes(),
+            "the right key must read every row after the preflight"
+        );
+    }
+    assert_eq!(
+        stored_sentinel(&dir).as_deref(),
+        Some(sentinel.as_slice()),
+        "the sentinel must be verified, never rewritten"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A brand-new encrypted database installs the sentinel exactly once: the
+/// second open with the same key leaves its bytes unchanged.
+#[cfg(feature = "encryption")]
+#[test]
+fn a_fresh_encrypted_database_installs_the_sentinel_once() {
+    const KEY_VAR: &str = "HELIOSDB_TEST_AT_REST_PREFLIGHT_FRESH";
+    let dir = scratch_dir("preflight_fresh_sentinel");
+
+    {
+        let db =
+            EmbeddedDatabase::with_config(encrypted_config(&dir, KEY_VAR, KEY_A)).expect("fresh encrypted database");
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY)").expect("create");
+        db.execute("INSERT INTO t VALUES (1)").expect("insert");
+    }
+    let first = stored_sentinel(&dir).expect("a fresh encrypted database must install a sentinel");
+
+    {
+        let db = EmbeddedDatabase::with_config(encrypted_config(&dir, KEY_VAR, KEY_A)).expect("reopen");
+        assert_eq!(
+            db.query("SELECT id FROM t", &[]).expect("select").len(),
+            1,
+            "the row must survive the reopen"
+        );
+    }
+    assert_eq!(
+        stored_sentinel(&dir).as_deref(),
+        Some(first.as_slice()),
+        "the sentinel must be installed once, not rewritten on the second open"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A plaintext/legacy database with NO sentinel is still adoptable: opening it
+/// with encryption enabled must succeed (its values predate sealing), read the
+/// legacy rows, and install a sentinel so every later open is verified.
+#[cfg(feature = "encryption")]
+#[test]
+fn a_plaintext_legacy_database_is_adopted_and_gains_a_sentinel() {
+    const KEY_VAR: &str = "HELIOSDB_TEST_AT_REST_PREFLIGHT_LEGACY";
+    let dir = scratch_dir("preflight_legacy_adopt");
+
+    {
+        let db = EmbeddedDatabase::with_config(plaintext_config(&dir)).expect("plaintext database");
+        write_rows_through_every_route(&db);
+    }
+    assert!(
+        stored_sentinel(&dir).is_none(),
+        "a plaintext database must not carry a sentinel"
+    );
+
+    {
+        let db = EmbeddedDatabase::with_config(encrypted_config(&dir, KEY_VAR, KEY_A))
+            .expect("a plaintext database must still open when encryption is turned on");
+        assert_eq!(
+            canary_notes(&db),
+            expected_canary_notes(),
+            "the legacy rows must still read after adoption"
+        );
+    }
+    assert!(
+        stored_sentinel(&dir).is_some(),
+        "adopting a legacy database must install a sentinel for the next open"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

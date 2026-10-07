@@ -2083,6 +2083,13 @@ pub struct StorageEngine {
     /// R4.2: how the last `rebuild_all_indexes` populated the in-memory
     /// indexes (snapshot-loaded vs scanned). Diagnostics + test surface.
     last_index_open_report: Arc<RwLock<Option<super::index_snapshot::IndexOpenReport>>>,
+    /// RocksDB `LOG` redirect for a READ-ONLY handle (including physical
+    /// snapshots): an owned directory OUTSIDE the database, kept alive through
+    /// the drop of the engine-owned `StorageEngine`/`DB` handle so the log
+    /// directory is never removed while that handle is still open. It does not
+    /// outlive external `Arc<DB>` clones returned by `db()`. Always `None` for
+    /// a writable or in-memory open.
+    _read_only_log_dir: Option<tempfile::TempDir>,
 }
 
 /// Minimum free disk space threshold (100 MB)
@@ -2307,6 +2314,182 @@ impl StorageEngine {
         self.physical_snapshot_mode
     }
 
+    /// Create a unique, owned temporary directory for a READ-ONLY RocksDB
+    /// handle's `LOG`, guaranteeing it is OUTSIDE the database.
+    ///
+    /// Used by BOTH read-only opens that can still write `LOG`: the writable
+    /// open's encryption preflight (a log left in the database would mutate the
+    /// very directory the preflight exists to leave untouched) and the live
+    /// read-only / physical-snapshot handle (an ostensibly read-only open must
+    /// not dirty the store). `base` (normally `std::env::temp_dir()`, i.e.
+    /// TMPDIR) is canonicalized and rejected if it resolves inside the database,
+    /// and the created directory is re-derived canonically and re-checked so a
+    /// symlinked base cannot smuggle it back in. The returned
+    /// [`tempfile::TempDir`] owns the directory; dropping it removes exactly
+    /// that directory and nothing else.
+    fn owned_log_dir_outside(db_path: &Path, base: &Path) -> Result<tempfile::TempDir> {
+        let canonical_db = std::fs::canonicalize(db_path).map_err(|e| {
+            Error::storage(format!(
+                "failed to canonicalize the database path to place the RocksDB log outside it: {e}"
+            ))
+        })?;
+        let canonical_base = std::fs::canonicalize(base).map_err(|e| {
+            Error::config(format!(
+                "a temporary RocksDB log directory is needed outside the database, but its base {} could not be \
+                 canonicalized: {e}",
+                base.display()
+            ))
+        })?;
+        if canonical_base.starts_with(&canonical_db) {
+            return Err(Error::config(format!(
+                "refusing to place the read-only RocksDB log: the temporary log base {} resolves inside the \
+                 database {}. Point TMPDIR at a location outside the database so a read-only open cannot write \
+                 into the data directory.",
+                canonical_base.display(),
+                canonical_db.display()
+            )));
+        }
+        let dir = tempfile::Builder::new()
+            .prefix("heliosdb-nano-log-")
+            .tempdir_in(&canonical_base)
+            .map_err(|e| Error::storage(format!("failed to create the temporary RocksDB log directory: {e}")))?;
+        let canonical_dir = std::fs::canonicalize(dir.path()).map_err(|e| {
+            Error::storage(format!(
+                "failed to canonicalize the temporary RocksDB log directory: {e}"
+            ))
+        })?;
+        if canonical_dir.starts_with(&canonical_db) {
+            return Err(Error::config(format!(
+                "refusing to use the temporary RocksDB log directory {}: it resolves inside the database {}",
+                canonical_dir.display(),
+                canonical_db.display()
+            )));
+        }
+        Ok(dir)
+    }
+
+    /// Whether `name` is one of the file or directory names RocksDB itself
+    /// writes directly under a database directory.
+    ///
+    /// The grammar is taken verbatim from the pinned `librocksdb-sys`
+    /// 0.16.0+8.10.0 build of RocksDB 8.10.0 (`rocksdb/file/filename.cc`:
+    /// `ParseFileName` / `MakeFileName` / `DescriptorFileName` /
+    /// `OptionsFileName` / `LockFileName` / `IdentityFileName` /
+    /// `OldInfoLogFileName` / `ArchivalDirectory`): the exact `IDENTITY`,
+    /// `LOCK`, `LOG`, `LOG.old`, `LOG.old.<digits>` and `archive` names, the
+    /// prefixed `MANIFEST-<digits>`, `METADB-<digits>` and `OPTIONS-<digits>`
+    /// (plus its `OPTIONS-<digits>.dbtmp` materialization temp), and the
+    /// numbered `<digits>.(sst|ldb|log|blob|dbtmp)` table/WAL/blob/temp files.
+    /// This is a NAME test only: it mirrors the exact grammar the engine
+    /// writes rather than guessing at "database-looking" names, so a fresh
+    /// directory holding a user's config or key files is not misread as a
+    /// store.
+    fn is_rocksdb_remnant_name(name: &str) -> bool {
+        if matches!(name, "IDENTITY" | "LOCK" | "LOG" | "LOG.old" | "archive") {
+            return true;
+        }
+        // The info log rotates to `LOG.old.<timestamp>`; Nano's writable open
+        // uses RocksDB's default (no `db_log_dir`) info-log prefix of `LOG`.
+        if let Some(timestamp) = name.strip_prefix("LOG.old.") {
+            return Self::is_decimal(timestamp);
+        }
+        if let Some(number) = name.strip_prefix("MANIFEST-") {
+            return Self::is_decimal(number);
+        }
+        if let Some(number) = name.strip_prefix("METADB-") {
+            return Self::is_decimal(number);
+        }
+        if let Some(rest) = name.strip_prefix("OPTIONS-") {
+            let number = rest.strip_suffix(".dbtmp").unwrap_or(rest);
+            return Self::is_decimal(number);
+        }
+        match name.rsplit_once('.') {
+            Some((number, extension)) => {
+                Self::is_decimal(number) && matches!(extension, "sst" | "ldb" | "log" | "blob" | "dbtmp")
+            }
+            None => false,
+        }
+    }
+
+    /// `<digits>` in the RocksDB filename grammar: one or more ASCII decimal
+    /// digits, leading zeros allowed (`ConsumeDecimalNumber` in the pinned
+    /// `file/filename.cc`).
+    fn is_decimal(value: &str) -> bool {
+        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+    }
+
+    /// Does `db_path` already hold a store that the writable open must
+    /// preflight, or is it a genuinely fresh directory?
+    ///
+    /// `Path::is_file()` is deliberately NOT used: it folds a real lookup
+    /// failure (permissions, I/O) together with a NONEMPTY directory whose
+    /// `CURRENT` is missing — an incomplete or corrupt store — into `false`, so
+    /// the caller would silently initialize a corrupt store as if it were
+    /// fresh, stranding the files already there. This distinguishes the states
+    /// explicitly: a regular `CURRENT` is an existing store (`true`), an
+    /// absent, empty, or remnant-free directory (a user's config or key files
+    /// with no RocksDB artifacts) is fresh (`false`), and every other shape (a
+    /// non-file `CURRENT`, a `CURRENT`-less directory that still holds a
+    /// recognizable RocksDB remnant, or a lookup error that is not `NotFound`)
+    /// is an error the caller must surface rather than paper over.
+    fn is_existing_store(db_path: &Path) -> Result<bool> {
+        match std::fs::symlink_metadata(db_path.join("CURRENT")) {
+            Ok(metadata) if metadata.file_type().is_file() => Ok(true),
+            Ok(_) => Err(Error::storage(format!(
+                "refusing to open {}: its 'CURRENT' entry is not a regular file; this is not a database this \
+                 build can open",
+                db_path.display()
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // `CURRENT` is absent. That is only a fresh store when the
+                // directory is absent, empty, or holds nothing RocksDB would
+                // write (a user's own config or key files). A directory that
+                // still holds a recognizable RocksDB remnant — `MANIFEST-*`,
+                // `OPTIONS-*`, `IDENTITY`, `LOCK`, a `LOG`/`LOG.old.*`, or a
+                // numbered `*.sst`/`*.log`/`*.ldb`/`*.blob` file — is
+                // incomplete or corrupt and must not be initialized over.
+                let entries = match std::fs::read_dir(db_path) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                    Err(error) => {
+                        return Err(Error::storage(format!(
+                            "failed to inspect the database directory {}: {error}",
+                            db_path.display()
+                        )))
+                    }
+                };
+                for entry in entries {
+                    let entry = entry.map_err(|error| {
+                        Error::storage(format!(
+                            "failed to inspect the database directory {}: {error}",
+                            db_path.display()
+                        ))
+                    })?;
+                    let name = entry.file_name();
+                    // RocksDB filenames are ASCII; a non-UTF-8 entry cannot be
+                    // one of its remnants and is left for the caller to manage.
+                    let Some(name) = name.to_str() else {
+                        continue;
+                    };
+                    if Self::is_rocksdb_remnant_name(name) {
+                        return Err(Error::storage(format!(
+                            "refusing to open {}: the directory is not empty but has no 'CURRENT' manifest, yet \
+                             it still holds the recognizable RocksDB file '{name}'. This looks like an incomplete \
+                             or corrupt database; initializing it as a fresh store would strand the files already \
+                             there. Point the path at a new directory to start fresh.",
+                            db_path.display()
+                        )));
+                    }
+                }
+                Ok(false)
+            }
+            Err(error) => Err(Error::storage(format!(
+                "failed to look up the 'CURRENT' manifest in {}: {error}",
+                db_path.display()
+            ))),
+        }
+    }
+
     fn open_with_mode(
         path: impl AsRef<Path>,
         config: &Config,
@@ -2398,13 +2581,75 @@ impl StorageEngine {
             opts.set_wal_size_limit_mb(physical.wal_retention_size_mb);
         }
 
-        let db = if read_only {
+        // Load the key material BEFORE any RocksDB open. A missing or malformed
+        // key must fail without creating a database or taking any handle;
+        // `KeyManager::from_source` only proves a key could be LOADED, and the
+        // check that it is the key this data was sealed with follows the open.
+        let key_manager = if config.encryption.enabled {
+            let km = KeyManager::from_source(&config.encryption.key_source)?;
+            Some(Arc::new(km))
+        } else {
+            None
+        };
+
+        // Preflight an EXISTING store through a READ-ONLY handle before taking
+        // the writable one. A writable RocksDB open rewrites `LOG`, `CURRENT`,
+        // `MANIFEST-*` and `OPTIONS-*` even when the key is then rejected, so
+        // the refusal must happen first. `verify_key_check_without_install`
+        // probes the stored values when no sentinel exists (a wrong key against
+        // a pre-sentinel database is `Contradicted`) and never writes, so a
+        // brand-new store still gains its sentinel on the writable handle
+        // below. The probe's own RocksDB log is redirected to a unique
+        // temporary directory OUTSIDE the database and removed afterwards, so
+        // the read-only open cannot mutate the data directory either.
+        //
+        // `is_existing_store` also refuses a nonempty directory whose `CURRENT`
+        // is missing (an incomplete/corrupt store) instead of silently
+        // initializing over the files already there, and surfaces any `CURRENT`
+        // lookup error rather than reading it as "fresh" the way `is_file()`
+        // did.
+        //
+        // BOUNDED CAVEAT: this closes the mutation caused by this process's own
+        // open. It does NOT defend against a hostile concurrent writer that
+        // replaces the store between the preflight and the writable open
+        // (TOCTOU); the window is bounded to the two opens below, and this
+        // process never writes inside it.
+        if !read_only && !physical_snapshot && Self::is_existing_store(&db_path)? {
+            let probe_log_dir = Self::owned_log_dir_outside(&db_path, &std::env::temp_dir())?;
+            let mut probe_opts = opts.clone();
+            probe_opts.set_db_log_dir(probe_log_dir.path());
+            let probe = DB::open_for_read_only(&probe_opts, &db_path, false).map_err(|e| {
+                Error::storage(format!(
+                    "Failed to open RocksDB read-only for the encryption preflight: {e}"
+                ))
+            })?;
+            let check = super::tde::verify_key_check_without_install(&probe, key_manager.as_deref());
+            drop(probe);
+            drop(probe_log_dir);
+            check?;
+        }
+
+        let (db, read_only_log_dir) = if read_only {
+            // A read-only RocksDB open can still write `LOG`, which would
+            // mutate the very data directory a read-only handle promises not to
+            // touch. Redirect that log to a unique owned directory OUTSIDE the
+            // database. The guard is moved into the engine (its LAST field, so
+            // it outlives the DB handle) and removes the directory only when
+            // the handle is gone; if the open fails, `?` drops the guard here,
+            // cleaning up the directory it just created.
+            let log_dir = Self::owned_log_dir_outside(&db_path, &std::env::temp_dir())?;
+            let mut read_only_opts = opts.clone();
+            read_only_opts.set_db_log_dir(log_dir.path());
             // No DB lock taken — a second process can open read-only while a
             // primary writes. `false` = tolerate an existing WAL/log file.
-            DB::open_for_read_only(&opts, path, false)
-                .map_err(|e| Error::storage(format!("Failed to open RocksDB read-only: {}", e)))?
+            let db = DB::open_for_read_only(&read_only_opts, path, false)
+                .map_err(|e| Error::storage(format!("Failed to open RocksDB read-only: {}", e)))?;
+            (db, Some(log_dir))
         } else {
-            DB::open(&opts, path).map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?
+            (
+                DB::open(&opts, path).map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?,
+                None,
+            )
         };
 
         let db = Arc::new(db);
@@ -2419,21 +2664,13 @@ impl StorageEngine {
             return Err(Error::storage("physical receiver cannot use logical recovery startup"));
         }
 
-        // Initialize encryption if enabled
-        let key_manager = if config.encryption.enabled {
-            let km = KeyManager::from_source(&config.encryption.key_source)?;
-            Some(Arc::new(km))
-        } else {
-            None
-        };
-
-        // Check the configured key against this database BEFORE anything reads
-        // a stored value, and install the sentinel on a database that has none
-        // yet. `KeyManager::from_source` only proves a key could be LOADED; this
-        // is what proves it is the key this data was sealed with. Deliberately
-        // ahead of snapshot recovery, WAL replay and catalog load — all of which
-        // read stored values — so a key mismatch is one error at open rather
-        // than an unbounded number of unreadable values afterwards.
+        // Re-run the key check against the writable handle. It re-verifies the
+        // sentinel the preflight already checked and, on the FIRST encrypted
+        // open of a database that has none, installs it. A fresh store (no
+        // `CURRENT`) skipped the preflight and installs here. Deliberately ahead
+        // of snapshot recovery, WAL replay and catalog load — all of which read
+        // stored values — so a key mismatch is one error at open rather than an
+        // unbounded number of unreadable values afterwards.
         if physical_snapshot {
             super::tde::verify_physical_snapshot_key(&db, key_manager.as_deref())?;
         } else {
@@ -2688,6 +2925,7 @@ impl StorageEngine {
             row_counter_flush_on_close: Arc::new(AtomicBool::new(!physical_snapshot)),
             physical_snapshot_mode: physical_snapshot,
             last_index_open_report: Arc::new(RwLock::new(None)),
+            _read_only_log_dir: read_only_log_dir,
         };
 
         // Load counters from storage
@@ -2867,6 +3105,18 @@ impl StorageEngine {
 
     /// Open in-memory storage engine
     pub fn open_in_memory(config: &Config) -> Result<Self> {
+        // Load the key material BEFORE creating the temporary store (or opening
+        // RocksDB): a missing or malformed key must fail without leaving a
+        // `heliosdb-nano-*` temp directory behind. The store is always fresh, so
+        // there is nothing on disk to preflight against; the key check below
+        // installs the sentinel on the new store.
+        let key_manager = if config.encryption.enabled {
+            let km = KeyManager::from_source(&config.encryption.key_source)?;
+            Some(Arc::new(km))
+        } else {
+            None
+        };
+
         // RocksDB doesn't support true in-memory mode with DB::open. Prefer
         // Linux tmpfs so `Config::in_memory()` does not silently benchmark or
         // run against disk-backed `/tmp`; fall back to the platform default.
@@ -2902,14 +3152,6 @@ impl StorageEngine {
             .map_err(|e| Error::storage(format!("Failed to open in-memory RocksDB: {}", e)))?;
 
         let db = Arc::new(db);
-
-        // Initialize encryption if enabled
-        let key_manager = if config.encryption.enabled {
-            let km = KeyManager::from_source(&config.encryption.key_source)?;
-            Some(Arc::new(km))
-        } else {
-            None
-        };
 
         // Same key check as the on-disk `open`. This store is always freshly
         // created, so in practice it is the "install a sentinel" arm — but the
@@ -3093,6 +3335,7 @@ impl StorageEngine {
             row_counter_flush_on_close: Arc::new(AtomicBool::new(true)),
             physical_snapshot_mode: false,
             last_index_open_report: Arc::new(RwLock::new(None)),
+            _read_only_log_dir: None,
         })
     }
 
@@ -13763,6 +14006,318 @@ mod tests {
                 storage_mode: crate::ColumnStorageMode::Default,
             }],
         }
+    }
+
+    // ---- encryption preflight temporary log directory ----------------------
+
+    /// The preflight log base must be outside the database. A TMPDIR pointing
+    /// inside the data directory would make the read-only key check write into
+    /// the very directory the preflight exists to leave untouched, so it is
+    /// refused before any temporary directory is created — and the database is
+    /// not modified.
+    #[test]
+    fn the_preflight_refuses_a_log_base_inside_the_database() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = dir.path().join("store");
+        std::fs::create_dir_all(&db).expect("db dir");
+        let inside = db.join("tmp");
+        std::fs::create_dir_all(&inside).expect("inside dir");
+
+        let err = StorageEngine::owned_log_dir_outside(&db, &inside)
+            .expect_err("a temp base inside the database must be refused");
+        assert!(
+            err.to_string().contains("resolves inside the database"),
+            "the refusal must name the inside-the-database cause, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&inside).expect("read inside").count(),
+            0,
+            "the refusal must not have created anything under the rejected base"
+        );
+    }
+
+    /// A base outside the database yields a unique owned directory that is
+    /// removed when the guard drops, and the database is untouched.
+    #[test]
+    fn the_preflight_creates_and_cleans_an_owned_log_directory_outside_the_database() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db = dir.path().join("store");
+        std::fs::create_dir_all(&db).expect("db dir");
+        let base = dir.path().join("outside");
+        std::fs::create_dir_all(&base).expect("base dir");
+
+        let log_dir = StorageEngine::owned_log_dir_outside(&db, &base).expect("a base outside the database");
+        let path = log_dir.path().to_path_buf();
+        assert!(path.is_dir(), "the owned log directory must exist");
+        assert!(
+            !path.starts_with(std::fs::canonicalize(&db).expect("canonical db")),
+            "the owned log directory must be outside the database"
+        );
+
+        drop(log_dir);
+        assert!(
+            !path.exists(),
+            "dropping the owned log directory must remove exactly it"
+        );
+        assert!(db.is_dir(), "cleanup must not touch the database");
+    }
+
+    // ---- CURRENT detection and read-only log retention ----------------------
+
+    /// `is_existing_store` must distinguish a real store, a fresh (absent or
+    /// empty) directory, and a nonempty directory whose manifest is missing
+    /// (which `Path::is_file()` silently read as "fresh"). A non-file `CURRENT`
+    /// is refused too rather than treated as absent.
+    #[test]
+    fn is_existing_store_distinguishes_fresh_existing_and_corrupt() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+
+        let absent = dir.path().join("absent");
+        assert!(
+            !StorageEngine::is_existing_store(&absent).expect("an absent path is readable"),
+            "an absent directory is fresh"
+        );
+
+        let empty = dir.path().join("empty");
+        std::fs::create_dir(&empty).expect("empty dir");
+        assert!(
+            !StorageEngine::is_existing_store(&empty).expect("an empty directory is readable"),
+            "an empty directory is fresh"
+        );
+
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).expect("existing dir");
+        std::fs::write(existing.join("CURRENT"), b"MANIFEST-000001\n").expect("write CURRENT");
+        assert!(
+            StorageEngine::is_existing_store(&existing).expect("an existing store is readable"),
+            "a regular CURRENT marks an existing store"
+        );
+
+        let corrupt = dir.path().join("corrupt");
+        std::fs::create_dir(&corrupt).expect("corrupt dir");
+        std::fs::write(corrupt.join("000007.sst"), b"orphan bytes").expect("write orphan");
+        let err = StorageEngine::is_existing_store(&corrupt)
+            .expect_err("a nonempty directory with no CURRENT must be refused");
+        assert!(err.to_string().contains("no 'CURRENT' manifest"), "{err}");
+
+        let odd = dir.path().join("odd");
+        std::fs::create_dir(&odd).expect("odd dir");
+        std::fs::create_dir(odd.join("CURRENT")).expect("CURRENT dir");
+        assert!(
+            StorageEngine::is_existing_store(&odd).is_err(),
+            "a CURRENT that is not a regular file must be refused"
+        );
+    }
+
+    /// A writable open of a nonempty directory whose `CURRENT` is missing must
+    /// stop before RocksDB and leave the orphaned files exactly as they were,
+    /// instead of initializing a fresh store over them (which `is_file()`
+    /// allowed by reporting the directory as "no store here").
+    #[test]
+    fn a_writable_open_refuses_a_nonempty_directory_without_current() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("store");
+        std::fs::create_dir(&db_path).expect("db dir");
+        std::fs::write(db_path.join("000007.sst"), b"orphan bytes").expect("write orphan");
+
+        let err = StorageEngine::open(&db_path, &Config::default())
+            .err()
+            .expect("a corrupt nonempty directory must not be initialized as fresh");
+        assert!(err.to_string().contains("no 'CURRENT' manifest"), "{err}");
+        assert_eq!(
+            std::fs::read_dir(&db_path).expect("read dir").count(),
+            1,
+            "the refusal must not create or remove files"
+        );
+        assert!(!db_path.join("CURRENT").exists(), "the refusal must not create a store");
+        assert_eq!(
+            std::fs::read(db_path.join("000007.sst")).expect("read orphan"),
+            b"orphan bytes"
+        );
+    }
+
+    /// A freshly prepared directory that holds a user's own config and key
+    /// files — not RocksDB state — must read as fresh so the writable open
+    /// initializes it instead of refusing. This is the root/Astra case: a data
+    /// directory mounted alongside benign files. The non-grammar names are
+    /// included to pin that the remnant test is not over-broad.
+    #[test]
+    fn is_existing_store_treats_benign_config_and_key_files_as_fresh() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let fresh = dir.path().join("fresh");
+        std::fs::create_dir(&fresh).expect("fresh dir");
+        for benign in [
+            "heliosdb-nano.toml",
+            "server.key",
+            "server.crt",
+            "README.md",
+            "backup.sqlite",
+            "CURRENT.bak",
+            "MANIFEST",
+            "OPTIONS-abc",
+        ] {
+            std::fs::write(fresh.join(benign), b"benign user bytes").expect("write benign file");
+        }
+
+        assert!(
+            !StorageEngine::is_existing_store(&fresh).expect("a benign directory is readable"),
+            "benign config/key files must not be mistaken for a database"
+        );
+    }
+
+    /// Every exact RocksDB 8.10.0 filename form (pinned `file/filename.cc`)
+    /// must still be refused when `CURRENT` is missing, so a real orphaned
+    /// store cannot be silently initialized over.
+    #[test]
+    fn is_existing_store_refuses_every_recognizable_rocksdb_remnant() {
+        for remnant in [
+            "IDENTITY",
+            "LOCK",
+            "LOG",
+            "LOG.old",
+            "LOG.old.1699999999",
+            "MANIFEST-000001",
+            "METADB-000001",
+            "OPTIONS-000001",
+            "OPTIONS-000001.dbtmp",
+            "000007.sst",
+            "000007.ldb",
+            "000007.log",
+            "000007.blob",
+            "000123.dbtmp",
+            "archive",
+        ] {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let store = dir.path().join("store");
+            std::fs::create_dir(&store).expect("store dir");
+            std::fs::write(store.join(remnant), b"remnant bytes").expect("write remnant");
+            let err =
+                StorageEngine::is_existing_store(&store).expect_err("a recognizable RocksDB remnant must be refused");
+            assert!(err.to_string().contains("no 'CURRENT' manifest"), "{remnant}: {err}");
+        }
+    }
+
+    /// The whole open path must accept a fresh directory that already holds a
+    /// user's files and initialize the store beside them.
+    #[test]
+    fn a_writable_open_initializes_a_fresh_directory_with_benign_files() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("store");
+        std::fs::create_dir(&db_path).expect("db dir");
+        std::fs::write(db_path.join("heliosdb-nano.toml"), b"[storage]\n").expect("write config");
+        std::fs::write(db_path.join("server.key"), b"user key material").expect("write key");
+
+        let engine = StorageEngine::open(&db_path, &Config::default()).expect("a fresh directory is initialized");
+        drop(engine);
+
+        assert!(db_path.join("CURRENT").is_file(), "the store must have been created");
+        assert_eq!(
+            std::fs::read(db_path.join("heliosdb-nano.toml")).expect("read config"),
+            b"[storage]\n",
+            "the user's config file must be preserved"
+        );
+        assert_eq!(
+            std::fs::read(db_path.join("server.key")).expect("read key"),
+            b"user key material",
+            "the user's key file must be preserved"
+        );
+    }
+
+    /// A read-only handle (the same branch physical snapshots take) must keep
+    /// its RocksDB `LOG` OUT of the database and retain the owned directory for
+    /// as long as the handle lives. Without the redirect the read-only open
+    /// recreates `LOG` in the data directory; without the retained guard the
+    /// directory would be deleted while the DB is still open.
+    #[test]
+    fn a_read_only_open_redirects_and_retains_its_log_outside_the_database() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("store");
+
+        {
+            let engine = StorageEngine::open(&db_path, &Config::default()).expect("writable open creates the store");
+            drop(engine);
+        }
+        // The writable open leaves a LOG. Remove it so the read-only open's own
+        // behaviour is observable: if its LOG is not redirected it recreates one.
+        let _ = std::fs::remove_file(db_path.join("LOG"));
+        assert!(!db_path.join("LOG").exists(), "precondition: no LOG in the database");
+
+        let engine = StorageEngine::open_read_only(&db_path, &Config::default()).expect("read-only open");
+        let log_path = engine
+            ._read_only_log_dir
+            .as_ref()
+            .expect("a read-only handle must retain an owned log directory")
+            .path()
+            .to_path_buf();
+        assert!(
+            log_path.is_dir(),
+            "the owned log directory must exist while the handle lives"
+        );
+        let canonical_db = std::fs::canonicalize(&db_path).expect("canonical db");
+        assert!(
+            !std::fs::canonicalize(&log_path)
+                .expect("canonical log")
+                .starts_with(&canonical_db),
+            "the read-only log directory must be outside the database"
+        );
+        assert!(
+            !db_path.join("LOG").exists(),
+            "a read-only open must not write LOG into the database"
+        );
+
+        drop(engine);
+        assert!(
+            !log_path.exists(),
+            "the retained log directory must be removed with the handle, not before"
+        );
+    }
+
+    /// The physical-snapshot path shares the read-only branch, so it too must
+    /// route its RocksDB `LOG` to an owned directory outside the database and
+    /// retain it for the handle's lifetime.
+    #[test]
+    fn a_physical_snapshot_open_retains_an_external_log_directory() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("store");
+        let mut config = Config::default();
+        config.storage.wal_enabled = false;
+        config.storage.elide_latest_version = false;
+
+        {
+            let engine = StorageEngine::open(&db_path, &config).expect("writable open creates the store");
+            drop(engine);
+        }
+        let _ = std::fs::remove_file(db_path.join("LOG"));
+        assert!(!db_path.join("LOG").exists(), "precondition: no LOG in the database");
+
+        let snapshot = StorageEngine::open_physical_snapshot(&db_path, &config).expect("physical snapshot open");
+        let log_path = snapshot
+            ._read_only_log_dir
+            .as_ref()
+            .expect("a physical snapshot must retain an owned log directory")
+            .path()
+            .to_path_buf();
+        assert!(
+            log_path.is_dir(),
+            "the owned log directory must exist while the handle lives"
+        );
+        let canonical_db = std::fs::canonicalize(&db_path).expect("canonical db");
+        assert!(
+            !std::fs::canonicalize(&log_path)
+                .expect("canonical log")
+                .starts_with(&canonical_db),
+            "the physical-snapshot log directory must be outside the database"
+        );
+        assert!(
+            !db_path.join("LOG").exists(),
+            "a physical-snapshot open must not write LOG into the database"
+        );
+
+        drop(snapshot);
+        assert!(
+            !log_path.exists(),
+            "the retained log directory must be removed with the handle, not before"
+        );
     }
 
     /// `get` must return BOTH a value written through the encrypting `put` and

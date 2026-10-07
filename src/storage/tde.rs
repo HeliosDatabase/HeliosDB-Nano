@@ -564,6 +564,93 @@ pub(crate) fn verify_physical_snapshot_key(db: &DB, key_manager: Option<&KeyMana
     verify_or_install_key_check(db, key_manager, true)
 }
 
+/// The STRICT sentinel check, shared by the installing verifier and the
+/// non-installing preflight: decrypt the stored sentinel under `km` and require
+/// the exact fixed constant back. A mismatch is one loud refusal naming the key
+/// SOURCE (never key material).
+fn verify_sentinel(km: &KeyManager, sealed: &[u8]) -> Result<()> {
+    let plaintext = crypto::decrypt(km.key(), sealed).map_err(|_| {
+        Error::encryption(format!(
+            "the configured encryption key does not match this database (key source: {:?}). Refusing to \
+             open: continuing would read every stored value as if it were unencrypted and write new values \
+             under a key the existing ones were not sealed with.",
+            km.source()
+        ))
+    })?;
+    if plaintext == KEY_CHECK_PLAINTEXT {
+        Ok(())
+    } else {
+        Err(Error::encryption(format!(
+            "the encryption key-check sentinel at '{}' decrypted to unexpected contents; this data \
+             directory is not in a state this build can safely open (key source: {:?}).",
+            String::from_utf8_lossy(KEY_CHECK_KEY),
+            km.source()
+        )))
+    }
+}
+
+/// The sentinel-absent evidence rule, shared by the installing verifier and the
+/// non-installing preflight: probe the values already on disk and refuse only on
+/// [`KeyEvidence::Contradicted`]. The other three outcomes are admissible —
+/// nothing stored (`NoStoredValues`), the key authenticates stored data
+/// (`KeyProven`), or the stored data predates sealing (`PredatesSealing`) — so a
+/// plaintext/legacy database still opens. Does not write anything.
+fn require_probe_evidence(db: &DB, km: &KeyManager) -> Result<()> {
+    match probe_key_against_existing_data(db, km)? {
+        KeyEvidence::NoStoredValues | KeyEvidence::KeyProven | KeyEvidence::PredatesSealing => Ok(()),
+        KeyEvidence::Contradicted => Err(Error::encryption(format!(
+            "this database holds stored values that the configured encryption key does not open and that \
+             are not in this build's unencrypted form either (key source: {:?}). Refusing to open: \
+             recording this key as the database's key is permanent, and doing it on a database sealed \
+             with a different key would lock that key out for good. Point [encryption] key_source at the \
+             key this database was created with.",
+            km.source()
+        ))),
+    }
+}
+
+/// Verify the configured key against this database WITHOUT installing the
+/// sentinel, probing the values already on disk when no sentinel is present.
+///
+/// This is the preflight a writable open runs against a read-only handle BEFORE
+/// taking the writable one. A writable RocksDB open rewrites `LOG`, `CURRENT`,
+/// `MANIFEST-*` and `OPTIONS-*` even when the key is then rejected, so the
+/// refusal has to happen first; the preflight therefore must NOT be the plain
+/// read-only arm of [`verify_or_install_key_check`], which cannot install and so
+/// only warns on a sentinel-absent database. Here the sentinel-absent path still
+/// runs [`probe_key_against_existing_data`] and refuses a
+/// [`KeyEvidence::Contradicted`] database, so a database sealed under a
+/// different key is rejected before any writable handle exists, while a
+/// plaintext/legacy database still passes.
+///
+/// Nothing is ever written: the sentinel is installed later, on the writable
+/// handle, by [`verify_or_install_key_check`].
+pub(crate) fn verify_key_check_without_install(db: &DB, key_manager: Option<&KeyManager>) -> Result<()> {
+    let stored = db
+        .get(KEY_CHECK_KEY)
+        .map_err(|e| Error::storage(format!("Failed to read the encryption key-check sentinel: {}", e)))?;
+
+    match (key_manager, stored) {
+        // The default configuration, or a database whose stored values cannot
+        // contradict the absent key.
+        (None, None) => Ok(()),
+
+        // An encrypted database opened with no key configured.
+        (None, Some(_)) => Err(Error::encryption(
+            "this data directory was written with encryption enabled, but [encryption] enabled is false in this \
+             configuration; its stored values cannot be read without the key. Set [encryption] enabled = true and \
+             point key_source at the key this database was created with.",
+        )),
+
+        // A sentinel exists: the strict check settles it.
+        (Some(km), Some(sealed)) => verify_sentinel(km, &sealed),
+
+        // No sentinel: the on-disk evidence must not contradict the key, and
+        // this path deliberately installs nothing.
+        (Some(km), None) => require_probe_evidence(db, km),
+    }
+}
+
 pub(crate) fn verify_or_install_key_check(db: &DB, key_manager: Option<&KeyManager>, read_only: bool) -> Result<()> {
     let stored = db
         .get(KEY_CHECK_KEY)
@@ -581,29 +668,11 @@ pub(crate) fn verify_or_install_key_check(db: &DB, key_manager: Option<&KeyManag
         )),
 
         // (3) Verify the configured key against the database.
-        (Some(km), Some(sealed)) => {
-            let plaintext = crypto::decrypt(km.key(), &sealed).map_err(|_| {
-                Error::encryption(format!(
-                    "the configured encryption key does not match this database (key source: {:?}). Refusing to \
-                     open: continuing would read every stored value as if it were unencrypted and write new values \
-                     under a key the existing ones were not sealed with.",
-                    km.source()
-                ))
-            })?;
-            if plaintext == KEY_CHECK_PLAINTEXT {
-                Ok(())
-            } else {
-                Err(Error::encryption(format!(
-                    "the encryption key-check sentinel at '{}' decrypted to unexpected contents; this data \
-                     directory is not in a state this build can safely open (key source: {:?}).",
-                    String::from_utf8_lossy(KEY_CHECK_KEY),
-                    km.source()
-                )))
-            }
-        }
+        (Some(km), Some(sealed)) => verify_sentinel(km, &sealed),
 
         // (4) No sentinel yet: install one only where the evidence on disk
-        //     justifies it.
+        //     justifies it. A read-only handle must not write, so it verifies
+        //     when it can and installs nothing.
         (Some(km), None) => {
             if read_only {
                 warn!(
@@ -612,19 +681,7 @@ pub(crate) fn verify_or_install_key_check(db: &DB, key_manager: Option<&KeyManag
                 );
                 return Ok(());
             }
-            match probe_key_against_existing_data(db, km)? {
-                KeyEvidence::NoStoredValues | KeyEvidence::KeyProven | KeyEvidence::PredatesSealing => {}
-                KeyEvidence::Contradicted => {
-                    return Err(Error::encryption(format!(
-                        "this database holds stored values that the configured encryption key does not open and that \
-                         are not in this build's unencrypted form either (key source: {:?}). Refusing to open: \
-                         recording this key as the database's key is permanent, and doing it on a database sealed \
-                         with a different key would lock that key out for good. Point [encryption] key_source at the \
-                         key this database was created with.",
-                        km.source()
-                    )));
-                }
-            }
+            require_probe_evidence(db, km)?;
             let sealed = crypto::encrypt(km.key(), KEY_CHECK_PLAINTEXT)?;
             db.put(KEY_CHECK_KEY, &sealed)
                 .map_err(|e| Error::storage(format!("Failed to install the encryption key-check sentinel: {}", e)))?;
@@ -998,5 +1055,111 @@ mod tests {
         let wrong = test_key_manager();
         verify_or_install_key_check(&db, Some(&wrong), true)
             .expect_err("a read-only handle must still refuse the wrong key");
+    }
+
+    // ---- non-installing preflight (verify_key_check_without_install) --------
+
+    /// The preflight must refuse a database sealed under another key EVEN WHEN
+    /// THE SENTINEL IS ABSENT, which the plain read-only arm of
+    /// `verify_or_install_key_check` cannot: that arm warns and returns `Ok`
+    /// because it cannot install, so on its own it would let a wrong key past
+    /// the preflight and onto a writable open. It must never write a sentinel.
+    #[test]
+    fn the_preflight_refuses_a_wrong_key_on_a_pre_sentinel_sealed_database() {
+        let (_dir, db) = scratch_db("preflight_wrong_no_sentinel");
+        let right = test_key_manager();
+        let wrong = test_key_manager();
+
+        db.put(
+            b"data:users:1",
+            crypto::encrypt(right.key(), &plaintext_row("sealed row")).expect("seal"),
+        )
+        .expect("put");
+        db.put(
+            b"counter:users",
+            crypto::encrypt(right.key(), &bincode::serialize(&1u64).expect("ser")).expect("seal"),
+        )
+        .expect("put");
+
+        // The plain read-only verifier would NOT catch this — pin the gap the
+        // preflight exists to close, so a regression to the old arm is caught.
+        verify_or_install_key_check(&db, Some(&wrong), true)
+            .expect("the read-only verifier alone cannot probe, which is why the preflight exists");
+
+        let err = verify_key_check_without_install(&db, Some(&wrong))
+            .expect_err("the preflight must probe and refuse a key that opens nothing");
+        assert!(err.to_string().contains("does not open"), "{err}");
+        assert!(
+            db.get(KEY_CHECK_KEY).expect("get").is_none(),
+            "*** IRREVERSIBLE *** the preflight must never install a sentinel"
+        );
+    }
+
+    /// The preflight on a sentinel-absent PLAINTEXT/legacy database must pass so
+    /// that upgrading such a database to encryption still works, and still must
+    /// not install the sentinel (the writable verifier does that later).
+    #[test]
+    fn the_preflight_passes_legacy_plaintext_without_installing_a_sentinel() {
+        let (_dir, db) = scratch_db("preflight_legacy");
+        let km = test_key_manager();
+
+        db.put(b"data:users:1", plaintext_row("legacy row")).expect("put");
+        db.put(b"counter:users", bincode::serialize(&1u64).expect("ser"))
+            .expect("put");
+
+        verify_key_check_without_install(&db, Some(&km)).expect("legacy plaintext must pass the preflight");
+        assert!(
+            db.get(KEY_CHECK_KEY).expect("get").is_none(),
+            "the preflight must not install the sentinel; the writable verifier does that"
+        );
+    }
+
+    /// With a sentinel present the preflight is the same strict check: right key
+    /// passes, wrong key is refused, and neither writes anything.
+    #[test]
+    fn the_preflight_verifies_an_existing_sentinel_strictly() {
+        let (_dir, db) = scratch_db("preflight_sentinel");
+        let km = test_key_manager();
+        verify_or_install_key_check(&db, Some(&km), false).expect("install");
+        let sentinel = db.get(KEY_CHECK_KEY).expect("get").expect("sentinel");
+
+        verify_key_check_without_install(&db, Some(&km)).expect("right key passes the preflight");
+        assert_eq!(
+            db.get(KEY_CHECK_KEY).expect("get").expect("sentinel"),
+            sentinel,
+            "the preflight must not rewrite the sentinel"
+        );
+
+        let wrong = test_key_manager();
+        let err = verify_key_check_without_install(&db, Some(&wrong))
+            .expect_err("the preflight must refuse the wrong key against an existing sentinel");
+        assert!(err.to_string().contains("does not match this database"), "{err}");
+    }
+
+    /// An encrypted database opened with encryption OFF must be refused by the
+    /// preflight too (`(None, Some)`), before any writable handle exists.
+    #[test]
+    fn the_preflight_refuses_an_encrypted_database_when_encryption_is_disabled() {
+        let (_dir, db) = scratch_db("preflight_disabled");
+        let km = test_key_manager();
+        verify_or_install_key_check(&db, Some(&km), false).expect("install");
+
+        let err = verify_key_check_without_install(&db, None)
+            .expect_err("an encrypted database must not pass the preflight with encryption off");
+        assert!(err.to_string().contains("written with encryption enabled"), "{err}");
+    }
+
+    /// A new database (nothing stored) and an unencrypted one pass the
+    /// preflight, and it writes nothing in either case.
+    #[test]
+    fn the_preflight_passes_a_new_or_unencrypted_database_without_writing() {
+        let (_dir, db) = scratch_db("preflight_new");
+        let km = test_key_manager();
+        verify_key_check_without_install(&db, Some(&km)).expect("a new database passes");
+        verify_key_check_without_install(&db, None).expect("an unencrypted database passes");
+        assert!(
+            db.get(KEY_CHECK_KEY).expect("get").is_none(),
+            "the preflight must never write a sentinel"
+        );
     }
 }
