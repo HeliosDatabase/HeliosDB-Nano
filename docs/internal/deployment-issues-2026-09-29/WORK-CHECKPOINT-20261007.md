@@ -27,8 +27,8 @@ original native path. Routing writes to a read-only standby is not remediation.
 ## Gate limits and retained failures
 
 - The frozen candidate has bounded library, targeted integration, CLI, documentation,
-  encrypted-upgrade, and live evidence. Default integration coverage is 14 of 358
-  targets: 12 nonempty and two expected empty. There are 344 default and 352 internal
+  encrypted-upgrade, and live evidence. Default integration coverage is 16 of 358
+  targets: 14 nonempty and two expected empty. There are 342 default and 352 internal
   target variants still outstanding. Repeating the native/durable-index pilot adds
   no unique target coverage.
 - Strict Clippy remains failing. Separate source-reviewed lint commits
@@ -54,8 +54,38 @@ archived executable. Every other entry, the older pilot, both complete source tr
 and both release binaries were preserved. Two evaluator representation failures
 are retained separately; the removal job was not retried.
 
-The next build, `durable_index_tests`, has not run. Its driver remains under repair
-and independent review. This progression does not establish full-matrix disk fit:
+The subsequent `durable_index_tests` compile passed independent acceptance: Cargo
+and its parent exited zero, 439 artifacts were reused, and only the requested test
+was compiled. The cache gained seven entries without changing or removing any
+prior entry. Its 29,335,552-byte allocation increase stayed within the admitted caps.
+This job did not run tests or add unique target coverage.
+
+The next `require_tls_cli_tests` compile also passed, reusing 439 artifacts and
+adding seven entries with 2,396,160 bytes of allocation growth. Its integration-test
+ELF and the distinct daemon executable are bound to the actual Cargo output.
+The fifth runtime harness passed independent review, then the actual three-test
+TLS gate passed with zero failures or skips. Parent, worker, discovery, and runtime
+exited zero; the scope was inactive, all children reaped, and no forced termination
+was needed. The four rejected, unexecuted drafts remain preserved. Coverage is
+limited to incomplete TLS startup flag refusal, not a TLS handshake.
+
+The subsequent two-target compile for `deployment_cli_tests` and
+`scram_gs2_and_trust_loopback` passed independent Astra acceptance: exact two test
+artifacts, 439 reused artifacts, Cargo and parent exit zero, and 32,808,960 bytes of
+allocation growth. The cache now has 4,943 entries with every prior entry preserved.
+The SCRAM/trust runtime subsequently passed all 13 tests with independent raw,
+cleanup, resource, and preservation acceptance: six parser and seven constructor
+policy checks, with no wire authentication claim. Deployment runtime remains unrun.
+Its harness passed 103 hermetic checks, but final review and concrete execution
+bindings remain unfinished at the user-requested handoff.
+
+Independent source review found that `deployment_modes_e2e_test` contains 26
+print-only placeholders. These receive no functional coverage credit. The proposed
+deployment CLI suite also has an IPv6-unavailable early return that must be reported
+separately from exercised IPv6 behavior. SCRAM/trust parser and constructor checks
+do not establish a network authentication handshake.
+
+This progression does not establish full-matrix disk fit:
 four retained cache manifests alone used 5,668,864 allocated bytes in this cycle.
 Compiler growth, compressed executables, and retained evidence must all be counted.
 
@@ -73,6 +103,13 @@ progress; prior versions are preserved. Under
 | `scratch-a-archive-prep-r3/a-archive/ASTRA-INDEPENDENT-ARCHIVE-AUDIT.json` | `88eeffbbb975d18b03228a89293031646137a13a22583d3b74d73b33a335a279` |
 | `scratch-a-removal-astra-audit-r3/actual-audit-01/ASTRA-INDEPENDENT-REMOVAL-AUDIT.json` | `1a1d5041c6b0a9b15b9320882cb3e06916b13965975ab849046277927715d5d8` |
 | `scratch-removal-preflight-root-r1/ASTRA-ACTUAL-REMOVAL-FULL-PRESERVATION-POSTCHECK.json` | `b99cdff496e395c3406e0f1a76a0221150421d56c1df92332ebbf823c5d6297e` |
+| `scratch-b-build-prep-r4/b-compile/astra-independent/ASTRA-INDEPENDENT-BUILD-AUDIT.json` | `2fea714742b80db3b332cd151ebae6d716b66dcf6b4f6419daf390a6b8a71d6f` |
+| `next-tls-actual-bindings-r1/ASTRA-INDEPENDENT-BUILD-AUDIT.json` | `e5b3ab6b0f3f9e4ca809c7a56476cac1b723ebbb39dc248fc9d79c3071a24a1d` |
+| `next-admission-actual-bindings-r1/ASTRA-INDEPENDENT-BUILD-AUDIT.json` | `fcba1d9b4971dc19e10cbaab52e9614b25d49a2ee8490335993f71823b0279c2` |
+| `next-tls-runtime-actual-bindings-r5/ASTRA-INDEPENDENT-RUNTIME-AUDIT.json` | `9253533c53b6a73cb7a51136eb869fd32b1235f0321455c1d470b86c48269be8` |
+| `next-scram-runtime-actual-bindings-r1/ASTRA-INDEPENDENT-RUNTIME-AUDIT.json` | `285a8fc6e87a4b58f41b1a49487b7159b2c26a0f3d3711fe0d4408f841210727` |
+| `next-tls-astra-review-r1/ASTRA-SOURCE-REVIEW.json` | `5dbb74b805bdfd8a78728e3b314c9996050e915eb2554c3e30acd5c87cc2803d` |
+| `next-tls-astra-review-r1/ASTRA-RUNTIME-R1-INDEPENDENT-REVIEW.json` | `2a857a807e2dae770e7bce749df72dfe096bebbaedf0e15b0aa735b438fb8e5d` |
 
 Heavy jobs acquire the shared build lock individually and use a 24 GiB/no-swap
 scope. Scratch currently uses a 72 GiB sampled fail-stop floor, not a hard quota.
@@ -81,3 +118,6 @@ preserved. The unaccepted archive-worker editing overlap was quarantined; subseq
 Flash sessions have only their own draft, private application state, and temporary
 directory writable. No push, PR publication, release, or issue closure follows from
 this checkpoint.
+
+Work stopped at the user's request. See [Claude handoff](CLAUDE-HANDOFF-20261007.md)
+for exact pins, remaining work, and receiver status. No owned jobs remain active.
