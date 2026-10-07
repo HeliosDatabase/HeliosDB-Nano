@@ -1967,7 +1967,9 @@ async fn start_server(
 
     // Start HA components if enabled
     #[cfg(feature = "ha-tier1")]
-    let mut ha_handles = if ha_role != "standalone" {
+    let mut ha_handles = if ha_role == "standalone" {
+        HAHandles::default()
+    } else {
         start_ha_components(
             &ha_config,
             &pg_addr.ip().to_string(),
@@ -1976,8 +1978,6 @@ async fn start_server(
             receiver_history,
         )
         .await?
-    } else {
-        HAHandles::default()
     };
 
     // Bind physical source before publishing any readiness. Its directly owned
@@ -2432,10 +2432,10 @@ async fn start_server(
     #[cfg(feature = "ha-tier1")]
     let server_result = {
         let _ = physical_stop.send(true);
-        let cleanup = if !physical_finished {
-            (&mut physical_service).await
-        } else {
+        let cleanup = if physical_finished {
             Ok(())
+        } else {
+            (&mut physical_service).await
         };
         ha_handles.shutdown().await;
         match server_result {
