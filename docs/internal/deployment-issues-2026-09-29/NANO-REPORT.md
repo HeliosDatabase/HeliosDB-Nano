@@ -1,4 +1,4 @@
-> Current preservation/PR handoff: [HANDOFF-TO-NANO-20261001.md](HANDOFF-TO-NANO-20261001.md). Earlier entries below are chronological checkpoints, not current acceptance.
+> Current acceptance checkpoint: [WORK-CHECKPOINT-20261007.md](WORK-CHECKPOINT-20261007.md). Preserved PR handoff: [HANDOFF-TO-NANO-20261001.md](HANDOFF-TO-NANO-20261001.md). Earlier entries below are chronological checkpoints, not current acceptance.
 
 # Nano deployment issue campaign — 2026-09-29
 
