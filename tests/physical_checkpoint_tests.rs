@@ -277,7 +277,7 @@ fn interior_batch_cursor_is_unsupported_and_must_not_skip_operations() {
     iterator.status().unwrap();
     assert!(export_checked(&db, 2, 8).is_err());
     let valid = export_checked(&db, 4, 8).unwrap();
-    assert_eq!((valid[0].first, valid[0].last), (5, 8));
+    assert_eq!(valid.first().map(|batch| (batch.first, batch.last)), Some((5, 8)));
     assert!(db.get_updates_since(9).is_err(), "out-of-range request must fail");
 }
 
@@ -452,7 +452,9 @@ fn raw_batch_roundtrip_preserves_delete_range_without_put_delete_callbacks() {
     source.flush_wal(true).unwrap();
     let exported = export_checked(&source, 3, 5).unwrap();
     assert_eq!(exported.len(), 1);
-    import_with_cursor(&receiver, &exported[0]);
+    if let Some(batch) = exported.first() {
+        import_with_cursor(&receiver, batch);
+    }
     assert_eq!(receiver.get(b"range/a").unwrap(), None);
     assert_eq!(receiver.get(b"range/b").unwrap(), None);
     assert_eq!(receiver.get(b"survivor").unwrap(), Some(b"keep".to_vec()));

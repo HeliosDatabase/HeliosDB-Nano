@@ -27,7 +27,9 @@ fn checkpoint() -> (tempfile::TempDir, PathBuf, Vec<Value>) {
         .unwrap();
     db.execute("CREATE PROCEDURE hydration_proc() LANGUAGE sql AS $$INSERT INTO hydration_rows VALUES (99, 'procedure-value')$$")
         .unwrap();
-    let source_udf = db.query("SELECT hydration_double(7)", &[]).unwrap()[0].values.clone();
+    let source_rows = db.query("SELECT hydration_double(7)", &[]).unwrap();
+    assert_eq!(source_rows.len(), 1, "hydration_double(7) must return one row");
+    let source_udf = source_rows.first().map_or_else(Vec::new, |row| row.values.clone());
     let raw = db.storage.db();
     rocksdb::checkpoint::Checkpoint::new(&raw)
         .unwrap()
@@ -84,8 +86,13 @@ fn sealed_checkpoint_hydrates_indexes_routines_and_triggers_without_durable_muta
         ]
     );
     assert_eq!(
-        hydrated.database.query("SELECT hydration_double(7)", &[]).unwrap()[0].values,
-        source_udf
+        hydrated
+            .database
+            .query("SELECT hydration_double(7)", &[])
+            .unwrap()
+            .first()
+            .map(|row| row.values.clone()),
+        Some(source_udf)
     );
     assert_eq!(
         hydrated.database.storage.art_indexes().pk_index_len("hydration_rows"),
@@ -151,8 +158,12 @@ fn ordinary_open_keeps_its_existing_resilient_routine_behavior() {
     raw_put(&path, b"meta:function:broken_function", b"invalid function");
     let ordinary = EmbeddedDatabase::with_config(config(&path)).unwrap();
     assert_eq!(
-        ordinary.query("SELECT hydration_double(7)", &[]).unwrap()[0].values,
-        source_udf
+        ordinary
+            .query("SELECT hydration_double(7)", &[])
+            .unwrap()
+            .first()
+            .map(|row| row.values.clone()),
+        Some(source_udf)
     );
 }
 
