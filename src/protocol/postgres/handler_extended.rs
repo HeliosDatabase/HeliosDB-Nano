@@ -1040,6 +1040,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     /// a `'…'` / `E'…'` string, a `"…"` identifier, a `$tag$…$tag$` body or a
     /// comment is data, and `$` inside an identifier (`a$1b`) is part of it —
     /// counting those made Describe report parameters that do not exist.
+    // Safety: every `b[..]` read below is guarded by the surrounding
+    // `i < b.len()` loop condition (or a `.get()` for look-ahead).
+    #[allow(clippy::indexing_slicing)]
     fn count_parameters(query: &str) -> usize {
         let b = query.as_bytes();
         let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;

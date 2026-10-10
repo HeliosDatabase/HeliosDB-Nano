@@ -199,7 +199,7 @@ impl std::fmt::Debug for HttpAuthPolicy {
             .field("bearer_token", &self.bearer_token.as_ref().map(|_| "<redacted>"))
             .field("allow_insecure_http", &self.allow_insecure_http)
             .field("limits", &self.limits)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -288,6 +288,7 @@ impl HttpAuthPolicy {
         ))
     }
 
+    #[allow(clippy::single_option_map)]
     fn verifier_from_password(password: Option<String>) -> Option<Arc<AuthManager>> {
         password.map(|password| {
             let mut store = InMemoryPasswordStore::new();
