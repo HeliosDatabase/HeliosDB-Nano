@@ -2353,7 +2353,54 @@ impl Transaction {
     ///
     /// This ensures "read-your-own-writes" consistency for scans.
     /// It replaces tuples with newer versions in the write set and adds new tuples.
-    pub fn merge_with_write_set(&self, table_name: &str, mut tuples: Vec<Tuple>) -> Result<Vec<Tuple>> {
+    pub fn merge_with_write_set(&self, table_name: &str, tuples: Vec<Tuple>) -> Result<Vec<Tuple>> {
+        self.merge_with_write_set_inner(table_name, tuples, None)
+    }
+
+    /// Forget every row this transaction staged for `table_name` (GH#62).
+    ///
+    /// `DROP TABLE` is applied to the catalog and storage immediately, but the
+    /// rows an earlier statement of the SAME transaction staged in
+    /// `write_set` / `insert_log` stay keyed `data:{table}:{row_id}`. At COMMIT
+    /// they were flushed into whichever table now owned that name, so
+    /// `INSERT; DROP TABLE; COMMIT; CREATE TABLE same_name` resurrected the
+    /// dropped table's rows in the new one. Called by the DROP funnel with the
+    /// dropped name; also clears the table's staged row counter.
+    pub fn discard_staged_for_table(&self, table_name: &str) {
+        let prefix = format!("data:{}:", table_name).into_bytes();
+        self.write_set.retain(|key, _| !key.starts_with(&prefix));
+        self.insert_log.write().retain(|(key, _)| !key.starts_with(&prefix));
+        self.row_counter_stages.write().remove(table_name);
+    }
+
+    /// `merge_with_write_set`, with every STAGED row shaped to the table's
+    /// current catalog `width`. `ALTER TABLE … ADD COLUMN` inside a
+    /// transaction rewrites committed rows only; a row this transaction staged
+    /// earlier still carries the old arity and projecting the new column
+    /// raised "Column index N out of bounds in tuple" (GH#61). Short staged
+    /// rows are NULL-padded, exactly as the committed-scan decode does.
+    pub fn merge_with_write_set_to_width(
+        &self,
+        table_name: &str,
+        tuples: Vec<Tuple>,
+        width: usize,
+    ) -> Result<Vec<Tuple>> {
+        self.merge_with_write_set_inner(table_name, tuples, Some(width))
+    }
+
+    fn merge_with_write_set_inner(
+        &self,
+        table_name: &str,
+        mut tuples: Vec<Tuple>,
+        width: Option<usize>,
+    ) -> Result<Vec<Tuple>> {
+        let pad = |t: &mut Tuple| {
+            if let Some(w) = width {
+                if t.values.len() < w {
+                    t.values.resize(w, crate::Value::Null);
+                }
+            }
+        };
         let prefix = format!("data:{}:", table_name);
 
         // Track which row IDs we've already handled from the base set
@@ -2374,6 +2421,7 @@ impl Transaction {
                             let mut updated_tuple: Tuple = bincode::deserialize(data)
                                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
                             updated_tuple.row_id = Some(row_id);
+                            pad(&mut updated_tuple);
                             if let Some(slot) = tuples.get_mut(i) {
                                 *slot = updated_tuple;
                             }
@@ -2404,6 +2452,7 @@ impl Transaction {
                                 let mut new_tuple: Tuple = bincode::deserialize(data)
                                     .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
                                 new_tuple.row_id = Some(row_id);
+                                pad(&mut new_tuple);
                                 tuples.push(new_tuple);
                             }
                         }
@@ -2424,6 +2473,7 @@ impl Transaction {
                             let mut new_tuple: Tuple = bincode::deserialize(data)
                                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
                             new_tuple.row_id = Some(row_id);
+                            pad(&mut new_tuple);
                             tuples.push(new_tuple);
                             handled_row_ids.insert(row_id);
                         }

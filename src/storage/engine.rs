@@ -12325,6 +12325,7 @@ impl StorageEngine {
         let mut tuple = tuple;
         let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
+            crate::note_explicit_identity_pk(self, table_name, col, tuple.values.get(i));
             if col.primary_key && matches!(tuple.values.get(i), Some(crate::Value::Null)) {
                 let filled = crate::pk_autofill_value(table_name, col, row_id)?;
                 if let Some(slot) = tuple.values.get_mut(i) {
@@ -12483,6 +12484,7 @@ impl StorageEngine {
         let mut tuple = tuple;
         let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
+            crate::note_explicit_identity_pk(self, table_name, col, tuple.values.get(i));
             if col.primary_key && matches!(tuple.values.get(i), Some(crate::Value::Null)) {
                 let filled = crate::pk_autofill_value(table_name, col, row_id)?;
                 if let Some(slot) = tuple.values.get_mut(i) {
@@ -13826,6 +13828,23 @@ impl StorageEngine {
     /// Only updates the in-memory atomic counter. The caller must
     /// call `flush_row_counter()` after the batch to persist the
     /// final counter value. Used by the fast INSERT path.
+    /// Raise the volatile row-id counter to at least `value` (GH#59).
+    ///
+    /// SERIAL / rowid-alias primary keys are generated from this counter, so an
+    /// EXPLICIT key above it must move it: otherwise the next generated key
+    /// lands below the largest key (SQLite continues after it) and, once the
+    /// counter climbs, collides with an explicit one.
+    pub fn raise_row_counter_to(&self, table_name: &str, value: u64) {
+        if let Some(counter) = self.row_counters.get(table_name) {
+            counter.fetch_max(value, Ordering::Relaxed);
+            return;
+        }
+        self.row_counters
+            .entry(table_name.to_string())
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
+            .fetch_max(value, Ordering::Relaxed);
+    }
+
     pub fn next_row_id_volatile(&self, table_name: &str) -> u64 {
         if let Some(counter) = self.row_counters.get(table_name) {
             return counter.fetch_add(1, Ordering::Relaxed) + 1;
@@ -15664,6 +15683,7 @@ impl StorageEngine {
         let mut tuple = tuple;
         let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
+            crate::note_explicit_identity_pk(self, table_name, col, tuple.values.get(i));
             if col.primary_key && matches!(tuple.values.get(i), Some(crate::Value::Null)) {
                 let filled = crate::pk_autofill_value(table_name, col, row_id)?;
                 if let Some(slot) = tuple.values.get_mut(i) {

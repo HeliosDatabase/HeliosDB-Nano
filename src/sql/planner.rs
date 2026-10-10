@@ -3381,10 +3381,19 @@ impl<'a> Planner<'a> {
                                 // Safety: ordinal validated in range 1..=num_output_cols above
                                 #[allow(clippy::indexing_slicing)]
                                 let col = &output_schema.columns[ordinal - 1];
-                                return Ok(LogicalExpr::Column {
+                                let by_name = LogicalExpr::Column {
                                     table: None,
                                     name: col.name.clone(),
-                                });
+                                };
+                                // GH#63: with duplicate output names (`SELECT p.id, k.id …
+                                // ORDER BY 2`) the bare name binds to the FIRST `id`.
+                                // Keep the select-list item's own qualified column as
+                                // the preferred key.
+                                let preferred = match projection_outputs.get(ordinal - 1) {
+                                    Some((e @ LogicalExpr::Column { table: Some(_), .. }, _)) => e.clone(),
+                                    _ => by_name.clone(),
+                                };
+                                return Ok((preferred, by_name));
                             } else if ordinal >= 1 {
                                 return Err(Error::query_execution(format!(
                                     "ORDER BY position {} is not in select list (select list has {} columns)",
@@ -3430,7 +3439,15 @@ impl<'a> Planner<'a> {
                     };
                     // Redirect an expression that matches a projected select-list
                     // expression to its output column (A17, see above).
-                    Ok(Self::rewrite_order_by_to_projection(resolved, &projection_outputs))
+                    // GH#63: a qualified column key is also kept as written, so
+                    // `place_order_by` can sort below the Project (where the
+                    // qualifier still resolves) instead of through an output
+                    // name that may be duplicated or absent.
+                    let preferred = resolved.clone();
+                    Ok((
+                        preferred,
+                        Self::rewrite_order_by_to_projection(resolved, &projection_outputs),
+                    ))
                 })
                 .collect();
             let asc: Vec<_> = order_by
@@ -3439,7 +3456,8 @@ impl<'a> Planner<'a> {
                 .map(|order_by_expr| order_by_expr.asc.unwrap_or(true))
                 .collect();
 
-            plan = Self::place_order_by(plan, exprs?, asc);
+            let (preferred, redirected): (Vec<_>, Vec<_>) = exprs?.into_iter().unzip();
+            plan = Self::place_order_by(plan, preferred, redirected, asc);
         }
 
         // Handle LIMIT and OFFSET
@@ -4692,7 +4710,35 @@ impl<'a> Planner<'a> {
         }
     }
 
-    fn place_order_by(plan: LogicalPlan, exprs: Vec<LogicalExpr>, asc: Vec<bool>) -> LogicalPlan {
+    /// `preferred` is each key as the query wrote it (resolved against any
+    /// aggregate); `exprs` is the same key redirected to a projected output
+    /// column. A qualified column key is tried as written first when the
+    /// Sort can sit below the Project (GH#63).
+    fn place_order_by(
+        plan: LogicalPlan,
+        preferred: Vec<LogicalExpr>,
+        exprs: Vec<LogicalExpr>,
+        asc: Vec<bool>,
+    ) -> LogicalPlan {
+        let qualified_keys: Vec<LogicalExpr> = preferred
+            .into_iter()
+            .zip(exprs.iter())
+            .map(|(pref, redirected)| match pref {
+                LogicalExpr::Column { table: Some(_), .. } => pref,
+                _ => redirected.clone(),
+            })
+            .collect();
+        let exprs = match &plan {
+            LogicalPlan::Project {
+                input,
+                distinct: false,
+                distinct_on: None,
+                ..
+            } if Self::order_by_resolves_against_schema(&qualified_keys, &Self::runtime_stamped_schema(input)) => {
+                qualified_keys
+            }
+            _ => exprs,
+        };
         match plan {
             LogicalPlan::Project {
                 input,
@@ -7454,6 +7500,18 @@ impl<'a> Planner<'a> {
             not_null = false;
         }
 
+        // GH#59: SQLite's rowid alias. An inline `INTEGER PRIMARY KEY`
+        // only that exact spelling, as in SQLite; `INT` / `BIGINT PRIMARY KEY`
+        // stay strict per #108) with no DEFAULT assigns the key when omitted.
+        // It rides the SERIAL machinery: nullable internally, auto-filled from
+        // the row-id allocator, which explicit keys raise.
+        let rowid_alias =
+            primary_key && default.is_none() && !is_identity && matches!(col.data_type, SqlDataType::Integer(_));
+        if rowid_alias {
+            not_null = false;
+            is_identity = true;
+        }
+
         Ok(ColumnDef {
             name: Self::normalize_ident(&col.name),
             data_type,
@@ -7521,6 +7579,18 @@ impl<'a> Planner<'a> {
             }
             SqlDataType::Text => Ok(DataType::Text),
             SqlDataType::Bytea => Ok(DataType::Bytea),
+            // GH#59: SQLite / MySQL spellings (the SQLite compatibility page lists
+            // them as mapped): BLOB → BYTEA, DATETIME → TIMESTAMP, TINYINT →
+            // SMALLINT, MEDIUMINT → INTEGER.
+            SqlDataType::Blob(_)
+            | SqlDataType::TinyBlob
+            | SqlDataType::MediumBlob
+            | SqlDataType::LongBlob
+            | SqlDataType::Binary(_)
+            | SqlDataType::Varbinary(_) => Ok(DataType::Bytea),
+            SqlDataType::Datetime(_) => Ok(DataType::Timestamp),
+            SqlDataType::TinyInt(_) => Ok(DataType::Int2),
+            SqlDataType::MediumInt(_) => Ok(DataType::Int4),
             SqlDataType::Date => Ok(DataType::Date),
             SqlDataType::Time(_, _) => Ok(DataType::Time),
             // GH#23: `TIMESTAMPTZ` / `TIMESTAMP WITH TIME ZONE` keep sqlparser's

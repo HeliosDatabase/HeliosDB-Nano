@@ -526,6 +526,70 @@ fn command_tags(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// PostgreSQL reports a procedure invocation with the bare `CALL` command
+/// tag on both query-protocol families.  The procedure's own affected-row
+/// count is deliberately absent from the tag.
+#[tokio::test]
+#[allow(clippy::expect_used, clippy::large_futures)]
+async fn call_uses_postgresql_command_tag_on_both_protocol_families() {
+    use super::messages::FrontendMessage;
+
+    for query in [
+        "CALL tag_probe()",
+        "cAlL tag_probe()",
+        "CALL\ntag_probe()",
+        "CALL\ttag_probe()",
+        "CALL\r\ntag_probe()",
+        "CALL/**/tag_probe()",
+        "/* leading */ CALL tag_probe()",
+        "-- leading\nCALL tag_probe()",
+    ] {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        let (mut handler, mut client) = test_handler(db);
+        for not_call in ["callback()", "call_name()", "call$name()", "callé()"] {
+            assert_eq!(handler.get_command_tag(not_call, 0), "OK 0", "{not_call}");
+        }
+        wire_setup(
+            &mut handler,
+            &mut client,
+            "CREATE PROCEDURE tag_probe() LANGUAGE sql AS $$SELECT 1$$",
+        )
+        .await;
+
+        let simple = wire_query(&mut handler, &mut client, query).await;
+        assert_eq!(command_tags(&simple), vec!["CALL".to_string()], "simple: {query:?}");
+
+        handler
+            .dispatch_message(FrontendMessage::Parse {
+                statement_name: "call_tag".into(),
+                query: query.into(),
+                param_types: vec![],
+            })
+            .await
+            .expect("parse CALL");
+        handler
+            .dispatch_message(FrontendMessage::Bind {
+                portal_name: "call_tag_portal".into(),
+                statement_name: "call_tag".into(),
+                param_formats: vec![],
+                params: vec![],
+                result_formats: vec![],
+            })
+            .await
+            .expect("bind CALL");
+        let _ = drain(&mut client).await;
+        handler
+            .dispatch_message(FrontendMessage::Execute {
+                portal_name: "call_tag_portal".into(),
+                max_rows: 0,
+            })
+            .await
+            .expect("execute CALL");
+        let extended = drain(&mut client).await;
+        assert_eq!(command_tags(&extended), vec!["CALL".to_string()], "extended: {query:?}");
+    }
+}
+
 fn param_status(bytes: &[u8]) -> Vec<(String, String)> {
     parse_messages(bytes)
         .into_iter()
