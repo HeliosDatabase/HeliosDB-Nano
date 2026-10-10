@@ -3880,6 +3880,12 @@ where
             "GRANT".to_string()
         } else if starts_with_icase(trimmed, "REVOKE") {
             "REVOKE".to_string()
+        } else if pg_is_call_statement(trimmed) {
+            // PostgreSQL reports procedure invocation with the bare `CALL`
+            // tag; the procedure body's affected-row count is not included.
+            // SQL permits tabs, newlines and comments around this keyword.
+            // Require a token boundary so call-prefixed identifiers do not match.
+            "CALL".to_string()
         // HDB-008: the savepoint family. PostgreSQL tags these `SAVEPOINT`,
         // `RELEASE` and — for `ROLLBACK TO [SAVEPOINT] n` — `ROLLBACK`; all
         // three fell through to `OK 0`, which is not a tag any PostgreSQL
@@ -4739,6 +4745,15 @@ pub(crate) fn pg_skip_leading_comments(stmt: &str) -> &str {
 #[inline]
 fn pg_is_identifier_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+fn pg_is_call_statement(sql: &str) -> bool {
+    let statement = pg_skip_leading_comments(sql);
+    starts_with_icase(statement, "CALL")
+        && statement
+            .as_bytes()
+            .get(4)
+            .is_some_and(|byte| byte.is_ascii() && !pg_is_identifier_byte(*byte))
 }
 
 /// Case-insensitive whole-word search. `upper` must already be
