@@ -215,7 +215,7 @@ pub fn rewrite_question_placeholders(sql: &str) -> Result<String> {
 /// MySQL `AUTO_INCREMENT`) are handled separately in the MySQL translator.
 fn rewrite_autoincrement(sql: &str) -> String {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| init_regex(r"(?i)\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b"));
+    let re = RE.get_or_init(|| init_regex(r"(?i)\b(?:INTEGER|INT|BIGINT)\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b"));
     re.replace_all(sql, "BIGSERIAL PRIMARY KEY").to_string()
 }
 

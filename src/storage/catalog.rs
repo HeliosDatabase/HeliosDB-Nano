@@ -1410,6 +1410,12 @@ impl<'a> Catalog<'a> {
         // stats or live-row presence. No-op prefix seeks for row-only tables.
         super::ColumnarStore::purge_table_sidecars(&self.storage.db, table_name)?;
 
+        // GH#56: the row cache is keyed `(table, row_id)` and `counter:{table}`
+        // was just deleted, so a later table of this name restarts at row id 1
+        // and would be served the DROPPED table's cached rows (stale reads and
+        // lost updates on primary-key lookups). Evict them with the table.
+        self.storage.row_cache().invalidate_table(table_name);
+
         Ok(())
     }
 
@@ -2887,6 +2893,12 @@ impl<'a> Catalog<'a> {
         if move_side_records {
             self.move_table_side_records(old_name, new_name)?;
         }
+
+        // GH#56: cached rows are keyed by table NAME. Rows cached under the old
+        // name belong to a relation that no longer has it, and rows cached under
+        // the new name belong to a table that was dropped to make room for it.
+        self.storage.row_cache().invalidate_table(old_name);
+        self.storage.row_cache().invalidate_table(new_name);
 
         Ok(())
     }

@@ -5661,6 +5661,16 @@ impl Evaluator {
         Ok(Value::Boolean(true))
     }
 
+    /// Float → INTEGER keeps the established truncation, but NaN / out-of-range
+    /// values are an error rather than a saturated or wrapped integer (GH#58).
+    fn float_to_i32(f: f64) -> Result<Value> {
+        let t = f.trunc();
+        if t.is_nan() || t < f64::from(i32::MIN) || t > f64::from(i32::MAX) {
+            return Err(Error::query_execution(format!("integer out of range: {}", f)));
+        }
+        Ok(Value::Int4(t as i32))
+    }
+
     /// Render a non-NULL value for a character cast, without SQL delimiters.
     fn cast_text_repr(value: Value) -> String {
         // Display renders SQL literals. Character casts store the value
@@ -5755,9 +5765,13 @@ impl Evaluator {
             DataType::Int4 => match value {
                 Value::Int2(i) => Ok(Value::Int4(i as i32)),
                 Value::Int4(i) => Ok(Value::Int4(i)),
-                Value::Int8(i) => Ok(Value::Int4(i as i32)),
-                Value::Float4(f) => Ok(Value::Int4(f as i32)),
-                Value::Float8(f) => Ok(Value::Int4(f as i32)),
+                // GH#58: a bare `as i32` wrapped modulo 2^32 and stored the
+                // wrapped value; PostgreSQL raises 22003 instead.
+                Value::Int8(i) => i32::try_from(i)
+                    .map(Value::Int4)
+                    .map_err(|_| Error::query_execution(format!("integer out of range: {}", i))),
+                Value::Float4(f) => Self::float_to_i32(f64::from(f)),
+                Value::Float8(f) => Self::float_to_i32(f),
                 Value::Numeric(n) => {
                     // Parse as decimal, truncate to integer, then to i32
                     n.parse::<Decimal>()

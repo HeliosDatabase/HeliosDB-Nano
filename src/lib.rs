@@ -1011,6 +1011,34 @@ pub(crate) fn is_identity_pk_type(data_type: &DataType) -> bool {
 /// unchanged. A DEFAULT, when the column has one, has already been applied by
 /// the planner arm that reaches here, so a NULL at this point means there was
 /// none.
+/// GH#59: an explicit integer value for a SERIAL / rowid-alias primary key
+/// raises the row-id counter the generated keys come from, so the next
+/// generated key continues ABOVE the largest explicit one (SQLite semantics)
+/// instead of reusing a lower number that may later collide.
+pub(crate) fn note_explicit_identity_pk(
+    storage: &crate::storage::StorageEngine,
+    table_name: &str,
+    col: &Column,
+    value: Option<&Value>,
+) {
+    if !(col.primary_key && is_identity_pk_type(&col.data_type)) {
+        return;
+    }
+    let v = match value {
+        Some(Value::Int2(v)) => i64::from(*v),
+        Some(Value::Int4(v)) => i64::from(*v),
+        Some(Value::Int8(v)) => *v,
+        _ => return,
+    };
+    // Bounded: a snowflake-style 64-bit key must not drag the row-id space up
+    // with it. Keys past 2^40 are application-assigned, not generated.
+    if let Ok(v) = u64::try_from(v) {
+        if v <= (1u64 << 40) {
+            storage.raise_row_counter_to(table_name, v);
+        }
+    }
+}
+
 pub(crate) fn pk_autofill_value(table_name: &str, col: &Column, row_id: u64) -> Result<Value> {
     match col.data_type {
         DataType::Int2 => Ok(Value::Int2(row_id as i16)),
@@ -8420,6 +8448,7 @@ impl EmbeddedDatabase {
                         // wrote an Int8 into a TEXT / UUID / NUMERIC primary key.
                         let mut generated_identity = false;
                         for (i, col) in schema.columns.iter().enumerate() {
+                            crate::note_explicit_identity_pk(&self.storage, table_name, col, tuple.values.get(i));
                             if col.primary_key && matches!(tuple.values.get(i), Some(Value::Null)) {
                                 let filled = crate::pk_autofill_value(table_name, col, row_id)?;
                                 if let Some(slot) = tuple.values.get_mut(i) {
@@ -15251,6 +15280,7 @@ impl EmbeddedDatabase {
 
         let mut generated_identity = false;
         for (i, col) in schema.columns.iter().enumerate() {
+            crate::note_explicit_identity_pk(&self.storage, table_name, col, tuple.values.get(i));
             if col.primary_key && matches!(tuple.values.get(i), Some(Value::Null)) {
                 let filled = crate::pk_autofill_value(table_name, col, row_id)?;
                 if let Some(slot) = tuple.values.get_mut(i) {
@@ -18666,6 +18696,12 @@ impl EmbeddedDatabase {
                                 // site. The `_ =>` arm this replaced stored an
                                 // Int8 in a TEXT / UUID / NUMERIC primary key.
                                 for (i, col) in schema.columns.iter().enumerate() {
+                                    crate::note_explicit_identity_pk(
+                                        &self.storage,
+                                        table_name,
+                                        col,
+                                        staged.values.get(i),
+                                    );
                                     if col.primary_key && matches!(staged.values.get(i), Some(Value::Null)) {
                                         let value = crate::pk_autofill_value(table_name, col, row_id)?;
                                         if let Some(slot) = staged.values.get_mut(i) {
@@ -18767,6 +18803,12 @@ impl EmbeddedDatabase {
                                 // with what was stored is exactly the class of
                                 // bug this item is about.
                                 for (i, col) in schema.columns.iter().enumerate() {
+                                    crate::note_explicit_identity_pk(
+                                        &self.storage,
+                                        table_name,
+                                        col,
+                                        filled.values.get(i),
+                                    );
                                     if col.primary_key && matches!(filled.values.get(i), Some(Value::Null)) {
                                         let value = crate::pk_autofill_value(table_name, col, row_id)?;
                                         if let Some(slot) = filled.values.get_mut(i) {

@@ -1031,30 +1031,138 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
 
     /// Count the number of $N placeholders in a SQL query
     /// Returns the highest parameter number found (e.g., "$7" means 7 parameters)
+    ///
+    /// GH#57: a placeholder is only recognised in SQL text proper. `$n` inside
+    /// a `'…'` / `E'…'` string, a `"…"` identifier, a `$tag$…$tag$` body or a
+    /// comment is data, and `$` inside an identifier (`a$1b`) is part of it —
+    /// counting those made Describe report parameters that do not exist.
     fn count_parameters(query: &str) -> usize {
-        let mut max_param = 0;
-        let mut chars = query.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            if c == '$' {
-                // Collect digits following the $
-                let mut num_str = String::new();
-                while let Some(&digit) = chars.peek() {
-                    if digit.is_ascii_digit() {
-                        num_str.push(digit);
-                        chars.next();
+        let b = query.as_bytes();
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80;
+        let mut max_param = 0usize;
+        let mut i = 0usize;
+        while i < b.len() {
+            match b[i] {
+                b'\'' => {
+                    // E'…' honours backslash escapes; a plain string only doubles quotes.
+                    let escape = i > 0 && matches!(b[i - 1], b'e' | b'E') && (i < 2 || !is_ident(b[i - 2]));
+                    i += 1;
+                    while i < b.len() {
+                        if escape && b[i] == b'\\' {
+                            i += 2;
+                        } else if b[i] == b'\'' {
+                            if b.get(i + 1) == Some(&b'\'') {
+                                i += 2;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    i += 1;
+                }
+                b'"' => {
+                    i += 1;
+                    while i < b.len() {
+                        if b[i] == b'"' {
+                            if b.get(i + 1) == Some(&b'"') {
+                                i += 2;
+                                continue;
+                            }
+                            break;
+                        }
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                b'-' if b.get(i + 1) == Some(&b'-') => {
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if b.get(i + 1) == Some(&b'*') => {
+                    let mut depth = 1;
+                    i += 2;
+                    while i < b.len() && depth > 0 {
+                        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                            depth += 1;
+                            i += 2;
+                        } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                b'$' if i > 0 && is_ident(b[i - 1]) => i += 1,
+                b'$' => {
+                    let start = i + 1;
+                    let mut k = start;
+                    while k < b.len() && b[k].is_ascii_digit() {
+                        k += 1;
+                    }
+                    if k > start {
+                        if let Ok(n) = query[start..k].parse::<usize>() {
+                            max_param = max_param.max(n);
+                        }
+                        i = k;
                     } else {
-                        break;
+                        // `$tag$ … $tag$` (tag may be empty): skip to the closing tag.
+                        let mut t = start;
+                        while t < b.len() && (b[t].is_ascii_alphabetic() || b[t] == b'_' || b[t] >= 0x80) {
+                            t += 1;
+                        }
+                        if b.get(t) == Some(&b'$') {
+                            let tag = &query[i..=t];
+                            match query[t + 1..].find(tag) {
+                                Some(off) => i = t + 1 + off + tag.len(),
+                                None => i = b.len(),
+                            }
+                        } else {
+                            i += 1;
+                        }
                     }
                 }
-                if !num_str.is_empty() {
-                    if let Ok(num) = num_str.parse::<usize>() {
-                        max_param = max_param.max(num);
-                    }
-                }
+                _ => i += 1,
             }
         }
-
         max_param
+    }
+}
+
+#[cfg(test)]
+mod count_parameters_tests {
+    use super::PgConnectionHandler;
+    use tokio::io::DuplexStream;
+
+    fn n(sql: &str) -> usize {
+        PgConnectionHandler::<DuplexStream>::count_parameters(sql)
+    }
+
+    /// GH#57: `$n` is a placeholder only in SQL text, never in data.
+    #[test]
+    fn placeholders_inside_literals_identifiers_and_comments_are_not_counted() {
+        assert_eq!(n("SELECT 'plain' AS v"), 0);
+        assert_eq!(n("SELECT 'cost $5' AS v"), 0);
+        assert_eq!(n("SELECT 'a$1b$2' AS v"), 0);
+        assert_eq!(n("SELECT $$ $1 $$ AS v"), 0);
+        assert_eq!(n("SELECT $tag$ $3 $tag$ AS v"), 0);
+        assert_eq!(n("SELECT 'it''s $9'"), 0);
+        assert_eq!(n(r"SELECT E'it\'s $9'"), 0);
+        assert_eq!(n("SELECT \"c$4\" FROM t"), 0);
+        assert_eq!(n("SELECT 1 -- $7\n"), 0);
+        assert_eq!(n("SELECT /* $8 /* $8 */ $8 */ 1"), 0);
+        assert_eq!(n("SELECT a$1 FROM t"), 0);
+        assert_eq!(n("INSERT INTO u VALUES ('$argon2id$v=19$m=65536', $1)"), 1);
+    }
+
+    #[test]
+    fn real_placeholders_are_still_counted() {
+        assert_eq!(n("SELECT $1, $2"), 2);
+        assert_eq!(n("SELECT $3 + $1"), 3);
+        assert_eq!(n("SELECT 'x' || $2::text WHERE a = $1"), 2);
+        assert_eq!(n("SELECT $1::int[]"), 1);
     }
 }

@@ -7500,6 +7500,18 @@ impl<'a> Planner<'a> {
             not_null = false;
         }
 
+        // GH#59: SQLite's rowid alias. An inline `INTEGER PRIMARY KEY`
+        // only that exact spelling, as in SQLite; `INT` / `BIGINT PRIMARY KEY`
+        // stay strict per #108) with no DEFAULT assigns the key when omitted.
+        // It rides the SERIAL machinery: nullable internally, auto-filled from
+        // the row-id allocator, which explicit keys raise.
+        let rowid_alias =
+            primary_key && default.is_none() && !is_identity && matches!(col.data_type, SqlDataType::Integer(_));
+        if rowid_alias {
+            not_null = false;
+            is_identity = true;
+        }
+
         Ok(ColumnDef {
             name: Self::normalize_ident(&col.name),
             data_type,
@@ -7567,6 +7579,18 @@ impl<'a> Planner<'a> {
             }
             SqlDataType::Text => Ok(DataType::Text),
             SqlDataType::Bytea => Ok(DataType::Bytea),
+            // GH#59: SQLite / MySQL spellings (the SQLite compatibility page lists
+            // them as mapped): BLOB → BYTEA, DATETIME → TIMESTAMP, TINYINT →
+            // SMALLINT, MEDIUMINT → INTEGER.
+            SqlDataType::Blob(_)
+            | SqlDataType::TinyBlob
+            | SqlDataType::MediumBlob
+            | SqlDataType::LongBlob
+            | SqlDataType::Binary(_)
+            | SqlDataType::Varbinary(_) => Ok(DataType::Bytea),
+            SqlDataType::Datetime(_) => Ok(DataType::Timestamp),
+            SqlDataType::TinyInt(_) => Ok(DataType::Int2),
+            SqlDataType::MediumInt(_) => Ok(DataType::Int4),
             SqlDataType::Date => Ok(DataType::Date),
             SqlDataType::Time(_, _) => Ok(DataType::Time),
             // GH#23: `TIMESTAMPTZ` / `TIMESTAMP WITH TIME ZONE` keep sqlparser's

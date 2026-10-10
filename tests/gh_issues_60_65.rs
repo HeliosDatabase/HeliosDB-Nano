@@ -161,3 +161,90 @@ fn gh64_sequences_are_per_database() {
     assert_eq!(ints(&b, "SELECT nextval('ks')"), vec![vec![1]]);
     assert_eq!(ints(&a, "SELECT nextval('ks')"), vec![vec![3]]);
 }
+
+#[test]
+fn gh58_out_of_range_integer_literal_is_rejected_not_wrapped() {
+    let db = db();
+    db.execute("CREATE TABLE w (i INTEGER, s SMALLINT)").expect("create");
+    assert!(
+        db.execute("INSERT INTO w (i) VALUES (5000000000)").is_err(),
+        "int4 literal wrapped"
+    );
+    assert!(
+        db.execute("INSERT INTO w (s) VALUES (70000)").is_err(),
+        "int2 literal wrapped"
+    );
+    assert!(
+        db.execute("INSERT INTO w (i) VALUES (1), (5000000000)").is_err(),
+        "multi-row literal wrapped"
+    );
+    assert!(db.query("SELECT * FROM w", &[]).expect("scan").is_empty());
+    db.execute("INSERT INTO w VALUES (2147483647, 32767)")
+        .expect("in range");
+    assert!(
+        db.execute("UPDATE w SET i = 5000000000").is_err(),
+        "UPDATE literal wrapped"
+    );
+    assert_eq!(ints(&db, "SELECT i, s FROM w"), vec![vec![2147483647, 32767]]);
+}
+
+#[test]
+fn gh56_row_cache_is_invalidated_by_drop_and_rename_rebuild() {
+    let db = db();
+    db.execute("CREATE TABLE t (id TEXT PRIMARY KEY, v TEXT, s TEXT)")
+        .expect("create");
+    db.execute("INSERT INTO t VALUES ('k', 'gen0', NULL)").expect("seed");
+    for g in 1..=2 {
+        db.execute("CREATE TABLE t_new (id TEXT PRIMARY KEY, v TEXT, s TEXT)")
+            .expect("t_new");
+        db.execute(&format!("INSERT INTO t_new VALUES ('k', 'gen{g}', NULL)"))
+            .expect("copy");
+        db.execute("DROP TABLE t").expect("drop");
+        db.execute("ALTER TABLE t_new RENAME TO t").expect("rename");
+        let point = db.query("SELECT v, s FROM t WHERE id = 'k'", &[]).expect("point");
+        assert_eq!(
+            point[0].values[0],
+            Value::String(format!("gen{g}")),
+            "stale point read in gen {g}"
+        );
+        db.execute(&format!("UPDATE t SET s = 's{g}' WHERE id = 'k'"))
+            .expect("update");
+        db.query("SELECT v, s FROM t WHERE id = 'k'", &[]).expect("fill cache");
+    }
+    let scan = db.query("SELECT v, s FROM t", &[]).expect("scan");
+    assert_eq!(
+        scan[0].values,
+        vec![Value::String("gen2".into()), Value::String("s2".into())]
+    );
+}
+
+#[test]
+fn gh59_sqlite_ddl_types_and_rowid_alias() {
+    let db = db();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, data BLOB, at DATETIME, flag TINYINT, m MEDIUMINT)")
+        .expect("sqlite types");
+    db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, x TEXT)")
+        .expect("create r");
+    db.execute("INSERT INTO r (x) VALUES ('a')").expect("rowid assigned");
+    db.execute("INSERT INTO r (id, x) VALUES (10, 'b')").expect("explicit");
+    db.execute("INSERT INTO r (x) VALUES ('c')").expect("after explicit");
+    assert_eq!(
+        ints(&db, "SELECT id FROM r ORDER BY id"),
+        vec![vec![1], vec![10], vec![11]]
+    );
+
+    for ty in ["INTEGER", "BIGINT"] {
+        db.execute(&format!(
+            "CREATE TABLE a_{ty} (id {ty} PRIMARY KEY AUTOINCREMENT, x TEXT)"
+        ))
+        .expect("autoincrement");
+        db.execute(&format!("INSERT INTO a_{ty} (x) VALUES ('a')")).expect("a");
+        db.execute(&format!("INSERT INTO a_{ty} (id, x) VALUES (10, 'b')"))
+            .expect("b");
+        db.execute(&format!("INSERT INTO a_{ty} (x) VALUES ('c')")).expect("c");
+        assert_eq!(
+            ints(&db, &format!("SELECT id FROM a_{ty} ORDER BY id")),
+            vec![vec![1], vec![10], vec![11]]
+        );
+    }
+}
