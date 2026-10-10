@@ -243,6 +243,11 @@ impl AggregateOperator {
                         Ok(Value::Int8(count as i64))
                     }
                     AggregateFunction::Sum => {
+                        // SQL: SUM over no non-NULL input is NULL, not 0 (GH#65;
+                        // the streaming path already did this).
+                        if values.is_empty() {
+                            return Ok(Value::Null);
+                        }
                         // PG: a NaN/±Infinity numeric operand makes the whole SUM
                         // special. Decimal accumulation below cannot represent it
                         // and would silently drop it, so fold the specials first.
@@ -399,6 +404,10 @@ impl AggregateOperator {
                                 other => Some(other.to_string()),
                             })
                             .collect();
+                        // PG / SQLite: no non-NULL input yields NULL, not '' (GH#65).
+                        if strings.is_empty() {
+                            return Ok(Value::Null);
+                        }
                         Ok(Value::String(strings.join(delimiter)))
                     }
                 }

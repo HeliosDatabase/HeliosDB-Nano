@@ -8983,7 +8983,11 @@ impl EmbeddedDatabase {
                     self.storage.scan_table_branch_aware(table_name)?
                 } else if merge_txn_writes {
                     let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
-                    txn.merge_with_write_set(table_name, base_tuples)?
+                    txn.merge_with_write_set_to_width(
+                        table_name,
+                        base_tuples,
+                        self.storage.catalog().get_table_schema(table_name)?.columns.len(),
+                    )?
                 } else if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema) {
                     match self
                         .storage
@@ -9395,7 +9399,11 @@ impl EmbeddedDatabase {
                     self.storage.scan_table_branch_aware(table_name)?
                 } else if merge_txn_writes {
                     let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
-                    txn.merge_with_write_set(table_name, base_tuples)?
+                    txn.merge_with_write_set_to_width(
+                        table_name,
+                        base_tuples,
+                        self.storage.catalog().get_table_schema(table_name)?.columns.len(),
+                    )?
                 } else if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema_arc) {
                     match self
                         .storage
@@ -9979,6 +9987,9 @@ impl EmbeddedDatabase {
                 // planned as `DropMulti`.
                 for dropped in Self::dropped_table_names(&plan) {
                     self.on_table_dropped(&dropped);
+                    // GH#62: rows this transaction staged for the dropped table
+                    // must not be flushed into a later table of the same name.
+                    txn.discard_staged_for_table(&dropped);
                 }
                 Ok(count)
             }
@@ -19210,7 +19221,11 @@ impl EmbeddedDatabase {
                 // also makes its PK point-lookup shortcut stand down.
                 let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
                 let tuples = if let Some(txn) = active_txn {
-                    txn.merge_with_write_set(table_name, base_tuples)?
+                    txn.merge_with_write_set_to_width(
+                        table_name,
+                        base_tuples,
+                        self.storage.catalog().get_table_schema(table_name)?.columns.len(),
+                    )?
                 } else {
                     base_tuples
                 };
@@ -19542,7 +19557,11 @@ impl EmbeddedDatabase {
                 // the params `Update` arm above for the full record.
                 let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
                 let tuples = if let Some(txn) = active_txn {
-                    txn.merge_with_write_set(table_name, base_tuples)?
+                    txn.merge_with_write_set_to_width(
+                        table_name,
+                        base_tuples,
+                        self.storage.catalog().get_table_schema(table_name)?.columns.len(),
+                    )?
                 } else {
                     base_tuples
                 };
@@ -19982,6 +20001,10 @@ impl EmbeddedDatabase {
                 let results = executor.execute(&plan)?;
                 for table in dropped_tables {
                     self.on_table_dropped(&table);
+                    // GH#62: see the text family's catch-all.
+                    if let Some(txn) = session_txn {
+                        txn.discard_staged_for_table(&table);
+                    }
                 }
                 Ok((results.len() as u64, Vec::new()))
             }
@@ -26969,7 +26992,11 @@ impl EmbeddedDatabase {
         let schema = catalog.get_table_schema(table_name)?;
         let base = self.storage.scan_table(table_name)?;
         let tuples = if let Some(txn) = active_txn {
-            txn.merge_with_write_set(table_name, base)?
+            txn.merge_with_write_set_to_width(
+                table_name,
+                base,
+                self.storage.catalog().get_table_schema(table_name)?.columns.len(),
+            )?
         } else {
             base
         };
@@ -27239,7 +27266,9 @@ impl EmbeddedDatabase {
                     if let Ok(default_expr) = serde_json::from_str::<sql::LogicalExpr>(json) {
                         if let Ok(v) = evaluator.evaluate(&default_expr, &empty_tuple) {
                             let casted = if v.data_type() != col.data_type {
-                                evaluator.cast_value(v, &col.data_type).unwrap_or(Value::Null)
+                                // A failed default conversion is a statement
+                                // error, not a request to insert SQL NULL.
+                                evaluator.cast_value(v, &col.data_type)?
                             } else {
                                 v
                             };

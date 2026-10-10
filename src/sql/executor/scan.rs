@@ -199,7 +199,7 @@ fn txn_base_tuples(
         }
     }
     let base_tuples = storage.scan_table_at_snapshot(actual_table_name, snapshot)?;
-    txn.merge_with_write_set(actual_table_name, base_tuples)
+    txn.merge_with_write_set_to_width(actual_table_name, base_tuples, schema.columns.len())
 }
 
 pub(crate) fn storage_predicates_are_sql_safe(schema: &Schema, predicates: &[AnalyzedPredicate]) -> bool {
