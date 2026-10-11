@@ -233,3 +233,41 @@ async fn standby_joining_after_the_data_receives_ddl_and_rows() {
         "history that predates the standby must be replayed, not crash the applier"
     );
 }
+
+/// Rolled-back and failed statements must never be shown to a standby: its rows must
+/// equal the primary's committed rows, not the union of everything that was attempted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rolled_back_and_failed_statements_never_reach_the_standby() {
+    let c = cluster();
+    let _primary = Daemon::spawn(c.dir.path(), "primary", &c.token, &c.primary_args);
+    let writer = connect(c.pg_p).await;
+    let _standby = Daemon::spawn(c.dir.path(), "standby", &c.token, &c.standby_args);
+    let _ = connect(c.pg_s).await;
+
+    writer
+        .batch_execute("CREATE TABLE t (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    writer.batch_execute("INSERT INTO t VALUES (1)").await.unwrap();
+    writer
+        .batch_execute("BEGIN; INSERT INTO t VALUES (10); INSERT INTO t VALUES (11); ROLLBACK")
+        .await
+        .unwrap();
+    // The third row collides with row 1: the whole statement must leave nothing behind.
+    assert!(writer
+        .batch_execute("INSERT INTO t VALUES (20), (21), (1)")
+        .await
+        .is_err());
+    writer
+        .batch_execute("BEGIN; INSERT INTO t VALUES (2); INSERT INTO t VALUES (3); COMMIT")
+        .await
+        .unwrap();
+
+    let committed = ids(&writer).await.unwrap();
+    assert_eq!(committed, vec![1, 2, 3]);
+    assert_eq!(
+        settle(c.pg_s, &committed, Duration::from_secs(30)).await,
+        Ok(committed),
+        "the standby must hold exactly what the primary committed"
+    );
+}

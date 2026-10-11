@@ -350,6 +350,182 @@ pub struct WalMetrics {
     pub sync_mode: WalSyncMode,
 }
 
+/// One reserved LSN in the ordered publisher.
+enum Slot {
+    /// Allocated; its write has not resolved yet.
+    Reserved,
+    /// Durable (or about to be) and ready to be shown to standbys.
+    Ready(WalOperation),
+    /// Allocated but never persisted (failed write or abandoned): a hole.
+    Skipped,
+}
+
+struct PublishState {
+    /// Lowest LSN not yet resolved. Everything below it has been published or skipped.
+    next: u64,
+    slots: std::collections::BTreeMap<u64, Slot>,
+}
+
+/// Publishes logical WAL entries to standbys strictly in LSN order, and only after
+/// the write that made them durable has succeeded.
+///
+/// Two committers can finish out of LSN order (an fsync stalls one of them). Showing
+/// LSN 6 before LSN 5 lets a standby advance its cursor past 5 and then drop 5 as
+/// "already applied". So an entry is published only when every lower LSN has resolved
+/// (published or skipped), and `published_lsn` is the watermark below which the
+/// persisted history is complete: catch-up must never read above it.
+struct Publisher {
+    state: Mutex<PublishState>,
+    published: AtomicU64,
+}
+
+impl Publisher {
+    fn new(last_lsn: u64) -> Self {
+        Self {
+            state: Mutex::new(PublishState {
+                next: last_lsn + 1,
+                slots: std::collections::BTreeMap::new(),
+            }),
+            published: AtomicU64::new(last_lsn),
+        }
+    }
+
+    /// Allocate `count` contiguous LSNs and register them as unresolved. Allocation
+    /// and registration happen under one lock so the publisher can never see a gap
+    /// it does not know about.
+    fn reserve(&self, current: &AtomicU64, count: u64) -> u64 {
+        let mut state = self.state.lock();
+        let first = current.fetch_add(count, Ordering::SeqCst) + 1;
+        for lsn in first..first + count {
+            state.slots.insert(lsn, Slot::Reserved);
+        }
+        first
+    }
+
+    /// Resolve reserved LSNs (`Some` = publish, `None` = skip) and publish every
+    /// entry that is now contiguous with the watermark, in order.
+    fn resolve(&self, items: Vec<(u64, Option<WalOperation>)>) {
+        let mut state = self.state.lock();
+        for (lsn, operation) in items {
+            let slot = match operation {
+                Some(operation) => Slot::Ready(operation),
+                None => Slot::Skipped,
+            };
+            state.slots.insert(lsn, slot);
+        }
+        loop {
+            let next = state.next;
+            if matches!(state.slots.get(&next), None | Some(Slot::Reserved)) {
+                break;
+            }
+            if let Some(Slot::Ready(_operation)) = state.slots.remove(&next) {
+                #[cfg(feature = "ha-tier1")]
+                {
+                    if ha_state().broadcast_wal_operation(next, &_operation).is_some() {
+                        debug!("WAL entry {} published to standbys", next);
+                    }
+                }
+            }
+            state.next = next + 1;
+        }
+        self.published.store(state.next - 1, Ordering::SeqCst);
+    }
+}
+
+/// Statement-scoped capture of logical WAL operations.
+///
+/// An autocommit statement logs its row changes while it runs, but it can still fail
+/// afterwards and roll back. Logging then would publish history for data that never
+/// committed. While a frame is open for the statement's transaction, `append*` calls
+/// on that thread are buffered instead; the transaction takes them at commit and
+/// writes them in the SAME RocksDB batch as its data, and a rollback simply drops
+/// the frame. With no frame open, appends behave exactly as before.
+pub(crate) mod statement_capture {
+    use super::WalOperation;
+    use std::cell::RefCell;
+    use std::marker::PhantomData;
+
+    struct Frame {
+        txn_id: u64,
+        wal_id: usize,
+        ops: Vec<WalOperation>,
+        sync: bool,
+    }
+
+    thread_local! {
+        static FRAMES: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Closes its frame (discarding anything not taken) on drop. Not `Send`: a frame
+    /// belongs to the thread that executes the statement.
+    pub struct Guard {
+        depth: usize,
+        _thread_bound: PhantomData<*const ()>,
+    }
+
+    pub fn begin(txn_id: u64, wal_id: usize) -> Guard {
+        let depth = FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            frames.push(Frame {
+                txn_id,
+                wal_id,
+                ops: Vec::new(),
+                sync: false,
+            });
+            frames.len()
+        });
+        Guard {
+            depth,
+            _thread_bound: PhantomData,
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FRAMES.with(|frames| frames.borrow_mut().truncate(self.depth.saturating_sub(1)));
+        }
+    }
+
+    /// Buffer `operation` if the innermost frame belongs to this WAL; otherwise give
+    /// it back so the caller appends it immediately.
+    pub(super) fn offer(wal_id: usize, operation: WalOperation, sync: bool) -> Option<WalOperation> {
+        FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            match frames.last_mut() {
+                Some(frame) if frame.wal_id == wal_id => {
+                    frame.ops.push(operation);
+                    frame.sync |= sync;
+                    None
+                }
+                _ => Some(operation),
+            }
+        })
+    }
+
+    /// Take what the transaction `txn_id` buffered, and whether any of it asked for
+    /// a synchronous write.
+    pub fn take(txn_id: u64, wal_id: usize) -> Option<(Vec<WalOperation>, bool)> {
+        FRAMES.with(|frames| {
+            frames
+                .borrow_mut()
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.txn_id == txn_id && frame.wal_id == wal_id)
+                .map(|frame| (std::mem::take(&mut frame.ops), std::mem::replace(&mut frame.sync, false)))
+        })
+    }
+}
+
+/// Entries reserved and sealed into a caller's batch but not yet durable.
+///
+/// Created by [`WriteAheadLog::stage`]. After the caller's write the owner MUST call
+/// exactly one of [`WriteAheadLog::publish_staged`] / [`WriteAheadLog::abandon_staged`];
+/// dropping it unresolved would stall publication of every later entry.
+#[must_use = "a staged WAL batch must be published or abandoned"]
+pub struct StagedWal {
+    entries: Vec<WalEntry>,
+}
+
 /// Write-Ahead Log
 ///
 /// Provides durability through write-ahead logging. All modifications are
@@ -373,6 +549,8 @@ pub struct WriteAheadLog {
     db: Arc<DB>,
     /// Current LSN (Log Sequence Number)
     current_lsn: Arc<AtomicU64>,
+    /// In-order, after-durable publication of entries to standbys.
+    publisher: Arc<Publisher>,
     /// Synchronization mode
     sync_mode: WalSyncMode,
     /// Write options for WAL operations
@@ -459,6 +637,7 @@ impl WriteAheadLog {
         let wal = Self {
             db: Arc::clone(&db),
             current_lsn: Arc::new(AtomicU64::new(current_lsn)),
+            publisher: Arc::new(Publisher::new(current_lsn)),
             sync_mode,
             write_opts,
             commit_queue: commit_queue.clone(),
@@ -477,13 +656,13 @@ impl WriteAheadLog {
         if sync_mode == WalSyncMode::GroupCommit {
             if let Some(queue) = commit_queue {
                 let db_clone = Arc::clone(&db);
-                let current_lsn_clone = Arc::clone(&wal.current_lsn);
+                let publisher_clone = Arc::clone(&wal.publisher);
                 let batch_timeout = wal.batch_timeout;
                 let key_manager_clone = wal.key_manager.clone();
 
                 let handle = thread::spawn(move || {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        Self::group_commit_loop(db_clone, queue, current_lsn_clone, batch_timeout, key_manager_clone);
+                        Self::group_commit_loop(db_clone, queue, publisher_clone, batch_timeout, key_manager_clone);
                     })) {
                         Ok(()) => {}
                         Err(panic_info) => {
@@ -585,9 +764,113 @@ impl WriteAheadLog {
         }
     }
 
-    /// Get next LSN
-    fn next_lsn(&self) -> u64 {
-        self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1
+    /// Reserve `count` contiguous LSNs with the publisher.
+    fn reserve(&self, count: u64) -> u64 {
+        self.publisher.reserve(&self.current_lsn, count)
+    }
+
+    /// Identity of this log, for matching statement-capture frames.
+    fn capture_id(&self) -> usize {
+        Arc::as_ptr(&self.current_lsn) as usize
+    }
+
+    /// Open a statement-capture frame for transaction `txn_id` on this log.
+    pub(crate) fn begin_statement_capture(&self, txn_id: u64) -> statement_capture::Guard {
+        statement_capture::begin(txn_id, self.capture_id())
+    }
+
+    /// What `txn_id`'s statement buffered (see [`statement_capture`]).
+    pub(crate) fn take_statement_capture(&self, txn_id: u64) -> Option<(Vec<WalOperation>, bool)> {
+        statement_capture::take(txn_id, self.capture_id())
+    }
+
+    /// Highest LSN below which every entry is either published or a known hole.
+    /// Catch-up reads must not go above it.
+    pub fn published_lsn(&self) -> u64 {
+        self.publisher.published.load(Ordering::SeqCst)
+    }
+
+    /// Resolve one reserved LSN as persisted, publish in order, and (sync modes)
+    /// wait for the standby acknowledgement.
+    fn publish_one(&self, lsn: u64, operation: WalOperation) {
+        self.publisher.resolve(vec![(lsn, Some(operation))]);
+        Self::wait_replicated(lsn);
+    }
+
+    /// Resolve a reserved LSN whose write failed: a hole, never published.
+    fn skip(&self, lsns: impl IntoIterator<Item = u64>) {
+        self.publisher.resolve(lsns.into_iter().map(|lsn| (lsn, None)).collect());
+    }
+
+    /// In sync/semi-sync mode block (bounded) until a standby has the entry. A no-op
+    /// without a connected standby, so a lone primary never pays the timeout.
+    pub fn wait_replicated(lsn: u64) {
+        #[cfg(feature = "ha-tier1")]
+        {
+            use crate::replication::ha_state::HARole;
+            let state = ha_state();
+            if state.get_role() == HARole::Primary && !state.get_standbys().is_empty() {
+                // Faster-safe: wait for the first standby ACK, not all.
+                const DEFAULT_SYNC_TIMEOUT_MS: u64 = 10000;
+                if let Err(e) = state.wait_for_sync(lsn, DEFAULT_SYNC_TIMEOUT_MS) {
+                    // Log but don't fail: data is written locally; degraded mode.
+                    warn!("Sync replication wait for LSN {}: {}", lsn, e);
+                }
+            }
+        }
+        #[cfg(not(feature = "ha-tier1"))]
+        {
+            let _ = lsn;
+        }
+    }
+
+    /// Seal `operations` into `batch` under freshly reserved LSNs WITHOUT writing.
+    ///
+    /// The caller writes `batch` (its data plus these entries plus `wal:last_lsn`) in
+    /// ONE RocksDB write, then calls [`Self::publish_staged`] on success or
+    /// [`Self::abandon_staged`] on failure. History and data are therefore atomic:
+    /// there is no state where a standby can be shown an entry for data that did not
+    /// commit, and none where committed data lacks its entry.
+    pub fn stage(&self, operations: Vec<WalOperation>, batch: &mut WriteBatch) -> Result<Option<StagedWal>> {
+        if operations.is_empty() {
+            return Ok(None);
+        }
+        let count = operations.len() as u64;
+        let first = self.reserve(count);
+        let mut entries = Vec::with_capacity(operations.len());
+        let mut sealed = Vec::with_capacity(operations.len());
+        for (offset, operation) in operations.into_iter().enumerate() {
+            let entry = WalEntry::new(first + offset as u64, operation);
+            match stored_entry_bytes(self.key_manager.as_deref(), &entry) {
+                Ok(data) => sealed.push((format!("wal:entries:{:020}", entry.lsn), data)),
+                Err(e) => {
+                    self.skip(first..first + count);
+                    return Err(e);
+                }
+            }
+            entries.push(entry);
+        }
+        // Only now touch the caller's batch, so a sealing failure leaves it untouched.
+        for (key, data) in &sealed {
+            batch.put(key.as_bytes(), data);
+        }
+        batch.put(b"wal:last_lsn", (first + count - 1).to_le_bytes());
+        Ok(Some(StagedWal { entries }))
+    }
+
+    /// The staged batch is durable: publish its entries in LSN order. Returns the
+    /// highest LSN, to pass to [`Self::wait_replicated`] once locks are released.
+    pub fn publish_staged(&self, staged: StagedWal) -> u64 {
+        let highest = staged.entries.last().map_or(0, |entry| entry.lsn);
+        self.publisher
+            .resolve(staged.entries.into_iter().map(|e| (e.lsn, Some(e.operation))).collect());
+        self.maybe_advance_checkpoint();
+        highest
+    }
+
+    /// The staged batch was not written: its LSNs become holes and nothing is published.
+    pub fn abandon_staged(&self, staged: StagedWal) {
+        self.skip(staged.entries.iter().map(|entry| entry.lsn));
     }
 
     /// Append an entry to the WAL
@@ -598,17 +881,29 @@ impl WriteAheadLog {
     /// If sync_mode is Sync, the write is fsynced immediately.
     /// If sync_mode is GroupCommit, the write is queued and batched.
     pub fn append(&self, operation: WalOperation) -> Result<u64> {
+        // Inside a statement-capture frame the entry is buffered and written with the
+        // transaction's own commit batch (see `statement_capture`).
+        let Some(operation) = statement_capture::offer(self.capture_id(), operation, true) else {
+            return Ok(0);
+        };
+
         // Use group commit path if enabled
         if self.sync_mode == WalSyncMode::GroupCommit {
             return self.append_group_commit(operation);
         }
 
         // Original synchronous/async path
-        let lsn = self.next_lsn();
+        let lsn = self.reserve(1);
         let entry = WalEntry::new(lsn, operation);
 
         // Serialize and seal the entry (see the value codec above).
-        let data = stored_entry_bytes(self.key_manager.as_deref(), &entry)?;
+        let data = match stored_entry_bytes(self.key_manager.as_deref(), &entry) {
+            Ok(data) => data,
+            Err(e) => {
+                self.skip([lsn]);
+                return Err(e);
+            }
+        };
 
         // Create a batch for atomic write
         let mut batch = WriteBatch::default();
@@ -621,12 +916,13 @@ impl WriteAheadLog {
         batch.put(b"wal:last_lsn", lsn.to_le_bytes());
 
         // Write atomically
-        self.db
-            .write_opt(batch, &self.write_opts)
-            .map_err(|e| Error::storage(format!("Failed to append WAL entry: {}", e)))?;
+        if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
+            self.skip([lsn]);
+            return Err(Error::storage(format!("Failed to append WAL entry: {}", e)));
+        }
 
-        // Broadcast to standbys (and, in sync/semi-sync mode, wait for first ACK).
-        Self::broadcast_after_append(lsn, &entry.operation);
+        // Publish to standbys in LSN order (and, in sync/semi-sync mode, wait for the ACK).
+        self.publish_one(lsn, entry.operation);
 
         // GH#35 (A3): periodic checkpoint advancement.
         self.maybe_advance_checkpoint();
@@ -635,53 +931,21 @@ impl WriteAheadLog {
         Ok(lsn)
     }
 
-    /// Broadcast a just-appended WAL entry to HA standbys, and (in sync/semi-sync
-    /// mode) wait for first-ACK. No-op without `ha-tier1` or when no standby is
-    /// configured. Shared by `append` and `append_nosync` so the fsync decision
-    /// can never silently disable replication (see P0#2): an autocommit
-    /// UPDATE/DELETE on the nosync path must still replicate exactly like INSERT.
-    fn broadcast_after_append(lsn: u64, operation: &WalOperation) {
-        Self::broadcast_after_batch(std::iter::once((lsn, operation)));
-    }
-
-    fn broadcast_after_batch<'a, I>(entries: I)
-    where
-        I: IntoIterator<Item = (u64, &'a WalOperation)>,
-    {
-        #[cfg(feature = "ha-tier1")]
-        {
-            let mut highest_replicated_lsn: Option<u64> = None;
-            for (lsn, operation) in entries {
-                if let Some(replicated_lsn) = ha_state().broadcast_wal_operation(lsn, operation) {
-                    debug!("WAL entry {} replicated to standbys", replicated_lsn);
-                    highest_replicated_lsn =
-                        Some(highest_replicated_lsn.map_or(replicated_lsn, |current| current.max(replicated_lsn)));
-                }
-            }
-
-            if let Some(replicated_lsn) = highest_replicated_lsn {
-                // Faster-safe: wait for the first standby ACK, not all.
-                // Standby flush/apply LSNs are monotonic, so waiting for the
-                // highest LSN in a committed batch covers every earlier entry.
-                const DEFAULT_SYNC_TIMEOUT_MS: u64 = 10000;
-                if let Err(e) = ha_state().wait_for_sync(replicated_lsn, DEFAULT_SYNC_TIMEOUT_MS) {
-                    // Log but don't fail — data is written locally; degraded mode.
-                    warn!("Sync replication wait for LSN {}: {}", replicated_lsn, e);
-                }
-            }
-        }
-        #[cfg(not(feature = "ha-tier1"))]
-        {
-            let _ = entries;
-        }
-    }
-
     /// Append a WAL entry without fsync (for DDL operations where metadata
     /// is already crash-safe in RocksDB). Saves ~1ms per DDL operation.
     pub fn append_nosync(&self, operation: WalOperation) -> Result<u64> {
-        let lsn = self.next_lsn();
+        let Some(operation) = statement_capture::offer(self.capture_id(), operation, false) else {
+            return Ok(0);
+        };
+        let lsn = self.reserve(1);
         let entry = WalEntry::new(lsn, operation);
-        let data = stored_entry_bytes(self.key_manager.as_deref(), &entry)?;
+        let data = match stored_entry_bytes(self.key_manager.as_deref(), &entry) {
+            Ok(data) => data,
+            Err(e) => {
+                self.skip([lsn]);
+                return Err(e);
+            }
+        };
 
         let mut batch = WriteBatch::default();
         let key = format!("wal:entries:{:020}", lsn);
@@ -691,13 +955,14 @@ impl WriteAheadLog {
         // Write without fsync
         let mut nosync_opts = WriteOptions::default();
         nosync_opts.set_sync(false);
-        self.db
-            .write_opt(batch, &nosync_opts)
-            .map_err(|e| Error::storage(format!("Failed to append WAL entry: {}", e)))?;
+        if let Err(e) = self.db.write_opt(batch, &nosync_opts) {
+            self.skip([lsn]);
+            return Err(Error::storage(format!("Failed to append WAL entry: {}", e)));
+        }
 
-        // P0#2 fix: still broadcast to HA standbys (and honor sync/semi-sync ACK).
+        // P0#2: still publish to HA standbys (and honor sync/semi-sync ACK).
         // The nosync path only skips the local fsync — it must NOT skip replication.
-        Self::broadcast_after_append(lsn, &entry.operation);
+        self.publish_one(lsn, entry.operation);
 
         // GH#35 (A3): periodic checkpoint advancement.
         self.maybe_advance_checkpoint();
@@ -735,52 +1000,63 @@ impl WriteAheadLog {
     /// `Ok(vec![])` — touching neither RocksDB nor the broadcast channel — when
     /// `operations` is empty (a transaction that staged nothing loggable).
     pub fn append_batch(&self, operations: Vec<WalOperation>, sync: bool) -> Result<Vec<u64>> {
-        if operations.is_empty() {
-            return Ok(Vec::new());
-        }
-
         let mut batch = WriteBatch::default();
-        let mut entries = Vec::with_capacity(operations.len());
-        let mut lsns = Vec::with_capacity(operations.len());
-        let mut highest_lsn = 0u64;
+        let Some(staged) = self.stage(operations, &mut batch)? else {
+            return Ok(Vec::new());
+        };
+        let lsns: Vec<u64> = staged.entries.iter().map(|entry| entry.lsn).collect();
 
-        for operation in operations {
-            let lsn = self.next_lsn();
-            let entry = WalEntry::new(lsn, operation);
-            let data = stored_entry_bytes(self.key_manager.as_deref(), &entry)?;
-            let key = format!("wal:entries:{:020}", lsn);
-            batch.put(key.as_bytes(), &data);
-            highest_lsn = lsn;
-            lsns.push(lsn);
-            entries.push(entry);
-        }
-        batch.put(b"wal:last_lsn", highest_lsn.to_le_bytes());
-
-        // Deliberately bypasses `WalSyncMode::GroupCommit` the way
-        // `append_nosync` does: the "batched/nosync family" of appends always
-        // writes directly, because the caller already owns the batching
-        // decision. Not a new inconsistency — the existing convention.
-        if sync {
-            self.db
-                .write_opt(batch, &self.write_opts)
-                .map_err(|e| Error::storage(format!("Failed to append WAL batch: {}", e)))?;
+        // Deliberately bypasses `WalSyncMode::GroupCommit` the way `append_nosync`
+        // does: the "batched/nosync family" of appends always writes directly.
+        let written = if sync {
+            self.db.write_opt(batch, &self.write_opts)
         } else {
             let mut nosync_opts = WriteOptions::default();
             nosync_opts.set_sync(false);
-            self.db
-                .write_opt(batch, &nosync_opts)
-                .map_err(|e| Error::storage(format!("Failed to append WAL batch: {}", e)))?;
+            self.db.write_opt(batch, &nosync_opts)
+        };
+        if let Err(e) = written {
+            self.abandon_staged(staged);
+            return Err(Error::storage(format!("Failed to append WAL batch: {}", e)));
         }
 
-        // Same broadcast + single highest-LSN sync-wait every other append path
-        // uses (P0#2: the nosync arm above must not have skipped replication).
-        Self::broadcast_after_batch(entries.iter().map(|e| (e.lsn, &e.operation)));
-
-        // GH#35 (A3): periodic checkpoint advancement.
-        self.maybe_advance_checkpoint();
-
-        debug!("Appended WAL batch: {} entries, LSN {}", lsns.len(), highest_lsn);
+        let highest = self.publish_staged(staged);
+        Self::wait_replicated(highest);
+        debug!("Appended WAL batch: {} entries, LSN {}", lsns.len(), highest);
         Ok(lsns)
+    }
+
+    /// Append `operation` together with the caller's data `batch` in ONE write, so
+    /// the entry exists exactly when the data does. Inside a statement-capture frame
+    /// the data is written now and the entry is deferred to the transaction commit.
+    pub fn append_with_batch(
+        &self,
+        operation: WalOperation,
+        mut batch: WriteBatch,
+        options: Option<&WriteOptions>,
+    ) -> Result<u64> {
+        let write = |batch: WriteBatch| -> Result<()> {
+            match options {
+                Some(options) => self.db.write_opt(batch, options),
+                None => self.db.write(batch),
+            }
+            .map_err(|e| Error::storage(format!("Failed to write data with WAL entry: {}", e)))
+        };
+        let Some(operation) = statement_capture::offer(self.capture_id(), operation, false) else {
+            write(batch)?;
+            return Ok(0);
+        };
+        let Some(staged) = self.stage(vec![operation], &mut batch)? else {
+            write(batch)?;
+            return Ok(0);
+        };
+        if let Err(e) = write(batch) {
+            self.abandon_staged(staged);
+            return Err(e);
+        }
+        let lsn = self.publish_staged(staged);
+        Self::wait_replicated(lsn);
+        Ok(lsn)
     }
 
     /// Append a WAL entry and wait for synchronous replication acknowledgement
@@ -819,7 +1095,7 @@ impl WriteAheadLog {
 
     /// Append entry using group commit
     fn append_group_commit(&self, operation: WalOperation) -> Result<u64> {
-        let lsn = self.next_lsn();
+        let lsn = self.reserve(1);
         let entry = WalEntry::new(lsn, operation);
 
         // Create channel for receiving result
@@ -830,6 +1106,7 @@ impl WriteAheadLog {
             let pending = PendingWrite { entry, result_tx: tx };
             queue.lock().push_back(pending);
         } else {
+            self.skip([lsn]);
             return Err(Error::storage("Group commit queue not initialized"));
         }
 
@@ -1158,7 +1435,11 @@ impl WriteAheadLog {
     /// the transaction system bypasses WAL for durability.
     /// Returns the new LSN value.
     pub fn increment_lsn(&self) -> u64 {
-        self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1
+        // Goes through the publisher so the number is a known hole, not a gap that
+        // would stall publication of every later entry.
+        let lsn = self.reserve(1);
+        self.skip([lsn]);
+        lsn
     }
 
     /// Get synchronization mode
@@ -1196,7 +1477,7 @@ impl WriteAheadLog {
     fn group_commit_loop(
         db: Arc<DB>,
         queue: Arc<Mutex<VecDeque<PendingWrite>>>,
-        _current_lsn: Arc<AtomicU64>,
+        publisher: Arc<Publisher>,
         batch_timeout: Duration,
         key_manager: Option<Arc<KeyManager>>,
     ) {
@@ -1224,6 +1505,7 @@ impl WriteAheadLog {
             // Build batch
             let mut batch = WriteBatch::default();
             let mut last_lsn = 0u64;
+            let mut sealing_failed = std::collections::HashSet::new();
 
             for write in &pending {
                 let lsn = write.entry.lsn;
@@ -1240,6 +1522,7 @@ impl WriteAheadLog {
                     Err(e) => {
                         // Send error to waiter
                         let _ = write.result_tx.send(Err(e));
+                        sealing_failed.insert(write.entry.lsn);
                         continue;
                     }
                 }
@@ -1254,18 +1537,30 @@ impl WriteAheadLog {
 
             match db.write_opt(batch, &write_opts) {
                 Ok(()) => {
-                    // Broadcast to standbys for replication and, in sync/semi-sync
-                    // mode, wait for the highest batch LSN before reporting success.
-                    Self::broadcast_after_batch(pending.iter().map(|write| (write.entry.lsn, &write.entry.operation)));
+                    // Publish to standbys in LSN order and, in sync/semi-sync mode,
+                    // wait for the highest batch LSN before reporting success.
+                    let highest = pending.iter().map(|write| write.entry.lsn).max().unwrap_or(0);
+                    let mut items = Vec::with_capacity(pending.len());
+                    let mut waiters = Vec::with_capacity(pending.len());
+                    for write in pending {
+                        let lsn = write.entry.lsn;
+                        let operation = (!sealing_failed.contains(&lsn)).then_some(write.entry.operation);
+                        items.push((lsn, operation));
+                        waiters.push((write.result_tx, lsn));
+                    }
+                    publisher.resolve(items);
+                    Self::wait_replicated(highest);
 
                     // Notify all waiters of success
-                    for write in pending {
-                        let _ = write.result_tx.send(Ok(write.entry.lsn));
+                    for (result_tx, lsn) in waiters {
+                        let _ = result_tx.send(Ok(lsn));
                     }
                     debug!("Group commit: successfully flushed {} writes", last_lsn);
                 }
                 Err(e) => {
                     let err_msg = format!("Group commit batch write failed: {}", e);
+                    // The LSNs become holes; nothing is published for them.
+                    publisher.resolve(pending.iter().map(|write| (write.entry.lsn, None)).collect());
                     // Notify all waiters of failure
                     for write in pending {
                         let _ = write.result_tx.send(Err(Error::storage(err_msg.clone())));
@@ -1649,6 +1944,112 @@ mod tests {
         opts.create_if_missing(true);
         let db = DB::open(&opts, temp_dir.path()).unwrap();
         (temp_dir, Arc::new(db))
+    }
+
+    fn insert_op(n: u8) -> WalOperation {
+        WalOperation::Insert {
+            table: "t".to_string(),
+            key: format!("data:t:{n}").into_bytes(),
+            tuple: vec![n],
+        }
+    }
+
+    /// A staged batch whose write FAILED must leave no history: nothing persisted,
+    /// nothing published, and its LSNs become holes that do not stall later entries.
+    #[test]
+    fn abandoned_staged_entries_leave_no_history_and_do_not_stall_publication() {
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+
+        let mut lost = WriteBatch::default();
+        let staged = wal.stage(vec![insert_op(1), insert_op(2)], &mut lost).unwrap().unwrap();
+        // The caller's write fails: the batch is dropped unwritten.
+        wal.abandon_staged(staged);
+        drop(lost);
+        assert!(wal.replay().unwrap().is_empty(), "nothing may have been persisted");
+
+        // A later entry still publishes (the holes did not stall the watermark).
+        let lsn = wal.append(insert_op(3)).unwrap();
+        assert_eq!(lsn, 3);
+        assert_eq!(wal.published_lsn(), 3);
+        let entries = wal.replay().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].lsn, 3);
+    }
+
+    /// Two committers finishing out of LSN order must not let the watermark (and so
+    /// catch-up and the live feed) jump over the earlier, still-unresolved entry.
+    #[test]
+    fn publication_waits_for_the_lowest_unresolved_lsn() {
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+
+        let mut first = WriteBatch::default();
+        let a = wal.stage(vec![insert_op(1)], &mut first).unwrap().unwrap();
+        let mut second = WriteBatch::default();
+        let b = wal.stage(vec![insert_op(2)], &mut second).unwrap().unwrap();
+
+        // B (LSN 2) lands and is published first.
+        db.write(second).unwrap();
+        wal.publish_staged(b);
+        assert_eq!(wal.published_lsn(), 0, "LSN 2 must not be visible while LSN 1 is unresolved");
+
+        // A (LSN 1) lands: both become visible, in order.
+        db.write(first).unwrap();
+        wal.publish_staged(a);
+        assert_eq!(wal.published_lsn(), 2);
+    }
+
+    /// Entries buffered in a statement-capture frame are written only if the owner
+    /// takes them; a rolled-back statement (frame dropped) leaves no history.
+    #[test]
+    fn statement_capture_defers_appends_and_discards_on_rollback() {
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+
+        {
+            let _frame = wal.begin_statement_capture(7);
+            assert_eq!(wal.append(insert_op(1)).unwrap(), 0, "captured, not appended");
+            assert_eq!(wal.append_nosync(insert_op(2)).unwrap(), 0);
+            assert!(wal.replay().unwrap().is_empty());
+            // Statement fails: the frame is dropped without being taken.
+        }
+        assert!(wal.replay().unwrap().is_empty(), "a rolled-back statement leaves no history");
+        assert_eq!(wal.append(insert_op(3)).unwrap(), 1, "with no frame, appends are immediate again");
+
+        // The committing transaction takes the buffered operations.
+        let frame = wal.begin_statement_capture(9);
+        wal.append(insert_op(4)).unwrap();
+        let (ops, wants_sync) = wal.take_statement_capture(9).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert!(wants_sync, "a synchronous append asks for a synchronous commit write");
+        assert!(wal.take_statement_capture(8).is_none(), "another transaction's frame is not taken");
+        drop(frame);
+    }
+
+    /// Data and its history entry are one write: a failed combined write leaves neither.
+    #[test]
+    fn append_with_batch_writes_data_and_entry_together() {
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        db.put(b"data:t:1", b"row").unwrap();
+
+        let mut batch = WriteBatch::default();
+        batch.delete(b"data:t:1");
+        let lsn = wal
+            .append_with_batch(
+                WalOperation::Delete {
+                    table: "t".into(),
+                    key: b"data:t:1".to_vec(),
+                },
+                batch,
+                None,
+            )
+            .unwrap();
+        assert_eq!(lsn, 1);
+        assert!(db.get(b"data:t:1").unwrap().is_none());
+        assert_eq!(wal.replay().unwrap().len(), 1);
+        assert_eq!(wal.published_lsn(), 1);
     }
 
     #[test]

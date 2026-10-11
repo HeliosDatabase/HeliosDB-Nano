@@ -102,9 +102,28 @@ Delivered:
 - A fresh standby joining after the data/DDL exist now receives the retained history (it used to crash with `Table 't' does not exist`); if that history was checkpointed away it gets the refusal instead.
 
 Not delivered by step 1 (still open, tracked above):
-- The logical WAL is still appended before the data batch commits (`transaction.rs`), so a commit that fails after the append can be replicated; the cursor does not fix that.
+- ~~The logical WAL is appended before the data batch commits~~ — closed in section 8.
 - LSNs are not a commit order and can have holes; catch-up trusts the source, it cannot verify contiguity.
 - ACK identity is still the numeric LSN (`Received`), and `report_applied` has no production caller.
 - Native protocol version is not bumped: a new standby against an old primary never sees a barrier and times out (fail closed), an old standby against a new primary ignores the barrier.
 - `replay_from` loads the whole retained range into memory; fine under the default checkpoint policy, needs chunked iteration before long retention is allowed.
 - Column-storage tables are refused on the standby (pre-existing).
+
+## 8. Append-before-commit hole (closed for the commit paths; read the residuals)
+
+The logical WAL used to be appended, made durable and broadcast BEFORE the data write it described, in three places. A failed write, or a statement that logged and then rolled back, left history for data that never committed, and a standby applied it.
+
+Changes:
+- **Transaction commit** (`transaction.rs`): the entries are sealed into the commit's own RocksDB batch (`WriteAheadLog::stage`) and written with the data in one write; they are published only after that write succeeds (`publish_staged`) and become holes if it fails (`abandon_staged`). Data and history are atomic in both directions (no entry without data, no data without entry). Strict `logical_wal_per_statement` forces that single write to be synced.
+- **Autocommit statements**: the `log_data_*`/`log_*` calls made while a statement runs are buffered in a statement-scoped frame (`statement_capture`, opened by the five autocommit wrappers in `lib.rs`) and written with that transaction's commit batch; a rollback drops the frame. Outside a frame (any caller that has none) appends behave exactly as before.
+- **`StorageEngine::delete`** of a `data:` key writes the delete and its entry in one batch (`append_with_batch`).
+- **Ordered publication**: entries reach standbys strictly in LSN order and only once every lower LSN has resolved; `published_lsn()` is the watermark and catch-up never reads above it. Without this, two committers finishing out of order let a standby move its cursor past an entry that was still in flight and then drop it as "already applied". `increment_lsn` now reserves and skips, so counter bumps are known holes instead of gaps that would stall publication.
+- The group-commit thread resolves through the same publisher; a failed batch publishes nothing.
+
+Tests: failed multi-row `INSERT` leaves no entries (red on the previous code: phantom entries for the rows before the violation), publication waits for the lowest unresolved LSN, abandoned entries leave no history and do not stall later ones, capture defers and discards, data+entry are one write, and a real-daemon check that rolled-back and failed statements never reach a standby.
+
+Residuals (not closed here):
+- Calls to `log_*` made OUTSIDE a capture frame or a session commit still append immediately and in the old order. Known ones: DDL executed outside an autocommit wrapper, statements on threads other than the executing one (the frame is thread-local), and any fast path that never opens a transaction. A source sweep for these is the next item.
+- Autocommit DDL is now logged at commit, after the catalog change: a crash between the two leaves the primary with a table the standby never receives (previously the reverse: the standby could get a DDL the primary lacked). Neither is acceptable long-term; the physical channel removes the question.
+- Sync/semi-sync ACK identity is still the numeric LSN, and group-commit ordering when `sync_commit` is on was not re-measured.
+- No performance measurement yet. The transaction commit now issues one write instead of two when the WAL is enabled, so it should not regress, but that is unmeasured; the A/B harness must confirm.

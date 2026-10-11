@@ -166,6 +166,10 @@ pub struct Transaction {
     /// durability for these rows comes from this commit's own RocksDB batch,
     /// and the nosync arm still broadcasts.
     logical_wal_sync: bool,
+    /// Log used ONLY to write the operations an autocommit statement buffered in its
+    /// statement-capture frame, atomically with this transaction's data. Distinct from
+    /// `wal`, which also derives operations from the write set (double-logging hazard).
+    statement_wal: Option<Arc<RwLock<WriteAheadLog>>>,
     /// R1.3: fsync the commit WriteBatch (power-loss durable commits).
     sync_commit: bool,
     /// R1.3 phase 2: engine-wide leader/follower group committer. When set
@@ -715,6 +719,7 @@ impl Transaction {
             rocksdb_wal_enabled: true,
             wal: None,
             logical_wal_sync: false,
+            statement_wal: None,
             sync_commit: false,
             group_committer: None,
             row_cache: None,
@@ -906,6 +911,21 @@ impl Transaction {
         self.logical_wal_sync = sync;
     }
 
+    /// Let this (autocommit) transaction carry the logical-WAL operations its statement
+    /// buffers, so they commit atomically with its data.
+    pub fn set_statement_wal(&mut self, wal: Option<Arc<RwLock<WriteAheadLog>>>) {
+        self.statement_wal = wal;
+    }
+
+    /// Open the statement-capture frame for this transaction. Hold the guard for the
+    /// statement's whole lifetime including the commit: dropping it discards anything
+    /// the commit did not take, which is exactly what a rollback needs.
+    pub(crate) fn begin_statement_wal_capture(&self) -> Option<super::wal::statement_capture::Guard> {
+        self.statement_wal
+            .as_ref()
+            .map(|wal| wal.read().begin_statement_capture(self.transaction_id))
+    }
+
     /// Create a new transaction with session and lock manager support
     pub fn new_with_session(
         db: Arc<DB>,
@@ -950,6 +970,7 @@ impl Transaction {
             rocksdb_wal_enabled: true,
             wal: None,
             logical_wal_sync: false,
+            statement_wal: None,
             sync_commit: false,
             group_committer: None,
             row_cache: None,
@@ -1547,44 +1568,30 @@ impl Transaction {
         // Placed before `_columnar_stats_guard` below on purpose too: in
         // sync/semi-sync mode this call blocks on a standby ACK, and it must
         // not hold the columnar zone-stats write lock while it does.
+        // Logical WAL: the operations this commit makes visible are collected here and
+        // staged into the SAME RocksDB batch as the data just before it is written
+        // (below), then published to standbys only after that write succeeded. The old
+        // order (append and broadcast first, write second) let a failed commit leave
+        // history behind for data that never landed.
+        let mut wal_plan: Option<(Arc<RwLock<WriteAheadLog>>, Vec<WalOperation>, bool)> = None;
         if let Some(wal) = &self.wal {
             let ops = Self::collect_logical_wal_ops(
                 &self.insert_log.read(),
                 &self.write_set,
                 &self.row_counter_stages.read(),
             );
-            if !ops.is_empty() {
-                // Guard released by the end of this statement, before the
-                // abort bookkeeping below.
-                let appended = wal.read().append_batch(ops, self.logical_wal_sync);
-                if let Err(e) = appended {
-                    // Fatal to the commit, mirroring the autocommit contract:
-                    // there, a failing `log_data_*` propagates out of
-                    // `execute_in_transaction_inner` and
-                    // `execute_with_implicit_transaction` rolls back instead of
-                    // committing. Falling through to the batch write would
-                    // commit data locally that was never logged — a narrower
-                    // rerun of this very bug, gated on WAL I/O failure instead
-                    // of `skip_fast_paths`. Unwind exactly like the
-                    // counter-serialize failure above: an announced in-flight
-                    // commit that never reaches `end_commit` stalls the
-                    // snapshot barrier forever.
-                    if inflight {
-                        if let Some(registry) = &self.conflict_registry {
-                            registry.end_commit(commit_ts);
+            wal_plan = Some((Arc::clone(wal), ops, self.logical_wal_sync));
+        }
+        if let Some(wal) = &self.statement_wal {
+            if let Some((captured, wants_sync)) = wal.read().take_statement_capture(self.transaction_id) {
+                if !captured.is_empty() {
+                    match &mut wal_plan {
+                        Some((_, ops, sync)) => {
+                            ops.extend(captured);
+                            *sync |= wants_sync;
                         }
+                        None => wal_plan = Some((Arc::clone(wal), captured, wants_sync)),
                     }
-                    self.acquired_locks.write().clear();
-                    self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
-                    warn!(
-                        txn_id = self.transaction_id,
-                        error = %e,
-                        "Commit aborted: logical WAL append failed"
-                    );
-                    return Err(Error::transaction(format!(
-                        "Commit failed: logical WAL append failed: {}",
-                        e
-                    )));
                 }
             }
         }
@@ -1625,8 +1632,44 @@ impl Transaction {
         // snapshot barrier or row-lock contenders. RocksDB's WAL is
         // sequential: the group fsync covers every byte written before it.
         let group_fsync = self.sync_commit && self.rocksdb_wal_enabled && self.group_committer.is_some();
+
+        // Stage the logical WAL entries into the commit batch (reserving their LSNs).
+        let mut staged_wal = None;
+        let mut wal_force_sync = false;
+        if let Some((wal, ops, sync)) = wal_plan {
+            if !ops.is_empty() {
+                let wal_guard = wal.read();
+                match wal_guard.stage(ops, &mut batch) {
+                    Ok(Some(staged)) => {
+                        wal_force_sync = sync;
+                        staged_wal = Some((Arc::clone(&wal), staged));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        drop(wal_guard);
+                        if inflight {
+                            if let Some(registry) = &self.conflict_registry {
+                                registry.end_commit(commit_ts);
+                            }
+                        }
+                        self.acquired_locks.write().clear();
+                        self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
+                        warn!(
+                            txn_id = self.transaction_id,
+                            error = %e,
+                            "Commit aborted: logical WAL staging failed"
+                        );
+                        return Err(Error::transaction(format!(
+                            "Commit failed: logical WAL staging failed: {}",
+                            e
+                        )));
+                    }
+                }
+            }
+        }
+
         let result = if self.rocksdb_wal_enabled {
-            if self.sync_commit && !group_fsync {
+            if (self.sync_commit && !group_fsync) || wal_force_sync {
                 // R1.3 phase 1 fallback (no group committer wired): one
                 // synced WriteBatch per commit; RocksDB write groups
                 // amortize it across concurrent committers.
@@ -1642,6 +1685,20 @@ impl Transaction {
             write_opts.disable_wal(true);
             self.db.write_opt(batch, &write_opts)
         };
+
+        // Publish (or abandon) the staged logical WAL entries now that the data write
+        // has definitively succeeded or failed; the zone-stats lock is released first
+        // because the sync-mode ACK wait below must not hold it.
+        drop(_columnar_stats_guard);
+        let mut replicated_through = None;
+        if let Some((wal, staged)) = staged_wal {
+            let wal = wal.read();
+            if result.is_ok() {
+                replicated_through = Some(wal.publish_staged(staged));
+            } else {
+                wal.abandon_staged(staged);
+            }
+        }
 
         // Stale-row-cache fence: written rows must leave the row cache
         // BEFORE end_commit lifts the snapshot barrier, or a fresh snapshot
@@ -1694,6 +1751,11 @@ impl Transaction {
             self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
             Error::transaction(format!("Commit failed: {}", e))
         })?;
+
+        // Sync/semi-sync replication: wait for a standby to hold this commit's entries.
+        if let Some(lsn) = replicated_through {
+            WriteAheadLog::wait_replicated(lsn);
+        }
 
         // R1.3 phase 2: group durability barrier. The commit is already
         // applied and visible (memtable + unsynced WAL); block until a

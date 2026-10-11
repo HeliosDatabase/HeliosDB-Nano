@@ -13822,6 +13822,7 @@ impl EmbeddedDatabase {
         // Begin implicit transaction
         let txn_start = std::time::Instant::now();
         let txn = self.storage.begin_autocommit_transaction()?;
+        let _wal_capture = txn.begin_statement_wal_capture();
         // sprinter beefd0d3d069: this statement's eager index ops go in ITS own
         // slot, not the shared log another concurrent autocommit statement
         // clears or drains. The guard drops the slot on every exit path below.
@@ -18498,6 +18499,7 @@ impl EmbeddedDatabase {
         original_sql: Option<&str>,
     ) -> Result<(u64, Vec<Tuple>)> {
         let txn = self.storage.begin_autocommit_transaction()?;
+        let _wal_capture = txn.begin_statement_wal_capture();
         // sprinter beefd0d3d069: own slot, not the shared log.
         let _undo_slot = self.claim_statement_art_undo(&txn);
         let undo_txn_id = _undo_slot.txn_id;
@@ -26060,6 +26062,7 @@ impl EmbeddedDatabase {
         // post-commit index/cache maintenance, no undo bookkeeping because
         // nothing can roll this back.
         let txn = self.storage.begin_autocommit_transaction()?;
+        let _wal_capture = txn.begin_statement_wal_capture();
         self.storage
             .stage_columnar_deletes_grouped_in_transaction(table_name, &cascade_row_ids, &schema, &txn)?;
         for (row_id, _) in &rows_to_delete {
@@ -26189,6 +26192,7 @@ impl EmbeddedDatabase {
         // Update the matching rows. R3.3: stage columnar side-data grouped
         // per touched batch (UPDATE — presence untouched).
         let txn = self.storage.begin_autocommit_transaction()?;
+        let _wal_capture = txn.begin_statement_wal_capture();
         if self.storage.get_current_branch().is_none() {
             let row_refs: Vec<(u64, &Tuple)> = rows_to_update.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
             self.storage

@@ -4120,10 +4120,19 @@ impl StorageEngine {
                     let wal = wal.read();
                     // Extract table name from key for proper WAL logging
                     let table_name = Self::extract_table_from_key(key);
-                    wal.append(WalOperation::Delete {
-                        table: table_name,
-                        key: key.clone(),
-                    })?;
+                    // The delete and its history entry are ONE write: the entry exists
+                    // exactly when the row is gone (it used to be logged first).
+                    let mut batch = WriteBatch::default();
+                    batch.delete(key);
+                    wal.append_with_batch(
+                        WalOperation::Delete {
+                            table: table_name,
+                            key: key.clone(),
+                        },
+                        batch,
+                        self.memory_write_options.as_ref(),
+                    )?;
+                    return Ok(());
                 }
             }
         }
@@ -4496,6 +4505,9 @@ impl StorageEngine {
         // W2.5: commit raises per-table committed-write watermarks in-band.
         txn.set_write_watermarks(self.write_watermarks_arc());
         txn.set_conflict_registry(self.conflict_registry(), false);
+        // Autocommit statements log per statement; buffering those operations until the
+        // commit lets them be written atomically with the data (or dropped on rollback).
+        txn.set_statement_wal(self.wal.clone());
         Ok(txn)
     }
 
@@ -11406,7 +11418,10 @@ impl StorageEngine {
             return Ok(LogicalCatchup::Unavailable);
         };
         let wal = wal.read();
-        let latest = wal.current_lsn();
+        // Only history below the publisher's watermark is complete: an entry above it
+        // may still be waiting on a lower, unresolved LSN, and a standby that skipped
+        // past that gap would drop the late entry as "already applied".
+        let latest = wal.published_lsn();
         if after_lsn > latest {
             return Ok(LogicalCatchup::StandbyAhead { latest });
         }
@@ -11415,7 +11430,8 @@ impl StorageEngine {
                 return Ok(LogicalCatchup::Pruned { checkpoint });
             }
         }
-        let entries = wal.replay_from(after_lsn)?;
+        let mut entries = wal.replay_from(after_lsn)?;
+        entries.retain(|entry| entry.lsn <= latest);
         Ok(LogicalCatchup::Entries { latest, entries })
     }
 
