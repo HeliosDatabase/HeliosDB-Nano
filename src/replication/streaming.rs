@@ -56,6 +56,60 @@ pub const AUTH_FAILED_MESSAGE: &str = "native replication authentication failed"
 /// Matched client-side by the failover watcher.
 pub const AUTH_REQUIRED_MESSAGE: &str = "native replication authentication required";
 
+/// Marker carried in a rejected handshake when the primary can no longer supply
+/// the history a standby is missing (pruned) or the standby claims a position the
+/// primary never reached. Terminal on the client: it needs a full resync, and
+/// retrying cannot help. The failover watcher and the client match this text.
+pub const FULL_RESYNC_REQUIRED_MESSAGE: &str = "full resync required";
+
+/// Rows the primary must replay to bring a standby from `after` to the present.
+pub enum CatchupPlan {
+    /// Entries strictly after the standby's position, oldest first (may be empty
+    /// when the standby is already current) and the primary's latest LSN.
+    Entries { latest: Lsn, entries: Vec<WalEntry> },
+    /// History is unavailable; the reason is shown to the operator.
+    ResyncRequired(String),
+}
+
+/// Authoritative, durable source of catch-up history on the primary.
+///
+/// Implementations must read persisted history, never the broadcast channel: a
+/// dropped or lagged broadcast then costs latency, not data.
+pub trait CatchupSource: Send + Sync {
+    fn plan(&self, after: Lsn) -> Result<CatchupPlan>;
+}
+
+/// [`CatchupSource`] over the storage engine's persisted logical WAL.
+pub struct StorageCatchupSource(pub Arc<crate::storage::StorageEngine>);
+
+impl CatchupSource for StorageCatchupSource {
+    fn plan(&self, after: Lsn) -> Result<CatchupPlan> {
+        use crate::storage::LogicalCatchup;
+        match self
+            .0
+            .logical_wal_catchup(after)
+            .map_err(|e| ReplicationError::Storage(format!("catch-up read failed: {e}")))?
+        {
+            LogicalCatchup::Entries { latest, entries } => Ok(CatchupPlan::Entries {
+                latest,
+                entries: entries
+                    .iter()
+                    .map(|entry| super::ha_state::wal_operation_to_entry(entry.lsn, &entry.operation))
+                    .collect(),
+            }),
+            LogicalCatchup::Pruned { checkpoint } => Ok(CatchupPlan::ResyncRequired(format!(
+                "primary history was checkpointed through LSN {checkpoint}; the standby (at LSN {after}) must be rebuilt"
+            ))),
+            LogicalCatchup::StandbyAhead { latest } => Ok(CatchupPlan::ResyncRequired(format!(
+                "standby is at LSN {after} but the primary only reached LSN {latest}; datasets diverged"
+            ))),
+            LogicalCatchup::Unavailable => Ok(CatchupPlan::ResyncRequired(
+                "primary has no logical WAL, so it cannot serve catch-up".into(),
+            )),
+        }
+    }
+}
+
 /// Streaming server configuration
 #[derive(Debug, Clone)]
 pub struct StreamingServerConfig {
@@ -145,6 +199,8 @@ pub struct StreamingServer {
     shutdown_tx: broadcast::Sender<()>,
     /// WAL store for batch catch-up
     wal_store: Arc<WalStore>,
+    /// Durable catch-up history. When set it is authoritative.
+    catchup: Option<Arc<dyn CatchupSource>>,
 }
 
 impl StreamingServer {
@@ -178,7 +234,14 @@ impl StreamingServer {
             wal_broadcast,
             shutdown_tx,
             wal_store,
+            catchup: None,
         })
+    }
+
+    /// Serve catch-up from durable history instead of the legacy in-memory store.
+    pub fn with_catchup_source(mut self, source: Arc<dyn CatchupSource>) -> Self {
+        self.catchup = Some(source);
+        self
     }
 
     /// Reserve the native replication endpoint before reporting startup success.
@@ -271,6 +334,7 @@ impl StreamingServer {
         let shutdown_rx = self.shutdown_tx.subscribe();
         let wal_store = self.wal_store.clone();
         let required_auth = self.config.auth.clone();
+        let catchup = self.catchup.clone();
 
         tokio::spawn(async move {
             if let Err(e) = Self::connection_loop(
@@ -284,6 +348,7 @@ impl StreamingServer {
                 shutdown_rx,
                 wal_store,
                 required_auth,
+                catchup,
             )
             .await
             {
@@ -293,6 +358,7 @@ impl StreamingServer {
     }
 
     /// Main connection handling loop
+    #[allow(clippy::too_many_arguments)]
     async fn connection_loop(
         mut conn: ReplicationConnection,
         server_node_id: Uuid,
@@ -304,6 +370,7 @@ impl StreamingServer {
         mut shutdown_rx: broadcast::Receiver<()>,
         wal_store: Arc<WalStore>,
         required_auth: Option<TransferToken>,
+        catchup: Option<Arc<dyn CatchupSource>>,
     ) -> Result<()> {
         let addr = conn.remote_addr();
         tracing::info!("New connection from {}", addr);
@@ -382,17 +449,44 @@ impl StreamingServer {
         let negotiated_sync = request.sync_mode;
 
         let history_matches = request.expected_history.is_none_or(|expected| expected == history_id);
+
+        // Read the history this standby is missing from DURABLE storage, after
+        // this connection already subscribed to the live broadcast: anything
+        // persisted before the read is in the plan, anything after it arrives
+        // live, so no entry can fall between the two (duplicates are dropped by
+        // the standby's LSN cursor).
+        let standby_position = request.current_lsn.unwrap_or(0);
+        let mut plan: Option<(Lsn, Vec<WalEntry>)> = None;
+        let mut resync_reason: Option<String> = None;
+        if history_matches && request.role == NodeRole::Standby {
+            if let Some(source) = catchup.clone() {
+                match tokio::task::spawn_blocking(move || source.plan(standby_position))
+                    .await
+                    .map_err(|e| ReplicationError::Internal(format!("catch-up task failed: {e}")))??
+                {
+                    CatchupPlan::Entries { latest, entries } => plan = Some((latest, entries)),
+                    CatchupPlan::ResyncRequired(reason) => resync_reason = Some(reason),
+                }
+            }
+        }
+        let accepted = history_matches && resync_reason.is_none();
+        let primary_lsn = plan.as_ref().map_or(current_lsn, |(latest, _)| *latest);
         let response = HandshakeResponse {
             history_id,
-            accepted: history_matches,
+            accepted,
             server_node_id,
             sync_mode: negotiated_sync,
-            primary_lsn: current_lsn,
+            primary_lsn,
             slot_name: request.slot_name.clone(),
             fencing_token,
             capabilities: Capabilities::all(),
-            error: (!history_matches)
-                .then(|| "Replication history mismatch; preserve this receiver and prepare a new dataset; online resync is not supported".into()),
+            error: if !history_matches {
+                Some("Replication history mismatch; preserve this receiver and prepare a new dataset; online resync is not supported".into())
+            } else {
+                resync_reason
+                    .as_ref()
+                    .map(|reason| format!("{FULL_RESYNC_REQUIRED_MESSAGE}: {reason}"))
+            },
         };
 
         let response_payload = bincode::serialize(&response)
@@ -402,6 +496,15 @@ impl StreamingServer {
             .await?;
 
         if !response.accepted {
+            if let Some(reason) = &resync_reason {
+                tracing::error!(
+                    "Refused standby {} at LSN {}: {} ({})",
+                    request.node_id,
+                    standby_position,
+                    FULL_RESYNC_REQUIRED_MESSAGE,
+                    reason
+                );
+            }
             conn.close().await?;
             return Ok(());
         }
@@ -451,9 +554,15 @@ impl StreamingServer {
             state: HAStandbyState::Connecting,
         });
 
+        // Durable catch-up: always ends with a final batch that fixes the barrier
+        // the standby must reach before it declares itself caught up.
+        if let Some((_, entries)) = plan {
+            Self::send_planned_catchup(&mut conn, standby_position, &entries).await?;
+        }
+
         // Check if standby needs catch-up
         let standby_lsn = request.current_lsn.unwrap_or(0);
-        if standby_lsn < current_lsn {
+        if catchup.is_none() && standby_lsn < current_lsn {
             tracing::info!(
                 "Standby {} needs catch-up: {} -> {}",
                 request.node_id,
@@ -483,7 +592,14 @@ impl StreamingServer {
                             tracing::info!("StreamingServer: Sent WAL entry LSN={} to standby", entry.lsn);
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!("Standby {} lagged {} entries", standby_node_id, n);
+                            // Entries were dropped from this standby's live feed. Continuing
+                            // would silently skip them; drop the connection so the standby
+                            // reconnects and catches up from durable history.
+                            tracing::warn!(
+                                "Standby {} lagged {} entries; disconnecting so it re-syncs from durable history",
+                                standby_node_id, n
+                            );
+                            break;
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             break;
@@ -627,6 +743,43 @@ impl StreamingServer {
             }
         }
 
+        Ok(())
+    }
+
+    /// Send the planned catch-up entries in bounded batches. The last batch is
+    /// marked final and its `end_lsn` is the catch-up barrier, even when there
+    /// is nothing to send.
+    async fn send_planned_catchup(conn: &mut ReplicationConnection, after: Lsn, entries: &[WalEntry]) -> Result<()> {
+        const BATCH_ENTRIES: usize = 500;
+        let barrier = entries.last().map_or(after, |entry| entry.lsn.max(after));
+        let mut chunks: Vec<&[WalEntry]> = entries.chunks(BATCH_ENTRIES).collect();
+        if chunks.is_empty() {
+            chunks.push(&[]);
+        }
+        let last = chunks.len() - 1;
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let is_final = index == last;
+            let payload = WalBatchPayload {
+                start_lsn: chunk.first().map_or(after, |entry| entry.lsn),
+                end_lsn: if is_final {
+                    barrier
+                } else {
+                    chunk.last().map_or(after, |entry| entry.lsn)
+                },
+                entry_count: chunk.len() as u32,
+                entries: chunk.iter().map(Self::wal_entry_to_payload).collect(),
+                is_final,
+            };
+            let bytes = bincode::serialize(&payload)
+                .map_err(|e| ReplicationError::Transport(format!("Serialize failed: {}", e)))?;
+            conn.send(MessageType::WalBatch, Bytes::from(bytes)).await?;
+        }
+        tracing::info!(
+            "Durable catch-up sent: {} entries after LSN {} (barrier {})",
+            entries.len(),
+            after,
+            barrier
+        );
         Ok(())
     }
 
@@ -893,13 +1046,24 @@ pub enum StreamingClientState {
 pub enum StreamingClientStatus {
     Connecting,
     Verified { history_id: Uuid },
+    /// Every entry the primary held at connect time has been durably applied.
+    /// Revoked (back to `Reconnecting`) on any disconnect.
+    CaughtUp { history_id: Uuid },
     Reconnecting,
     Failed { error: String },
     Stopped,
 }
 
+/// Reads the standby's durable applied LSN (the engine's replication cursor).
+pub type AppliedSource = Arc<dyn Fn() -> Lsn + Send + Sync>;
+
 /// Streaming client for standby nodes with a mandatory receiver history binding.
 pub struct StreamingClient {
+    /// Durable applied position. Absent only in transport-level tests.
+    applied_source: std::sync::OnceLock<AppliedSource>,
+    /// Catch-up barrier announced by the primary's final batch (0 = unknown).
+    catchup_barrier: AtomicU64,
+    catchup_known: AtomicBool,
     history: Arc<ReceiverHistory>,
     status_tx: watch::Sender<StreamingClientStatus>,
     // A terminal identity failure cannot be bypassed by restarting this instance.
@@ -930,6 +1094,9 @@ impl StreamingClient {
 
         let (status_tx, _) = watch::channel(StreamingClientStatus::Connecting);
         let client = Self {
+            applied_source: std::sync::OnceLock::new(),
+            catchup_barrier: AtomicU64::new(0),
+            catchup_known: AtomicBool::new(false),
             config,
             history,
             status_tx,
@@ -944,6 +1111,18 @@ impl StreamingClient {
         };
 
         (client, entry_rx)
+    }
+
+    /// Provide the durable applied position used for the handshake and for the
+    /// caught-up decision. Without it the in-memory counter is used.
+    pub fn set_applied_source(&self, source: AppliedSource) {
+        let _ = self.applied_source.set(source);
+    }
+
+    fn durable_applied(&self) -> Lsn {
+        self.applied_source
+            .get()
+            .map_or_else(|| self.applied_lsn.load(Ordering::SeqCst), |read| read())
     }
 
     pub fn subscribe_status(&self) -> watch::Receiver<StreamingClientStatus> {
@@ -983,7 +1162,8 @@ impl StreamingClient {
                         ReplicationError::HistoryMismatch { .. }
                             | ReplicationError::HistoryMetadata(_)
                             | ReplicationError::ProtocolVersion { .. }
-                    ) {
+                    ) || e.to_string().contains(FULL_RESYNC_REQUIRED_MESSAGE)
+                    {
                         tracing::error!("Terminal native replication history/protocol failure: {}", e);
                         *self.state.write().await = StreamingClientState::Error;
                         self.status_tx
@@ -1072,7 +1252,8 @@ impl StreamingClient {
         // Send handshake
         *self.state.write().await = StreamingClientState::Handshaking;
 
-        let current_lsn = self.applied_lsn.load(Ordering::SeqCst);
+        self.catchup_known.store(false, Ordering::SeqCst);
+        let current_lsn = self.durable_applied();
         let request = HandshakeRequest {
             expected_history,
             node_id: self.config.node_id,
@@ -1130,9 +1311,22 @@ impl StreamingClient {
 
         // Main streaming loop
         let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+        let mut readiness_interval = tokio::time::interval(Duration::from_millis(100));
+        let mut caught_up = false;
 
         loop {
             tokio::select! {
+                _ = readiness_interval.tick(), if !caught_up => {
+                    if self.catchup_known.load(Ordering::SeqCst)
+                        && self.durable_applied() >= self.catchup_barrier.load(Ordering::SeqCst)
+                    {
+                        caught_up = true;
+                        self.status_tx.send_replace(StreamingClientStatus::CaughtUp {
+                            history_id: response.history_id,
+                        });
+                    }
+                }
+
                 // Receive messages from primary
                 msg_result = conn.recv() => {
                     match msg_result {
@@ -1210,6 +1404,8 @@ impl StreamingClient {
                     .await?;
 
                 if payload.is_final {
+                    self.catchup_barrier.store(payload.end_lsn, Ordering::SeqCst);
+                    self.catchup_known.store(true, Ordering::SeqCst);
                     *self.state.write().await = StreamingClientState::Streaming;
                 }
             }

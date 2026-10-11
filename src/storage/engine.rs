@@ -2095,6 +2095,20 @@ pub struct StorageEngine {
 /// Minimum free disk space threshold (100 MB)
 const MIN_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024;
 
+/// Outcome of reading the primary's logical WAL for a standby (see
+/// [`StorageEngine::logical_wal_catchup`]).
+#[derive(Debug)]
+pub enum LogicalCatchup {
+    /// Entries strictly after the requested LSN, oldest first (may be empty).
+    Entries { latest: u64, entries: Vec<super::wal::WalEntry> },
+    /// The requested position lies below the checkpoint: history was removed.
+    Pruned { checkpoint: u64 },
+    /// The standby claims a position this primary never reached.
+    StandbyAhead { latest: u64 },
+    /// No logical WAL on this engine.
+    Unavailable,
+}
+
 impl StorageEngine {
     /// Process-unique identity for ONE open database.
     ///
@@ -11316,9 +11330,9 @@ impl StorageEngine {
         self.is_replaying.store(true, Ordering::Release);
         let result = match operation {
             WalOperation::Insert { table, key, tuple } | WalOperation::Update { table, key, tuple } => {
-                self.apply_live_replicated_row(&table, &key, Some(&tuple))
+                self.apply_live_replicated_row(&table, &key, Some(&tuple), None)
             }
-            WalOperation::Delete { table, key } => self.apply_live_replicated_row(&table, &key, None),
+            WalOperation::Delete { table, key } => self.apply_live_replicated_row(&table, &key, None, None),
             WalOperation::UpdateCounter { table_name, new_value } => {
                 self.apply_live_replicated_counter(&table_name, new_value)
             }
@@ -11326,6 +11340,83 @@ impl StorageEngine {
         };
         self.is_replaying.store(false, Ordering::Release);
         result
+    }
+
+    /// Durable key holding the highest primary LSN this standby has applied.
+    const REPLICATION_CURSOR_KEY: &'static [u8] = b"repl:applied_lsn";
+
+    /// Highest primary LSN durably applied by this standby (0 if none).
+    ///
+    /// Written in the SAME RocksDB batch as the row it describes (see
+    /// [`Self::apply_replicated_operation_at`]), so after a crash either both or
+    /// neither survive and the standby can ask the primary for exactly what it lacks.
+    pub fn replication_applied_lsn(&self) -> Result<u64> {
+        match self.get(&Self::REPLICATION_CURSOR_KEY.to_vec())? {
+            None => Ok(0),
+            Some(bytes) => {
+                let raw: [u8; 8] = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::storage("corrupt replication cursor"))?;
+                Ok(u64::from_le_bytes(raw))
+            }
+        }
+    }
+
+    fn write_replication_cursor(&self, lsn: u64) -> Result<()> {
+        let cursor_bytes = lsn.to_le_bytes();
+        let stored = self.seal_stored(&cursor_bytes)?;
+        let mut batch = WriteBatch::default();
+        batch.put(Self::REPLICATION_CURSOR_KEY, stored.as_ref());
+        let mut options = rocksdb::WriteOptions::default();
+        options.set_sync(true);
+        self.db
+            .write_opt(batch, &options)
+            .map_err(|e| Error::storage(format!("replication cursor write failed: {e}")))
+    }
+
+    /// Apply a replicated operation carrying primary LSN `lsn` and advance the
+    /// durable cursor. Row operations write data and cursor in one batch; other
+    /// operations (DDL, counters) are applied and then the cursor is fsynced, so
+    /// a crash between the two re-delivers the operation and a non-idempotent one
+    /// fails closed instead of being skipped.
+    pub fn apply_replicated_operation_at(&self, lsn: u64, operation: WalOperation) -> Result<()> {
+        let _replay_guard = self.live_replay_lock.lock();
+        self.is_replaying.store(true, Ordering::Release);
+        let result = match operation {
+            WalOperation::Insert { table, key, tuple } | WalOperation::Update { table, key, tuple } => {
+                self.apply_live_replicated_row(&table, &key, Some(&tuple), Some(lsn))
+            }
+            WalOperation::Delete { table, key } => self.apply_live_replicated_row(&table, &key, None, Some(lsn)),
+            WalOperation::UpdateCounter { table_name, new_value } => self
+                .apply_live_replicated_counter(&table_name, new_value)
+                .and_then(|()| self.write_replication_cursor(lsn)),
+            other => self.apply_wal_operation(other).and_then(|()| self.write_replication_cursor(lsn)),
+        };
+        self.is_replaying.store(false, Ordering::Release);
+        result
+    }
+
+    /// Read the logical WAL a standby is missing, for catch-up.
+    ///
+    /// `Pruned` means entries after `after_lsn` were checkpointed away; the
+    /// standby needs a full resync and must NOT be told it is caught up.
+    pub fn logical_wal_catchup(&self, after_lsn: u64) -> Result<LogicalCatchup> {
+        let Some(wal) = &self.wal else {
+            return Ok(LogicalCatchup::Unavailable);
+        };
+        let wal = wal.read();
+        let latest = wal.current_lsn();
+        if after_lsn > latest {
+            return Ok(LogicalCatchup::StandbyAhead { latest });
+        }
+        if let Some(checkpoint) = wal.checkpoint_lsn()? {
+            if after_lsn < checkpoint {
+                return Ok(LogicalCatchup::Pruned { checkpoint });
+            }
+        }
+        let entries = wal.replay_from(after_lsn)?;
+        Ok(LogicalCatchup::Entries { latest, entries })
     }
 
     /// Read the durable and in-memory allocation high-water marks without
@@ -11370,7 +11461,13 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn apply_live_replicated_row(&self, table: &str, key: &Key, bytes: Option<&Vec<u8>>) -> Result<()> {
+    fn apply_live_replicated_row(
+        &self,
+        table: &str,
+        key: &Key,
+        bytes: Option<&Vec<u8>>,
+        cursor: Option<u64>,
+    ) -> Result<()> {
         let prefix = format!("data:{table}:");
         let row_id = key
             .strip_prefix(prefix.as_bytes())
@@ -11432,6 +11529,11 @@ impl StorageEngine {
                 let stored = self.seal_stored(&value)?;
                 batch.put(key, stored.as_ref());
             }
+        }
+        if let Some(lsn) = cursor {
+            let cursor_bytes = lsn.to_le_bytes();
+        let stored = self.seal_stored(&cursor_bytes)?;
+            batch.put(Self::REPLICATION_CURSOR_KEY, stored.as_ref());
         }
         // Preserve the raw put path's resource checks before claiming indexes.
         if let Some(path) = &self.db_path {
@@ -14989,6 +15091,109 @@ mod tests {
         // Test numeric table names (if allowed)
         let key = b"data:table123:456";
         assert_eq!(StorageEngine::extract_table_from_key(key), "table123");
+    }
+
+    fn replication_test_schema() -> Schema {
+        Schema {
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            }],
+        }
+    }
+
+    fn replication_primary() -> StorageEngine {
+        let mut config = Config::in_memory();
+        config.storage.wal_enabled = true;
+        let engine = StorageEngine::open_in_memory(&config).expect("open primary");
+        engine
+            .catalog()
+            .create_table("t", replication_test_schema())
+            .expect("create table");
+        for id in 1..=3 {
+            engine
+                .insert_tuple(
+                    "t",
+                    Tuple {
+                        values: vec![Value::Int4(id)],
+                        row_id: None,
+                        branch_id: None,
+                    },
+                )
+                .expect("insert");
+        }
+        engine
+    }
+
+    /// Catch-up must say "everything you lack", "you are ahead" or "history gone".
+    /// It must never answer an unservable position with an empty, successful batch.
+    #[test]
+    fn logical_wal_catchup_distinguishes_entries_ahead_and_pruned() {
+        let primary = replication_primary();
+        let latest = primary.wal_lsn().expect("lsn");
+        assert!(latest > 0);
+
+        match primary.logical_wal_catchup(0).expect("catch-up") {
+            LogicalCatchup::Entries { latest: l, entries } => {
+                assert_eq!(l, latest);
+                assert!(!entries.is_empty(), "a fresh standby must receive the retained history");
+                assert!(entries.windows(2).all(|w| w[0].lsn < w[1].lsn), "oldest first");
+            }
+            other => panic!("expected entries, got {other:?}"),
+        }
+        assert!(matches!(
+            primary.logical_wal_catchup(latest).expect("current"),
+            LogicalCatchup::Entries { entries, .. } if entries.is_empty()
+        ));
+        assert!(matches!(
+            primary.logical_wal_catchup(latest + 10).expect("ahead"),
+            LogicalCatchup::StandbyAhead { .. }
+        ));
+
+        // Checkpointing removes history: a standby below it can no longer be served.
+        primary
+            .wal
+            .as_ref()
+            .expect("wal")
+            .read()
+            .truncate_to_checkpoint(latest)
+            .expect("checkpoint");
+        assert!(matches!(
+            primary.logical_wal_catchup(0).expect("pruned"),
+            LogicalCatchup::Pruned { .. }
+        ));
+        assert!(matches!(
+            primary.logical_wal_catchup(latest).expect("at checkpoint"),
+            LogicalCatchup::Entries { entries, .. } if entries.is_empty()
+        ));
+    }
+
+    /// The standby's cursor advances with every applied entry, is readable from
+    /// durable state, and a re-delivered insert does not silently succeed twice.
+    #[test]
+    fn replication_cursor_tracks_applied_entries() {
+        let primary = replication_primary();
+        let entries = primary.wal_entries_for_tests().expect("entries");
+        let last = entries.last().expect("entries").lsn;
+
+        let mut config = Config::in_memory();
+        config.storage.wal_enabled = true;
+        let standby = StorageEngine::open_in_memory(&config).expect("open standby");
+        assert_eq!(standby.replication_applied_lsn().expect("cursor"), 0);
+        for entry in entries {
+            standby
+                .apply_replicated_operation_at(entry.lsn, entry.operation)
+                .expect("apply");
+        }
+        assert_eq!(standby.replication_applied_lsn().expect("cursor"), last);
+        assert_eq!(standby.scan_table("t").expect("scan").len(), 3);
     }
 
     #[test]

@@ -4,9 +4,13 @@
 //! standby is stopped, the primary commits two more rows, the standby restarts,
 //! and a further row is committed. The standby MUST end with every committed row.
 //!
-//! Observed on the 4.41.1 candidate: primary `[1,2,3,4]`, standby `[1,4]`, the
-//! standby reporting healthy throughout. Rows committed while it was down are
-//! silently lost, because reconnect resumes from live broadcast only.
+//! Observed on the 4.41.1 candidate before the fix: primary `[1,2,3,4]`, standby
+//! `[1,4]`, the standby reporting healthy throughout. Rows committed while it was
+//! down were silently lost, because reconnect resumed from live broadcast only and
+//! the standby's applied position was not durable.
+//!
+//! A second case covers a standby that joins AFTER the data (and the DDL) exist:
+//! it used to crash with `Table 't' does not exist`.
 
 #![cfg(feature = "ha-tier1")]
 
@@ -114,9 +118,16 @@ async fn settle(port: u16, want: &[i32], budget: Duration) -> Result<Vec<i32>, S
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "RED until 4.41.1 replication step 1 (committed catch-up) lands; run with --ignored"]
-async fn standby_restart_recovers_rows_committed_while_down() {
+struct Cluster {
+    dir: tempfile::TempDir,
+    token: std::path::PathBuf,
+    pg_p: u16,
+    pg_s: u16,
+    primary_args: Vec<String>,
+    standby_args: Vec<String>,
+}
+
+fn cluster() -> Cluster {
     let dir = tempfile::tempdir().unwrap();
     let token = dir.path().join("replication.token");
     std::fs::write(&token, [0x42u8; 32]).unwrap();
@@ -125,7 +136,6 @@ async fn standby_restart_recovers_rows_committed_while_down() {
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     let (pg_p, repl_p, pg_s, repl_s) = (free_port(), free_port(), free_port(), free_port());
-
     let primary_args = vec![
         "--port".into(),
         pg_p.to_string(),
@@ -144,16 +154,31 @@ async fn standby_restart_recovers_rows_committed_while_down() {
         "--replication-port".into(),
         repl_s.to_string(),
     ];
+    Cluster {
+        dir,
+        token,
+        pg_p,
+        pg_s,
+        primary_args,
+        standby_args,
+    }
+}
 
-    let _primary = Daemon::spawn(dir.path(), "primary", &token, &primary_args);
-    let writer = connect(pg_p).await;
-    let mut standby = Daemon::spawn(dir.path(), "standby", &token, &standby_args);
-    let _ = connect(pg_s).await;
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standby_restart_recovers_rows_committed_while_down() {
+    let c = cluster();
+    let _primary = Daemon::spawn(c.dir.path(), "primary", &c.token, &c.primary_args);
+    let writer = connect(c.pg_p).await;
+    let mut standby = Daemon::spawn(c.dir.path(), "standby", &c.token, &c.standby_args);
+    let _ = connect(c.pg_s).await;
 
-    writer.batch_execute("CREATE TABLE t (id INT PRIMARY KEY)").await.unwrap();
+    writer
+        .batch_execute("CREATE TABLE t (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
     writer.batch_execute("INSERT INTO t VALUES (1)").await.unwrap();
     assert_eq!(
-        settle(pg_s, &[1], Duration::from_secs(20)).await,
+        settle(c.pg_s, &[1], Duration::from_secs(20)).await,
         Ok(vec![1]),
         "live streaming must deliver the first row (precondition)"
     );
@@ -162,16 +187,49 @@ async fn standby_restart_recovers_rows_committed_while_down() {
     writer.batch_execute("INSERT INTO t VALUES (2)").await.unwrap();
     writer.batch_execute("INSERT INTO t VALUES (3)").await.unwrap();
 
-    let _standby = Daemon::spawn(dir.path(), "standby", &token, &standby_args);
-    let _ = connect(pg_s).await;
+    let mut standby = Daemon::spawn(c.dir.path(), "standby", &c.token, &c.standby_args);
+    let _ = connect(c.pg_s).await;
     writer.batch_execute("INSERT INTO t VALUES (4)").await.unwrap();
 
     let primary_rows = ids(&writer).await.unwrap();
     assert_eq!(primary_rows, vec![1, 2, 3, 4]);
-    let standby_rows = settle(pg_s, &primary_rows, Duration::from_secs(30)).await;
     assert_eq!(
-        standby_rows,
-        Ok(primary_rows),
-        "standby must hold every committed row after restart (or refuse reads), never a silent gap"
+        settle(c.pg_s, &primary_rows, Duration::from_secs(30)).await,
+        Ok(primary_rows.clone()),
+        "standby must hold every committed row after restart, never a silent gap"
+    );
+
+    // A second restart must resume from the durable cursor: no duplicate replay,
+    // no lost row, and a row committed in the gap still arrives.
+    standby.stop();
+    writer.batch_execute("INSERT INTO t VALUES (5)").await.unwrap();
+    let _standby = Daemon::spawn(c.dir.path(), "standby", &c.token, &c.standby_args);
+    let _ = connect(c.pg_s).await;
+    assert_eq!(
+        settle(c.pg_s, &[1, 2, 3, 4, 5], Duration::from_secs(30)).await,
+        Ok(vec![1, 2, 3, 4, 5])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standby_joining_after_the_data_receives_ddl_and_rows() {
+    let c = cluster();
+    let _primary = Daemon::spawn(c.dir.path(), "primary", &c.token, &c.primary_args);
+    let writer = connect(c.pg_p).await;
+    writer
+        .batch_execute("CREATE TABLE t (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    writer
+        .batch_execute("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)")
+        .await
+        .unwrap();
+
+    let _standby = Daemon::spawn(c.dir.path(), "standby", &c.token, &c.standby_args);
+    let _ = connect(c.pg_s).await;
+    assert_eq!(
+        settle(c.pg_s, &[1, 2, 3], Duration::from_secs(30)).await,
+        Ok(vec![1, 2, 3]),
+        "history that predates the standby must be replayed, not crash the applier"
     );
 }

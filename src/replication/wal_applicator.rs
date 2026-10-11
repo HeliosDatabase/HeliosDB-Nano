@@ -105,6 +105,17 @@ impl WalApplicator {
         *current_state = ApplicatorState::Streaming;
         info!("WAL Applicator started, ready to receive entries");
 
+        // Resume from the durable cursor: an in-memory zero after a restart would
+        // let the primary replay history this standby already holds.
+        let durable = storage
+            .replication_applied_lsn()
+            .map_err(|e| ReplicationError::Storage(format!("Cannot read replication cursor: {e}")))?;
+        {
+            let mut guard = self.applied_lsn.write().await;
+            if durable > *guard {
+                *guard = durable;
+            }
+        }
         let applied_lsn = self.applied_lsn.clone();
         let state = self.state.clone();
         let entries_applied = self.entries_applied.clone();
@@ -221,7 +232,7 @@ impl WalApplicator {
         // Apply the operation to storage
         // The storage engine's apply_wal_operation handles all operation types
         storage
-            .apply_replicated_operation(operation)
+            .apply_replicated_operation_at(entry.lsn, operation)
             .map_err(|e| ReplicationError::Storage(format!("Failed to apply WAL operation: {}", e)))?;
 
         // Update applied LSN

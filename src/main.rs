@@ -3286,6 +3286,12 @@ async fn start_ha_components(
             }
             let server = StreamingServer::new(server_config, node_id, history_id, wal_store)
                 .map_err(|error| Error::config(format!("Cannot configure replication history: {error}")))?;
+            // Catch-up is served from the persisted logical WAL, never from the
+            // broadcast channel, so a standby that was down or lagged gets every
+            // committed entry it missed (or a terminal full-resync refusal).
+            let server = server.with_catchup_source(Arc::new(
+                heliosdb_nano::replication::streaming::StorageCatchupSource(storage.clone()),
+            ));
             info!("Streaming replication server starting on {}", repl_addr);
 
             let listener = server.bind_listener().await.map_err(|e| Error::network(format!(
@@ -3346,6 +3352,12 @@ async fn start_ha_components(
             };
 
             let (client, entry_rx) = StreamingClient::new(client_config, receiver_history);
+            {
+                // The durable cursor, not process memory, defines what this
+                // standby already holds.
+                let cursor_storage = storage.clone();
+                client.set_applied_source(Arc::new(move || cursor_storage.replication_applied_lsn().unwrap_or(0)));
+            }
             let mut status = client.subscribe_status();
             info!("Streaming client connecting to primary at {}", primary_host);
 
@@ -3408,12 +3420,18 @@ async fn start_ha_components(
             // Identity verification is a startup prerequisite, not proof of
             // catchup. No PG accept task, HTTP/MCP route or daemon ready marker
             // is started until the transport durably verifies/binds history.
+            let history_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let history_seen_in = history_seen.clone();
             let verified = tokio::time::timeout_at(verification_deadline, async {
                 loop {
                     let current = status.borrow().clone();
                     match current {
                         StreamingClientStatus::Verified { history_id } => {
-                            info!("Standby dataset history verified: {history_id}");
+                            info!("Standby dataset history verified: {history_id}; waiting for catch-up");
+                            history_seen_in.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        StreamingClientStatus::CaughtUp { history_id } => {
+                            info!("Standby caught up with the primary (history {history_id})");
                             return Ok(());
                         }
                         StreamingClientStatus::Failed { error } => {
@@ -3433,10 +3451,18 @@ async fn start_ha_components(
             })
             .await
             .map_err(|_| {
-                Error::network(format!(
-                    "Standby did not verify primary dataset history within {}s (replication.startup_timeout_secs)",
-                    ha_config.startup_timeout_secs
-                ))
+                if history_seen.load(std::sync::atomic::Ordering::SeqCst) {
+                    Error::network(format!(
+                        "Standby verified the primary dataset history but did not finish catching up within {}s \
+                         (replication.startup_timeout_secs); it stays unavailable instead of serving a partial copy",
+                        ha_config.startup_timeout_secs
+                    ))
+                } else {
+                    Error::network(format!(
+                        "Standby did not verify primary dataset history within {}s (replication.startup_timeout_secs)",
+                        ha_config.startup_timeout_secs
+                    ))
+                }
             })
             .and_then(|result| result);
             if let Err(error) = verified {

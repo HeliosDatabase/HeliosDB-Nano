@@ -549,71 +549,79 @@ impl HAStateRegistry {
         }
 
         // Convert storage WalOperation to replication WalEntry
-        let (entry_type, data) = match operation {
-            // DML operations
-            WalOperation::Insert { .. } => (WalEntryType::Insert, serialize_operation(operation)),
-            WalOperation::Update { .. } => (WalEntryType::Update, serialize_operation(operation)),
-            WalOperation::Delete { .. } => (WalEntryType::Delete, serialize_operation(operation)),
-            WalOperation::Truncate { .. } => (WalEntryType::Delete, serialize_operation(operation)),
-
-            // Table DDL
-            WalOperation::CreateTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::DropTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::RenameTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::AlterColumnStorage { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-            // Index operations
-            WalOperation::CreateIndex { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::DropIndex { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-            // Trigger operations
-            WalOperation::CreateTrigger { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::DropTrigger { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-            // Function/Procedure operations
-            WalOperation::CreateFunction { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::DropFunction { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::CreateProcedure { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::DropProcedure { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-            // Materialized view operations
-            WalOperation::CreateMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::DropMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::RefreshMaterializedView { .. } => {
-                (WalEntryType::SchemaChange, serialize_operation(operation))
-            }
-
-            // Constraint operations
-            WalOperation::AddConstraint { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::DropConstraint { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-            // GH#36: the remaining schema-changing DDL.
-            WalOperation::AlterTableSchema { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::CreateView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::DropView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::CreateSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::AlterSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::DropSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-            // Transaction control
-            WalOperation::Begin { .. } => (WalEntryType::TxBegin, serialize_operation(operation)),
-            WalOperation::Commit { .. } => (WalEntryType::TxCommit, serialize_operation(operation)),
-            WalOperation::Abort { .. } => (WalEntryType::TxRollback, serialize_operation(operation)),
-
-            // HA replication operations
-            WalOperation::UpdateCounter { .. } => (WalEntryType::Update, serialize_operation(operation)),
-        };
-
-        let checksum = crc32fast::hash(&data);
-        let entry = WalEntry {
-            lsn,
-            tx_id: None, // Individual operations don't have tx_id
-            entry_type,
-            data,
-            checksum,
-        };
+        let entry = wal_operation_to_entry(lsn, operation);
 
         self.broadcast_wal_entry(entry)
+    }
+}
+
+/// Convert a storage [`WalOperation`] into the replication wire entry.
+///
+/// Shared by live broadcast and by catch-up from the persisted logical WAL so
+/// both paths encode an operation identically.
+pub fn wal_operation_to_entry(lsn: u64, operation: &WalOperation) -> WalEntry {
+    let (entry_type, data) = match operation {
+        // DML operations
+        WalOperation::Insert { .. } => (WalEntryType::Insert, serialize_operation(operation)),
+        WalOperation::Update { .. } => (WalEntryType::Update, serialize_operation(operation)),
+        WalOperation::Delete { .. } => (WalEntryType::Delete, serialize_operation(operation)),
+        WalOperation::Truncate { .. } => (WalEntryType::Delete, serialize_operation(operation)),
+
+        // Table DDL
+        WalOperation::CreateTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::DropTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::RenameTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::AlterColumnStorage { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+
+        // Index operations
+        WalOperation::CreateIndex { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::DropIndex { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+
+        // Trigger operations
+        WalOperation::CreateTrigger { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::DropTrigger { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+
+        // Function/Procedure operations
+        WalOperation::CreateFunction { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::DropFunction { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::CreateProcedure { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::DropProcedure { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+
+        // Materialized view operations
+        WalOperation::CreateMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::DropMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::RefreshMaterializedView { .. } => {
+            (WalEntryType::SchemaChange, serialize_operation(operation))
+        }
+
+        // Constraint operations
+        WalOperation::AddConstraint { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::DropConstraint { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+
+        // GH#36: the remaining schema-changing DDL.
+        WalOperation::AlterTableSchema { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::CreateView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::DropView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::CreateSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::AlterSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+        WalOperation::DropSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+
+        // Transaction control
+        WalOperation::Begin { .. } => (WalEntryType::TxBegin, serialize_operation(operation)),
+        WalOperation::Commit { .. } => (WalEntryType::TxCommit, serialize_operation(operation)),
+        WalOperation::Abort { .. } => (WalEntryType::TxRollback, serialize_operation(operation)),
+
+        // HA replication operations
+        WalOperation::UpdateCounter { .. } => (WalEntryType::Update, serialize_operation(operation)),
+    };
+
+    let checksum = crc32fast::hash(&data);
+    WalEntry {
+        lsn,
+        tx_id: None, // Individual operations don't have tx_id
+        entry_type,
+        data,
+        checksum,
     }
 }
 

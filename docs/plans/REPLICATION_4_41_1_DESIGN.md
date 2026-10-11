@@ -88,3 +88,23 @@ Primary identity is an **epoch** stored durably in the dataset (`repl:epoch`, wr
 5. **End-to-end acceptance on real daemons** (restart gap, crash before/after batch, retention loss, duplicate/conflicting batch, kill during apply, broadcast loss, stale primary after promote, encrypted dataset, warm/cold/PK/secondary/catalog reads, perf A/B).
 
 Steps 1-2 are independent of the owner's §5 decisions and can start immediately. Steps 3-5 start after items 1 and 5 are answered.
+
+## 7. Step 1 as implemented (deviation from §3.3, read this)
+
+Step 1 closed the silent restart gap on the **logical** channel, using the primary's persisted `wal:entries:*` as the durable source, because that was the smallest change that makes the real-daemon defect go green and fail closed. The physical-channel authority in §3 is still the target for steps 2-4; nothing here blocks it.
+
+Delivered:
+- **Standby durable cursor** `repl:applied_lsn`, written in the same RocksDB batch as each replicated row (DDL/counters: applied, then cursor fsynced; a crash between them re-delivers and a non-idempotent DDL fails closed). The applicator and the handshake both start from it, never from RAM.
+- **Primary plans catch-up from durable history** (`CatchupSource` / `StorageCatchupSource`), after the connection has subscribed to the live broadcast, so nothing falls between the two; duplicates are dropped by the cursor. The old plan used a never-fed `WalStore` and a `current_lsn` stuck at 0.
+- **Typed refusal**: history below the checkpoint, a standby ahead of the primary, or no logical WAL gives a rejected handshake carrying `full resync required`, terminal on the client. An empty batch is never the answer to an unservable position.
+- **Catch-up barrier**: every catch-up ends with a final batch that fixes the barrier; the standby reports `CaughtUp` only once its durable cursor reaches it, and `start` waits for `CaughtUp` (not merely `Verified`) before opening the SQL listener.
+- A lagged live feed now disconnects the standby so it re-syncs from durable history (it used to log a warning and skip the entries).
+- A fresh standby joining after the data/DDL exist now receives the retained history (it used to crash with `Table 't' does not exist`); if that history was checkpointed away it gets the refusal instead.
+
+Not delivered by step 1 (still open, tracked above):
+- The logical WAL is still appended before the data batch commits (`transaction.rs`), so a commit that fails after the append can be replicated; the cursor does not fix that.
+- LSNs are not a commit order and can have holes; catch-up trusts the source, it cannot verify contiguity.
+- ACK identity is still the numeric LSN (`Received`), and `report_applied` has no production caller.
+- Native protocol version is not bumped: a new standby against an old primary never sees a barrier and times out (fail closed), an old standby against a new primary ignores the barrier.
+- `replay_from` loads the whole retained range into memory; fine under the default checkpoint policy, needs chunked iteration before long retention is allowed.
+- Column-storage tables are refused on the standby (pre-existing).
