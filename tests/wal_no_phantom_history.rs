@@ -101,3 +101,30 @@ fn committed_statements_are_in_the_history_in_lsn_order() {
         other => panic!("{other:?}"),
     }
 }
+
+fn ddl_entries(db: &EmbeddedDatabase) -> Vec<String> {
+    match db.storage.logical_wal_catchup(0).expect("catch-up read") {
+        LogicalCatchup::Entries { entries, .. } => entries
+            .into_iter()
+            .map(|e| format!("{:?}", e.operation))
+            .filter(|t| t.starts_with("CreateTable") || t.starts_with("DropTable"))
+            .collect(),
+        other => panic!("expected entries, got {other:?}"),
+    }
+}
+
+/// DDL issued over a session (the wire path) reaches the history through the commit
+/// batch, in order, exactly once.
+#[test]
+fn session_ddl_is_in_the_history() {
+    use heliosdb_nano::session::IsolationLevel;
+    let (_d, db) = database();
+    let before = ddl_entries(&db).len();
+    let s = db.create_session("u", IsolationLevel::ReadCommitted).unwrap();
+    db.execute_in_session(s, "CREATE TABLE sess_a (id INT PRIMARY KEY)").unwrap();
+    db.execute_in_session(s, "DROP TABLE sess_a").unwrap();
+    let after = ddl_entries(&db);
+    assert_eq!(after.len(), before + 2, "{after:?}");
+    assert!(after[before].contains("sess_a") && after[before].starts_with("CreateTable"));
+    assert!(after[before + 1].contains("sess_a") && after[before + 1].starts_with("DropTable"));
+}

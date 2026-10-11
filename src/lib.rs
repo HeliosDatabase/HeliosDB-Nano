@@ -7286,11 +7286,8 @@ impl EmbeddedDatabase {
         // here, since the table does not exist yet at this point.
         Self::validate_create_table_fk_targets(&catalog, name, columns, constraints)?;
 
-        // Log to WAL for replication before creating (schema will be moved)
-        if let Err(e) = self.storage.log_create_table(name, &schema) {
-            tracing::warn!("Failed to log CREATE TABLE to WAL: {}", e);
-        }
-
+        // `Catalog::create_table` logs the CreateTable itself; logging here too put every
+        // table into the replicated history twice.
         catalog.create_table(name, schema)?;
 
         // KanttBan #23 (v3.31.1 phase 2): persist the list of
@@ -22075,6 +22072,10 @@ impl EmbeddedDatabase {
                 self.storage.wal_arc(),
                 self.storage.config().storage.logical_wal_per_statement,
             );
+            // DDL (and any other log_* call) this statement makes is buffered and
+            // committed with the statement, instead of reaching standbys first.
+            txn.set_statement_wal(self.storage.wal_arc());
+            let _wal_capture = txn.begin_statement_wal_capture();
 
             let result = self.execute_in_transaction_no_fast_path(sql, &txn);
 
