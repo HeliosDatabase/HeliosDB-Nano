@@ -10156,7 +10156,10 @@ impl StorageEngine {
             if !key.starts_with(prefix.as_bytes()) {
                 break;
             }
-            let suffix = std::str::from_utf8(&key[prefix.len()..])
+            let suffix = key
+                .strip_prefix(prefix.as_bytes())
+                .ok_or_else(|| Error::storage("metadata key lost its prefix during scan"))?;
+            let suffix = std::str::from_utf8(suffix)
                 .map_err(|_| Error::storage("invalid UTF-8 metadata key"))?
                 .to_owned();
             let value = self

@@ -3433,10 +3433,9 @@ impl ArtIndexManager {
                     if Self::key_is_null_distinct(entry.index_type, values.iter().copied()) {
                         return Ok(None);
                     }
-                    let dense = if entry.index_type == ArtIndexType::PrimaryKey && values.len() == 1 {
-                        Self::int_value_width(values[0])
-                    } else {
-                        None
+                    let dense = match (entry.index_type == ArtIndexType::PrimaryKey, values.as_slice()) {
+                        (true, [only]) => Self::int_value_width(only),
+                        _ => None,
                     };
                     Ok(Some((Self::encode_key_from_values(values.into_iter()), dense)))
                 };

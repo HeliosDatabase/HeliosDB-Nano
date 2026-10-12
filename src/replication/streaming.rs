@@ -1564,6 +1564,7 @@ mod tests {
     /// C2: server/client configs hold the token but never Debug-print its
     /// decimal ("171") or hex ("ab") rendering.
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn server_and_client_configs_redact_auth_token() {
         let token = TransferToken::new([0xAB; 32]).unwrap();
         let server = StreamingServerConfig {

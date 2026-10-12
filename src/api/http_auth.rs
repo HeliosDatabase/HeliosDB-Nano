@@ -1057,6 +1057,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::indexing_slicing)]
     async fn middleware_health_is_fixed_and_other_routes_are_not() {
         let app = attach_http_auth(
             Router::new()

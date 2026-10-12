@@ -1245,6 +1245,7 @@ mod tests {
     /// `expected_history` and `auth`, so two peers that only agree on the old
     /// number must never be allowed to reach the positional payload decoder.
     #[test]
+    #[allow(clippy::unwrap_used)]
     fn test_older_protocol_versions_refused_before_decode() {
         for peer_version in [1u16, 2u16] {
             let mut buf = BytesMut::new();
@@ -1412,6 +1413,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::unwrap_used)]
     async fn basic_server_history_mismatch_never_registers() {
         let actual = Uuid::new_v4();
         let expected = Uuid::new_v4();

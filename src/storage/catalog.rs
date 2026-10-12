@@ -525,8 +525,10 @@ impl<'a> Catalog<'a> {
                 if version != INDEX_DEF_FORMAT_VERSION {
                     return Err(fail(format!("unsupported format version {version}")));
                 }
-                bincode::deserialize::<PersistedIndexDefinition>(&bytes[INDEX_DEF_MAGIC.len() + 1..])
-                    .map_err(|e| fail(e.to_string()))?
+                let body = bytes
+                    .get(INDEX_DEF_MAGIC.len() + 1..)
+                    .ok_or_else(|| fail("truncated index definition".into()))?;
+                bincode::deserialize::<PersistedIndexDefinition>(body).map_err(|e| fail(e.to_string()))?
             } else if let Ok(definition) = bincode::deserialize::<PersistedIndexDefinition>(&bytes) {
                 definition
             } else {
@@ -729,7 +731,12 @@ impl<'a> Catalog<'a> {
             if definition.index_type.as_deref() != Some("hnsw") {
                 continue;
             }
-            let schema = &tables[&definition.table_name];
+            let schema = tables.get(&definition.table_name).ok_or_else(|| {
+                Error::storage(format!(
+                    "physical snapshot vector '{name}' refers to missing table '{}'",
+                    definition.table_name
+                ))
+            })?;
             let column = schema
                 .get_column(&definition.column_name)
                 .ok_or_else(|| Error::storage(format!("physical snapshot vector '{name}' has no column")))?;
@@ -4317,7 +4324,11 @@ impl<'a> Catalog<'a> {
                     "physical snapshot sequence '{name}' has unsupported/truncated version"
                 )));
             }
-            &bytes[magic.len() + 1..]
+            bytes.get(magic.len() + 1..).ok_or_else(|| {
+                Error::storage(format!(
+                    "physical snapshot sequence '{name}' is truncated after its version"
+                ))
+            })?
         } else {
             bytes
         };
