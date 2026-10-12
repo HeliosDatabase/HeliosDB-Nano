@@ -1045,12 +1045,18 @@ pub enum StreamingClientState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamingClientStatus {
     Connecting,
-    Verified { history_id: Uuid },
+    Verified {
+        history_id: Uuid,
+    },
     /// Every entry the primary held at connect time has been durably applied.
     /// Revoked (back to `Reconnecting`) on any disconnect.
-    CaughtUp { history_id: Uuid },
+    CaughtUp {
+        history_id: Uuid,
+    },
     Reconnecting,
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
     Stopped,
 }
 

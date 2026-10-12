@@ -2100,7 +2100,10 @@ const MIN_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024;
 #[derive(Debug)]
 pub enum LogicalCatchup {
     /// Entries strictly after the requested LSN, oldest first (may be empty).
-    Entries { latest: u64, entries: Vec<super::wal::WalEntry> },
+    Entries {
+        latest: u64,
+        entries: Vec<super::wal::WalEntry>,
+    },
     /// The requested position lies below the checkpoint: history was removed.
     Pruned { checkpoint: u64 },
     /// The standby claims a position this primary never reached.
@@ -11403,7 +11406,9 @@ impl StorageEngine {
             WalOperation::UpdateCounter { table_name, new_value } => self
                 .apply_live_replicated_counter(&table_name, new_value)
                 .and_then(|()| self.write_replication_cursor(lsn)),
-            other => self.apply_wal_operation(other).and_then(|()| self.write_replication_cursor(lsn)),
+            other => self
+                .apply_wal_operation(other)
+                .and_then(|()| self.write_replication_cursor(lsn)),
         };
         self.is_replaying.store(false, Ordering::Release);
         result
@@ -11548,7 +11553,7 @@ impl StorageEngine {
         }
         if let Some(lsn) = cursor {
             let cursor_bytes = lsn.to_le_bytes();
-        let stored = self.seal_stored(&cursor_bytes)?;
+            let stored = self.seal_stored(&cursor_bytes)?;
             batch.put(Self::REPLICATION_CURSOR_KEY, stored.as_ref());
         }
         // Preserve the raw put path's resource checks before claiming indexes.
@@ -15156,13 +15161,19 @@ mod tests {
         let latest = primary.wal_lsn().expect("lsn");
         assert!(latest > 0);
 
-        match primary.logical_wal_catchup(0).expect("catch-up") {
-            LogicalCatchup::Entries { latest: l, entries } => {
-                assert_eq!(l, latest);
-                assert!(!entries.is_empty(), "a fresh standby must receive the retained history");
-                assert!(entries.windows(2).all(|w| w[0].lsn < w[1].lsn), "oldest first");
-            }
-            other => panic!("expected entries, got {other:?}"),
+        let first = primary.logical_wal_catchup(0).expect("catch-up");
+        assert!(
+            matches!(first, LogicalCatchup::Entries { .. }),
+            "expected entries, got {first:?}"
+        );
+        if let LogicalCatchup::Entries { latest: l, entries } = first {
+            assert_eq!(l, latest);
+            assert!(!entries.is_empty(), "a fresh standby must receive the retained history");
+            let lsns: Vec<u64> = entries.iter().map(|e| e.lsn).collect();
+            let mut sorted = lsns.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            assert_eq!(lsns, sorted, "oldest first, no duplicates");
         }
         assert!(matches!(
             primary.logical_wal_catchup(latest).expect("current"),

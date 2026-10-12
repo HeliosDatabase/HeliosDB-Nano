@@ -121,7 +121,8 @@ fn session_ddl_is_in_the_history() {
     let (_d, db) = database();
     let before = ddl_entries(&db).len();
     let s = db.create_session("u", IsolationLevel::ReadCommitted).unwrap();
-    db.execute_in_session(s, "CREATE TABLE sess_a (id INT PRIMARY KEY)").unwrap();
+    db.execute_in_session(s, "CREATE TABLE sess_a (id INT PRIMARY KEY)")
+        .unwrap();
     db.execute_in_session(s, "DROP TABLE sess_a").unwrap();
     let after = ddl_entries(&db);
     assert_eq!(after.len(), before + 2, "{after:?}");

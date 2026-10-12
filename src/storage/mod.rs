@@ -80,7 +80,9 @@ pub use dump::{
     DumpReport, DumpType, RestoreOptions, RestoreReport, RestoreValidation,
 };
 pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
-pub use engine::{DirectBulkLoadResult, LogicalCatchup, StorageEngine, StorageStats, SynchronousCommitOverrideGuard, TableKind};
+pub use engine::{
+    DirectBulkLoadResult, LogicalCatchup, StorageEngine, StorageStats, SynchronousCommitOverrideGuard, TableKind,
+};
 pub use gin_index::{GinIndex, GinIndexStats};
 pub use index_snapshot::{IndexOpenReport, IndexSnapshotPersistReport};
 pub use lock_manager::{LockGuard, LockManager, LockState, LockType, StatementRetryPolicy};

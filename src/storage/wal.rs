@@ -440,6 +440,9 @@ impl Publisher {
 /// on that thread are buffered instead; the transaction takes them at commit and
 /// writes them in the SAME RocksDB batch as its data, and a rollback simply drops
 /// the frame. With no frame open, appends behave exactly as before.
+// `Guard` is returned by a `pub(crate)` method that `lib.rs` calls, so the module has to be
+// crate-visible even though `wal` itself is private.
+#[allow(clippy::redundant_pub_crate)]
 pub(crate) mod statement_capture {
     use super::WalOperation;
     use std::cell::RefCell;
@@ -511,7 +514,12 @@ pub(crate) mod statement_capture {
                 .iter_mut()
                 .rev()
                 .find(|frame| frame.txn_id == txn_id && frame.wal_id == wal_id)
-                .map(|frame| (std::mem::take(&mut frame.ops), std::mem::replace(&mut frame.sync, false)))
+                .map(|frame| {
+                    (
+                        std::mem::take(&mut frame.ops),
+                        std::mem::replace(&mut frame.sync, false),
+                    )
+                })
         })
     }
 }
@@ -799,7 +807,8 @@ impl WriteAheadLog {
 
     /// Resolve a reserved LSN whose write failed: a hole, never published.
     fn skip(&self, lsns: impl IntoIterator<Item = u64>) {
-        self.publisher.resolve(lsns.into_iter().map(|lsn| (lsn, None)).collect());
+        self.publisher
+            .resolve(lsns.into_iter().map(|lsn| (lsn, None)).collect());
     }
 
     /// In sync/semi-sync mode block (bounded) until a standby has the entry. A no-op
@@ -1973,8 +1982,7 @@ mod tests {
         assert_eq!(lsn, 3);
         assert_eq!(wal.published_lsn(), 3);
         let entries = wal.replay().unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].lsn, 3);
+        assert_eq!(entries.iter().map(|e| e.lsn).collect::<Vec<_>>(), vec![3]);
     }
 
     /// Two committers finishing out of LSN order must not let the watermark (and so
@@ -1992,7 +2000,11 @@ mod tests {
         // B (LSN 2) lands and is published first.
         db.write(second).unwrap();
         wal.publish_staged(b);
-        assert_eq!(wal.published_lsn(), 0, "LSN 2 must not be visible while LSN 1 is unresolved");
+        assert_eq!(
+            wal.published_lsn(),
+            0,
+            "LSN 2 must not be visible while LSN 1 is unresolved"
+        );
 
         // A (LSN 1) lands: both become visible, in order.
         db.write(first).unwrap();
@@ -2014,8 +2026,15 @@ mod tests {
             assert!(wal.replay().unwrap().is_empty());
             // Statement fails: the frame is dropped without being taken.
         }
-        assert!(wal.replay().unwrap().is_empty(), "a rolled-back statement leaves no history");
-        assert_eq!(wal.append(insert_op(3)).unwrap(), 1, "with no frame, appends are immediate again");
+        assert!(
+            wal.replay().unwrap().is_empty(),
+            "a rolled-back statement leaves no history"
+        );
+        assert_eq!(
+            wal.append(insert_op(3)).unwrap(),
+            1,
+            "with no frame, appends are immediate again"
+        );
 
         // The committing transaction takes the buffered operations.
         let frame = wal.begin_statement_capture(9);
@@ -2023,7 +2042,10 @@ mod tests {
         let (ops, wants_sync) = wal.take_statement_capture(9).unwrap();
         assert_eq!(ops.len(), 1);
         assert!(wants_sync, "a synchronous append asks for a synchronous commit write");
-        assert!(wal.take_statement_capture(8).is_none(), "another transaction's frame is not taken");
+        assert!(
+            wal.take_statement_capture(8).is_none(),
+            "another transaction's frame is not taken"
+        );
         drop(frame);
     }
 

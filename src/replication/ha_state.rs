@@ -590,9 +590,7 @@ pub fn wal_operation_to_entry(lsn: u64, operation: &WalOperation) -> WalEntry {
         // Materialized view operations
         WalOperation::CreateMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
         WalOperation::DropMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::RefreshMaterializedView { .. } => {
-            (WalEntryType::SchemaChange, serialize_operation(operation))
-        }
+        WalOperation::RefreshMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
 
         // Constraint operations
         WalOperation::AddConstraint { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),

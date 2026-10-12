@@ -724,7 +724,6 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use axum::routing::get;
-    use base64::Engine as _;
     use tower::ServiceExt;
 
     fn basic(username: &str, password: &str) -> String {

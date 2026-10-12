@@ -1573,15 +1573,15 @@ impl Transaction {
         // (below), then published to standbys only after that write succeeded. The old
         // order (append and broadcast first, write second) let a failed commit leave
         // history behind for data that never landed.
-        let mut wal_plan: Option<(Arc<RwLock<WriteAheadLog>>, Vec<WalOperation>, bool)> = None;
-        if let Some(wal) = &self.wal {
-            let ops = Self::collect_logical_wal_ops(
-                &self.insert_log.read(),
-                &self.write_set,
-                &self.row_counter_stages.read(),
-            );
-            wal_plan = Some((Arc::clone(wal), ops, self.logical_wal_sync));
-        }
+        let mut wal_plan: Option<(Arc<RwLock<WriteAheadLog>>, Vec<WalOperation>, bool)> =
+            self.wal.as_ref().map(|wal| {
+                let ops = Self::collect_logical_wal_ops(
+                    &self.insert_log.read(),
+                    &self.write_set,
+                    &self.row_counter_stages.read(),
+                );
+                (Arc::clone(wal), ops, self.logical_wal_sync)
+            });
         if let Some(wal) = &self.statement_wal {
             if let Some((captured, wants_sync)) = wal.read().take_statement_capture(self.transaction_id) {
                 if !captured.is_empty() {
