@@ -1,12 +1,120 @@
 # HeliosDB Nano
 
 [![Crates.io](https://img.shields.io/crates/v/heliosdb-nano.svg)](https://crates.io/crates/heliosdb-nano)
+[![Downloads](https://img.shields.io/crates/d/heliosdb-nano.svg)](https://crates.io/crates/heliosdb-nano)
+[![Latest release](https://img.shields.io/github/v/release/HeliosDatabase/HeliosDB-Nano)](https://github.com/HeliosDatabase/HeliosDB-Nano/releases/latest)
+[![Tests](https://github.com/HeliosDatabase/HeliosDB-Nano/actions/workflows/tests.yml/badge.svg)](https://github.com/HeliosDatabase/HeliosDB-Nano/actions/workflows/tests.yml)
 [![Documentation](https://docs.rs/heliosdb-nano/badge.svg)](https://docs.rs/heliosdb-nano)
+[![GitHub stars](https://img.shields.io/github/stars/HeliosDatabase/HeliosDB-Nano?style=social)](https://github.com/HeliosDatabase/HeliosDB-Nano/stargazers)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-**An embedded database with native PostgreSQL and MySQL wire-protocol compatibility, plus one-shot SQLite file import.** Single self-contained binary (~32 MB; ~12 MB compressed download). HNSW vector search, git-like branching, time-travel queries, AES-256-GCM encryption, built-in BaaS layer (Auth, REST API, Realtime).
+**One ~32 MB binary: SQL + vector search + full-text search, speaking the PostgreSQL and MySQL wire protocols. Embed it as a Rust library or run it as a server.**
 
-Use your existing clients (`psql`, `mysql`), RESTful HTTP, drivers (`psycopg2`, `mysql-connector`, `node-postgres`, JDBC), and ORMs (SQLAlchemy, Prisma, Drizzle, Hibernate, GORM) — zero migration required. Existing `.sqlite` files import via a bundled converter.
+## 60-second quickstart
+
+No Rust toolchain needed. Pick one:
+
+```bash
+# Docker (public image on GHCR; the server requires a password when it listens on 0.0.0.0)
+docker run -d --name nano -p 5432:5432 -e HELIOSDB_PASSWORD=change-me \
+  ghcr.io/heliosdatabase/heliosdb-nano
+PGPASSWORD=change-me psql "host=localhost user=helios sslmode=require"
+
+# ...or a prebuilt binary (Linux x86_64/arm64 with glibc >= 2.39, macOS Apple Silicon; checksum-verified)
+curl -fsSL https://raw.githubusercontent.com/HeliosDatabase/HeliosDB-Nano/main/scripts/install.sh | sh
+heliosdb-nano start --data-dir ./helios-data      # loopback only, no password needed
+psql -h localhost -U helios
+```
+
+```sql
+CREATE TABLE docs(id int, body text, emb vector(3));
+INSERT INTO docs VALUES (1, 'hello', '[0.1,0.2,0.3]'), (2, 'world', '[0.9,0.8,0.7]');
+SELECT id FROM docs ORDER BY emb <-> '[0.1,0.2,0.3]' LIMIT 5;
+```
+
+The Linux binary needs glibc ≥ 2.39 (Ubuntu 24.04, Debian 13 or newer); on older distros such as RHEL/Rocky 9, Ubuntu 22.04 or Debian 12 the installer stops without installing anything, so use Docker there. Windows and macOS Intel: see [Install](#install).
+If Nano saves you a Postgres container, a ⭐ helps others find it.
+
+## What you get
+
+- **Wire compatibility:** PostgreSQL (`psql`, `psycopg2`, `node-postgres`, JDBC, Prisma, Drizzle, SQLAlchemy…) and MySQL (`--mysql`) clients work unchanged; one-shot SQLite file import.
+- **Vector search:** HNSW indexes with `<->`, `<#>`, `<=>`; hybrid with full-text.
+- **Full-text search:** `tsvector` / `tsquery` / `@@` / `ts_rank_cd`, BM25-backed (see [limits](docs/compatibility/fts.md)).
+- **Branching and time travel:** git-like database branches, `AS OF TIMESTAMP` queries.
+- **Security:** AES-256-GCM encryption at rest (opt-in), SCRAM auth, TLS.
+- **Built-in BaaS layer:** Auth, REST API, Realtime.
+- **HA tier 1:** warm standby replication (see [High Availability](#high-availability) for what is and is not automatic).
+- **Opt-in at build time:** code-graph indexing, graph-RAG, MCP server (`--features code-graph,graph-rag,mcp-endpoint`). Graph traversal is a Rust/MCP API, not SQL.
+
+## Who it's for
+
+- **Local-first apps** that want real Postgres/MySQL clients against a single file-backed process.
+- **AI agent memory:** vectors, full-text and branches in one store, with an MCP server available as an opt-in feature.
+- **Edge and IoT:** one self-contained binary, no external services.
+- **Hosting providers** offering per-tenant databases (multi-tenant support is built in).
+
+## How it compares
+
+Rows where others win are deliberate. Competitor columns reflect their documented defaults as of 2026-10; check each project for the current state.
+
+| | HeliosDB Nano | SQLite | DuckDB | PGlite | Postgres + pgvector |
+|---|---|---|---|---|---|
+| Wire protocol | PostgreSQL + MySQL | none (library) | none (library/CLI) | PostgreSQL via an add-on socket server | PostgreSQL |
+| Vector search | built-in HNSW | extension (sqlite-vec) | extension (vss) | pgvector bundled | extension |
+| Graph | Rust / MCP API only | no | extension | no | extensions (e.g. Apache AGE) |
+| Full-text search | built-in | FTS5 | extension | Postgres FTS | Postgres FTS |
+| WASM / browser | **not shipped** | yes | yes | yes (it is WASM) | no |
+| Embedded | yes | yes | yes | yes | no (server) |
+| Branching / time travel | yes | no | no | no | no (managed vendors only) |
+| Maturity and ecosystem | young | decades, ubiquitous | mature | young | decades, huge |
+| License | Apache-2.0 | public domain | MIT | Apache-2.0 / PostgreSQL | PostgreSQL |
+
+## Install
+
+### Prebuilt binaries (fastest)
+
+The one-line installer downloads the right archive from [GitHub Releases](https://github.com/HeliosDatabase/HeliosDB-Nano/releases/latest), verifies it against the release `SHA256SUMS`, and installs to `/usr/local/bin` (root) or `~/.local/bin`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HeliosDatabase/HeliosDB-Nano/main/scripts/install.sh | sh
+heliosdb-nano --version
+```
+
+Release assets (v4.41.0): Linux `x86_64` and `aarch64` (glibc ≥ 2.39, built on Ubuntu 24.04), macOS `aarch64` (Apple Silicon), Windows `x86_64` (`.zip`, manual download). **Not provided:** macOS Intel, Linux musl/Alpine — use Docker or build from source there. Manual download:
+
+```bash
+VER=<release-tag>
+curl -sSfL -O "https://github.com/HeliosDatabase/HeliosDB-Nano/releases/download/$VER/heliosdb-nano-$VER-x86_64-unknown-linux-gnu.tar.gz"
+tar xzf "heliosdb-nano-$VER-x86_64-unknown-linux-gnu.tar.gz"
+./heliosdb-nano --version
+```
+
+### Docker
+
+Published to GHCR on each release (`linux/amd64`, `linux/arm64`) as `ghcr.io/heliosdatabase/heliosdb-nano` (tags `latest`, `X.Y.Z`, `X.Y`, `vX.Y.Z`). The container listens on `0.0.0.0`, so it requires `HELIOSDB_PASSWORD` (or `HELIOSDB_PASSWORD_FILE`) and serves TLS with a generated self-signed certificate; mount a volume at `/data` to persist. There is no Docker Hub image. See [`deployment/docker/`](deployment/docker/) for compose files.
+
+### Build from source (Cargo)
+
+Compiling takes minutes. Install Rust first (`rustup`, <https://rustup.rs>), then:
+
+```bash
+cargo install heliosdb-nano --locked
+heliosdb-nano --version
+
+# Optional features
+cargo install heliosdb-nano --locked --features code-graph,mcp-endpoint
+
+# Embedded Rust library
+cargo add heliosdb-nano
+
+# From a checkout
+git clone https://github.com/HeliosDatabase/HeliosDB-Nano.git
+cd HeliosDB-Nano
+cargo build --release --locked
+./target/release/heliosdb-nano --version
+```
+
+Package-manager channels such as npm and Homebrew are not published; treat a channel as available only if it is listed on the releases page.
 
 ## Ecosystem
 
@@ -25,77 +133,9 @@ Nano is one of four products in the HeliosDB family. SDKs and integrations are c
 
 **Performance:** [what's fast, and where we're still improving](docs/PERFORMANCE.md) — honest strengths + transparent limits.
 
-**Benchmark:** [HeliosDB-Nano vs PostgreSQL 18.4 — the `pg35` benchmark, its history & evolution](docs/benchmarks/PG35_BENCHMARK.md) — 35 SQL categories head-to-head; Nano wins all 35/35 at 300 iterations (30 by 10×–35,000×, the joins by 1.1×–2×). The one category that ever classified against Nano (Prepared stmts) turned out to expose a real `ROLLBACK TO SAVEPOINT` bug — fixed in v3.60.3, and now a ~157× Nano win. **Read the methodology note before quoting those ratios:** `pg35` runs Nano *embedded and in-memory* against a *networked, fsyncing* PostgreSQL, so the margins include deployment effects, not just engine speed.
+**Benchmark (wire-to-wire):** [**vs PostgreSQL, 2026-08-28**](docs/benchmarks/heliosdb-nano-vs-postgresql-2026-08-28.md) runs Nano as a TCP server with `pgbench` driving both: Nano leads on indexed point-reads across all three query protocols (1.33×–2.22×) and on `SELECT 1` (1.84×–2.84×); PostgreSQL leads on `COPY` above ~50k rows (1.28× at 100k) and on `DROP TABLE` (2.05×), and **PostgreSQL keeps scaling from 32→64 clients (+32–41%) where Nano plateaus**.
 
-For a like-for-like **wire-to-wire** comparison — Nano also as a TCP server, `pgbench` driving both — see [**vs PostgreSQL, 2026-08-28**](docs/benchmarks/heliosdb-nano-vs-postgresql-2026-08-28.md): Nano leads on indexed point-reads across all three query protocols (1.33×–2.22×) and on `SELECT 1` (1.84×–2.84×); PostgreSQL leads on `COPY` above ~50k rows (1.28× at 100k) and on `DROP TABLE` (2.05×), and **PostgreSQL keeps scaling from 32→64 clients (+32–41%) where Nano plateaus**.
-
-## Install
-
-### Supported now: Cargo / crates.io
-
-Install Rust and Cargo first. On Linux, macOS, or WSL, the recommended installer
-is `rustup`:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-rustc --version
-cargo --version
-```
-
-On Windows, install Rust from [rustup.rs](https://rustup.rs/), then open a new
-terminal so `cargo` is on `PATH`.
-
-Install the `heliosdb-nano` CLI binary from crates.io:
-
-```bash
-cargo install heliosdb-nano --locked
-heliosdb-nano --version
-```
-
-Use Nano as an embedded Rust library:
-
-```bash
-cargo add heliosdb-nano
-```
-
-Enable optional crate features when installing or adding the dependency:
-
-```bash
-cargo install heliosdb-nano --locked --features code-graph,mcp-endpoint
-cargo add heliosdb-nano --features code-graph,mcp-endpoint
-```
-
-Build from source:
-
-```bash
-git clone https://github.com/HeliosDatabase/HeliosDB-Nano.git
-cd HeliosDB-Nano
-cargo build --release --locked
-./target/release/heliosdb-nano --version
-```
-
-### Prebuilt Binaries
-
-Grab a self-contained binary from the [**GitHub Releases**](https://github.com/HeliosDatabase/HeliosDB-Nano/releases/latest)
-page — Linux (`x86_64` / `aarch64`), macOS (`aarch64`), and Windows (`x86_64`),
-each with `SHA256SUMS`. No Rust toolchain required: download the archive for your
-platform, verify it against `SHA256SUMS`, extract, and run the `heliosdb-nano`
-binary.
-
-```bash
-# Example: Linux x86_64 (see Releases for macOS arm64 / Linux aarch64 / Windows)
-VER=<release-tag>
-curl -sSfL -O "https://github.com/HeliosDatabase/HeliosDB-Nano/releases/download/$VER/heliosdb-nano-$VER-x86_64-unknown-linux-gnu.tar.gz"
-tar xzf "heliosdb-nano-$VER-x86_64-unknown-linux-gnu.tar.gz"
-./heliosdb-nano --version
-```
-
-### Install Channels
-
-Use Cargo or the GitHub release binaries for a verified install. Package-manager
-channels such as npm, Homebrew, and container images should be treated as
-available only when they are listed on the official releases page.
+**Benchmark (embedded, `pg35`):** [the 35-category suite, its history & evolution](docs/benchmarks/PG35_BENCHMARK.md) runs Nano *embedded and in-memory* against a *networked, fsyncing* PostgreSQL, so its large margins include deployment effects, not just engine speed. Read the methodology note before quoting those ratios.
 
 ## Start the Server
 
@@ -795,3 +835,5 @@ Hosted docs:
 ## License
 
 [Apache-2.0](LICENSE) — Apache License, Version 2.0
+
+If Nano saves you a Postgres container, a ⭐ on [GitHub](https://github.com/HeliosDatabase/HeliosDB-Nano) helps others find it.
