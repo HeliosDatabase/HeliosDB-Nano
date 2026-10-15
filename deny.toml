@@ -42,6 +42,14 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "bincode = storage codec; migration is a format project, tracked" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile -> rustls-pki-types migration tracked" },
     { id = "RUSTSEC-2025-0119", reason = "number_prefix is an indicatif leaf dep, display-only" },
+    # Unmaintained (no vulnerability), added 2026-10-15: unsafe-libyaml is
+    # serde_yaml 0.9's parser/emitter. Its only parse inputs are the OpenAPI
+    # spec compiled into the binary (`include_str!` in src/api/openapi/mod.rs
+    # and src/api/server.rs); the emitter only renders EXPLAIN output the
+    # engine builds itself. No externally supplied YAML ever reaches it.
+    # Replacing serde_yaml can change EXPLAIN (FORMAT YAML) output, so it is
+    # tracked for a minor release rather than done in a patch.
+    { id = "RUSTSEC-2024-0449", reason = "serde_yaml backend; parses only the compiled-in OpenAPI spec" },
 ]
 
 [licenses]

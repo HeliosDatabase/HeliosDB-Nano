@@ -2,13 +2,14 @@
 //!
 //! Wraps the Rust embedded API directly so Python clients avoid the `heliosdb-nano
 //! repl` subprocess pipe + text protocol that loses to sqlite3 on aggregates. Every
-//! engine call releases the GIL (`allow_threads`), so multiple Python threads can run
+//! engine call releases the GIL (`detach`), so multiple Python threads can run
 //! queries concurrently — sound because `EmbeddedDatabase` is `Send + Sync`.
 
 use heliosdb_core::{EmbeddedDatabase, Tuple, Value};
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use pyo3::IntoPyObjectExt;
 
 // Compile-time proof of the property that makes GIL release sound. If the core crate
 // ever makes EmbeddedDatabase non-Send/Sync, this fails to build instead of silently
@@ -42,7 +43,7 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     if let Ok(s) = obj.extract::<String>() {
         return Ok(Value::String(s));
     }
-    if let Ok(b) = obj.downcast::<PyBytes>() {
+    if let Ok(b) = obj.cast::<PyBytes>() {
         return Ok(Value::Bytes(b.as_bytes().to_vec()));
     }
     if let Ok(v) = obj.extract::<Vec<f32>>() {
@@ -55,50 +56,49 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
 }
 
 /// engine `Value` -> Python object, for row output.
-fn value_to_py(py: Python<'_>, v: &Value) -> PyObject {
+fn value_to_py(py: Python<'_>, v: &Value) -> PyResult<Py<PyAny>> {
     match v {
-        Value::Null => py.None(),
-        Value::Boolean(b) => (*b).into_py(py),
-        Value::Int2(n) => (*n).into_py(py),
-        Value::Int4(n) => (*n).into_py(py),
-        Value::Int8(n) => (*n).into_py(py),
-        Value::Float4(f) => (*f).into_py(py),
-        Value::Float8(f) => (*f).into_py(py),
-        Value::Numeric(s) | Value::String(s) | Value::Json(s) => s.clone().into_py(py),
-        Value::Bytes(b) => PyBytes::new_bound(py, b).into_py(py),
-        Value::Uuid(u) => u.to_string().into_py(py),
-        Value::Timestamp(t) => t.to_rfc3339().into_py(py),
-        Value::Date(d) => d.to_string().into_py(py),
-        Value::Time(t) => t.to_string().into_py(py),
-        Value::Interval(us) => (*us).into_py(py),
-        Value::Vector(vec) => vec.clone().into_py(py),
+        Value::Null => Ok(py.None()),
+        Value::Boolean(b) => (*b).into_py_any(py),
+        Value::Int2(n) => (*n).into_py_any(py),
+        Value::Int4(n) => (*n).into_py_any(py),
+        Value::Int8(n) => (*n).into_py_any(py),
+        Value::Float4(f) => (*f).into_py_any(py),
+        Value::Float8(f) => (*f).into_py_any(py),
+        Value::Numeric(s) | Value::String(s) | Value::Json(s) => s.as_str().into_py_any(py),
+        Value::Bytes(b) => PyBytes::new(py, b).into_py_any(py),
+        Value::Uuid(u) => u.to_string().into_py_any(py),
+        Value::Timestamp(t) => t.to_rfc3339().into_py_any(py),
+        Value::Date(d) => d.to_string().into_py_any(py),
+        Value::Time(t) => t.to_string().into_py_any(py),
+        Value::Interval(us) => (*us).into_py_any(py),
+        Value::Vector(vec) => vec.as_slice().into_py_any(py),
         Value::Array(items) => {
-            let list = PyList::empty_bound(py);
+            let list = PyList::empty(py);
             for it in items {
-                let _ = list.append(value_to_py(py, it));
+                list.append(value_to_py(py, it)?)?;
             }
-            list.into_py(py)
+            list.into_py_any(py)
         }
         // DictRef / CasRef / ColumnarRef are resolved by the scan path before output.
-        _ => py.None(),
+        _ => Ok(py.None()),
     }
 }
 
-fn rows_to_dicts(py: Python<'_>, rows: &[Tuple], cols: &[String]) -> PyObject {
-    let out = PyList::empty_bound(py);
+fn rows_to_dicts(py: Python<'_>, rows: &[Tuple], cols: &[String]) -> PyResult<Py<PyAny>> {
+    let out = PyList::empty(py);
     for row in rows {
-        let d = PyDict::new_bound(py);
+        let d = PyDict::new(py);
         for (i, col) in cols.iter().enumerate() {
-            let v = row
-                .values
-                .get(i)
-                .map(|v| value_to_py(py, v))
-                .unwrap_or_else(|| py.None());
-            let _ = d.set_item(col, v);
+            let v = match row.values.get(i) {
+                Some(v) => value_to_py(py, v)?,
+                None => py.None(),
+            };
+            d.set_item(col, v)?;
         }
-        let _ = out.append(d);
+        out.append(d)?;
     }
-    out.into_py(py)
+    out.into_py_any(py)
 }
 
 /// Accept a Python tuple/list of params (or `None`) as `Vec<Value>`.
@@ -108,11 +108,11 @@ fn collect_params(params: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<Value>> {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    if let Ok(list) = p.downcast::<PyList>() {
+    if let Ok(list) = p.cast::<PyList>() {
         for item in list.iter() {
             out.push(py_to_value(&item)?);
         }
-    } else if let Ok(tup) = p.downcast::<PyTuple>() {
+    } else if let Ok(tup) = p.cast::<PyTuple>() {
         for item in tup.iter() {
             out.push(py_to_value(&item)?);
         }
@@ -160,19 +160,19 @@ impl PyDatabase {
     /// Run a query and return rows as `list[dict]`. Optional positional `params`
     /// bind to `$1..$n`.
     #[pyo3(signature = (sql, params = None))]
-    fn query(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyAny>>) -> PyResult<PyObject> {
+    fn query(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let ps = collect_params(params)?;
         let (rows, cols) = py
-            .allow_threads(|| self.inner.query_params_with_columns(sql, &ps))
+            .detach(|| self.inner.query_params_with_columns(sql, &ps))
             .map_err(rt_err)?;
-        Ok(rows_to_dicts(py, &rows, &cols))
+        rows_to_dicts(py, &rows, &cols)
     }
 
     /// Execute DDL/DML and return the affected row count. Optional positional params.
     #[pyo3(signature = (sql, params = None))]
     fn execute(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyAny>>) -> PyResult<u64> {
         let ps = collect_params(params)?;
-        py.allow_threads(|| {
+        py.detach(|| {
             if ps.is_empty() {
                 self.inner.execute(sql)
             } else {
@@ -185,14 +185,13 @@ impl PyDatabase {
     /// Execute one statement against many parameter rows; returns total affected.
     fn execute_many(&self, py: Python<'_>, sql: &str, rows: &Bound<'_, PyList>) -> PyResult<u64> {
         let batches: Vec<Vec<Value>> = rows.iter().map(|r| collect_params(Some(&r))).collect::<PyResult<_>>()?;
-        py.allow_threads(|| self.inner.execute_many_params(sql, &batches))
+        py.detach(|| self.inner.execute_many_params(sql, &batches))
             .map_err(rt_err)
     }
 
     /// HNSW similarity search. Returns `list[(id, distance)]`.
     fn vector_search(&self, py: Python<'_>, store: &str, query: Vec<f32>, k: usize) -> PyResult<Vec<(String, f32)>> {
-        py.allow_threads(|| self.inner.search_vectors(store, query, k))
-            .map_err(rt_err)
+        py.detach(|| self.inner.search_vectors(store, query, k)).map_err(rt_err)
     }
 
     /// Create a vector store with the given dimensionality.
@@ -205,13 +204,12 @@ impl PyDatabase {
 
     /// Bulk-insert vectors; returns the generated ids.
     fn insert_vectors(&self, py: Python<'_>, store: &str, vectors: Vec<Vec<f32>>) -> PyResult<Vec<String>> {
-        py.allow_threads(|| self.inner.insert_vectors(store, vectors))
-            .map_err(rt_err)
+        py.detach(|| self.inner.insert_vectors(store, vectors)).map_err(rt_err)
     }
 
     /// Force the memtable to flush to SST.
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| self.inner.flush()).map_err(rt_err)
+        py.detach(|| self.inner.flush()).map_err(rt_err)
     }
 
     fn __repr__(&self) -> String {

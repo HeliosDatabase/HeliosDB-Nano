@@ -1,0 +1,14 @@
+# cargo-audit configuration. cargo-deny keeps its own list in deny.toml; an
+# advisory ignored here must have a reason that holds for every build.
+
+[advisories]
+ignore = [
+    # rkyv 0.7.46 (out-of-bounds read validating Rc/Arc archives) is in
+    # Cargo.lock only as rust_decimal 1.40's optional `rkyv` dependency. No
+    # feature of this workspace enables it, so it is never compiled:
+    # `cargo tree --workspace --all-features --target all -i rkyv` prints
+    # nothing, and cargo-deny (which walks the build graph) does not report it.
+    # rust_decimal >= 1.43 drops it but changes decimal arithmetic results, so
+    # that upgrade is a minor-release item.
+    "RUSTSEC-2026-0235",
+]
