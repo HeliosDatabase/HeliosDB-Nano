@@ -69,7 +69,11 @@ pub const INDEX_SNAPSHOT_FORMAT_VERSION: u32 = 1;
 /// v2: order-preserving encoding (R4.4) — sign-flipped big-endian integers,
 ///     total-order floats, `0x00 -> 0x00 0xFF` escaping inside composite
 ///     string/byte values.
-pub const ART_KEY_ENCODING_VERSION: u32 = 2;
+/// v3: the v2 encoding, bumped in 4.41.1 to retire v2 snapshots. Earlier trees
+///     dropped the row ids of keys that end at an inner node whenever that node
+///     was resized, so a v2 snapshot can be missing entries; it is ignored and
+///     the table's indexes are rebuilt from rows once.
+pub const ART_KEY_ENCODING_VERSION: u32 = 3;
 
 /// RocksDB key prefixes for snapshot blobs and their validity markers.
 pub const ART_SNAPSHOT_PREFIX: &str = "idxsnap:";
@@ -121,6 +125,12 @@ impl SnapshotMarker {
 
     pub fn matches_current(&self) -> bool {
         self.format_version == INDEX_SNAPSHOT_FORMAT_VERSION && self.key_encoding_version == ART_KEY_ENCODING_VERSION
+    }
+
+    /// Marker check for HNSW graph snapshots. The ART key encoding does not
+    /// apply to them, so retiring ART snapshots must not force a graph rebuild.
+    pub fn matches_current_format(&self) -> bool {
+        self.format_version == INDEX_SNAPSHOT_FORMAT_VERSION
     }
 }
 

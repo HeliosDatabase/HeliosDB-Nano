@@ -2318,6 +2318,7 @@ impl<'a> Catalog<'a> {
             };
 
             let mut max_row_id: Option<u64> = None;
+            let mut duplicate_rows = 0u64;
             for tuple in &tuples {
                 let row_id = match tuple.row_id {
                     Some(id) => id,
@@ -2331,6 +2332,9 @@ impl<'a> Catalog<'a> {
                     }
                 }
                 if let Err(e) = art_manager.on_insert(&table_name, row_id, &col_values) {
+                    if matches!(e, super::art_index::ArtIndexError::DuplicateKey(_)) {
+                        duplicate_rows += 1;
+                    }
                     tracing::debug!(
                         "Index rebuild: on_insert skipped for {} row {}: {}",
                         table_name,
@@ -2339,6 +2343,20 @@ impl<'a> Catalog<'a> {
                     );
                 }
                 total_rows += 1;
+            }
+            // Stored rows that repeat a PRIMARY KEY / UNIQUE value. Constraint
+            // checks keep these out today, but releases before 4.41.1 could
+            // admit them for TEXT keys that are a prefix of other keys. The
+            // rows stay readable through scans; only the first is indexed.
+            if duplicate_rows > 0 {
+                tracing::warn!(
+                    "Index rebuild: {} row(s) of '{}' repeat a PRIMARY KEY or UNIQUE value of an earlier row and \
+                     are not indexed. Earlier releases could accept such duplicates (see CHANGELOG 4.41.1); list \
+                     them with SELECT <key>, count(*) FROM {} GROUP BY <key> HAVING count(*) > 1",
+                    duplicate_rows,
+                    table_name,
+                    table_name
+                );
             }
 
             // Reconcile the row-id counter against the highest row id actually

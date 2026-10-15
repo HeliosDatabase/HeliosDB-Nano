@@ -257,9 +257,12 @@ impl Node4 {
     }
 
     /// Grow to Node16
-    pub fn grow(self) -> Node16 {
+    pub fn grow(mut self) -> Node16 {
         let mut node16 = Node16::with_prefix(self.header.get_prefix());
         node16.header.prefix_len = self.header.prefix_len;
+        // Row ids of keys that END at this node move with it; dropping them lost
+        // every key that is a prefix of enough other keys to resize the node.
+        node16.header.values = std::mem::take(&mut self.header.values);
 
         for i in 0..4 {
             if let Some(child) = self.children[i].clone() {
@@ -375,9 +378,12 @@ impl Node16 {
     }
 
     /// Grow to Node48
-    pub fn grow(self) -> Node48 {
+    pub fn grow(mut self) -> Node48 {
         let mut node48 = Node48::with_prefix(self.header.get_prefix());
         node48.header.prefix_len = self.header.prefix_len;
+        // Row ids of keys that END at this node move with it; dropping them lost
+        // every key that is a prefix of enough other keys to resize the node.
+        node48.header.values = std::mem::take(&mut self.header.values);
 
         for i in 0..16 {
             if let Some(child) = self.children[i].clone() {
@@ -391,9 +397,12 @@ impl Node16 {
     }
 
     /// Shrink to Node4
-    pub fn shrink(self) -> Node4 {
+    pub fn shrink(mut self) -> Node4 {
         let mut node4 = Node4::with_prefix(self.header.get_prefix());
         node4.header.prefix_len = self.header.prefix_len;
+        // Row ids of keys that END at this node move with it; dropping them lost
+        // every key that is a prefix of enough other keys to resize the node.
+        node4.header.values = std::mem::take(&mut self.header.values);
 
         let mut idx = 0;
         for i in 0..16 {
@@ -520,9 +529,12 @@ impl Node48 {
     }
 
     /// Grow to Node256
-    pub fn grow(self) -> Node256 {
+    pub fn grow(mut self) -> Node256 {
         let mut node256 = Node256::with_prefix(self.header.get_prefix());
         node256.header.prefix_len = self.header.prefix_len;
+        // Row ids of keys that END at this node move with it; dropping them lost
+        // every key that is a prefix of enough other keys to resize the node.
+        node256.header.values = std::mem::take(&mut self.header.values);
 
         for key in 0..256u16 {
             let idx = self.child_index[key as usize];
@@ -537,9 +549,12 @@ impl Node48 {
     }
 
     /// Shrink to Node16
-    pub fn shrink(self) -> Node16 {
+    pub fn shrink(mut self) -> Node16 {
         let mut node16 = Node16::with_prefix(self.header.get_prefix());
         node16.header.prefix_len = self.header.prefix_len;
+        // Row ids of keys that END at this node move with it; dropping them lost
+        // every key that is a prefix of enough other keys to resize the node.
+        node16.header.values = std::mem::take(&mut self.header.values);
 
         let mut idx = 0;
         for key in 0..256u16 {
@@ -639,9 +654,12 @@ impl Node256 {
     }
 
     /// Shrink to Node48
-    pub fn shrink(self) -> Node48 {
+    pub fn shrink(mut self) -> Node48 {
         let mut node48 = Node48::with_prefix(self.header.get_prefix());
         node48.header.prefix_len = self.header.prefix_len;
+        // Row ids of keys that END at this node move with it; dropping them lost
+        // every key that is a prefix of enough other keys to resize the node.
+        node48.header.values = std::mem::take(&mut self.header.values);
 
         let mut slot = 0;
         for key in 0..256u16 {

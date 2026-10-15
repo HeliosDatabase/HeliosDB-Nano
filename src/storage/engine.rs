@@ -10066,7 +10066,7 @@ impl StorageEngine {
             let Ok(marker) = bincode::deserialize::<snap::SnapshotMarker>(&marker_bytes) else {
                 continue;
             };
-            if !marker.matches_current() {
+            if !marker.matches_current_format() {
                 continue;
             }
             let Ok(Some(blob)) = self.get(&snap::vec_snapshot_key(&index)) else {

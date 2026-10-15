@@ -1690,4 +1690,43 @@ mod tests {
         assert_eq!(user42_orders.len(), 2);
         assert_eq!(tree.len(), 3);
     }
+
+    /// A key that is a prefix of other keys keeps its row ids in the inner node
+    /// where it ends. Growing that node (4 -> 16 -> 48 -> 256 children) and
+    /// shrinking it back used to drop them: the key was no longer found, and a
+    /// PRIMARY KEY / UNIQUE index accepted it a second time.
+    #[test]
+    fn prefix_key_survives_every_node_resize() {
+        // 94 one-byte extensions take the node holding `k-1` through every size.
+        let suffixes: Vec<u8> = (b'!'..=b'~').collect();
+        for index_type in [ArtIndexType::PrimaryKey, ArtIndexType::Unique, ArtIndexType::Manual] {
+            let mut tree = AdaptiveRadixTree::new("t_k", "t", vec!["k".to_string()], index_type);
+            tree.insert(b"k-1", 1).unwrap();
+            for (i, s) in suffixes.iter().enumerate() {
+                tree.insert(&[b'k', b'-', b'1', *s], 100 + i as RowId).unwrap();
+                assert_eq!(
+                    tree.get(b"k-1"),
+                    Some(1),
+                    "{index_type:?}: lost after {} extensions",
+                    i + 1
+                );
+            }
+            if index_type != ArtIndexType::Manual {
+                assert!(
+                    matches!(tree.insert(b"k-1", 2), Err(ArtIndexError::DuplicateKey(_))),
+                    "{index_type:?}: duplicate accepted"
+                );
+            }
+            for (i, s) in suffixes.iter().enumerate() {
+                assert_eq!(tree.remove(&[b'k', b'-', b'1', *s]).unwrap(), Some(100 + i as RowId));
+                assert_eq!(
+                    tree.get(b"k-1"),
+                    Some(1),
+                    "{index_type:?}: lost after {} removals",
+                    i + 1
+                );
+            }
+            assert_eq!(tree.len(), 1);
+        }
+    }
 }
