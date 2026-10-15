@@ -1,15 +1,24 @@
 # Native replication history guard
 
-The CLI primary and standby use native protocol version 2 to compare a dataset
+The CLI primary and standby use native protocol version 3 to compare a dataset
 history UUID before a receiver accepts WAL. This UUID is independent of
 `--node-id`: reusing a node name or UUID does not authorize another dataset.
 Legacy native peers are refused. Upgrade both endpoints together.
 
 This guard prevents a receiver from silently attaching to a different primary
-history. It does **not** provide online resync, a snapshot boundary, durable
-receiver LSN continuity, complete WAL retention, or protection against a deliberate
-fork made by copying an entire primary directory. A verified handshake means
-identity was checked; it does not mean catchup completed.
+history. It does **not** provide online resync, a snapshot boundary, complete WAL
+retention, or protection against a deliberate fork made by copying an entire
+primary directory. A verified handshake means identity was checked; it does not
+mean catch-up completed.
+
+Since 4.41.1 a standby stores its applied position durably, in the same write as
+each replicated row, and on reconnect the primary catches it up from its
+persisted logical WAL. The standby opens its SQL listener only after it has
+caught up. The primary keeps logical WAL only above its checkpoint (by default it
+advances every 1000 entries or 30 seconds, and at a clean shutdown), so a standby
+whose position is below that checkpoint, including a new standby started after
+it, is refused with a terminal "full resync required" error rather than served
+with missing rows.
 
 For a disk primary, `NANO-PRIMARY-HISTORY.json` is created or validated after
 RocksDB has acquired its database lock and before the native listener starts.

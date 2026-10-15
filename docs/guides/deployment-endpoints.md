@@ -19,7 +19,10 @@ heliosdb-nano start --data-dir /srv/nano-standby --listen 127.0.0.1 \
 Both peers require native protocol v3. A standby verifies dataset history before
 readiness and refuses a replacement history. First startup needs a new, nonexistent
 standby data-directory leaf; do not pre-create it. A successful native connection
-does not prove catchup across a restart or a recreated primary. See the
+does not by itself prove catch-up: the standby serves SQL only after it has caught
+up from the primary's retained logical WAL, a position the primary no longer
+retains is refused with "full resync required", and a recreated primary is
+refused as a different history. See the
 [history guard and interface restrictions](replication-history-guard.md) and
 [offline recovery limitations](offline-reseed.md).
 
