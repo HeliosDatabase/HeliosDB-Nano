@@ -5,7 +5,163 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [4.41.1] - 2026-10-15
+
+A security release. Since 4.27.0 the daemon's HTTP API executed SQL without
+authentication even when the PostgreSQL wire required a password, so anyone who
+could reach the HTTP port could read and change data. That is fixed, and the
+password no longer appears on any process command line. It also fixes an index
+bug that made TEXT `PRIMARY KEY` and `UNIQUE` columns accept duplicates and made
+indexed lookups miss existing rows, stops a standby from silently losing rows
+committed while it was disconnected, and fixes the correctness bugs reported
+against 4.41.0 (GH#39, GH#56–GH#59, GH#61–GH#63, GH#65).
+
+### Upgrade notes — read before upgrading
+
+Data directories written by 4.41.0, encrypted or not, open unchanged; there is
+no migration step. The first start after upgrading rebuilds each table's
+B-tree/ART indexes from its rows once, because index snapshots saved by earlier
+versions can be missing entries (see "Fixed"); vector (HNSW) graph snapshots
+are reused. The changes below refuse setups that 4.41.0 accepted. Each one fails
+at startup with an error that names the fix.
+
+- **HTTP clients must authenticate.** When the PostgreSQL wire has a credential
+  (`--auth password|md5|scram-sha-256`, or a password set with `--auth trust`),
+  every HTTP route except `GET /health` and CORS preflight requires
+  `Authorization: Basic <base64(user:password)>`. BaaS requests that carry an
+  application JWT in `Authorization: Bearer` send the database credential in
+  `X-HeliosDB-Authorization: Basic …` instead. See README, "HTTP API
+  authentication and exposure".
+- **The HTTP API listens on 127.0.0.1 by default** and no longer follows
+  `--listen`. Set `--http-listen` to expose it. An authenticated API is refused
+  on a non-loopback plaintext address, because Basic credentials would cross the
+  network in the clear; the listener does not terminate TLS, so put a TLS proxy
+  in front. A trust-mode API needs `--allow-insecure-http` to bind a
+  non-loopback address.
+- **MySQL is trust-only.** `--mysql` and `--mysql-socket` now refuse to start
+  while the PostgreSQL wire has a credential, instead of offering an
+  unauthenticated SQL path beside it.
+- **Upgrade a primary and its standbys together.** Native replication is now
+  protocol version 3, and 4.41.0 and 4.41.1 nodes refuse each other. A standby
+  binds to its primary's dataset history on first start, so a standby data
+  directory created by 4.41.0 (which has no binding) is refused: start the
+  standby on a new, not yet existing directory. See
+  `docs/guides/replication-history-guard.md` and the replication limits under
+  "Known limitations" below.
+- **Replication token.** With `[replication] token_file` /
+  `--replication-token-file` set, a non-loopback native replication listener is
+  refused unless `--allow-insecure-replication-remote` is given, because the
+  channel is plaintext. See `docs/guides/deployment-endpoints.md`.
+- **`SWITCHOVER` is refused.** The SQL `SWITCHOVER` command used to report
+  success without changing any role. It now returns an error; runtime switchover
+  and promotion are not supported.
+
+### Security
+- **HTTP API authentication.** The HTTP listener (the BaaS surface and
+  `POST /v1/branches/:name/query`) checks credentials against the same user
+  store as the PostgreSQL wire, so the two cannot disagree. Unknown users fail
+  closed with `401`. `GET /health` always returns the fixed `{"status":"ok"}`
+  and never a version or branch. Failed attempts are rate-limited per peer
+  (`[api] http_auth_max_failures`, default 10 per
+  `http_auth_failure_window_secs`, default 60; then `429` with `Retry-After`),
+  concurrent verifications are capped (`http_auth_max_in_flight`, default 64),
+  and so are tracked peers (`http_auth_max_tracked_peers`, default 4096).
+- **Password off the command line.** `heliosdb-nano start` accepts
+  `--password-file <path>` and, when neither `--password` nor
+  `--password-file` is given for a password auth method, reads
+  `HELIOSDB_PASSWORD_FILE` or `HELIOSDB_PASSWORD` from the environment. The
+  container entrypoint uses these, so the password no longer shows up in the
+  host's process table (`ps`, `docker top`). `--daemon` no longer hands the
+  password (or the MCP token) to its child process on the command line. An
+  explicit empty value, an empty password file or a non-UTF-8 value is a
+  startup error, never a silent fall back to trust (an empty environment
+  variable counts as unset). `--password` still works but prints a deprecation
+  warning; on Linux the process re-executes itself so the value leaves its
+  long-lived command line, but it was visible until then and stays in shell
+  history.
+- **`--require-tls`** (GH#53) makes the PostgreSQL TCP listener refuse clients
+  that do not complete a TLS handshake; startup fails without `--tls-cert` and
+  `--tls-key`. It does not cover MySQL, the PostgreSQL Unix socket or HTTP.
+- **One replication secret.** A 32-byte, owner-only token file authenticates
+  both the native and the physical replication channels; when it is configured
+  the primary requires it from every standby and from the failover health probe
+  before any registration or WAL streaming. The token never comes from TOML
+  values or the environment.
+- **A wrong encryption key no longer modifies the data directory.** An
+  encrypted store is now checked against the configured key through a read-only
+  handle before the writable open, so a refused open (wrong key, or no key for
+  an encrypted store) leaves every file byte-for-byte unchanged.
+- **FIPS builds** use the FIPS provider for SCRAM-SHA-256 primitives.
+
+### Replication
+- **No more silent gap after a standby restart.** Rows committed on the primary
+  while a standby was down were missing after it reconnected, with the standby
+  reporting healthy. The standby now keeps its applied position on disk, in the
+  same write as each replicated row, and the primary catches it up from its
+  persisted logical WAL. The standby serves SQL only after it has caught up. A
+  position the primary can no longer serve is refused with "full resync
+  required" instead of being skipped.
+- **A standby that joins after the data exists** receives the retained history
+  instead of crashing with `Table '…' does not exist`.
+- **Rolled-back and failed statements never reach a standby.** The logical WAL
+  was written and broadcast before the data write it described, so a failed
+  commit or a statement that rolled back still reached standbys. Entries now
+  commit in the same write as their data and are published in order, only after
+  that write succeeds. DDL on a wire session commits the same way, and
+  `CREATE TABLE` is no longer logged twice.
+- **History guard.** A standby verifies its primary's dataset history before it
+  accepts any WAL, and refuses a different history. Writes are no longer
+  forwarded from a guarded standby; connect to the primary to write.
+- **`heliosdb-nano resync`** (new, experimental) installs and follows a physical
+  copy of a primary. It never opens SQL or reports readiness; it is not yet a way
+  to rebuild a serving standby.
+
+### Fixed
+- **Indexes lost TEXT keys that are a prefix of other keys.** Once a value such
+  as `'k-1'` was a prefix of five or more other values in the same index
+  (`'k-10'` … `'k-19'`), `WHERE k = 'k-1'` returned no row although the row
+  existed, and a TEXT `PRIMARY KEY` or `UNIQUE` column accepted `'k-1'` a second
+  time. The index dropped such keys whenever one of its nodes grew or shrank.
+  Present in 4.41.0 and earlier releases; integer keys are not affected. Index
+  snapshots written by earlier versions are rebuilt at the first start. A table
+  that already holds duplicates from this bug keeps them; the rebuild logs a
+  warning naming the table, and
+  `SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > 1` lists them.
+- **GH#56:** after `DROP TABLE` or `RENAME` and a rebuild under the same name,
+  primary-key lookups and `UPDATE`s could read rows of the dropped table from the
+  row cache (lost updates). The cache is now evicted.
+- **GH#57:** the extended protocol counted `$n` inside string literals as
+  parameters, so drivers refused the statement.
+- **GH#58:** an out-of-range integer literal was stored modulo 2^32 in an
+  `INTEGER` column. It is now an error.
+- **GH#59:** SQLite DDL accepts `BLOB`, `DATETIME` and `TINYINT`, and an
+  `INTEGER PRIMARY KEY` column (that exact spelling) is assigned automatically
+  when omitted, as SQLite's rowid alias. `INT`/`BIGINT PRIMARY KEY` stay strict.
+- **GH#61:** `ALTER TABLE … ADD COLUMN` inside a transaction made rows inserted
+  earlier in that transaction unreadable.
+- **GH#62:** rows inserted in a transaction that then dropped the table
+  reappeared in a new table of the same name.
+- **GH#63:** `ORDER BY t.col` and `ORDER BY <n>` were ignored in joins.
+- **GH#65:** `sum()` over no rows returned `0` instead of `NULL` when the query
+  also used `string_agg` / `group_concat`.
+- **GH#39:** a `TEXT` column defaulting to `CURRENT_TIMESTAMP` or
+  `datetime('now')` stored the value wrapped in SQL quotes; casting a timestamp,
+  date or time to text now gives plain text (`2026-09-23 12:34:56.123456+00`).
+  A default that cannot be converted to its column type is an error instead of
+  storing `NULL`. `CALL` reports the `CALL` command tag.
+- GH#60 and GH#64 did not reproduce on 4.41.0; regression tests now guard them.
+
+### Startup and shutdown
+- **`[storage] flush_on_close`** (default `true`) flushes RocksDB's memtables at
+  a clean shutdown, so the next start has no RocksDB WAL to replay. The
+  encryption-key check above reads the store a second time at open; without the
+  flush, that read replays everything written since the last flush (+22–25 ms
+  per 2 MB of WAL), so a long-running server would start slower than on 4.41.0.
+  Measured against 4.41.0, restarting after a session that wrote 4,096 rows:
+  startup 185 → 100 ms (plaintext) and 186 → 91 ms (encrypted) on disk, and
+  about half on tmpfs; shutdown takes one flush longer (tens of milliseconds
+  here). Turn it off if shutdown time matters more. A crash skips the flush and
+  loses nothing.
 
 ### Distribution
 - **Official container image on GHCR, multi-arch.** Release CI now publishes
@@ -16,8 +172,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Container entrypoint.** `HELIOSDB_PASSWORD` / `HELIOSDB_PASSWORD_FILE`
   enable scram-sha-256 auth (trust is loopback-only, so the old image exited at
   start); a self-signed TLS certificate is generated in `/data/tls` on first
-  start so `sslmode=require` works; the unauthenticated HTTP API is bound to
-  127.0.0.1 unless `HELIOSDB_HTTP_LISTEN` says otherwise; fixed uid/gid 999; OCI labels link the
+  start so `sslmode=require` works; the HTTP API is bound to 127.0.0.1 unless
+  `HELIOSDB_HTTP_LISTEN` says otherwise; fixed uid/gid 999; OCI labels link the
   package to this repository.
 - **Image honours `HELIOSDB_DATA_DIR`.** The default command is now plain
   `start`; the entrypoint adds `--data-dir $HELIOSDB_DATA_DIR` (default `/data`)
@@ -32,14 +188,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`:X.Y` only follows the newest patch.** Rebuilding an older patch with
   `workflow_dispatch` no longer moves the floating minor tag backwards.
 
-### Security
-- **Password off the command line.** `heliosdb-nano start` accepts
-  `--password-file <path>` and, when neither `--password` nor
-  `--password-file` is given for a password auth method, reads
-  `HELIOSDB_PASSWORD` from the environment. The container entrypoint uses
-  these, so the password no longer shows up in the host's process table
-  (`ps`, `docker top`). `--password` still works but is visible to every
-  local user.
+### Dependencies
+- rustls 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349) and quinn-proto
+  0.11.18 (RUSTSEC-2026-0185, -0338, -0339, -0340, -0342).
+- anyhow 1.0.104 (RUSTSEC-2026-0190) and rand 0.9.5 (RUSTSEC-2026-0097).
+- The Python binding (`bindings/python`, the `heliosdb-nano-embedded` wheel)
+  moves to pyo3 0.29 (RUSTSEC-2025-0020, RUSTSEC-2026-0177). Its supported
+  Python range is unchanged (3.8+). The wheel is released separately.
+- Not changed, with the reason recorded in `deny.toml` / `.cargo/audit.toml`:
+  rkyv 0.7 (RUSTSEC-2026-0235) appears in `Cargo.lock` only as an optional
+  dependency of rust_decimal that no build enables, so it is never compiled
+  (`cargo tree --all-features --target all -i rkyv` is empty); the rust_decimal
+  upgrade that drops it changes decimal arithmetic and waits for a minor
+  release. unsafe-libyaml (unmaintained, no vulnerability) only ever parses the
+  OpenAPI spec compiled into the binary.
+
+### Known limitations
+- **Standby catch-up only covers a short outage.** The primary deletes its
+  logical WAL up to each checkpoint, which advances every 1000 entries or 30
+  seconds by default (`[storage] wal_checkpoint_interval_entries`,
+  `wal_checkpoint_interval_secs`) and at a clean shutdown. A standby that falls
+  behind the checkpoint, or that is first started after it, is refused with
+  "full resync required". Larger intervals widen the window and lengthen crash
+  recovery. There is no online way to rebuild a standby yet:
+  `docs/guides/offline-reseed.md` prepares an offline copy for standalone use
+  only.
+- The HTTP listener does not terminate TLS, and MySQL has no authentication
+  (see "Upgrade notes").
+- The first start of a store last closed by 4.41.0 replays its RocksDB WAL
+  twice (once for the key check) and rebuilds its indexes from rows, so it is
+  slower than later starts; a start after a crash also replays the WAL twice.
+  Clean restarts of 4.41.1 do neither.
 
 ## [4.41.0] - 2026-09-22
 
