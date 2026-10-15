@@ -614,6 +614,16 @@ pub struct StorageConfig {
     /// mistake for redo. Default: true.
     #[serde(default = "default_true")]
     pub wal_checkpoint_on_close: bool,
+    /// Flush RocksDB's memtables at a CLEAN close, so the next open has no
+    /// RocksDB WAL to replay. An open of an existing store reads it twice (the
+    /// read-only encryption preflight, then the writable handle), and each read
+    /// replays everything written since the last memtable flush; with this on,
+    /// that work happens once, at the shutdown that produced it. Turn it off if
+    /// shutdown time matters more than startup time (a large write buffer can
+    /// take seconds to flush). A crash never runs it, and nothing is lost
+    /// either way. Default: true.
+    #[serde(default = "default_true")]
+    pub flush_on_close: bool,
     /// GH#35: advance the logical-WAL checkpoint every N appended entries
     /// (0 disables). This bounds the crash window: a process killed without
     /// running `Drop` leaves at most this many entries above the checkpoint.
@@ -952,6 +962,7 @@ impl Default for StorageConfig {
             slow_query_threshold_ms: Some(1000), // 1 second default
             logical_wal_per_statement: false,    // rely on RocksDB WAL at commit (see field docs)
             wal_checkpoint_on_close: true,       // GH#35: a clean close leaves nothing to redo
+            flush_on_close: true,                // the next open has no RocksDB WAL to replay
             wal_checkpoint_interval_entries: 1000,
             wal_checkpoint_interval_secs: 30,
             wal_replay_destructive_ddl: DestructiveDdlReplay::Refuse,

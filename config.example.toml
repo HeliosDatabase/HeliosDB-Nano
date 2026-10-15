@@ -140,6 +140,15 @@ slow_query_threshold_ms = 1000
 # than write latency.
 durable_commit = false
 
+# Flush RocksDB's in-memory write buffers to table files at a CLEAN close, so
+# the next start has no RocksDB WAL to replay. Opening an existing store reads
+# it twice (a read-only encryption-key check, then the writable handle) and
+# each read replays everything written since the last flush. Turn this off if
+# a short shutdown matters more than a short startup: a full write buffer
+# (25% of cache_size) can take seconds to flush. A crash skips it and loses
+# nothing; the next start simply replays the WAL. Default true.
+flush_on_close = true
+
 # GH#35 — logical-WAL checkpointing and destructive-DDL replay policy.
 #
 # The logical WAL records DDL (and, with logical_wal_per_statement, DML) in

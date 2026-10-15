@@ -2635,6 +2635,13 @@ impl StorageEngine {
             let probe_log_dir = Self::owned_log_dir_outside(&db_path, &std::env::temp_dir())?;
             let mut probe_opts = opts.clone();
             probe_opts.set_db_log_dir(probe_log_dir.path());
+            // The probe reads one key (or, on a store without a sentinel, a
+            // bounded sample of values). Opening every table file and loading
+            // its stats up front is work the writable open below repeats, so
+            // the probe opens table files on demand and skips both.
+            probe_opts.set_max_open_files(64);
+            probe_opts.set_skip_stats_update_on_db_open(true);
+            probe_opts.set_skip_checking_sst_file_sizes_on_db_open(true);
             let probe = DB::open_for_read_only(&probe_opts, &db_path, false).map_err(|e| {
                 Error::storage(format!(
                     "Failed to open RocksDB read-only for the encryption preflight: {e}"
@@ -11129,6 +11136,36 @@ impl StorageEngine {
     /// GH#35 (A2): whether a clean close advances the checkpoint.
     pub fn wal_checkpoint_on_close(&self) -> bool {
         !self.physical_snapshot_mode && self.config.storage.wal_checkpoint_on_close
+    }
+
+    /// Flush RocksDB's memtables at a CLEAN close (`storage.flush_on_close`).
+    ///
+    /// A writable open of an existing store reads it twice: the read-only
+    /// encryption preflight in `open_with_mode`, then the writable handle. Both
+    /// replay whatever is still only in the RocksDB WAL, which is everything
+    /// written since the last memtable flush (up to the whole write buffer).
+    /// Flushing here does that work once, at the shutdown that produced it, and
+    /// the next open has nothing to replay. RocksDB drops a WAL only after its
+    /// contents are in a table file, so a failure or a crash before this point
+    /// loses nothing; recovery replays the WAL as before.
+    ///
+    /// No-op for read-only, physical-snapshot and in-memory engines.
+    pub fn flush_memtables_on_close(&self) -> Result<()> {
+        // Only a read-only engine owns the external log-directory guard.
+        let read_only = self._read_only_log_dir.is_some();
+        if !self.config.storage.flush_on_close
+            || read_only
+            || self.physical_snapshot_mode
+            || self.config.storage.memory_only
+        {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        self.db
+            .flush()
+            .map_err(|e| Error::storage(format!("memtable flush at close failed: {e}")))?;
+        debug!("flushed RocksDB memtables at close in {:?}", started.elapsed());
+        Ok(())
     }
 
     /// GH#35 (Half B): should this OPEN-TIME RECOVERY entry be SKIPPED?

@@ -1566,6 +1566,17 @@ impl Drop for EmbeddedDatabase {
             }
         }
 
+        // Flush RocksDB's memtables after every close-time write above, so the
+        // next open has no RocksDB WAL to replay (`storage.flush_on_close`;
+        // see `StorageEngine::flush_memtables_on_close`). Same gates as the
+        // checkpoint: never with a transaction open, and never from a
+        // `clone_for_trigger()` clone, which drops mid-statement.
+        if !txn_open && std::sync::Arc::strong_count(&self.auto_refresh_worker) == 1 {
+            if let Err(e) = self.storage.flush_memtables_on_close() {
+                tracing::warn!("{}", e);
+            }
+        }
+
         // Signal the auto-refresh worker to stop (non-blocking).
         //
         // LAST-OWNER GATE — do not remove. `Drop` runs for EVERY value of this struct,
