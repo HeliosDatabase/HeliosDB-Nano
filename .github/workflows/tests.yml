@@ -193,9 +193,27 @@ jobs:
         with:
           shared-key: tests-featgate
       - name: Free disk space
-        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+      # Only the GATED files. `internal-tests` appears nowhere under `src/`, so building
+      # every target under it (`--tests`) recompiles the ~300 ungated targets that
+      # `integration-full` already builds, and on 2026-10-15 that ran the runner out of
+      # disk ("No space left on device") once the suite grew. Same derivation and floor
+      # as `internal-tests-execute` below.
       - name: internal-tests must compile
-        run: cargo build --locked --features internal-tests --tests
+        run: |
+          set -o pipefail
+          targets=$(grep -lE '^#!\[cfg\(.*internal-tests' tests/*.rs \
+                    | sed 's|^tests/||; s|\.rs$||' | sort || true)
+          n=$(echo "$targets" | wc -w)
+          echo "internal-tests targets ($n): $(echo $targets | tr '\n' ' ')"
+          if [ "$n" -lt 15 ]; then
+            echo "::error::expected at least 15 internal-tests targets, found $n"
+            exit 1
+          fi
+          args=$(echo "$targets" | awk '{printf "--test %s ", $0}')
+          cargo build --locked --features internal-tests $args
 
   # ---------------------------------------------------------------------------
   # Tier 3b — EXECUTE the feature-gated suites. Nightly + `v*` tags + manual.
