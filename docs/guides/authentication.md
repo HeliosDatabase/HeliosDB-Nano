@@ -1,14 +1,17 @@
 # Authentication
 
-HeliosDB Nano exposes four authentication modes on the PG-wire and
-MySQL-wire listeners: `trust` (default for same-host development),
-`password` (cleartext, suitable only with TLS), `md5` (PG legacy), and
-`scram-sha-256` (PG 10+ default, standards-compliant).
+HeliosDB Nano exposes four authentication modes on the PG-wire listener
+(and the HTTP API, which shares its credentials): `trust` (default for
+same-host development), `password` (cleartext, suitable only with TLS), `md5`
+(PG legacy), and `scram-sha-256` (PG 10+ default, standards-compliant). The
+MySQL-wire listener is trust-only in 4.41.x and refuses to start next to a
+password-protected PG wire; password authentication for it is planned for
+4.42.0 (see "Custom password stores" below).
 
 ```bash
-# Production default — SCRAM-SHA-256 over TLS
-heliosdb-nano start --data-dir ./mydata --mysql \
-  --auth scram-sha-256 --password s3cret \
+# Production default — SCRAM-SHA-256 over TLS, password from a file
+heliosdb-nano start --data-dir ./mydata \
+  --auth scram-sha-256 --password-file /run/secrets/heliosdb_password \
   --tls-cert cert.pem --tls-key key.pem
 ```
 
