@@ -1668,6 +1668,8 @@ async fn start_server(
         node_id: ha_config.node_id.clone(),
         token_file: ha_config.token_file.clone(),
         allow_insecure_remote: ha_config.allow_insecure_remote,
+        // TOML-only setting: keep the value the config file loaded above.
+        logical_wal_retention_entries: db_config.replication.logical_wal_retention_entries,
     };
 
     // CLI flags win over the config file for storage location/mode.

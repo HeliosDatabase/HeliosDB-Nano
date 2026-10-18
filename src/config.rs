@@ -386,6 +386,14 @@ pub struct ReplicationConfig {
     /// via `--allow-insecure-replication-remote`.
     #[serde(default)]
     pub allow_insecure_remote: bool,
+    /// How many logical-WAL entries a PRIMARY keeps below its checkpoint, so a
+    /// standby that was behind when the primary restarted (or that was down for
+    /// a while) can still catch up. The checkpoint stays the redo floor; this
+    /// is only history kept for standbys. A standby that needs an entry older
+    /// than the window is refused with "full resync required". Ignored unless
+    /// `role = "primary"`. 0 deletes every entry at each checkpoint (the
+    /// 4.41.1 behaviour). Default 100000.
+    pub logical_wal_retention_entries: u64,
 }
 
 impl std::fmt::Debug for ReplicationConfig {
@@ -404,6 +412,7 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("node_id", &self.node_id)
             .field("token_file", &self.token_file)
             .field("allow_insecure_remote", &self.allow_insecure_remote)
+            .field("logical_wal_retention_entries", &self.logical_wal_retention_entries)
             .finish()
     }
 }
@@ -422,11 +431,28 @@ impl Default for ReplicationConfig {
             node_id: None,
             token_file: None,
             allow_insecure_remote: false,
+            logical_wal_retention_entries: Self::DEFAULT_LOGICAL_WAL_RETENTION_ENTRIES,
         }
     }
 }
 
 impl ReplicationConfig {
+    /// Default history window a primary keeps below its logical-WAL checkpoint.
+    pub const DEFAULT_LOGICAL_WAL_RETENTION_ENTRIES: u64 = 100_000;
+    /// Upper bound accepted for `logical_wal_retention_entries`.
+    pub const MAX_LOGICAL_WAL_RETENTION_ENTRIES: u64 = 100_000_000;
+
+    /// The window the storage engine should apply: the configured value on a
+    /// primary, 0 everywhere else (a standalone node or a standby has no
+    /// standby to keep history for).
+    pub fn effective_logical_wal_retention(&self) -> u64 {
+        if self.role.eq_ignore_ascii_case("primary") {
+            self.logical_wal_retention_entries
+        } else {
+            0
+        }
+    }
+
     /// Validate configured values without requiring role-dependent CLI arguments.
     pub fn validate(&self) -> crate::Result<()> {
         if !matches!(
@@ -444,6 +470,12 @@ impl ReplicationConfig {
             return Err(crate::Error::config(
                 "replication.sync_mode must be async, semi-sync, or sync",
             ));
+        }
+        if self.logical_wal_retention_entries > Self::MAX_LOGICAL_WAL_RETENTION_ENTRIES {
+            return Err(crate::Error::config(format!(
+                "replication.logical_wal_retention_entries must be at most {}",
+                Self::MAX_LOGICAL_WAL_RETENTION_ENTRIES
+            )));
         }
         if !(1..=3600).contains(&self.startup_timeout_secs) {
             return Err(crate::Error::config(

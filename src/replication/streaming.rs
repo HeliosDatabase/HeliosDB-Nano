@@ -97,8 +97,10 @@ impl CatchupSource for StorageCatchupSource {
                     .map(|entry| super::ha_state::wal_operation_to_entry(entry.lsn, &entry.operation))
                     .collect(),
             }),
-            LogicalCatchup::Pruned { checkpoint } => Ok(CatchupPlan::ResyncRequired(format!(
-                "primary history was checkpointed through LSN {checkpoint}; the standby (at LSN {after}) must be rebuilt"
+            LogicalCatchup::Pruned { pruned_through } => Ok(CatchupPlan::ResyncRequired(format!(
+                "primary history was pruned through LSN {pruned_through}; the standby (at LSN {after}) must be \
+                 rebuilt. A primary keeps `[replication] logical_wal_retention_entries` entries of history \
+                 for standbys; raise it to cover longer outages"
             ))),
             LogicalCatchup::StandbyAhead { latest } => Ok(CatchupPlan::ResyncRequired(format!(
                 "standby is at LSN {after} but the primary only reached LSN {latest}; datasets diverged"

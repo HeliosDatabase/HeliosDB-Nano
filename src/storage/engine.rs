@@ -2104,8 +2104,9 @@ pub enum LogicalCatchup {
         latest: u64,
         entries: Vec<super::wal::WalEntry>,
     },
-    /// The requested position lies below the checkpoint: history was removed.
-    Pruned { checkpoint: u64 },
+    /// Entries after the requested position were deleted: every entry up to
+    /// `pruned_through` is gone, so this position cannot be caught up.
+    Pruned { pruned_through: u64 },
     /// The standby claims a position this primary never reached.
     StandbyAhead { latest: u64 },
     /// No logical WAL on this engine.
@@ -2780,10 +2781,15 @@ impl StorageEngine {
                 Ok(wal) => {
                     // GH#35 (A3): bound the crash window with periodic
                     // checkpoint advancement.
-                    let wal = wal.with_checkpoint_policy(
-                        config.storage.wal_checkpoint_interval_entries,
-                        config.storage.wal_checkpoint_interval_secs,
-                    );
+                    let wal = wal
+                        .with_checkpoint_policy(
+                            config.storage.wal_checkpoint_interval_entries,
+                            config.storage.wal_checkpoint_interval_secs,
+                        )
+                        // Field J: a primary keeps a window of history under the
+                        // checkpoint so a standby that is behind (or a primary
+                        // restart) does not force a full rebuild.
+                        .with_retention(config.replication.effective_logical_wal_retention());
                     info!("WAL initialized successfully");
                     Some(Arc::new(RwLock::new(wal)))
                 }
@@ -3222,10 +3228,15 @@ impl StorageEngine {
                 Ok(wal) => {
                     // GH#35 (A3): bound the crash window with periodic
                     // checkpoint advancement.
-                    let wal = wal.with_checkpoint_policy(
-                        config.storage.wal_checkpoint_interval_entries,
-                        config.storage.wal_checkpoint_interval_secs,
-                    );
+                    let wal = wal
+                        .with_checkpoint_policy(
+                            config.storage.wal_checkpoint_interval_entries,
+                            config.storage.wal_checkpoint_interval_secs,
+                        )
+                        // Field J: a primary keeps a window of history under the
+                        // checkpoint so a standby that is behind (or a primary
+                        // restart) does not force a full rebuild.
+                        .with_retention(config.replication.effective_logical_wal_retention());
                     debug!("WAL initialized for in-memory storage");
                     Some(Arc::new(RwLock::new(wal)))
                 }
@@ -11456,8 +11467,9 @@ impl StorageEngine {
 
     /// Read the logical WAL a standby is missing, for catch-up.
     ///
-    /// `Pruned` means entries after `after_lsn` were checkpointed away; the
-    /// standby needs a full resync and must NOT be told it is caught up.
+    /// `Pruned` means entries after `after_lsn` were deleted (the position is
+    /// below the history floor); the standby needs a full resync and must NOT
+    /// be told it is caught up.
     pub fn logical_wal_catchup(&self, after_lsn: u64) -> Result<LogicalCatchup> {
         let Some(wal) = &self.wal else {
             return Ok(LogicalCatchup::Unavailable);
@@ -11470,10 +11482,12 @@ impl StorageEngine {
         if after_lsn > latest {
             return Ok(LogicalCatchup::StandbyAhead { latest });
         }
-        if let Some(checkpoint) = wal.checkpoint_lsn()? {
-            if after_lsn < checkpoint {
-                return Ok(LogicalCatchup::Pruned { checkpoint });
-            }
+        // The history floor, not the checkpoint: entries kept under the
+        // checkpoint for standbys (`[replication] logical_wal_retention_entries`)
+        // can still be served. Only a position below what was deleted cannot.
+        let pruned_through = wal.pruned_through()?;
+        if after_lsn < pruned_through {
+            return Ok(LogicalCatchup::Pruned { pruned_through });
         }
         let mut entries = wal.replay_from(after_lsn)?;
         entries.retain(|entry| entry.lsn <= latest);

@@ -14,11 +14,16 @@ mean catch-up completed.
 Since 4.41.1 a standby stores its applied position durably, in the same write as
 each replicated row, and on reconnect the primary catches it up from its
 persisted logical WAL. The standby opens its SQL listener only after it has
-caught up. The primary keeps logical WAL only above its checkpoint (by default it
-advances every 1000 entries or 30 seconds, and at a clean shutdown), so a standby
-whose position is below that checkpoint, including a new standby started after
-it, is refused with a terminal "full resync required" error rather than served
-with missing rows.
+caught up. The primary's checkpoint (which advances every 1000 entries or 30
+seconds by default, and at a clean shutdown) is only its crash-recovery floor: a
+primary also keeps the newest `[replication] logical_wal_retention_entries`
+entries below it (default 100000) for standbys. A restarted primary, a standby
+outage shorter than that window, and a new standby on a primary whose whole
+history still fits the window are all caught up. A standby that needs an entry
+older than the window is refused with a terminal "full resync required" error
+naming the LSN history was pruned through, rather than served with missing rows.
+Each retained entry carries the row images of one change, so size the window for
+your write rate and the longest standby outage you want to survive.
 
 For a disk primary, `NANO-PRIMARY-HISTORY.json` is created or validated after
 RocksDB has acquired its database lock and before the native listener starts.

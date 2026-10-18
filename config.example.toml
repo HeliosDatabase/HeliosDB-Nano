@@ -437,6 +437,14 @@ observer_hosts = [] # e.g. ["observer.example:5433"]
 sync_mode = "async" # async | semi-sync (alias semisync) | sync
 # node_id = "550e8400-e29b-41d4-a716-446655440000" # UUID; generated if omitted
 
+# PRIMARY only: logical-WAL entries kept below the checkpoint so a standby that
+# was behind when the primary restarted, or was down for a while, can still
+# catch up. A standby that needs an older entry is refused with "full resync
+# required". Each entry holds the row images of one change: size the window for
+# your write rate and the longest standby outage to survive. 0 keeps nothing
+# (every checkpoint deletes up to itself). Ignored on other roles. Default 100000.
+logical_wal_retention_entries = 100000
+
 # One owner-only 32-byte token file authenticating BOTH the native logical
 # channel and the physical transfer channel. Put the identical file on the
 # primary and every standby. The token bytes are never read from TOML or the

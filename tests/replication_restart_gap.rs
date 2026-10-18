@@ -48,6 +48,20 @@ impl Daemon {
         Self(Some(child))
     }
 
+    /// Wait up to `budget` for the daemon to exit on its own; `None` if it is still running.
+    fn wait_exit(&mut self, budget: Duration) -> Option<std::process::ExitStatus> {
+        let child = self.0.as_mut()?;
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                self.0 = None;
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        None
+    }
+
     /// Graceful stop (SIGTERM), then wait; a daemon that ignores it is killed.
     fn stop(&mut self) {
         if let Some(mut child) = self.0.take() {
@@ -269,5 +283,147 @@ async fn rolled_back_and_failed_statements_never_reach_the_standby() {
         settle(c.pg_s, &committed, Duration::from_secs(30)).await,
         Ok(committed),
         "the standby must hold exactly what the primary committed"
+    );
+}
+
+/// Field finding J (Sprinter 58d4e3113e56): restarting the PRIMARY used to break the
+/// pair. Its clean close checkpointed the logical WAL and deleted every entry up to the
+/// checkpoint, so a standby that was behind at that moment got a terminal "full resync
+/// required" and exited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn standby_catches_up_after_the_primary_restarts_while_it_is_down() {
+    let c = cluster();
+    let mut primary = Daemon::spawn(c.dir.path(), "primary", &c.token, &c.primary_args);
+    let writer = connect(c.pg_p).await;
+    let mut standby = Daemon::spawn(c.dir.path(), "standby", &c.token, &c.standby_args);
+    let _ = connect(c.pg_s).await;
+
+    writer
+        .batch_execute("CREATE TABLE t (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    writer.batch_execute("INSERT INTO t VALUES (1)").await.unwrap();
+    assert_eq!(
+        settle(c.pg_s, &[1], Duration::from_secs(20)).await,
+        Ok(vec![1]),
+        "precondition"
+    );
+
+    standby.stop();
+    writer.batch_execute("INSERT INTO t VALUES (2)").await.unwrap();
+    writer.batch_execute("INSERT INTO t VALUES (3)").await.unwrap();
+    drop(writer);
+
+    // Clean primary restart: the close-time checkpoint must not take the standby's
+    // missing entries with it.
+    primary.stop();
+    let _primary = Daemon::spawn(c.dir.path(), "primary", &c.token, &c.primary_args);
+    let writer = connect(c.pg_p).await;
+
+    let _standby = Daemon::spawn(c.dir.path(), "standby", &c.token, &c.standby_args);
+    assert_eq!(
+        settle(c.pg_s, &[1, 2, 3], Duration::from_secs(30)).await,
+        Ok(vec![1, 2, 3]),
+        "the standby must catch up after a primary restart instead of being refused"
+    );
+    writer.batch_execute("INSERT INTO t VALUES (4)").await.unwrap();
+    assert_eq!(
+        settle(c.pg_s, &[1, 2, 3, 4], Duration::from_secs(30)).await,
+        Ok(vec![1, 2, 3, 4])
+    );
+}
+
+/// Field finding J, second half: after a primary restart even a freshly wiped standby was
+/// refused, so the pair could not be rebuilt in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_standby_after_a_primary_restart_receives_the_history() {
+    let c = cluster();
+    let mut primary = Daemon::spawn(c.dir.path(), "primary", &c.token, &c.primary_args);
+    let writer = connect(c.pg_p).await;
+    writer
+        .batch_execute("CREATE TABLE t (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    writer
+        .batch_execute("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)")
+        .await
+        .unwrap();
+    drop(writer);
+    primary.stop();
+    let _primary = Daemon::spawn(c.dir.path(), "primary", &c.token, &c.primary_args);
+    let _ = connect(c.pg_p).await;
+
+    let _standby = Daemon::spawn(c.dir.path(), "standby", &c.token, &c.standby_args);
+    assert_eq!(
+        settle(c.pg_s, &[1, 2, 3], Duration::from_secs(30)).await,
+        Ok(vec![1, 2, 3]),
+        "a new standby must receive history the primary still retains"
+    );
+}
+
+/// The window is bounded: `[replication] logical_wal_retention_entries` on the primary.
+/// Past it a standby is still refused (fail closed, never a silent gap); inside it, it
+/// catches up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_window_bounds_what_a_restarted_primary_can_serve() {
+    let c = cluster();
+    let config = c.dir.path().join("primary.toml");
+    std::fs::write(&config, "[replication]\nlogical_wal_retention_entries = 12\n").unwrap();
+    let mut primary_args = c.primary_args.clone();
+    primary_args.extend(["--config".to_string(), config.display().to_string()]);
+
+    let mut primary = Daemon::spawn(c.dir.path(), "primary", &c.token, &primary_args);
+    let writer = connect(c.pg_p).await;
+    let mut standby = Daemon::spawn(c.dir.path(), "standby", &c.token, &c.standby_args);
+    let _ = connect(c.pg_s).await;
+    writer
+        .batch_execute("CREATE TABLE t (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    let many: Vec<i32> = (1..=40).collect();
+    for id in &many {
+        writer
+            .batch_execute(&format!("INSERT INTO t VALUES ({id})"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(settle(c.pg_s, &many, Duration::from_secs(30)).await, Ok(many.clone()));
+
+    // A standby one row behind is inside the window.
+    standby.stop();
+    writer.batch_execute("INSERT INTO t VALUES (41)").await.unwrap();
+    drop(writer);
+    primary.stop();
+    let _primary = Daemon::spawn(c.dir.path(), "primary", &c.token, &primary_args);
+    let _ = connect(c.pg_p).await;
+    let mut standby = Daemon::spawn(c.dir.path(), "standby", &c.token, &c.standby_args);
+    let all: Vec<i32> = (1..=41).collect();
+    assert_eq!(
+        settle(c.pg_s, &all, Duration::from_secs(30)).await,
+        Ok(all),
+        "a standby inside the retention window catches up after the primary restart"
+    );
+    standby.stop();
+
+    // A NEW standby needs the whole history, which the primary pruned past the window:
+    // it must be refused, loudly, not served a partial dataset.
+    let fresh_args = {
+        let mut args = c.standby_args.clone();
+        let port = free_port();
+        let at = args.iter().position(|a| a == "--port").unwrap();
+        args[at + 1] = port.to_string();
+        args
+    };
+    let mut fresh = Daemon::spawn(c.dir.path(), "fresh-standby", &c.token, &fresh_args);
+    let status = fresh.wait_exit(Duration::from_secs(60));
+    assert!(
+        status.is_some_and(|s| !s.success()),
+        "the fresh standby must refuse, got {status:?}"
+    );
+    let log = std::fs::read_to_string(c.dir.path().join("fresh-standby.log")).unwrap();
+    assert!(
+        log.contains("full resync required"),
+        "the refusal must name the cause; log tail: {}",
+        log.lines().rev().take(5).collect::<Vec<_>>().join(" | ")
     );
 }

@@ -5,6 +5,23 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Replication
+- **A primary restart no longer breaks its standby** (field finding J). A clean
+  primary restart checkpointed the logical WAL and deleted every entry up to the
+  checkpoint, so a standby that was even one entry behind, and any new standby,
+  was refused with "full resync required" and exited; the only recovery was to
+  wipe both nodes. A primary now keeps a window of history below its checkpoint
+  (`[replication] logical_wal_retention_entries`, default 100000, primaries
+  only) and refuses only a standby that needs an entry older than the window. A
+  restarted primary, a standby outage shorter than the window and a new standby
+  on a primary whose history fits the window all catch up without operator
+  action. The checkpoint is still the crash-recovery floor: entries kept under
+  it are served to standbys and never replayed on the primary. Standalone nodes
+  keep nothing extra. The refusal now says which LSN history was pruned through
+  and which setting widens the window.
+
 ## [4.41.1] - 2026-10-15
 
 A security release. Since 4.27.0 the daemon's HTTP API executed SQL without

@@ -583,6 +583,11 @@ pub struct WriteAheadLog {
     appends_since_checkpoint: AtomicU64,
     /// Epoch seconds of the last periodic checkpoint (lock-free time check).
     last_checkpoint_epoch_secs: AtomicU64,
+    /// How many entries to keep BELOW the checkpoint for standbys (0 = keep
+    /// none). The checkpoint is the redo floor; entries kept under it are never
+    /// replayed on this store, only served to a standby catching up. See
+    /// [`Self::truncate_to_checkpoint`] and [`Self::PRUNED_THROUGH_KEY`].
+    retain_entries: u64,
 }
 
 impl WriteAheadLog {
@@ -658,6 +663,7 @@ impl WriteAheadLog {
             checkpoint_interval_secs: 0,
             appends_since_checkpoint: AtomicU64::new(0),
             last_checkpoint_epoch_secs: AtomicU64::new(Self::now_epoch_secs()),
+            retain_entries: 0,
         };
 
         // Start group commit thread if in GroupCommit mode
@@ -701,6 +707,15 @@ impl WriteAheadLog {
     pub fn with_checkpoint_policy(mut self, entries: u64, secs: u64) -> Self {
         self.checkpoint_interval_entries = entries;
         self.checkpoint_interval_secs = secs;
+        self
+    }
+
+    /// Keep the newest `entries` LSNs below each checkpoint instead of deleting
+    /// them, so a standby that is behind can still be caught up (0 = delete
+    /// everything up to the checkpoint, the pre-4.42 behaviour). Called by the
+    /// engine with `ReplicationConfig::effective_logical_wal_retention`.
+    pub fn with_retention(mut self, entries: u64) -> Self {
+        self.retain_entries = entries;
         self
     }
 
@@ -1166,6 +1181,16 @@ impl WriteAheadLog {
     /// Prefix under which individual entries live: `wal:entries:{lsn:020}`.
     pub const ENTRY_PREFIX: &'static [u8] = b"wal:entries:";
 
+    /// Storage key holding the history floor: a little-endian `u64` `P` meaning
+    /// **every entry with `lsn <= P` has been deleted.** It differs from the
+    /// checkpoint (the redo floor) when the store keeps history for standbys
+    /// ([`Self::with_retention`]); catch-up can serve any position `>= P`.
+    ///
+    /// Stores written before this key existed deleted every entry up to their
+    /// checkpoint, so its absence means "the checkpoint" (see
+    /// [`Self::pruned_through`]).
+    pub const PRUNED_THROUGH_KEY: &'static [u8] = b"wal:pruned_through";
+
     /// Parse the LSN out of a `wal:entries:{lsn:020}` storage key.
     ///
     /// Key-level rather than value-level on purpose: it needs neither
@@ -1194,6 +1219,26 @@ impl WriteAheadLog {
             }
             Ok(None) => Ok(None),
             Err(e) => Err(Error::storage(format!("Failed to read WAL checkpoint: {}", e))),
+        }
+    }
+
+    /// The history floor: every entry with `lsn <= ` the returned value has been
+    /// deleted, so a standby can be caught up from any position at or above it.
+    ///
+    /// Without a [`Self::PRUNED_THROUGH_KEY`] marker the floor is the checkpoint,
+    /// because that is what earlier builds deleted through; a store that never
+    /// checkpointed has deleted nothing (0).
+    pub fn pruned_through(&self) -> Result<u64> {
+        match self.db.get(Self::PRUNED_THROUGH_KEY) {
+            Ok(Some(data)) => {
+                let bytes: [u8; 8] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Error::storage("Invalid WAL history-floor format"))?;
+                Ok(u64::from_le_bytes(bytes))
+            }
+            Ok(None) => Ok(self.checkpoint_lsn()?.unwrap_or(0)),
+            Err(e) => Err(Error::storage(format!("Failed to read the WAL history floor: {}", e))),
         }
     }
 
@@ -1234,8 +1279,15 @@ impl WriteAheadLog {
         }
     }
 
-    /// Delete every retained entry with `lsn <= up_to_lsn` AND record
-    /// `up_to_lsn` as the checkpoint, in ONE RocksDB `WriteBatch`.
+    /// Record `up_to_lsn` as the checkpoint and delete the entries it makes
+    /// unnecessary, in ONE RocksDB `WriteBatch`.
+    ///
+    /// With no retention every entry with `lsn <= up_to_lsn` is deleted. With
+    /// [`Self::with_retention`]`(n)` the newest `n` LSNs at or below the
+    /// checkpoint stay, for standbys to catch up from: they are below the redo
+    /// floor, so open-time recovery never replays them. The history floor
+    /// ([`Self::PRUNED_THROUGH_KEY`]) records what was actually deleted and only
+    /// moves forward.
     ///
     /// Atomicity here is the whole point. The two facts "these entries are
     /// gone" and "everything up to this LSN is applied" must never disagree on
@@ -1252,6 +1304,8 @@ impl WriteAheadLog {
     ///
     /// Returns the number of entries deleted.
     pub fn truncate_to_checkpoint(&self, up_to_lsn: u64) -> Result<usize> {
+        let delete_through = up_to_lsn.saturating_sub(self.retain_entries);
+        let pruned_through = self.pruned_through()?.max(delete_through);
         let mut batch = WriteBatch::default();
         let mut deleted = 0usize;
 
@@ -1262,10 +1316,15 @@ impl WriteAheadLog {
                 break;
             }
             match Self::lsn_from_entry_key(&key) {
-                Some(lsn) if lsn <= up_to_lsn => {
+                Some(lsn) if lsn <= delete_through => {
                     batch.delete(&key);
                     deleted += 1;
                 }
+                // Keys are zero-padded LSNs, so they sort numerically: once one is
+                // kept, so is everything after it. Stopping keeps a checkpoint's
+                // cost proportional to what it deletes, not to the retained
+                // window (which would otherwise be rescanned every checkpoint).
+                Some(_) if self.retain_entries > 0 => break,
                 Some(_) => {}
                 None => {
                     // Unparseable key under the entry prefix: replay parses the
@@ -1277,6 +1336,7 @@ impl WriteAheadLog {
         }
 
         batch.put(Self::CHECKPOINT_KEY, up_to_lsn.to_le_bytes());
+        batch.put(Self::PRUNED_THROUGH_KEY, pruned_through.to_le_bytes());
 
         // Keep the LSN counter monotonic across sessions: the checkpoint is a
         // floor, so the next session's first append must be > up_to_lsn or it
@@ -1305,10 +1365,17 @@ impl WriteAheadLog {
             .write_opt(batch, &sync_opts)
             .map_err(|e| Error::storage(format!("Failed to checkpoint WAL: {}", e)))?;
 
-        info!(
-            "WAL checkpoint recorded at LSN {} ({} entries reclaimed)",
-            up_to_lsn, deleted
-        );
+        if self.retain_entries > 0 {
+            info!(
+                "WAL checkpoint recorded at LSN {} ({} entries reclaimed; history kept for standbys above LSN {})",
+                up_to_lsn, deleted, pruned_through
+            );
+        } else {
+            info!(
+                "WAL checkpoint recorded at LSN {} ({} entries reclaimed)",
+                up_to_lsn, deleted
+            );
+        }
         Ok(deleted)
     }
 
@@ -1983,6 +2050,91 @@ mod tests {
         assert_eq!(wal.published_lsn(), 3);
         let entries = wal.replay().unwrap();
         assert_eq!(entries.iter().map(|e| e.lsn).collect::<Vec<_>>(), vec![3]);
+    }
+
+    fn retained_lsns(wal: &WriteAheadLog) -> Vec<u64> {
+        wal.replay().unwrap().iter().map(|e| e.lsn).collect()
+    }
+
+    /// Without retention a checkpoint deletes everything up to it (the 4.41.1
+    /// behaviour), and the history floor equals the checkpoint.
+    #[test]
+    fn checkpoint_without_retention_deletes_through_the_checkpoint() {
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        for n in 1..=10 {
+            wal.append(insert_op(n)).unwrap();
+        }
+        assert_eq!(wal.pruned_through().unwrap(), 0, "nothing deleted yet");
+        assert_eq!(wal.truncate_to_checkpoint(10).unwrap(), 10);
+        assert!(retained_lsns(&wal).is_empty());
+        assert_eq!(wal.checkpoint_lsn().unwrap(), Some(10));
+        assert_eq!(wal.pruned_through().unwrap(), 10);
+    }
+
+    /// Field J: with retention the newest entries under the checkpoint stay, the
+    /// checkpoint (redo floor) still advances, and the history floor records only
+    /// what was actually deleted and never moves backwards.
+    #[test]
+    fn checkpoint_with_retention_keeps_a_window_below_the_checkpoint() {
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync)
+            .unwrap()
+            .with_retention(4);
+        for n in 1..=10 {
+            wal.append(insert_op(n)).unwrap();
+        }
+        assert_eq!(wal.truncate_to_checkpoint(10).unwrap(), 6);
+        assert_eq!(retained_lsns(&wal), vec![7, 8, 9, 10]);
+        assert_eq!(wal.checkpoint_lsn().unwrap(), Some(10));
+        assert_eq!(wal.pruned_through().unwrap(), 6);
+        // Open-time recovery replays only past the checkpoint: the window is history.
+        assert!(wal.replay_from(10).unwrap().is_empty());
+
+        // The window follows the checkpoint forward.
+        for n in 11..=12 {
+            wal.append(insert_op(n)).unwrap();
+        }
+        assert_eq!(wal.truncate_to_checkpoint(12).unwrap(), 2);
+        assert_eq!(retained_lsns(&wal), vec![9, 10, 11, 12]);
+        assert_eq!(wal.pruned_through().unwrap(), 8);
+
+        // A checkpoint smaller than the window deletes nothing; the floor stays.
+        let widened = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync)
+            .unwrap()
+            .with_retention(1000);
+        assert_eq!(widened.truncate_to_checkpoint(12).unwrap(), 0);
+        assert_eq!(
+            widened.pruned_through().unwrap(),
+            8,
+            "the history floor never moves back"
+        );
+        assert_eq!(retained_lsns(&widened), vec![9, 10, 11, 12]);
+    }
+
+    /// A store checkpointed by 4.41.1 or earlier has no history-floor marker; it
+    /// deleted everything up to its checkpoint, so that is its floor.
+    #[test]
+    fn missing_history_floor_marker_means_the_checkpoint() {
+        let (_temp, db) = create_test_db();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        for n in 1..=5 {
+            wal.append(insert_op(n)).unwrap();
+        }
+        wal.truncate_to_checkpoint(5).unwrap();
+        db.delete(WriteAheadLog::PRUNED_THROUGH_KEY).unwrap();
+        assert_eq!(wal.pruned_through().unwrap(), 5);
+        for n in 6..=8 {
+            wal.append(insert_op(n)).unwrap();
+        }
+        // A retention-enabled checkpoint after upgrade keeps the new window but
+        // cannot claim the old, already-deleted entries back.
+        let upgraded = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync)
+            .unwrap()
+            .with_retention(100);
+        upgraded.truncate_to_checkpoint(8).unwrap();
+        assert_eq!(retained_lsns(&upgraded), vec![6, 7, 8]);
+        assert_eq!(upgraded.pruned_through().unwrap(), 5);
     }
 
     /// Two committers finishing out of LSN order must not let the watermark (and so
