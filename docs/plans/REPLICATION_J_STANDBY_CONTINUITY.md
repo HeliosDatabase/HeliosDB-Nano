@@ -60,6 +60,28 @@ Acceptance (real daemons, `tests/replication_restart_gap.rs`):
    required", while a standby whose position is inside the window catches up;
 4. GH#35 redo semantics unchanged (`tests/gh_issue_35.rs`), standalone retention 0.
 
+### J1a — a catch-up must arrive whole (`0c9e1a4faab6`, found by the J1 crash probe)
+
+J1 makes catch-ups long: up to the window, at 500 entries per `WalBatch`. Replaying the
+field sequence with a SIGKILLed primary showed a fresh standby serving 2010 of 2510 rows
+after one 500-entry batch (message sequence 2 on its second connection) vanished without
+an error. The cause predates J1. `ReplicationConnection::recv` read each frame with three
+`read_exact` calls into locals and then awaited a lock. Both streaming loops race `recv`
+against timers in `tokio::select!`, so a cancelled `recv` lost a partly read frame (the
+next read started mid-frame: "Invalid magic") or, after the last read, a whole frame.
+
+- `recv` keeps unconsumed bytes in a per-connection buffer filled with `read_buf`, and
+  takes a frame out only in the synchronous step that returns it. The handshake reads go
+  through the same path.
+- The standby checks that data messages (`WalEntry`, `WalBatch`) arrive as 1, 2, 3, ... on
+  each connection. A gap drops the connection before the next message is acted on, and the
+  standby reconnects from its durable position instead of applying over the hole.
+
+Acceptance: deterministic transport tests (a frame cut in the header, payload and checksum,
+with `recv` dropped in between; 300 large frames against a 1 ms timer), a sequence-guard
+unit test, and `multi_batch_catch_up_delivers_every_row` (three fresh standbys, 3000 rows,
+exact counts).
+
 ### J1b — follow the slowest registered standby (next)
 
 Persist each standby's durably applied position on the primary (from its acknowledgements,

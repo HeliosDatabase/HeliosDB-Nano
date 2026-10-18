@@ -62,6 +62,9 @@ pub const HEADER_SIZE: usize = 24;
 /// Maximum message payload size (64MB)
 pub const MAX_PAYLOAD_SIZE: usize = 64 * 1024 * 1024;
 
+/// Initial capacity of a connection's read buffer; it grows to fit a larger frame.
+const READ_BUF_CAPACITY: usize = 64 * 1024;
+
 /// Default connection timeout
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -336,6 +339,39 @@ impl Message {
             payload: Bytes::from(payload),
             checksum,
         })
+    }
+
+    /// Take one whole message off the front of `buf`, or `None` (with room
+    /// reserved for the rest) if `buf` does not hold one yet. A bad header is
+    /// reported as soon as the header is complete, before any payload is
+    /// waited for, and its length bound is checked before the reservation.
+    fn take_frame(buf: &mut BytesMut) -> Result<Option<Self>> {
+        let Some(mut head) = buf.get(..HEADER_SIZE) else {
+            return Ok(None);
+        };
+        let header = MessageHeader::decode(&mut head)?;
+        let payload_len = header.length as usize;
+        let total = HEADER_SIZE + payload_len + 4;
+        if buf.len() < total {
+            buf.reserve(total - buf.len());
+            return Ok(None);
+        }
+        let mut frame = buf.split_to(total);
+        frame.advance(HEADER_SIZE);
+        let payload = frame.split_to(payload_len).freeze();
+        let checksum = frame.get_u32();
+        let computed_checksum = crc32fast::hash(&payload);
+        if checksum != computed_checksum {
+            return Err(ReplicationError::Transport(format!(
+                "Checksum mismatch: expected {:08X}, got {:08X}",
+                checksum, computed_checksum
+            )));
+        }
+        Ok(Some(Self {
+            header,
+            payload,
+            checksum,
+        }))
     }
 
     pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
@@ -769,8 +805,12 @@ pub struct ReplicationConnection {
     sequence: AtomicU64,
     /// Handshake info
     handshake: Option<HandshakeResponse>,
-    /// Last activity time
-    last_activity: RwLock<Instant>,
+    /// Bytes read from the socket that do not yet form a whole message. Keeping
+    /// them here, not in a local of `recv`, is what makes `recv` cancellation-safe.
+    read_buf: BytesMut,
+    /// Last activity time. A plain mutex, so `recv` never awaits after it has
+    /// taken a message out of `read_buf`.
+    last_activity: parking_lot::Mutex<Instant>,
     /// Pending ACKs
     pending_acks: RwLock<HashMap<u64, oneshot::Sender<AckPayload>>>,
 }
@@ -803,7 +843,8 @@ impl ReplicationConnection {
             state: ConnectionState::Connecting,
             sequence: AtomicU64::new(0),
             handshake: None,
-            last_activity: RwLock::new(Instant::now()),
+            read_buf: BytesMut::with_capacity(READ_BUF_CAPACITY),
+            last_activity: parking_lot::Mutex::new(Instant::now()),
             pending_acks: RwLock::new(HashMap::new()),
         })
     }
@@ -818,7 +859,8 @@ impl ReplicationConnection {
             state: ConnectionState::Connecting,
             sequence: AtomicU64::new(0),
             handshake: None,
-            last_activity: RwLock::new(Instant::now()),
+            read_buf: BytesMut::with_capacity(READ_BUF_CAPACITY),
+            last_activity: parking_lot::Mutex::new(Instant::now()),
             pending_acks: RwLock::new(HashMap::new()),
         }
     }
@@ -834,7 +876,9 @@ impl ReplicationConnection {
         let msg = Message::new(MessageType::HandshakeRequest, Bytes::from(payload), seq);
         msg.write_to(&mut self.stream).await?;
 
-        let response = Message::read_from(&mut self.stream).await?;
+        // Through `recv`, like every later read: once `read_buf` holds bytes, a
+        // direct read of the socket would skip them.
+        let response = self.recv().await?;
         if response.header.msg_type != MessageType::HandshakeResponse {
             return Err(ReplicationError::Transport("Expected HandshakeResponse".to_string()));
         }
@@ -879,7 +923,7 @@ impl ReplicationConnection {
 
         self.handshake = Some(handshake.clone());
         self.state = ConnectionState::Streaming;
-        *self.last_activity.write().await = Instant::now();
+        *self.last_activity.lock() = Instant::now();
 
         Ok(handshake)
     }
@@ -889,7 +933,7 @@ impl ReplicationConnection {
         let seq = self.next_sequence();
         let msg = Message::new(msg_type, payload, seq);
         msg.write_to(&mut self.stream).await?;
-        *self.last_activity.write().await = Instant::now();
+        *self.last_activity.lock() = Instant::now();
         Ok(seq)
     }
 
@@ -915,11 +959,33 @@ impl ReplicationConnection {
             .map_err(|_| ReplicationError::Transport("ACK channel closed".to_string()))
     }
 
-    /// Receive a message
+    /// Receive a message.
+    ///
+    /// Cancellation-safe, because both streaming loops race it against timers
+    /// in `tokio::select!` and so drop it at whatever await it is parked on.
+    /// Bytes read from the socket stay in `read_buf` until they form a whole
+    /// message, and a message leaves the buffer only in the synchronous step
+    /// that returns it. A dropped `recv` therefore loses nothing; the next call
+    /// resumes from the same bytes. (Reading with three `read_exact` calls into
+    /// locals lost a partly read frame, and the next read started mid-frame; an
+    /// await after the frame was consumed could drop a whole frame silently.)
     pub async fn recv(&mut self) -> Result<Message> {
-        let msg = Message::read_from(&mut self.stream).await?;
-        *self.last_activity.write().await = Instant::now();
-        Ok(msg)
+        loop {
+            if let Some(msg) = Message::take_frame(&mut self.read_buf)? {
+                *self.last_activity.lock() = Instant::now();
+                return Ok(msg);
+            }
+            // `read_buf` is cancellation-safe: if this is dropped, no data was read.
+            let read = self
+                .stream
+                .read_buf(&mut self.read_buf)
+                .await
+                .map_err(|e| ReplicationError::Transport(format!("Failed to read message: {}", e)))?;
+            if read == 0 {
+                let part = if self.read_buf.is_empty() { "header" } else { "message" };
+                return Err(ReplicationError::Transport(format!("Failed to read {part}: early eof")));
+            }
+        }
     }
 
     /// Send acknowledgment
@@ -949,7 +1015,7 @@ impl ReplicationConnection {
     /// Send a pre-constructed message
     pub async fn send_message(&mut self, msg: &Message) -> Result<()> {
         msg.write_to(&mut self.stream).await?;
-        *self.last_activity.write().await = Instant::now();
+        *self.last_activity.lock() = Instant::now();
         Ok(())
     }
 
@@ -1451,5 +1517,89 @@ mod tests {
             matches!(result.unwrap(), Err(ReplicationError::HistoryMismatch { expected: e, actual: a }) if e == expected && a == actual)
         );
         assert!(server.state.read().await.standbys.is_empty());
+    }
+
+    /// A connected client and the raw server end of its socket, so a test can
+    /// write frames byte by byte.
+    #[allow(clippy::unwrap_used)]
+    async fn raw_pair() -> (ReplicationConnection, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = ReplicationConnection::connect(addr, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    /// Both streaming loops race `recv` against timers in `tokio::select!`, so a
+    /// `recv` can be dropped part-way through a frame. The bytes it already read
+    /// must not be lost: the frame must still arrive intact, and so must the next.
+    /// Cut inside the header, inside the payload and inside the checksum.
+    #[tokio::test]
+    #[allow(clippy::unwrap_used)]
+    async fn recv_dropped_mid_frame_loses_nothing() {
+        let first = Message::new(MessageType::WalBatch, Bytes::from(vec![7u8; 64 * 1024]), 1).encode();
+        let second = Message::new(MessageType::WalBatch, Bytes::from(vec![9u8; 1024]), 2).encode();
+        for cut in [10, HEADER_SIZE + 1000, first.len() - 2] {
+            let (mut client, mut server) = raw_pair().await;
+            let (head, tail) = first.split_at(cut);
+            server.write_all(head).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), client.recv())
+                    .await
+                    .is_err(),
+                "a partial frame must leave recv pending (cut at {cut})"
+            );
+            server.write_all(tail).await.unwrap();
+            server.write_all(&second).await.unwrap();
+            let a = tokio::time::timeout(Duration::from_secs(3), client.recv())
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("first frame lost after a cut at {cut}: {e}"));
+            let b = tokio::time::timeout(Duration::from_secs(3), client.recv())
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("second frame lost after a cut at {cut}: {e}"));
+            assert_eq!((a.header.sequence, a.payload.len()), (1, 64 * 1024), "cut at {cut}");
+            assert_eq!((b.header.sequence, b.payload.len()), (2, 1024), "cut at {cut}");
+        }
+    }
+
+    /// The standby loop's shape under load: `recv` raced against a timer that is
+    /// ready constantly, while large frames stream in. Every frame must arrive
+    /// exactly once, in order: a dropped frame is a silent hole in the standby.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::unwrap_used)]
+    async fn recv_raced_against_a_timer_delivers_every_frame_once_in_order() {
+        const FRAMES: u64 = 300;
+        let (mut client, mut server) = raw_pair().await;
+        let writer = tokio::spawn(async move {
+            for seq in 1..=FRAMES {
+                let msg = Message::new(MessageType::WalBatch, Bytes::from(vec![seq as u8; 32 * 1024]), seq);
+                server.write_all(&msg.encode()).await.unwrap();
+            }
+            server
+        });
+        let mut tick = tokio::time::interval(Duration::from_millis(1));
+        let mut next = 1;
+        let outcome = tokio::time::timeout(Duration::from_secs(60), async {
+            while next <= FRAMES {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    msg = client.recv() => {
+                        let msg = msg.map_err(|e| format!("frame {next}: {e}"))?;
+                        if msg.header.sequence != next || msg.payload.iter().any(|b| *b != next as u8) {
+                            return Err(format!("expected frame {next}, got frame {}", msg.header.sequence));
+                        }
+                        next += 1;
+                    }
+                }
+            }
+            Ok::<(), String>(())
+        })
+        .await;
+        assert_eq!(outcome, Ok(Ok(())), "frames delivered before the failure: {}", next - 1);
+        drop(writer.await.unwrap());
     }
 }

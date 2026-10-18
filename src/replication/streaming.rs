@@ -1321,6 +1321,7 @@ impl StreamingClient {
         let mut heartbeat_interval = tokio::time::interval(HEARTBEAT_INTERVAL);
         let mut readiness_interval = tokio::time::interval(Duration::from_millis(100));
         let mut caught_up = false;
+        let mut sequence = DataSequence::default();
 
         loop {
             tokio::select! {
@@ -1339,6 +1340,7 @@ impl StreamingClient {
                 msg_result = conn.recv() => {
                     match msg_result {
                         Ok(msg) => {
+                            sequence.admit(&msg)?;
                             self.handle_primary_message(&mut conn, msg).await?;
                         }
                         Err(e) => {
@@ -1548,6 +1550,38 @@ impl StreamingClient {
     }
 }
 
+/// Continuity of the data a standby receives on one connection.
+///
+/// The primary sends every `WalEntry` and `WalBatch` through the connection's
+/// own sequence counter, so on one connection they run 1, 2, 3, ... (the
+/// handshake response takes 0, and heartbeats are sent with 0 and carry no
+/// data). A gap means a frame was lost; applying the next one would put later
+/// entries over a hole and move the durable cursor past it for good. Refusing
+/// it drops the connection instead, and the standby reconnects from what it
+/// has actually applied.
+#[derive(Default)]
+struct DataSequence {
+    last: u64,
+}
+
+impl DataSequence {
+    fn admit(&mut self, msg: &Message) -> Result<()> {
+        if !matches!(msg.header.msg_type, MessageType::WalEntry | MessageType::WalBatch) {
+            return Ok(());
+        }
+        let expected = self.last + 1;
+        if msg.header.sequence != expected {
+            return Err(ReplicationError::Transport(format!(
+                "replication data from the primary is out of sequence (expected message {}, got {}); \
+                 reconnecting from the applied position",
+                expected, msg.header.sequence
+            )));
+        }
+        self.last = expected;
+        Ok(())
+    }
+}
+
 // =============================================================================
 // TESTS
 // =============================================================================
@@ -1689,5 +1723,27 @@ mod tests {
         let (client, _rx) = StreamingClient::new(config, Arc::new(ReceiverHistory::in_memory()));
         assert_eq!(client.applied_lsn(), 0);
         assert_eq!(client.lag_bytes(), 0);
+    }
+
+    /// A lost data frame must stop the connection before the next one is acted
+    /// on; heartbeats (always sequence 0) never count.
+    #[test]
+    fn data_sequence_refuses_a_gap_and_ignores_heartbeats() {
+        let data = |kind, seq| Message::new(kind, Bytes::new(), seq);
+        let mut sequence = DataSequence::default();
+        assert!(sequence.admit(&data(MessageType::WalBatch, 1)).is_ok());
+        assert!(sequence.admit(&data(MessageType::Heartbeat, 0)).is_ok());
+        assert!(sequence.admit(&data(MessageType::WalBatch, 2)).is_ok());
+        assert!(sequence.admit(&data(MessageType::WalEntry, 3)).is_ok());
+        assert!(sequence.admit(&data(MessageType::Heartbeat, 0)).is_ok());
+        let gap = sequence.admit(&data(MessageType::WalEntry, 5));
+        assert!(
+            matches!(&gap, Err(ReplicationError::Transport(m)) if m.contains("expected message 4, got 5")),
+            "{gap:?}"
+        );
+        // A repeated frame is refused too: it could only come from a broken stream.
+        let mut sequence = DataSequence::default();
+        assert!(sequence.admit(&data(MessageType::WalEntry, 1)).is_ok());
+        assert!(sequence.admit(&data(MessageType::WalEntry, 1)).is_err());
     }
 }

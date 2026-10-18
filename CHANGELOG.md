@@ -21,6 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it are served to standbys and never replayed on the primary. Standalone nodes
   keep nothing extra. The refusal now says which LSN history was pruned through
   and which setting widens the window.
+- **A standby no longer silently loses replicated data** (critical; present in
+  4.41.1 and earlier). The native replication reader was not safe to cancel,
+  and both ends race it against timers. A read interrupted part-way through a
+  message lost the bytes already read, so the next read started mid-message
+  ("Invalid magic"). Worse, a message that had been read in full could be
+  dropped without any error. The standby then applied later entries over the
+  hole, moved its durable position past it and reported itself caught up while
+  missing committed rows. It was seen live when a fresh standby caught up from
+  a restarted primary: one whole 500-entry batch vanished, leaving 2010 of 2510
+  rows. Incoming bytes now stay in a per-connection buffer until a whole
+  message is there, so an interrupted read loses nothing. Independently, the
+  standby now checks that the primary's data messages arrive in unbroken
+  sequence; a gap drops the connection, and the standby reconnects from what
+  it has actually applied rather than continuing over the hole. A standby that
+  ran under 4.41.1 or earlier should be rebuilt, or its row counts compared
+  with the primary's, because a hole left by the old reader is never repaired.
 
 ## [4.41.1] - 2026-10-15
 

@@ -427,3 +427,63 @@ async fn retention_window_bounds_what_a_restarted_primary_can_serve() {
         log.lines().rev().take(5).collect::<Vec<_>>().join(" | ")
     );
 }
+
+/// Poll until the standby reports `want` rows or the budget runs out; returns the last observation.
+async fn settle_count(port: u16, want: i64, budget: Duration) -> Result<i64, String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        let seen = match tokio_postgres::connect(
+            &format!("host=127.0.0.1 port={port} user=postgres dbname=postgres connect_timeout=2"),
+            NoTls,
+        )
+        .await
+        {
+            Ok((client, connection)) => {
+                tokio::spawn(connection);
+                client
+                    .query_one("SELECT count(*) FROM t", &[])
+                    .await
+                    .map(|row| row.get::<_, i64>(0))
+                    .map_err(|e| e.to_string())
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        if seen == Ok(want) || Instant::now() > deadline {
+            return seen;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A catch-up longer than one batch (the primary sends 500 entries per WalBatch)
+/// must arrive whole. Field-J crash probe on the J1 branch: a fresh standby lost
+/// one whole batch on reconnect (message sequence 2 never surfaced), then served
+/// 2010 of 2510 rows and reported itself caught up. Three fresh standbys in turn
+/// must each hold every row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_batch_catch_up_delivers_every_row() {
+    const ROWS: i32 = 3000;
+    let c = cluster();
+    let _primary = Daemon::spawn(c.dir.path(), "primary", &c.token, &c.primary_args);
+    let writer = connect(c.pg_p).await;
+    writer
+        .batch_execute("CREATE TABLE t (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    for id in 1..=ROWS {
+        writer.execute("INSERT INTO t VALUES ($1)", &[&id]).await.unwrap();
+    }
+    for name in ["standby-a", "standby-b", "standby-c"] {
+        let mut args = c.standby_args.clone();
+        let port = free_port();
+        let at = args.iter().position(|a| a == "--port").unwrap();
+        args[at + 1] = port.to_string();
+        let mut standby = Daemon::spawn(c.dir.path(), name, &c.token, &args);
+        assert_eq!(
+            settle_count(port, i64::from(ROWS), Duration::from_secs(60)).await,
+            Ok(i64::from(ROWS)),
+            "{name}: a fresh standby must hold every committed row"
+        );
+        standby.stop();
+    }
+}
