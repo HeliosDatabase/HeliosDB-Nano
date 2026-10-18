@@ -1282,12 +1282,12 @@ impl WriteAheadLog {
     /// Record `up_to_lsn` as the checkpoint and delete the entries it makes
     /// unnecessary, in ONE RocksDB `WriteBatch`.
     ///
-    /// With no retention every entry with `lsn <= up_to_lsn` is deleted. With
-    /// [`Self::with_retention`]`(n)` the newest `n` LSNs at or below the
-    /// checkpoint stay, for standbys to catch up from: they are below the redo
-    /// floor, so open-time recovery never replays them. The history floor
-    /// ([`Self::PRUNED_THROUGH_KEY`]) records what was actually deleted and only
-    /// moves forward.
+    /// With no retention every entry with `lsn <= up_to_lsn` is deleted. With a
+    /// retention of `n` entries ([`Self::with_retention`]) the newest `n` LSNs
+    /// at or below the checkpoint stay, for standbys to catch up from: they are
+    /// below the redo floor, so open-time recovery never replays them. The
+    /// history floor ([`Self::PRUNED_THROUGH_KEY`]) records what was actually
+    /// deleted and only moves forward.
     ///
     /// Atomicity here is the whole point. The two facts "these entries are
     /// gone" and "everything up to this LSN is applied" must never disagree on
