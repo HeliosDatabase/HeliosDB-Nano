@@ -1,7 +1,7 @@
 # Field finding J — a primary restart must not break the HA pair
 
-**Status:** J1 in progress (branch `fix/replication-retention-j`, base `4af19e1c` = v4.41.1).
-J2 and J3 are designed here but not started. Sprinter: `58d4e3113e56` (J), with
+**Status:** J1 and J1a done and gated (branch `fix/replication-retention-j`, base `4af19e1c` =
+v4.41.1). J2 and J3 are decided (§5) and planned in `STANDBY_RECOVERY_PLAN.md`; not started. Sprinter: `58d4e3113e56` (J), with
 `36b56ac796e2` (retention), `551a9cdd2e0b` (serving rebuild), `bbba90ddfc61` (promotion).
 
 ## How this document was built
@@ -114,12 +114,15 @@ exact, and the field run notes the physical initial transfer is loopback-only to
 - A store downgraded to 4.41.1 ignores `wal:pruned_through` and deletes the window at its
   next checkpoint, which only loses history, never applied data.
 
-## 5. Blocked on the maintainer
+## 5. Maintainer decisions (2026-10-19)
 
-- J2: exit (today) or stay up as "needs rebuild"?
-- J3: physical serving rebuild or logical bootstrap first?
+- J2: **stay up.** History kept for standbys becomes a tunable recovery window, default 7 days.
+- J3: **two rebuild modes**, from the primary (fast-forward only what changed, after Oracle
+  `RECOVER … FROM SERVICE`) and from WAL available on the standby host, with a catalog.
+
+Both are planned in `STANDBY_RECOVERY_PLAN.md` (phases R0-R5), for review before implementation.
 
 ## 6. Milestones
 
-J1 (retention window + catch-up floor + tests) -> J1b (per-standby floor, chunked catch-up)
--> J2 (posture, after the decision) -> J3 (rebuild).
+J1 (retention window + catch-up floor + tests) and J1a (cancel-safe transport) are done. J1b, J2
+and J3 continue as phases R0-R4 of `STANDBY_RECOVERY_PLAN.md`.
