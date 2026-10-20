@@ -2149,6 +2149,10 @@ pub struct StorageEngine {
     /// R4.2: how the last `rebuild_all_indexes` populated the in-memory
     /// indexes (snapshot-loaded vs scanned). Diagnostics + test surface.
     last_index_open_report: Arc<RwLock<Option<super::index_snapshot::IndexOpenReport>>>,
+    /// Spec P1.4: a physical hydration ([`Self::hydrate_physical`]) was
+    /// started on this engine. Set once, never cleared: an engine is hydrated
+    /// once, by one owner.
+    physical_hydration_started: AtomicBool,
     /// RocksDB `LOG` redirect for a READ-ONLY handle (including physical
     /// snapshots): an owned directory OUTSIDE the database, kept alive through
     /// the drop of the engine-owned `StorageEngine`/`DB` handle so the log
@@ -2484,6 +2488,43 @@ impl StorageEngine {
     /// Whether this engine may write to its store (only a primary may).
     pub(crate) fn engine_may_write(&self) -> bool {
         self.open_mode.engine_may_write()
+    }
+
+    /// Whether this engine serves a physical standby
+    /// ([`Self::open_physical_standby`]). The SQL layer asks this before every
+    /// write entry point (spec P1.4), so it is one discriminant test.
+    #[inline]
+    pub fn is_physical_standby(&self) -> bool {
+        matches!(self.open_mode, OpenMode::PhysicalStandby { .. })
+    }
+
+    /// Hydrate a physical engine's in-memory derived state from its store,
+    /// exactly once: the strict physical-image index rebuild
+    /// (`Catalog::rebuild_all_indexes_for_physical_snapshot`: ART indexes,
+    /// standard HNSW from rows, row counters in memory) and the lazy catalog
+    /// validation.
+    ///
+    /// Spec P1.4: the one hydration for every caller —
+    /// `EmbeddedDatabase::open_physical_snapshot` and
+    /// `EmbeddedDatabase::with_physical_standby` (through the SQL layer's
+    /// shared open), and `PhysicalApplier::hydrate` for an engine nobody serves
+    /// SQL from — so the three cannot drift, and so a second hydration is
+    /// refused whatever the store holds. The rebuild's own "fresh ART
+    /// registry" check refuses only once some table has an index; over a store
+    /// without one, a second hydration used to run in silence. A hydration that
+    /// failed is not retried either: the engine is reopened. Runs under the
+    /// replay guard, so no applier publishes into a registry being built.
+    pub(crate) fn hydrate_physical(&self) -> Result<()> {
+        let _replay = self.replay_guard();
+        if self.physical_hydration_started.swap(true, Ordering::AcqRel) {
+            return Err(Error::storage(
+                "this physical engine was already hydrated: a serving standby is hydrated by \
+                 EmbeddedDatabase::with_physical_standby alone, so do not call PhysicalApplier::hydrate on it",
+            ));
+        }
+        let catalog = self.catalog();
+        catalog.rebuild_all_indexes_for_physical_snapshot()?;
+        catalog.validate_lazy_physical_catalog()
     }
 
     /// The gate every raw write of this engine — and of every component built
@@ -3272,6 +3313,7 @@ impl StorageEngine {
             row_counter_flush_on_close: Arc::new(AtomicBool::new(!mode.is_physical())),
             open_mode: mode,
             last_index_open_report: Arc::new(RwLock::new(None)),
+            physical_hydration_started: AtomicBool::new(false),
             _read_only_log_dir: read_only_log_dir,
         };
 
@@ -3699,6 +3741,7 @@ impl StorageEngine {
             row_counter_flush_on_close: Arc::new(AtomicBool::new(true)),
             open_mode: OpenMode::Primary,
             last_index_open_report: Arc::new(RwLock::new(None)),
+            physical_hydration_started: AtomicBool::new(false),
             _read_only_log_dir: None,
         })
     }
@@ -4010,6 +4053,13 @@ impl StorageEngine {
     /// storage.enable_lockfree_ingestion(config)?;
     /// ```
     pub fn enable_lockfree_ingestion(&self, config: super::lockfree::LockFreeIngestionConfig) -> Result<()> {
+        // Spec P1.4: refused on a physical standby before anything happens.
+        // Enabling creates a WAL directory and an engine whose apply callback
+        // writes `data:` keys; the gate would refuse those writes one by one on
+        // a worker thread with no caller to report to.
+        if self.is_physical_standby() {
+            return Err(Error::physical_standby_write_refused("enable_lockfree_ingestion"));
+        }
         // Determine WAL path
         let wal_path = if let Some(ref temp) = self._temp_dir {
             temp.path().join("lockfree_wal")
@@ -15116,6 +15166,28 @@ mod tests {
         );
     }
 
+    /// Spec P1.4: a physical engine is hydrated at most once, whatever its
+    /// store holds. This store has no table, so no index: the rebuild's own
+    /// fresh-registry check cannot tell a second hydration from the first.
+    #[test]
+    fn a_physical_engine_is_hydrated_at_most_once() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("store");
+        let mut config = Config::default();
+        config.storage.wal_enabled = false;
+        config.storage.elide_latest_version = false;
+        drop(StorageEngine::open(&db_path, &config).expect("writable open creates the store"));
+
+        let snapshot = StorageEngine::open_physical_snapshot(&db_path, &config).expect("physical snapshot open");
+        assert!(!snapshot.is_physical_standby());
+        snapshot.hydrate_physical().expect("the first hydration");
+        let second = snapshot
+            .hydrate_physical()
+            .expect_err("a second hydration must be refused");
+        assert!(second.to_string().contains("already hydrated"), "{second}");
+        assert_eq!(snapshot.write_gate().refusals(), 0, "hydration attempted a write");
+    }
+
     /// P0.2/P0.3: the standby mode hydrates on its writer's own writable
     /// handle — the SAME `Arc<DB>`, not a second open — behind the caller's
     /// closed gate, and writes nothing on its own: the sequence number is
@@ -15175,6 +15247,10 @@ mod tests {
         );
         assert!(engine.physical_snapshot_mode(), "a standby hydrates strictly");
         assert!(!engine.engine_may_write());
+        assert!(
+            engine.is_physical_standby(),
+            "spec P1.4: the SQL layer's write guard asks this"
+        );
         assert!(
             engine._read_only_log_dir.is_none(),
             "the handle is not the engine's to redirect"

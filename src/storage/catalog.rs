@@ -5690,6 +5690,28 @@ impl<'a> Catalog<'a> {
         self.storage.delete(&key)
     }
 
+    /// One trigger's persisted rewrite recipe, or `None` when it has none — the
+    /// per-key twin of [`Catalog::load_all_trigger_row_mutations`], for a
+    /// physical standby that reloads the recipe its applier just changed (spec
+    /// P1.4). An unreadable record is an error here; the caller decides.
+    pub fn load_trigger_row_mutation(
+        &self,
+        table_name: &str,
+        trigger_name: &str,
+    ) -> Result<Option<crate::sql::triggers::TriggerRowMutation>> {
+        let key = Self::trigger_row_mutation_key(table_name, trigger_name);
+        match self.storage.get(&key)? {
+            Some(value) => Self::decode_tagged(
+                TRIGGER_ROWMUT_MAGIC,
+                TRIGGER_ROWMUT_FORMAT_VERSION,
+                &value,
+                "trigger row mutation",
+            )
+            .map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Every persisted rewrite recipe, as `(table_name, trigger_name, recipe)`.
     ///
     /// Unreadable entries are warned about and skipped, for the same reason

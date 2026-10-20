@@ -328,18 +328,19 @@ impl PhysicalApplier {
         self.stats.lock().clone()
     }
 
-    /// Hydrate a freshly opened standby engine: the strict physical-image
+    /// Hydrate a freshly opened standby engine nobody serves SQL from (tests,
+    /// tools): `StorageEngine::hydrate_physical`, the strict physical-image
     /// index rebuild (`Catalog::rebuild_all_indexes_for_physical_snapshot`:
     /// ART indexes, standard HNSW from rows, row counters in memory) and the
-    /// lazy catalog validation, exactly as `EmbeddedDatabase::open_physical_snapshot`
-    /// does. Call it once, before the first batch, on an engine nothing else
-    /// hydrated — `EmbeddedDatabase::with_physical_standby` (P1.4) does the
-    /// same on its own; a second hydration is refused.
+    /// lazy catalog validation that `EmbeddedDatabase::open_physical_snapshot`
+    /// runs too. Call it once, before the first batch.
+    ///
+    /// Spec P1.4: a SERVING standby is hydrated by
+    /// `EmbeddedDatabase::with_physical_standby`, which owns the hydration of
+    /// its engine; do not call this on that engine. The engine refuses a
+    /// second hydration whatever the store holds.
     pub fn hydrate(&self) -> Result<()> {
-        let _replay = self.engine.replay_guard();
-        let catalog = self.engine.catalog();
-        catalog.rebuild_all_indexes_for_physical_snapshot()?;
-        catalog.validate_lazy_physical_catalog()?;
+        self.engine.hydrate_physical()?;
         Ok(())
     }
 

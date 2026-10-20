@@ -333,6 +333,7 @@ pub use crypto::{
 };
 pub use error::{
     Error, Result, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE, NOT_NULL_VIOLATION_MARKER,
+    PHYSICAL_STANDBY_WRITE_REFUSED,
 };
 pub use storage::StorageEngine;
 pub use types::{
@@ -632,6 +633,38 @@ thread_local! {
     /// Set by `charge_tenant_query_for_session` and RESTORED, not cleared, on
     /// drop, exactly like `TENANT_QUERY_METERED` beside it.
     static SESSION_BOUND_STATEMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Spec P1.4: the text — `(address, length)` of the `&str` — that a
+    /// physical standby admitted for the statement running on this thread.
+    ///
+    /// WRITTEN by `EmbeddedDatabase::admit_on_physical_standby` when it admits
+    /// a statement, and restored by the returned guard when that statement
+    /// ends. READ by the same function at the entry points the statement
+    /// delegates to on this thread (`execute_for_session` → `execute` →
+    /// `execute_in_transaction_inner` all ask). While the outer call borrows
+    /// the admitted `&str`, no other text can occupy those bytes, so an equal
+    /// pair is the same text and — the rule being a function of the text alone
+    /// — the same verdict: the nested ask skips its parse. A nested statement
+    /// with its own text (a UDF or `CALL` body) is classified on its own.
+    /// `(0, 0)` = nothing admitted: a `&str` never has a null address.
+    static PHYSICAL_STANDBY_ADMITTED: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// RAII record of a statement a physical standby admitted (spec P1.4,
+/// [`PHYSICAL_STANDBY_ADMITTED`]). Restores the PREVIOUS value on `Drop` —
+/// including on an unwinding panic — like [`TenantQueryMeter`]; `None` when
+/// nothing was recorded (a primary, or a nested ask that found its text
+/// already admitted).
+#[must_use = "the admission lasts only while the guard is held"]
+struct PhysicalStandbyAdmission {
+    previous: Option<(usize, usize)>,
+}
+
+impl Drop for PhysicalStandbyAdmission {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous {
+            PHYSICAL_STANDBY_ADMITTED.with(|admitted| admitted.set(previous));
+        }
+    }
 }
 
 /// RAII marker for `TENANT_QUERY_METERED` (sprinter d03de7fc3b22).
@@ -1526,7 +1559,19 @@ impl Drop for EmbeddedDatabase {
         // monotonic-safe (it can never lower the durable value), so flushing a
         // counter bumped by a still-open transaction costs at most a row-id gap
         // — never a collision. Only the snapshot checkpoint needs that guard.
-        if self.storage.row_counter_flush_on_close() {
+        //
+        // Spec P1.4: NONE of the four close-time writes below runs for a
+        // physical standby's handle, explicitly rather than by leaning on the
+        // engine's flags. A physical open already clears the counter-flush and
+        // snapshot flags and refuses the WAL checkpoint, but the two flags are
+        // public setters, and the write gate would only refuse what got
+        // through — a refusal counted on every clean shutdown. The memtable
+        // flush is not a write the gate sees at all: the handle is the
+        // standby's `LocalWriter`'s, which outlives this database (the applier
+        // keeps applying), and its owner decides when the store is flushed. A
+        // standby's close leaves the directory exactly as it found it.
+        let writes_at_close = !self.storage.is_physical_standby();
+        if writes_at_close && self.storage.row_counter_flush_on_close() {
             if let Err(e) = self.storage.flush_all_row_counters() {
                 tracing::warn!("row counter flush at close failed: {}", e);
             }
@@ -1541,7 +1586,7 @@ impl Drop for EmbeddedDatabase {
         // requirement documented on the counter flush above.
         let txn_open = self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
             || self.session_txn_count.load(std::sync::atomic::Ordering::Acquire) > 0;
-        if !txn_open && self.storage.index_snapshots_on_close() {
+        if writes_at_close && !txn_open && self.storage.index_snapshots_on_close() {
             if let Err(e) = self.storage.persist_index_snapshots() {
                 tracing::warn!("index snapshot checkpoint at close failed: {}", e);
             }
@@ -1557,7 +1602,8 @@ impl Drop for EmbeddedDatabase {
         // with a transaction still open (its write set is not committed data)
         // and on `clone_for_trigger()` clones (the last-owner gate below), so a
         // trigger firing mid-statement can never checkpoint.
-        if !txn_open
+        if writes_at_close
+            && !txn_open
             && self.storage.wal_checkpoint_on_close()
             && std::sync::Arc::strong_count(&self.auto_refresh_worker) == 1
         {
@@ -1571,7 +1617,7 @@ impl Drop for EmbeddedDatabase {
         // see `StorageEngine::flush_memtables_on_close`). Same gates as the
         // checkpoint: never with a transaction open, and never from a
         // `clone_for_trigger()` clone, which drops mid-statement.
-        if !txn_open && std::sync::Arc::strong_count(&self.auto_refresh_worker) == 1 {
+        if writes_at_close && !txn_open && std::sync::Arc::strong_count(&self.auto_refresh_worker) == 1 {
             if let Err(e) = self.storage.flush_memtables_on_close() {
                 tracing::warn!("{}", e);
             }
@@ -1622,6 +1668,63 @@ impl Drop for EmbeddedDatabase {
         self.parse_cache.clear();
 
         tracing::debug!("EmbeddedDatabase dropped, resources cleaned up");
+    }
+}
+
+/// Spec P1.4: a physical standby's SQL layer follows the catalog its applier
+/// applies. Hand the `Arc<EmbeddedDatabase>` built by
+/// [`EmbeddedDatabase::with_physical_standby`] to `PhysicalApplier::new`; the
+/// applier calls this after publishing each batch's engine-level state, under
+/// its replay guard, once per catalog key the batch touched.
+///
+/// | Key class | Action |
+/// |---|---|
+/// | `MetaFunction` / `MetaProcedure` | that ONE registry entry reloaded from the store (any surviving case variant of its name), or forgotten |
+/// | `Trigger` | that one definition re-registered from the store (or unregistered), then its rewrite recipe |
+/// | `TriggerRowMut` | that one recipe re-attached while its definition is registered, else dropped |
+/// | `MetaSequence` / `MetaSeqState` | the cached sequence runtime evicted (rebuilt from the records on next use) |
+/// | `MetaMv` / `ViewMeta` | nothing beyond the caches below: neither catalog has a cache of its own (`MaterializedViewCatalog` and `ViewCatalog` read the store on every call, and the existence cache keys off the schema generation the applier bumps) |
+/// | `Unknown`, and `on_full_rebuild` | both routine registries and the trigger registry reloaded whole |
+/// | every class | `invalidate_plan_cache`: the plan and parse caches, every fast-path spec cache, and the result cache — cleared outright with the storage generation recorded, which is what `reconcile_result_cache_with_storage` would do on the next cached read, done now |
+///
+/// The reloads read the post-batch bytes rather than trusting `deleted`
+/// alone; `deleted` only spares the read of a key that is gone.
+#[cfg(feature = "ha-tier1")]
+impl crate::replication::physical_applier::DerivedStateListener for EmbeddedDatabase {
+    fn on_catalog_change(&self, class: crate::storage::keyspace::KeyClass, key: &[u8], deleted: bool) {
+        use crate::storage::keyspace::KeyClass;
+        match class {
+            KeyClass::MetaFunction => self.reload_routine_record(false, key, deleted),
+            KeyClass::MetaProcedure => self.reload_routine_record(true, key, deleted),
+            KeyClass::Trigger => self.reload_trigger_record(key, deleted),
+            KeyClass::TriggerRowMut => match Self::trigger_key_parts(key, "trigger_rowmut:") {
+                Some((table, name)) => self.reload_trigger_row_mutation(table, name),
+                None => tracing::warn!(
+                    "physical standby: trigger recipe key {:?} is malformed; the registry is left as it was",
+                    String::from_utf8_lossy(key)
+                ),
+            },
+            KeyClass::MetaSequence | KeyClass::MetaSeqState => self.evict_sequence_runtime(key),
+            KeyClass::Unknown => self.reload_derived_registries(),
+            _ => {}
+        }
+        self.invalidate_plan_cache();
+    }
+
+    fn on_full_rebuild(&self) {
+        self.reload_derived_registries();
+        self.invalidate_plan_cache();
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+impl EmbeddedDatabase {
+    /// Every registry the SQL layer derives from the catalog, reloaded whole
+    /// (spec P1.4: a full re-derivation, or a key the applier cannot classify).
+    fn reload_derived_registries(&self) {
+        self.reload_all_routines(false);
+        self.reload_all_routines(true);
+        self.reload_all_triggers();
     }
 }
 
@@ -3685,6 +3788,89 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// Spec P1.4: whether this handle serves a physical standby
+    /// ([`Self::with_physical_standby`]). Every write entry point of such a
+    /// handle refuses with [`Error::physical_standby_write_refused`] before it
+    /// reaches the storage engine; reads are served.
+    pub fn is_physical_standby(&self) -> bool {
+        self.storage.is_physical_standby()
+    }
+
+    /// Spec P1.4: admit `sql` on a physical standby only if it is a read; on
+    /// any other handle, one discriminant test and an inert guard.
+    ///
+    /// WHERE: first thing at every SQL entry point — the eighteen entry points
+    /// that charge the tenant QPS budget ([`Self::charge_tenant_query`], whose
+    /// census IS the list of execution families, there being no single
+    /// funnel), asked at the charge itself or, where an HDB-008 transaction
+    /// boundary wraps the charge, just outside that boundary — plus the
+    /// statement lists `execute_batch` / `execute_sql_script` and the RAII
+    /// [`Transaction`]. Outside the boundary, a refused statement never aborts
+    /// the caller's transaction block (only `execute_in_transaction_inner`'s
+    /// ask sits inside one, as the backstop of its own callers). The non-SQL
+    /// write APIs ask [`Self::refuse_write_on_physical_standby`].
+    ///
+    /// WHAT: the PostgreSQL wire's rule for a guarded standby
+    /// (`protocol::postgres::handler::guarded_standby_statement_allowed`), so
+    /// the wire and the embedded API cannot disagree: one SELECT / VALUES /
+    /// WITH query without `nextval` / `setval` / `INTO` / row locks, EXPLAIN of
+    /// one, SET / SHOW / RESET, and transaction control. Everything else is
+    /// refused rather than guessed: DML (`… RETURNING` too), DDL, `CALL`,
+    /// PREPARE / EXECUTE, COPY FROM, maintenance, branch statements, PRAGMA,
+    /// unrecognised utility statements, and several statements in one string.
+    /// A UDF called by an admitted SELECT runs its body through this same API
+    /// (`sql::udf_bridge`), so a body that writes is refused here as well.
+    ///
+    /// The guard records the admitted text for this thread while it lives
+    /// ([`PHYSICAL_STANDBY_ADMITTED`]): the entry points a statement delegates
+    /// to with the same `&str` then skip the parse.
+    #[inline]
+    fn admit_on_physical_standby(&self, sql: &str) -> Result<PhysicalStandbyAdmission> {
+        if !self.storage.is_physical_standby() {
+            return Ok(PhysicalStandbyAdmission { previous: None });
+        }
+        Self::admit_statement_on_physical_standby(sql)
+    }
+
+    /// The standby half of [`Self::admit_on_physical_standby`].
+    #[cold]
+    fn admit_statement_on_physical_standby(sql: &str) -> Result<PhysicalStandbyAdmission> {
+        let text = (sql.as_ptr() as usize, sql.len());
+        if PHYSICAL_STANDBY_ADMITTED.with(|admitted| admitted.get()) == text {
+            return Ok(PhysicalStandbyAdmission { previous: None });
+        }
+        // Without `ha-tier1` no engine can be a physical standby, and this is
+        // unreachable; it still refuses rather than admits.
+        #[cfg(feature = "ha-tier1")]
+        if crate::protocol::postgres::handler::guarded_standby_statement_allowed(sql) {
+            return Ok(PhysicalStandbyAdmission {
+                previous: Some(PHYSICAL_STANDBY_ADMITTED.with(|admitted| admitted.replace(text))),
+            });
+        }
+        Err(Error::physical_standby_write_refused(&Self::statement_keyword(sql)))
+    }
+
+    /// Spec P1.4: refuse the non-SQL write API `operation` (`insert_vectors`,
+    /// `restore_from_dump`, …) on a physical standby, before it reaches the
+    /// engine. Several of them change in-memory state the gate never sees (a
+    /// standard HNSW store is memory-only), so the gate cannot be relied on.
+    #[inline]
+    fn refuse_write_on_physical_standby(&self, operation: &str) -> Result<()> {
+        if self.storage.is_physical_standby() {
+            return Err(Error::physical_standby_write_refused(operation));
+        }
+        Ok(())
+    }
+
+    /// The leading keyword of `sql` (`INSERT`, `CREATE`, …), for a refusal.
+    fn statement_keyword(sql: &str) -> String {
+        crate::protocol::postgres::handler::pg_skip_leading_comments(sql)
+            .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+            .find(|word| !word.is_empty())
+            .map(|word| word.chars().take(32).collect::<String>().to_ascii_uppercase())
+            .unwrap_or_else(|| "an empty statement".to_string())
+    }
+
     /// Charge one client statement against the bound tenant's QPS budget.
     ///
     /// SCOPE: every execution family's entry point charges — eighteen call
@@ -4491,6 +4677,8 @@ impl EmbeddedDatabase {
     /// R4.3: run a full MVCC version-GC pass (the library twin of the
     /// `VACUUM VERSIONS` SQL statement). Returns reclaimed version count.
     pub fn vacuum_versions(&self) -> Result<u64> {
+        // Spec P1.4: version GC deletes keys; a standby's history is its primary's.
+        self.refuse_write_on_physical_standby("vacuum_versions")?;
         self.storage.vacuum_versions()
     }
 
@@ -6718,6 +6906,262 @@ impl EmbeddedDatabase {
         Ok(self)
     }
 
+    // ---- Spec P1.4: a physical standby's registries follow its applier ----
+    //
+    // A standby's catalog changes underneath this handle: its applier writes
+    // the primary's batches verbatim and then names the catalog keys that
+    // changed (`DerivedStateListener`, implemented after `Drop`). These reload
+    // what an open builds from those keys, one record at a time, from the
+    // store, with the decoders the open-time loaders use
+    // (`install_routine_runtime_with_policy`, `load_persisted_triggers`). A
+    // record that does not read back leaves its entry ABSENT rather than
+    // stale — "does not exist" is loud, an old body is a wrong answer — exactly
+    // what the tolerant open-time loaders leave for it.
+
+    /// Reload the function (`procedures == false`) or procedure registry
+    /// entry that a `meta:function:` / `meta:procedure:` key names.
+    ///
+    /// The registry keys a routine by its LOWERCASE name, the durable key by
+    /// the name as written, and a DROP deletes every case variant
+    /// (`delete_routine_meta`). So the record that decides the entry is any
+    /// variant that survives: this key's, else another's, else none.
+    #[cfg(feature = "ha-tier1")]
+    fn reload_routine_record(&self, procedures: bool, key: &[u8], deleted: bool) {
+        let (prefix, kind) = Self::routine_prefix(procedures);
+        let Some(name) = key
+            .strip_prefix(prefix.as_bytes())
+            .and_then(|name| std::str::from_utf8(name).ok())
+        else {
+            tracing::warn!(
+                "physical standby: {} key {:?} names no routine; the registry is left as it was",
+                kind,
+                String::from_utf8_lossy(key)
+            );
+            return;
+        };
+        let this_record = if deleted {
+            Ok(None)
+        } else {
+            self.storage.get(&key.to_vec())
+        };
+        let record = match this_record {
+            Ok(None) => self.storage.meta_blobs_with_prefix(prefix).map(|records| {
+                records
+                    .into_iter()
+                    .find(|(suffix, _)| suffix.eq_ignore_ascii_case(name))
+                    .map(|(_, blob)| blob)
+            }),
+            other => other,
+        };
+        let loaded = match record {
+            Ok(Some(blob)) => self.load_routine_blob(procedures, name, &blob),
+            Ok(None) => {
+                self.forget_routine(procedures, name);
+                return;
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = loaded {
+            tracing::warn!(
+                "physical standby: {} '{}' could not be reloaded ({}); it is unavailable until its next change",
+                kind,
+                name,
+                e
+            );
+            self.forget_routine(procedures, name);
+        }
+    }
+
+    /// Reload the whole function or procedure registry from the store: load
+    /// every durable record, then forget the names left without one — in that
+    /// order, so no reader sees a routine that still exists go missing.
+    #[cfg(feature = "ha-tier1")]
+    fn reload_all_routines(&self, procedures: bool) {
+        let (prefix, kind) = Self::routine_prefix(procedures);
+        let records = match self.storage.meta_blobs_with_prefix(prefix) {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::warn!(
+                    "physical standby: the {} records could not be read ({}); the registry is left as it was",
+                    kind,
+                    e
+                );
+                return;
+            }
+        };
+        let mut durable = std::collections::HashSet::new();
+        for (name, blob) in records {
+            match self.load_routine_blob(procedures, &name, &blob) {
+                Ok(()) => {
+                    durable.insert(name.to_lowercase());
+                }
+                Err(e) => tracing::warn!("physical standby: {} '{}' could not be reloaded: {}", kind, name, e),
+            }
+        }
+        let registered = if procedures {
+            self.function_registry.list_procedures()
+        } else {
+            self.function_registry.list_functions()
+        };
+        for name in registered.into_iter().filter(|name| !durable.contains(name)) {
+            self.forget_routine(procedures, &name);
+        }
+    }
+
+    /// The durable key prefix and the noun of a routine kind.
+    #[cfg(feature = "ha-tier1")]
+    fn routine_prefix(procedures: bool) -> (&'static str, &'static str) {
+        if procedures {
+            (Self::PROCEDURE_META_PREFIX, "procedure")
+        } else {
+            (Self::FUNCTION_META_PREFIX, "function")
+        }
+    }
+
+    /// Decode one durable routine record and load it, as the open does.
+    #[cfg(feature = "ha-tier1")]
+    fn load_routine_blob(&self, procedures: bool, name: &str, blob: &[u8]) -> Result<()> {
+        if procedures {
+            let procedure: sql::StoredProcedure = bincode::deserialize(blob)
+                .map_err(|e| Error::storage(format!("persisted procedure '{name}' is unreadable: {e}")))?;
+            self.function_registry.load_procedure(procedure)
+        } else {
+            let function: sql::StoredFunction = bincode::deserialize(blob)
+                .map_err(|e| Error::storage(format!("persisted function '{name}' is unreadable: {e}")))?;
+            self.function_registry.load_function(function)
+        }
+    }
+
+    #[cfg(feature = "ha-tier1")]
+    fn forget_routine(&self, procedures: bool, name: &str) {
+        let forgotten = if procedures {
+            self.function_registry.drop_procedure(name, true)
+        } else {
+            self.function_registry.drop_function(name, true)
+        };
+        if let Err(e) = forgotten {
+            tracing::warn!("physical standby: forgetting routine '{}' failed: {}", name, e);
+        }
+    }
+
+    /// Reload the trigger a `trigger:{table}:{name}` key names, then its
+    /// BEFORE-row rewrite recipe, which follows its definition.
+    #[cfg(feature = "ha-tier1")]
+    fn reload_trigger_record(&self, key: &[u8], deleted: bool) {
+        let Some((table, name)) = Self::trigger_key_parts(key, "trigger:") else {
+            tracing::warn!(
+                "physical standby: trigger key {:?} is malformed; the registry is left as it was",
+                String::from_utf8_lossy(key)
+            );
+            return;
+        };
+        let registry = &self.trigger_registry;
+        // `register_trigger` refuses a name already present: a changed
+        // definition replaces the old one by going through absence.
+        if let Err(e) = registry.drop_trigger(table, name) {
+            tracing::warn!(
+                "physical standby: unregistering trigger '{}.{}' failed: {}",
+                table,
+                name,
+                e
+            );
+        }
+        if !deleted {
+            match self.storage.catalog().load_trigger(table, name) {
+                Ok(Some(definition)) if definition.table_name == table && definition.name == name => {
+                    if let Err(e) = registry.register_trigger(definition) {
+                        tracing::warn!("physical standby: trigger '{}.{}' did not register: {}", table, name, e);
+                    }
+                }
+                Ok(Some(_)) => tracing::warn!(
+                    "physical standby: trigger record '{}.{}' names another trigger; it is not registered",
+                    table,
+                    name
+                ),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    "physical standby: trigger '{}.{}' could not be reloaded ({}); it is unregistered until its \
+                     next change",
+                    table,
+                    name,
+                    e
+                ),
+            }
+        }
+        self.reload_trigger_row_mutation(table, name);
+    }
+
+    /// Reload one trigger's rewrite recipe. Attached only while its
+    /// definition is registered — the rule `load_persisted_triggers` applies
+    /// at open — so the two orders a primary may write them in, and a
+    /// definition's removal, all converge.
+    #[cfg(feature = "ha-tier1")]
+    fn reload_trigger_row_mutation(&self, table: &str, name: &str) {
+        let registry = &self.trigger_registry;
+        if !matches!(registry.get_trigger(table, name), Ok(Some(_))) {
+            registry.drop_row_mutation(table, name);
+            return;
+        }
+        match self.storage.catalog().load_trigger_row_mutation(table, name) {
+            Ok(Some(mutation)) => registry.register_row_mutation(table, name, mutation),
+            Ok(None) => registry.drop_row_mutation(table, name),
+            Err(e) => {
+                tracing::warn!(
+                    "physical standby: the rewrite recipe of trigger '{}.{}' could not be reloaded: {}",
+                    table,
+                    name,
+                    e
+                );
+                registry.drop_row_mutation(table, name);
+            }
+        }
+    }
+
+    /// Rebuild the trigger registry from the store, exactly as an open loads
+    /// it. Triggers never fire on a standby (it takes no writes), so the
+    /// moment the registry is empty in between is not observable by a write.
+    #[cfg(feature = "ha-tier1")]
+    fn reload_all_triggers(&self) {
+        match self.trigger_registry.list_all_triggers() {
+            Ok(definitions) => {
+                for definition in definitions {
+                    let _ = self
+                        .trigger_registry
+                        .drop_trigger(&definition.table_name, &definition.name);
+                    self.trigger_registry
+                        .drop_row_mutation(&definition.table_name, &definition.name);
+                }
+            }
+            Err(e) => tracing::warn!("physical standby: listing the registered triggers failed: {}", e),
+        }
+        self.load_persisted_triggers();
+    }
+
+    /// `(table, name)` of a `trigger:` / `trigger_rowmut:` key, split from the
+    /// RIGHT as `Catalog::load_all_trigger_row_mutations` splits it (a table
+    /// name may be schema-qualified; a trigger name is a bare identifier).
+    #[cfg(feature = "ha-tier1")]
+    fn trigger_key_parts<'k>(key: &'k [u8], prefix: &str) -> Option<(&'k str, &'k str)> {
+        std::str::from_utf8(key.strip_prefix(prefix.as_bytes())?)
+            .ok()?
+            .rsplit_once(':')
+            .filter(|(table, name)| !table.is_empty() && !name.is_empty())
+    }
+
+    /// Evict the cached sequence runtime a `meta:sequence:` / `meta:seqstate:`
+    /// key names, so the next read rebuilds it from the durable records —
+    /// what the DDL executor does after CREATE / ALTER / DROP SEQUENCE.
+    #[cfg(feature = "ha-tier1")]
+    fn evict_sequence_runtime(&self, key: &[u8]) {
+        let name = key
+            .strip_prefix(b"meta:sequence:".as_slice())
+            .or_else(|| key.strip_prefix(b"meta:seqstate:".as_slice()))
+            .and_then(|name| std::str::from_utf8(name).ok());
+        if let Some(name) = name {
+            crate::sql::sequences::invalidate_cache_on(&self.storage, name);
+        }
+    }
+
     /// Plan a PostgreSQL-spelled `CREATE [OR REPLACE] PROCEDURE name(args)
     /// LANGUAGE lang AS $$body$$`, or `Ok(None)` if `sql` is not that form.
     ///
@@ -7609,6 +8053,11 @@ impl EmbeddedDatabase {
         txn: &storage::Transaction,
         skip_fast_paths: bool,
     ) -> Result<u64> {
+        // Spec P1.4: reads only on a physical standby. A public caller has
+        // usually asked with this same text already (then this costs no
+        // parse); it stays here for the funnel's other callers, like the
+        // tenant charge below.
+        let _standby = self.admit_on_physical_standby(sql)?;
         // Record query for quota tracking (QPS enforcement).
         //
         // sprinter d03de7fc3b22: this used to be the ONE production caller of
@@ -10546,6 +10995,68 @@ impl EmbeddedDatabase {
                 storage::StorageEngine::open(path, &config)?
             }
         });
+        Self::over_storage(config, storage, physical_snapshot)
+    }
+
+    /// Build the SQL layer over a serving physical standby's engine (spec P1.4).
+    ///
+    /// `storage` must come from `StorageEngine::open_physical_standby`, fresh:
+    /// this hydrates it, exactly as [`Self::open_physical_snapshot`] hydrates a
+    /// sealed checkpoint — `StorageEngine::hydrate_physical`, the strict
+    /// rebuild (`Catalog::rebuild_all_indexes_for_physical_snapshot`) plus the
+    /// lazy catalog validation — then loads the function / procedure and
+    /// trigger registries with the strict loaders. `config` is the one the
+    /// engine was opened with.
+    ///
+    /// HYDRATION HAS ONE OWNER, and on a serving standby it is this: build the
+    /// database BEFORE the `PhysicalApplier`, hand it to the applier as its
+    /// `DerivedStateListener` (`Arc<EmbeddedDatabase>`), and do not call
+    /// `PhysicalApplier::hydrate` on the same engine — the engine refuses a
+    /// second hydration. Building in that order loses no publication: until
+    /// the applier exists no batch can be applied, and from its first batch on
+    /// every catalog change reaches this database's registries and caches.
+    ///
+    /// The result writes nothing:
+    /// * every write entry point refuses with
+    ///   [`Error::physical_standby_write_refused`] before reaching the engine
+    ///   ([`Self::is_physical_standby`]); the engine's closed `WriteGate` is
+    ///   only the backstop;
+    /// * no materialized view is refreshed: [`Self::start_auto_refresh`] is
+    ///   refused. The `MVScheduler` is still constructed, because
+    ///   [`Self::mv_scheduler`] hands out a non-optional reference; its
+    ///   constructor starts nothing and touches no storage, and without the
+    ///   auto-refresh worker nothing runs it;
+    /// * `durable_commit` is off (below);
+    /// * `Drop` skips every close-time write, explicitly.
+    #[cfg(feature = "ha-tier1")]
+    pub fn with_physical_standby(mut config: Config, storage: std::sync::Arc<storage::StorageEngine>) -> Result<Self> {
+        if !storage.is_physical_standby() {
+            return Err(Error::config(
+                "EmbeddedDatabase::with_physical_standby needs an engine opened with \
+                 StorageEngine::open_physical_standby",
+            ));
+        }
+        if config.storage.memory_only || config.storage.path.is_none() {
+            return Err(Error::config(
+                "a physical standby's SQL layer needs the persistent storage path its engine was opened with",
+            ));
+        }
+        // The SQL layer's copy. The engine decided its own at open, and on a
+        // standby nothing it governs runs: a COMMIT that staged nothing never
+        // reaches the WAL, and a closed gate skips the sync (`Transaction::commit`).
+        config.storage.durable_commit = false;
+        Self::over_storage(config, storage, true)
+    }
+
+    /// Everything [`Self::with_config_open_policy`] does once the engine is
+    /// open, shared with [`Self::with_physical_standby`] (spec P1.4), whose
+    /// caller opens the engine. `physical` selects the strict path of a
+    /// physical engine — a sealed snapshot or a serving standby, which hydrate
+    /// alike: `StorageEngine::hydrate_physical`, then the strict routine and
+    /// trigger loaders.
+    #[allow(clippy::expect_used)] // Safety: cache sizes are non-zero compile-time constants
+    fn over_storage(config: Config, storage: std::sync::Arc<storage::StorageEngine>, physical: bool) -> Result<Self> {
+        let memory_only = config.storage.memory_only;
         let mv_scheduler = std::sync::Arc::new(storage::MVScheduler::new(
             Self::scheduler_config_from(&config),
             std::sync::Arc::clone(&storage),
@@ -10569,13 +11080,13 @@ impl EmbeddedDatabase {
 
         // For persistent storage, replay existing rows through the ART so a
         // fresh process attaching to an existing data dir has consistent
-        // PK/UNIQUE/FK indexes. In-memory mode never has prior state.
+        // PK/UNIQUE/FK indexes. In-memory mode never has prior state. A
+        // physical engine takes the strict, write-free hydration, which the
+        // engine runs at most once (spec P1.4).
         if !memory_only {
-            let catalog = storage::Catalog::new(&storage);
-            if physical_snapshot {
-                catalog.rebuild_all_indexes_for_physical_snapshot()?;
-                catalog.validate_lazy_physical_catalog()?;
-            } else if let Err(e) = catalog.rebuild_all_indexes() {
+            if physical {
+                storage.hydrate_physical()?;
+            } else if let Err(e) = storage::Catalog::new(&storage).rebuild_all_indexes() {
                 tracing::warn!("ART rebuild on open failed: {} — falling back to scan paths", e);
             }
         }
@@ -10692,8 +11203,8 @@ impl EmbeddedDatabase {
             cold_optimizer: std::sync::OnceLock::new(),
             udf_bridge: std::sync::OnceLock::new(),
         }
-        .install_routine_runtime_with_policy(physical_snapshot)?
-        .finish_trigger_runtime(physical_snapshot)
+        .install_routine_runtime_with_policy(physical)?
+        .finish_trigger_runtime(physical)
     }
 
     /// Execute a SQL statement (POTENTIALLY UNSAFE - use execute_params for user input)
@@ -10804,6 +11315,13 @@ impl EmbeddedDatabase {
     ///
     /// Total number of rows affected across all statements.
     pub fn execute_batch(&self, statements: &[&str]) -> Result<u64> {
+        // Spec P1.4: on a physical standby the whole batch is refused before
+        // its transaction begins if any statement is not a read.
+        if self.is_physical_standby() {
+            for sql in statements {
+                drop(self.admit_on_physical_standby(sql)?);
+            }
+        }
         let start = std::time::Instant::now();
 
         let txn_start = std::time::Instant::now();
@@ -10961,6 +11479,8 @@ impl EmbeddedDatabase {
 
     #[cfg(feature = "code-graph")]
     pub fn code_index(&self, opts: code_graph::CodeIndexOptions) -> Result<code_graph::CodeIndexStats> {
+        // Spec P1.4: indexing writes the `_hdb_code_*` tables.
+        self.refuse_write_on_physical_standby("code_index")?;
         let stats = code_graph::storage::code_index(self, opts)?;
         // Incremental projection: when graph-rag is enabled, mirror
         // new code symbols + refs into the universal `_hdb_graph_*`
@@ -11052,6 +11572,7 @@ impl EmbeddedDatabase {
     /// haven't changed keep the same roll-up hash.
     #[cfg(feature = "code-graph")]
     pub fn code_graph_merkle_refresh(&self) -> Result<code_graph::MerkleStats> {
+        self.refuse_write_on_physical_standby("code_graph_merkle_refresh")?;
         code_graph::merkle_refresh(self)
     }
 
@@ -11067,6 +11588,11 @@ impl EmbeddedDatabase {
         new_name: &str,
         opts: &code_graph::RenameApplyOptions,
     ) -> Result<code_graph::RenameApplyStats> {
+        // Spec P1.4: a dry run only reads, and any write it attempted would
+        // still meet the SQL entry points' refusal.
+        if !opts.dry_run {
+            self.refuse_write_on_physical_standby("lsp_rename_apply")?;
+        }
         code_graph::rename_apply(self, symbol_id, new_name, opts)
     }
 
@@ -11292,6 +11818,8 @@ impl EmbeddedDatabase {
     /// Idempotent. Creates the graph tables on first call.
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_project_symbols(&self) -> Result<graph_rag::GraphRagStats> {
+        // Spec P1.4: projection writes the `_hdb_graph_*` tables.
+        self.refuse_write_on_physical_standby("graph_rag_project_symbols")?;
         let mut stats = graph_rag::GraphRagStats::default();
         graph_rag::project_code_symbols(self, &mut stats)?;
         Ok(stats)
@@ -11314,6 +11842,7 @@ impl EmbeddedDatabase {
     /// text-bearing `node_kind`s to the match set beyond the default.
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_link_exact(&self, extra_kinds: &[&str]) -> Result<graph_rag::LinkerStats> {
+        self.refuse_write_on_physical_standby("graph_rag_link_exact")?;
         graph_rag::link_exact_qualified(self, extra_kinds)
     }
 
@@ -11332,6 +11861,7 @@ impl EmbeddedDatabase {
         top_k: usize,
         threshold: f32,
     ) -> Result<graph_rag::LinkerStats> {
+        self.refuse_write_on_physical_standby("graph_rag_link_vector")?;
         graph_rag::link_vector_similar(self, text_queries, symbol_targets, top_k, threshold)
     }
 
@@ -11339,6 +11869,8 @@ impl EmbeddedDatabase {
     /// nodes.  See `graph_rag::IngestDocsOptions`.
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_ingest_docs(&self, opts: &graph_rag::IngestDocsOptions) -> Result<graph_rag::IngestStats> {
+        // Spec P1.4: every ingestor writes the `_hdb_graph_*` tables.
+        self.refuse_write_on_physical_standby("graph_rag_ingest_docs")?;
         graph_rag::ingest_docs(self, opts)
     }
 
@@ -11346,39 +11878,46 @@ impl EmbeddedDatabase {
     /// See `graph_rag::DoclingIngestOptions`.
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_ingest_pdf(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
+        self.refuse_write_on_physical_standby("graph_rag_ingest_pdf")?;
         graph_rag::docling_ingest_pdf(self, opts)
     }
 
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_ingest_office(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
+        self.refuse_write_on_physical_standby("graph_rag_ingest_office")?;
         graph_rag::docling_ingest_office(self, opts)
     }
 
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_ingest_audio(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
+        self.refuse_write_on_physical_standby("graph_rag_ingest_audio")?;
         graph_rag::docling_ingest_audio(self, opts)
     }
 
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_ingest_image(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
+        self.refuse_write_on_physical_standby("graph_rag_ingest_image")?;
         graph_rag::docling_ingest_image(self, opts)
     }
 
     /// Ingest structured email rows into Email + Person nodes.
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_ingest_email(&self, opts: &graph_rag::IngestEmailOptions) -> Result<graph_rag::IngestStats> {
+        self.refuse_write_on_physical_standby("graph_rag_ingest_email")?;
         graph_rag::ingest_email(self, opts)
     }
 
     /// Ingest structured issue rows into Issue + Comment + Person nodes.
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_ingest_issues(&self, opts: &graph_rag::IngestIssuesOptions) -> Result<graph_rag::IngestStats> {
+        self.refuse_write_on_physical_standby("graph_rag_ingest_issues")?;
         graph_rag::ingest_issues(self, opts)
     }
 
     /// Ingest structured Q&A rows into InvestorQuestion + Answer + Person.
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_ingest_qa(&self, opts: &graph_rag::IngestQaOptions) -> Result<graph_rag::IngestStats> {
+        self.refuse_write_on_physical_standby("graph_rag_ingest_qa")?;
         graph_rag::ingest_qa(self, opts)
     }
 
@@ -11393,6 +11932,9 @@ impl EmbeddedDatabase {
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
+        // Spec P1.4: a physical standby serves reads only; see
+        // `admit_on_physical_standby` (the same at every entry point below).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -11949,6 +12491,13 @@ impl EmbeddedDatabase {
         columns: &[String],
         rows: &[Vec<Option<String>>],
     ) -> Option<Result<u64>> {
+        // Spec P1.4: COPY FROM reaches this fast path from the wire handler
+        // directly, past every SQL entry point, so it refuses on its own — and
+        // answers rather than declining (`None`): the caller's generic
+        // fallback would render the rows as INSERTs only to have each refused.
+        if let Err(e) = self.refuse_write_on_physical_standby("COPY FROM") {
+            return Some(Err(e));
+        }
         if rows.is_empty() {
             return Some(Ok(0));
         }
@@ -17965,6 +18514,8 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<u64> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -18070,6 +18621,9 @@ impl EmbeddedDatabase {
     /// transaction when one exists. Other statements fall back to the exact
     /// per-row `execute_params` behavior.
     pub fn execute_many_params(&self, sql: &str, rows: &[Vec<Value>]) -> Result<u64> {
+        // Spec P1.4: reads only on a physical standby, ahead of the HDB-008
+        // boundary below (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // HDB-008: the batch fast path (`try_fast_insert_many_params`) stages
         // straight into the GLOBAL `current_transaction` slot, so this is a
         // full in-transaction execution site and needs the failed-transaction
@@ -18155,6 +18709,9 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn execute_params_returning(&self, sql: &str, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
+        // Spec P1.4: reads only on a physical standby, ahead of the HDB-008
+        // boundary below (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // HDB-008: the params-family `RETURNING` entry point, inside the
         // failed-transaction boundary (see `execute_params_inner`).
         self.run_global_statement(sql, || self.execute_params_returning_inner(sql, params))
@@ -20273,6 +20830,9 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`):
+        // `query` serves DML with RETURNING and `nextval` too.
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -20971,6 +21531,8 @@ impl EmbeddedDatabase {
     /// (GH#23). Every internal fast path answers with a real schema: the
     /// cached and the uncached branch describe a result identically.
     pub(crate) fn query_with_schema(&self, sql: &str) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -21250,6 +21812,17 @@ impl EmbeddedDatabase {
     /// a transaction.
     pub fn execute_sql_script(&self, sql: &str) -> Result<u64> {
         let statements = crate::protocol::postgres::handler::pg_split_sql_respecting_quotes(sql);
+        // Spec P1.4: on a physical standby a script that is not all reads is
+        // refused as a whole, before its first statement runs, and with the
+        // refusal itself rather than the per-statement wrapper below.
+        if self.is_physical_standby() {
+            for statement in &statements {
+                let trimmed = crate::protocol::postgres::handler::pg_skip_leading_comments(statement);
+                if !trimmed.is_empty() {
+                    drop(self.admit_on_physical_standby(trimmed)?);
+                }
+            }
+        }
         let mut executed = 0u64;
         for (index, statement) in statements.iter().enumerate() {
             let trimmed = crate::protocol::postgres::handler::pg_skip_leading_comments(statement);
@@ -21334,6 +21907,8 @@ impl EmbeddedDatabase {
     ///
     /// * `path` - Path to the dump file to restore from
     pub fn restore_from_dump(&mut self, path: &std::path::Path) -> Result<()> {
+        // Spec P1.4: refused before the dump file is even opened.
+        self.refuse_write_on_physical_standby("restore_from_dump")?;
         let dump_manager = self.dump_manager.clone();
         dump_manager.restore_from_dump(path, self)
     }
@@ -22001,6 +22576,8 @@ impl EmbeddedDatabase {
     ///
     /// Number of rows affected by the statement
     pub fn execute_in_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -22167,6 +22744,8 @@ impl EmbeddedDatabase {
         sql: &str,
         _params: &[&dyn std::fmt::Display],
     ) -> Result<Vec<Tuple>> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -23142,6 +23721,8 @@ impl EmbeddedDatabase {
 
     /// Execute a statement on behalf of a wire-protocol session.
     pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -23264,6 +23845,8 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -23351,6 +23934,8 @@ impl EmbeddedDatabase {
         session_id: crate::session::SessionId,
         sql: &str,
     ) -> Result<(u64, Vec<Tuple>)> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -23471,6 +24056,8 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(u64, Vec<Tuple>)> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -23588,6 +24175,8 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<u64> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -23699,6 +24288,8 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<Vec<Tuple>> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -23797,6 +24388,8 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -24019,6 +24612,8 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<Vec<Tuple>> {
+        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
         // tenant's `max_qps`. Every family's entry point charges — there is no
         // funnel all of them pass through — and the returned guard makes every
@@ -24280,6 +24875,9 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        // Spec P1.4: reads only on a physical standby, ahead of the HDB-008
+        // boundary below (`admit_on_physical_standby`).
+        let _standby = self.admit_on_physical_standby(sql)?;
         // HDB-008: column-aware params read, inside the failed-transaction
         // boundary (see `execute_params_inner`). Its tail attaches the global
         // `current_transaction` to the executor, so it really does run inside
@@ -24587,6 +25185,8 @@ impl EmbeddedDatabase {
     /// Returns the allocated `row_id`s in input order.
     #[allow(dead_code)]
     pub(crate) fn bulk_insert_tuples(&self, table_name: &str, tuples: Vec<Tuple>) -> Result<Vec<u64>> {
+        // Spec P1.4: below every SQL entry point (code-graph indexing calls it).
+        self.refuse_write_on_physical_standby("a bulk insert")?;
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
 
@@ -24868,6 +25468,9 @@ impl EmbeddedDatabase {
         metric: &str,
         index_type: &str,
     ) -> Result<VectorStoreInfo> {
+        // Spec P1.4: a standard HNSW store is memory-only, so the write gate
+        // never sees this; a standby's vector state follows its primary (P1.2).
+        self.refuse_write_on_physical_standby("create_vector_store")?;
         let vector_mgr = self.storage.vector_indexes();
         let distance_metric = parse_vector_metric(metric)?;
         let normalized_index_type = index_type.to_ascii_lowercase();
@@ -24964,6 +25567,8 @@ impl EmbeddedDatabase {
 
     /// Delete a vector store
     pub fn delete_vector_store(&self, name: &str) -> Result<()> {
+        // Spec P1.4: see `create_vector_store_with_options`.
+        self.refuse_write_on_physical_standby("delete_vector_store")?;
         let vector_mgr = self.storage.vector_indexes();
         vector_mgr.drop_index(name)
     }
@@ -24983,6 +25588,8 @@ impl EmbeddedDatabase {
         metadata: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
         namespace: Option<String>,
     ) -> Result<Vec<String>> {
+        // Spec P1.4: see `create_vector_store_with_options`.
+        self.refuse_write_on_physical_standby("insert_vectors")?;
         let vector_mgr = self.storage.vector_indexes();
 
         // Verify store exists
@@ -25022,6 +25629,8 @@ impl EmbeddedDatabase {
 
     /// Upsert vectors (insert or update)
     pub fn upsert_vectors(&self, store: &str, vectors: Vec<(String, Vec<f32>)>) -> Result<()> {
+        // Spec P1.4: refused up front — the delete below ignores its error.
+        self.refuse_write_on_physical_standby("upsert_vectors")?;
         let ids: Vec<String> = vectors.iter().map(|(id, _)| id.clone()).collect();
         let values: Vec<Vec<f32>> = vectors.into_iter().map(|(_, vector)| vector).collect();
         let _ = self.delete_vectors(store, ids.clone());
@@ -25037,12 +25646,16 @@ impl EmbeddedDatabase {
         metadata: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
         namespace: Option<String>,
     ) -> Result<()> {
+        // Spec P1.4: refused up front — the delete below ignores its error.
+        self.refuse_write_on_physical_standby("upsert_vectors")?;
         let _ = self.delete_vectors(store, ids.clone());
         self.insert_vectors_with_options(store, Some(ids), vectors, metadata, namespace)?;
         Ok(())
     }
 
     fn upsert_vectors_legacy(&self, store: &str, vectors: Vec<(String, Vec<f32>)>) -> Result<()> {
+        // Spec P1.4: see `create_vector_store_with_options`.
+        self.refuse_write_on_physical_standby("upsert_vectors")?;
         let vector_mgr = self.storage.vector_indexes();
 
         // Verify store exists
@@ -25121,6 +25734,8 @@ impl EmbeddedDatabase {
 
     /// Delete vectors by ID, optionally scoped to namespace. Returns actual deleted count.
     pub fn delete_vectors_in_namespace(&self, store: &str, ids: Vec<String>, namespace: Option<&str>) -> Result<usize> {
+        // Spec P1.4: see `create_vector_store_with_options`.
+        self.refuse_write_on_physical_standby("delete_vectors")?;
         let vector_mgr = self.storage.vector_indexes();
 
         // Verify store exists
@@ -25407,11 +26022,17 @@ impl EmbeddedDatabase {
 
     /// Create an isolated database branch (copy-on-write).
     pub fn create_branch(&self, name: &str) -> Result<u64> {
+        // Spec P1.4: the statement below would be refused too; refusing here
+        // names the API, and builds no SQL from `name` first.
+        self.refuse_write_on_physical_standby("create_branch")?;
         self.execute(&format!("CREATE BRANCH {name}"))
     }
 
     /// Switch the active branch.
     pub fn switch_branch(&self, name: &str) -> Result<u64> {
+        // Spec P1.4: refused with the other branch operations: the active
+        // branch is engine-wide state every reader of the standby shares.
+        self.refuse_write_on_physical_standby("switch_branch")?;
         self.execute(&format!("USE BRANCH {name}"))
     }
 
@@ -25424,12 +26045,14 @@ impl EmbeddedDatabase {
     /// could never succeed. Callers that want an explicit target should switch
     /// branches first, which is what that tool does.
     pub fn merge_branch(&self, source: &str) -> Result<u64> {
+        self.refuse_write_on_physical_standby("merge_branch")?;
         let target = self.storage.get_current_branch().unwrap_or_else(|| "main".to_string());
         self.execute(&format!("MERGE BRANCH {source} INTO {target}"))
     }
 
     /// Drop a branch.
     pub fn drop_branch(&self, name: &str) -> Result<u64> {
+        self.refuse_write_on_physical_standby("drop_branch")?;
         self.execute(&format!("DROP BRANCH {name}"))
     }
 
@@ -25456,6 +26079,8 @@ impl EmbeddedDatabase {
 
     /// Refresh a materialized view.
     pub fn refresh_materialized_view(&self, name: &str) -> Result<u64> {
+        // Spec P1.4: a standby's materialized rows are its primary's.
+        self.refuse_write_on_physical_standby("refresh_materialized_view")?;
         self.execute(&format!("REFRESH MATERIALIZED VIEW {name}"))
     }
 
@@ -28089,6 +28714,11 @@ impl EmbeddedDatabase {
     /// }
     /// ```
     pub async fn start_auto_refresh(&self, config: Option<storage::AutoRefreshConfig>) -> Result<()> {
+        // Spec P1.4: no materialized view is refreshed on a physical standby —
+        // its materialized rows arrive from the primary. This is the API that
+        // runs the scheduler `with_physical_standby` leaves inert (a caller
+        // driving `mv_scheduler()` by hand meets the write gate instead).
+        self.refuse_write_on_physical_standby("start_auto_refresh")?;
         // Reject a second start rather than silently overwriting the stored worker.
         // The overwritten worker's `command_tx` would drop, its `worker_loop`'s
         // `command_rx.recv()` branch would go dead, and the loop would spin on its
@@ -28341,6 +28971,10 @@ impl Transaction<'_> {
     /// # }
     /// ```
     pub fn execute(&self, sql: &str) -> Result<u64> {
+        // Spec P1.4: reads only on a physical standby, ahead of the HDB-008
+        // boundary so a refusal does not abort this transaction
+        // (`EmbeddedDatabase::admit_on_physical_standby`).
+        let _standby = self.db.admit_on_physical_standby(sql)?;
         // Execute within transaction context, skipping fast paths.
         // Fast paths write directly to storage (bypassing the transaction write set),
         // which would make rollback impossible and break isolation guarantees.
@@ -28390,6 +29024,9 @@ impl Transaction<'_> {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        // Spec P1.4: reads only on a physical standby. This path plans the
+        // statement itself and does not pass a charge site, so it asks here.
+        let _standby = self.db.admit_on_physical_standby(sql)?;
         // HDB-008: parse, plan and execution all sit inside the
         // failed-transaction boundary, so a planning error aborts this
         // transaction exactly as an executor error does — and a query issued

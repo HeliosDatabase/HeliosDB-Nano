@@ -5561,6 +5561,11 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
                 // prefix the two shared consts in `src/error.rs` both start
                 // with, not on a bare substring.
                 sqlstate::IN_FAILED_SQL_TRANSACTION // 25P02
+            } else if message.starts_with(crate::error::PHYSICAL_STANDBY_WRITE_REFUSED) {
+                // Spec P1.4: a write refused by an `EmbeddedDatabase` serving a
+                // physical standby (`Error::physical_standby_write_refused`) —
+                // what PostgreSQL reports for a write on a hot standby.
+                sqlstate::READ_ONLY_SQL_TRANSACTION // 25006
             } else {
                 sqlstate::INVALID_TRANSACTION_STATE // 25000
             }
@@ -7299,8 +7304,13 @@ mod md5_auth_wire_tests {
 /// `setval` persist a high-water mark, so a read that calls either is denied here
 /// (SQLSTATE 25006 before the engine is reached); the storage write gate refuses
 /// the write as the backstop. Unknown utility statements are denied, not guessed.
+///
+/// Spec P1.4: also the admission rule of an `EmbeddedDatabase` serving a
+/// physical standby (`EmbeddedDatabase::admit_on_physical_standby`), so the
+/// wire and the embedded API cannot disagree about what a standby serves. A
+/// function of the text alone: the same text is always admitted or refused.
 #[cfg(any(feature = "ha-tier1", test))]
-fn guarded_standby_statement_allowed(sql: &str) -> bool {
+pub(crate) fn guarded_standby_statement_allowed(sql: &str) -> bool {
     use sqlparser::ast::{Expr, Query, SetExpr, Statement, Visit, Visitor};
     use std::ops::ControlFlow;
 
