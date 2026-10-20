@@ -170,6 +170,17 @@ P0 and P1 are the critical path; P2 can overlap P1's tail; P3/P4 after P1.
 5. J1's `logical_wal_retention_entries` stays one release as the primary's redo/catch-up window, then defaults to 0.
 6. Standby-side archive on by default; cascading standbys opt-in.
 7. Cut markers deferred pending the DDL-window torn-read test.
+8. **No backward compatibility is required** (2026-10-20): existing logical standbys and 4.41.x
+   standby directories are not migrated; a user who needs their data moves it through the PG
+   wire. So the native v3 listener and logical standby support can go in P2 rather than one
+   release later (supersedes 1 and 5 where they kept compatibility), and `logical_wal_retention_entries`
+   is only the primary's own redo window.
+9. **Promotion (P5): both** `SELECT pg_promote(wait, seconds)` on the standby and the CLI
+   `heliosdb-nano promote`, one code path; no HTTP endpoint.
+10. **Push rule:** every phase P1-P5 is pushed to `feat/physical-standby` as soon as its gates
+    are green (standing approval); merges to `main` and releases still need a go-ahead.
+11. The trigger-clone `Drop` fix (`96e5a8cfa254`) ships with the P1 merge; no separate hotfix
+    release for 4.41.x users.
 
 ## Tracking
 
