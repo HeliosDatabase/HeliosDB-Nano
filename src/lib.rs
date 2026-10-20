@@ -7360,8 +7360,11 @@ impl EmbeddedDatabase {
             catalog.register_partition_child(&parent, name)?;
         }
 
-        // Save table constraints if any
-        if !constraints.is_empty() {
+        // Save table constraints if any. The set this statement saved, kept
+        // for the column-level merge below.
+        let statement_constraints: Option<sql::TableConstraints> = if constraints.is_empty() {
+            None
+        } else {
             let mut table_constraints = sql::TableConstraints::new();
             for constraint in constraints {
                 match constraint {
@@ -7495,11 +7498,11 @@ impl EmbeddedDatabase {
             // emits the compensating `DropTable` WAL record a standby
             // that already applied `CreateTable` needs, and clears the
             // ART indexes, the `meta:index:` definitions, the schema,
-            // the counter, the compression keys, the triggers and the
-            // rows. It does not own the constraint record, so that is
-            // deleted after it (which also invalidates the memoised
-            // constraint set — otherwise the next `CREATE TABLE` of
-            // this name is handed the dead one).
+            // the counter, the compression keys, the triggers, the rows
+            // and — since spec P1.1b, in the same write group — the
+            // constraint record just saved, invalidating the memoised
+            // constraint set with it (otherwise the next `CREATE TABLE`
+            // of this name would be handed the dead one).
             if let Err(e) = catalog.register_unique_constraint_indexes(name, &table_constraints) {
                 if let Err(unwind) = catalog.drop_table(name) {
                     tracing::warn!(
@@ -7508,16 +7511,10 @@ impl EmbeddedDatabase {
                         unwind
                     );
                 }
-                if let Err(unwind) = catalog.delete_table_constraints(name) {
-                    tracing::warn!(
-                        "CREATE TABLE '{}' unwind: failed to delete the constraint record: {}",
-                        name,
-                        unwind
-                    );
-                }
                 return Err(e);
             }
-        }
+            Some(table_constraints)
+        };
 
         // Also add column-level UNIQUE and PRIMARY KEY constraints
         // These are stored in ColumnDef but need to be in table_constraints for enforcement
@@ -7579,8 +7576,17 @@ impl EmbeddedDatabase {
         }
 
         if has_col_constraints {
-            // Merge with existing table constraints
-            if let Ok(existing) = catalog.load_table_constraints(name) {
+            // Merge with the table-level constraints THIS statement saved —
+            // never with whatever record storage holds under the name (spec
+            // P1.1b). Reading it back here merged a dropped table's leftover
+            // record into the new table's set whenever this statement had no
+            // table-level constraint of its own: the dead table's PRIMARY KEY,
+            // UNIQUE, CHECK and FOREIGN KEY records, enforced on the new
+            // table. `Catalog::create_table` refuses such an orphan loudly
+            // (debug builds) and discards it (release builds) before this
+            // statement writes anything; taking the set from the statement
+            // makes the merge independent of that too.
+            if let Some(existing) = statement_constraints {
                 for fk in existing.foreign_keys {
                     col_constraints.foreign_keys.push(fk);
                 }
@@ -14812,8 +14818,10 @@ impl EmbeddedDatabase {
     ///    needed at all.
     ///
     /// Validation first (a CHECK body that cannot be rewritten refuses the
-    /// statement), then the schema, then the records, then the live indexes.
-    /// Refusing is recoverable; a silently unenforced UNIQUE is not.
+    /// statement), then the schema together with the `meta:index:`
+    /// definitions (one write group, spec P1.1b), then the constraint records,
+    /// then the live indexes. Refusing is recoverable; a silently unenforced
+    /// UNIQUE is not.
     fn alter_table_rename_column(&self, table_name: &str, old_column_name: &str, new_column_name: &str) -> Result<u64> {
         let catalog = self.storage.catalog();
         let mut schema = catalog.get_table_schema(table_name)?;
@@ -14843,7 +14851,26 @@ impl EmbeddedDatabase {
             .get_column_at_mut(col_idx)
             .ok_or_else(|| Error::internal("column index out of bounds"))?
             .name = new_column_name.to_string();
-        catalog.update_table_schema(table_name, &schema)?;
+        // The schema and every `meta:index:` definition naming the column, in
+        // ONE write group (spec P1.1b): a definition left on the old name made
+        // the reopen register its index over a column that no longer exists,
+        // and strict physical hydration refuse the store.
+        let rewritten = catalog.rename_column_in_schema_and_index_definitions(
+            table_name,
+            &schema,
+            old_column_name,
+            new_column_name,
+        )?;
+        if !rewritten.is_empty() {
+            tracing::debug!(
+                "Rewrote {} index definition(s) of '{}' from column '{}' to '{}': {:?}",
+                rewritten.len(),
+                table_name,
+                old_column_name,
+                new_column_name,
+                rewritten
+            );
+        }
 
         catalog.rename_column_in_constraints(table_name, old_column_name, new_column_name)?;
         let repointed =

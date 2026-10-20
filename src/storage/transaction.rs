@@ -463,7 +463,10 @@ impl UncommittedWriteCensus {
     /// applier takes a hold for the tables it is publishing: every miss-based
     /// and cardinality fast path declines to the planner, which reads row
     /// storage and is already exact. Counted like one transaction.
-    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    ///
+    /// `StorageEngine::merge_branch` takes the same hold on a primary while it
+    /// writes branch rows into main and re-derives main's indexes from them
+    /// (spec P1.1b): the same window, opened by the same order of operations.
     pub(crate) fn hold_for_replay(self: &Arc<Self>, tables: Vec<String>, every_table: bool) -> UncommittedWriteHold {
         self.hold(CensusMembership {
             counted: true,

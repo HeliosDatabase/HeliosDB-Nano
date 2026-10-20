@@ -47,7 +47,7 @@ use heliosdb_nano::replication::checkpoint_transfer::{
 use heliosdb_nano::replication::history::load_or_create_primary_history;
 use heliosdb_nano::replication::physical::{poll_source, range_digest, MAX_BATCH_BYTES};
 use heliosdb_nano::replication::physical_applier::{
-    Applied, NoopDerivedStateListener, PhysicalApplier, RANGE_ENUMERATION_CAP,
+    decode_raw_batch, Applied, NoopDerivedStateListener, PhysicalApplier, RawOp, RANGE_ENUMERATION_CAP,
 };
 use heliosdb_nano::storage::{ArtIndexManager, StorageEngine, WriteGate};
 use heliosdb_nano::{Config, EmbeddedDatabase, Tuple, Value};
@@ -247,6 +247,33 @@ impl Pair {
         }
     }
 
+    /// The primary's write groups past the standby's cursor, read without
+    /// applying them: each as its records' `(deleted, key)` (a range deletion
+    /// by its start key).
+    fn pending_groups(&self) -> Vec<Vec<(bool, Vec<u8>)>> {
+        let mut groups = Vec::new();
+        let mut after = self.cursor();
+        loop {
+            let poll = poll_source(&self.raw, self.history, after, MAX_BATCH_BYTES).unwrap();
+            if poll.batches.is_empty() {
+                return groups;
+            }
+            for batch in &poll.batches {
+                let ops = decode_raw_batch(batch.data()).unwrap();
+                groups.push(
+                    ops.into_iter()
+                        .map(|op| match op {
+                            RawOp::Put { key, .. } => (false, key.to_vec()),
+                            RawOp::Delete { key } => (true, key.to_vec()),
+                            RawOp::DeleteRange { start, .. } => (true, start.to_vec()),
+                        })
+                        .collect(),
+                );
+                after = batch.last_sequence();
+            }
+        }
+    }
+
     /// The reference at the primary's current head, and the standby brought
     /// to exactly its sequence through the applier. Their stores are then
     /// byte-identical.
@@ -325,8 +352,8 @@ fn branch_names(engine: &StorageEngine) -> Option<Vec<String>> {
 
 /// The standby's derived state equals a fresh hydration of the same bytes,
 /// and its answers equal the primary's (`primary_too`; false where the test
-/// wrote below the primary's engine, or where the primary's own live indexes
-/// are known to lag its rows, as after MERGE BRANCH).
+/// wrote below the primary's engine, so the primary's own live indexes lag
+/// its rows).
 fn assert_same(pair: &Pair, reference: &Reference, tables: &[&str], primary_too: bool) {
     let standby = &*pair.standby;
     let fresh = reference.engine();
@@ -708,13 +735,36 @@ fn add_column_then_insert_in_the_same_and_in_separate_batches() {
     assert_no_fallback(&pair);
 }
 
+/// The renamed column carries a UNIQUE flag, a plain `CREATE INDEX` and the
+/// full key of a composite `CREATE UNIQUE INDEX`. Spec P1.1b: the two durable
+/// index definitions are rewritten to the new name in the schema's write
+/// group — before, they kept naming `username`, and strict hydration refused
+/// the primary's checkpoint ("index has invalid columns"), so this case could
+/// only rename an unindexed column.
 #[test]
 fn rename_column_repoints_the_live_indexes() {
     let mut pair = Pair::new(&[
         "CREATE TABLE accounts (id INT PRIMARY KEY, username TEXT UNIQUE, score INT)",
         "INSERT INTO accounts VALUES (1, 'ada', 10), (2, 'bob', 20)",
+        "CREATE INDEX accounts_username_idx ON accounts (username)",
+        "CREATE UNIQUE INDEX accounts_username_score_uidx ON accounts (username, score)",
     ]);
     pair.run(&["ALTER TABLE accounts RENAME COLUMN username TO login"]);
+    let groups = pair.pending_groups();
+    let schema_group = groups
+        .iter()
+        .find(|ops| ops.contains(&(false, b"meta:table:accounts".to_vec())))
+        .expect("the rename wrote the schema");
+    for key in [
+        b"meta:index:accounts_username_idx".as_slice(),
+        b"meta:index:accounts_username_score_uidx",
+    ] {
+        assert!(
+            schema_group.contains(&(false, key.to_vec())),
+            "{} is not rewritten in the schema's write group",
+            String::from_utf8_lossy(key)
+        );
+    }
     let reference = pair.settle();
     assert_same(&pair, &reference, &["accounts"], true);
     let login = vec!["login".to_string()];
@@ -722,6 +772,28 @@ fn rename_column_repoints_the_live_indexes() {
         .standby
         .art_indexes()
         .unique_key_exists("accounts", &login, &[Value::String("ada".into())]));
+    // The user indexes keep their names and follow the column on the
+    // standby, on a fresh hydration and on the primary alike.
+    let bob = ArtIndexManager::encode_key(&[Value::String("bob".into())]);
+    for engine in [&*pair.standby, reference.engine(), &*pair.primary.storage] {
+        let indexes = engine.art_indexes().list_table_indexes("accounts");
+        let columns_of = |name: &str| {
+            indexes
+                .iter()
+                .find(|(index, _, _)| index == name)
+                .map(|(_, _, columns)| columns.clone())
+        };
+        assert_eq!(columns_of("accounts_username_idx"), Some(login.clone()));
+        assert_eq!(
+            columns_of("accounts_username_score_uidx"),
+            Some(vec!["login".to_string(), "score".to_string()])
+        );
+        assert_eq!(
+            engine.art_indexes().index_get_all("accounts_username_idx", &bob),
+            vec![2],
+            "a lookup on the renamed column"
+        );
+    }
 
     pair.run(&[
         "INSERT INTO accounts VALUES (3, 'cy', 30)",
@@ -811,8 +883,8 @@ fn drop_table_retires_its_indexes() {
         "CREATE INDEX doomed_v_idx ON doomed (v)",
         "INSERT INTO doomed VALUES (1, 'a'), (2, 'b')",
     ]);
-    // A heap table (no key, no constraint record): after its DROP the store
-    // still hydrates strictly, so it is compared with a fresh hydration.
+    // A heap table (no key, no constraint record), dropped and re-created
+    // with a different shape.
     pair.run(&[
         "CREATE TABLE heap (k INT, v TEXT)",
         "CREATE INDEX heap_v_idx ON heap (v)",
@@ -834,12 +906,41 @@ fn drop_table_retires_its_indexes() {
     let reference = pair.settle();
     assert_same(&pair, &reference, &["kept", "heap"], true);
 
-    // A table with a PRIMARY KEY leaves its `table_constraints:` record behind
-    // on DROP TABLE (`Catalog::drop_table` never deletes it), and strict
-    // hydration refuses that orphan — so past this point no fresh reference
-    // exists. The standby is asserted directly.
+    // A table with a PRIMARY KEY, a UNIQUE column and a secondary index.
+    // Spec P1.1b: its DROP is ONE write group — the schema, the constraint
+    // record, the index definition, the counter and the rows together — so
+    // no batch boundary holds a catalog naming a dropped table, and nothing
+    // is left behind. Before, `table_constraints:doomed` outlived the drop and
+    // strict hydration refused it, so past this point no fresh reference
+    // existed and the standby could only be asserted on its own.
     pair.run(&["DROP TABLE doomed"]);
-    let _ = pair.sync();
+    let groups = pair.pending_groups();
+    let drop_group = groups
+        .iter()
+        .find(|ops| ops.contains(&(true, b"meta:table:doomed".to_vec())))
+        .expect("the drop deleted the schema");
+    for key in [
+        b"table_constraints:doomed".as_slice(),
+        b"meta:index:doomed_v_idx",
+        b"counter:doomed",
+        b"data:doomed:1",
+        b"data:doomed:2",
+    ] {
+        assert!(
+            drop_group.contains(&(true, key.to_vec())),
+            "{} is not deleted in the schema's write group",
+            String::from_utf8_lossy(key)
+        );
+    }
+    let reference = pair.settle();
+    assert_same(&pair, &reference, &["kept", "doomed"], true);
+    for engine in [&*pair.standby, reference.engine(), &*pair.primary.storage] {
+        assert_eq!(
+            engine.db().get(b"table_constraints:doomed").unwrap(),
+            None,
+            "the dropped table's constraint record survived"
+        );
+    }
     let standby = pair.standby.as_ref();
     assert!(standby.art_indexes().list_table_indexes("doomed").is_empty());
     assert!(!standby.catalog().table_exists("doomed").unwrap());
@@ -851,6 +952,21 @@ fn drop_table_retires_its_indexes() {
         "the surviving table is untouched"
     );
     assert_eq!(standby.art_indexes().pk_index_len("kept"), Some(2));
+
+    // Re-created under the same name: the new table's constraints only.
+    pair.run(&[
+        "CREATE TABLE doomed (id INT PRIMARY KEY, note TEXT)",
+        "INSERT INTO doomed VALUES (5, 'again')",
+    ]);
+    let reference = pair.settle();
+    assert_same(&pair, &reference, &["kept", "doomed"], true);
+    let constraints = pair.primary.storage.catalog().load_table_constraints("doomed").unwrap();
+    let names: Vec<&str> = constraints.unique_constraints.iter().map(|u| u.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["doomed_id_pkey"],
+        "constraints of the dropped table were inherited"
+    );
     assert_no_fallback(&pair);
 }
 
@@ -994,6 +1110,7 @@ fn a_deleted_snapshot_record_is_forgotten_in_every_form() {
 fn branch_create_write_and_merge() {
     let mut pair = Pair::new(&[
         "CREATE TABLE t (id INT PRIMARY KEY, val TEXT)",
+        "CREATE INDEX t_val_idx ON t (val)",
         "INSERT INTO t VALUES (1, 'main_row')",
     ]);
     pair.run(&["CREATE BRANCH dev AS OF NOW"]);
@@ -1005,20 +1122,34 @@ fn branch_create_write_and_merge() {
         "the standby's branch registry follows the primary's"
     );
 
-    // MERGE writes main's `data:` keys outside the primary's index funnels,
-    // so the PRIMARY's live indexes lag its rows until it reopens; the
-    // standby must equal the fresh hydration (what a reopen computes).
+    // MERGE writes main's `data:` keys below the primary's index funnels.
+    // Spec P1.1b: it now re-derives main's indexes from them, so the PRIMARY
+    // answers like a reopen of its own bytes — before, its live indexes lagged
+    // its rows until it reopened, and this case compared the standby with
+    // the fresh hydration only.
     pair.run(&[
         "USE BRANCH dev",
         "INSERT INTO t VALUES (2, 'dev_row')",
         "USE BRANCH main",
     ]);
     let reference = pair.settle();
-    assert_same(&pair, &reference, &["t"], false);
+    assert_same(&pair, &reference, &["t"], true);
     pair.run(&["MERGE BRANCH dev INTO main"]);
     let reference = pair.settle();
-    assert_same(&pair, &reference, &["t"], false);
+    assert_same(&pair, &reference, &["t"], true);
+    let primary = &*pair.primary.storage;
+    assert_eq!(
+        primary.art_indexes().pk_index_len("t"),
+        reference.engine().art_indexes().pk_index_len("t"),
+        "the primary's COUNT(*) fast path after MERGE"
+    );
+    assert_eq!(
+        index_census(primary, "t"),
+        index_census(reference.engine(), "t"),
+        "the primary's ART indexes after MERGE"
+    );
     assert!(pair.standby.get_row_by_pk("t", &Value::Int4(2)).unwrap().is_some());
+    assert!(primary.get_row_by_pk("t", &Value::Int4(2)).unwrap().is_some());
     assert_no_fallback(&pair);
 }
 

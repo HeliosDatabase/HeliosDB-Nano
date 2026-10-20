@@ -79,8 +79,10 @@
 //!
 //! One [`PhysicalBatch`] is one primary write group, so publishing per batch
 //! exposes exactly the states a primary passes through; DDL that spans write
-//! groups (DROP TABLE's metadata then its rows; a column-storage migration's
-//! rows then its schema) converges when its last group is published.
+//! groups (a column-storage migration's rows then its schema; RENAME COLUMN's
+//! schema and index definitions, then its constraint records) converges when
+//! its last group is published. DROP TABLE deletes everything the table owns
+//! in one group (spec P1.1b).
 //!
 //! What this module does not do: the SQL layer's registries and caches
 //! (functions, triggers, plan caches) are the [`DerivedStateListener`]'s

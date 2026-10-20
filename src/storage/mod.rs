@@ -201,7 +201,7 @@ pub use catalog::PersistedIndexDefinition;
 pub use catalog::{index_family, IndexFamily};
 // The ONE physical-teardown body behind that classifier, shared by DROP INDEX
 // (`sql::executor::ddl::handle_drop_index`) and DROP TABLE
-// (`Catalog::drop_table_index_definitions`).
+// (`Catalog::drop_table_taking_partition_children`).
 pub(crate) use catalog::teardown_index_structures;
 pub use catalog::{PersistedSeqState, PersistedSequence, DEFAULT_SEQUENCE_CACHE};
 // Role / ACL catalog (HC4 storage slice). STORED AND INTROSPECTABLE ONLY —

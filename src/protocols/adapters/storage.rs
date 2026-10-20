@@ -129,10 +129,15 @@ impl StorageAdapter for LiteStorageAdapter {
         use rocksdb::IteratorMode;
 
         let mut results = Vec::new();
+        // Total-order (spec P1.1b): `prefix` is the caller's, of any length,
+        // so the scan may cross the store's 5-byte extractor prefixes, which a
+        // prefix-mode iterator is not defined across.
+        let mut read = rocksdb::ReadOptions::default();
+        read.set_total_order_seek(true);
         let iter = self
             .engine
             .db
-            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward));
+            .iterator_opt(IteratorMode::From(prefix, rocksdb::Direction::Forward), read);
 
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Scan error: {}", e)))?;

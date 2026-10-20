@@ -914,9 +914,21 @@ impl SnapshotManager {
         // to find the most recent version <= snapshot_ts
         let mut best_version: Option<(u64, Vec<u8>)> = None;
 
-        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+        // Spec P1.1b: a total-order seek to the row's versions. This walked
+        // the whole keyspace with prefix-mode options, which a range tombstone
+        // anywhere before `v:` could cut short (see
+        // `recover_snapshots_with_policy`), losing the versions after it.
+        let mut read = ReadOptions::default();
+        read.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            read,
+        );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
 
             // Parse key: v:{table}:{row_id}:{timestamp}
             if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -1695,14 +1707,14 @@ impl SnapshotManager {
         // Remove snapshots
         let count = to_remove.len();
         let mut delete_batch = WriteBatch::default();
+        let mut removed = Vec::with_capacity(count);
         for ts in &to_remove {
             if let Some(metadata) = snapshots.remove(ts) {
-                // Remove from mappings
-                self.txn_to_timestamp.write().remove(&metadata.transaction_id);
-                self.scn_to_timestamp.write().remove(&metadata.scn);
-
                 if self.persist_metadata {
                     let snap_key = format!("snapshot:{}", ts);
+                    // The legacy id-map records of databases written by older
+                    // versions: nothing reads them (recovery rebuilds the maps
+                    // from `snapshot:` alone), so they go with the snapshot.
                     let txn_key = format!("txn_map:{}", metadata.transaction_id);
                     let scn_key = format!("scn_map:{}", metadata.scn);
 
@@ -1714,8 +1726,18 @@ impl SnapshotManager {
                 // Note: We don't delete the versioned data (v:*) here
                 // That would require a separate GC pass to avoid breaking
                 // any in-flight queries
+                removed.push(metadata);
             }
         }
+        // Remove from the id mappings only what names a removed snapshot
+        // (spec P1.1b). This removed every removed snapshot's transaction-id
+        // mapping unconditionally, but an id can name several snapshots
+        // (`register_snapshot_with_lsn` takes the WAL LSN, and commits with
+        // nothing logged between them share one): GC dropped the id of a
+        // surviving snapshot, `AS OF TRANSACTION` stopped resolving it, and a
+        // restart — which maps every id a surviving record carries — disagreed
+        // with the running process.
+        self.unmap_forgotten_snapshots(&snapshots, &removed);
 
         if count > 0 && self.persist_metadata {
             self.write_batch(delete_batch, "Failed to delete old snapshots")?;
@@ -1884,52 +1906,64 @@ impl SnapshotManager {
     /// were deleted on the primary (snapshot GC): the in-memory half of
     /// [`Self::gc_old_snapshots`], without the write, leaving the maps as a
     /// fresh recovery of the surviving records builds them. Returns how many
-    /// were known.
+    /// were known. The id maps follow [`Self::unmap_forgotten_snapshots`], the
+    /// rule GC applies too.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn forget_snapshots(&self, timestamps: &[u64]) -> usize {
+        let mut snapshots = self.snapshots.write();
+        let forgotten: Vec<SnapshotMetadata> = timestamps
+            .iter()
+            .filter_map(|timestamp| snapshots.remove(timestamp))
+            .collect();
+        self.unmap_forgotten_snapshots(&snapshots, &forgotten);
+        forgotten.len()
+    }
+
+    /// The id-map half of forgetting snapshots, shared by GC
+    /// ([`Self::gc_old_snapshots`]) and a physical standby's
+    /// [`Self::forget_snapshots`] (factored out of the latter, spec P1.1b).
+    /// `survivors` is the snapshot map with `forgotten` already removed.
     ///
-    /// GC removes a forgotten snapshot's id mappings unconditionally, but a
-    /// transaction id can name several snapshots (`register_snapshot_with_lsn`
+    /// A transaction id can name several snapshots (`register_snapshot_with_lsn`
     /// takes the WAL LSN, and commits with nothing logged between them share
     /// one), and recovery maps every id a surviving record still carries. So
     /// a mapping is removed only when it names a forgotten snapshot, and an id
     /// left unmapped that way moves to its newest surviving snapshot, the one
     /// the latest registration under it would have mapped. SCNs are never
-    /// shared.
+    /// shared, but are held to the same rule.
     /// The counters stay where they are: they only move forward, and GC runs
     /// as a snapshot is registered and keeps that one, whose ids are the
     /// highest and are what recovery derives the counters from. The lock order
-    /// is GC's: the snapshot map, then one id map at a time.
-    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
-    pub(crate) fn forget_snapshots(&self, timestamps: &[u64]) -> usize {
-        let mut snapshots = self.snapshots.write();
-        let mut forgotten = 0;
+    /// is GC's: the snapshot map (held by the caller), then one id map at a
+    /// time.
+    fn unmap_forgotten_snapshots(&self, survivors: &HashMap<u64, SnapshotMetadata>, forgotten: &[SnapshotMetadata]) {
         let mut unmapped = HashSet::new();
-        for timestamp in timestamps {
-            let Some(metadata) = snapshots.remove(timestamp) else {
-                continue;
-            };
-            forgotten += 1;
-            {
-                let mut by_txn = self.txn_to_timestamp.write();
-                if by_txn.get(&metadata.transaction_id) == Some(timestamp) {
+        {
+            let mut by_txn = self.txn_to_timestamp.write();
+            for metadata in forgotten {
+                if by_txn.get(&metadata.transaction_id) == Some(&metadata.timestamp) {
                     by_txn.remove(&metadata.transaction_id);
                     unmapped.insert(metadata.transaction_id);
                 }
             }
+        }
+        {
             let mut by_scn = self.scn_to_timestamp.write();
-            if by_scn.get(&metadata.scn) == Some(timestamp) {
-                by_scn.remove(&metadata.scn);
+            for metadata in forgotten {
+                if by_scn.get(&metadata.scn) == Some(&metadata.timestamp) {
+                    by_scn.remove(&metadata.scn);
+                }
             }
         }
         if !unmapped.is_empty() {
             let mut by_txn = self.txn_to_timestamp.write();
-            for metadata in snapshots.values() {
+            for metadata in survivors.values() {
                 if unmapped.contains(&metadata.transaction_id) {
                     let mapped = by_txn.entry(metadata.transaction_id).or_insert(metadata.timestamp);
                     *mapped = (*mapped).max(metadata.timestamp);
                 }
             }
         }
-        forgotten
     }
 
     /// Load one replicated `vmeta:` COPY marker into the in-memory interval
@@ -1983,11 +2017,16 @@ impl SnapshotManager {
         let mut total_size: u64 = 0;
         let prefix = format!("v:");
 
-        // Iterate through all version keys
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        // Iterate through all version keys. `v:` is shorter than the store's
+        // 5-byte prefix extractor, so this scan crosses one extractor prefix
+        // per table and row: it must be total-order (spec P1.1b), or a range
+        // tombstone on the way drops older files from it.
+        let mut read = ReadOptions::default();
+        read.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            read,
+        );
 
         for item in iter {
             let (key, value) =
@@ -2032,11 +2071,16 @@ impl SnapshotManager {
         let mut versions = Vec::new();
         let prefix = format!("v:{}:", table_name);
 
-        // Iterate through all version keys for this table
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        // Iterate through all version keys for this table. For a one-letter
+        // table name the prefix (`v:t:`) is shorter than the store's 5-byte
+        // extractor, and the scan crosses one extractor prefix per row: it
+        // must be total-order (spec P1.1b), as `calculate_snapshot_size` is.
+        let mut read = ReadOptions::default();
+        read.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            read,
+        );
 
         for item in iter {
             let (key, value) =
@@ -2308,6 +2352,55 @@ mod tests {
         assert!(manager.resolve_transaction(7).is_err());
         assert_eq!(manager.resolve_transaction(alone.transaction_id).unwrap(), 300);
         assert_eq!((manager.current_scn(), manager.current_transaction_id()), (scn, txn));
+    }
+
+    /// Spec P1.1b: snapshot GC keeps a shared transaction id mapped while a
+    /// snapshot that carries it survives, and leaves exactly the maps a
+    /// recovery of the surviving records builds. Red before the fix: GC removed
+    /// every removed snapshot's id mapping unconditionally, so `AS OF
+    /// TRANSACTION 7` failed in the running process while a restart resolved it.
+    #[test]
+    fn gc_keeps_a_shared_transaction_id_mapped_to_its_surviving_snapshot() {
+        let gc_config = || GcConfig {
+            // Nothing is old enough to go by age: only the `max_snapshots`
+            // excess is collected.
+            min_retention_seconds: 3600,
+            max_snapshots: 1,
+            auto_gc_enabled: false,
+        };
+        let recovered_mapping = |db: &Arc<DB>| {
+            let recovered = SnapshotManager::new(Arc::clone(db), WriteGate::open());
+            recovered.recover_snapshots().unwrap();
+            recovered.resolve_transaction(7).ok()
+        };
+
+        // The survivor is the snapshot the id maps to: GC removes the older
+        // one and must not take the mapping with it.
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), gc_config());
+        manager.register_snapshot_with_lsn(100, 7).unwrap();
+        manager.register_snapshot_with_lsn(200, 7).unwrap();
+        assert_eq!(manager.gc_old_snapshots().unwrap(), 1);
+        assert!(manager.get_snapshot_metadata(100).is_none());
+        assert_eq!(manager.resolve_transaction(7).unwrap(), 200);
+        assert_eq!(recovered_mapping(&db), Some(200));
+
+        // The id maps to the snapshot GC removes while an older one carrying
+        // it is pinned: the mapping moves to the survivor.
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), gc_config());
+        manager.register_snapshot_with_lsn(100, 7).unwrap();
+        manager.register_snapshot_with_lsn(200, 7).unwrap();
+        manager.snapshots.write().get_mut(&100).unwrap().gc_eligible = false;
+        let shared_scn = manager.get_snapshot_metadata(200).unwrap().scn;
+        assert_eq!(manager.gc_old_snapshots().unwrap(), 1);
+        assert!(manager.get_snapshot_metadata(200).is_none());
+        assert_eq!(manager.resolve_transaction(7).unwrap(), 100);
+        assert!(
+            manager.resolve_scn(shared_scn).is_err(),
+            "the removed snapshot's SCN goes with it"
+        );
+        assert_eq!(recovered_mapping(&db), Some(100));
     }
 
     #[test]

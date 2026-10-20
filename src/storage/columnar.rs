@@ -713,6 +713,21 @@ impl ColumnarStore {
     pub fn purge_table_sidecars(db: &DB, gate: &WriteGate, table: &str) -> Result<()> {
         let _guard = stats_write_lock();
         let mut write_batch = rocksdb::WriteBatch::default();
+        Self::stage_table_sidecar_purge(db, table, &mut write_batch)?;
+        gate.write(db, write_batch, None)
+            .map_err(|e| Error::storage(format!("Columnar sidecar purge failed: {}", e)))
+    }
+
+    /// Stage the deletes [`Self::purge_table_sidecars`] writes into `write_batch`
+    /// instead of writing them, so `Catalog::drop_table` can delete a table's
+    /// sidecars in the same write group as its rows and catalog records (spec
+    /// P1.1b). The caller holds [`stats_write_lock`] from this call until the
+    /// batch is written, as `purge_table_sidecars` does.
+    ///
+    /// Each prefix is `{family}:{table}:` — at least the extractor's five bytes
+    /// and inside one family — so the prefix-mode iterator never leaves the
+    /// family it seeks into.
+    pub(crate) fn stage_table_sidecar_purge(db: &DB, table: &str, write_batch: &mut rocksdb::WriteBatch) -> Result<()> {
         for prefix in [
             format!("col:{}:", table).into_bytes(),
             format!("colz:{}:", table).into_bytes(),
@@ -729,8 +744,7 @@ impl ColumnarStore {
             }
         }
         write_batch.delete(Self::presence_marker_key(table));
-        gate.write(db, write_batch, None)
-            .map_err(|e| Error::storage(format!("Columnar sidecar purge failed: {}", e)))
+        Ok(())
     }
 
     /// R3.3 grouped write: apply `values` (in order — later entries win) to ONE

@@ -3871,6 +3871,14 @@ impl StorageEngine {
         self.referencing_fk_cache.lock().clear();
     }
 
+    /// Forget the cached dictionaries of a dropped table, dirty ones included
+    /// (`DictionaryManager::forget_table`). `Catalog::drop_table` deletes the
+    /// `dict:{table}:*` records; a cached copy would otherwise be flushed back
+    /// over the deletion, or serve a later table of the same name.
+    pub(crate) fn forget_table_dictionaries(&self, table_name: &str) {
+        self.dict_manager.forget_table(table_name);
+    }
+
     /// Pre-warm schema cache by loading all table schemas into memory.
     /// Eliminates first-query schema cache miss penalty (~250μs per table).
     pub fn prewarm_schema_cache(&self) -> Result<()> {
@@ -8475,8 +8483,9 @@ impl StorageEngine {
     /// The `RowDecodeHint::Full` arm of the decode closure in
     /// [`Self::scan_table_with_schema_opt`], for a physical standby's applier,
     /// which decodes each replicated row change one key at a time and must see
-    /// the tuple a rebuild by scan would see.
-    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    /// the tuple a rebuild by scan would see — and for MERGE BRANCH, which
+    /// feeds each row it merged into main to the vector indexes the same way
+    /// (`rederive_indexes_after_merge`).
     pub(crate) fn decode_stored_row(
         &self,
         table_name: &str,
@@ -10792,6 +10801,21 @@ impl StorageEngine {
         let catalog = Catalog::new(self);
         let tables = catalog.list_tables()?;
 
+        // Spec P1.1b: merging into main writes main's `data:` keys below every
+        // index funnel, so main's ART and vector indexes must be brought in
+        // line with them here (`rederive_indexes_after_merge`, step 3b) — a
+        // primary used to keep answering PK lookups, UNIQUE probes and
+        // `COUNT(*)` from its pre-merge indexes until it reopened. Until that
+        // is done an index can miss a merged row or under-count its table, the
+        // window the uncommitted-write census guards for eager transaction
+        // writes; hold it for every table the merge may write (from before the
+        // first write until the indexes are re-derived) so the miss-based and
+        // cardinality fast paths decline to the planner, which reads rows.
+        let _index_hold = merge_to_main.then(|| self.write_census().hold_for_replay(tables.clone(), false));
+        // Main rows this merge wrote or deleted, per table.
+        let mut merged_main_rows: std::collections::HashMap<String, std::collections::BTreeSet<u64>> =
+            std::collections::HashMap::new();
+
         // Track deleted rows per table from source branch
         let mut deleted_rows_by_table: std::collections::HashMap<String, HashSet<u64>> =
             std::collections::HashMap::new();
@@ -10888,6 +10912,9 @@ impl StorageEngine {
                     // pre-merge value).
                     self.row_cache.invalidate(table_name, row_id);
                     merged_keys += 1;
+                    if merge_to_main {
+                        merged_main_rows.entry(table_name.clone()).or_default().insert(row_id);
+                    }
                 }
             }
         }
@@ -10901,7 +10928,12 @@ impl StorageEngine {
                         .delete(&self.db, target_key.as_bytes(), None)
                         .map_err(|e| Error::storage(format!("Failed to apply delete: {}", e)))?;
                     self.row_cache.invalidate(table_name, *row_id);
+                    merged_main_rows.entry(table_name.clone()).or_default().insert(*row_id);
                 }
+            }
+            // Step 3b (spec P1.1b): main's indexes follow the rows above.
+            for (table_name, row_ids) in &merged_main_rows {
+                self.rederive_indexes_after_merge(&catalog, table_name, row_ids)?;
             }
         } else {
             // Copy delete markers to target branch
@@ -10966,6 +10998,66 @@ impl StorageEngine {
             conflicts: Vec::new(),
             completed: true,
         })
+    }
+
+    /// MERGE BRANCH into main, step 3b (spec P1.1b): bring main's in-memory
+    /// indexes of `table_name` in line with the rows the merge wrote or deleted
+    /// (`row_ids`), which reached `data:` below every index funnel.
+    ///
+    /// ART: re-derived from the table's rows as an open derives them —
+    /// `Catalog::index_table_rows`, the row-replay half of
+    /// `Catalog::rebuild_all_indexes` (and of the physical applier's
+    /// re-derivation) — keeping every registration and its name. A merge is
+    /// last-writer-wins, so a merged row can take a UNIQUE value another row
+    /// still holds; the re-derivation indexes the first such row and warns,
+    /// exactly as a reopen of the same rows does, so the primary is left with
+    /// the indexes a restart would compute. The rows are scanned BEFORE the
+    /// trees are cleared: a failed scan leaves the lagging entries (and fails
+    /// the merge), never an empty index answering "absent" for every key. The
+    /// caller's census hold keeps readers off the trees in between.
+    ///
+    /// Vector: each touched row's entry is replaced from its post-merge image
+    /// (`on_row_update` without an old image: delete, then insert) or dropped
+    /// when the row is gone — the R5.V1 maintenance a DML write gets.
+    fn rederive_indexes_after_merge(
+        &self,
+        catalog: &Catalog<'_>,
+        table_name: &str,
+        row_ids: &std::collections::BTreeSet<u64>,
+    ) -> Result<()> {
+        let has_art = !self.art_index_manager.list_table_indexes(table_name).is_empty();
+        let has_vector = self.vector_indexes.table_has_indexes(table_name);
+        if !has_art && !has_vector {
+            return Ok(());
+        }
+        let schema = catalog.get_table_schema(table_name)?;
+        if has_art {
+            let tuples = self.scan_table_with_schema(table_name, &schema)?;
+            self.art_index_manager.clear_table_indexes(table_name);
+            catalog.index_table_rows(table_name, &schema, &tuples);
+        }
+        if has_vector {
+            for row_id in row_ids {
+                let key = format!("data:{}:{}", table_name, row_id).into_bytes();
+                match self.get(&key)? {
+                    Some(stored) => match self.decode_stored_row(table_name, &schema, *row_id, &stored) {
+                        Ok(tuple) => {
+                            let _ = self
+                                .vector_indexes
+                                .on_row_update(table_name, *row_id, &schema, None, &tuple);
+                        }
+                        Err(e) => debug!(
+                            "MERGE BRANCH: merged '{}' row {} does not decode for its vector indexes: {}",
+                            table_name, row_id, e
+                        ),
+                    },
+                    None => {
+                        let _ = self.vector_indexes.on_row_delete(table_name, *row_id, None, None);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Begin a transaction on a specific branch
@@ -12325,15 +12417,24 @@ impl StorageEngine {
                 let prefix_bytes = prefix.as_bytes();
                 let mut keys_to_delete = Vec::new();
 
-                let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+                // Spec P1.1b: seek to the table's rows with a total-order
+                // iterator. A prefix-mode walk from the start of the keyspace
+                // crossed every family before `data:`, and one range tombstone
+                // on the way dropped whole older files from the scan (see
+                // `load_counters`): their rows survived the replayed TRUNCATE.
+                // An iterator error is propagated for the same reason — it
+                // was skipped, leaving the rows after it in place, too.
+                let mut read = ReadOptions::default();
+                read.set_total_order_seek(true);
+                let iter = self
+                    .db
+                    .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read);
                 for item in iter {
-                    if let Ok((key, _)) = item {
-                        if key.starts_with(prefix_bytes) {
-                            keys_to_delete.push(key.to_vec());
-                        } else if key.first() > prefix_bytes.first() {
-                            break;
-                        }
+                    let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                    if !key.starts_with(prefix_bytes) {
+                        break;
                     }
+                    keys_to_delete.push(key.to_vec());
                 }
 
                 for key in keys_to_delete {
@@ -14407,7 +14508,23 @@ impl StorageEngine {
     /// Load row counters from storage
     fn load_counters(&self) -> Result<()> {
         let prefix = b"counter:";
-        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+        // Seek straight to the family with a TOTAL-ORDER iterator (spec
+        // P1.1b). This used to walk from the start of the keyspace with the
+        // default, prefix-mode options, crossing every family that sorts
+        // before `counter:` (`bdata:`, `cas:`, `col*:` …). The store's 5-byte
+        // prefix extractor makes such an iterator defined only within one
+        // prefix: stepping onto a key a range tombstone covers re-seeks the
+        // older files to the tombstone's end, and a file holding no key with
+        // that end's prefix is dropped from the scan — every `counter:` record
+        // in it with it (the mechanism `recover_snapshots_with_policy`
+        // documents). A table whose rows are all gone (TRUNCATE) has nothing
+        // else to reseed its counter from, so its next row id restarted at 1
+        // and collided with the history `v:` keeps for the truncated rows.
+        let mut read = ReadOptions::default();
+        read.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix, rocksdb::Direction::Forward), read);
 
         for item in iter {
             let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
@@ -14429,7 +14546,8 @@ impl StorageEngine {
 
                 self.row_counters
                     .insert(table_name, std::sync::atomic::AtomicU64::new(count));
-            } else if key.first() > prefix.first() {
+            } else {
+                // Sorted: the first key outside the family ends it.
                 break;
             }
         }
