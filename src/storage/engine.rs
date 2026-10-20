@@ -31,7 +31,9 @@ use crate::crypto::KeyManager;
 use crate::ColumnStorageMode;
 use crate::{Config, Error, Result, Tuple, Value};
 use parking_lot::RwLock;
-use rocksdb::{BlockBasedOptions, Cache, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB};
+use rocksdb::{
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB,
+};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -1920,9 +1922,17 @@ pub enum OpenMode {
     ReadOnly,
     /// `open_physical_snapshot`: read-only, strict hydration, no writes of any kind.
     PhysicalSnapshot,
-    /// A serving physical standby: the handle is injected by the applier (P0.3), writable at the
-    /// RocksDB level but the ENGINE never writes to it; `WriteGate` refuses every raw write.
-    PhysicalStandby { db: Arc<DB>, gate: Arc<WriteGate> },
+    /// A serving physical standby: the handle is the applier's, owned by its `LocalWriter` and
+    /// writable at the RocksDB level, but the ENGINE never writes to its default column family —
+    /// `WriteGate` refuses every raw write — and reaches the node-local one only through `writer`
+    /// (`write_local`). Without `ha-tier1` there is no writer, and nothing can construct this mode.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    PhysicalStandby {
+        db: Arc<DB>,
+        gate: Arc<WriteGate>,
+        #[cfg(feature = "ha-tier1")]
+        writer: Arc<crate::replication::physical::LocalWriter>,
+    },
 }
 
 impl OpenMode {
@@ -2393,21 +2403,23 @@ impl StorageEngine {
     /// snapshot and catalog recovery, no logical WAL, no background workers, no
     /// close-time persistence — but on the applier's WRITABLE handle instead of
     /// a read-only one of its own, so the store can keep advancing underneath
-    /// the engine. The engine itself never writes to it: `gate` must be closed,
-    /// and every raw write site in the storage layer asks it.
+    /// the engine. The engine itself never writes to the replicated keyspace:
+    /// `gate` must be closed, and every raw write site in the storage layer
+    /// asks it.
     ///
-    /// The handle must carry the node-local column family
-    /// ([`keyspace::LOCAL_CF`](super::keyspace::LOCAL_CF)); that family is what
-    /// marks a directory as a standby's, and every other open mode refuses it.
-    ///
-    /// P0.3 HOOK: the `LocalWriter` that owns every write this process makes to
-    /// a standby (the applier's batches and the node-local cursor) is not wired
-    /// yet. It will be passed here alongside `db`, carried by
-    /// `OpenMode::PhysicalStandby`, and `write_local` will delegate to it.
-    pub(crate) fn open_physical_standby(
+    /// The handle is `writer`'s: the `LocalWriter` owns every write this
+    /// process makes to the standby — the applier's batches and the node-local
+    /// cursor — and keeps the store's sequence number accounted for. The engine
+    /// keeps it so that [`Self::write_local`] can route node-local state through
+    /// it rather than around it. The handle carries the node-local column
+    /// family ([`keyspace::LOCAL_CF`](super::keyspace::LOCAL_CF)); that family
+    /// is what marks a directory as a standby's, and every other open mode
+    /// refuses it.
+    #[cfg(feature = "ha-tier1")]
+    pub fn open_physical_standby(
         path: impl AsRef<Path>,
         config: &Config,
-        db: Arc<DB>,
+        writer: Arc<crate::replication::physical::LocalWriter>,
         gate: Arc<WriteGate>,
     ) -> Result<Self> {
         if config.storage.memory_only {
@@ -2418,7 +2430,49 @@ impl StorageEngine {
                 "a physical standby's write gate must be closed: the engine never writes to a standby's store",
             ));
         }
-        Self::open_with_mode(path, config, OpenMode::PhysicalStandby { db, gate })
+        if writer.is_poisoned() {
+            return Err(Error::storage(
+                "a physical standby's writer is poisoned after an uncertain write; reopen the standby",
+            ));
+        }
+        // Every directory check below reads `path`; it must be the store the
+        // handle has open, not a different directory beside it.
+        let canonical = |p: &Path| {
+            std::fs::canonicalize(p)
+                .map_err(|e| Error::storage(format!("failed to resolve the standby directory {}: {e}", p.display())))
+        };
+        if canonical(path.as_ref())? != canonical(writer.db().path())? {
+            return Err(Error::storage(format!(
+                "the physical standby's handle has {} open, not {}",
+                writer.db().path().display(),
+                path.as_ref().display()
+            )));
+        }
+        let db = Arc::clone(writer.db());
+        Self::open_with_mode(path, config, OpenMode::PhysicalStandby { db, gate, writer })
+    }
+
+    /// Persist node-local state (a standby's posture, archive catalog,
+    /// statistics) in the [`keyspace::LOCAL_CF`](super::keyspace::LOCAL_CF)
+    /// column family of a physical standby.
+    ///
+    /// This is the only write a standby's engine may make. Its default column
+    /// family must stay a verbatim copy of the primary's, so the gate refuses
+    /// every write there; node-local state goes to its own family instead, and
+    /// through the standby's `LocalWriter`, which applies the batch together
+    /// with the cursor update that keeps the sequence accounted for — a write
+    /// around it would poison the applier. Every other open mode has no
+    /// node-local namespace and refuses.
+    #[cfg(feature = "ha-tier1")]
+    pub fn write_local(&self, batch: crate::replication::physical::LocalBatch) -> Result<()> {
+        match &self.open_mode {
+            OpenMode::PhysicalStandby { writer, .. } => writer
+                .write_local(batch)
+                .map_err(|e| Error::storage(format!("node-local write failed: {e}"))),
+            OpenMode::Primary | OpenMode::ReadOnly | OpenMode::PhysicalSnapshot => Err(Error::storage(
+                "node-local writes exist only on a physical standby: this database has no node-local namespace",
+            )),
+        }
     }
 
     /// True for both physical modes (snapshot and standby): the catalog takes
@@ -2457,24 +2511,10 @@ impl StorageEngine {
     /// directory untouched. A directory without `CURRENT` is not a store yet,
     /// cannot carry the family, and is left to the open to judge.
     fn refuse_physical_standby_store(db_path: &Path) -> Result<()> {
-        match std::fs::metadata(db_path.join("CURRENT")) {
-            Ok(metadata) if metadata.is_file() => {}
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(Error::storage(format!(
-                    "failed to look up the 'CURRENT' manifest in {}: {error}",
-                    db_path.display()
-                )))
-            }
-        }
-        let families = DB::list_cf(&Options::default(), db_path).map_err(|e| {
-            Error::storage(format!(
-                "failed to list the column families of {}: {e}",
-                db_path.display()
-            ))
-        })?;
-        if families.iter().any(|name| name == super::keyspace::LOCAL_CF) {
+        if Self::existing_column_families(db_path)?
+            .iter()
+            .any(|name| name == super::keyspace::LOCAL_CF)
+        {
             return Err(Error::storage(format!(
                 "refusing to open {}: it holds the '{}' column family of a physical standby, which only the \
                  physical standby start path (`heliosdb-nano start --replication-role standby`) may open",
@@ -2483,6 +2523,158 @@ impl StorageEngine {
             )));
         }
         Ok(())
+    }
+
+    /// The column families `db_path`'s MANIFEST lists, or none when the
+    /// directory holds no store yet (no regular `CURRENT`). Reads the MANIFEST
+    /// without opening a handle, so it never touches the directory.
+    fn existing_column_families(db_path: &Path) -> Result<Vec<String>> {
+        match std::fs::metadata(db_path.join("CURRENT")) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Ok(Vec::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(Error::storage(format!(
+                    "failed to look up the 'CURRENT' manifest in {}: {error}",
+                    db_path.display()
+                )))
+            }
+        }
+        DB::list_cf(&Options::default(), db_path).map_err(|e| {
+            Error::storage(format!(
+                "failed to list the column families of {}: {e}",
+                db_path.display()
+            ))
+        })
+    }
+
+    /// Options of the node-local column family
+    /// ([`keyspace::LOCAL_CF`](super::keyspace::LOCAL_CF)).
+    ///
+    /// Plain and small on purpose: it holds a handful of point-updated keys
+    /// (the applier cursor, a standby's posture), so a prefix extractor or a
+    /// bloom filter would buy nothing, and a small memtable keeps the family
+    /// flushing often enough that it does not pin old WAL files the much
+    /// larger default family has long since flushed.
+    pub fn local_cf_options() -> Options {
+        let mut opts = Options::default();
+        opts.set_compression_type(rocksdb::DBCompressionType::Lz4);
+        opts.set_write_buffer_size(4 * 1024 * 1024);
+        opts
+    }
+
+    /// The RocksDB options of a Nano store, and the column families to open it
+    /// with.
+    ///
+    /// Every open of a store's directory takes its options from here: the
+    /// engine's own (every mode but the physical standby's, whose handle comes
+    /// from its applier) and the physical receiver's staging and standby opens
+    /// (`replication::checkpoint_transfer`). A standby therefore runs with
+    /// exactly its primary's compression, block cache, bloom filter, prefix
+    /// extractor and write tuning, and an SST written on either side is read
+    /// the same way on the other.
+    ///
+    /// The descriptor list names what `db_path` holds: the default family
+    /// always, carrying these same options — a descriptor's options, not the
+    /// database's, are what RocksDB applies to a family, so a bare
+    /// `DB::open_cf` by name would silently drop them — plus the node-local
+    /// family with [`Self::local_cf_options`] when the MANIFEST lists it.
+    /// `create_if_missing` is left to the caller: only it knows whether it may
+    /// create a store.
+    pub fn build_db_options(config: &Config, db_path: &Path) -> Result<(Options, Vec<ColumnFamilyDescriptor>)> {
+        let with_local_family = Self::existing_column_families(db_path)?
+            .iter()
+            .any(|name| name == super::keyspace::LOCAL_CF);
+        Self::db_options(config, with_local_family)
+    }
+
+    /// [`Self::build_db_options`] for a caller that already knows whether the
+    /// store holds the node-local family (the engine's own opens: the refusal
+    /// that precedes them has just read the MANIFEST).
+    fn db_options(config: &Config, with_local_family: bool) -> Result<(Options, Vec<ColumnFamilyDescriptor>)> {
+        let mut opts = Options::default();
+        opts.set_compression_type(match config.storage.compression {
+            crate::config::CompressionType::None => rocksdb::DBCompressionType::None,
+            crate::config::CompressionType::Zstd => rocksdb::DBCompressionType::Zstd,
+            crate::config::CompressionType::Lz4 => rocksdb::DBCompressionType::Lz4,
+        });
+
+        // Performance optimization: Configure cache allocation
+        // - Block cache: 75% of cache_size for read-heavy workloads (decompressed block caching)
+        // - Write buffer: 25% of cache_size for write batching
+        let cache_size = config.storage.cache_size;
+        // Item 8: an explicit rocksdb_write_buffer_size sets the memtable
+        // directly and gives the FULL cache_size to the block cache (so a
+        // write-only ingest gets a big memtable without over-allocating read
+        // cache). None = legacy 75/25 split — byte-identical to pre-3.58.
+        let (block_cache_size, write_buffer_size) = match config.storage.rocksdb_write_buffer_size {
+            Some(wb) => (cache_size, wb),
+            None => {
+                let bc = (cache_size as f64 * 0.75) as usize;
+                (bc, cache_size - bc)
+            }
+        };
+
+        // Create LRU block cache for optimized read performance
+        let block_cache = Cache::new_lru_cache(block_cache_size);
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_block_cache(&block_cache);
+        block_opts.set_block_size(16 * 1024); // 16KB blocks (optimized for SSD)
+        block_opts.set_cache_index_and_filter_blocks(true); // Cache index/filter for faster lookups
+        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true); // Pin L0 blocks
+
+        // Full bloom filter: 14 bits/key → 0.08% false positive rate (vs 1% at 10 bits)
+        // Full filter (not block-based) stored per SST file — optimal for point lookups
+        block_opts.set_bloom_filter(14.0, false);
+        // Whole-key filtering: bloom checks exact key, not just 5-byte "data:" prefix
+        // A prefix-only bloom matches ALL rows (zero selectivity for Get())
+        block_opts.set_whole_key_filtering(true);
+
+        // Prefix extractor still used for prefix-based iteration (table scans)
+        opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(5));
+
+        opts.set_block_based_table_factory(&block_opts);
+
+        opts.set_write_buffer_size(write_buffer_size);
+        // Write path performance tuning (item 8: config-overridable; None = the
+        // literal shown, so default/pg35 behavior is unchanged).
+        let sc = &config.storage;
+        opts.set_max_write_buffer_number(sc.rocksdb_max_write_buffer_number.unwrap_or(4)); // concurrent memtables
+        opts.set_min_write_buffer_number_to_merge(sc.rocksdb_min_write_buffer_number_to_merge.unwrap_or(2)); // merge before flush
+        opts.set_level_zero_file_num_compaction_trigger(sc.rocksdb_level0_file_num_compaction_trigger.unwrap_or(4));
+        opts.set_max_background_jobs(sc.rocksdb_max_background_jobs.unwrap_or(4)); // compaction/flush threads
+        opts.set_bytes_per_sync(sc.rocksdb_bytes_per_sync.unwrap_or(1048576)); // sync every 1MB
+        opts.set_enable_pipelined_write(true); // Pipeline WAL + memtable writes
+
+        // Online physical replication needs archived RocksDB WAL beyond the
+        // active memtables. This is a bounded retention window, not a lease:
+        // receivers that fall outside it must fail on a gap and resnapshot.
+        // Ordinary configurations keep the previous RocksDB defaults.
+        if config.replication.physical.enabled {
+            let physical = &config.replication.physical;
+            if config.storage.memory_only
+                || !(60..=86_400).contains(&physical.wal_retention_secs)
+                || !(64..=65_536).contains(&physical.wal_retention_size_mb)
+            {
+                return Err(Error::config(
+                    "physical replication requires persistent storage and bounded WAL retention".to_string(),
+                ));
+            }
+            opts.set_wal_ttl_seconds(physical.wal_retention_secs);
+            opts.set_wal_size_limit_mb(physical.wal_retention_size_mb);
+        }
+
+        let mut families = vec![ColumnFamilyDescriptor::new(
+            rocksdb::DEFAULT_COLUMN_FAMILY_NAME,
+            opts.clone(),
+        )];
+        if with_local_family {
+            families.push(ColumnFamilyDescriptor::new(
+                super::keyspace::LOCAL_CF,
+                Self::local_cf_options(),
+            ));
+        }
+        Ok((opts, families))
     }
 
     /// Create a unique, owned temporary directory for a READ-ONLY RocksDB
@@ -2661,11 +2853,68 @@ impl StorageEngine {
         }
     }
 
+    /// Preflight an EXISTING store through a READ-ONLY handle before the
+    /// writable open takes one.
+    ///
+    /// A writable RocksDB open rewrites `LOG`, `CURRENT`, `MANIFEST-*` and
+    /// `OPTIONS-*` even when the key is then rejected, so the refusal must
+    /// happen first. `verify_key_check_without_install` probes the stored
+    /// values when no sentinel exists (a wrong key against a pre-sentinel
+    /// database is `Contradicted`) and never writes, so a brand-new store still
+    /// gains its sentinel on the writable handle. The probe's own RocksDB log
+    /// is redirected to a unique temporary directory OUTSIDE the database and
+    /// removed afterwards, so the read-only open cannot mutate the data
+    /// directory either.
+    ///
+    /// `is_existing_store` also refuses a nonempty directory whose `CURRENT` is
+    /// missing (an incomplete/corrupt store) instead of silently initializing
+    /// over the files already there, and surfaces any `CURRENT` lookup error
+    /// rather than reading it as "fresh" the way `is_file()` did.
+    ///
+    /// BOUNDED CAVEAT: this closes the mutation caused by this process's own
+    /// open. It does NOT defend against a hostile concurrent writer that
+    /// replaces the store between the preflight and the writable open
+    /// (TOCTOU); the window is bounded to the two opens, and this process never
+    /// writes inside it.
+    fn preflight_existing_store(db_path: &Path, opts: &Options, key_manager: Option<&KeyManager>) -> Result<()> {
+        if !Self::is_existing_store(db_path)? {
+            return Ok(());
+        }
+        let probe_log_dir = Self::owned_log_dir_outside(db_path, &std::env::temp_dir())?;
+        let mut probe_opts = opts.clone();
+        probe_opts.set_db_log_dir(probe_log_dir.path());
+        // The probe reads one key (or, on a store without a sentinel, a
+        // bounded sample of values). Opening every table file and loading
+        // its stats up front is work the writable open repeats, so the probe
+        // opens table files on demand and skips both.
+        probe_opts.set_max_open_files(64);
+        probe_opts.set_skip_stats_update_on_db_open(true);
+        probe_opts.set_skip_checking_sst_file_sizes_on_db_open(true);
+        let probe = DB::open_for_read_only(&probe_opts, db_path, false).map_err(|e| {
+            Error::storage(format!(
+                "Failed to open RocksDB read-only for the encryption preflight: {e}"
+            ))
+        })?;
+        let check = super::tde::verify_key_check_without_install(&probe, key_manager);
+        drop(probe);
+        drop(probe_log_dir);
+        check
+    }
+
     fn open_with_mode(path: impl AsRef<Path>, config: &Config, mode: OpenMode) -> Result<Self> {
         let db_path = path.as_ref().to_path_buf();
         // Decided here, once, and handed to every component below that holds
         // the raw handle: only a primary may write.
         let gate = mode.write_gate();
+        // Before any RocksDB handle exists: a standby's directory is refused in
+        // every other mode — ahead of the physical-marker check, so the refusal
+        // names the one start path that may open it even when the directory is
+        // also marked as a physical replica — and a standby's injected handle
+        // must carry its node-local column family (it is checked where the
+        // handle is taken).
+        if !matches!(mode, OpenMode::PhysicalStandby { .. }) {
+            Self::refuse_physical_standby_store(&db_path)?;
+        }
         if !mode.is_physical() {
             match std::fs::symlink_metadata(db_path.join("NANO-PHYSICAL-REPLICA.json")) {
                 Ok(_) => {
@@ -2676,84 +2925,6 @@ impl StorageEngine {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
                 Err(error) => return Err(Error::storage(format!("physical marker lookup failed: {error}"))),
             }
-        }
-        // Before any RocksDB handle exists: a standby's directory is refused in
-        // every other mode, and a standby's injected handle must carry its
-        // node-local column family (it is checked where the handle is taken).
-        if !matches!(mode, OpenMode::PhysicalStandby { .. }) {
-            Self::refuse_physical_standby_store(&db_path)?;
-        }
-        let mut opts = Options::default();
-        opts.create_if_missing(mode.engine_may_write());
-        opts.set_compression_type(match config.storage.compression {
-            crate::config::CompressionType::None => rocksdb::DBCompressionType::None,
-            crate::config::CompressionType::Zstd => rocksdb::DBCompressionType::Zstd,
-            crate::config::CompressionType::Lz4 => rocksdb::DBCompressionType::Lz4,
-        });
-
-        // Performance optimization: Configure cache allocation
-        // - Block cache: 75% of cache_size for read-heavy workloads (decompressed block caching)
-        // - Write buffer: 25% of cache_size for write batching
-        let cache_size = config.storage.cache_size;
-        // Item 8: an explicit rocksdb_write_buffer_size sets the memtable
-        // directly and gives the FULL cache_size to the block cache (so a
-        // write-only ingest gets a big memtable without over-allocating read
-        // cache). None = legacy 75/25 split — byte-identical to pre-3.58.
-        let (block_cache_size, write_buffer_size) = match config.storage.rocksdb_write_buffer_size {
-            Some(wb) => (cache_size, wb),
-            None => {
-                let bc = (cache_size as f64 * 0.75) as usize;
-                (bc, cache_size - bc)
-            }
-        };
-
-        // Create LRU block cache for optimized read performance
-        let block_cache = Cache::new_lru_cache(block_cache_size);
-        let mut block_opts = BlockBasedOptions::default();
-        block_opts.set_block_cache(&block_cache);
-        block_opts.set_block_size(16 * 1024); // 16KB blocks (optimized for SSD)
-        block_opts.set_cache_index_and_filter_blocks(true); // Cache index/filter for faster lookups
-        block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true); // Pin L0 blocks
-
-        // Full bloom filter: 14 bits/key → 0.08% false positive rate (vs 1% at 10 bits)
-        // Full filter (not block-based) stored per SST file — optimal for point lookups
-        block_opts.set_bloom_filter(14.0, false);
-        // Whole-key filtering: bloom checks exact key, not just 5-byte "data:" prefix
-        // A prefix-only bloom matches ALL rows (zero selectivity for Get())
-        block_opts.set_whole_key_filtering(true);
-
-        // Prefix extractor still used for prefix-based iteration (table scans)
-        opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(5));
-
-        opts.set_block_based_table_factory(&block_opts);
-
-        opts.set_write_buffer_size(write_buffer_size);
-        // Write path performance tuning (item 8: config-overridable; None = the
-        // literal shown, so default/pg35 behavior is unchanged).
-        let sc = &config.storage;
-        opts.set_max_write_buffer_number(sc.rocksdb_max_write_buffer_number.unwrap_or(4)); // concurrent memtables
-        opts.set_min_write_buffer_number_to_merge(sc.rocksdb_min_write_buffer_number_to_merge.unwrap_or(2)); // merge before flush
-        opts.set_level_zero_file_num_compaction_trigger(sc.rocksdb_level0_file_num_compaction_trigger.unwrap_or(4));
-        opts.set_max_background_jobs(sc.rocksdb_max_background_jobs.unwrap_or(4)); // compaction/flush threads
-        opts.set_bytes_per_sync(sc.rocksdb_bytes_per_sync.unwrap_or(1048576)); // sync every 1MB
-        opts.set_enable_pipelined_write(true); // Pipeline WAL + memtable writes
-
-        // Online physical replication needs archived RocksDB WAL beyond the
-        // active memtables. This is a bounded retention window, not a lease:
-        // receivers that fall outside it must fail on a gap and resnapshot.
-        // Ordinary configurations keep the previous RocksDB defaults.
-        if config.replication.physical.enabled {
-            let physical = &config.replication.physical;
-            if config.storage.memory_only
-                || !(60..=86_400).contains(&physical.wal_retention_secs)
-                || !(64..=65_536).contains(&physical.wal_retention_size_mb)
-            {
-                return Err(Error::config(
-                    "physical replication requires persistent storage and bounded WAL retention".to_string(),
-                ));
-            }
-            opts.set_wal_ttl_seconds(physical.wal_retention_secs);
-            opts.set_wal_size_limit_mb(physical.wal_retention_size_mb);
         }
 
         // Load the key material BEFORE any RocksDB open. A missing or malformed
@@ -2767,73 +2938,7 @@ impl StorageEngine {
             None
         };
 
-        // Preflight an EXISTING store through a READ-ONLY handle before taking
-        // the writable one. A writable RocksDB open rewrites `LOG`, `CURRENT`,
-        // `MANIFEST-*` and `OPTIONS-*` even when the key is then rejected, so
-        // the refusal must happen first. `verify_key_check_without_install`
-        // probes the stored values when no sentinel exists (a wrong key against
-        // a pre-sentinel database is `Contradicted`) and never writes, so a
-        // brand-new store still gains its sentinel on the writable handle
-        // below. The probe's own RocksDB log is redirected to a unique
-        // temporary directory OUTSIDE the database and removed afterwards, so
-        // the read-only open cannot mutate the data directory either.
-        //
-        // `is_existing_store` also refuses a nonempty directory whose `CURRENT`
-        // is missing (an incomplete/corrupt store) instead of silently
-        // initializing over the files already there, and surfaces any `CURRENT`
-        // lookup error rather than reading it as "fresh" the way `is_file()`
-        // did.
-        //
-        // BOUNDED CAVEAT: this closes the mutation caused by this process's own
-        // open. It does NOT defend against a hostile concurrent writer that
-        // replaces the store between the preflight and the writable open
-        // (TOCTOU); the window is bounded to the two opens below, and this
-        // process never writes inside it.
-        if mode.engine_may_write() && Self::is_existing_store(&db_path)? {
-            let probe_log_dir = Self::owned_log_dir_outside(&db_path, &std::env::temp_dir())?;
-            let mut probe_opts = opts.clone();
-            probe_opts.set_db_log_dir(probe_log_dir.path());
-            // The probe reads one key (or, on a store without a sentinel, a
-            // bounded sample of values). Opening every table file and loading
-            // its stats up front is work the writable open below repeats, so
-            // the probe opens table files on demand and skips both.
-            probe_opts.set_max_open_files(64);
-            probe_opts.set_skip_stats_update_on_db_open(true);
-            probe_opts.set_skip_checking_sst_file_sizes_on_db_open(true);
-            let probe = DB::open_for_read_only(&probe_opts, &db_path, false).map_err(|e| {
-                Error::storage(format!(
-                    "Failed to open RocksDB read-only for the encryption preflight: {e}"
-                ))
-            })?;
-            let check = super::tde::verify_key_check_without_install(&probe, key_manager.as_deref());
-            drop(probe);
-            drop(probe_log_dir);
-            check?;
-        }
-
         let (db, read_only_log_dir) = match &mode {
-            OpenMode::ReadOnly | OpenMode::PhysicalSnapshot => {
-                // A read-only RocksDB open can still write `LOG`, which would
-                // mutate the very data directory a read-only handle promises not
-                // to touch. Redirect that log to a unique owned directory
-                // OUTSIDE the database. The guard is moved into the engine (its
-                // LAST field, so it outlives the DB handle) and removes the
-                // directory only when the handle is gone; if the open fails, `?`
-                // drops the guard here, cleaning up the directory it just
-                // created.
-                let log_dir = Self::owned_log_dir_outside(&db_path, &std::env::temp_dir())?;
-                let mut read_only_opts = opts.clone();
-                read_only_opts.set_db_log_dir(log_dir.path());
-                // No DB lock taken — a second process can open read-only while a
-                // primary writes. `false` = tolerate an existing WAL/log file.
-                let db = DB::open_for_read_only(&read_only_opts, path, false)
-                    .map_err(|e| Error::storage(format!("Failed to open RocksDB read-only: {}", e)))?;
-                (Arc::new(db), Some(log_dir))
-            }
-            OpenMode::Primary => (
-                Arc::new(DB::open(&opts, path).map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?),
-                None,
-            ),
             // The applier opened (and owns) the handle; the engine shares it.
             OpenMode::PhysicalStandby { db, .. } => {
                 if db.cf_handle(super::keyspace::LOCAL_CF).is_none() {
@@ -2843,6 +2948,37 @@ impl StorageEngine {
                     )));
                 }
                 (Arc::clone(db), None)
+            }
+            // Every other mode opens its own handle, with the options every
+            // open of a Nano store shares (`build_db_options`). The refusal
+            // above proved the store has no node-local family.
+            OpenMode::Primary | OpenMode::ReadOnly | OpenMode::PhysicalSnapshot => {
+                let (mut opts, column_families) = Self::db_options(config, false)?;
+                opts.create_if_missing(mode.engine_may_write());
+                if mode.rocksdb_read_only() {
+                    // A read-only RocksDB open can still write `LOG`, which
+                    // would mutate the very data directory a read-only handle
+                    // promises not to touch. Redirect that log to a unique
+                    // owned directory OUTSIDE the database. The guard is moved
+                    // into the engine (its LAST field, so it outlives the DB
+                    // handle) and removes the directory only when the handle is
+                    // gone; if the open fails, `?` drops the guard here,
+                    // cleaning up the directory it just created.
+                    let log_dir = Self::owned_log_dir_outside(&db_path, &std::env::temp_dir())?;
+                    let mut read_only_opts = opts.clone();
+                    read_only_opts.set_db_log_dir(log_dir.path());
+                    // No DB lock taken — a second process can open read-only
+                    // while a primary writes. `false` = tolerate an existing
+                    // WAL/log file.
+                    let db = DB::open_cf_descriptors_read_only(&read_only_opts, path, column_families, false)
+                        .map_err(|e| Error::storage(format!("Failed to open RocksDB read-only: {}", e)))?;
+                    (Arc::new(db), Some(log_dir))
+                } else {
+                    Self::preflight_existing_store(&db_path, &opts, key_manager.as_deref())?;
+                    let db = DB::open_cf_descriptors(&opts, path, column_families)
+                        .map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?;
+                    (Arc::new(db), None)
+                }
             }
         };
 
@@ -14711,13 +14847,16 @@ mod tests {
         );
     }
 
-    /// P0.2: the standby mode hydrates on the applier's own writable handle —
-    /// the SAME `Arc<DB>`, not a second open — behind the caller's closed gate,
-    /// and writes nothing: the sequence number is unchanged and the gate saw no
-    /// attempt. The node-local column family is what admits the mode, and its
-    /// absence, or an open gate, refuses it.
+    /// P0.2/P0.3: the standby mode hydrates on its writer's own writable
+    /// handle — the SAME `Arc<DB>`, not a second open — behind the caller's
+    /// closed gate, and writes nothing on its own: the sequence number is
+    /// unchanged and the gate saw no attempt. Its one write, `write_local`,
+    /// goes to the node-local column family through the writer, which accounts
+    /// for the sequence it consumes; the default column family is untouched.
+    #[cfg(feature = "ha-tier1")]
     #[test]
-    fn a_physical_standby_open_shares_the_injected_handle_and_never_writes() {
+    fn a_physical_standby_open_shares_the_writer_handle_and_writes_only_through_it() {
+        use crate::replication::physical::{LocalBatch, StagedPhysicalReplica};
         let dir = tempfile::TempDir::new().expect("temp dir");
         let db_path = dir.path().join("store");
         let mut config = Config::default();
@@ -14725,39 +14864,41 @@ mod tests {
         config.storage.elide_latest_version = false;
         drop(StorageEngine::open(&db_path, &config).expect("writable open creates the store"));
 
-        let plain = Arc::new(DB::open(&Options::default(), &db_path).expect("plain open"));
-        let error =
-            StorageEngine::open_physical_standby(&db_path, &config, plain, WriteGate::closed("physical standby"))
-                .err()
-                .expect("a handle without the node-local column family is not a standby's");
-        assert!(error.to_string().contains(super::super::keyspace::LOCAL_CF), "{error}");
-
-        // P0.3 makes the applier create this family; plain RocksDB stands in.
-        let mut raw = DB::open(&Options::default(), &db_path).expect("plain open");
-        raw.create_cf(super::super::keyspace::LOCAL_CF, &Options::default())
-            .expect("create the node-local column family");
-        drop(raw);
-        let raw = Arc::new(
-            DB::open_cf(
-                &Options::default(),
-                &db_path,
-                ["default", super::super::keyspace::LOCAL_CF],
-            )
-            .expect("open with both column families"),
-        );
-        let sequence = raw.latest_sequence_number();
+        // The receiver opens the store with the engine's own options and
+        // creates its node-local column family and cursor.
+        let (mut options, families) = StorageEngine::build_db_options(&config, &db_path).expect("options");
+        options.create_if_missing(false);
+        let raw = DB::open_cf_descriptors(&options, &db_path, families).expect("receiver open");
+        let cut = raw.latest_sequence_number();
+        let replica =
+            StagedPhysicalReplica::from_checkpoint(raw, uuid::Uuid::new_v4(), cut).expect("initialize the receiver");
+        let writer = Arc::clone(replica.writer());
+        let sequence = writer.db().latest_sequence_number();
+        assert_eq!(sequence, writer.cursor().local_sequence());
 
         assert!(
-            StorageEngine::open_physical_standby(&db_path, &config, Arc::clone(&raw), WriteGate::open()).is_err(),
+            StorageEngine::open_physical_standby(&db_path, &config, Arc::clone(&writer), WriteGate::open()).is_err(),
             "an open gate must be refused: the engine never writes to a standby"
+        );
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("second directory");
+        assert!(
+            StorageEngine::open_physical_standby(
+                &elsewhere,
+                &config,
+                Arc::clone(&writer),
+                WriteGate::closed("physical standby")
+            )
+            .is_err(),
+            "the engine must open the directory its writer's handle has open"
         );
 
         let gate = WriteGate::closed("physical standby");
-        let engine = StorageEngine::open_physical_standby(&db_path, &config, Arc::clone(&raw), Arc::clone(&gate))
+        let engine = StorageEngine::open_physical_standby(&db_path, &config, Arc::clone(&writer), Arc::clone(&gate))
             .expect("physical standby open");
         assert!(
-            Arc::ptr_eq(&engine.db(), &raw),
-            "the engine must share the injected handle"
+            Arc::ptr_eq(&engine.db(), writer.db()),
+            "the engine must share the writer's handle"
         );
         assert!(
             Arc::ptr_eq(engine.write_gate(), &gate),
@@ -14773,19 +14914,60 @@ mod tests {
         assert!(!engine.row_counter_flush_on_close());
         assert!(!engine.wal_checkpoint_on_close());
         assert_eq!(gate.refusals(), 0, "hydration must not even attempt a write");
+        assert_eq!(
+            writer.db().latest_sequence_number(),
+            sequence,
+            "the standby open wrote to its store"
+        );
         let error = engine
             .put(&b"meta:standby:probe".to_vec(), b"x")
             .expect_err("a standby engine refuses every write");
         assert!(error.to_string().contains("physical standby"), "{error}");
         assert_eq!(gate.refusals(), 1);
+
+        let mut batch = LocalBatch::new();
+        batch.put(b"posture", b"streaming");
+        batch.put(b"standby_note", b"node-local");
+        engine.write_local(batch).expect("node-local write");
+        assert_eq!(gate.refusals(), 1, "a node-local write is not a gated write");
+        assert_eq!(writer.db().latest_sequence_number(), sequence + 3);
+        assert_eq!(writer.cursor().local_sequence(), sequence + 3);
+        assert!(!writer.is_poisoned());
+        let local = writer
+            .db()
+            .cf_handle(super::super::keyspace::LOCAL_CF)
+            .expect("node-local family");
+        assert_eq!(
+            writer.db().get_cf(local, b"posture").expect("get_cf").as_deref(),
+            Some(b"streaming".as_slice())
+        );
+        assert!(writer.db().get(b"posture").expect("get").is_none());
         drop(engine);
 
-        assert_eq!(
-            raw.latest_sequence_number(),
-            sequence,
-            "the standby open wrote to its store"
-        );
-        assert!(raw.get(b"meta:standby:probe").expect("get").is_none());
+        assert!(writer.db().get(b"meta:standby:probe").expect("get").is_none());
+        drop(writer);
+        let closed = replica
+            .close()
+            .expect("the engine released the writer and its handle on drop");
+        assert_eq!(closed.local_sequence(), sequence + 3);
+    }
+
+    /// Only a physical standby has a node-local namespace.
+    #[cfg(feature = "ha-tier1")]
+    #[test]
+    fn write_local_refuses_outside_a_physical_standby() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let mut config = Config::default();
+        config.storage.wal_enabled = false;
+        let engine = StorageEngine::open(dir.path().join("store"), &config).expect("primary open");
+        let sequence = engine.db().latest_sequence_number();
+        let mut batch = crate::replication::physical::LocalBatch::new();
+        batch.put(b"posture", b"streaming");
+        let error = engine
+            .write_local(batch)
+            .expect_err("a primary has no node-local namespace");
+        assert!(error.to_string().contains("only on a physical standby"), "{error}");
+        assert_eq!(engine.db().latest_sequence_number(), sequence);
     }
 
     /// `get` must return BOTH a value written through the encrypting `put` and

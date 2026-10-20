@@ -27,10 +27,12 @@
 ///
 /// All of them are replicated verbatim to a physical standby except the two
 /// receiver cursors, [`KeyClass::ReplAppliedLsn`] and
-/// [`KeyClass::PhysicalCursor`]: those are node-local progress that today still
-/// lives in the default column family and is due to move to a node-local column
-/// family (`PHYSICAL_STANDBY_REPLICATION.md` D3.1). Nothing else node-local uses
-/// the default column family.
+/// [`KeyClass::PhysicalCursor`]. A physical receiver keeps its cursor in the
+/// [`LOCAL_CF`] column family; `PhysicalCursor` names only where a receiver
+/// kept it before that family existed, which the engine and the receiver
+/// refuse. `ReplAppliedLsn` is a logical standby's cursor and still lives in
+/// the default column family (`PHYSICAL_STANDBY_REPLICATION.md` D2). Nothing
+/// else node-local uses the default column family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyClass {
     /// `data:{table}:{row_id}` — the current row image.
@@ -146,8 +148,8 @@ pub enum KeyClass {
     WalPrunedThrough,
     /// `repl:applied_lsn` — a logical standby's applied cursor (node-local).
     ReplAppliedLsn,
-    /// `__nano_physical_replica_cursor_v1` — a physical receiver's cursor
-    /// (node-local).
+    /// `__nano_physical_replica_cursor_v1` — where a physical receiver kept
+    /// its cursor before [`LOCAL_CF`] (node-local; refused on open).
     PhysicalCursor,
     /// `vgc:low_watermark` — the version-GC horizon.
     VgcWatermark,
@@ -356,7 +358,7 @@ pub const FIXED_KEYS: &[(&[u8], KeyClass)] = &[
     (b"wal:pruned_through", KeyClass::WalPrunedThrough),
     // storage/engine.rs:11415 `REPLICATION_CURSOR_KEY`
     (b"repl:applied_lsn", KeyClass::ReplAppliedLsn),
-    // replication/physical.rs:13 `CURSOR_KEY`
+    // replication/physical.rs `LEGACY_CURSOR_KEY`
     (b"__nano_physical_replica_cursor_v1", KeyClass::PhysicalCursor),
     // storage/version_gc.rs:67 `LOW_WATERMARK_KEY`
     (b"vgc:low_watermark", KeyClass::VgcWatermark),

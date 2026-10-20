@@ -58,8 +58,8 @@ const EXCLUDED: &[(&str, &str)] = &[
     ),
     (
         "src/replication/physical.rs",
-        "the physical applier, a standby's only writer; it becomes the `LocalWriter` (P0.3), which owns the \
-         cursor invariant instead",
+        "the physical standby's `LocalWriter`, its only writer (source batches and node-local state), which owns \
+         the cursor invariant instead of the gate",
     ),
     (
         "src/replication/checkpoint_transfer.rs",

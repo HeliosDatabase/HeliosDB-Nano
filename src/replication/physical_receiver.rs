@@ -1,16 +1,20 @@
-//! EXTERNAL DRAFT: snapshot download and durable physical continuation.
+//! Owned by the physical-standby plan (docs/plans/PHYSICAL_STANDBY_REPLICATION.md).
+//! Snapshot download and durable physical continuation.
 //!
 //! Every receiver mutation belongs to one dedicated, joined worker thread. A
 //! dropped async future cannot detach an append/apply/publication operation.
 //! Cancellation is observed between commands; an in-flight RocksDB/fsync call
 //! cannot be forcibly interrupted, so Drop may wait for that OS call to finish.
 //! No phase in this module declares SQL readiness or opens a serving database.
+//! The worker's stage owns the receiver's `LocalWriter`; every RocksDB open of
+//! the stage uses the storage options of `ReceiverOptions::config`.
 
 use super::checkpoint_transfer::{
     ClosedPhysicalStage, PhysicalStage, ReceiverStaging, ReopenedPhysicalStage, TransferLimits,
 };
 use super::physical::{PhysicalBatch, PhysicalCursor, MAX_BATCH_BYTES};
 use super::physical_wire::{BatchSink, PhysicalClient, SourceSessionInfo, TransferToken, WireError, WireLimits};
+use crate::Config;
 use async_trait::async_trait;
 use std::{
     net::SocketAddr,
@@ -64,6 +68,10 @@ pub enum ReceiverMode {
 /// Loopback is deliberate: use an authenticated tunnel for remote sources until
 /// a reviewed TLS transport is provided. Token and mode have no implicit default.
 pub struct ReceiverOptions {
+    /// The node's configuration. Its storage section decides the RocksDB
+    /// options of every open of the receiver's store, so the stage runs with
+    /// the same options as the engine that serves it (and as the primary).
+    pub config: Config,
     pub sources: Vec<SocketAddr>,
     pub token: TransferToken,
     pub start: ReceiverStart,
@@ -240,11 +248,11 @@ impl State {
             },
             Self::Initial(stage) => Position {
                 path: Some(stage.staging_path().to_path_buf()),
-                cursor: Some(stage.cursor().clone()),
+                cursor: Some(stage.cursor()),
             },
             Self::Reopened(stage) => Position {
                 path: Some(stage.path().to_path_buf()),
-                cursor: Some(stage.cursor().clone()),
+                cursor: Some(stage.cursor()),
             },
             Self::Closed(stage) => Position {
                 path: Some(stage.path.clone()),
@@ -264,7 +272,7 @@ struct Worker {
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Worker {
-    fn spawn() -> Result<Self> {
+    fn spawn(config: Config) -> Result<Self> {
         let (tx, rx) = mpsc::channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let last = Arc::new(Mutex::new(Position::default()));
@@ -272,7 +280,7 @@ impl Worker {
         let worker_last = last.clone();
         let thread = thread::Builder::new()
             .name("nano-physical-receiver".into())
-            .spawn(move || worker_loop(rx, worker_cancel, worker_last))
+            .spawn(move || worker_loop(rx, worker_cancel, worker_last, &config))
             .map_err(storage)?;
         Ok(Self {
             tx: Some(tx),
@@ -322,7 +330,7 @@ fn record_position(state: &State, last: &Mutex<Position>) {
         *last.lock().unwrap_or_else(|poison| poison.into_inner()) = position;
     }
 }
-fn worker_loop(mut rx: mpsc::Receiver<Command>, cancel: Arc<AtomicBool>, last: Arc<Mutex<Position>>) {
+fn worker_loop(mut rx: mpsc::Receiver<Command>, cancel: Arc<AtomicBool>, last: Arc<Mutex<Position>>, config: &Config) {
     let mut state = State::Empty;
     while !cancel.load(Ordering::Acquire) {
         let Some(command) = rx.blocking_recv() else {
@@ -369,8 +377,8 @@ fn worker_loop(mut rx: mpsc::Receiver<Command>, cancel: Arc<AtomicBool>, last: A
             Command::Open { reply } => {
                 let result = match std::mem::replace(&mut state, State::Failed) {
                     State::Download(stage) => stage
-                        .finish_download()
-                        .and_then(|checkpoint| checkpoint.open())
+                        .finish_download(config)
+                        .and_then(|checkpoint| checkpoint.open(config))
                         .map(|stage| {
                             state = State::Initial(stage);
                         })
@@ -388,7 +396,7 @@ fn worker_loop(mut rx: mpsc::Receiver<Command>, cancel: Arc<AtomicBool>, last: A
                 reply,
             } => {
                 let result = if matches!(state, State::Empty | State::Closed(_)) {
-                    ReopenedPhysicalStage::open(&path, history, limits)
+                    ReopenedPhysicalStage::open(&path, history, limits, config)
                         .map(|stage| {
                             state = State::Reopened(stage);
                         })
@@ -559,7 +567,7 @@ pub async fn run_receiver(
     progress: watch::Sender<ReceiverStatus>,
 ) -> Result<ClosedPhysicalStage> {
     options.validate()?;
-    let worker = Worker::spawn()?;
+    let worker = Worker::spawn(options.config.clone())?;
     let outcome = run_inner(&options, &mut shutdown, &progress, &worker).await;
     match outcome {
         Ok(closed) => {
@@ -947,6 +955,7 @@ mod tests {
     }
     fn options(source: &SourceHarness, start: ReceiverStart, mode: ReceiverMode) -> ReceiverOptions {
         ReceiverOptions {
+            config: Config::default(),
             sources: vec![source.address],
             token: fixture_token(),
             start,
@@ -1081,7 +1090,8 @@ mod tests {
         assert_eq!(closed.cursor.source_sequence(), 3);
         // A second exclusive owner can now open the same path: no detached
         // worker retains its lock or can mutate it after this function returns.
-        let stage = ReopenedPhysicalStage::open(&target, history, TransferLimits::default()).unwrap();
+        let stage =
+            ReopenedPhysicalStage::open(&target, history, TransferLimits::default(), &Config::default()).unwrap();
         assert_eq!(stage.cursor().source_sequence(), 3);
         stage.close().unwrap();
         let raw = DB::open_for_read_only(&Options::default(), &target, false).unwrap();

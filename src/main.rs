@@ -5266,12 +5266,16 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
             run_receiver, ReceiverMode, ReceiverOptions, ReceiverStart, ReceiverStatus,
         };
         use std::time::Duration;
-        let mut replication = if let Some(path) = args.config {
-            Config::from_file(path)?.replication
+        // The whole file, not only its replication section: the receiver opens
+        // its store with the storage options the standby engine will serve it
+        // with (`StorageEngine::build_db_options`).
+        let mut config = if let Some(path) = args.config {
+            Config::from_file(path)?
         } else {
-            Default::default()
+            Config::default()
         };
-        args.physical.apply(&mut replication);
+        args.physical.apply(&mut config.replication);
+        let replication = config.replication.clone();
         let mut physical = replication.physical;
         physical.validate()?;
         if !(1..=60_000).contains(&args.poll_interval_ms)
@@ -5334,6 +5338,7 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
             }
         };
         let options = ReceiverOptions {
+            config,
             sources,
             token,
             start,

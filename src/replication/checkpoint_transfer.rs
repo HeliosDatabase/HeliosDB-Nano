@@ -2,9 +2,13 @@
 //! Export ownership retains snapshot files, never WAL history. Poll continuity
 //! and retention must be checked separately. Local parent directories must be
 //! owned and not group/world writable; hostile same-user renames are out of scope.
+//! Every RocksDB open of a receiver's directory uses the engine's options
+//! (`StorageEngine::build_db_options`), so the stage and a standby serving it
+//! run with the primary's prefix extractor, filters, cache and compression.
 
-use super::physical::{PhysicalBatch, PhysicalCursor, PhysicalError, StagedPhysicalReplica};
-use rocksdb::{checkpoint::Checkpoint, Options, DB};
+use super::physical::{LocalWriter, PhysicalBatch, PhysicalCursor, PhysicalError, StagedPhysicalReplica, LOCAL_CF};
+use crate::{storage::StorageEngine, Config};
+use rocksdb::{checkpoint::Checkpoint, ColumnFamilyDescriptor, Options, DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -306,6 +310,24 @@ fn create_file(path: &Path, bytes: &[u8]) -> Result<()> {
 fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
     Ok(())
+}
+/// The engine's options and column-family descriptors for `path`; see
+/// `StorageEngine::build_db_options`. Never creates a store.
+///
+/// One exception to the engine's options: a receiver retains no archived WAL.
+/// It is never a WAL source — its own records carry node-local writes and are
+/// refused as source batches, and cascading is not supported — and with a
+/// retention window RocksDB moves obsolete logs into an `archive/` directory,
+/// which the stage file census refuses. Everything that decides how data is
+/// laid out and read (compression, table format, filters, prefix extractor,
+/// memtables) is the engine's.
+fn receiver_options(config: &Config, path: &Path) -> Result<(Options, Vec<ColumnFamilyDescriptor>)> {
+    let (mut options, families) = StorageEngine::build_db_options(config, path)
+        .map_err(|error| invalid(format!("receiver storage options: {error}")))?;
+    options.set_wal_ttl_seconds(0);
+    options.set_wal_size_limit_mb(0);
+    options.create_if_missing(false);
+    Ok((options, families))
 }
 fn identity(path: &Path) -> Result<String> {
     let bytes = read_small(&path.join("IDENTITY"), 128)?;
@@ -734,7 +756,8 @@ impl ReceiverStaging {
         }
         outcome
     }
-    pub fn finish_download(self) -> Result<VerifiedCheckpoint> {
+    /// `config` supplies the storage options every open of the receiver uses.
+    pub fn finish_download(self, config: &Config) -> Result<VerifiedCheckpoint> {
         if self.poisoned
             || self
                 .received
@@ -750,7 +773,8 @@ impl ReceiverStaging {
         }
         sync_dir(&self.owner.directory.path)?;
         // Prove exact source cut BEFORE opening writable storage or adding a cursor.
-        let checkpoint = DB::open_for_read_only(&Options::default(), &self.owner.directory.path, false)?;
+        let (options, families) = receiver_options(config, &self.owner.directory.path)?;
+        let checkpoint = DB::open_cf_descriptors_read_only(&options, &self.owner.directory.path, families, false)?;
         if checkpoint.latest_sequence_number() != self.owner.manifest.checkpoint_sequence {
             return Err(invalid("downloaded checkpoint cut mismatch"));
         }
@@ -767,7 +791,11 @@ impl VerifiedCheckpoint {
     pub fn staging_path(&self) -> &Path {
         &self.owner.directory.path
     }
-    pub fn open(self) -> Result<PhysicalStage> {
+    /// Open the verified checkpoint writable and initialize its receiver: the
+    /// node-local column family and the first cursor ([`LocalWriter`]). A
+    /// checkpoint that already carries that family came from a receiver and is
+    /// refused.
+    pub fn open(self, config: &Config) -> Result<PhysicalStage> {
         self.owner.verify()?;
         // Read-only RocksDB opening may add diagnostics, so recheck every
         // advertised file rather than requiring the original directory census.
@@ -777,9 +805,8 @@ impl VerifiedCheckpoint {
                 return Err(invalid("verified checkpoint changed before open"));
             }
         }
-        let mut options = Options::default();
-        options.create_if_missing(false);
-        let db = DB::open(&options, &self.owner.directory.path)?;
+        let (options, families) = receiver_options(config, &self.owner.directory.path)?;
+        let db = DB::open_cf_descriptors(&options, &self.owner.directory.path, families)?;
         if identity(&self.owner.directory.path)? != self.owner.manifest.storage_identity {
             return Err(invalid("RocksDB repaired/replaced snapshot identity during open"));
         }
@@ -807,8 +834,13 @@ impl PhysicalStage {
     pub fn close(self) -> Result<ClosedPhysicalStage> {
         close_owned_stage(self.owner, self.replica)
     }
-    pub fn cursor(&self) -> &PhysicalCursor {
+    pub fn cursor(&self) -> PhysicalCursor {
         self.replica.cursor()
+    }
+    /// The stage's only writer. Every clone must be dropped before the stage
+    /// can close or publish.
+    pub fn writer(&self) -> &std::sync::Arc<LocalWriter> {
+        self.replica.writer()
     }
     pub fn apply(&mut self, batch: &PhysicalBatch) -> Result<bool> {
         self.owner.verify()?;
@@ -944,23 +976,38 @@ pub struct ReopenedPhysicalStage {
     replica: StagedPhysicalReplica,
 }
 impl ReopenedPhysicalStage {
-    pub fn open(path: &Path, expected_history: Uuid, limits: TransferLimits) -> Result<Self> {
+    /// `config` supplies the storage options every open of the receiver uses.
+    pub fn open(path: &Path, expected_history: Uuid, limits: TransferLimits, config: &Config) -> Result<Self> {
         let owner = load_existing_stage(path, expected_history, &limits)?;
+        // The file census above vetted every name before RocksDB follows
+        // CURRENT. A stage without the node-local family keeps its cursor in
+        // the default one (it predates the namespace) or was never
+        // initialized; either way it is refused here, before any RocksDB
+        // handle exists, so not even a LOG is rotated.
+        if !DB::list_cf(&Options::default(), &owner.directory.path)?
+            .iter()
+            .any(|family| family == LOCAL_CF)
+        {
+            return Err(PhysicalError::FullResyncRequired(
+                "the staging directory predates the node-local namespace (or was never initialized); rebuild it",
+            )
+            .into());
+        }
         // Raw read-only RocksDB replays its own WAL into an immutable view. No
         // Nano logical recovery, metadata adoption or writable open occurs until
         // an existing atomic cursor is validated against the current local seq.
-        let readonly = DB::open_for_read_only(&Options::default(), &owner.directory.path, false)?;
+        let (options, families) = receiver_options(config, &owner.directory.path)?;
+        let readonly = DB::open_cf_descriptors_read_only(&options, &owner.directory.path, families, false)?;
         let preflight = StagedPhysicalReplica::resume(readonly, expected_history)?.close()?;
         if preflight.snapshot_sequence() != owner.manifest.checkpoint_sequence {
             return Err(invalid("existing physical cursor belongs to a different snapshot cut"));
         }
         verify_existing_stage(&owner)?;
-        let mut options = Options::default();
-        options.create_if_missing(false);
-        let db = DB::open(&options, &owner.directory.path)?; // Exclusive RocksDB LOCK.
+        let (options, families) = receiver_options(config, &owner.directory.path)?;
+        let db = DB::open_cf_descriptors(&options, &owner.directory.path, families)?; // Exclusive RocksDB LOCK.
         verify_existing_stage(&owner)?;
         let replica = StagedPhysicalReplica::resume(db, expected_history)?;
-        if replica.cursor() != &preflight {
+        if replica.cursor() != preflight {
             return Err(invalid("physical cursor changed between preflight and exclusive open"));
         }
         Ok(Self { owner, replica })
@@ -968,8 +1015,13 @@ impl ReopenedPhysicalStage {
     pub fn path(&self) -> &Path {
         &self.owner.directory.path
     }
-    pub fn cursor(&self) -> &PhysicalCursor {
+    pub fn cursor(&self) -> PhysicalCursor {
         self.replica.cursor()
+    }
+    /// The stage's only writer. Every clone must be dropped before the stage
+    /// can close.
+    pub fn writer(&self) -> &std::sync::Arc<LocalWriter> {
+        self.replica.writer()
     }
     pub fn apply(&mut self, batch: &PhysicalBatch) -> Result<bool> {
         verify_existing_stage(&self.owner)?;
@@ -1017,6 +1069,15 @@ mod tests {
     };
     use rocksdb::WriteBatch;
     use std::os::unix::fs::symlink;
+
+    fn config() -> Config {
+        Config::default()
+    }
+    /// An installed receiver's store holds two column families; a writable
+    /// open must name both.
+    fn open_receiver(path: &Path) -> DB {
+        DB::open_cf(&Options::default(), path, ["default", LOCAL_CF]).unwrap()
+    }
 
     fn primary(root: &Path) -> (DB, Uuid) {
         let mut options = Options::default();
@@ -1068,7 +1129,7 @@ mod tests {
         let target = root.path().join("installed");
         let receiver = download(&export, &target);
         let old_stage = receiver.staging_path().to_path_buf();
-        let mut stage = receiver.finish_download().unwrap().open().unwrap();
+        let mut stage = receiver.finish_download(&config()).unwrap().open(&config()).unwrap();
         assert_eq!(stage.cursor().source_sequence(), cut);
         for batch in &poll.batches {
             assert!(stage.apply(batch).unwrap());
@@ -1083,12 +1144,12 @@ mod tests {
         assert_eq!(marker.history, history);
         assert!(!target.join(PRIMARY_MARKER).exists());
         assert!(!target.join(STANDBY_MARKER).exists());
-        let db = DB::open(&Options::default(), &target).unwrap();
+        let db = open_receiver(&target);
         assert_eq!(db.get(b"first").unwrap(), Some(b"committed-one".to_vec()));
         assert_eq!(db.get(b"second").unwrap(), Some(b"committed-two".to_vec()));
         assert_eq!(db.get(b"seed").unwrap(), None);
         let resumed = StagedPhysicalReplica::resume(db, history).unwrap();
-        assert_eq!(resumed.cursor(), &installed.cursor);
+        assert_eq!(resumed.cursor(), installed.cursor);
         resumed.close().unwrap();
         assert_eq!(fs::read(source.path().join(PRIMARY_MARKER)).unwrap(), original_marker);
     }
@@ -1111,7 +1172,7 @@ mod tests {
         let race_target = root.path().join("raced");
         let receiver = download(&export, &race_target);
         let retained = receiver.staging_path().to_path_buf();
-        let stage = receiver.finish_download().unwrap().open().unwrap();
+        let stage = receiver.finish_download(&config()).unwrap().open(&config()).unwrap();
         fs::create_dir(&race_target).unwrap();
         fs::write(race_target.join("user-owned"), b"preserve").unwrap();
         assert!(stage.publish().is_err());
@@ -1179,7 +1240,7 @@ mod tests {
         let bytes = export.read_chunk(index, 0, 1).unwrap();
         assert!(receiver.append_chunk(index, 1, &bytes).is_err());
         assert!(receiver.append_chunk(index, 0, &bytes).is_err());
-        assert!(receiver.finish_download().is_err());
+        assert!(receiver.finish_download(&config()).is_err());
         assert!(path.join(PHYSICAL_MARKER_FILE).exists());
         assert!(!root.path().join("target").exists());
     }
@@ -1194,16 +1255,16 @@ mod tests {
         let mut bytes = fs::read(path.join("IDENTITY")).unwrap();
         bytes[0] ^= 1;
         fs::write(path.join("IDENTITY"), bytes).unwrap();
-        assert!(receiver.finish_download().is_err());
+        assert!(receiver.finish_download(&config()).is_err());
         assert!(path.exists());
         let receiver = download(&export, &root.path().join("bad-marker"));
         let path = receiver.staging_path().to_path_buf();
         fs::write(path.join(PHYSICAL_MARKER_FILE), b"{}").unwrap();
-        assert!(receiver.finish_download().is_err());
+        assert!(receiver.finish_download(&config()).is_err());
         assert!(path.exists());
         let receiver = download(&export, &root.path().join("bad-open-manifest"));
         let path = receiver.staging_path().to_path_buf();
-        let stage = receiver.finish_download().unwrap().open().unwrap();
+        let stage = receiver.finish_download(&config()).unwrap().open(&config()).unwrap();
         fs::write(path.join(PHYSICAL_MANIFEST_FILE), b"{}").unwrap();
         assert!(stage.publish().is_err());
         assert!(path.exists());
@@ -1261,7 +1322,7 @@ mod tests {
                 offset += bytes.len() as u64;
             }
         }
-        assert!(receiver.finish_download().is_err());
+        assert!(receiver.finish_download(&config()).is_err());
         assert!(!root.path().join("wrong-cut").exists());
     }
     fn installed_fixture(root: &Path) -> (DB, Uuid, PathBuf, CheckpointManifest) {
@@ -1269,9 +1330,9 @@ mod tests {
         let export = export(&source, history, root);
         let manifest = export.manifest.clone();
         let installed = download(&export, &root.join("installed"))
-            .finish_download()
+            .finish_download(&config())
             .unwrap()
-            .open()
+            .open(&config())
             .unwrap()
             .publish()
             .unwrap();
@@ -1282,7 +1343,7 @@ mod tests {
     fn reopened_installed_stage_preserves_progress_and_continues_without_original_file_hashes() {
         let root = tempfile::tempdir().unwrap();
         let (source, history, path, manifest) = installed_fixture(root.path());
-        let mut resumed = ReopenedPhysicalStage::open(&path, history, TransferLimits::default()).unwrap();
+        let mut resumed = ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).unwrap();
         assert_eq!(resumed.path(), path);
         assert_eq!(resumed.cursor().snapshot_sequence(), manifest.checkpoint_sequence);
         let mut batch = WriteBatch::default();
@@ -1306,8 +1367,8 @@ mod tests {
             }),
             "fixture did not evolve any original checkpoint file"
         );
-        let mut again = ReopenedPhysicalStage::open(&path, history, TransferLimits::default()).unwrap();
-        assert_eq!(again.cursor(), &closed.cursor);
+        let mut again = ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).unwrap();
+        assert_eq!(again.cursor(), closed.cursor);
         assert!(!again.apply(&poll.batches[0]).unwrap());
         source.put(b"after-c", b"c").unwrap();
         let later = poll_source(&source, history, 3, MAX_BATCH_BYTES).unwrap();
@@ -1322,23 +1383,52 @@ mod tests {
         }
     }
 
+    /// A column family adds files, not file names: the node-local family's
+    /// own SST is an ordinary `<n>.sst`, so the census still admits the stage.
+    #[test]
+    fn a_stage_with_the_node_local_family_passes_the_file_census() {
+        let root = tempfile::tempdir().unwrap();
+        let (_source, history, path, _) = installed_fixture(root.path());
+        {
+            let db = open_receiver(&path);
+            let sequence = db.latest_sequence_number();
+            db.flush_cf(db.cf_handle(LOCAL_CF).unwrap()).unwrap();
+            db.flush().unwrap();
+            // A flush is not a write: the cursor still accounts for the sequence.
+            assert_eq!(db.latest_sequence_number(), sequence);
+            assert!(db
+                .live_files()
+                .unwrap()
+                .iter()
+                .any(|file| file.column_family_name == LOCAL_CF));
+        }
+        assert!(DB::list_cf(&Options::default(), &path)
+            .unwrap()
+            .iter()
+            .any(|family| family == LOCAL_CF));
+        load_existing_stage(&path, history, &TransferLimits::default()).unwrap();
+        let reopened = ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).unwrap();
+        assert_eq!(reopened.cursor().snapshot_sequence(), 1);
+        reopened.close().unwrap();
+    }
+
     #[test]
     fn reopening_does_not_adopt_partial_download_and_initial_close_does_not_install() {
         let root = tempfile::tempdir().unwrap();
         let (source, history) = primary(root.path());
         let export = export(&source, history, root.path());
         let target = root.path().join("not-installed");
-        let verified = download(&export, &target).finish_download().unwrap();
+        let verified = download(&export, &target).finish_download(&config()).unwrap();
         let sibling = verified.staging_path().to_path_buf();
-        assert!(ReopenedPhysicalStage::open(&sibling, history, TransferLimits::default()).is_err());
+        assert!(ReopenedPhysicalStage::open(&sibling, history, TransferLimits::default(), &config()).is_err());
         assert!(!target.exists());
-        let initial = verified.open().unwrap();
+        let initial = verified.open(&config()).unwrap();
         assert_eq!(initial.staging_path(), sibling);
         let closed = initial.close().unwrap();
         assert_eq!(closed.path, sibling);
         assert!(!target.exists());
-        let resumed = ReopenedPhysicalStage::open(&sibling, history, TransferLimits::default()).unwrap();
-        assert_eq!(resumed.cursor(), &closed.cursor);
+        let resumed = ReopenedPhysicalStage::open(&sibling, history, TransferLimits::default(), &config()).unwrap();
+        assert_eq!(resumed.cursor(), closed.cursor);
         assert_eq!(resumed.close().unwrap().path, sibling);
         assert!(!target.exists());
     }
@@ -1347,9 +1437,9 @@ mod tests {
     fn reopening_checks_history_lock_and_original_snapshot_cut_without_rebinding() {
         let root = tempfile::tempdir().unwrap();
         let (_source, history, path, mut manifest) = installed_fixture(root.path());
-        assert!(ReopenedPhysicalStage::open(&path, Uuid::new_v4(), TransferLimits::default()).is_err());
-        let owned = ReopenedPhysicalStage::open(&path, history, TransferLimits::default()).unwrap();
-        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default()).is_err());
+        assert!(ReopenedPhysicalStage::open(&path, Uuid::new_v4(), TransferLimits::default(), &config()).is_err());
+        let owned = ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).unwrap();
+        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).is_err());
         let closed = owned.close().unwrap();
         // Even internally consistent external metadata cannot change the
         // original cut already recorded in the durable physical cursor.
@@ -1362,9 +1452,9 @@ mod tests {
         let marker_bytes = serde_json::to_vec(&marker).unwrap();
         fs::write(path.join(PHYSICAL_MANIFEST_FILE), &bytes).unwrap();
         fs::write(path.join(PHYSICAL_MARKER_FILE), &marker_bytes).unwrap();
-        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default()).is_err());
+        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).is_err());
         assert_eq!(fs::read(path.join(PHYSICAL_MARKER_FILE)).unwrap(), marker_bytes);
-        let readonly = DB::open_for_read_only(&Options::default(), &path, false).unwrap();
+        let readonly = DB::open_cf_for_read_only(&Options::default(), &path, ["default", LOCAL_CF], false).unwrap();
         let durable = StagedPhysicalReplica::resume(readonly, history)
             .unwrap()
             .close()
@@ -1376,17 +1466,17 @@ mod tests {
     fn reopening_refuses_untracked_writes_and_mixed_legacy_authorization() {
         let root = tempfile::tempdir().unwrap();
         let (_source, history, path, _) = installed_fixture(root.path());
-        let db = DB::open(&Options::default(), &path).unwrap();
+        let db = open_receiver(&path);
         db.put(b"unrelated-local-write", b"preserved").unwrap();
         drop(db);
-        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default()).is_err());
+        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).is_err());
         let db = DB::open_for_read_only(&Options::default(), &path, false).unwrap();
         assert_eq!(db.get(b"unrelated-local-write").unwrap(), Some(b"preserved".to_vec()));
         drop(db);
         let other = tempfile::tempdir().unwrap();
         let (_source, history, path, _) = installed_fixture(other.path());
         create_file(&path.join(STANDBY_MARKER), b"{}").unwrap();
-        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default()).is_err());
+        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).is_err());
         assert_eq!(fs::read(path.join(STANDBY_MARKER)).unwrap(), b"{}");
     }
 
@@ -1396,14 +1486,14 @@ mod tests {
         let (_source, history, path, _) = installed_fixture(root.path());
         let alias = root.path().join("alias");
         symlink(&path, &alias).unwrap();
-        assert!(ReopenedPhysicalStage::open(&alias, history, TransferLimits::default()).is_err());
+        assert!(ReopenedPhysicalStage::open(&alias, history, TransferLimits::default(), &config()).is_err());
         fs::write(path.join("IDENTITY"), b"replacement-identity\n").unwrap();
-        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default()).is_err());
+        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).is_err());
         assert_eq!(fs::read(path.join("IDENTITY")).unwrap(), b"replacement-identity\n");
         let other = tempfile::tempdir().unwrap();
         let (_source, history, path, _) = installed_fixture(other.path());
         fs::hard_link(path.join("CURRENT"), other.path().join("aliased-current")).unwrap();
-        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default()).is_err());
+        assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).is_err());
         assert!(other.path().join("aliased-current").is_file());
     }
 }
