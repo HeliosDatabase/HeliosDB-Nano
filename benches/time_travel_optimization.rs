@@ -22,7 +22,7 @@ fn create_db_with_versions(num_versions: usize) -> (Arc<DB>, tempfile::TempDir, 
 
     let db = DB::open(&opts, temp_dir.path()).unwrap();
     let db_arc = Arc::new(db);
-    let manager = SnapshotManager::new(db_arc.clone());
+    let manager = SnapshotManager::new(db_arc.clone(), heliosdb_nano::storage::WriteGate::open());
 
     // Insert versions for a single row at different timestamps
     let table_name = "test_table";
@@ -173,7 +173,7 @@ fn bench_write_overhead(c: &mut Criterion) {
 
     let db = DB::open(&opts, temp_dir.path()).unwrap();
     let db_arc = Arc::new(db);
-    let manager = SnapshotManager::new(db_arc);
+    let manager = SnapshotManager::new(db_arc, heliosdb_nano::storage::WriteGate::open());
 
     let mut counter = 0u64;
 
@@ -210,7 +210,7 @@ fn bench_multi_row(c: &mut Criterion) {
 
     let db = DB::open(&opts, temp_dir.path()).unwrap();
     let db_arc = Arc::new(db);
-    let manager = SnapshotManager::new(db_arc);
+    let manager = SnapshotManager::new(db_arc, heliosdb_nano::storage::WriteGate::open());
 
     // Create versions for multiple rows
     let num_rows = 100;

@@ -1635,8 +1635,7 @@ impl<'a> Catalog<'a> {
             batch.delete(Self::compression_config_key(table_name));
             batch.delete(Self::compression_stats_key(table_name));
             self.storage
-                .db
-                .write(batch)
+                .db_write(batch, None)
                 .map_err(|e| crate::Error::storage(format!("Batch delete failed: {}", e)))?;
         }
 
@@ -1707,14 +1706,13 @@ impl<'a> Catalog<'a> {
             data_batch.delete(key);
         }
         self.storage
-            .db
-            .write(data_batch)
+            .db_write(data_batch, None)
             .map_err(|e| Error::storage(format!("Batch delete of table data failed: {}", e)))?;
 
         // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) so a
         // re-created table with the same name never reads stale batches, zone
         // stats or live-row presence. No-op prefix seeks for row-only tables.
-        super::ColumnarStore::purge_table_sidecars(&self.storage.db, table_name)?;
+        super::ColumnarStore::purge_table_sidecars(&self.storage.db, self.storage.write_gate(), table_name)?;
 
         // GH#56: the row cache is keyed `(table, row_id)` and `counter:{table}`
         // was just deleted, so a later table of this name restarts at row id 1
@@ -2745,6 +2743,7 @@ impl<'a> Catalog<'a> {
                     &definition.column_name,
                     config,
                     std::sync::Arc::clone(&self.storage.db),
+                    std::sync::Arc::clone(self.storage.write_gate()),
                 ) {
                     Ok(()) => {
                         report.vector_reopened_persistent += 1;
@@ -3074,8 +3073,7 @@ impl<'a> Catalog<'a> {
         batch.delete(Self::compression_stats_key(old_name));
 
         self.storage
-            .db
-            .write(batch)
+            .db_write(batch, None)
             .map_err(|e| Error::storage(format!("Rename batch write failed: {}", e)))?;
 
         // Carry the VOLATILE in-memory row-id counter to the new name. The batch

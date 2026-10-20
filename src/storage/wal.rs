@@ -4,6 +4,7 @@
 //! Uses RocksDB's WriteBatch for atomic operations and built-in WAL support.
 
 use super::tde;
+use super::write_gate::WriteGate;
 use crate::crypto::KeyManager;
 use crate::{Error, Result};
 use parking_lot::Mutex;
@@ -553,8 +554,11 @@ pub struct StagedWal {
 /// 2. Replay entries that aren't reflected in the main database
 /// 3. Continue normal operation
 pub struct WriteAheadLog {
-    /// RocksDB instance (shares the same DB as the storage engine)
+    /// RocksDB instance (shares the same DB as the storage engine). Written
+    /// only through `gate`.
     db: Arc<DB>,
+    /// The write gate of the engine that owns `db`.
+    gate: Arc<WriteGate>,
     /// Current LSN (Log Sequence Number)
     current_lsn: Arc<AtomicU64>,
     /// In-order, after-durable publication of entries to standbys.
@@ -595,9 +599,11 @@ impl WriteAheadLog {
     ///
     /// Thin wrapper over [`WriteAheadLog::open_with_key_manager`]; every caller
     /// that has a key manager must use that one instead, so that the WAL agrees
-    /// with the rest of the storage boundary about the stored form.
-    pub fn open(db: Arc<DB>, sync_mode: WalSyncMode) -> Result<Self> {
-        Self::open_with_key_manager(db, sync_mode, None)
+    /// with the rest of the storage boundary about the stored form. `gate` is
+    /// the write gate of the engine that owns `db` (`WriteGate::open()` for a
+    /// handle the caller owns outright).
+    pub fn open(db: Arc<DB>, gate: Arc<WriteGate>, sync_mode: WalSyncMode) -> Result<Self> {
+        Self::open_with_key_manager(db, gate, sync_mode, None)
     }
 
     /// Open or create a WAL
@@ -608,9 +614,10 @@ impl WriteAheadLog {
     /// `key_manager` is taken at construction rather than through a later
     /// setter because the group-commit thread is spawned here and captures it:
     /// a key installed after the spawn would leave that thread writing in a
-    /// different form from every other append path.
+    /// different form from every other append path. The same holds for `gate`.
     pub fn open_with_key_manager(
         db: Arc<DB>,
+        gate: Arc<WriteGate>,
         sync_mode: WalSyncMode,
         key_manager: Option<Arc<KeyManager>>,
     ) -> Result<Self> {
@@ -649,6 +656,7 @@ impl WriteAheadLog {
 
         let wal = Self {
             db: Arc::clone(&db),
+            gate: Arc::clone(&gate),
             current_lsn: Arc::new(AtomicU64::new(current_lsn)),
             publisher: Arc::new(Publisher::new(current_lsn)),
             sync_mode,
@@ -670,13 +678,21 @@ impl WriteAheadLog {
         if sync_mode == WalSyncMode::GroupCommit {
             if let Some(queue) = commit_queue {
                 let db_clone = Arc::clone(&db);
+                let gate_clone = Arc::clone(&gate);
                 let publisher_clone = Arc::clone(&wal.publisher);
                 let batch_timeout = wal.batch_timeout;
                 let key_manager_clone = wal.key_manager.clone();
 
                 let handle = thread::spawn(move || {
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        Self::group_commit_loop(db_clone, queue, publisher_clone, batch_timeout, key_manager_clone);
+                        Self::group_commit_loop(
+                            db_clone,
+                            gate_clone,
+                            queue,
+                            publisher_clone,
+                            batch_timeout,
+                            key_manager_clone,
+                        );
                     })) {
                         Ok(()) => {}
                         Err(panic_info) => {
@@ -940,7 +956,7 @@ impl WriteAheadLog {
         batch.put(b"wal:last_lsn", lsn.to_le_bytes());
 
         // Write atomically
-        if let Err(e) = self.db.write_opt(batch, &self.write_opts) {
+        if let Err(e) = self.gate.write(&self.db, batch, Some(&self.write_opts)) {
             self.skip([lsn]);
             return Err(Error::storage(format!("Failed to append WAL entry: {}", e)));
         }
@@ -979,7 +995,7 @@ impl WriteAheadLog {
         // Write without fsync
         let mut nosync_opts = WriteOptions::default();
         nosync_opts.set_sync(false);
-        if let Err(e) = self.db.write_opt(batch, &nosync_opts) {
+        if let Err(e) = self.gate.write(&self.db, batch, Some(&nosync_opts)) {
             self.skip([lsn]);
             return Err(Error::storage(format!("Failed to append WAL entry: {}", e)));
         }
@@ -1033,11 +1049,11 @@ impl WriteAheadLog {
         // Deliberately bypasses `WalSyncMode::GroupCommit` the way `append_nosync`
         // does: the "batched/nosync family" of appends always writes directly.
         let written = if sync {
-            self.db.write_opt(batch, &self.write_opts)
+            self.gate.write(&self.db, batch, Some(&self.write_opts))
         } else {
             let mut nosync_opts = WriteOptions::default();
             nosync_opts.set_sync(false);
-            self.db.write_opt(batch, &nosync_opts)
+            self.gate.write(&self.db, batch, Some(&nosync_opts))
         };
         if let Err(e) = written {
             self.abandon_staged(staged);
@@ -1060,11 +1076,9 @@ impl WriteAheadLog {
         options: Option<&WriteOptions>,
     ) -> Result<u64> {
         let write = |batch: WriteBatch| -> Result<()> {
-            match options {
-                Some(options) => self.db.write_opt(batch, options),
-                None => self.db.write(batch),
-            }
-            .map_err(|e| Error::storage(format!("Failed to write data with WAL entry: {}", e)))
+            self.gate
+                .write(&self.db, batch, options)
+                .map_err(|e| Error::storage(format!("Failed to write data with WAL entry: {}", e)))
         };
         let Some(operation) = statement_capture::offer(self.capture_id(), operation, false) else {
             write(batch)?;
@@ -1361,8 +1375,8 @@ impl WriteAheadLog {
 
         let mut sync_opts = WriteOptions::default();
         sync_opts.set_sync(true);
-        self.db
-            .write_opt(batch, &sync_opts)
+        self.gate
+            .write(&self.db, batch, Some(&sync_opts))
             .map_err(|e| Error::storage(format!("Failed to checkpoint WAL: {}", e)))?;
 
         if self.retain_entries > 0 {
@@ -1492,8 +1506,8 @@ impl WriteAheadLog {
         }
 
         // Apply deletions
-        self.db
-            .write(batch)
+        self.gate
+            .write(&self.db, batch, None)
             .map_err(|e| Error::storage(format!("Failed to truncate WAL: {}", e)))?;
 
         info!("Truncated {} WAL entries", deleted_count);
@@ -1552,6 +1566,7 @@ impl WriteAheadLog {
     /// Runs until the WAL is dropped or an unrecoverable error occurs.
     fn group_commit_loop(
         db: Arc<DB>,
+        gate: Arc<WriteGate>,
         queue: Arc<Mutex<VecDeque<PendingWrite>>>,
         publisher: Arc<Publisher>,
         batch_timeout: Duration,
@@ -1611,7 +1626,7 @@ impl WriteAheadLog {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(true);
 
-            match db.write_opt(batch, &write_opts) {
+            match gate.write(&db, batch, Some(&write_opts)) {
                 Ok(()) => {
                     // Publish to standbys in LSN order and, in sync/semi-sync mode,
                     // wait for the highest batch LSN before reporting success.
@@ -1921,8 +1936,8 @@ impl WriteAheadLog {
                 stats.bytes_freed += *size as u64;
             }
 
-            self.db
-                .write(batch)
+            self.gate
+                .write(&self.db, batch, None)
                 .map_err(|e| Error::storage(format!("Failed to cleanup WAL: {}", e)))?;
 
             stats.entries_deleted = entries_to_delete.len() as u64;
@@ -2035,7 +2050,7 @@ mod tests {
     #[test]
     fn abandoned_staged_entries_leave_no_history_and_do_not_stall_publication() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
 
         let mut lost = WriteBatch::default();
         let staged = wal.stage(vec![insert_op(1), insert_op(2)], &mut lost).unwrap().unwrap();
@@ -2061,7 +2076,7 @@ mod tests {
     #[test]
     fn checkpoint_without_retention_deletes_through_the_checkpoint() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
         for n in 1..=10 {
             wal.append(insert_op(n)).unwrap();
         }
@@ -2078,7 +2093,7 @@ mod tests {
     #[test]
     fn checkpoint_with_retention_keeps_a_window_below_the_checkpoint() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync)
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync)
             .unwrap()
             .with_retention(4);
         for n in 1..=10 {
@@ -2100,7 +2115,7 @@ mod tests {
         assert_eq!(wal.pruned_through().unwrap(), 8);
 
         // A checkpoint smaller than the window deletes nothing; the floor stays.
-        let widened = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync)
+        let widened = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync)
             .unwrap()
             .with_retention(1000);
         assert_eq!(widened.truncate_to_checkpoint(12).unwrap(), 0);
@@ -2117,7 +2132,7 @@ mod tests {
     #[test]
     fn missing_history_floor_marker_means_the_checkpoint() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
         for n in 1..=5 {
             wal.append(insert_op(n)).unwrap();
         }
@@ -2129,7 +2144,7 @@ mod tests {
         }
         // A retention-enabled checkpoint after upgrade keeps the new window but
         // cannot claim the old, already-deleted entries back.
-        let upgraded = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync)
+        let upgraded = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync)
             .unwrap()
             .with_retention(100);
         upgraded.truncate_to_checkpoint(8).unwrap();
@@ -2142,7 +2157,7 @@ mod tests {
     #[test]
     fn publication_waits_for_the_lowest_unresolved_lsn() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
 
         let mut first = WriteBatch::default();
         let a = wal.stage(vec![insert_op(1)], &mut first).unwrap().unwrap();
@@ -2169,7 +2184,7 @@ mod tests {
     #[test]
     fn statement_capture_defers_appends_and_discards_on_rollback() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
 
         {
             let _frame = wal.begin_statement_capture(7);
@@ -2205,7 +2220,7 @@ mod tests {
     #[test]
     fn append_with_batch_writes_data_and_entry_together() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
         db.put(b"data:t:1", b"row").unwrap();
 
         let mut batch = WriteBatch::default();
@@ -2229,7 +2244,7 @@ mod tests {
     #[test]
     fn test_wal_basic_operations() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(db, WriteGate::open(), WalSyncMode::Sync).unwrap();
 
         // Append entries
         let lsn1 = wal
@@ -2255,7 +2270,7 @@ mod tests {
     #[test]
     fn test_wal_replay() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
 
         // Append some entries
         wal.append(WalOperation::CreateTable {
@@ -2288,7 +2303,7 @@ mod tests {
     #[test]
     fn test_append_batch_assigns_contiguous_lsns_and_persists_all() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Async).unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Async).unwrap();
 
         // Pre-existing entry, so the batch does not start at LSN 1.
         wal.append(WalOperation::CreateTable {
@@ -2340,7 +2355,7 @@ mod tests {
 
         // `wal:last_lsn` must reflect the highest LSN in the batch, so a
         // reopened WAL resumes after it rather than reusing LSNs.
-        let reopened = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Async).unwrap();
+        let reopened = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Async).unwrap();
         assert_eq!(reopened.current_lsn(), 5);
     }
 
@@ -2349,7 +2364,7 @@ mod tests {
     #[test]
     fn test_append_batch_empty_is_a_noop() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(db, WalSyncMode::Async).unwrap();
+        let wal = WriteAheadLog::open(db, WriteGate::open(), WalSyncMode::Async).unwrap();
 
         let lsns = wal.append_batch(Vec::new(), false).unwrap();
         assert!(lsns.is_empty());
@@ -2363,7 +2378,7 @@ mod tests {
         // whole replay — the valid prefix (LSN 1, 2) is kept and replay stops
         // at the first undecodable record.
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
 
         wal.append(WalOperation::CreateTable {
             table: "t".to_string(),
@@ -2393,7 +2408,7 @@ mod tests {
     #[test]
     fn test_wal_truncate() {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
 
         // Append multiple entries
         for i in 0..5 {
@@ -2421,7 +2436,7 @@ mod tests {
 
         // Create WAL and append entries
         {
-            let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+            let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
             wal.append(WalOperation::Insert {
                 table: "test".to_string(),
                 key: b"data:test:1".to_vec(),
@@ -2432,7 +2447,7 @@ mod tests {
 
         // "Crash" - drop the WAL
         // Reopen and check LSN is recovered
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync).unwrap();
         assert_eq!(wal.current_lsn(), 1);
 
         // Next entry should have LSN 2
@@ -2452,7 +2467,7 @@ mod tests {
 
         // Test all sync modes
         for mode in [WalSyncMode::Sync, WalSyncMode::Async, WalSyncMode::GroupCommit] {
-            let wal = WriteAheadLog::open(Arc::clone(&db), mode).unwrap();
+            let wal = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), mode).unwrap();
             assert_eq!(wal.sync_mode(), mode);
 
             let lsn = wal

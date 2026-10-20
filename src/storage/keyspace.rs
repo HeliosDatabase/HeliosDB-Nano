@@ -181,6 +181,14 @@ pub struct Classified<'a> {
     pub table: Option<&'a str>,
 }
 
+/// The column family a physical standby keeps its node-local state in (the
+/// applier cursor, its posture), so that the default column family stays a
+/// byte-for-byte copy of the primary's. Its presence is what marks a directory
+/// as a standby's: `StorageEngine` refuses every open mode but the physical
+/// standby one when `DB::list_cf` reports it, and requires it in that mode.
+/// Nothing in this table describes it, because nothing in it is replicated.
+pub const LOCAL_CF: &str = "__nano_local";
+
 /// Every `(literal prefix, class)` pair, in match order: [`classify`] takes the
 /// first entry the key starts with, so an entry must precede any shorter entry
 /// that is a prefix of it (longest prefix wins). No two entries overlap today;

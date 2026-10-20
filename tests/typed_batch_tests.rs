@@ -263,8 +263,16 @@ mod typed_batches {
     fn test_mixed_type_batch_stays_v1() {
         let db = test_db();
         let raw = db.storage.db();
-        ColumnarStore::store(&raw, "mix_t", "c", 0, Value::Int8(42)).unwrap();
-        ColumnarStore::store(&raw, "mix_t", "c", 1, Value::String("x".into())).unwrap();
+        ColumnarStore::store(&raw, db.storage.write_gate(), "mix_t", "c", 0, Value::Int8(42)).unwrap();
+        ColumnarStore::store(
+            &raw,
+            db.storage.write_gate(),
+            "mix_t",
+            "c",
+            1,
+            Value::String("x".into()),
+        )
+        .unwrap();
         let bytes = raw_batch(&db, "mix_t", "c", 0).expect("batch must exist");
         assert!(!is_v2(&bytes), "mixed-family batch must be v1");
         assert_eq!(
@@ -277,8 +285,8 @@ mod typed_batches {
         );
 
         // Mixed int widths also stay v1 (round-trip exactness over format purity).
-        ColumnarStore::store(&raw, "mix_w", "c", 0, Value::Int4(1)).unwrap();
-        ColumnarStore::store(&raw, "mix_w", "c", 1, Value::Int8(2)).unwrap();
+        ColumnarStore::store(&raw, db.storage.write_gate(), "mix_w", "c", 0, Value::Int4(1)).unwrap();
+        ColumnarStore::store(&raw, db.storage.write_gate(), "mix_w", "c", 1, Value::Int8(2)).unwrap();
         let bytes = raw_batch(&db, "mix_w", "c", 0).expect("batch must exist");
         assert!(!is_v2(&bytes), "mixed-width batch must be v1");
         assert_eq!(ColumnarStore::get(&raw, "mix_w", "c", 0).unwrap(), Some(Value::Int4(1)));
@@ -292,12 +300,28 @@ mod typed_batches {
         let db = test_db();
         let raw = db.storage.db();
         for i in 0..10u64 {
-            ColumnarStore::store(&raw, "rmw_t", "c", i, Value::Int8(i as i64 * 11)).unwrap();
+            ColumnarStore::store(
+                &raw,
+                db.storage.write_gate(),
+                "rmw_t",
+                "c",
+                i,
+                Value::Int8(i as i64 * 11),
+            )
+            .unwrap();
         }
         let bytes = raw_batch(&db, "rmw_t", "c", 0).expect("batch must exist");
         assert_eq!(is_v2(&bytes), v2_writes_on(), "homogeneous int batch format");
 
-        ColumnarStore::store(&raw, "rmw_t", "c", 5, Value::String("downgrade".into())).unwrap();
+        ColumnarStore::store(
+            &raw,
+            db.storage.write_gate(),
+            "rmw_t",
+            "c",
+            5,
+            Value::String("downgrade".into()),
+        )
+        .unwrap();
         let bytes = raw_batch(&db, "rmw_t", "c", 0).expect("batch must exist");
         assert!(!is_v2(&bytes), "RMW with incompatible value must downgrade to v1");
         assert_eq!(
@@ -311,7 +335,7 @@ mod typed_batches {
 
         // And back: overwriting the alien value with an int re-upgrades on
         // the next RMW (when v2 writes are enabled).
-        ColumnarStore::store(&raw, "rmw_t", "c", 5, Value::Int8(55)).unwrap();
+        ColumnarStore::store(&raw, db.storage.write_gate(), "rmw_t", "c", 5, Value::Int8(55)).unwrap();
         let bytes = raw_batch(&db, "rmw_t", "c", 0).expect("batch must exist");
         assert_eq!(is_v2(&bytes), v2_writes_on());
         assert_eq!(

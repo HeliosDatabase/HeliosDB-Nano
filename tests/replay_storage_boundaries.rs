@@ -55,7 +55,12 @@ fn raw_snapshot(db: &EmbeddedDatabase) -> Vec<(Vec<u8>, Vec<u8>)> {
 fn capture(db: &EmbeddedDatabase, sql: &str) -> Vec<WalOperation> {
     let before = db.storage.wal_lsn().unwrap();
     db.execute(sql).unwrap();
-    let reader = WriteAheadLog::open(db.storage.db(), WalSyncMode::Async).unwrap();
+    let reader = WriteAheadLog::open(
+        db.storage.db(),
+        std::sync::Arc::clone(db.storage.write_gate()),
+        WalSyncMode::Async,
+    )
+    .unwrap();
     let entries = reader.replay_from(before).unwrap();
     assert!(!entries.is_empty());
     entries.into_iter().map(|entry| entry.operation).collect()

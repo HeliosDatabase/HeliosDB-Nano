@@ -303,6 +303,7 @@ impl VectorIndexManager {
         rerank_precision: Option<crate::vector::persistent::VectorPrecision>,
         training_vectors: &[Vector],
         db: Arc<rocksdb::DB>,
+        gate: Arc<super::write_gate::WriteGate>,
     ) -> Result<()> {
         self.note_mutation();
         let mut indexes = self.indexes.write();
@@ -322,9 +323,15 @@ impl VectorIndexManager {
 
         let pq_enabled = config.pq_config.is_some();
         let index = if pq_enabled {
-            crate::vector::persistent::PersistentVectorIndex::create_with_pq(db, index_id, config, training_vectors)?
+            crate::vector::persistent::PersistentVectorIndex::create_with_pq(
+                db,
+                gate,
+                index_id,
+                config,
+                training_vectors,
+            )?
         } else {
-            crate::vector::persistent::PersistentVectorIndex::create(db, index_id, config)?
+            crate::vector::persistent::PersistentVectorIndex::create(db, gate, index_id, config)?
         };
 
         let meta = VectorIndexMetadata {
@@ -360,6 +367,7 @@ impl VectorIndexManager {
         _rerank_precision: Option<()>,
         _training_vectors: &[Vector],
         _db: Arc<rocksdb::DB>,
+        _gate: Arc<super::write_gate::WriteGate>,
     ) -> Result<()> {
         Err(Error::query_execution(
             "Persistent vector indexes require the 'vector-persist' feature".to_string(),
@@ -1295,9 +1303,10 @@ impl VectorIndexManager {
         column_name: &str,
         config: PersistentVectorConfig,
         db: Arc<rocksdb::DB>,
+        gate: Arc<super::write_gate::WriteGate>,
     ) -> Result<()> {
         let index_id = stable_index_id(name);
-        let index = crate::vector::persistent::PersistentVectorIndex::open(db, index_id)?;
+        let index = crate::vector::persistent::PersistentVectorIndex::open(db, gate, index_id)?;
 
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();

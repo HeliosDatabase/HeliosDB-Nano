@@ -38,7 +38,7 @@ pub mod hooks;
 pub mod link_manager;
 pub mod webhooks;
 
-use crate::storage::{BranchId, BranchManager, SnapshotId, GIT_CONFIG_KEY};
+use crate::storage::{BranchId, BranchManager, SnapshotId, WriteGate, GIT_CONFIG_KEY};
 use crate::{Error, Result};
 use parking_lot::RwLock;
 use rocksdb::DB;
@@ -198,8 +198,11 @@ pub enum PrStatus {
 
 /// Git Integration Manager - main entry point
 pub struct GitIntegrationManager {
-    /// RocksDB instance
+    /// RocksDB instance. Written only through `gate`.
     db: Arc<DB>,
+
+    /// The write gate of the engine that owns `db`.
+    gate: Arc<WriteGate>,
 
     /// Branch manager reference
     branch_manager: Arc<BranchManager>,
@@ -219,15 +222,21 @@ pub struct GitIntegrationManager {
 
 impl GitIntegrationManager {
     /// Create a new Git integration manager
-    pub fn new(db: Arc<DB>, branch_manager: Arc<BranchManager>, timestamp: Arc<RwLock<u64>>) -> Result<Self> {
+    pub fn new(
+        db: Arc<DB>,
+        gate: Arc<WriteGate>,
+        branch_manager: Arc<BranchManager>,
+        timestamp: Arc<RwLock<u64>>,
+    ) -> Result<Self> {
         // Load existing config if any
         let config = Self::load_config(&db)?;
 
-        let link_manager = LinkManager::new(Arc::clone(&db), Arc::clone(&timestamp));
-        let commit_tracker = CommitTracker::new(Arc::clone(&db), Arc::clone(&timestamp));
+        let link_manager = LinkManager::new(Arc::clone(&db), Arc::clone(&gate), Arc::clone(&timestamp));
+        let commit_tracker = CommitTracker::new(Arc::clone(&db), Arc::clone(&gate), Arc::clone(&timestamp));
 
         Ok(Self {
             db,
+            gate,
             branch_manager,
             config: Arc::new(RwLock::new(config)),
             link_manager,
@@ -253,8 +262,8 @@ impl GitIntegrationManager {
     fn save_config(&self, config: &GitRepoConfig) -> Result<()> {
         let data =
             bincode::serialize(config).map_err(|e| Error::storage(format!("Failed to serialize Git config: {}", e)))?;
-        self.db
-            .put(GIT_CONFIG_KEY, &data)
+        self.gate
+            .put(&self.db, GIT_CONFIG_KEY, &data, None)
             .map_err(|e| Error::storage(format!("Failed to save Git config: {}", e)))
     }
 

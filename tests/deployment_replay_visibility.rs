@@ -76,7 +76,12 @@ fn capture(primary: &EmbeddedDatabase, sql: &[&str]) -> Vec<WalEntry> {
     for statement in sql {
         primary.execute(statement).unwrap();
     }
-    let reader = WriteAheadLog::open(primary.storage.db(), WalSyncMode::Async).unwrap();
+    let reader = WriteAheadLog::open(
+        primary.storage.db(),
+        std::sync::Arc::clone(primary.storage.write_gate()),
+        WalSyncMode::Async,
+    )
+    .unwrap();
     let entries = reader.replay_from(before).unwrap();
     assert!(!entries.is_empty(), "SQL must produce real WAL records");
     entries

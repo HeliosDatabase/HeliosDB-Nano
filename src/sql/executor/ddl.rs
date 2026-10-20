@@ -459,6 +459,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             rerank_precision,
                             &training_vectors,
                             storage.db(),
+                            std::sync::Arc::clone(storage.write_gate()),
                         )?;
                         let backfilled = backfill_vector_index(vector_indexes, name, &existing_vectors)?;
                         tracing::info!(
@@ -914,7 +915,7 @@ pub(super) fn handle_truncate(executor: &Executor, table_name: &str) -> Result<B
         // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) with
         // the rows — stale batches or live-row presence must not resurrect
         // truncated rows. No-op prefix seeks for row-only tables.
-        crate::storage::ColumnarStore::purge_table_sidecars(&storage.db, table_name)?;
+        crate::storage::ColumnarStore::purge_table_sidecars(&storage.db, storage.write_gate(), table_name)?;
 
         // Clear ART index entries for this table so that stale PK/UNIQUE
         // values do not block re-insertion of the same values.

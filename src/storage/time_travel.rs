@@ -25,6 +25,7 @@
 //! - SCN mapping: `scn_map:{scn}`
 
 use super::tde;
+use super::write_gate::WriteGate;
 use crate::crypto::KeyManager;
 use crate::{Error, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -198,8 +199,10 @@ type SnapshotCacheKey = (String, u64, u64);
 ///
 /// Manages historical snapshots for time-travel queries.
 pub struct SnapshotManager {
-    /// Database handle
+    /// Database handle. Written only through `gate`.
     db: Arc<DB>,
+    /// The write gate of the engine that owns `db`.
+    gate: Arc<WriteGate>,
     /// In-memory snapshot registry for fast lookups
     snapshots: Arc<RwLock<HashMap<u64, SnapshotMetadata>>>,
     /// Transaction ID to timestamp mapping
@@ -232,7 +235,10 @@ pub struct SnapshotManager {
     /// Use non-durable RocksDB writes for memory-only databases.
     non_durable_writes: bool,
     /// Persist snapshot metadata keys. Memory-only databases keep this metadata
-    /// in process and do not need it for recovery.
+    /// in process and do not need it for recovery, and neither does a physical
+    /// image: its `snapshot:` keys are the primary's, and a snapshot
+    /// registered by a read-only COMMIT on it must stay in memory (see
+    /// [`Self::set_persistence`]).
     persist_metadata: bool,
     /// R4.3: version-GC low watermark — the highest GC horizon ever applied
     /// (persisted as `vgc:low_watermark` by the collector). Historical reads
@@ -313,14 +319,16 @@ impl Default for GcConfig {
 }
 
 impl SnapshotManager {
-    /// Create a new snapshot manager
-    pub fn new(db: Arc<DB>) -> Self {
+    /// Create a new snapshot manager. `gate` is the write gate of the engine
+    /// that owns `db` (a handle the caller owns outright: `WriteGate::open()`).
+    pub fn new(db: Arc<DB>, gate: Arc<WriteGate>) -> Self {
         let cache_config = CacheConfig::default();
         let cache_size = NonZeroUsize::new(cache_config.max_entries)
             .unwrap_or_else(|| NonZeroUsize::new(1000).unwrap_or(NonZeroUsize::MIN));
 
         Self {
             db,
+            gate,
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
@@ -341,21 +349,22 @@ impl SnapshotManager {
     }
 
     /// Create a snapshot manager for memory-only databases.
-    pub fn new_non_durable(db: Arc<DB>) -> Self {
-        let mut manager = Self::new(db);
+    pub fn new_non_durable(db: Arc<DB>, gate: Arc<WriteGate>) -> Self {
+        let mut manager = Self::new(db, gate);
         manager.non_durable_writes = true;
         manager.persist_metadata = false;
         manager
     }
 
     /// Create a new snapshot manager with custom GC config
-    pub fn with_gc_config(db: Arc<DB>, gc_config: GcConfig) -> Self {
+    pub fn with_gc_config(db: Arc<DB>, gate: Arc<WriteGate>, gc_config: GcConfig) -> Self {
         let cache_config = CacheConfig::default();
         let cache_size = NonZeroUsize::new(cache_config.max_entries)
             .unwrap_or_else(|| NonZeroUsize::new(1000).unwrap_or(NonZeroUsize::MIN));
 
         Self {
             db,
+            gate,
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
@@ -376,12 +385,13 @@ impl SnapshotManager {
     }
 
     /// Create a new snapshot manager with custom cache and GC config
-    pub fn with_config(db: Arc<DB>, cache_config: CacheConfig, gc_config: GcConfig) -> Self {
+    pub fn with_config(db: Arc<DB>, gate: Arc<WriteGate>, cache_config: CacheConfig, gc_config: GcConfig) -> Self {
         let cache_size = NonZeroUsize::new(cache_config.max_entries)
             .unwrap_or_else(|| NonZeroUsize::new(1000).unwrap_or(NonZeroUsize::MIN));
 
         Self {
             db,
+            gate,
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
@@ -414,6 +424,17 @@ impl SnapshotManager {
     /// row on a database whose live rows are ciphertext.
     pub fn set_key_manager(&mut self, key_manager: Option<Arc<KeyManager>>) {
         self.key_manager = key_manager;
+    }
+
+    /// Whether registering (and garbage-collecting) snapshots persists their
+    /// `snapshot:` keys. `false` keeps the in-memory maps and counters exactly
+    /// as before and writes nothing: the engine sets it for a physical
+    /// snapshot or standby, whose store must change only through replication.
+    ///
+    /// Like [`Self::set_key_manager`], called before the manager is wrapped in
+    /// an `Arc` and published.
+    pub fn set_persistence(&mut self, enabled: bool) {
+        self.persist_metadata = enabled;
     }
 
     /// Seal a `data:`/`v:` value for storage. `Cow::Borrowed` — no allocation,
@@ -476,7 +497,7 @@ impl SnapshotManager {
             let sentinel_durable = if sentinel_present || !self.persist_metadata {
                 true
             } else {
-                match self.db.put(ELIDE_SENTINEL_KEY, [1u8]) {
+                match self.gate.put(&self.db, ELIDE_SENTINEL_KEY, [1u8], None) {
                     Ok(()) => true,
                     Err(e) => {
                         eprintln!(
@@ -514,12 +535,12 @@ impl SnapshotManager {
             let mut opts = WriteOptions::default();
             opts.set_sync(false);
             opts.disable_wal(true);
-            self.db
-                .write_opt(batch, &opts)
+            self.gate
+                .write(&self.db, batch, Some(&opts))
                 .map_err(|e| Error::storage(format!("{}: {}", context, e)))
         } else {
-            self.db
-                .write(batch)
+            self.gate
+                .write(&self.db, batch, None)
                 .map_err(|e| Error::storage(format!("{}: {}", context, e)))
         }
     }
@@ -1093,8 +1114,8 @@ impl SnapshotManager {
         // version chain beside a ciphertext row would defeat the whole point.
         let key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
         let stored = self.seal_stored(value)?;
-        self.db
-            .put(key.as_bytes(), stored.as_ref())
+        self.gate
+            .put(&self.db, key.as_bytes(), stored.as_ref(), None)
             .map_err(|e| Error::storage(format!("Failed to write version: {}", e)))?;
 
         // Create reverse timestamp index entry
@@ -1206,8 +1227,8 @@ impl SnapshotManager {
         )?;
 
         if let Some(opts) = write_options {
-            self.db
-                .write_opt(batch, opts)
+            self.gate
+                .write(&self.db, batch, Some(opts))
                 .map_err(|e| Error::storage(format!("Failed to write data/version snapshot batch: {}", e)))?;
         } else {
             self.write_batch(batch, "Failed to write data/version snapshot batch")?;
@@ -1607,8 +1628,8 @@ impl SnapshotManager {
         // Store the actual timestamp as the value (8 bytes, big-endian)
         let timestamp_bytes = timestamp.to_be_bytes();
 
-        self.db
-            .put(index_key.as_bytes(), timestamp_bytes)
+        self.gate
+            .put(&self.db, index_key.as_bytes(), timestamp_bytes, None)
             .map_err(|e| Error::storage(format!("Failed to create reverse index: {}", e)))
     }
 
@@ -1624,8 +1645,8 @@ impl SnapshotManager {
         let value =
             bincode::serialize(metadata).map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
 
-        self.db
-            .put(key.as_bytes(), value)
+        self.gate
+            .put(&self.db, key.as_bytes(), value, None)
             .map_err(|e| Error::storage(format!("Failed to persist metadata: {}", e)))
     }
 
@@ -1949,7 +1970,7 @@ mod tests {
     #[test]
     fn test_snapshot_registration() {
         let (db, _temp) = create_test_db();
-        let manager = SnapshotManager::new(db);
+        let manager = SnapshotManager::new(db, WriteGate::open());
 
         let metadata = manager.register_snapshot(100).unwrap();
         assert_eq!(metadata.timestamp, 100);
@@ -1960,7 +1981,7 @@ mod tests {
     #[test]
     fn test_resolve_transaction() {
         let (db, _temp) = create_test_db();
-        let manager = SnapshotManager::new(db);
+        let manager = SnapshotManager::new(db, WriteGate::open());
 
         let metadata = manager.register_snapshot(100).unwrap();
         let txn_id = metadata.transaction_id;
@@ -1972,7 +1993,7 @@ mod tests {
     #[test]
     fn test_resolve_scn() {
         let (db, _temp) = create_test_db();
-        let manager = SnapshotManager::new(db);
+        let manager = SnapshotManager::new(db, WriteGate::open());
 
         let metadata = manager.register_snapshot(100).unwrap();
         let scn = metadata.scn;
@@ -1984,7 +2005,7 @@ mod tests {
     #[test]
     fn test_non_durable_snapshot_manager_keeps_metadata_in_memory_only() {
         let (db, _temp) = create_test_db();
-        let manager = SnapshotManager::new_non_durable(Arc::clone(&db));
+        let manager = SnapshotManager::new_non_durable(Arc::clone(&db), WriteGate::open());
 
         let metadata = manager
             .write_version_and_register_snapshot("users", 1, 100, b"value_at_100", Some(42), false)
@@ -2008,7 +2029,7 @@ mod tests {
     #[test]
     fn test_version_write_and_read() {
         let (db, _temp) = create_test_db();
-        let manager = SnapshotManager::new(db);
+        let manager = SnapshotManager::new(db, WriteGate::open());
 
         // Write versions at different timestamps
         let value1 = b"value_at_100".to_vec();
@@ -2038,7 +2059,7 @@ mod tests {
             max_snapshots: 5,
             auto_gc_enabled: false, // Manual GC for testing
         };
-        let manager = SnapshotManager::with_gc_config(db, gc_config);
+        let manager = SnapshotManager::with_gc_config(db, WriteGate::open(), gc_config);
 
         // Create 10 snapshots
         for i in 1..=10 {
@@ -2063,7 +2084,7 @@ mod tests {
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
             let db = Arc::new(DB::open(&opts, db_path).unwrap());
-            let manager = SnapshotManager::new(db);
+            let manager = SnapshotManager::new(db, WriteGate::open());
 
             manager.register_snapshot(100).unwrap();
             manager.register_snapshot(200).unwrap();
@@ -2074,7 +2095,7 @@ mod tests {
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
             let db = Arc::new(DB::open(&opts, db_path).unwrap());
-            let manager = SnapshotManager::new(db);
+            let manager = SnapshotManager::new(db, WriteGate::open());
 
             let count = manager.recover_snapshots().unwrap();
             assert_eq!(count, 2);
@@ -2133,7 +2154,7 @@ mod tests {
         // W2.2(b): the RFC3339 string display/API surfaces reconstruct from
         // epoch-micros must still resolve back to the same snapshot.
         let (db, _temp) = create_test_db();
-        let manager = SnapshotManager::new(db);
+        let manager = SnapshotManager::new(db, WriteGate::open());
         let metadata = manager.register_snapshot(500).unwrap();
         let ts_str = metadata.wall_clock_rfc3339();
         assert_eq!(manager.resolve_timestamp(&ts_str).unwrap(), 500);
@@ -2145,7 +2166,7 @@ mod tests {
         // once a newer version is written. Flips if the generation is not bumped
         // (the stale cached value `A` would be served instead of `B`).
         let (db, _temp) = create_test_db();
-        let manager = SnapshotManager::new(db);
+        let manager = SnapshotManager::new(db, WriteGate::open());
 
         manager.write_version("t", 1, 100, b"A").unwrap();
         // Populate the cache for the open-ended snapshot.
@@ -2187,7 +2208,7 @@ mod tests {
         // `v_idx:` event — and AS-OF reads resolve via `data:`. Flips on pre-W3.2
         // code, which always writes a full `v:` (version_keys would be 1, not 0).
         let (db, _temp) = create_test_db();
-        let manager = SnapshotManager::new(Arc::clone(&db));
+        let manager = SnapshotManager::new(Arc::clone(&db), WriteGate::open());
         manager.configure_elision(true);
 
         manager
@@ -2213,7 +2234,7 @@ mod tests {
         // and clears the flag BEFORE `data:` is overwritten, so AS-OF at the
         // insert ts keeps returning the pre-overwrite value.
         let (db, _temp) = create_test_db();
-        let manager = SnapshotManager::new(Arc::clone(&db));
+        let manager = SnapshotManager::new(Arc::clone(&db), WriteGate::open());
         manager.configure_elision(true);
         manager
             .write_data_version_and_register_snapshot(b"data:t:1", b"A", "t", 1, 100, b"A", Some(1), None, true)
@@ -2244,7 +2265,7 @@ mod tests {
         // A flagged (elided) row and a full-`v:` row in the same table resolve by
         // their own per-row flag — the transition is per-row, not global.
         let (db, _temp) = create_test_db();
-        let manager = SnapshotManager::new(Arc::clone(&db));
+        let manager = SnapshotManager::new(Arc::clone(&db), WriteGate::open());
         manager.configure_elision(true);
 
         manager
@@ -2271,7 +2292,7 @@ mod tests {
         // bit clear) alongside a full `v:`. The new decoder must read those via
         // `v:` forever — never as an elided `data:` read.
         let (db, _temp) = create_test_db();
-        let manager = SnapshotManager::new(Arc::clone(&db));
+        let manager = SnapshotManager::new(Arc::clone(&db), WriteGate::open());
         db.put(b"v:t:1:100", b"legacy").unwrap();
         db.put(
             format!("v_idx:t:1:{:020}", u64::MAX - 100).as_bytes(),
@@ -2299,7 +2320,7 @@ mod tests {
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
             let db = Arc::new(DB::open(&opts, path).unwrap());
-            let manager = SnapshotManager::new(Arc::clone(&db));
+            let manager = SnapshotManager::new(Arc::clone(&db), WriteGate::open());
             manager.configure_elision(true); // session 1: elision ON
             manager
                 .write_data_version_and_register_snapshot(b"data:t:1", b"A", "t", 1, 100, b"A", Some(1), None, true)
@@ -2310,7 +2331,7 @@ mod tests {
             let mut opts = rocksdb::Options::default();
             opts.create_if_missing(true);
             let db = Arc::new(DB::open(&opts, path).unwrap());
-            let manager = SnapshotManager::new(Arc::clone(&db));
+            let manager = SnapshotManager::new(Arc::clone(&db), WriteGate::open());
             manager.configure_elision(false); // session 2: elision OFF
             assert!(
                 manager.maybe_elided_rows(),

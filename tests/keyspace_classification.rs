@@ -99,6 +99,9 @@ const ALLOW: &[(&str, &str)] = &[
     // The TDE read-tolerance tests.
     ("src/storage/engine.rs", "meta:plain:"),
     ("src/storage/engine.rs", "meta:tolerance:"),
+    // The physical-standby open-mode test's probe key (never written by the
+    // engine; the test proves the gate refuses it).
+    ("src/storage/engine.rs", "meta:standby:probe"),
     ("src/storage/transaction.rs", "meta:some_key"),
     // The raw key-value adapter's tests.
     ("src/protocols/adapters/storage.rs", "other:"),

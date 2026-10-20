@@ -166,7 +166,11 @@ fn prepare(primary: &EmbeddedDatabase, n: usize, phase: &str, report: &mut Repor
         };
         primary.execute(&sql)?;
     }
-    let reader = WriteAheadLog::open(primary.storage.db(), WalSyncMode::Async)?;
+    let reader = WriteAheadLog::open(
+        primary.storage.db(),
+        std::sync::Arc::clone(primary.storage.write_gate()),
+        WalSyncMode::Async,
+    )?;
     let entries = reader.replay_from(before)?;
     let mut row_operations = 0;
     let mut operations = Vec::new();

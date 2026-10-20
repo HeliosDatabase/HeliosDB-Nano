@@ -32,6 +32,8 @@ mod vector_index;
 pub mod version_gc;
 mod view_catalog;
 mod wal;
+// The one decision of whether this process may write to the RocksDB store.
+mod write_gate;
 
 // Storage-level filtering modules
 pub mod bloom_filter;
@@ -116,6 +118,7 @@ pub use view_catalog::{ViewCatalog, ViewMetadata};
 pub use wal::{
     CleanupStats, ReplayStats, WalEntry, WalIntegrityReport, WalMetrics, WalOperation, WalSyncMode, WriteAheadLog,
 };
+pub use write_gate::{GateMode, WriteGate};
 
 // Storage-level filtering exports
 pub use bloom_filter::{

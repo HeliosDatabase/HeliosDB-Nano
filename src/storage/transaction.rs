@@ -10,6 +10,7 @@ use super::dirty_tracker::DirtyTracker;
 use super::lock_manager::{LockGuard, LockManager, LockType};
 use super::tde;
 use super::time_travel::SnapshotManager;
+use super::write_gate::WriteGate;
 use super::{Key, Snapshot, SnapshotId, WalOperation, WriteAheadLog};
 use crate::crypto::KeyManager;
 use crate::session::{IsolationLevel, SessionId};
@@ -86,8 +87,11 @@ impl TransactionState {
 /// - Lock manager integration for deadlock detection
 /// - Dirty state tracking for dump operations
 pub struct Transaction {
-    /// Database handle
+    /// Database handle. Commit writes it only through `gate`.
     db: Arc<DB>,
+    /// The write gate of the engine that owns `db`: a transaction opened on a
+    /// handle that may not write commits nothing.
+    gate: Arc<WriteGate>,
     /// Snapshot for reads
     snapshot: Snapshot,
     /// Snapshot timestamp (read timestamp for MVCC)
@@ -687,7 +691,12 @@ struct SavepointEntry {
 
 impl Transaction {
     /// Create a new transaction (backwards compatible)
-    pub fn new(db: Arc<DB>, snapshot_id: SnapshotId, snapshot_manager: Arc<SnapshotManager>) -> Result<Self> {
+    pub fn new(
+        db: Arc<DB>,
+        gate: Arc<WriteGate>,
+        snapshot_id: SnapshotId,
+        snapshot_manager: Arc<SnapshotManager>,
+    ) -> Result<Self> {
         // Module-scope [`TXN_COUNTER`] — shared with `new_with_session`. Read
         // its doc comment before touching this.
         let transaction_id = TXN_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -700,6 +709,7 @@ impl Transaction {
 
         Ok(Self {
             db,
+            gate,
             snapshot: Snapshot::new(snapshot_id),
             snapshot_ts: snapshot_id,
             transaction_id,
@@ -927,8 +937,10 @@ impl Transaction {
     }
 
     /// Create a new transaction with session and lock manager support
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_session(
         db: Arc<DB>,
+        gate: Arc<WriteGate>,
         snapshot_id: SnapshotId,
         snapshot_manager: Arc<SnapshotManager>,
         session_id: SessionId,
@@ -951,6 +963,7 @@ impl Transaction {
 
         Ok(Self {
             db,
+            gate,
             snapshot: Snapshot::new(snapshot_id),
             snapshot_ts: snapshot_id,
             transaction_id,
@@ -1668,6 +1681,9 @@ impl Transaction {
             }
         }
 
+        // An empty batch (a read-only transaction) passes a closed gate as a
+        // no-op, so COMMIT of a read-only transaction on a read-only or
+        // physical open succeeds without attempting a write.
         let result = if self.rocksdb_wal_enabled {
             if (self.sync_commit && !group_fsync) || wal_force_sync {
                 // R1.3 phase 1 fallback (no group committer wired): one
@@ -1675,15 +1691,15 @@ impl Transaction {
                 // amortize it across concurrent committers.
                 let mut write_opts = WriteOptions::default();
                 write_opts.set_sync(true);
-                self.db.write_opt(batch, &write_opts)
+                self.gate.write(&self.db, batch, Some(&write_opts))
             } else {
-                self.db.write(batch)
+                self.gate.write(&self.db, batch, None)
             }
         } else {
             let mut write_opts = WriteOptions::default();
             write_opts.set_sync(false);
             write_opts.disable_wal(true);
-            self.db.write_opt(batch, &write_opts)
+            self.gate.write(&self.db, batch, Some(&write_opts))
         };
 
         // Publish (or abandon) the staged logical WAL entries now that the data write
@@ -2916,6 +2932,7 @@ mod tests {
         for i in 0..20u64 {
             let embedded = Transaction::new(
                 Arc::clone(&engine.db),
+                Arc::clone(engine.write_gate()),
                 engine.next_timestamp(),
                 engine.snapshot_manager_arc(),
             )
@@ -2924,6 +2941,7 @@ mod tests {
 
             let session = Transaction::new_with_session(
                 Arc::clone(&engine.db),
+                Arc::clone(engine.write_gate()),
                 engine.next_timestamp(),
                 engine.snapshot_manager_arc(),
                 SessionId(i + 1),

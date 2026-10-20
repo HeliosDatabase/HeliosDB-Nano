@@ -1234,7 +1234,12 @@ fn durable_user_index_wins_over_a_wal_replayed_mint_on_crash_recovery() {
     //     `meta:table:` record is not, and the checkpoint sits just below it.
     let planted_lsn = {
         let raw = open_raw(dir.path());
-        let wal = WriteAheadLog::open(Arc::clone(&raw), WalSyncMode::Sync).expect("open wal");
+        let wal = WriteAheadLog::open(
+            Arc::clone(&raw),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .expect("open wal");
         let schema = Schema::new(vec![
             Column::new("id", DataType::Int4).primary_key(),
             Column::new("name", DataType::Int4).unique(),

@@ -25,7 +25,7 @@ fn create_test_db() -> (TempDir, Arc<DB>) {
 #[test]
 fn test_wal_integrity_verification_clean() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Append some entries
     for i in 0..100 {
@@ -49,7 +49,7 @@ fn test_wal_integrity_verification_clean() {
 #[test]
 fn test_wal_integrity_verification_empty() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Verify empty WAL
     let report = wal.verify_integrity().unwrap();
@@ -63,7 +63,12 @@ fn test_crash_recovery_basic() {
 
     // Phase 1: Write some data
     {
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(
+            Arc::clone(&db),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .unwrap();
 
         for i in 0..50 {
             wal.append(WalOperation::Insert {
@@ -80,7 +85,12 @@ fn test_crash_recovery_basic() {
 
     // Phase 2: Simulate crash and recovery
     {
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(
+            Arc::clone(&db),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .unwrap();
 
         // LSN should be recovered
         assert_eq!(wal.current_lsn(), 50);
@@ -98,7 +108,7 @@ fn test_crash_recovery_basic() {
 #[test]
 fn test_crash_recovery_partial_replay() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Write 100 entries
     for i in 0..100 {
@@ -125,7 +135,12 @@ fn test_crash_recovery_multiple_crashes() {
 
     // Crash 1: Write some data
     {
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(
+            Arc::clone(&db),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .unwrap();
         for i in 0..25 {
             wal.append(WalOperation::Insert {
                 table: "test".to_string(),
@@ -138,7 +153,12 @@ fn test_crash_recovery_multiple_crashes() {
 
     // Crash 2: Recover and write more
     {
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(
+            Arc::clone(&db),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .unwrap();
         assert_eq!(wal.current_lsn(), 25);
 
         for i in 0..25 {
@@ -154,7 +174,12 @@ fn test_crash_recovery_multiple_crashes() {
 
     // Crash 3: Final recovery
     {
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(
+            Arc::clone(&db),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .unwrap();
         assert_eq!(wal.current_lsn(), 50);
 
         // Verify replay is idempotent
@@ -169,7 +194,7 @@ fn test_crash_recovery_multiple_crashes() {
 #[test]
 fn test_wal_rotation() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Write some data
     for i in 0..100 {
@@ -198,7 +223,7 @@ fn test_wal_rotation() {
 #[ignore = "TODO: WAL cleanup by time needs verification"]
 fn test_wal_cleanup_by_time() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Write some entries
     for i in 0..50 {
@@ -235,7 +260,7 @@ fn test_wal_cleanup_by_time() {
 #[test]
 fn test_wal_cleanup_respects_minimum() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Write 100 entries
     for i in 0..100 {
@@ -258,7 +283,7 @@ fn test_wal_cleanup_respects_minimum() {
 #[test]
 fn test_wal_metrics() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::GroupCommit).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::GroupCommit).unwrap();
 
     // Initially empty
     let metrics = wal.metrics().unwrap();
@@ -290,7 +315,7 @@ fn test_wal_metrics() {
 #[test]
 fn test_wal_transaction_operations() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Log a complete transaction
     let tx_id = 42;
@@ -328,7 +353,7 @@ fn test_wal_transaction_operations() {
 #[test]
 fn test_wal_table_operations() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Log table operations
     wal.append(WalOperation::CreateTable {
@@ -367,7 +392,7 @@ fn test_wal_table_operations() {
 #[test]
 fn test_wal_sync_mode_changes() {
     let (_temp, db) = create_test_db();
-    let mut wal = WriteAheadLog::open(db, WalSyncMode::Async).unwrap();
+    let mut wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Async).unwrap();
 
     assert_eq!(wal.sync_mode(), WalSyncMode::Async);
 
@@ -391,7 +416,7 @@ fn test_wal_sync_mode_changes() {
 #[test]
 fn test_wal_flush_operations() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Async).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Async).unwrap();
 
     // Write some data
     for i in 0..10 {
@@ -414,7 +439,7 @@ fn test_wal_flush_operations() {
 #[test]
 fn test_wal_truncate() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Write 100 entries
     for i in 0..100 {
@@ -439,7 +464,8 @@ fn test_wal_truncate() {
 #[test]
 fn test_wal_concurrent_operations() {
     let (_temp, db) = create_test_db();
-    let wal = Arc::new(WriteAheadLog::open(db, WalSyncMode::GroupCommit).unwrap());
+    let wal =
+        Arc::new(WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::GroupCommit).unwrap());
 
     let mut handles = vec![];
 
@@ -477,7 +503,7 @@ fn test_wal_concurrent_operations() {
 #[test]
 fn test_wal_large_entries() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Write large entries (1MB each)
     let large_data = vec![0u8; 1024 * 1024];
@@ -506,7 +532,12 @@ fn test_wal_recovery_after_truncate() {
     let (temp, db) = create_test_db();
 
     {
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(
+            Arc::clone(&db),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .unwrap();
 
         // Write 100 entries
         for i in 0..100 {
@@ -524,7 +555,12 @@ fn test_wal_recovery_after_truncate() {
 
     // Recover after crash
     {
-        let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
+        let wal = WriteAheadLog::open(
+            Arc::clone(&db),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .unwrap();
 
         // LSN should continue from 100
         assert_eq!(wal.current_lsn(), 100);
@@ -540,7 +576,7 @@ fn test_wal_recovery_after_truncate() {
 #[ignore = "TODO: WAL metrics after cleanup needs verification"]
 fn test_wal_metrics_after_cleanup() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Write entries
     for i in 0..100 {
@@ -566,7 +602,7 @@ fn test_wal_metrics_after_cleanup() {
 #[test]
 fn test_wal_empty_replay() {
     let (_temp, db) = create_test_db();
-    let wal = WriteAheadLog::open(db, WalSyncMode::Sync).unwrap();
+    let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), WalSyncMode::Sync).unwrap();
 
     // Replay empty WAL
     let stats = wal.replay_with_stats(0).unwrap();
@@ -579,7 +615,7 @@ fn test_wal_empty_replay() {
 fn test_wal_all_sync_modes() {
     for mode in [WalSyncMode::Sync, WalSyncMode::Async, WalSyncMode::GroupCommit] {
         let (_temp, db) = create_test_db();
-        let wal = WriteAheadLog::open(db, mode).unwrap();
+        let wal = WriteAheadLog::open(db, heliosdb_nano::storage::WriteGate::open(), mode).unwrap();
 
         assert_eq!(wal.sync_mode(), mode);
 

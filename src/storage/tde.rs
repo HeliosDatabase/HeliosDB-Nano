@@ -22,6 +22,7 @@
 //! `Cow::Borrowed` straight to `batch.put`, which is byte-for-byte the call it
 //! made before.
 
+use super::write_gate::WriteGate;
 use crate::crypto::{self, KeyManager};
 use crate::{Error, Result};
 use rocksdb::DB;
@@ -561,7 +562,7 @@ pub(super) fn verify_physical_snapshot_key(db: &DB, key_manager: Option<&KeyMana
             "physical snapshot has no encryption key-check sentinel",
         ));
     }
-    verify_or_install_key_check(db, key_manager, true)
+    check_or_install_key_check(db, key_manager, None)
 }
 
 /// The STRICT sentinel check, shared by the installing verifier and the
@@ -651,7 +652,15 @@ pub(super) fn verify_key_check_without_install(db: &DB, key_manager: Option<&Key
     }
 }
 
-pub(crate) fn verify_or_install_key_check(db: &DB, key_manager: Option<&KeyManager>, read_only: bool) -> Result<()> {
+/// `gate` decides whether this handle may install a sentinel: a closed gate (a
+/// read-only open) verifies when it can and installs nothing.
+pub(crate) fn verify_or_install_key_check(db: &DB, key_manager: Option<&KeyManager>, gate: &WriteGate) -> Result<()> {
+    check_or_install_key_check(db, key_manager, gate.is_open().then_some(gate))
+}
+
+/// The key check itself; `installer` is the gate a missing sentinel would be
+/// installed through, or `None` for a handle that must never install one.
+fn check_or_install_key_check(db: &DB, key_manager: Option<&KeyManager>, installer: Option<&WriteGate>) -> Result<()> {
     let stored = db
         .get(KEY_CHECK_KEY)
         .map_err(|e| Error::storage(format!("Failed to read the encryption key-check sentinel: {}", e)))?;
@@ -674,16 +683,16 @@ pub(crate) fn verify_or_install_key_check(db: &DB, key_manager: Option<&KeyManag
         //     justifies it. A read-only handle must not write, so it verifies
         //     when it can and installs nothing.
         (Some(km), None) => {
-            if read_only {
+            let Some(gate) = installer else {
                 warn!(
                     "no encryption key-check sentinel in this database and this handle is read-only, so the \
                      configured key cannot be verified against it; open a writable handle once to install one"
                 );
                 return Ok(());
-            }
+            };
             require_probe_evidence(db, km)?;
             let sealed = crypto::encrypt(km.key(), KEY_CHECK_PLAINTEXT)?;
-            db.put(KEY_CHECK_KEY, &sealed)
+            gate.put(db, KEY_CHECK_KEY, &sealed, None)
                 .map_err(|e| Error::storage(format!("Failed to install the encryption key-check sentinel: {}", e)))?;
             Ok(())
         }
@@ -867,7 +876,7 @@ mod tests {
     #[test]
     fn the_default_configuration_needs_no_sentinel() {
         let (_dir, db) = scratch_db("plain");
-        verify_or_install_key_check(&db, None, false).expect("a plain database must open");
+        verify_or_install_key_check(&db, None, &WriteGate::open()).expect("a plain database must open");
         assert!(
             db.get(KEY_CHECK_KEY).expect("get").is_none(),
             "no sentinel may be written when encryption is off"
@@ -880,12 +889,12 @@ mod tests {
         let km = test_key_manager();
 
         // First open: nothing to check against, so it opens AND gains a sentinel.
-        verify_or_install_key_check(&db, Some(&km), false).expect("first open installs");
+        verify_or_install_key_check(&db, Some(&km), &WriteGate::open()).expect("first open installs");
         let sealed = db.get(KEY_CHECK_KEY).expect("get").expect("sentinel installed");
         assert_ne!(sealed, KEY_CHECK_PLAINTEXT, "the sentinel must be stored sealed");
 
         // Every later open verifies, and does not rewrite it.
-        verify_or_install_key_check(&db, Some(&km), false).expect("second open verifies");
+        verify_or_install_key_check(&db, Some(&km), &WriteGate::open()).expect("second open verifies");
         assert_eq!(db.get(KEY_CHECK_KEY).expect("get").expect("still there"), sealed);
     }
 
@@ -893,10 +902,10 @@ mod tests {
     fn a_different_key_is_refused_at_open_instead_of_reading_garbage() {
         let (_dir, db) = scratch_db("wrongkey");
         let right = test_key_manager();
-        verify_or_install_key_check(&db, Some(&right), false).expect("install");
+        verify_or_install_key_check(&db, Some(&right), &WriteGate::open()).expect("install");
 
         let wrong = test_key_manager();
-        let err = verify_or_install_key_check(&db, Some(&wrong), false)
+        let err = verify_or_install_key_check(&db, Some(&wrong), &WriteGate::open())
             .expect_err("a database must not open under a key it was not sealed with");
         let msg = err.to_string();
         assert!(
@@ -947,7 +956,7 @@ mod tests {
         )
         .expect("put");
 
-        let err = verify_or_install_key_check(&db, Some(&wrong), false)
+        let err = verify_or_install_key_check(&db, Some(&wrong), &WriteGate::open())
             .expect_err("a key that opens nothing must not be recorded as this database's key");
         assert!(
             err.to_string().contains("does not open"),
@@ -962,7 +971,8 @@ mod tests {
         // …and the RIGHT key still opens it and installs the sentinel, which is
         // what makes the assertion above a discrimination rather than a blanket
         // refusal.
-        verify_or_install_key_check(&db, Some(&right), false).expect("the key that seals this data must open it");
+        verify_or_install_key_check(&db, Some(&right), &WriteGate::open())
+            .expect("the key that seals this data must open it");
         assert!(db.get(KEY_CHECK_KEY).expect("get").is_some(), "the proven key installs");
     }
 
@@ -980,7 +990,7 @@ mod tests {
         db.put(b"counter:users", bincode::serialize(&2u64).expect("ser"))
             .expect("put");
 
-        verify_or_install_key_check(&db, Some(&km), false)
+        verify_or_install_key_check(&db, Some(&km), &WriteGate::open())
             .expect("a database whose values predate sealing must open and gain a sentinel");
         assert!(
             db.get(KEY_CHECK_KEY).expect("get").is_some(),
@@ -994,7 +1004,7 @@ mod tests {
     fn a_new_database_installs_without_needing_anything_to_check_against() {
         let (_dir, db) = scratch_db("brand_new");
         let km = test_key_manager();
-        verify_or_install_key_check(&db, Some(&km), false).expect("a new database must open");
+        verify_or_install_key_check(&db, Some(&km), &WriteGate::open()).expect("a new database must open");
         assert!(db.get(KEY_CHECK_KEY).expect("get").is_some());
     }
 
@@ -1031,9 +1041,9 @@ mod tests {
     fn an_encrypted_database_is_refused_when_no_key_is_configured() {
         let (_dir, db) = scratch_db("nokey");
         let km = test_key_manager();
-        verify_or_install_key_check(&db, Some(&km), false).expect("install");
+        verify_or_install_key_check(&db, Some(&km), &WriteGate::open()).expect("install");
 
-        let err = verify_or_install_key_check(&db, None, false)
+        let err = verify_or_install_key_check(&db, None, &WriteGate::open())
             .expect_err("an encrypted database must not open with encryption disabled");
         assert!(err.to_string().contains("written with encryption enabled"), "{err}");
     }
@@ -1044,16 +1054,17 @@ mod tests {
         let km = test_key_manager();
 
         // No sentinel and no write permission: open, install nothing.
-        verify_or_install_key_check(&db, Some(&km), true).expect("read-only open must succeed");
+        verify_or_install_key_check(&db, Some(&km), &WriteGate::closed("read-only open"))
+            .expect("read-only open must succeed");
         assert!(
             db.get(KEY_CHECK_KEY).expect("get").is_none(),
             "a read-only handle must not write the sentinel"
         );
 
         // Once one exists, a read-only handle still verifies it.
-        verify_or_install_key_check(&db, Some(&km), false).expect("install");
+        verify_or_install_key_check(&db, Some(&km), &WriteGate::open()).expect("install");
         let wrong = test_key_manager();
-        verify_or_install_key_check(&db, Some(&wrong), true)
+        verify_or_install_key_check(&db, Some(&wrong), &WriteGate::closed("read-only open"))
             .expect_err("a read-only handle must still refuse the wrong key");
     }
 
@@ -1083,7 +1094,7 @@ mod tests {
 
         // The plain read-only verifier would NOT catch this — pin the gap the
         // preflight exists to close, so a regression to the old arm is caught.
-        verify_or_install_key_check(&db, Some(&wrong), true)
+        verify_or_install_key_check(&db, Some(&wrong), &WriteGate::closed("read-only open"))
             .expect("the read-only verifier alone cannot probe, which is why the preflight exists");
 
         let err = verify_key_check_without_install(&db, Some(&wrong))
@@ -1120,7 +1131,7 @@ mod tests {
     fn the_preflight_verifies_an_existing_sentinel_strictly() {
         let (_dir, db) = scratch_db("preflight_sentinel");
         let km = test_key_manager();
-        verify_or_install_key_check(&db, Some(&km), false).expect("install");
+        verify_or_install_key_check(&db, Some(&km), &WriteGate::open()).expect("install");
         let sentinel = db.get(KEY_CHECK_KEY).expect("get").expect("sentinel");
 
         verify_key_check_without_install(&db, Some(&km)).expect("right key passes the preflight");
@@ -1142,7 +1153,7 @@ mod tests {
     fn the_preflight_refuses_an_encrypted_database_when_encryption_is_disabled() {
         let (_dir, db) = scratch_db("preflight_disabled");
         let km = test_key_manager();
-        verify_or_install_key_check(&db, Some(&km), false).expect("install");
+        verify_or_install_key_check(&db, Some(&km), &WriteGate::open()).expect("install");
 
         let err = verify_key_check_without_install(&db, None)
             .expect_err("an encrypted database must not pass the preflight with encryption off");

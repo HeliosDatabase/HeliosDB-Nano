@@ -19,7 +19,7 @@
 #![allow(unused_variables)]
 #![allow(dead_code)]
 
-use crate::storage::{BranchId, SnapshotId, GIT_DDL_HISTORY_PREFIX, GIT_SCHEMA_SNAPSHOT_PREFIX};
+use crate::storage::{BranchId, SnapshotId, WriteGate, GIT_DDL_HISTORY_PREFIX, GIT_SCHEMA_SNAPSHOT_PREFIX};
 use crate::{Error, Result};
 use parking_lot::RwLock;
 use rocksdb::DB;
@@ -206,8 +206,11 @@ pub enum DdlConflictType {
 
 /// DDL Versioning Manager
 pub struct DdlVersioningManager {
-    /// RocksDB instance
+    /// RocksDB instance. Written only through `gate`.
     db: Arc<DB>,
+
+    /// The write gate of the engine that owns `db`.
+    gate: Arc<WriteGate>,
 
     /// Current timestamp
     timestamp: Arc<RwLock<u64>>,
@@ -221,13 +224,14 @@ pub struct DdlVersioningManager {
 
 impl DdlVersioningManager {
     /// Create a new DDL versioning manager
-    pub fn new(db: Arc<DB>, timestamp: Arc<RwLock<u64>>) -> Result<Self> {
+    pub fn new(db: Arc<DB>, gate: Arc<WriteGate>, timestamp: Arc<RwLock<u64>>) -> Result<Self> {
         // Load next IDs from storage or start at 1
         let next_ddl_id = Self::load_next_id(&db, b"git:ddl:next_id")?;
         let next_snapshot_id = Self::load_next_id(&db, b"git:schema_snapshot:next_id")?;
 
         Ok(Self {
             db,
+            gate,
             timestamp,
             next_ddl_id: Arc::new(RwLock::new(next_ddl_id)),
             next_snapshot_id: Arc::new(RwLock::new(next_snapshot_id)),
@@ -248,8 +252,8 @@ impl DdlVersioningManager {
 
     fn save_next_id(&self, key: &[u8], id: u64) -> Result<()> {
         let data = bincode::serialize(&id).map_err(|e| Error::storage(format!("Failed to serialize ID: {}", e)))?;
-        self.db
-            .put(key, &data)
+        self.gate
+            .put(&self.db, key, &data, None)
             .map_err(|e| Error::storage(format!("Failed to save ID: {}", e)))
     }
 
@@ -293,8 +297,8 @@ impl DdlVersioningManager {
         let key = Self::encode_ddl_key(branch_id, ddl_id);
         let value =
             bincode::serialize(&entry).map_err(|e| Error::storage(format!("Failed to serialize DDL entry: {}", e)))?;
-        self.db
-            .put(&key, &value)
+        self.gate
+            .put(&self.db, &key, &value, None)
             .map_err(|e| Error::storage(format!("Failed to save DDL entry: {}", e)))?;
 
         tracing::debug!(
@@ -392,8 +396,8 @@ impl DdlVersioningManager {
         let key = Self::encode_snapshot_key(branch_id, &snapshot.name);
         let value = bincode::serialize(&snapshot)
             .map_err(|e| Error::storage(format!("Failed to serialize snapshot: {}", e)))?;
-        self.db
-            .put(&key, &value)
+        self.gate
+            .put(&self.db, &key, &value, None)
             .map_err(|e| Error::storage(format!("Failed to save snapshot: {}", e)))?;
 
         tracing::info!(
@@ -524,8 +528,12 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open engine");
 
-        let manager = DdlVersioningManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp))
-            .expect("Failed to create manager");
+        let manager = DdlVersioningManager::new(
+            Arc::clone(&engine.db),
+            Arc::clone(engine.write_gate()),
+            Arc::clone(&engine.timestamp),
+        )
+        .expect("Failed to create manager");
 
         // Record DDL
         let entry = manager
@@ -554,8 +562,12 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open engine");
 
-        let manager = DdlVersioningManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp))
-            .expect("Failed to create manager");
+        let manager = DdlVersioningManager::new(
+            Arc::clone(&engine.db),
+            Arc::clone(engine.write_gate()),
+            Arc::clone(&engine.timestamp),
+        )
+        .expect("Failed to create manager");
 
         // Create snapshot
         let snapshot = manager

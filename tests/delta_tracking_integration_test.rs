@@ -41,7 +41,8 @@ fn test_delta_tracking_basic_insert() {
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(engine.db()).expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(engine.db(), std::sync::Arc::clone(engine.write_gate()))
+        .expect("Failed to create delta tracker");
 
     // Create a delta
     let tuple = Tuple::new(vec![Value::Int4(1), Value::String("Alice".to_string())]);
@@ -78,7 +79,8 @@ fn test_delta_tracking_multiple_operations() {
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(engine.db()).expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(engine.db(), std::sync::Arc::clone(engine.write_gate()))
+        .expect("Failed to create delta tracker");
 
     let now = SystemTime::now();
 
@@ -131,7 +133,8 @@ fn test_delta_tracking_multiple_tables() {
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(engine.db()).expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(engine.db(), std::sync::Arc::clone(engine.write_gate()))
+        .expect("Failed to create delta tracker");
 
     let now = SystemTime::now();
 
@@ -167,7 +170,8 @@ fn test_delta_tracking_time_range() {
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(engine.db()).expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(engine.db(), std::sync::Arc::clone(engine.write_gate()))
+        .expect("Failed to create delta tracker");
 
     let t0 = SystemTime::now() - Duration::from_secs(100);
     let t1 = SystemTime::now() - Duration::from_secs(50);
@@ -220,7 +224,8 @@ fn test_delta_tracking_compaction() {
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(engine.db()).expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(engine.db(), std::sync::Arc::clone(engine.write_gate()))
+        .expect("Failed to create delta tracker");
 
     let old_time = SystemTime::now() - Duration::from_secs(7200); // 2 hours ago
     let recent_time = SystemTime::now();
@@ -287,7 +292,7 @@ fn test_delta_tracking_compaction() {
 fn record_delta_allocates_a_key_id_so_deltas_do_not_collide() {
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config).unwrap();
-    let tracker = MvDeltaTracker::new(engine.db()).unwrap();
+    let tracker = MvDeltaTracker::new(engine.db(), std::sync::Arc::clone(engine.write_gate())).unwrap();
 
     let base = SystemTime::now() - Duration::from_secs(60);
     let cutoff = as_utc(base - Duration::from_secs(10));
@@ -321,7 +326,7 @@ fn record_delta_allocates_a_key_id_so_deltas_do_not_collide() {
 fn record_insert_still_controls_its_own_delta_numbering() {
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config).unwrap();
-    let tracker = MvDeltaTracker::new(engine.db()).unwrap();
+    let tracker = MvDeltaTracker::new(engine.db(), std::sync::Arc::clone(engine.write_gate())).unwrap();
 
     let before = as_utc(SystemTime::now() - Duration::from_secs(60));
     for row_id in 1..=3u64 {

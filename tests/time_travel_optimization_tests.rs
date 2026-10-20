@@ -31,7 +31,7 @@ fn create_test_db() -> (Arc<DB>, tempfile::TempDir) {
 #[test]
 fn test_indexed_lookup_single_version() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     let table = "users";
     let row_id = 1;
@@ -57,7 +57,7 @@ fn test_indexed_lookup_single_version() {
 #[test]
 fn test_indexed_lookup_multiple_versions() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     let table = "users";
     let row_id = 1;
@@ -84,7 +84,7 @@ fn test_indexed_lookup_multiple_versions() {
 #[test]
 fn test_indexed_vs_linear_consistency() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     let table = "test";
     let row_id = 42;
@@ -118,7 +118,7 @@ fn test_indexed_vs_linear_consistency() {
 #[test]
 fn test_reverse_index_creation() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db.clone());
+    let manager = SnapshotManager::new(db.clone(), heliosdb_nano::storage::WriteGate::open());
 
     let table = "test";
     let row_id = 1;
@@ -143,7 +143,7 @@ fn test_reverse_index_creation() {
 #[test]
 fn test_multiple_rows_same_table() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     let table = "users";
 
@@ -185,7 +185,7 @@ fn test_multiple_rows_same_table() {
 #[test]
 fn test_multiple_tables() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     // Write to different tables
     manager.write_version("users", 1, 1000, b"user_data").unwrap();
@@ -209,7 +209,7 @@ fn test_multiple_tables() {
 #[test]
 fn test_large_number_of_versions() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     let table = "test";
     let row_id = 1;
@@ -244,7 +244,7 @@ fn test_large_number_of_versions() {
 #[test]
 fn test_boundary_timestamps() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     let table = "test";
     let row_id = 1;
@@ -282,7 +282,7 @@ fn test_index_persistence() {
         opts.set_block_based_table_factory(&block_opts);
 
         let db = Arc::new(DB::open(&opts, db_path).unwrap());
-        let manager = SnapshotManager::new(db);
+        let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
         manager.write_version("test", 1, 1000, b"v1").unwrap();
         manager.write_version("test", 1, 2000, b"v2").unwrap();
@@ -298,7 +298,7 @@ fn test_index_persistence() {
         opts.set_block_based_table_factory(&block_opts);
 
         let db = Arc::new(DB::open(&opts, db_path).unwrap());
-        let manager = SnapshotManager::new(db);
+        let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
         // Queries should still work using the persisted index
         assert_eq!(manager.read_at_snapshot("test", 1, 1500).unwrap(), Some(b"v1".to_vec()));
@@ -311,7 +311,7 @@ fn test_concurrent_queries() {
     use std::thread;
 
     let (db, _temp) = create_test_db();
-    let manager = Arc::new(SnapshotManager::new(db));
+    let manager = Arc::new(SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open()));
 
     let table = "concurrent_test";
     let row_id = 1;
@@ -346,7 +346,7 @@ fn test_concurrent_queries() {
 #[test]
 fn test_empty_table() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     // Query non-existent row
     let result = manager.read_at_snapshot("nonexistent", 1, 1000).unwrap();
@@ -356,7 +356,7 @@ fn test_empty_table() {
 #[test]
 fn test_version_overwrite() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     let table = "test";
     let row_id = 1;
@@ -380,7 +380,7 @@ fn test_version_overwrite() {
 #[test]
 fn test_out_of_order_writes() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     let table = "test";
     let row_id = 1;
@@ -408,7 +408,7 @@ fn test_out_of_order_writes() {
 #[test]
 fn test_large_values() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     let table = "test";
     let row_id = 1;
@@ -425,7 +425,7 @@ fn test_large_values() {
 #[test]
 fn test_special_characters_in_table_name() {
     let (db, _temp) = create_test_db();
-    let manager = SnapshotManager::new(db);
+    let manager = SnapshotManager::new(db, heliosdb_nano::storage::WriteGate::open());
 
     // Tables with special characters in name
     let tables = [

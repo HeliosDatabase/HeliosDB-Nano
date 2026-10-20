@@ -3,7 +3,7 @@
 //! Records and restores database state at specific Git commits.
 //! Enables `AS OF COMMIT 'sha'` queries and commit-based restoration.
 
-use crate::storage::{BranchId, SnapshotId, GIT_COMMIT_PREFIX};
+use crate::storage::{BranchId, SnapshotId, WriteGate, GIT_COMMIT_PREFIX};
 use crate::{Error, Result};
 use parking_lot::RwLock;
 use rocksdb::DB;
@@ -40,8 +40,11 @@ pub struct CommitState {
 
 /// Commit Tracker - records and retrieves database state at Git commits
 pub struct CommitTracker {
-    /// RocksDB instance
+    /// RocksDB instance. Written only through `gate`.
     db: Arc<DB>,
+
+    /// The write gate of the engine that owns `db`.
+    gate: Arc<WriteGate>,
 
     /// Current timestamp
     timestamp: Arc<RwLock<u64>>,
@@ -52,9 +55,10 @@ pub struct CommitTracker {
 
 impl CommitTracker {
     /// Create a new commit tracker
-    pub fn new(db: Arc<DB>, timestamp: Arc<RwLock<u64>>) -> Self {
+    pub fn new(db: Arc<DB>, gate: Arc<WriteGate>, timestamp: Arc<RwLock<u64>>) -> Self {
         Self {
             db,
+            gate,
             timestamp,
             cache: RwLock::new(std::collections::HashMap::new()),
         }
@@ -93,8 +97,8 @@ impl CommitTracker {
         let value = bincode::serialize(&state)
             .map_err(|e| Error::storage(format!("Failed to serialize commit state: {}", e)))?;
 
-        self.db
-            .put(&key, &value)
+        self.gate
+            .put(&self.db, &key, &value, None)
             .map_err(|e| Error::storage(format!("Failed to save commit state: {}", e)))?;
 
         // Update cache
@@ -138,8 +142,8 @@ impl CommitTracker {
         let value = bincode::serialize(&state)
             .map_err(|e| Error::storage(format!("Failed to serialize commit state: {}", e)))?;
 
-        self.db
-            .put(&key, &value)
+        self.gate
+            .put(&self.db, &key, &value, None)
             .map_err(|e| Error::storage(format!("Failed to save commit state: {}", e)))?;
 
         self.cache.write().insert(commit_sha.to_string(), state.clone());
@@ -274,8 +278,8 @@ impl CommitTracker {
     pub fn delete_state(&self, commit_sha: &str) -> Result<()> {
         let key = Self::encode_key(commit_sha);
 
-        self.db
-            .delete(&key)
+        self.gate
+            .delete(&self.db, &key, None)
             .map_err(|e| Error::storage(format!("Failed to delete commit state: {}", e)))?;
 
         self.cache.write().remove(commit_sha);
@@ -295,7 +299,11 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open engine");
 
-        let tracker = CommitTracker::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp));
+        let tracker = CommitTracker::new(
+            Arc::clone(&engine.db),
+            Arc::clone(engine.write_gate()),
+            Arc::clone(&engine.timestamp),
+        );
 
         // Record state
         let state = tracker
@@ -325,7 +333,11 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open engine");
 
-        let tracker = CommitTracker::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp));
+        let tracker = CommitTracker::new(
+            Arc::clone(&engine.db),
+            Arc::clone(engine.write_gate()),
+            Arc::clone(&engine.timestamp),
+        );
 
         tracker.record_state("commit123", 2, 500).expect("Failed to record");
 

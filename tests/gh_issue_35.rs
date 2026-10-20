@@ -163,7 +163,12 @@ fn retained_span(db: &DB) -> (usize, u64) {
 /// per directory, so opening a second one here would deadlock the test against
 /// itself.
 fn retained_ops(raw: &Arc<DB>) -> Vec<(u64, WalOperation)> {
-    let wal = WriteAheadLog::open(Arc::clone(raw), WalSyncMode::Sync).expect("open wal");
+    let wal = WriteAheadLog::open(
+        Arc::clone(raw),
+        heliosdb_nano::storage::WriteGate::open(),
+        WalSyncMode::Sync,
+    )
+    .expect("open wal");
     wal.replay()
         .expect("read the retained log")
         .into_iter()
@@ -277,7 +282,12 @@ fn genuine_redo_past_the_checkpoint_still_works() {
     }
     {
         let raw = open_raw(dir);
-        let wal = WriteAheadLog::open(Arc::clone(&raw), WalSyncMode::Sync).expect("open wal");
+        let wal = WriteAheadLog::open(
+            Arc::clone(&raw),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .expect("open wal");
         let entries = wal.replay().expect("read log");
         let (lsn, data_key) = entries
             .iter()

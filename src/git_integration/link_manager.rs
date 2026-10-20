@@ -2,7 +2,7 @@
 //!
 //! Manages the mapping between Git branches and database branches.
 
-use crate::storage::{BranchId, GIT_LINK_PREFIX};
+use crate::storage::{BranchId, WriteGate, GIT_LINK_PREFIX};
 use crate::{Error, Result};
 use parking_lot::RwLock;
 use rocksdb::DB;
@@ -33,8 +33,11 @@ pub struct GitBranchLink {
 
 /// Link Manager - handles Git-DB branch linking
 pub struct LinkManager {
-    /// RocksDB instance
+    /// RocksDB instance. Written only through `gate`.
     db: Arc<DB>,
+
+    /// The write gate of the engine that owns `db`.
+    gate: Arc<WriteGate>,
 
     /// Current timestamp
     timestamp: Arc<RwLock<u64>>,
@@ -45,9 +48,10 @@ pub struct LinkManager {
 
 impl LinkManager {
     /// Create a new link manager
-    pub fn new(db: Arc<DB>, timestamp: Arc<RwLock<u64>>) -> Self {
+    pub fn new(db: Arc<DB>, gate: Arc<WriteGate>, timestamp: Arc<RwLock<u64>>) -> Self {
         Self {
             db,
+            gate,
             timestamp,
             cache: RwLock::new(std::collections::HashMap::new()),
         }
@@ -79,8 +83,8 @@ impl LinkManager {
         let value =
             bincode::serialize(&link).map_err(|e| Error::storage(format!("Failed to serialize Git link: {}", e)))?;
 
-        self.db
-            .put(&key, &value)
+        self.gate
+            .put(&self.db, &key, &value, None)
             .map_err(|e| Error::storage(format!("Failed to save Git link: {}", e)))?;
 
         // Update cache
@@ -95,8 +99,8 @@ impl LinkManager {
     pub fn unlink(&self, git_branch: &str) -> Result<()> {
         let key = Self::encode_key(git_branch);
 
-        self.db
-            .delete(&key)
+        self.gate
+            .delete(&self.db, &key, None)
             .map_err(|e| Error::storage(format!("Failed to delete Git link: {}", e)))?;
 
         // Remove from cache
@@ -169,8 +173,8 @@ impl LinkManager {
             let value = bincode::serialize(&link)
                 .map_err(|e| Error::storage(format!("Failed to serialize Git link: {}", e)))?;
 
-            self.db
-                .put(&key, &value)
+            self.gate
+                .put(&self.db, &key, &value, None)
                 .map_err(|e| Error::storage(format!("Failed to update Git link: {}", e)))?;
 
             self.cache.write().insert(git_branch.to_string(), link);
@@ -250,7 +254,11 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open engine");
 
-        let link_manager = LinkManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp));
+        let link_manager = LinkManager::new(
+            Arc::clone(&engine.db),
+            Arc::clone(engine.write_gate()),
+            Arc::clone(&engine.timestamp),
+        );
 
         // Link a branch
         link_manager.link("feature/test", 2, true).expect("Failed to link");

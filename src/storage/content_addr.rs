@@ -22,6 +22,7 @@
 use blake3;
 use rocksdb::DB;
 
+use super::write_gate::WriteGate;
 use crate::{DataType, Error, Result, Value};
 
 /// Minimum size (in bytes) for content-addressed storage
@@ -49,12 +50,13 @@ impl ContentAddressedStore {
     ///
     /// # Arguments
     /// * `db` - RocksDB instance for persistence
+    /// * `gate` - the write gate of the engine that owns `db`
     /// * `value` - Value to potentially store in CAS
     ///
     /// # Returns
     /// * `Value::CasRef` if the value was stored in CAS
     /// * Original value if it's too small for CAS (< 1KB)
-    pub fn maybe_store(db: &DB, value: &Value) -> Result<Value> {
+    pub fn maybe_store(db: &DB, gate: &WriteGate, value: &Value) -> Result<Value> {
         let bytes = match value {
             Value::String(s) if s.len() >= CAS_MIN_SIZE => s.as_bytes(),
             Value::Bytes(b) if b.len() >= CAS_MIN_SIZE => b.as_slice(),
@@ -72,7 +74,7 @@ impl ContentAddressedStore {
             .is_some();
 
         if !exists {
-            db.put(&key, bytes)
+            gate.put(db, &key, bytes, None)
                 .map_err(|e| Error::storage(format!("CAS store failed: {}", e)))?;
         }
 
@@ -82,7 +84,7 @@ impl ContentAddressedStore {
     /// Store a value unconditionally (for migration), returning the CasRef
     ///
     /// Unlike `maybe_store`, this always stores the value regardless of size.
-    pub fn store(db: &DB, value: &Value) -> Result<Value> {
+    pub fn store(db: &DB, gate: &WriteGate, value: &Value) -> Result<Value> {
         let bytes = match value {
             Value::String(s) => s.as_bytes(),
             Value::Bytes(b) => b.as_slice(),
@@ -101,7 +103,7 @@ impl ContentAddressedStore {
             .is_some();
 
         if !exists {
-            db.put(&key, bytes)
+            gate.put(db, &key, bytes, None)
                 .map_err(|e| Error::storage(format!("CAS store failed: {}", e)))?;
         }
 
@@ -159,9 +161,9 @@ impl ContentAddressedStore {
     ///
     /// This should only be used during garbage collection after verifying
     /// no references exist.
-    pub fn delete(db: &DB, hash: &[u8; 32]) -> Result<()> {
+    pub fn delete(db: &DB, gate: &WriteGate, hash: &[u8; 32]) -> Result<()> {
         let key = Self::cas_key(hash);
-        db.delete(&key)
+        gate.delete(db, &key, None)
             .map_err(|e| Error::storage(format!("CAS delete failed: {}", e)))
     }
 
@@ -205,7 +207,7 @@ mod tests {
 
         // Small value should be returned as-is
         let small = Value::String("hello".to_string());
-        let result = ContentAddressedStore::maybe_store(&db, &small).unwrap();
+        let result = ContentAddressedStore::maybe_store(&db, &WriteGate::open(), &small).unwrap();
 
         match result {
             Value::String(s) => assert_eq!(s, "hello"),
@@ -219,7 +221,7 @@ mod tests {
 
         // Large value should be stored and return CasRef
         let large = Value::String("x".repeat(2000));
-        let result = ContentAddressedStore::maybe_store(&db, &large).unwrap();
+        let result = ContentAddressedStore::maybe_store(&db, &WriteGate::open(), &large).unwrap();
 
         match result {
             Value::CasRef { hash } => {
@@ -240,8 +242,8 @@ mod tests {
 
         // Store same content twice
         let content = Value::String("y".repeat(2000));
-        let ref1 = ContentAddressedStore::maybe_store(&db, &content).unwrap();
-        let ref2 = ContentAddressedStore::maybe_store(&db, &content).unwrap();
+        let ref1 = ContentAddressedStore::maybe_store(&db, &WriteGate::open(), &content).unwrap();
+        let ref2 = ContentAddressedStore::maybe_store(&db, &WriteGate::open(), &content).unwrap();
 
         // Both should return the same hash
         match (ref1, ref2) {
@@ -258,7 +260,7 @@ mod tests {
 
         // Large bytes should be stored
         let large = Value::Bytes(vec![0u8; 2000]);
-        let result = ContentAddressedStore::maybe_store(&db, &large).unwrap();
+        let result = ContentAddressedStore::maybe_store(&db, &WriteGate::open(), &large).unwrap();
 
         match result {
             Value::CasRef { hash } => {

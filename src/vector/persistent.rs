@@ -26,6 +26,7 @@
 
 use super::quantization::{Codebook, ProductQuantizer, ProductQuantizerConfig, QuantizedVector};
 use super::{DistanceMetric, Vector};
+use crate::storage::WriteGate;
 use crate::{Error, Result};
 use parking_lot::RwLock;
 use rocksdb::{Direction, IteratorMode, WriteBatch, DB};
@@ -633,7 +634,10 @@ fn graph_insert(st: &mut IndexState, row_id: u64, vector: &Vector) -> Result<(El
 
 /// A durable, crash-recoverable vector index backed by RocksDB.
 pub struct PersistentVectorIndex {
+    /// Written only through `gate`.
     db: Arc<DB>,
+    /// The write gate of the engine that owns `db`.
+    gate: Arc<WriteGate>,
     index_id: u64,
     state: Arc<RwLock<IndexState>>,
 }
@@ -641,7 +645,7 @@ pub struct PersistentVectorIndex {
 impl PersistentVectorIndex {
     /// Create a new, empty index (PQ inactive — full vectors resident in RAM, persisted
     /// at the configured rerank precision: F32 / F16 / I8).
-    pub fn create(db: Arc<DB>, index_id: u64, config: PqHnswConfig) -> Result<Self> {
+    pub fn create(db: Arc<DB>, gate: Arc<WriteGate>, index_id: u64, config: PqHnswConfig) -> Result<Self> {
         let p = prefix(index_id);
         if db.get(key_meta(&p)).map_err(map_db)?.is_some() {
             return Err(Error::storage(format!(
@@ -649,9 +653,10 @@ impl PersistentVectorIndex {
             )));
         }
         let state = IndexState::new(config);
-        db.put(key_meta(&p), state.meta_bytes()?).map_err(map_db)?;
+        gate.put(&db, key_meta(&p), state.meta_bytes()?, None)?;
         Ok(Self {
             db,
+            gate,
             index_id,
             state: Arc::new(RwLock::new(state)),
         })
@@ -660,7 +665,13 @@ impl PersistentVectorIndex {
     /// Create a PQ-backed index: train a Product Quantizer on `training` vectors,
     /// persist the codebook, and store PQ codes in RAM with full vectors on disk
     /// (faulted in only for the two-stage rerank). PQ is L2-only.
-    pub fn create_with_pq(db: Arc<DB>, index_id: u64, mut config: PqHnswConfig, training: &[Vector]) -> Result<Self> {
+    pub fn create_with_pq(
+        db: Arc<DB>,
+        gate: Arc<WriteGate>,
+        index_id: u64,
+        mut config: PqHnswConfig,
+        training: &[Vector],
+    ) -> Result<Self> {
         if config.distance_metric != DistanceMetric::L2 {
             return Err(Error::storage(
                 "vector-persist: PQ is supported only with the L2 metric",
@@ -696,10 +707,11 @@ impl PersistentVectorIndex {
         if let Some(pq) = state.pq.as_ref() {
             wb.put(key_pq(&p), ser(&*pq.codebook())?);
         }
-        db.write(wb).map_err(map_db)?;
+        gate.write(&db, wb, None)?;
 
         Ok(Self {
             db,
+            gate,
             index_id,
             state: Arc::new(RwLock::new(state)),
         })
@@ -708,7 +720,7 @@ impl PersistentVectorIndex {
     /// Open (recover) an existing index from RocksDB. Reconstructs the PQ codebook if
     /// the index was created with PQ. Errors if it does not exist or the on-disk schema
     /// version is unknown.
-    pub fn open(db: Arc<DB>, index_id: u64) -> Result<Self> {
+    pub fn open(db: Arc<DB>, gate: Arc<WriteGate>, index_id: u64) -> Result<Self> {
         let p = prefix(index_id);
         let meta_bytes = db
             .get(key_meta(&p))
@@ -795,6 +807,7 @@ impl PersistentVectorIndex {
 
         Ok(Self {
             db,
+            gate,
             index_id,
             state: Arc::new(RwLock::new(st)),
         })
@@ -805,8 +818,9 @@ impl PersistentVectorIndex {
         Ok(db.get(key_meta(&prefix(index_id))).map_err(map_db)?.is_some())
     }
 
-    /// Delete every key belonging to an index.
-    pub fn drop_index(db: &DB, index_id: u64) -> Result<()> {
+    /// Delete every key belonging to an index, through the gate of the engine
+    /// that owns `db`.
+    pub fn drop_index(db: &DB, gate: &WriteGate, index_id: u64) -> Result<()> {
         let p = prefix(index_id);
         let pb = p.as_bytes();
         let mut wb = WriteBatch::default();
@@ -818,13 +832,13 @@ impl PersistentVectorIndex {
             }
             wb.delete(k);
         }
-        db.write(wb).map_err(map_db)?;
+        gate.write(db, wb, None)?;
         Ok(())
     }
 
     /// Drop this index's persisted RocksDB keyspace.
     pub fn drop_storage(&self) -> Result<()> {
-        Self::drop_index(&self.db, self.index_id)
+        Self::drop_index(&self.db, &self.gate, self.index_id)
     }
 
     // ── Low-level write-through mutators (substrate; used directly in P1 tests) ──
@@ -862,7 +876,7 @@ impl PersistentVectorIndex {
         }
 
         wb.put(key_meta(&p), st.meta_bytes()?);
-        self.db.write(wb).map_err(map_db)?;
+        self.gate.write(&self.db, wb, None)?;
         Ok(())
     }
 
@@ -877,7 +891,7 @@ impl PersistentVectorIndex {
             st.layer_count = layer as usize + 1;
             wb.put(key_meta(&p), st.meta_bytes()?);
         }
-        self.db.write(wb).map_err(map_db)?;
+        self.gate.write(&self.db, wb, None)?;
         Ok(())
     }
 
@@ -885,9 +899,8 @@ impl PersistentVectorIndex {
     pub fn set_entry_point(&self, ep: Option<ElementId>) -> Result<()> {
         let mut st = self.state.write();
         st.entry_point = ep;
-        self.db
-            .put(key_meta(&prefix(self.index_id)), st.meta_bytes()?)
-            .map_err(map_db)?;
+        self.gate
+            .put(&self.db, key_meta(&prefix(self.index_id)), st.meta_bytes()?, None)?;
         Ok(())
     }
 
@@ -896,9 +909,8 @@ impl PersistentVectorIndex {
         let mut st = self.state.write();
         st.tombstones.insert(elem_id);
         let set: Vec<ElementId> = st.tombstones.iter().copied().collect();
-        self.db
-            .put(key_tomb(&prefix(self.index_id)), ser(&set)?)
-            .map_err(map_db)?;
+        self.gate
+            .put(&self.db, key_tomb(&prefix(self.index_id)), ser(&set)?, None)?;
         Ok(())
     }
 
@@ -935,7 +947,7 @@ impl PersistentVectorIndex {
             wb.put(key_adj(&p, layer_u, e), ser(&nbrs)?);
         }
         wb.put(key_meta(&p), st.meta_bytes()?);
-        self.db.write(wb).map_err(map_db)?;
+        self.gate.write(&self.db, wb, None)?;
         Ok(elem)
     }
 
@@ -1131,7 +1143,7 @@ impl PersistentVectorIndex {
             wb.put(key_tomb(&p), ser(&set)?);
         }
         wb.put(key_meta(&p), st.meta_bytes()?);
-        self.db.write(wb).map_err(map_db)?;
+        self.gate.write(&self.db, wb, None)?;
         Ok(true)
     }
 
@@ -1217,7 +1229,7 @@ impl PersistentVectorIndex {
         for (&(layer, elem), nbrs) in &st.adjacency {
             wb.put(key_adj(&p, layer, elem), ser(nbrs)?);
         }
-        self.db.write(wb).map_err(map_db)?;
+        self.gate.write(&self.db, wb, None)?;
         Ok(())
     }
 
@@ -1368,12 +1380,12 @@ mod tests {
     fn test_create_then_open_roundtrip() {
         let (_dir, db) = test_db();
         {
-            let idx = PersistentVectorIndex::create(db.clone(), 7, sample_config()).unwrap();
+            let idx = PersistentVectorIndex::create(db.clone(), WriteGate::open(), 7, sample_config()).unwrap();
             populate(&idx);
             assert_eq!(idx.len(), 3);
             assert_eq!(idx.entry_point(), Some(0));
         }
-        let reopened = PersistentVectorIndex::open(db.clone(), 7).unwrap();
+        let reopened = PersistentVectorIndex::open(db.clone(), WriteGate::open(), 7).unwrap();
         let cfg = reopened.config();
         assert_eq!(cfg.dimension, 3);
         assert_eq!(cfg.distance_metric, DistanceMetric::L2);
@@ -1400,11 +1412,11 @@ mod tests {
         let path = dir.path().to_path_buf();
         {
             let db = Arc::new(DB::open_default(&path).unwrap());
-            let idx = PersistentVectorIndex::create(db.clone(), 1, sample_config()).unwrap();
+            let idx = PersistentVectorIndex::create(db.clone(), WriteGate::open(), 1, sample_config()).unwrap();
             populate(&idx);
         }
         let db = Arc::new(DB::open_default(&path).unwrap());
-        let idx = PersistentVectorIndex::open(db, 1).unwrap();
+        let idx = PersistentVectorIndex::open(db, WriteGate::open(), 1).unwrap();
         assert_eq!(idx.len(), 3);
         assert_eq!(idx.entry_point(), Some(0));
         assert_eq!(idx.vector(2), Some(vec![0.0, 0.0, 1.0]));
@@ -1415,38 +1427,38 @@ mod tests {
     #[test]
     fn test_open_missing_is_err() {
         let (_dir, db) = test_db();
-        assert!(PersistentVectorIndex::open(db.clone(), 999).is_err());
+        assert!(PersistentVectorIndex::open(db.clone(), WriteGate::open(), 999).is_err());
         assert!(!PersistentVectorIndex::exists(&db, 999).unwrap());
     }
 
     #[test]
     fn test_create_duplicate_is_err() {
         let (_dir, db) = test_db();
-        let _idx = PersistentVectorIndex::create(db.clone(), 5, sample_config()).unwrap();
-        assert!(PersistentVectorIndex::create(db.clone(), 5, sample_config()).is_err());
+        let _idx = PersistentVectorIndex::create(db.clone(), WriteGate::open(), 5, sample_config()).unwrap();
+        assert!(PersistentVectorIndex::create(db.clone(), WriteGate::open(), 5, sample_config()).is_err());
         assert!(PersistentVectorIndex::exists(&db, 5).unwrap());
     }
 
     #[test]
     fn test_drop_index_removes_keys() {
         let (_dir, db) = test_db();
-        let idx = PersistentVectorIndex::create(db.clone(), 3, sample_config()).unwrap();
+        let idx = PersistentVectorIndex::create(db.clone(), WriteGate::open(), 3, sample_config()).unwrap();
         populate(&idx);
         drop(idx);
-        PersistentVectorIndex::drop_index(&db, 3).unwrap();
+        PersistentVectorIndex::drop_index(&db, &WriteGate::open(), 3).unwrap();
         assert!(!PersistentVectorIndex::exists(&db, 3).unwrap());
-        assert!(PersistentVectorIndex::open(db.clone(), 3).is_err());
+        assert!(PersistentVectorIndex::open(db.clone(), WriteGate::open(), 3).is_err());
     }
 
     #[test]
     fn test_two_indexes_isolated() {
         let (_dir, db) = test_db();
-        let a = PersistentVectorIndex::create(db.clone(), 1, sample_config()).unwrap();
-        let b = PersistentVectorIndex::create(db.clone(), 2, sample_config()).unwrap();
+        let a = PersistentVectorIndex::create(db.clone(), WriteGate::open(), 1, sample_config()).unwrap();
+        let b = PersistentVectorIndex::create(db.clone(), WriteGate::open(), 2, sample_config()).unwrap();
         a.put_vector(0, 10, &vec![1.0, 2.0, 3.0], 0).unwrap();
         b.put_vector(0, 20, &vec![4.0, 5.0, 6.0], 0).unwrap();
-        let a2 = PersistentVectorIndex::open(db.clone(), 1).unwrap();
-        let b2 = PersistentVectorIndex::open(db.clone(), 2).unwrap();
+        let a2 = PersistentVectorIndex::open(db.clone(), WriteGate::open(), 1).unwrap();
+        let b2 = PersistentVectorIndex::open(db.clone(), WriteGate::open(), 2).unwrap();
         assert_eq!(a2.len(), 1);
         assert_eq!(b2.len(), 1);
         assert_eq!(a2.vector(0), Some(vec![1.0, 2.0, 3.0]));
@@ -1458,7 +1470,7 @@ mod tests {
     #[test]
     fn test_dimension_mismatch_is_err() {
         let (_dir, db) = test_db();
-        let idx = PersistentVectorIndex::create(db.clone(), 1, sample_config()).unwrap();
+        let idx = PersistentVectorIndex::create(db.clone(), WriteGate::open(), 1, sample_config()).unwrap();
         assert!(idx.put_vector(0, 1, &vec![1.0, 2.0], 0).is_err());
     }
 
@@ -1468,7 +1480,7 @@ mod tests {
         let (_dir, db) = test_db();
         let mut cfg = PqHnswConfig::new(8, DistanceMetric::L2);
         cfg.rerank_precision = VectorPrecision::F16;
-        let idx = PersistentVectorIndex::create(db.clone(), 1, cfg).unwrap();
+        let idx = PersistentVectorIndex::create(db.clone(), WriteGate::open(), 1, cfg).unwrap();
         for i in 0..50u64 {
             idx.insert(i, &rand_vec(i, 8)).unwrap();
         }
@@ -1486,7 +1498,7 @@ mod tests {
     fn test_graph_search_finds_self() {
         let (_dir, db) = test_db();
         let cfg = PqHnswConfig::new(4, DistanceMetric::L2);
-        let idx = PersistentVectorIndex::create(db.clone(), 1, cfg).unwrap();
+        let idx = PersistentVectorIndex::create(db.clone(), WriteGate::open(), 1, cfg).unwrap();
         let vecs = [
             vec![1.0, 0.0, 0.0, 0.0],
             vec![0.0, 1.0, 0.0, 0.0],
@@ -1506,7 +1518,13 @@ mod tests {
     fn test_recall_vs_bruteforce_l2() {
         let (_dir, db) = test_db();
         let (dim, n, k, ef, queries) = (16usize, 1000usize, 10usize, 100usize, 100u64);
-        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
+        let idx = PersistentVectorIndex::create(
+            db.clone(),
+            WriteGate::open(),
+            1,
+            PqHnswConfig::new(dim, DistanceMetric::L2),
+        )
+        .unwrap();
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
         for (i, v) in data.iter().enumerate() {
             idx.insert(i as u64, v).unwrap();
@@ -1535,7 +1553,13 @@ mod tests {
 
         let before = {
             let db = Arc::new(DB::open_default(&path).unwrap());
-            let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
+            let idx = PersistentVectorIndex::create(
+                db.clone(),
+                WriteGate::open(),
+                1,
+                PqHnswConfig::new(dim, DistanceMetric::L2),
+            )
+            .unwrap();
             for i in 0..n {
                 idx.insert(i, &rand_vec(i, dim)).unwrap();
             }
@@ -1545,7 +1569,7 @@ mod tests {
         };
 
         let db = Arc::new(DB::open_default(&path).unwrap());
-        let idx = PersistentVectorIndex::open(db, 1).unwrap();
+        let idx = PersistentVectorIndex::open(db, WriteGate::open(), 1).unwrap();
         let after = idx.search(&q, 5, 64).unwrap();
         assert_eq!(before, after, "search must be identical after crash-recovery reopen");
     }
@@ -1556,7 +1580,13 @@ mod tests {
     fn test_remove_excludes_and_keeps_searchable() {
         let (_dir, db) = test_db();
         let dim = 8;
-        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
+        let idx = PersistentVectorIndex::create(
+            db.clone(),
+            WriteGate::open(),
+            1,
+            PqHnswConfig::new(dim, DistanceMetric::L2),
+        )
+        .unwrap();
         for i in 0..60u64 {
             idx.insert(i, &rand_vec(i, dim)).unwrap();
         }
@@ -1586,7 +1616,13 @@ mod tests {
 
         let before = {
             let db = Arc::new(DB::open_default(&path).unwrap());
-            let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
+            let idx = PersistentVectorIndex::create(
+                db.clone(),
+                WriteGate::open(),
+                1,
+                PqHnswConfig::new(dim, DistanceMetric::L2),
+            )
+            .unwrap();
             for i in 0..100u64 {
                 idx.insert(i, &rand_vec(i, dim)).unwrap();
             }
@@ -1597,7 +1633,7 @@ mod tests {
         };
 
         let db = Arc::new(DB::open_default(&path).unwrap());
-        let idx = PersistentVectorIndex::open(db, 1).unwrap();
+        let idx = PersistentVectorIndex::open(db, WriteGate::open(), 1).unwrap();
         assert_eq!(idx.len(), 96);
         let after = idx.search(&q, 8, 64).unwrap();
         assert_eq!(before, after, "deletions must survive reopen");
@@ -1611,7 +1647,13 @@ mod tests {
         use std::collections::BTreeMap;
         let (_dir, db) = test_db();
         let (dim, k, ef) = (12usize, 10usize, 100usize);
-        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
+        let idx = PersistentVectorIndex::create(
+            db.clone(),
+            WriteGate::open(),
+            1,
+            PqHnswConfig::new(dim, DistanceMetric::L2),
+        )
+        .unwrap();
 
         let mut live: BTreeMap<u64, Vec<f32>> = BTreeMap::new();
         let mut next = 0u64;
@@ -1658,7 +1700,13 @@ mod tests {
     fn test_compact_drops_tombstoned_and_clears() {
         let (_dir, db) = test_db();
         let dim = 8;
-        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
+        let idx = PersistentVectorIndex::create(
+            db.clone(),
+            WriteGate::open(),
+            1,
+            PqHnswConfig::new(dim, DistanceMetric::L2),
+        )
+        .unwrap();
         for i in 0..100u64 {
             assert_eq!(idx.insert(i, &rand_vec(i, dim)).unwrap(), i);
         }
@@ -1704,7 +1752,8 @@ mod tests {
         let (dim, n, k, ef) = (64usize, 600usize, 10usize, 100usize);
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
 
-        let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
+        let idx =
+            PersistentVectorIndex::create_with_pq(db.clone(), WriteGate::open(), 1, pq_config_dim64(), &data).unwrap();
         assert!(idx.pq_active());
         for (i, v) in data.iter().enumerate() {
             idx.insert(i as u64, v).unwrap();
@@ -1743,7 +1792,8 @@ mod tests {
 
         let before = {
             let db = Arc::new(DB::open_default(&path).unwrap());
-            let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
+            let idx = PersistentVectorIndex::create_with_pq(db.clone(), WriteGate::open(), 1, pq_config_dim64(), &data)
+                .unwrap();
             for (i, v) in data.iter().enumerate() {
                 idx.insert(i as u64, v).unwrap();
             }
@@ -1751,7 +1801,7 @@ mod tests {
         };
 
         let db = Arc::new(DB::open_default(&path).unwrap());
-        let idx = PersistentVectorIndex::open(db, 1).unwrap();
+        let idx = PersistentVectorIndex::open(db, WriteGate::open(), 1).unwrap();
         assert!(idx.pq_active(), "PQ must be reconstructed on reopen");
         assert_eq!(idx.len(), n);
         let after = idx.search(&q, 10, 100).unwrap();
@@ -1763,7 +1813,8 @@ mod tests {
         let (_dir, db) = test_db();
         let (dim, n) = (64usize, 300usize);
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
-        let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
+        let idx =
+            PersistentVectorIndex::create_with_pq(db.clone(), WriteGate::open(), 1, pq_config_dim64(), &data).unwrap();
         for (i, v) in data.iter().enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
@@ -1781,7 +1832,13 @@ mod tests {
     fn test_filtered_knn_correctness() {
         let (_dir, db) = test_db();
         let (dim, n, k, ef) = (16usize, 1000usize, 10usize, 200usize);
-        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
+        let idx = PersistentVectorIndex::create(
+            db.clone(),
+            WriteGate::open(),
+            1,
+            PqHnswConfig::new(dim, DistanceMetric::L2),
+        )
+        .unwrap();
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
         for (i, v) in data.iter().enumerate() {
             idx.insert(i as u64, v).unwrap();
@@ -1817,7 +1874,8 @@ mod tests {
         let (_dir, db) = test_db();
         let (dim, n, k, ef) = (64usize, 600usize, 10usize, 200usize);
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
-        let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
+        let idx =
+            PersistentVectorIndex::create_with_pq(db.clone(), WriteGate::open(), 1, pq_config_dim64(), &data).unwrap();
         for (i, v) in data.iter().enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
@@ -1856,7 +1914,13 @@ mod tests {
         // top-k loses results that predicate-during-traversal retains.
         let (_dir, db) = test_db();
         let (dim, n) = (16usize, 1000usize);
-        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
+        let idx = PersistentVectorIndex::create(
+            db.clone(),
+            WriteGate::open(),
+            1,
+            PqHnswConfig::new(dim, DistanceMetric::L2),
+        )
+        .unwrap();
         for i in 0..n as u64 {
             idx.insert(i, &rand_vec(i, dim)).unwrap();
         }
@@ -1884,7 +1948,13 @@ mod tests {
     fn test_filtered_no_matches_returns_empty() {
         let (_dir, db) = test_db();
         let dim = 8;
-        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
+        let idx = PersistentVectorIndex::create(
+            db.clone(),
+            WriteGate::open(),
+            1,
+            PqHnswConfig::new(dim, DistanceMetric::L2),
+        )
+        .unwrap();
         for i in 0..50u64 {
             idx.insert(i, &rand_vec(i, dim)).unwrap();
         }
@@ -1949,7 +2019,7 @@ mod tests {
             let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
             let mut cfg = pq_config_dim64();
             cfg.rerank_precision = prec;
-            let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, cfg, &data).unwrap();
+            let idx = PersistentVectorIndex::create_with_pq(db.clone(), WriteGate::open(), 1, cfg, &data).unwrap();
             for (i, v) in data.iter().enumerate() {
                 idx.insert(i as u64, v).unwrap();
             }
@@ -1980,7 +2050,7 @@ mod tests {
             let db = Arc::new(DB::open_default(&path).unwrap());
             let mut cfg = PqHnswConfig::new(dim, DistanceMetric::L2);
             cfg.rerank_precision = VectorPrecision::I8;
-            let idx = PersistentVectorIndex::create(db.clone(), 1, cfg).unwrap();
+            let idx = PersistentVectorIndex::create(db.clone(), WriteGate::open(), 1, cfg).unwrap();
             for i in 0..100u64 {
                 idx.insert(i, &rand_vec(i, dim)).unwrap();
             }
@@ -1988,7 +2058,7 @@ mod tests {
         };
 
         let db = Arc::new(DB::open_default(&path).unwrap());
-        let idx = PersistentVectorIndex::open(db, 1).unwrap();
+        let idx = PersistentVectorIndex::open(db, WriteGate::open(), 1).unwrap();
         let after = idx.search(&q, 5, 64).unwrap();
         assert_eq!(before, after, "i8 exact-mode search must match across reopen");
     }
@@ -2004,7 +2074,7 @@ mod tests {
         let (dim, n, k, ef) = (128usize, 1500usize, 10usize, 100usize);
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
         let cfg = PqHnswConfig::new(dim, DistanceMetric::L2); // pq_config = None on purpose
-        let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, cfg, &data).unwrap();
+        let idx = PersistentVectorIndex::create_with_pq(db.clone(), WriteGate::open(), 1, cfg, &data).unwrap();
         assert!(
             idx.config().pq_config.is_some(),
             "create_with_pq should fill in a config"
@@ -2081,19 +2151,25 @@ mod tests {
         let (_d1, db1) = test_db();
         run(
             "exact f32   ",
-            &PersistentVectorIndex::create(db1.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap(),
+            &PersistentVectorIndex::create(
+                db1.clone(),
+                WriteGate::open(),
+                1,
+                PqHnswConfig::new(dim, DistanceMetric::L2),
+            )
+            .unwrap(),
         );
         let (_d2, db2) = test_db();
         run(
             "pq f32-rerank",
-            &PersistentVectorIndex::create_with_pq(db2.clone(), 1, pq_cfg(), &data).unwrap(),
+            &PersistentVectorIndex::create_with_pq(db2.clone(), WriteGate::open(), 1, pq_cfg(), &data).unwrap(),
         );
         let (_d3, db3) = test_db();
         let mut ci8 = pq_cfg();
         ci8.rerank_precision = VectorPrecision::I8;
         run(
             "pq i8-rerank ",
-            &PersistentVectorIndex::create_with_pq(db3.clone(), 1, ci8, &data).unwrap(),
+            &PersistentVectorIndex::create_with_pq(db3.clone(), WriteGate::open(), 1, ci8, &data).unwrap(),
         );
     }
 }

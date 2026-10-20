@@ -172,7 +172,12 @@ fn a_stale_drop_table_in_an_uncheckpointed_log_must_not_destroy_the_live_table()
     // Plant the historical entry, exactly as an older build would have left it.
     {
         let raw = open_raw(dir);
-        let wal = WriteAheadLog::open(Arc::clone(&raw), WalSyncMode::Sync).expect("open wal");
+        let wal = WriteAheadLog::open(
+            Arc::clone(&raw),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .expect("open wal");
         wal.append(WalOperation::DropTable {
             table: "organizations".to_string(),
         })
@@ -229,7 +234,12 @@ fn a_stale_truncate_in_an_uncheckpointed_log_must_not_empty_the_live_table() {
 
     {
         let raw = open_raw(dir);
-        let wal = WriteAheadLog::open(Arc::clone(&raw), WalSyncMode::Sync).expect("open wal");
+        let wal = WriteAheadLog::open(
+            Arc::clone(&raw),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .expect("open wal");
         wal.append(WalOperation::Truncate {
             table: "ledger".to_string(),
         })
@@ -269,7 +279,12 @@ fn the_legacy_upgrade_records_a_checkpoint_and_reclaims_the_log() {
 
     let planted_lsn = {
         let raw = open_raw(dir);
-        let wal = WriteAheadLog::open(Arc::clone(&raw), WalSyncMode::Sync).expect("open wal");
+        let wal = WriteAheadLog::open(
+            Arc::clone(&raw),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .expect("open wal");
         let lsn = wal
             .append(WalOperation::DropTable { table: "t".to_string() })
             .expect("append");
@@ -312,7 +327,12 @@ fn reopening_repeatedly_is_stable() {
 
     {
         let raw = open_raw(dir);
-        let wal = WriteAheadLog::open(Arc::clone(&raw), WalSyncMode::Sync).expect("open wal");
+        let wal = WriteAheadLog::open(
+            Arc::clone(&raw),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .expect("open wal");
         wal.append(WalOperation::DropTable {
             table: "orgs".to_string(),
         })
@@ -361,7 +381,12 @@ fn an_entry_past_the_checkpoint_is_still_replayed() {
 
     {
         let raw = open_raw(dir);
-        let wal = WriteAheadLog::open(Arc::clone(&raw), WalSyncMode::Sync).expect("open wal");
+        let wal = WriteAheadLog::open(
+            Arc::clone(&raw),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .expect("open wal");
         let entries = wal.replay().expect("read the retained log");
 
         // The last logged Insert for `t` — its `key` field IS the data key the
@@ -426,7 +451,12 @@ fn an_entry_at_or_below_the_checkpoint_is_not_replayed() {
 
     {
         let raw = open_raw(dir);
-        let wal = WriteAheadLog::open(Arc::clone(&raw), WalSyncMode::Sync).expect("open wal");
+        let wal = WriteAheadLog::open(
+            Arc::clone(&raw),
+            heliosdb_nano::storage::WriteGate::open(),
+            WalSyncMode::Sync,
+        )
+        .expect("open wal");
         let entries = wal.replay().expect("read the retained log");
 
         let (lsn, data_key) = entries

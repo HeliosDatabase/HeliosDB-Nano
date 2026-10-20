@@ -31,6 +31,7 @@
 
 #![allow(deprecated)]
 
+use super::write_gate::WriteGate;
 use crate::crypto::KeyManager;
 use crate::{Error, Result, Tuple};
 use chrono::{DateTime, Utc};
@@ -263,8 +264,10 @@ impl DeltaSet {
 
 /// Delta tracker for incremental materialized views
 pub struct DeltaTracker {
-    /// RocksDB instance
+    /// RocksDB instance. Written only through `gate`.
     db: Arc<DB>,
+    /// The write gate of the engine that owns `db`.
+    gate: Arc<WriteGate>,
     /// Current delta sequence number
     current_delta_id: parking_lot::RwLock<u64>,
     /// TDE key manager, mirroring `StorageEngine::key_manager`.
@@ -285,9 +288,10 @@ impl DeltaTracker {
     ///
     /// Delegates to [`DeltaTracker::new_with_key_manager`]; both engine
     /// constructors use that one, so this is the shape a caller outside the
-    /// engine gets.
-    pub fn new(db: Arc<DB>) -> Result<Self> {
-        Self::new_with_key_manager(db, None)
+    /// engine gets. `gate` is the write gate of the engine that owns `db`
+    /// (`WriteGate::open()` for a handle the caller owns outright).
+    pub fn new(db: Arc<DB>, gate: Arc<WriteGate>) -> Result<Self> {
+        Self::new_with_key_manager(db, gate, None)
     }
 
     /// Create a delta tracker that seals its records under `key_manager`.
@@ -296,12 +300,17 @@ impl DeltaTracker {
     /// tracker can never be published to the engine in a state where it would
     /// write `delta:` records in a different form from the one its own readers
     /// expect.
-    pub fn new_with_key_manager(db: Arc<DB>, key_manager: Option<Arc<KeyManager>>) -> Result<Self> {
+    pub fn new_with_key_manager(
+        db: Arc<DB>,
+        gate: Arc<WriteGate>,
+        key_manager: Option<Arc<KeyManager>>,
+    ) -> Result<Self> {
         // Load the last delta ID from storage
         let last_delta_id = Self::load_last_delta_id(&db)?;
 
         Ok(Self {
             db,
+            gate,
             current_delta_id: parking_lot::RwLock::new(last_delta_id),
             key_manager,
         })
@@ -331,8 +340,8 @@ impl DeltaTracker {
     fn save_last_delta_id(&self, id: u64) -> Result<()> {
         let key = b"meta:delta:last_id";
         let value = id.to_le_bytes();
-        self.db
-            .put(key, value)
+        self.gate
+            .put(&self.db, key, value, None)
             .map_err(|e| Error::storage(format!("Failed to save last delta ID: {}", e)))
     }
 
@@ -376,8 +385,8 @@ impl DeltaTracker {
         // i.e. byte-for-byte the call below made before, when encryption is off.
         let stored = super::tde::seal_row_value(self.key_manager.as_deref(), key.as_bytes(), &value)?;
 
-        self.db
-            .put(key.as_bytes(), stored.as_ref())
+        self.gate
+            .put(&self.db, key.as_bytes(), stored.as_ref(), None)
             .map_err(|e| Error::storage(format!("Failed to store delta: {}", e)))?;
 
         // Update last delta ID
@@ -525,8 +534,8 @@ impl DeltaTracker {
 
         // Delete old deltas
         for key in &keys_to_delete {
-            self.db
-                .delete(key)
+            self.gate
+                .delete(&self.db, key, None)
                 .map_err(|e| Error::storage(format!("Failed to delete delta: {}", e)))?;
             purged_count += 1;
         }
@@ -563,7 +572,8 @@ mod tests {
     fn test_delta_tracker_record() {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
-        let tracker = DeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create tracker");
+        let tracker = DeltaTracker::new(Arc::clone(&engine.db), Arc::clone(engine.write_gate()))
+            .expect("Failed to create tracker");
 
         let tuple = Tuple::new(vec![Value::Int4(1), Value::String("test".to_string())]);
 
@@ -578,7 +588,8 @@ mod tests {
     fn test_delta_retrieval() {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
-        let tracker = DeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create tracker");
+        let tracker = DeltaTracker::new(Arc::clone(&engine.db), Arc::clone(engine.write_gate()))
+            .expect("Failed to create tracker");
 
         let tuple = Tuple::new(vec![Value::Int4(1)]);
         tracker
@@ -600,7 +611,8 @@ mod tests {
     fn test_delta_count() {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
-        let tracker = DeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create tracker");
+        let tracker = DeltaTracker::new(Arc::clone(&engine.db), Arc::clone(engine.write_gate()))
+            .expect("Failed to create tracker");
 
         let tuple = Tuple::new(vec![Value::Int4(1)]);
         tracker
@@ -630,8 +642,12 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
         let km = Arc::new(crate::crypto::KeyManager::generate_random());
-        let tracker = DeltaTracker::new_with_key_manager(Arc::clone(&engine.db), Some(Arc::clone(&km)))
-            .expect("Failed to create tracker");
+        let tracker = DeltaTracker::new_with_key_manager(
+            Arc::clone(&engine.db),
+            Arc::clone(engine.write_gate()),
+            Some(Arc::clone(&km)),
+        )
+        .expect("Failed to create tracker");
 
         const SECRET: &str = "QZX-MV-DELTA-DELETED-ROW-5501";
         let tuple = Tuple::new(vec![Value::Int4(1), Value::String(SECRET.to_string())]);

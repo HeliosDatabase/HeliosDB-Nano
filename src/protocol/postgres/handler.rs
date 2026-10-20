@@ -7294,16 +7294,34 @@ mod md5_auth_wire_tests {
 }
 
 /// Bounded SQL-shape admission for a history-guarded CLI standby. This is not
-/// function volatility analysis: SELECT UDF/sequence side effects need a separate
-/// storage/session policy. Unknown utility statements are denied, not guessed.
+/// function volatility analysis: SELECT UDF side effects need a separate
+/// storage/session policy. The one exception is the sequence pair: `nextval` /
+/// `setval` persist a high-water mark, so a read that calls either is denied here
+/// (SQLSTATE 25006 before the engine is reached); the storage write gate refuses
+/// the write as the backstop. Unknown utility statements are denied, not guessed.
 #[cfg(any(feature = "ha-tier1", test))]
 fn guarded_standby_statement_allowed(sql: &str) -> bool {
-    use sqlparser::ast::{Query, SetExpr, Statement, Visit, Visitor};
+    use sqlparser::ast::{Expr, Query, SetExpr, Statement, Visit, Visitor};
     use std::ops::ControlFlow;
 
     struct ReadQuery;
     impl Visitor for ReadQuery {
         type Break = ();
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if let Expr::Function(function) = expr {
+                // `pg_catalog.nextval` too: the last name part decides.
+                let name = function
+                    .name
+                    .0
+                    .last()
+                    .map(|part| part.value.as_str())
+                    .unwrap_or_default();
+                if name.eq_ignore_ascii_case("nextval") || name.eq_ignore_ascii_case("setval") {
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        }
         fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
             // The visitor reaches write statements inside CTEs/subqueries too.
             if matches!(statement, Statement::Query(_)) {
@@ -7407,6 +7425,7 @@ mod guarded_standby_admission_tests {
             "SET application_name = 'replica reader'",
             "SHOW application_name",
             "RESET application_name",
+            "SELECT currval('s')",
             "",
             "-- only a comment",
         ] {
@@ -7443,6 +7462,12 @@ mod guarded_standby_admission_tests {
             "GRANT SELECT ON t TO user1",
             "SELECT 1; INSERT INTO t VALUES (1)",
             "BEGIN; INSERT INTO t VALUES (1)",
+            "SELECT nextval('s')",
+            "SELECT NEXTVAL('s')",
+            "SELECT pg_catalog.nextval('s')",
+            "SELECT setval('s', 10)",
+            "SELECT id FROM t WHERE id < nextval('s')",
+            "SELECT (SELECT setval('s', 1, false))",
             "unrecognized utility syntax",
         ] {
             assert!(!allowed(sql), "write/unknown statement admitted: {sql}");

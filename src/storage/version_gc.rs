@@ -62,6 +62,7 @@ use tracing::{debug, info, warn};
 use super::branch::BranchManager;
 use super::conflict::WriteConflictRegistry;
 use super::time_travel::SnapshotManager;
+use super::write_gate::WriteGate;
 
 /// Persisted low watermark: highest GC horizon ever applied (u64 BE).
 pub const LOW_WATERMARK_KEY: &[u8] = b"vgc:low_watermark";
@@ -113,6 +114,10 @@ pub struct VersionStorageStats {
 /// Shared version-GC state and collector. One per `StorageEngine`.
 pub struct VersionGc {
     db: Arc<DB>,
+    /// The write gate of the engine that owns `db`. The collector only ever
+    /// runs on a primary, but every component holding the raw handle writes
+    /// through its gate, so the funnel has no exceptions to remember.
+    gate: Arc<WriteGate>,
     snapshot_manager: Arc<SnapshotManager>,
     conflict_registry: Arc<WriteConflictRegistry>,
     branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
@@ -130,6 +135,7 @@ pub struct VersionGc {
 impl VersionGc {
     pub fn new(
         db: Arc<DB>,
+        gate: Arc<WriteGate>,
         snapshot_manager: Arc<SnapshotManager>,
         conflict_registry: Arc<WriteConflictRegistry>,
         branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
@@ -152,6 +158,7 @@ impl VersionGc {
 
         Self {
             db,
+            gate,
             snapshot_manager,
             conflict_registry,
             branch_manager,
@@ -182,7 +189,7 @@ impl VersionGc {
         }
 
         let key = anchor_key(now_secs);
-        if let Err(e) = self.db.put(&key, ts.to_be_bytes()) {
+        if let Err(e) = self.gate.put(&self.db, &key, ts.to_be_bytes(), None) {
             warn!("version-gc: failed to persist time anchor: {}", e);
         }
     }
@@ -239,8 +246,8 @@ impl VersionGc {
         //    a crash, "error too eagerly" is safe; "read a pruned chain"
         //    is not). Monotonic.
         if horizon > self.snapshot_manager.gc_low_watermark() {
-            self.db
-                .put(LOW_WATERMARK_KEY, horizon.to_be_bytes())
+            self.gate
+                .put(&self.db, LOW_WATERMARK_KEY, horizon.to_be_bytes(), None)
                 .map_err(|e| Error::storage(format!("version-gc: failed to persist watermark: {}", e)))?;
             self.snapshot_manager.set_gc_low_watermark(horizon);
         }
@@ -320,8 +327,8 @@ impl VersionGc {
             for key in stale_anchor_keys {
                 batch.delete(&key);
             }
-            self.db
-                .write(batch)
+            self.gate
+                .write(&self.db, batch, None)
                 .map_err(|e| Error::storage(format!("version-gc anchor prune: {}", e)))?;
         }
 
@@ -381,10 +388,10 @@ impl VersionGc {
         let mut next_cursor: Option<Vec<u8>> = None;
         let mut finished_pass = true;
 
-        let flush = |batch: &mut WriteBatch, batch_keys: &mut usize, db: &DB| -> Result<()> {
+        let flush = |batch: &mut WriteBatch, batch_keys: &mut usize, db: &DB, gate: &WriteGate| -> Result<()> {
             if *batch_keys > 0 {
                 let owned = std::mem::take(batch);
-                db.write(owned)
+                gate.write(db, owned, None)
                     .map_err(|e| Error::storage(format!("version-gc delete batch: {}", e)))?;
                 *batch_keys = 0;
             }
@@ -456,7 +463,7 @@ impl VersionGc {
                         }
                     }
                     if *batch_keys >= DELETE_BATCH_KEYS {
-                        flush(batch, batch_keys, &self.db)?;
+                        flush(batch, batch_keys, &self.db, &self.gate)?;
                     }
                 }
             }
@@ -513,7 +520,7 @@ impl VersionGc {
                 &mut stats,
             )?;
         }
-        flush(&mut batch, &mut batch_keys, &self.db)?;
+        flush(&mut batch, &mut batch_keys, &self.db, &self.gate)?;
 
         *self.cursor.lock() = next_cursor;
         stats.finished_pass = finished_pass;

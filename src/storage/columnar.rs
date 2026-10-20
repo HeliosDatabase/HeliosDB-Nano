@@ -80,6 +80,7 @@ use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+use super::write_gate::WriteGate;
 use super::Transaction;
 use crate::{Error, Result, Value};
 
@@ -606,13 +607,17 @@ impl ColumnarStore {
     /// image can never be clobbered by a write computed from a pre-backfill
     /// view, and writers that start after the backfill see the marker and
     /// read-modify-write complete images. One-time cost per legacy table.
-    pub fn backfill_presence(db: &DB, table: &str) -> Result<Vec<(u64, BatchPresence)>> {
+    ///
+    /// Behind a closed `gate` (a handle that may not write) the map is built and
+    /// returned exactly the same, but nothing is persisted: the read still gets
+    /// its answer and the next scan rebuilds it.
+    pub fn backfill_presence(db: &DB, gate: &WriteGate, table: &str) -> Result<Vec<(u64, BatchPresence)>> {
         let _guard = stats_write_lock();
-        Self::backfill_presence_locked(db, table)
+        Self::backfill_presence_locked(db, gate, table)
     }
 
     /// Inner backfill; caller must hold the zone-stats write lock.
-    fn backfill_presence_locked(db: &DB, table: &str) -> Result<Vec<(u64, BatchPresence)>> {
+    fn backfill_presence_locked(db: &DB, gate: &WriteGate, table: &str) -> Result<Vec<(u64, BatchPresence)>> {
         // Re-check under the lock: a concurrent backfill may have completed.
         if Self::presence_manifest_complete(db, table) {
             return Self::load_presence_map(db, table);
@@ -642,6 +647,12 @@ impl ColumnarStore {
             map.entry(batch_id).or_default().set(offset);
         }
 
+        let mut built: Vec<(u64, BatchPresence)> = map.into_iter().collect();
+        built.sort_by_key(|(batch_id, _)| *batch_id);
+        if !gate.is_open() {
+            return Ok(built);
+        }
+
         // Purge any stale records (e.g. left behind by an invalidation that
         // removed only the marker) before writing the rebuilt image.
         let mut write_batch = rocksdb::WriteBatch::default();
@@ -655,15 +666,13 @@ impl ColumnarStore {
             write_batch.delete(&key);
         }
 
-        let mut built: Vec<(u64, BatchPresence)> = map.into_iter().collect();
-        built.sort_by_key(|(batch_id, _)| *batch_id);
         for (batch_id, presence) in &built {
             let data = bincode::serialize(presence)
                 .map_err(|e| Error::storage(format!("Columnar presence serialize failed: {}", e)))?;
             write_batch.put(Self::presence_key(table, *batch_id), data);
         }
         write_batch.put(Self::presence_marker_key(table), [1u8]);
-        db.write(write_batch)
+        gate.write(db, write_batch, None)
             .map_err(|e| Error::storage(format!("Columnar presence backfill failed: {}", e)))?;
         Ok(built)
     }
@@ -671,16 +680,16 @@ impl ColumnarStore {
     /// Read-side presence lookup: `Some(map)` when the manifest is complete
     /// (loading it) or after lazily backfilling it; callers fall back to the
     /// row-keyspace walk on `None` (which only happens on backfill failure).
-    pub fn presence_scan_map(db: &DB, table: &str) -> Result<Vec<(u64, BatchPresence)>> {
+    pub fn presence_scan_map(db: &DB, gate: &WriteGate, table: &str) -> Result<Vec<(u64, BatchPresence)>> {
         if Self::presence_manifest_complete(db, table) {
             return Self::load_presence_map(db, table);
         }
-        Self::backfill_presence(db, table)
+        Self::backfill_presence(db, gate, table)
     }
 
     /// Remove the presence sidecar and marker for a table (storage-mode
     /// migrations, truncate, drop). The next columnar read re-backfills.
-    pub fn purge_presence(db: &DB, table: &str) -> Result<()> {
+    pub fn purge_presence(db: &DB, gate: &WriteGate, table: &str) -> Result<()> {
         let _guard = stats_write_lock();
         let mut write_batch = rocksdb::WriteBatch::default();
         let prefix = Self::presence_prefix(table);
@@ -693,7 +702,7 @@ impl ColumnarStore {
             write_batch.delete(&key);
         }
         write_batch.delete(Self::presence_marker_key(table));
-        db.write(write_batch)
+        gate.write(db, write_batch, None)
             .map_err(|e| Error::storage(format!("Columnar presence purge failed: {}", e)))
     }
 
@@ -701,7 +710,7 @@ impl ColumnarStore {
     /// `colzm:` markers, `colp:` presence and the `colpm:` marker. Used by
     /// TRUNCATE / DROP TABLE / orphan purges so recreated or refilled tables
     /// never observe stale side-data.
-    pub fn purge_table_sidecars(db: &DB, table: &str) -> Result<()> {
+    pub fn purge_table_sidecars(db: &DB, gate: &WriteGate, table: &str) -> Result<()> {
         let _guard = stats_write_lock();
         let mut write_batch = rocksdb::WriteBatch::default();
         for prefix in [
@@ -720,7 +729,7 @@ impl ColumnarStore {
             }
         }
         write_batch.delete(Self::presence_marker_key(table));
-        db.write(write_batch)
+        gate.write(db, write_batch, None)
             .map_err(|e| Error::storage(format!("Columnar sidecar purge failed: {}", e)))
     }
 
@@ -799,7 +808,7 @@ impl ColumnarStore {
     /// * `column` - Column name
     /// * `row_id` - Row identifier
     /// * `value` - Value to store
-    pub fn store(db: &DB, table: &str, column: &str, row_id: u64, value: Value) -> Result<()> {
+    pub fn store(db: &DB, gate: &WriteGate, table: &str, column: &str, row_id: u64, value: Value) -> Result<()> {
         let (batch_id, _offset) = Self::batch_location(row_id);
 
         // Load-modify-write entirely under the zone-stats write lock so a
@@ -815,7 +824,7 @@ impl ColumnarStore {
             batch_id,
             std::slice::from_ref(&(row_id, value)),
         )?;
-        db.write(write_batch)
+        gate.write(db, write_batch, None)
             .map_err(|e| Error::storage(format!("Columnar store failed: {}", e)))?;
 
         Ok(())
@@ -950,9 +959,11 @@ impl ColumnarStore {
     /// stats backfill: the write happens under the zone-stats write lock and
     /// only when the committed bytes still equal the image we decoded (a
     /// concurrent writer otherwise wins). Failures are logged and ignored —
-    /// the batch simply stays v1 until the next scan.
+    /// the batch simply stays v1 until the next scan, as it does behind a
+    /// closed `gate`, where the rewrite is not even attempted.
     fn maybe_migrate_v1_batch(
         db: &DB,
+        gate: &WriteGate,
         table: &str,
         column: &str,
         batch_id: u64,
@@ -960,6 +971,9 @@ impl ColumnarStore {
         batch: &ColumnBatch,
     ) {
         use super::typed_batch as tb;
+        if !gate.is_open() {
+            return;
+        }
         if batch.typed.is_some() || !tb::batch_v2_migrate_enabled() || !tb::batch_v2_write_enabled() {
             return;
         }
@@ -973,7 +987,7 @@ impl ColumnarStore {
                 let stats = BatchStats::from_batch(batch);
                 match tb::encode_column_batch(batch, &stats) {
                     Ok(encoded) => {
-                        if let Err(e) = db.put(&key, encoded) {
+                        if let Err(e) = gate.put(db, &key, encoded, None) {
                             tracing::warn!(table, column, batch_id, error = %e, "Batch v2 migration write failed");
                         }
                     }
@@ -997,7 +1011,7 @@ impl ColumnarStore {
     ///
     /// # Returns
     /// Vector of (row_id, value) pairs for all non-null values
-    pub fn scan_column(db: &DB, table: &str, column: &str) -> Result<Vec<(u64, Value)>> {
+    pub fn scan_column(db: &DB, gate: &WriteGate, table: &str, column: &str) -> Result<Vec<(u64, Value)>> {
         let prefix = Self::column_prefix(table, column);
         let mut results = Vec::new();
 
@@ -1013,7 +1027,7 @@ impl ColumnarStore {
             let batch = super::typed_batch::decode_column_batch(&value)?;
             if super::typed_batch::batch_v2_migrate_enabled() {
                 if let Some(batch_id) = Self::parse_batch_id(&key, prefix.len()) {
-                    Self::maybe_migrate_v1_batch(db, table, column, batch_id, &value, &batch);
+                    Self::maybe_migrate_v1_batch(db, gate, table, column, batch_id, &value, &batch);
                 }
             }
 
@@ -1034,7 +1048,12 @@ impl ColumnarStore {
     /// This is the lower-overhead primitive for executor-side columnar scans:
     /// callers can use the batch id and row offset directly instead of expanding
     /// every cell into a row-id map first.
-    pub fn scan_column_batches(db: &DB, table: &str, column: &str) -> Result<Vec<(u64, ColumnBatch)>> {
+    pub fn scan_column_batches(
+        db: &DB,
+        gate: &WriteGate,
+        table: &str,
+        column: &str,
+    ) -> Result<Vec<(u64, ColumnBatch)>> {
         let prefix = Self::column_prefix(table, column);
         let mut batches = Vec::new();
 
@@ -1049,7 +1068,7 @@ impl ColumnarStore {
             let batch = super::typed_batch::decode_column_batch(&value)?;
             let batch_id = batch.start_row_id / BATCH_SIZE as u64;
             if super::typed_batch::batch_v2_migrate_enabled() {
-                Self::maybe_migrate_v1_batch(db, table, column, batch_id, &value, &batch);
+                Self::maybe_migrate_v1_batch(db, gate, table, column, batch_id, &value, &batch);
             }
             batches.push((batch_id, batch));
         }
@@ -1101,9 +1120,11 @@ impl ColumnarStore {
     ///   iteration. Pruned batches skip the bincode decode; batches missing
     ///   stats are backfilled (best-effort, non-fatal) and the manifest marker
     ///   is written once a pass completes cleanly, so the next scan takes the
-    ///   manifest path.
+    ///   manifest path. Behind a closed `gate` neither is written: batches
+    ///   without stats are simply not pruned this scan.
     pub fn scan_column_batches_pruned(
         db: &DB,
+        gate: &WriteGate,
         table: &str,
         column: &str,
         pruned: &HashSet<u64>,
@@ -1111,7 +1132,7 @@ impl ColumnarStore {
         let manifest_complete = Self::stats_manifest_complete(db, table, column);
         if manifest_complete && pruned.is_empty() {
             // Nothing to prune: a plain prefix iteration is the cheapest full read.
-            return Self::scan_column_batches(db, table, column);
+            return Self::scan_column_batches(db, gate, table, column);
         }
 
         if manifest_complete {
@@ -1140,7 +1161,7 @@ impl ColumnarStore {
                 if let Some(data) = data {
                     let batch = super::typed_batch::decode_column_batch(&data)?;
                     if super::typed_batch::batch_v2_migrate_enabled() {
-                        Self::maybe_migrate_v1_batch(db, table, column, *batch_id, &data, &batch);
+                        Self::maybe_migrate_v1_batch(db, gate, table, column, *batch_id, &data, &batch);
                     }
                     batches.push((*batch_id, batch));
                 }
@@ -1169,7 +1190,11 @@ impl ColumnarStore {
                 if pruned.contains(&batch_id) {
                     continue; // skip decode entirely
                 }
-            } else if let Err(e) = Self::backfill_batch_stats(db, table, column, batch_id) {
+            } else if !gate.is_open() {
+                // Nothing may be recorded: the batch is just not prunable now,
+                // and the marker stays withheld.
+                pass_clean = false;
+            } else if let Err(e) = Self::backfill_batch_stats(db, gate, table, column, batch_id) {
                 // Best-effort: stats stay missing (no pruning for this batch),
                 // marker is withheld so a later scan retries.
                 tracing::warn!(
@@ -1187,16 +1212,16 @@ impl ColumnarStore {
             }
             let batch = super::typed_batch::decode_column_batch(&value)?;
             if super::typed_batch::batch_v2_migrate_enabled() {
-                Self::maybe_migrate_v1_batch(db, table, column, batch_id, &value, &batch);
+                Self::maybe_migrate_v1_batch(db, gate, table, column, batch_id, &value, &batch);
             }
             batches.push((batch_id, batch));
         }
 
-        if pass_clean {
+        if pass_clean && gate.is_open() {
             // Every batch now has a sidecar entry: record manifest completeness
             // (best-effort; reads work either way).
             let _guard = stats_write_lock();
-            if let Err(e) = db.put(Self::stats_marker_key(table, column), [1u8]) {
+            if let Err(e) = gate.put(db, Self::stats_marker_key(table, column), [1u8], None) {
                 tracing::warn!(table = table, column = column, error = %e, "Zone-stats marker write failed");
             }
         }
@@ -1209,7 +1234,7 @@ impl ColumnarStore {
     /// committed content. Takes the stats write lock and re-reads the batch
     /// under it so the stats can never be computed from a stale image while a
     /// concurrent writer updates the batch.
-    fn backfill_batch_stats(db: &DB, table: &str, column: &str, batch_id: u64) -> Result<()> {
+    fn backfill_batch_stats(db: &DB, gate: &WriteGate, table: &str, column: &str, batch_id: u64) -> Result<()> {
         let stats_key = Self::stats_key(table, column, batch_id);
         let _guard = stats_write_lock();
         if db
@@ -1228,19 +1253,19 @@ impl ColumnarStore {
         let batch = super::typed_batch::decode_column_batch(&data)?;
         let stats_data = bincode::serialize(&BatchStats::from_batch(&batch))
             .map_err(|e| Error::storage(format!("Columnar stats serialize failed: {}", e)))?;
-        db.put(&stats_key, &stats_data)
+        gate.put(db, &stats_key, &stats_data, None)
             .map_err(|e| Error::storage(format!("Columnar stats store failed: {}", e)))
     }
 
     /// Delete columnar data for a specific row
     ///
     /// Sets the value to Null in the batch (doesn't delete the batch).
-    pub fn delete(db: &DB, table: &str, column: &str, row_id: u64) -> Result<()> {
-        Self::store(db, table, column, row_id, Value::Null)
+    pub fn delete(db: &DB, gate: &WriteGate, table: &str, column: &str, row_id: u64) -> Result<()> {
+        Self::store(db, gate, table, column, row_id, Value::Null)
     }
 
     /// Delete all columnar data for a table.column
-    pub fn drop_column(db: &DB, table: &str, column: &str) -> Result<usize> {
+    pub fn drop_column(db: &DB, gate: &WriteGate, table: &str, column: &str) -> Result<usize> {
         let prefix = Self::column_prefix(table, column);
         let mut deleted = 0;
 
@@ -1253,7 +1278,7 @@ impl ColumnarStore {
                 break;
             }
 
-            db.delete(&key)
+            gate.delete(db, &key, None)
                 .map_err(|e| Error::storage(format!("Columnar delete failed: {}", e)))?;
             deleted += 1;
         }
@@ -1267,10 +1292,10 @@ impl ColumnarStore {
             if !key.starts_with(&stats_prefix) {
                 break;
             }
-            db.delete(&key)
+            gate.delete(db, &key, None)
                 .map_err(|e| Error::storage(format!("Columnar stats delete failed: {}", e)))?;
         }
-        db.delete(Self::stats_marker_key(table, column))
+        gate.delete(db, Self::stats_marker_key(table, column), None)
             .map_err(|e| Error::storage(format!("Columnar stats marker delete failed: {}", e)))?;
 
         Ok(deleted)
@@ -1336,9 +1361,9 @@ mod tests {
         let (_dir, db) = test_db();
 
         // Store values
-        ColumnarStore::store(&db, "metrics", "value", 0, Value::Float8(1.5)).unwrap();
-        ColumnarStore::store(&db, "metrics", "value", 1, Value::Float8(2.5)).unwrap();
-        ColumnarStore::store(&db, "metrics", "value", 2, Value::Float8(3.5)).unwrap();
+        ColumnarStore::store(&db, &WriteGate::open(), "metrics", "value", 0, Value::Float8(1.5)).unwrap();
+        ColumnarStore::store(&db, &WriteGate::open(), "metrics", "value", 1, Value::Float8(2.5)).unwrap();
+        ColumnarStore::store(&db, &WriteGate::open(), "metrics", "value", 2, Value::Float8(3.5)).unwrap();
 
         // Retrieve values
         assert_eq!(
@@ -1366,12 +1391,12 @@ mod tests {
         let (_dir, db) = test_db();
 
         // Store sparse values
-        ColumnarStore::store(&db, "test", "col", 0, Value::Int4(100)).unwrap();
-        ColumnarStore::store(&db, "test", "col", 5, Value::Int4(500)).unwrap();
-        ColumnarStore::store(&db, "test", "col", 10, Value::Int4(1000)).unwrap();
+        ColumnarStore::store(&db, &WriteGate::open(), "test", "col", 0, Value::Int4(100)).unwrap();
+        ColumnarStore::store(&db, &WriteGate::open(), "test", "col", 5, Value::Int4(500)).unwrap();
+        ColumnarStore::store(&db, &WriteGate::open(), "test", "col", 10, Value::Int4(1000)).unwrap();
 
         // Scan should return only non-null values
-        let results = ColumnarStore::scan_column(&db, "test", "col").unwrap();
+        let results = ColumnarStore::scan_column(&db, &WriteGate::open(), "test", "col").unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0], (0, Value::Int4(100)));
         assert_eq!(results[1], (5, Value::Int4(500)));
@@ -1383,10 +1408,10 @@ mod tests {
         let (_dir, db) = test_db();
 
         // Store values across multiple batches
-        ColumnarStore::store(&db, "test", "col", 0, Value::Int4(1)).unwrap();
-        ColumnarStore::store(&db, "test", "col", 1023, Value::Int4(2)).unwrap(); // Last in batch 0
-        ColumnarStore::store(&db, "test", "col", 1024, Value::Int4(3)).unwrap(); // First in batch 1
-        ColumnarStore::store(&db, "test", "col", 2048, Value::Int4(4)).unwrap(); // First in batch 2
+        ColumnarStore::store(&db, &WriteGate::open(), "test", "col", 0, Value::Int4(1)).unwrap();
+        ColumnarStore::store(&db, &WriteGate::open(), "test", "col", 1023, Value::Int4(2)).unwrap(); // Last in batch 0
+        ColumnarStore::store(&db, &WriteGate::open(), "test", "col", 1024, Value::Int4(3)).unwrap(); // First in batch 1
+        ColumnarStore::store(&db, &WriteGate::open(), "test", "col", 2048, Value::Int4(4)).unwrap(); // First in batch 2
 
         // Verify all values
         assert_eq!(ColumnarStore::get(&db, "test", "col", 0).unwrap(), Some(Value::Int4(1)));
@@ -1413,10 +1438,26 @@ mod tests {
     fn test_columnar_scan_orders_decimal_batch_keys_by_row_id() {
         let (_dir, db) = test_db();
 
-        ColumnarStore::store(&db, "test", "col", 10 * BATCH_SIZE as u64, Value::Int4(10)).unwrap();
-        ColumnarStore::store(&db, "test", "col", 2 * BATCH_SIZE as u64, Value::Int4(2)).unwrap();
+        ColumnarStore::store(
+            &db,
+            &WriteGate::open(),
+            "test",
+            "col",
+            10 * BATCH_SIZE as u64,
+            Value::Int4(10),
+        )
+        .unwrap();
+        ColumnarStore::store(
+            &db,
+            &WriteGate::open(),
+            "test",
+            "col",
+            2 * BATCH_SIZE as u64,
+            Value::Int4(2),
+        )
+        .unwrap();
 
-        let results = ColumnarStore::scan_column(&db, "test", "col").unwrap();
+        let results = ColumnarStore::scan_column(&db, &WriteGate::open(), "test", "col").unwrap();
         assert_eq!(
             results,
             vec![
@@ -1431,8 +1472,8 @@ mod tests {
         let (_dir, db) = test_db();
 
         // Store and then delete
-        ColumnarStore::store(&db, "test", "col", 5, Value::Int4(100)).unwrap();
-        ColumnarStore::delete(&db, "test", "col", 5).unwrap();
+        ColumnarStore::store(&db, &WriteGate::open(), "test", "col", 5, Value::Int4(100)).unwrap();
+        ColumnarStore::delete(&db, &WriteGate::open(), "test", "col", 5).unwrap();
 
         // Should be Null now
         assert_eq!(ColumnarStore::get(&db, "test", "col", 5).unwrap(), Some(Value::Null));
@@ -1502,7 +1543,7 @@ mod tests {
     #[test]
     fn test_store_writes_stats_sidecar_atomically() {
         let (_dir, db) = test_db();
-        ColumnarStore::store(&db, "t", "v", 5, Value::Int4(100)).unwrap();
+        ColumnarStore::store(&db, &WriteGate::open(), "t", "v", 5, Value::Int4(100)).unwrap();
 
         let stats_map = ColumnarStore::load_stats_map(&db, "t", "v").unwrap();
         assert_eq!(stats_map.len(), 1);
@@ -1511,7 +1552,7 @@ mod tests {
         assert_eq!(stats.max, Some(Value::Int4(100)));
 
         // Delete (stores Null) must refresh the sidecar in the same write.
-        ColumnarStore::delete(&db, "t", "v", 5).unwrap();
+        ColumnarStore::delete(&db, &WriteGate::open(), "t", "v", 5).unwrap();
         let stats_map = ColumnarStore::load_stats_map(&db, "t", "v").unwrap();
         let stats = stats_map.get(&0).unwrap();
         assert_eq!(stats.min, None);
@@ -1539,7 +1580,7 @@ mod tests {
 
         // First pruned scan: backfills all stats and sets the marker.
         let empty = HashSet::new();
-        let batches = ColumnarStore::scan_column_batches_pruned(&db, "t", "v", &empty).unwrap();
+        let batches = ColumnarStore::scan_column_batches_pruned(&db, &WriteGate::open(), "t", "v", &empty).unwrap();
         assert_eq!(batches.len(), 3);
         let stats_map = ColumnarStore::load_stats_map(&db, "t", "v").unwrap();
         assert_eq!(stats_map.len(), 3);
@@ -1549,14 +1590,14 @@ mod tests {
 
         // Second scan takes the manifest path; pruning skips batch fetches.
         let pruned: HashSet<u64> = [0u64, 2u64].into_iter().collect();
-        let batches = ColumnarStore::scan_column_batches_pruned(&db, "t", "v", &pruned).unwrap();
+        let batches = ColumnarStore::scan_column_batches_pruned(&db, &WriteGate::open(), "t", "v", &pruned).unwrap();
         assert_eq!(batches.len(), 1);
         assert_eq!(batches.first().map(|(id, _)| *id), Some(1));
 
         // Equivalence with the eager scan when nothing is pruned.
         let pruned_none = HashSet::new();
-        let lazy = ColumnarStore::scan_column_batches_pruned(&db, "t", "v", &pruned_none).unwrap();
-        let eager = ColumnarStore::scan_column_batches(&db, "t", "v").unwrap();
+        let lazy = ColumnarStore::scan_column_batches_pruned(&db, &WriteGate::open(), "t", "v", &pruned_none).unwrap();
+        let eager = ColumnarStore::scan_column_batches(&db, &WriteGate::open(), "t", "v").unwrap();
         assert_eq!(lazy.len(), eager.len());
         for ((lid, lbatch), (eid, ebatch)) in lazy.iter().zip(eager.iter()) {
             assert_eq!(lid, eid);
@@ -1567,12 +1608,12 @@ mod tests {
     #[test]
     fn test_drop_column_purges_stats_and_marker() {
         let (_dir, db) = test_db();
-        ColumnarStore::store(&db, "t", "v", 0, Value::Int4(1)).unwrap();
+        ColumnarStore::store(&db, &WriteGate::open(), "t", "v", 0, Value::Int4(1)).unwrap();
         let empty = HashSet::new();
-        ColumnarStore::scan_column_batches_pruned(&db, "t", "v", &empty).unwrap();
+        ColumnarStore::scan_column_batches_pruned(&db, &WriteGate::open(), "t", "v", &empty).unwrap();
         assert!(ColumnarStore::stats_manifest_complete(&db, "t", "v"));
 
-        ColumnarStore::drop_column(&db, "t", "v").unwrap();
+        ColumnarStore::drop_column(&db, &WriteGate::open(), "t", "v").unwrap();
         assert!(ColumnarStore::load_stats_map(&db, "t", "v").unwrap().is_empty());
         assert!(!ColumnarStore::stats_manifest_complete(&db, "t", "v"));
     }

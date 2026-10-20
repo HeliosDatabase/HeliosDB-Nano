@@ -31,16 +31,20 @@ fn capture_insert(primary: &EmbeddedDatabase, id: i32) -> WalOperation {
         .execute(&format!("INSERT INTO applicator_rows VALUES ({id}, {})", id * 10))
         .unwrap();
     // Async open/replay is read-only: no group-commit worker, append, or Drop write.
-    WriteAheadLog::open(primary.storage.db(), WalSyncMode::Async)
-        .unwrap()
-        .replay_from(before)
-        .unwrap()
-        .into_iter()
-        .find_map(|entry| match entry.operation {
-            operation @ WalOperation::Insert { .. } => Some(operation),
-            _ => None,
-        })
-        .expect("SQL fixture must emit an actual Insert WAL operation")
+    WriteAheadLog::open(
+        primary.storage.db(),
+        std::sync::Arc::clone(primary.storage.write_gate()),
+        WalSyncMode::Async,
+    )
+    .unwrap()
+    .replay_from(before)
+    .unwrap()
+    .into_iter()
+    .find_map(|entry| match entry.operation {
+        operation @ WalOperation::Insert { .. } => Some(operation),
+        _ => None,
+    })
+    .expect("SQL fixture must emit an actual Insert WAL operation")
 }
 
 fn entry(lsn: u64, operation: &WalOperation) -> WalEntry {

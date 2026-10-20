@@ -77,7 +77,12 @@ fn captured_update(primary: &EmbeddedDatabase, from: i32, to: i32) -> (WalOperat
             to * 10
         ))
         .unwrap();
-    let reader = WriteAheadLog::open(primary.storage.db(), WalSyncMode::Async).unwrap();
+    let reader = WriteAheadLog::open(
+        primary.storage.db(),
+        std::sync::Arc::clone(primary.storage.write_gate()),
+        WalSyncMode::Async,
+    )
+    .unwrap();
     let updates: Vec<_> = reader
         .replay_from(before)
         .unwrap()

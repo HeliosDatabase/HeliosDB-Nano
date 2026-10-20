@@ -24,6 +24,7 @@ use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use super::write_gate::WriteGate;
 use crate::{Error, Result};
 
 /// Single column dictionary mapping strings to compact IDs
@@ -137,12 +138,13 @@ impl DictionaryManager {
         }
     }
 
-    /// Save a dictionary to RocksDB
-    fn save_dict(db: &DB, table: &str, column: &str, dict: &ColumnDictionary) -> Result<()> {
+    /// Save a dictionary to RocksDB, through the gate of the engine that owns
+    /// `db`.
+    fn save_dict(db: &DB, gate: &WriteGate, table: &str, column: &str, dict: &ColumnDictionary) -> Result<()> {
         let key = Self::dict_key(table, column);
         let data =
             bincode::serialize(dict).map_err(|e| Error::storage(format!("Failed to serialize dictionary: {}", e)))?;
-        db.put(&key, &data)
+        gate.put(db, &key, &data, None)
             .map_err(|e| Error::storage(format!("Failed to save dictionary: {}", e)))?;
         Ok(())
     }
@@ -244,12 +246,13 @@ impl DictionaryManager {
     ///
     /// # Arguments
     /// * `db` - RocksDB instance for persistence
-    pub fn flush(&self, db: &DB) -> Result<()> {
+    /// * `gate` - the write gate of the engine that owns `db`
+    pub fn flush(&self, db: &DB, gate: &WriteGate) -> Result<()> {
         let mut cache = self.cache.write();
 
         for ((table, column), entry) in cache.iter_mut() {
             if entry.dirty {
-                Self::save_dict(db, table, column, &entry.dict)?;
+                Self::save_dict(db, gate, table, column, &entry.dict)?;
                 entry.dirty = false;
             }
         }
@@ -258,13 +261,13 @@ impl DictionaryManager {
     }
 
     /// Flush dictionary for a specific table.column
-    pub fn flush_column(&self, db: &DB, table: &str, column: &str) -> Result<()> {
+    pub fn flush_column(&self, db: &DB, gate: &WriteGate, table: &str, column: &str) -> Result<()> {
         let cache_key = (table.to_string(), column.to_string());
         let mut cache = self.cache.write();
 
         if let Some(entry) = cache.get_mut(&cache_key) {
             if entry.dirty {
-                Self::save_dict(db, table, column, &entry.dict)?;
+                Self::save_dict(db, gate, table, column, &entry.dict)?;
                 entry.dirty = false;
             }
         }
@@ -301,7 +304,7 @@ impl DictionaryManager {
     }
 
     /// Drop a dictionary from cache and storage
-    pub fn drop_dictionary(&self, db: &DB, table: &str, column: &str) -> Result<()> {
+    pub fn drop_dictionary(&self, db: &DB, gate: &WriteGate, table: &str, column: &str) -> Result<()> {
         let cache_key = (table.to_string(), column.to_string());
 
         // Remove from cache
@@ -309,7 +312,7 @@ impl DictionaryManager {
 
         // Remove from storage
         let key = Self::dict_key(table, column);
-        db.delete(&key)
+        gate.delete(db, &key, None)
             .map_err(|e| Error::storage(format!("Failed to delete dictionary: {}", e)))?;
 
         Ok(())

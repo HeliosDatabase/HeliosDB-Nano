@@ -15211,13 +15211,13 @@ impl EmbeddedDatabase {
         if !was_columnar {
             return Ok(());
         }
-        storage::ColumnarStore::drop_column(&self.storage.db(), table_name, column_name)?;
+        storage::ColumnarStore::drop_column(&self.storage.db(), self.storage.write_gate(), table_name, column_name)?;
         if !schema_after
             .columns
             .iter()
             .any(|c| c.storage_mode == ColumnStorageMode::Columnar)
         {
-            storage::ColumnarStore::purge_presence(&self.storage.db(), table_name)?;
+            storage::ColumnarStore::purge_presence(&self.storage.db(), self.storage.write_gate(), table_name)?;
         }
         Ok(())
     }
@@ -21629,6 +21629,7 @@ impl EmbeddedDatabase {
         // Create a real storage transaction with a FRESH snapshot
         let mut txn = storage::Transaction::new_with_session(
             self.storage.db.clone(),
+            std::sync::Arc::clone(self.storage.write_gate()),
             self.storage.next_timestamp(),
             self.storage.snapshot_manager_arc(),
             session_id,
@@ -22043,6 +22044,7 @@ impl EmbeddedDatabase {
             // requires MVCC versioning for proper isolation across sessions
             let mut txn = storage::Transaction::new_with_session(
                 self.storage.db.clone(),
+                std::sync::Arc::clone(self.storage.write_gate()),
                 self.storage.next_timestamp(),
                 self.storage.snapshot_manager_arc(),
                 session_id,
@@ -24854,6 +24856,7 @@ impl EmbeddedDatabase {
                 None,
                 &[],
                 self.storage.db(),
+                std::sync::Arc::clone(self.storage.write_gate()),
             )?,
             // R5.V6: construction parameters come from the `[vector]`
             // config section instead of being hardcoded to 16/200.

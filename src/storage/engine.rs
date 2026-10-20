@@ -21,6 +21,7 @@ use super::speculative_filter::{SpeculativeConfig, SpeculativeFilterManager};
 use super::typed_batch::TypedValues;
 use super::typed_kernels::{self as tk, CompiledPredicate};
 use super::wal::{WalOperation, WalSyncMode, WriteAheadLog};
+use super::write_gate::WriteGate;
 use super::zone_map::TableZoneMap;
 use super::{
     BranchId, BranchManager, BranchMetadata, BranchOptions, BranchTransaction, Catalog, DatabaseStats, Key,
@@ -348,14 +349,15 @@ fn compute_zone_pruned_batches(
 /// kill switch engaged this is exactly the pre-R3.1 eager scan.
 fn load_columnar_batch_index(
     db: &DB,
+    gate: &WriteGate,
     table_name: &str,
     column_name: &str,
     pruned: &HashSet<u64>,
 ) -> Result<ColumnarBatchIndex> {
     let batches = if zone_map_pruning_enabled() {
-        ColumnarStore::scan_column_batches_pruned(db, table_name, column_name, pruned)?
+        ColumnarStore::scan_column_batches_pruned(db, gate, table_name, column_name, pruned)?
     } else {
-        ColumnarStore::scan_column_batches(db, table_name, column_name)?
+        ColumnarStore::scan_column_batches(db, gate, table_name, column_name)?
     };
     Ok(ColumnarBatchIndex::from_batches(batches))
 }
@@ -1903,10 +1905,64 @@ pub enum TableKind {
 /// the "process-global `static`s" design rule in `src/lib.rs`).
 static NEXT_STORAGE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// How a [`StorageEngine`] was opened.
+///
+/// Decided once, at open, and consulted by every mode-dependent step of
+/// `open_with_mode` and of close. It replaces two booleans (`read_only`,
+/// `physical_snapshot`) whose four combinations did not name the cases the
+/// engine actually has, and it decides the engine's [`WriteGate`]: only a
+/// `Primary` may write.
+#[derive(Clone)]
+pub enum OpenMode {
+    /// Ordinary writable open: WAL recovery, workers, close-time persistence.
+    Primary,
+    /// `open_read_only`: RocksDB read-only handle, sees the state as of open.
+    ReadOnly,
+    /// `open_physical_snapshot`: read-only, strict hydration, no writes of any kind.
+    PhysicalSnapshot,
+    /// A serving physical standby: the handle is injected by the applier (P0.3), writable at the
+    /// RocksDB level but the ENGINE never writes to it; `WriteGate` refuses every raw write.
+    PhysicalStandby { db: Arc<DB>, gate: Arc<WriteGate> },
+}
+
+impl OpenMode {
+    /// The store is a physical image: strict hydration, no logical recovery,
+    /// no metadata repair, nothing persisted on the engine's behalf.
+    pub(crate) fn is_physical(&self) -> bool {
+        matches!(self, Self::PhysicalSnapshot | Self::PhysicalStandby { .. })
+    }
+
+    /// RocksDB itself was opened read-only by this engine.
+    pub(crate) fn rocksdb_read_only(&self) -> bool {
+        matches!(self, Self::ReadOnly | Self::PhysicalSnapshot)
+    }
+
+    /// The engine may write to its store: a primary, and nothing else.
+    pub(crate) fn engine_may_write(&self) -> bool {
+        matches!(self, Self::Primary)
+    }
+
+    /// The gate every component of an engine opened in this mode shares. A
+    /// standby's gate comes from its caller, which may hand the same gate to
+    /// the other components it builds around the store.
+    fn write_gate(&self) -> Arc<WriteGate> {
+        match self {
+            Self::Primary => WriteGate::open(),
+            Self::ReadOnly => WriteGate::closed("read-only open"),
+            Self::PhysicalSnapshot => WriteGate::closed("physical snapshot"),
+            Self::PhysicalStandby { gate, .. } => Arc::clone(gate),
+        }
+    }
+}
+
 /// Storage engine
 pub struct StorageEngine {
-    /// RocksDB instance
+    /// RocksDB instance. Never written directly: every write goes through
+    /// `gate` (see `storage::write_gate`).
     pub(crate) db: Arc<DB>,
+    /// Whether this process may write to `db`, decided by `open_mode` and
+    /// shared with every component below that holds `db`.
+    gate: Arc<WriteGate>,
     /// Identity of THIS open database within this process — see
     /// [`StorageEngine::instance_id`].
     instance_id: u64,
@@ -2078,8 +2134,8 @@ pub struct StorageEngine {
     /// whose ORDER `EmbeddedDatabase::drop` is careful about). Defaults to
     /// `true`; nothing in production ever clears it.
     row_counter_flush_on_close: Arc<AtomicBool>,
-    /// Strict, immutable physical checkpoint hydration only.
-    physical_snapshot_mode: bool,
+    /// How this engine was opened. `is_physical()` selects strict hydration.
+    open_mode: OpenMode,
     /// R4.2: how the last `rebuild_all_indexes` populated the in-memory
     /// indexes (snapshot-loaded vs scanned). Diagnostics + test surface.
     last_index_open_report: Arc<RwLock<Option<super::index_snapshot::IndexOpenReport>>>,
@@ -2301,7 +2357,7 @@ impl StorageEngine {
 
     /// Open a storage engine
     pub fn open(path: impl AsRef<Path>, config: &Config) -> Result<Self> {
-        Self::open_with_mode(path, config, false, false)
+        Self::open_with_mode(path, config, OpenMode::Primary)
     }
 
     /// Open an EXISTING database read-only (RocksDB open-for-read-only). A
@@ -2312,7 +2368,7 @@ impl StorageEngine {
     /// (Used by `EmbeddedDatabase::open_read_only` for a2h's concurrent manifest
     /// reader: one writer + one or more read-only readers, same file.)
     pub fn open_read_only(path: impl AsRef<Path>, config: &Config) -> Result<Self> {
-        Self::open_with_mode(path, config, true, false)
+        Self::open_with_mode(path, config, OpenMode::ReadOnly)
     }
 
     /// Hydrate a closed physical checkpoint without logical replay, metadata
@@ -2328,11 +2384,105 @@ impl StorageEngine {
                 path.display()
             )));
         }
-        Self::open_with_mode(path, config, true, true)
+        Self::open_with_mode(path, config, OpenMode::PhysicalSnapshot)
     }
 
+    /// Serve a physical standby from the RocksDB handle its applier owns.
+    ///
+    /// Hydrates exactly as [`Self::open_physical_snapshot`] does — strict
+    /// snapshot and catalog recovery, no logical WAL, no background workers, no
+    /// close-time persistence — but on the applier's WRITABLE handle instead of
+    /// a read-only one of its own, so the store can keep advancing underneath
+    /// the engine. The engine itself never writes to it: `gate` must be closed,
+    /// and every raw write site in the storage layer asks it.
+    ///
+    /// The handle must carry the node-local column family
+    /// ([`keyspace::LOCAL_CF`](super::keyspace::LOCAL_CF)); that family is what
+    /// marks a directory as a standby's, and every other open mode refuses it.
+    ///
+    /// P0.3 HOOK: the `LocalWriter` that owns every write this process makes to
+    /// a standby (the applier's batches and the node-local cursor) is not wired
+    /// yet. It will be passed here alongside `db`, carried by
+    /// `OpenMode::PhysicalStandby`, and `write_local` will delegate to it.
+    pub(crate) fn open_physical_standby(
+        path: impl AsRef<Path>,
+        config: &Config,
+        db: Arc<DB>,
+        gate: Arc<WriteGate>,
+    ) -> Result<Self> {
+        if config.storage.memory_only {
+            return Err(Error::config("a physical standby requires persistent storage"));
+        }
+        if gate.is_open() {
+            return Err(Error::config(
+                "a physical standby's write gate must be closed: the engine never writes to a standby's store",
+            ));
+        }
+        Self::open_with_mode(path, config, OpenMode::PhysicalStandby { db, gate })
+    }
+
+    /// True for both physical modes (snapshot and standby): the catalog takes
+    /// the strict, write-free rebuild path.
     pub(crate) fn physical_snapshot_mode(&self) -> bool {
-        self.physical_snapshot_mode
+        self.open_mode.is_physical()
+    }
+
+    /// Whether this engine may write to its store (only a primary may).
+    pub(crate) fn engine_may_write(&self) -> bool {
+        self.open_mode.engine_may_write()
+    }
+
+    /// The gate every raw write of this engine — and of every component built
+    /// around its RocksDB handle — goes through.
+    pub fn write_gate(&self) -> &Arc<WriteGate> {
+        &self.gate
+    }
+
+    /// Apply a raw `batch` to this engine's store through its gate, for code
+    /// outside the engine that builds batches against its handle (catalog DDL).
+    pub(crate) fn db_write(&self, batch: WriteBatch, opts: Option<&WriteOptions>) -> Result<()> {
+        self.gate.write(&self.db, batch, opts)
+    }
+
+    /// Refuse to open a physical standby's directory in any mode but
+    /// `PhysicalStandby`.
+    ///
+    /// A standby keeps its node-local state (the applier cursor, its posture)
+    /// in the [`keyspace::LOCAL_CF`](super::keyspace::LOCAL_CF) column family,
+    /// which nothing but the standby's own writer creates. Opened any other way
+    /// the directory would either fail inside RocksDB after the open had
+    /// already rewritten `LOG`/`MANIFEST`, or — read-only, which may open a
+    /// subset of the column families — be served as an ordinary database. The
+    /// MANIFEST is asked before any handle exists, so the refusal leaves the
+    /// directory untouched. A directory without `CURRENT` is not a store yet,
+    /// cannot carry the family, and is left to the open to judge.
+    fn refuse_physical_standby_store(db_path: &Path) -> Result<()> {
+        match std::fs::metadata(db_path.join("CURRENT")) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(Error::storage(format!(
+                    "failed to look up the 'CURRENT' manifest in {}: {error}",
+                    db_path.display()
+                )))
+            }
+        }
+        let families = DB::list_cf(&Options::default(), db_path).map_err(|e| {
+            Error::storage(format!(
+                "failed to list the column families of {}: {e}",
+                db_path.display()
+            ))
+        })?;
+        if families.iter().any(|name| name == super::keyspace::LOCAL_CF) {
+            return Err(Error::storage(format!(
+                "refusing to open {}: it holds the '{}' column family of a physical standby, which only the \
+                 physical standby start path (`heliosdb-nano start --replication-role standby`) may open",
+                db_path.display(),
+                super::keyspace::LOCAL_CF
+            )));
+        }
+        Ok(())
     }
 
     /// Create a unique, owned temporary directory for a READ-ONLY RocksDB
@@ -2511,14 +2661,12 @@ impl StorageEngine {
         }
     }
 
-    fn open_with_mode(
-        path: impl AsRef<Path>,
-        config: &Config,
-        read_only: bool,
-        physical_snapshot: bool,
-    ) -> Result<Self> {
+    fn open_with_mode(path: impl AsRef<Path>, config: &Config, mode: OpenMode) -> Result<Self> {
         let db_path = path.as_ref().to_path_buf();
-        if !physical_snapshot {
+        // Decided here, once, and handed to every component below that holds
+        // the raw handle: only a primary may write.
+        let gate = mode.write_gate();
+        if !mode.is_physical() {
             match std::fs::symlink_metadata(db_path.join("NANO-PHYSICAL-REPLICA.json")) {
                 Ok(_) => {
                     return Err(Error::storage(
@@ -2529,8 +2677,14 @@ impl StorageEngine {
                 Err(error) => return Err(Error::storage(format!("physical marker lookup failed: {error}"))),
             }
         }
+        // Before any RocksDB handle exists: a standby's directory is refused in
+        // every other mode, and a standby's injected handle must carry its
+        // node-local column family (it is checked where the handle is taken).
+        if !matches!(mode, OpenMode::PhysicalStandby { .. }) {
+            Self::refuse_physical_standby_store(&db_path)?;
+        }
         let mut opts = Options::default();
-        opts.create_if_missing(!read_only);
+        opts.create_if_missing(mode.engine_may_write());
         opts.set_compression_type(match config.storage.compression {
             crate::config::CompressionType::None => rocksdb::DBCompressionType::None,
             crate::config::CompressionType::Zstd => rocksdb::DBCompressionType::Zstd,
@@ -2635,7 +2789,7 @@ impl StorageEngine {
         // replaces the store between the preflight and the writable open
         // (TOCTOU); the window is bounded to the two opens below, and this
         // process never writes inside it.
-        if !read_only && !physical_snapshot && Self::is_existing_store(&db_path)? {
+        if mode.engine_may_write() && Self::is_existing_store(&db_path)? {
             let probe_log_dir = Self::owned_log_dir_outside(&db_path, &std::env::temp_dir())?;
             let mut probe_opts = opts.clone();
             probe_opts.set_db_log_dir(probe_log_dir.path());
@@ -2657,33 +2811,44 @@ impl StorageEngine {
             check?;
         }
 
-        let (db, read_only_log_dir) = if read_only {
-            // A read-only RocksDB open can still write `LOG`, which would
-            // mutate the very data directory a read-only handle promises not to
-            // touch. Redirect that log to a unique owned directory OUTSIDE the
-            // database. The guard is moved into the engine (its LAST field, so
-            // it outlives the DB handle) and removes the directory only when
-            // the handle is gone; if the open fails, `?` drops the guard here,
-            // cleaning up the directory it just created.
-            let log_dir = Self::owned_log_dir_outside(&db_path, &std::env::temp_dir())?;
-            let mut read_only_opts = opts.clone();
-            read_only_opts.set_db_log_dir(log_dir.path());
-            // No DB lock taken — a second process can open read-only while a
-            // primary writes. `false` = tolerate an existing WAL/log file.
-            let db = DB::open_for_read_only(&read_only_opts, path, false)
-                .map_err(|e| Error::storage(format!("Failed to open RocksDB read-only: {}", e)))?;
-            (db, Some(log_dir))
-        } else {
-            (
-                DB::open(&opts, path).map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?,
+        let (db, read_only_log_dir) = match &mode {
+            OpenMode::ReadOnly | OpenMode::PhysicalSnapshot => {
+                // A read-only RocksDB open can still write `LOG`, which would
+                // mutate the very data directory a read-only handle promises not
+                // to touch. Redirect that log to a unique owned directory
+                // OUTSIDE the database. The guard is moved into the engine (its
+                // LAST field, so it outlives the DB handle) and removes the
+                // directory only when the handle is gone; if the open fails, `?`
+                // drops the guard here, cleaning up the directory it just
+                // created.
+                let log_dir = Self::owned_log_dir_outside(&db_path, &std::env::temp_dir())?;
+                let mut read_only_opts = opts.clone();
+                read_only_opts.set_db_log_dir(log_dir.path());
+                // No DB lock taken — a second process can open read-only while a
+                // primary writes. `false` = tolerate an existing WAL/log file.
+                let db = DB::open_for_read_only(&read_only_opts, path, false)
+                    .map_err(|e| Error::storage(format!("Failed to open RocksDB read-only: {}", e)))?;
+                (Arc::new(db), Some(log_dir))
+            }
+            OpenMode::Primary => (
+                Arc::new(DB::open(&opts, path).map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?),
                 None,
-            )
+            ),
+            // The applier opened (and owns) the handle; the engine shares it.
+            OpenMode::PhysicalStandby { db, .. } => {
+                if db.cf_handle(super::keyspace::LOCAL_CF).is_none() {
+                    return Err(Error::storage(format!(
+                        "a physical standby's RocksDB handle must be opened with its '{}' column family",
+                        super::keyspace::LOCAL_CF
+                    )));
+                }
+                (Arc::clone(db), None)
+            }
         };
 
-        let db = Arc::new(db);
         // Also protect interrupted staging before its external marker exists.
         // This key is owned only by replication::physical, never logical WAL.
-        if !physical_snapshot
+        if !mode.is_physical()
             && db
                 .get(b"__nano_physical_replica_cursor_v1")
                 .map_err(|e| Error::storage(format!("physical cursor lookup failed: {e}")))?
@@ -2699,10 +2864,10 @@ impl StorageEngine {
         // of snapshot recovery, WAL replay and catalog load — all of which read
         // stored values — so a key mismatch is one error at open rather than an
         // unbounded number of unreadable values afterwards.
-        if physical_snapshot {
+        if mode.is_physical() {
             super::tde::verify_physical_snapshot_key(&db, key_manager.as_deref())?;
         } else {
-            super::tde::verify_or_install_key_check(&db, key_manager.as_deref(), read_only)?;
+            super::tde::verify_or_install_key_check(&db, key_manager.as_deref(), &gate)?;
         }
 
         // Initialize snapshot manager. It builds its own `WriteBatch`es against
@@ -2710,13 +2875,18 @@ impl StorageEngine {
         // otherwise the version chain and the fast autocommit `data:` write
         // would disagree with `put`/`put_internal` about the on-disk form.
         let snapshot_manager = {
-            let mut sm = SnapshotManager::new(Arc::clone(&db));
+            let mut sm = SnapshotManager::new(Arc::clone(&db), Arc::clone(&gate));
             sm.set_key_manager(key_manager.clone());
+            // A physical image registers snapshots in memory only: a read-only
+            // COMMIT on it must not write a `snapshot:` key.
+            if mode.is_physical() {
+                sm.set_persistence(false);
+            }
             Arc::new(sm)
         };
 
         // Recover existing snapshots
-        if physical_snapshot {
+        if mode.is_physical() {
             snapshot_manager.recover_snapshots_strict()?;
         } else if let Err(e) = snapshot_manager.recover_snapshots() {
             warn!("Failed to recover snapshots: {}", e);
@@ -2725,7 +2895,7 @@ impl StorageEngine {
         // W3.2: wire the single-copy-latest-version knob (after recovery, so the
         // durable elision sentinel is loaded and the materialize gate is armed
         // for any rows a prior session left flagged).
-        if physical_snapshot {
+        if mode.is_physical() {
             snapshot_manager.configure_elision_read_only()?;
         } else {
             snapshot_manager.configure_elision(config.storage.elide_latest_version);
@@ -2743,10 +2913,10 @@ impl StorageEngine {
 
         // Initialize branch manager
         debug!("Initializing BranchManager");
-        let branch_open = if physical_snapshot {
-            BranchManager::open_existing(Arc::clone(&db), Arc::clone(&timestamp))
+        let branch_open = if mode.is_physical() {
+            BranchManager::open_existing(Arc::clone(&db), Arc::clone(&gate), Arc::clone(&timestamp))
         } else {
-            BranchManager::new(Arc::clone(&db), Arc::clone(&timestamp))
+            BranchManager::new(Arc::clone(&db), Arc::clone(&gate), Arc::clone(&timestamp))
         };
         let branch_manager = match branch_open {
             Ok(mut manager) => {
@@ -2757,7 +2927,7 @@ impl StorageEngine {
                 Arc::new(RwLock::new(Some(Arc::new(manager))))
             }
             Err(e) => {
-                if physical_snapshot {
+                if mode.is_physical() {
                     return Err(e);
                 }
                 warn!(
@@ -2768,9 +2938,9 @@ impl StorageEngine {
             }
         };
 
-        // Initialize WAL if enabled (never for a read-only handle — it must not
-        // write, and `wal = None` also skips the WAL replay+truncate below).
-        let wal = if !read_only && config.storage.wal_enabled {
+        // Initialize WAL if enabled (only for a primary — every other mode must
+        // not write, and `wal = None` also skips the WAL replay+truncate below).
+        let wal = if mode.engine_may_write() && config.storage.wal_enabled {
             // Convert config sync mode to WAL sync mode
             let sync_mode = match config.storage.wal_sync_mode {
                 crate::config::WalSyncModeConfig::Sync => WalSyncMode::Sync,
@@ -2780,7 +2950,12 @@ impl StorageEngine {
             // The WAL writes `wal:entries:` straight to RocksDB, bypassing
             // `StorageEngine::put`, and those entries carry row tuples — so it
             // carries the engine's key manager and seals them itself.
-            match WriteAheadLog::open_with_key_manager(Arc::clone(&db), sync_mode, key_manager.clone()) {
+            match WriteAheadLog::open_with_key_manager(
+                Arc::clone(&db),
+                Arc::clone(&gate),
+                sync_mode,
+                key_manager.clone(),
+            ) {
                 Ok(wal) => {
                     // GH#35 (A3): bound the crash window with periodic
                     // checkpoint advancement.
@@ -2818,6 +2993,7 @@ impl StorageEngine {
         // the key manager and applies the boundary rule itself.
         let mv_delta_tracker = Arc::new(super::MvDeltaTracker::new_with_key_manager(
             Arc::clone(&db),
+            Arc::clone(&gate),
             key_manager.clone(),
         )?);
         debug!("Delta tracker initialized for incremental MV refresh");
@@ -2836,9 +3012,9 @@ impl StorageEngine {
         let speculative_filter_manager = Arc::new(SpeculativeFilterManager::new(SpeculativeConfig::default()));
         let parallel_filter_engine = Arc::new(ParallelFilterEngine::new(ParallelFilterConfig::default()));
 
-        // Initialize consolidation worker (skipped for a read-only handle — it
-        // mutates the filter index in the background).
-        let consolidation_worker = if read_only {
+        // Initialize consolidation worker (primary only — it mutates the filter
+        // index in the background).
+        let consolidation_worker = if !mode.engine_may_write() {
             None
         } else {
             let worker = FilterConsolidationWorker::new(
@@ -2855,7 +3031,7 @@ impl StorageEngine {
 
         // Initialize sync components if enabled
         #[cfg(feature = "sync-experimental")]
-        let (change_log, node_id) = if !physical_snapshot && config.sync.enabled && config.sync.change_log_enabled {
+        let (change_log, node_id) = if !mode.is_physical() && config.sync.enabled && config.sync.change_log_enabled {
             let node_id = if let Some(ref id_str) = config.sync.node_id {
                 uuid::Uuid::parse_str(id_str).map_err(|e| Error::config(format!("Invalid node_id UUID: {}", e)))?
             } else {
@@ -2875,7 +3051,7 @@ impl StorageEngine {
         // collector). Retention parse errors fail the open: a misread
         // retention must not silently disable (or enable) collection.
         let conflict_registry = Arc::new(super::conflict::WriteConflictRegistry::new());
-        if physical_snapshot {
+        if mode.is_physical() {
             if let Some(raw) = db
                 .get(super::version_gc::LOW_WATERMARK_KEY)
                 .map_err(|e| Error::storage(format!("version GC watermark read failed: {e}")))?
@@ -2892,16 +3068,18 @@ impl StorageEngine {
         let (version_gc, version_gc_worker) = Self::init_version_gc(
             &config,
             Arc::clone(&db),
+            Arc::clone(&gate),
             Arc::clone(&snapshot_manager),
             Arc::clone(&conflict_registry),
             Arc::clone(&branch_manager),
             Arc::clone(&timestamp),
-            read_only,
+            !mode.engine_may_write(),
         )?;
 
         let engine = Self {
             instance_id: NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             db: Arc::clone(&db),
+            gate,
             config: config.clone(),
             timestamp,
             key_manager,
@@ -2954,9 +3132,9 @@ impl StorageEngine {
             write_watermarks: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
-            index_snapshots_on_close: Arc::new(AtomicBool::new(!physical_snapshot)),
-            row_counter_flush_on_close: Arc::new(AtomicBool::new(!physical_snapshot)),
-            physical_snapshot_mode: physical_snapshot,
+            index_snapshots_on_close: Arc::new(AtomicBool::new(!mode.is_physical())),
+            row_counter_flush_on_close: Arc::new(AtomicBool::new(!mode.is_physical())),
+            open_mode: mode,
             last_index_open_report: Arc::new(RwLock::new(None)),
             _read_only_log_dir: read_only_log_dir,
         };
@@ -2966,8 +3144,10 @@ impl StorageEngine {
 
         // R4.2: arm the snapshot invalidation hooks BEFORE any mutation can
         // run (WAL replay below included), so post-checkpoint mutations
-        // durably invalidate stale index snapshots.
-        if !physical_snapshot {
+        // durably invalidate stale index snapshots. Only a primary has durable
+        // snapshots to invalidate: on every other mode the hook could only
+        // attempt a write the gate refuses.
+        if engine.open_mode.engine_may_write() {
             engine.wire_index_snapshot_hooks();
         }
 
@@ -2993,7 +3173,7 @@ impl StorageEngine {
         //
         // Costs one prefix scan of a key range that is empty on every clean
         // start, once per open.
-        if read_only {
+        if !engine.open_mode.engine_may_write() {
             // A read-only handle must not write, so it cannot reclaim. Arm the
             // visibility filter instead: a leftover stays hidden rather than
             // resurfacing as a permanent, globally-visible table.
@@ -3185,17 +3365,19 @@ impl StorageEngine {
             .map_err(|e| Error::storage(format!("Failed to open in-memory RocksDB: {}", e)))?;
 
         let db = Arc::new(db);
+        // An in-memory store is always a primary's.
+        let gate = WriteGate::open();
 
         // Same key check as the on-disk `open`. This store is always freshly
         // created, so in practice it is the "install a sentinel" arm — but the
         // rule is the rule, and running it here keeps one implementation rather
         // than two.
-        super::tde::verify_or_install_key_check(&db, key_manager.as_deref(), false)?;
+        super::tde::verify_or_install_key_check(&db, key_manager.as_deref(), &gate)?;
 
         // Initialize snapshot manager (see the on-disk StorageEngine::open for
         // why it carries the engine's key manager).
         let snapshot_manager = {
-            let mut sm = SnapshotManager::new_non_durable(Arc::clone(&db));
+            let mut sm = SnapshotManager::new_non_durable(Arc::clone(&db), Arc::clone(&gate));
             sm.set_key_manager(key_manager.clone());
             Arc::new(sm)
         };
@@ -3207,7 +3389,7 @@ impl StorageEngine {
 
         // Initialize branch manager
         debug!("Initializing BranchManager for in-memory storage");
-        let branch_manager = match BranchManager::new(Arc::clone(&db), Arc::clone(&timestamp)) {
+        let branch_manager = match BranchManager::new(Arc::clone(&db), Arc::clone(&gate), Arc::clone(&timestamp)) {
             Ok(mut manager) => {
                 // Same reason as the on-disk open.
                 manager.set_key_manager(key_manager.clone());
@@ -3227,7 +3409,12 @@ impl StorageEngine {
         let wal = if config.storage.wal_enabled {
             let sync_mode = WalSyncMode::Async; // Use async for in-memory
                                                 // Carries the key manager for the same reason the on-disk open does.
-            match WriteAheadLog::open_with_key_manager(Arc::clone(&db), sync_mode, key_manager.clone()) {
+            match WriteAheadLog::open_with_key_manager(
+                Arc::clone(&db),
+                Arc::clone(&gate),
+                sync_mode,
+                key_manager.clone(),
+            ) {
                 Ok(wal) => {
                     // GH#35 (A3): bound the crash window with periodic
                     // checkpoint advancement.
@@ -3262,6 +3449,7 @@ impl StorageEngine {
         // Carries the key manager for the same reason the on-disk open does.
         let mv_delta_tracker = Arc::new(super::MvDeltaTracker::new_with_key_manager(
             Arc::clone(&db),
+            Arc::clone(&gate),
             key_manager.clone(),
         )?);
         debug!("Delta tracker initialized for in-memory incremental MV refresh");
@@ -3306,6 +3494,7 @@ impl StorageEngine {
         let (version_gc, version_gc_worker) = Self::init_version_gc(
             &config,
             Arc::clone(&db),
+            Arc::clone(&gate),
             Arc::clone(&snapshot_manager),
             Arc::clone(&conflict_registry),
             Arc::clone(&branch_manager),
@@ -3316,6 +3505,7 @@ impl StorageEngine {
         Ok(Self {
             instance_id: NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             db: Arc::clone(&db),
+            gate,
             config: config.clone(),
             timestamp,
             key_manager,
@@ -3371,7 +3561,7 @@ impl StorageEngine {
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
             row_counter_flush_on_close: Arc::new(AtomicBool::new(true)),
-            physical_snapshot_mode: false,
+            open_mode: OpenMode::Primary,
             last_index_open_report: Arc::new(RwLock::new(None)),
             _read_only_log_dir: None,
         })
@@ -3696,6 +3886,7 @@ impl StorageEngine {
 
         // Set up the apply callback to write to RocksDB
         let db = Arc::clone(&self.db);
+        let gate = Arc::clone(&self.gate);
         let key_manager = self.key_manager.clone();
         engine.set_apply_callback(move |table, row_id, data| {
             // Build key
@@ -3727,13 +3918,13 @@ impl StorageEngine {
                         }
                     };
 
-                    if let Err(e) = db.put(key_bytes, to_write.as_ref()) {
+                    if let Err(e) = gate.put(&db, key_bytes, to_write.as_ref(), None) {
                         tracing::error!("Lock-free apply callback failed for {}:{} - {}", table, row_id, e);
                     }
                 }
                 None => {
                     // Delete
-                    if let Err(e) = db.delete(key_bytes) {
+                    if let Err(e) = gate.delete(&db, key_bytes, None) {
                         tracing::error!("Lock-free delete callback failed for {}:{} - {}", table, row_id, e);
                     }
                 }
@@ -3977,8 +4168,8 @@ impl StorageEngine {
 
             // Flush batch when full
             if batch_count >= batch_size {
-                self.db
-                    .write(batch)
+                self.gate
+                    .write(&self.db, batch, None)
                     .map_err(|e| Error::storage(format!("WriteBatch failed: {}", e)))?;
                 batch = WriteBatch::default();
                 batch_count = 0;
@@ -3987,8 +4178,8 @@ impl StorageEngine {
 
         // Flush remaining
         if batch_count > 0 {
-            self.db
-                .write(batch)
+            self.gate
+                .write(&self.db, batch, None)
                 .map_err(|e| Error::storage(format!("Final WriteBatch failed: {}", e)))?;
         }
 
@@ -4120,15 +4311,9 @@ impl StorageEngine {
         // encryption off `seal` borrows the caller's slice and the `put` below
         // is byte-for-byte the call this function made before.
         let stored = super::tde::seal(self.key_manager.as_deref(), value)?;
-        if let Some(opts) = &self.memory_write_options {
-            self.db
-                .put_opt(key, stored.as_ref(), opts)
-                .map_err(|e| Error::storage(format!("Put failed: {}", e)))
-        } else {
-            self.db
-                .put(key, stored.as_ref())
-                .map_err(|e| Error::storage(format!("Put failed: {}", e)))
-        }
+        self.gate
+            .put(&self.db, key, stored.as_ref(), self.memory_write_options.as_ref())
+            .map_err(|e| Error::storage(format!("Put failed: {}", e)))
     }
 
     /// Delete a key
@@ -4162,15 +4347,9 @@ impl StorageEngine {
         }
 
         // Then delete from main database
-        if let Some(opts) = &self.memory_write_options {
-            self.db
-                .delete_opt(key, opts)
-                .map_err(|e| Error::storage(format!("Delete failed: {}", e)))
-        } else {
-            self.db
-                .delete(key)
-                .map_err(|e| Error::storage(format!("Delete failed: {}", e)))
-        }
+        self.gate
+            .delete(&self.db, key, self.memory_write_options.as_ref())
+            .map_err(|e| Error::storage(format!("Delete failed: {}", e)))
     }
 
     /// Log a data INSERT operation to WAL for replication
@@ -4314,15 +4493,9 @@ impl StorageEngine {
         // Seals every key it is handed, like `put` — see the note there for why
         // this takes `tde::seal` rather than `seal_row_value`.
         let stored = super::tde::seal(self.key_manager.as_deref(), value)?;
-        if let Some(opts) = &self.memory_write_options {
-            self.db
-                .put_opt(key, stored.as_ref(), opts)
-                .map_err(|e| Error::storage(format!("Internal put failed: {}", e)))
-        } else {
-            self.db
-                .put(key, stored.as_ref())
-                .map_err(|e| Error::storage(format!("Internal put failed: {}", e)))
-        }
+        self.gate
+            .put(&self.db, key, stored.as_ref(), self.memory_write_options.as_ref())
+            .map_err(|e| Error::storage(format!("Internal put failed: {}", e)))
     }
 
     /// Internal get: fetch and decrypt without WAL involvement
@@ -4475,7 +4648,12 @@ impl StorageEngine {
     /// Begin a transaction
     pub fn begin_transaction(&self) -> Result<Transaction> {
         let snapshot_id = self.next_timestamp();
-        let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
+        let mut txn = Transaction::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.gate),
+            snapshot_id,
+            Arc::clone(&self.snapshot_manager),
+        )?;
         // The commit batch writes `data:`/`v:`/`counter:` straight to RocksDB,
         // bypassing `StorageEngine::put`, so it must carry the key manager and
         // seal them itself.
@@ -4518,7 +4696,12 @@ impl StorageEngine {
     /// would break every driver's expectations.
     pub fn begin_autocommit_transaction(&self) -> Result<Transaction> {
         let snapshot_id = self.next_timestamp();
-        let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
+        let mut txn = Transaction::new(
+            Arc::clone(&self.db),
+            Arc::clone(&self.gate),
+            snapshot_id,
+            Arc::clone(&self.snapshot_manager),
+        )?;
         // See `begin_transaction`: the commit batch seals its own row values.
         txn.set_key_manager(self.key_manager.clone());
         txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
@@ -4574,7 +4757,12 @@ impl StorageEngine {
     /// recovery, so sequences are documented-volatile and the fsync is moot.
     /// Goes through `save_sequence_state` -> `StorageEngine::put`, so the
     /// record inherits the same at-rest encryption as enum/identity records.
+    ///
+    /// A handle that may not write (read-only, physical snapshot or standby)
+    /// refuses here, with the gate's own error and before any fsync: `nextval`
+    /// / `setval` cannot reserve a value it could never make durable.
     pub fn flush_sequence_state(&self, name: &str, st: crate::storage::catalog::PersistedSeqState) -> Result<()> {
+        self.gate.check()?;
         self.catalog().save_sequence_state(name, &st)?;
         if !self.config.storage.memory_only {
             self.group_committer
@@ -4619,9 +4807,11 @@ impl StorageEngine {
 
     /// R4.3: build the version GC (recovers the persisted low watermark)
     /// and start the background worker when configured.
+    #[allow(clippy::too_many_arguments)]
     fn init_version_gc(
         config: &Config,
         db: Arc<DB>,
+        gate: Arc<WriteGate>,
         snapshot_manager: Arc<SnapshotManager>,
         conflict_registry: Arc<super::conflict::WriteConflictRegistry>,
         branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
@@ -4640,6 +4830,7 @@ impl StorageEngine {
         };
         let version_gc = Arc::new(super::version_gc::VersionGc::new(
             db,
+            gate,
             snapshot_manager,
             conflict_registry,
             branch_manager,
@@ -4981,7 +5172,7 @@ impl StorageEngine {
         // R3.3: drop any columnar sidecars with the rows (no-op prefix seeks
         // for tables without side storage) so refilled tables never read
         // stale batches, zone stats or presence.
-        ColumnarStore::purge_table_sidecars(&self.db, table_name)?;
+        ColumnarStore::purge_table_sidecars(&self.db, &self.gate, table_name)?;
         if removed > 0 {
             tracing::debug!(
                 "purge_table_data: removed {} orphaned rows for '{}'",
@@ -5478,7 +5669,7 @@ impl StorageEngine {
             let column = &schema.columns[idx];
             column_batches.insert(
                 idx,
-                load_columnar_batch_index(&self.db, table_name, &column.name, &pruned)?,
+                load_columnar_batch_index(&self.db, &self.gate, table_name, &column.name, &pruned)?,
             );
         }
 
@@ -5951,7 +6142,7 @@ impl StorageEngine {
         let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(requested.len());
         for &idx in &requested {
             let column = &schema.columns[idx];
-            let batches = ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)?;
+            let batches = ColumnarStore::scan_column_batches(&self.db, &self.gate, table_name, &column.name)?;
             column_batches.insert(idx, ColumnarBatchIndex::from_batches(batches));
         }
 
@@ -6110,7 +6301,7 @@ impl StorageEngine {
             let column = &schema.columns[idx];
             column_batches.insert(
                 idx,
-                load_columnar_batch_index(&self.db, table_name, &column.name, &pruned)?,
+                load_columnar_batch_index(&self.db, &self.gate, table_name, &column.name, &pruned)?,
             );
         }
 
@@ -6256,7 +6447,7 @@ impl StorageEngine {
             let column = &schema.columns[idx];
             column_batches.insert(
                 idx,
-                load_columnar_batch_index(&self.db, table_name, &column.name, &pruned)?,
+                load_columnar_batch_index(&self.db, &self.gate, table_name, &column.name, &pruned)?,
             );
         }
 
@@ -6387,7 +6578,7 @@ impl StorageEngine {
             let column = &schema.columns[idx];
             column_batches.insert(
                 idx,
-                load_columnar_batch_index(&self.db, table_name, &column.name, &pruned)?,
+                load_columnar_batch_index(&self.db, &self.gate, table_name, &column.name, &pruned)?,
             );
         }
 
@@ -9112,14 +9303,14 @@ impl StorageEngine {
                     // For migration, always store regardless of size
                     match &original_value {
                         crate::Value::String(_) | crate::Value::Bytes(_) => {
-                            ContentAddressedStore::store(&self.db, &original_value)?
+                            ContentAddressedStore::store(&self.db, &self.gate, &original_value)?
                         }
                         _ => original_value,
                     }
                 }
                 ColumnStorageMode::Columnar => {
                     // Store in columnar format
-                    ColumnarStore::store(&self.db, table_name, &column.name, row_id, original_value)?;
+                    ColumnarStore::store(&self.db, &self.gate, table_name, &column.name, row_id, original_value)?;
                     crate::Value::ColumnarRef
                 }
                 ColumnStorageMode::Default => original_value,
@@ -9132,7 +9323,7 @@ impl StorageEngine {
             // Step 3: Clean up old columnar data if migrating away from columnar
             if old_mode == ColumnStorageMode::Columnar && new_mode != ColumnStorageMode::Columnar {
                 // Delete from columnar storage
-                ColumnarStore::delete(&self.db, table_name, &column.name, row_id)?;
+                ColumnarStore::delete(&self.db, &self.gate, table_name, &column.name, row_id)?;
             }
 
             // Write back row tuple
@@ -9142,8 +9333,8 @@ impl StorageEngine {
             // Through the one rule, keyed on the key this row is landing under.
             let final_value = super::tde::seal_row_value(self.key_manager.as_deref(), &key, &new_value)?;
 
-            self.db
-                .put(&key, final_value.as_ref())
+            self.gate
+                .put(&self.db, &key, final_value.as_ref(), None)
                 .map_err(|e| Error::storage(format!("Failed to write migrated row: {}", e)))?;
 
             migrated += 1;
@@ -9151,7 +9342,7 @@ impl StorageEngine {
 
         // Flush dictionary changes if we're using dictionary mode
         if new_mode == ColumnStorageMode::Dictionary {
-            self.dict_manager.flush(&self.db)?;
+            self.dict_manager.flush(&self.db, &self.gate)?;
         }
 
         // R3.3: storage-mode changes touching COLUMNAR invalidate the
@@ -9159,7 +9350,7 @@ impl StorageEngine {
         // just lost its last columnar column — must not trust any stale
         // `colp:` records). The next columnar read re-backfills lazily.
         if old_mode == ColumnStorageMode::Columnar || new_mode == ColumnStorageMode::Columnar {
-            ColumnarStore::purge_presence(&self.db, table_name)?;
+            ColumnarStore::purge_presence(&self.db, &self.gate, table_name)?;
         }
 
         tracing::info!(
@@ -9279,8 +9470,8 @@ impl StorageEngine {
                 }
             }
 
-            self.db
-                .put(&key, final_value.as_ref())
+            self.gate
+                .put(&self.db, &key, final_value.as_ref(), None)
                 .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
 
             updated += 1;
@@ -9376,8 +9567,8 @@ impl StorageEngine {
                     }
                 }
 
-                self.db
-                    .put(&key, final_value.as_ref())
+                self.gate
+                    .put(&self.db, &key, final_value.as_ref(), None)
                     .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
 
                 updated += 1;
@@ -9623,12 +9814,21 @@ impl StorageEngine {
             .branch_manager()
             .ok_or_else(|| Error::config("Branching must be enabled for Git integration".to_string()))?;
 
-        crate::git_integration::GitIntegrationManager::new(self.db(), branch_manager, self.timestamp())
+        crate::git_integration::GitIntegrationManager::new(
+            self.db(),
+            Arc::clone(&self.gate),
+            branch_manager,
+            self.timestamp(),
+        )
     }
 
     /// Get DDL versioning manager for Git integration
     pub fn ddl_versioning_manager(&self) -> Result<crate::git_integration::ddl_versioning::DdlVersioningManager> {
-        crate::git_integration::ddl_versioning::DdlVersioningManager::new(self.db(), self.timestamp())
+        crate::git_integration::ddl_versioning::DdlVersioningManager::new(
+            self.db(),
+            Arc::clone(&self.gate),
+            self.timestamp(),
+        )
     }
 
     /// Log a DDL operation to Git integration DDL history
@@ -9779,18 +9979,20 @@ impl StorageEngine {
     /// once at open, before WAL replay or any other mutation can run.
     fn wire_index_snapshot_hooks(&self) {
         let db = Arc::clone(&self.db);
+        let gate = Arc::clone(&self.gate);
         self.art_index_manager.set_snapshot_invalidation_hook(Arc::new(move || {
-            Self::delete_prefix_raw(&db, super::index_snapshot::ART_SNAPSHOT_MARKER_PREFIX.as_bytes());
+            Self::delete_prefix_raw(&db, &gate, super::index_snapshot::ART_SNAPSHOT_MARKER_PREFIX.as_bytes());
         }));
         let db = Arc::clone(&self.db);
+        let gate = Arc::clone(&self.gate);
         self.vector_indexes.set_snapshot_invalidation_hook(Arc::new(move || {
-            Self::delete_prefix_raw(&db, super::index_snapshot::VEC_SNAPSHOT_MARKER_PREFIX.as_bytes());
+            Self::delete_prefix_raw(&db, &gate, super::index_snapshot::VEC_SNAPSHOT_MARKER_PREFIX.as_bytes());
         }));
     }
 
     /// Delete every key under `prefix`. Used by the invalidation hooks, which
     /// only have the raw DB handle (keys are plaintext even with encryption).
-    fn delete_prefix_raw(db: &DB, prefix: &[u8]) {
+    fn delete_prefix_raw(db: &DB, gate: &WriteGate, prefix: &[u8]) {
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(true);
         let iter = db.iterator_opt(IteratorMode::From(prefix, rocksdb::Direction::Forward), read_opts);
@@ -9802,19 +10004,27 @@ impl StorageEngine {
             }
             batch.delete(key);
         }
-        if let Err(e) = db.write(batch) {
+        if let Err(e) = gate.write(db, batch, None) {
             warn!("index snapshot marker invalidation failed: {}", e);
         }
     }
 
     /// Durably invalidate all ART snapshot markers.
     pub fn invalidate_art_snapshot_markers(&self) {
-        Self::delete_prefix_raw(&self.db, super::index_snapshot::ART_SNAPSHOT_MARKER_PREFIX.as_bytes());
+        Self::delete_prefix_raw(
+            &self.db,
+            &self.gate,
+            super::index_snapshot::ART_SNAPSHOT_MARKER_PREFIX.as_bytes(),
+        );
     }
 
     /// Durably invalidate all vector snapshot markers.
     pub fn invalidate_vector_snapshot_markers(&self) {
-        Self::delete_prefix_raw(&self.db, super::index_snapshot::VEC_SNAPSHOT_MARKER_PREFIX.as_bytes());
+        Self::delete_prefix_raw(
+            &self.db,
+            &self.gate,
+            super::index_snapshot::VEC_SNAPSHOT_MARKER_PREFIX.as_bytes(),
+        );
     }
 
     /// Enable/disable snapshot persistence at clean shutdown. Crash-recovery
@@ -9876,6 +10086,10 @@ impl StorageEngine {
             // In-memory engine: nothing survives the process anyway.
             return Ok(report);
         };
+        // Every artefact below is a write, and the HNSW dumps are files in the
+        // data directory: ask the gate once, before anything is touched, so a
+        // handle that may not write leaves the directory as it found it.
+        self.gate.check()?;
 
         // Re-arm validity BEFORE exporting. A mutation racing this checkpoint
         // flips the flag (and deletes whatever markers exist); the post-write
@@ -10020,7 +10234,7 @@ impl StorageEngine {
             snap::vec_snapshot_key(index_name),
             snap::vec_snapshot_marker_key(index_name),
         ] {
-            if let Err(e) = self.db.delete(&key) {
+            if let Err(e) = self.gate.delete(&self.db, &key, None) {
                 warn!(
                     "dropping vector index '{}': could not remove snapshot record: {}",
                     index_name, e
@@ -10193,7 +10407,7 @@ impl StorageEngine {
 
     /// Seed allocation state from a strict immutable image without writing it.
     pub(crate) fn reseed_row_counter_for_physical_snapshot(&self, table_name: &str, max_row_id: u64) -> Result<()> {
-        if !self.physical_snapshot_mode {
+        if !self.open_mode.is_physical() {
             return Err(Error::storage(
                 "snapshot counter hydration requires immutable snapshot mode",
             ));
@@ -10467,8 +10681,8 @@ impl StorageEngine {
                     let stored =
                         super::tde::seal_row_value(self.key_manager.as_deref(), target_key.as_bytes(), plain.as_ref())?;
 
-                    self.db
-                        .put(target_key.as_bytes(), stored.as_ref())
+                    self.gate
+                        .put(&self.db, target_key.as_bytes(), stored.as_ref(), None)
                         .map_err(|e| Error::storage(format!("Failed to merge data: {}", e)))?;
                     // The row cache is keyed (table, row_id) with NO branch
                     // dimension; the merged write changes the row's value, so
@@ -10485,8 +10699,8 @@ impl StorageEngine {
             for (table_name, row_ids) in &deleted_rows_by_table {
                 for row_id in row_ids {
                     let target_key = format!("data:{}:{}", table_name, row_id);
-                    self.db
-                        .delete(target_key.as_bytes())
+                    self.gate
+                        .delete(&self.db, target_key.as_bytes(), None)
                         .map_err(|e| Error::storage(format!("Failed to apply delete: {}", e)))?;
                     self.row_cache.invalidate(table_name, *row_id);
                 }
@@ -10496,8 +10710,8 @@ impl StorageEngine {
             for (table_name, row_ids) in &deleted_rows_by_table {
                 for row_id in row_ids {
                     let target_key = format!("bdel:{}:{}:{}", target_id, table_name, row_id);
-                    self.db
-                        .put(target_key.as_bytes(), b"")
+                    self.gate
+                        .put(&self.db, target_key.as_bytes(), b"", None)
                         .map_err(|e| Error::storage(format!("Failed to copy delete marker: {}", e)))?;
                 }
             }
@@ -10536,8 +10750,8 @@ impl StorageEngine {
             let meta_key = format!("branch:meta:{}", source_name);
             let meta_value = bincode::serialize(&source)
                 .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-            self.db
-                .put(meta_key.as_bytes(), &meta_value)
+            self.gate
+                .put(&self.db, meta_key.as_bytes(), &meta_value, None)
                 .map_err(|e| Error::storage(format!("Failed to save merged branch metadata: {}", e)))?;
         }
 
@@ -10579,6 +10793,7 @@ impl StorageEngine {
         // Create branch transaction
         BranchTransaction::new(
             Arc::clone(&self.db),
+            Arc::clone(&self.gate),
             branch.branch_id,
             branch,
             parent_chain,
@@ -11149,7 +11364,7 @@ impl StorageEngine {
 
     /// GH#35 (A2): whether a clean close advances the checkpoint.
     pub fn wal_checkpoint_on_close(&self) -> bool {
-        !self.physical_snapshot_mode && self.config.storage.wal_checkpoint_on_close
+        !self.open_mode.is_physical() && self.config.storage.wal_checkpoint_on_close
     }
 
     /// Flush RocksDB's memtables at a CLEAN close (`storage.flush_on_close`).
@@ -11163,14 +11378,11 @@ impl StorageEngine {
     /// contents are in a table file, so a failure or a crash before this point
     /// loses nothing; recovery replays the WAL as before.
     ///
-    /// No-op for read-only, physical-snapshot and in-memory engines.
+    /// No-op for read-only, physical-snapshot and in-memory engines. A physical
+    /// standby flushes: its handle is writable, and a flush moves no sequence
+    /// number, so the store stays the byte-identical image it was.
     pub fn flush_memtables_on_close(&self) -> Result<()> {
-        // Only a read-only engine owns the external log-directory guard.
-        let read_only = self._read_only_log_dir.is_some();
-        if !self.config.storage.flush_on_close
-            || read_only
-            || self.physical_snapshot_mode
-            || self.config.storage.memory_only
+        if !self.config.storage.flush_on_close || self.open_mode.rocksdb_read_only() || self.config.storage.memory_only
         {
             return Ok(());
         }
@@ -11336,8 +11548,8 @@ impl StorageEngine {
 
                         // Flush batch when size reached
                         if batch_count >= BATCH_SIZE {
-                            self.db
-                                .write(batch)
+                            self.gate
+                                .write(&self.db, batch, None)
                                 .map_err(|e| Error::storage(format!("Batch write failed: {}", e)))?;
                             batch = WriteBatch::default();
                             batch_count = 0;
@@ -11366,8 +11578,8 @@ impl StorageEngine {
 
             // Flush remaining operations in batch
             if batch_count > 0 {
-                self.db
-                    .write(batch)
+                self.gate
+                    .write(&self.db, batch, None)
                     .map_err(|e| Error::storage(format!("Final batch write failed: {}", e)))?;
             }
 
@@ -11439,8 +11651,8 @@ impl StorageEngine {
         batch.put(Self::REPLICATION_CURSOR_KEY, stored.as_ref());
         let mut options = rocksdb::WriteOptions::default();
         options.set_sync(true);
-        self.db
-            .write_opt(batch, &options)
+        self.gate
+            .write(&self.db, batch, Some(&options))
             .map_err(|e| Error::storage(format!("replication cursor write failed: {e}")))
     }
 
@@ -11646,11 +11858,7 @@ impl StorageEngine {
             };
         // Invalidate BEFORE the row becomes visible, including versionless DELETE.
         self.invalidate_write_watermark(table);
-        let written = if let Some(options) = &self.memory_write_options {
-            self.db.write_opt(batch, options)
-        } else {
-            self.db.write(batch)
-        };
+        let written = self.gate.write(&self.db, batch, self.memory_write_options.as_ref());
         if let Err(error) = written {
             if accounted {
                 self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
@@ -13183,11 +13391,7 @@ impl StorageEngine {
         drop(_cps_bb);
         // W3.4: the durable RocksDB write itself (the funnel's I/O phase).
         let _cps_cm = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::Commit, batch_rows);
-        let result = if let Some(opts) = &self.memory_write_options {
-            self.db.write_opt(batch, opts)
-        } else {
-            self.db.write(batch)
-        };
+        let result = self.gate.write(&self.db, batch, self.memory_write_options.as_ref());
         drop(columnar_guard);
         result.map_err(|e| Error::storage(format!("Fast batch insert failed: {}", e)))?;
         // sprinter 5a78b8288153: the single WriteBatch landed — every row of the
@@ -13274,7 +13478,7 @@ impl StorageEngine {
                         .values
                         .get(idx)
                         .ok_or_else(|| Error::internal("index out of bounds in content-addressed transform"))?;
-                    let new_val = ContentAddressedStore::maybe_store(&self.db, cur_val)?;
+                    let new_val = ContentAddressedStore::maybe_store(&self.db, &self.gate, cur_val)?;
                     if let Some(val) = transformed.values.get_mut(idx) {
                         *val = new_val;
                     }
@@ -13296,7 +13500,7 @@ impl StorageEngine {
         }
 
         if used_dictionary {
-            self.dict_manager.flush(&self.db)?;
+            self.dict_manager.flush(&self.db, &self.gate)?;
         }
         Ok(transformed)
     }
@@ -13311,7 +13515,7 @@ impl StorageEngine {
     fn columnar_presence_writes_active(&self, table_name: &str) -> Result<bool> {
         if columnar_presence_enabled() {
             if !ColumnarStore::presence_manifest_complete(&self.db, table_name) {
-                ColumnarStore::backfill_presence(&self.db, table_name)?;
+                ColumnarStore::backfill_presence(&self.db, &self.gate, table_name)?;
             }
             Ok(true)
         } else {
@@ -13335,7 +13539,7 @@ impl StorageEngine {
                 return None;
             }
         }
-        match ColumnarStore::presence_scan_map(&self.db, table_name) {
+        match ColumnarStore::presence_scan_map(&self.db, &self.gate, table_name) {
             Ok(map) => Some(map),
             Err(e) => {
                 tracing::warn!(table = table_name, error = %e, "Columnar presence load failed; using row walk");
@@ -13380,8 +13584,8 @@ impl StorageEngine {
                 ColumnarStore::apply_presence_updates(&self.db, &mut write_batch, table_name, batch_id, &set, &[])?;
             }
         }
-        self.db
-            .write(write_batch)
+        self.gate
+            .write(&self.db, write_batch, None)
             .map_err(|e| Error::storage(format!("Grouped columnar store failed: {}", e)))
     }
 
@@ -13425,8 +13629,8 @@ impl StorageEngine {
                 ColumnarStore::apply_presence_updates(&self.db, &mut write_batch, table_name, *batch_id, &[], clear)?;
             }
         }
-        self.db
-            .write(write_batch)
+        self.gate
+            .write(&self.db, write_batch, None)
             .map_err(|e| Error::storage(format!("Grouped columnar delete failed: {}", e)))
     }
 
@@ -13708,15 +13912,9 @@ impl StorageEngine {
         self.snapshot_manager
             .materialize_copy_marker_row_durable(table_name, row_id)?;
         let key = Self::build_data_key(table_name, row_id);
-        if let Some(opts) = &self.memory_write_options {
-            self.db
-                .delete_opt(&key, opts)
-                .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
-        } else {
-            self.db
-                .delete(&key)
-                .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
-        }
+        self.gate
+            .delete(&self.db, &key, self.memory_write_options.as_ref())
+            .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
         if crate::write_volume::enabled() {
             crate::write_volume::add_row();
             crate::write_volume::add(crate::write_volume::Category::Data, key.len() as u64);
@@ -13759,15 +13957,9 @@ impl StorageEngine {
         self.snapshot_manager
             .materialize_copy_marker_row_durable(table_name, row_id)?;
         let key = Self::build_data_key(table_name, row_id);
-        if let Some(opts) = &self.memory_write_options {
-            self.db
-                .delete_opt(&key, opts)
-                .map_err(|e| Error::storage(format!("Fast PK delete failed: {}", e)))?;
-        } else {
-            self.db
-                .delete(&key)
-                .map_err(|e| Error::storage(format!("Fast PK delete failed: {}", e)))?;
-        }
+        self.gate
+            .delete(&self.db, &key, self.memory_write_options.as_ref())
+            .map_err(|e| Error::storage(format!("Fast PK delete failed: {}", e)))?;
         if crate::write_volume::enabled() {
             crate::write_volume::add_row();
             crate::write_volume::add(crate::write_volume::Category::Data, key.len() as u64);
@@ -13949,7 +14141,7 @@ impl StorageEngine {
                 let value = self.decrypt_value(&key, &raw_value)?;
 
                 let suffix = key.get(prefix.len()..).unwrap_or_default();
-                let table_name = if self.physical_snapshot_mode {
+                let table_name = if self.open_mode.is_physical() {
                     std::str::from_utf8(suffix)
                         .map_err(|_| Error::storage("invalid UTF-8 row counter table"))?
                         .to_owned()
@@ -14517,6 +14709,83 @@ mod tests {
             !log_path.exists(),
             "the retained log directory must be removed with the handle, not before"
         );
+    }
+
+    /// P0.2: the standby mode hydrates on the applier's own writable handle —
+    /// the SAME `Arc<DB>`, not a second open — behind the caller's closed gate,
+    /// and writes nothing: the sequence number is unchanged and the gate saw no
+    /// attempt. The node-local column family is what admits the mode, and its
+    /// absence, or an open gate, refuses it.
+    #[test]
+    fn a_physical_standby_open_shares_the_injected_handle_and_never_writes() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("store");
+        let mut config = Config::default();
+        config.storage.wal_enabled = false;
+        config.storage.elide_latest_version = false;
+        drop(StorageEngine::open(&db_path, &config).expect("writable open creates the store"));
+
+        let plain = Arc::new(DB::open(&Options::default(), &db_path).expect("plain open"));
+        let error =
+            StorageEngine::open_physical_standby(&db_path, &config, plain, WriteGate::closed("physical standby"))
+                .err()
+                .expect("a handle without the node-local column family is not a standby's");
+        assert!(error.to_string().contains(super::super::keyspace::LOCAL_CF), "{error}");
+
+        // P0.3 makes the applier create this family; plain RocksDB stands in.
+        let mut raw = DB::open(&Options::default(), &db_path).expect("plain open");
+        raw.create_cf(super::super::keyspace::LOCAL_CF, &Options::default())
+            .expect("create the node-local column family");
+        drop(raw);
+        let raw = Arc::new(
+            DB::open_cf(
+                &Options::default(),
+                &db_path,
+                ["default", super::super::keyspace::LOCAL_CF],
+            )
+            .expect("open with both column families"),
+        );
+        let sequence = raw.latest_sequence_number();
+
+        assert!(
+            StorageEngine::open_physical_standby(&db_path, &config, Arc::clone(&raw), WriteGate::open()).is_err(),
+            "an open gate must be refused: the engine never writes to a standby"
+        );
+
+        let gate = WriteGate::closed("physical standby");
+        let engine = StorageEngine::open_physical_standby(&db_path, &config, Arc::clone(&raw), Arc::clone(&gate))
+            .expect("physical standby open");
+        assert!(
+            Arc::ptr_eq(&engine.db(), &raw),
+            "the engine must share the injected handle"
+        );
+        assert!(
+            Arc::ptr_eq(engine.write_gate(), &gate),
+            "the engine must use the injected gate"
+        );
+        assert!(engine.physical_snapshot_mode(), "a standby hydrates strictly");
+        assert!(!engine.engine_may_write());
+        assert!(
+            engine._read_only_log_dir.is_none(),
+            "the handle is not the engine's to redirect"
+        );
+        assert!(!engine.index_snapshots_on_close());
+        assert!(!engine.row_counter_flush_on_close());
+        assert!(!engine.wal_checkpoint_on_close());
+        assert_eq!(gate.refusals(), 0, "hydration must not even attempt a write");
+        let error = engine
+            .put(&b"meta:standby:probe".to_vec(), b"x")
+            .expect_err("a standby engine refuses every write");
+        assert!(error.to_string().contains("physical standby"), "{error}");
+        assert_eq!(gate.refusals(), 1);
+        drop(engine);
+
+        assert_eq!(
+            raw.latest_sequence_number(),
+            sequence,
+            "the standby open wrote to its store"
+        );
+        assert!(raw.get(b"meta:standby:probe").expect("get").is_none());
     }
 
     /// `get` must return BOTH a value written through the encrypting `put` and
