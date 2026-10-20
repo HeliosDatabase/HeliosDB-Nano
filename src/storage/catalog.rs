@@ -459,6 +459,17 @@ fn hnsw_construction_params(
     (m, ef_construction)
 }
 
+/// What [`Catalog::backfill_table_indexes`] did to one table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableIndexBackfill {
+    /// Rows with a row id that were fed through `on_insert`.
+    pub(crate) rows: u64,
+    /// Of those, rows refused as a duplicate PRIMARY KEY / UNIQUE value.
+    pub(crate) duplicate_rows: u64,
+    /// The highest row id scanned, `None` for an empty table.
+    pub(crate) max_row_id: Option<u64>,
+}
+
 /// Catalog manager for table metadata
 pub struct Catalog<'a> {
     storage: &'a StorageEngine,
@@ -1705,9 +1716,13 @@ impl<'a> Catalog<'a> {
             }
             data_batch.delete(key);
         }
-        self.storage
-            .db_write(data_batch, None)
-            .map_err(|e| Error::storage(format!("Batch delete of table data failed: {}", e)))?;
+        // An empty table has no rows to delete; an empty batch would only log
+        // a write group with no operations.
+        if !data_batch.is_empty() {
+            self.storage
+                .db_write(data_batch, None)
+                .map_err(|e| Error::storage(format!("Batch delete of table data failed: {}", e)))?;
+        }
 
         // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) so a
         // re-created table with the same name never reads stale batches, zone
@@ -2174,110 +2189,7 @@ impl<'a> Catalog<'a> {
         // constraint-owned, all minted onto a FREE key), FK, then the snapshot
         // load or the row replay.
         for (table_name, schema) in tables {
-            // (Re)register the PK index structure if the table has one.
-            let pk_columns: Vec<String> = schema
-                .columns
-                .iter()
-                .filter(|c| c.primary_key)
-                .map(|c| c.name.clone())
-                .collect();
-            if !pk_columns.is_empty() {
-                if let Err(e) = art_manager.create_pk_index(&table_name, &pk_columns) {
-                    // IndexAlreadyExists is expected if create_table ran in
-                    // the same process; log at debug, continue.
-                    tracing::debug!("Index rebuild: PK index for {} already registered: {}", table_name, e);
-                }
-            }
-
-            // (Re)register UNIQUE indexes (one per UNIQUE non-PK column),
-            // through the SAME call `create_table` uses, so the key comes back
-            // as the same `{table}_{col}_key` — or, when that name is taken by
-            // a durable index registered in pass 1 (or by another table's
-            // identically-derived flag), as the same free `{key}_{n}` the DDL
-            // minted. Passing the bare column name here once put every
-            // table's `email` index under one global key and lost all but the
-            // first (see `create_table`); failing on a taken name, as
-            // `create_unique_index` does, lost the flag instead.
-            for col in &schema.columns {
-                if col.unique && !col.primary_key {
-                    let cols = vec![col.name.clone()];
-                    // Structural idempotency, the same test as `create_table`:
-                    // a WAL-recovered `CreateTable` this process replayed
-                    // before the rebuild already installed this flag's tree,
-                    // and minting again would add a duplicate `{key}_2`. A user
-                    // index over the column does NOT satisfy it (the flag would
-                    // ride on a droppable index, and the registered set would
-                    // differ from the one `create_table` produced). A read
-                    // failure registers rather than skips — a second tree only
-                    // over-enforces.
-                    if self
-                        .constraint_owned_unique_index_on(&table_name, &cols)
-                        .unwrap_or(false)
-                    {
-                        tracing::debug!(
-                            "Index rebuild: UNIQUE index for {}.{} already registered",
-                            table_name,
-                            col.name
-                        );
-                        continue;
-                    }
-                    if let Err(e) = art_manager.create_constraint_unique_index(&table_name, &cols, None) {
-                        // Not a name clash (those are absorbed by the mint):
-                        // this column's UNIQUE constraint is now enforced by
-                        // nothing. Loud, because every INSERT will silently
-                        // accept duplicates until it is fixed.
-                        tracing::warn!(
-                            "Index rebuild: UNIQUE index for {}.{} FAILED to register ({}); \
-                             the constraint is NOT enforced in this process",
-                            table_name,
-                            col.name,
-                            e
-                        );
-                    }
-                }
-            }
-
-            // (Re)register FK indexes from persisted constraints — and, from the
-            // same load, the table-level UNIQUE indexes. Both are constraint-derived
-            // rather than schema-derived, so neither is covered by the
-            // `schema.columns` loops above. Registering here (before the snapshot
-            // load / row replay below) is what makes a table-level UNIQUE survive a
-            // restart AND get backfilled with the table's existing rows; register
-            // it after the replay and the tree would be empty, so duplicates
-            // against pre-restart rows would be accepted.
-            if let Ok(constraints) = self.load_table_constraints(&table_name) {
-                // OPEN, not DDL — deliberately log-and-continue, which is
-                // TODAY's behaviour and must stay that way. Fail closed on the
-                // DDL path only: there is no statement to return an error to
-                // here, and a constraint can legitimately be unregisterable on
-                // an existing store (RENAME COLUMN / DROP COLUMN never update
-                // `TableConstraints`, so a renamed column already leaves a
-                // record naming a column that no longer exists — src/lib.rs
-                // `AlterTableRenameColumn` / `AlterTableDropColumn` mutate only
-                // `schema.columns[i].name`). Turning that into a refusal to
-                // open, or into a write block, would permanently brick such a
-                // table on restart. Recording it and refusing writes is
-                // separately tracked; do NOT "fix" this into a hard failure.
-                if let Err(e) = self.register_unique_constraint_indexes(&table_name, &constraints) {
-                    tracing::error!(
-                        "Index rebuild: a UNIQUE constraint of '{}' could NOT be backed by an index ({}); \
-                         it is not enforced in this process",
-                        table_name,
-                        e
-                    );
-                }
-                for fk in &constraints.foreign_keys {
-                    if let Err(e) = art_manager.create_fk_index(
-                        &fk.table_name,
-                        &fk.columns,
-                        &fk.references_table,
-                        &fk.references_columns,
-                        Some(&fk.name),
-                    ) {
-                        tracing::debug!("Index rebuild: FK index {} already registered: {}", fk.name, e);
-                    }
-                }
-            }
+            self.register_table_indexes(&table_name, &schema);
 
             // User `CREATE [UNIQUE] INDEX` definitions were registered for this
             // table in pass 1, ahead of every mint above.
@@ -2307,55 +2219,14 @@ impl<'a> Catalog<'a> {
 
             // Replay every existing row through on_insert so the indexes
             // know about pre-existing data.
-            let tuples = match self.storage.scan_table_with_schema(&table_name, &schema) {
-                Ok(t) => t,
+            let backfill = match self.backfill_table_indexes(&table_name, &schema) {
+                Ok(backfill) => backfill,
                 Err(e) => {
                     tracing::warn!("Index rebuild: scan failed for table {}: {}", table_name, e);
                     continue;
                 }
             };
-
-            let mut max_row_id: Option<u64> = None;
-            let mut duplicate_rows = 0u64;
-            for tuple in &tuples {
-                let row_id = match tuple.row_id {
-                    Some(id) => id,
-                    None => continue,
-                };
-                max_row_id = Some(max_row_id.map_or(row_id, |m| m.max(row_id)));
-                let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-                for (idx, col) in schema.columns.iter().enumerate() {
-                    if let Some(v) = tuple.values.get(idx) {
-                        col_values.insert(col.name.clone(), v.clone());
-                    }
-                }
-                if let Err(e) = art_manager.on_insert(&table_name, row_id, &col_values) {
-                    if matches!(e, super::art_index::ArtIndexError::DuplicateKey(_)) {
-                        duplicate_rows += 1;
-                    }
-                    tracing::debug!(
-                        "Index rebuild: on_insert skipped for {} row {}: {}",
-                        table_name,
-                        row_id,
-                        e
-                    );
-                }
-                total_rows += 1;
-            }
-            // Stored rows that repeat a PRIMARY KEY / UNIQUE value. Constraint
-            // checks keep these out today, but releases before 4.41.1 could
-            // admit them for TEXT keys that are a prefix of other keys. The
-            // rows stay readable through scans; only the first is indexed.
-            if duplicate_rows > 0 {
-                tracing::warn!(
-                    "Index rebuild: {} row(s) of '{}' repeat a PRIMARY KEY or UNIQUE value of an earlier row and \
-                     are not indexed. Earlier releases could accept such duplicates (see CHANGELOG 4.41.1); list \
-                     them with SELECT <key>, count(*) FROM {} GROUP BY <key> HAVING count(*) > 1",
-                    duplicate_rows,
-                    table_name,
-                    table_name
-                );
-            }
+            total_rows += backfill.rows;
 
             // Reconcile the row-id counter against the highest row id actually
             // scanned. This scan-fallback branch only runs when no valid R4.2
@@ -2368,7 +2239,7 @@ impl<'a> Catalog<'a> {
             // silently overwrite an existing `data:` row. An empty table leaves
             // `max_row_id` as None and is correctly a no-op (its durable counter,
             // seeded at 0 by CREATE TABLE, is already correct).
-            if let Some(max_id) = max_row_id {
+            if let Some(max_id) = backfill.max_row_id {
                 if let Err(e) = self.storage.reseed_row_counter_from_max_row_id(&table_name, max_id) {
                     tracing::warn!(
                         "Index rebuild: row-counter reseed for '{}' failed ({}) — a crash \
@@ -2403,6 +2274,197 @@ impl<'a> Catalog<'a> {
         );
         self.storage.set_last_index_open_report(report);
         Ok(())
+    }
+
+    /// The per-table registration half of pass 2 of [`Self::rebuild_all_indexes`]:
+    /// the PK, the column-flag UNIQUEs, the constraint records' UNIQUE indexes
+    /// (all constraint-owned, all minted onto a FREE key) and the FKs of
+    /// `table_name`, registered EMPTY. The caller fills them
+    /// ([`Self::backfill_table_indexes`] or a snapshot load).
+    ///
+    /// Factored out of `rebuild_all_indexes` (its loop body, verbatim) so a
+    /// physical standby's applier registers one table's indexes exactly as an
+    /// open would: a table that appears or is re-derived on a standby must end
+    /// up with the same registered set a reopen of the same bytes builds. It
+    /// keeps the open path's posture — log and continue — because a standby,
+    /// like an open, has no statement to return an error to. Durable
+    /// `meta:index:` definitions are NOT registered here: that is pass 1
+    /// ([`Self::register_index_definition`]), which must run first.
+    pub(crate) fn register_table_indexes(&self, table_name: &str, schema: &Schema) {
+        let art_manager = self.storage.art_indexes();
+        // (Re)register the PK index structure if the table has one.
+        let pk_columns: Vec<String> = schema
+            .columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.clone())
+            .collect();
+        if !pk_columns.is_empty() {
+            if let Err(e) = art_manager.create_pk_index(&table_name, &pk_columns) {
+                // IndexAlreadyExists is expected if create_table ran in
+                // the same process; log at debug, continue.
+                tracing::debug!("Index rebuild: PK index for {} already registered: {}", table_name, e);
+            }
+        }
+
+        // (Re)register UNIQUE indexes (one per UNIQUE non-PK column),
+        // through the SAME call `create_table` uses, so the key comes back
+        // as the same `{table}_{col}_key` — or, when that name is taken by
+        // a durable index registered in pass 1 (or by another table's
+        // identically-derived flag), as the same free `{key}_{n}` the DDL
+        // minted. Passing the bare column name here once put every
+        // table's `email` index under one global key and lost all but the
+        // first (see `create_table`); failing on a taken name, as
+        // `create_unique_index` does, lost the flag instead.
+        for col in &schema.columns {
+            if col.unique && !col.primary_key {
+                let cols = vec![col.name.clone()];
+                // Structural idempotency, the same test as `create_table`:
+                // a WAL-recovered `CreateTable` this process replayed
+                // before the rebuild already installed this flag's tree,
+                // and minting again would add a duplicate `{key}_2`. A user
+                // index over the column does NOT satisfy it (the flag would
+                // ride on a droppable index, and the registered set would
+                // differ from the one `create_table` produced). A read
+                // failure registers rather than skips — a second tree only
+                // over-enforces.
+                if self
+                    .constraint_owned_unique_index_on(&table_name, &cols)
+                    .unwrap_or(false)
+                {
+                    tracing::debug!(
+                        "Index rebuild: UNIQUE index for {}.{} already registered",
+                        table_name,
+                        col.name
+                    );
+                    continue;
+                }
+                if let Err(e) = art_manager.create_constraint_unique_index(&table_name, &cols, None) {
+                    // Not a name clash (those are absorbed by the mint):
+                    // this column's UNIQUE constraint is now enforced by
+                    // nothing. Loud, because every INSERT will silently
+                    // accept duplicates until it is fixed.
+                    tracing::warn!(
+                        "Index rebuild: UNIQUE index for {}.{} FAILED to register ({}); \
+                         the constraint is NOT enforced in this process",
+                        table_name,
+                        col.name,
+                        e
+                    );
+                }
+            }
+        }
+
+        // (Re)register FK indexes from persisted constraints — and, from the
+        // same load, the table-level UNIQUE indexes. Both are constraint-derived
+        // rather than schema-derived, so neither is covered by the
+        // `schema.columns` loops above. Registering here (before the snapshot
+        // load / row replay below) is what makes a table-level UNIQUE survive a
+        // restart AND get backfilled with the table's existing rows; register
+        // it after the replay and the tree would be empty, so duplicates
+        // against pre-restart rows would be accepted.
+        if let Ok(constraints) = self.load_table_constraints(&table_name) {
+            // OPEN, not DDL — deliberately log-and-continue, which is
+            // TODAY's behaviour and must stay that way. Fail closed on the
+            // DDL path only: there is no statement to return an error to
+            // here, and a constraint can legitimately be unregisterable on
+            // an existing store (RENAME COLUMN / DROP COLUMN never update
+            // `TableConstraints`, so a renamed column already leaves a
+            // record naming a column that no longer exists — src/lib.rs
+            // `AlterTableRenameColumn` / `AlterTableDropColumn` mutate only
+            // `schema.columns[i].name`). Turning that into a refusal to
+            // open, or into a write block, would permanently brick such a
+            // table on restart. Recording it and refusing writes is
+            // separately tracked; do NOT "fix" this into a hard failure.
+            if let Err(e) = self.register_unique_constraint_indexes(&table_name, &constraints) {
+                tracing::error!(
+                    "Index rebuild: a UNIQUE constraint of '{}' could NOT be backed by an index ({}); \
+                     it is not enforced in this process",
+                    table_name,
+                    e
+                );
+            }
+            for fk in &constraints.foreign_keys {
+                if let Err(e) = art_manager.create_fk_index(
+                    &fk.table_name,
+                    &fk.columns,
+                    &fk.references_table,
+                    &fk.references_columns,
+                    Some(&fk.name),
+                ) {
+                    tracing::debug!("Index rebuild: FK index {} already registered: {}", fk.name, e);
+                }
+            }
+        }
+    }
+
+    /// The row-replay half of pass 2 of [`Self::rebuild_all_indexes`]: scan
+    /// `table_name` and feed every row through `on_insert`, so the indexes
+    /// [`Self::register_table_indexes`] registered hold every stored row. A
+    /// stored duplicate of a PRIMARY KEY / UNIQUE value is counted and warned
+    /// about, not fatal (only the first such row is indexed). The row counter
+    /// is left to the caller: an ordinary open reseeds it durably, a physical
+    /// standby in memory only.
+    ///
+    /// `Err` only when the scan itself fails, before any row was indexed.
+    pub(crate) fn backfill_table_indexes(&self, table_name: &str, schema: &Schema) -> Result<TableIndexBackfill> {
+        let art_manager = self.storage.art_indexes();
+        let tuples = self.storage.scan_table_with_schema(table_name, schema)?;
+
+        let mut backfill = TableIndexBackfill::default();
+        for tuple in &tuples {
+            let row_id = match tuple.row_id {
+                Some(id) => id,
+                None => continue,
+            };
+            backfill.max_row_id = Some(backfill.max_row_id.map_or(row_id, |m| m.max(row_id)));
+            let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+            for (idx, col) in schema.columns.iter().enumerate() {
+                if let Some(v) = tuple.values.get(idx) {
+                    col_values.insert(col.name.clone(), v.clone());
+                }
+            }
+            if let Err(e) = art_manager.on_insert(table_name, row_id, &col_values) {
+                if matches!(e, super::art_index::ArtIndexError::DuplicateKey(_)) {
+                    backfill.duplicate_rows += 1;
+                }
+                tracing::debug!(
+                    "Index rebuild: on_insert skipped for {} row {}: {}",
+                    table_name,
+                    row_id,
+                    e
+                );
+            }
+            backfill.rows += 1;
+        }
+        // Stored rows that repeat a PRIMARY KEY / UNIQUE value. Constraint
+        // checks keep these out today, but releases before 4.41.1 could
+        // admit them for TEXT keys that are a prefix of other keys. The
+        // rows stay readable through scans; only the first is indexed.
+        if backfill.duplicate_rows > 0 {
+            tracing::warn!(
+                "Index rebuild: {} row(s) of '{}' repeat a PRIMARY KEY or UNIQUE value of an earlier row and \
+                 are not indexed. Earlier releases could accept such duplicates (see CHANGELOG 4.41.1); list \
+                 them with SELECT <key>, count(*) FROM {} GROUP BY <key> HAVING count(*) > 1",
+                backfill.duplicate_rows,
+                table_name,
+                table_name
+            );
+        }
+        Ok(backfill)
+    }
+
+    /// Register ONE durable `meta:index:` definition as pass 1 of
+    /// [`Self::rebuild_all_indexes`] does (`register_persisted_art_index`): under
+    /// its recorded name, evicting a constraint mint that squats it. The tree
+    /// is registered empty; the caller backfills it. Vector and DDL-only
+    /// families are not ART indexes and are left alone.
+    ///
+    /// For a physical standby's applier, which registers a replicated
+    /// `CREATE INDEX` without a reopen.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn register_index_definition(&self, index_name: &str, definition: &PersistedIndexDefinition) {
+        self.register_persisted_art_index(index_name, definition);
     }
 
     /// (Re)register one user-created scalar secondary index from its durable

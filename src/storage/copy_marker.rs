@@ -86,6 +86,17 @@ impl CopyMarkers {
     /// (skipped on load rather than aborting recovery — a torn marker just
     /// means those rows fall back to the "no versions → visible to all" path).
     fn parse_marker(key: &[u8], value: &[u8]) -> Option<(String, u64, u64, u64)> {
+        let (table, first, last) = Self::parse_marker_key(key)?;
+        if value.len() < 8 {
+            return None;
+        }
+        let ts = u64::from_be_bytes(value.get(0..8)?.try_into().ok()?);
+        Some((table, first, last, ts))
+    }
+
+    /// The `(table, first, last)` a marker key names — the key half of
+    /// [`Self::parse_marker`], which a delete (no value) needs on its own.
+    fn parse_marker_key(key: &[u8]) -> Option<(String, u64, u64)> {
         let key = std::str::from_utf8(key).ok()?;
         let rest = key.strip_prefix(VMETA_PREFIX)?;
         // Split from the RIGHT: the two trailing `:first:last` are fixed-width
@@ -94,11 +105,7 @@ impl CopyMarkers {
         let (table, first) = rest.rsplit_once(':')?;
         let first: u64 = first.parse().ok()?;
         let last: u64 = last.parse().ok()?;
-        if value.len() < 8 {
-            return None;
-        }
-        let ts = u64::from_be_bytes(value.get(0..8)?.try_into().ok()?);
-        Some((table.to_string(), first, last, ts))
+        Some((table.to_string(), first, last))
     }
 
     /// Record a marker in the in-memory index (call after the durable write).
@@ -115,6 +122,36 @@ impl CopyMarkers {
         if let Some((table, first, last, ts)) = Self::parse_marker(key, value) {
             self.insert(&table, first, last, ts);
         }
+    }
+
+    /// Forget the marker a deleted `vmeta:` record described. A physical
+    /// standby mirrors its primary's markers from the replicated records, so a
+    /// delete must leave the interval index too: a stale interval would keep
+    /// hiding the covered rows from AS-OF reads older than the marker. Nothing
+    /// on a primary deletes markers today (materialization is a documented
+    /// follow-up); this keeps the mirror exact when something does. Returns
+    /// whether an interval was removed.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn remove_record(&self, key: &[u8]) -> bool {
+        let Some((table, first, last)) = Self::parse_marker_key(key) else {
+            return false;
+        };
+        let mut g = self.by_table.write();
+        let Some(intervals) = g.get_mut(&table) else {
+            return false;
+        };
+        let before = intervals.len();
+        intervals.retain(|iv| !(iv.first == first && iv.last == last));
+        let removed = intervals.len() != before;
+        if intervals.is_empty() {
+            g.remove(&table);
+        }
+        // Under the same write lock `insert` arms it with, so the fast-out
+        // never reads "empty" while an interval exists.
+        if g.is_empty() {
+            self.any.store(false, Ordering::Relaxed);
+        }
+        removed
     }
 
     /// Strict physical-image hydration cannot skip corrupt visibility markers.
@@ -207,6 +244,22 @@ mod tests {
         m.load_record(b"vmeta:garbage", b"x");
         m.load_record(b"not-a-marker", b"");
         assert_eq!(m.covering_ts("t", 5), Some(50));
+    }
+
+    #[test]
+    fn remove_record_forgets_exactly_the_named_interval() {
+        let m = CopyMarkers::new();
+        m.insert("t", 1, 9, 50);
+        m.insert("t", 10, 20, 60);
+        assert!(m.remove_record(CopyMarkers::marker_key("t", 1, 9).as_bytes()));
+        assert_eq!(m.covering_ts("t", 5), None);
+        assert_eq!(m.covering_ts("t", 15), Some(60));
+        // Already gone, or never a marker: nothing to remove.
+        assert!(!m.remove_record(CopyMarkers::marker_key("t", 1, 9).as_bytes()));
+        assert!(!m.remove_record(b"not-a-marker"));
+        assert!(m.remove_record(CopyMarkers::marker_key("t", 10, 20).as_bytes()));
+        assert!(m.is_empty());
+        assert_eq!(m.len(), 0);
     }
 
     #[test]

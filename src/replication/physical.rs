@@ -8,7 +8,8 @@
 //! column family, and every write a receiver makes goes through one
 //! [`LocalWriter`], which keeps the store's sequence number accounted for.
 //! These primitives do not publish changes to a serving `StorageEngine`: its
-//! catalog, indexes and caches require a separate publication protocol.
+//! catalog, indexes and caches require a separate publication protocol, which
+//! `replication::physical_applier` implements on top of [`LocalWriter`].
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -141,12 +142,38 @@ impl PhysicalBatch {
     }
 }
 
+/// One sequence-consuming record of a raw default-column-family write batch,
+/// borrowing its key and value from the batch bytes.
+///
+/// `rocksdb::WriteBatchIterator` reports puts and deletes only — it drops range
+/// deletions and column-family ids — so whoever must know exactly what a batch
+/// did (a physical standby's applier, publishing derived state) reads the raw
+/// records through [`walk_raw_batch`] instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawOp<'a> {
+    /// `kTypeValue`.
+    Put { key: &'a [u8], value: &'a [u8] },
+    /// `kTypeDeletion` / `kTypeSingleDeletion`.
+    Delete { key: &'a [u8] },
+    /// `kTypeRangeDeletion` over the half-open interval `[start, end)`.
+    DeleteRange { start: &'a [u8], end: &'a [u8] },
+}
+
 /// Decode the pinned RocksDB 8.10 default-column-family batch format. Preserve
 /// the original bytes for application; the C API's put/delete callback loses
 /// range deletions. Unknown opcodes fail closed rather than silently advancing,
 /// and that includes every column-family opcode: a receiver's own WAL records
 /// carry its `put_cf` into [`LOCAL_CF`] and must never be shipped as a source.
 fn validate_raw_batch(raw: &[u8]) -> Result<u32> {
+    walk_raw_batch(raw, |_| ())
+}
+
+/// The one record walker behind [`validate_raw_batch`] and the physical
+/// applier's `decode_raw_batch`: every check `validate_raw_batch` makes, with
+/// `visit` called for each sequence-consuming record in batch order. A batch
+/// that fails a check may already have visited a prefix of its records, so a
+/// caller acts on what it collected only after `Ok`.
+pub(crate) fn walk_raw_batch<'a>(raw: &'a [u8], mut visit: impl FnMut(RawOp<'a>)) -> Result<u32> {
     if !(12..=MAX_BATCH_BYTES).contains(&raw.len()) {
         return Err(invalid("batch byte limit/header"));
     }
@@ -155,7 +182,15 @@ fn validate_raw_batch(raw: &[u8]) -> Result<u32> {
             .and_then(|slice| slice.try_into().ok())
             .ok_or_else(|| invalid("batch header too short"))?,
     );
-    if count == 0 || count > MAX_BATCH_OPERATIONS {
+    // A write group with no operations consumes no sequence number and is
+    // never part of a source interval (`poll_source` skips it), so one that
+    // arrives as a batch is refused by name rather than as oversized.
+    if count == 0 {
+        return Err(invalid(
+            "empty batch: a write group with no operations is never a source batch",
+        ));
+    }
+    if count > MAX_BATCH_OPERATIONS {
         return Err(invalid("batch operation limit"));
     }
     let mut input = raw.get(12..).ok_or_else(|| invalid("batch header too short"))?;
@@ -167,13 +202,15 @@ fn validate_raw_batch(raw: &[u8]) -> Result<u32> {
             0 | 7 => {
                 let key = take_slice(&mut input)?;
                 check_source_key(key)?;
+                visit(RawOp::Delete { key });
                 observed += 1;
             }
             // kTypeValue.
             1 => {
                 let key = take_slice(&mut input)?;
                 check_source_key(key)?;
-                let _value = take_slice(&mut input)?;
+                let value = take_slice(&mut input)?;
+                visit(RawOp::Put { key, value });
                 observed += 1;
             }
             // kTypeLogData: does not consume a sequence number.
@@ -189,6 +226,7 @@ fn validate_raw_batch(raw: &[u8]) -> Result<u32> {
                 if start > end {
                     return Err(invalid("invalid range deletion"));
                 }
+                visit(RawOp::DeleteRange { start, end });
                 observed += 1;
             }
             _ => return Err(invalid(format!("unsupported RocksDB write opcode {tag}"))),
@@ -300,6 +338,14 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Res
             });
         };
         let (first, batch) = entry?;
+        // RocksDB logs a write group with no operations (a `DB::write` of an
+        // empty batch) at the next sequence number but consumes none: the
+        // record after it starts at that same number. It changes nothing, so
+        // it is not part of the interval; shipped, it would ask the receiver
+        // to account for a sequence number nobody used.
+        if batch.is_empty() {
+            continue;
+        }
         if first != result.through + 1 {
             return Err(PhysicalError::Gap {
                 expected: result.through + 1,
@@ -1002,6 +1048,74 @@ mod tests {
         assert!(caught_up.batches.is_empty());
         assert_eq!(caught_up.through, 6);
         assert!(poll_source(&source, history, 0, 1).is_err());
+    }
+
+    /// A `DB::write` of an empty batch is logged as a WAL record with no
+    /// operations that consumes no sequence number. The source must read past
+    /// it, the receiver never sees it, and an empty raw batch is refused by
+    /// name rather than as an oversized one.
+    #[test]
+    fn empty_write_groups_are_read_past_and_never_shipped() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"seed", b"keep").unwrap();
+        let copy_path = root.path().join("copy");
+        Checkpoint::new(&source).unwrap().create_checkpoint(&copy_path).unwrap();
+        let copy = open(&copy_path);
+        let cut = copy.latest_sequence_number();
+        let history = Uuid::new_v4();
+        let receiver = StagedPhysicalReplica::from_checkpoint(copy, history, cut).unwrap();
+
+        // Empty write groups before, between and after two real ones.
+        source.write(WriteBatch::default()).unwrap();
+        let mut batch = WriteBatch::default();
+        batch.put(b"a", b"1");
+        batch.put(b"b", b"2");
+        source.write(batch).unwrap();
+        source.write(WriteBatch::default()).unwrap();
+        source.put(b"c", b"3").unwrap();
+        source.write(WriteBatch::default()).unwrap();
+        assert_eq!(
+            source.latest_sequence_number(),
+            cut + 3,
+            "an empty write group consumes no sequence number"
+        );
+        // The WAL really holds them, so this exercises the skip.
+        let empty_records = source
+            .get_updates_since(cut)
+            .unwrap()
+            .filter(|record| record.as_ref().unwrap().1.is_empty())
+            .count();
+        assert!(empty_records >= 2, "RocksDB logged {empty_records} empty write groups");
+
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        assert_eq!(polled.through, cut + 3);
+        assert_eq!(polled.durable_barrier, cut + 3);
+        assert_eq!(
+            polled
+                .batches
+                .iter()
+                .map(|batch| (batch.first_sequence(), batch.last_sequence()))
+                .collect::<Vec<_>>(),
+            vec![(cut + 1, cut + 2), (cut + 3, cut + 3)]
+        );
+        for batch in &polled.batches {
+            assert!(receiver.apply(batch).unwrap());
+        }
+        assert_eq!(receiver.cursor().source_sequence(), cut + 3);
+        assert_eq!(
+            receiver.writer().db().get(b"c").unwrap().as_deref(),
+            Some(b"3".as_slice())
+        );
+        let caught_up = poll_source(&source, history, cut + 3, MAX_BATCH_BYTES).unwrap();
+        assert!(caught_up.batches.is_empty());
+
+        let error = validate_raw_batch(WriteBatch::default().data())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty batch"), "{error}");
+        let digest = Sha256::digest(WriteBatch::default().data()).into();
+        assert!(PhysicalBatch::decode(history, 1, WriteBatch::default().data().to_vec(), digest).is_err());
     }
 
     #[test]

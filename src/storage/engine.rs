@@ -8408,6 +8408,92 @@ impl StorageEngine {
         )
     }
 
+    /// Replace every per-column storage reference in `tuple` — `DictRef`,
+    /// `CasRef`, `ColumnarRef` — with the value it stands for, by the storage
+    /// mode `schema` gives its column.
+    ///
+    /// The body of the row decode in [`Self::scan_table_with_schema_opt`],
+    /// factored out unchanged so a physical standby's applier
+    /// ([`Self::decode_stored_row`]) resolves a replicated row exactly as a scan
+    /// does: the index entries it maintains must hold the values a rebuild by
+    /// scan would.
+    fn resolve_column_storage_refs(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        row_id: u64,
+        tuple: &mut Tuple,
+    ) -> Result<()> {
+        for (idx, column) in schema.columns.iter().enumerate() {
+            if idx >= tuple.values.len() {
+                break;
+            }
+            match column.storage_mode {
+                ColumnStorageMode::Dictionary => {
+                    // Resolve dictionary reference
+                    if let Some(crate::Value::DictRef { dict_id }) = tuple.values.get(idx) {
+                        let dict_id = *dict_id;
+                        let s = self.dict_manager.decode(&self.db, table_name, &column.name, dict_id)?;
+                        if let Some(val) = tuple.values.get_mut(idx) {
+                            *val = crate::Value::String(s);
+                        }
+                    }
+                }
+                ColumnStorageMode::ContentAddressed => {
+                    // Resolve content-addressed reference
+                    if let Some(crate::Value::CasRef { hash }) = tuple.values.get(idx) {
+                        let hash = hash.clone();
+                        let resolved = ContentAddressedStore::resolve(&self.db, &hash, &column.data_type)?;
+                        if let Some(val) = tuple.values.get_mut(idx) {
+                            *val = resolved;
+                        }
+                    }
+                }
+                ColumnStorageMode::Columnar => {
+                    // Resolve columnar reference
+                    if matches!(tuple.values.get(idx), Some(crate::Value::ColumnarRef)) {
+                        if let Some(val) = ColumnarStore::get(&self.db, table_name, &column.name, row_id)? {
+                            if let Some(slot) = tuple.values.get_mut(idx) {
+                                *slot = val;
+                            }
+                        }
+                    }
+                }
+                ColumnStorageMode::Default => {
+                    // No resolution needed
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode one stored row value of `table_name` into the tuple a full-row
+    /// scan ([`Self::scan_table_with_schema`]) yields for it: bincode, the W3.5
+    /// width shaping, the row id, and the per-column storage references.
+    /// `stored` is the value as [`Self::get`] returns it — already decrypted.
+    ///
+    /// The `RowDecodeHint::Full` arm of the decode closure in
+    /// [`Self::scan_table_with_schema_opt`], for a physical standby's applier,
+    /// which decodes each replicated row change one key at a time and must see
+    /// the tuple a rebuild by scan would see.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn decode_stored_row(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        row_id: u64,
+        stored: &[u8],
+    ) -> Result<Tuple> {
+        let mut tuple: Tuple =
+            bincode::deserialize(stored).map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+        if self.null_pad_snapshot_schema() {
+            Self::shape_base_tuple_to_width(&mut tuple, schema.columns.len());
+        }
+        tuple.row_id = Some(row_id);
+        self.resolve_column_storage_refs(table_name, schema, row_id, &mut tuple)?;
+        Ok(tuple)
+    }
+
     fn scan_table_with_schema_opt(
         &self,
         table_name: &str,
@@ -8462,46 +8548,7 @@ impl StorageEngine {
                 }
 
                 // Resolve per-column storage references
-                for (idx, column) in schema.columns.iter().enumerate() {
-                    if idx >= tuple.values.len() {
-                        break;
-                    }
-                    match column.storage_mode {
-                        ColumnStorageMode::Dictionary => {
-                            // Resolve dictionary reference
-                            if let Some(crate::Value::DictRef { dict_id }) = tuple.values.get(idx) {
-                                let dict_id = *dict_id;
-                                let s = self.dict_manager.decode(&self.db, table_name, &column.name, dict_id)?;
-                                if let Some(val) = tuple.values.get_mut(idx) {
-                                    *val = crate::Value::String(s);
-                                }
-                            }
-                        }
-                        ColumnStorageMode::ContentAddressed => {
-                            // Resolve content-addressed reference
-                            if let Some(crate::Value::CasRef { hash }) = tuple.values.get(idx) {
-                                let hash = hash.clone();
-                                let resolved = ContentAddressedStore::resolve(&self.db, &hash, &column.data_type)?;
-                                if let Some(val) = tuple.values.get_mut(idx) {
-                                    *val = resolved;
-                                }
-                            }
-                        }
-                        ColumnStorageMode::Columnar => {
-                            // Resolve columnar reference
-                            if matches!(tuple.values.get(idx), Some(crate::Value::ColumnarRef)) {
-                                if let Some(val) = ColumnarStore::get(&self.db, table_name, &column.name, row_id)? {
-                                    if let Some(slot) = tuple.values.get_mut(idx) {
-                                        *slot = val;
-                                    }
-                                }
-                            }
-                        }
-                        ColumnStorageMode::Default => {
-                            // No resolution needed
-                        }
-                    }
-                }
+                self.resolve_column_storage_refs(table_name, schema, row_id, &mut tuple)?;
 
                 Ok(tuple)
             }
@@ -9618,6 +9665,11 @@ impl StorageEngine {
         // `merge_branch`); the whole map resets to the default-closed snapshot
         // path until the next snapshot-correct write re-establishes an entry.
         self.bump_schema_generation();
+        // Every row was rewritten outside the row-cache funnels, so a cached
+        // pre-ALTER image (one value short) would keep answering PK lookups.
+        // After the bump: a fill that read the old bytes was stamped with the
+        // old generation and is refused, so this sweep cannot be undone.
+        self.row_cache.invalidate_table(table_name);
 
         Ok(updated)
     }
@@ -9714,6 +9766,9 @@ impl StorageEngine {
         // W2.5: close any watermark entry a concurrent tracked commit
         // re-established mid-rewrite (mirrors the merge-to-main choke point).
         self.bump_schema_generation();
+        // As in `add_column_to_rows`: a cached pre-DROP image would keep the
+        // dropped value in place, shifting every later column of a PK lookup.
+        self.row_cache.invalidate_table(table_name);
 
         Ok(updated)
     }
@@ -10139,6 +10194,13 @@ impl StorageEngine {
                 break;
             }
             batch.delete(key);
+        }
+        // The first index mutation after every open fires this hook, and a
+        // store that never checkpointed its index snapshots has no marker to
+        // delete. Writing the empty batch anyway logged a write group with no
+        // operations — a no-op that a physical standby still has to read past.
+        if batch.is_empty() {
+            return;
         }
         if let Err(e) = gate.write(db, batch, None) {
             warn!("index snapshot marker invalidation failed: {}", e);
@@ -12025,12 +12087,90 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn publish_live_replay_visibility(&self, table: &str, row_id: u64) {
+    pub(crate) fn publish_live_replay_visibility(&self, table: &str, row_id: u64) {
         // Row-cache publication must share the shard lock with guarded fills.
         // Advancing this existing generation also invalidates SQL result caches,
         // without clearing unrelated tables' committed-write watermarks.
         self.row_cache
             .invalidate_with_generation(table, row_id, &self.schema_generation);
+    }
+
+    // ==================== Physical-standby publication ====================
+    //
+    // A physical standby's applier (`replication::physical_applier`) writes its
+    // primary's batches verbatim through the standby's `LocalWriter` and then
+    // brings this engine's in-memory derived state in line with the keys each
+    // batch touched. These are the few hooks it needs that the engine did not
+    // already expose. None of them writes to the store.
+
+    /// Hold the lock that serializes live appliers (`live_replay_lock`, the
+    /// one `apply_replicated_operation_at` takes) for as long as the guard
+    /// lives. A physical applier holds it for a whole batch — decode, apply and
+    /// publish — so no other applier can interleave its publication.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn replay_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.live_replay_lock.lock()
+    }
+
+    /// Raise the logical MVCC timestamp to at least `ts`; never lowers it.
+    ///
+    /// Readers take their snapshot timestamp from this counter
+    /// (`next_timestamp`), and a version is visible to a snapshot at or after
+    /// its commit timestamp. On a primary every commit allocates from the
+    /// counter, so it is always ahead. A physical standby's versions carry the
+    /// PRIMARY's timestamps instead, so the applier raises the counter past
+    /// every replicated commit; otherwise a reader that starts after the batch
+    /// would get a snapshot older than the commit and miss its rows.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn raise_timestamp(&self, ts: u64) {
+        let mut current = self.timestamp.write();
+        if *current < ts {
+            *current = ts;
+        }
+    }
+
+    /// Drop every cached dictionary (`DictionaryManager::clear_cache`).
+    ///
+    /// The cache never reloads a dictionary it already holds, which is right
+    /// on a primary (only it extends its dictionaries) and wrong on a physical
+    /// standby, whose `dict:` records grow underneath it: a row referencing a
+    /// new entry would decode as "Invalid dict_id" against the cached copy.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn forget_cached_dictionaries(&self) {
+        self.dict_manager.clear_cache();
+    }
+
+    /// Replace the branch manager with one freshly loaded from the store's
+    /// branch registry, as the physical open loads it (`open_with_mode`:
+    /// `BranchManager::open_existing` plus the engine's key manager).
+    ///
+    /// The registry is read once, at open; on a physical standby `branch:`
+    /// records keep arriving, and `count_table_rows`, branch resolution and the
+    /// version GC's anchors all ask the manager. Every holder of the shared
+    /// slot (the version GC included) sees the swap. On error — a registry
+    /// naming a branch whose metadata has not arrived yet — the current
+    /// manager stays in place.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn reload_branch_manager(&self) -> Result<()> {
+        let mut manager = BranchManager::open_existing(
+            Arc::clone(&self.db),
+            Arc::clone(&self.gate),
+            Arc::clone(&self.timestamp),
+        )?;
+        manager.set_key_manager(self.key_manager.clone());
+        *self.branch_manager.write() = Some(Arc::new(manager));
+        Ok(())
+    }
+
+    /// The `LocalWriter` of a physical standby (the one whose handle this
+    /// engine shares); `None` in every other open mode. Lets the applier prove
+    /// it was handed the writer of THIS engine's store.
+    #[cfg(feature = "ha-tier1")]
+    pub(crate) fn physical_standby_writer(&self) -> Option<&Arc<crate::replication::physical::LocalWriter>> {
+        match &self.open_mode {
+            OpenMode::PhysicalStandby { writer, .. } => Some(writer),
+            OpenMode::Primary | OpenMode::ReadOnly | OpenMode::PhysicalSnapshot => None,
+        }
     }
 
     /// Apply a single WAL operation to restore database state
@@ -14351,6 +14491,17 @@ impl StorageEngine {
             .entry(table_name.to_string())
             .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
             .fetch_max(value, Ordering::Relaxed);
+    }
+
+    /// The in-memory row-id high-water mark of `table_name` — the last id
+    /// `next_row_id_volatile` handed out (or was raised to) — without moving
+    /// it; `None` when no counter exists for the table. A read-only
+    /// diagnostic: a physical standby must hold at least its primary's mark
+    /// for every table, or a promotion would reuse row ids.
+    pub fn row_counter_high_water(&self, table_name: &str) -> Option<u64> {
+        self.row_counters
+            .get(table_name)
+            .map(|counter| counter.load(Ordering::Acquire))
     }
 
     pub fn next_row_id_volatile(&self, table_name: &str) -> u64 {

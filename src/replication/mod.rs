@@ -29,6 +29,8 @@ pub mod lsn_manager;
 #[cfg(feature = "ha-tier1")]
 pub mod physical;
 #[cfg(feature = "ha-tier1")]
+pub mod physical_applier;
+#[cfg(feature = "ha-tier1")]
 pub mod physical_receiver;
 #[cfg(feature = "ha-tier1")]
 pub mod physical_source;
