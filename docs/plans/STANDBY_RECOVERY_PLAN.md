@@ -98,6 +98,11 @@ Facts this plan relies on. All were read on `8d1575a8`; the ones marked ✓ were
 
 ## 4. The central decision: which standby the recovery modes work on
 
+**Decided 2026-10-20: the physical standby replaces the logical one for all standbys.** The
+design (node-local column family, derived-state maintenance from raw batches, serving handle,
+physical-sequence ACKs, archive segments, phases P0-P5) is `PHYSICAL_STANDBY_REPLICATION.md`.
+The analysis below is kept for the record.
+
 Both requested modes assume an Oracle physical standby: a block copy of the primary that applies redo. In HeliosDB that is the **physical receiver**, not today's serving standby.
 
 - **"Changed blocks since the standby's SCN"** needs the standby's data to equal the primary's data as of a known position.
