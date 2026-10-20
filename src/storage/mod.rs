@@ -8,9 +8,12 @@ mod branch;
 mod catalog;
 mod copy_marker;
 mod dirty_tracker;
+mod disk;
 pub mod dump;
 mod engine;
 mod gin_index;
+// The authoritative map of every key prefix in the default column family.
+pub mod keyspace;
 mod lock_manager;
 mod materialized_view;
 mod mv_auto_refresh;
@@ -85,6 +88,7 @@ pub use engine::{
 };
 pub use gin_index::{GinIndex, GinIndexStats};
 pub use index_snapshot::{IndexOpenReport, IndexSnapshotPersistReport};
+pub use keyspace::{Classified, KeyClass};
 pub use lock_manager::{LockGuard, LockManager, LockState, LockType, StatementRetryPolicy};
 pub use materialized_view::{MaterializedViewCatalog, MaterializedViewMetadata};
 pub use mv_auto_refresh::{AutoRefreshConfig, AutoRefreshWorker};

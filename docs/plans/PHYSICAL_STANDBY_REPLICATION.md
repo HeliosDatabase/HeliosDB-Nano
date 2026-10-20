@@ -115,6 +115,21 @@ Everything the primary persists must be reachable through the RocksDB WAL.
 - `shutdown_dump.heliodump` must not be written into a replica dir (`--dump-on-shutdown` refused on a standby).
 - Encryption: a standby needs the same key (ciphertext is shipped verbatim); key rotation re-encrypts through RocksDB (replicates) but the standby must hold both keys during rotation → refuse `rotate` while any standby is attached without the new key (control-plane capability flag).
 
+### D8. PG-wire surface for HeliosDB Proxy (from `sprint/coordination/proxy-to-nano-physical-standby-20261020.md`; P1 unless noted)
+Proxy's health, topology and lag routing are PG-wire only (it never fetches `/ready`), so the standby contract is carried on the PG port:
+- `SELECT heliosdb_require_ready()` → `t` on a primary or a ready standby (streaming, or reconnecting within `max_standby_lag`); otherwise SQLSTATE `55000` severity ERROR. Intended as Proxy `[health] check_query`. Health/topology logins (`postgres`/`postgres`, app names `heliosdb-proxy-health`, `helios-topology`) are accepted in every posture; SSLRequest is always answered; readiness is never a startup ErrorResponse (a node that must leave the read set closes its listener).
+- `pg_is_in_recovery()` correct in every posture (`t` standby, `f` primary; flips synchronously at promotion, P5).
+- `pg_current_wal_lsn()` (primary) and `pg_last_wal_replay_lsn()` (standby) return PostgreSQL `HI/LO` hex text of the physical sequence (`hi = seq >> 32`, `lo = seq & 0xFFFFFFFF`). Proxy's `lag_bytes` is therefore "write operations behind" (monotone, comparable); documented, with the fixture stating its load ops/s so a `max_lag_bytes` test value can be derived. Nano's `max_standby_lag` (seconds) stays the readiness gate; the two are independent.
+- `pg_control_checkpoint()` with `timeline_id bigint` = replication epoch (`1` until P5; strictly increasing per promotion).
+- ParameterStatus `in_hot_standby` exactly `on` on standby sessions, `off` on a primary and after promotion; `server_version` unchanged.
+- Statement refusals stay severity ERROR (`55000`, `25006`); fencing/demotion terminates sessions with FATAL `57P01` (P5).
+- PG-wire TLS stays optional on every node; no token on PG-wire.
+- `heliosdb_standby_status` view and the `/health` replication block share one frozen field set: `role, state, ready, cursor, primary_cursor (LSN text), lag_bytes, lag_secs, primary (host:port), sync_mode, last_ack_sequence, epoch`; `/ready` 200 iff `ready` else 503, same body.
+- Exact query forms Proxy sends (must parse and return exactly one row, one column): `SELECT pg_is_in_recovery()`, `SELECT pg_is_in_recovery()::text`, `SELECT pg_current_wal_lsn()::text`, `SELECT pg_last_wal_replay_lsn()::text`, `SELECT timeline_id::bigint FROM pg_control_checkpoint()`, `SELECT pg_promote(true, N)` (literal `true`, integer). The credentialed health probe runs `check_query` then the LSN query on the same session. Hex case is free.
+- Fixture `scripts/regress/nano-physical-pair.sh` (P1 acceptance): primary on 127.0.0.1:27721, physical standby on 127.0.0.1:27722 (Proxy listens on 27730, admin 27731; Proxy's lab owns 27701-27792), both logins/app names accepted, survives SIGKILL/restart of either side, prints ports and load ops/s (Proxy's template assumes 1000 ops/s → `max_lag_bytes = 30000`). Proxy-side template: `sprint/coordination/proxy-nano-physical-pair.toml.in`.
+- Removing the native 5433 listener (one release after P2) changes nothing on this surface.
+- **Promotion interface (P5, owner to confirm):** `SELECT pg_promote(wait bool, wait_seconds int)` on the standby, same path as `heliosdb-nano promote`; no HTTP endpoint.
+
 ### D6. Recovery modes (from `STANDBY_RECOVERY_PLAN.md`, now physical-only)
 - **From the primary:** ladder = tail (primary's archive/segments cover `S+1…`) → incremental fast-forward (same history, valid cursor, position older than history: leaf digests over the replicated keyspace at a pinned snapshot, differing leaves shipped as SSTs via `SstFileWriter`, applied with `delete_range` + `ingest_external_file`, crash-resumable under a `local` recovery record) → full copy (resumable checkpoint transfer). Sprinter `dafb3894ef87`.
 - **From WAL:** `standby recover --from-archive [DIR…]` builds the chain from `S+1`, verifies header/footer/SHA-256 before applying anything, applies through the same applier (so derived state is maintained identically), then continues from the primary if reachable or stays `needs_recovery` naming the exact gap. The standby may also run **archive-only** (no primary connection; Oracle managed recovery from archived logs) with `--source archive`. Sprinter `e619d47c3457`.
@@ -147,12 +162,14 @@ P0 and P1 are the critical path; P2 can overlap P1's tail; P3/P4 after P1.
 4. Perf: release-profile A/B (never the `perf` profile) of primary commit latency (the only hot-path change is one `latest_sequence_number()` load) and applier throughput; pg35 no flips.
 5. Docs: CHANGELOG, `docs/guides/replication-history-guard.md`, `offline-reseed.md`, `deployment-endpoints.md`, `.claude/skills/heliosdb-nano-server` (stale failover line), new `docs/guides/physical-standby.md` (Oracle→HeliosDB vocabulary table from `STANDBY_RECOVERY_PLAN.md` §1).
 
-## Open points for the Fable review (decide before P0)
-1. Control plane: single connection (NPHYS v2 carries control frames; recommended) vs keep two listeners.
-2. `sync_timeout_action` default `warn` (recommended) vs `fail`.
-3. J1's `logical_wal_retention_entries`: keep as the primary's redo/catch-up window for one release, then default to 0 once logical standbys are gone (recommended) vs remove now.
-4. Cascading standbys and standby-side archive on by default? (recommended: archive on, cascading opt-in).
-5. Cut markers: deferred pending the DDL-window torn-read test (recommended) vs implement in P1.
+## Decisions (maintainer, 2026-10-20)
+1. **One replication connection and port**: NPHYS v2 (TLS + token) carries the control frames; the native 5433 listener stays one release for logical standbys, then is removed.
+2. **Readiness contract for Proxy**: `GET /ready` is 200 only when streaming, or reconnecting within `[replication] max_standby_lag` (default 30 s), 503 otherwise; `/health` stays liveness with a replication block {state, cursor, lag_secs, primary}; SQL `heliosdb_standby_status` view and `pg_is_in_recovery()`. Proxy routes reads on `/ready`.
+3. `sync_timeout_action` default **`warn`** (`fail` available).
+4. **First milestone for Proxy = P0-P2** (serving physical standby over TLS, readiness, sync ACKs); P3-P5 follow.
+5. J1's `logical_wal_retention_entries` stays one release as the primary's redo/catch-up window, then defaults to 0.
+6. Standby-side archive on by default; cascading standbys opt-in.
+7. Cut markers deferred pending the DDL-window torn-read test.
 
 ## Tracking
 

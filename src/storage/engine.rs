@@ -2139,34 +2139,37 @@ impl StorageEngine {
         opts
     }
 
-    /// Check available disk space and return error if below threshold.
-    /// Uses /proc/mounts + statvfs syscall via std to avoid libc dependency.
+    /// Refuse a write when the filesystem holding `path` has less than
+    /// `MIN_DISK_SPACE_BYTES` available to an unprivileged writer.
+    ///
+    /// Measured with `statvfs` through `storage::disk::free_bytes`; this used to
+    /// spawn `df` on every 1000th write. If the measurement itself fails
+    /// (unsupported platform, the path vanished) the check is skipped rather
+    /// than blocking writes — a failed probe is not evidence of a full disk —
+    /// and the first such failure is logged at debug.
     fn check_disk_space(path: &std::path::Path) -> Result<()> {
-        // Read available space from /proc filesystem (Linux-specific, safe fallback)
-        let output = std::process::Command::new("df")
-            .arg("--output=avail")
-            .arg("-B1") // bytes
-            .arg(path)
-            .output();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                // Second line contains the available bytes
-                if let Some(avail_str) = stdout.lines().nth(1) {
-                    if let Ok(available_bytes) = avail_str.trim().parse::<u64>() {
-                        if available_bytes < MIN_DISK_SPACE_BYTES {
-                            return Err(Error::storage(format!(
-                                "Insufficient disk space: {} MB available (minimum {} MB required). \
-                                 Free disk space or use VACUUM to reclaim storage.",
-                                available_bytes / (1024 * 1024),
-                                MIN_DISK_SPACE_BYTES / (1024 * 1024)
-                            )));
-                        }
-                    }
-                }
+        match super::disk::free_bytes(path) {
+            Ok(available_bytes) => Self::check_disk_space_with(available_bytes),
+            Err(e) => {
+                static PROBE_FAILURE_LOGGED: std::sync::Once = std::sync::Once::new();
+                PROBE_FAILURE_LOGGED.call_once(|| {
+                    debug!("Skipping the free-disk-space check for {}: {}", path.display(), e);
+                });
+                Ok(())
             }
-            _ => {} // If df fails, skip the check rather than blocking writes
+        }
+    }
+
+    /// The threshold half of `check_disk_space`, separate so the refusal can be
+    /// tested without filling a filesystem.
+    fn check_disk_space_with(available_bytes: u64) -> Result<()> {
+        if available_bytes < MIN_DISK_SPACE_BYTES {
+            return Err(Error::storage(format!(
+                "Insufficient disk space: {} MB available (minimum {} MB required). \
+                 Free disk space or use VACUUM to reclaim storage.",
+                available_bytes / (1024 * 1024),
+                MIN_DISK_SPACE_BYTES / (1024 * 1024)
+            )));
         }
         Ok(())
     }
@@ -15493,6 +15496,33 @@ mod tests {
             engine.get_internal(&legacy_key).expect("get_internal failed").is_none(),
             "direct_bulk_load must NOT write the dead meta-counter legacy key"
         );
+    }
+
+    // ---- free-disk-space guard ---------------------------------------------
+
+    #[test]
+    fn disk_space_below_the_minimum_is_refused() {
+        let err = StorageEngine::check_disk_space_with(MIN_DISK_SPACE_BYTES - 1)
+            .expect_err("one byte under the minimum must refuse the write");
+        let msg = err.to_string();
+        assert!(msg.contains("Insufficient disk space"), "{msg}");
+        assert!(msg.contains("minimum 100 MB required"), "{msg}");
+        assert!(StorageEngine::check_disk_space_with(0).is_err());
+    }
+
+    #[test]
+    fn disk_space_at_or_above_the_minimum_is_accepted() {
+        StorageEngine::check_disk_space_with(MIN_DISK_SPACE_BYTES).expect("exactly the minimum is enough");
+        StorageEngine::check_disk_space_with(u64::MAX).expect("plenty of space");
+    }
+
+    /// A probe that cannot measure must not block writes: the guard skips
+    /// itself instead of reading a failed `statvfs` as "0 bytes free".
+    #[test]
+    fn an_unmeasurable_path_skips_the_disk_space_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        StorageEngine::check_disk_space(&dir.path().join("does-not-exist"))
+            .expect("a failed measurement must not refuse the write");
     }
 }
 

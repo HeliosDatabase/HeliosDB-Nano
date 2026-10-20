@@ -930,6 +930,59 @@ pub fn parse_retention_duration_secs(raw: &str) -> crate::Result<u64> {
         .ok_or_else(|| crate::Error::config(format!("storage.version_retention '{}' overflows u64 seconds", raw)))
 }
 
+/// Parse a byte size: plain bytes (`"123"`, `"123B"`) or a whole number with a
+/// unit — `K`/`KB`/`KiB`, `M`/`MB`/`MiB`, `G`/`GB`/`GiB`, `T`/`TB`/`TiB` —
+/// matched case-insensitively, with optional whitespace around the unit.
+///
+/// Every unit is binary (`K` = 1024) whichever spelling is used: these sizes cap
+/// disk use and are compared against `statvfs` block counts, and a `"16GB"`
+/// that quietly meant 10^9-byte gigabytes would undershoot the operator's
+/// intent by 7%. `"unlimited"` is not a size; settings that allow it parse with
+/// [`parse_byte_size_or_unlimited`].
+///
+/// Not wired to a setting yet, so errors quote the value; callers add the
+/// setting name.
+pub fn parse_byte_size(raw: &str) -> crate::Result<u64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return Err(crate::Error::config(
+            "byte size is empty; use e.g. \"512MiB\", \"16GiB\" or a number of bytes",
+        ));
+    }
+    let invalid = || {
+        crate::Error::config(format!(
+            "invalid byte size '{}': expected <n>[B|K|KB|KiB|M|MB|MiB|G|GB|GiB|T|TB|TiB]",
+            raw
+        ))
+    };
+    let (digits, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let shift = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 0,
+        "k" | "kb" | "kib" => 10,
+        "m" | "mb" | "mib" => 20,
+        "g" | "gb" | "gib" => 30,
+        "t" | "tb" | "tib" => 40,
+        _ => return Err(invalid()),
+    };
+    if digits.is_empty() {
+        return Err(invalid());
+    }
+    let overflow = || crate::Error::config(format!("byte size '{}' overflows u64 bytes", raw));
+    // `digits` is non-empty ASCII digits, so the only way `parse` fails is a
+    // number too large for u64 — the same overflow as the unit multiplication.
+    let value: u64 = digits.parse().map_err(|_| overflow())?;
+    value.checked_mul(1u64 << shift).ok_or_else(overflow)
+}
+
+/// [`parse_byte_size`] for settings where `"unlimited"` (any case) means "no
+/// cap": `None` instead of an error.
+pub fn parse_byte_size_or_unlimited(raw: &str) -> crate::Result<Option<u64>> {
+    if raw.trim().eq_ignore_ascii_case("unlimited") {
+        return Ok(None);
+    }
+    parse_byte_size(raw).map(Some)
+}
+
 /// The untouched default of the deprecated `[server] idle_timeout_secs` key.
 /// `ConnectionTimeouts::from_server_config` honours that key as
 /// `idle_session_timeout` ONLY when it was explicitly changed from this value —
@@ -3326,5 +3379,82 @@ mod physical_config_tests {
             let config: ReplicationConfig = toml::from_str(&format!("[physical]\n{field}={value}")).unwrap();
             assert!(config.validate().is_err(), "{field}={value}");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod byte_size_tests {
+    use super::*;
+
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
+    const TIB: u64 = 1024 * GIB;
+
+    #[test]
+    fn plain_numbers_are_bytes() {
+        assert_eq!(parse_byte_size("0").unwrap(), 0);
+        assert_eq!(parse_byte_size("123").unwrap(), 123);
+        assert_eq!(parse_byte_size("123B").unwrap(), 123);
+        assert_eq!(parse_byte_size("18446744073709551615").unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn every_unit_spelling_is_binary_and_case_insensitive() {
+        for (unit, scale) in [("K", KIB), ("M", MIB), ("G", GIB), ("T", TIB)] {
+            for spelling in [unit.to_string(), format!("{unit}B"), format!("{unit}iB")] {
+                for text in [spelling.clone(), spelling.to_lowercase(), spelling.to_uppercase()] {
+                    assert_eq!(parse_byte_size(&format!("3{text}")).unwrap(), 3 * scale, "3{text}");
+                }
+            }
+        }
+        assert_eq!(parse_byte_size("512KiB").unwrap(), 512 * KIB);
+        assert_eq!(parse_byte_size("16GiB").unwrap(), 16 * GIB);
+        assert_eq!(parse_byte_size("1T").unwrap(), TIB);
+    }
+
+    #[test]
+    fn whitespace_around_the_number_and_unit_is_ignored() {
+        assert_eq!(parse_byte_size("  16 GiB  ").unwrap(), 16 * GIB);
+        assert_eq!(parse_byte_size("\t2g\n").unwrap(), 2 * GIB);
+    }
+
+    #[test]
+    fn overflow_is_an_error_not_a_wrap() {
+        assert_eq!(parse_byte_size("16777215T").unwrap(), 16_777_215 * TIB);
+        for raw in ["16777216T", "18446744073709551616", "99999999999999999999999K"] {
+            let err = parse_byte_size(raw).expect_err(raw).to_string();
+            assert!(err.contains("overflows"), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn empty_and_malformed_values_are_errors() {
+        let empty = parse_byte_size("   ").expect_err("blank").to_string();
+        assert!(empty.contains("empty"), "{empty}");
+        for raw in [
+            "GiB",
+            "1.5G",
+            "-5",
+            "+5",
+            "5 G iB",
+            "5PB",
+            "0x10",
+            "unlimited",
+            "5 bytes",
+        ] {
+            let err = parse_byte_size(raw).expect_err(raw).to_string();
+            assert!(err.contains("invalid byte size") && err.contains(raw), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn unlimited_is_none_only_where_allowed() {
+        assert_eq!(parse_byte_size_or_unlimited("unlimited").unwrap(), None);
+        assert_eq!(parse_byte_size_or_unlimited(" UNLIMITED ").unwrap(), None);
+        assert_eq!(parse_byte_size_or_unlimited("64MiB").unwrap(), Some(64 * MIB));
+        assert!(parse_byte_size_or_unlimited("").is_err());
+        assert!(parse_byte_size_or_unlimited("limitless").is_err());
     }
 }
