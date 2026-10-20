@@ -24,6 +24,21 @@ pub struct SystemViewSchema {
     pub description: String,
 }
 
+/// A plain column of a status view: no key, no default, no storage mode.
+fn status_column(name: &str, data_type: DataType, nullable: bool) -> Column {
+    Column {
+        name: name.to_string(),
+        data_type,
+        nullable,
+        primary_key: false,
+        source_table: None,
+        source_table_name: None,
+        default_expr: None,
+        unique: false,
+        storage_mode: ColumnStorageMode::Default,
+    }
+}
+
 impl SystemViewRegistry {
     /// Create a new system view registry with Phase 3 views
     pub fn new() -> Self {
@@ -1751,6 +1766,50 @@ impl SystemViewRegistry {
                 ],
             },
             description: "Shows replication performance metrics".to_string(),
+        });
+
+        // Spec P1.3 (plan §D8): the replication block every surface shares —
+        // `/health`'s `replication` object, `/ready`'s body and this view
+        // carry one frozen field set (`standby_posture::ReplicationBlock`).
+        // `cursor` / `primary_cursor` are PostgreSQL LSN text of the physical
+        // sequence; `lag_bytes` is the sequence delta between them.
+        self.register_view(SystemViewSchema {
+            name: "heliosdb_standby_status".to_string(),
+            schema: Schema {
+                columns: vec![
+                    status_column("role", DataType::Text, false),
+                    status_column("state", DataType::Text, false),
+                    status_column("ready", DataType::Boolean, false),
+                    status_column("cursor", DataType::Text, false),
+                    status_column("primary_cursor", DataType::Text, false),
+                    status_column("lag_bytes", DataType::Int8, false),
+                    status_column("lag_secs", DataType::Float8, true),
+                    status_column("primary", DataType::Text, true),
+                    status_column("sync_mode", DataType::Text, false),
+                    status_column("last_ack_sequence", DataType::Int8, true),
+                    status_column("epoch", DataType::Int8, false),
+                ],
+            },
+            description: "Replication posture of this node (standby readiness, cursor, lag)".to_string(),
+        });
+
+        // Spec P1.3 (plan §D8): `SELECT timeline_id::bigint FROM
+        // pg_control_checkpoint()` is how HeliosDB Proxy reads the
+        // replication epoch. A subset of PostgreSQL's columns, one row; the
+        // table-function call parses as a relation with arguments and lands
+        // here. `timeline_id` is the epoch (1 until promotion, phase P5).
+        self.register_view(SystemViewSchema {
+            name: "pg_control_checkpoint".to_string(),
+            schema: Schema {
+                columns: vec![
+                    status_column("checkpoint_lsn", DataType::Text, false),
+                    status_column("redo_lsn", DataType::Text, false),
+                    status_column("timeline_id", DataType::Int8, false),
+                    status_column("prev_timeline_id", DataType::Int8, false),
+                    status_column("full_page_writes", DataType::Boolean, false),
+                ],
+            },
+            description: "Control data of this node's last checkpoint (replication epoch as timeline_id)".to_string(),
         });
 
         // heliosdb_art_indexes - ART index information
@@ -4054,6 +4113,9 @@ impl SystemViewRegistry {
             "pg_replication_standbys" => Self::execute_pg_replication_standbys(),
             "pg_replication_primary" => Self::execute_pg_replication_primary(),
             "pg_replication_metrics" => Self::execute_pg_replication_metrics(),
+            // Spec P1.3: this node's replication posture and control data.
+            "heliosdb_standby_status" => Ok(vec![Self::execute_heliosdb_standby_status(storage)]),
+            "pg_control_checkpoint" => Ok(vec![Self::execute_pg_control_checkpoint(storage)]),
             // ART index monitoring
             "heliosdb_art_indexes" => Self::execute_heliosdb_art_indexes(storage),
             // SIMD capabilities
@@ -6078,6 +6140,44 @@ impl SystemViewRegistry {
             Value::Int8(0),
             Value::String("HA feature not enabled".to_string()),
         ])])
+    }
+
+    /// `heliosdb_standby_status`: the replication block of the node serving
+    /// `storage` (spec P1.3) — the same values `/health` reports.
+    fn execute_heliosdb_standby_status(storage: &StorageEngine) -> Tuple {
+        let block = crate::standby_posture::status_block(storage);
+        let optional_text = |value: Option<String>| value.map_or(Value::Null, Value::String);
+        Tuple::new(vec![
+            Value::String(block.role),
+            Value::String(block.state),
+            Value::Boolean(block.ready),
+            Value::String(block.cursor),
+            Value::String(block.primary_cursor),
+            Value::Int8(i64::try_from(block.lag_bytes).unwrap_or(i64::MAX)),
+            block.lag_secs.map_or(Value::Null, Value::Float8),
+            optional_text(block.primary),
+            Value::String(block.sync_mode),
+            block.last_ack_sequence.map_or(Value::Null, |sequence| {
+                Value::Int8(i64::try_from(sequence).unwrap_or(i64::MAX))
+            }),
+            Value::Int8(i64::try_from(block.epoch).unwrap_or(i64::MAX)),
+        ])
+    }
+
+    /// `pg_control_checkpoint()`: one row whose LSNs are this node's physical
+    /// position (a standby's applied cursor, a primary's written sequence) and
+    /// whose `timeline_id` is the replication epoch (spec P1.3).
+    fn execute_pg_control_checkpoint(storage: &StorageEngine) -> Tuple {
+        use crate::standby_posture::{current_sequence, format_lsn, EPOCH};
+        let lsn = format_lsn(current_sequence(Some(storage)));
+        let epoch = i64::try_from(EPOCH).unwrap_or(i64::MAX);
+        Tuple::new(vec![
+            Value::String(lsn.clone()),
+            Value::String(lsn),
+            Value::Int8(epoch),
+            Value::Int8(epoch),
+            Value::Boolean(true),
+        ])
     }
 
     /// Execute heliosdb_art_indexes view

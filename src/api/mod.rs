@@ -17,8 +17,9 @@ pub mod server;
 
 // Re-exports for convenience
 pub use http_auth::{
-    attach_http_auth, http_bind_safety_check, resolve_http_listen, HttpAuthPolicy, HttpAuthRejection, HttpRateLimits,
-    FAILURE_WINDOW, HTTP_DEFAULT_LISTEN, MAX_FAILURES, MAX_IN_FLIGHT_VERIFICATIONS, MAX_TRACKED_PEERS,
+    attach_http_auth, attach_http_auth_with_replication, http_bind_safety_check, resolve_http_listen, HttpAuthPolicy,
+    HttpAuthRejection, HttpRateLimits, ReplicationStatus, FAILURE_WINDOW, HTTP_DEFAULT_LISTEN, MAX_FAILURES,
+    MAX_IN_FLIGHT_VERIFICATIONS, MAX_TRACKED_PEERS,
 };
 pub use middleware::{AuthMiddleware, RateLimitConfig, RateLimitMiddleware, UserContext};
 pub use models::error::ApiError;

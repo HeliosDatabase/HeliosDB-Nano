@@ -5,20 +5,24 @@
 //! dropped async future cannot detach an append/apply/publication operation.
 //! Cancellation is observed between commands; an in-flight RocksDB/fsync call
 //! cannot be forcibly interrupted, so Drop may wait for that OS call to finish.
-//! No phase in this module declares SQL readiness or opens a serving database.
+//! No phase in this module declares SQL readiness or opens a serving database
+//! itself: a serving standby hands [`run_serving_receiver`] the closure that
+//! builds one (spec P1.3), and the readiness that follows is the posture's
+//! (`standby_posture`), derived from this module's [`ReceiverStatus`].
 //! The worker's stage owns the receiver's `LocalWriter`; every RocksDB open of
 //! the stage uses the storage options of `ReceiverOptions::config`.
 
 use super::checkpoint_transfer::{
     ClosedPhysicalStage, PhysicalStage, ReceiverStaging, ReopenedPhysicalStage, TransferLimits,
 };
-use super::physical::{PhysicalBatch, PhysicalCursor, MAX_BATCH_BYTES};
+use super::physical::{LocalWriter, PhysicalBatch, PhysicalCursor, MAX_BATCH_BYTES};
+use super::physical_applier::PhysicalApplier;
 use super::physical_wire::{BatchSink, PhysicalClient, SourceSessionInfo, TransferToken, WireError, WireLimits};
 use crate::Config;
 use async_trait::async_trait;
 use std::{
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -131,6 +135,16 @@ impl ReceiverOptions {
     }
 }
 
+/// Spec P1.3: builds the serving side of a following receiver over its
+/// reopened store — `StorageEngine::open_physical_standby` over the stage's
+/// writer, `EmbeddedDatabase::with_physical_standby`, and the
+/// `PhysicalApplier` every later batch is applied through. Runs once, on the
+/// receiver's owner thread, right after the stage is reopened and before the
+/// first connection, so no batch can be applied around it; an `Err` stops the
+/// receiver with nothing applied.
+pub type ServingAttach =
+    Box<dyn FnOnce(&Path, &Arc<LocalWriter>) -> std::result::Result<Arc<PhysicalApplier>, String> + Send>;
+
 #[derive(Clone, Debug)]
 pub enum ReceiverStatus {
     Connecting {
@@ -142,10 +156,15 @@ pub enum ReceiverStatus {
         received: u64,
         total: u64,
     },
+    /// `session` numbers the receiver's connections (1 for the first, one
+    /// more per reconnect), so an observer can tell a poll of the streaming
+    /// session from the first poll of a new one even when the `Connecting` in
+    /// between was overwritten before it saw it.
     Applying {
         path: PathBuf,
         cursor: PhysicalCursor,
         source_barrier: Option<u64>,
+        session: u64,
     },
     /// Raw physical files installed only. This is not a serving/readiness signal.
     Installed {
@@ -157,6 +176,7 @@ pub enum ReceiverStatus {
         path: PathBuf,
         cursor: PhysicalCursor,
         source_barrier: u64,
+        session: u64,
     },
     Stopped {
         path: Option<PathBuf>,
@@ -211,6 +231,12 @@ enum Command {
     Apply {
         batch: PhysicalBatch,
         reply: Reply<()>,
+    },
+    /// A serving receiver's idle moment: run what its applier deferred
+    /// (`PhysicalApplier::run_pending_rebuilds`). Replies whether anything
+    /// was pending; a no-op without an applier.
+    Maintain {
+        reply: Reply<bool>,
     },
     Position {
         reply: Reply<Position>,
@@ -272,7 +298,7 @@ struct Worker {
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Worker {
-    fn spawn(config: Config) -> Result<Self> {
+    fn spawn(config: Config, attach: Option<ServingAttach>) -> Result<Self> {
         let (tx, rx) = mpsc::channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let last = Arc::new(Mutex::new(Position::default()));
@@ -280,7 +306,7 @@ impl Worker {
         let worker_last = last.clone();
         let thread = thread::Builder::new()
             .name("nano-physical-receiver".into())
-            .spawn(move || worker_loop(rx, worker_cancel, worker_last, &config))
+            .spawn(move || worker_loop(rx, worker_cancel, worker_last, &config, attach))
             .map_err(storage)?;
         Ok(Self {
             tx: Some(tx),
@@ -330,8 +356,19 @@ fn record_position(state: &State, last: &Mutex<Position>) {
         *last.lock().unwrap_or_else(|poison| poison.into_inner()) = position;
     }
 }
-fn worker_loop(mut rx: mpsc::Receiver<Command>, cancel: Arc<AtomicBool>, last: Arc<Mutex<Position>>, config: &Config) {
+fn worker_loop(
+    mut rx: mpsc::Receiver<Command>,
+    cancel: Arc<AtomicBool>,
+    last: Arc<Mutex<Position>>,
+    config: &Config,
+    mut attach: Option<ServingAttach>,
+) {
     let mut state = State::Empty;
+    // Spec P1.3: a serving receiver applies every batch through the applier
+    // `attach` builds over the reopened stage, never through the raw stage, so
+    // the serving engine's derived state follows each batch. Dropped before
+    // the stage closes: the applier shares the stage's writer.
+    let mut applier: Option<Arc<PhysicalApplier>> = None;
     while !cancel.load(Ordering::Acquire) {
         let Some(command) = rx.blocking_recv() else {
             break;
@@ -404,18 +441,42 @@ fn worker_loop(mut rx: mpsc::Receiver<Command>, cancel: Arc<AtomicBool>, last: A
                 } else {
                     Err(storage("resume cannot replace a live worker state"))
                 };
+                // Spec P1.3: build the serving side over the reopened writer,
+                // here, before the first connection can deliver a batch.
+                let result = result.and_then(|()| match (attach.take(), &state) {
+                    (None, _) => Ok(()),
+                    (Some(attach), State::Reopened(stage)) => attach(stage.path(), stage.writer())
+                        .map(|built| {
+                            applier = Some(built);
+                        })
+                        .map_err(|error| storage(format!("serving standby could not be built: {error}"))),
+                    (Some(_), _) => Err(storage("serving attach without a reopened stage")),
+                });
                 stop = result.is_err();
                 record_position(&state, &last);
                 let _ = reply.send(result);
             }
             Command::Apply { batch, reply } => {
-                let result = match &mut state {
-                    State::Initial(stage) => stage.apply(&batch).map(|_| ()).map_err(storage),
-                    State::Reopened(stage) => stage.apply(&batch).map(|_| ()).map_err(storage),
+                let result = match (&mut state, &applier) {
+                    (State::Reopened(stage), Some(applier)) => stage
+                        .verify()
+                        .map_err(storage)
+                        .and_then(|()| applier.apply(&batch).map(|_| ()).map_err(storage)),
+                    (State::Initial(stage), _) => stage.apply(&batch).map(|_| ()).map_err(storage),
+                    (State::Reopened(stage), None) => stage.apply(&batch).map(|_| ()).map_err(storage),
                     _ => Err(storage("physical batch outside live stage state")),
                 };
                 stop = result.is_err();
                 record_position(&state, &last);
+                let _ = reply.send(result);
+            }
+            Command::Maintain { reply } => {
+                // A failed re-derivation leaves the table pending (its readers
+                // keep the scan paths); it never stops the receiver.
+                let result = match &applier {
+                    Some(applier) => applier.run_pending_rebuilds().map_err(storage),
+                    None => Ok(false),
+                };
                 let _ = reply.send(result);
             }
             Command::Position { reply } => {
@@ -441,6 +502,7 @@ fn worker_loop(mut rx: mpsc::Receiver<Command>, cancel: Arc<AtomicBool>, last: A
                 let _ = reply.send(result);
             }
             Command::Close { reply } => {
+                drop(applier.take());
                 let result = std::mem::replace(&mut state, State::Empty).close();
                 if let Ok(closed) = &result {
                     state = State::Closed(closed.clone());
@@ -456,6 +518,11 @@ fn worker_loop(mut rx: mpsc::Receiver<Command>, cancel: Arc<AtomicBool>, last: A
     }
     // Joining this thread proves the live DB/append handles are closed. A cleanup
     // error cannot turn a previous error/cancel into an installation success.
+    // A serving standby's engine still shares the writer while its database
+    // is alive, so the close below can only succeed once that is dropped too;
+    // every batch was fsynced, so a handle closed by process exit instead
+    // loses nothing.
+    drop(applier.take());
     if matches!(state, State::Initial(_) | State::Reopened(_)) {
         if let Err(error) = state.close() {
             tracing::error!(%error,"physical receiver cleanup close failed");
@@ -508,12 +575,17 @@ fn session_barrier(info: Option<&SourceSessionInfo>, known_barrier: u64) -> Resu
     }
     Ok(barrier)
 }
+/// `serving`: a serving standby's receiver (spec P1.3) retries a transport
+/// failure for as long as it runs — it must come back by itself when its
+/// primary does, however long that takes — so `max_reconnects` does not bound
+/// it; a refusal still stops it.
 async fn connect(
     options: &ReceiverOptions,
     shutdown: &mut watch::Receiver<bool>,
     progress: &watch::Sender<ReceiverStatus>,
     cursor: Option<&PhysicalCursor>,
     attempts: &mut u32,
+    serving: bool,
 ) -> Result<PhysicalClient<TcpStream>> {
     loop {
         let mut last_error = None;
@@ -547,10 +619,10 @@ async fn connect(
             }
         }
         let error = last_error.ok_or_else(|| ReceiverError::Invalid("no physical source addresses".into()))?;
-        if *attempts >= options.max_reconnects {
+        if !serving && *attempts >= options.max_reconnects {
             return Err(error.into());
         }
-        *attempts += 1;
+        *attempts = attempts.saturating_add(1);
         if wait_or_stop(options.reconnect_delay, shutdown).await {
             return Err(WireError::Shutdown.into());
         }
@@ -563,12 +635,43 @@ async fn connect(
 /// closed resumed path). Neither outcome authorizes SQL serving.
 pub async fn run_receiver(
     options: ReceiverOptions,
+    shutdown: watch::Receiver<bool>,
+    progress: watch::Sender<ReceiverStatus>,
+) -> Result<ClosedPhysicalStage> {
+    run_receiver_with(options, None, shutdown, progress).await
+}
+
+/// Spec P1.3: follow an installed physical standby AND serve it. `attach`
+/// builds the serving database and its applier over the reopened store
+/// ([`ServingAttach`]); every batch is then applied through that applier, so
+/// the database's derived state follows each one, and an idle poll runs what
+/// the applier deferred. Only `ReceiverStart::Resume` with
+/// `ReceiverMode::Follow`. Transport failures are retried for as long as the
+/// receiver runs ([`connect`]); it returns after shutdown, or on a refusal.
+pub async fn run_serving_receiver(
+    options: ReceiverOptions,
+    attach: ServingAttach,
+    shutdown: watch::Receiver<bool>,
+    progress: watch::Sender<ReceiverStatus>,
+) -> Result<ClosedPhysicalStage> {
+    if options.mode != ReceiverMode::Follow || !matches!(options.start, ReceiverStart::Resume { .. }) {
+        return Err(ReceiverError::Invalid(
+            "a serving receiver follows an installed physical standby (Resume, Follow)".into(),
+        ));
+    }
+    run_receiver_with(options, Some(attach), shutdown, progress).await
+}
+
+async fn run_receiver_with(
+    options: ReceiverOptions,
+    attach: Option<ServingAttach>,
     mut shutdown: watch::Receiver<bool>,
     progress: watch::Sender<ReceiverStatus>,
 ) -> Result<ClosedPhysicalStage> {
     options.validate()?;
-    let worker = Worker::spawn(options.config.clone())?;
-    let outcome = run_inner(&options, &mut shutdown, &progress, &worker).await;
+    let serving = attach.is_some();
+    let worker = Worker::spawn(options.config.clone(), attach)?;
+    let outcome = run_inner(&options, &mut shutdown, &progress, &worker, serving).await;
     match outcome {
         Ok(closed) => {
             progress.send_replace(ReceiverStatus::Stopped {
@@ -618,15 +721,19 @@ async fn run_inner(
     shutdown: &mut watch::Receiver<bool>,
     progress: &watch::Sender<ReceiverStatus>,
     worker: &Worker,
+    serving: bool,
 ) -> Result<ClosedPhysicalStage> {
-    let mut reconnects = 0;
+    let mut reconnects: u32 = 0;
+    // Numbers this receiver's connections for `ReceiverStatus` (one per
+    // successful `connect`).
+    let mut session: u64 = 1;
     let mut initial = matches!(&options.start, ReceiverStart::Snapshot { .. });
     let mut client = match &options.start {
         ReceiverStart::Snapshot {
             target,
             expected_history,
         } => {
-            let mut client = connect(options, shutdown, progress, None, &mut reconnects).await?;
+            let mut client = connect(options, shutdown, progress, None, &mut reconnects, serving).await?;
             let manifest = client.fetch_manifest(*expected_history).await?;
             let manifest_bytes = serde_json::to_vec(&manifest).map_err(storage)?;
             worker
@@ -691,7 +798,7 @@ async fn run_inner(
                 })
                 .await?;
             let (_, cursor) = worker.position().await?.initialized()?;
-            connect(options, shutdown, progress, Some(&cursor), &mut reconnects).await?
+            connect(options, shutdown, progress, Some(&cursor), &mut reconnects, serving).await?
         }
     };
     let mut observed_barrier = check_session_barrier(&client, 0)?;
@@ -704,6 +811,7 @@ async fn run_inner(
             path: path.clone(),
             cursor: cursor.clone(),
             source_barrier: None,
+            session,
         });
         let outcome = client
             .poll(cursor.source_sequence(), options.poll_byte_limit, &mut Sink { worker })
@@ -715,7 +823,7 @@ async fn run_inner(
                 // essential: a sink deadline may have expired while its durable
                 // apply was still completing on the owned worker.
                 drop(client);
-                if !retryable(&error) || reconnects >= options.max_reconnects {
+                if !retryable(&error) || (!serving && reconnects >= options.max_reconnects) {
                     // run_receiver closes/joins the owner before reporting this
                     // original protocol/apply error; do not mask it with a later
                     // queue-closed diagnostic from an already failed worker.
@@ -729,11 +837,12 @@ async fn run_inner(
                 if stopped(shutdown) {
                     return Err(WireError::Shutdown.into());
                 }
-                reconnects += 1;
+                reconnects = reconnects.saturating_add(1);
                 if wait_or_stop(options.reconnect_delay, shutdown).await {
                     return Err(WireError::Shutdown.into());
                 }
-                client = connect(options, shutdown, progress, Some(&durable), &mut reconnects).await?;
+                client = connect(options, shutdown, progress, Some(&durable), &mut reconnects, serving).await?;
+                session += 1;
                 observed_barrier = check_session_barrier(&client, observed_barrier)?;
                 continue;
             }
@@ -753,6 +862,7 @@ async fn run_inner(
                 path,
                 cursor: durable,
                 source_barrier: Some(summary.durable_barrier),
+                session,
             });
             continue;
         }
@@ -760,6 +870,7 @@ async fn run_inner(
             path,
             cursor: durable.clone(),
             source_barrier: summary.durable_barrier,
+            session,
         });
         if stopped(shutdown) {
             return Err(WireError::Shutdown.into());
@@ -784,7 +895,8 @@ async fn run_inner(
                 })
                 .await?;
             let (_, durable) = worker.position().await?.initialized()?;
-            client = connect(options, shutdown, progress, Some(&durable), &mut reconnects).await?;
+            client = connect(options, shutdown, progress, Some(&durable), &mut reconnects, serving).await?;
+            session += 1;
             observed_barrier = check_session_barrier(&client, observed_barrier)?;
             initial = false;
             continue;
@@ -792,6 +904,18 @@ async fn run_inner(
         if options.mode == ReceiverMode::InstallOnce {
             drop(client);
             return worker.close().await;
+        }
+        if serving {
+            // An idle moment: what the applier deferred (a re-derivation that
+            // waits for a later key, a full re-derivation after an unknown
+            // key) runs now rather than at the next batch.
+            match worker.request(|reply| Command::Maintain { reply }).await {
+                Ok(true) => tracing::debug!("physical standby: deferred derived-state work completed"),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "physical standby: deferred derived-state work failed; it stays pending")
+                }
+            }
         }
         if wait_or_stop(options.poll_interval, shutdown).await {
             return Err(WireError::Shutdown.into());
@@ -805,7 +929,8 @@ async fn run_inner(
     clippy::expect_used,
     clippy::indexing_slicing,
     clippy::panic,
-    clippy::ignored_unit_patterns
+    clippy::ignored_unit_patterns,
+    clippy::large_futures
 )]
 mod tests {
     use super::super::{

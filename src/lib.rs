@@ -302,6 +302,13 @@ pub mod mcp;
 ))]
 pub mod replication;
 
+// Spec P1.3: a physical standby's posture. Compiled in every build because the
+// SQL layer asks it in every build (`pg_is_in_recovery()`, the LSN functions,
+// the PostgreSQL wire's `in_hot_standby` and read guard); without an HA
+// feature a node is simply never in recovery. `replication::standby_posture`
+// re-exports it.
+pub mod standby_posture;
+
 // Connection routing, load balancing, and failover proxy live in the
 // standalone HeliosProxy binary: https://github.com/HeliosDatabase/heliosdb-proxy
 
@@ -4227,6 +4234,20 @@ impl EmbeddedDatabase {
             b"PG_BACKEND_PID".as_slice(),
             b"APPLICATION_NAME".as_slice(),
             b"PG_STAT_ACTIVITY".as_slice(),
+            // Spec P1.3: the standby probes answer from the replication
+            // posture and the physical sequence, neither of which moves the
+            // storage generation the cache is keyed on — a cached
+            // `heliosdb_require_ready()` would keep a standby "ready" after its
+            // primary was lost, and a cached LSN would freeze the lag a proxy
+            // routes on. The two prefixes cover `pg_current_wal_lsn` /
+            // `_insert_lsn` / `_flush_lsn` and `pg_last_wal_replay_lsn` /
+            // `_receive_lsn`.
+            b"PG_IS_IN_RECOVERY".as_slice(),
+            b"PG_CURRENT_WAL".as_slice(),
+            b"PG_LAST_WAL".as_slice(),
+            b"PG_CONTROL_CHECKPOINT".as_slice(),
+            b"HELIOSDB_REQUIRE_READY".as_slice(),
+            b"HELIOSDB_STANDBY_STATUS".as_slice(),
         ]
         .iter()
         .any(|needle| Self::contains_ascii_case_insensitive(sql, needle))

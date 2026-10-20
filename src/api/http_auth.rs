@@ -548,13 +548,43 @@ pub fn attach_http_auth<S>(router: Router<S>, policy: Arc<HttpAuthPolicy>) -> Ro
 where
     S: Clone + Send + Sync + 'static,
 {
+    attach_http_auth_with_replication(router, policy, None)
+}
+
+/// What a replication node reports on `/health` and `/ready` (spec P1.3): its
+/// frozen replication block (`standby_posture::ReplicationBlock`)
+/// and whether it is ready. Read-only and side-effect free, like the fixed
+/// health body it extends.
+pub type ReplicationStatus = Arc<dyn Fn() -> Option<(bool, serde_json::Value)> + Send + Sync>;
+
+/// [`attach_http_auth`] for a replication node: `/health` (and `/`) answer
+/// `{"status":"ok","replication":{…}}`, and `GET /ready` answers the
+/// replication block itself with 200 when the node is ready and 503 when it
+/// is not. Both stay public and are answered by this layer, never forwarded:
+/// a readiness probe carries no credential, and the block is the same data
+/// `/health` already publishes. With `None` (or a status that reports
+/// nothing) the layer is exactly [`attach_http_auth`]'s.
+pub fn attach_http_auth_with_replication<S>(
+    router: Router<S>,
+    policy: Arc<HttpAuthPolicy>,
+    replication: Option<ReplicationStatus>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     router.layer(axum::middleware::from_fn(move |req: Request, next: Next| {
         let policy = Arc::clone(&policy);
-        async move { guard(policy, req, next).await }
+        let replication = replication.clone();
+        async move { guard(policy, replication, req, next).await }
     }))
 }
 
-async fn guard(policy: Arc<HttpAuthPolicy>, req: Request, next: Next) -> Response {
+async fn guard(
+    policy: Arc<HttpAuthPolicy>,
+    replication: Option<ReplicationStatus>,
+    req: Request,
+    next: Next,
+) -> Response {
     // Requirement P0-5: preflight never reaches a handler and carries no side effect.
     if req.method() == Method::OPTIONS {
         return fixed_preflight_response();
@@ -565,7 +595,25 @@ async fn guard(policy: Arc<HttpAuthPolicy>, req: Request, next: Next) -> Respons
     // Requirement P0-2: health is answered here, not by `ApiServer::health_check`.
     // `/` is the daemon's health alias.
     if req.method() == Method::GET && (path == "/health" || path == "/") {
-        return fixed_health_response();
+        return match replication.as_ref().and_then(|status| status()) {
+            Some((_, block)) => (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "status": "ok", "replication": block })),
+            )
+                .into_response(),
+            None => fixed_health_response(),
+        };
+    }
+    // Spec P1.3: readiness of a replication node, same public contract.
+    if req.method() == Method::GET && path == "/ready" {
+        if let Some((ready, block)) = replication.as_ref().and_then(|status| status()) {
+            let code = if ready {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            return (code, axum::Json(block)).into_response();
+        }
     }
 
     if !policy.is_required() {
@@ -1054,6 +1102,72 @@ mod tests {
 
         // The override does not apply; an actual HTTPS listener would be allowed.
         assert!(http_bind_safety_check(addr, &policy, true).is_ok());
+    }
+
+    /// Spec P1.3: a replication node's `/health` carries the replication
+    /// block, and `/ready` answers it publicly with 200 / 503 by readiness.
+    #[tokio::test]
+    #[allow(clippy::indexing_slicing)]
+    async fn replication_status_extends_health_and_answers_ready() {
+        async fn json(response: Response) -> serde_json::Value {
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+        for ready in [true, false] {
+            let status: ReplicationStatus =
+                Arc::new(move || Some((ready, serde_json::json!({ "role": "standby", "ready": ready }))));
+            let app = attach_http_auth_with_replication(
+                Router::new().route("/version", get(|| async { "v" })),
+                required_policy(),
+                Some(status),
+            );
+            let health = app
+                .clone()
+                .oneshot(HttpRequest::builder().uri("/health").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                health.status(),
+                StatusCode::OK,
+                "health is liveness, whatever readiness says"
+            );
+            let body = json(health).await;
+            assert_eq!(body["status"], "ok");
+            assert_eq!(body["replication"]["ready"], ready);
+            let readiness = app
+                .clone()
+                .oneshot(HttpRequest::builder().uri("/ready").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                readiness.status(),
+                if ready {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            );
+            assert_eq!(
+                json(readiness).await,
+                serde_json::json!({ "role": "standby", "ready": ready })
+            );
+            let version = app
+                .oneshot(HttpRequest::builder().uri("/version").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                version.status(),
+                StatusCode::UNAUTHORIZED,
+                "only health and ready are public"
+            );
+        }
+        // Without a replication status `/ready` is an ordinary route.
+        let app = attach_http_auth(Router::new(), required_policy());
+        let readiness = app
+            .oneshot(HttpRequest::builder().uri("/ready").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(readiness.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

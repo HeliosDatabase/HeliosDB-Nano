@@ -394,6 +394,26 @@ pub struct ReplicationConfig {
     /// `role = "primary"`. 0 deletes every entry at each checkpoint (the
     /// 4.41.1 behaviour). Default 100000.
     pub logical_wal_retention_entries: u64,
+    /// How long a physical standby that has lost its primary keeps reporting
+    /// itself READY (spec P1.3): `/ready`, `heliosdb_require_ready()` and the
+    /// read guard treat a `reconnecting` standby as ready while it has been
+    /// disconnected for at most this long, so a brief primary restart does not
+    /// take every replica out of a proxy's read set at once. Past it the
+    /// standby keeps running and keeps its data, but refuses data reads with
+    /// SQLSTATE 55000 until it has caught up again. Seconds or a single
+    /// `s`/`m`/`h`/`d`/`w` suffix; `"0"` means "not ready the moment the
+    /// primary is lost". Default `"30s"`. Ignored unless `role = "standby"`.
+    pub max_standby_lag: String,
+    /// What a physical standby does when its receiver reaches a state it
+    /// cannot recover from by itself — a history mismatch, a gap in the
+    /// primary's WAL, a poisoned store, a data directory it may not adopt
+    /// (spec P1.3, field finding J2). `"stay-up"` (default): the process and
+    /// its listeners stay up in posture `needs_recovery`, refusing data reads
+    /// with SQLSTATE 55000 and reporting the reason on `/health`, so an
+    /// operator (or a proxy) sees why instead of a crash loop. `"exit"`: the
+    /// process exits with the reason, for supervisors that rebuild a standby
+    /// on exit. Ignored unless `role = "standby"`.
+    pub on_unrecoverable: String,
 }
 
 impl std::fmt::Debug for ReplicationConfig {
@@ -413,6 +433,8 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("token_file", &self.token_file)
             .field("allow_insecure_remote", &self.allow_insecure_remote)
             .field("logical_wal_retention_entries", &self.logical_wal_retention_entries)
+            .field("max_standby_lag", &self.max_standby_lag)
+            .field("on_unrecoverable", &self.on_unrecoverable)
             .finish()
     }
 }
@@ -432,6 +454,8 @@ impl Default for ReplicationConfig {
             token_file: None,
             allow_insecure_remote: false,
             logical_wal_retention_entries: Self::DEFAULT_LOGICAL_WAL_RETENTION_ENTRIES,
+            max_standby_lag: Self::DEFAULT_MAX_STANDBY_LAG.to_string(),
+            on_unrecoverable: Self::ON_UNRECOVERABLE_STAY_UP.to_string(),
         }
     }
 }
@@ -441,6 +465,38 @@ impl ReplicationConfig {
     pub const DEFAULT_LOGICAL_WAL_RETENTION_ENTRIES: u64 = 100_000;
     /// Upper bound accepted for `logical_wal_retention_entries`.
     pub const MAX_LOGICAL_WAL_RETENTION_ENTRIES: u64 = 100_000_000;
+    /// Default `max_standby_lag`.
+    pub const DEFAULT_MAX_STANDBY_LAG: &str = "30s";
+    /// Upper bound accepted for `max_standby_lag`: a standby that claims to be
+    /// ready after a day without its primary is not a read replica any more.
+    pub const MAX_STANDBY_LAG_SECS: u64 = 86_400;
+    /// `on_unrecoverable` values.
+    pub const ON_UNRECOVERABLE_STAY_UP: &str = "stay-up";
+    pub const ON_UNRECOVERABLE_EXIT: &str = "exit";
+
+    /// `max_standby_lag` as a duration (validated by [`Self::validate`]).
+    pub fn max_standby_lag_duration(&self) -> crate::Result<std::time::Duration> {
+        let secs = parse_retention_duration_secs(&self.max_standby_lag).map_err(|_| {
+            crate::Error::config(format!(
+                "invalid replication.max_standby_lag '{}': expected seconds or <n>[s|m|h|d|w], e.g. \"30s\"",
+                self.max_standby_lag
+            ))
+        })?;
+        if secs > Self::MAX_STANDBY_LAG_SECS {
+            return Err(crate::Error::config(format!(
+                "replication.max_standby_lag must be at most {}s",
+                Self::MAX_STANDBY_LAG_SECS
+            )));
+        }
+        Ok(std::time::Duration::from_secs(secs))
+    }
+
+    /// Whether `on_unrecoverable = "exit"` (validated by [`Self::validate`]).
+    pub fn exit_on_unrecoverable(&self) -> bool {
+        self.on_unrecoverable
+            .trim()
+            .eq_ignore_ascii_case(Self::ON_UNRECOVERABLE_EXIT)
+    }
 
     /// The window the storage engine should apply: the configured value on a
     /// primary, 0 everywhere else (a standalone node or a standby has no
@@ -480,6 +536,15 @@ impl ReplicationConfig {
         if !(1..=3600).contains(&self.startup_timeout_secs) {
             return Err(crate::Error::config(
                 "replication.startup_timeout_secs must be between 1 and 3600 seconds",
+            ));
+        }
+        self.max_standby_lag_duration()?;
+        let on_unrecoverable = self.on_unrecoverable.trim();
+        if !on_unrecoverable.eq_ignore_ascii_case(Self::ON_UNRECOVERABLE_STAY_UP)
+            && !on_unrecoverable.eq_ignore_ascii_case(Self::ON_UNRECOVERABLE_EXIT)
+        {
+            return Err(crate::Error::config(
+                "replication.on_unrecoverable must be \"stay-up\" or \"exit\"",
             ));
         }
         if self.replication_port == 0 {
@@ -3257,12 +3322,25 @@ redirect_uri = "http://localhost:8080/auth/v1/callback"
     }
 }
 
-/// Explicit, default-off physical transfer source. The initial transport is
-/// authenticated plaintext on loopback only; use an authenticated tunnel for peers.
+/// Physical transfer source. The initial transport is authenticated plaintext
+/// on loopback only; use an authenticated tunnel for peers.
+///
+/// `enabled` is the source's explicit switch; `start --replication-role
+/// primary` with a replication token turns it on by itself (spec P1.3: a
+/// physical standby cannot be built without it) unless
+/// `--physical-replication=false` is given.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PhysicalReplicationConfig {
     pub enabled: bool,
+    /// On a primary, where its physical source listens; on a physical
+    /// standby, where it finds its primary's (both nodes name the same
+    /// endpoint). A literal loopback `IP:port`. Empty (the default) derives
+    /// it from the native replication endpoint, so a pair configured only
+    /// with `--replication-port` / `--primary-host` finds its physical channel
+    /// without another setting: [`Self::resolved_listen`], `127.0.0.1:<native
+    /// port + 7>` — `127.0.0.1:5440` for the default native port 5433, the
+    /// address this setting always defaulted to.
     pub listen: String,
     /// Existing private directory, disjoint from the live source database.
     pub export_dir: Option<std::path::PathBuf>,
@@ -3281,7 +3359,7 @@ impl Default for PhysicalReplicationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            listen: "127.0.0.1:5440".into(),
+            listen: String::new(),
             export_dir: None,
             wal_retention_secs: 3600,
             wal_retention_size_mb: 1024,
@@ -3297,15 +3375,40 @@ impl Default for PhysicalReplicationConfig {
 }
 
 impl PhysicalReplicationConfig {
-    /// Pure validation permits CLI overrides to supply paths after file loading.
-    /// Enabled-role, persistent-storage and file ownership checks run before open.
-    pub fn validate(&self) -> crate::Result<()> {
+    /// The port offset of a derived [`Self::listen`] from the native
+    /// replication port (5433 + 7 = 5440, the historical default).
+    pub const DERIVED_PORT_OFFSET: u16 = 7;
+
+    /// The physical endpoint: [`Self::listen`] when set, else
+    /// `127.0.0.1:<native_port + 7>`. `native_port` is this node's
+    /// replication port on a primary and the port of `primary_host` on a
+    /// standby, so both ends derive the same address.
+    pub fn resolved_listen(&self, native_port: u16) -> crate::Result<std::net::SocketAddr> {
+        if self.listen.trim().is_empty() {
+            let port = native_port.checked_add(Self::DERIVED_PORT_OFFSET).ok_or_else(|| {
+                crate::Error::config(format!(
+                    "cannot derive replication.physical.listen from native port {native_port}; set it explicitly"
+                ))
+            })?;
+            return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        }
         let address: std::net::SocketAddr = self
             .listen
             .parse()
             .map_err(|_| crate::Error::config("replication.physical.listen must be a literal loopback IP:port"))?;
         if !address.ip().is_loopback() || address.port() == 0 {
             return Err(crate::Error::config("replication.physical.listen requires loopback and a nonzero port; remote transfer requires an authenticated tunnel"));
+        }
+        Ok(address)
+    }
+
+    /// Pure validation permits CLI overrides to supply paths after file loading.
+    /// Enabled-role, persistent-storage and file ownership checks run before open.
+    pub fn validate(&self) -> crate::Result<()> {
+        if !self.listen.trim().is_empty() {
+            // The derived form needs the native port, which the caller
+            // supplies; only an explicit address can be checked here.
+            self.resolved_listen(0)?;
         }
         for (name, value, minimum, maximum) in [
             ("wal_retention_secs", self.wal_retention_secs, 60, 86400),
@@ -3378,6 +3481,56 @@ mod physical_config_tests {
         ] {
             let config: ReplicationConfig = toml::from_str(&format!("[physical]\n{field}={value}")).unwrap();
             assert!(config.validate().is_err(), "{field}={value}");
+        }
+    }
+    #[test]
+    fn physical_listen_derives_from_the_native_port_unless_set() {
+        let derived = PhysicalReplicationConfig::default();
+        derived.validate().unwrap();
+        assert_eq!(
+            derived.resolved_listen(5433).unwrap(),
+            "127.0.0.1:5440".parse::<std::net::SocketAddr>().unwrap(),
+            "the historical default endpoint for the default native port"
+        );
+        assert_eq!(
+            derived.resolved_listen(27741).unwrap(),
+            "127.0.0.1:27748".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert!(derived.resolved_listen(u16::MAX).is_err());
+        let explicit = PhysicalReplicationConfig {
+            listen: "[::1]:6000".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            explicit.resolved_listen(5433).unwrap(),
+            "[::1]:6000".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+    #[test]
+    fn standby_posture_settings_default_and_validate() {
+        let config = ReplicationConfig::default();
+        config.validate().unwrap();
+        assert_eq!(
+            config.max_standby_lag_duration().unwrap(),
+            std::time::Duration::from_secs(30)
+        );
+        assert!(!config.exit_on_unrecoverable());
+        let config: ReplicationConfig = toml::from_str("max_standby_lag = '2m'\non_unrecoverable = 'EXIT'").unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.max_standby_lag_duration().unwrap(),
+            std::time::Duration::from_secs(120)
+        );
+        assert!(config.exit_on_unrecoverable());
+        let config: ReplicationConfig = toml::from_str("max_standby_lag = '0'").unwrap();
+        assert_eq!(config.max_standby_lag_duration().unwrap(), std::time::Duration::ZERO);
+        for text in [
+            "max_standby_lag = 'soon'",
+            "max_standby_lag = '2d'",
+            "on_unrecoverable = 'restart'",
+        ] {
+            let config: ReplicationConfig = toml::from_str(text).unwrap();
+            assert!(config.validate().is_err(), "{text}");
         }
     }
 }

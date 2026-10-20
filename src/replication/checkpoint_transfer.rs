@@ -587,6 +587,20 @@ struct PhysicalMarker {
     manifest_sha256: [u8; 32],
 }
 
+/// The dataset history an installed physical standby directory follows, read
+/// from its marker: what a restarted standby resumes with (spec P1.3). Only a
+/// first answer — [`ReopenedPhysicalStage::open`] proves it against the
+/// marker's manifest and the durable cursor, and the primary's history is
+/// checked again at every connection.
+pub fn physical_stage_history(path: &Path) -> Result<Uuid> {
+    let marker: PhysicalMarker = serde_json::from_slice(&read_small(&path.join(PHYSICAL_MARKER_FILE), 4096)?)
+        .map_err(|error| invalid(format!("physical stage marker: {error}")))?;
+    if marker.format != 1 || marker.history.is_nil() {
+        return Err(invalid("physical stage marker has an unknown format or a nil history"));
+    }
+    Ok(marker.history)
+}
+
 struct StageOwner {
     directory: OwnedDirectory,
     parent: OwnedDirectory,
@@ -1026,6 +1040,13 @@ impl ReopenedPhysicalStage {
     pub fn apply(&mut self, batch: &PhysicalBatch) -> Result<bool> {
         verify_existing_stage(&self.owner)?;
         Ok(self.replica.apply(batch)?)
+    }
+    /// The checks [`Self::apply`] runs before every batch — the directory is
+    /// still this stage's, carries no primary/standby marker and the same
+    /// IDENTITY — for a caller that applies through the stage's writer
+    /// itself (a serving standby's `PhysicalApplier`, spec P1.3).
+    pub fn verify(&self) -> Result<()> {
+        verify_existing_stage(&self.owner)
     }
     pub fn close(self) -> Result<ClosedPhysicalStage> {
         close_owned_stage(self.owner, self.replica)

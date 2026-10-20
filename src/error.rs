@@ -118,6 +118,14 @@ pub const NOT_NULL_VIOLATION_MARKER: &str = "violates not-null constraint";
 /// and [`Error::is_physical_standby_write_refusal`] recognises it.
 pub const PHYSICAL_STANDBY_WRITE_REFUSED: &str = "writes are not permitted on a physical standby";
 
+/// Spec P1.3: the prefix of the refusal a physical standby answers while it is
+/// not ready (`crate::standby_posture`): `standby is not ready: <state>
+/// (cursor X, primary Y)`, raised by `heliosdb_require_ready()` and by the
+/// PostgreSQL wire's read guard. One shared const because the wire maps it to
+/// `55000 object_not_in_prerequisite_state` (`sqlstate_for_error`), which is
+/// what a proxy's health check keys on, and no other message may claim it.
+pub const STANDBY_NOT_READY: &str = "standby is not ready";
+
 /// Database error type
 ///
 /// All errors from HeliosDB Lite operations are represented by this enum.
