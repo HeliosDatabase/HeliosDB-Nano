@@ -459,6 +459,30 @@ fn hnsw_construction_params(
     (m, ef_construction)
 }
 
+/// The vector families a PHYSICAL engine builds (spec P1.2): `hnsw` from rows,
+/// and `persistent_hnsw` from its replicated keyspace where the persistent
+/// index is compiled in. Every other family is refused by name at strict
+/// hydration and marked degraded by a standby's vector hook — never
+/// downgraded to another structure.
+pub fn physical_vector_family(tag: Option<&str>) -> bool {
+    match tag {
+        Some("hnsw") => true,
+        #[cfg(feature = "vector-persist")]
+        Some("persistent_hnsw") => true,
+        _ => false,
+    }
+}
+
+/// What [`Catalog::build_physical_vector_index`] built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalVectorBuild {
+    /// A standard `hnsw` graph, from the table's rows.
+    Rebuilt,
+    /// A `persistent_hnsw` index, reopened from its `__vidx:` keyspace.
+    #[cfg_attr(not(feature = "vector-persist"), allow(dead_code))]
+    Reopened,
+}
+
 /// What [`Catalog::backfill_table_indexes`] did to one table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TableIndexBackfill {
@@ -648,7 +672,7 @@ impl<'a> Catalog<'a> {
                             .map_err(|e| Error::storage(format!("physical snapshot index '{name}': {e}")))?;
                     }
                 }
-                Some(IndexFamily::Vector) if definition.index_type.as_deref() == Some("hnsw") => {}
+                Some(IndexFamily::Vector) if physical_vector_family(definition.index_type.as_deref()) => {}
                 Some(IndexFamily::DdlOnly) => {} // Same metadata-only contract as normal serving.
                 _ => return Err(Error::storage(format!(
                     "physical snapshot index '{name}' uses unsupported strict-hydration family {:?}; no downgrade is allowed",
@@ -739,7 +763,7 @@ impl<'a> Catalog<'a> {
             report.tables_total += 1;
         }
         for (name, definition) in &definitions {
-            if definition.index_type.as_deref() != Some("hnsw") {
+            if !physical_vector_family(definition.index_type.as_deref()) {
                 continue;
             }
             let schema = tables.get(&definition.table_name).ok_or_else(|| {
@@ -748,38 +772,101 @@ impl<'a> Catalog<'a> {
                     definition.table_name
                 ))
             })?;
-            let column = schema
-                .get_column(&definition.column_name)
-                .ok_or_else(|| Error::storage(format!("physical snapshot vector '{name}' has no column")))?;
-            let DataType::Vector(dimension) = &column.data_type else {
-                return Err(Error::storage(format!(
-                    "physical snapshot vector '{name}' column is not VECTOR"
-                )));
-            };
-            let vectors =
-                self.collect_existing_vectors(schema, &definition.table_name, &definition.column_name, *dimension)?;
-            let metric = vector_distance_metric(&definition.options);
-            let (m, ef) = hnsw_construction_params(&definition.options, self.storage.config());
-            let manager = self.storage.vector_indexes();
-            manager
-                .create_index_with_params(
-                    name.clone(),
-                    definition.table_name.clone(),
-                    definition.column_name.clone(),
-                    *dimension,
-                    metric,
-                    m,
-                    ef,
-                )
-                .map_err(|e| Error::storage(format!("physical snapshot vector '{name}' create: {e}")))?;
-            manager
-                .insert_vectors_batch(name, &vectors)
-                .map_err(|e| Error::storage(format!("physical snapshot vector '{name}' populate: {e}")))?;
-            report.vector_rebuilt += 1;
+            match self.build_physical_vector_index(name, definition, schema)? {
+                PhysicalVectorBuild::Rebuilt => report.vector_rebuilt += 1,
+                PhysicalVectorBuild::Reopened => report.vector_reopened_persistent += 1,
+            }
         }
         report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         self.storage.set_last_index_open_report(report);
         Ok(())
+    }
+
+    /// Build one vector index of a PHYSICAL engine from its store: strict
+    /// hydration's per-index step, shared with a physical standby's vector
+    /// hook (spec P1.2) so that an index the primary creates, or one rebuilt
+    /// after a fallback, is built exactly as an open builds it.
+    ///
+    /// * `hnsw` from `schema`'s rows of the table. Never from a `vecsnap:`
+    ///   sidecar or an `hnsw_snapshots/` dump: those describe the source's
+    ///   graph at its last checkpoint, not these rows (no source snapshot
+    ///   marker is trusted here either). A graph that cannot be populated is
+    ///   unregistered again, so a failure never leaves an empty index behind.
+    /// * `persistent_hnsw` (with `vector-persist`) by reopening its
+    ///   `__vidx:` keyspace through `reopen_persistent_index`, with the same
+    ///   catalog metadata `rebuild_vector_indexes` gives it on a primary.
+    ///   `PersistentVectorIndex::open` reads and writes nothing; on a standby
+    ///   the copy then follows the replicated records (`ReplicaMemoryOnly`).
+    ///
+    /// Any other family is refused by name ([`physical_vector_family`]);
+    /// nothing is downgraded.
+    pub(crate) fn build_physical_vector_index(
+        &self,
+        name: &str,
+        definition: &PersistedIndexDefinition,
+        schema: &Schema,
+    ) -> Result<PhysicalVectorBuild> {
+        if !self.storage.physical_snapshot_mode() {
+            return Err(Error::storage(
+                "a physical vector index build requires a physical open mode",
+            ));
+        }
+        let column = schema
+            .get_column(&definition.column_name)
+            .ok_or_else(|| Error::storage(format!("physical snapshot vector '{name}' has no column")))?;
+        let DataType::Vector(dimension) = &column.data_type else {
+            return Err(Error::storage(format!(
+                "physical snapshot vector '{name}' column is not VECTOR"
+            )));
+        };
+        let metric = vector_distance_metric(&definition.options);
+        let manager = self.storage.vector_indexes();
+        match definition.index_type.as_deref() {
+            Some("hnsw") => {
+                let vectors =
+                    self.collect_existing_vectors(schema, &definition.table_name, &definition.column_name, *dimension)?;
+                let (m, ef) = hnsw_construction_params(&definition.options, self.storage.config());
+                manager
+                    .create_index_with_params(
+                        name.to_string(),
+                        definition.table_name.clone(),
+                        definition.column_name.clone(),
+                        *dimension,
+                        metric,
+                        m,
+                        ef,
+                    )
+                    .map_err(|e| Error::storage(format!("physical snapshot vector '{name}' create: {e}")))?;
+                if let Err(e) = manager.insert_vectors_batch(name, &vectors) {
+                    let _ = manager.drop_index(name);
+                    return Err(Error::storage(format!("physical snapshot vector '{name}' populate: {e}")));
+                }
+                Ok(PhysicalVectorBuild::Rebuilt)
+            }
+            #[cfg(feature = "vector-persist")]
+            Some("persistent_hnsw") => {
+                let config = super::vector_index::PersistentVectorConfig {
+                    dimension: *dimension,
+                    distance_metric: metric,
+                    pq_enabled: false,
+                    rerank_precision: "f32".to_string(),
+                };
+                manager
+                    .reopen_persistent_index(
+                        name,
+                        &definition.table_name,
+                        &definition.column_name,
+                        config,
+                        std::sync::Arc::clone(&self.storage.db),
+                        std::sync::Arc::clone(self.storage.write_gate()),
+                    )
+                    .map_err(|e| Error::storage(format!("physical snapshot vector '{name}' reopen: {e}")))?;
+                Ok(PhysicalVectorBuild::Reopened)
+            }
+            other => Err(Error::storage(format!(
+                "physical snapshot index '{name}' uses unsupported strict-hydration family {other:?}; no downgrade is allowed"
+            ))),
+        }
     }
 
     /// Create a new catalog

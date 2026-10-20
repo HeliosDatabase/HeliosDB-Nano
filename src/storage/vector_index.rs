@@ -117,6 +117,33 @@ pub enum VectorIndexUndoOp {
     },
 }
 
+/// How a [`VectorIndexManager`] treats the RocksDB keyspace of its persistent
+/// (`vector-persist`) indexes (spec P1.2).
+///
+/// A persistent index is an in-RAM copy of its `__vidx:{index_id}:*` keys
+/// whose own mutators WRITE those keys. On a physical standby the keys are
+/// the primary's, applied byte for byte by the standby's applier, and the
+/// engine's write gate is closed: a mutator that wrote would be refused (and
+/// counted), and one that changed memory alone would leave the copy disagreeing
+/// with the keys it claims to mirror.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PersistentPolicy {
+    /// Every mutator writes its keys through the engine's gate: a primary,
+    /// and every engine that may write.
+    #[default]
+    Durable,
+    /// A physical standby (`StorageEngine::open_physical_standby`): no mutator
+    /// reaches the gate. Standard and quantized indexes are maintained in
+    /// memory as always (`on_row_*` from the applier's row changes); persistent
+    /// ones follow the replicated records (`apply_persistent_records`) and
+    /// are skipped by `on_row_*`; `drop_index` forgets them without
+    /// deleting keys (the primary's drop deletes them, and the deletes
+    /// replicate); and every mutation that only a write could express —
+    /// creating one, or an insert or delete aimed at one — is refused before
+    /// it changes anything.
+    ReplicaMemoryOnly,
+}
+
 /// Vector index manager
 pub struct VectorIndexManager {
     /// Map from index name to index storage
@@ -141,6 +168,9 @@ pub struct VectorIndexManager {
     /// Surfaced instead of silently degrading to an empty/missing index
     /// (the ISSUE-08 incident class).
     degraded: RwLock<HashMap<String, String>>,
+    /// Spec P1.2: [`PersistentPolicy::ReplicaMemoryOnly`] when set. One
+    /// relaxed load per check, so a primary (`Durable`) pays nothing else.
+    replica_memory_only: std::sync::atomic::AtomicBool,
 }
 
 impl VectorIndexManager {
@@ -155,6 +185,102 @@ impl VectorIndexManager {
             snapshot_clean: std::sync::atomic::AtomicBool::new(true),
             snapshot_invalidation_hook: RwLock::new(None),
             degraded: RwLock::new(HashMap::new()),
+            replica_memory_only: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    // ---- Spec P1.2: the persistent-keyspace policy -------------------------
+
+    /// Choose how persistent indexes treat their keyspace. The engine sets
+    /// [`PersistentPolicy::ReplicaMemoryOnly`] when it opens a physical
+    /// standby, before anything is registered; every other engine keeps the
+    /// default [`PersistentPolicy::Durable`].
+    pub fn set_persistent_policy(&self, policy: PersistentPolicy) {
+        self.replica_memory_only.store(
+            policy == PersistentPolicy::ReplicaMemoryOnly,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// The policy in force (see [`PersistentPolicy`]).
+    pub fn persistent_policy(&self) -> PersistentPolicy {
+        if self.replica_memory_only() {
+            PersistentPolicy::ReplicaMemoryOnly
+        } else {
+            PersistentPolicy::Durable
+        }
+    }
+
+    #[inline]
+    fn replica_memory_only(&self) -> bool {
+        self.replica_memory_only.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Under `ReplicaMemoryOnly`, the refusal of a mutation of persistent
+    /// index `name` that only a write could express. Checked before the
+    /// mutation touches the index, so nothing changes and the gate is never
+    /// asked.
+    #[cfg(feature = "vector-persist")]
+    fn refuse_replica_persistent_write(&self, name: &str) -> Result<()> {
+        if self.replica_memory_only() {
+            return Err(Error::storage(format!(
+                "persistent vector index '{name}' follows its primary's replicated records on a physical standby; \
+                 it is never written here"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether `index_name` is a persistent index that, under
+    /// `ReplicaMemoryOnly`, follows its replicated records rather than the
+    /// rows: the row hooks skip it. Always `false` on a primary.
+    fn follows_replicated_records(&self, index_name: &str) -> bool {
+        #[cfg(feature = "vector-persist")]
+        if self.replica_memory_only() {
+            return matches!(self.indexes.read().get(index_name), Some(IndexStorage::Persistent(_)));
+        }
+        false
+    }
+
+    /// Whether a physical standby must decode `table`'s changed rows to keep
+    /// its vector indexes right: the table has an index the row hooks
+    /// maintain (any but a persistent one under `ReplicaMemoryOnly`).
+    pub fn maintains_rows_of(&self, table_name: &str) -> bool {
+        self.indexes_on_table(table_name)
+            .iter()
+            .any(|(index_name, _)| !self.follows_replicated_records(index_name))
+    }
+
+    /// The registered persistent index whose keyspace is
+    /// `__vidx:{index_id}:` (`PersistentVectorIndex::index_id`), if any.
+    #[cfg(feature = "vector-persist")]
+    pub fn persistent_index_with_id(&self, index_id: u64) -> Option<String> {
+        self.indexes.read().iter().find_map(|(name, storage)| match storage {
+            IndexStorage::Persistent(index) if index.index_id() == index_id => Some(name.clone()),
+            _ => None,
+        })
+    }
+
+    /// Apply the replicated records one batch wrote to persistent index
+    /// `name`'s keyspace — `(suffix after "__vidx:{id}:", post-batch value)`
+    /// in key order — to its in-memory copy, under one hold of the index lock
+    /// (`PersistentVectorIndex::apply_records`). Memory only: a physical
+    /// standby's way of following the keys its applier wrote. An error leaves
+    /// the copy partly updated; the caller replaces it from the keys
+    /// ([`Self::reopen_persistent_index`]).
+    #[cfg(feature = "vector-persist")]
+    pub fn apply_persistent_records(&self, name: &str, records: &[(Vec<u8>, Option<Vec<u8>>)]) -> Result<()> {
+        let indexes = self.indexes.read();
+        match indexes.get(name) {
+            Some(IndexStorage::Persistent(index)) => index.apply_records(
+                records
+                    .iter()
+                    .map(|(suffix, value)| (suffix.as_slice(), value.as_deref())),
+            ),
+            Some(_) => Err(Error::storage(format!(
+                "vector index '{name}' is not a persistent index; it has no replicated records"
+            ))),
+            None => Err(Error::query_execution(format!("Index '{}' not found", name))),
         }
     }
 
@@ -305,6 +431,9 @@ impl VectorIndexManager {
         db: Arc<rocksdb::DB>,
         gate: Arc<super::write_gate::WriteGate>,
     ) -> Result<()> {
+        // Spec P1.2: creating one writes its `meta` key. A standby registers
+        // the primary's from the replicated keys (`reopen_persistent_index`).
+        self.refuse_replica_persistent_write(&name)?;
         self.note_mutation();
         let mut indexes = self.indexes.write();
         let mut metadata = self.metadata.write();
@@ -478,6 +607,7 @@ impl VectorIndexManager {
                 IndexStorage::Quantized(idx) => idx.insert(row_id, vector)?,
                 #[cfg(feature = "vector-persist")]
                 IndexStorage::Persistent(idx) => {
+                    self.refuse_replica_persistent_write(index_name)?;
                     idx.insert(row_id, vector)?;
                 }
             }
@@ -511,6 +641,7 @@ impl VectorIndexManager {
             }
             #[cfg(feature = "vector-persist")]
             IndexStorage::Persistent(idx) => {
+                self.refuse_replica_persistent_write(index_name)?;
                 for (row_id, vector) in batch {
                     idx.insert(*row_id, vector)?;
                 }
@@ -544,6 +675,7 @@ impl VectorIndexManager {
                 IndexStorage::Quantized(idx) => idx.delete(row_id)?,
                 #[cfg(feature = "vector-persist")]
                 IndexStorage::Persistent(idx) => {
+                    self.refuse_replica_persistent_write(index_name)?;
                     idx.remove(row_id)?;
                 }
             }
@@ -570,9 +702,13 @@ impl VectorIndexManager {
             return Err(Error::query_execution(format!("Index '{}' does not exist", name)));
         };
 
+        // Spec P1.2: a standby forgets the index and keeps its keys — they are
+        // the primary's, whose own drop deletes them, and the deletes replicate.
         #[cfg(feature = "vector-persist")]
         if let IndexStorage::Persistent(index) = index {
-            index.drop_storage()?;
+            if !self.replica_memory_only() {
+                index.drop_storage()?;
+            }
         }
 
         metadata.remove(name);
@@ -893,6 +1029,9 @@ impl VectorIndexManager {
         }
         let mut undo = Vec::new();
         for (index_name, column_name) in self.indexes_on_table(table_name) {
+            if self.follows_replicated_records(&index_name) {
+                continue; // spec P1.2: its replicated records carry the change
+            }
             let Some(vector) = Self::tuple_vector_value(schema, tuple, &column_name) else {
                 continue; // NULL / missing vector: nothing to index
             };
@@ -928,6 +1067,9 @@ impl VectorIndexManager {
         }
         let mut undo = Vec::new();
         for (index_name, column_name) in self.indexes_on_table(table_name) {
+            if self.follows_replicated_records(&index_name) {
+                continue; // spec P1.2: its replicated records carry the change
+            }
             let old_vector = match (schema, old_tuple) {
                 (Some(schema), Some(tuple)) => Self::tuple_vector_value(schema, tuple, &column_name).cloned(),
                 _ => None,
@@ -966,6 +1108,9 @@ impl VectorIndexManager {
         }
         let mut undo = Vec::new();
         for (index_name, column_name) in self.indexes_on_table(table_name) {
+            if self.follows_replicated_records(&index_name) {
+                continue; // spec P1.2: its replicated records carry the change
+            }
             let old_vector = old_tuple.and_then(|t| Self::tuple_vector_value(schema, t, &column_name));
             let new_vector = Self::tuple_vector_value(schema, new_tuple, &column_name);
 

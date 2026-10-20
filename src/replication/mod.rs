@@ -35,6 +35,8 @@ pub mod physical_receiver;
 #[cfg(feature = "ha-tier1")]
 pub mod physical_source;
 #[cfg(feature = "ha-tier1")]
+pub mod physical_vector;
+#[cfg(feature = "ha-tier1")]
 pub mod physical_wire;
 #[cfg(feature = "ha-tier1")]
 pub mod query_forwarder;

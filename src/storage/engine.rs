@@ -2501,8 +2501,8 @@ impl StorageEngine {
     /// Hydrate a physical engine's in-memory derived state from its store,
     /// exactly once: the strict physical-image index rebuild
     /// (`Catalog::rebuild_all_indexes_for_physical_snapshot`: ART indexes,
-    /// standard HNSW from rows, row counters in memory) and the lazy catalog
-    /// validation.
+    /// standard HNSW from rows, persistent HNSW reopened from its keys, row
+    /// counters in memory) and the lazy catalog validation.
     ///
     /// Spec P1.4: the one hydration for every caller —
     /// `EmbeddedDatabase::open_physical_snapshot` and
@@ -3253,6 +3253,14 @@ impl StorageEngine {
             !mode.engine_may_write(),
         )?;
 
+        // Spec P1.2: a standby's persistent vector indexes follow the
+        // `__vidx:` keys its applier writes and never write them, from the
+        // first registration on (hydration included).
+        let vector_indexes = VectorIndexManager::new();
+        if matches!(mode, OpenMode::PhysicalStandby { .. }) {
+            vector_indexes.set_persistent_policy(super::vector_index::PersistentPolicy::ReplicaMemoryOnly);
+        }
+
         let engine = Self {
             instance_id: NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             db: Arc::clone(&db),
@@ -3260,7 +3268,7 @@ impl StorageEngine {
             config: config.clone(),
             timestamp,
             key_manager,
-            vector_indexes: Arc::new(VectorIndexManager::new()),
+            vector_indexes: Arc::new(vector_indexes),
             snapshot_manager,
             conflict_registry,
             write_census: Arc::new(super::UncommittedWriteCensus::new()),

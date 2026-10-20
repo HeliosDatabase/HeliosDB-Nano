@@ -48,7 +48,7 @@
 //! | `VgcWatermark` | `set_gc_low_watermark` + `raise_timestamp` |
 //! | `Branch` / `Git` | `reload_branch_manager` (retried on the next batch while a registry names metadata not yet arrived) |
 //! | `Statistics`, `Columnar*`, branch rows | statistics / row caches of the table |
-//! | `Vidx` | vector hook |
+//! | `Vidx` | vector hook (`on_vidx_record` per key, then `on_batch_published` once per batch) |
 //! | catalog classes (`Meta*`, `TableConstraints`, `Trigger*`, `ViewMeta`, `Statistics`, `Compression`) | [`DerivedStateListener::on_catalog_change`]; schema generation bumped once |
 //! | `Cas` | nothing to invalidate (content-addressed by hash); only retries a pending re-derivation |
 //! | logical WAL, cursors, durable index snapshots, TDE / elision sentinels, `vgc:anchor`, legacy counters, MV deltas, sync change log | nothing: no derived state reads them on a standby |
@@ -87,7 +87,7 @@
 //! What this module does not do: the SQL layer's registries and caches
 //! (functions, triggers, plan caches) are the [`DerivedStateListener`]'s
 //! (`EmbeddedDatabase`, spec P1.4); vector indexes are the [`VectorHook`]'s
-//! (spec P1.2), a no-op by default.
+//! (spec P1.2), by default `physical_vector::StandbyVectorHook`.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -97,6 +97,7 @@ use rocksdb::{Direction, IteratorMode, ReadOptions};
 use tracing::{debug, warn};
 
 use super::physical::{walk_raw_batch, LocalWriter, PhysicalBatch, PhysicalError};
+use super::physical_vector::StandbyVectorHook;
 use crate::sql::TableConstraints;
 use crate::storage::keyspace::{classify, KeyClass};
 use crate::storage::{index_family, ArtIndexType, IndexFamily, StorageEngine, UncommittedWriteHold};
@@ -173,6 +174,7 @@ impl DerivedStateListener for NoopDerivedStateListener {
 /// of replicated `__vidx:` keys whose own mutators WRITE those keys, so a
 /// standby must follow them memory-only. The applier calls these hooks at the
 /// points where the ART indexes are published; every default does nothing.
+/// The applier's own is `physical_vector::StandbyVectorHook`.
 pub trait VectorHook: Send + Sync {
     /// Whether rows of `table` must be decoded for [`Self::on_row`] even when
     /// the table has no ART index.
@@ -194,8 +196,16 @@ pub trait VectorHook: Send + Sync {
     }
 
     /// One `__vidx:` record changed; `value` is its post-batch value (`None`
-    /// when deleted).
+    /// when deleted). Called in key order, after every other hook of the
+    /// batch's publication but [`Self::on_batch_published`].
     fn on_vidx_record(&self, _engine: &StorageEngine, _key: &[u8], _value: Option<&[u8]>) {}
+
+    /// The publication of one applied batch is complete: every hook above
+    /// has been called for it, and the batch's re-derivations (step 5, which
+    /// call [`Self::on_table_rederived`]) are next. Lets a hook publish the
+    /// batch's records as one unit, as the primary changed them in one write
+    /// group.
+    fn on_batch_published(&self, _engine: &StorageEngine) {}
 
     /// A vector-family `meta:index:` definition was written or deleted.
     fn on_index_definition(&self, _engine: &StorageEngine, _index_name: &str, _deleted: bool) {}
@@ -210,7 +220,9 @@ pub trait VectorHook: Send + Sync {
     fn on_full_rebuild(&self, _engine: &StorageEngine) {}
 }
 
-/// The default [`VectorHook`]: vector indexes are not maintained (P1.2).
+/// A [`VectorHook`] that maintains nothing: a standby's vector indexes keep
+/// what hydration built (tools, and the tests' control case). The applier's
+/// default is `physical_vector::StandbyVectorHook`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopVectorHook;
 
@@ -304,13 +316,13 @@ impl PhysicalApplier {
             engine,
             writer,
             listener,
-            vector: Arc::new(NoopVectorHook),
+            vector: Arc::new(StandbyVectorHook::new()),
             stats: Mutex::new(ApplierStats::default()),
             state: Mutex::new(ApplierState::default()),
         })
     }
 
-    /// Replace the default (no-op) [`VectorHook`].
+    /// Replace the default [`VectorHook`] ([`StandbyVectorHook`], spec P1.2).
     pub fn with_vector_hook(mut self, hook: Arc<dyn VectorHook>) -> Self {
         self.vector = hook;
         self
@@ -331,7 +343,8 @@ impl PhysicalApplier {
     /// Hydrate a freshly opened standby engine nobody serves SQL from (tests,
     /// tools): `StorageEngine::hydrate_physical`, the strict physical-image
     /// index rebuild (`Catalog::rebuild_all_indexes_for_physical_snapshot`:
-    /// ART indexes, standard HNSW from rows, row counters in memory) and the
+    /// ART indexes, standard HNSW from rows, persistent HNSW reopened from its
+    /// replicated keys, row counters in memory) and the
     /// lazy catalog validation that `EmbeddedDatabase::open_physical_snapshot`
     /// runs too. Call it once, before the first batch.
     ///
@@ -636,6 +649,7 @@ impl PhysicalApplier {
         }
         self.publish_caches(touched);
         self.publish_vector_records(touched);
+        self.vector.on_batch_published(&self.engine);
         self.publish_listener(touched);
         self.publish_unknown(touched, state);
     }
@@ -1443,23 +1457,9 @@ impl PhysicalApplier {
     // Helpers
     // ---------------------------------------------------------------------
 
-    /// `table`'s durable schema, read past the schema cache and the
-    /// session-private visibility rule (`Catalog::get_table_schema` applies
-    /// both; the applier has no session and must see every table), with the
-    /// same B31 `source_table_name` stamp. `None` when the table does not
-    /// exist.
+    /// `table`'s durable schema ([`durable_schema`]).
     fn durable_schema(&self, table: &str) -> crate::Result<Option<Schema>> {
-        let Some(bytes) = self.engine.get(&format!("meta:table:{table}").into_bytes())? else {
-            return Ok(None);
-        };
-        let mut schema: Schema = bincode::deserialize(&bytes)
-            .map_err(|e| crate::Error::storage(format!("the schema of '{table}' does not decode: {e}")))?;
-        for column in &mut schema.columns {
-            if column.source_table_name.is_none() {
-                column.source_table_name = Some(table.to_string());
-            }
-        }
-        Ok(Some(schema))
+        durable_schema(&self.engine, table)
     }
 
     /// `table`'s durable constraint set, read past the constraints cache.
@@ -1484,6 +1484,25 @@ impl PhysicalApplier {
             debug!("physical applier: invalidating the statistics of '{}': {}", table, e);
         }
     }
+}
+
+/// `table`'s durable schema, read past the schema cache and the
+/// session-private visibility rule (`Catalog::get_table_schema` applies
+/// both; the applier has no session and must see every table), with the
+/// same B31 `source_table_name` stamp. `None` when the table does not
+/// exist. Shared with the standby's vector hook (spec P1.2).
+pub(crate) fn durable_schema(engine: &StorageEngine, table: &str) -> crate::Result<Option<Schema>> {
+    let Some(bytes) = engine.get(&format!("meta:table:{table}").into_bytes())? else {
+        return Ok(None);
+    };
+    let mut schema: Schema = bincode::deserialize(&bytes)
+        .map_err(|e| crate::Error::storage(format!("the schema of '{table}' does not decode: {e}")))?;
+    for column in &mut schema.columns {
+        if column.source_table_name.is_none() {
+            column.source_table_name = Some(table.to_string());
+        }
+    }
+    Ok(Some(schema))
 }
 
 /// One row a batch changed: its image before the batch (decoded with the
