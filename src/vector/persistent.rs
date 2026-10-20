@@ -332,6 +332,18 @@ fn key_tomb(p: &str) -> Vec<u8> {
     format!("{p}tomb").into_bytes()
 }
 
+/// Split a key of the persistent keyspace into its index id and the suffix
+/// after `__vidx:{index_id}:` — the inverse of the key builders above, for a physical
+/// standby that receives the keys rather than writing them (spec P1.2).
+/// `None` for a key of any other shape.
+#[must_use]
+pub fn split_record_key(key: &[u8]) -> Option<(u64, &[u8])> {
+    let rest = key.strip_prefix(b"__vidx:")?;
+    let colon = rest.iter().position(|&byte| byte == b':')?;
+    let index_id = std::str::from_utf8(rest.get(..colon)?).ok()?.parse().ok()?;
+    Some((index_id, rest.get(colon + 1..)?))
+}
+
 // ── Encoding helpers ─────────────────────────────────────────────────────────
 
 fn ser<T: Serialize>(v: &T) -> Result<Vec<u8>> {
@@ -346,6 +358,155 @@ fn map_db(e: rocksdb::Error) -> Error {
 fn parse_id(s: Option<&str>) -> Result<u64> {
     s.and_then(|x| x.parse().ok())
         .ok_or_else(|| Error::storage("vector-persist: malformed key id"))
+}
+
+/// Refuse a `meta` record of an on-disk format this build does not read.
+/// Shared by [`PersistentVectorIndex::open`] and [`PersistentVectorIndex::apply_record`].
+fn check_schema_version(meta: &PersistedMeta) -> Result<()> {
+    if meta.schema_version != PERSIST_SCHEMA_VERSION {
+        return Err(Error::storage(format!(
+            "vector-persist: on-disk schema version {} unsupported (expected {})",
+            meta.schema_version, PERSIST_SCHEMA_VERSION
+        )));
+    }
+    Ok(())
+}
+
+/// Rebuild the quantizer from a persisted `pq` codebook under `config`'s PQ
+/// parameters (or the dimension's default when none were recorded). Shared
+/// by [`PersistentVectorIndex::open`] and [`PersistentVectorIndex::apply_record`].
+fn quantizer_from_codebook(config: &PqHnswConfig, codebook_bytes: &[u8]) -> Result<ProductQuantizer> {
+    let codebook: Codebook = de(codebook_bytes)?;
+    let pq_cfg = match config.pq_config.clone() {
+        Some(c) => c,
+        None => ProductQuantizerConfig::default_for_dimension(config.dimension)
+            .map_err(|e| Error::storage(format!("vector-persist: pq config: {e}")))?,
+    };
+    ProductQuantizer::new(pq_cfg, codebook).map_err(|e| Error::storage(format!("vector-persist: pq reconstruct: {e}")))
+}
+
+/// One record of an index's keyspace, applied to its in-memory mirror: the
+/// per-key step of [`PersistentVectorIndex::open`] turned into a state
+/// transition (spec P1.2; the suffix → structure table is on
+/// [`PersistentVectorIndex::apply_record`]). `suffix` is the key after
+/// `__vidx:{index_id}:`; `value` is its post-batch value, `None` when the key
+/// was deleted.
+///
+/// A suffix outside that table is an error naming it: `open` skips a suffix
+/// it does not know, but a follower that skipped one would claim to mirror
+/// keys it never read. The order records are applied in matters only through
+/// `config` and `pq` (how a `vec` is decoded, and whether it is kept); a
+/// replicated batch arrives in key order, and `meta` < `pq` < `vec`.
+fn apply_record_to(st: &mut IndexState, index_id: u64, suffix: &[u8], value: Option<&[u8]>) -> Result<()> {
+    let text = std::str::from_utf8(suffix).map_err(|e| Error::storage(format!("vector-persist: non-utf8 key: {e}")))?;
+    let mut parts = text.split(':');
+    match parts.next() {
+        Some("meta") => match value {
+            Some(v) => {
+                let meta: PersistedMeta = de(v)?;
+                check_schema_version(&meta)?;
+                st.config = meta.config;
+                st.entry_point = meta.entry_point;
+                st.next_element_id = meta.next_element_id;
+                st.layer_count = meta.layer_count;
+                st.element_count = meta.element_count;
+            }
+            None => {
+                st.entry_point = None;
+                st.next_element_id = 0;
+                st.layer_count = 0;
+                st.element_count = 0;
+            }
+        },
+        Some("pq") => {
+            st.pq = match value {
+                Some(v) => Some(Arc::new(quantizer_from_codebook(&st.config, v)?)),
+                None => None,
+            };
+        }
+        Some("tomb") => {
+            st.tombstones = match value {
+                Some(v) => de::<Vec<ElementId>>(v)?.into_iter().collect(),
+                None => HashSet::new(),
+            };
+        }
+        Some("vec") => {
+            let e = parse_id(parts.next())?;
+            match value {
+                Some(v) => {
+                    if st.pq.is_none() {
+                        let vector = decode_vector(&st.config, v)?;
+                        st.vectors.insert(e, vector);
+                    }
+                }
+                None => {
+                    st.vectors.remove(&e);
+                }
+            }
+        }
+        Some("code") => {
+            let e = parse_id(parts.next())?;
+            match value {
+                Some(v) => {
+                    st.codes.insert(e, de::<QuantizedVector>(v)?);
+                }
+                None => {
+                    st.codes.remove(&e);
+                }
+            }
+        }
+        Some("lvl") => {
+            let e = parse_id(parts.next())?;
+            match value {
+                Some(v) => {
+                    st.levels.insert(e, de::<u32>(v)?);
+                }
+                None => {
+                    st.levels.remove(&e);
+                }
+            }
+        }
+        Some("adj") => {
+            let layer = parse_id(parts.next())? as u32;
+            let e = parse_id(parts.next())?;
+            match value {
+                Some(v) => {
+                    st.adjacency.insert((layer, e), de::<Vec<ElementId>>(v)?);
+                }
+                None => {
+                    st.adjacency.remove(&(layer, e));
+                }
+            }
+        }
+        Some("map") => {
+            let e = parse_id(parts.next())?;
+            match value {
+                Some(v) => {
+                    st.elem_to_row.insert(e, de::<u64>(v)?);
+                }
+                None => {
+                    st.elem_to_row.remove(&e);
+                }
+            }
+        }
+        Some("rmap") => {
+            let row = parse_id(parts.next())?;
+            match value {
+                Some(v) => {
+                    st.row_to_elem.insert(row, de::<ElementId>(v)?);
+                }
+                None => {
+                    st.row_to_elem.remove(&row);
+                }
+            }
+        }
+        _ => {
+            return Err(Error::storage(format!(
+                "vector-persist: index {index_id}: unknown record suffix '{text}'"
+            )))
+        }
+    }
+    Ok(())
 }
 
 /// Encode a rerank vector for storage at the configured precision. `F16` halves the
@@ -727,12 +888,7 @@ impl PersistentVectorIndex {
             .map_err(map_db)?
             .ok_or_else(|| Error::storage(format!("vector-persist: index {index_id} not found")))?;
         let meta: PersistedMeta = de(&meta_bytes)?;
-        if meta.schema_version != PERSIST_SCHEMA_VERSION {
-            return Err(Error::storage(format!(
-                "vector-persist: on-disk schema version {} unsupported (expected {})",
-                meta.schema_version, PERSIST_SCHEMA_VERSION
-            )));
-        }
+        check_schema_version(&meta)?;
 
         let mut st = IndexState::new(meta.config.clone());
         st.entry_point = meta.entry_point;
@@ -742,15 +898,7 @@ impl PersistentVectorIndex {
 
         // Reconstruct the quantizer if a codebook was persisted.
         let pq_active = if let Some(cb_bytes) = db.get(key_pq(&p)).map_err(map_db)? {
-            let codebook: Codebook = de(&cb_bytes)?;
-            let pq_cfg = match meta.config.pq_config.clone() {
-                Some(c) => c,
-                None => ProductQuantizerConfig::default_for_dimension(meta.config.dimension)
-                    .map_err(|e| Error::storage(format!("vector-persist: pq config: {e}")))?,
-            };
-            let pq = ProductQuantizer::new(pq_cfg, codebook)
-                .map_err(|e| Error::storage(format!("vector-persist: pq reconstruct: {e}")))?;
-            st.pq = Some(Arc::new(pq));
+            st.pq = Some(Arc::new(quantizer_from_codebook(&meta.config, &cb_bytes)?));
             true
         } else {
             false
@@ -811,6 +959,55 @@ impl PersistentVectorIndex {
             index_id,
             state: Arc::new(RwLock::new(st)),
         })
+    }
+
+    /// Apply one replicated record of this index's keyspace to the in-memory
+    /// mirror (spec P1.2), on a physical standby: there the `__vidx:` keys are
+    /// the primary's, written byte for byte by the standby's applier, and this
+    /// index only follows them. `suffix` is the key after `__vidx:{index_id}:`,
+    /// `value` the record's post-batch value (`None`: deleted). Writes nothing
+    /// and never asks the gate.
+    ///
+    /// Each suffix updates the structure [`Self::open`]'s per-key loading
+    /// fills from it, so that a mirror maintained record by record equals the
+    /// one `open` builds from the same keys:
+    ///
+    /// | suffix | put | delete |
+    /// |---|---|---|
+    /// | `meta` | `config`, `entry_point`, `next_element_id`, `layer_count`, `element_count` (schema version checked, as `open` does) | the counters of an empty index (`drop_index` deletes the whole keyspace) |
+    /// | `pq` | the quantizer, rebuilt under the current `config` | cleared |
+    /// | `tomb` | `tombstones` replaced | cleared |
+    /// | `vec:{e}` | `vectors[e]`, decoded at the configured precision — skipped while PQ is active (full vectors stay on disk, as in `open`) | removed |
+    /// | `code:{e}` | `codes[e]` | removed |
+    /// | `lvl:{e}` | `levels[e]` | removed |
+    /// | `adj:{layer}:{e}` | `adjacency[(layer, e)]` | removed |
+    /// | `map:{e}` | `elem_to_row[e]` | removed |
+    /// | `rmap:{row}` | `row_to_elem[row]` | removed |
+    ///
+    /// Errors: a suffix `open` does not load (named in the error), a malformed
+    /// element id, a value that does not decode, an unsupported `meta` schema
+    /// version. The mirror may then be partly updated; the caller replaces the
+    /// index with [`Self::open`] over the same keys, which is always valid
+    /// because the keys are already the primary's.
+    pub fn apply_record(&self, suffix: &[u8], value: Option<&[u8]>) -> Result<()> {
+        let mut st = self.state.write();
+        apply_record_to(&mut st, self.index_id, suffix, value)
+    }
+
+    /// [`Self::apply_record`] for every record one replicated batch wrote to
+    /// this keyspace, under ONE hold of the index lock. The primary's own
+    /// mutators (`insert`, `remove`, `compact`) change the mirror under one
+    /// lock hold per write group; applied record by record, a concurrent
+    /// search could meet adjacency naming an element whose vector or row
+    /// mapping is not in yet — or, across a `compact`, an element id already
+    /// reassigned to another row. Stops at the first error (see
+    /// [`Self::apply_record`]).
+    pub fn apply_records<'r>(&self, records: impl IntoIterator<Item = (&'r [u8], Option<&'r [u8]>)>) -> Result<()> {
+        let mut st = self.state.write();
+        for (suffix, value) in records {
+            apply_record_to(&mut st, self.index_id, suffix, value)?;
+        }
+        Ok(())
     }
 
     /// Whether an index with the given id exists in the store.
@@ -2099,6 +2296,168 @@ mod tests {
             recall >= 0.75,
             "default-config PQ recall@{k} = {recall:.3} (expected >= 0.75; old heuristic gave ~0.14)"
         );
+    }
+
+    // ── Spec P1.2: a physical standby's follower ─────────────────────────────
+
+    /// Every key of index `index_id`'s keyspace with its value.
+    fn keyspace(db: &DB, index_id: u64) -> std::collections::BTreeMap<Vec<u8>, Vec<u8>> {
+        let p = prefix(index_id);
+        db.iterator(IteratorMode::From(p.as_bytes(), Direction::Forward))
+            .map(|item| item.unwrap())
+            .take_while(|(k, _)| k.starts_with(p.as_bytes()))
+            .map(|(k, v)| (k.to_vec(), v.to_vec()))
+            .collect()
+    }
+
+    /// Feed `follower` what changed between two keyspace states, as a
+    /// standby's applier delivers a batch: each changed key once, in key
+    /// order, with its post-batch value.
+    fn replay(
+        follower: &PersistentVectorIndex,
+        before: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+        after: &std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    ) {
+        let p = prefix(follower.index_id());
+        let keys: std::collections::BTreeSet<&Vec<u8>> = before.keys().chain(after.keys()).collect();
+        let records: Vec<(Vec<u8>, Option<Vec<u8>>)> = keys
+            .into_iter()
+            .filter(|key| before.get(*key) != after.get(*key))
+            .map(|key| (key.get(p.len()..).unwrap().to_vec(), after.get(key).cloned()))
+            .collect();
+        follower
+            .apply_records(records.iter().map(|(s, v)| (s.as_slice(), v.as_deref())))
+            .unwrap();
+    }
+
+    /// Everything a search and the accessors expose, for an equality check.
+    fn observed(idx: &PersistentVectorIndex, dim: usize) -> Vec<String> {
+        let mut out = vec![format!(
+            "ep {:?} layers {} next {} len {} tomb {:?}",
+            idx.entry_point(),
+            idx.layer_count(),
+            idx.next_element_id(),
+            idx.len(),
+            idx.tombstones()
+        )];
+        for qi in 0..12u64 {
+            out.push(format!(
+                "{:?}",
+                idx.search(&rand_vec(4_000_000 + qi, dim), 7, 48).unwrap()
+            ));
+        }
+        out
+    }
+
+    #[test]
+    fn test_apply_records_follows_a_keyspace_it_never_writes() {
+        let (_dir, db) = test_db();
+        let dim = 8;
+        let leader = PersistentVectorIndex::create(
+            db.clone(),
+            WriteGate::open(),
+            1,
+            PqHnswConfig::new(dim, DistanceMetric::L2),
+        )
+        .unwrap();
+        // The follower shares the store, as a standby's engine shares its
+        // applier's, behind a closed gate it must never ask.
+        let gate = WriteGate::closed("follower");
+        let follower = PersistentVectorIndex::open(db.clone(), Arc::clone(&gate), 1).unwrap();
+        let mut before = keyspace(&db, 1);
+        // One leader write group, then the follower fed its keys and compared.
+        let mut follow = || {
+            let after = keyspace(&db, 1);
+            replay(&follower, &before, &after);
+            assert_eq!(observed(&follower, dim), observed(&leader, dim));
+            before = after;
+        };
+        for i in 0..80u64 {
+            leader.insert(i, &rand_vec(i, dim)).unwrap();
+            follow();
+        }
+        for row in [3u64, 40, 41, 79, 0] {
+            assert!(leader.remove(row).unwrap());
+            follow();
+        }
+        leader.mark_tombstone(7).unwrap();
+        follow();
+        // `compact` rewrites the whole keyspace under new element ids.
+        leader.compact().unwrap();
+        follow();
+        for i in 100..110u64 {
+            leader.insert(i, &rand_vec(i, dim)).unwrap();
+            follow();
+        }
+        assert_eq!(gate.refusals(), 0, "the follower asked the gate to write");
+        let reopened = PersistentVectorIndex::open(db.clone(), WriteGate::open(), 1).unwrap();
+        assert_eq!(observed(&follower, dim), observed(&reopened, dim));
+
+        // Dropping the keyspace leaves an empty mirror.
+        let before = keyspace(&db, 1);
+        PersistentVectorIndex::drop_index(&db, &WriteGate::open(), 1).unwrap();
+        replay(&follower, &before, &keyspace(&db, 1));
+        assert!(follower.is_empty());
+        assert_eq!(follower.entry_point(), None);
+        assert!(follower.search(&rand_vec(1, dim), 3, 16).unwrap().is_empty());
+        assert_eq!(gate.refusals(), 0);
+    }
+
+    #[test]
+    fn test_apply_records_follows_a_pq_keyspace() {
+        let (_dir, db) = test_db();
+        // `train_codebook` needs max(num_centroids, 10 * num_subquantizers)
+        // = max(64, 160) samples for `pq_config_dim64`; 240 leaves margin.
+        let (dim, n) = (64usize, 240usize);
+        let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
+        let leader =
+            PersistentVectorIndex::create_with_pq(db.clone(), WriteGate::open(), 1, pq_config_dim64(), &data).unwrap();
+        let follower = PersistentVectorIndex::open(db.clone(), WriteGate::closed("follower"), 1).unwrap();
+        assert!(follower.pq_active());
+        let mut before = keyspace(&db, 1);
+        for (i, v) in data.iter().enumerate() {
+            leader.insert(i as u64, v).unwrap();
+            let after = keyspace(&db, 1);
+            replay(&follower, &before, &after);
+            before = after;
+        }
+        assert!(leader.remove(17).unwrap());
+        replay(&follower, &before, &keyspace(&db, 1));
+        assert_eq!(
+            follower.ram_vector_bytes(),
+            leader.ram_vector_bytes(),
+            "codes, not vectors"
+        );
+        assert_eq!(observed(&follower, dim), observed(&leader, dim));
+        // A re-delivered codebook rebuilds the same quantizer.
+        let codebook = db.get(key_pq(&prefix(1))).unwrap().unwrap();
+        follower.apply_record(b"pq", Some(codebook.as_slice())).unwrap();
+        assert_eq!(observed(&follower, dim), observed(&leader, dim));
+    }
+
+    #[test]
+    fn test_apply_record_names_what_it_cannot_mirror() {
+        let (_dir, db) = test_db();
+        let idx = PersistentVectorIndex::create(db.clone(), WriteGate::open(), 9, sample_config()).unwrap();
+        // Suffixes are built at run time: `tests/keyspace_classification.rs`
+        // requires every key-shaped literal under `src/` to be a real family.
+        let suffix = |kind: &str, rest: &str| format!("{}:{}", kind, rest).into_bytes();
+        let unknown = idx
+            .apply_record(&suffix("bogus", "1"), Some(&b"x"[..]))
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("bogus:1"), "the error names the suffix: {unknown}");
+        assert!(idx
+            .apply_record(&suffix("vec", "not-a-number"), Some(&b"x"[..]))
+            .is_err());
+        assert!(
+            idx.apply_record(&suffix("lvl", "1"), Some(&b""[..])).is_err(),
+            "a value that does not decode"
+        );
+        let adjacency = suffix("adj", "0:3");
+        assert_eq!(split_record_key(b"__vidx:9:adj:0:3"), Some((9, adjacency.as_slice())));
+        assert_eq!(split_record_key(b"__vidx:x:meta"), None);
+        assert_eq!(split_record_key(b"data:t:1"), None);
     }
 
     // ── P7: measurement (ignored; run with `-- --ignored --nocapture`) ───────

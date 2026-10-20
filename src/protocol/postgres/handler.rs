@@ -1430,6 +1430,16 @@ where
             // round-trips. Sending it makes those drivers emit single-backslash
             // literals that Nano decodes correctly.
             self.send_parameter_status("standard_conforming_strings", "on").await?;
+            // Spec P1.3 (plan §D8): PostgreSQL 14's GUC_REPORT `in_hot_standby`,
+            // exactly `on` on a physical standby (in every posture — a session
+            // on the placeholder of a standby that has no store yet included)
+            // and `off` everywhere else. A proxy and libpq's
+            // `target_session_attrs` tell a standby from a primary by it
+            // without a query. Never an error: readiness is a statement-level
+            // answer (`heliosdb_require_ready()`), never a startup refusal.
+            let hot_standby = crate::standby_posture::in_recovery(Some(self.database.storage.as_ref()));
+            self.send_parameter_status("in_hot_standby", if hot_standby { "on" } else { "off" })
+                .await?;
 
             // Item 10: advertise the helios.* opt-in capabilities so a
             // capability-probing client (HeliosProxy) auto-enables only what
@@ -1788,6 +1798,20 @@ where
 
     /// Called before simple-query interception and extended Execute. The
     /// sticky CLI guard cannot be bypassed by a read-only/role toggle or cache hit.
+    ///
+    /// Two gates, in this order:
+    /// 1. the statement's SHAPE ([`guarded_standby_statement_allowed`]): a
+    ///    write or an unknown utility statement is SQLSTATE 25006 in every
+    ///    posture — a standby never routes or accepts a write;
+    /// 2. spec P1.3, the standby's POSTURE (`crate::standby_posture`):
+    ///    while the standby is not ready, a statement that reads user data
+    ///    ([`standby_statement_reads_data`]) is SQLSTATE 55000 `standby is not
+    ///    ready: …`. The readiness and status functions, `SET` / `SHOW`,
+    ///    transaction control, relation-free `SELECT`s and the system views
+    ///    stay answered, so a proxy can always ask why. A session served by
+    ///    the placeholder of a standby whose store has since been attached is
+    ///    told to reconnect (FATAL 57P01): its next connection reaches the
+    ///    store.
     pub(super) async fn reject_guarded_standby_statement(&mut self, query: &str, extended: bool) -> Result<bool> {
         #[cfg(not(feature = "ha-tier1"))]
         {
@@ -1796,42 +1820,95 @@ where
         }
         #[cfg(feature = "ha-tier1")]
         {
-            if !crate::replication::ha_state::ha_state().forwarding_disabled()
-                || guarded_standby_statement_allowed(query)
-            {
+            if !crate::replication::ha_state::ha_state().forwarding_disabled() {
                 return Ok(false);
             }
-            if self.transaction_status == TransactionStatus::Failed {
-                if extended {
-                    self.send_extended_failed_transaction_error().await?;
-                } else {
-                    self.send_failed_transaction_error().await?;
-                }
-            } else if extended {
-                self.mark_transaction_failed_after_error();
-                self.suppress_ready_for_query = false;
-                self.awaiting_sync_after_error = true;
-                self.send_error_message(
-                    "ERROR",
+            if !guarded_standby_statement_allowed(query) {
+                self.send_standby_refusal(
+                    extended,
                     "25006",
                     "statement is not permitted on a history-guarded standby",
-                    None,
                     Some("Connect directly to the primary for writes and unsupported utility statements.".into()),
                 )
                 .await?;
-                // Extended recovery belongs to Sync; never send ReadyForQuery here.
-                self.flush().await?;
-            } else {
-                self.send_error(
-                    "ERROR",
-                    "25006",
-                    "statement is not permitted on a history-guarded standby",
-                    None,
-                    Some("Connect directly to the primary for writes and unsupported utility statements.".into()),
-                )
-                .await?;
+                return Ok(true);
             }
+            let Some(posture) = crate::standby_posture::standby() else {
+                return Ok(false);
+            };
+            // The per-statement check never touches the store's cursor.
+            let (ready, store_attached) = posture.readiness();
+            let on_store = self.database.is_physical_standby();
+            if store_attached && !on_store {
+                let message = "terminating connection: this standby's data store is now attached; reconnect";
+                let budget = self.teardown_write_budget();
+                let _ = tokio::time::timeout(budget, async {
+                    let _ = self
+                        .send_error_message(
+                            "FATAL",
+                            crate::network::protocol::sqlstate::ADMIN_SHUTDOWN,
+                            message,
+                            None,
+                            None,
+                        )
+                        .await;
+                    let _ = self.flush().await;
+                })
+                .await;
+                return Err(Error::network(message));
+            }
+            if ready && on_store {
+                return Ok(false);
+            }
+            let registry = std::sync::Arc::clone(&self.database.function_registry);
+            if !standby_statement_reads_data(query, |name| registry.get_function(name).is_some()) {
+                return Ok(false);
+            }
+            let mut snapshot = posture.snapshot();
+            snapshot.store_attached &= on_store;
+            let refusal = snapshot.not_ready_message();
+            self.send_standby_refusal(
+                extended,
+                crate::network::protocol::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                &refusal,
+                Some(
+                    "The standby serves data reads once it is streaming from its primary; \
+                     SELECT heliosdb_require_ready() or GET /ready reports when."
+                        .into(),
+                ),
+            )
+            .await?;
             Ok(true)
+        }
+    }
+
+    /// One standby refusal as an ERROR statement response: in an aborted
+    /// block the block's own 25P02; on the extended protocol the error now
+    /// and ReadyForQuery at Sync; on the simple protocol the error and
+    /// ReadyForQuery.
+    #[cfg(feature = "ha-tier1")]
+    async fn send_standby_refusal(
+        &mut self,
+        extended: bool,
+        code: &str,
+        message: &str,
+        hint: Option<String>,
+    ) -> Result<()> {
+        if self.transaction_status == TransactionStatus::Failed {
+            if extended {
+                self.send_extended_failed_transaction_error().await
+            } else {
+                self.send_failed_transaction_error().await
+            }
+        } else if extended {
+            self.mark_transaction_failed_after_error();
+            self.suppress_ready_for_query = false;
+            self.awaiting_sync_after_error = true;
+            self.send_error_message("ERROR", code, message, None, hint).await?;
+            // Extended recovery belongs to Sync; never send ReadyForQuery here.
+            self.flush().await
+        } else {
+            self.send_error("ERROR", code, message, None, hint).await
         }
     }
 
@@ -4024,7 +4101,26 @@ where
             // classified as a plain `BEGIN` and no write path consults a
             // read-only flag. It used to answer the empty string, which libpq
             // happened to read as "not read-only" by accident.
-            "transaction_read_only" | "default_transaction_read_only" => "off".to_string(),
+            //
+            // Spec P1.3: on a physical standby it is "on" — the truth there,
+            // every write is refused — so `target_session_attrs=read-write`
+            // skips a standby exactly as it skips a PostgreSQL hot standby.
+            "transaction_read_only" | "default_transaction_read_only" => {
+                if crate::standby_posture::in_recovery(None) {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            }
+            // Spec P1.3: the GUC behind the `in_hot_standby` ParameterStatus
+            // the startup burst reports.
+            "in_hot_standby" => {
+                if crate::standby_posture::in_recovery(None) {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            }
             // PostgreSQL's wording, verbatim (guc.c), so a client's own error
             // matching keeps working. `sqlstate_for_query_execution_message`
             // maps it to 42704 undefined_object.
@@ -5561,6 +5657,11 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
                 // prefix the two shared consts in `src/error.rs` both start
                 // with, not on a bare substring.
                 sqlstate::IN_FAILED_SQL_TRANSACTION // 25P02
+            } else if message.starts_with(crate::error::PHYSICAL_STANDBY_WRITE_REFUSED) {
+                // Spec P1.4: a write refused by an `EmbeddedDatabase` serving a
+                // physical standby (`Error::physical_standby_write_refused`) —
+                // what PostgreSQL reports for a write on a hot standby.
+                sqlstate::READ_ONLY_SQL_TRANSACTION // 25006
             } else {
                 sqlstate::INVALID_TRANSACTION_STATE // 25000
             }
@@ -5571,6 +5672,14 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
         // message shapes ("Table 'x' does not exist", "Column 'x' not
         // found", "Table 'x' already exists", "Unknown scalar function").
         Error::QueryExecution(message) => sqlstate_for_query_execution_message(message),
+        // Spec P1.3: a physical standby that is not ready
+        // (`StandbySnapshot::not_ready_error`). `Generic`, so the wire message
+        // is exactly `standby is not ready: <state> (cursor X, primary Y)`;
+        // 55000 is what a proxy's health check keys on, never XX000. Anchored
+        // on the emitter's const (marker-const discipline).
+        Error::Generic(message) if message.starts_with(crate::error::STANDBY_NOT_READY) => {
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE // 55000
+        }
         _ => sqlstate::INTERNAL_ERROR, // XX000
     }
 }
@@ -5762,6 +5871,13 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     // backend is broken". Anchored on the prefix because the emitter interpolates
     // the sequence name (`session::scoped::currval_undefined_message`).
     if message.contains(crate::session::scoped::CURRVAL_UNDEFINED_PREFIX) {
+        return sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE; // 55000
+    }
+    // Spec P1.3: a physical standby that is not ready (`heliosdb_require_ready()`
+    // and the read guard). 55000 is the code a proxy's health check keys on to
+    // take the node out of its read set — never XX000, which reads as a broken
+    // backend. Anchored on the emitter's const (marker-const discipline).
+    if message.contains(crate::error::STANDBY_NOT_READY) {
         return sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE; // 55000
     }
     // sprinter d03de7fc3b22: a tenant that has spent its `max_qps` budget (or its
@@ -7299,8 +7415,13 @@ mod md5_auth_wire_tests {
 /// `setval` persist a high-water mark, so a read that calls either is denied here
 /// (SQLSTATE 25006 before the engine is reached); the storage write gate refuses
 /// the write as the backstop. Unknown utility statements are denied, not guessed.
+///
+/// Spec P1.4: also the admission rule of an `EmbeddedDatabase` serving a
+/// physical standby (`EmbeddedDatabase::admit_on_physical_standby`), so the
+/// wire and the embedded API cannot disagree about what a standby serves. A
+/// function of the text alone: the same text is always admitted or refused.
 #[cfg(any(feature = "ha-tier1", test))]
-fn guarded_standby_statement_allowed(sql: &str) -> bool {
+pub(crate) fn guarded_standby_statement_allowed(sql: &str) -> bool {
     use sqlparser::ast::{Expr, Query, SetExpr, Statement, Visit, Visitor};
     use std::ops::ControlFlow;
 
@@ -7400,6 +7521,118 @@ fn guarded_standby_statement_allowed(sql: &str) -> bool {
     }
 }
 
+/// Spec P1.3: whether `sql` — a statement [`guarded_standby_statement_allowed`]
+/// admits — reads user data, which a standby that is not ready refuses with
+/// SQLSTATE 55000.
+///
+/// What stays answered in every posture: transaction control, `SET` / `SHOW`
+/// / `RESET` and the other session statements, and any query whose every
+/// relation is a system view or catalog relation (`pg_catalog.*`,
+/// `information_schema.*`, the registered system views — among them
+/// `heliosdb_standby_status` and `pg_control_checkpoint()`), including the
+/// relation-free probes `SELECT 1`, `SELECT heliosdb_require_ready()`,
+/// `SELECT pg_is_in_recovery()` and the LSN functions. Everything else counts
+/// as a data read, failing closed: a user table, a view, a CTE name, a
+/// table function, `COPY … TO STDOUT`, a statement that does not parse, and a
+/// call of a user-defined function (`is_user_function`), whose body reads
+/// whatever it likes.
+#[cfg(any(feature = "ha-tier1", test))]
+pub(crate) fn standby_statement_reads_data(sql: &str, is_user_function: impl Fn(&str) -> bool) -> bool {
+    use sqlparser::ast::{Expr, ObjectName, Statement, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    /// Catalog relations the wire layer emulates beside the registry's.
+    const WIRE_CATALOG: &[&str] = &[
+        "pg_type",
+        "pg_class",
+        "pg_namespace",
+        "pg_attribute",
+        "pg_database",
+        "pg_index",
+        "pg_indexes",
+        "pg_sequences",
+        "pg_tables",
+        "pg_views",
+        "pg_constraint",
+        "pg_description",
+        "pg_roles",
+        "pg_user",
+        "pg_proc",
+        "pg_settings",
+        "pg_policies",
+        "pg_matviews",
+    ];
+
+    fn is_status_relation(name: &ObjectName) -> bool {
+        let parts: Vec<String> = name.0.iter().map(|part| part.value.to_lowercase()).collect();
+        match parts.as_slice() {
+            [schema, _] if schema == "pg_catalog" || schema == "information_schema" => true,
+            [bare] => {
+                crate::sql::phase3::SystemViewRegistry::shared().is_system_view(bare)
+                    || WIRE_CATALOG.contains(&bare.as_str())
+            }
+            _ => false,
+        }
+    }
+
+    struct DataReads<F> {
+        is_user_function: F,
+    }
+    impl<F: Fn(&str) -> bool> Visitor for DataReads<F> {
+        type Break = ();
+        fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<Self::Break> {
+            if is_status_relation(relation) {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        }
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if let Expr::Function(function) = expr {
+                let name = function
+                    .name
+                    .0
+                    .last()
+                    .map(|part| part.value.as_str())
+                    .unwrap_or_default();
+                if (self.is_user_function)(name) {
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let sql = pg_skip_leading_comments(sql).trim();
+    if sql.trim_end_matches(';').trim().is_empty() || classify_transaction_control(sql).is_some() {
+        return false;
+    }
+    if super::copy::parse_copy(sql).is_some() {
+        return true;
+    }
+    if starts_with_icase(sql, "RESET ") {
+        // The admitted RESET forms are session-only (see the admission rule).
+        return false;
+    }
+    let rewritten = pg_rewrite_empty_projection(sql);
+    let Ok(statements) = crate::sql::Parser::new().parse(&rewritten) else {
+        return true;
+    };
+    let mut visitor = DataReads { is_user_function };
+    statements.iter().any(|statement| match statement {
+        Statement::SetVariable { .. }
+        | Statement::SetTimeZone { .. }
+        | Statement::SetRole { .. }
+        | Statement::SetTransaction { .. }
+        | Statement::ShowVariable { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::Savepoint { .. }
+        | Statement::ReleaseSavepoint { .. }
+        | Statement::Deallocate { .. } => false,
+        _ => statement.visit(&mut visitor).is_break(),
+    })
+}
+
 #[cfg(test)]
 mod guarded_standby_admission_tests {
     use super::guarded_standby_statement_allowed as allowed;
@@ -7471,6 +7704,51 @@ mod guarded_standby_admission_tests {
             "unrecognized utility syntax",
         ] {
             assert!(!allowed(sql), "write/unknown statement admitted: {sql}");
+        }
+    }
+
+    /// Spec P1.3: what a standby that is not ready still answers, and what it
+    /// refuses with 55000 (every one of these is admitted by the shape rule).
+    #[test]
+    fn not_ready_standby_answers_status_and_refuses_data_reads() {
+        use super::standby_statement_reads_data as reads;
+        let udf = |name: &str| name.eq_ignore_ascii_case("my_udf");
+        for sql in [
+            "SELECT 1",
+            "SELECT heliosdb_require_ready()",
+            "SELECT pg_is_in_recovery()",
+            "SELECT pg_is_in_recovery()::text",
+            "SELECT pg_current_wal_lsn()::text",
+            "SELECT pg_last_wal_replay_lsn()::text",
+            "SELECT timeline_id::bigint FROM pg_control_checkpoint()",
+            "SELECT * FROM heliosdb_standby_status",
+            "SELECT relname FROM pg_catalog.pg_class",
+            "SELECT table_name FROM information_schema.tables",
+            "SELECT version()",
+            "SHOW in_hot_standby",
+            "SET application_name = 'heliosdb-proxy-health'",
+            "RESET application_name",
+            "BEGIN",
+            "COMMIT",
+            "",
+        ] {
+            assert!(allowed(sql), "precondition, admitted: {sql}");
+            assert!(!reads(sql, udf), "status statement refused while not ready: {sql}");
+        }
+        for sql in [
+            "SELECT * FROM t",
+            "SELECT count(*) FROM t",
+            "SELECT (SELECT count(*) FROM t)",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "SELECT * FROM public.t",
+            "EXPLAIN SELECT * FROM t",
+            "COPY t TO STDOUT",
+            "SELECT my_udf()",
+            "SELECT * FROM generate_series(1, 3)",
+            "SELECT * FROM heliosdb_standby_status, t",
+        ] {
+            assert!(allowed(sql), "precondition, admitted: {sql}");
+            assert!(reads(sql, udf), "data read served while not ready: {sql}");
         }
     }
 }

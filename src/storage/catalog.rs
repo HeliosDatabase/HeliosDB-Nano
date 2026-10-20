@@ -459,6 +459,41 @@ fn hnsw_construction_params(
     (m, ef_construction)
 }
 
+/// The vector families a PHYSICAL engine builds (spec P1.2): `hnsw` from rows,
+/// and `persistent_hnsw` from its replicated keyspace where the persistent
+/// index is compiled in. Every other family is refused by name at strict
+/// hydration and marked degraded by a standby's vector hook — never
+/// downgraded to another structure.
+pub fn physical_vector_family(tag: Option<&str>) -> bool {
+    match tag {
+        Some("hnsw") => true,
+        #[cfg(feature = "vector-persist")]
+        Some("persistent_hnsw") => true,
+        _ => false,
+    }
+}
+
+/// What [`Catalog::build_physical_vector_index`] built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhysicalVectorBuild {
+    /// A standard `hnsw` graph, from the table's rows.
+    Rebuilt,
+    /// A `persistent_hnsw` index, reopened from its `__vidx:` keyspace.
+    #[cfg_attr(not(feature = "vector-persist"), allow(dead_code))]
+    Reopened,
+}
+
+/// What [`Catalog::backfill_table_indexes`] did to one table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TableIndexBackfill {
+    /// Rows with a row id that were fed through `on_insert`.
+    pub(crate) rows: u64,
+    /// Of those, rows refused as a duplicate PRIMARY KEY / UNIQUE value.
+    pub(crate) duplicate_rows: u64,
+    /// The highest row id scanned, `None` for an empty table.
+    pub(crate) max_row_id: Option<u64>,
+}
+
 /// Catalog manager for table metadata
 pub struct Catalog<'a> {
     storage: &'a StorageEngine,
@@ -637,7 +672,7 @@ impl<'a> Catalog<'a> {
                             .map_err(|e| Error::storage(format!("physical snapshot index '{name}': {e}")))?;
                     }
                 }
-                Some(IndexFamily::Vector) if definition.index_type.as_deref() == Some("hnsw") => {}
+                Some(IndexFamily::Vector) if physical_vector_family(definition.index_type.as_deref()) => {}
                 Some(IndexFamily::DdlOnly) => {} // Same metadata-only contract as normal serving.
                 _ => return Err(Error::storage(format!(
                     "physical snapshot index '{name}' uses unsupported strict-hydration family {:?}; no downgrade is allowed",
@@ -728,7 +763,7 @@ impl<'a> Catalog<'a> {
             report.tables_total += 1;
         }
         for (name, definition) in &definitions {
-            if definition.index_type.as_deref() != Some("hnsw") {
+            if !physical_vector_family(definition.index_type.as_deref()) {
                 continue;
             }
             let schema = tables.get(&definition.table_name).ok_or_else(|| {
@@ -737,38 +772,101 @@ impl<'a> Catalog<'a> {
                     definition.table_name
                 ))
             })?;
-            let column = schema
-                .get_column(&definition.column_name)
-                .ok_or_else(|| Error::storage(format!("physical snapshot vector '{name}' has no column")))?;
-            let DataType::Vector(dimension) = &column.data_type else {
-                return Err(Error::storage(format!(
-                    "physical snapshot vector '{name}' column is not VECTOR"
-                )));
-            };
-            let vectors =
-                self.collect_existing_vectors(schema, &definition.table_name, &definition.column_name, *dimension)?;
-            let metric = vector_distance_metric(&definition.options);
-            let (m, ef) = hnsw_construction_params(&definition.options, self.storage.config());
-            let manager = self.storage.vector_indexes();
-            manager
-                .create_index_with_params(
-                    name.clone(),
-                    definition.table_name.clone(),
-                    definition.column_name.clone(),
-                    *dimension,
-                    metric,
-                    m,
-                    ef,
-                )
-                .map_err(|e| Error::storage(format!("physical snapshot vector '{name}' create: {e}")))?;
-            manager
-                .insert_vectors_batch(name, &vectors)
-                .map_err(|e| Error::storage(format!("physical snapshot vector '{name}' populate: {e}")))?;
-            report.vector_rebuilt += 1;
+            match self.build_physical_vector_index(name, definition, schema)? {
+                PhysicalVectorBuild::Rebuilt => report.vector_rebuilt += 1,
+                PhysicalVectorBuild::Reopened => report.vector_reopened_persistent += 1,
+            }
         }
         report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         self.storage.set_last_index_open_report(report);
         Ok(())
+    }
+
+    /// Build one vector index of a PHYSICAL engine from its store: strict
+    /// hydration's per-index step, shared with a physical standby's vector
+    /// hook (spec P1.2) so that an index the primary creates, or one rebuilt
+    /// after a fallback, is built exactly as an open builds it.
+    ///
+    /// * `hnsw` from `schema`'s rows of the table. Never from a `vecsnap:`
+    ///   sidecar or an `hnsw_snapshots/` dump: those describe the source's
+    ///   graph at its last checkpoint, not these rows (no source snapshot
+    ///   marker is trusted here either). A graph that cannot be populated is
+    ///   unregistered again, so a failure never leaves an empty index behind.
+    /// * `persistent_hnsw` (with `vector-persist`) by reopening its
+    ///   `__vidx:` keyspace through `reopen_persistent_index`, with the same
+    ///   catalog metadata `rebuild_vector_indexes` gives it on a primary.
+    ///   `PersistentVectorIndex::open` reads and writes nothing; on a standby
+    ///   the copy then follows the replicated records (`ReplicaMemoryOnly`).
+    ///
+    /// Any other family is refused by name ([`physical_vector_family`]);
+    /// nothing is downgraded.
+    pub(crate) fn build_physical_vector_index(
+        &self,
+        name: &str,
+        definition: &PersistedIndexDefinition,
+        schema: &Schema,
+    ) -> Result<PhysicalVectorBuild> {
+        if !self.storage.physical_snapshot_mode() {
+            return Err(Error::storage(
+                "a physical vector index build requires a physical open mode",
+            ));
+        }
+        let column = schema
+            .get_column(&definition.column_name)
+            .ok_or_else(|| Error::storage(format!("physical snapshot vector '{name}' has no column")))?;
+        let DataType::Vector(dimension) = &column.data_type else {
+            return Err(Error::storage(format!(
+                "physical snapshot vector '{name}' column is not VECTOR"
+            )));
+        };
+        let metric = vector_distance_metric(&definition.options);
+        let manager = self.storage.vector_indexes();
+        match definition.index_type.as_deref() {
+            Some("hnsw") => {
+                let vectors =
+                    self.collect_existing_vectors(schema, &definition.table_name, &definition.column_name, *dimension)?;
+                let (m, ef) = hnsw_construction_params(&definition.options, self.storage.config());
+                manager
+                    .create_index_with_params(
+                        name.to_string(),
+                        definition.table_name.clone(),
+                        definition.column_name.clone(),
+                        *dimension,
+                        metric,
+                        m,
+                        ef,
+                    )
+                    .map_err(|e| Error::storage(format!("physical snapshot vector '{name}' create: {e}")))?;
+                if let Err(e) = manager.insert_vectors_batch(name, &vectors) {
+                    let _ = manager.drop_index(name);
+                    return Err(Error::storage(format!("physical snapshot vector '{name}' populate: {e}")));
+                }
+                Ok(PhysicalVectorBuild::Rebuilt)
+            }
+            #[cfg(feature = "vector-persist")]
+            Some("persistent_hnsw") => {
+                let config = super::vector_index::PersistentVectorConfig {
+                    dimension: *dimension,
+                    distance_metric: metric,
+                    pq_enabled: false,
+                    rerank_precision: "f32".to_string(),
+                };
+                manager
+                    .reopen_persistent_index(
+                        name,
+                        &definition.table_name,
+                        &definition.column_name,
+                        config,
+                        std::sync::Arc::clone(&self.storage.db),
+                        std::sync::Arc::clone(self.storage.write_gate()),
+                    )
+                    .map_err(|e| Error::storage(format!("physical snapshot vector '{name}' reopen: {e}")))?;
+                Ok(PhysicalVectorBuild::Reopened)
+            }
+            other => Err(Error::storage(format!(
+                "physical snapshot index '{name}' uses unsupported strict-hydration family {other:?}; no downgrade is allowed"
+            ))),
+        }
     }
 
     /// Create a new catalog
@@ -786,6 +884,34 @@ impl<'a> Catalog<'a> {
         // Check if table already exists
         if self.table_exists(table_name)? {
             return Err(Error::query_execution(format!("Table '{}' already exists", table_name)));
+        }
+
+        // Spec P1.1b: a constraint record for a table that does not exist is a
+        // catalog ORPHAN, and the new table must never take it over. Every
+        // constraint arm reads `table_constraints:{t}` by name, so a record left
+        // by an earlier table of this name was enforced on this one (stale
+        // CHECKs and FOREIGN KEYs), and `execute_create_table_plan` merged its
+        // UNIQUE / PRIMARY KEY records into the new set. DROP TABLE now deletes
+        // the record in its own write group, so a new orphan means a regression
+        // there: loud in every debug build (the test suites). A store written by
+        // a release before that fix still holds them, so a release build does
+        // not refuse the CREATE — the table would then be uncreatable under its
+        // name for good — it logs the orphan and discards it before the first
+        // durable write of the new table.
+        let constraints_key = Self::table_constraints_key(table_name);
+        let orphan = self.storage.get(&constraints_key)?;
+        debug_assert!(
+            orphan.is_none(),
+            "catalog orphan: table_constraints:{table_name} exists while the table does not"
+        );
+        if orphan.is_some() {
+            tracing::error!(
+                "CREATE TABLE '{}': discarding the constraint record of an earlier table of this name, which \
+                 its DROP TABLE left behind (a catalog orphan); the new table starts with its own constraints only",
+                table_name
+            );
+            self.storage.delete(&constraints_key)?;
+            self.storage.invalidate_table_constraints_cache(table_name);
         }
 
         // PRE-FLIGHT, before ANY durable write.
@@ -1547,7 +1673,100 @@ impl<'a> Catalog<'a> {
             bincode::serialize(schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
 
         self.storage.put(&key, &value)?;
+        self.publish_table_schema(table_name, schema, &value);
 
+        Ok(())
+    }
+
+    /// `ALTER TABLE … RENAME COLUMN`'s catalog change as ONE write group (spec
+    /// P1.1b): the table's renamed `schema` and every `meta:index:` definition
+    /// of `table_name` that names column `old` — its `column_name` or a
+    /// `UniqueColumns` entry — rewritten to `new`. Returns the rewritten index
+    /// names. The live ART entries are repointed separately
+    /// (`ArtIndexManager::rename_column_in_indexes`), as are the constraint
+    /// records (`Self::rename_column_in_constraints`).
+    ///
+    /// The definitions used to keep the old name: `rebuild_all_indexes`
+    /// re-registered the index over a column the schema no longer had (empty,
+    /// so lookups on the renamed column full-scanned after every restart), and
+    /// strict physical-image hydration refused the store outright ("index has
+    /// invalid columns"), so no standby could be built from a primary that had
+    /// renamed an indexed column. In one batch with the schema, a standby that
+    /// applies the group — and any checkpoint cut around it — sees a catalog
+    /// whose definitions name the columns its schema has.
+    ///
+    /// The definitions are read as DROP TABLE reads them
+    /// ([`Self::table_index_definitions`]: decrypting, `table_name` matched with
+    /// `==`); column names are matched case-insensitively, as the constraint
+    /// and live-index renames match them. A definition that does not decode is
+    /// left alone: nothing in it can be matched. The values are sealed with the
+    /// one rule every writer of these keys uses (`tde::seal`, as
+    /// `rename_table_inner` seals its batch).
+    pub fn rename_column_in_schema_and_index_definitions(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        old: &str,
+        new: &str,
+    ) -> Result<Vec<String>> {
+        if !self.table_exists(table_name)? {
+            return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
+        }
+        let value =
+            bincode::serialize(schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
+        let key_manager = self.storage.key_manager_arc();
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(
+            Self::table_metadata_key(table_name),
+            super::tde::seal(key_manager.as_deref(), &value)?.as_ref(),
+        );
+        let mut rewritten = Vec::new();
+        for (index_name, mut definition) in self.table_index_definitions(table_name)? {
+            if !Self::rename_index_definition_column(&mut definition, old, new) {
+                continue;
+            }
+            let encoded = Self::encode_index_definition(&definition)?;
+            batch.put(
+                Self::index_metadata_key(&index_name),
+                super::tde::seal(key_manager.as_deref(), &encoded)?.as_ref(),
+            );
+            rewritten.push(index_name);
+        }
+        self.storage
+            .db_write(batch, None)
+            .map_err(|e| Error::storage(format!("Rename column batch write failed: {}", e)))?;
+        self.publish_table_schema(table_name, schema, &value);
+        Ok(rewritten)
+    }
+
+    /// Point every column reference of one index definition — the indexed
+    /// `column_name` and the full key of a multi-column `CREATE UNIQUE INDEX`
+    /// (`IndexOption::UniqueColumns`) — from `old` to `new`. `true` when one
+    /// changed.
+    fn rename_index_definition_column(definition: &mut PersistedIndexDefinition, old: &str, new: &str) -> bool {
+        let mut changed = definition.column_name.eq_ignore_ascii_case(old);
+        if changed {
+            definition.column_name = new.to_string();
+        }
+        for option in &mut definition.options {
+            if let crate::sql::logical_plan::IndexOption::UniqueColumns(columns) = option {
+                for column in columns.iter_mut() {
+                    if column.eq_ignore_ascii_case(old) {
+                        *column = new.to_string();
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// What every schema replacement does once its record is durable, shared
+    /// by [`Self::update_table_schema`] and
+    /// [`Self::rename_column_in_schema_and_index_definitions`]: the logical-WAL
+    /// entry, the schema cache and the schema generation. `value` is the
+    /// serialized `schema` that was stored.
+    fn publish_table_schema(&self, table_name: &str, schema: &Schema, value: &[u8]) {
         // GH#36: represent the schema replacement in the logical WAL. Every
         // column-shape ALTER (ADD/DROP/RENAME COLUMN, ALTER COLUMN … DROP NOT
         // NULL) funnels through here on BOTH executor families — including the
@@ -1555,7 +1774,7 @@ impl<'a> Catalog<'a> {
         // `EmbeddedDatabase::execute_alter_table_op` — so this one emitter
         // covers them all. The blob is the complete new Schema, so replay is
         // idempotent; `is_replaying` keeps the replay arm from re-emitting.
-        if let Err(e) = self.storage.log_alter_table_schema(table_name, &value) {
+        if let Err(e) = self.storage.log_alter_table_schema(table_name, value) {
             tracing::warn!("Failed to log schema change for '{}' to WAL: {}", table_name, e);
         }
 
@@ -1572,18 +1791,45 @@ impl<'a> Catalog<'a> {
         // until the next tracked commit. Caught by
         // w2_5_watermark_read_tests::alter_add_column_hidden_from_open_snapshot_reader.
         self.storage.bump_schema_generation();
-
-        Ok(())
     }
 
     /// Drop a table
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
+        self.drop_table_taking_partition_children(table_name).map(drop)
+    }
+
+    /// [`Self::drop_table`], handing back the Stage-0 `PARTITION OF` children
+    /// that were registered under `table_name`. The drop deletes that registry
+    /// record, so the caller's cascade (`ddl::drop_table_and_partition_children`)
+    /// has nowhere else to find them.
+    ///
+    /// # One write group (spec P1.1b)
+    ///
+    /// Every durable key the table owns goes in ONE `WriteBatch`: the schema,
+    /// the rows, the columnar sidecars and every per-table catalog record
+    /// ([`Self::stage_table_records_drop`] lists them, with the writer each
+    /// undoes). They used to take five writes or more, and some were never
+    /// deleted at all: `table_constraints:{t}`, `statistics:table:{t}`, the
+    /// dictionaries, `meta:col_storage:` and the table's grants outlived every
+    /// DROP, and `meta:identity:` and the partition registry were cleaned by
+    /// the SQL arm alone, not by WAL replay or the MV and temp-table drops that
+    /// reach this funnel directly. An orphan is not just a leak. Strict
+    /// physical-image hydration refuses a constraint record whose table is
+    /// gone, so no standby could be built from a primary that had ever dropped
+    /// a table with a PRIMARY KEY; and a later table of the same name inherited
+    /// it (`execute_create_table_plan` merged the dead constraint set into the
+    /// new one — see the orphan check in [`Self::create_table`]). One group is
+    /// also exactly what a physical standby applies: at no batch boundary does
+    /// it, or a checkpoint cut there, hold a catalog naming a dropped table.
+    ///
+    /// Order: everything is READ first (index definitions, trigger and
+    /// partition records, the row keys), so a failed read refuses the drop
+    /// before anything changed; then the logical-WAL `DropTable`, the
+    /// in-memory teardown and the one write; then the caches.
+    pub fn drop_table_taking_partition_children(&self, table_name: &str) -> Result<Vec<String>> {
         if !self.table_exists(table_name)? {
             return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
         }
-
-        // Log DropTable to WAL first (for replication to standbys)
-        self.storage.log_drop_table(table_name)?;
 
         // #90: a dropped table's user-created INDEXES die with it — the live ART
         // or HNSW structure, the durable vector artefacts (`vecsnap:` blob,
@@ -1607,11 +1853,55 @@ impl<'a> Catalog<'a> {
         // ignore exactly the warnings this item is about.
         //
         // Best effort with a named warn!, identical posture and for the identical
-        // reason as the ART teardown below and the trigger teardown further down:
-        // the table is already going away, and turning a successful DROP TABLE
-        // into an error because a cleanup scan failed is worse than the leak.
-        if let Err(e) = self.drop_table_index_definitions(table_name) {
-            tracing::warn!("DROP TABLE '{}': failed to scan index definitions: {}", table_name, e);
+        // reason as the ART teardown below and the trigger teardown in
+        // `stage_table_records_drop`: the table is going away, and turning a
+        // successful DROP TABLE into an error because a cleanup scan failed is
+        // worse than the leak.
+        let definitions = match self.table_index_definitions(table_name) {
+            Ok(definitions) => definitions,
+            Err(e) => {
+                tracing::warn!("DROP TABLE '{}': failed to scan index definitions: {}", table_name, e);
+                Vec::new()
+            }
+        };
+        let mut batch = rocksdb::WriteBatch::default();
+        for (index_name, _) in &definitions {
+            batch.delete(Self::index_metadata_key(index_name));
+        }
+        let children = self.stage_table_records_drop(table_name, &mut batch)?;
+
+        // Delete all data rows: a seek to the table's key range, O(rows in the
+        // table), every key into the same batch.
+        //
+        // An implementation that deleted rows one at a time via
+        // `self.storage.delete()` appended a WAL `Delete` entry per row — and
+        // the WAL append issues a synchronous `fdatasync`. So DROP TABLE cost
+        // one fsync PER ROW: a 200-row table took ~8s and a Pagila-sized table
+        // appeared to hang and monopolized the WAL writer, stalling other
+        // sessions. The drop is WAL-logged as a single DDL op below
+        // (`log_drop_table`, replayed on recovery/replication), so per-row WAL
+        // entries are redundant; one batched write is O(1) fsyncs. A failed
+        // scan refuses the drop here, before anything has changed.
+        self.stage_prefix_delete(&format!("data:{}:", table_name), &mut batch)?;
+
+        // Log DropTable to WAL first (for replication to standbys)
+        self.storage.log_drop_table(table_name)?;
+
+        // Tear down the physical structures of the indexes whose definitions
+        // the batch deletes. Per-index best effort: a structure that refuses
+        // to come down must not stop the REMAINING indexes of the same table
+        // from being torn down, nor the definition delete — leaving the
+        // definition is what makes the index come back at the next open.
+        for (index_name, definition) in &definitions {
+            if let Err(e) = teardown_index_structures(self.storage, index_name, definition.index_type.as_deref()) {
+                tracing::warn!(
+                    "DROP TABLE '{}': index '{}' could not be torn down ({}); \
+                     removing its catalog definition anyway",
+                    table_name,
+                    index_name,
+                    e
+                );
+            }
         }
 
         // Drop all ART indexes for this table
@@ -1627,24 +1917,93 @@ impl<'a> Catalog<'a> {
         // Invalidate schema cache
         self.storage.invalidate_schema_cache(table_name);
 
-        // Batch-delete all metadata keys in a single RocksDB write
         {
-            let mut batch = rocksdb::WriteBatch::default();
-            batch.delete(Self::table_metadata_key(table_name));
-            batch.delete(Self::table_counter_key(table_name));
-            batch.delete(Self::compression_config_key(table_name));
-            batch.delete(Self::compression_stats_key(table_name));
+            // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) so a
+            // re-created table with the same name never reads stale batches, zone
+            // stats or live-row presence. No-op prefix seeks for row-only tables.
+            // Staged under the zone-stats write lock and written before it is
+            // released, as `ColumnarStore::purge_table_sidecars` does, so no
+            // columnar writer's read-modify-write interleaves with the scan.
+            // Best effort, like the other sidecar scans: the rows and the
+            // catalog still go.
+            let _stats = super::columnar::stats_write_lock();
+            if let Err(e) = super::ColumnarStore::stage_table_sidecar_purge(&self.storage.db, table_name, &mut batch) {
+                tracing::warn!(
+                    "DROP TABLE '{}': failed to scan the columnar sidecars: {}",
+                    table_name,
+                    e
+                );
+            }
             self.storage
                 .db_write(batch, None)
-                .map_err(|e| crate::Error::storage(format!("Batch delete failed: {}", e)))?;
+                .map_err(|e| Error::storage(format!("DROP TABLE '{}': batch delete failed: {}", table_name, e)))?;
         }
 
-        // W1.3: bump immediately after the metadata delete commits — that is
-        // the point where `table_exists` flips false. The remaining steps
-        // (data-row deletes, sidecar purge) don't change existence and each can
-        // early-return with `?`; bumping here means even those error paths
-        // leave no stale `Table` entry for the dropped table.
+        // W1.3: bump immediately after the delete commits — that is the point
+        // where `table_exists` flips false.
         self.storage.bump_schema_generation();
+
+        // The constraint set, and with it the reverse-FK cache, which listed
+        // this table's foreign keys under every table they reference; a parent
+        // DELETE must stop probing a child that no longer exists.
+        self.storage.invalidate_table_constraints_cache(table_name);
+        self.storage.forget_table_dictionaries(table_name);
+
+        // GH#56: the row cache is keyed `(table, row_id)` and `counter:{table}`
+        // was just deleted, so a later table of this name restarts at row id 1
+        // and would be served the DROPPED table's cached rows (stale reads and
+        // lost updates on primary-key lookups). Evict them with the table.
+        self.storage.row_cache().invalidate_table(table_name);
+
+        Ok(children)
+    }
+
+    /// Stage into `batch` the delete of every per-table record and sidecar of
+    /// `table_name` other than its rows and its `meta:index:` definitions —
+    /// the families [`Self::drop_table_taking_partition_children`] used to
+    /// leave behind or delete in writes of their own — and return the
+    /// partition children the registry named (spec P1.1b). Each, with what
+    /// writes it:
+    ///
+    /// * `meta:table:{t}` — the schema (`create_table`, `update_table_schema`);
+    /// * `counter:{t}` — the row-id counter (`create_table`, `flush_row_counter`);
+    /// * `compression:config:{t}`, `compression:stats:{t}` —
+    ///   `set_compression_config` / `set_compression_stats`;
+    /// * `table_constraints:{t}` — `save_table_constraints` (every CHECK,
+    ///   FOREIGN KEY, UNIQUE and PRIMARY KEY record); never deleted before;
+    /// * `statistics:table:{t}` — `set_table_statistics` (`ANALYZE`); never
+    ///   deleted before;
+    /// * `meta:identity:{t}` — `register_identity_columns`; was deleted only by
+    ///   the SQL DROP arm (`ddl::drop_table_and_partition_children`);
+    /// * `idxsnap:{t}`, `idxsnapv:{t}` — the R4.2 ART snapshot and its marker
+    ///   (`index_snapshot::art_snapshot_key` / `art_snapshot_marker_key`);
+    /// * `trigger:{t}:*`, `trigger_rowmut:{t}:*` — `save_trigger` /
+    ///   `save_trigger_row_mutation` (was `delete_table_triggers`, its own writes);
+    /// * `dict:{t}:*` — `DictionaryManager::save_dict`; never deleted before;
+    /// * `meta:col_storage:{t}:*` — the `AlterColumnStorage` replay arm of
+    ///   `StorageEngine::apply_wal_operation`; never deleted before;
+    /// * `meta:acl:table:{t}:*` — `grant_privileges` (PostgreSQL drops a
+    ///   relation's privileges with it); never deleted before;
+    /// * `meta:partparent:{t}`, `meta:partchild:{t}`, and the parent's
+    ///   `meta:partchild:` list rewritten without `t` —
+    ///   `register_partition_child` (was `take_partition_children_on_drop`,
+    ///   called by the SQL DROP arm alone).
+    ///
+    /// The prefix scans are best effort with a named warning, the posture the
+    /// trigger cleanup always had: a failed cleanup scan must not turn a DROP
+    /// into an error. A read of the partition registry that fails refuses the
+    /// drop (nothing has changed yet); a record that does not decode is
+    /// warned about, its own key still deleted, and nothing cascaded from it.
+    fn stage_table_records_drop(&self, table_name: &str, batch: &mut rocksdb::WriteBatch) -> Result<Vec<String>> {
+        batch.delete(Self::table_metadata_key(table_name));
+        batch.delete(Self::table_counter_key(table_name));
+        batch.delete(Self::compression_config_key(table_name));
+        batch.delete(Self::compression_stats_key(table_name));
+        batch.delete(Self::table_constraints_key(table_name));
+        batch.delete(Self::table_statistics_key(table_name));
+        batch.delete(Self::identity_key(table_name));
+        batch.delete(super::index_snapshot::art_snapshot_key(table_name));
+        batch.delete(super::index_snapshot::art_snapshot_marker_key(table_name));
 
         // A dropped table's TRIGGER records die with it — both the
         // `trigger:{table}:*` definitions and the `trigger_rowmut:{table}:*`
@@ -1666,61 +2025,113 @@ impl<'a> Catalog<'a> {
         //     recurses through this funnel for CHILD tables, whose names never
         //     appear in the drop plan the upper layer inspects.
         //
-        // Best effort by design, exactly like the ART-index teardown above: the
-        // table is already gone by this point, and turning a successful
-        // DROP TABLE into an error because a cleanup scan failed would be worse
-        // than the leak. Failures are warned, loudly and by name.
-        if let Err(e) = self.delete_table_triggers(table_name) {
-            tracing::warn!("DROP TABLE '{}': failed to delete trigger records: {}", table_name, e);
+        // The same holds for every other family below. `trigger:` and
+        // `trigger_rowmut:` do not collide: they diverge at byte 7.
+        for prefix in [
+            format!("trigger:{}:", table_name),
+            format!("trigger_rowmut:{}:", table_name),
+            format!("dict:{}:", table_name),
+            format!("meta:col_storage:{}:", table_name),
+            format!("meta:acl:table:{}:", table_name),
+        ] {
+            if let Err(e) = self.stage_prefix_delete(&prefix, batch) {
+                tracing::warn!(
+                    "DROP TABLE '{}': failed to scan the '{}' records: {}",
+                    table_name,
+                    prefix,
+                    e
+                );
+            }
         }
 
-        // Delete all data rows using prefix seek (jumps directly to table's key range)
-        // Key format: data:{table_name}:{row_id}
-        let data_prefix = format!("data:{}:", table_name);
-        let prefix_bytes = data_prefix.as_bytes();
+        // Partition registry. (1) `table_name` is itself a child: detach it
+        // from its parent's list, so a later DROP of the parent never touches
+        // a re-created name. (2) It is a parent: its list goes, and the
+        // children are returned for the cascade.
+        if let Some(bytes) = self.storage.get(&Self::partition_parent_key(table_name))? {
+            match bincode::deserialize::<String>(&bytes) {
+                Ok(parent) => {
+                    let siblings = match self.storage.get(&Self::partition_children_key(&parent))? {
+                        Some(list) => bincode::deserialize::<Vec<String>>(&list).map_err(|e| e.to_string()),
+                        None => Ok(Vec::new()),
+                    };
+                    match siblings {
+                        Ok(mut siblings) => {
+                            siblings.retain(|c| c != table_name);
+                            if siblings.is_empty() {
+                                batch.delete(Self::partition_children_key(&parent));
+                            } else {
+                                let value = bincode::serialize(&siblings)
+                                    .map_err(|e| Error::query_execution(format!("partition-child serialize: {e}")))?;
+                                // `storage.put`'s seal, as `register_partition_child` stored it.
+                                let key_manager = self.storage.key_manager_arc();
+                                batch.put(
+                                    Self::partition_children_key(&parent),
+                                    super::tde::seal(key_manager.as_deref(), &value)?.as_ref(),
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            "DROP TABLE '{}': the child list of its partition parent '{}' does not decode ({}); \
+                             it is left as it is",
+                            table_name,
+                            parent,
+                            e
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    "DROP TABLE '{}': its partition-parent record does not decode ({}); the parent's child \
+                     list is left as it is",
+                    table_name,
+                    e
+                ),
+            }
+            batch.delete(Self::partition_parent_key(table_name));
+        }
+        let children = match self.storage.get(&Self::partition_children_key(table_name))? {
+            Some(bytes) => {
+                batch.delete(Self::partition_children_key(table_name));
+                match bincode::deserialize::<Vec<String>>(&bytes) {
+                    Ok(children) => children,
+                    Err(e) => {
+                        tracing::warn!(
+                            "DROP TABLE '{}': its partition-child list does not decode ({}); no child is \
+                             cascade-dropped",
+                            table_name,
+                            e
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+        Ok(children)
+    }
 
-        // Batch-delete all data rows in a SINGLE RocksDB write (prefix seek,
-        // O(rows_in_table) keys, not O(all_keys)).
-        //
-        // The previous implementation deleted rows one at a time via
-        // `self.storage.delete()`, which appends a WAL `Delete` entry per row —
-        // and the WAL append issues a synchronous `fdatasync`. So DROP TABLE
-        // cost one fsync PER ROW: a 200-row table took ~8s and a Pagila-sized
-        // table appeared to hang and monopolized the WAL writer, stalling other
-        // sessions. The drop is already WAL-logged as a single DDL op above
-        // (`log_drop_table`, replayed on recovery/replication), so the per-row
-        // WAL entries were redundant. One batched write is correct and turns
-        // O(rows) fsyncs into O(1) — matching the metadata batch just above.
-        let mut data_batch = rocksdb::WriteBatch::default();
+    /// Stage into `batch` a delete of every key under `prefix`; returns how
+    /// many. A total-order iterator seeked to the prefix (the scan
+    /// [`Self::delete_keys_with_prefix`] uses), so the walk is exact whatever
+    /// the prefix's length and whatever range tombstones lie on the way.
+    fn stage_prefix_delete(&self, prefix: &str, batch: &mut rocksdb::WriteBatch) -> Result<usize> {
+        let prefix_bytes = prefix.as_bytes();
         let mut read_opts = rocksdb::ReadOptions::default();
-        read_opts.set_total_order_seek(false); // Enable prefix-based seek
+        read_opts.set_total_order_seek(true);
         let iter = self.storage.db.iterator_opt(
             rocksdb::IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
             read_opts,
         );
+        let mut count = 0;
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if !key.starts_with(prefix_bytes) {
-                break; // Past the prefix range
+                break;
             }
-            data_batch.delete(key);
+            batch.delete(key);
+            count += 1;
         }
-        self.storage
-            .db_write(data_batch, None)
-            .map_err(|e| Error::storage(format!("Batch delete of table data failed: {}", e)))?;
-
-        // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) so a
-        // re-created table with the same name never reads stale batches, zone
-        // stats or live-row presence. No-op prefix seeks for row-only tables.
-        super::ColumnarStore::purge_table_sidecars(&self.storage.db, self.storage.write_gate(), table_name)?;
-
-        // GH#56: the row cache is keyed `(table, row_id)` and `counter:{table}`
-        // was just deleted, so a later table of this name restarts at row id 1
-        // and would be served the DROPPED table's cached rows (stale reads and
-        // lost updates on primary-key lookups). Evict them with the table.
-        self.storage.row_cache().invalidate_table(table_name);
-
-        Ok(())
+        Ok(count)
     }
 
     /// Get next row ID for a table
@@ -1882,13 +2293,22 @@ impl<'a> Catalog<'a> {
     /// Persist a user-created index definition in the catalog.
     pub fn save_index_definition(&self, index_name: &str, definition: &PersistedIndexDefinition) -> Result<()> {
         let key = Self::index_metadata_key(index_name);
+        let value = Self::encode_index_definition(definition)?;
+        self.storage.put(&key, &value)
+    }
+
+    /// The current tagged on-disk form of an index definition (magic, version
+    /// byte, bincode body), factored out of [`Self::save_index_definition`] for
+    /// the batch writers that must store the identical bytes
+    /// ([`Self::rename_column_in_schema_and_index_definitions`]).
+    fn encode_index_definition(definition: &PersistedIndexDefinition) -> Result<Vec<u8>> {
         let body = bincode::serialize(definition)
             .map_err(|e| Error::storage(format!("Failed to serialize index definition: {}", e)))?;
         let mut value = Vec::with_capacity(INDEX_DEF_MAGIC.len() + 1 + body.len());
         value.extend_from_slice(INDEX_DEF_MAGIC);
         value.push(INDEX_DEF_FORMAT_VERSION);
         value.extend_from_slice(&body);
-        self.storage.put(&key, &value)
+        Ok(value)
     }
 
     /// Decode one persisted index record, tolerating every on-disk format we
@@ -2174,110 +2594,7 @@ impl<'a> Catalog<'a> {
         // constraint-owned, all minted onto a FREE key), FK, then the snapshot
         // load or the row replay.
         for (table_name, schema) in tables {
-            // (Re)register the PK index structure if the table has one.
-            let pk_columns: Vec<String> = schema
-                .columns
-                .iter()
-                .filter(|c| c.primary_key)
-                .map(|c| c.name.clone())
-                .collect();
-            if !pk_columns.is_empty() {
-                if let Err(e) = art_manager.create_pk_index(&table_name, &pk_columns) {
-                    // IndexAlreadyExists is expected if create_table ran in
-                    // the same process; log at debug, continue.
-                    tracing::debug!("Index rebuild: PK index for {} already registered: {}", table_name, e);
-                }
-            }
-
-            // (Re)register UNIQUE indexes (one per UNIQUE non-PK column),
-            // through the SAME call `create_table` uses, so the key comes back
-            // as the same `{table}_{col}_key` — or, when that name is taken by
-            // a durable index registered in pass 1 (or by another table's
-            // identically-derived flag), as the same free `{key}_{n}` the DDL
-            // minted. Passing the bare column name here once put every
-            // table's `email` index under one global key and lost all but the
-            // first (see `create_table`); failing on a taken name, as
-            // `create_unique_index` does, lost the flag instead.
-            for col in &schema.columns {
-                if col.unique && !col.primary_key {
-                    let cols = vec![col.name.clone()];
-                    // Structural idempotency, the same test as `create_table`:
-                    // a WAL-recovered `CreateTable` this process replayed
-                    // before the rebuild already installed this flag's tree,
-                    // and minting again would add a duplicate `{key}_2`. A user
-                    // index over the column does NOT satisfy it (the flag would
-                    // ride on a droppable index, and the registered set would
-                    // differ from the one `create_table` produced). A read
-                    // failure registers rather than skips — a second tree only
-                    // over-enforces.
-                    if self
-                        .constraint_owned_unique_index_on(&table_name, &cols)
-                        .unwrap_or(false)
-                    {
-                        tracing::debug!(
-                            "Index rebuild: UNIQUE index for {}.{} already registered",
-                            table_name,
-                            col.name
-                        );
-                        continue;
-                    }
-                    if let Err(e) = art_manager.create_constraint_unique_index(&table_name, &cols, None) {
-                        // Not a name clash (those are absorbed by the mint):
-                        // this column's UNIQUE constraint is now enforced by
-                        // nothing. Loud, because every INSERT will silently
-                        // accept duplicates until it is fixed.
-                        tracing::warn!(
-                            "Index rebuild: UNIQUE index for {}.{} FAILED to register ({}); \
-                             the constraint is NOT enforced in this process",
-                            table_name,
-                            col.name,
-                            e
-                        );
-                    }
-                }
-            }
-
-            // (Re)register FK indexes from persisted constraints — and, from the
-            // same load, the table-level UNIQUE indexes. Both are constraint-derived
-            // rather than schema-derived, so neither is covered by the
-            // `schema.columns` loops above. Registering here (before the snapshot
-            // load / row replay below) is what makes a table-level UNIQUE survive a
-            // restart AND get backfilled with the table's existing rows; register
-            // it after the replay and the tree would be empty, so duplicates
-            // against pre-restart rows would be accepted.
-            if let Ok(constraints) = self.load_table_constraints(&table_name) {
-                // OPEN, not DDL — deliberately log-and-continue, which is
-                // TODAY's behaviour and must stay that way. Fail closed on the
-                // DDL path only: there is no statement to return an error to
-                // here, and a constraint can legitimately be unregisterable on
-                // an existing store (RENAME COLUMN / DROP COLUMN never update
-                // `TableConstraints`, so a renamed column already leaves a
-                // record naming a column that no longer exists — src/lib.rs
-                // `AlterTableRenameColumn` / `AlterTableDropColumn` mutate only
-                // `schema.columns[i].name`). Turning that into a refusal to
-                // open, or into a write block, would permanently brick such a
-                // table on restart. Recording it and refusing writes is
-                // separately tracked; do NOT "fix" this into a hard failure.
-                if let Err(e) = self.register_unique_constraint_indexes(&table_name, &constraints) {
-                    tracing::error!(
-                        "Index rebuild: a UNIQUE constraint of '{}' could NOT be backed by an index ({}); \
-                         it is not enforced in this process",
-                        table_name,
-                        e
-                    );
-                }
-                for fk in &constraints.foreign_keys {
-                    if let Err(e) = art_manager.create_fk_index(
-                        &fk.table_name,
-                        &fk.columns,
-                        &fk.references_table,
-                        &fk.references_columns,
-                        Some(&fk.name),
-                    ) {
-                        tracing::debug!("Index rebuild: FK index {} already registered: {}", fk.name, e);
-                    }
-                }
-            }
+            self.register_table_indexes(&table_name, &schema);
 
             // User `CREATE [UNIQUE] INDEX` definitions were registered for this
             // table in pass 1, ahead of every mint above.
@@ -2307,55 +2624,14 @@ impl<'a> Catalog<'a> {
 
             // Replay every existing row through on_insert so the indexes
             // know about pre-existing data.
-            let tuples = match self.storage.scan_table_with_schema(&table_name, &schema) {
-                Ok(t) => t,
+            let backfill = match self.backfill_table_indexes(&table_name, &schema) {
+                Ok(backfill) => backfill,
                 Err(e) => {
                     tracing::warn!("Index rebuild: scan failed for table {}: {}", table_name, e);
                     continue;
                 }
             };
-
-            let mut max_row_id: Option<u64> = None;
-            let mut duplicate_rows = 0u64;
-            for tuple in &tuples {
-                let row_id = match tuple.row_id {
-                    Some(id) => id,
-                    None => continue,
-                };
-                max_row_id = Some(max_row_id.map_or(row_id, |m| m.max(row_id)));
-                let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
-                for (idx, col) in schema.columns.iter().enumerate() {
-                    if let Some(v) = tuple.values.get(idx) {
-                        col_values.insert(col.name.clone(), v.clone());
-                    }
-                }
-                if let Err(e) = art_manager.on_insert(&table_name, row_id, &col_values) {
-                    if matches!(e, super::art_index::ArtIndexError::DuplicateKey(_)) {
-                        duplicate_rows += 1;
-                    }
-                    tracing::debug!(
-                        "Index rebuild: on_insert skipped for {} row {}: {}",
-                        table_name,
-                        row_id,
-                        e
-                    );
-                }
-                total_rows += 1;
-            }
-            // Stored rows that repeat a PRIMARY KEY / UNIQUE value. Constraint
-            // checks keep these out today, but releases before 4.41.1 could
-            // admit them for TEXT keys that are a prefix of other keys. The
-            // rows stay readable through scans; only the first is indexed.
-            if duplicate_rows > 0 {
-                tracing::warn!(
-                    "Index rebuild: {} row(s) of '{}' repeat a PRIMARY KEY or UNIQUE value of an earlier row and \
-                     are not indexed. Earlier releases could accept such duplicates (see CHANGELOG 4.41.1); list \
-                     them with SELECT <key>, count(*) FROM {} GROUP BY <key> HAVING count(*) > 1",
-                    duplicate_rows,
-                    table_name,
-                    table_name
-                );
-            }
+            total_rows += backfill.rows;
 
             // Reconcile the row-id counter against the highest row id actually
             // scanned. This scan-fallback branch only runs when no valid R4.2
@@ -2368,7 +2644,7 @@ impl<'a> Catalog<'a> {
             // silently overwrite an existing `data:` row. An empty table leaves
             // `max_row_id` as None and is correctly a no-op (its durable counter,
             // seeded at 0 by CREATE TABLE, is already correct).
-            if let Some(max_id) = max_row_id {
+            if let Some(max_id) = backfill.max_row_id {
                 if let Err(e) = self.storage.reseed_row_counter_from_max_row_id(&table_name, max_id) {
                     tracing::warn!(
                         "Index rebuild: row-counter reseed for '{}' failed ({}) — a crash \
@@ -2403,6 +2679,209 @@ impl<'a> Catalog<'a> {
         );
         self.storage.set_last_index_open_report(report);
         Ok(())
+    }
+
+    /// The per-table registration half of pass 2 of [`Self::rebuild_all_indexes`]:
+    /// the PK, the column-flag UNIQUEs, the constraint records' UNIQUE indexes
+    /// (all constraint-owned, all minted onto a FREE key) and the FKs of
+    /// `table_name`, registered EMPTY. The caller fills them
+    /// ([`Self::backfill_table_indexes`] or a snapshot load).
+    ///
+    /// Factored out of `rebuild_all_indexes` (its loop body, verbatim) so a
+    /// physical standby's applier registers one table's indexes exactly as an
+    /// open would: a table that appears or is re-derived on a standby must end
+    /// up with the same registered set a reopen of the same bytes builds. It
+    /// keeps the open path's posture — log and continue — because a standby,
+    /// like an open, has no statement to return an error to. Durable
+    /// `meta:index:` definitions are NOT registered here: that is pass 1
+    /// ([`Self::register_index_definition`]), which must run first.
+    pub(crate) fn register_table_indexes(&self, table_name: &str, schema: &Schema) {
+        let art_manager = self.storage.art_indexes();
+        // (Re)register the PK index structure if the table has one.
+        let pk_columns: Vec<String> = schema
+            .columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.clone())
+            .collect();
+        if !pk_columns.is_empty() {
+            if let Err(e) = art_manager.create_pk_index(&table_name, &pk_columns) {
+                // IndexAlreadyExists is expected if create_table ran in
+                // the same process; log at debug, continue.
+                tracing::debug!("Index rebuild: PK index for {} already registered: {}", table_name, e);
+            }
+        }
+
+        // (Re)register UNIQUE indexes (one per UNIQUE non-PK column),
+        // through the SAME call `create_table` uses, so the key comes back
+        // as the same `{table}_{col}_key` — or, when that name is taken by
+        // a durable index registered in pass 1 (or by another table's
+        // identically-derived flag), as the same free `{key}_{n}` the DDL
+        // minted. Passing the bare column name here once put every
+        // table's `email` index under one global key and lost all but the
+        // first (see `create_table`); failing on a taken name, as
+        // `create_unique_index` does, lost the flag instead.
+        for col in &schema.columns {
+            if col.unique && !col.primary_key {
+                let cols = vec![col.name.clone()];
+                // Structural idempotency, the same test as `create_table`:
+                // a WAL-recovered `CreateTable` this process replayed
+                // before the rebuild already installed this flag's tree,
+                // and minting again would add a duplicate `{key}_2`. A user
+                // index over the column does NOT satisfy it (the flag would
+                // ride on a droppable index, and the registered set would
+                // differ from the one `create_table` produced). A read
+                // failure registers rather than skips — a second tree only
+                // over-enforces.
+                if self
+                    .constraint_owned_unique_index_on(&table_name, &cols)
+                    .unwrap_or(false)
+                {
+                    tracing::debug!(
+                        "Index rebuild: UNIQUE index for {}.{} already registered",
+                        table_name,
+                        col.name
+                    );
+                    continue;
+                }
+                if let Err(e) = art_manager.create_constraint_unique_index(&table_name, &cols, None) {
+                    // Not a name clash (those are absorbed by the mint):
+                    // this column's UNIQUE constraint is now enforced by
+                    // nothing. Loud, because every INSERT will silently
+                    // accept duplicates until it is fixed.
+                    tracing::warn!(
+                        "Index rebuild: UNIQUE index for {}.{} FAILED to register ({}); \
+                         the constraint is NOT enforced in this process",
+                        table_name,
+                        col.name,
+                        e
+                    );
+                }
+            }
+        }
+
+        // (Re)register FK indexes from persisted constraints — and, from the
+        // same load, the table-level UNIQUE indexes. Both are constraint-derived
+        // rather than schema-derived, so neither is covered by the
+        // `schema.columns` loops above. Registering here (before the snapshot
+        // load / row replay below) is what makes a table-level UNIQUE survive a
+        // restart AND get backfilled with the table's existing rows; register
+        // it after the replay and the tree would be empty, so duplicates
+        // against pre-restart rows would be accepted.
+        if let Ok(constraints) = self.load_table_constraints(&table_name) {
+            // OPEN, not DDL — deliberately log-and-continue, which is
+            // TODAY's behaviour and must stay that way. Fail closed on the
+            // DDL path only: there is no statement to return an error to
+            // here, and a constraint can legitimately be unregisterable on
+            // an existing store (RENAME COLUMN / DROP COLUMN never update
+            // `TableConstraints`, so a renamed column already leaves a
+            // record naming a column that no longer exists — src/lib.rs
+            // `AlterTableRenameColumn` / `AlterTableDropColumn` mutate only
+            // `schema.columns[i].name`). Turning that into a refusal to
+            // open, or into a write block, would permanently brick such a
+            // table on restart. Recording it and refusing writes is
+            // separately tracked; do NOT "fix" this into a hard failure.
+            if let Err(e) = self.register_unique_constraint_indexes(&table_name, &constraints) {
+                tracing::error!(
+                    "Index rebuild: a UNIQUE constraint of '{}' could NOT be backed by an index ({}); \
+                     it is not enforced in this process",
+                    table_name,
+                    e
+                );
+            }
+            for fk in &constraints.foreign_keys {
+                if let Err(e) = art_manager.create_fk_index(
+                    &fk.table_name,
+                    &fk.columns,
+                    &fk.references_table,
+                    &fk.references_columns,
+                    Some(&fk.name),
+                ) {
+                    tracing::debug!("Index rebuild: FK index {} already registered: {}", fk.name, e);
+                }
+            }
+        }
+    }
+
+    /// The row-replay half of pass 2 of [`Self::rebuild_all_indexes`]: scan
+    /// `table_name` and feed every row through `on_insert`, so the indexes
+    /// [`Self::register_table_indexes`] registered hold every stored row. A
+    /// stored duplicate of a PRIMARY KEY / UNIQUE value is counted and warned
+    /// about, not fatal (only the first such row is indexed). The row counter
+    /// is left to the caller: an ordinary open reseeds it durably, a physical
+    /// standby in memory only.
+    ///
+    /// `Err` only when the scan itself fails, before any row was indexed.
+    pub(crate) fn backfill_table_indexes(&self, table_name: &str, schema: &Schema) -> Result<TableIndexBackfill> {
+        let tuples = self.storage.scan_table_with_schema(table_name, schema)?;
+        Ok(self.index_table_rows(table_name, schema, &tuples))
+    }
+
+    /// The feed half of [`Self::backfill_table_indexes`], for a caller that
+    /// scanned the rows itself: `StorageEngine::merge_branch` scans BEFORE it
+    /// clears the trees it re-derives, so a failed scan can never leave a
+    /// registered index empty.
+    pub(crate) fn index_table_rows(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        tuples: &[crate::Tuple],
+    ) -> TableIndexBackfill {
+        let art_manager = self.storage.art_indexes();
+        let mut backfill = TableIndexBackfill::default();
+        for tuple in tuples {
+            let row_id = match tuple.row_id {
+                Some(id) => id,
+                None => continue,
+            };
+            backfill.max_row_id = Some(backfill.max_row_id.map_or(row_id, |m| m.max(row_id)));
+            let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+            for (idx, col) in schema.columns.iter().enumerate() {
+                if let Some(v) = tuple.values.get(idx) {
+                    col_values.insert(col.name.clone(), v.clone());
+                }
+            }
+            if let Err(e) = art_manager.on_insert(table_name, row_id, &col_values) {
+                if matches!(e, super::art_index::ArtIndexError::DuplicateKey(_)) {
+                    backfill.duplicate_rows += 1;
+                }
+                tracing::debug!(
+                    "Index rebuild: on_insert skipped for {} row {}: {}",
+                    table_name,
+                    row_id,
+                    e
+                );
+            }
+            backfill.rows += 1;
+        }
+        // Stored rows that repeat a PRIMARY KEY / UNIQUE value. Constraint
+        // checks keep these out today, but releases before 4.41.1 could
+        // admit them for TEXT keys that are a prefix of other keys. The
+        // rows stay readable through scans; only the first is indexed.
+        if backfill.duplicate_rows > 0 {
+            tracing::warn!(
+                "Index rebuild: {} row(s) of '{}' repeat a PRIMARY KEY or UNIQUE value of an earlier row and \
+                 are not indexed. Earlier releases could accept such duplicates (see CHANGELOG 4.41.1); list \
+                 them with SELECT <key>, count(*) FROM {} GROUP BY <key> HAVING count(*) > 1",
+                backfill.duplicate_rows,
+                table_name,
+                table_name
+            );
+        }
+        backfill
+    }
+
+    /// Register ONE durable `meta:index:` definition as pass 1 of
+    /// [`Self::rebuild_all_indexes`] does (`register_persisted_art_index`): under
+    /// its recorded name, evicting a constraint mint that squats it. The tree
+    /// is registered empty; the caller backfills it. Vector and DDL-only
+    /// families are not ART indexes and are left alone.
+    ///
+    /// For a physical standby's applier, which registers a replicated
+    /// `CREATE INDEX` without a reopen.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn register_index_definition(&self, index_name: &str, definition: &PersistedIndexDefinition) {
+        self.register_persisted_art_index(index_name, definition);
     }
 
     /// (Re)register one user-created scalar secondary index from its durable
@@ -4208,7 +4687,8 @@ impl<'a> Catalog<'a> {
         Ok(cols.iter().any(|c| c.eq_ignore_ascii_case(column_name)))
     }
 
-    /// Drop the identity record for a table (called from DROP TABLE).
+    /// Drop the identity record for a table. DROP TABLE deletes the same key
+    /// inside its own write group (`stage_table_records_drop`).
     pub fn drop_identity_columns(&self, table_name: &str) -> Result<()> {
         let key = Self::identity_key(table_name);
         self.storage.delete(&key)
@@ -4280,37 +4760,11 @@ impl<'a> Catalog<'a> {
         }
     }
 
-    /// Called from the DROP TABLE path for `table`. Performs the registry
-    /// bookkeeping and returns the children that were registered under `table`
-    /// so the caller can cascade the drop to them. Specifically:
-    ///  1. If `table` is itself a registered partition child, detaches it from
-    ///     its parent's child list and deletes its reverse link (so a re-created
-    ///     name is never cascade-dropped by a later parent DROP).
-    ///  2. Removes `table`'s own child-list record and returns its children.
-    /// Idempotent; returns an empty Vec for a table with no partition links.
-    pub fn take_partition_children_on_drop(&self, table: &str) -> Result<Vec<String>> {
-        // (1) detach from parent, if any.
-        if let Some(bytes) = self.storage.get(&Self::partition_parent_key(table))? {
-            let parent: String = bincode::deserialize(&bytes)
-                .map_err(|e| Error::query_execution(format!("partition-parent deserialize: {e}")))?;
-            let mut siblings = self.partition_children(&parent)?;
-            siblings.retain(|c| c != table);
-            if siblings.is_empty() {
-                self.storage.delete(&Self::partition_children_key(&parent))?;
-            } else {
-                let value = bincode::serialize(&siblings)
-                    .map_err(|e| Error::query_execution(format!("partition-child serialize: {e}")))?;
-                self.storage.put(&Self::partition_children_key(&parent), &value)?;
-            }
-            self.storage.delete(&Self::partition_parent_key(table))?;
-        }
-        // (2) take + clear this table's own child list.
-        let children = self.partition_children(table)?;
-        if !children.is_empty() {
-            self.storage.delete(&Self::partition_children_key(table))?;
-        }
-        Ok(children)
-    }
+    // DROP TABLE's half of the registry bookkeeping — detach a dropped child
+    // from its parent's list, take a dropped parent's list for the cascade —
+    // is staged into the drop's one write group by `stage_table_records_drop`
+    // (spec P1.1b; it was `take_partition_children_on_drop`, separate writes
+    // made by the SQL DROP arm alone).
 
     // -------------------------------------------------------------------
     // v3.60.0 — durable + scalable SEQUENCES.
@@ -5070,7 +5524,10 @@ impl<'a> Catalog<'a> {
         Ok(triggers)
     }
 
-    /// Delete all triggers for a table (called when table is dropped).
+    /// Delete all triggers of a table whose `DropTable` the WAL replay arm finds
+    /// already applied (`StorageEngine::apply_wal_operation`). A live DROP
+    /// TABLE deletes the same keys inside its own write group
+    /// (`stage_table_records_drop`).
     ///
     /// Removes BOTH the `trigger:{table}:*` definitions and the
     /// `trigger_rowmut:{table}:*` rewrite recipes — the two are always written
@@ -5081,9 +5538,10 @@ impl<'a> Catalog<'a> {
         Ok(count)
     }
 
-    /// Tear down every user-created index that belongs to `table_name` — the
-    /// physical structure via [`teardown_index_structures`] AND the durable
-    /// `meta:index:<name>` definition. Returns how many definitions were removed.
+    /// Every user-created index definition that belongs to `table_name`: the
+    /// `meta:index:<name>` records [`Catalog::drop_table`] deletes (in its one
+    /// write group) after tearing down each index's physical structure via
+    /// [`teardown_index_structures`].
     ///
     /// Called from [`Catalog::drop_table`], the one funnel every table removal
     /// goes through — see the comment at that call site for why this cannot live
@@ -5116,45 +5574,15 @@ impl<'a> Catalog<'a> {
     /// destroy a user's vector store the moment a table happened to share its
     /// name. `delete_vector_store` owns those.
     ///
-    /// WAL: emits NO per-index `log_drop_index` record. `DROP TABLE` is already
-    /// logged once (`log_drop_table`) and its replay arm re-enters
+    /// WAL: DROP TABLE emits NO per-index `log_drop_index` record. It is
+    /// already logged once (`log_drop_table`) and its replay arm re-enters
     /// `Catalog::drop_table`, so a standby runs this same teardown. Per-index
     /// records would double-log and could race the replayed
     /// `WalOperation::CreateIndex` — the hazard the trigger teardown documents.
-    fn drop_table_index_definitions(&self, table_name: &str) -> Result<usize> {
-        let mut removed = 0usize;
-        for (index_name, definition) in self.list_index_definitions()? {
-            if definition.table_name != table_name {
-                continue;
-            }
-
-            // Per-index best effort: a structure that refuses to come down must
-            // not stop the REMAINING indexes of the same table from being torn
-            // down, and must not stop the definition delete below — leaving the
-            // definition is what makes the index come back at the next open.
-            if let Err(e) = teardown_index_structures(self.storage, &index_name, definition.index_type.as_deref()) {
-                tracing::warn!(
-                    "DROP TABLE '{}': index '{}' could not be torn down ({}); \
-                     removing its catalog definition anyway",
-                    table_name,
-                    index_name,
-                    e
-                );
-            }
-
-            if let Err(e) = self.drop_index_definition(&index_name) {
-                tracing::warn!(
-                    "DROP TABLE '{}': failed to delete the catalog definition for index '{}' ({}); \
-                     it will be re-registered at the next open",
-                    table_name,
-                    index_name,
-                    e
-                );
-                continue;
-            }
-            removed += 1;
-        }
-        Ok(removed)
+    fn table_index_definitions(&self, table_name: &str) -> Result<Vec<(String, PersistedIndexDefinition)>> {
+        let mut definitions = self.list_index_definitions()?;
+        definitions.retain(|(_, definition)| definition.table_name == table_name);
+        Ok(definitions)
     }
 
     /// Carry a renamed table's TRIGGER records across to the new name — both the
@@ -5347,6 +5775,28 @@ impl<'a> Catalog<'a> {
     pub fn delete_trigger_row_mutation(&self, table_name: &str, trigger_name: &str) -> Result<()> {
         let key = Self::trigger_row_mutation_key(table_name, trigger_name);
         self.storage.delete(&key)
+    }
+
+    /// One trigger's persisted rewrite recipe, or `None` when it has none — the
+    /// per-key twin of [`Catalog::load_all_trigger_row_mutations`], for a
+    /// physical standby that reloads the recipe its applier just changed (spec
+    /// P1.4). An unreadable record is an error here; the caller decides.
+    pub fn load_trigger_row_mutation(
+        &self,
+        table_name: &str,
+        trigger_name: &str,
+    ) -> Result<Option<crate::sql::triggers::TriggerRowMutation>> {
+        let key = Self::trigger_row_mutation_key(table_name, trigger_name);
+        match self.storage.get(&key)? {
+            Some(value) => Self::decode_tagged(
+                TRIGGER_ROWMUT_MAGIC,
+                TRIGGER_ROWMUT_FORMAT_VERSION,
+                &value,
+                "trigger row mutation",
+            )
+            .map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Every persisted rewrite recipe, as `(table_name, trigger_name, recipe)`.
@@ -5839,16 +6289,24 @@ mod tests {
         // Verify metadata is gone
         assert!(!catalog.table_exists("users").expect("Failed to check if table exists"));
 
-        // Verify data rows are actually deleted by checking the raw database
+        // Verify data rows are actually deleted by checking the raw database,
+        // through a total-order seek: an absence probe that a prefix-mode walk
+        // could cut short would pass by seeing nothing (spec P1.1b).
         let data_prefix = b"data:users:";
-        let iter = storage.db.iterator(rocksdb::IteratorMode::Start);
+        let mut read = rocksdb::ReadOptions::default();
+        read.set_total_order_seek(true);
+        let iter = storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(data_prefix, rocksdb::Direction::Forward),
+            read,
+        );
         let mut orphaned_keys = Vec::new();
 
         for item in iter {
             let (key, _) = item.expect("Iterator error");
-            if key.starts_with(data_prefix) {
-                orphaned_keys.push(String::from_utf8_lossy(&key).to_string());
+            if !key.starts_with(data_prefix) {
+                break;
             }
+            orphaned_keys.push(String::from_utf8_lossy(&key).to_string());
         }
 
         assert_eq!(
@@ -6002,9 +6460,8 @@ mod tests {
         catalog
             .create_table("plain", Schema::new(vec![Column::new("id", DataType::Int4)]))
             .expect("create table");
-        assert_eq!(
-            catalog.drop_table_index_definitions("plain").expect("scan"),
-            0,
+        assert!(
+            catalog.table_index_definitions("plain").expect("scan").is_empty(),
             "a table with no indexes reported a teardown"
         );
         catalog.drop_table("plain").expect("drop table");

@@ -11,4 +11,11 @@ ignore = [
     # rust_decimal >= 1.43 drops it but changes decimal arithmetic results, so
     # that upgrade is a minor-release item.
     "RUSTSEC-2026-0235",
+    # webpki-roots 0.26.11 (bundled roots trust distrusted emSign intermediates)
+    # is reachable only through the optional `code-embed` feature: fastembed
+    # 4.9 -> hf-hub 0.4 -> ureq 2, used solely to download embedding models
+    # from the Hugging Face hub. The default build never compiles it. The fix
+    # is an hf-hub/ureq major upgrade (webpki-roots >= 1.0.10), tracked as a
+    # dependency item; the workspace's own TLS uses webpki-roots 1.0.10.
+    "RUSTSEC-2026-0381",
 ]

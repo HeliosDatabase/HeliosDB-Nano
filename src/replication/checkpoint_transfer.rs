@@ -6,7 +6,9 @@
 //! (`StorageEngine::build_db_options`), so the stage and a standby serving it
 //! run with the primary's prefix extractor, filters, cache and compression.
 
-use super::physical::{LocalWriter, PhysicalBatch, PhysicalCursor, PhysicalError, StagedPhysicalReplica, LOCAL_CF};
+use super::physical::{
+    Durability, LocalWriter, PhysicalBatch, PhysicalCursor, PhysicalError, StagedPhysicalReplica, LOCAL_CF,
+};
 use crate::{storage::StorageEngine, Config};
 use rocksdb::{checkpoint::Checkpoint, ColumnFamilyDescriptor, Options, DB};
 use serde::{Deserialize, Serialize};
@@ -587,6 +589,20 @@ struct PhysicalMarker {
     manifest_sha256: [u8; 32],
 }
 
+/// The dataset history an installed physical standby directory follows, read
+/// from its marker: what a restarted standby resumes with (spec P1.3). Only a
+/// first answer — [`ReopenedPhysicalStage::open`] proves it against the
+/// marker's manifest and the durable cursor, and the primary's history is
+/// checked again at every connection.
+pub fn physical_stage_history(path: &Path) -> Result<Uuid> {
+    let marker: PhysicalMarker = serde_json::from_slice(&read_small(&path.join(PHYSICAL_MARKER_FILE), 4096)?)
+        .map_err(|error| invalid(format!("physical stage marker: {error}")))?;
+    if marker.format != 1 || marker.history.is_nil() {
+        return Err(invalid("physical stage marker has an unknown format or a nil history"));
+    }
+    Ok(marker.history)
+}
+
 struct StageOwner {
     directory: OwnedDirectory,
     parent: OwnedDirectory,
@@ -843,8 +859,12 @@ impl PhysicalStage {
         self.replica.writer()
     }
     pub fn apply(&mut self, batch: &PhysicalBatch) -> Result<bool> {
+        self.apply_with(batch, Durability::Synced)
+    }
+    /// [`Self::apply`], fsynced or not by `durability` ([`LocalWriter::apply_source_with`]).
+    pub fn apply_with(&mut self, batch: &PhysicalBatch, durability: Durability) -> Result<bool> {
         self.owner.verify()?;
-        Ok(self.replica.apply(batch)?)
+        Ok(self.replica.apply_with(batch, durability)?)
     }
     /// Install a closed physical stage, never a ready/serving Nano standby.
     /// Ordinary CLI startup must refuse PHYSICAL_MARKER_FILE until its physical
@@ -1024,8 +1044,19 @@ impl ReopenedPhysicalStage {
         self.replica.writer()
     }
     pub fn apply(&mut self, batch: &PhysicalBatch) -> Result<bool> {
+        self.apply_with(batch, Durability::Synced)
+    }
+    /// [`Self::apply`], fsynced or not by `durability` ([`LocalWriter::apply_source_with`]).
+    pub fn apply_with(&mut self, batch: &PhysicalBatch, durability: Durability) -> Result<bool> {
         verify_existing_stage(&self.owner)?;
-        Ok(self.replica.apply(batch)?)
+        Ok(self.replica.apply_with(batch, durability)?)
+    }
+    /// The checks [`Self::apply`] runs before every batch — the directory is
+    /// still this stage's, carries no primary/standby marker and the same
+    /// IDENTITY — for a caller that applies through the stage's writer
+    /// itself (a serving standby's `PhysicalApplier`, spec P1.3).
+    pub fn verify(&self) -> Result<()> {
+        verify_existing_stage(&self.owner)
     }
     pub fn close(self) -> Result<ClosedPhysicalStage> {
         close_owned_stage(self.owner, self.replica)

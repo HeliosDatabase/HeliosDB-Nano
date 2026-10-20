@@ -1105,6 +1105,33 @@ impl Evaluator {
             "pg_backend_pid" | "pg_catalog.pg_backend_pid" => Ok(Value::Int4(
                 crate::session_scoped_state_tls().map_or(0, |state| state.backend_pid()),
             )),
+            // Spec P1.3 (the HeliosDB Proxy contract, plan §D8): the standby
+            // probes, answered from this node's posture
+            // (`crate::standby_posture`) and the physical sequence of
+            // the database this statement runs against (the per-statement
+            // engine scope, the same one `nextval` resolves through). The LSN
+            // functions return PostgreSQL's `HI/LO` text of that sequence;
+            // `::text` is an identity cast on it.
+            "pg_is_in_recovery" => Ok(Value::Boolean(crate::standby_posture::in_recovery(
+                crate::sql::sequences::current_engine().as_deref(),
+            ))),
+            "pg_current_wal_lsn" | "pg_current_wal_insert_lsn" | "pg_current_wal_flush_lsn" => {
+                Ok(Value::String(crate::standby_posture::format_lsn(
+                    crate::standby_posture::current_sequence(crate::sql::sequences::current_engine().as_deref()),
+                )))
+            }
+            "pg_last_wal_replay_lsn" | "pg_last_wal_receive_lsn" => Ok(crate::standby_posture::replay_sequence(
+                crate::sql::sequences::current_engine().as_deref(),
+            )
+            .map_or(Value::Null, |sequence| {
+                Value::String(crate::standby_posture::format_lsn(sequence))
+            })),
+            // `t`, or SQLSTATE 55000 "standby is not ready: …" — meant as a
+            // proxy's health `check_query`.
+            "heliosdb_require_ready" => {
+                crate::standby_posture::require_ready(crate::sql::sequences::current_engine().as_deref())
+                    .map(Value::Boolean)
+            }
             // sprinter 7903b7111cb4: `currval('s')` — the value THIS SESSION's
             // last `nextval('s')` (or `setval('s', …)`) returned.
             //

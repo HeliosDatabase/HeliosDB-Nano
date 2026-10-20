@@ -8,9 +8,10 @@
 //! column family, and every write a receiver makes goes through one
 //! [`LocalWriter`], which keeps the store's sequence number accounted for.
 //! These primitives do not publish changes to a serving `StorageEngine`: its
-//! catalog, indexes and caches require a separate publication protocol.
+//! catalog, indexes and caches require a separate publication protocol, which
+//! `replication::physical_applier` implements on top of [`LocalWriter`].
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -141,12 +142,38 @@ impl PhysicalBatch {
     }
 }
 
+/// One sequence-consuming record of a raw default-column-family write batch,
+/// borrowing its key and value from the batch bytes.
+///
+/// `rocksdb::WriteBatchIterator` reports puts and deletes only — it drops range
+/// deletions and column-family ids — so whoever must know exactly what a batch
+/// did (a physical standby's applier, publishing derived state) reads the raw
+/// records through [`walk_raw_batch`] instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawOp<'a> {
+    /// `kTypeValue`.
+    Put { key: &'a [u8], value: &'a [u8] },
+    /// `kTypeDeletion` / `kTypeSingleDeletion`.
+    Delete { key: &'a [u8] },
+    /// `kTypeRangeDeletion` over the half-open interval `[start, end)`.
+    DeleteRange { start: &'a [u8], end: &'a [u8] },
+}
+
 /// Decode the pinned RocksDB 8.10 default-column-family batch format. Preserve
 /// the original bytes for application; the C API's put/delete callback loses
 /// range deletions. Unknown opcodes fail closed rather than silently advancing,
 /// and that includes every column-family opcode: a receiver's own WAL records
 /// carry its `put_cf` into [`LOCAL_CF`] and must never be shipped as a source.
 fn validate_raw_batch(raw: &[u8]) -> Result<u32> {
+    walk_raw_batch(raw, |_| ())
+}
+
+/// The one record walker behind [`validate_raw_batch`] and the physical
+/// applier's `decode_raw_batch`: every check `validate_raw_batch` makes, with
+/// `visit` called for each sequence-consuming record in batch order. A batch
+/// that fails a check may already have visited a prefix of its records, so a
+/// caller acts on what it collected only after `Ok`.
+pub(crate) fn walk_raw_batch<'a>(raw: &'a [u8], mut visit: impl FnMut(RawOp<'a>)) -> Result<u32> {
     if !(12..=MAX_BATCH_BYTES).contains(&raw.len()) {
         return Err(invalid("batch byte limit/header"));
     }
@@ -155,7 +182,15 @@ fn validate_raw_batch(raw: &[u8]) -> Result<u32> {
             .and_then(|slice| slice.try_into().ok())
             .ok_or_else(|| invalid("batch header too short"))?,
     );
-    if count == 0 || count > MAX_BATCH_OPERATIONS {
+    // A write group with no operations consumes no sequence number and is
+    // never part of a source interval (`poll_source` skips it), so one that
+    // arrives as a batch is refused by name rather than as oversized.
+    if count == 0 {
+        return Err(invalid(
+            "empty batch: a write group with no operations is never a source batch",
+        ));
+    }
+    if count > MAX_BATCH_OPERATIONS {
         return Err(invalid("batch operation limit"));
     }
     let mut input = raw.get(12..).ok_or_else(|| invalid("batch header too short"))?;
@@ -167,13 +202,15 @@ fn validate_raw_batch(raw: &[u8]) -> Result<u32> {
             0 | 7 => {
                 let key = take_slice(&mut input)?;
                 check_source_key(key)?;
+                visit(RawOp::Delete { key });
                 observed += 1;
             }
             // kTypeValue.
             1 => {
                 let key = take_slice(&mut input)?;
                 check_source_key(key)?;
-                let _value = take_slice(&mut input)?;
+                let value = take_slice(&mut input)?;
+                visit(RawOp::Put { key, value });
                 observed += 1;
             }
             // kTypeLogData: does not consume a sequence number.
@@ -189,6 +226,7 @@ fn validate_raw_batch(raw: &[u8]) -> Result<u32> {
                 if start > end {
                     return Err(invalid("invalid range deletion"));
                 }
+                visit(RawOp::DeleteRange { start, end });
                 observed += 1;
             }
             _ => return Err(invalid(format!("unsupported RocksDB write opcode {tag}"))),
@@ -300,6 +338,14 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Res
             });
         };
         let (first, batch) = entry?;
+        // RocksDB logs a write group with no operations (a `DB::write` of an
+        // empty batch) at the next sequence number but consumes none: the
+        // record after it starts at that same number. It changes nothing, so
+        // it is not part of the interval; shipped, it would ask the receiver
+        // to account for a sequence number nobody used.
+        if batch.is_empty() {
+            continue;
+        }
         if first != result.through + 1 {
             return Err(PhysicalError::Gap {
                 expected: result.through + 1,
@@ -459,9 +505,32 @@ fn read_cursor(db: &DB) -> Result<PhysicalCursor> {
 }
 
 fn sync_options() -> WriteOptions {
+    write_options(Durability::Synced)
+}
+
+fn write_options(durability: Durability) -> WriteOptions {
     let mut options = WriteOptions::default();
-    options.set_sync(true);
+    options.set_sync(durability == Durability::Synced);
     options
+}
+
+/// How one [`LocalWriter`] write reaches disk.
+///
+/// Either way the write is ONE RocksDB write group that carries its cursor,
+/// so `latest_sequence_number == cursor.local_sequence` holds after it and
+/// the data and its cursor survive or are lost together. What differs is only
+/// when it is fsynced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Durability {
+    /// The write fsyncs the WAL: it, and every deferred write before it, is
+    /// durable when the call returns.
+    Synced,
+    /// The write reaches the WAL (the OS page cache) without an fsync. A
+    /// process crash loses nothing; a power or kernel failure may lose a
+    /// tail of deferred writes — each together with its cursor, so the store
+    /// reopens at an earlier, consistent cursor and re-fetches from there.
+    /// Made durable by the next synced write or [`LocalWriter::sync`].
+    Deferred,
 }
 
 fn encode_cursor(cursor: &PhysicalCursor) -> Result<Vec<u8>> {
@@ -522,9 +591,19 @@ impl LocalBatch {
 /// sequence numbers (its own operations plus the cursor put into
 /// [`LOCAL_CF`]); a [`LocalBatch`] of `n` operations consumes `n + 1`.
 /// Creating the family consumes none.
+///
+/// Durability: every write is fsynced unless it says otherwise
+/// ([`Self::apply_source_with`] with [`Durability::Deferred`]). The writer
+/// tracks the durable barrier — the cursor as of its last fsync — separately
+/// from the applied cursor ([`Self::cursor`]); [`Self::sync`] brings the two
+/// together, and so does any later synced write.
 pub struct LocalWriter {
     db: Arc<DB>,
     cursor: Mutex<PhysicalCursor>,
+    /// The cursor's `source_sequence` / `local_sequence` as of the last
+    /// fsync that covered it. Only written while `cursor` is locked.
+    durable_source: AtomicU64,
+    durable_local: AtomicU64,
     poisoned: AtomicBool,
 }
 
@@ -568,11 +647,19 @@ impl LocalWriter {
         if db.latest_sequence_number() != cursor.local_sequence {
             return Err(invalid("receiver was modified outside physical replication"));
         }
-        Ok(Self {
+        Ok(Self::adopt(db, cursor))
+    }
+
+    /// A writer over `db` at `cursor`, which is durable: just written with an
+    /// fsync, or read back from the store.
+    fn adopt(db: DB, cursor: PhysicalCursor) -> Self {
+        Self {
             db: Arc::new(db),
+            durable_source: AtomicU64::new(cursor.source_sequence),
+            durable_local: AtomicU64::new(cursor.local_sequence),
             cursor: Mutex::new(cursor),
             poisoned: AtomicBool::new(false),
-        })
+        }
     }
 
     /// Reopen a receiver at its durable cursor without Nano logical recovery
@@ -584,11 +671,10 @@ impl LocalWriter {
         if cursor.history != history {
             return Err(PhysicalError::HistoryMismatch);
         }
-        Ok(Self {
-            db: Arc::new(db),
-            cursor: Mutex::new(cursor),
-            poisoned: AtomicBool::new(false),
-        })
+        // What the store recovered is its durable state: a writable open
+        // flushes the recovered memtables to fsynced tables (RocksDB's
+        // default, which the engine does not override).
+        Ok(Self::adopt(db, cursor))
     }
 
     /// The receiver's handle. Reads are free; a write through it moves the
@@ -597,9 +683,49 @@ impl LocalWriter {
         &self.db
     }
 
-    /// The durable cursor as of the last successful write.
+    /// The cursor as of the last successful write: the applied position. It
+    /// is durable once [`Self::durable_source_sequence`] reaches its
+    /// `source_sequence` (always, unless a write was [`Durability::Deferred`]).
     pub fn cursor(&self) -> PhysicalCursor {
         self.cursor.lock().clone()
+    }
+
+    /// The source sequence of the durable barrier: the cursor as of the last
+    /// fsync that covered it. Never above `cursor().source_sequence()`. Lock
+    /// free, so it can be read while a write (and its fsync) is in flight.
+    pub fn durable_source_sequence(&self) -> u64 {
+        self.durable_source.load(Ordering::Acquire)
+    }
+
+    /// Whether every applied write is durable.
+    fn is_synced(&self, cursor: &PhysicalCursor) -> bool {
+        self.durable_local.load(Ordering::Acquire) == cursor.local_sequence
+    }
+
+    /// `cursor` (the one adopted under the lock) is now durable.
+    fn mark_durable(&self, cursor: &PhysicalCursor) {
+        self.durable_local.store(cursor.local_sequence, Ordering::Release);
+        self.durable_source.store(cursor.source_sequence, Ordering::Release);
+    }
+
+    /// Make every deferred write durable: one WAL fsync, unless nothing is
+    /// pending. Returns the durable barrier's source sequence, which is then
+    /// the cursor's. A failed fsync leaves what reached the disk uncertain and
+    /// poisons the writer, like a failed write.
+    pub fn sync(&self) -> Result<u64> {
+        let cursor = self.cursor.lock();
+        if self.is_poisoned() {
+            return Err(PhysicalError::Poisoned);
+        }
+        if !self.is_synced(&cursor) {
+            self.check_accounted(&cursor)?;
+            if let Err(error) = self.db.flush_wal(true) {
+                self.poison();
+                return Err(error.into());
+            }
+            self.mark_durable(&cursor);
+        }
+        Ok(cursor.source_sequence)
     }
 
     pub fn is_poisoned(&self) -> bool {
@@ -623,11 +749,17 @@ impl LocalWriter {
     }
 
     /// Apply `batch` (which already carries `next`'s cursor put) in one
-    /// fsynced write, then adopt `next`. A failed write leaves the outcome
-    /// uncertain and poisons; so does a sequence that moved by anything but
-    /// this write.
-    fn commit(&self, cursor: &mut PhysicalCursor, next: PhysicalCursor, batch: WriteBatch) -> Result<()> {
-        if let Err(error) = self.db.write_opt(batch, &sync_options()) {
+    /// write, fsynced unless `durability` defers it, then adopt `next`. A
+    /// failed write leaves the outcome uncertain and poisons; so does a
+    /// sequence that moved by anything but this write.
+    fn commit(
+        &self,
+        cursor: &mut PhysicalCursor,
+        next: PhysicalCursor,
+        batch: WriteBatch,
+        durability: Durability,
+    ) -> Result<()> {
+        if let Err(error) = self.db.write_opt(batch, &write_options(durability)) {
             self.poison();
             return Err(error.into());
         }
@@ -635,6 +767,10 @@ impl LocalWriter {
         if self.db.latest_sequence_number() != cursor.local_sequence {
             self.poison();
             return Err(invalid("receiver was modified outside physical replication"));
+        }
+        if durability == Durability::Synced {
+            // The fsync covered every earlier deferred write too.
+            self.mark_durable(cursor);
         }
         Ok(())
     }
@@ -644,6 +780,14 @@ impl LocalWriter {
     /// The source bytes are applied verbatim to the default column family and
     /// the cursor goes to [`LOCAL_CF`], in the same fsynced write.
     pub fn apply_source(&self, batch: &PhysicalBatch) -> Result<bool> {
+        self.apply_source_with(batch, Durability::Synced)
+    }
+
+    /// [`Self::apply_source`], fsynced or not by `durability`. The cursor is
+    /// in the batch's own write either way (see [`Durability`]); a receiver
+    /// applies the groups of one poll [`Durability::Deferred`] and then calls
+    /// [`Self::sync`] once, so a poll costs one fsync instead of one per group.
+    pub fn apply_source_with(&self, batch: &PhysicalBatch, durability: Durability) -> Result<bool> {
         let mut cursor = self.cursor.lock();
         self.check_accounted(&cursor)?;
         if batch.history != cursor.history {
@@ -672,7 +816,7 @@ impl LocalWriter {
         let bytes = encode_cursor(&next)?;
         let mut imported = WriteBatch::from_data(&batch.raw);
         imported.put_cf(local_family(&self.db)?, CURSOR_KEY, bytes);
-        self.commit(&mut cursor, next, imported)?;
+        self.commit(&mut cursor, next, imported, durability)?;
         Ok(true)
     }
 
@@ -709,16 +853,16 @@ impl LocalWriter {
             }
         }
         write.put_cf(local, CURSOR_KEY, bytes);
-        self.commit(&mut cursor, next, write)
+        self.commit(&mut cursor, next, write, Durability::Synced)
     }
 
     /// Prove the durable cursor is the one in memory, then close the handle.
     /// Refuses while anything else still holds the handle: a caller that
     /// renames or reopens the directory next relies on it being closed.
+    /// Deferred writes are fsynced first: a closed (or installed) store is
+    /// durable at its cursor.
     fn close(self) -> Result<PhysicalCursor> {
-        if self.is_poisoned() {
-            return Err(PhysicalError::Poisoned);
-        }
+        self.sync()?;
         let cursor = self.cursor.into_inner();
         let durable = read_cursor(&self.db)?;
         if durable != cursor {
@@ -766,6 +910,11 @@ impl StagedPhysicalReplica {
     /// [`LocalWriter::apply_source`].
     pub fn apply(&self, batch: &PhysicalBatch) -> Result<bool> {
         self.writer.apply_source(batch)
+    }
+
+    /// [`LocalWriter::apply_source_with`].
+    pub fn apply_with(&self, batch: &PhysicalBatch, durability: Durability) -> Result<bool> {
+        self.writer.apply_source_with(batch, durability)
     }
 
     /// Close staging before installation. Serving requires its own validated
@@ -848,6 +997,118 @@ mod tests {
             resumed.writer().db().get(b"b").unwrap().as_deref(),
             Some(b"second".as_slice())
         );
+    }
+
+    /// A receiver applies the groups of one poll deferred and syncs once: each
+    /// deferred write still carries its cursor (the store's sequence equals
+    /// the cursor's local sequence after every one), the durable barrier stays
+    /// where the last fsync left it until the sync, and then equals the last
+    /// group's source sequence.
+    #[test]
+    fn deferred_groups_keep_the_cursor_invariant_and_one_sync_moves_the_durable_barrier() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"seed", b"keep").unwrap();
+        let copy_path = root.path().join("copy");
+        Checkpoint::new(&source).unwrap().create_checkpoint(&copy_path).unwrap();
+        let copy = open(&copy_path);
+        let cut = copy.latest_sequence_number();
+        let history = Uuid::new_v4();
+        let receiver = StagedPhysicalReplica::from_checkpoint(copy, history, cut).unwrap();
+        let writer = Arc::clone(receiver.writer());
+        assert_eq!(writer.durable_source_sequence(), cut);
+        for index in 0..5_u32 {
+            let mut batch = WriteBatch::default();
+            batch.put(format!("k{index}"), b"v");
+            batch.put(format!("i{index}"), b"w");
+            source.write(batch).unwrap();
+        }
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        assert_eq!(polled.batches.len(), 5);
+        assert_eq!(polled.through, polled.durable_barrier);
+
+        for batch in &polled.batches {
+            assert!(receiver.apply_with(batch, Durability::Deferred).unwrap());
+            let cursor = writer.cursor();
+            assert_eq!(cursor.source_sequence(), batch.last_sequence());
+            assert_eq!(writer.db().latest_sequence_number(), cursor.local_sequence());
+            // The cursor went into the same write group as the data.
+            assert_eq!(read_cursor(writer.db()).unwrap(), cursor);
+            assert_eq!(writer.durable_source_sequence(), cut, "no fsync yet");
+        }
+        // An exact retransmission of a deferred group is still recognised.
+        assert!(!receiver
+            .apply_with(polled.batches.last().unwrap(), Durability::Deferred)
+            .unwrap());
+
+        let applied = writer.cursor();
+        assert_eq!(writer.sync().unwrap(), polled.through);
+        assert_eq!(writer.durable_source_sequence(), polled.through);
+        assert_eq!(
+            writer.durable_source_sequence(),
+            polled.batches.last().unwrap().last_sequence()
+        );
+        assert_eq!(writer.cursor(), applied, "a sync moves no cursor");
+        assert_eq!(writer.db().latest_sequence_number(), applied.local_sequence());
+        // Nothing pending: a second sync is a no-op.
+        assert_eq!(writer.sync().unwrap(), polled.through);
+        assert!(!writer.is_poisoned());
+
+        drop(writer);
+        let closed = receiver.close().unwrap();
+        assert_eq!(closed, applied);
+        let resumed = StagedPhysicalReplica::resume(open_receiver(&copy_path), history).unwrap();
+        assert_eq!(resumed.cursor(), applied);
+        assert_eq!(resumed.writer().durable_source_sequence(), polled.through);
+        assert_eq!(
+            resumed.writer().db().get(b"k4").unwrap().as_deref(),
+            Some(b"v".as_slice())
+        );
+    }
+
+    /// `apply_source` keeps its synced behaviour (each write is its own
+    /// durable barrier), any synced write covers the deferred ones before it,
+    /// and closing a store with a deferred tail syncs it.
+    #[test]
+    fn synced_writes_are_durable_barriers_and_cover_deferred_ones() {
+        let root = TempDir::new().unwrap();
+        let history = Uuid::new_v4();
+        let receiver = StagedPhysicalReplica::from_checkpoint(open(root.path()), history, 0).unwrap();
+        let writer = Arc::clone(receiver.writer());
+        let group = |first: u64, key: &str| {
+            let mut batch = WriteBatch::default();
+            batch.put(key, b"v");
+            encoded(history, first, batch)
+        };
+        assert!(writer.apply_source(&group(1, "a")).unwrap());
+        assert_eq!(writer.durable_source_sequence(), 1);
+        assert_eq!(writer.db().latest_sequence_number(), writer.cursor().local_sequence());
+
+        assert!(writer.apply_source_with(&group(2, "b"), Durability::Deferred).unwrap());
+        assert!(writer.apply_source_with(&group(3, "c"), Durability::Deferred).unwrap());
+        assert_eq!(writer.durable_source_sequence(), 1);
+        assert!(writer.apply_source(&group(4, "d")).unwrap());
+        assert_eq!(
+            writer.durable_source_sequence(),
+            4,
+            "the fsync covers the deferred groups"
+        );
+
+        assert!(writer.apply_source_with(&group(5, "e"), Durability::Deferred).unwrap());
+        let mut local = LocalBatch::new();
+        local.put(b"posture", b"streaming");
+        writer.write_local(local).unwrap();
+        assert_eq!(writer.durable_source_sequence(), 5, "write_local stays synced");
+
+        assert!(writer.apply_source_with(&group(6, "f"), Durability::Deferred).unwrap());
+        assert_eq!(writer.durable_source_sequence(), 5);
+        let applied = writer.cursor();
+        drop(writer);
+        // Closing syncs the deferred tail and proves the stored cursor.
+        assert_eq!(receiver.close().unwrap(), applied);
+        let resumed = StagedPhysicalReplica::resume(open_receiver(root.path()), history).unwrap();
+        assert_eq!(resumed.cursor(), applied);
+        assert_eq!(resumed.writer().durable_source_sequence(), 6);
     }
 
     #[test]
@@ -1002,6 +1263,74 @@ mod tests {
         assert!(caught_up.batches.is_empty());
         assert_eq!(caught_up.through, 6);
         assert!(poll_source(&source, history, 0, 1).is_err());
+    }
+
+    /// A `DB::write` of an empty batch is logged as a WAL record with no
+    /// operations that consumes no sequence number. The source must read past
+    /// it, the receiver never sees it, and an empty raw batch is refused by
+    /// name rather than as an oversized one.
+    #[test]
+    fn empty_write_groups_are_read_past_and_never_shipped() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"seed", b"keep").unwrap();
+        let copy_path = root.path().join("copy");
+        Checkpoint::new(&source).unwrap().create_checkpoint(&copy_path).unwrap();
+        let copy = open(&copy_path);
+        let cut = copy.latest_sequence_number();
+        let history = Uuid::new_v4();
+        let receiver = StagedPhysicalReplica::from_checkpoint(copy, history, cut).unwrap();
+
+        // Empty write groups before, between and after two real ones.
+        source.write(WriteBatch::default()).unwrap();
+        let mut batch = WriteBatch::default();
+        batch.put(b"a", b"1");
+        batch.put(b"b", b"2");
+        source.write(batch).unwrap();
+        source.write(WriteBatch::default()).unwrap();
+        source.put(b"c", b"3").unwrap();
+        source.write(WriteBatch::default()).unwrap();
+        assert_eq!(
+            source.latest_sequence_number(),
+            cut + 3,
+            "an empty write group consumes no sequence number"
+        );
+        // The WAL really holds them, so this exercises the skip.
+        let empty_records = source
+            .get_updates_since(cut)
+            .unwrap()
+            .filter(|record| record.as_ref().unwrap().1.is_empty())
+            .count();
+        assert!(empty_records >= 2, "RocksDB logged {empty_records} empty write groups");
+
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        assert_eq!(polled.through, cut + 3);
+        assert_eq!(polled.durable_barrier, cut + 3);
+        assert_eq!(
+            polled
+                .batches
+                .iter()
+                .map(|batch| (batch.first_sequence(), batch.last_sequence()))
+                .collect::<Vec<_>>(),
+            vec![(cut + 1, cut + 2), (cut + 3, cut + 3)]
+        );
+        for batch in &polled.batches {
+            assert!(receiver.apply(batch).unwrap());
+        }
+        assert_eq!(receiver.cursor().source_sequence(), cut + 3);
+        assert_eq!(
+            receiver.writer().db().get(b"c").unwrap().as_deref(),
+            Some(b"3".as_slice())
+        );
+        let caught_up = poll_source(&source, history, cut + 3, MAX_BATCH_BYTES).unwrap();
+        assert!(caught_up.batches.is_empty());
+
+        let error = validate_raw_batch(WriteBatch::default().data())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty batch"), "{error}");
+        let digest = Sha256::digest(WriteBatch::default().data()).into();
+        assert!(PhysicalBatch::decode(history, 1, WriteBatch::default().data().to_vec(), digest).is_err());
     }
 
     #[test]

@@ -303,6 +303,15 @@ impl DictionaryManager {
         self.cache.write().clear();
     }
 
+    /// Forget every cached dictionary of `table`, dirty or not, without
+    /// writing any of them — for `DROP TABLE`, which deletes the table's
+    /// `dict:{table}:*` records. A dirty entry left here would be written back
+    /// by the next [`Self::flush`], resurrecting a dictionary for a table that
+    /// no longer exists (and handing it to a new table of the same name).
+    pub fn forget_table(&self, table: &str) {
+        self.cache.write().retain(|(cached_table, _), _| cached_table != table);
+    }
+
     /// Drop a dictionary from cache and storage
     pub fn drop_dictionary(&self, db: &DB, gate: &WriteGate, table: &str, column: &str) -> Result<()> {
         let cache_key = (table.to_string(), column.to_string());

@@ -2149,6 +2149,10 @@ pub struct StorageEngine {
     /// R4.2: how the last `rebuild_all_indexes` populated the in-memory
     /// indexes (snapshot-loaded vs scanned). Diagnostics + test surface.
     last_index_open_report: Arc<RwLock<Option<super::index_snapshot::IndexOpenReport>>>,
+    /// Spec P1.4: a physical hydration ([`Self::hydrate_physical`]) was
+    /// started on this engine. Set once, never cleared: an engine is hydrated
+    /// once, by one owner.
+    physical_hydration_started: AtomicBool,
     /// RocksDB `LOG` redirect for a READ-ONLY handle (including physical
     /// snapshots): an owned directory OUTSIDE the database, kept alive through
     /// the drop of the engine-owned `StorageEngine`/`DB` handle so the log
@@ -2484,6 +2488,43 @@ impl StorageEngine {
     /// Whether this engine may write to its store (only a primary may).
     pub(crate) fn engine_may_write(&self) -> bool {
         self.open_mode.engine_may_write()
+    }
+
+    /// Whether this engine serves a physical standby
+    /// ([`Self::open_physical_standby`]). The SQL layer asks this before every
+    /// write entry point (spec P1.4), so it is one discriminant test.
+    #[inline]
+    pub fn is_physical_standby(&self) -> bool {
+        matches!(self.open_mode, OpenMode::PhysicalStandby { .. })
+    }
+
+    /// Hydrate a physical engine's in-memory derived state from its store,
+    /// exactly once: the strict physical-image index rebuild
+    /// (`Catalog::rebuild_all_indexes_for_physical_snapshot`: ART indexes,
+    /// standard HNSW from rows, persistent HNSW reopened from its keys, row
+    /// counters in memory) and the lazy catalog validation.
+    ///
+    /// Spec P1.4: the one hydration for every caller —
+    /// `EmbeddedDatabase::open_physical_snapshot` and
+    /// `EmbeddedDatabase::with_physical_standby` (through the SQL layer's
+    /// shared open), and `PhysicalApplier::hydrate` for an engine nobody serves
+    /// SQL from — so the three cannot drift, and so a second hydration is
+    /// refused whatever the store holds. The rebuild's own "fresh ART
+    /// registry" check refuses only once some table has an index; over a store
+    /// without one, a second hydration used to run in silence. A hydration that
+    /// failed is not retried either: the engine is reopened. Runs under the
+    /// replay guard, so no applier publishes into a registry being built.
+    pub(crate) fn hydrate_physical(&self) -> Result<()> {
+        let _replay = self.replay_guard();
+        if self.physical_hydration_started.swap(true, Ordering::AcqRel) {
+            return Err(Error::storage(
+                "this physical engine was already hydrated: a serving standby is hydrated by \
+                 EmbeddedDatabase::with_physical_standby alone, so do not call PhysicalApplier::hydrate on it",
+            ));
+        }
+        let catalog = self.catalog();
+        catalog.rebuild_all_indexes_for_physical_snapshot()?;
+        catalog.validate_lazy_physical_catalog()
     }
 
     /// The gate every raw write of this engine — and of every component built
@@ -3212,6 +3253,14 @@ impl StorageEngine {
             !mode.engine_may_write(),
         )?;
 
+        // Spec P1.2: a standby's persistent vector indexes follow the
+        // `__vidx:` keys its applier writes and never write them, from the
+        // first registration on (hydration included).
+        let vector_indexes = VectorIndexManager::new();
+        if matches!(mode, OpenMode::PhysicalStandby { .. }) {
+            vector_indexes.set_persistent_policy(super::vector_index::PersistentPolicy::ReplicaMemoryOnly);
+        }
+
         let engine = Self {
             instance_id: NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
             db: Arc::clone(&db),
@@ -3219,7 +3268,7 @@ impl StorageEngine {
             config: config.clone(),
             timestamp,
             key_manager,
-            vector_indexes: Arc::new(VectorIndexManager::new()),
+            vector_indexes: Arc::new(vector_indexes),
             snapshot_manager,
             conflict_registry,
             write_census: Arc::new(super::UncommittedWriteCensus::new()),
@@ -3272,6 +3321,7 @@ impl StorageEngine {
             row_counter_flush_on_close: Arc::new(AtomicBool::new(!mode.is_physical())),
             open_mode: mode,
             last_index_open_report: Arc::new(RwLock::new(None)),
+            physical_hydration_started: AtomicBool::new(false),
             _read_only_log_dir: read_only_log_dir,
         };
 
@@ -3699,6 +3749,7 @@ impl StorageEngine {
             row_counter_flush_on_close: Arc::new(AtomicBool::new(true)),
             open_mode: OpenMode::Primary,
             last_index_open_report: Arc::new(RwLock::new(None)),
+            physical_hydration_started: AtomicBool::new(false),
             _read_only_log_dir: None,
         })
     }
@@ -3871,6 +3922,14 @@ impl StorageEngine {
         self.referencing_fk_cache.lock().clear();
     }
 
+    /// Forget the cached dictionaries of a dropped table, dirty ones included
+    /// (`DictionaryManager::forget_table`). `Catalog::drop_table` deletes the
+    /// `dict:{table}:*` records; a cached copy would otherwise be flushed back
+    /// over the deletion, or serve a later table of the same name.
+    pub(crate) fn forget_table_dictionaries(&self, table_name: &str) {
+        self.dict_manager.forget_table(table_name);
+    }
+
     /// Pre-warm schema cache by loading all table schemas into memory.
     /// Eliminates first-query schema cache miss penalty (~250μs per table).
     pub fn prewarm_schema_cache(&self) -> Result<()> {
@@ -4002,6 +4061,13 @@ impl StorageEngine {
     /// storage.enable_lockfree_ingestion(config)?;
     /// ```
     pub fn enable_lockfree_ingestion(&self, config: super::lockfree::LockFreeIngestionConfig) -> Result<()> {
+        // Spec P1.4: refused on a physical standby before anything happens.
+        // Enabling creates a WAL directory and an engine whose apply callback
+        // writes `data:` keys; the gate would refuse those writes one by one on
+        // a worker thread with no caller to report to.
+        if self.is_physical_standby() {
+            return Err(Error::physical_standby_write_refused("enable_lockfree_ingestion"));
+        }
         // Determine WAL path
         let wal_path = if let Some(ref temp) = self._temp_dir {
             temp.path().join("lockfree_wal")
@@ -8408,6 +8474,93 @@ impl StorageEngine {
         )
     }
 
+    /// Replace every per-column storage reference in `tuple` — `DictRef`,
+    /// `CasRef`, `ColumnarRef` — with the value it stands for, by the storage
+    /// mode `schema` gives its column.
+    ///
+    /// The body of the row decode in [`Self::scan_table_with_schema_opt`],
+    /// factored out unchanged so a physical standby's applier
+    /// ([`Self::decode_stored_row`]) resolves a replicated row exactly as a scan
+    /// does: the index entries it maintains must hold the values a rebuild by
+    /// scan would.
+    fn resolve_column_storage_refs(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        row_id: u64,
+        tuple: &mut Tuple,
+    ) -> Result<()> {
+        for (idx, column) in schema.columns.iter().enumerate() {
+            if idx >= tuple.values.len() {
+                break;
+            }
+            match column.storage_mode {
+                ColumnStorageMode::Dictionary => {
+                    // Resolve dictionary reference
+                    if let Some(crate::Value::DictRef { dict_id }) = tuple.values.get(idx) {
+                        let dict_id = *dict_id;
+                        let s = self.dict_manager.decode(&self.db, table_name, &column.name, dict_id)?;
+                        if let Some(val) = tuple.values.get_mut(idx) {
+                            *val = crate::Value::String(s);
+                        }
+                    }
+                }
+                ColumnStorageMode::ContentAddressed => {
+                    // Resolve content-addressed reference
+                    if let Some(crate::Value::CasRef { hash }) = tuple.values.get(idx) {
+                        let hash = hash.clone();
+                        let resolved = ContentAddressedStore::resolve(&self.db, &hash, &column.data_type)?;
+                        if let Some(val) = tuple.values.get_mut(idx) {
+                            *val = resolved;
+                        }
+                    }
+                }
+                ColumnStorageMode::Columnar => {
+                    // Resolve columnar reference
+                    if matches!(tuple.values.get(idx), Some(crate::Value::ColumnarRef)) {
+                        if let Some(val) = ColumnarStore::get(&self.db, table_name, &column.name, row_id)? {
+                            if let Some(slot) = tuple.values.get_mut(idx) {
+                                *slot = val;
+                            }
+                        }
+                    }
+                }
+                ColumnStorageMode::Default => {
+                    // No resolution needed
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode one stored row value of `table_name` into the tuple a full-row
+    /// scan ([`Self::scan_table_with_schema`]) yields for it: bincode, the W3.5
+    /// width shaping, the row id, and the per-column storage references.
+    /// `stored` is the value as [`Self::get`] returns it — already decrypted.
+    ///
+    /// The `RowDecodeHint::Full` arm of the decode closure in
+    /// [`Self::scan_table_with_schema_opt`], for a physical standby's applier,
+    /// which decodes each replicated row change one key at a time and must see
+    /// the tuple a rebuild by scan would see — and for MERGE BRANCH, which
+    /// feeds each row it merged into main to the vector indexes the same way
+    /// (`rederive_indexes_after_merge`).
+    pub(crate) fn decode_stored_row(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        row_id: u64,
+        stored: &[u8],
+    ) -> Result<Tuple> {
+        let mut tuple: Tuple =
+            bincode::deserialize(stored).map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+        if self.null_pad_snapshot_schema() {
+            Self::shape_base_tuple_to_width(&mut tuple, schema.columns.len());
+        }
+        tuple.row_id = Some(row_id);
+        self.resolve_column_storage_refs(table_name, schema, row_id, &mut tuple)?;
+        Ok(tuple)
+    }
+
     fn scan_table_with_schema_opt(
         &self,
         table_name: &str,
@@ -8462,46 +8615,7 @@ impl StorageEngine {
                 }
 
                 // Resolve per-column storage references
-                for (idx, column) in schema.columns.iter().enumerate() {
-                    if idx >= tuple.values.len() {
-                        break;
-                    }
-                    match column.storage_mode {
-                        ColumnStorageMode::Dictionary => {
-                            // Resolve dictionary reference
-                            if let Some(crate::Value::DictRef { dict_id }) = tuple.values.get(idx) {
-                                let dict_id = *dict_id;
-                                let s = self.dict_manager.decode(&self.db, table_name, &column.name, dict_id)?;
-                                if let Some(val) = tuple.values.get_mut(idx) {
-                                    *val = crate::Value::String(s);
-                                }
-                            }
-                        }
-                        ColumnStorageMode::ContentAddressed => {
-                            // Resolve content-addressed reference
-                            if let Some(crate::Value::CasRef { hash }) = tuple.values.get(idx) {
-                                let hash = hash.clone();
-                                let resolved = ContentAddressedStore::resolve(&self.db, &hash, &column.data_type)?;
-                                if let Some(val) = tuple.values.get_mut(idx) {
-                                    *val = resolved;
-                                }
-                            }
-                        }
-                        ColumnStorageMode::Columnar => {
-                            // Resolve columnar reference
-                            if matches!(tuple.values.get(idx), Some(crate::Value::ColumnarRef)) {
-                                if let Some(val) = ColumnarStore::get(&self.db, table_name, &column.name, row_id)? {
-                                    if let Some(slot) = tuple.values.get_mut(idx) {
-                                        *slot = val;
-                                    }
-                                }
-                            }
-                        }
-                        ColumnStorageMode::Default => {
-                            // No resolution needed
-                        }
-                    }
-                }
+                self.resolve_column_storage_refs(table_name, schema, row_id, &mut tuple)?;
 
                 Ok(tuple)
             }
@@ -9618,6 +9732,11 @@ impl StorageEngine {
         // `merge_branch`); the whole map resets to the default-closed snapshot
         // path until the next snapshot-correct write re-establishes an entry.
         self.bump_schema_generation();
+        // Every row was rewritten outside the row-cache funnels, so a cached
+        // pre-ALTER image (one value short) would keep answering PK lookups.
+        // After the bump: a fill that read the old bytes was stamped with the
+        // old generation and is refused, so this sweep cannot be undone.
+        self.row_cache.invalidate_table(table_name);
 
         Ok(updated)
     }
@@ -9714,6 +9833,9 @@ impl StorageEngine {
         // W2.5: close any watermark entry a concurrent tracked commit
         // re-established mid-rewrite (mirrors the merge-to-main choke point).
         self.bump_schema_generation();
+        // As in `add_column_to_rows`: a cached pre-DROP image would keep the
+        // dropped value in place, shifting every later column of a PK lookup.
+        self.row_cache.invalidate_table(table_name);
 
         Ok(updated)
     }
@@ -10139,6 +10261,13 @@ impl StorageEngine {
                 break;
             }
             batch.delete(key);
+        }
+        // The first index mutation after every open fires this hook, and a
+        // store that never checkpointed its index snapshots has no marker to
+        // delete. Writing the empty batch anyway logged a write group with no
+        // operations — a no-op that a physical standby still has to read past.
+        if batch.is_empty() {
+            return;
         }
         if let Err(e) = gate.write(db, batch, None) {
             warn!("index snapshot marker invalidation failed: {}", e);
@@ -10730,6 +10859,21 @@ impl StorageEngine {
         let catalog = Catalog::new(self);
         let tables = catalog.list_tables()?;
 
+        // Spec P1.1b: merging into main writes main's `data:` keys below every
+        // index funnel, so main's ART and vector indexes must be brought in
+        // line with them here (`rederive_indexes_after_merge`, step 3b) — a
+        // primary used to keep answering PK lookups, UNIQUE probes and
+        // `COUNT(*)` from its pre-merge indexes until it reopened. Until that
+        // is done an index can miss a merged row or under-count its table, the
+        // window the uncommitted-write census guards for eager transaction
+        // writes; hold it for every table the merge may write (from before the
+        // first write until the indexes are re-derived) so the miss-based and
+        // cardinality fast paths decline to the planner, which reads rows.
+        let _index_hold = merge_to_main.then(|| self.write_census().hold_for_replay(tables.clone(), false));
+        // Main rows this merge wrote or deleted, per table.
+        let mut merged_main_rows: std::collections::HashMap<String, std::collections::BTreeSet<u64>> =
+            std::collections::HashMap::new();
+
         // Track deleted rows per table from source branch
         let mut deleted_rows_by_table: std::collections::HashMap<String, HashSet<u64>> =
             std::collections::HashMap::new();
@@ -10826,6 +10970,9 @@ impl StorageEngine {
                     // pre-merge value).
                     self.row_cache.invalidate(table_name, row_id);
                     merged_keys += 1;
+                    if merge_to_main {
+                        merged_main_rows.entry(table_name.clone()).or_default().insert(row_id);
+                    }
                 }
             }
         }
@@ -10839,7 +10986,12 @@ impl StorageEngine {
                         .delete(&self.db, target_key.as_bytes(), None)
                         .map_err(|e| Error::storage(format!("Failed to apply delete: {}", e)))?;
                     self.row_cache.invalidate(table_name, *row_id);
+                    merged_main_rows.entry(table_name.clone()).or_default().insert(*row_id);
                 }
+            }
+            // Step 3b (spec P1.1b): main's indexes follow the rows above.
+            for (table_name, row_ids) in &merged_main_rows {
+                self.rederive_indexes_after_merge(&catalog, table_name, row_ids)?;
             }
         } else {
             // Copy delete markers to target branch
@@ -10904,6 +11056,66 @@ impl StorageEngine {
             conflicts: Vec::new(),
             completed: true,
         })
+    }
+
+    /// MERGE BRANCH into main, step 3b (spec P1.1b): bring main's in-memory
+    /// indexes of `table_name` in line with the rows the merge wrote or deleted
+    /// (`row_ids`), which reached `data:` below every index funnel.
+    ///
+    /// ART: re-derived from the table's rows as an open derives them —
+    /// `Catalog::index_table_rows`, the row-replay half of
+    /// `Catalog::rebuild_all_indexes` (and of the physical applier's
+    /// re-derivation) — keeping every registration and its name. A merge is
+    /// last-writer-wins, so a merged row can take a UNIQUE value another row
+    /// still holds; the re-derivation indexes the first such row and warns,
+    /// exactly as a reopen of the same rows does, so the primary is left with
+    /// the indexes a restart would compute. The rows are scanned BEFORE the
+    /// trees are cleared: a failed scan leaves the lagging entries (and fails
+    /// the merge), never an empty index answering "absent" for every key. The
+    /// caller's census hold keeps readers off the trees in between.
+    ///
+    /// Vector: each touched row's entry is replaced from its post-merge image
+    /// (`on_row_update` without an old image: delete, then insert) or dropped
+    /// when the row is gone — the R5.V1 maintenance a DML write gets.
+    fn rederive_indexes_after_merge(
+        &self,
+        catalog: &Catalog<'_>,
+        table_name: &str,
+        row_ids: &std::collections::BTreeSet<u64>,
+    ) -> Result<()> {
+        let has_art = !self.art_index_manager.list_table_indexes(table_name).is_empty();
+        let has_vector = self.vector_indexes.table_has_indexes(table_name);
+        if !has_art && !has_vector {
+            return Ok(());
+        }
+        let schema = catalog.get_table_schema(table_name)?;
+        if has_art {
+            let tuples = self.scan_table_with_schema(table_name, &schema)?;
+            self.art_index_manager.clear_table_indexes(table_name);
+            catalog.index_table_rows(table_name, &schema, &tuples);
+        }
+        if has_vector {
+            for row_id in row_ids {
+                let key = format!("data:{}:{}", table_name, row_id).into_bytes();
+                match self.get(&key)? {
+                    Some(stored) => match self.decode_stored_row(table_name, &schema, *row_id, &stored) {
+                        Ok(tuple) => {
+                            let _ = self
+                                .vector_indexes
+                                .on_row_update(table_name, *row_id, &schema, None, &tuple);
+                        }
+                        Err(e) => debug!(
+                            "MERGE BRANCH: merged '{}' row {} does not decode for its vector indexes: {}",
+                            table_name, row_id, e
+                        ),
+                    },
+                    None => {
+                        let _ = self.vector_indexes.on_row_delete(table_name, *row_id, None, None);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Begin a transaction on a specific branch
@@ -12025,12 +12237,90 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn publish_live_replay_visibility(&self, table: &str, row_id: u64) {
+    pub(crate) fn publish_live_replay_visibility(&self, table: &str, row_id: u64) {
         // Row-cache publication must share the shard lock with guarded fills.
         // Advancing this existing generation also invalidates SQL result caches,
         // without clearing unrelated tables' committed-write watermarks.
         self.row_cache
             .invalidate_with_generation(table, row_id, &self.schema_generation);
+    }
+
+    // ==================== Physical-standby publication ====================
+    //
+    // A physical standby's applier (`replication::physical_applier`) writes its
+    // primary's batches verbatim through the standby's `LocalWriter` and then
+    // brings this engine's in-memory derived state in line with the keys each
+    // batch touched. These are the few hooks it needs that the engine did not
+    // already expose. None of them writes to the store.
+
+    /// Hold the lock that serializes live appliers (`live_replay_lock`, the
+    /// one `apply_replicated_operation_at` takes) for as long as the guard
+    /// lives. A physical applier holds it for a whole batch — decode, apply and
+    /// publish — so no other applier can interleave its publication.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn replay_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.live_replay_lock.lock()
+    }
+
+    /// Raise the logical MVCC timestamp to at least `ts`; never lowers it.
+    ///
+    /// Readers take their snapshot timestamp from this counter
+    /// (`next_timestamp`), and a version is visible to a snapshot at or after
+    /// its commit timestamp. On a primary every commit allocates from the
+    /// counter, so it is always ahead. A physical standby's versions carry the
+    /// PRIMARY's timestamps instead, so the applier raises the counter past
+    /// every replicated commit; otherwise a reader that starts after the batch
+    /// would get a snapshot older than the commit and miss its rows.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn raise_timestamp(&self, ts: u64) {
+        let mut current = self.timestamp.write();
+        if *current < ts {
+            *current = ts;
+        }
+    }
+
+    /// Drop every cached dictionary (`DictionaryManager::clear_cache`).
+    ///
+    /// The cache never reloads a dictionary it already holds, which is right
+    /// on a primary (only it extends its dictionaries) and wrong on a physical
+    /// standby, whose `dict:` records grow underneath it: a row referencing a
+    /// new entry would decode as "Invalid dict_id" against the cached copy.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn forget_cached_dictionaries(&self) {
+        self.dict_manager.clear_cache();
+    }
+
+    /// Replace the branch manager with one freshly loaded from the store's
+    /// branch registry, as the physical open loads it (`open_with_mode`:
+    /// `BranchManager::open_existing` plus the engine's key manager).
+    ///
+    /// The registry is read once, at open; on a physical standby `branch:`
+    /// records keep arriving, and `count_table_rows`, branch resolution and the
+    /// version GC's anchors all ask the manager. Every holder of the shared
+    /// slot (the version GC included) sees the swap. On error — a registry
+    /// naming a branch whose metadata has not arrived yet — the current
+    /// manager stays in place.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    pub(crate) fn reload_branch_manager(&self) -> Result<()> {
+        let mut manager = BranchManager::open_existing(
+            Arc::clone(&self.db),
+            Arc::clone(&self.gate),
+            Arc::clone(&self.timestamp),
+        )?;
+        manager.set_key_manager(self.key_manager.clone());
+        *self.branch_manager.write() = Some(Arc::new(manager));
+        Ok(())
+    }
+
+    /// The `LocalWriter` of a physical standby (the one whose handle this
+    /// engine shares); `None` in every other open mode. Lets the applier prove
+    /// it was handed the writer of THIS engine's store.
+    #[cfg(feature = "ha-tier1")]
+    pub(crate) fn physical_standby_writer(&self) -> Option<&Arc<crate::replication::physical::LocalWriter>> {
+        match &self.open_mode {
+            OpenMode::PhysicalStandby { writer, .. } => Some(writer),
+            OpenMode::Primary | OpenMode::ReadOnly | OpenMode::PhysicalSnapshot => None,
+        }
     }
 
     /// Apply a single WAL operation to restore database state
@@ -12185,15 +12475,24 @@ impl StorageEngine {
                 let prefix_bytes = prefix.as_bytes();
                 let mut keys_to_delete = Vec::new();
 
-                let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+                // Spec P1.1b: seek to the table's rows with a total-order
+                // iterator. A prefix-mode walk from the start of the keyspace
+                // crossed every family before `data:`, and one range tombstone
+                // on the way dropped whole older files from the scan (see
+                // `load_counters`): their rows survived the replayed TRUNCATE.
+                // An iterator error is propagated for the same reason — it
+                // was skipped, leaving the rows after it in place, too.
+                let mut read = ReadOptions::default();
+                read.set_total_order_seek(true);
+                let iter = self
+                    .db
+                    .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read);
                 for item in iter {
-                    if let Ok((key, _)) = item {
-                        if key.starts_with(prefix_bytes) {
-                            keys_to_delete.push(key.to_vec());
-                        } else if key.first() > prefix_bytes.first() {
-                            break;
-                        }
+                    let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                    if !key.starts_with(prefix_bytes) {
+                        break;
                     }
+                    keys_to_delete.push(key.to_vec());
                 }
 
                 for key in keys_to_delete {
@@ -14267,7 +14566,23 @@ impl StorageEngine {
     /// Load row counters from storage
     fn load_counters(&self) -> Result<()> {
         let prefix = b"counter:";
-        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+        // Seek straight to the family with a TOTAL-ORDER iterator (spec
+        // P1.1b). This used to walk from the start of the keyspace with the
+        // default, prefix-mode options, crossing every family that sorts
+        // before `counter:` (`bdata:`, `cas:`, `col*:` …). The store's 5-byte
+        // prefix extractor makes such an iterator defined only within one
+        // prefix: stepping onto a key a range tombstone covers re-seeks the
+        // older files to the tombstone's end, and a file holding no key with
+        // that end's prefix is dropped from the scan — every `counter:` record
+        // in it with it (the mechanism `recover_snapshots_with_policy`
+        // documents). A table whose rows are all gone (TRUNCATE) has nothing
+        // else to reseed its counter from, so its next row id restarted at 1
+        // and collided with the history `v:` keeps for the truncated rows.
+        let mut read = ReadOptions::default();
+        read.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix, rocksdb::Direction::Forward), read);
 
         for item in iter {
             let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
@@ -14289,7 +14604,8 @@ impl StorageEngine {
 
                 self.row_counters
                     .insert(table_name, std::sync::atomic::AtomicU64::new(count));
-            } else if key.first() > prefix.first() {
+            } else {
+                // Sorted: the first key outside the family ends it.
                 break;
             }
         }
@@ -14351,6 +14667,17 @@ impl StorageEngine {
             .entry(table_name.to_string())
             .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
             .fetch_max(value, Ordering::Relaxed);
+    }
+
+    /// The in-memory row-id high-water mark of `table_name` — the last id
+    /// `next_row_id_volatile` handed out (or was raised to) — without moving
+    /// it; `None` when no counter exists for the table. A read-only
+    /// diagnostic: a physical standby must hold at least its primary's mark
+    /// for every table, or a promotion would reuse row ids.
+    pub fn row_counter_high_water(&self, table_name: &str) -> Option<u64> {
+        self.row_counters
+            .get(table_name)
+            .map(|counter| counter.load(Ordering::Acquire))
     }
 
     pub fn next_row_id_volatile(&self, table_name: &str) -> u64 {
@@ -14847,6 +15174,28 @@ mod tests {
         );
     }
 
+    /// Spec P1.4: a physical engine is hydrated at most once, whatever its
+    /// store holds. This store has no table, so no index: the rebuild's own
+    /// fresh-registry check cannot tell a second hydration from the first.
+    #[test]
+    fn a_physical_engine_is_hydrated_at_most_once() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db_path = dir.path().join("store");
+        let mut config = Config::default();
+        config.storage.wal_enabled = false;
+        config.storage.elide_latest_version = false;
+        drop(StorageEngine::open(&db_path, &config).expect("writable open creates the store"));
+
+        let snapshot = StorageEngine::open_physical_snapshot(&db_path, &config).expect("physical snapshot open");
+        assert!(!snapshot.is_physical_standby());
+        snapshot.hydrate_physical().expect("the first hydration");
+        let second = snapshot
+            .hydrate_physical()
+            .expect_err("a second hydration must be refused");
+        assert!(second.to_string().contains("already hydrated"), "{second}");
+        assert_eq!(snapshot.write_gate().refusals(), 0, "hydration attempted a write");
+    }
+
     /// P0.2/P0.3: the standby mode hydrates on its writer's own writable
     /// handle — the SAME `Arc<DB>`, not a second open — behind the caller's
     /// closed gate, and writes nothing on its own: the sequence number is
@@ -14906,6 +15255,10 @@ mod tests {
         );
         assert!(engine.physical_snapshot_mode(), "a standby hydrates strictly");
         assert!(!engine.engine_may_write());
+        assert!(
+            engine.is_physical_standby(),
+            "spec P1.4: the SQL layer's write guard asks this"
+        );
         assert!(
             engine._read_only_log_dir.is_none(),
             "the handle is not the engine's to redirect"

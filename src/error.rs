@@ -106,6 +106,26 @@ pub const UNSUPPORTED_STATEMENT_KIND_MARKER: &str = "is not supported by HeliosD
 /// `null value in column "id" of relation "t" violates not-null constraint`.
 pub const NOT_NULL_VIOLATION_MARKER: &str = "violates not-null constraint";
 
+/// Spec P1.4: the prefix of the one error every write entry point of an
+/// `EmbeddedDatabase` serving a physical standby returns
+/// ([`Error::physical_standby_write_refused`]).
+///
+/// The refusal is raised by the SQL layer BEFORE the statement or call
+/// reaches the storage engine, whose closed `WriteGate` is only the backstop:
+/// a refusal the gate had to make is a write the SQL layer let through. A
+/// shared const, like [`IN_FAILED_TRANSACTION_MESSAGE`], because the PostgreSQL
+/// wire maps it to `25006 read_only_sql_transaction` in `sqlstate_for_error`
+/// and [`Error::is_physical_standby_write_refusal`] recognises it.
+pub const PHYSICAL_STANDBY_WRITE_REFUSED: &str = "writes are not permitted on a physical standby";
+
+/// Spec P1.3: the prefix of the refusal a physical standby answers while it is
+/// not ready (`crate::standby_posture`): `standby is not ready: <state>
+/// (cursor X, primary Y)`, raised by `heliosdb_require_ready()` and by the
+/// PostgreSQL wire's read guard. One shared const because the wire maps it to
+/// `55000 object_not_in_prerequisite_state` (`sqlstate_for_error`), which is
+/// what a proxy's health check keys on, and no other message may claim it.
+pub const STANDBY_NOT_READY: &str = "standby is not ready";
+
 /// Database error type
 ///
 /// All errors from HeliosDB Lite operations are represented by this enum.
@@ -282,6 +302,25 @@ impl Error {
     pub fn is_failed_transaction(&self) -> bool {
         match self {
             Error::Transaction(message) => message.starts_with("current transaction is aborted"),
+            _ => false,
+        }
+    }
+
+    /// Spec P1.4: `operation` (a statement's leading keyword, or the name of
+    /// the API called) was refused on a physical standby before it reached the
+    /// storage engine. PostgreSQL SQLSTATE 25006. A `Transaction` variant for
+    /// the reason [`Error::in_failed_transaction`] gives.
+    pub fn physical_standby_write_refused(operation: &str) -> Self {
+        Error::Transaction(format!(
+            "{PHYSICAL_STANDBY_WRITE_REFUSED}: {operation} was refused before reaching the storage engine; \
+             run it on the primary"
+        ))
+    }
+
+    /// True for [`Error::physical_standby_write_refused`].
+    pub fn is_physical_standby_write_refusal(&self) -> bool {
+        match self {
+            Error::Transaction(message) => message.starts_with(PHYSICAL_STANDBY_WRITE_REFUSED),
             _ => false,
         }
     }

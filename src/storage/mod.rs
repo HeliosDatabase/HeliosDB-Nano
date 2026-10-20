@@ -110,8 +110,8 @@ pub use stats::{DatabaseStats, GlobalStatsCollector, ReplicationRole, StatsSnaps
 pub use time_travel::{GcConfig, Scn, SnapshotManager, SnapshotMetadata, TransactionId};
 pub use transaction::{Transaction, TransactionSavepointSnapshot, UncommittedWriteCensus, UncommittedWriteHold};
 pub use vector_index::{
-    StoredVectorRecord, StoredVectorSearchResult, VectorIndexManager, VectorIndexMetadata, VectorIndexStats,
-    VectorIndexType, VectorIndexUndoOp,
+    PersistentPolicy, StoredVectorRecord, StoredVectorSearchResult, VectorIndexManager, VectorIndexMetadata,
+    VectorIndexStats, VectorIndexType, VectorIndexUndoOp,
 };
 pub use version_gc::{VersionGcConfig, VersionGcCycleStats, VersionStorageStats};
 pub use view_catalog::{ViewCatalog, ViewMetadata};
@@ -199,9 +199,12 @@ pub use catalog::PersistedIndexDefinition;
 // The ONE index-type → owning-structure classifier, shared by CREATE INDEX,
 // DROP INDEX and the open-time rebuild so the mapping cannot drift again.
 pub use catalog::{index_family, IndexFamily};
+// Spec P1.2: the vector families a physical standby's hook builds.
+#[cfg(feature = "ha-tier1")]
+pub(crate) use catalog::physical_vector_family;
 // The ONE physical-teardown body behind that classifier, shared by DROP INDEX
 // (`sql::executor::ddl::handle_drop_index`) and DROP TABLE
-// (`Catalog::drop_table_index_definitions`).
+// (`Catalog::drop_table_taking_partition_children`).
 pub(crate) use catalog::teardown_index_structures;
 pub use catalog::{PersistedSeqState, PersistedSequence, DEFAULT_SEQUENCE_CACHE};
 // Role / ACL catalog (HC4 storage slice). STORED AND INTROSPECTABLE ONLY —

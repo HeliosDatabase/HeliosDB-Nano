@@ -266,11 +266,20 @@ pub trait PhysicalSource: Send + Sync {
     async fn poll(&self, after: u64, byte_limit: usize) -> Result<PhysicalPoll>;
 }
 
-/// Apply each validated physical batch with durable progress before returning.
-/// Any error/cancellation poisons the wire session. Serving/publication is a
-/// distinct owner protocol; receiving PollEnd alone never means SQL-ready.
+/// Apply each validated physical batch with its progress (the cursor in the
+/// same write) before returning; a sink may defer the fsync of a poll's
+/// batches to the poll's end, which its owner then performs before it reports
+/// or acknowledges the cursor. Any error/cancellation poisons the wire
+/// session. Serving/publication is a distinct owner protocol; receiving
+/// PollEnd alone never means SQL-ready.
 #[async_trait]
 pub trait BatchSink: Send {
+    /// One poll's validated summary, before its first batch: the source's
+    /// durable barrier is known from here on, even when the batches take long
+    /// to apply. Does nothing by default.
+    async fn begin(&mut self, _summary: PollSummary) -> Result<()> {
+        Ok(())
+    }
     async fn apply(&mut self, batch: PhysicalBatch) -> Result<()>;
 }
 
@@ -870,6 +879,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             let frame = read_frame(&mut self.io, &[Kind::PollStart], &self.limits, &mut self.shutdown).await?;
             let summary = PollSummary::decode(&frame.payload)?;
             summary.validate_since(after, byte_limit, self.known_barrier)?;
+            sink.begin(summary).await?;
             let mut cursor = after;
             let mut bytes = 0usize;
             for _ in 0..summary.batches {

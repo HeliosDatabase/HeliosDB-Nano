@@ -29,15 +29,23 @@ pub mod lsn_manager;
 #[cfg(feature = "ha-tier1")]
 pub mod physical;
 #[cfg(feature = "ha-tier1")]
+pub mod physical_applier;
+#[cfg(feature = "ha-tier1")]
 pub mod physical_receiver;
 #[cfg(feature = "ha-tier1")]
 pub mod physical_source;
+#[cfg(feature = "ha-tier1")]
+pub mod physical_vector;
 #[cfg(feature = "ha-tier1")]
 pub mod physical_wire;
 #[cfg(feature = "ha-tier1")]
 pub mod query_forwarder;
 #[cfg(feature = "ha-tier1")]
 pub mod split_brain;
+// Spec P1.3: the posture lives at the crate root (`crate::standby_posture`),
+// compiled in every build because the SQL layer asks it whether this node is
+// in recovery; re-exported here beside the receiver it is derived from.
+pub use crate::standby_posture;
 #[cfg(feature = "ha-tier1")]
 pub mod streaming;
 #[cfg(feature = "ha-tier1")]

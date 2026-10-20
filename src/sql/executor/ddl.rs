@@ -838,12 +838,13 @@ fn drop_table_and_partition_children(
         return Ok(());
     }
 
-    // Drop this table via the ordinary funnel FIRST, so a drop failure leaves
-    // the registry untouched.
-    catalog.drop_table(table_name)?;
-    // KanttBan #23 (v3.31.1 phase 2): clean up the identity side-table record.
-    // Best-effort; a missing record is fine.
-    let _ = catalog.drop_identity_columns(table_name);
+    // Drop this table via the ordinary funnel. It deletes the table's IDENTITY
+    // record (KanttBan #23) and its partition registry links in the same
+    // write group as everything else it owns (spec P1.1b: they used to be
+    // separate writes made here, after the drop), and hands back the children
+    // the registry named — detaching this table from its own parent, if it is
+    // itself a partition child, rides the same group.
+    let children = catalog.drop_table_taking_partition_children(table_name)?;
     // sprinter 29ecb34e3245: purge this table's storage-level pushdown
     // structures (bloom filters + zone maps). Keeping them past the drop is a
     // leak AND a wrong-answer hazard: a bloom filter is an authoritative
@@ -853,13 +854,9 @@ fn drop_table_and_partition_children(
     // child is purged too. Infallible and cheap (two hash-map removes).
     storage.predicate_pushdown().remove_table(table_name);
 
-    // Registry bookkeeping: detach this table from its own parent (if it is
-    // itself a partition child) and take the list of children registered under
-    // it. Empty for a non-partition table → no cascade.
-    let children = catalog.take_partition_children_on_drop(table_name)?;
-
-    // Cascade to partition children (dependents). Each recursion repeats the
-    // same funnel + registry cleanup, so sub-partitioned children unwind fully.
+    // Cascade to partition children (dependents); empty for a non-partition
+    // table. Each recursion repeats the same funnel + registry cleanup, so
+    // sub-partitioned children unwind fully.
     for child in children {
         drop_table_and_partition_children(storage, &child, true)?;
     }

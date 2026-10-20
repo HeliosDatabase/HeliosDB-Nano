@@ -232,6 +232,33 @@ impl PgServer {
 
     /// Serve an already-bound listener, allowing startup to fail before readiness.
     pub async fn serve_with_listener(&self, listener: TcpListener) -> Result<()> {
+        self.accept_loop(listener, None).await
+    }
+
+    /// [`Self::serve_with_listener`], each accepted connection served by the
+    /// database `databases` holds at accept time instead of the one this
+    /// server was built with.
+    ///
+    /// Spec P1.3: a physical standby opens its listener before its serving
+    /// store exists (a bootstrap copy, or a directory it may not adopt) and
+    /// serves an empty placeholder until then; when the store is attached the
+    /// start path publishes it here, and every later connection is served by
+    /// it. One listener throughout, so a client is never refused in between.
+    /// A session already accepted keeps its database (the PostgreSQL wire's
+    /// standby guard tells a placeholder session to reconnect).
+    pub async fn serve_with_listener_dynamic(
+        &self,
+        listener: TcpListener,
+        databases: tokio::sync::watch::Receiver<Arc<EmbeddedDatabase>>,
+    ) -> Result<()> {
+        self.accept_loop(listener, Some(databases)).await
+    }
+
+    async fn accept_loop(
+        &self,
+        listener: TcpListener,
+        databases: Option<tokio::sync::watch::Receiver<Arc<EmbeddedDatabase>>>,
+    ) -> Result<()> {
         let mut effective_config = self.config.clone();
         effective_config.address = listener
             .local_addr()
@@ -271,7 +298,10 @@ impl PgServer {
                     tracing::debug!("Accepted connection from {}", addr);
                     self.maybe_warn_utilisation();
 
-                    let database = Arc::clone(&self.database);
+                    let database = match &databases {
+                        Some(current) => Arc::clone(&current.borrow()),
+                        None => Arc::clone(&self.database),
+                    };
                     let auth_manager = Arc::clone(&self.auth_manager);
                     let ssl_negotiator = self.ssl_negotiator.clone();
                     // GH#28: ONE absolute authentication deadline, computed here

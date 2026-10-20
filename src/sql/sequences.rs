@@ -289,6 +289,16 @@ fn namespace() -> Arc<SeqNamespace> {
     }
 }
 
+/// The database whose statement runs on this thread, when an [`EngineScope`]
+/// is installed — and only then: unlike [`namespace`] there is no "newest live
+/// database" fallback, because a caller asking WHICH database it serves must
+/// not be handed another one. Spec P1.3: what `pg_current_wal_lsn()` and the
+/// other standby probes in the storage-less evaluator read their physical
+/// sequence from.
+pub(crate) fn current_engine() -> Option<Arc<StorageEngine>> {
+    CURRENT_NS.with(|c| c.borrow().as_ref().and_then(|(_, ns)| ns.engine()))
+}
+
 /// The namespace owned by `engine`, for callers that hold the engine outright
 /// (the CREATE/ALTER/DROP SEQUENCE executor arms, [`warm_load`]) and therefore
 /// need not depend on an [`EngineScope`] being installed at all.

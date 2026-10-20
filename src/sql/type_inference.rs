@@ -173,6 +173,19 @@ impl TypeInference for LogicalExpr {
                     "currval" | "pg_catalog.currval" => Ok(DataType::Int8),
                     "setval" | "pg_catalog.setval" => Ok(DataType::Int8),
                     "pg_backend_pid" | "pg_catalog.pg_backend_pid" => Ok(DataType::Int4),
+                    // Spec P1.3: the standby probes. PostgreSQL types the LSN
+                    // functions `pg_lsn`; this server answers their `HI/LO`
+                    // text, so `text` is the honest declaration.
+                    "pg_is_in_recovery" | "pg_catalog.pg_is_in_recovery" | "heliosdb_require_ready" => {
+                        Ok(DataType::Boolean)
+                    }
+                    "pg_current_wal_lsn"
+                    | "pg_catalog.pg_current_wal_lsn"
+                    | "pg_current_wal_insert_lsn"
+                    | "pg_current_wal_flush_lsn"
+                    | "pg_last_wal_replay_lsn"
+                    | "pg_catalog.pg_last_wal_replay_lsn"
+                    | "pg_last_wal_receive_lsn" => Ok(DataType::Text),
                     "now" | "current_timestamp" => Ok(DataType::Timestamp),
                     "current_date" => Ok(DataType::Date),
                     "current_time" => Ok(DataType::Time),

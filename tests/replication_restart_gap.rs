@@ -11,6 +11,13 @@
 //!
 //! A second case covers a standby that joins AFTER the data (and the DDL) exist:
 //! it used to crash with `Table 't' does not exist`.
+//!
+//! Spec P1.3: the standby is now a PHYSICAL replica (bootstrapped from the
+//! primary's physical source, which a primary with a replication token
+//! serves), so every case here runs over the physical channel; the contracts
+//! — no silent gap, every committed row, nothing uncommitted — are unchanged.
+//! Both nodes name the physical endpoint explicitly so parallel clusters
+//! cannot meet on a derived port.
 
 #![cfg(feature = "ha-tier1")]
 
@@ -149,7 +156,8 @@ fn cluster() -> Cluster {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let (pg_p, repl_p, pg_s, repl_s) = (free_port(), free_port(), free_port(), free_port());
+    let (pg_p, repl_p, pg_s, repl_s, phys) = (free_port(), free_port(), free_port(), free_port(), free_port());
+    let physical = format!("127.0.0.1:{phys}");
     let primary_args = vec![
         "--port".into(),
         pg_p.to_string(),
@@ -157,6 +165,8 @@ fn cluster() -> Cluster {
         "primary".into(),
         "--replication-port".into(),
         repl_p.to_string(),
+        "--physical-replication-listen".into(),
+        physical.clone(),
     ];
     let standby_args = vec![
         "--port".into(),
@@ -167,6 +177,8 @@ fn cluster() -> Cluster {
         format!("127.0.0.1:{repl_p}"),
         "--replication-port".into(),
         repl_s.to_string(),
+        "--physical-replication-listen".into(),
+        physical,
     ];
     Cluster {
         dir,
@@ -361,11 +373,14 @@ async fn fresh_standby_after_a_primary_restart_receives_the_history() {
     );
 }
 
-/// The window is bounded: `[replication] logical_wal_retention_entries` on the primary.
-/// Past it a standby is still refused (fail closed, never a silent gap); inside it, it
-/// catches up.
+/// `[replication] logical_wal_retention_entries` bounded what a restarted primary could
+/// serve a LOGICAL standby: past it a fresh standby was refused "full resync required".
+/// Spec P1.3: a standby is physical, and the logical window bounds it no longer —
+/// a standby one row behind still catches up after the primary restarts, and a NEW
+/// standby is installed from a physical copy of the whole dataset instead of being
+/// refused for history the logical window pruned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retention_window_bounds_what_a_restarted_primary_can_serve() {
+async fn logical_retention_window_no_longer_bounds_a_physical_standby() {
     let c = cluster();
     let config = c.dir.path().join("primary.toml");
     std::fs::write(&config, "[replication]\nlogical_wal_retention_entries = 12\n").unwrap();
@@ -405,26 +420,25 @@ async fn retention_window_bounds_what_a_restarted_primary_can_serve() {
     );
     standby.stop();
 
-    // A NEW standby needs the whole history, which the primary pruned past the window:
-    // it must be refused, loudly, not served a partial dataset.
+    // A NEW standby needs the whole dataset, whose logical history the primary pruned
+    // past the window: it is installed from a physical copy, and holds every row.
+    let port = free_port();
     let fresh_args = {
         let mut args = c.standby_args.clone();
-        let port = free_port();
         let at = args.iter().position(|a| a == "--port").unwrap();
         args[at + 1] = port.to_string();
         args
     };
     let mut fresh = Daemon::spawn(c.dir.path(), "fresh-standby", &c.token, &fresh_args);
-    let status = fresh.wait_exit(Duration::from_secs(60));
-    assert!(
-        status.is_some_and(|s| !s.success()),
-        "the fresh standby must refuse, got {status:?}"
+    let all: Vec<i32> = (1..=41).collect();
+    assert_eq!(
+        settle(port, &all, Duration::from_secs(60)).await,
+        Ok(all),
+        "a fresh physical standby holds every row, whatever the logical window kept"
     );
-    let log = std::fs::read_to_string(c.dir.path().join("fresh-standby.log")).unwrap();
     assert!(
-        log.contains("full resync required"),
-        "the refusal must name the cause; log tail: {}",
-        log.lines().rev().take(5).collect::<Vec<_>>().join(" | ")
+        fresh.wait_exit(Duration::from_millis(100)).is_none(),
+        "the fresh standby keeps running"
     );
 }
 

@@ -431,12 +431,18 @@ fn unrelated_pg_listener_cannot_satisfy_daemon_readiness() {
     assert!(!server.fixture.path().join("owned.pid").exists());
 }
 
+/// Spec P1.3: an existing directory that is not a physical standby is refused
+/// without being touched. A refusal leaves a standby up by default
+/// (`on_unrecoverable = "stay-up"`); `"exit"` turns it into a startup failure,
+/// which is what this pins.
 #[test]
 #[cfg(feature = "ha-tier1")]
 fn guarded_standby_refuses_existing_unbound_data_before_database_open() {
     let pg = reserve("127.0.0.1");
     let port = pg.local_addr().unwrap().port();
     drop(pg);
+    let (_token_dir, token) = replication_token_file();
+    let token_arg = token.display().to_string();
     let mut server = Server::start_with_existing_data(
         port,
         &[
@@ -446,8 +452,10 @@ fn guarded_standby_refuses_existing_unbound_data_before_database_open() {
             "standby",
             "--primary-host",
             "127.0.0.1:1",
+            "--replication-token-file",
+            &token_arg,
         ],
-        None,
+        Some("[replication]\non_unrecoverable = \"exit\"\n"),
         true,
     );
     server.assert_failure();
@@ -518,14 +526,21 @@ fn simple_query_error(stream: &mut TcpStream, sql: &str) -> Option<String> {
     panic!("query did not finish");
 }
 
+/// Spec P1.3: the standby is physical — bootstrapped from the primary's
+/// physical source (which needs the replication token) — and the native
+/// channel still verifies the primary's history, as its control plane.
 #[test]
 #[cfg(feature = "ha-tier1")]
 fn guarded_standby_verifies_history_and_refuses_transparent_forwarding_in_every_mode() {
     let primary_pg = reserve("127.0.0.1");
     let primary_repl = reserve("127.0.0.1");
+    let primary_physical = reserve("127.0.0.1");
     let pg_port = primary_pg.local_addr().unwrap().port();
     let repl_port = primary_repl.local_addr().unwrap().port();
-    drop((primary_pg, primary_repl));
+    let physical = primary_physical.local_addr().unwrap().to_string();
+    drop((primary_pg, primary_repl, primary_physical));
+    let (_token_dir, token) = replication_token_file();
+    let token_arg = token.display().to_string();
     let mut primary = Server::start(
         pg_port,
         &[
@@ -535,6 +550,10 @@ fn guarded_standby_verifies_history_and_refuses_transparent_forwarding_in_every_
             "primary",
             "--replication-port",
             &repl_port.to_string(),
+            "--replication-token-file",
+            &token_arg,
+            "--physical-replication-listen",
+            &physical,
         ],
         None,
     );
@@ -560,6 +579,10 @@ fn guarded_standby_verifies_history_and_refuses_transparent_forwarding_in_every_
                 &format!("127.0.0.1:{repl_port}"),
                 "--sync-mode",
                 mode,
+                "--replication-token-file",
+                &token_arg,
+                "--physical-replication-listen",
+                &physical,
             ],
             None,
         );
@@ -638,17 +661,27 @@ fn replication_startup_timeout_rejects_out_of_range_before_data_creation() {
     }
 }
 
+/// Spec P1.3 (field finding J2): a standby whose primary does not answer no
+/// longer exits when `replication.startup_timeout_secs` runs out — it opens its
+/// listeners NOT READY and keeps trying. The budget still bounds how long the
+/// listeners wait, and the explicit CLI value must survive the daemon re-exec:
+/// a child that kept the file's 45 s would not acknowledge within its parent's
+/// 1 + 5 s readiness window.
 #[test]
 #[cfg(feature = "ha-tier1")]
-fn standby_small_timeout_bounds_verification_and_survives_daemon_reexec() {
+fn standby_small_timeout_opens_not_ready_listeners_and_survives_daemon_reexec() {
     for daemon in [false, true] {
-        // Own an idle endpoint that accepts TCP into its backlog but never sends
-        // a handshake. This deterministically exercises the history startup budget.
+        // Own idle endpoints that accept TCP into their backlog but never send
+        // a handshake: the native and the physical channel both stay pending.
         let peer = reserve("127.0.0.1");
+        let physical_peer = reserve("127.0.0.1");
         let pg = reserve("127.0.0.1");
         let port = pg.local_addr().unwrap().port();
         let endpoint = peer.local_addr().unwrap().to_string();
+        let physical = physical_peer.local_addr().unwrap().to_string();
         drop(pg);
+        let (_token_dir, token) = replication_token_file();
+        let token_arg = token.display().to_string();
         let mut args = vec![
             "--http-port",
             "0",
@@ -656,36 +689,38 @@ fn standby_small_timeout_bounds_verification_and_survives_daemon_reexec() {
             "standby",
             "--primary-host",
             &endpoint,
+            "--physical-replication-listen",
+            &physical,
+            "--replication-token-file",
+            &token_arg,
             "--replication-startup-timeout-secs",
             "1",
         ];
         if daemon {
             args.push("--daemon");
         }
-        // Without forwarding the explicit CLI override, the daemon child would
-        // retain 45s and be killed by its parent, rather than fail its own 1s budget.
         let mut server = Server::start(port, &args, Some("[replication]\nstartup_timeout_secs=45\n"));
-        server.assert_failure();
         if daemon {
-            assert!(
-                server.logs().contains("Daemon worker exited at startup"),
-                "{}",
-                server.logs()
-            );
+            assert!(server.wait_exit().success(), "{}", server.logs());
             assert!(
                 !server.logs().contains("Daemon did not acknowledge"),
                 "{}",
                 server.logs()
             );
+            assert!(!server.worker_pids.is_empty(), "daemon PID missing");
         } else {
-            assert!(
-                server
-                    .logs()
-                    .contains("did not verify primary dataset history within 1s"),
-                "{}",
-                server.logs()
-            );
+            server.wait_ready();
+            assert!(server.logs().contains("is not ready after 1s"), "{}", server.logs());
         }
+        // Listening, accepting the login, and refusing readiness with 55000.
+        let mut client = trust_connection(port);
+        let error = simple_query_error(&mut client, "SELECT heliosdb_require_ready()")
+            .expect("a standby without its primary is not ready");
+        assert!(
+            error.contains("55000") && error.contains("standby is not ready"),
+            "{error}"
+        );
+        drop((peer, physical_peer));
     }
 }
 

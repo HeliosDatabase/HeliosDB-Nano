@@ -452,6 +452,30 @@ impl UncommittedWriteCensus {
         let _ = slot.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| Some(v.saturating_sub(1)));
     }
 
+    /// Mark `tables` — or, with `every_table`, all of them — as having staged
+    /// writes AND staged index removals until the returned hold drops.
+    ///
+    /// For a physical standby's applier. It applies a batch to row storage
+    /// first and brings the ART indexes in line afterwards, and it may re-derive
+    /// a table's indexes from a scan; in between, an index can miss a committed
+    /// row or under-count a table. That is the exact shape of the dirty-index
+    /// window this census already guards for eager transaction writes, so the
+    /// applier takes a hold for the tables it is publishing: every miss-based
+    /// and cardinality fast path declines to the planner, which reads row
+    /// storage and is already exact. Counted like one transaction.
+    ///
+    /// `StorageEngine::merge_branch` takes the same hold on a primary while it
+    /// writes branch rows into main and re-derives main's indexes from them
+    /// (spec P1.1b): the same window, opened by the same order of operations.
+    pub(crate) fn hold_for_replay(self: &Arc<Self>, tables: Vec<String>, every_table: bool) -> UncommittedWriteHold {
+        self.hold(CensusMembership {
+            counted: true,
+            unattributed: every_table,
+            tables_written: tables.clone(),
+            tables_removed: tables,
+        })
+    }
+
     /// Take a standalone set of census slots, released when the returned value
     /// drops. See [`UncommittedWriteHold`].
     fn hold(self: &Arc<Self>, membership: CensusMembership) -> UncommittedWriteHold {
@@ -1681,10 +1705,25 @@ impl Transaction {
             }
         }
 
-        // An empty batch (a read-only transaction) passes a closed gate as a
-        // no-op, so COMMIT of a read-only transaction on a read-only or
-        // physical open succeeds without attempting a write.
-        let result = if self.rocksdb_wal_enabled {
+        // An empty batch is not handed to RocksDB at all. Nothing was staged:
+        // a read-only transaction, or an autocommit statement that wrote
+        // outside its write set and logged nothing (CREATE / USE / MERGE
+        // BRANCH). RocksDB would still log it, as a write group with no
+        // operations that consumes no sequence number — a record a physical
+        // standby reading this WAL has to skip. A commit that asked for a
+        // synced write keeps its fsync: it can be the durability barrier for
+        // writes the statement made outside the write set. On a closed gate
+        // this is what `WriteGate::write` already did with an empty batch, so
+        // COMMIT of a read-only transaction on a read-only or physical open
+        // still succeeds without attempting a write.
+        let result = if batch.is_empty() {
+            if self.rocksdb_wal_enabled && ((self.sync_commit && !group_fsync) || wal_force_sync) && self.gate.is_open()
+            {
+                self.db.flush_wal(true).map_err(Error::from)
+            } else {
+                Ok(())
+            }
+        } else if self.rocksdb_wal_enabled {
             if (self.sync_commit && !group_fsync) || wal_force_sync {
                 // R1.3 phase 1 fallback (no group committer wired): one
                 // synced WriteBatch per commit; RocksDB write groups
