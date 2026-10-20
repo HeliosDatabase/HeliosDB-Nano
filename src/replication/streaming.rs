@@ -1279,12 +1279,13 @@ impl StreamingClient {
 
         // This persists/fsyncs a first binding before any WAL dispatch or readiness.
         self.history.verify_or_bind(response.history_id)?;
+        // Stored before `Verified` is published, so an observer of that
+        // status reads this handshake's values.
+        self.fencing_token.store(response.fencing_token, Ordering::SeqCst);
+        self.primary_lsn.store(response.primary_lsn, Ordering::SeqCst);
         self.status_tx.send_replace(StreamingClientStatus::Verified {
             history_id: response.history_id,
         });
-
-        self.fencing_token.store(response.fencing_token, Ordering::SeqCst);
-        self.primary_lsn.store(response.primary_lsn, Ordering::SeqCst);
 
         tracing::info!(
             "Connected to primary (node: {}, LSN: {}, fencing: {})",
@@ -1530,6 +1531,13 @@ impl StreamingClient {
     /// Get current state
     pub async fn state(&self) -> StreamingClientState {
         *self.state.read().await
+    }
+
+    /// The primary's LOGICAL WAL LSN, as of the last handshake or heartbeat.
+    /// Not a physical sequence: a physical standby never compares it with
+    /// its cursor (`standby_posture::PostureTracker::observe_native_handshake`).
+    pub fn primary_lsn(&self) -> Lsn {
+        self.primary_lsn.load(Ordering::SeqCst)
     }
 
     /// Get applied LSN

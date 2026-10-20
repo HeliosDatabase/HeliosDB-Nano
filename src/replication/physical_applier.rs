@@ -29,8 +29,9 @@
 //!    schemas and constraint sets of touched tables. Then the census hold
 //!    (below), and the row-cache / committed-write-watermark invalidation of
 //!    every touched row — invalidated before the new bytes are visible.
-//! 3. **Apply** verbatim through [`LocalWriter::apply_source`]: one fsynced
-//!    write of the source bytes plus the node-local cursor. The applier never
+//! 3. **Apply** verbatim through [`LocalWriter::apply_source_with`]: one
+//!    write of the source bytes plus the node-local cursor (fsynced, or —
+//!    from a receiver's poll — deferred to one fsync per poll). The applier never
 //!    writes to RocksDB in any other way.
 //! 4. **Publish**, in this order:
 //!
@@ -96,7 +97,7 @@ use parking_lot::Mutex;
 use rocksdb::{Direction, IteratorMode, ReadOptions};
 use tracing::{debug, warn};
 
-use super::physical::{walk_raw_batch, LocalWriter, PhysicalBatch, PhysicalError};
+use super::physical::{walk_raw_batch, Durability, LocalWriter, PhysicalBatch, PhysicalError};
 use super::physical_vector::StandbyVectorHook;
 use crate::sql::TableConstraints;
 use crate::storage::keyspace::{classify, KeyClass};
@@ -365,13 +366,21 @@ impl PhysicalApplier {
     /// cannot be completed is a re-derivation or the suspect flag, never an
     /// error.
     pub fn apply(&self, batch: &PhysicalBatch) -> Result<Applied> {
+        self.apply_with(batch, Durability::Synced)
+    }
+
+    /// [`Self::apply`], with the write fsynced or not by `durability`
+    /// ([`LocalWriter::apply_source_with`]). The publication is the same
+    /// either way: a deferred group is applied (it and its cursor are in the
+    /// store), only not yet fsynced; the receiver syncs once per poll.
+    pub fn apply_with(&self, batch: &PhysicalBatch, durability: Durability) -> Result<Applied> {
         let _replay = self.engine.replay_guard();
         let mut state = self.state.lock();
 
         // An exact retransmission changes nothing, and anything else at or
         // below the cursor is refused by the writer; neither needs a plan.
         if batch.last_sequence() <= self.writer.cursor().source_sequence() {
-            if self.writer.apply_source(batch)? {
+            if self.writer.apply_source_with(batch, durability)? {
                 // Unreachable through `apply_source`'s own rules; if it ever
                 // happens, the batch was applied without a publication.
                 self.defer_full_rebuild(&mut state, "a batch at or below the cursor was applied");
@@ -409,7 +418,7 @@ impl PhysicalApplier {
         }
 
         // 3. Apply verbatim.
-        if !self.writer.apply_source(batch)? {
+        if !self.writer.apply_source_with(batch, durability)? {
             return Ok(Applied {
                 source_sequence: batch.last_sequence(),
                 ..Applied::default()

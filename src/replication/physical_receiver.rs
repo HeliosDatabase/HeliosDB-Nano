@@ -15,9 +15,11 @@
 use super::checkpoint_transfer::{
     ClosedPhysicalStage, PhysicalStage, ReceiverStaging, ReopenedPhysicalStage, TransferLimits,
 };
-use super::physical::{LocalWriter, PhysicalBatch, PhysicalCursor, MAX_BATCH_BYTES};
+use super::physical::{Durability, LocalWriter, PhysicalBatch, PhysicalCursor, MAX_BATCH_BYTES};
 use super::physical_applier::PhysicalApplier;
-use super::physical_wire::{BatchSink, PhysicalClient, SourceSessionInfo, TransferToken, WireError, WireLimits};
+use super::physical_wire::{
+    BatchSink, PhysicalClient, PollSummary, SourceSessionInfo, TransferToken, WireError, WireLimits,
+};
 use crate::Config;
 use async_trait::async_trait;
 use std::{
@@ -160,6 +162,13 @@ pub enum ReceiverStatus {
     /// more per reconnect), so an observer can tell a poll of the streaming
     /// session from the first poll of a new one even when the `Connecting` in
     /// between was overwritten before it saw it.
+    ///
+    /// `cursor` (here and in `CaughtUp`) is always durable: a poll's groups
+    /// are applied deferred and synced once before anything reports past them
+    /// (the applied-but-unsynced position is the writer's own cursor, which
+    /// readers of the store see). `source_barrier` is the last physical
+    /// barrier observed: the session's connect barrier or a poll's, reported
+    /// when the poll announces it, before its groups are applied.
     Applying {
         path: PathBuf,
         cursor: PhysicalCursor,
@@ -228,9 +237,17 @@ enum Command {
         limits: TransferLimits,
         reply: Reply<()>,
     },
+    /// Apply one source group. A poll's groups are applied
+    /// [`Durability::Deferred`] and made durable by one [`Command::Sync`].
     Apply {
         batch: PhysicalBatch,
+        durability: Durability,
         reply: Reply<()>,
+    },
+    /// fsync every deferred group of the live stage (`LocalWriter::sync`);
+    /// replies the durable barrier's source sequence.
+    Sync {
+        reply: Reply<u64>,
     },
     /// A serving receiver's idle moment: run what its applier deferred
     /// (`PhysicalApplier::run_pending_rebuilds`). Replies whether anything
@@ -264,6 +281,14 @@ impl State {
             Self::Closed(closed) => Ok(closed),
             Self::Empty | Self::Download(_) => Err(ReceiverError::Interrupted),
             Self::Failed => Err(storage("receiver worker already failed")),
+        }
+    }
+    /// The live stage's writer, if there is one.
+    fn writer(&self) -> Option<&Arc<LocalWriter>> {
+        match self {
+            Self::Initial(stage) => Some(stage.writer()),
+            Self::Reopened(stage) => Some(stage.writer()),
+            _ => None,
         }
     }
     fn position(&self) -> Position {
@@ -456,18 +481,30 @@ fn worker_loop(
                 record_position(&state, &last);
                 let _ = reply.send(result);
             }
-            Command::Apply { batch, reply } => {
+            Command::Apply {
+                batch,
+                durability,
+                reply,
+            } => {
                 let result = match (&mut state, &applier) {
                     (State::Reopened(stage), Some(applier)) => stage
                         .verify()
                         .map_err(storage)
-                        .and_then(|()| applier.apply(&batch).map(|_| ()).map_err(storage)),
-                    (State::Initial(stage), _) => stage.apply(&batch).map(|_| ()).map_err(storage),
-                    (State::Reopened(stage), None) => stage.apply(&batch).map(|_| ()).map_err(storage),
+                        .and_then(|()| applier.apply_with(&batch, durability).map(|_| ()).map_err(storage)),
+                    (State::Initial(stage), _) => stage.apply_with(&batch, durability).map(|_| ()).map_err(storage),
+                    (State::Reopened(stage), None) => stage.apply_with(&batch, durability).map(|_| ()).map_err(storage),
                     _ => Err(storage("physical batch outside live stage state")),
                 };
                 stop = result.is_err();
                 record_position(&state, &last);
+                let _ = reply.send(result);
+            }
+            Command::Sync { reply } => {
+                let result = match state.writer() {
+                    Some(writer) => writer.sync().map_err(storage),
+                    None => Err(storage("physical sync outside live stage state")),
+                };
+                stop = result.is_err();
                 let _ = reply.send(result);
             }
             Command::Maintain { reply } => {
@@ -503,6 +540,7 @@ fn worker_loop(
             }
             Command::Close { reply } => {
                 drop(applier.take());
+                sync_before_close(&state);
                 let result = std::mem::replace(&mut state, State::Empty).close();
                 if let Ok(closed) = &result {
                     state = State::Closed(closed.clone());
@@ -520,23 +558,61 @@ fn worker_loop(
     // error cannot turn a previous error/cancel into an installation success.
     // A serving standby's engine still shares the writer while its database
     // is alive, so the close below can only succeed once that is dropped too;
-    // every batch was fsynced, so a handle closed by process exit instead
-    // loses nothing.
+    // the deferred groups were fsynced first, so a handle closed by process
+    // exit instead loses nothing.
     drop(applier.take());
+    sync_before_close(&state);
     if matches!(state, State::Initial(_) | State::Reopened(_)) {
         if let Err(error) = state.close() {
             tracing::error!(%error,"physical receiver cleanup close failed");
         }
     }
 }
+/// fsync the live stage's deferred groups before it is closed — or left to
+/// close with the process, when a serving database still shares its writer.
+/// `LocalWriter::close` syncs too, but only once it owns the handle.
+fn sync_before_close(state: &State) {
+    // A poisoned writer refuses to vouch for its store; its close says so.
+    if let Some(writer) = state.writer().filter(|writer| !writer.is_poisoned()) {
+        if let Err(error) = writer.sync() {
+            tracing::error!(%error, "physical receiver could not fsync its applied groups before closing");
+        }
+    }
+}
+
+/// The sink of one poll: every group is applied [`Durability::Deferred`] and
+/// the poll's caller syncs them once ([`Command::Sync`]) before it reports or
+/// acknowledges the cursor. It reports the source's durable barrier as soon
+/// as the poll announces it, so the posture's `primary_cursor` is current
+/// while a long poll is still being applied.
 struct Sink<'a> {
     worker: &'a Worker,
+    progress: &'a watch::Sender<ReceiverStatus>,
+    path: &'a Path,
+    /// The durable cursor the poll started from.
+    cursor: &'a PhysicalCursor,
+    session: u64,
 }
 #[async_trait]
 impl BatchSink for Sink<'_> {
+    async fn begin(&mut self, summary: PollSummary) -> super::physical_wire::Result<()> {
+        if summary.batches > 0 {
+            self.progress.send_replace(ReceiverStatus::Applying {
+                path: self.path.to_path_buf(),
+                cursor: self.cursor.clone(),
+                source_barrier: Some(summary.durable_barrier),
+                session: self.session,
+            });
+        }
+        Ok(())
+    }
     async fn apply(&mut self, batch: PhysicalBatch) -> super::physical_wire::Result<()> {
         self.worker
-            .request(|reply| Command::Apply { batch, reply })
+            .request(|reply| Command::Apply {
+                batch,
+                durability: Durability::Deferred,
+                reply,
+            })
             .await
             .map_err(|error| WireError::Source(error.to_string()))
     }
@@ -807,14 +883,24 @@ async fn run_inner(
             return Err(WireError::Shutdown.into());
         }
         let (path, cursor) = worker.position().await?.initialized()?;
+        // Every reported cursor is durable: the previous poll's groups were
+        // synced before this one starts. The barrier is the last physical one
+        // observed (the session's connect barrier, or the previous poll's).
         progress.send_replace(ReceiverStatus::Applying {
             path: path.clone(),
             cursor: cursor.clone(),
-            source_barrier: None,
+            source_barrier: Some(observed_barrier),
             session,
         });
+        let mut sink = Sink {
+            worker,
+            progress,
+            path: &path,
+            cursor: &cursor,
+            session,
+        };
         let outcome = client
-            .poll(cursor.source_sequence(), options.poll_byte_limit, &mut Sink { worker })
+            .poll(cursor.source_sequence(), options.poll_byte_limit, &mut sink)
             .await;
         let summary = match outcome {
             Ok(summary) => summary,
@@ -829,6 +915,12 @@ async fn run_inner(
                     // queue-closed diagnostic from an already failed worker.
                     return Err(error.into());
                 }
+                // The FIFO sync also makes the groups this poll applied
+                // durable, so the reconnect resumes after a durable cursor.
+                worker
+                    .request(|reply| Command::Sync { reply })
+                    .await
+                    .map_err(|drain| storage(format!("{error}; cannot drain receiver apply: {drain}")))?;
                 let (_, durable) = worker
                     .position()
                     .await
@@ -847,9 +939,16 @@ async fn run_inner(
                 continue;
             }
         };
+        // One fsync for the whole poll: its groups were applied deferred.
+        let synced = if summary.batches > 0 {
+            worker.request(|reply| Command::Sync { reply }).await?
+        } else {
+            cursor.source_sequence()
+        };
         let (path, durable) = worker.position().await?.initialized()?;
         if durable.history() != cursor.history()
             || durable.source_sequence() != summary.through
+            || synced != summary.through
             || summary.durable_barrier < observed_barrier
         {
             return Err(storage("wire completion differs from receiver durable history/cursor"));
@@ -916,6 +1015,12 @@ async fn run_inner(
                     tracing::warn!(%error, "physical standby: deferred derived-state work failed; it stays pending")
                 }
             }
+        }
+        // A poll that carried groups is followed by the next one at once: the
+        // primary kept writing while they were applied. Only an empty poll
+        // (nothing new at the primary's barrier) waits `poll_interval`.
+        if summary.batches > 0 {
+            continue;
         }
         if wait_or_stop(options.poll_interval, shutdown).await {
             return Err(WireError::Shutdown.into());

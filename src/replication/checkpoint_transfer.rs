@@ -6,7 +6,9 @@
 //! (`StorageEngine::build_db_options`), so the stage and a standby serving it
 //! run with the primary's prefix extractor, filters, cache and compression.
 
-use super::physical::{LocalWriter, PhysicalBatch, PhysicalCursor, PhysicalError, StagedPhysicalReplica, LOCAL_CF};
+use super::physical::{
+    Durability, LocalWriter, PhysicalBatch, PhysicalCursor, PhysicalError, StagedPhysicalReplica, LOCAL_CF,
+};
 use crate::{storage::StorageEngine, Config};
 use rocksdb::{checkpoint::Checkpoint, ColumnFamilyDescriptor, Options, DB};
 use serde::{Deserialize, Serialize};
@@ -857,8 +859,12 @@ impl PhysicalStage {
         self.replica.writer()
     }
     pub fn apply(&mut self, batch: &PhysicalBatch) -> Result<bool> {
+        self.apply_with(batch, Durability::Synced)
+    }
+    /// [`Self::apply`], fsynced or not by `durability` ([`LocalWriter::apply_source_with`]).
+    pub fn apply_with(&mut self, batch: &PhysicalBatch, durability: Durability) -> Result<bool> {
         self.owner.verify()?;
-        Ok(self.replica.apply(batch)?)
+        Ok(self.replica.apply_with(batch, durability)?)
     }
     /// Install a closed physical stage, never a ready/serving Nano standby.
     /// Ordinary CLI startup must refuse PHYSICAL_MARKER_FILE until its physical
@@ -1038,8 +1044,12 @@ impl ReopenedPhysicalStage {
         self.replica.writer()
     }
     pub fn apply(&mut self, batch: &PhysicalBatch) -> Result<bool> {
+        self.apply_with(batch, Durability::Synced)
+    }
+    /// [`Self::apply`], fsynced or not by `durability` ([`LocalWriter::apply_source_with`]).
+    pub fn apply_with(&mut self, batch: &PhysicalBatch, durability: Durability) -> Result<bool> {
         verify_existing_stage(&self.owner)?;
-        Ok(self.replica.apply(batch)?)
+        Ok(self.replica.apply_with(batch, durability)?)
     }
     /// The checks [`Self::apply`] runs before every batch — the directory is
     /// still this stage's, carries no primary/standby marker and the same

@@ -4152,6 +4152,7 @@ async fn run_physical_standby(
                 store.subscribe(),
                 control_plane,
                 refuse_history,
+                std::sync::Arc::clone(&plan.tracker),
                 shutdown.clone(),
             )))
         }
@@ -4187,8 +4188,8 @@ async fn run_physical_standby(
             closed.cursor.source_sequence()
         ),
         // The serving database still shares the store at shutdown, so the
-        // receiver cannot close it; it closes with the process (every batch
-        // was fsynced).
+        // receiver cannot close it; it closes with the process (the receiver
+        // fsynced its applied groups before it stopped).
         Err(error) if stopping => tracing::debug!("physical standby receiver stopped: {error}"),
         Err(error) => plan.refuse(&refusal, format!("the physical receiver stopped: {error}")),
     }
@@ -4227,7 +4228,9 @@ fn replicated_logical_position(storage: &std::sync::Weak<heliosdb_nano::storage:
 /// The physical channel cannot say so itself (its source drops a session it
 /// refuses, which reads as a transport failure and is retried), so the
 /// native handshake is what turns that case into `needs_recovery`
-/// (`refuse_history`).
+/// (`refuse_history`). The primary's position it learns is a LOGICAL WAL
+/// LSN: it reaches the posture only as `native_primary_lsn`
+/// (`PostureTracker::observe_native_handshake`), never as a physical cursor.
 #[cfg(feature = "ha-tier1")]
 async fn run_native_control_plane(
     native: NativeControlPlan,
@@ -4235,6 +4238,7 @@ async fn run_native_control_plane(
     mut store: tokio::sync::watch::Receiver<Option<std::sync::Arc<EmbeddedDatabase>>>,
     verified: tokio::sync::watch::Sender<bool>,
     refuse_history: std::sync::Arc<dyn Fn(String) + Send + Sync>,
+    tracker: std::sync::Arc<heliosdb_nano::standby_posture::PostureTracker>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     use heliosdb_nano::replication::history::ReceiverHistory;
@@ -4315,6 +4319,8 @@ async fn run_native_control_plane(
         let current = status.borrow_and_update().clone();
         match current {
             StreamingClientStatus::Verified { history_id } | StreamingClientStatus::CaughtUp { history_id } => {
+                // Logical: kept apart from the physical posture.
+                tracker.observe_native_handshake(client.primary_lsn());
                 if !announced {
                     info!("Standby dataset history verified: {history_id}");
                     announced = true;

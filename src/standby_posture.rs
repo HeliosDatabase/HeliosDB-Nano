@@ -25,7 +25,7 @@
 //! | `connecting` | no session has applied anything since the store was attached | no |
 //! | `recovering` | a bootstrap copy is downloading (`mode = "bootstrap"`) | no |
 //! | `catching_up` | the first session after the store was attached has not reached its connect barrier yet | no |
-//! | `streaming` | the current session's cursor reached the barrier the primary reported (`CaughtUp`); kept while that session lives | yes |
+//! | `streaming` | the current session's cursor reached the barrier the primary reported (`CaughtUp`, or an `Applying` of the same session at or past a barrier it reported earlier — its `CaughtUp` was overwritten before it was observed); kept while that session lives | yes |
 //! | `reconnecting` | a streaming session was lost; kept until a new session catches up | while disconnected for at most `[replication] max_standby_lag` |
 //! | `needs_recovery` | a refusal the receiver cannot resolve by itself (history mismatch, gap, poison, a directory it may not adopt); sticky until restart | no |
 //!
@@ -39,7 +39,13 @@
 //! apply" would grow without bound on a perfectly current standby.
 //! `lag_bytes` is the sequence delta `primary_cursor - cursor` — "write
 //! operations behind", monotone and comparable, as Proxy's `max_lag_bytes`
-//! expects (§D8). `primary_cursor` is the barrier of the last poll.
+//! expects (§D8). `primary_cursor` is the last PHYSICAL barrier observed: a
+//! session's connect barrier, a poll's announced durable barrier (reported
+//! before its batches are applied, so it stays current through a long poll),
+//! a caught-up poll's barrier. It never moves back, and it is kept across
+//! reconnects until a new barrier arrives. The native v3 control channel's
+//! positions are logical WAL LSNs — another number space — and never feed it
+//! ([`PostureTracker::observe_native_handshake`]).
 //!
 //! # Where it lives
 //!
@@ -124,8 +130,14 @@ pub struct StandbySnapshot {
     /// The primary's sequence this standby has applied through (its durable
     /// physical cursor); 0 before its first copy is installed.
     pub cursor: u64,
-    /// The primary's durable barrier as of the last poll.
+    /// The last physical durable barrier the primary reported (module
+    /// documentation); 0 until one is observed. Physical sequences only.
     pub primary_cursor: u64,
+    /// The primary's LOGICAL WAL LSN as of the native v3 control channel's
+    /// last handshake: a diagnostic in another number space, never compared
+    /// with `cursor` or `primary_cursor` and not part of the replication
+    /// block. `None` until a handshake is observed.
+    pub native_primary_lsn: Option<u64>,
     /// When a poll last reached the primary's barrier.
     pub last_caught_up: Option<Instant>,
     /// The physical source this standby follows (`host:port`).
@@ -317,6 +329,26 @@ struct Machine {
     streaming_session: Option<u64>,
     /// When the last streaming session was lost, until a new one catches up.
     reconnect_since: Option<Instant>,
+    /// The session the last `Applying` / `CaughtUp` came from, and the
+    /// highest barrier it reported before that event.
+    session: Option<u64>,
+    session_barrier: Option<u64>,
+}
+
+impl Machine {
+    /// Note that `session` reported `barrier`; returns the highest barrier
+    /// that session reported BEFORE this event (`None` for a new session).
+    fn note_barrier(&mut self, session: u64, barrier: Option<u64>) -> Option<u64> {
+        if self.session != Some(session) {
+            self.session = Some(session);
+            self.session_barrier = None;
+        }
+        let before = self.session_barrier;
+        if let Some(barrier) = barrier {
+            self.session_barrier = Some(before.map_or(barrier, |known| known.max(barrier)));
+        }
+        before
+    }
 }
 
 /// The one writer of a standby's posture.
@@ -332,6 +364,7 @@ impl PostureTracker {
             posture: StandbyPosture::Connecting,
             cursor: 0,
             primary_cursor: 0,
+            native_primary_lsn: None,
             last_caught_up: None,
             primary,
             sync_mode,
@@ -383,6 +416,18 @@ impl PostureTracker {
                     since: Instant::now(),
                 };
             }
+        });
+    }
+
+    /// The native v3 control channel completed a handshake in which the
+    /// primary reported `primary_logical_lsn`, its LOGICAL WAL position. Kept
+    /// as [`StandbySnapshot::native_primary_lsn`] only: it changes no physical
+    /// position, no posture and no readiness.
+    pub fn observe_native_handshake(&self, primary_logical_lsn: u64) {
+        self.tx.send_if_modified(|snapshot| {
+            let changed = snapshot.native_primary_lsn != Some(primary_logical_lsn);
+            snapshot.native_primary_lsn = Some(primary_logical_lsn);
+            changed
         });
     }
 
@@ -472,10 +517,23 @@ impl PostureTracker {
                     session,
                 } => {
                     machine.ever_connected = true;
+                    // The session's cursor already reached a barrier the
+                    // same session reported: it caught up, and its
+                    // `CaughtUp` was overwritten (the receiver polls again at
+                    // once after a poll that carried groups) before it was
+                    // observed.
+                    let reached = machine
+                        .note_barrier(session, barrier)
+                        .is_some_and(|known| cursor >= known);
                     snapshot.cursor = snapshot.cursor.max(cursor);
                     snapshot.last_ack_sequence = Some(snapshot.cursor);
                     if let Some(barrier) = barrier {
                         snapshot.primary_cursor = snapshot.primary_cursor.max(barrier);
+                    }
+                    if reached && machine.streaming_session != Some(session) {
+                        machine.streaming_session = Some(session);
+                        machine.reconnect_since = None;
+                        snapshot.last_caught_up = Some(now);
                     }
                     if machine.streaming_session == Some(session) {
                         // Every poll of a streaming session starts with an
@@ -507,10 +565,11 @@ impl PostureTracker {
                     session,
                 } => {
                     machine.ever_connected = true;
+                    machine.note_barrier(session, Some(barrier));
                     machine.streaming_session = Some(session);
                     machine.reconnect_since = None;
                     snapshot.cursor = snapshot.cursor.max(cursor);
-                    snapshot.primary_cursor = barrier.max(snapshot.cursor);
+                    snapshot.primary_cursor = snapshot.primary_cursor.max(barrier).max(snapshot.cursor);
                     snapshot.last_ack_sequence = Some(snapshot.cursor);
                     snapshot.last_caught_up = Some(now);
                     snapshot.posture = StandbyPosture::Streaming {
@@ -891,6 +950,137 @@ mod tests {
             ),
             "{message}"
         );
+    }
+
+    /// Field finding: a reconnecting standby reported `primary 0/C97` while
+    /// its primary's physical sequence was 0/46EB. `primary_cursor` is the
+    /// last PHYSICAL barrier: a native handshake's logical LSN never moves it,
+    /// a reconnect keeps it, and only a physical barrier advances it.
+    #[test]
+    fn primary_cursor_is_the_last_physical_barrier_never_a_native_lsn() {
+        let posture = tracker();
+        let t0 = Instant::now();
+        // Before any physical barrier: a native handshake changes nothing.
+        posture.observe_native_handshake(0xC97);
+        let snapshot = posture.snapshot();
+        assert_eq!(snapshot.primary_cursor, 0);
+        assert_eq!(snapshot.block().primary_cursor, "0/0");
+        assert_eq!(snapshot.native_primary_lsn, Some(0xC97));
+        assert_eq!(snapshot.posture, StandbyPosture::Connecting);
+
+        posture.attach_store(0x4000, Arc::new(|| None));
+        posture.apply_event(
+            ReceiverEvent::CaughtUp {
+                cursor: 0x46EB,
+                barrier: 0x46EB,
+                session: 1,
+            },
+            t0,
+        );
+        posture.apply_event(ReceiverEvent::Connecting { after: Some(0x46EB) }, t0);
+        assert_eq!(posture.snapshot().posture.state(), "reconnecting");
+        assert_eq!(posture.snapshot().primary_cursor, 0x46EB, "kept across the reconnect");
+
+        // The native channel reconnects first and reports its logical LSN.
+        posture.observe_native_handshake(0xC97);
+        let snapshot = posture.snapshot();
+        assert_eq!(snapshot.primary_cursor, 0x46EB);
+        assert_eq!(snapshot.cursor, 0x46EB);
+        assert_eq!(snapshot.block().primary_cursor, "0/46EB");
+        assert_eq!(snapshot.lag_bytes(), 0);
+        assert_eq!(snapshot.posture.state(), "reconnecting");
+
+        // A physical barrier (the new session's, or a poll's) advances it ...
+        posture.apply_event(
+            ReceiverEvent::Applying {
+                cursor: 0x46EB,
+                barrier: Some(0x5000),
+                session: 2,
+            },
+            t0,
+        );
+        let snapshot = posture.snapshot();
+        assert_eq!(snapshot.primary_cursor, 0x5000);
+        assert_eq!(snapshot.block().primary_cursor, "0/5000");
+        assert_eq!(snapshot.lag_bytes(), 0x5000 - 0x46EB);
+        // ... and an older one never takes it back.
+        posture.apply_event(
+            ReceiverEvent::Applying {
+                cursor: 0x46EB,
+                barrier: Some(0x4800),
+                session: 2,
+            },
+            t0,
+        );
+        assert_eq!(posture.snapshot().primary_cursor, 0x5000);
+        posture.apply_event(
+            ReceiverEvent::CaughtUp {
+                cursor: 0x4900,
+                barrier: 0x4900,
+                session: 2,
+            },
+            t0,
+        );
+        assert_eq!(posture.snapshot().primary_cursor, 0x5000);
+        assert_eq!(posture.snapshot().native_primary_lsn, Some(0xC97));
+    }
+
+    /// The receiver polls again at once after a poll that carried groups, so
+    /// a `CaughtUp` can be overwritten by the next poll's `Applying` before
+    /// it is observed. That `Applying` (same session, cursor at the barrier
+    /// the session reported) still makes the standby streaming; a new
+    /// session's first report never does.
+    #[test]
+    fn an_overwritten_caught_up_still_reaches_streaming() {
+        let posture = tracker();
+        let t0 = Instant::now();
+        posture.attach_store(5, Arc::new(|| None));
+        posture.apply_event(ReceiverEvent::Connecting { after: Some(5) }, t0);
+        posture.apply_event(
+            ReceiverEvent::Applying {
+                cursor: 5,
+                barrier: Some(12),
+                session: 1,
+            },
+            t0,
+        );
+        assert_eq!(posture.snapshot().posture.state(), "catching_up");
+        // `CaughtUp { cursor: 12, barrier: 12 }` was never observed.
+        posture.apply_event(
+            ReceiverEvent::Applying {
+                cursor: 12,
+                barrier: Some(20),
+                session: 1,
+            },
+            t0,
+        );
+        let snapshot = posture.snapshot();
+        assert_eq!(snapshot.posture, StandbyPosture::Streaming { cursor: 12 });
+        assert!(snapshot.ready());
+        assert_eq!(snapshot.last_caught_up, Some(t0));
+        assert_eq!(snapshot.primary_cursor, 20);
+        assert_eq!(snapshot.lag_bytes(), 8);
+
+        // A new session must reach a barrier it reported itself.
+        posture.apply_event(ReceiverEvent::Connecting { after: Some(12) }, t0);
+        posture.apply_event(
+            ReceiverEvent::Applying {
+                cursor: 20,
+                barrier: Some(20),
+                session: 2,
+            },
+            t0,
+        );
+        assert_eq!(posture.snapshot().posture.state(), "reconnecting");
+        posture.apply_event(
+            ReceiverEvent::Applying {
+                cursor: 20,
+                barrier: Some(25),
+                session: 2,
+            },
+            t0,
+        );
+        assert_eq!(posture.snapshot().posture, StandbyPosture::Streaming { cursor: 20 });
     }
 
     #[test]
