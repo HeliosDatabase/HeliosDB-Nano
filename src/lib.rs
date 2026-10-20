@@ -1647,25 +1647,44 @@ impl Drop for EmbeddedDatabase {
         // callers of one handle the SAME lock and released it only when the
         // last handle dropped.
 
-        // Clear session transactions
-        self.session_transactions.clear();
-        self.session_txn_count.store(0, std::sync::atomic::Ordering::Release);
-        // #103: `session_notices` is deliberately NOT cleared here. `Drop` runs
-        // for every `clone_for_trigger()` clone too, and those clones share the
-        // Arc; clearing would discard live sessions' undelivered notices
-        // mid-statement. The map is freed with the last owner, and
-        // `destroy_session` removes a session's queue at disconnect.
+        // Sprinter 96e5a8cfa254: the handle-wide state below is cleared ONLY by
+        // the last owner — the same last-owner gate as the worker stop above,
+        // and the same rule #103 applies to `session_notices`.
+        //
+        // `session_transactions`, `session_txn_count`, the three prepared-
+        // statement maps and the plan / parse caches are all shared `Arc`s that
+        // `clone_for_trigger()` hands to every clone, and DML on a table with
+        // triggers mints one such clone PER ROW and drops it mid-statement.
+        // Clearing them unconditionally meant ONE triggered INSERT, from any
+        // session, silently:
+        //   * dropped every other session's open transaction slot — without its
+        //     ART undo — so that session's later `COMMIT` found no slot, was a
+        //     no-op reporting success, and its writes were gone (its eager index
+        //     entries stayed behind), and its next statements ran in autocommit;
+        //   * zeroed the open-transaction count the snapshot / checkpoint /
+        //     memtable-flush gates above read, while those transactions were
+        //     still open;
+        //   * deleted every PREPAREd statement in the process (`EXECUTE` then
+        //     failed "Prepared statement '…' does not exist");
+        //   * emptied the process-wide plan and parse caches, once per row.
+        // A clone owns none of this, so it must drop none of it. The last owner
+        // clears it explicitly so live transaction slots are released before
+        // the storage engine they reference.
+        //
+        // #103: `session_notices` is deliberately NOT cleared even here: the map
+        // is freed with the last owner, and `destroy_session` removes a
+        // session's queue at disconnect.
+        if std::sync::Arc::strong_count(&self.auto_refresh_worker) == 1 {
+            self.session_transactions.clear();
+            self.session_txn_count.store(0, std::sync::atomic::Ordering::Release);
 
-        // Clear prepared statements
-        self.prepared_statements.write().clear();
-        self.prepared_statement_sql.write().clear();
-        self.prepared_fast_selects.write().clear();
+            self.prepared_statements.write().clear();
+            self.prepared_statement_sql.write().clear();
+            self.prepared_fast_selects.write().clear();
 
-        // Clear plan cache
-        self.plan_cache.clear();
-
-        // Clear parse cache
-        self.parse_cache.clear();
+            self.plan_cache.clear();
+            self.parse_cache.clear();
+        }
 
         tracing::debug!("EmbeddedDatabase dropped, resources cleaned up");
     }
@@ -30939,6 +30958,56 @@ mod tests {
         db.begin_transaction_for_session(session).unwrap();
         db.destroy_session(session).unwrap();
         assert!(db.take_session_notices(session).is_empty());
+    }
+
+    /// Sprinter 96e5a8cfa254: dropping a `clone_for_trigger()` handle — which
+    /// DML on a triggered table does once per row — must leave the root's
+    /// open session transactions, its open-transaction count and its prepared
+    /// statements exactly as they were. Only the last owner clears them.
+    #[test]
+    fn test_dropping_a_trigger_clone_keeps_sessions_and_prepared_statements() {
+        use crate::session::IsolationLevel;
+
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE tcd (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("INSERT INTO tcd VALUES (1, 10)").unwrap();
+        db.query("PREPARE tcd_q AS SELECT v FROM tcd WHERE v >= $1", &[])
+            .unwrap();
+        let session = db.create_session("s_96e5", IsolationLevel::ReadCommitted).unwrap();
+        db.begin_transaction_for_session(session).unwrap();
+
+        let txns_before = db.session_transactions.len();
+        let count_before = db.session_txn_count.load(std::sync::atomic::Ordering::Acquire);
+        let prepared_before = db.prepared_statements.read().len() + db.prepared_statement_sql.read().len();
+        assert_eq!(txns_before, 1, "precondition: one open session transaction");
+        assert_eq!(count_before, 1, "precondition: open-transaction count is 1");
+        assert!(
+            prepared_before > 0,
+            "precondition: the PREPAREd statement is registered"
+        );
+
+        drop(db.clone_for_trigger());
+
+        assert_eq!(
+            db.session_transactions.len(),
+            txns_before,
+            "a trigger clone's Drop must not discard the root's session transactions"
+        );
+        assert_eq!(
+            db.session_txn_count.load(std::sync::atomic::Ordering::Acquire),
+            count_before,
+            "a trigger clone's Drop must not zero the open-transaction count"
+        );
+        assert_eq!(
+            db.prepared_statements.read().len() + db.prepared_statement_sql.read().len(),
+            prepared_before,
+            "a trigger clone's Drop must not discard the root's prepared statements"
+        );
+        assert!(db.session_in_transaction(session));
+        assert_eq!(db.query("EXECUTE tcd_q(5)", &[]).unwrap().len(), 1);
+
+        db.commit_transaction_for_session(session).unwrap();
+        db.destroy_session(session).unwrap();
     }
 
     // ========================================================================
