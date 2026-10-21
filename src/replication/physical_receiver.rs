@@ -11,6 +11,14 @@
 //! (`standby_posture`), derived from this module's [`ReceiverStatus`].
 //! The worker's stage owns the receiver's `LocalWriter`; every RocksDB open of
 //! the stage uses the storage options of `ReceiverOptions::config`.
+//!
+//! Spec P2.1: the receiver's control plane rides its one `NPHYS002` session —
+//! its `Hello` names it (node id, history, durable cursor), it acknowledges
+//! every durable advance with a heartbeat ([`Heartbeat`] = the ACK the
+//! primary's synchronous commits wait on), and a source's refusal arrives as
+//! a typed code: [`RefuseCode::retryable`] ones are retried with backoff,
+//! `AuthFailed` a few times, and every other one stops the receiver, which
+//! the serving standby reports as `needs_recovery`.
 
 use super::checkpoint_transfer::{
     ClosedPhysicalStage, PhysicalStage, ReceiverStaging, ReopenedPhysicalStage, TransferLimits,
@@ -18,7 +26,8 @@ use super::checkpoint_transfer::{
 use super::physical::{Durability, LocalWriter, PhysicalBatch, PhysicalCursor, MAX_BATCH_BYTES};
 use super::physical_applier::PhysicalApplier;
 use super::physical_wire::{
-    BatchSink, PhysicalClient, PollSummary, SourceSessionInfo, TransferToken, WireError, WireLimits,
+    now_millis, BatchSink, Heartbeat, PhysicalClient, PollSummary, ReceiverIdentity, RefuseCode, SourceSessionInfo,
+    TransferToken, WireError, WireLimits,
 };
 use crate::Config;
 use async_trait::async_trait;
@@ -30,8 +39,18 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+/// `AuthFailed` is retried this many times in all — a token file being
+/// replaced on both nodes — before the receiver gives up (spec P2.1 §1).
+const AUTH_ATTEMPTS: u32 = 3;
+/// A failed connection round is retried after `reconnect_delay`, doubling up
+/// to this bound (or `reconnect_delay`, if that is longer).
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
+/// Acknowledgements of durable progress are coalesced to one per this
+/// interval, so a stream of small polls does not double the round trips.
+pub const ACK_COALESCE: Duration = Duration::from_millis(50);
 use tokio::{
     net::TcpStream,
     sync::{mpsc, oneshot, watch},
@@ -80,6 +99,8 @@ pub struct ReceiverOptions {
     pub config: Config,
     pub sources: Vec<SocketAddr>,
     pub token: TransferToken,
+    /// What every `Hello` of this receiver announces.
+    pub identity: ReceiverIdentity,
     pub start: ReceiverStart,
     pub mode: ReceiverMode,
     pub wire: WireLimits,
@@ -87,9 +108,21 @@ pub struct ReceiverOptions {
     pub poll_interval: Duration,
     pub reconnect_delay: Duration,
     pub max_reconnects: u32,
+    /// How often an idle receiver sends a heartbeat (spec P2.1: 5 s). A
+    /// durable advance is acknowledged sooner ([`ACK_COALESCE`]).
+    pub heartbeat_interval: Duration,
 }
 impl ReceiverOptions {
     fn validate(&self) -> Result<()> {
+        if self.identity.node_id.is_nil()
+            || self.identity.epoch == 0
+            || self.heartbeat_interval.is_zero()
+            || self.heartbeat_interval > Duration::from_secs(3600)
+        {
+            return Err(ReceiverError::Invalid(
+                "invalid physical receiver identity or heartbeat interval".into(),
+            ));
+        }
         if self.sources.is_empty()
             || self.sources.len() > 16
             || self
@@ -632,8 +665,62 @@ async fn wait_or_stop(delay: Duration, shutdown: &mut watch::Receiver<bool>) -> 
         }
     }
 }
+/// Worth reconnecting for: a transport failure, or a source that refused
+/// with a code that says "later" ([`RefuseCode::retryable`]).
 fn retryable(error: &WireError) -> bool {
-    matches!(error, WireError::Io(_) | WireError::Timeout)
+    match error {
+        WireError::Io(_) | WireError::Timeout => true,
+        WireError::Refused(refusal) => refusal.code.retryable(),
+        _ => false,
+    }
+}
+
+/// When this session's next heartbeat (= acknowledgement) is due: every
+/// heartbeat interval, and once a poll has advanced the durable cursor —
+/// coalesced to one per [`ACK_COALESCE`].
+struct Acknowledgements {
+    last: Instant,
+    pending: bool,
+}
+
+impl Acknowledgements {
+    /// A new session: its `Hello` carried the durable cursor already.
+    fn new() -> Self {
+        Self {
+            last: Instant::now(),
+            pending: false,
+        }
+    }
+
+    fn advanced(&mut self) {
+        self.pending = true;
+    }
+
+    fn sent(&mut self) {
+        self.last = Instant::now();
+        self.pending = false;
+    }
+
+    /// The heartbeat to send now, if one is due. `cursor` is durable (the
+    /// previous poll's groups were synced), so applied = durable = it.
+    fn due(&self, heartbeats: bool, cursor: &PhysicalCursor, interval: Duration) -> Option<Heartbeat> {
+        let elapsed = self.last.elapsed();
+        (heartbeats && ((self.pending && elapsed >= ACK_COALESCE) || elapsed >= interval)).then(|| Heartbeat {
+            applied_sequence: cursor.source_sequence(),
+            durable_sequence: cursor.source_sequence(),
+            received_at: now_millis(),
+        })
+    }
+
+    /// How long an idle receiver waits before its next poll: no longer than
+    /// it takes a pending acknowledgement to become due.
+    fn idle_wait(&self, poll_interval: Duration) -> Duration {
+        if self.pending {
+            ACK_COALESCE.saturating_sub(self.last.elapsed()).min(poll_interval)
+        } else {
+            poll_interval
+        }
+    }
 }
 fn check_session_barrier(client: &PhysicalClient<TcpStream>, known_barrier: u64) -> Result<u64> {
     session_barrier(client.session_info(), known_barrier)
@@ -654,7 +741,9 @@ fn session_barrier(info: Option<&SourceSessionInfo>, known_barrier: u64) -> Resu
 /// `serving`: a serving standby's receiver (spec P1.3) retries a transport
 /// failure for as long as it runs — it must come back by itself when its
 /// primary does, however long that takes — so `max_reconnects` does not bound
-/// it; a refusal still stops it.
+/// it; a refusal still stops it (spec P2.1: unless its code is retryable, or
+/// it is one of [`AUTH_ATTEMPTS`] `AuthFailed`s). Rounds back off from
+/// `reconnect_delay` up to [`MAX_RECONNECT_BACKOFF`].
 async fn connect(
     options: &ReceiverOptions,
     shutdown: &mut watch::Receiver<bool>,
@@ -663,6 +752,13 @@ async fn connect(
     attempts: &mut u32,
     serving: bool,
 ) -> Result<PhysicalClient<TcpStream>> {
+    // A fresh snapshot names the history it was pinned to, if any.
+    let snapshot_history = match &options.start {
+        ReceiverStart::Snapshot { expected_history, .. } => *expected_history,
+        ReceiverStart::Resume { history, .. } => Some(*history),
+    };
+    let mut auth_failures = 0_u32;
+    let mut delay = options.reconnect_delay;
     loop {
         let mut last_error = None;
         // These are the actual authenticated connections, never readiness probes.
@@ -679,6 +775,7 @@ async fn connect(
                 PhysicalClient::connect_resume_loopback(
                     *source,
                     &options.token,
+                    &options.identity,
                     options.wire,
                     shutdown.clone(),
                     cursor.history(),
@@ -686,10 +783,35 @@ async fn connect(
                 )
                 .await
             } else {
-                PhysicalClient::connect_loopback(*source, &options.token, options.wire, shutdown.clone()).await
+                let hello = options.identity.hello(snapshot_history, None);
+                PhysicalClient::connect_loopback(*source, &options.token, hello, options.wire, shutdown.clone()).await
             };
             match result {
-                Ok(client) => return Ok(client),
+                Ok(client) => {
+                    let ok = client.hello_ok();
+                    tracing::info!(
+                        "Standby dataset history verified: {} (primary node {}, epoch {}, replication endpoint {})",
+                        ok.history,
+                        ok.node_id,
+                        ok.epoch,
+                        if ok.physical_endpoint.is_empty() {
+                            source.to_string()
+                        } else {
+                            ok.physical_endpoint.clone()
+                        }
+                    );
+                    return Ok(client);
+                }
+                Err(WireError::Refused(refusal))
+                    if refusal.code == RefuseCode::AuthFailed && auth_failures + 1 < AUTH_ATTEMPTS =>
+                {
+                    auth_failures += 1;
+                    tracing::warn!(
+                        "the physical source at {source} refused this receiver's token ({auth_failures} of \
+                         {AUTH_ATTEMPTS} attempts): {refusal}"
+                    );
+                    last_error = Some(WireError::Refused(refusal));
+                }
                 Err(error) if retryable(&error) => last_error = Some(error),
                 Err(error) => return Err(error.into()),
             }
@@ -699,10 +821,58 @@ async fn connect(
             return Err(error.into());
         }
         *attempts = attempts.saturating_add(1);
-        if wait_or_stop(options.reconnect_delay, shutdown).await {
+        if wait_or_stop(delay, shutdown).await {
             return Err(WireError::Shutdown.into());
         }
+        delay = delay
+            .saturating_mul(2)
+            .min(MAX_RECONNECT_BACKOFF.max(options.reconnect_delay));
     }
+}
+
+/// Recover from a failed operation of `client`'s session: drop it, make the
+/// receiver's applied groups durable, and reconnect at that durable cursor —
+/// unless the failure is not worth retrying (the original error is returned).
+#[allow(clippy::too_many_arguments)]
+async fn reconnect(
+    error: WireError,
+    client: PhysicalClient<TcpStream>,
+    options: &ReceiverOptions,
+    shutdown: &mut watch::Receiver<bool>,
+    progress: &watch::Sender<ReceiverStatus>,
+    worker: &Worker,
+    reconnects: &mut u32,
+    serving: bool,
+) -> Result<PhysicalClient<TcpStream>> {
+    // Discard poisoned framing before reconnect. FIFO drain is essential: a
+    // sink deadline may have expired while its durable apply was still
+    // completing on the owned worker.
+    drop(client);
+    if !retryable(&error) || (!serving && *reconnects >= options.max_reconnects) {
+        // run_receiver closes/joins the owner before reporting this original
+        // protocol/apply error; do not mask it with a later queue-closed
+        // diagnostic from an already failed worker.
+        return Err(error.into());
+    }
+    // The FIFO sync also makes the groups the failed poll applied durable,
+    // so the reconnect resumes after a durable cursor.
+    worker
+        .request(|reply| Command::Sync { reply })
+        .await
+        .map_err(|drain| storage(format!("{error}; cannot drain receiver apply: {drain}")))?;
+    let (_, durable) = worker
+        .position()
+        .await
+        .map_err(|drain| storage(format!("{error}; cannot drain receiver apply: {drain}")))?
+        .initialized()?;
+    if stopped(shutdown) {
+        return Err(WireError::Shutdown.into());
+    }
+    *reconnects = reconnects.saturating_add(1);
+    if wait_or_stop(options.reconnect_delay, shutdown).await {
+        return Err(WireError::Shutdown.into());
+    }
+    connect(options, shutdown, progress, Some(&durable), reconnects, serving).await
 }
 
 /// Runs actual snapshot download and physical replay. Any failure retains owned
@@ -878,11 +1048,36 @@ async fn run_inner(
         }
     };
     let mut observed_barrier = check_session_barrier(&client, 0)?;
+    // Spec P2.1: the control plane rides this session — a heartbeat every
+    // `heartbeat_interval`, and the acknowledgement of every durable advance.
+    let mut acks = Acknowledgements::new();
     loop {
         if stopped(shutdown) {
             return Err(WireError::Shutdown.into());
         }
         let (path, cursor) = worker.position().await?.initialized()?;
+        if let Some(heartbeat) = acks.due(client.heartbeats(), &cursor, options.heartbeat_interval) {
+            match client.heartbeat(heartbeat).await {
+                Ok(_) => acks.sent(),
+                Err(error) => {
+                    client = reconnect(
+                        error,
+                        client,
+                        options,
+                        shutdown,
+                        progress,
+                        worker,
+                        &mut reconnects,
+                        serving,
+                    )
+                    .await?;
+                    session += 1;
+                    observed_barrier = check_session_barrier(&client, observed_barrier)?;
+                    acks = Acknowledgements::new();
+                    continue;
+                }
+            }
+        }
         // Every reported cursor is durable: the previous poll's groups were
         // synced before this one starts. The barrier is the last physical one
         // observed (the session's connect barrier, or the previous poll's).
@@ -905,37 +1100,20 @@ async fn run_inner(
         let summary = match outcome {
             Ok(summary) => summary,
             Err(error) => {
-                // Discard poisoned framing before reconnect. FIFO drain is
-                // essential: a sink deadline may have expired while its durable
-                // apply was still completing on the owned worker.
-                drop(client);
-                if !retryable(&error) || (!serving && reconnects >= options.max_reconnects) {
-                    // run_receiver closes/joins the owner before reporting this
-                    // original protocol/apply error; do not mask it with a later
-                    // queue-closed diagnostic from an already failed worker.
-                    return Err(error.into());
-                }
-                // The FIFO sync also makes the groups this poll applied
-                // durable, so the reconnect resumes after a durable cursor.
-                worker
-                    .request(|reply| Command::Sync { reply })
-                    .await
-                    .map_err(|drain| storage(format!("{error}; cannot drain receiver apply: {drain}")))?;
-                let (_, durable) = worker
-                    .position()
-                    .await
-                    .map_err(|drain| storage(format!("{error}; cannot drain receiver apply: {drain}")))?
-                    .initialized()?;
-                if stopped(shutdown) {
-                    return Err(WireError::Shutdown.into());
-                }
-                reconnects = reconnects.saturating_add(1);
-                if wait_or_stop(options.reconnect_delay, shutdown).await {
-                    return Err(WireError::Shutdown.into());
-                }
-                client = connect(options, shutdown, progress, Some(&durable), &mut reconnects, serving).await?;
+                client = reconnect(
+                    error,
+                    client,
+                    options,
+                    shutdown,
+                    progress,
+                    worker,
+                    &mut reconnects,
+                    serving,
+                )
+                .await?;
                 session += 1;
                 observed_barrier = check_session_barrier(&client, observed_barrier)?;
+                acks = Acknowledgements::new();
                 continue;
             }
         };
@@ -952,6 +1130,10 @@ async fn run_inner(
             || summary.durable_barrier < observed_barrier
         {
             return Err(storage("wire completion differs from receiver durable history/cursor"));
+        }
+        if summary.batches > 0 {
+            // Durable progress: acknowledged at the next loop turn (coalesced).
+            acks.advanced();
         }
         observed_barrier = summary.durable_barrier;
         reconnects = 0;
@@ -997,6 +1179,7 @@ async fn run_inner(
             client = connect(options, shutdown, progress, Some(&durable), &mut reconnects, serving).await?;
             session += 1;
             observed_barrier = check_session_barrier(&client, observed_barrier)?;
+            acks = Acknowledgements::new();
             initial = false;
             continue;
         }
@@ -1018,11 +1201,13 @@ async fn run_inner(
         }
         // A poll that carried groups is followed by the next one at once: the
         // primary kept writing while they were applied. Only an empty poll
-        // (nothing new at the primary's barrier) waits `poll_interval`.
+        // (nothing new at the primary's barrier) waits `poll_interval` — or
+        // less, while an acknowledgement is pending: a synchronous commit on
+        // the primary waits for it.
         if summary.batches > 0 {
             continue;
         }
-        if wait_or_stop(options.poll_interval, shutdown).await {
+        if wait_or_stop(acks.idle_wait(options.poll_interval), shutdown).await {
             return Err(WireError::Shutdown.into());
         }
     }
@@ -1041,7 +1226,10 @@ mod tests {
     use super::super::{
         history::load_or_create_primary_history,
         physical_source::{open_primary_session, SourceWorkLimiter},
-        physical_wire::{serve_session, OpenRequest, PhysicalSource, SourceSessionInfo},
+        physical_wire::{
+            serve_session, OpenRequest, PeerRole, PhysicalSource, SourceContext, SourceIdentity, SourceSessionInfo,
+            WireSyncMode,
+        },
     };
     use super::*;
     use rocksdb::{Options, DB};
@@ -1106,6 +1294,13 @@ mod tests {
             let observed_snapshots = snapshots.clone();
             let observed_resumes = resumes.clone();
             let work = SourceWorkLimiter::new(2).unwrap();
+            let context = Arc::new(SourceContext::unobserved(SourceIdentity {
+                node_id: Uuid::new_v4(),
+                history,
+                epoch: 1,
+                physical_endpoint: address.to_string(),
+                pg_port: 0,
+            }));
             let thread = thread::spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -1124,8 +1319,9 @@ mod tests {
                                 let snapshots=observed_snapshots.clone();let resumes=observed_resumes.clone();
                                 let disconnect_once=disconnect_once.clone();
                                 let work=work.clone();
+                                let context=context.clone();
                                 sessions.spawn(async move {
-                                    serve_session(io,&fixture_token(),wire_limits(),stop,move |request|async move {
+                                    serve_session(io,&fixture_token(),wire_limits(),stop,&context,None,move |request|async move {
                                         match request {OpenRequest::Snapshot=>{snapshots.fetch_add(1,Ordering::SeqCst);},OpenRequest::Resume{..}=>{resumes.fetch_add(1,Ordering::SeqCst);}}
                                         let source=open_primary_session(db.clone(),history,parent,TransferLimits::default(),request,work).await?;
                                         if matches!(request,OpenRequest::Snapshot) {
@@ -1188,6 +1384,13 @@ mod tests {
             config: Config::default(),
             sources: vec![source.address],
             token: fixture_token(),
+            identity: ReceiverIdentity {
+                node_id: Uuid::new_v4(),
+                role: PeerRole::Resync,
+                epoch: 1,
+                pg_port: 0,
+                sync_mode: WireSyncMode::Async,
+            },
             start,
             mode,
             wire: wire_limits(),
@@ -1195,6 +1398,7 @@ mod tests {
             poll_interval: Duration::from_millis(10),
             reconnect_delay: Duration::from_millis(10),
             max_reconnects: 3,
+            heartbeat_interval: Duration::from_millis(20),
         }
     }
     fn status() -> (watch::Sender<ReceiverStatus>, watch::Receiver<ReceiverStatus>) {
@@ -1391,7 +1595,12 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(10), run_receiver(options, shutdown, progress))
             .await
             .unwrap();
-        assert!(matches!(result, Err(ReceiverError::Wire(WireError::Authentication))));
+        // Spec P2.1: a typed refusal, after `AUTH_ATTEMPTS` tries.
+        assert!(
+            matches!(&result, Err(ReceiverError::Wire(WireError::Refused(refusal))) if refusal.code == RefuseCode::AuthFailed),
+            "{:?}",
+            result.err()
+        );
         assert!(!target.exists());
         assert_eq!(source.snapshots.load(Ordering::SeqCst), 0);
         assert!(std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
@@ -1399,6 +1608,43 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with(".nano-resync-")));
+    }
+    /// Spec P2.1: a source of another dataset refuses the receiver with a
+    /// typed code it does not retry (the P1.3 residual: a refusal looked like a
+    /// dropped socket and was retried forever).
+    #[tokio::test]
+    async fn history_mismatch_is_a_typed_refusal_that_is_never_retried() {
+        let root = tempfile::tempdir().unwrap();
+        let (db, history) = primary(root.path());
+        let source = SourceHarness::start(db, history, root.path().to_path_buf(), false);
+        let target = root.path().join("other-history");
+        let (_stop, shutdown) = watch::channel(false);
+        let (progress, _) = status();
+        let mut options = options(
+            &source,
+            ReceiverStart::Snapshot {
+                target: target.clone(),
+                expected_history: Some(Uuid::new_v4()),
+            },
+            ReceiverMode::InstallOnce,
+        );
+        options.reconnect_delay = Duration::from_secs(5);
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(10), run_receiver(options, shutdown, progress))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&result, Err(ReceiverError::Wire(WireError::Refused(refusal)))
+                if refusal.code == RefuseCode::HistoryMismatch && refusal.code.needs_recovery()),
+            "{:?}",
+            result.err()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no reconnect delay was paid"
+        );
+        assert!(!target.exists());
+        assert_eq!(source.snapshots.load(Ordering::SeqCst), 0);
     }
     #[test]
     fn dropping_worker_waits_for_owned_inflight_command_instead_of_detaching_it() {

@@ -551,19 +551,30 @@ where
     attach_http_auth_with_replication(router, policy, None)
 }
 
-/// What a replication node reports on `/health` and `/ready` (spec P1.3): its
-/// frozen replication block (`standby_posture::ReplicationBlock`)
-/// and whether it is ready. Read-only and side-effect free, like the fixed
-/// health body it extends.
-pub type ReplicationStatus = Arc<dyn Fn() -> Option<(bool, serde_json::Value)> + Send + Sync>;
+/// What a replication node reports on `/health` and `/ready`.
+#[derive(Clone, Debug)]
+pub struct ReplicationReport {
+    /// Whether the node is ready (`/ready` 200 or 503).
+    pub ready: bool,
+    /// The frozen replication block (`standby_posture::ReplicationBlock`,
+    /// spec P1.3): `/health`'s `replication` object and `/ready`'s body.
+    pub block: serde_json::Value,
+    /// Spec P2.1: on a primary, the standbys it serves — `/health`'s
+    /// `standbys` array, beside (never inside) the frozen block.
+    pub standbys: Option<serde_json::Value>,
+}
+
+/// What a replication node reports (spec P1.3, P2.1). Read-only and
+/// side-effect free, like the fixed health body it extends.
+pub type ReplicationStatus = Arc<dyn Fn() -> Option<ReplicationReport> + Send + Sync>;
 
 /// [`attach_http_auth`] for a replication node: `/health` (and `/`) answer
-/// `{"status":"ok","replication":{…}}`, and `GET /ready` answers the
-/// replication block itself with 200 when the node is ready and 503 when it
-/// is not. Both stay public and are answered by this layer, never forwarded:
-/// a readiness probe carries no credential, and the block is the same data
-/// `/health` already publishes. With `None` (or a status that reports
-/// nothing) the layer is exactly [`attach_http_auth`]'s.
+/// `{"status":"ok","replication":{…}}` (plus `"standbys":[…]` on a primary),
+/// and `GET /ready` answers the replication block itself with 200 when the
+/// node is ready and 503 when it is not. Both stay public and are answered by
+/// this layer, never forwarded: a readiness probe carries no credential, and
+/// the block is the same data `/health` already publishes. With `None` (or a
+/// status that reports nothing) the layer is exactly [`attach_http_auth`]'s.
 pub fn attach_http_auth_with_replication<S>(
     router: Router<S>,
     policy: Arc<HttpAuthPolicy>,
@@ -596,23 +607,25 @@ async fn guard(
     // `/` is the daemon's health alias.
     if req.method() == Method::GET && (path == "/health" || path == "/") {
         return match replication.as_ref().and_then(|status| status()) {
-            Some((_, block)) => (
-                StatusCode::OK,
-                axum::Json(serde_json::json!({ "status": "ok", "replication": block })),
-            )
-                .into_response(),
+            Some(report) => {
+                let mut body = serde_json::json!({ "status": "ok", "replication": report.block });
+                if let (Some(standbys), Some(object)) = (report.standbys, body.as_object_mut()) {
+                    object.insert("standbys".to_string(), standbys);
+                }
+                (StatusCode::OK, axum::Json(body)).into_response()
+            }
             None => fixed_health_response(),
         };
     }
     // Spec P1.3: readiness of a replication node, same public contract.
     if req.method() == Method::GET && path == "/ready" {
-        if let Some((ready, block)) = replication.as_ref().and_then(|status| status()) {
-            let code = if ready {
+        if let Some(report) = replication.as_ref().and_then(|status| status()) {
+            let code = if report.ready {
                 StatusCode::OK
             } else {
                 StatusCode::SERVICE_UNAVAILABLE
             };
-            return (code, axum::Json(block)).into_response();
+            return (code, axum::Json(report.block)).into_response();
         }
     }
 
@@ -1114,8 +1127,17 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap()
         }
         for ready in [true, false] {
-            let status: ReplicationStatus =
-                Arc::new(move || Some((ready, serde_json::json!({ "role": "standby", "ready": ready }))));
+            // Spec P2.1: a primary's report carries its standbys beside the
+            // block; `/ready` answers the frozen block alone.
+            let standbys = (!ready).then(|| serde_json::json!([{ "node_id": "n", "applied": "0/9" }]));
+            let listed = standbys.clone();
+            let status: ReplicationStatus = Arc::new(move || {
+                Some(ReplicationReport {
+                    ready,
+                    block: serde_json::json!({ "role": "standby", "ready": ready }),
+                    standbys: listed.clone(),
+                })
+            });
             let app = attach_http_auth_with_replication(
                 Router::new().route("/version", get(|| async { "v" })),
                 required_policy(),
@@ -1134,6 +1156,7 @@ mod tests {
             let body = json(health).await;
             assert_eq!(body["status"], "ok");
             assert_eq!(body["replication"]["ready"], ready);
+            assert_eq!(body.get("standbys"), standbys.as_ref());
             let readiness = app
                 .clone()
                 .oneshot(HttpRequest::builder().uri("/ready").body(Body::empty()).unwrap())

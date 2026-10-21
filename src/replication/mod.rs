@@ -1,7 +1,19 @@
 //! High Availability Replication Module
 //!
-//! Implements Tier 1 HA for HeliosDB-Nano:
-//! - Tier 1: Warm Standby (Active-Passive WAL streaming)
+//! Tier 1 HA for HeliosDB-Nano: a primary and its physical standbys.
+//!
+//! A standby is a 1:1 physical replica of its primary (plan
+//! `docs/plans/PHYSICAL_STANDBY_REPLICATION.md`): it applies the primary's
+//! RocksDB write groups verbatim and serves read-only SQL from them. Spec P2.1
+//! put the whole conversation on ONE connection per standby, protocol
+//! `NPHYS002` on the primary's `[replication] replication_port`
+//! ([`physical_wire`]): the bootstrap copy, the physical WAL, the standby's
+//! identity and history, its heartbeats and the acknowledgements synchronous
+//! commits wait on ([`ha_state::HAStateRegistry::wait_for_sequence`]). The
+//! native v3 channel, the logical standby (WAL applicator, logical catch-up,
+//! the `replication_wal/` segment store) and the observer, failover-watcher
+//! and split-brain machinery that only spoke v3 are gone; fencing and
+//! promotion return on the physical protocol (plan phase P5).
 //!
 //! # Feature Flags
 //!
@@ -13,19 +25,16 @@ pub mod config;
 #[cfg(feature = "ha-tier1")]
 pub mod ha_state;
 #[cfg(feature = "ha-tier1")]
-pub use ha_state::{ha_state, HARole, HAStateRegistry, NodeConfig, PrimaryInfo, StandbyInfo, SyncMode};
+pub use ha_state::{
+    ha_state, HARole, HAStateRegistry, NodeConfig, PrimaryInfo, StandbyHandle, StandbyInfo, StandbyRegistration,
+    SyncMode, SyncTimeoutAction,
+};
 
 // Tier 1: Warm Standby (ha-tier1)
 #[cfg(feature = "ha-tier1")]
 pub mod checkpoint_transfer;
 #[cfg(feature = "ha-tier1")]
-pub mod failover_watcher;
-#[cfg(feature = "ha-tier1")]
 pub mod history;
-#[cfg(feature = "ha-tier1")]
-pub mod logical_replication;
-#[cfg(feature = "ha-tier1")]
-pub mod lsn_manager;
 #[cfg(feature = "ha-tier1")]
 pub mod physical;
 #[cfg(feature = "ha-tier1")]
@@ -38,26 +47,12 @@ pub mod physical_source;
 pub mod physical_vector;
 #[cfg(feature = "ha-tier1")]
 pub mod physical_wire;
-#[cfg(feature = "ha-tier1")]
-pub mod query_forwarder;
-#[cfg(feature = "ha-tier1")]
-pub mod split_brain;
 // Spec P1.3: the posture lives at the crate root (`crate::standby_posture`),
 // compiled in every build because the SQL layer asks it whether this node is
 // in recovery; re-exported here beside the receiver it is derived from.
 pub use crate::standby_posture;
 #[cfg(feature = "ha-tier1")]
-pub mod streaming;
-#[cfg(feature = "ha-tier1")]
 pub mod token;
-#[cfg(feature = "ha-tier1")]
-pub mod transport;
-#[cfg(feature = "ha-tier1")]
-pub mod wal_applicator;
-#[cfg(feature = "ha-tier1")]
-pub mod wal_replicator;
-#[cfg(feature = "ha-tier1")]
-pub mod wal_store;
 
 // Controlled Switchover (ha-tier1)
 #[cfg(feature = "ha-tier1")]
@@ -77,49 +72,7 @@ pub use topology::{topology_manager, ClusterSummary, NodeInfo, TopologyEvent, To
 pub use config::*;
 
 #[cfg(feature = "ha-tier1")]
-pub use failover_watcher::{
-    AutomaticFailoverBuilder, AutomaticFailoverCoordinator, FailoverCandidate, FailoverEvent, FailoverWatcher,
-    HealthCheckResult,
-};
-#[cfg(feature = "ha-tier1")]
-pub use logical_replication::{
-    ChangeEvent, ChangeOperation, ChangeRow, ColumnMapping, ColumnTransform, FieldValue, LogicalReplicationConfig,
-    LogicalReplicationPipeline, RowFilter, TableFilter,
-};
-#[cfg(feature = "ha-tier1")]
-pub use lsn_manager::LsnManager;
-#[cfg(feature = "ha-tier1")]
-pub use query_forwarder::{
-    init_query_forwarder, query_forwarder, ColumnInfo, ForwardedResult, ForwarderError, QueryForwarder,
-};
-#[cfg(feature = "ha-tier1")]
-pub use split_brain::{
-    ClusterNode, ObserverConfig, ObserverNode, ProtectionEvent, ProtectionState, SplitBrainProtector,
-};
-#[cfg(feature = "ha-tier1")]
-pub use streaming::{
-    StreamingClient, StreamingClientConfig, StreamingClientState, StreamingClientStatus, StreamingServer,
-    StreamingServerConfig,
-};
-#[cfg(feature = "ha-tier1")]
 pub use token::read_replication_token;
-#[cfg(feature = "ha-tier1")]
-pub use transport::{
-    AckType,
-    Capabilities,
-    HealthStatus,
-    MessageType,
-    NodeRole as WireNodeRole, // Renamed to avoid conflict with role_manager::NodeRole
-    ReplicationConnection,
-    ReplicationServer,
-    SyncModeConfig,
-};
-#[cfg(feature = "ha-tier1")]
-pub use wal_applicator::WalApplicator;
-#[cfg(feature = "ha-tier1")]
-pub use wal_replicator::{Lsn, WalReplicator};
-#[cfg(feature = "ha-tier1")]
-pub use wal_store::{BatchRequest, BatchResult, BatchStreamState, WalStore, WalStoreConfig};
 
 use thiserror::Error;
 
@@ -131,9 +84,6 @@ pub enum ReplicationError {
 
     #[error("Replication history metadata: {0}")]
     HistoryMetadata(String),
-
-    #[error("Unsupported native replication protocol version {actual}; required version {expected} includes mandatory history identity")]
-    ProtocolVersion { expected: u16, actual: u16 },
 
     #[error("WAL streaming error: {0}")]
     WalStreaming(String),

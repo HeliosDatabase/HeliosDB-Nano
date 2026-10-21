@@ -3,6 +3,7 @@
 //! Provides durability guarantees through write-ahead logging.
 //! Uses RocksDB's WriteBatch for atomic operations and built-in WAL support.
 
+use super::replication_wait;
 use super::tde;
 use super::write_gate::WriteGate;
 use crate::crypto::KeyManager;
@@ -16,10 +17,6 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, warn};
-
-// Import HA state for replication broadcast (when ha-tier1 is enabled)
-#[cfg(feature = "ha-tier1")]
-use crate::replication::ha_state::ha_state;
 
 /// Write-Ahead Log operation types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -223,11 +220,9 @@ impl WalEntry {
 // `decode_entry`. Free functions rather than methods because the group-commit
 // thread builds its batch off the `WriteAheadLog`.
 //
-// The HA/CDC broadcast path is deliberately untouched: `broadcast_after_append`
-// and `broadcast_after_batch` are handed the in-memory `&WalOperation`, not the
-// stored bytes, so a standby receives exactly what it received before and seals
-// what it applies under its OWN key on its own write path. What one node has on
-// disk is not what another node should have on disk.
+// No standby reads these entries (spec P2.1): a physical standby receives the
+// primary's RocksDB write groups verbatim — sealed `wal:entries:` values
+// included, which is why it needs the primary's dataset key.
 
 /// Seal a WAL entry into the bytes stored at `wal:entries:{lsn}`.
 ///
@@ -355,8 +350,8 @@ pub struct WalMetrics {
 enum Slot {
     /// Allocated; its write has not resolved yet.
     Reserved,
-    /// Durable (or about to be) and ready to be shown to standbys.
-    Ready(WalOperation),
+    /// Durable (or about to be).
+    Ready,
     /// Allocated but never persisted (failed write or abandoned): a hole.
     Skipped,
 }
@@ -367,14 +362,16 @@ struct PublishState {
     slots: std::collections::BTreeMap<u64, Slot>,
 }
 
-/// Publishes logical WAL entries to standbys strictly in LSN order, and only after
-/// the write that made them durable has succeeded.
+/// Tracks, strictly in LSN order, which logical WAL entries the writes that
+/// made them durable have resolved.
 ///
-/// Two committers can finish out of LSN order (an fsync stalls one of them). Showing
-/// LSN 6 before LSN 5 lets a standby advance its cursor past 5 and then drop 5 as
-/// "already applied". So an entry is published only when every lower LSN has resolved
-/// (published or skipped), and `published_lsn` is the watermark below which the
-/// persisted history is complete: catch-up must never read above it.
+/// Two committers can finish out of LSN order (an fsync stalls one of them). An
+/// entry is published only when every lower LSN has resolved (published or
+/// skipped), so `published_lsn` is the watermark below which the persisted
+/// history is complete: a reader of the logical WAL (`logical_wal_catchup`)
+/// must never read above it. Spec P2.1: nothing is broadcast any more — a
+/// standby follows the physical WAL — but the watermark still bounds what the
+/// primary's own redo history may be read up to.
 struct Publisher {
     state: Mutex<PublishState>,
     published: AtomicU64,
@@ -403,30 +400,21 @@ impl Publisher {
         first
     }
 
-    /// Resolve reserved LSNs (`Some` = publish, `None` = skip) and publish every
-    /// entry that is now contiguous with the watermark, in order.
-    fn resolve(&self, items: Vec<(u64, Option<WalOperation>)>) {
+    /// Resolve reserved LSNs (`true` = persisted, `false` = a hole) and
+    /// advance the watermark over every entry now contiguous with it.
+    fn resolve(&self, items: impl IntoIterator<Item = (u64, bool)>) {
         let mut state = self.state.lock();
-        for (lsn, operation) in items {
-            let slot = match operation {
-                Some(operation) => Slot::Ready(operation),
-                None => Slot::Skipped,
-            };
-            state.slots.insert(lsn, slot);
+        for (lsn, persisted) in items {
+            state
+                .slots
+                .insert(lsn, if persisted { Slot::Ready } else { Slot::Skipped });
         }
         loop {
             let next = state.next;
             if matches!(state.slots.get(&next), None | Some(Slot::Reserved)) {
                 break;
             }
-            if let Some(Slot::Ready(_operation)) = state.slots.remove(&next) {
-                #[cfg(feature = "ha-tier1")]
-                {
-                    if ha_state().broadcast_wal_operation(next, &_operation).is_some() {
-                        debug!("WAL entry {} published to standbys", next);
-                    }
-                }
-            }
+            state.slots.remove(&next);
             state.next = next + 1;
         }
         self.published.store(state.next - 1, Ordering::SeqCst);
@@ -829,39 +817,30 @@ impl WriteAheadLog {
         self.publisher.published.load(Ordering::SeqCst)
     }
 
-    /// Resolve one reserved LSN as persisted, publish in order, and (sync modes)
-    /// wait for the standby acknowledgement.
-    fn publish_one(&self, lsn: u64, operation: WalOperation) {
-        self.publisher.resolve(vec![(lsn, Some(operation))]);
-        Self::wait_replicated(lsn);
+    /// Resolve one reserved LSN as persisted, in order.
+    fn publish_one(&self, lsn: u64) {
+        self.publisher.resolve([(lsn, true)]);
     }
 
     /// Resolve a reserved LSN whose write failed: a hole, never published.
     fn skip(&self, lsns: impl IntoIterator<Item = u64>) {
-        self.publisher
-            .resolve(lsns.into_iter().map(|lsn| (lsn, None)).collect());
+        self.publisher.resolve(lsns.into_iter().map(|lsn| (lsn, false)));
     }
 
-    /// In sync/semi-sync mode block (bounded) until a standby has the entry. A no-op
-    /// without a connected standby, so a lone primary never pays the timeout.
-    pub fn wait_replicated(lsn: u64) {
-        #[cfg(feature = "ha-tier1")]
-        {
-            use crate::replication::ha_state::HARole;
-            let state = ha_state();
-            if state.get_role() == HARole::Primary && !state.get_standbys().is_empty() {
-                // Faster-safe: wait for the first standby ACK, not all.
-                const DEFAULT_SYNC_TIMEOUT_MS: u64 = 10000;
-                if let Err(e) = state.wait_for_sync(lsn, DEFAULT_SYNC_TIMEOUT_MS) {
-                    // Log but don't fail: data is written locally; degraded mode.
-                    warn!("Sync replication wait for LSN {}: {}", lsn, e);
-                }
-            }
-        }
-        #[cfg(not(feature = "ha-tier1"))]
-        {
-            let _ = lsn;
-        }
+    /// Spec P2.1: the physical sequence a sync/semi-sync primary's write must
+    /// see acknowledged, read right after that write (`None` on every other
+    /// node). Passed to [`Self::wait_replicated_sequence`] once the entry is
+    /// resolved and locks are released.
+    pub fn replication_barrier(&self) -> Option<u64> {
+        replication_wait::barrier(&self.db)
+    }
+
+    /// In sync/semi-sync mode block (bounded by `[replication]
+    /// sync_timeout_ms`) until enough standbys acknowledge `barrier`, the
+    /// physical sequence a write read right after it was applied. A no-op for
+    /// `None`; never fails the write (`storage::replication_wait`).
+    pub fn wait_replicated_sequence(barrier: Option<u64>) {
+        replication_wait::wait(barrier);
     }
 
     /// Seal `operations` into `batch` under freshly reserved LSNs WITHOUT writing.
@@ -898,12 +877,14 @@ impl WriteAheadLog {
         Ok(Some(StagedWal { entries }))
     }
 
-    /// The staged batch is durable: publish its entries in LSN order. Returns the
-    /// highest LSN, to pass to [`Self::wait_replicated`] once locks are released.
+    /// The staged batch is durable: publish its entries in LSN order. Returns
+    /// the highest LSN. The caller, which wrote the batch, waits for standbys
+    /// on the physical sequence it read after that write
+    /// ([`Self::wait_replicated_sequence`]), not on this logical LSN.
     pub fn publish_staged(&self, staged: StagedWal) -> u64 {
         let highest = staged.entries.last().map_or(0, |entry| entry.lsn);
         self.publisher
-            .resolve(staged.entries.into_iter().map(|e| (e.lsn, Some(e.operation))).collect());
+            .resolve(staged.entries.iter().map(|entry| (entry.lsn, true)));
         self.maybe_advance_checkpoint();
         highest
     }
@@ -960,13 +941,15 @@ impl WriteAheadLog {
             self.skip([lsn]);
             return Err(Error::storage(format!("Failed to append WAL entry: {}", e)));
         }
+        let barrier = self.replication_barrier();
 
-        // Publish to standbys in LSN order (and, in sync/semi-sync mode, wait for the ACK).
-        self.publish_one(lsn, entry.operation);
+        self.publish_one(lsn);
 
         // GH#35 (A3): periodic checkpoint advancement.
         self.maybe_advance_checkpoint();
 
+        // Sync/semi-sync: wait for the standbys' physical acknowledgement.
+        Self::wait_replicated_sequence(barrier);
         debug!("Appended WAL entry with LSN {}", lsn);
         Ok(lsn)
     }
@@ -999,45 +982,43 @@ impl WriteAheadLog {
             self.skip([lsn]);
             return Err(Error::storage(format!("Failed to append WAL entry: {}", e)));
         }
+        let barrier = self.replication_barrier();
 
-        // P0#2: still publish to HA standbys (and honor sync/semi-sync ACK).
-        // The nosync path only skips the local fsync — it must NOT skip replication.
-        self.publish_one(lsn, entry.operation);
+        self.publish_one(lsn);
 
         // GH#35 (A3): periodic checkpoint advancement.
         self.maybe_advance_checkpoint();
 
+        // P0#2: the nosync path only skips the local fsync — it must NOT skip
+        // the sync/semi-sync wait for the standbys' acknowledgement.
+        Self::wait_replicated_sequence(barrier);
         Ok(lsn)
     }
 
-    /// Append a whole batch of operations as ONE RocksDB write, then broadcast
-    /// the batch and wait for sync ONCE — not once per entry.
+    /// Append a whole batch of operations as ONE RocksDB write, then wait for
+    /// the standbys ONCE — not once per entry.
     ///
     /// Built for `Transaction::commit_with_timestamp`: an explicit or session
     /// transaction's writes are only fully known at COMMIT, so they arrive here
     /// as a set rather than one at a time (ROADMAP_V5.md §1.8). Looping over
     /// `append`/`append_nosync` instead would be quietly catastrophic under
-    /// sync/semi-sync replication: each call runs its own
-    /// `broadcast_after_append`, so an N-row transaction would pay N
-    /// independent `wait_for_sync` calls of up to `DEFAULT_SYNC_TIMEOUT_MS`
-    /// each. `broadcast_after_batch`'s existing "wait once, on the highest LSN"
-    /// contract is exactly right for a committed batch and is reused verbatim.
+    /// sync/semi-sync replication: each call runs its own wait, so an N-row
+    /// transaction would pay N independent waits of up to
+    /// `[replication] sync_timeout_ms` each.
     ///
     /// `sync` fsyncs this WAL-keyspace write (legacy strict logical-WAL
     /// durability — `StorageConfig::logical_wal_per_statement`). The default,
     /// `false`, follows the same P0#2 rationale as `append_nosync`: the
     /// caller's own commit WriteBatch is the durability boundary, not this
-    /// one — and, exactly as there, skipping the fsync must NOT skip
-    /// replication, so both arms broadcast.
+    /// one — and, exactly as there, skipping the fsync must NOT skip the
+    /// standbys' acknowledgement, so both arms wait.
     ///
     /// LSNs are handed out by a tight `next_lsn()` loop with no yield point, so
     /// one transaction's entries land on contiguous LSNs that no other
-    /// committer can interleave into. That is a property a future atomic-apply
-    /// standby can lean on instead of adding a `tx_id` field to the per-row
-    /// variants (ROADMAP_V5.md §1.8 follow-up).
+    /// committer can interleave into.
     ///
     /// Returns the assigned LSNs in the same order as `operations`, or
-    /// `Ok(vec![])` — touching neither RocksDB nor the broadcast channel — when
+    /// `Ok(vec![])` — touching neither RocksDB nor the standbys — when
     /// `operations` is empty (a transaction that staged nothing loggable).
     pub fn append_batch(&self, operations: Vec<WalOperation>, sync: bool) -> Result<Vec<u64>> {
         let mut batch = WriteBatch::default();
@@ -1059,9 +1040,10 @@ impl WriteAheadLog {
             self.abandon_staged(staged);
             return Err(Error::storage(format!("Failed to append WAL batch: {}", e)));
         }
+        let barrier = self.replication_barrier();
 
         let highest = self.publish_staged(staged);
-        Self::wait_replicated(highest);
+        Self::wait_replicated_sequence(barrier);
         debug!("Appended WAL batch: {} entries, LSN {}", lsns.len(), highest);
         Ok(lsns)
     }
@@ -1092,42 +1074,9 @@ impl WriteAheadLog {
             self.abandon_staged(staged);
             return Err(e);
         }
+        let barrier = self.replication_barrier();
         let lsn = self.publish_staged(staged);
-        Self::wait_replicated(lsn);
-        Ok(lsn)
-    }
-
-    /// Append a WAL entry and wait for synchronous replication acknowledgement
-    ///
-    /// This method appends the operation to WAL and then blocks until standbys
-    /// have acknowledged receipt (semi-sync) or application (sync) of the entry,
-    /// based on the configured sync mode.
-    ///
-    /// # Arguments
-    /// * `operation` - The WAL operation to append
-    ///
-    /// # Returns
-    /// * `Ok(lsn)` - The LSN of the appended entry
-    /// * `Err` - If WAL append fails or sync wait times out
-    pub fn append_sync(&self, operation: WalOperation) -> Result<u64> {
-        // First, append the entry normally
-        let lsn = self.append(operation)?;
-
-        // Then wait for synchronous replication based on configured mode
-        #[cfg(feature = "ha-tier1")]
-        {
-            use crate::replication::ha_state::ha_state;
-
-            // Default timeout of 30 seconds for sync wait
-            const DEFAULT_SYNC_TIMEOUT_MS: u64 = 30000;
-
-            if let Err(e) = ha_state().wait_for_sync(lsn, DEFAULT_SYNC_TIMEOUT_MS) {
-                // Log warning but don't fail the append - the data is safely written locally
-                // This allows the system to continue operating in degraded mode
-                warn!("Sync replication timeout for LSN {}: {}", lsn, e);
-            }
-        }
-
+        Self::wait_replicated_sequence(barrier);
         Ok(lsn)
     }
 
@@ -1154,8 +1103,13 @@ impl WriteAheadLog {
             Err(e) => Err(Error::storage(format!("Group commit failed: {}", e))),
         };
         if result.is_ok() {
+            // Read after the group's write completed (it covers this entry),
+            // and waited for HERE, on the committer's own thread, so an
+            // unconfirmed commit is reported to the request that made it.
+            let barrier = self.replication_barrier();
             // GH#35 (A3): periodic checkpoint advancement.
             self.maybe_advance_checkpoint();
+            Self::wait_replicated_sequence(barrier);
         }
         result
     }
@@ -1628,19 +1582,16 @@ impl WriteAheadLog {
 
             match gate.write(&db, batch, Some(&write_opts)) {
                 Ok(()) => {
-                    // Publish to standbys in LSN order and, in sync/semi-sync mode,
-                    // wait for the highest batch LSN before reporting success.
-                    let highest = pending.iter().map(|write| write.entry.lsn).max().unwrap_or(0);
+                    // Resolve in LSN order. Each committer waits for the
+                    // standbys itself, after this reply (`append_group_commit`).
                     let mut items = Vec::with_capacity(pending.len());
                     let mut waiters = Vec::with_capacity(pending.len());
                     for write in pending {
                         let lsn = write.entry.lsn;
-                        let operation = (!sealing_failed.contains(&lsn)).then_some(write.entry.operation);
-                        items.push((lsn, operation));
+                        items.push((lsn, !sealing_failed.contains(&lsn)));
                         waiters.push((write.result_tx, lsn));
                     }
                     publisher.resolve(items);
-                    Self::wait_replicated(highest);
 
                     // Notify all waiters of success
                     for (result_tx, lsn) in waiters {
@@ -1651,7 +1602,7 @@ impl WriteAheadLog {
                 Err(e) => {
                     let err_msg = format!("Group commit batch write failed: {}", e);
                     // The LSNs become holes; nothing is published for them.
-                    publisher.resolve(pending.iter().map(|write| (write.entry.lsn, None)).collect());
+                    publisher.resolve(pending.iter().map(|write| (write.entry.lsn, false)));
                     // Notify all waiters of failure
                     for write in pending {
                         let _ = write.result_tx.send(Err(Error::storage(err_msg.clone())));
@@ -2360,7 +2311,7 @@ mod tests {
     }
 
     /// An empty batch (a transaction that staged nothing WAL-loggable) must
-    /// not touch RocksDB, burn an LSN, or broadcast.
+    /// not touch RocksDB, burn an LSN, or wait for standbys.
     #[test]
     fn test_append_batch_empty_is_a_noop() {
         let (_temp, db) = create_test_db();

@@ -49,6 +49,17 @@ pub enum PhysicalError {
     Invalid(String),
     #[error("physical replication interval missing: expected {expected}, observed {observed}")]
     Gap { expected: u64, observed: u64 },
+    /// The source's retained WAL starts after the sequence a receiver needs
+    /// (`oldest` is the first sequence it still has; `None` when it retains no
+    /// record of the interval at all): the receiver cannot be continued from
+    /// this source. Spec P2.1: reported to the receiver as `WalPruned`.
+    #[error("physical replication WAL pruned: sequence {wanted} is no longer retained")]
+    Pruned { wanted: u64, oldest: Option<u64> },
+    /// The receiver claims a position its source never reached: the source is
+    /// not the dataset the receiver followed (restored from an older copy,
+    /// say), whatever its history identity says.
+    #[error("physical receiver is at sequence {after}, ahead of its source's {barrier}")]
+    Ahead { after: u64, barrier: u64 },
     #[error("physical replication history mismatch")]
     HistoryMismatch,
     #[error("physical receiver must be reopened after an uncertain storage failure")]
@@ -314,8 +325,11 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Res
     }
     refuse_receiver_source(db)?;
     let barrier = db.latest_sequence_number();
-    if after > barrier || barrier > MAX_SEQUENCE {
-        return Err(invalid("source is behind receiver or sequence overflow"));
+    if barrier > MAX_SEQUENCE {
+        return Err(invalid("source sequence overflow"));
+    }
+    if after > barrier {
+        return Err(PhysicalError::Ahead { after, barrier });
     }
     // Sample the barrier first; fsync subsequently covers every sampled write.
     db.flush_wal(true)?;
@@ -332,6 +346,11 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Res
     while result.through < barrier {
         let Some(entry) = iterator.next() else {
             iterator.status()?;
+            // No record at all although the interval is not empty: the WAL
+            // that held it is gone, or `after` is inside the last write group.
+            if result.through == after {
+                return Err(missing_after(db, after, barrier));
+            }
             return Err(PhysicalError::Gap {
                 expected: result.through + 1,
                 observed: barrier,
@@ -347,6 +366,11 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Res
             continue;
         }
         if first != result.through + 1 {
+            // The very first record past the wanted sequence: its WAL was
+            // purged, or `after` is inside a write group the iterator skipped.
+            if result.through == after {
+                return Err(missing_after(db, after, first));
+            }
             return Err(PhysicalError::Gap {
                 expected: result.through + 1,
                 observed: first,
@@ -370,6 +394,43 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Res
     }
     iterator.status()?;
     Ok(result)
+}
+
+/// Why the record that should follow `after` is missing (the first record
+/// the iterator yields starts at `observed`). RocksDB's iterator skips the
+/// write group that holds `after` (`DBWALIterator` drops every record that
+/// starts at or before it), so a WAL purged by retention and a cursor INSIDE
+/// a write group look alike from the iterator. The oldest record the WAL
+/// still holds tells them apart: at or before `after`, the WAL is all there
+/// and the cursor splits a group (a gap); past it, the records the receiver
+/// needs are gone (spec P2.1: refused as `WalPruned`, never retried).
+fn missing_after(db: &DB, after: u64, observed: u64) -> PhysicalError {
+    match oldest_retained_sequence(db) {
+        Ok(Some(oldest)) if oldest <= after => PhysicalError::Gap {
+            expected: after + 1,
+            observed,
+        },
+        Ok(oldest) => PhysicalError::Pruned {
+            wanted: after + 1,
+            oldest,
+        },
+        Err(error) => error,
+    }
+}
+
+/// The first sequence of the oldest write group the source's WAL still
+/// holds; `None` when it holds none. Read only on the error path above.
+fn oldest_retained_sequence(db: &DB) -> Result<Option<u64>> {
+    // Sequences start at 1, so nothing is skipped from 0.
+    let mut iterator = db.get_updates_since(0)?;
+    for entry in iterator.by_ref() {
+        let (first, batch) = entry?;
+        if !batch.is_empty() {
+            return Ok(Some(first));
+        }
+    }
+    iterator.status()?;
+    Ok(None)
 }
 
 /// SHA-256 over every key/value pair of one column family whose key starts
@@ -1236,6 +1297,58 @@ mod tests {
         assert_eq!(read_cursor(receiver.writer().db()).unwrap(), receiver.cursor());
     }
 
+    /// Spec P2.1: a receiver whose next sequence the source no longer retains
+    /// is told the WAL was pruned (and from where it still has it), never
+    /// handed an ordinary gap it could only retry.
+    #[test]
+    fn source_poll_reports_purged_wal_as_pruned_with_its_oldest_sequence() {
+        let root = TempDir::new().unwrap();
+        {
+            let source = open(root.path());
+            for index in 0..3 {
+                source.put(format!("old{index}"), b"v").unwrap();
+            }
+            // Into tables: the WAL holding 1..=3 is obsolete (and archived,
+            // the TTL being set) once the flush completes.
+            source.flush().unwrap();
+        }
+        // What retention does to that WAL, while the store is closed: every
+        // archived file and every log but the newest goes.
+        let archive = root.path().join("archive");
+        if archive.is_dir() {
+            for entry in std::fs::read_dir(&archive).unwrap() {
+                std::fs::remove_file(entry.unwrap().path()).unwrap();
+            }
+        }
+        let mut logs: Vec<_> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
+            .collect();
+        logs.sort();
+        logs.pop();
+        for log in logs {
+            std::fs::remove_file(log).unwrap();
+        }
+        let source = open(root.path());
+        assert_eq!(
+            source.latest_sequence_number(),
+            3,
+            "the purged writes stay in the tables"
+        );
+        source.put(b"new", b"v").unwrap();
+        let history = Uuid::new_v4();
+        assert!(matches!(
+            poll_source(&source, history, 0, MAX_BATCH_BYTES),
+            Err(PhysicalError::Pruned {
+                wanted: 1,
+                oldest: Some(4)
+            })
+        ));
+        // A receiver at 3 needs only what is still retained.
+        assert_eq!(poll_source(&source, history, 3, MAX_BATCH_BYTES).unwrap().through, 4);
+    }
+
     #[test]
     fn source_poll_is_bounded_and_rejects_mid_batch_or_future_cursor() {
         let root = TempDir::new().unwrap();
@@ -1258,7 +1371,10 @@ mod tests {
             poll_source(&source, history, 1, MAX_BATCH_BYTES),
             Err(PhysicalError::Gap { .. })
         ));
-        assert!(poll_source(&source, history, 7, MAX_BATCH_BYTES).is_err());
+        assert!(matches!(
+            poll_source(&source, history, 7, MAX_BATCH_BYTES),
+            Err(PhysicalError::Ahead { after: 7, barrier: 6 })
+        ));
         let caught_up = poll_source(&source, history, 6, MAX_BATCH_BYTES).unwrap();
         assert!(caught_up.batches.is_empty());
         assert_eq!(caught_up.through, 6);

@@ -13,11 +13,14 @@
 //! it used to crash with `Table 't' does not exist`.
 //!
 //! Spec P1.3: the standby is now a PHYSICAL replica (bootstrapped from the
-//! primary's physical source, which a primary with a replication token
+//! primary's replication port, which a primary with a replication token
 //! serves), so every case here runs over the physical channel; the contracts
 //! — no silent gap, every committed row, nothing uncommitted — are unchanged.
-//! Both nodes name the physical endpoint explicitly so parallel clusters
-//! cannot meet on a derived port.
+//! Spec P2.1: that channel is the only one — the standby's `--primary-host`
+//! is the primary's `--replication-port`, on a private port per cluster. The
+//! logical-only cases (the logical WAL as a standby's catch-up source, its
+//! "full resync required" refusal) went with the logical standby; their
+//! scenarios run here on the physical pair.
 
 #![cfg(feature = "ha-tier1")]
 
@@ -156,8 +159,7 @@ fn cluster() -> Cluster {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let (pg_p, repl_p, pg_s, repl_s, phys) = (free_port(), free_port(), free_port(), free_port(), free_port());
-    let physical = format!("127.0.0.1:{phys}");
+    let (pg_p, repl_p, pg_s) = (free_port(), free_port(), free_port());
     let primary_args = vec![
         "--port".into(),
         pg_p.to_string(),
@@ -165,8 +167,6 @@ fn cluster() -> Cluster {
         "primary".into(),
         "--replication-port".into(),
         repl_p.to_string(),
-        "--physical-replication-listen".into(),
-        physical.clone(),
     ];
     let standby_args = vec![
         "--port".into(),
@@ -175,10 +175,6 @@ fn cluster() -> Cluster {
         "standby".into(),
         "--primary-host".into(),
         format!("127.0.0.1:{repl_p}"),
-        "--replication-port".into(),
-        repl_s.to_string(),
-        "--physical-replication-listen".into(),
-        physical,
     ];
     Cluster {
         dir,
@@ -300,8 +296,8 @@ async fn rolled_back_and_failed_statements_never_reach_the_standby() {
 
 /// Field finding J (Sprinter 58d4e3113e56): restarting the PRIMARY used to break the
 /// pair. Its clean close checkpointed the logical WAL and deleted every entry up to the
-/// checkpoint, so a standby that was behind at that moment got a terminal "full resync
-/// required" and exited.
+/// checkpoint, so a standby that was behind at that moment was refused for good and
+/// exited. A physical standby continues from the primary's retained physical WAL.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standby_catches_up_after_the_primary_restarts_while_it_is_down() {
     let c = cluster();
@@ -374,11 +370,12 @@ async fn fresh_standby_after_a_primary_restart_receives_the_history() {
 }
 
 /// `[replication] logical_wal_retention_entries` bounded what a restarted primary could
-/// serve a LOGICAL standby: past it a fresh standby was refused "full resync required".
+/// serve a LOGICAL standby: past it a fresh standby was refused for good.
 /// Spec P1.3: a standby is physical, and the logical window bounds it no longer —
 /// a standby one row behind still catches up after the primary restarts, and a NEW
 /// standby is installed from a physical copy of the whole dataset instead of being
-/// refused for history the logical window pruned.
+/// refused for history the logical window pruned. Spec P2.1: the window is only the
+/// primary's own redo window (default 0).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn logical_retention_window_no_longer_bounds_a_physical_standby() {
     let c = cluster();
@@ -469,9 +466,8 @@ async fn settle_count(port: u16, want: i64, budget: Duration) -> Result<i64, Str
     }
 }
 
-/// A catch-up longer than one batch (the primary sends 500 entries per WalBatch)
-/// must arrive whole. Field-J crash probe on the J1 branch: a fresh standby lost
-/// one whole batch on reconnect (message sequence 2 never surfaced), then served
+/// A catch-up longer than one poll must arrive whole. Field-J crash probe on the J1
+/// branch: a fresh (then logical) standby lost one whole batch on reconnect, then served
 /// 2010 of 2510 rows and reported itself caught up. Three fresh standbys in turn
 /// must each hold every row.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

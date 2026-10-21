@@ -1716,6 +1716,7 @@ impl Transaction {
         // this is what `WriteGate::write` already did with an empty batch, so
         // COMMIT of a read-only transaction on a read-only or physical open
         // still succeeds without attempting a write.
+        let wrote = !batch.is_empty();
         let result = if batch.is_empty() {
             if self.rocksdb_wal_enabled && ((self.sync_commit && !group_fsync) || wal_force_sync) && self.gate.is_open()
             {
@@ -1741,15 +1742,24 @@ impl Transaction {
             self.gate.write(&self.db, batch, Some(&write_opts))
         };
 
+        // Spec P2.1: the physical sequence this commit's standbys must
+        // acknowledge, read right after its data write (a conservative upper
+        // bound of its write group). `None` unless this is a sync/semi-sync
+        // primary, so every other node pays one atomic load.
+        let replication_barrier = if wrote && result.is_ok() {
+            super::replication_wait::barrier(&self.db)
+        } else {
+            None
+        };
+
         // Publish (or abandon) the staged logical WAL entries now that the data write
         // has definitively succeeded or failed; the zone-stats lock is released first
         // because the sync-mode ACK wait below must not hold it.
         drop(_columnar_stats_guard);
-        let mut replicated_through = None;
         if let Some((wal, staged)) = staged_wal {
             let wal = wal.read();
             if result.is_ok() {
-                replicated_through = Some(wal.publish_staged(staged));
+                wal.publish_staged(staged);
             } else {
                 wal.abandon_staged(staged);
             }
@@ -1807,11 +1817,6 @@ impl Transaction {
             Error::transaction(format!("Commit failed: {}", e))
         })?;
 
-        // Sync/semi-sync replication: wait for a standby to hold this commit's entries.
-        if let Some(lsn) = replicated_through {
-            WriteAheadLog::wait_replicated(lsn);
-        }
-
         // R1.3 phase 2: group durability barrier. The commit is already
         // applied and visible (memtable + unsynced WAL); block until a
         // cohort fsync covering it completes. On failure the commit is NOT
@@ -1832,6 +1837,16 @@ impl Transaction {
                     })?;
             }
         }
+
+        // Spec P2.1: sync/semi-sync replication — the commit is durable here;
+        // wait for its standbys to acknowledge its physical sequence. Locks
+        // and the snapshot barrier are released, so the wait holds up nobody
+        // else. It never fails the commit: every caller treats an error as
+        // "nothing committed" and would undo index state of a committed
+        // transaction; an unconfirmed commit under `sync_timeout_action =
+        // "fail"` is reported to the client request instead
+        // (`storage::replication_wait`).
+        WriteAheadLog::wait_replicated_sequence(replication_barrier);
 
         debug!(
             txn_id = self.transaction_id,

@@ -33,7 +33,7 @@ allowed-tools: Bash(cargo *), Bash(heliosdb-nano *), Bash(rustc *), Read
 | `encryption` | ✅ | TDE at-rest (AES-256-GCM) | Encrypted storage |
 | `vector-search` | ✅ | HNSW indexing, PQ codebook | Similarity search |
 | `ring-crypto` | ✅ | `ring` + BLAKE3 | Standard crypto provider |
-| `ha-tier1` | ✅ | WAL streaming, automatic failover | Warm standby (active-passive) |
+| `ha-tier1` | ✅ | Physical WAL over one replication port, sync/semi-sync commits (no failover/promotion yet) | Read-only physical standby (active-passive) |
 | `code-graph` | — | tree-sitter (rust/python/ts/go/md/sql), `_hdb_code_*` tables, LSP API | Index source code |
 | `graph-rag` | — | `_hdb_graph_*` schema, seed+expand+rerank API; **implies `code-graph`** | RAG knowledge graph |
 | `code-embed` | — | fastembed-rs (ONNX), local in-process embedder; **implies `code-graph`** | Embed without external HTTP service |
@@ -83,8 +83,11 @@ cargo install heliosdb-nano --no-default-features \
 ### Recipe 5: HA full bundle
 ```bash
 cargo install heliosdb-nano --features ha-full
-heliosdb-nano start --data-dir ./data --replication-role primary --sync-mode semi-sync
+head -c 32 /dev/urandom > ./replication.token && chmod 600 ./replication.token
+heliosdb-nano start --data-dir ./data --replication-role primary --sync-mode semi-sync \
+  --replication-token-file ./replication.token   # without a token no replication port is served
 ```
+Standby setup: `heliosdb-nano-server` Recipe 4 and `docs/guides/physical-standby.md`.
 
 ### Recipe 6: Build from source (development)
 ```bash

@@ -1,5 +1,13 @@
 # HeliosDB Nano HA Cluster Tutorial
 
+> **Out of service — does not describe this release.** The Docker lab this
+> tutorial uses (`tests/docker`) is out of service until remote replication over
+> TLS (spec P2.2), and the features it demonstrates are gone: standbys never
+> forward writes, there is no observer node, and the native replication channel
+> was replaced by one physical replication connection. For HA in this release
+> read [the physical standby guide](physical-standby.md) and the
+> [HA testing guide](ha_testing.md). The text below is kept for reference only.
+
 This tutorial guides you through deploying a HeliosDB Nano High Availability cluster and testing its innovative **Transparent Write Routing** feature.
 
 ## What You'll Learn

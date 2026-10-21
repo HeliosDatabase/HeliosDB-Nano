@@ -15,7 +15,7 @@ Authoritative source: `Cargo.toml:189-299`. Re-check with `cargo info heliosdb-n
 | `encryption` | TDE at-rest (AES-256-GCM) | `heliosdb-nano-server` (encryption config) |
 | `vector-search` | HNSW indexing, PQ codebook | `heliosdb-nano-vector`, `heliosdb-nano-mcp` (`hybrid_search`), `heliosdb-nano-graph-rag` |
 | `ring-crypto` | `ring` + BLAKE3 crypto provider | `heliosdb-nano-server` (TLS, password hashing) |
-| `ha-tier1` | WAL streaming, automatic failover | `heliosdb-nano-server` (HA recipes), `heliosdb-nano-deploy` |
+| `ha-tier1` | Read-only physical standby over one replication port; sync/semi-sync commits (no failover/promotion yet) | `heliosdb-nano-server` (HA recipes), `heliosdb-nano-deploy` |
 
 ## Optional features
 
@@ -48,7 +48,7 @@ cargo install heliosdb-nano \
 
 | Feature | Adds | Implies | Skills |
 |---------|------|---------|--------|
-| `ha-tier1` (default) | Warm standby (active-passive), WAL streaming | — | `heliosdb-nano-server` |
+| `ha-tier1` (default) | Read-only physical standby (active-passive), physical WAL over one replication port | — | `heliosdb-nano-server` |
 | `ha-tier2` | Multi-primary (active-active), branch-based replication, vector-clock conflicts | `ha-tier1` | `heliosdb-nano-server`, `heliosdb-nano-branches` |
 | `ha-tier3` | Sharding (consistent hash ring, cross-shard routing) | — | `heliosdb-nano-server`, `heliosdb-nano-deploy` |
 | `ha-dedup` | Content-addressed dedup across nodes | — | `heliosdb-nano-server` |

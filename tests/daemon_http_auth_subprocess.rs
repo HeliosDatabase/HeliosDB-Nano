@@ -194,7 +194,6 @@ fn spawn_with_failure_limit(
         .env_remove("HELIOSDB_PASSWORD_FILE")
         .env_remove("HELIOSDB_MCP_TOKEN")
         .env_remove("MCP_TOKEN")
-        .env_remove("HELIOSDB_PRIMARY_PG_PORT")
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))

@@ -144,10 +144,11 @@ jobs:
                  'NR % 6 == s { n=$0; sub(/^tests\//,"",n); sub(/\.rs$/,"",n); printf "--test %s ", n }')
           if [ -z "$args" ]; then echo "::error::shard produced no targets"; exit 1; fi
           echo "shard ${{ matrix.shard }} targets: $(echo $args | wc -w | awk '{print $1/2}')"
-          # The two documented pre-existing flakes on constrained runners.
-          # docs/GATES.md forbids adding NEW skips — these two and no others.
+          # The documented pre-existing flake on constrained runners (the
+          # native v3 `ha_tests::streaming_tests` skip went with that channel,
+          # spec P2.1). docs/GATES.md forbids adding NEW skips.
           cargo test --locked --no-fail-fast $args -- \
-            --skip ha_tests::streaming_tests --skip lock_management 2>&1 | tee shard.log
+            --skip lock_management 2>&1 | tee shard.log
       - name: No unexpected empty suites
         run: |
           # This tier runs EVERY tests/*.rs, which includes the ~49 targets that are empty
@@ -273,7 +274,7 @@ jobs:
           fi
           args=$(echo "$targets" | awk '{printf "--test %s ", $0}')
           cargo test --locked --no-fail-fast --features internal-tests $args -- \
-            --skip ha_tests::streaming_tests --skip lock_management 2>&1 | tee internal.log
+            --skip lock_management 2>&1 | tee internal.log
       # The STRICT check from the smoke tier, not the shard tier's allowlist. Every
       # target above is gated on the feature this job turns ON, so each one is
       # supposed to run tests here; `.github/expected-empty-suites.txt` lists them

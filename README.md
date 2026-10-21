@@ -151,13 +151,13 @@ the same token works on the CLI, in `config.toml`, and in `SET` / `SHOW`:
 | `authentication_timeout` (bare = seconds) | `60s` | server (`SET` refused, 55P02) | A socket that has not finished the handshake — startup packet, TLS, password / SCRAM — is closed and its slot released. This is what stops an internet scanner from holding a connection slot forever. |
 | `idle_session_timeout` (bare = ms) | `0` (off) | session (`SET` / `RESET`) | An authenticated session idle outside a transaction is closed with `FATAL 57P05 terminating connection due to idle-session timeout`. |
 | `idle_in_transaction_session_timeout` (bare = ms) | `0` (off) | session (`SET` / `RESET`) | A session idle inside a transaction block is closed with `FATAL 25P03`; the transaction is rolled back. Inside a block the shorter of the two idle limits applies. |
-| `tcp_keepalives_idle` / `tcp_keepalives_interval` (bare = seconds), `tcp_keepalives_count` | `0` (OS default) | server | `SO_KEEPALIVE` is always on for accepted PostgreSQL, MySQL and replication sockets, so half-open peers are reaped by the kernel; these tune the timers. |
+| `tcp_keepalives_idle` / `tcp_keepalives_interval` (bare = seconds), `tcp_keepalives_count` | `0` (OS default) | server | `SO_KEEPALIVE` is always on for accepted PostgreSQL, MySQL and replication sockets, so half-open peers are reaped by the kernel; these tune the timers. (A replication connection gets keepalive only, never an idle timeout; it also detects a dead peer by its heartbeats and `[replication.physical] frame_timeout_secs`.) |
 
 The two idle timeouts ship **disabled**, exactly as in PostgreSQL — the
 availability fix for dead sockets is `authentication_timeout` (on by default)
 plus TCP keepalive. A timeout never fires on a busy connection: it bounds only
 the wait for the *next* client message, and the first byte of a message
-disarms it. Replication connections are never subject to a timeout. CLI flags:
+disarms it. Replication connections are never subject to these timeouts. CLI flags:
 `--authentication-timeout`, `--idle-session-timeout`,
 `--idle-in-transaction-session-timeout`, `--tcp-keepalives-idle`,
 `--tcp-keepalives-interval`, `--tcp-keepalives-count`,
@@ -596,7 +596,7 @@ and `MERGE BRANCH`.
 | **HNSW graph snapshots** under `<data_dir>/hnsw_snapshots/` | Plain files outside RocksDB containing raw vectors |
 | **Backup dumps** (`[dump]`, `--dump-on-shutdown`, `--dump-schedule`) | Written unencrypted; protect the dump directory separately |
 | **Data written before enabling encryption** | Existing values are read as-is and never rewritten. Enabling encryption seals *new* writes; it does not retroactively seal an existing database |
-| **The replication link** | Rows are shipped to standbys in the clear. Encryption at rest says nothing about the wire — use TLS |
+| **The replication link** | A physical standby receives the primary's write groups verbatim: sealed values stay sealed (the standby needs the same key), but RocksDB keys and the replication token cross the link in the clear. Replication has no TLS yet, so the replication port is loopback-only — use an authenticated tunnel for a remote standby |
 
 **Wrong-key protection.** A sentinel is sealed at first open and verified strictly on every
 subsequent open, so a wrong or rotated key is refused up front rather than silently yielding
@@ -611,23 +611,50 @@ deployments should track write volume against that bound.
 
 ## High Availability
 
-**Warm standby is enabled by default** — no feature flag needed. Just pass the replication flags at startup:
+**Physical standby is enabled by default** — no feature flag needed. A standby is a read-only
+**physical replica** of its primary: it applies the primary's RocksDB write groups verbatim, so its
+data is identical to the primary's at the same sequence, and it serves read-only SQL while it applies.
+Everything travels over **one replication connection** to the primary's `--replication-port`: the
+bootstrap copy, the physical WAL, heartbeats and acknowledgements. Both nodes share one owner-only
+32-byte token file:
 
 ```bash
-# Primary
-heliosdb-nano start --data-dir ./data --replication-role primary \
-  --standby-hosts 10.0.0.2:5433,10.0.0.3:5433
+install -d -m 700 /srv/nano   # owner-only parent of the data directories
+head -c 32 /dev/urandom > replication.token && chmod 600 replication.token
 
-# Standby
-heliosdb-nano start --data-dir ./data --replication-role standby \
-  --primary-host 10.0.0.1:5433
+# Primary: SQL on 5432, standbys on its replication port 5433
+heliosdb-nano start --data-dir /srv/nano/primary --replication-role primary \
+  --replication-port 5433 --replication-token-file replication.token
+
+# Standby: --primary-host is the primary's REPLICATION port; an empty or absent
+# data directory is bootstrapped from the primary, then followed
+heliosdb-nano start --data-dir /srv/nano/standby --port 5442 --http-port 8081 \
+  --replication-role standby --primary-host 127.0.0.1:5433 \
+  --replication-token-file replication.token
 ```
+
+- **Readiness**: `GET /ready` is 200 only while the standby is current (or briefly disconnected,
+  `[replication] max_standby_lag`); on the PostgreSQL wire, `SELECT heliosdb_require_ready()`,
+  `pg_is_in_recovery()`, `pg_last_wal_replay_lsn()` and `in_hot_standby` give HeliosDB Proxy the same
+  answer. A primary's `/health` lists its standbys with their applied and durable positions.
+- **Sync modes**: `[replication] sync_mode = "semi-sync"` makes a commit wait until `min_acks`
+  standbys hold it durably, `"sync"` until they have applied it; `sync_timeout_ms` and
+  `sync_timeout_action = "warn" | "fail"` decide what a commit does when they do not answer.
+- **Stays up**: a standby the primary refuses (another dataset, pruned WAL, wrong token) stays up in
+  `needs_recovery`, refusing data reads with SQLSTATE 55000 that names the reason. It is rebuilt by
+  starting it on a new, empty data directory.
+- **Limits of this release**: the replication port is loopback-only until TLS replication (use an
+  authenticated tunnel for a remote primary); no promotion or failover yet (`SWITCHOVER` is
+  refused); writes are never forwarded from a standby; a 4.41.x logical standby directory is not
+  converted — rebuild it once.
+
+Full guide: [docs/guides/physical-standby.md](docs/guides/physical-standby.md).
 
 Optional HA features (opt-in at compile time):
 
 | Flag | Description |
 |------|-------------|
-| `ha-tier1` | Warm standby — **enabled by default** |
+| `ha-tier1` | Physical standby — **enabled by default** |
 | `ha-tier2` | Multi-primary: branch-based active-active |
 | `ha-tier3` | Sharding: consistent hash ring |
 | `ha-dedup` | Content-addressed deduplication across nodes |
@@ -639,17 +666,17 @@ Optional HA features (opt-in at compile time):
 cargo build --release --features ha-full    # everything
 ```
 
-> **Tip — verify HA changes locally, not in CI**: the HA streaming and
-> lock-management integration tests rely on tight TCP-port spin-waits
-> that pass cleanly on a developer workstation (sub-second) but routinely
-> hang on the 2-CPU GitHub Actions runner. The release workflow gates on
+> **Tip — verify HA changes locally, not in CI**: the HA integration tests
+> start real primary and standby daemons on loopback ports and wait on
+> them, which is quick on a developer workstation but slow and flaky on
+> the 2-CPU GitHub Actions runner. The release workflow gates on
 > `cargo test --lib` only; if you're modifying anything under
-> `src/storage/wal/`, `src/cluster/`, or `src/storage/locks/`, run the full
-> integration suite locally first:
+> `src/replication/`, `src/storage/`, or the commit path, run the HA suites
+> locally first (see [docs/guides/ha_testing.md](docs/guides/ha_testing.md)):
 >
 > ```bash
-> cargo test --features ha-tier1 --test ha_integration   # warm-standby + streaming
-> cargo test --tests --skip ha_tests::streaming_tests --skip lock_management
+> cargo test --test physical_standby_serving --test physical_standby_sync \
+>   --test physical_standby_refusals --test ha_integration --test replication_restart_gap
 > ```
 
 ### Connection Routing & Load Balancing
@@ -657,7 +684,8 @@ cargo build --release --features ha-full    # everything
 For production deployments with multiple HeliosDB Nano instances, put **[HeliosProxy](https://github.com/HeliosDatabase/HeliosDB-Proxy)** in front — a standalone binary providing:
 
 - Read/write splitting across primary + standbys
-- Automatic failover with transaction replay (Oracle TAF-style)
+- Automatic failover with transaction replay (Oracle TAF-style) — on the Nano side this needs
+  standby promotion, which is not available yet (plan phase P5)
 - Connection pooling
 - Health checks + circuit breakers
 - TLS termination
@@ -666,17 +694,18 @@ For production deployments with multiple HeliosDB Nano instances, put **[HeliosP
 
 ```
            ┌────────────────┐
-    psql ─▶│                │──▶ HeliosDB Nano (primary, read+write)
-   mysql ─▶│  HeliosProxy   │──▶ HeliosDB Nano (standby, read-only)
-    curl ─▶│                │──▶ HeliosDB Nano (standby, read-only)
+    psql ─▶│                │──▶ HeliosDB Nano (primary, read+write; PostgreSQL, MySQL, HTTP)
+           │  HeliosProxy   │──▶ HeliosDB Nano (standby, read-only; PostgreSQL)
+           │                │──▶ HeliosDB Nano (standby, read-only; PostgreSQL)
            └────────────────┘
-              port 5432/3306/8080
 ```
 
-1. Deploy 1 primary + 2 standbys (Fly.io / Render / Docker Swarm)
-2. HeliosProxy in front for routing + failover
-3. Automatic failover on primary death (< 5 s typical)
-4. Readonly queries load-balanced across standbys
+1. Deploy 1 primary + standbys. In this release the replication port is loopback-only, so standbys
+   run on the primary's host (or reach it through an authenticated tunnel) until TLS replication lands
+2. HeliosProxy in front for routing: it sends writes to the primary and reads to standbys whose
+   `SELECT heliosdb_require_ready()` succeeds, with `pg_last_wal_replay_lsn()` for lag
+3. Read-only queries load-balanced across ready standbys (standbys serve the PostgreSQL wire only;
+   MySQL and REST go to the primary)
 
 ## Deploy
 
@@ -703,7 +732,7 @@ See **[the Rust API guide](https://docs.rs/heliosdb-nano)** for embedded usage a
 The `heliosdb-nano` binary builds with `cargo build --release`. Default features are `encryption + vector-search + ring-crypto + ha-tier1` — covers most embedded and single-node-server cases. Run `cargo info heliosdb-nano` (or `cargo metadata --no-deps --format-version 1 | jq '.packages[0].features'`) for the live list. Recipes for the non-obvious combinations:
 
 ```bash
-# Default build — embedded + Postgres/MySQL wire + warm-standby HA.
+# Default build — embedded + Postgres/MySQL wire + physical-standby HA.
 cargo build --release
 
 # Code-graph + MCP server (matches what heliosdb-codekb-mcp links).
@@ -828,7 +857,7 @@ In-repo guides (`docs/`):
 - [`information_schema` compatibility](docs/compatibility/information_schema.md)
 - [SQLite drop-in tutorial](docs/guides/sqlite_drop_in_tutorial.md)
 - [REPL demo](docs/guides/repl_demo.md)
-- [HA cluster tutorial](docs/guides/ha_cluster_tutorial.md) · [HA testing](docs/guides/ha_testing.md)
+- [Physical standby (HA)](docs/guides/physical-standby.md) · [HA testing](docs/guides/ha_testing.md) · [Replication history guard](docs/guides/replication-history-guard.md)
 - [Audit logging](docs/guides/audit.md)
 - [Tracing guide](docs/TRACING_GUIDE.md)
 - [Full-text search](docs/compatibility/fts.md) · [PL/pgSQL compatibility](docs/compatibility/plpgsql.md) · [SQLite compatibility](docs/compatibility/sqlite.md)

@@ -386,7 +386,7 @@ impl SwitchoverCoordinator {
                 .into_iter()
                 .find(|s| s.node_id == target_node);
             if let Some(info) = standby_info {
-                if info.apply_lsn >= final_lsn {
+                if info.applied_seq >= final_lsn {
                     tracing::info!("Target standby {} caught up to LSN {}", target_node, final_lsn);
                     break;
                 }
@@ -525,11 +525,11 @@ impl SwitchoverCoordinator {
             .find(|s| s.node_id == target_node);
         if let Some(info) = standby_info {
             check.target_healthy = true;
-            check.target_lsn = info.apply_lsn;
+            check.target_lsn = info.applied_seq;
             check.lag_bytes = check.primary_lsn.saturating_sub(check.target_lsn);
 
-            if info.apply_lsn < check.primary_lsn {
-                let lag = check.primary_lsn - info.apply_lsn;
+            if info.applied_seq < check.primary_lsn {
+                let lag = check.primary_lsn - info.applied_seq;
                 check.warnings.push(format!(
                     "Target standby is {} LSN behind (will sync during switchover)",
                     lag
@@ -544,7 +544,7 @@ impl SwitchoverCoordinator {
 
         // Check other standbys
         for info in self.ha_registry.get_standbys() {
-            if info.apply_lsn >= check.primary_lsn.saturating_sub(100) {
+            if info.applied_seq >= check.primary_lsn.saturating_sub(100) {
                 // Within 100 LSN is considered synced
                 check.synced_standbys.push(info.node_id);
             }

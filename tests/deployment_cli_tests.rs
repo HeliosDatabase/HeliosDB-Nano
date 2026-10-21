@@ -254,6 +254,8 @@ fn http_disabled_ignores_invalid_listen_address() {
     trust_session(pg_port);
 }
 
+/// Spec P2.1: the TOML `replication_port` is the primary's one replication
+/// port (NPHYS002), served once it has a token.
 #[test]
 #[cfg(feature = "ha-tier1")]
 fn replication_toml_starts_primary_listener() {
@@ -261,14 +263,23 @@ fn replication_toml_starts_primary_listener() {
     let replication = reserve("127.0.0.1");
     let pg_port = pg.local_addr().unwrap().port();
     let replication_addr = replication.local_addr().unwrap();
+    let (_token_dir, token) = replication_token_file();
     let config = format!(
-        "[replication]\nrole='primary'\nreplication_port={}\nsync_mode='semi-sync'\n",
-        replication_addr.port()
+        "[replication]\nrole='primary'\nreplication_port={}\nsync_mode='semi-sync'\ntoken_file='{}'\n",
+        replication_addr.port(),
+        token.display()
     );
     drop((pg, replication));
     let mut server = Server::start(pg_port, &["--http-port", "0"], Some(&config));
     server.wait_ready();
     assert!(server.logs().contains("Replication role: primary"), "{}", server.logs());
+    assert!(
+        server
+            .logs()
+            .contains(&format!("Replication port listening on {replication_addr}")),
+        "{}",
+        server.logs()
+    );
     TcpStream::connect_timeout(&replication_addr, Duration::from_secs(3)).unwrap();
     trust_session(pg_port);
 }
@@ -394,6 +405,8 @@ fn occupied_replication_listener_fails_foreground_and_daemon() {
         let replication = reserve("127.0.0.1");
         let pg_port = pg.local_addr().unwrap().port();
         let replication_port = replication.local_addr().unwrap().port().to_string();
+        let (_token_dir, token) = replication_token_file();
+        let token_arg = token.display().to_string();
         drop(pg);
         let mut args = vec![
             "--http-port",
@@ -402,6 +415,8 @@ fn occupied_replication_listener_fails_foreground_and_daemon() {
             "primary",
             "--replication-port",
             &replication_port,
+            "--replication-token-file",
+            &token_arg,
         ];
         if daemon {
             args.push("--daemon");
@@ -411,7 +426,7 @@ fn occupied_replication_listener_fails_foreground_and_daemon() {
         assert!(!server.fixture.path().join("owned.pid").exists());
         if !daemon {
             assert!(
-                server.logs().contains("native replication listener"),
+                server.logs().contains("Cannot bind the replication listener"),
                 "{}",
                 server.logs()
             );
@@ -527,18 +542,16 @@ fn simple_query_error(stream: &mut TcpStream, sql: &str) -> Option<String> {
 }
 
 /// Spec P1.3: the standby is physical — bootstrapped from the primary's
-/// physical source (which needs the replication token) — and the native
-/// channel still verifies the primary's history, as its control plane.
+/// replication port (which needs the replication token). Spec P2.1: the same
+/// one connection verifies the primary's history (its `Hello` / `HelloOk`).
 #[test]
 #[cfg(feature = "ha-tier1")]
 fn guarded_standby_verifies_history_and_refuses_transparent_forwarding_in_every_mode() {
     let primary_pg = reserve("127.0.0.1");
     let primary_repl = reserve("127.0.0.1");
-    let primary_physical = reserve("127.0.0.1");
     let pg_port = primary_pg.local_addr().unwrap().port();
     let repl_port = primary_repl.local_addr().unwrap().port();
-    let physical = primary_physical.local_addr().unwrap().to_string();
-    drop((primary_pg, primary_repl, primary_physical));
+    drop((primary_pg, primary_repl));
     let (_token_dir, token) = replication_token_file();
     let token_arg = token.display().to_string();
     let mut primary = Server::start(
@@ -552,8 +565,6 @@ fn guarded_standby_verifies_history_and_refuses_transparent_forwarding_in_every_
             &repl_port.to_string(),
             "--replication-token-file",
             &token_arg,
-            "--physical-replication-listen",
-            &physical,
         ],
         None,
     );
@@ -562,10 +573,8 @@ fn guarded_standby_verifies_history_and_refuses_transparent_forwarding_in_every_
     assert!(simple_query_error(&mut source, "CREATE TABLE forwarding_guard (id INT PRIMARY KEY)").is_none());
     for mode in ["async", "semi-sync", "sync"] {
         let standby_pg = reserve("127.0.0.1");
-        let standby_repl = reserve("127.0.0.1");
         let port = standby_pg.local_addr().unwrap().port();
-        let native_port = standby_repl.local_addr().unwrap().port();
-        drop((standby_pg, standby_repl));
+        drop(standby_pg);
         let mut standby = Server::start(
             port,
             &[
@@ -573,16 +582,12 @@ fn guarded_standby_verifies_history_and_refuses_transparent_forwarding_in_every_
                 "0",
                 "--replication-role",
                 "standby",
-                "--replication-port",
-                &native_port.to_string(),
                 "--primary-host",
                 &format!("127.0.0.1:{repl_port}"),
                 "--sync-mode",
                 mode,
                 "--replication-token-file",
                 &token_arg,
-                "--physical-replication-listen",
-                &physical,
             ],
             None,
         );
@@ -671,14 +676,12 @@ fn replication_startup_timeout_rejects_out_of_range_before_data_creation() {
 #[cfg(feature = "ha-tier1")]
 fn standby_small_timeout_opens_not_ready_listeners_and_survives_daemon_reexec() {
     for daemon in [false, true] {
-        // Own idle endpoints that accept TCP into their backlog but never send
-        // a handshake: the native and the physical channel both stay pending.
+        // An owned idle endpoint that accepts TCP into its backlog but never
+        // answers: the replication connection stays pending.
         let peer = reserve("127.0.0.1");
-        let physical_peer = reserve("127.0.0.1");
         let pg = reserve("127.0.0.1");
         let port = pg.local_addr().unwrap().port();
         let endpoint = peer.local_addr().unwrap().to_string();
-        let physical = physical_peer.local_addr().unwrap().to_string();
         drop(pg);
         let (_token_dir, token) = replication_token_file();
         let token_arg = token.display().to_string();
@@ -689,8 +692,6 @@ fn standby_small_timeout_opens_not_ready_listeners_and_survives_daemon_reexec() 
             "standby",
             "--primary-host",
             &endpoint,
-            "--physical-replication-listen",
-            &physical,
             "--replication-token-file",
             &token_arg,
             "--replication-startup-timeout-secs",
@@ -720,7 +721,7 @@ fn standby_small_timeout_opens_not_ready_listeners_and_survives_daemon_reexec() 
             error.contains("55000") && error.contains("standby is not ready"),
             "{error}"
         );
-        drop((peer, physical_peer));
+        drop(peer);
     }
 }
 
@@ -735,9 +736,12 @@ fn replication_token_file() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
+/// Spec P2.1: the replication port is loopback-only until TLS replication
+/// (P2.2), whatever `--listen` opens: a wildcard PostgreSQL listener does not
+/// put the plaintext replication token on the network.
 #[test]
 #[cfg(feature = "ha-tier1")]
-fn remote_replication_token_is_refused_without_opt_in() {
+fn a_wildcard_listen_keeps_the_replication_port_on_loopback() {
     let pg = reserve("0.0.0.0");
     let replication = reserve("127.0.0.1");
     let pg_port = pg.local_addr().unwrap().port();
@@ -762,27 +766,37 @@ fn remote_replication_token_is_refused_without_opt_in() {
         ],
         None,
     );
-    server.assert_failure();
+    server.wait_ready();
     assert!(
-        server.logs().contains("allow-insecure-replication-remote"),
+        server
+            .logs()
+            .contains(&format!("Replication port listening on 127.0.0.1:{replication_port}")),
         "{}",
         server.logs()
     );
+    assert!(server.logs().contains("stays on loopback"), "{}", server.logs());
+    TcpStream::connect_timeout(
+        &format!("127.0.0.1:{replication_port}").parse().unwrap(),
+        Duration::from_secs(3),
+    )
+    .unwrap();
 }
 
+/// `--allow-insecure-replication-remote` is reserved for remote replication
+/// over TLS (P2.2): accepted, forwarded through the daemon re-exec, and said
+/// to change nothing yet — never silently ignored.
 #[test]
 #[cfg(feature = "ha-tier1")]
-fn remote_replication_token_opt_in_serves_and_warns() {
-    let pg = reserve("0.0.0.0");
-    let replication = reserve("127.0.0.1");
-    let pg_port = pg.local_addr().unwrap().port();
-    let replication_port = replication.local_addr().unwrap().port().to_string();
-    let (_token_dir, token) = replication_token_file();
-    let token_arg = token.display().to_string();
-    drop((pg, replication));
-    let mut server = Server::start(
-        pg_port,
-        &[
+fn the_insecure_remote_opt_in_says_it_has_no_effect_yet() {
+    for daemon in [false, true] {
+        let pg = reserve("0.0.0.0");
+        let replication = reserve("127.0.0.1");
+        let pg_port = pg.local_addr().unwrap().port();
+        let replication_port = replication.local_addr().unwrap().port().to_string();
+        let (_token_dir, token) = replication_token_file();
+        let token_arg = token.display().to_string();
+        drop((pg, replication));
+        let mut args = vec![
             "--http-port",
             "0",
             "--listen",
@@ -795,20 +809,33 @@ fn remote_replication_token_opt_in_serves_and_warns() {
             "--replication-token-file",
             &token_arg,
             "--allow-insecure-replication-remote",
-        ],
-        None,
-    );
-    server.wait_ready();
-    assert!(
-        server.logs().contains("INSECURE REPLICATION OVERRIDE"),
-        "{}",
-        server.logs()
-    );
+        ];
+        if daemon {
+            args.push("--daemon");
+        }
+        let mut server = Server::start(pg_port, &args, None);
+        if daemon {
+            assert!(server.wait_exit().success(), "{}", server.logs());
+            assert!(!server.worker_pids.is_empty(), "daemon PID missing");
+        } else {
+            server.wait_ready();
+        }
+        assert!(
+            server.logs().contains("has no effect in this release"),
+            "{}",
+            server.logs()
+        );
+        TcpStream::connect_timeout(
+            &format!("127.0.0.1:{replication_port}").parse().unwrap(),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+    }
 }
 
 #[test]
 #[cfg(feature = "ha-tier1")]
-fn loopback_replication_token_is_unaffected() {
+fn loopback_replication_port_serves_without_any_opt_in() {
     let pg = reserve("127.0.0.1");
     let replication = reserve("127.0.0.1");
     let pg_port = pg.local_addr().unwrap().port();
@@ -834,46 +861,15 @@ fn loopback_replication_token_is_unaffected() {
     );
     server.wait_ready();
     assert!(
-        !server.logs().contains("INSECURE REPLICATION OVERRIDE"),
-        "loopback must not need the opt-in: {}",
-        server.logs()
-    );
-}
-
-#[test]
-#[cfg(feature = "ha-tier1")]
-fn remote_replication_token_opt_in_survives_daemon_reexec() {
-    let pg = reserve("0.0.0.0");
-    let replication = reserve("127.0.0.1");
-    let pg_port = pg.local_addr().unwrap().port();
-    let replication_port = replication.local_addr().unwrap().port().to_string();
-    let (_token_dir, token) = replication_token_file();
-    let token_arg = token.display().to_string();
-    drop((pg, replication));
-    let mut server = Server::start(
-        pg_port,
-        &[
-            "--http-port",
-            "0",
-            "--listen",
-            "0.0.0.0",
-            "--allow-insecure-trust",
-            "--replication-role",
-            "primary",
-            "--replication-port",
-            &replication_port,
-            "--replication-token-file",
-            &token_arg,
-            "--allow-insecure-replication-remote",
-            "--daemon",
-        ],
-        None,
-    );
-    assert!(server.wait_exit().success(), "{}", server.logs());
-    assert!(
-        server.logs().contains("INSECURE REPLICATION OVERRIDE"),
+        server
+            .logs()
+            .contains(&format!("Replication port listening on 127.0.0.1:{replication_port}")),
         "{}",
         server.logs()
     );
-    assert!(!server.worker_pids.is_empty(), "daemon PID missing");
+    assert!(
+        !server.logs().contains("has no effect in this release") && !server.logs().contains("stays on loopback"),
+        "loopback needs no opt-in and no notice: {}",
+        server.logs()
+    );
 }

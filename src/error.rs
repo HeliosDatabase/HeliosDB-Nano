@@ -126,6 +126,14 @@ pub const PHYSICAL_STANDBY_WRITE_REFUSED: &str = "writes are not permitted on a 
 /// what a proxy's health check keys on, and no other message may claim it.
 pub const STANDBY_NOT_READY: &str = "standby is not ready";
 
+/// Spec P2.1: the prefix of the error a client receives for a commit its
+/// standbys did not acknowledge within `[replication] sync_timeout_ms` under
+/// `sync_timeout_action = "fail"` (`replication::ha_state::SyncUnconfirmed`).
+/// The commit is durable on the primary — like a cancelled synchronous commit
+/// in PostgreSQL — so a client that retries it blindly writes it twice. One
+/// shared const because the commit path emits it and the docs and tests key on it.
+pub const SYNC_REPLICATION_UNCONFIRMED: &str = "synchronous replication not confirmed";
+
 /// Database error type
 ///
 /// All errors from HeliosDB Lite operations are represented by this enum.

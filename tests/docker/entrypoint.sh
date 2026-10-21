@@ -3,6 +3,13 @@ set -e
 
 # HeliosDB Nano HA Entrypoint Script
 # Configures and starts the database based on role
+#
+# OUT OF SERVICE for replication (spec P2.1): this multi-container lab drove
+# the native v3 replication channel, removed with the logical standby. A
+# physical standby follows its primary's ONE replication port, which is
+# loopback-only until TLS replication (spec P2.2), so a standby in another
+# container cannot reach it yet — and the observer role is gone. Use
+# scripts/regress/nano-physical-pair.sh (docs/guides/physical-standby.md).
 
 # Default values
 : "${HELIOSDB_DATA_DIR:=/data}"
@@ -80,23 +87,12 @@ build_command() {
             if [ -n "$HELIOSDB_STANDBYS" ]; then
                 cmd="$cmd --standby-hosts $HELIOSDB_STANDBYS"
             fi
-            if [ -n "$HELIOSDB_OBSERVER_HOSTS" ]; then
-                cmd="$cmd --observer-hosts $HELIOSDB_OBSERVER_HOSTS"
-            fi
             cmd="$cmd --sync-mode $HELIOSDB_SYNC_MODE"
             ;;
         standby)
             cmd="$cmd --replication-role standby"
             cmd="$cmd --primary-host $HELIOSDB_PRIMARY_HOST"
-            cmd="$cmd --replication-port $HELIOSDB_REPL_PORT"
             cmd="$cmd --sync-mode $HELIOSDB_SYNC_MODE"
-            ;;
-        observer)
-            cmd="$cmd --replication-role observer"
-            cmd="$cmd --replication-port $HELIOSDB_REPL_PORT"
-            if [ -n "$HELIOSDB_PRIMARY_HOST" ]; then
-                cmd="$cmd --primary-host $HELIOSDB_PRIMARY_HOST"
-            fi
             ;;
         proxy)
             # Run the proxy instead of the database

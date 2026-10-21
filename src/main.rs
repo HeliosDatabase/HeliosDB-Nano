@@ -20,12 +20,19 @@ use tracing::info;
 struct HAConfig {
     physical: heliosdb_nano::config::PhysicalReplicationConfig,
     role: String,
+    /// THE replication port (`NPHYS002`): a primary serves its standbys here.
     replication_port: u16,
     startup_timeout_secs: u64,
+    /// A standby's primary: the primary's replication port.
     primary_host: Option<String>,
     standby_hosts: Option<String>,
-    observer_hosts: Option<String>,
     sync_mode: String,
+    /// Spec P2.1: `[replication] min_acks`, `sync_timeout_ms`,
+    /// `sync_timeout_action` (TOML only; a daemon child re-reads them from
+    /// the forwarded `--config`).
+    min_acks: usize,
+    sync_timeout_ms: u64,
+    sync_timeout_action: String,
     http_port: u16,
     http_listen: Option<String>,
     mcp_token: Option<String>,
@@ -33,9 +40,10 @@ struct HAConfig {
     allow_insecure_http: bool,
     allow_insecure_trust: bool,
     node_id: Option<String>,
-    /// One owner-only 32-byte token file authenticating both replication channels.
+    /// The owner-only 32-byte token file authenticating the replication connection.
     token_file: Option<PathBuf>,
-    /// Acknowledge plaintext token transport on a non-loopback replication listener.
+    /// Reserved for remote replication over TLS (spec P2.2): the replication
+    /// port is loopback-only in this release.
     allow_insecure_remote: bool,
     /// Spec P1.3: `[replication] max_standby_lag` (TOML only; a daemon child
     /// re-reads it from the forwarded `--config`).
@@ -838,31 +846,34 @@ enum Commands {
         physical: PhysicalSourceArgs,
 
         // ========== HA Replication Options ==========
-        /// Replication role: standalone, primary, standby, observer
+        /// Replication role: standalone, primary, standby
         #[arg(long)]
         replication_role: Option<String>,
 
-        /// Replication port for WAL streaming (default: 5433)
+        /// THE replication port (protocol NPHYS002, default: 5433): a primary
+        /// serves its physical standbys here — the bootstrap copy, the physical
+        /// WAL, heartbeats and acknowledgements on one connection each.
+        /// Loopback only in this release.
         #[arg(long)]
         replication_port: Option<u16>,
 
-        /// Standby initial history verification timeout in seconds (1..=3600; default: 30)
+        /// How long a standby's listeners wait for it to stream before they
+        /// open anyway, not ready (1..=3600 seconds; default: 30)
         #[arg(long)]
         replication_startup_timeout_secs: Option<u64>,
 
-        /// Primary host for standbys to connect to (host:port)
+        /// For a standby: its primary's replication port (host:port; it must
+        /// resolve to loopback)
         #[arg(long)]
         primary_host: Option<String>,
 
-        /// Standby hosts for primary to track (comma-separated host:port)
+        /// Standby hosts (informational, comma-separated host:port)
         #[arg(long)]
         standby_hosts: Option<String>,
 
-        /// Observer hosts for split-brain protection (comma-separated host:port)
-        #[arg(long)]
-        observer_hosts: Option<String>,
-
-        /// Sync mode: async, semi-sync, sync
+        /// Sync mode: async, semi-sync, sync. On a primary, what a commit
+        /// waits for (`[replication] min_acks`, `sync_timeout_ms`,
+        /// `sync_timeout_action` tune it).
         #[arg(long)]
         sync_mode: Option<String>,
 
@@ -897,7 +908,8 @@ enum Commands {
         #[arg(long)]
         node_id: Option<String>,
 
-        /// Permit the replication token over a non-loopback plaintext native listener
+        /// Reserved for remote replication over TLS: the replication port is
+        /// loopback-only in this release, so this changes nothing yet
         /// (isolated development only; mirrors --allow-insecure-trust).
         #[arg(long)]
         allow_insecure_replication_remote: bool,
@@ -1206,7 +1218,6 @@ async fn run(cli: Cli) -> Result<()> {
             replication_startup_timeout_secs,
             primary_host,
             standby_hosts,
-            observer_hosts,
             sync_mode,
             http_port,
             http_listen,
@@ -1321,9 +1332,6 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(value) = standby_hosts {
                 replication.standby_hosts = split_hosts(&value);
             }
-            if let Some(value) = observer_hosts {
-                replication.observer_hosts = split_hosts(&value);
-            }
             if let Some(value) = sync_mode {
                 replication.sync_mode = value;
             }
@@ -1341,7 +1349,6 @@ async fn run(cli: Cli) -> Result<()> {
             replication.role = replication.role.to_ascii_lowercase();
             replication.sync_mode = replication.sync_mode.to_ascii_lowercase();
             replication.validate()?;
-            resolve_physical_listen(&mut replication)?;
             #[cfg(feature = "ha-tier1")]
             auto_enable_physical_source(&mut replication, explicit_physical, memory, &resolved_data_dir)?;
             #[cfg(not(feature = "ha-tier1"))]
@@ -1379,8 +1386,10 @@ async fn run(cli: Cli) -> Result<()> {
                 startup_timeout_secs: replication.startup_timeout_secs,
                 primary_host: replication.primary_host,
                 standby_hosts: Some(replication.standby_hosts.join(",")),
-                observer_hosts: Some(replication.observer_hosts.join(",")),
                 sync_mode: replication.sync_mode,
+                min_acks: replication.min_acks,
+                sync_timeout_ms: replication.sync_timeout_ms,
+                sync_timeout_action: replication.sync_timeout_action,
                 http_port: http_address.map_or(0, |address| address.port()),
                 http_listen: http_address.map(|address| address.ip().to_string()),
                 mcp_token,
@@ -1703,8 +1712,10 @@ async fn start_server(
         startup_timeout_secs: ha_config.startup_timeout_secs,
         primary_host: ha_config.primary_host.clone(),
         standby_hosts: split_hosts(ha_config.standby_hosts.as_deref().unwrap_or("")),
-        observer_hosts: split_hosts(ha_config.observer_hosts.as_deref().unwrap_or("")),
         sync_mode: ha_config.sync_mode.clone(),
+        min_acks: ha_config.min_acks,
+        sync_timeout_ms: ha_config.sync_timeout_ms,
+        sync_timeout_action: ha_config.sync_timeout_action.clone(),
         node_id: ha_config.node_id.clone(),
         token_file: ha_config.token_file.clone(),
         allow_insecure_remote: ha_config.allow_insecure_remote,
@@ -1953,22 +1964,6 @@ async fn start_server(
     };
     println!("      Database initialized successfully");
 
-    // Spec P1.3: what a primary (or observer) reports to the SQL probes and
-    // `/health` — its written physical sequence and its physical endpoint.
-    #[cfg(feature = "ha-tier1")]
-    if !guarded_standby && !ha_config.role.eq_ignore_ascii_case("standalone") {
-        heliosdb_nano::standby_posture::install_primary(heliosdb_nano::standby_posture::PrimaryStatus {
-            role: if ha_config.role.eq_ignore_ascii_case("observer") {
-                "observer"
-            } else {
-                "primary"
-            },
-            engine: Arc::downgrade(&db.storage),
-            endpoint: ha_config.physical.enabled.then(|| ha_config.physical.listen.clone()),
-            sync_mode: ha_config.sync_mode.clone(),
-        });
-    }
-
     // Build server config
     let mut pg_config = PgServerConfig::with_address(pg_addr)
         .with_auth_method(auth_method)
@@ -2040,20 +2035,29 @@ async fn start_server(
         println!("      - Replication port: {}", ha_config.replication_port);
         println!("      - History startup timeout: {}s", ha_config.startup_timeout_secs);
         println!("      - Sync mode: {}", ha_config.sync_mode);
+        if ha_role == "primary" && ha_config.sync_mode != "async" {
+            println!(
+                "      - Sync acknowledgements: min_acks {}, timeout {} ms, on timeout {}",
+                ha_config.min_acks, ha_config.sync_timeout_ms, ha_config.sync_timeout_action
+            );
+        }
         if let Some(ref primary) = ha_config.primary_host {
             println!("      - Primary host: {primary}");
         }
         if let Some(ref standbys) = ha_config.standby_hosts {
             println!("      - Standby hosts: {standbys}");
         }
-        if let Some(ref observers) = ha_config.observer_hosts {
-            println!("      - Observer hosts: {observers}");
-        }
         if ha_config.physical.enabled {
-            println!("      - Physical source: {}", ha_config.physical.listen);
+            println!(
+                "      - Replication listener: {} (NPHYS002, loopback only)",
+                replication_listen_address(pg_addr.ip(), ha_config.replication_port)
+            );
         }
         if guarded_standby {
-            println!("      - Physical primary: {}", ha_config.physical.listen);
+            println!(
+                "      - Physical primary: {}",
+                ha_config.primary_host.as_deref().unwrap_or("none")
+            );
             println!(
                 "      - Max standby lag: {}",
                 banner_duration(ha_config.max_standby_lag)
@@ -2085,26 +2089,26 @@ async fn start_server(
         .map(|runtime| runtime.publish_store(serving_db_tx.clone()));
     drop(serving_db_tx);
 
-    // Start HA components if enabled. A standby's replication belongs to its
-    // `StandbyRuntime` (above); it has no native HA task of its own here.
+    // Spec P2.1: a primary's replication is its ONE replication port
+    // (`NPHYS002`), bound here before any readiness is published; its directly
+    // owned future is polled alongside PostgreSQL only after startup succeeds.
+    // A standby's replication belongs to its `StandbyRuntime` (above).
     #[cfg(feature = "ha-tier1")]
-    let mut ha_handles = if ha_role == "standalone" || guarded_standby {
-        HAHandles::default()
+    let physical_source = if ha_role == "primary" {
+        let node = configure_ha_node(&ha_config, &pg_addr.ip().to_string(), pg_addr.port())?;
+        let prepared = prepare_physical_source(&ha_config, &node, pg_addr, &db.storage).await?;
+        // What a primary reports to the SQL probes and `/health`: its written
+        // physical sequence and its replication port.
+        heliosdb_nano::standby_posture::install_primary(heliosdb_nano::standby_posture::PrimaryStatus {
+            role: "primary",
+            engine: Arc::downgrade(&db.storage),
+            endpoint: prepared.as_ref().map(|source| source.address.to_string()),
+            sync_mode: ha_config.sync_mode.clone(),
+        });
+        prepared
     } else {
-        start_ha_components(
-            &ha_config,
-            &pg_addr.ip().to_string(),
-            pg_addr.port(),
-            db.storage.clone(),
-        )
-        .await?
+        None
     };
-
-    // Bind physical source before publishing any readiness. Its directly owned
-    // future is polled alongside PostgreSQL only after startup succeeds.
-    #[cfg(feature = "ha-tier1")]
-    let physical_source =
-        prepare_physical_source(&ha_config.physical, ha_config.token_file.as_deref(), &db.storage).await?;
 
     // Start HTTP endpoint (health checks, plus MCP routes when compiled in).
     //
@@ -2159,13 +2163,18 @@ async fn start_server(
                 let http_api_config = api_config.clone();
                 let policy = std::sync::Arc::clone(&http_auth_policy);
                 // Spec P1.3: a replication node's `/health` carries its
-                // replication block and `/ready` answers its readiness.
+                // replication block and `/ready` answers its readiness. Spec
+                // P2.1: a primary's `/health` also lists its standbys.
+                let primary_node = ha_role == "primary";
                 let replication_status: Option<heliosdb_nano::api::ReplicationStatus> =
                     (ha_role != "standalone").then(|| {
-                        let status: heliosdb_nano::api::ReplicationStatus = std::sync::Arc::new(|| {
+                        let status: heliosdb_nano::api::ReplicationStatus = std::sync::Arc::new(move || {
                             let block = heliosdb_nano::standby_posture::node_block()?;
-                            let ready = block.ready;
-                            Some((ready, serde_json::to_value(block).ok()?))
+                            Some(heliosdb_nano::api::ReplicationReport {
+                                ready: block.ready,
+                                block: serde_json::to_value(block).ok()?,
+                                standbys: primary_node.then(primary_standbys_report),
+                            })
                         });
                         status
                     });
@@ -2444,18 +2453,6 @@ async fn start_server(
         ));
     }
 
-    #[cfg(feature = "ha-tier1")]
-    if let Err(error) = ha_handles.ensure_running().await {
-        for handle in [&http_handle, &mysql_handle, &mysql_unix_handle, &pg_unix_handle]
-            .into_iter()
-            .flatten()
-        {
-            handle.abort();
-        }
-        ha_handles.shutdown().await;
-        return Err(error);
-    }
-
     // Daemon parents must observe completion of this child's startup, not
     // merely a successful TCP connect to a prebound socket or another process.
     if let Some(path) = std::env::var_os("HELIOSDB_NANO_READY_FILE") {
@@ -2536,7 +2533,8 @@ async fn start_server(
             {
                 match standby_runtime.as_ref() {
                     Some(runtime) => runtime.unrecoverable().await,
-                    None => ha_handles.failure().await,
+                    // A primary's replication is its source future (below).
+                    None => std::future::pending::<Error>().await,
                 }
             }
             #[cfg(not(feature = "ha-tier1"))]
@@ -2583,12 +2581,14 @@ async fn start_server(
     #[cfg(feature = "ha-tier1")]
     let server_result = {
         let _ = physical_stop.send(true);
+        // No commit may wait for a standby the source no longer serves: a
+        // waiting one returns now instead of at its timeout.
+        heliosdb_nano::replication::ha_state::ha_state().set_replication_serving(false);
         let cleanup = if physical_finished {
             Ok(())
         } else {
             (&mut physical_service).await
         };
-        ha_handles.shutdown().await;
         if let Some(forward) = serving_forward {
             forward.abort();
             let _ = forward.await;
@@ -2906,10 +2906,6 @@ async fn start_server_daemon(
         args.push("--standby-hosts".to_string());
         args.push(standbys);
     }
-    if let Some(observers) = ha_config.observer_hosts {
-        args.push("--observer-hosts".to_string());
-        args.push(observers);
-    }
     if let Some(node_id) = ha_config.node_id {
         args.push("--node-id".to_string());
         args.push(node_id);
@@ -2993,7 +2989,10 @@ async fn start_server_daemon(
             eprintln!("INSECURE DEVELOPMENT OVERRIDE: daemon may permit unauthenticated non-loopback database access (--allow-insecure-trust).");
         }
         if ha_config.allow_insecure_remote && ha_config.token_file.is_some() {
-            eprintln!("INSECURE REPLICATION OVERRIDE: daemon replication token may cross the network in plaintext (--allow-insecure-replication-remote).");
+            eprintln!(
+                "--allow-insecure-replication-remote has no effect in this release: the replication port is \
+                 loopback-only until TLS replication."
+            );
         }
 
         println!();
@@ -3163,144 +3162,24 @@ fn check_server_status(pid_file: &PathBuf) -> Result<()> {
 
 // ========== HA Helper Functions ==========
 
-/// Owned HA tasks. A transport or applicator failure ends CLI serving.
-#[cfg(feature = "ha-tier1")]
-#[derive(Default)]
-struct HAHandles {
-    replication_handle: Option<tokio::task::JoinHandle<Result<()>>>,
-    forwarding_handle: Option<tokio::task::JoinHandle<Result<()>>>,
-    applicator: Option<std::sync::Arc<heliosdb_nano::replication::wal_applicator::WalApplicator>>,
-    client_status: Option<tokio::sync::watch::Receiver<heliosdb_nano::replication::streaming::StreamingClientStatus>>,
-    _ephemeral_wal: Option<tempfile::TempDir>,
-}
-
-#[cfg(feature = "ha-tier1")]
-impl HAHandles {
-    fn status_error(&self) -> Option<Error> {
-        use heliosdb_nano::replication::streaming::StreamingClientStatus;
-        match self.client_status.as_ref().map(|status| status.borrow().clone()) {
-            Some(StreamingClientStatus::Failed { error }) => Some(Error::network(format!(
-                "Replication history verification failed: {error}"
-            ))),
-            Some(StreamingClientStatus::Stopped) => Some(Error::network("Replication client stopped")),
-            _ => None,
-        }
-    }
-
-    async fn ensure_running(&mut self) -> Result<()> {
-        if let Some(error) = self.status_error() {
-            return Err(error);
-        }
-        if self.replication_handle.as_ref().is_some_and(|task| task.is_finished())
-            || self.forwarding_handle.as_ref().is_some_and(|task| task.is_finished())
-        {
-            return Err(self.failure().await);
-        }
-        Ok(())
-    }
-
-    async fn failure(&mut self) -> Error {
-        if let Some(error) = self.status_error() {
-            return error;
-        }
-        async fn terminal_status(
-            status: &mut Option<
-                tokio::sync::watch::Receiver<heliosdb_nano::replication::streaming::StreamingClientStatus>,
-            >,
-        ) -> Error {
-            use heliosdb_nano::replication::streaming::StreamingClientStatus;
-            let Some(status) = status else {
-                return std::future::pending().await;
-            };
-            loop {
-                let current = status.borrow().clone();
-                match current {
-                    StreamingClientStatus::Failed { error } => {
-                        return Error::network(format!("Replication history verification failed: {error}"))
-                    }
-                    StreamingClientStatus::Stopped => return Error::network("Replication client stopped"),
-                    _ => (),
-                }
-                if status.changed().await.is_err() {
-                    return Error::network("Replication client status closed");
-                }
-            }
-        }
-
-        async fn completed(
-            handle: &mut Option<tokio::task::JoinHandle<Result<()>>>,
-        ) -> std::result::Result<Result<()>, tokio::task::JoinError> {
-            match handle.as_mut() {
-                Some(handle) => handle.await,
-                None => std::future::pending().await,
-            }
-        }
-        let (transport, result) = tokio::select! {
-            biased;
-            error = terminal_status(&mut self.client_status) => return error,
-            result = completed(&mut self.replication_handle) => (true, result),
-            result = completed(&mut self.forwarding_handle) => (false, result),
-        };
-        let name = if transport {
-            let _ = self.replication_handle.take();
-            "replication transport"
-        } else {
-            let _ = self.forwarding_handle.take();
-            "replication applicator forwarding"
-        };
-        if let Some(error) = self.status_error() {
-            return error;
-        }
-        match result {
-            Ok(Err(error)) => error,
-            Ok(Ok(())) => Error::network(format!("{name} stopped unexpectedly")),
-            Err(error) => Error::network(format!("{name} task failed: {error}")),
-        }
-    }
-
-    async fn shutdown(&mut self) {
-        for task in [&mut self.replication_handle, &mut self.forwarding_handle] {
-            if let Some(handle) = task.take() {
-                handle.abort();
-                let _ = handle.await;
-            }
-        }
-        if let Some(applicator) = self.applicator.take() {
-            let _ = applicator.stop().await;
-        }
-    }
-}
-
-#[cfg(feature = "ha-tier1")]
-impl Drop for HAHandles {
-    fn drop(&mut self) {
-        // Also cover a later startup validation error before the serving select.
-        if let Some(handle) = &self.replication_handle {
-            handle.abort();
-        }
-        if let Some(handle) = &self.forwarding_handle {
-            handle.abort();
-        }
-    }
-}
-
-/// What every replication role starts from: this node's operational ID, the
-/// token both replication channels present, and the native sync mode.
+/// What every replication role starts from: this node's operational ID and
+/// the token its replication connection presents (spec P2.1: one connection,
+/// so one token, one place).
 #[cfg(feature = "ha-tier1")]
 struct HaNode {
     node_id: uuid::Uuid,
     auth: Option<heliosdb_nano::replication::physical_wire::TransferToken>,
-    sync_mode: heliosdb_nano::replication::SyncModeConfig,
 }
 
-/// Resolve [`HaNode`] and publish this node's configuration to `ha_state()`
-/// (the replication system views read it). Shared by the primary/observer
-/// start path and the physical standby's (`StandbyRuntime`).
+/// Resolve [`HaNode`] and publish this node's configuration to `ha_state()`:
+/// the replication system views read it, and so does the commit path's
+/// synchronous-replication wait (sync mode, `min_acks`, timeout and its
+/// action). Shared by the primary's start path and the physical standby's
+/// (`StandbyRuntime`).
 #[cfg(feature = "ha-tier1")]
 fn configure_ha_node(ha_config: &HAConfig, listen: &str, port: u16) -> Result<HaNode> {
-    use heliosdb_nano::replication::{
-        ha_state::{ha_state, HARole, NodeConfig, SyncMode as HASyncMode},
-        SyncModeConfig,
+    use heliosdb_nano::replication::ha_state::{
+        ha_state, HARole, NodeConfig, SyncMode as HASyncMode, SyncTimeoutAction,
     };
     use uuid::Uuid;
 
@@ -3312,25 +3191,16 @@ fn configure_ha_node(ha_config: &HAConfig, listen: &str, port: u16) -> Result<Ha
 
     info!("Starting HA components with node ID: {}", node_id);
 
-    // One token file authenticates both replication channels. Load it once here
-    // (it is validated by the owner-only loader) and present the same bytes on
-    // the native channel as the physical channel.
+    // The token file is validated by the owner-only loader, once.
     let replication_auth = match &ha_config.token_file {
         Some(path) => Some(heliosdb_nano::replication::read_replication_token(path)?),
         None => None,
     };
 
-    // Parse sync mode
     let sync_mode = match ha_config.sync_mode.to_lowercase().as_str() {
-        "async" => SyncModeConfig::Async,
-        "semi-sync" | "semisync" => SyncModeConfig::SemiSync {
-            min_acks: 1,
-            timeout_ms: 5000,
-        },
-        "sync" => SyncModeConfig::Sync {
-            min_applied: 1,
-            timeout_ms: 10000,
-        },
+        "async" => HASyncMode::Async,
+        "semi-sync" | "semisync" => HASyncMode::SemiSync,
+        "sync" => HASyncMode::Sync,
         other => {
             return Err(Error::config(format!(
                 "Unknown sync mode: '{}'. Use: async, semi-sync, sync",
@@ -3339,207 +3209,106 @@ fn configure_ha_node(ha_config: &HAConfig, listen: &str, port: u16) -> Result<Ha
         }
     };
 
-    let role = ha_config.role.to_lowercase();
-
-    // Set HA state configuration for system views
-    let ha_role = HARole::from_str(&role);
-    let ha_sync_mode = HASyncMode::from_str(&ha_config.sync_mode);
-
     ha_state().set_config(NodeConfig {
         node_id,
-        role: ha_role,
+        role: HARole::from_str(&ha_config.role.to_lowercase()),
         listen_addr: listen.to_string(),
         port,
         replication_port: ha_config.replication_port,
-        sync_mode: ha_sync_mode,
+        sync_mode,
         primary_host: ha_config.primary_host.clone(),
         started_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64,
+        min_acks: ha_config.min_acks,
+        sync_timeout: std::time::Duration::from_millis(ha_config.sync_timeout_ms),
+        sync_timeout_action: SyncTimeoutAction::from_str(&ha_config.sync_timeout_action),
     });
     Ok(HaNode {
         node_id,
         auth: replication_auth,
-        sync_mode,
     })
 }
 
-/// Start HA replication components of a primary or an observer. A standby's
-/// replication is its `StandbyRuntime`'s (spec P1.3).
-#[cfg(feature = "ha-tier1")]
-async fn start_ha_components(
-    ha_config: &HAConfig,
-    listen: &str,
-    port: u16,
-    storage: std::sync::Arc<heliosdb_nano::storage::StorageEngine>,
-) -> Result<HAHandles> {
-    use heliosdb_nano::replication::{
-        streaming::{StreamingServer, StreamingServerConfig},
-        wal_store::{WalStore, WalStoreConfig},
-    };
-    use std::sync::Arc;
-    use std::time::Duration;
-    use uuid::Uuid;
-
-    let HaNode {
-        node_id,
-        auth: replication_auth,
-        sync_mode,
-    } = configure_ha_node(ha_config, listen, port)?;
-    let role = ha_config.role.to_lowercase();
-
-    match role.as_str() {
-        "primary" => {
-            // RocksDB is already exclusively opened. Dataset history is durable
-            // and deliberately independent of the configured operational node ID.
-            let history_id = if storage.config().storage.memory_only {
-                Uuid::new_v4()
-            } else {
-                let directory = storage
-                    .config()
-                    .storage
-                    .path
-                    .as_ref()
-                    .ok_or_else(|| Error::config("persistent replication requires a data directory"))?;
-                heliosdb_nano::replication::history::load_or_create_primary_history(directory)
-                    .map_err(|error| Error::config(format!("Cannot load primary history: {error}")))?
-            };
-            // Start streaming server for primary
-            let repl_addr = parse_listen_address(listen, Some(ha_config.replication_port), 5433)?;
-
-            // Never let unrelated nodes share the process working directory's
-            // default WAL path. In-memory nodes get an owned temporary lifetime.
-            let ephemeral_wal = if storage.config().storage.memory_only {
-                Some(
-                    tempfile::tempdir()
-                        .map_err(|e| Error::io(format!("Cannot create ephemeral replication WAL: {e}")))?,
-                )
-            } else {
-                None
-            };
-            let wal_dir = if let Some(directory) = &ephemeral_wal {
-                directory.path().to_path_buf()
-            } else {
-                storage
-                    .config()
-                    .storage
-                    .path
-                    .as_ref()
-                    .ok_or_else(|| Error::config("persistent replication requires a data directory"))?
-                    .join("replication_wal")
-            };
-            let wal_store = Arc::new(WalStore::new(WalStoreConfig {
-                wal_dir,
-                ..Default::default()
-            }));
-            wal_store
-                .init()
-                .await
-                .map_err(|e| Error::io(format!("WAL store init failed: {e}")))?;
-
-            let server_config = StreamingServerConfig {
-                listen_addr: repl_addr,
-                sync_mode,
-                max_standbys: 10,
-                heartbeat_interval: Duration::from_secs(1),
-                // GH#28: keepalive ONLY — no timeout ever reaches the
-                // replication stream (a standby is idle between WAL segments).
-                tcp_keepalive: heliosdb_nano::protocol::postgres::timeouts::ConnectionTimeouts::from_server_config(
-                    &storage.config().server,
-                )
-                .tcp_keepalive,
-                auth: replication_auth,
-                ..Default::default()
-            };
-
-            if ha_config.token_file.is_some() && !repl_addr.ip().is_loopback() {
-                if !ha_config.allow_insecure_remote {
-                    return Err(Error::config(
-                        "native replication token is a plaintext bearer; bind --listen to a loopback \
-                         address, or set --allow-insecure-replication-remote / \
-                         [replication] allow_insecure_remote = true to acknowledge the documented \
-                         plaintext risk on a protected tunnel",
-                    ));
-                }
-                tracing::warn!(
-                    "INSECURE REPLICATION OVERRIDE: the replication token crosses the network in \
-                     PLAINTEXT to {} (--allow-insecure-replication-remote); use a loopback listener or \
-                     an authenticated tunnel",
-                    repl_addr
-                );
-            }
-            let server = StreamingServer::new(server_config, node_id, history_id, wal_store)
-                .map_err(|error| Error::config(format!("Cannot configure replication history: {error}")))?;
-            // Catch-up is served from the persisted logical WAL, never from the
-            // broadcast channel, so a standby that was down or lagged gets every
-            // committed entry it missed (or a terminal full-resync refusal).
-            let server = server.with_catchup_source(Arc::new(
-                heliosdb_nano::replication::streaming::StorageCatchupSource(storage.clone()),
-            ));
-            info!("Streaming replication server starting on {}", repl_addr);
-
-            let listener = server.bind_listener().await.map_err(|e| Error::network(format!(
-                "Cannot bind native replication listener {repl_addr}: {e}. Use distinct PostgreSQL --port and --replication-port endpoints; --primary-host must point to the primary native replication port."
-            )))?;
-            // Only detach after binding has succeeded.
-            let handle = tokio::spawn(async move {
-                server
-                    .start_with_listener(listener)
-                    .await
-                    .map_err(|error| Error::network(format!("Streaming server failed: {error}")))
-            });
-
-            Ok(HAHandles {
-                replication_handle: Some(handle),
-                _ephemeral_wal: ephemeral_wal,
-                forwarding_handle: None,
-                applicator: None,
-                client_status: None,
-            })
-        }
-        // Spec P1.3: a standby is a physical replica started by `StandbyRuntime`;
-        // the native channel survives there as its control plane only.
-        "standby" => Err(Error::config(
-            "a standby is started by the physical standby start path (StandbyRuntime), not as a native HA component",
-        )),
-
-        "observer" => {
-            info!("Starting as observer node");
-            Ok(HAHandles::default())
-        }
-        _ => Err(Error::config(format!(
-            "Unknown replication role: '{}'. Use: standalone, primary, standby, observer",
-            ha_config.role
-        ))),
+/// Spec P2.1: where a primary's replication port listens. Loopback only
+/// until TLS replication (spec P2.2): `--listen`'s own address when that is a
+/// loopback one, else `127.0.0.1` — a wildcard or remote `--listen` opens the
+/// PostgreSQL port to the network, never the plaintext replication token.
+fn replication_listen_address(pg_listen: std::net::IpAddr, port: u16) -> std::net::SocketAddr {
+    if pg_listen.is_loopback() {
+        std::net::SocketAddr::new(pg_listen, port)
+    } else {
+        std::net::SocketAddr::from(([127, 0, 0, 1], port))
     }
 }
 
-// ========== Physical standby start path (spec P1.3) ==========
+/// Spec P2.1: what a primary's `/health` lists as `standbys` — every standby
+/// its replication port serves, with the physical sequences it acknowledged
+/// (as PostgreSQL LSN text and as numbers), its lag and when it was last seen.
+fn primary_standbys_report() -> serde_json::Value {
+    #[cfg(feature = "ha-tier1")]
+    {
+        use heliosdb_nano::standby_posture::format_lsn;
+        serde_json::Value::Array(
+            heliosdb_nano::replication::ha_state::ha_state()
+                .get_standbys()
+                .into_iter()
+                .map(|standby| {
+                    serde_json::json!({
+                        "node_id": standby.node_id.to_string(),
+                        "address": standby.address,
+                        "pg_port": standby.pg_port,
+                        "history": standby.history.map(|history| history.to_string()),
+                        "state": standby.state.as_str(),
+                        "sync_mode": standby.sync_mode.as_str(),
+                        "counts_for_sync": standby.counts_for_sync,
+                        "applied": format_lsn(standby.applied_seq),
+                        "durable": format_lsn(standby.durable_seq),
+                        "applied_sequence": standby.applied_seq,
+                        "durable_sequence": standby.durable_seq,
+                        "lag_bytes": standby.lag_bytes,
+                        "lag_secs": standby.lag_ms as f64 / 1000.0,
+                        "last_seen": standby.last_seen,
+                    })
+                })
+                .collect(),
+        )
+    }
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        serde_json::Value::Array(Vec::new())
+    }
+}
+
+// ========== Physical standby start path (spec P1.3, P2.1) ==========
 //
 // `start --replication-role standby` runs a physical replica
-// (docs/plans/specs/P1_3_standby_start_posture_pgwire.md):
+// (docs/plans/specs/P1_3_standby_start_posture_pgwire.md, P2_1_*.md):
 //
 // 1. the data directory is classified ([`classify_standby_directory`]): an
 //    installed physical standby is resumed at its durable cursor; an absent
 //    (or empty) one is bootstrapped — `run_receiver(InstallOnce)` downloads a
-//    verified copy from the primary's physical source and renames it into
+//    verified copy from the primary's replication port and renames it into
 //    place, retried while the primary is unreachable; anything else (a 4.41.x
 //    logical standby, a primary's directory, unrelated data) is refused;
 // 2. the installed copy is followed and served: `run_serving_receiver` reopens
 //    it and, on its owner thread, builds `StorageEngine::open_physical_standby`
 //    → `EmbeddedDatabase::with_physical_standby` → `PhysicalApplier` over the
 //    stage's writer ([`standby_serving_attach`]); every batch is applied
-//    through that applier. Transport failures are retried for as long as the
-//    standby runs;
+//    through that applier. Transport failures, and refusals that say "later",
+//    are retried for as long as the standby runs;
 // 3. the posture (`standby_posture`) follows the receiver's progress and
 //    decides readiness; the listeners open once it streams, or when
 //    `replication.startup_timeout_secs` runs out, whatever the posture;
-// 4. a refusal leaves the standby up in `needs_recovery` (or exits, with
+// 4. a refusal — a typed `Refuse` of the primary (history mismatch, pruned
+//    WAL, a gap, a stale epoch, a protocol version, a token it kept refusing)
+//    — leaves the standby up in `needs_recovery` naming it (or exits, with
 //    `[replication] on_unrecoverable = "exit"`);
-// 5. the native v3 channel stays as the control plane only — handshake and
-//    history, heartbeats, acknowledgements — with the logical WAL batches the
-//    primary still sends drained and dropped ([`run_native_control_plane`]).
+// 5. spec P2.1: that one connection — to the primary's `--primary-host`, its
+//    replication port — is also the control plane: the standby's identity and
+//    history in its `Hello`, its heartbeats and the acknowledgements the
+//    primary's synchronous commits wait on. There is no other channel.
 
 /// The refusal a 4.41.x logical standby's directory gets (spec P1.3).
 #[cfg(feature = "ha-tier1")]
@@ -3557,6 +3326,10 @@ const STANDBY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 const STANDBY_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(feature = "ha-tier1")]
 const STANDBY_POLL_BYTES: usize = 8 * 1024 * 1024;
+/// Spec P2.1: how often an idle standby sends its primary a heartbeat. Every
+/// durable advance is acknowledged sooner (`physical_receiver::ACK_COALESCE`).
+#[cfg(feature = "ha-tier1")]
+const STANDBY_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What a standby's data directory is (see the section comment).
 #[cfg(feature = "ha-tier1")]
@@ -3632,15 +3405,34 @@ fn classify_standby_directory(path: &std::path::Path) -> StandbyLayout {
     }
 }
 
-/// The native control channel's settings.
+/// Spec P2.1: the addresses of `--primary-host`, the primary's replication
+/// port. Loopback only until TLS replication (spec P2.2), like the listener
+/// it names; at most 16, deduplicated, resolved once at startup.
 #[cfg(feature = "ha-tier1")]
-#[derive(Clone)]
-struct NativeControlPlan {
-    primary_host: String,
-    node_id: uuid::Uuid,
-    sync_mode: heliosdb_nano::replication::SyncModeConfig,
-    auth: Option<heliosdb_nano::replication::physical_wire::TransferToken>,
-    connect_timeout: std::time::Duration,
+fn resolve_replication_sources(primary_host: &str) -> Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    heliosdb_nano::config::validate_replication_endpoint(primary_host)?;
+    let resolved = primary_host
+        .to_socket_addrs()
+        .map_err(|e| Error::config(format!("cannot resolve --primary-host {primary_host}: {e}")))?;
+    let mut sources = Vec::new();
+    for address in resolved {
+        if !address.ip().is_loopback() {
+            return Err(Error::config(format!(
+                "--primary-host {primary_host} resolves to {address}: the replication port is loopback-only until \
+                 TLS replication; reach a remote primary through an authenticated tunnel ending on loopback"
+            )));
+        }
+        if !sources.contains(&address) {
+            sources.push(address);
+        }
+    }
+    if sources.is_empty() || sources.len() > 16 {
+        return Err(Error::config(format!(
+            "--primary-host {primary_host} must resolve to between 1 and 16 loopback addresses"
+        )));
+    }
+    Ok(sources)
 }
 
 /// Everything the standby's supervisor needs.
@@ -3650,11 +3442,13 @@ struct StandbyPlan {
     /// The node's configuration (storage path = `data_dir`): the receiver's
     /// RocksDB options and the serving database's.
     config: Config,
-    /// The primary's physical source (`[replication.physical] listen`).
-    source: std::net::SocketAddr,
+    /// `--primary-host` as given, and its addresses (the primary's replication port).
+    primary: String,
+    sources: Vec<std::net::SocketAddr>,
     token: heliosdb_nano::replication::physical_wire::TransferToken,
+    /// What this standby's `Hello` announces.
+    identity: heliosdb_nano::replication::physical_wire::ReceiverIdentity,
     wire: heliosdb_nano::replication::physical_wire::WireLimits,
-    native: Option<NativeControlPlan>,
     tracker: std::sync::Arc<heliosdb_nano::standby_posture::PostureTracker>,
 }
 
@@ -3668,8 +3462,9 @@ impl StandbyPlan {
     ) -> heliosdb_nano::replication::physical_receiver::ReceiverOptions {
         heliosdb_nano::replication::physical_receiver::ReceiverOptions {
             config: self.config.clone(),
-            sources: vec![self.source],
+            sources: self.sources.clone(),
             token: self.token.clone(),
+            identity: self.identity.clone(),
             start,
             mode,
             wire: self.wire,
@@ -3677,6 +3472,7 @@ impl StandbyPlan {
             poll_interval: STANDBY_POLL_INTERVAL,
             reconnect_delay: STANDBY_RECONNECT_DELAY,
             max_reconnects,
+            heartbeat_interval: STANDBY_HEARTBEAT_INTERVAL,
         }
     }
 
@@ -3707,9 +3503,6 @@ struct StandbyRuntime {
     store: tokio::sync::watch::Receiver<Option<std::sync::Arc<EmbeddedDatabase>>>,
     /// A refusal the receiver cannot resolve by itself.
     refusal: tokio::sync::watch::Receiver<Option<String>>,
-    /// The native control channel verified the primary's history (or is
-    /// known not to come up); part of the readiness gate only.
-    control_plane: tokio::sync::watch::Receiver<bool>,
     stop: tokio::sync::watch::Sender<bool>,
     supervisor: Option<tokio::task::JoinHandle<()>>,
     exit_on_unrecoverable: bool,
@@ -3725,6 +3518,7 @@ impl StandbyRuntime {
         listen: &str,
         port: u16,
     ) -> Result<Self> {
+        use heliosdb_nano::replication::physical_wire::{PeerRole, ReceiverIdentity, WireSyncMode};
         use heliosdb_nano::standby_posture::{install_standby, PostureTracker};
         // Every PostgreSQL session of this process is a standby session: the
         // write guard (25006) holds in every posture.
@@ -3734,66 +3528,57 @@ impl StandbyRuntime {
             .auth
             .clone()
             .ok_or_else(|| Error::config("a physical standby requires --replication-token-file"))?;
-        let source: std::net::SocketAddr = ha_config.physical.listen.parse().map_err(|_| {
-            Error::config(format!(
-                "replication.physical.listen '{}' must be a literal loopback IP:port naming the primary's physical source",
-                ha_config.physical.listen
-            ))
-        })?;
-        if !source.ip().is_loopback() {
-            return Err(Error::config(
-                "a physical standby follows a loopback physical source; reach a remote primary through an \
-                 authenticated tunnel",
-            ));
-        }
+        let primary = ha_config
+            .primary_host
+            .clone()
+            .ok_or_else(|| Error::config("standby role requires --primary-host or [replication] primary_host"))?;
+        let sources = resolve_replication_sources(&primary)?;
         let tracker = std::sync::Arc::new(PostureTracker::new(
-            source.to_string(),
+            primary.clone(),
             ha_config.sync_mode.clone(),
             ha_config.max_standby_lag,
         ));
         let posture = tracker.handle();
         install_standby(tracker.handle());
-        let native = ha_config.primary_host.clone().map(|primary_host| NativeControlPlan {
-            primary_host,
-            node_id: node.node_id,
-            sync_mode: node.sync_mode,
-            auth: node.auth.clone(),
-            connect_timeout: std::time::Duration::from_secs(ha_config.startup_timeout_secs),
-        });
         info!(
-            "Physical standby following {} (native control channel {})",
-            source,
-            ha_config.primary_host.as_deref().unwrap_or("none")
+            "Physical standby following {} ({}) on its replication port",
+            primary,
+            sources.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
         );
         let plan = StandbyPlan {
             data_dir: data_dir.to_path_buf(),
             config: config.clone(),
-            source,
+            primary,
+            sources,
             token,
+            identity: ReceiverIdentity {
+                node_id: node.node_id,
+                role: PeerRole::Standby,
+                epoch: heliosdb_nano::standby_posture::EPOCH,
+                pg_port: port,
+                sync_mode: WireSyncMode::from_config(&ha_config.sync_mode),
+            },
             wire: physical_wire_limits(&ha_config.physical),
-            native,
             tracker,
         };
         let (stop, shutdown) = tokio::sync::watch::channel(false);
         let (store_tx, store) = tokio::sync::watch::channel(None);
         let (refusal_tx, refusal) = tokio::sync::watch::channel(None);
-        let (control_tx, control_plane) = tokio::sync::watch::channel(false);
-        let supervisor = tokio::spawn(run_physical_standby(plan, store_tx, refusal_tx, control_tx, shutdown));
+        let supervisor = tokio::spawn(run_physical_standby(plan, store_tx, refusal_tx, shutdown));
         Ok(Self {
             posture,
             store,
             refusal,
-            control_plane,
             stop,
             supervisor: Some(supervisor),
             exit_on_unrecoverable: ha_config.exit_on_unrecoverable,
         })
     }
 
-    /// Wait until the standby streams (with its control channel verified),
-    /// a refusal arrives, `budget` runs out, or a shutdown signal arrives.
-    /// Only a refusal with `on_unrecoverable = "exit"` is an error: in every
-    /// other case the listeners open, and the posture decides what they serve.
+    /// Wait until the standby streams, a refusal arrives, `budget` runs out,
+    /// or a shutdown signal arrives. Only a refusal with `on_unrecoverable =
+    /// "exit"` is an error: in every other case the listeners open, and the
+    /// posture decides what they serve.
     async fn open_gate(&self, budget: std::time::Duration) -> Result<GateOutcome> {
         use heliosdb_nano::standby_posture::format_lsn;
         let deadline = tokio::time::Instant::now() + budget;
@@ -3811,7 +3596,7 @@ impl StandbyRuntime {
                 return Ok(GateOutcome::Open);
             }
             let snapshot = self.posture.snapshot();
-            if snapshot.ready() && *self.control_plane.borrow() {
+            if snapshot.ready() {
                 info!(
                     "Physical standby streaming from {} at {} (primary at {})",
                     snapshot.primary,
@@ -3944,16 +3729,18 @@ async fn forward_receiver_progress(
 }
 
 /// Bootstrap failures worth asking the primary again for: it is unreachable,
-/// timed out, or failed on its side. An authentication or protocol refusal,
+/// timed out, failed on its side, or refused with a code that says "later"
+/// (too many sessions, not serving). An authentication or protocol refusal,
 /// and a local storage refusal, are not.
 #[cfg(feature = "ha-tier1")]
 fn bootstrap_retryable(error: &heliosdb_nano::replication::physical_receiver::ReceiverError) -> bool {
     use heliosdb_nano::replication::physical_receiver::ReceiverError;
     use heliosdb_nano::replication::physical_wire::WireError;
-    matches!(
-        error,
-        ReceiverError::Wire(WireError::Io(_) | WireError::Timeout | WireError::Source(_) | WireError::Poisoned)
-    )
+    match error {
+        ReceiverError::Wire(WireError::Io(_) | WireError::Timeout | WireError::Source(_) | WireError::Poisoned) => true,
+        ReceiverError::Wire(WireError::Refused(refusal)) => refusal.code.retryable(),
+        _ => false,
+    }
 }
 
 /// Install a verified copy of the primary at `plan.data_dir`. `Ok(None)` on
@@ -3967,7 +3754,7 @@ async fn bootstrap_physical_standby(
     info!(
         "Bootstrapping physical standby {} from {}: a verified copy is installed, then followed",
         plan.data_dir.display(),
-        plan.source
+        plan.primary
     );
     // Doubles after each failed attempt, up to 30 s: a primary that stays
     // away is asked again, without a warning every second.
@@ -4009,7 +3796,7 @@ async fn bootstrap_physical_standby(
             Err(error) if bootstrap_retryable(&error) => {
                 tracing::warn!(
                     "physical standby bootstrap from {} did not complete ({error}); retrying in {:?}",
-                    plan.source,
+                    plan.primary,
                     retry
                 );
                 let mut wait = shutdown.clone();
@@ -4022,7 +3809,7 @@ async fn bootstrap_physical_standby(
             Err(error) => {
                 return Err(format!(
                     "the physical standby bootstrap from {} was refused: {error}",
-                    plan.source
+                    plan.primary
                 ))
             }
         }
@@ -4082,13 +3869,13 @@ fn standby_serving_attach(
 }
 
 /// The supervisor: classify, bootstrap if needed, then follow and serve until
-/// shutdown or a refusal (see the section comment).
+/// shutdown or a refusal (see the section comment). A refusal — the primary's
+/// typed `Refuse`, or a local one — becomes the posture's `needs_recovery`.
 #[cfg(feature = "ha-tier1")]
 async fn run_physical_standby(
     plan: StandbyPlan,
     store: tokio::sync::watch::Sender<Option<std::sync::Arc<EmbeddedDatabase>>>,
     refusal: tokio::sync::watch::Sender<Option<String>>,
-    control_plane: tokio::sync::watch::Sender<bool>,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     use heliosdb_nano::replication::physical_receiver::{
@@ -4096,7 +3883,6 @@ async fn run_physical_standby(
     };
     let history = match classify_standby_directory(&plan.data_dir) {
         StandbyLayout::Refused(reason) => {
-            control_plane.send_replace(true);
             plan.refuse(&refusal, reason);
             return;
         }
@@ -4112,7 +3898,6 @@ async fn run_physical_standby(
                 // The verified copy is renamed into this path; an empty
                 // directory holds nothing, and `remove_dir` refuses anything else.
                 if let Err(error) = std::fs::remove_dir(&plan.data_dir) {
-                    control_plane.send_replace(true);
                     plan.refuse(
                         &refusal,
                         format!(
@@ -4128,37 +3913,10 @@ async fn run_physical_standby(
                 Ok(Some(history)) => history,
                 Ok(None) => return,
                 Err(reason) => {
-                    control_plane.send_replace(true);
                     plan.refuse(&refusal, reason);
                     return;
                 }
             }
-        }
-    };
-
-    let native = match plan.native.clone() {
-        Some(native) => {
-            let tracker = std::sync::Arc::clone(&plan.tracker);
-            let refused = refusal.clone();
-            let refuse_history: std::sync::Arc<dyn Fn(String) + Send + Sync> =
-                std::sync::Arc::new(move |reason: String| {
-                    tracing::error!("physical standby needs recovery: {reason}");
-                    tracker.needs_recovery(reason.clone());
-                    refused.send_replace(Some(reason));
-                });
-            Some(tokio::spawn(run_native_control_plane(
-                native,
-                history,
-                store.subscribe(),
-                control_plane,
-                refuse_history,
-                std::sync::Arc::clone(&plan.tracker),
-                shutdown.clone(),
-            )))
-        }
-        None => {
-            control_plane.send_replace(true);
-            None
         }
     };
 
@@ -4193,166 +3951,6 @@ async fn run_physical_standby(
         Err(error) if stopping => tracing::debug!("physical standby receiver stopped: {error}"),
         Err(error) => plan.refuse(&refusal, format!("the physical receiver stopped: {error}")),
     }
-    if let Some(native) = native {
-        if stopping {
-            let _ = native.await;
-        } else {
-            // No acknowledgement may reach the primary for a standby that no
-            // longer applies anything.
-            native.abort();
-        }
-    }
-}
-
-/// The primary's logical-WAL position this store holds (`wal:last_lsn`, a
-/// plaintext 8-byte counter in the replicated keyspace): what the native
-/// handshake asks the primary to continue after, so it sends only what is
-/// newer instead of its whole retained logical WAL.
-#[cfg(feature = "ha-tier1")]
-fn replicated_logical_position(storage: &std::sync::Weak<heliosdb_nano::storage::StorageEngine>) -> u64 {
-    storage
-        .upgrade()
-        .and_then(|engine| engine.db().get(b"wal:last_lsn").ok().flatten())
-        .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
-        .map_or(0, u64::from_le_bytes)
-}
-
-/// The native v3 channel as a control plane only: it verifies the primary's
-/// history against this standby's (bound in memory: the physical directory
-/// holds no binding file), keeps the primary's heartbeat and acknowledgement
-/// state, and drains the logical WAL batches a v3 primary still sends. It
-/// never applies anything; the data arrives on the physical channel.
-///
-/// Its failure is logged and leaves the posture alone — with one exception:
-/// a history mismatch, which says the primary is now a different dataset.
-/// The physical channel cannot say so itself (its source drops a session it
-/// refuses, which reads as a transport failure and is retried), so the
-/// native handshake is what turns that case into `needs_recovery`
-/// (`refuse_history`). The primary's position it learns is a LOGICAL WAL
-/// LSN: it reaches the posture only as `native_primary_lsn`
-/// (`PostureTracker::observe_native_handshake`), never as a physical cursor.
-#[cfg(feature = "ha-tier1")]
-async fn run_native_control_plane(
-    native: NativeControlPlan,
-    history: uuid::Uuid,
-    mut store: tokio::sync::watch::Receiver<Option<std::sync::Arc<EmbeddedDatabase>>>,
-    verified: tokio::sync::watch::Sender<bool>,
-    refuse_history: std::sync::Arc<dyn Fn(String) + Send + Sync>,
-    tracker: std::sync::Arc<heliosdb_nano::standby_posture::PostureTracker>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    use heliosdb_nano::replication::history::ReceiverHistory;
-    use heliosdb_nano::replication::streaming::{StreamingClient, StreamingClientConfig, StreamingClientStatus};
-    let storage = loop {
-        if let Some(database) = store.borrow_and_update().clone() {
-            break std::sync::Arc::downgrade(&database.storage);
-        }
-        tokio::select! {
-            changed = store.changed() => if changed.is_err() {
-                verified.send_replace(true);
-                return;
-            },
-            _ = shutdown.changed() => return,
-        }
-    };
-    let resolved = tokio::time::timeout(native.connect_timeout, tokio::net::lookup_host(&native.primary_host)).await;
-    let primary_addr = match resolved {
-        Ok(Ok(mut addresses)) => addresses.next(),
-        Ok(Err(error)) => {
-            tracing::error!("cannot resolve --primary-host {}: {error}", native.primary_host);
-            None
-        }
-        Err(_) => {
-            tracing::error!("resolving --primary-host {} timed out", native.primary_host);
-            None
-        }
-    };
-    let Some(primary_addr) = primary_addr else {
-        tracing::error!(
-            "the standby follows its primary without the native control channel: no heartbeats or \
-             acknowledgements reach the primary"
-        );
-        verified.send_replace(true);
-        return;
-    };
-    let guard = std::sync::Arc::new(ReceiverHistory::in_memory());
-    if let Err(error) = guard.verify_or_bind(history) {
-        tracing::error!("the native control channel cannot bind history {history}: {error}");
-        verified.send_replace(true);
-        return;
-    }
-    let (client, mut entries) = StreamingClient::new(
-        StreamingClientConfig {
-            node_id: native.node_id,
-            primary_addr,
-            sync_mode: native.sync_mode,
-            connect_timeout: native.connect_timeout,
-            reconnect_delay: std::time::Duration::from_secs(5),
-            max_reconnect_attempts: 0, // Unlimited
-            auth: native.auth,
-        },
-        guard,
-    );
-    client.set_applied_source(std::sync::Arc::new(move || replicated_logical_position(&storage)));
-    let client = std::sync::Arc::new(client);
-    let mut status = client.subscribe_status();
-    info!(
-        "Native replication control channel connecting to {}",
-        native.primary_host
-    );
-    let drain = tokio::spawn(async move {
-        let mut announced = false;
-        while let Some(entry) = entries.recv().await {
-            if !announced {
-                tracing::debug!(
-                    lsn = entry.lsn,
-                    "the primary sends logical WAL batches on the native channel; a physical standby drops them"
-                );
-                announced = true;
-            }
-        }
-    });
-    let running = std::sync::Arc::clone(&client);
-    let task = tokio::spawn(async move { running.start().await });
-    let mut announced = false;
-    loop {
-        let current = status.borrow_and_update().clone();
-        match current {
-            StreamingClientStatus::Verified { history_id } | StreamingClientStatus::CaughtUp { history_id } => {
-                // Logical: kept apart from the physical posture.
-                tracker.observe_native_handshake(client.primary_lsn());
-                if !announced {
-                    info!("Standby dataset history verified: {history_id}");
-                    announced = true;
-                }
-                verified.send_replace(true);
-            }
-            StreamingClientStatus::Failed { error } => {
-                if error.to_ascii_lowercase().contains("history mismatch") {
-                    refuse_history(format!(
-                        "the primary at {} serves a different dataset: {error}",
-                        native.primary_host
-                    ));
-                } else {
-                    tracing::error!(
-                        "the native replication control channel stopped: {error}; heartbeats and \
-                         acknowledgements to the primary are lost (the physical stream is unaffected)"
-                    );
-                }
-                verified.send_replace(true);
-                break;
-            }
-            StreamingClientStatus::Stopped => break,
-            StreamingClientStatus::Connecting | StreamingClientStatus::Reconnecting => {}
-        }
-        tokio::select! {
-            changed = status.changed() => if changed.is_err() { break },
-            _ = shutdown.changed() => break,
-        }
-    }
-    client.shutdown();
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
-    drain.abort();
 }
 
 /// HTTP listener for Docker health checks, the BaaS HTTP surface, and (when
@@ -4520,7 +4118,7 @@ mod tests {
             assert_eq!(daemon_readiness_timeout("standby", seconds).as_secs(), seconds + 5);
         }
         assert_eq!(daemon_readiness_timeout("STANDBY", 30).as_secs(), 35);
-        for role in ["standalone", "primary", "observer"] {
+        for role in ["standalone", "primary"] {
             assert_eq!(daemon_readiness_timeout(role, 30).as_secs(), 5);
         }
     }
@@ -5782,7 +5380,7 @@ mod tests {
 /// Transfer bounds and authentication shared by source and receiver.
 #[derive(clap::Args, Debug, Default)]
 struct PhysicalTransferArgs {
-    /// Owner-only 32-byte token file authenticating both replication channels.
+    /// Owner-only 32-byte token file authenticating the replication connection.
     #[arg(long)]
     replication_token_file: Option<PathBuf>,
     #[arg(long)]
@@ -5831,19 +5429,12 @@ impl PhysicalTransferArgs {
 struct PhysicalSourceArgs {
     #[command(flatten)]
     transfer: PhysicalTransferArgs,
-    /// Loopback physical transfer source (persistent primary only), which a
+    /// Serve the replication port (persistent primary only), which a
     /// physical standby is built and followed from. On by default for a
     /// primary with a replication token; `--physical-replication=false` keeps
-    /// it off.
+    /// it off (and with it every standby).
     #[arg(long, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
     physical_replication: Option<bool>,
-    /// Physical endpoint (literal loopback IP:port): where a primary serves its
-    /// physical source, and where a standby finds its primary's. Default:
-    /// 127.0.0.1:<native replication port + 7> (5440 for the default 5433) —
-    /// the primary's own replication port, or the port of a standby's
-    /// --primary-host.
-    #[arg(long)]
-    physical_replication_listen: Option<String>,
     #[arg(long)]
     physical_export_dir: Option<PathBuf>,
     #[arg(long)]
@@ -5860,9 +5451,6 @@ impl PhysicalSourceArgs {
         let config = &mut replication.physical;
         if let Some(value) = self.physical_replication {
             config.enabled = value;
-        }
-        if let Some(value) = self.physical_replication_listen {
-            config.listen = value;
         }
         if let Some(value) = self.physical_export_dir {
             config.export_dir = Some(value);
@@ -5881,7 +5469,7 @@ impl PhysicalSourceArgs {
 
 #[derive(clap::Args, Debug)]
 struct ResyncArgs {
-    /// Physical source endpoint, reached through loopback or an authenticated tunnel.
+    /// The primary's replication port, reached through loopback or an authenticated tunnel.
     #[arg(long)]
     primary_host: String,
     /// Absent destination for a fresh snapshot. Existing data is never overwritten.
@@ -5918,11 +5506,6 @@ fn append_physical_daemon_args(
     if let Some(path) = replication_token_file {
         args.extend(["--replication-token-file".into(), path.display().to_string()]);
     }
-    // An empty listen is the derived default (`PhysicalReplicationConfig::listen`);
-    // `start` resolves it before re-exec, so only a caller that did not reaches here.
-    if !config.listen.trim().is_empty() {
-        args.extend(["--physical-replication-listen".into(), config.listen.clone()]);
-    }
     for (name, value) in [
         ("--physical-replication", config.enabled.to_string()),
         ("--physical-wal-retention-secs", config.wal_retention_secs.to_string()),
@@ -5948,39 +5531,10 @@ fn append_physical_daemon_args(
     }
 }
 
-/// Spec P1.3: make `[replication.physical] listen` explicit. Empty means
-/// "derived from the native endpoint" (`PhysicalReplicationConfig::resolved_listen`):
-/// a primary derives it from its own replication port, a standby from the
-/// port of `--primary-host`, so a pair configured with those two settings
-/// alone meets on the same physical endpoint. Resolved once, before a daemon
-/// re-exec forwards it.
-fn resolve_physical_listen(replication: &mut heliosdb_nano::config::ReplicationConfig) -> Result<()> {
-    if !replication.physical.listen.trim().is_empty() {
-        return Ok(());
-    }
-    let native_port = if replication.role == "standby" {
-        // A standby without --primary-host is refused later, with its own message.
-        match replication
-            .primary_host
-            .as_deref()
-            .and_then(|host| host.rsplit_once(':'))
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-        {
-            Some(port) => port,
-            None => return Ok(()),
-        }
-    } else {
-        replication.replication_port
-    };
-    replication.physical.listen = replication.physical.resolved_listen(native_port)?.to_string();
-    Ok(())
-}
-
-/// Spec P1.3: a primary with a replication token serves its physical source
-/// by default — a physical standby can be built from nothing else, and an HA
-/// pair that worked with 4.41's logical standbys keeps working without a new
-/// flag. `--physical-replication=false` keeps it off. A primary without a
-/// token (or in memory) cannot serve one; that is said once at startup.
+/// Spec P1.3: a primary with a replication token serves its replication port
+/// by default — a physical standby can be built from nothing else.
+/// `--physical-replication=false` keeps it off. A primary without a token (or
+/// in memory) cannot serve one; that is said once at startup.
 ///
 /// The source checkpoints into `export_dir`; when none is configured it is
 /// `<data dir>.physical-export` beside the data directory (same filesystem,
@@ -5998,7 +5552,7 @@ fn auto_enable_physical_source(
     if !replication.physical.enabled {
         if memory || replication.token_file.is_none() {
             tracing::warn!(
-                "this primary serves no physical source ({}); physical standbys cannot follow it",
+                "this primary serves no replication port ({}); physical standbys cannot follow it",
                 if memory {
                     "in-memory storage"
                 } else {
@@ -6155,24 +5709,59 @@ fn physical_wire_limits(
     }
 }
 
+/// Spec P2.1: a primary's ONE replication port (`NPHYS002`), bound, with
+/// everything its sessions share.
 #[cfg(feature = "ha-tier1")]
 struct PreparedPhysicalSource {
     listener: tokio::net::TcpListener,
+    /// Where it listens (reported by `/health` and every `HelloOk`).
+    address: std::net::SocketAddr,
     token: heliosdb_nano::replication::physical_wire::TransferToken,
     db: std::sync::Arc<rocksdb::DB>,
     history: uuid::Uuid,
     export_dir: PathBuf,
     config: heliosdb_nano::config::PhysicalReplicationConfig,
     work: heliosdb_nano::replication::physical_source::SourceWorkLimiter,
+    /// The identity every session answers a `Hello` with, and the standby
+    /// registry it reports to (the one the commit path's sync wait reads).
+    context: std::sync::Arc<heliosdb_nano::replication::physical_wire::SourceContext>,
+    /// `SO_KEEPALIVE` for every accepted replication socket (GH#28, which the
+    /// native listener had): the `[server] tcp_keepalives_*` timers, so the
+    /// kernel reaps a standby whose host vanished. Keepalive only — no idle
+    /// timeout, since a standby of an idle primary sends only heartbeats.
+    tcp_keepalive: Option<heliosdb_nano::protocol::postgres::timeouts::TcpKeepaliveSettings>,
 }
 
+/// How many connections past `[replication.physical] max_sessions` a source
+/// answers with `Refuse { TooManySessions }` at a time; beyond them the
+/// listen backlog waits.
+#[cfg(feature = "ha-tier1")]
+const REFUSING_SESSIONS: usize = 4;
+
+/// Bind a primary's replication port and arm its standby registry: from here
+/// on a sync/semi-sync commit waits for its standbys' acknowledgements.
+/// `None` when the primary serves no replication port (no token, in memory,
+/// or `--physical-replication=false`) — then nothing waits, whatever
+/// `sync_mode` says, since no standby could ever acknowledge.
 #[cfg(feature = "ha-tier1")]
 async fn prepare_physical_source(
-    config: &heliosdb_nano::config::PhysicalReplicationConfig,
-    token_file: Option<&std::path::Path>,
+    ha_config: &HAConfig,
+    node: &HaNode,
+    pg_addr: std::net::SocketAddr,
     storage: &heliosdb_nano::storage::StorageEngine,
 ) -> Result<Option<PreparedPhysicalSource>> {
+    use heliosdb_nano::replication::ha_state::ha_state;
+    use heliosdb_nano::replication::physical_source::{SourceWorkLimiter, StandbyRegistryObserver};
+    use heliosdb_nano::replication::physical_wire::{bind_loopback, SourceContext, SourceIdentity};
+    let config = &ha_config.physical;
     if !config.enabled {
+        if !ha_config.sync_mode.eq_ignore_ascii_case("async") {
+            tracing::warn!(
+                "sync_mode = \"{}\" has no effect: this primary serves no replication port, so no standby can \
+                 acknowledge its commits",
+                ha_config.sync_mode
+            );
+        }
         return Ok(None);
     }
     let directory = storage
@@ -6183,45 +5772,82 @@ async fn prepare_physical_source(
         .ok_or_else(|| Error::config("physical source requires persistent data"))?;
     validate_physical_source(
         config,
-        token_file,
+        ha_config.token_file.as_deref(),
         "primary",
         storage.config().storage.memory_only,
         directory,
     )?;
-    // Native primary startup has already opened/locked the DB and established this marker.
+    // Primary startup has already opened/locked the DB and established this marker.
     let history = heliosdb_nano::replication::history::load_or_create_primary_history(directory)
         .map_err(|e| Error::config(e.to_string()))?;
-    let token_path = token_file.ok_or_else(|| {
+    let token = node.auth.clone().ok_or_else(|| {
         Error::config("physical source requires --replication-token-file or [replication] token_file")
     })?;
-    let token = heliosdb_nano::replication::read_replication_token(token_path)?;
-    let listener = heliosdb_nano::replication::physical_wire::bind_loopback(
-        config
-            .listen
-            .parse()
-            .map_err(|e| Error::config(format!("physical listen: {e}")))?,
-    )
-    .await
-    .map_err(|e| Error::network(format!("physical source bind failed: {e}")))?;
+    let address = replication_listen_address(pg_addr.ip(), ha_config.replication_port);
+    if !pg_addr.ip().is_loopback() {
+        info!(
+            "the replication port listens on {address} only: it stays on loopback until TLS replication, \
+             whatever --listen opens; reach it from another host through an authenticated tunnel"
+        );
+    }
+    if ha_config.allow_insecure_remote {
+        tracing::warn!(
+            "--allow-insecure-replication-remote has no effect in this release: the replication port listens on \
+             loopback only ({address})"
+        );
+    }
+    let listener = bind_loopback(address).await.map_err(|e| {
+        Error::network(format!(
+            "Cannot bind the replication listener {address} (NPHYS002): {e}. Use distinct PostgreSQL --port and \
+             --replication-port endpoints; a standby's --primary-host names this port."
+        ))
+    })?;
+    let db = storage.db();
+    let state = ha_state();
+    state.set_history(Some(history));
+    let sequence = std::sync::Arc::downgrade(&db);
+    state.set_sequence_source(Some(std::sync::Arc::new(move || {
+        sequence.upgrade().map_or(0, |db| db.latest_sequence_number())
+    })));
+    state.set_replication_serving(true);
+    let context = std::sync::Arc::new(SourceContext {
+        identity: SourceIdentity {
+            node_id: node.node_id,
+            history,
+            epoch: heliosdb_nano::standby_posture::EPOCH,
+            physical_endpoint: address.to_string(),
+            pg_port: pg_addr.port(),
+        },
+        observer: std::sync::Arc::new(StandbyRegistryObserver::new(&db)),
+    });
+    info!("Replication port listening on {address} (NPHYS002, dataset history {history})");
     Ok(Some(PreparedPhysicalSource {
         listener,
+        address,
         token,
-        db: storage.db(),
+        db,
         history,
         export_dir: config.export_dir.clone().expect("validated export path"),
         config: config.clone(),
-        work: heliosdb_nano::replication::physical_source::SourceWorkLimiter::new(config.max_sessions)
-            .map_err(|e| Error::config(e.to_string()))?,
+        work: SourceWorkLimiter::new(config.max_sessions).map_err(|e| Error::config(e.to_string()))?,
+        context,
+        tcp_keepalive: heliosdb_nano::protocol::postgres::timeouts::ConnectionTimeouts::from_server_config(
+            &storage.config().server,
+        )
+        .tcp_keepalive,
     }))
 }
 
 /// Directly owned by main, never detached. The listener is bound before readiness;
 /// every authenticated session is joined after shutdown before source DB close.
+/// A connection past `max_sessions` is told so (`Refuse { TooManySessions }`,
+/// which its receiver retries) instead of waiting unanswered in the backlog.
 #[cfg(feature = "ha-tier1")]
 async fn serve_physical_source(
     source: Option<PreparedPhysicalSource>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    use heliosdb_nano::replication::physical_wire::{refuse_session, serve_session, Refusal, RefuseCode};
     let Some(source) = source else {
         while !*shutdown.borrow() {
             if shutdown.changed().await.is_err() {
@@ -6233,7 +5859,9 @@ async fn serve_physical_source(
     let token = std::sync::Arc::new(source.token);
     let (session_stop, session_shutdown) = tokio::sync::watch::channel(false);
     let mut sessions = tokio::task::JoinSet::new();
+    let mut refusing = tokio::task::JoinSet::new();
     let limits = physical_wire_limits(&source.config);
+    let max_sessions = source.config.max_sessions;
     let result = loop {
         if *shutdown.borrow() {
             break Ok(());
@@ -6242,22 +5870,39 @@ async fn serve_physical_source(
             biased;
             _ = shutdown.changed() => { break Ok(()); }
             completed = sessions.join_next(), if !sessions.is_empty() => {
-                if let Some(Err(error)) = completed { tracing::warn!("physical session task failed: {error}"); }
+                if let Some(Err(error)) = completed { tracing::warn!("replication session task failed: {error}"); }
             }
-            accepted = source.listener.accept(), if sessions.len() < source.config.max_sessions => {
-                let (stream, peer) = match accepted { Ok(value) => value, Err(error) => break Err(Error::network(format!("physical accept failed: {error}"))) };
+            _ = refusing.join_next(), if !refusing.is_empty() => {}
+            accepted = source.listener.accept(), if sessions.len() < max_sessions || refusing.len() < REFUSING_SESSIONS => {
+                let (stream, peer) = match accepted { Ok(value) => value, Err(error) => break Err(Error::network(format!("replication accept failed: {error}"))) };
                 if !peer.ip().is_loopback() { continue; }
+                if let Err(error) = heliosdb_nano::protocol::postgres::timeouts::apply_tcp_keepalive(&stream, &source.tcp_keepalive) {
+                    tracing::warn!("Failed to enable TCP keepalive for the replication session from {peer}: {error}");
+                }
+                let stop = session_shutdown.clone();
+                if sessions.len() >= max_sessions {
+                    refusing.spawn(async move {
+                        let refusal = Refusal::new(
+                            RefuseCode::TooManySessions,
+                            format!("this primary already serves {max_sessions} replication sessions ([replication.physical] max_sessions)"),
+                        );
+                        if let Err(error) = refuse_session(stream, refusal, limits, stop).await {
+                            tracing::info!("replication session from {peer}: {error}");
+                        }
+                    });
+                    continue;
+                }
                 let db = source.db.clone();
                 let export = source.export_dir.clone();
                 let history = source.history;
                 let work = source.work.clone();
                 let token = token.clone();
-                let stop = session_shutdown.clone();
+                let context = source.context.clone();
                 sessions.spawn(async move {
-                    let result = heliosdb_nano::replication::physical_wire::serve_session(stream, &token, limits, stop,
+                    let result = serve_session(stream, &token, limits, stop, &context, Some(peer),
                         move |request| heliosdb_nano::replication::physical_source::open_primary_session(db, history, export, limits.transfer, request, work)
                     ).await;
-                    if let Err(error) = result { tracing::warn!("physical transfer session ended: {error}"); }
+                    if let Err(error) = result { tracing::warn!("replication session from {peer} ended: {error}"); }
                 });
             }
         }
@@ -6265,9 +5910,10 @@ async fn serve_physical_source(
     let _ = session_stop.send(true);
     while let Some(completed) = sessions.join_next().await {
         if let Err(error) = completed {
-            tracing::warn!("physical session cleanup failed: {error}");
+            tracing::warn!("replication session cleanup failed: {error}");
         }
     }
+    while refusing.join_next().await.is_some() {}
     let drained = source
         .work
         .drain()
@@ -6362,10 +6008,19 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
                 expected_history: args.expected_history,
             }
         };
+        // An offline receiver: it never counts toward a primary's `min_acks`.
+        let identity = heliosdb_nano::replication::physical_wire::ReceiverIdentity {
+            node_id: uuid::Uuid::new_v4(),
+            role: heliosdb_nano::replication::physical_wire::PeerRole::Resync,
+            epoch: heliosdb_nano::standby_posture::EPOCH,
+            pg_port: 0,
+            sync_mode: heliosdb_nano::replication::physical_wire::WireSyncMode::Async,
+        };
         let options = ReceiverOptions {
             config,
             sources,
             token,
+            identity,
             start,
             mode: if args.once {
                 ReceiverMode::InstallOnce
@@ -6377,6 +6032,7 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
             poll_interval: Duration::from_millis(args.poll_interval_ms),
             reconnect_delay: Duration::from_millis(args.reconnect_delay_ms),
             max_reconnects: args.max_reconnects,
+            heartbeat_interval: Duration::from_secs(5),
         };
         let (stop, shutdown) = tokio::sync::watch::channel(false);
         let (progress, mut statuses) = tokio::sync::watch::channel(ReceiverStatus::Connecting {
@@ -6509,6 +6165,73 @@ mod physical_cli_tests {
             panic!("wrong command")
         };
         assert!(!args.once && !args.resume_existing);
+    }
+    /// Spec P2.1: one replication port, no compatibility — the separate
+    /// physical endpoint flag and the observer role's flag are gone.
+    #[test]
+    fn removed_replication_flags_are_refused() {
+        // Spelled in two pieces so `tests/logical_standby_removed.rs`, which
+        // scans the sources for the removed flag, finds no use of it.
+        for removed in [
+            [concat!("--physical-", "replication-listen"), "127.0.0.1:5440"],
+            ["--observer-hosts", "127.0.0.1:7433"],
+        ] {
+            let mut argv = vec!["nano", "start"];
+            argv.extend(removed);
+            assert!(Cli::try_parse_from(argv).is_err(), "{removed:?} is still accepted");
+        }
+        let Commands::Start {
+            replication_port,
+            primary_host,
+            ..
+        } = Cli::try_parse_from([
+            "nano",
+            "start",
+            "--replication-port",
+            "27741",
+            "--primary-host",
+            "127.0.0.1:27741",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(replication_port, Some(27741));
+        assert_eq!(primary_host.as_deref(), Some("127.0.0.1:27741"));
+    }
+    /// The replication port stays on loopback whatever `--listen` opens (spec
+    /// P2.1, until TLS replication).
+    #[test]
+    fn replication_port_listens_on_loopback_only() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        assert_eq!(
+            replication_listen_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5433),
+            "127.0.0.1:5433".parse().unwrap()
+        );
+        assert_eq!(
+            replication_listen_address(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 5433),
+            "127.0.0.1:5433".parse().unwrap()
+        );
+        assert_eq!(
+            replication_listen_address(IpAddr::V6(Ipv6Addr::LOCALHOST), 6000),
+            "[::1]:6000".parse().unwrap()
+        );
+        assert_eq!(
+            replication_listen_address(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 6000),
+            "127.0.0.2:6000".parse().unwrap()
+        );
+    }
+    #[cfg(feature = "ha-tier1")]
+    #[test]
+    fn a_standby_primary_host_must_resolve_to_loopback() {
+        assert_eq!(
+            resolve_replication_sources("127.0.0.1:27741").unwrap(),
+            vec!["127.0.0.1:27741".parse().unwrap()]
+        );
+        for refused in ["192.0.2.1:5433", "127.0.0.1:0", "127.0.0.1"] {
+            assert!(resolve_replication_sources(refused).is_err(), "{refused}");
+        }
     }
     #[cfg(all(feature = "ha-tier1", unix))]
     #[test]
