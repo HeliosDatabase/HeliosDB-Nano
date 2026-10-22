@@ -29,6 +29,7 @@
 //! download"); transport errors during a download reconnect instead of
 //! failing it.
 
+use super::archiver::ArchiveFeed;
 use super::checkpoint_transfer::{
     partial_snapshot, CheckpointManifest, ClosedPhysicalStage, PhysicalStage, ReceiverStaging, ReopenedPhysicalStage,
     StagingStart, TransferLimits,
@@ -131,6 +132,10 @@ pub struct ReceiverOptions {
     /// How often an idle receiver sends a heartbeat (spec P2.1: 5 s). A
     /// durable advance is acknowledged sooner ([`ACK_COALESCE`]).
     pub heartbeat_interval: Duration,
+    /// Spec P3.1: a serving standby's WAL archive. Every batch its applier
+    /// applied is offered to it right after the apply, without waiting
+    /// ([`ArchiveFeed::offer`]); `None` archives nothing.
+    pub archive: Option<ArchiveFeed>,
 }
 impl ReceiverOptions {
     fn validate(&self) -> Result<()> {
@@ -394,7 +399,7 @@ struct Worker {
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Worker {
-    fn spawn(config: Config, attach: Option<ServingAttach>) -> Result<Self> {
+    fn spawn(config: Config, attach: Option<ServingAttach>, archive: Option<ArchiveFeed>) -> Result<Self> {
         let (tx, rx) = mpsc::channel(1);
         let cancel = Arc::new(AtomicBool::new(false));
         let last = Arc::new(Mutex::new(Position::default()));
@@ -402,7 +407,7 @@ impl Worker {
         let worker_last = last.clone();
         let thread = thread::Builder::new()
             .name("nano-physical-receiver".into())
-            .spawn(move || worker_loop(rx, worker_cancel, worker_last, &config, attach))
+            .spawn(move || worker_loop(rx, worker_cancel, worker_last, &config, attach, archive))
             .map_err(storage)?;
         Ok(Self {
             tx: Some(tx),
@@ -458,6 +463,7 @@ fn worker_loop(
     last: Arc<Mutex<Position>>,
     config: &Config,
     mut attach: Option<ServingAttach>,
+    archive: Option<ArchiveFeed>,
 ) {
     let mut state = State::Empty;
     // Spec P1.3: a serving receiver applies every batch through the applier
@@ -557,10 +563,22 @@ fn worker_loop(
                 reply,
             } => {
                 let result = match (&mut state, &applier) {
-                    (State::Reopened(stage), Some(applier)) => stage
-                        .verify()
-                        .map_err(storage)
-                        .and_then(|()| applier.apply_with(&batch, durability).map(|_| ()).map_err(storage)),
+                    (State::Reopened(stage), Some(applier)) => {
+                        let before = stage.cursor().source_sequence();
+                        let applied = stage
+                            .verify()
+                            .map_err(storage)
+                            .and_then(|()| applier.apply_with(&batch, durability).map(|_| ()).map_err(storage));
+                        // Spec P3.1: the standby archives what it applied —
+                        // handed over without waiting, after the apply, never
+                        // a retransmission it already held.
+                        if let (Ok(()), Some(feed)) = (&applied, &archive) {
+                            if batch.last_sequence() > before {
+                                feed.offer(&batch, stage.writer().db());
+                            }
+                        }
+                        applied
+                    }
                     (State::Initial(stage), _) => stage.apply_with(&batch, durability).map(|_| ()).map_err(storage),
                     (State::Reopened(stage), None) => stage.apply_with(&batch, durability).map(|_| ()).map_err(storage),
                     _ => Err(storage("physical batch outside live stage state")),
@@ -1225,7 +1243,10 @@ async fn run_receiver_with(
 ) -> Result<ClosedPhysicalStage> {
     options.validate()?;
     let serving = attach.is_some();
-    let worker = Worker::spawn(options.config.clone(), attach)?;
+    // Only a serving standby archives (spec P3.1): a bootstrap copy or an
+    // offline `resync` follows no binding the archive could be filed under.
+    let archive = if serving { options.archive.clone() } else { None };
+    let worker = Worker::spawn(options.config.clone(), attach, archive)?;
     let outcome = run_inner(&options, &mut shutdown, &progress, &worker, serving).await;
     match outcome {
         Ok(closed) => {
@@ -1735,6 +1756,7 @@ mod tests {
             reconnect_delay: Duration::from_millis(10),
             max_reconnects: 3,
             heartbeat_interval: Duration::from_millis(20),
+            archive: None,
         }
     }
     fn status() -> (watch::Sender<ReceiverStatus>, watch::Receiver<ReceiverStatus>) {

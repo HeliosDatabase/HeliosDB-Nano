@@ -15,7 +15,9 @@
 //! logical standby (WAL applicator, logical catch-up, its on-disk segment
 //! store) and the observer, failover-watcher and split-brain machinery that
 //! only spoke v3 are gone; fencing and promotion return on the physical
-//! protocol (plan phase P5).
+//! protocol (plan phase P5). Spec P3.1 archives every write group, on both
+//! roles, into sealed segment files kept for a recovery window
+//! ([`archiver`], [`archive_segment`], [`archive_catalog`]).
 //!
 //! # Feature Flags
 //!
@@ -33,6 +35,14 @@ pub use ha_state::{
 };
 
 // Tier 1: Warm Standby (ha-tier1)
+// Spec P3.1: archived WAL segments, the archiver of both roles, and the
+// catalog the views and the `archive` CLI read.
+#[cfg(feature = "ha-tier1")]
+pub mod archive_catalog;
+#[cfg(feature = "ha-tier1")]
+pub mod archive_segment;
+#[cfg(feature = "ha-tier1")]
+pub mod archiver;
 #[cfg(feature = "ha-tier1")]
 pub mod checkpoint_transfer;
 #[cfg(feature = "ha-tier1")]

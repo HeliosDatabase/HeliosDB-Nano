@@ -21,6 +21,10 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `restore` | Restore from backup file | `heliosdb-nano-backup` |
 | `code-graph hook` | Git-hook source indexer (`code-graph` feature) | `heliosdb-nano-code-graph` |
 | `resync` | Offline physical receiver: copies (and follows, unless `--once`) a primary's `--replication-port` into an absent dir; never serves SQL | `heliosdb-nano-server` |
+| `archive list [--json]` | Offline: one line per archived WAL segment (`available` / `corrupt`, history/epoch, sequences, bytes, observed times) of `--archive-dir` (default `<--data-dir>.archive`, or `--config`'s `[replication.archive] dir`) | `heliosdb-nano-server` |
+| `archive verify [--deep] [--key-file f] [--keep-going]` | Offline: header + footer of every segment; `--deep` re-hashes files and decodes every frame (dataset key for an encrypted dataset); exit 1 naming the first failing file | `heliosdb-nano-server` |
+| `archive gaps [--from SEQ]` | Offline: sequence intervals the archive lacks, and why | `heliosdb-nano-server` |
+| `archive prune [--dry-run] [--recovery-window d] [--max-bytes s] [--disk-reserve r]` | Offline: apply the retention policy; refused while a node archives into the directory | `heliosdb-nano-server` |
 
 ## CLI flags (`heliosdb-nano start …`)
 
@@ -46,6 +50,9 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `--allow-insecure-replication-remote` | off | Plaintext replication over a non-loopback network (dev only; INSECURE warning) | `heliosdb-nano-server` |
 | `--snapshot-export-lease-secs <n>` / `--snapshot-export-max-leases <n>` | `3600` / `4` | Primary: how long an interrupted bootstrap copy can resume the same snapshot | `heliosdb-nano-server` |
 | `--replication-token-file <f>` | — | Owner-only 32-byte token; same file on primary and standbys; required for a primary to serve its replication port | `heliosdb-nano-server` |
+| `--archive[=BOOL]` / `--archive-dir <d>` | on / `<data dir>.archive` | Archived WAL (spec P3.1): a primary serving its replication port and every standby seal each write group into `.hseg` segments beside the data dir | `heliosdb-nano-server` |
+| `--archive-segment-max-bytes <s>` / `--archive-segment-max-secs <n>` / `--archive-poll-ms <n>` / `--archive-fsync-bytes <s>` | `64MiB` / `300` / `1000` / `8MiB` | Segment roll by size and age; primary WAL poll cadence; fsync cadence | `heliosdb-nano-server` |
+| `--archive-recovery-window <d>` / `--archive-max-bytes <s>` / `--archive-disk-reserve <r>` / `--archive-prune-interval-secs <n>` | `7d` / `unlimited` / `10%` / `60` | The recovery window and its bounds; pruning inside the window shortens it (WARN), never stalls writes | `heliosdb-nano-server` |
 | `--physical-replication=false` | on for a primary with a token | Turn the primary's replication port off | `heliosdb-nano-server` |
 | `--replication-startup-timeout-secs <n>` | `30` | Standby: wait for streaming before listeners open (not ready) | `heliosdb-nano-server` |
 | `--standby-hosts <list>` | — | Informational only (a primary dials nobody) | `heliosdb-nano-server` |
@@ -142,6 +149,7 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `CREATE INDEX … USING HNSW` / `<->`, `<#>`, `<=>` operators | `heliosdb-nano-vector` |
 | `PRAGMA <foreign_keys\|table_info\|journal_mode\|synchronous\|busy_timeout>` | `heliosdb-nano-migrate` |
 | `SHOW ALL` / `SET <var> = …` | `heliosdb-nano-server` |
+| `SELECT * FROM heliosdb_archived_wal` / `heliosdb_archive_gaps` / `heliosdb_recovery_window` (archived WAL catalog, gaps, recovery window) | `heliosdb-nano-server` |
 
 ## MCP tools (`mcp-endpoint` feature, 16 tools)
 

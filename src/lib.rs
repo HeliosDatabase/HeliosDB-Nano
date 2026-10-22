@@ -4248,6 +4248,15 @@ impl EmbeddedDatabase {
             b"PG_CONTROL_CHECKPOINT".as_slice(),
             b"HELIOSDB_REQUIRE_READY".as_slice(),
             b"HELIOSDB_STANDBY_STATUS".as_slice(),
+            // Spec P3.1: the archive views answer from the archiver's catalog
+            // and pruner, which never move the storage generation either — a
+            // cached `heliosdb_recovery_window` row kept reporting an archive
+            // as empty and unshortened long after segments were sealed and
+            // pruned (the row was evaluated twice across fourteen identical
+            // queries during the P3.1 gate).
+            b"HELIOSDB_ARCHIVED_WAL".as_slice(),
+            b"HELIOSDB_ARCHIVE_GAPS".as_slice(),
+            b"HELIOSDB_RECOVERY_WINDOW".as_slice(),
         ]
         .iter()
         .any(|needle| Self::contains_ascii_case_insensitive(sql, needle))

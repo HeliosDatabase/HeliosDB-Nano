@@ -168,6 +168,50 @@ redo window, default 0).
   directory; the PostgreSQL ports are unchanged); its JSON summary adds
   `"tls"`.
 
+### Added — archived WAL segments and the recovery window (spec P3.1)
+Oracle's archived redo for HeliosDB (`docs/guides/physical-standby.md`,
+"Archived WAL and the recovery window").
+- **Every node with an HA role archives its WAL.** A primary serving its
+  replication port seals every write group of its store, and every standby
+  every write group it applies, into rotating, self-describing segment files
+  `<archive>/<history>/<epoch>/<first>-<last>.hseg` (header, frames, footer,
+  SHA-256 over the file; each frame is the replication connection's own batch
+  payload, digest included; sealed with the dataset key on an encrypted
+  dataset). A standby's frames are byte for byte the primary's for the same
+  sequences. A crash leaves at most an open `.hseg.partial`, repaired and sealed
+  at the next start with every intact frame. Default directory
+  `<data dir>.archive` beside the data directory (owner-only; refused inside it
+  or on the physical export directory). Recovering a standby from segments
+  arrives in P3.2.
+- **The recovery window.** Sealed segments are kept for
+  `[replication.archive] recovery_window` (default `"7d"`), bounded by
+  `max_bytes` (default `"unlimited"`) and `disk_reserve` (default `"10%"` of
+  the filesystem), pruned oldest first. The archive never holds a write back:
+  pruning inside the window **shortens** it, with one WARN per episode
+  (`recovery window shortened to …`), the `pruned_inside_window_total` counter
+  and `shortened = true`. The newest segment and corrupt files are never
+  pruned; a segment a connected standby still needs is kept while the window
+  covers it.
+- **New `[replication.archive]` table**, each key with a `start` flag:
+  `enabled` (`--archive[=BOOL]`, default on), `dir` (`--archive-dir`),
+  `segment_max_bytes` (`"64MiB"`), `segment_max_secs` (300), `poll_ms` (1000),
+  `fsync_bytes` (`"8MiB"`), `recovery_window` (`"7d"`), `max_bytes`
+  (`"unlimited"`), `disk_reserve` (`"10%"`), `prune_interval_secs` (60).
+- **Views** `heliosdb_archived_wal` (one row per segment file, `available` or
+  `corrupt`), `heliosdb_archive_gaps` (the intervals the archive lacks, and
+  why) and `heliosdb_recovery_window` (configured and effective window,
+  bytes, free space, `shortened`, state `ok | shortened | gap | disabled`).
+- **`/health` gains an `archive` object** (`enabled`, `segments`,
+  `bytes_retained`, `effective_window_secs`, `shortened`, `gaps`) beside the
+  `replication` block, whose frozen fields are unchanged; `/ready` is unchanged.
+- **`heliosdb-nano archive list | verify | gaps | prune`**, offline (reads the
+  files only, no database lock): `verify` checks headers and footers, `--deep`
+  every byte and frame (`--key-file` for an encrypted dataset), exiting 1 on the
+  first failing file (`--keep-going` lists all); `prune [--dry-run]` applies
+  the policy and is refused while a node archives into the directory.
+- **`scripts/regress/nano-physical-pair.sh --status`** adds
+  `"archive":{"segments":N,"bytes":N}` from the primary's `/health`.
+
 ### Fixed — replication (fireproof, plan §D5)
 - **`enable_lockfree_ingestion` is refused on every HA role.** It writes rows
   straight into the store from its own worker, bypassing the logical WAL, MVCC
@@ -234,6 +278,16 @@ redo window, default 0).
   (lock-free ingestion refusal and WAL path, a stale or missing HNSW dump is
   rebuilt from rows, `--dump-on-shutdown` on a standby), and
   `tests/support/tls_certs.rs` (openssl-generated test certificates).
+- Added for spec P3.1: `tests/physical_archive.rs` (contiguous segments under
+  load whose frames the standby archives byte for byte; `heliosdb_archived_wal`
+  equals the files; a SIGKILLed primary repairs its open segment and archives
+  on without a gap; an expiring 2 s window; a tiny `max_bytes` shortens the
+  window with one WARN and no failed write; the disk reserve with injected free
+  space under `--features internal-tests`; an encrypted dataset's sealed
+  segments and `archive verify --deep --key-file`) and
+  `tests/archive_cli_tests.rs` (`archive list | verify | gaps | prune` on a
+  prepared directory with a corrupt and a misfiled segment and a hole; `prune`
+  refused under a running node).
 
 ### Replication
 - **A primary restart no longer breaks its standby** (field finding J). A clean

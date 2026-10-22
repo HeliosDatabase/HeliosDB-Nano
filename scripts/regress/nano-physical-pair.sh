@@ -49,11 +49,12 @@
 # Every invocation ends with one JSON line on stdout:
 #   {"ports":{...},"pids":{"primary":N|null,"standby":N|null},"ops_per_s":X|null,
 #    "ready":{"primary":CODE|null,"standby":CODE|null},"standbys":N|null,
-#    "tls":true|false|null,...}
+#    "tls":true|false|null,"archive":{"segments":N,"bytes":N}|null,...}
 # where ready.* is the HTTP status of GET /ready (200 ready, 503 not ready),
-# standbys is how many standbys the primary's /health lists, and tls is whether
+# standbys is how many standbys the primary's /health lists, tls is whether
 # the standby's replication session is on TLS (its /health; null when it does
-# not answer).
+# not answer), and archive is the primary's archived WAL (spec P3.1: sealed
+# segments and their bytes, from its /health; null when it does not answer).
 # Proxy's lag threshold: lag_bytes is "write operations behind" (the physical
 # sequence delta), so at the measured ops/s a max_lag_bytes of ops_per_s * 30
 # allows about 30 s of lag (1000 ops/s -> 30000).
@@ -206,6 +207,17 @@ def replication_tls(port):
         return None
 
 
+def archive_summary(port):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as response:
+            archive = json.load(response).get("archive")
+            if not isinstance(archive, dict):
+                return None
+            return {"segments": archive.get("segments"), "bytes": archive.get("bytes_retained")}
+    except Exception:
+        return None
+
+
 def recv_exact(sock, n):
     data = b""
     while len(data) < n:
@@ -325,6 +337,8 @@ if __name__ == "__main__":
     elif command == "replication-tls":
         tls = replication_tls(int(args[0]))
         print("null" if tls is None else ("true" if tls else "false"))
+    elif command == "archive":
+        print(json.dumps(archive_summary(int(args[0])), separators=(",", ":")))
     elif command == "wait-http":
         sys.exit(wait_http(int(args[0]), args[1], int(args[2]), float(args[3])))
     elif command == "wait-pg":
@@ -400,7 +414,7 @@ stop_side() {
 }
 
 summary() {
-    local p s ops rp rs count tls
+    local p s ops rp rs count tls archive
     p="$(pid_of primary || echo null)"
     s="$(pid_of standby || echo null)"
     ops="$(cat "$OPS_FILE" 2>/dev/null || echo null)"
@@ -408,8 +422,9 @@ summary() {
     rs="$(python3 "$HELPER" http-code "$HTTP_S" /ready)"
     count="$(python3 "$HELPER" standby-count "$HTTP_P")"
     tls="$(python3 "$HELPER" replication-tls "$HTTP_S")"
-    printf '{"ports":{"primary":%s,"standby":%s,"replication":%s,"primary_http":%s,"standby_http":%s},"pids":{"primary":%s,"standby":%s},"ops_per_s":%s,"ready":{"primary":%s,"standby":%s},"standbys":%s,"tls":%s,"sync_mode":"%s","dir":"%s"}\n' \
-        "$PG_P" "$PG_S" "$REPL_P" "$HTTP_P" "$HTTP_S" "$p" "$s" "$ops" "$rp" "$rs" "$count" "$tls" "$SYNC_MODE" "$DIR"
+    archive="$(python3 "$HELPER" archive "$HTTP_P")"
+    printf '{"ports":{"primary":%s,"standby":%s,"replication":%s,"primary_http":%s,"standby_http":%s},"pids":{"primary":%s,"standby":%s},"ops_per_s":%s,"ready":{"primary":%s,"standby":%s},"standbys":%s,"tls":%s,"archive":%s,"sync_mode":"%s","dir":"%s"}\n' \
+        "$PG_P" "$PG_S" "$REPL_P" "$HTTP_P" "$HTTP_S" "$p" "$s" "$ops" "$rp" "$rs" "$count" "$tls" "$archive" "$SYNC_MODE" "$DIR"
 }
 
 for action in "${ACTIONS[@]}"; do

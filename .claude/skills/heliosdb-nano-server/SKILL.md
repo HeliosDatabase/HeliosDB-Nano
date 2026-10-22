@@ -27,6 +27,7 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(systemctl *), Read
 | HA primary | CLI | `--replication-role primary --replication-port 5433 --replication-token-file ./replication.token --sync-mode semi-sync` |
 | HA standby | CLI | `--replication-role standby --primary-host 127.0.0.1:5433 --replication-token-file ./replication.token` (`--primary-host` = the primary's replication port) |
 | HA readiness | HTTP / SQL | `curl :8081/ready` (200 ready, 503 not) · `SELECT heliosdb_require_ready()` · primary's `/health` lists `standbys` |
+| archived WAL | CLI / SQL | `heliosdb-nano archive list\|verify [--deep]\|gaps\|prune [--dry-run] --data-dir ./mydata` · `SELECT * FROM heliosdb_recovery_window` (also `heliosdb_archived_wal`, `heliosdb_archive_gaps`) · `/health` → `"archive":{…}` |
 | MySQL listener | CLI | `--mysql --mysql-listen 127.0.0.1:3306` |
 | Unix socket (PG) | CLI | `--pg-socket-dir /tmp` |
 | Unix socket (MySQL) | CLI | `--mysql-socket /tmp/heliosdb-mysql.sock` |
@@ -92,6 +93,17 @@ sync_timeout_action = "warn"      # warn | fail
 # primary_tls_ca_path = "/etc/heliosdb/repl-ca.crt"   # TLS is the default for a non-loopback primary
 # max_standby_lag  = "30s"
 # on_unrecoverable = "stay-up"    # stay-up | exit
+
+[replication.archive]        # archived WAL + recovery window (both roles; spec P3.1)
+# enabled             = true            # --archive=false
+# dir                 = "/srv/nano/primary.archive"   # default <data dir>.archive; never inside the data dir
+# segment_max_bytes   = "64MiB"         # --archive-segment-max-bytes
+# segment_max_secs    = 300
+# fsync_bytes         = "8MiB"
+# recovery_window     = "7d"            # --archive-recovery-window
+# max_bytes           = "unlimited"     # pruning inside the window SHORTENS it (WARN), never stalls writes
+# disk_reserve        = "10%"           # or a size, e.g. "20GiB"
+# prune_interval_secs = 60
 ```
 
 ## Recipes
@@ -180,6 +192,17 @@ curl -s http://127.0.0.1:8080/health | grep '"tls":true'
 ```
 The token is still required over TLS. The certificate must name the `--primary-host` host (an IP is checked as an IP SAN; `--primary-server-name` overrides). Plaintext over a network needs `--allow-insecure-replication-remote` on both sides (dev only, INSECURE warning). A standby re-reads its CA/client cert at every reconnect; the primary loads its cert at start. Give a standby the primary's encryption key; there is no key rotation command, and rotation with standbys attached is unsupported until P5.
 
+### Recipe 4c: Archived WAL and the recovery window
+Every primary serving its replication port and every standby seals each write group it applies into `<data dir>.archive/<history>/<epoch>/<first>-<last>.hseg` (Oracle: archived redo logs; on by default). Segments are kept for `--archive-recovery-window` (default `7d`), bounded by `--archive-max-bytes` and `--archive-disk-reserve` (default `10%`). A full archive **never stalls the primary**: pruning inside the window shortens it, with one WARN (`recovery window shortened to …`) and `shortened = true`. Recovery FROM the archive arrives in P3.2.
+```bash
+psql -h 127.0.0.1 -p 5432 -c "SELECT configured_window_secs, effective_window_secs, segments, bytes_retained, shortened, state FROM heliosdb_recovery_window"
+heliosdb-nano archive list   --data-dir /srv/nano/primary            # one line per segment (available / corrupt)
+heliosdb-nano archive verify --data-dir /srv/nano/primary --deep     # re-hash + decode every frame; --key-file for an encrypted dataset
+heliosdb-nano archive gaps   --data-dir /srv/nano/primary
+heliosdb-nano archive prune  --data-dir /srv/nano/primary --dry-run  # a real prune is refused while the node runs
+```
+Each node needs its own archive directory (the archiver locks it). Moving a standby's data directory aside for a rebuild? Move its `<data dir>.archive` with it.
+
 ### Recipe 5: Active-active (Tier 2, requires `--features ha-tier2`)
 ```bash
 # Each node runs as both primary and reachable from peers.
@@ -247,7 +270,7 @@ WantedBy=multi-user.target
 - `heliosdb-nano-deploy` — Docker/compose, Fly.io, Railway, Render specifics.
 - `heliosdb-nano-observability` — `/health`, slow-query log, `\stats`, tracing.
 - `heliosdb-nano-backup` — combine `--dump-schedule` with daemon mode.
-- `docs/guides/physical-standby.md` — physical standby: start, readiness, Proxy contract, sync modes, rebuild, limits.
+- `docs/guides/physical-standby.md` — physical standby: start, readiness, Proxy contract, sync modes, archived WAL and the recovery window, rebuild, limits.
 - `docs/guides/ha_testing.md` — HA test suites and the pair fixture (the `tests/docker` lab is still out of service).
 - `docs/guides/audit.md` — audit-log configuration.
 - `config.example.toml` — full TOML config schema.

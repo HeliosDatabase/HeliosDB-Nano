@@ -562,6 +562,11 @@ pub struct ReplicationReport {
     /// Spec P2.1: on a primary, the standbys it serves — `/health`'s
     /// `standbys` array, beside (never inside) the frozen block.
     pub standbys: Option<serde_json::Value>,
+    /// Spec P3.1: the node's WAL archive — `/health`'s `archive` object
+    /// (`enabled`, `segments`, `bytes_retained`, `effective_window_secs`,
+    /// `shortened`, `gaps`), beside (never inside) the frozen block. `/ready`
+    /// does not carry it.
+    pub archive: Option<serde_json::Value>,
 }
 
 /// What a replication node reports (spec P1.3, P2.1). Read-only and
@@ -609,8 +614,13 @@ async fn guard(
         return match replication.as_ref().and_then(|status| status()) {
             Some(report) => {
                 let mut body = serde_json::json!({ "status": "ok", "replication": report.block });
-                if let (Some(standbys), Some(object)) = (report.standbys, body.as_object_mut()) {
-                    object.insert("standbys".to_string(), standbys);
+                if let Some(object) = body.as_object_mut() {
+                    if let Some(standbys) = report.standbys {
+                        object.insert("standbys".to_string(), standbys);
+                    }
+                    if let Some(archive) = report.archive {
+                        object.insert("archive".to_string(), archive);
+                    }
                 }
                 (StatusCode::OK, axum::Json(body)).into_response()
             }
@@ -1131,11 +1141,15 @@ mod tests {
             // block; `/ready` answers the frozen block alone.
             let standbys = (!ready).then(|| serde_json::json!([{ "node_id": "n", "applied": "0/9" }]));
             let listed = standbys.clone();
+            // Spec P3.1: the archive is a sibling object of the block.
+            let archive = serde_json::json!({ "enabled": true, "segments": 2, "shortened": false });
+            let archived = archive.clone();
             let status: ReplicationStatus = Arc::new(move || {
                 Some(ReplicationReport {
                     ready,
                     block: serde_json::json!({ "role": "standby", "ready": ready }),
                     standbys: listed.clone(),
+                    archive: Some(archived.clone()),
                 })
             });
             let app = attach_http_auth_with_replication(
@@ -1157,6 +1171,11 @@ mod tests {
             assert_eq!(body["status"], "ok");
             assert_eq!(body["replication"]["ready"], ready);
             assert_eq!(body.get("standbys"), standbys.as_ref());
+            assert_eq!(body["archive"], archive);
+            assert!(
+                body["replication"].get("archive").is_none(),
+                "the frozen block stays as it was"
+            );
             let readiness = app
                 .clone()
                 .oneshot(HttpRequest::builder().uri("/ready").body(Body::empty()).unwrap())

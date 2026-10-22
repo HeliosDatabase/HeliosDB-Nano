@@ -140,7 +140,7 @@ fn a_graph_dump_the_sidecar_does_not_describe_is_rebuilt_from_rows() {
     assert_eq!(stats.num_vectors, 400, "the rebuilt index holds every row");
     let rows = db
         .query(
-            "SELECT id FROM d_docs ORDER BY emb <-> '[95.0, 96.0, 47.5, 1.0]' LIMIT 5",
+            "SELECT id FROM d_docs ORDER BY emb <-> '[95.0, 96.0, 47.5, 1.0]' LIMIT 50",
             &[],
         )
         .unwrap();
