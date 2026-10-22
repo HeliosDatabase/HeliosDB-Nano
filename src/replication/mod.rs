@@ -9,11 +9,13 @@
 //! `NPHYS002` on the primary's `[replication] replication_port`
 //! ([`physical_wire`]): the bootstrap copy, the physical WAL, the standby's
 //! identity and history, its heartbeats and the acknowledgements synchronous
-//! commits wait on ([`ha_state::HAStateRegistry::wait_for_sequence`]). The
-//! native v3 channel, the logical standby (WAL applicator, logical catch-up,
-//! the `replication_wal/` segment store) and the observer, failover-watcher
-//! and split-brain machinery that only spoke v3 are gone; fencing and
-//! promotion return on the physical protocol (plan phase P5).
+//! commits wait on ([`ha_state::HAStateRegistry::wait_for_sequence`]). Spec
+//! P2.2 put that connection on TLS for remote standbys ([`physical_tls`]) and
+//! made an interrupted bootstrap copy resumable. The native v3 channel, the
+//! logical standby (WAL applicator, logical catch-up, its on-disk segment
+//! store) and the observer, failover-watcher and split-brain machinery that
+//! only spoke v3 are gone; fencing and promotion return on the physical
+//! protocol (plan phase P5).
 //!
 //! # Feature Flags
 //!
@@ -43,6 +45,8 @@ pub mod physical_applier;
 pub mod physical_receiver;
 #[cfg(feature = "ha-tier1")]
 pub mod physical_source;
+#[cfg(feature = "ha-tier1")]
+pub mod physical_tls;
 #[cfg(feature = "ha-tier1")]
 pub mod physical_vector;
 #[cfg(feature = "ha-tier1")]

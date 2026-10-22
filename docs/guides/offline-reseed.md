@@ -84,10 +84,13 @@ heliosdb-nano resync --primary-host 127.0.0.1:5433 --data-dir /srv/nano-copy \
   --replication-token-file /etc/heliosdb/replication.token --once
 ```
 
-- `--primary-host` is the primary's **replication port** (loopback only in this
-  release; use an authenticated tunnel for a remote primary).
+- `--primary-host` is the primary's **replication port**. A remote primary is
+  reached over TLS (`--primary-tls`, the default for a non-loopback address,
+  with `--primary-ca` and the other standby TLS flags of
+  [the physical standby guide](physical-standby.md#remote-standbys-tls)).
 - A fresh copy requires an absent destination; existing data is never
-  overwritten.
+  overwritten. An interrupted copy into the same destination resumes from its
+  progress record while the primary still leases the snapshot.
 - `--resume-existing` resumes ONLY an already installed physical replica at its
   durable cursor, and requires `--expected-history`, the source's dataset UUID,
   so it can never continue from another dataset.

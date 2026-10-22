@@ -83,6 +83,28 @@ pub const VEC_SNAPSHOT_MARKER_PREFIX: &str = "vecsnapv:";
 
 /// Subdirectory of the data dir holding `hnsw_rs` graph dumps.
 pub const HNSW_SNAPSHOT_DIR: &str = "hnsw_snapshots";
+/// The two files of one graph dump: `{basename}{suffix}`.
+pub const HNSW_GRAPH_SUFFIX: &str = ".hnsw.graph";
+pub const HNSW_DATA_SUFFIX: &str = ".hnsw.data";
+
+/// SHA-256 of one graph dump file (spec P2.2: recorded in the sidecar, so a
+/// dump that is not the one the sidecar describes — another checkpoint's,
+/// a truncated or missing one — is never loaded).
+pub fn dump_file_digest(path: &std::path::Path) -> std::io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(buffer.get(..count).unwrap_or_default());
+    }
+    Ok(hash.finalize().into())
+}
 
 pub fn art_snapshot_key(table: &str) -> Vec<u8> {
     format!("{ART_SNAPSHOT_PREFIX}{table}").into_bytes()
@@ -174,6 +196,14 @@ pub struct VectorGraphSidecar {
     pub id_mapping: Vec<u64>,
     /// Live `(row_id, hnsw_id)` pairs (tombstones excluded).
     pub reverse_mapping: Vec<(u64, u64)>,
+    /// Spec P2.2 (plan §D5): SHA-256 of `{basename}.hnsw.graph` and
+    /// `{basename}.hnsw.data` as dumped. Hydration refuses a dump whose files
+    /// are missing or differ and rebuilds the index from rows instead: the
+    /// dump files live outside RocksDB, so nothing else ties them to this
+    /// sidecar. (A sidecar written before this field fails to decode and is
+    /// rebuilt from rows too.)
+    pub graph_sha256: [u8; 32],
+    pub data_sha256: [u8; 32],
 }
 
 /// What `persist_index_snapshots` wrote (diagnostics / tests).

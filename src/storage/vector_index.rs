@@ -1362,6 +1362,13 @@ impl VectorIndexManager {
         let basename = graph_dump_basename(name);
         index.dump_graph(dir, &basename)?;
         let (id_mapping, reverse_mapping) = index.export_mappings();
+        let digest = |suffix: &str| {
+            let path = dir.join(format!("{basename}{suffix}"));
+            super::index_snapshot::dump_file_digest(&path)
+                .map_err(|e| Error::storage(format!("HNSW graph dump {} digest: {e}", path.display())))
+        };
+        let graph_sha256 = digest(super::index_snapshot::HNSW_GRAPH_SUFFIX)?;
+        let data_sha256 = digest(super::index_snapshot::HNSW_DATA_SUFFIX)?;
 
         Ok(Some(super::index_snapshot::VectorGraphSidecar {
             format_version: super::index_snapshot::INDEX_SNAPSHOT_FORMAT_VERSION,
@@ -1375,6 +1382,8 @@ impl VectorIndexManager {
             basename,
             id_mapping,
             reverse_mapping,
+            graph_sha256,
+            data_sha256,
         }))
     }
 
@@ -1392,6 +1401,27 @@ impl VectorIndexManager {
                 sidecar.format_version,
                 super::index_snapshot::INDEX_SNAPSHOT_FORMAT_VERSION
             )));
+        }
+        // Spec P2.2: only the dump this sidecar describes is loaded. A dump
+        // file that is missing or differs (another checkpoint's, a partial
+        // copy) is an error here, and the caller rebuilds the index from rows.
+        for (suffix, expected) in [
+            (super::index_snapshot::HNSW_GRAPH_SUFFIX, sidecar.graph_sha256),
+            (super::index_snapshot::HNSW_DATA_SUFFIX, sidecar.data_sha256),
+        ] {
+            let path = dir.join(format!("{}{suffix}", sidecar.basename));
+            let actual = super::index_snapshot::dump_file_digest(&path).map_err(|e| {
+                Error::storage(format!(
+                    "HNSW graph dump {} is missing or unreadable ({e})",
+                    path.display()
+                ))
+            })?;
+            if actual != expected {
+                return Err(Error::storage(format!(
+                    "HNSW graph dump {} does not match the digest its vecsnap sidecar recorded",
+                    path.display()
+                )));
+            }
         }
         let distance_metric = metric_from_name(&sidecar.metric)?;
         let config = HnswConfig {

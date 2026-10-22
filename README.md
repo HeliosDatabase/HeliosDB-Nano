@@ -596,7 +596,7 @@ and `MERGE BRANCH`.
 | **HNSW graph snapshots** under `<data_dir>/hnsw_snapshots/` | Plain files outside RocksDB containing raw vectors |
 | **Backup dumps** (`[dump]`, `--dump-on-shutdown`, `--dump-schedule`) | Written unencrypted; protect the dump directory separately |
 | **Data written before enabling encryption** | Existing values are read as-is and never rewritten. Enabling encryption seals *new* writes; it does not retroactively seal an existing database |
-| **The replication link** | A physical standby receives the primary's write groups verbatim: sealed values stay sealed (the standby needs the same key), but RocksDB keys and the replication token cross the link in the clear. Replication has no TLS yet, so the replication port is loopback-only — use an authenticated tunnel for a remote standby |
+| **The replication link** | A physical standby receives the primary's write groups verbatim: sealed values stay sealed (the standby needs the same key), and RocksDB keys and the replication token travel inside the link. Over TLS (`--replication-tls` / `--primary-tls`, required for a remote standby) the link is encrypted; plaintext stays on loopback unless `--allow-insecure-replication-remote` |
 
 **Wrong-key protection.** A sentinel is sealed at first open and verified strictly on every
 subsequent open, so a wrong or rotated key is refused up front rather than silently yielding
@@ -640,13 +640,18 @@ heliosdb-nano start --data-dir /srv/nano/standby --port 5442 --http-port 8081 \
 - **Sync modes**: `[replication] sync_mode = "semi-sync"` makes a commit wait until `min_acks`
   standbys hold it durably, `"sync"` until they have applied it; `sync_timeout_ms` and
   `sync_timeout_action = "warn" | "fail"` decide what a commit does when they do not answer.
+- **Remote standbys over TLS**: `--replication-tls` (with `--replication-tls-cert` /
+  `--replication-tls-key`, or the PostgreSQL `--tls-cert` pair) lets the primary's replication port
+  bind its `--listen` address; a standby reaches a non-loopback `--primary-host` over TLS by default,
+  verified against `--primary-ca`. `--replication-tls-ca` adds mutual TLS. The token is still
+  required. Plaintext over a network needs `--allow-insecure-replication-remote` (dev only).
 - **Stays up**: a standby the primary refuses (another dataset, pruned WAL, wrong token) stays up in
   `needs_recovery`, refusing data reads with SQLSTATE 55000 that names the reason. It is rebuilt by
-  starting it on a new, empty data directory.
-- **Limits of this release**: the replication port is loopback-only until TLS replication (use an
-  authenticated tunnel for a remote primary); no promotion or failover yet (`SWITCHOVER` is
-  refused); writes are never forwarded from a standby; a 4.41.x logical standby directory is not
-  converted — rebuild it once.
+  starting it on a new, empty data directory. An interrupted bootstrap copy resumes where it
+  stopped (the primary leases the snapshot for `[replication] snapshot_export_lease_secs`).
+- **Limits of this release**: no promotion or failover yet (`SWITCHOVER` is refused); writes are
+  never forwarded from a standby; key rotation is not supported with standbys attached; a 4.41.x
+  logical standby directory is not converted — rebuild it once.
 
 Full guide: [docs/guides/physical-standby.md](docs/guides/physical-standby.md).
 
@@ -700,8 +705,8 @@ For production deployments with multiple HeliosDB Nano instances, put **[HeliosP
            └────────────────┘
 ```
 
-1. Deploy 1 primary + standbys. In this release the replication port is loopback-only, so standbys
-   run on the primary's host (or reach it through an authenticated tunnel) until TLS replication lands
+1. Deploy 1 primary + standbys. Standbys on other hosts replicate over TLS (`--replication-tls` on
+   the primary, `--primary-ca` on each standby)
 2. HeliosProxy in front for routing: it sends writes to the primary and reads to standbys whose
    `SELECT heliosdb_require_ready()` succeeds, with `pg_last_wal_replay_lsn()` for lag
 3. Read-only queries load-balanced across ready standbys (standbys serve the PostgreSQL wire only;

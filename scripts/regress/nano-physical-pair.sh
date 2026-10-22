@@ -2,7 +2,8 @@
 #
 # nano-physical-pair.sh — a HeliosDB-Nano primary and its PHYSICAL standby on
 # loopback (spec P1.3 §5, docs/plans/specs/P1_3_standby_start_posture_pgwire.md;
-# spec P2.1: one replication connection, docs/guides/physical-standby.md).
+# spec P2.1: one replication connection; spec P2.2: --tls,
+# docs/guides/physical-standby.md).
 #
 # The pair HeliosDB Proxy's lab and the live probes run against:
 #   primary  PostgreSQL 127.0.0.1:27721  (writes; replication port 127.0.0.1:27741)
@@ -38,17 +39,26 @@
 #                              (default async); --min-acks N, --sync-timeout-ms MS and
 #                              --sync-timeout-action warn|fail tune it
 #   --timeout S                how long --start / --restart wait for readiness (default 120)
+#   --tls                      replicate over TLS (spec P2.2): a throwaway CA and a server
+#                              certificate for 127.0.0.1 are generated with openssl under
+#                              DIR/tls, the primary serves --replication-tls and the standby
+#                              verifies it with --primary-ca. Remembered for DIR (later
+#                              invocations without --tls keep it). TLS is on the replication
+#                              port only: the PostgreSQL and HTTP ports are unchanged.
 #
 # Every invocation ends with one JSON line on stdout:
 #   {"ports":{...},"pids":{"primary":N|null,"standby":N|null},"ops_per_s":X|null,
-#    "ready":{"primary":CODE|null,"standby":CODE|null},"standbys":N|null}
-# where ready.* is the HTTP status of GET /ready (200 ready, 503 not ready) and
-# standbys is how many standbys the primary's /health lists.
+#    "ready":{"primary":CODE|null,"standby":CODE|null},"standbys":N|null,
+#    "tls":true|false|null,...}
+# where ready.* is the HTTP status of GET /ready (200 ready, 503 not ready),
+# standbys is how many standbys the primary's /health lists, and tls is whether
+# the standby's replication session is on TLS (its /health; null when it does
+# not answer).
 # Proxy's lag threshold: lag_bytes is "write operations behind" (the physical
 # sequence delta), so at the measured ops/s a max_lag_bytes of ops_per_s * 30
 # allows about 30 s of lag (1000 ops/s -> 30000).
 #
-# Requires bash and python3 (standard library only).
+# Requires bash and python3 (standard library only); --tls also needs openssl.
 
 set -euo pipefail
 # The physical source refuses a group/world-writable primary directory and
@@ -70,10 +80,11 @@ SYNC_TIMEOUT_MS=10000
 SYNC_TIMEOUT_ACTION="warn"
 TIMEOUT=120
 DURATION=10
+TLS=0
 ACTIONS=()
 
 usage() {
-    sed -n '3,52p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,/^# Requires/p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -97,6 +108,7 @@ while [ $# -gt 0 ]; do
         --sync-timeout-action) SYNC_TIMEOUT_ACTION="${2:?}"; shift 2 ;;
         --timeout) TIMEOUT="${2:?}"; shift 2 ;;
         --duration) DURATION="${2:?}"; shift 2 ;;
+        --tls) TLS=1; shift ;;
         --start | --stop | --status) ACTIONS+=("${1#--}"); shift ;;
         --load) ACTIONS+=("load:${2:?--load needs a rate}"); shift 2 ;;
         --kill | --pause | --resume)
@@ -128,6 +140,36 @@ if [ ! -f "$TOKEN" ]; then
     (umask 077 && head -c 32 /dev/urandom >"$TOKEN")
 fi
 chmod 600 "$TOKEN"
+
+# Spec P2.2: TLS on the replication port, remembered for this state directory.
+TLS_DIR="$DIR/tls"
+if [ "$TLS" = 1 ]; then
+    : >"$DIR/tls.enabled"
+elif [ -f "$DIR/tls.enabled" ]; then
+    TLS=1
+fi
+PRIMARY_TLS_ARGS=()
+STANDBY_TLS_ARGS=()
+if [ "$TLS" = 1 ]; then
+    command -v openssl >/dev/null || die "--tls needs openssl"
+    if [ ! -f "$TLS_DIR/server.crt" ]; then
+        mkdir -p "$TLS_DIR"
+        chmod 700 "$TLS_DIR"
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout "$TLS_DIR/ca.key" -out "$TLS_DIR/ca.crt" \
+            -days 30 -subj "/CN=nano-physical-pair test CA" >/dev/null 2>&1 || die "openssl: CA"
+        openssl req -newkey rsa:2048 -nodes -keyout "$TLS_DIR/server.key" -out "$TLS_DIR/server.csr" \
+            -subj "/CN=nano-physical-pair primary" >/dev/null 2>&1 || die "openssl: server key"
+        printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1,DNS:localhost\n' \
+            >"$TLS_DIR/server.ext"
+        openssl x509 -req -in "$TLS_DIR/server.csr" -CA "$TLS_DIR/ca.crt" -CAkey "$TLS_DIR/ca.key" \
+            -CAcreateserial -out "$TLS_DIR/server.crt" -days 30 -extfile "$TLS_DIR/server.ext" \
+            >/dev/null 2>&1 || die "openssl: server certificate"
+        chmod 600 "$TLS_DIR/ca.key" "$TLS_DIR/server.key"
+    fi
+    PRIMARY_TLS_ARGS=(--replication-tls --replication-tls-cert "$TLS_DIR/server.crt"
+        --replication-tls-key "$TLS_DIR/server.key")
+    STANDBY_TLS_ARGS=(--primary-tls --primary-ca "$TLS_DIR/ca.crt")
+fi
 printf '[replication]\nmax_standby_lag = "%s"\n' "$MAX_LAG" >"$DIR/standby.toml"
 printf '[replication]\nsync_mode = "%s"\nmin_acks = %s\nsync_timeout_ms = %s\nsync_timeout_action = "%s"\n' \
     "$SYNC_MODE" "$MIN_ACKS" "$SYNC_TIMEOUT_MS" "$SYNC_TIMEOUT_ACTION" >"$DIR/primary.toml"
@@ -151,6 +193,15 @@ def standby_count(port):
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as response:
             return len(json.load(response).get("standbys", []))
+    except Exception:
+        return None
+
+
+def replication_tls(port):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as response:
+            value = json.load(response).get("replication", {}).get("tls")
+            return value if isinstance(value, bool) else None
     except Exception:
         return None
 
@@ -271,6 +322,9 @@ if __name__ == "__main__":
     elif command == "standby-count":
         count = standby_count(int(args[0]))
         print("null" if count is None else count)
+    elif command == "replication-tls":
+        tls = replication_tls(int(args[0]))
+        print("null" if tls is None else ("true" if tls else "false"))
     elif command == "wait-http":
         sys.exit(wait_http(int(args[0]), args[1], int(args[2]), float(args[3])))
     elif command == "wait-pg":
@@ -294,6 +348,7 @@ start_primary() {
     pid_of primary >/dev/null && return 0
     nohup "$BIN" start --data-dir "$DIR/primary" --listen 127.0.0.1 --port "$PG_P" --auth trust \
         --replication-role primary --replication-port "$REPL_P" --replication-token-file "$TOKEN" \
+        ${PRIMARY_TLS_ARGS[@]+"${PRIMARY_TLS_ARGS[@]}"} \
         --http-port "$HTTP_P" --config "$DIR/primary.toml" </dev/null >>"$DIR/primary.log" 2>&1 &
     echo $! >"$DIR/primary.pid"
     python3 "$HELPER" wait-pg "$PG_P" "$TIMEOUT" || die "primary did not accept connections; see $DIR/primary.log"
@@ -303,6 +358,7 @@ start_standby() {
     pid_of standby >/dev/null && return 0
     nohup "$BIN" start --data-dir "$DIR/standby" --listen 127.0.0.1 --port "$PG_S" --auth trust \
         --replication-role standby --primary-host "127.0.0.1:$REPL_P" --replication-token-file "$TOKEN" \
+        ${STANDBY_TLS_ARGS[@]+"${STANDBY_TLS_ARGS[@]}"} \
         --http-port "$HTTP_S" --config "$DIR/standby.toml" </dev/null >>"$DIR/standby.log" 2>&1 &
     echo $! >"$DIR/standby.pid"
 }
@@ -344,15 +400,16 @@ stop_side() {
 }
 
 summary() {
-    local p s ops rp rs count
+    local p s ops rp rs count tls
     p="$(pid_of primary || echo null)"
     s="$(pid_of standby || echo null)"
     ops="$(cat "$OPS_FILE" 2>/dev/null || echo null)"
     rp="$(python3 "$HELPER" http-code "$HTTP_P" /ready)"
     rs="$(python3 "$HELPER" http-code "$HTTP_S" /ready)"
     count="$(python3 "$HELPER" standby-count "$HTTP_P")"
-    printf '{"ports":{"primary":%s,"standby":%s,"replication":%s,"primary_http":%s,"standby_http":%s},"pids":{"primary":%s,"standby":%s},"ops_per_s":%s,"ready":{"primary":%s,"standby":%s},"standbys":%s,"sync_mode":"%s","dir":"%s"}\n' \
-        "$PG_P" "$PG_S" "$REPL_P" "$HTTP_P" "$HTTP_S" "$p" "$s" "$ops" "$rp" "$rs" "$count" "$SYNC_MODE" "$DIR"
+    tls="$(python3 "$HELPER" replication-tls "$HTTP_S")"
+    printf '{"ports":{"primary":%s,"standby":%s,"replication":%s,"primary_http":%s,"standby_http":%s},"pids":{"primary":%s,"standby":%s},"ops_per_s":%s,"ready":{"primary":%s,"standby":%s},"standbys":%s,"tls":%s,"sync_mode":"%s","dir":"%s"}\n' \
+        "$PG_P" "$PG_S" "$REPL_P" "$HTTP_P" "$HTTP_S" "$p" "$s" "$ops" "$rp" "$rs" "$count" "$tls" "$SYNC_MODE" "$DIR"
 }
 
 for action in "${ACTIONS[@]}"; do

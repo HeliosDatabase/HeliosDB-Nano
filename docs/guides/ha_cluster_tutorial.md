@@ -1,8 +1,9 @@
 # HeliosDB Nano HA Cluster Tutorial
 
 > **Out of service — does not describe this release.** The Docker lab this
-> tutorial uses (`tests/docker`) is out of service until remote replication over
-> TLS (spec P2.2), and the features it demonstrates are gone: standbys never
+> tutorial uses (`tests/docker`) is out of service (remote replication over TLS
+> exists since spec P2.2, but the lab was not brought up to date for it), and the
+> features it demonstrates are gone: standbys never
 > forward writes, there is no observer node, and the native replication channel
 > was replaced by one physical replication connection. For HA in this release
 > read [the physical standby guide](physical-standby.md) and the

@@ -57,6 +57,13 @@ fn removed() -> Vec<(String, &'static str)> {
             concat!("observe_native_", "handshake").to_string(),
             "the posture's view of the native channel",
         ),
+        // Spec P2.2 (plan §D5): the logical standby's on-disk segment store
+        // and its directory. Its creation went with P2.1; nothing may create,
+        // read or document it again.
+        (
+            concat!("replication", "_wal").to_string(),
+            "the logical standby's segment store directory",
+        ),
     ]
 }
 

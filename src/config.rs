@@ -352,8 +352,10 @@ pub struct ReplicationConfig {
     pub role: String,
     /// THE replication port (protocol `NPHYS002`): a primary serves its
     /// standbys here — snapshot copies, physical WAL, heartbeats and
-    /// acknowledgements on one connection each. Loopback only until TLS
-    /// replication (spec P2.2). Separate from PostgreSQL and HTTP.
+    /// acknowledgements on one connection each. It binds on `--listen`'s
+    /// address only when that is loopback, or with `tls_enabled` /
+    /// `allow_insecure_remote` (spec P2.2); otherwise on `127.0.0.1`.
+    /// Separate from PostgreSQL and HTTP.
     #[serde(alias = "port")]
     pub replication_port: u16,
     /// How long a standby's listeners wait for it to stream before they open
@@ -390,18 +392,80 @@ pub struct ReplicationConfig {
     /// presents it to the primary. The token bytes are NEVER read from TOML or
     /// the environment.
     ///
-    /// SECURITY CONTRACT (bounded): the token is sent as a raw bearer over the
-    /// **plaintext** replication connection (no TLS, no primary-to-standby
-    /// proof, until spec P2.2). It is only a network-path control for the
-    /// loopback listener; reach a remote primary through an authenticated tunnel.
+    /// SECURITY CONTRACT: the token is the replication connection's
+    /// authentication, in every transport mode. Over TLS (`tls_enabled` on
+    /// the primary, `primary_tls` on the standby; spec P2.2) it travels
+    /// encrypted and the standby has verified the primary's certificate; with
+    /// mutual TLS (`tls_ca_path`) the primary has verified the standby's too,
+    /// and the token is still checked. Over plaintext it is a raw bearer, safe
+    /// only on loopback or with the explicit `allow_insecure_remote` opt-in.
     #[serde(default)]
     pub token_file: Option<std::path::PathBuf>,
-    /// Acknowledgment that the replication token may cross a non-loopback
-    /// (plaintext) network. Reserved for remote replication (spec P2.2): the
-    /// replication port is loopback-only in this release, so it changes
-    /// nothing yet. Set via `--allow-insecure-replication-remote`.
+    /// Acknowledgment that the replication connection may cross a
+    /// non-loopback network in PLAINTEXT, token included (spec P2.2). Without
+    /// it a primary binds its replication port on loopback unless
+    /// `tls_enabled`, and a standby refuses a non-loopback `primary_host`
+    /// unless `primary_tls`. Isolated development only; an INSECURE warning is
+    /// printed once. Also the precondition of
+    /// `primary_tls_insecure_skip_verify`. Set via
+    /// `--allow-insecure-replication-remote`.
     #[serde(default)]
     pub allow_insecure_remote: bool,
+    /// PRIMARY (spec P2.2): serve the replication port over TLS, which lets it
+    /// bind on a non-loopback `--listen` address. The certificate and key are
+    /// `tls_cert_path` / `tls_key_path`, else the `[server]` pair (`--tls-cert`
+    /// / `--tls-key`, or `[server] tls_cert_path` / `tls_key_path` with
+    /// `[server] tls_enabled`); with neither the primary refuses to start.
+    /// `--replication-tls`.
+    #[serde(default)]
+    pub tls_enabled: bool,
+    /// PRIMARY: PEM certificate chain of the replication port.
+    /// `--replication-tls-cert`.
+    pub tls_cert_path: Option<std::path::PathBuf>,
+    /// PRIMARY: PEM private key of the replication port.
+    /// `--replication-tls-key`.
+    pub tls_key_path: Option<std::path::PathBuf>,
+    /// PRIMARY: PEM CA certificate(s). When set, every standby must present a
+    /// client certificate issued by it (mutual TLS); the token is still
+    /// checked. `--replication-tls-ca`.
+    pub tls_ca_path: Option<std::path::PathBuf>,
+    /// PRIMARY: offer the `X25519MLKEM768` hybrid post-quantum key exchange on
+    /// the replication port. Unset: follows `--tls-post-quantum` (`[server]
+    /// tls_post_quantum`). `--replication-tls-post-quantum[=true|false]`.
+    pub tls_post_quantum: Option<bool>,
+    /// STANDBY: connect to the primary over TLS. Unset: on when `primary_host`
+    /// resolves to a non-loopback address, off on loopback.
+    /// `--primary-tls[=true|false]`.
+    pub primary_tls: Option<bool>,
+    /// STANDBY: PEM CA certificate(s) the primary's certificate must chain to;
+    /// unset, the system trust store. `--primary-ca`.
+    pub primary_tls_ca_path: Option<std::path::PathBuf>,
+    /// STANDBY: the name the primary's certificate must carry; unset, the host
+    /// part of `primary_host`. An IP literal is verified as an IP subject
+    /// alternative name. `--primary-server-name`.
+    pub primary_tls_server_name: Option<String>,
+    /// STANDBY: PEM client certificate presented to a mutual-TLS primary.
+    /// `--primary-client-cert`; requires `primary_tls_client_key_path`.
+    pub primary_tls_client_cert_path: Option<std::path::PathBuf>,
+    /// STANDBY: PEM private key of `primary_tls_client_cert_path`.
+    /// `--primary-client-key`.
+    pub primary_tls_client_key_path: Option<std::path::PathBuf>,
+    /// STANDBY: accept ANY primary certificate (no chain or name check). Only
+    /// honoured together with `allow_insecure_remote` (refused otherwise);
+    /// warned at start. `--primary-tls-insecure-skip-verify`.
+    #[serde(default)]
+    pub primary_tls_insecure_skip_verify: bool,
+    /// PRIMARY (spec P2.2): how long a bootstrap copy's checkpoint export is
+    /// kept after the session that opened it ends, so a standby whose
+    /// download was interrupted reconnects to the SAME snapshot and resumes it
+    /// instead of starting over. A leased checkpoint is hard links to the
+    /// primary's SST files: it pins their disk space while it is kept.
+    /// Seconds, 0..=604800 (0: dropped with its session). Default 3600.
+    /// `--snapshot-export-lease-secs`.
+    pub snapshot_export_lease_secs: u64,
+    /// PRIMARY: at most this many leased exports are kept; past it the oldest
+    /// is dropped. 1..=64, default 4. `--snapshot-export-max-leases`.
+    pub snapshot_export_max_leases: usize,
     /// How many logical-WAL entries a PRIMARY keeps below its checkpoint: its
     /// own redo window. No standby reads the logical WAL (a standby follows
     /// the physical WAL), so this is not standby history. Ignored unless
@@ -447,6 +511,22 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("node_id", &self.node_id)
             .field("token_file", &self.token_file)
             .field("allow_insecure_remote", &self.allow_insecure_remote)
+            .field("tls_enabled", &self.tls_enabled)
+            .field("tls_cert_path", &self.tls_cert_path)
+            .field("tls_key_path", &self.tls_key_path)
+            .field("tls_ca_path", &self.tls_ca_path)
+            .field("tls_post_quantum", &self.tls_post_quantum)
+            .field("primary_tls", &self.primary_tls)
+            .field("primary_tls_ca_path", &self.primary_tls_ca_path)
+            .field("primary_tls_server_name", &self.primary_tls_server_name)
+            .field("primary_tls_client_cert_path", &self.primary_tls_client_cert_path)
+            .field("primary_tls_client_key_path", &self.primary_tls_client_key_path)
+            .field(
+                "primary_tls_insecure_skip_verify",
+                &self.primary_tls_insecure_skip_verify,
+            )
+            .field("snapshot_export_lease_secs", &self.snapshot_export_lease_secs)
+            .field("snapshot_export_max_leases", &self.snapshot_export_max_leases)
             .field("logical_wal_retention_entries", &self.logical_wal_retention_entries)
             .field("max_standby_lag", &self.max_standby_lag)
             .field("on_unrecoverable", &self.on_unrecoverable)
@@ -470,6 +550,19 @@ impl Default for ReplicationConfig {
             node_id: None,
             token_file: None,
             allow_insecure_remote: false,
+            tls_enabled: false,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_ca_path: None,
+            tls_post_quantum: None,
+            primary_tls: None,
+            primary_tls_ca_path: None,
+            primary_tls_server_name: None,
+            primary_tls_client_cert_path: None,
+            primary_tls_client_key_path: None,
+            primary_tls_insecure_skip_verify: false,
+            snapshot_export_lease_secs: Self::DEFAULT_SNAPSHOT_EXPORT_LEASE_SECS,
+            snapshot_export_max_leases: Self::DEFAULT_SNAPSHOT_EXPORT_MAX_LEASES,
             logical_wal_retention_entries: Self::DEFAULT_LOGICAL_WAL_RETENTION_ENTRIES,
             max_standby_lag: Self::DEFAULT_MAX_STANDBY_LAG.to_string(),
             on_unrecoverable: Self::ON_UNRECOVERABLE_STAY_UP.to_string(),
@@ -502,6 +595,68 @@ impl ReplicationConfig {
     /// `on_unrecoverable` values.
     pub const ON_UNRECOVERABLE_STAY_UP: &str = "stay-up";
     pub const ON_UNRECOVERABLE_EXIT: &str = "exit";
+    /// Default `snapshot_export_lease_secs`: one hour.
+    pub const DEFAULT_SNAPSHOT_EXPORT_LEASE_SECS: u64 = 3600;
+    /// Upper bound accepted for `snapshot_export_lease_secs`: a week.
+    pub const MAX_SNAPSHOT_EXPORT_LEASE_SECS: u64 = 604_800;
+    /// Default `snapshot_export_max_leases`.
+    pub const DEFAULT_SNAPSHOT_EXPORT_MAX_LEASES: usize = 4;
+    /// Upper bound accepted for `snapshot_export_max_leases`.
+    pub const MAX_SNAPSHOT_EXPORT_MAX_LEASES: usize = 64;
+
+    /// Whether a standby connects to its primary over TLS: `primary_tls` when
+    /// set, else on exactly when the primary's address is not loopback.
+    pub fn primary_tls_for(&self, non_loopback: bool) -> bool {
+        self.primary_tls.unwrap_or(non_loopback)
+    }
+
+    /// The TLS settings checked without touching any file (spec P2.2); the
+    /// certificate files themselves are loaded, and refused, at start.
+    fn validate_tls(&self) -> crate::Result<()> {
+        for (cert, key, cert_key, key_key) in [
+            (&self.tls_cert_path, &self.tls_key_path, "tls_cert_path", "tls_key_path"),
+            (
+                &self.primary_tls_client_cert_path,
+                &self.primary_tls_client_key_path,
+                "primary_tls_client_cert_path",
+                "primary_tls_client_key_path",
+            ),
+        ] {
+            if cert.is_some() != key.is_some() {
+                return Err(crate::Error::config(format!(
+                    "replication.{cert_key} and replication.{key_key} must be set together"
+                )));
+            }
+        }
+        if let Some(name) = &self.primary_tls_server_name {
+            let name = name.trim();
+            if name.is_empty() || rustls::pki_types::ServerName::try_from(name.to_string()).is_err() {
+                return Err(crate::Error::config(format!(
+                    "replication.primary_tls_server_name '{name}' is neither a DNS name nor an IP address"
+                )));
+            }
+        }
+        if self.primary_tls_insecure_skip_verify && !self.allow_insecure_remote {
+            return Err(crate::Error::config(
+                "replication.primary_tls_insecure_skip_verify (--primary-tls-insecure-skip-verify) accepts any \
+                 certificate, so it is only honoured together with allow_insecure_remote \
+                 (--allow-insecure-replication-remote)",
+            ));
+        }
+        if self.snapshot_export_lease_secs > Self::MAX_SNAPSHOT_EXPORT_LEASE_SECS {
+            return Err(crate::Error::config(format!(
+                "replication.snapshot_export_lease_secs must be at most {}",
+                Self::MAX_SNAPSHOT_EXPORT_LEASE_SECS
+            )));
+        }
+        if !(1..=Self::MAX_SNAPSHOT_EXPORT_MAX_LEASES).contains(&self.snapshot_export_max_leases) {
+            return Err(crate::Error::config(format!(
+                "replication.snapshot_export_max_leases must be between 1 and {}",
+                Self::MAX_SNAPSHOT_EXPORT_MAX_LEASES
+            )));
+        }
+        Ok(())
+    }
 
     /// `max_standby_lag` as a duration (validated by [`Self::validate`]).
     pub fn max_standby_lag_duration(&self) -> crate::Result<std::time::Duration> {
@@ -616,6 +771,7 @@ impl ReplicationConfig {
             }
         }
         self.physical.validate()?;
+        self.validate_tls()?;
         if let Some(node_id) = &self.node_id {
             uuid::Uuid::parse_str(node_id)
                 .map_err(|error| crate::Error::config(format!("replication.node_id must be a UUID: {error}")))?;
@@ -3417,8 +3573,8 @@ redirect_uri = "http://localhost:8080/auth/v1/callback"
 /// The replication port's source side on a primary: snapshot exports and
 /// the bounded RocksDB WAL retention a physical standby continues from. The
 /// port itself is `[replication] replication_port` (spec P2.1: one port,
-/// protocol `NPHYS002`); the transport is authenticated plaintext on loopback
-/// only until TLS replication (P2.2) — use an authenticated tunnel for peers.
+/// protocol `NPHYS002`); its transport is TLS (`[replication] tls_enabled`,
+/// spec P2.2) or token-authenticated plaintext on loopback.
 ///
 /// `enabled` is the source's explicit switch; `start --replication-role
 /// primary` with a replication token turns it on by itself (spec P1.3: a
@@ -3542,6 +3698,51 @@ mod physical_config_tests {
         }
         PhysicalReplicationConfig::default().validate().unwrap();
     }
+    /// Spec P2.2: the replication TLS keys are flat `[replication]` keys,
+    /// default off, and the combinations that cannot work are refused
+    /// before any file is read.
+    #[test]
+    fn replication_tls_settings_default_and_validate() {
+        let config = ReplicationConfig::default();
+        assert!(!config.tls_enabled && config.primary_tls.is_none());
+        assert!(!config.primary_tls_for(false) && config.primary_tls_for(true));
+        assert_eq!(config.snapshot_export_lease_secs, 3600);
+        assert_eq!(config.snapshot_export_max_leases, 4);
+        let config: ReplicationConfig = toml::from_str(
+            "tls_enabled = true\ntls_cert_path = '/c.pem'\ntls_key_path = '/k.pem'\ntls_ca_path = '/ca.pem'\n\
+             tls_post_quantum = false\nprimary_tls = false\nprimary_tls_ca_path = '/pca.pem'\n\
+             primary_tls_server_name = 'db.example'\nprimary_tls_client_cert_path = '/cc.pem'\n\
+             primary_tls_client_key_path = '/ck.pem'\nsnapshot_export_lease_secs = 0\n\
+             snapshot_export_max_leases = 64",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert!(!config.primary_tls_for(true), "an explicit primary_tls = false wins");
+        assert_eq!(config.tls_post_quantum, Some(false));
+        let config: ReplicationConfig = toml::from_str("primary_tls_server_name = '127.0.0.2'").unwrap();
+        config.validate().unwrap();
+        for text in [
+            "tls_cert_path = '/c.pem'",
+            "primary_tls_client_key_path = '/ck.pem'",
+            "primary_tls_server_name = ''",
+            "primary_tls_server_name = 'not a name'",
+            "primary_tls_insecure_skip_verify = true",
+            "snapshot_export_lease_secs = 604801",
+            "snapshot_export_max_leases = 0",
+            "snapshot_export_max_leases = 65",
+        ] {
+            let config: ReplicationConfig = toml::from_str(text).unwrap();
+            assert!(config.validate().is_err(), "{text}");
+        }
+        let config: ReplicationConfig =
+            toml::from_str("primary_tls_insecure_skip_verify = true\nallow_insecure_remote = true").unwrap();
+        config.validate().unwrap();
+        assert!(
+            toml::from_str::<ReplicationConfig>("tls = true").is_err(),
+            "unknown keys stay refused"
+        );
+    }
+
     #[test]
     fn standby_posture_settings_default_and_validate() {
         let config = ReplicationConfig::default();

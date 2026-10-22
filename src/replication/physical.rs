@@ -418,6 +418,26 @@ fn missing_after(db: &DB, after: u64, observed: u64) -> PhysicalError {
     }
 }
 
+/// Spec P2.2: whether the source's WAL still holds the write group that
+/// follows `after` — a leased snapshot cut at `after` can still be continued
+/// from (else a resumed download would be refused `WalPruned` once it is
+/// installed). Reads one record at most.
+pub fn wal_retains_after(db: &DB, after: u64) -> Result<bool> {
+    if after >= db.latest_sequence_number() {
+        return Ok(true);
+    }
+    let mut iterator = db.get_updates_since(after)?;
+    for entry in iterator.by_ref() {
+        let (first, batch) = entry?;
+        if batch.is_empty() {
+            continue;
+        }
+        return Ok(first <= after.saturating_add(1));
+    }
+    iterator.status()?;
+    Ok(false)
+}
+
 /// The first sequence of the oldest write group the source's WAL still
 /// holds; `None` when it holds none. Read only on the error path above.
 fn oldest_retained_sequence(db: &DB) -> Result<Option<u64>> {

@@ -29,7 +29,7 @@
 //! | `Hello` | R→S | [`Hello`]: node id, role, history, epoch, durable cursor, capabilities, PG port, sync mode |
 //! | `HelloOk` | S→R | [`HelloOk`]: node id, history, epoch, barrier, capabilities, replication endpoint, PG port |
 //! | `Refuse` | S→R | [`Refusal`]: a [`RefuseCode`] and a reason; the session ends |
-//! | `Open` | R→S | snapshot, or resume `{history, after}` |
+//! | `Open` | R→S | snapshot (optionally preferring a leased snapshot id: a resumed download, spec P2.2), or resume `{history, after}` |
 //! | `Manifest` / `ResumeInfo` | S→R | the session the source opened |
 //! | `ChunkRequest` / `Chunk` | R→S / S→R | one bounded, digested piece of a checkpoint file |
 //! | `PollRequest` | R→S | `{session, after, byte limit}` |
@@ -45,15 +45,20 @@
 //!
 //! # Trust
 //!
-//! Plaintext bearer authentication on an explicit loopback socket, behind an
-//! authenticated tunnel for remote peers; TLS arrives with P2.2. The token is
-//! checked in constant time before any other frame is read; the export
-//! factory is never invoked for an unauthenticated, refused or malformed
-//! session. Installation verifies every complete file against its manifest
-//! digest; the per-chunk digest only checks framing and corruption.
+//! Bearer authentication in every transport mode. The stream is TLS
+//! ([`super::physical_tls`], spec P2.2: required for a non-loopback peer
+//! unless the explicit plaintext opt-in is given) or plaintext on loopback;
+//! TLS is transport only, so the token is checked over TLS too, mutual TLS
+//! included. Both sides set [`CAP_TLS`] in `Hello` / `HelloOk` when their end
+//! of the session is TLS. The token is checked in constant time before any
+//! other frame is read; the export factory is never invoked for an
+//! unauthenticated, refused or malformed session. Installation verifies every
+//! complete file against its manifest digest; the per-chunk digest only
+//! checks framing and corruption.
 
 use super::checkpoint_transfer::{CheckpointManifest, TransferLimits};
 use super::physical::{PhysicalBatch, PhysicalPoll, MAX_BATCH_BYTES};
+use super::physical_tls::{remote_transport_allowed, ReplicationStream, ReplicationTransport};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
@@ -63,6 +68,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::watch,
 };
+use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -105,13 +111,24 @@ const MAX_DRAIN_BYTES: usize = 64 * 1024;
 pub const CAP_HEARTBEAT: u64 = 1;
 /// Reserved for fencing at promotion (P5). Never offered by this release.
 pub const CAP_FENCE: u64 = 1 << 1;
-/// What this release offers.
+/// Spec P2.2: this side's end of the session is TLS. Set per session, by the
+/// receiver in its `Hello` and by the source in its `HelloOk`; a session is on
+/// TLS (`/health` `"tls": true`) when both set it.
+pub const CAP_TLS: u64 = 1 << 2;
+/// What this release offers on every session ([`CAP_TLS`] is added per
+/// session, by its transport).
 pub const CAPABILITIES: u64 = CAP_HEARTBEAT;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
     #[error("physical transfer I/O: {0}")]
     Io(#[from] std::io::Error),
+    /// Spec P2.2: the TLS handshake, or a TLS alert, ended the connection (a
+    /// wrong CA, an untrusted or misnamed certificate, a missing client
+    /// certificate). A transport failure: the data is fine, the receiver
+    /// reconnects with backoff.
+    #[error("tls: {0}")]
+    Tls(String),
     #[error("physical transfer protocol: {0}")]
     Protocol(String),
     /// The session was refused, by the peer or (on the source) by this node:
@@ -745,12 +762,30 @@ impl WireLimits {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenRequest {
     Snapshot,
-    Resume { history: Uuid, after: u64 },
+    /// Spec P2.2: a snapshot, preferring the export `snapshot` — the one a
+    /// receiver's interrupted download belongs to. A source still leasing it
+    /// answers with that export's `Manifest`; otherwise with a fresh one, and
+    /// the receiver starts its download over.
+    SnapshotOf {
+        snapshot: Uuid,
+    },
+    Resume {
+        history: Uuid,
+        after: u64,
+    },
 }
 impl OpenRequest {
     fn encode(self) -> Result<Vec<u8>> {
         match self {
             Self::Snapshot => Ok(vec![0]),
+            Self::SnapshotOf { snapshot } => {
+                if snapshot.is_nil() {
+                    return Err(invalid("invalid preferred snapshot identity"));
+                }
+                let mut bytes = vec![2];
+                bytes.extend(snapshot.as_bytes());
+                Ok(bytes)
+            }
             Self::Resume { history, after } => {
                 if history.is_nil() || after > MAX_SOURCE_SEQUENCE {
                     return Err(invalid("invalid resume identity/cursor"));
@@ -765,6 +800,9 @@ impl OpenRequest {
     fn decode(bytes: &[u8]) -> Result<Self> {
         let value = match bytes {
             [0] => Self::Snapshot,
+            [2, ..] if bytes.len() == 17 => Self::SnapshotOf {
+                snapshot: uuid_at(bytes, 1)?,
+            },
             [1, ..] if bytes.len() == 25 => Self::Resume {
                 history: uuid_at(bytes, 1)?,
                 after: u64_at(bytes, 17)?,
@@ -779,9 +817,15 @@ impl OpenRequest {
     /// cursor, or a resume of exactly the history and cursor it announced.
     fn agrees_with(self, hello: &Hello) -> bool {
         match self {
-            Self::Snapshot => hello.cursor.is_none(),
+            Self::Snapshot | Self::SnapshotOf { .. } => hello.cursor.is_none(),
             Self::Resume { history, after } => hello.history == Some(history) && hello.cursor == Some(after),
         }
+    }
+
+    /// Whether this opens a snapshot (a bootstrap copy) rather than resuming
+    /// a durable cursor.
+    pub fn is_snapshot(self) -> bool {
+        matches!(self, Self::Snapshot | Self::SnapshotOf { .. })
     }
 }
 
@@ -831,7 +875,7 @@ impl SourceSessionInfo {
     }
     fn validate(&self, request: OpenRequest, limits: &WireLimits) -> Result<()> {
         match (self, request) {
-            (Self::Snapshot(m), OpenRequest::Snapshot) => {
+            (Self::Snapshot(m), OpenRequest::Snapshot | OpenRequest::SnapshotOf { .. }) => {
                 m.validate(&limits.transfer).map_err(|e| invalid(e.to_string()))
             }
             (
@@ -956,19 +1000,25 @@ impl SessionObserver for NoSessionObserver {
     }
 }
 
-/// Everything a source's sessions share: its identity and its observer.
+/// Everything a source's sessions share: its identity, its observer, and its
+/// transport.
 #[derive(Clone)]
 pub struct SourceContext {
     pub identity: SourceIdentity,
     pub observer: Arc<dyn SessionObserver>,
+    /// Spec P2.2: the source's listener serves TLS, so every session it hands
+    /// [`serve_session`] completed a TLS handshake first; its `HelloOk` then
+    /// carries [`CAP_TLS`].
+    pub tls: bool,
 }
 
 impl SourceContext {
-    /// A source whose sessions nobody observes.
+    /// A plaintext source whose sessions nobody observes.
     pub fn unobserved(identity: SourceIdentity) -> Self {
         Self {
             identity,
             observer: Arc::new(NoSessionObserver),
+            tls: false,
         }
     }
 }
@@ -1052,7 +1102,7 @@ impl Kind {
         match self {
             Self::Auth => n == TOKEN_BYTES,
             Self::AuthOk | Self::Close | Self::Closed => n == 0,
-            Self::Open => n == 1 || n == 25,
+            Self::Open => n == 1 || n == 17 || n == 25,
             Self::ResumeInfo => n == 48,
             Self::Manifest => (1..=MAX_MANIFEST_BYTES).contains(&n),
             Self::ChunkRequest => n == 32,
@@ -1367,13 +1417,53 @@ impl PollSummary {
     }
 }
 
-/// Explicit opt-in only. Non-loopback binding requires a separate reviewed TLS
-/// transport (P2.2); this plaintext listener never accepts a wildcard/remote bind.
-pub async fn bind_loopback(address: SocketAddr) -> Result<TcpListener> {
-    if !address.ip().is_loopback() {
-        return Err(invalid("physical transfer requires loopback plus authenticated tunnel"));
+/// Bind a source's replication listener. Spec P2.2: a non-loopback address
+/// (a wildcard included) is refused unless the listener serves TLS (`tls`) or
+/// plaintext over the network was explicitly allowed
+/// ([`remote_transport_allowed`]).
+pub async fn bind_replication(address: SocketAddr, tls: bool, allow_insecure_remote: bool) -> Result<TcpListener> {
+    if !remote_transport_allowed(&address, tls, allow_insecure_remote) {
+        return Err(invalid(format!(
+            "the replication port may bind the non-loopback address {address} only with TLS (--replication-tls) \
+             or the plaintext opt-in (--allow-insecure-replication-remote)"
+        )));
     }
     Ok(TcpListener::bind(address).await?)
+}
+
+/// The source's side of one accepted connection: the TLS handshake when the
+/// listener serves TLS (`acceptor`), bounded by the frame deadline and the
+/// shutdown watch. A failed handshake is [`WireError::Tls`]: nothing was read
+/// from the peer, and no `Refuse` frame can be sent before a handshake.
+pub async fn accept_replication(
+    stream: TcpStream,
+    acceptor: Option<&TlsAcceptor>,
+    limits: &WireLimits,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<ReplicationStream> {
+    let Some(acceptor) = acceptor else {
+        return Ok(ReplicationStream::Plain(stream));
+    };
+    let stream = bounded(shutdown, limits.frame_timeout, async {
+        acceptor
+            .accept(stream)
+            .await
+            .map_err(|error| WireError::Tls(error.to_string()))
+    })
+    .await?;
+    Ok(ReplicationStream::Tls(Box::new(stream.into())))
+}
+
+/// A TLS alert that arrived after the handshake (a mutual-TLS source that
+/// refused this receiver's certificate) surfaces as an I/O error carrying a
+/// `rustls` error: report it as the TLS failure it is.
+fn tls_failure(error: WireError) -> WireError {
+    match error {
+        WireError::Io(io) if io.get_ref().is_some_and(|inner| inner.is::<rustls::Error>()) => {
+            WireError::Tls(io.to_string())
+        }
+        other => other,
+    }
 }
 
 /// Answer a connection the source does not admit — it already serves its
@@ -1479,7 +1569,11 @@ where
         history: identity.history,
         epoch: identity.epoch,
         barrier: source.observer.barrier().min(MAX_SOURCE_SEQUENCE),
-        capabilities: CAPABILITIES,
+        capabilities: if source.tls {
+            CAPABILITIES | CAP_TLS
+        } else {
+            CAPABILITIES
+        },
         physical_endpoint: identity.physical_endpoint.clone(),
         pg_port: identity.pg_port,
     };
@@ -1723,6 +1817,11 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
     pub fn heartbeats(&self) -> bool {
         self.hello_ok.capabilities & self.hello.capabilities & CAP_HEARTBEAT != 0
     }
+    /// Spec P2.2: whether this session is on TLS — both ends said so
+    /// ([`CAP_TLS`]).
+    pub fn tls(&self) -> bool {
+        self.hello_ok.capabilities & self.hello.capabilities & CAP_TLS != 0
+    }
     pub fn manifest(&self) -> Option<&CheckpointManifest> {
         self.info.as_ref().and_then(SourceSessionInfo::manifest)
     }
@@ -1743,6 +1842,17 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
         }
     }
     pub async fn fetch_manifest(&mut self, expected_history: Option<Uuid>) -> Result<CheckpointManifest> {
+        self.fetch_manifest_preferring(expected_history, None).await
+    }
+    /// [`Self::fetch_manifest`], asking for the export `preferred` (spec
+    /// P2.2: the snapshot an interrupted download belongs to). The source may
+    /// answer with another snapshot — its lease expired — so the caller
+    /// compares the manifest it gets with the one it holds.
+    pub async fn fetch_manifest_preferring(
+        &mut self,
+        expected_history: Option<Uuid>,
+        preferred: Option<Uuid>,
+    ) -> Result<CheckpointManifest> {
         self.check_live()?;
         // Arm BEFORE any await: cancellation/drop can leave a partial frame or
         // durable sink prefix, even when no Result is returned to this caller.
@@ -1751,13 +1861,14 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             if self.info.is_some() {
                 return Err(invalid("manifest already selected for this session"));
             }
-            if !OpenRequest::Snapshot.agrees_with(&self.hello) {
+            let request = preferred.map_or(OpenRequest::Snapshot, |snapshot| OpenRequest::SnapshotOf { snapshot });
+            if !request.agrees_with(&self.hello) {
                 return Err(invalid("a snapshot session announces no cursor in its hello"));
             }
             write_frame(
                 &mut self.io,
                 Kind::Open,
-                &OpenRequest::Snapshot.encode()?,
+                &request.encode()?,
                 &self.limits,
                 &mut self.shutdown,
             )
@@ -2030,9 +2141,12 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
         .await
     }
 }
-impl PhysicalClient<TcpStream> {
-    pub async fn connect_resume_loopback(
+impl PhysicalClient<ReplicationStream> {
+    /// [`Self::connect_replication`], then `Open { resume }` at `after`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_resume_replication(
         address: SocketAddr,
+        transport: &ReplicationTransport,
         token: &TransferToken,
         identity: &ReceiverIdentity,
         limits: WireLimits,
@@ -2041,26 +2155,57 @@ impl PhysicalClient<TcpStream> {
         after: u64,
     ) -> Result<Self> {
         let hello = identity.hello(Some(history), Some(after));
-        let mut client = Self::connect_loopback(address, token, hello, limits, shutdown).await?;
+        let mut client = Self::connect_replication(address, transport, token, hello, limits, shutdown).await?;
         client.resume(history, after).await?;
         Ok(client)
     }
-    pub async fn connect_loopback(
+    /// Connect to a source's replication port over `transport` and
+    /// authenticate. Spec P2.2: a non-loopback `address` needs TLS or the
+    /// plaintext opt-in; over TLS the source's certificate is verified before
+    /// the token is sent, the `Hello` carries [`CAP_TLS`], and a handshake or
+    /// alert failure is [`WireError::Tls`].
+    pub async fn connect_replication(
         address: SocketAddr,
+        transport: &ReplicationTransport,
         token: &TransferToken,
-        hello: Hello,
+        mut hello: Hello,
         limits: WireLimits,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<Self> {
-        if !address.ip().is_loopback() {
-            return Err(invalid("plaintext physical transfer requires a loopback tunnel"));
+        if !transport.allows(&address) {
+            return Err(invalid(format!(
+                "a replication connection to the non-loopback address {address} needs TLS (--primary-tls) or the \
+                 plaintext opt-in (--allow-insecure-replication-remote)"
+            )));
         }
         limits.validate()?;
         let stream = bounded(&mut shutdown, limits.frame_timeout, async {
             Ok(TcpStream::connect(address).await?)
         })
         .await?;
-        Self::authenticate(stream, token, hello, limits, shutdown).await
+        let Some(tls) = &transport.tls else {
+            return Self::authenticate(ReplicationStream::Plain(stream), token, hello, limits, shutdown).await;
+        };
+        // Files are read per connection: a rotated CA takes effect at the next one.
+        let connector = tls.connector().map_err(|error| WireError::Tls(error.to_string()))?;
+        let server_name = tls.server_name();
+        let stream = bounded(&mut shutdown, limits.frame_timeout, async {
+            connector
+                .connect(server_name, stream)
+                .await
+                .map_err(|error| WireError::Tls(error.to_string()))
+        })
+        .await?;
+        hello.capabilities |= CAP_TLS;
+        Self::authenticate(
+            ReplicationStream::Tls(Box::new(stream.into())),
+            token,
+            hello,
+            limits,
+            shutdown,
+        )
+        .await
+        .map_err(tls_failure)
     }
 }
 
@@ -2531,6 +2676,7 @@ mod tests {
         let context = SourceContext {
             identity: identity(source.manifest.history),
             observer: recorder.clone(),
+            tls: false,
         };
         let (_shutdown, rx) = watch::channel(false);
         let (client_io, server_io) = duplex(256);
@@ -2571,6 +2717,7 @@ mod tests {
         let context = SourceContext {
             identity: identity(source.manifest.history),
             observer: recorder.clone(),
+            tls: false,
         };
         let (_shutdown, rx) = watch::channel(false);
         let (client_io, server_io) = duplex(256);
@@ -2664,6 +2811,7 @@ mod tests {
             let context = SourceContext {
                 identity: identity(source.manifest.history),
                 observer: recorder.clone(),
+                tls: false,
             };
             let (_shutdown, rx) = watch::channel(false);
             let (client_io, server_io) = duplex(256);
@@ -3538,5 +3686,182 @@ mod tests {
             Err(WireError::Poisoned)
         ));
         run.await.unwrap().unwrap();
+    }
+
+    // --- spec P2.2 ---------------------------------------------------------
+
+    /// `CAP_TLS` is set by each side for its own end of the session; the
+    /// session counts as TLS only when both set it.
+    #[tokio::test]
+    async fn cap_tls_is_set_per_side_and_a_session_is_tls_only_when_both_set_it() {
+        for (source_tls, receiver_tls) in [(true, true), (true, false), (false, true), (false, false)] {
+            let source = Arc::new(MockSource::new());
+            let context = SourceContext {
+                identity: identity(source.manifest.history),
+                observer: Arc::new(NoSessionObserver),
+                tls: source_tls,
+            };
+            let (_shutdown, rx) = watch::channel(false);
+            let (client_io, server_io) = duplex(256);
+            let provider = source.clone();
+            let server_rx = rx.clone();
+            let run = tokio::spawn(async move {
+                serve_session(
+                    server_io,
+                    &token(),
+                    limits(),
+                    server_rx,
+                    &context,
+                    None,
+                    move |_| async move { Ok(provider as Arc<dyn PhysicalSource>) },
+                )
+                .await
+            });
+            let hello = Hello {
+                capabilities: if receiver_tls {
+                    CAPABILITIES | CAP_TLS
+                } else {
+                    CAPABILITIES
+                },
+                ..fresh()
+            };
+            let client = PhysicalClient::authenticate(client_io, &token(), hello, limits(), rx)
+                .await
+                .unwrap();
+            assert_eq!(
+                client.hello_ok().capabilities & CAP_TLS != 0,
+                source_tls,
+                "HelloOk carries CAP_TLS exactly when the source's end is TLS"
+            );
+            assert_eq!(client.tls(), source_tls && receiver_tls, "{source_tls} {receiver_tls}");
+            assert!(client.heartbeats(), "CAP_TLS leaves the other capabilities alone");
+            client.close().await.unwrap();
+            run.await.unwrap().unwrap();
+        }
+        assert_eq!(CAP_TLS, 1 << 2);
+        assert_eq!(
+            CAPABILITIES & CAP_TLS,
+            0,
+            "CAP_TLS is per session, never offered blindly"
+        );
+    }
+
+    /// Spec P2.2: `Open` may name the snapshot an interrupted download
+    /// belongs to; it is a snapshot request in every other respect.
+    #[tokio::test]
+    async fn an_open_may_prefer_a_snapshot_and_is_served_as_a_snapshot() {
+        let preferred = Uuid::new_v4();
+        let request = OpenRequest::SnapshotOf { snapshot: preferred };
+        let bytes = request.encode().unwrap();
+        assert!(Kind::Open.valid_size(bytes.len()));
+        assert_eq!(OpenRequest::decode(&bytes).unwrap(), request);
+        assert!(request.is_snapshot() && OpenRequest::Snapshot.is_snapshot());
+        assert!(!OpenRequest::Resume {
+            history: preferred,
+            after: 1
+        }
+        .is_snapshot());
+        assert!(OpenRequest::SnapshotOf { snapshot: Uuid::nil() }.encode().is_err());
+        let mut nil = vec![2];
+        nil.extend([0; 16]);
+        assert!(OpenRequest::decode(&nil).is_err());
+        assert!(request.agrees_with(&fresh()));
+        assert!(!request.agrees_with(&receiver().hello(Some(preferred), Some(3))));
+
+        let source = Arc::new(MockSource::new());
+        let history = source.manifest.history;
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, peer) = duplex(256);
+        let provider = source.clone();
+        let server_rx = rx.clone();
+        let run = tokio::spawn(async move {
+            let context = SourceContext::unobserved(identity(history));
+            serve_session(
+                peer,
+                &token(),
+                limits(),
+                server_rx,
+                &context,
+                None,
+                move |open| async move {
+                    assert_eq!(open, OpenRequest::SnapshotOf { snapshot: preferred });
+                    Ok(provider as Arc<dyn PhysicalSource>)
+                },
+            )
+            .await
+        });
+        let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx)
+            .await
+            .unwrap();
+        let manifest = client
+            .fetch_manifest_preferring(Some(history), Some(preferred))
+            .await
+            .unwrap();
+        // The source answered with ITS export (the preferred one had expired):
+        // the receiver compares and starts over.
+        assert_eq!(manifest.snapshot_id, source.manifest.snapshot_id);
+        assert_eq!(client.read_chunk(0, 0, 1).await.unwrap(), source.data[0][..1].to_vec());
+        client.close().await.unwrap();
+        run.await.unwrap().unwrap();
+    }
+
+    /// Spec P2.2: the replication listener binds a non-loopback address only
+    /// with TLS or the plaintext opt-in; the refusal binds nothing.
+    #[tokio::test]
+    async fn a_plaintext_replication_listener_stays_on_loopback() {
+        for refused in ["0.0.0.0:0", "192.0.2.1:0"] {
+            let address: SocketAddr = refused.parse().unwrap();
+            assert!(
+                matches!(
+                    bind_replication(address, false, false).await,
+                    Err(WireError::Protocol(_))
+                ),
+                "{refused}"
+            );
+        }
+        let listener = bind_replication("127.0.0.1:0".parse().unwrap(), false, false)
+            .await
+            .unwrap();
+        assert!(listener.local_addr().unwrap().ip().is_loopback());
+        let wildcard = bind_replication("0.0.0.0:0".parse().unwrap(), false, true)
+            .await
+            .unwrap();
+        assert!(wildcard.local_addr().unwrap().ip().is_unspecified());
+    }
+
+    /// A rustls error inside an I/O error is a TLS failure; anything else is
+    /// left as it is.
+    #[test]
+    fn tls_alerts_after_the_handshake_are_reported_as_tls() {
+        let alert = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::AlertReceived(rustls::AlertDescription::CertificateRequired),
+        );
+        let mapped = tls_failure(WireError::Io(alert));
+        assert!(matches!(&mapped, WireError::Tls(_)), "{mapped}");
+        assert!(mapped.to_string().starts_with("tls: "), "{mapped}");
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        assert!(matches!(tls_failure(WireError::Io(reset)), WireError::Io(_)));
+    }
+
+    /// A refused plaintext connection to a non-loopback address is refused
+    /// before any socket is opened.
+    #[tokio::test]
+    async fn a_plaintext_connection_to_a_remote_primary_is_refused_before_connecting() {
+        let (_shutdown, rx) = watch::channel(false);
+        let outcome = PhysicalClient::connect_replication(
+            "192.0.2.1:5433".parse().unwrap(),
+            &ReplicationTransport::default(),
+            &token(),
+            fresh(),
+            limits(),
+            rx,
+        )
+        .await;
+        assert!(
+            matches!(&outcome, Err(WireError::Protocol(reason)) if reason.contains("--primary-tls")),
+            "{:?}",
+            outcome.err()
+        );
     }
 }

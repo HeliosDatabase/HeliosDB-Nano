@@ -6,11 +6,14 @@ write groups, byte for byte. It serves read-only SQL on the PostgreSQL wire whil
 it applies, reports exactly how current it is, and stays up when its primary
 cannot serve it.
 
-This guide covers starting a pair, readiness, the PostgreSQL-wire contract that
-HeliosDB Proxy relies on, the replication connection, synchronous replication,
-rebuilding a standby, and the limits of this release. The design is
+This guide covers starting a pair, remote standbys over TLS, readiness, the
+PostgreSQL-wire contract that HeliosDB Proxy relies on, the replication
+connection, synchronous replication, rebuilding a standby (and resuming an
+interrupted copy), and the limits of this release. The design is
 `docs/plans/PHYSICAL_STANDBY_REPLICATION.md`; the one-connection protocol is
-spec P2.1 (`docs/plans/specs/P2_1_single_connection_control_plane.md`).
+spec P2.1 (`docs/plans/specs/P2_1_single_connection_control_plane.md`), TLS
+and the resumable copy are spec P2.2
+(`docs/plans/specs/P2_2_tls_remote_resumable.md`).
 
 ## What a physical standby is
 
@@ -50,7 +53,7 @@ ships. "P3", "P4" and "P5" are phases of the physical standby plan.
 | Standby `MOUNTED`, not open | No equivalent: a standby that may not serve data reads stays open and refuses them with SQLSTATE `55000` |
 | SCN | The **physical sequence**: the RocksDB sequence number of the primary's writes. Shown as PostgreSQL LSN text, `HI/LO` hex (`hi = seq >> 32`, `lo = seq & 0xFFFFFFFF`) |
 | Online redo | The RocksDB WAL (`*.log`) |
-| Redo transport | The replication connection (`NPHYS002`) to the primary's `replication_port`. The standby pulls write groups |
+| Redo transport | The replication connection (`NPHYS002`) to the primary's `replication_port`, over TLS for a remote standby. The standby pulls write groups |
 | Redo apply (MRP) | The physical applier: each write group is applied verbatim and fsynced, then the standby's in-memory indexes are updated |
 | Archived redo | The RocksDB WAL archive a primary keeps for its standbys, bounded by `[replication.physical] wal_retention_secs` and `wal_retention_size_mb`. No catalog. Sealed archive segments arrive in P3 |
 | `LOG_ARCHIVE_DEST_n`, `archive_command` | Not yet (P3) |
@@ -58,7 +61,7 @@ ships. "P3", "P4" and "P5" are phases of the physical standby plan.
 | FAL (gap fetch) | None. A standby whose next sequence the primary no longer retains is refused (`WalPruned`) and is rebuilt |
 | `RECOVERY WINDOW OF n DAYS` | `wal_retention_secs` (60..86400, default 3600). A multi-day recovery window arrives with the archive in P3 |
 | `DB_RECOVERY_FILE_DEST_SIZE` | `wal_retention_size_mb` (64..65536, default 1024) |
-| `DUPLICATE … FOR STANDBY FROM ACTIVE DATABASE` | The **bootstrap copy**: a standby started on an empty directory downloads a verified checkpoint of the primary, then follows it |
+| `DUPLICATE … FOR STANDBY FROM ACTIVE DATABASE` | The **bootstrap copy**: a standby started on an empty directory downloads a verified checkpoint of the primary, then follows it. An interrupted copy resumes (like RMAN's restartable duplicate) |
 | `RECOVER STANDBY DATABASE FROM SERVICE` | Not yet (P4, incremental rebuild). Today a rebuild is a full bootstrap copy into a new directory |
 | Managed recovery from archived logs | Not yet (P3) |
 | Datafile block, block SCN, block change tracking | None: one key-value space with no per-key sequence. P4 compares key ranges by digest |
@@ -121,10 +124,11 @@ on_unrecoverable = "stay-up" # stay-up | exit
 replication port on its own; `--physical-replication=false` turns it off, and
 with it every standby. An in-memory primary, or one without a token, serves no
 replication port and says so once at startup. The port binds on `--listen`'s
-address when that is a loopback address, and on `127.0.0.1` otherwise: it stays
-on loopback whatever `--listen` opens, because the replication connection is
-plaintext until TLS replication (spec P2.2), and a log line says so. The
-primary checkpoints into `[replication.physical] export_dir` to serve a
+address when that is a loopback address, or when it serves TLS
+(`--replication-tls`, see "Remote standbys: TLS"); otherwise on `127.0.0.1`,
+whatever `--listen` opens, and a log line says so: a plaintext token never
+crosses the network unless `--allow-insecure-replication-remote` says it may.
+The primary checkpoints into `[replication.physical] export_dir` to serve a
 bootstrap copy; when none is set it is `<data dir>.physical-export` beside the
 data directory (same filesystem, so a checkpoint is hard links), created mode
 `0700`. `[replication.physical] max_sessions` (default 2) bounds concurrent
@@ -145,9 +149,10 @@ standby's data directory must be owned by the user running Nano and not group-
 or world-writable, because the copy is renamed into place there (so `/tmp`
 itself will not do; use an owner-only directory inside it). The primary refuses
 to serve from a group- or world-writable data directory for the same reason.
-If the primary encrypts at rest, give the standby the same key: it holds the
-primary's ciphertext unchanged. `--primary-host` must resolve to loopback in
-this release. `--replication-port` is unused on a standby. A standby started
+If the primary encrypts at rest, start the standby with the same dataset key:
+it holds the primary's ciphertext unchanged (see "Encryption keys" under the
+limits). A `--primary-host` on another host is reached over TLS (see "Remote
+standbys: TLS"). `--replication-port` is unused on a standby. A standby started
 before its primary is up and not ready, and bootstraps once the primary
 appears.
 
@@ -156,6 +161,75 @@ appears.
 A standby accepts no MySQL listener (`--mysql` and `--mysql-socket` are refused
 before storage opens), and its HTTP listener mounts only `/`, `/health`,
 `/ready` and `/version`.
+
+## Remote standbys: TLS
+
+A standby on another host reaches its primary's replication port over TLS. TLS
+is the transport only: the replication token is still required, and checked,
+in every mode, mutual TLS included. The protocol is unchanged (`NPHYS002`
+inside the TLS stream; each side sets the `CAP_TLS` capability bit for its end
+of the session).
+
+```bash
+# Primary on 10.0.0.5: the replication port binds 10.0.0.5:5433, over TLS.
+heliosdb-nano start --data-dir /srv/nano/primary --listen 10.0.0.5 --port 5432 \
+  --replication-role primary --replication-port 5433 \
+  --replication-token-file /etc/heliosdb/replication.token \
+  --replication-tls --replication-tls-cert /etc/heliosdb/repl.crt --replication-tls-key /etc/heliosdb/repl.key
+
+# Standby on another host: TLS is the default for a non-loopback primary.
+heliosdb-nano start --data-dir /srv/nano/standby --listen 10.0.0.6 --port 5432 \
+  --replication-role standby --primary-host 10.0.0.5:5433 --primary-ca /etc/heliosdb/repl-ca.crt \
+  --replication-token-file /etc/heliosdb/replication.token
+```
+
+Every key is a flat `[replication]` key with a CLI flag (the flag wins):
+
+| `[replication]` key | Flag | Side | Meaning |
+|---|---|---|---|
+| `tls_enabled` | `--replication-tls` | primary | serve the replication port over TLS; it then binds on `--listen`'s address even when that is not loopback |
+| `tls_cert_path`, `tls_key_path` | `--replication-tls-cert`, `--replication-tls-key` | primary | PEM certificate chain and key; when unset, the PostgreSQL pair (`--tls-cert` / `--tls-key`, or `[server] tls_cert_path` / `tls_key_path` with `[server] tls_enabled`); with neither the primary refuses to start, naming the keys |
+| `tls_ca_path` | `--replication-tls-ca` | primary | mutual TLS: every standby must present a client certificate issued by this CA (and its token) |
+| `tls_post_quantum` | `--replication-tls-post-quantum[=BOOL]` | primary | offer the X25519MLKEM768 hybrid key exchange; default: follows `--tls-post-quantum` |
+| `primary_tls` | `--primary-tls[=BOOL]` | standby | connect over TLS; default **on when `--primary-host` resolves to a non-loopback address**, off on loopback |
+| `primary_tls_ca_path` | `--primary-ca` | standby | the CA the primary's certificate must chain to; default: the system trust store (`SSL_CERT_FILE` or the distribution's CA bundle) |
+| `primary_tls_server_name` | `--primary-server-name` | standby | the name the primary's certificate must carry; default: the host part of `--primary-host`. An IP literal is verified as an IP subject alternative name |
+| `primary_tls_client_cert_path`, `primary_tls_client_key_path` | `--primary-client-cert`, `--primary-client-key` | standby | the client certificate for a mutual-TLS primary |
+| `primary_tls_insecure_skip_verify` | `--primary-tls-insecure-skip-verify` | standby | accept any certificate (no chain or name check); only together with `allow_insecure_remote`, warned at start |
+| `allow_insecure_remote` | `--allow-insecure-replication-remote` | both | plaintext over a non-loopback network, token included: isolated development only; an `INSECURE DEVELOPMENT OVERRIDE` warning is printed |
+| `snapshot_export_lease_secs` | `--snapshot-export-lease-secs` | primary | how long a bootstrap copy's export outlives its session (see "Resuming an interrupted copy"); default 3600 |
+| `snapshot_export_max_leases` | `--snapshot-export-max-leases` | primary | at most this many leased exports (1..=64, default 4; the oldest is dropped first) |
+
+The rules:
+
+- **The listener.** A plaintext replication port binds on loopback (on
+  `--listen`'s address when that is loopback, else `127.0.0.1`). It binds on a
+  non-loopback `--listen` address only with `--replication-tls`, or with
+  `--allow-insecure-replication-remote`. Peers from any address are then
+  accepted; each still authenticates with the token.
+- **The standby.** A `--primary-host` that resolves to a non-loopback address
+  is reached over TLS (the default there), or in plaintext only with
+  `--allow-insecure-replication-remote`; `--primary-tls=false` without the
+  opt-in is refused at start. Loopback stays plaintext unless `--primary-tls`
+  asks for TLS.
+- **Certificate failures are transport failures.** A wrong CA, an untrusted
+  certificate, a name mismatch, or a mutual-TLS primary that refuses the
+  standby's certificate leave the standby `connecting` / `reconnecting` (never
+  `needs_recovery`: the data is fine, the network is not) with the reason on
+  `/health` (`"reason": "tls: invalid peer certificate: UnknownIssuer"`), and
+  it retries with the usual backoff. The primary logs every failed handshake
+  with the peer and counts it; no `Refuse` frame can be sent before a
+  handshake.
+- **Rotation.** A standby reads its CA and client certificate again at every
+  connection attempt: replace the files and the next reconnect uses them. A
+  primary loads its certificate at start; restart it to rotate.
+- **Reporting.** `/health`, `/ready` and `heliosdb_standby_status` carry
+  `"tls": true|false` on both roles: on a standby, whether its current session
+  is on TLS (both ends said so); on a primary, whether its replication port
+  serves TLS.
+
+The PostgreSQL wire is unaffected: PG-wire TLS (`--tls-cert`) stays optional and
+independent, and carries no replication token.
 
 ## Readiness
 
@@ -166,7 +240,7 @@ so those surfaces can never disagree.
 | Posture | Entered when | Data reads | `/ready` |
 |---|---|---|---|
 | `connecting` | no session has applied anything since the store was attached | refused, `55000` | 503 |
-| `recovering` | a bootstrap copy is downloading | refused, `55000` | 503 |
+| `recovering` | a bootstrap copy is downloading (`progress`: bytes held / total) | refused, `55000` | 503 |
 | `catching_up` | the first session has not yet reached its connect barrier (the primary's written sequence when the session began) | refused, `55000` | 503 |
 | `streaming` | the session's cursor reached that barrier; kept while the session lives | served | 200 |
 | `reconnecting` | a streaming session was lost; data is current as of the cursor | served for at most `max_standby_lag` after the loss, then refused | 200, then 503 |
@@ -181,8 +255,18 @@ so those surfaces can never disagree.
   ```json
   {"status":"ok","replication":{"role":"standby","state":"streaming","ready":true,
    "cursor":"0/1F4","primary_cursor":"0/1F4","lag_bytes":0,"lag_secs":0.4,
-   "primary":"127.0.0.1:5433","sync_mode":"async","last_ack_sequence":500,"epoch":1}}
+   "primary":"127.0.0.1:5433","sync_mode":"async","last_ack_sequence":500,"epoch":1,
+   "tls":false,"reason":null,"progress":null}}
   ```
+
+  The first eleven fields are frozen for HeliosDB Proxy (names and types).
+  Spec P2.2 added three after them: `tls` (the replication session is on TLS),
+  `reason` (why a standby is not streaming: the reason of a `needs_recovery`,
+  or the last connection failure while `connecting` / `reconnecting`, such as
+  `tls: invalid peer certificate: UnknownIssuer`; null otherwise) and
+  `progress` (a `recovering` standby's download, `"<held>/<total> bytes"`). The
+  `heliosdb_standby_status` view has the same three columns after the frozen
+  ones.
 
   `cursor` is the sequence the standby has applied through and `primary_cursor`
   the primary's last reported barrier, both as LSN text. `lag_bytes` is their
@@ -257,10 +341,10 @@ receiver) against the primary (S, the source):
 |---|---|---|
 | `Auth` | R to S | the 32-byte token, checked in constant time before anything else is read |
 | `AuthOk` | S to R | none |
-| `Hello` | R to S | node id; role `standby` or `resync`; history (none while bootstrapping); epoch; durable cursor (none for a fresh snapshot); capabilities; PostgreSQL port; sync mode |
-| `HelloOk` | S to R | node id, history, epoch, barrier (the primary's written sequence), capabilities, replication endpoint, PostgreSQL port |
+| `Hello` | R to S | node id; role `standby` or `resync`; history (none while bootstrapping); epoch; durable cursor (none for a fresh snapshot); capabilities (`CAP_TLS` when the standby's end is TLS); PostgreSQL port; sync mode |
+| `HelloOk` | S to R | node id, history, epoch, barrier (the primary's written sequence), capabilities (`CAP_TLS` when the primary's end is TLS), replication endpoint, PostgreSQL port |
 | `Refuse` | S to R | a code and a reason; the session ends |
-| `Open` | R to S | `snapshot`, or `resume {history, after}` |
+| `Open` | R to S | `snapshot`, `snapshot of <id>` (a resumed download: the leased export it belongs to, else a fresh one), or `resume {history, after}` |
 | `Manifest` / `ResumeInfo` | S to R | the session the primary opened |
 | `ChunkRequest` / `Chunk` | R to S / S to R | one bounded, digested piece of a checkpoint file |
 | `PollRequest` | R to S | session, the sequence to continue after, a byte limit |
@@ -289,6 +373,7 @@ that `--primary-host` must name the primary's `--replication-port`.
 | `TooManySessions` | the primary already serves `max_sessions` sessions | `reconnecting`, with backoff |
 | `SourceNotServing` | the primary is shutting down or failing on its side | `reconnecting`, with backoff |
 | (transport error) | connection refused, reset, timed out | `reconnecting`, with backoff |
+| (TLS failure) | wrong CA, untrusted or misnamed certificate, refused client certificate | `reconnecting` (or `connecting` before the first session), reason `tls: …`, with backoff |
 
 The reconnect backoff starts at 1 s and doubles up to 5 s. A standby in
 `needs_recovery` stays up (unless `on_unrecoverable = "exit"`), refuses data
@@ -388,8 +473,47 @@ continues over a hole. To rebuild it:
 A rebuild is a full copy today. An incremental rebuild that ships only the
 changed key ranges arrives in plan phase P4, and recovery from archived WAL in
 P3. An interrupted bootstrap copy is never installed (the copy is verified and
-renamed into place only when complete), and the next start downloads it again
-from the beginning; a resumable download arrives with P2.2.
+renamed into place only when complete); it is resumed.
+
+### Resuming an interrupted copy
+
+A bootstrap copy (and `heliosdb-nano resync`) stages into one private sibling
+of the data directory, `.nano-resync-<hash of the directory's name>`, and keeps
+its progress there in `NANO-PHYSICAL-PARTIAL.json`: the snapshot, the
+manifest's SHA-256, the dataset history, and per file its size, digest and the
+bytes that are on disk and fsynced. The record is rewritten (temporary file,
+rename, fsync) after every completed file and after at most 8 MiB inside a
+file.
+
+- **Within one run**, a transport error during the download reconnects with
+  the usual backoff and continues where it was, instead of failing the copy.
+- **After a restart** (a crash, a SIGKILL, a host reboot), the standby asks the
+  primary for the snapshot its record names. The primary keeps a copy's
+  checkpoint export **leased** for `[replication] snapshot_export_lease_secs`
+  (default 3600) after the session that opened it ends, keyed by snapshot id,
+  so it answers with the SAME manifest, and the standby continues: every file
+  the record marks complete is hashed again (a mismatch is downloaded again),
+  the file in progress is cut back to its recorded length, and the download
+  goes on from there. The standby logs `resuming the download of snapshot …:
+  N of M bytes already held and verified`.
+- **Anything else starts over**, and the log says why
+  (`the snapshot download is starting over …`): no record, another snapshot
+  (the lease expired, or the primary restarted), another manifest, a record
+  that cannot be read, a file whose size disagrees with it, or an unexpected
+  file in the staging directory. The staging directory is deleted only when it
+  carries this receiver's staging marker; anything else at that path is
+  refused and left alone.
+- Once every file is complete the record is removed, and the copy is verified
+  and installed exactly as a fresh one (file census, per-file SHA-256, the
+  checkpoint's sequence): an installed standby carries no extra file.
+
+**What a lease costs.** A checkpoint is hard links to the primary's SST files:
+a leased export pins their disk space (files compaction has since replaced are
+not freed) until the lease ends. At most `snapshot_export_max_leases` (default
+4) are kept, the oldest dropped first; an export a session still uses stays
+until that session ends. A leased export is offered again only while the
+primary's WAL still holds everything after its checkpoint, so a resumed copy
+can continue streaming; otherwise the standby gets a fresh snapshot.
 
 Before rebuilding, consider why it was refused:
 
@@ -441,29 +565,38 @@ scripts/regress/nano-physical-pair.sh --binary target/release/heliosdb-nano --di
   `--restart primary|standby|both`, `--stop`, `--status`.
 - Options: `--sync-mode`, `--min-acks`, `--sync-timeout-ms`,
   `--sync-timeout-action` (the primary's `[replication]` keys),
-  `--max-standby-lag`, `--timeout`.
+  `--max-standby-lag`, `--timeout`, and `--tls`: a throwaway CA and server
+  certificate are generated with `openssl` in the state directory and the pair
+  replicates over TLS (remembered for that directory). The PostgreSQL ports are
+  unchanged; TLS is on the replication port only.
 - Every run ends with one JSON line: ports, pids, `ops_per_s`, the `/ready`
-  status of each side, and `standbys`, the number of standbys the primary's
-  `/health` lists.
+  status of each side, `standbys`, the number of standbys the primary's
+  `/health` lists, and `tls`, whether the standby's session is on TLS.
 
 The test suites are listed in the [HA testing guide](ha_testing.md).
 
 ## Limits of this release
 
-- **Loopback only.** The replication port listens on loopback and a standby's
-  `--primary-host` must resolve to loopback, until remote replication over TLS
-  (spec P2.2). Reach a primary on another host through an authenticated tunnel
-  that ends on loopback at both sides, for example
-  `ssh -N -L 127.0.0.1:5433:127.0.0.1:5433 primary.example` on the standby host.
-  `--allow-insecure-replication-remote` / `[replication] allow_insecure_remote`
-  are accepted but change nothing yet (a WARN says so).
+- **Remote standbys need TLS.** Plaintext replication stays on loopback unless
+  `--allow-insecure-replication-remote` (isolated development only). An
+  authenticated tunnel that ends on loopback at both sides (for example
+  `ssh -N -L 127.0.0.1:5433:127.0.0.1:5433 primary.example`) still works, with
+  plaintext on loopback at each end.
+- **Encryption keys.** A standby must be started with the same dataset key as
+  its primary: it holds the primary's ciphertext verbatim. There is no key
+  rotation command in this release (the internal `KeyManager::rotate` has no
+  caller and re-encrypts nothing); rotating the key while standbys are attached
+  is not supported until promotion and fencing arrive (P5), which add the
+  control-plane check that every standby holds the new key first.
 - **No promotion or failover** until plan phase P5. `SWITCHOVER` is refused, and
   a standby's data directory cannot be opened as a primary or standalone
   database. Writes are never routed through a standby: connect to the primary to
   write.
 - **No cascading.** A standby cannot serve other standbys.
 - **One primary per standby.**
-- **Full-copy rebuilds** that restart from zero when interrupted (incremental
-  rebuild P4, archive recovery P3, resumable download P2.2).
-- **The multi-container lab under `tests/docker` is out of service** until remote
-  replication (P2.2); see the [HA testing guide](ha_testing.md).
+- **Full-copy rebuilds** (incremental rebuild P4, archive recovery P3); an
+  interrupted copy resumes from its progress record while the primary still
+  leases its snapshot.
+- **The multi-container lab under `tests/docker` is still out of service**: it
+  has not yet been brought up to date for remote physical standbys over TLS;
+  see the [HA testing guide](ha_testing.md).

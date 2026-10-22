@@ -42,14 +42,230 @@ struct HAConfig {
     node_id: Option<String>,
     /// The owner-only 32-byte token file authenticating the replication connection.
     token_file: Option<PathBuf>,
-    /// Reserved for remote replication over TLS (spec P2.2): the replication
-    /// port is loopback-only in this release.
+    /// Spec P2.2: the replication connection may cross a non-loopback
+    /// network in plaintext (`--allow-insecure-replication-remote`).
     allow_insecure_remote: bool,
+    /// Spec P2.2: the replication port's TLS (primary), the standby's TLS to
+    /// its primary, and the snapshot export lease.
+    replication_tls: ReplicationTlsSettings,
     /// Spec P1.3: `[replication] max_standby_lag` (TOML only; a daemon child
     /// re-reads it from the forwarded `--config`).
     max_standby_lag: std::time::Duration,
     /// Spec P1.3: `[replication] on_unrecoverable = "exit"`.
     exit_on_unrecoverable: bool,
+}
+
+/// Spec P2.2: the `[replication]` TLS keys and the snapshot export lease,
+/// resolved CLI > TOML > defaults (`ReplicationTlsArgs`), carried to
+/// `start_server` and forwarded through the daemon re-exec.
+#[derive(Debug, Clone)]
+struct ReplicationTlsSettings {
+    tls_enabled: bool,
+    tls_cert_path: Option<PathBuf>,
+    tls_key_path: Option<PathBuf>,
+    tls_ca_path: Option<PathBuf>,
+    tls_post_quantum: Option<bool>,
+    primary_tls: Option<bool>,
+    primary_tls_ca_path: Option<PathBuf>,
+    primary_tls_server_name: Option<String>,
+    primary_tls_client_cert_path: Option<PathBuf>,
+    primary_tls_client_key_path: Option<PathBuf>,
+    primary_tls_insecure_skip_verify: bool,
+    snapshot_export_lease_secs: u64,
+    snapshot_export_max_leases: usize,
+}
+
+impl ReplicationTlsSettings {
+    fn from_config(replication: &heliosdb_nano::config::ReplicationConfig) -> Self {
+        Self {
+            tls_enabled: replication.tls_enabled,
+            tls_cert_path: replication.tls_cert_path.clone(),
+            tls_key_path: replication.tls_key_path.clone(),
+            tls_ca_path: replication.tls_ca_path.clone(),
+            tls_post_quantum: replication.tls_post_quantum,
+            primary_tls: replication.primary_tls,
+            primary_tls_ca_path: replication.primary_tls_ca_path.clone(),
+            primary_tls_server_name: replication.primary_tls_server_name.clone(),
+            primary_tls_client_cert_path: replication.primary_tls_client_cert_path.clone(),
+            primary_tls_client_key_path: replication.primary_tls_client_key_path.clone(),
+            primary_tls_insecure_skip_verify: replication.primary_tls_insecure_skip_verify,
+            snapshot_export_lease_secs: replication.snapshot_export_lease_secs,
+            snapshot_export_max_leases: replication.snapshot_export_max_leases,
+        }
+    }
+
+    /// The flags that reproduce these settings in a daemon child (which also
+    /// re-reads the forwarded `--config`; explicit flags win there too).
+    fn daemon_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.tls_enabled {
+            args.push("--replication-tls".to_string());
+        }
+        for (flag, path) in [
+            ("--replication-tls-cert", &self.tls_cert_path),
+            ("--replication-tls-key", &self.tls_key_path),
+            ("--replication-tls-ca", &self.tls_ca_path),
+            ("--primary-ca", &self.primary_tls_ca_path),
+            ("--primary-client-cert", &self.primary_tls_client_cert_path),
+            ("--primary-client-key", &self.primary_tls_client_key_path),
+        ] {
+            if let Some(path) = path {
+                args.push(flag.to_string());
+                args.push(path.display().to_string());
+            }
+        }
+        if let Some(value) = self.tls_post_quantum {
+            args.push(format!("--replication-tls-post-quantum={value}"));
+        }
+        if let Some(value) = self.primary_tls {
+            args.push(format!("--primary-tls={value}"));
+        }
+        if let Some(name) = &self.primary_tls_server_name {
+            args.push("--primary-server-name".to_string());
+            args.push(name.clone());
+        }
+        if self.primary_tls_insecure_skip_verify {
+            args.push("--primary-tls-insecure-skip-verify".to_string());
+        }
+        args.push("--snapshot-export-lease-secs".to_string());
+        args.push(self.snapshot_export_lease_secs.to_string());
+        args.push("--snapshot-export-max-leases".to_string());
+        args.push(self.snapshot_export_max_leases.to_string());
+        args
+    }
+}
+
+/// Spec P2.2: the standby side of `[replication]`'s TLS — how it reaches its
+/// primary. Shared by `start` and `resync`.
+#[derive(clap::Args, Debug, Default)]
+struct PrimaryTlsArgs {
+    /// STANDBY: connect to the primary's replication port over TLS. Default:
+    /// on when --primary-host resolves to a non-loopback address, off on
+    /// loopback; `--primary-tls=false` forces plaintext (then a non-loopback
+    /// primary needs --allow-insecure-replication-remote).
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    primary_tls: Option<bool>,
+    /// STANDBY: PEM CA certificate(s) the primary's certificate must chain
+    /// to (default: the system trust store).
+    #[arg(long, value_name = "PEM")]
+    primary_ca: Option<PathBuf>,
+    /// STANDBY: the name the primary's certificate must carry (default: the
+    /// host part of --primary-host; an IP literal is verified as an IP SAN).
+    #[arg(long, value_name = "NAME")]
+    primary_server_name: Option<String>,
+    /// STANDBY: PEM client certificate for a mutual-TLS primary
+    /// (with --primary-client-key).
+    #[arg(long, value_name = "PEM")]
+    primary_client_cert: Option<PathBuf>,
+    /// STANDBY: PEM private key of --primary-client-cert.
+    #[arg(long, value_name = "PEM")]
+    primary_client_key: Option<PathBuf>,
+    /// STANDBY: accept ANY primary certificate (no chain or name check).
+    /// Only together with --allow-insecure-replication-remote; isolated
+    /// development only.
+    #[arg(long)]
+    primary_tls_insecure_skip_verify: bool,
+}
+
+impl PrimaryTlsArgs {
+    fn apply(self, replication: &mut heliosdb_nano::config::ReplicationConfig) {
+        if let Some(value) = self.primary_tls {
+            replication.primary_tls = Some(value);
+        }
+        if let Some(value) = self.primary_ca {
+            replication.primary_tls_ca_path = Some(value);
+        }
+        if let Some(value) = self.primary_server_name {
+            replication.primary_tls_server_name = Some(value);
+        }
+        if let Some(value) = self.primary_client_cert {
+            replication.primary_tls_client_cert_path = Some(value);
+        }
+        if let Some(value) = self.primary_client_key {
+            replication.primary_tls_client_key_path = Some(value);
+        }
+        // A flag only turns it on; a config-file `true` is kept.
+        if self.primary_tls_insecure_skip_verify {
+            replication.primary_tls_insecure_skip_verify = true;
+        }
+    }
+}
+
+/// Spec P2.2: TLS on the replication port (primary), the standby's TLS
+/// (`PrimaryTlsArgs`), and the snapshot export lease.
+#[derive(clap::Args, Debug, Default)]
+struct ReplicationTlsArgs {
+    /// PRIMARY: serve the replication port over TLS; it then binds on
+    /// --listen's address even when that is not loopback. Certificate and
+    /// key: --replication-tls-cert / --replication-tls-key, else
+    /// --tls-cert / --tls-key. The replication token is still required.
+    #[arg(long)]
+    replication_tls: bool,
+    /// PRIMARY: PEM certificate chain of the replication port.
+    #[arg(long, value_name = "PEM")]
+    replication_tls_cert: Option<PathBuf>,
+    /// PRIMARY: PEM private key of the replication port.
+    #[arg(long, value_name = "PEM")]
+    replication_tls_key: Option<PathBuf>,
+    /// PRIMARY: PEM CA certificate(s); when set, every standby must present a
+    /// client certificate issued by it (mutual TLS), and its token.
+    #[arg(long, value_name = "PEM")]
+    replication_tls_ca: Option<PathBuf>,
+    /// PRIMARY: offer the `X25519MLKEM768` post-quantum key exchange on the
+    /// replication port (default: follows --tls-post-quantum).
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    replication_tls_post_quantum: Option<bool>,
+    #[command(flatten)]
+    primary: PrimaryTlsArgs,
+    /// PRIMARY: how long a bootstrap copy's checkpoint export is kept after
+    /// its session ends, so an interrupted download resumes (0..=604800 s,
+    /// default 3600). A leased checkpoint pins the SST files it hard-links.
+    #[arg(long, value_name = "SECONDS")]
+    snapshot_export_lease_secs: Option<u64>,
+    /// PRIMARY: at most this many leased exports (1..=64, default 4; the
+    /// oldest is dropped first).
+    #[arg(long, value_name = "N")]
+    snapshot_export_max_leases: Option<usize>,
+}
+
+impl ReplicationTlsArgs {
+    fn apply(self, replication: &mut heliosdb_nano::config::ReplicationConfig) {
+        // A flag only turns it on; a config-file `true` is kept.
+        if self.replication_tls {
+            replication.tls_enabled = true;
+        }
+        if let Some(value) = self.replication_tls_cert {
+            replication.tls_cert_path = Some(value);
+        }
+        if let Some(value) = self.replication_tls_key {
+            replication.tls_key_path = Some(value);
+        }
+        if let Some(value) = self.replication_tls_ca {
+            replication.tls_ca_path = Some(value);
+        }
+        if let Some(value) = self.replication_tls_post_quantum {
+            replication.tls_post_quantum = Some(value);
+        }
+        if let Some(value) = self.snapshot_export_lease_secs {
+            replication.snapshot_export_lease_secs = value;
+        }
+        if let Some(value) = self.snapshot_export_max_leases {
+            replication.snapshot_export_max_leases = value;
+        }
+        self.primary.apply(replication);
+    }
 }
 
 /// Standbys receive their full verification window plus the ordinary startup allowance.
@@ -852,8 +1068,9 @@ enum Commands {
 
         /// THE replication port (protocol NPHYS002, default: 5433): a primary
         /// serves its physical standbys here — the bootstrap copy, the physical
-        /// WAL, heartbeats and acknowledgements on one connection each.
-        /// Loopback only in this release.
+        /// WAL, heartbeats and acknowledgements on one connection each. It
+        /// binds on --listen's address with --replication-tls (or
+        /// --allow-insecure-replication-remote), else on loopback.
         #[arg(long)]
         replication_port: Option<u16>,
 
@@ -862,8 +1079,10 @@ enum Commands {
         #[arg(long)]
         replication_startup_timeout_secs: Option<u64>,
 
-        /// For a standby: its primary's replication port (host:port; it must
-        /// resolve to loopback)
+        /// For a standby: its primary's replication port (host:port). A
+        /// non-loopback primary is reached over TLS (--primary-tls, the
+        /// default there) or, plaintext, only with
+        /// --allow-insecure-replication-remote
         #[arg(long)]
         primary_host: Option<String>,
 
@@ -908,11 +1127,16 @@ enum Commands {
         #[arg(long)]
         node_id: Option<String>,
 
-        /// Reserved for remote replication over TLS: the replication port is
-        /// loopback-only in this release, so this changes nothing yet
-        /// (isolated development only; mirrors --allow-insecure-trust).
+        /// Let the replication connection cross a non-loopback network in
+        /// PLAINTEXT, its token included: a primary then binds its replication
+        /// port on --listen's address without TLS, and a standby connects to a
+        /// non-loopback --primary-host without TLS. Isolated development only
+        /// (an INSECURE warning is printed; mirrors --allow-insecure-trust).
         #[arg(long)]
         allow_insecure_replication_remote: bool,
+
+        #[command(flatten)]
+        replication_tls: ReplicationTlsArgs,
 
         // ========== MySQL Protocol Options ==========
         /// Enable MySQL protocol listener
@@ -1226,6 +1450,7 @@ async fn run(cli: Cli) -> Result<()> {
             allow_insecure_http,
             node_id,
             allow_insecure_replication_remote,
+            replication_tls,
             mysql,
             mysql_listen,
             mysql_socket,
@@ -1342,6 +1567,7 @@ async fn run(cli: Cli) -> Result<()> {
             if allow_insecure_replication_remote {
                 replication.allow_insecure_remote = true;
             }
+            replication_tls.apply(&mut replication);
             // Read before `apply` consumes the flags: only an explicit
             // `--physical-replication=false` keeps a primary's physical source off.
             let explicit_physical = physical.physical_replication;
@@ -1378,6 +1604,7 @@ async fn run(cli: Cli) -> Result<()> {
             // Validated above; read before the fields below are moved out.
             let max_standby_lag = replication.max_standby_lag_duration()?;
             let exit_on_unrecoverable = replication.exit_on_unrecoverable();
+            let replication_tls = ReplicationTlsSettings::from_config(&replication);
             // Build HA configuration
             let ha_config = HAConfig {
                 physical: replication.physical,
@@ -1399,6 +1626,7 @@ async fn run(cli: Cli) -> Result<()> {
                 node_id: replication.node_id,
                 token_file: replication.token_file,
                 allow_insecure_remote: replication.allow_insecure_remote,
+                replication_tls,
                 max_standby_lag,
                 exit_on_unrecoverable,
             };
@@ -1719,6 +1947,19 @@ async fn start_server(
         node_id: ha_config.node_id.clone(),
         token_file: ha_config.token_file.clone(),
         allow_insecure_remote: ha_config.allow_insecure_remote,
+        tls_enabled: ha_config.replication_tls.tls_enabled,
+        tls_cert_path: ha_config.replication_tls.tls_cert_path.clone(),
+        tls_key_path: ha_config.replication_tls.tls_key_path.clone(),
+        tls_ca_path: ha_config.replication_tls.tls_ca_path.clone(),
+        tls_post_quantum: ha_config.replication_tls.tls_post_quantum,
+        primary_tls: ha_config.replication_tls.primary_tls,
+        primary_tls_ca_path: ha_config.replication_tls.primary_tls_ca_path.clone(),
+        primary_tls_server_name: ha_config.replication_tls.primary_tls_server_name.clone(),
+        primary_tls_client_cert_path: ha_config.replication_tls.primary_tls_client_cert_path.clone(),
+        primary_tls_client_key_path: ha_config.replication_tls.primary_tls_client_key_path.clone(),
+        primary_tls_insecure_skip_verify: ha_config.replication_tls.primary_tls_insecure_skip_verify,
+        snapshot_export_lease_secs: ha_config.replication_tls.snapshot_export_lease_secs,
+        snapshot_export_max_leases: ha_config.replication_tls.snapshot_export_max_leases,
         // TOML-only settings: keep the values the config file loaded above.
         logical_wal_retention_entries: db_config.replication.logical_wal_retention_entries,
         max_standby_lag: db_config.replication.max_standby_lag.clone(),
@@ -1741,6 +1982,17 @@ async fn start_server(
     // makes `[server] max_connections` live: it used to be read by nothing.
     policy_args.apply_to(&mut db_config.server);
     db_config.server.validate_connection_policy()?;
+    // Spec P2.2: the replication port's TLS is resolved and its files loaded
+    // now, so a missing or unreadable certificate refuses the start before
+    // the database opens.
+    #[cfg(feature = "ha-tier1")]
+    let replication_server_tls = resolve_replication_server_tls(
+        &ha_config,
+        tls_cert.as_ref(),
+        tls_key.as_ref(),
+        tls_post_quantum,
+        &db_config.server,
+    )?;
     // GH#29 (c7, M3): the join materialization cap, CLI > config > default.
     // `EmbeddedDatabase` installs it process-wide when it takes `db_config`.
     performance_args.apply_to(&mut db_config.performance);
@@ -1927,6 +2179,7 @@ async fn start_server(
             &db_config,
             &pg_addr.ip().to_string(),
             pg_addr.port(),
+            ha_config.replication_tls.tls_post_quantum.unwrap_or(tls_post_quantum),
         )?;
         let gate = runtime
             .open_gate(std::time::Duration::from_secs(ha_config.startup_timeout_secs))
@@ -2048,9 +2301,22 @@ async fn start_server(
             println!("      - Standby hosts: {standbys}");
         }
         if ha_config.physical.enabled {
+            let address = replication_listen_address(
+                pg_addr.ip(),
+                ha_config.replication_port,
+                replication_remote_allowed(&ha_config),
+            );
             println!(
-                "      - Replication listener: {} (NPHYS002, loopback only)",
-                replication_listen_address(pg_addr.ip(), ha_config.replication_port)
+                "      - Replication listener: {address} (NPHYS002, {})",
+                if ha_config.replication_tls.tls_enabled && ha_config.replication_tls.tls_ca_path.is_some() {
+                    "TLS, client certificates required"
+                } else if ha_config.replication_tls.tls_enabled {
+                    "TLS"
+                } else if address.ip().is_loopback() {
+                    "plaintext, loopback"
+                } else {
+                    "PLAINTEXT over the network: insecure opt-in"
+                }
             );
         }
         if guarded_standby {
@@ -2096,14 +2362,16 @@ async fn start_server(
     #[cfg(feature = "ha-tier1")]
     let physical_source = if ha_role == "primary" {
         let node = configure_ha_node(&ha_config, &pg_addr.ip().to_string(), pg_addr.port())?;
-        let prepared = prepare_physical_source(&ha_config, &node, pg_addr, &db.storage).await?;
+        let prepared =
+            prepare_physical_source(&ha_config, &node, pg_addr, &db.storage, replication_server_tls.as_ref()).await?;
         // What a primary reports to the SQL probes and `/health`: its written
-        // physical sequence and its replication port.
+        // physical sequence, its replication port and whether it serves TLS.
         heliosdb_nano::standby_posture::install_primary(heliosdb_nano::standby_posture::PrimaryStatus {
             role: "primary",
             engine: Arc::downgrade(&db.storage),
             endpoint: prepared.as_ref().map(|source| source.address.to_string()),
             sync_mode: ha_config.sync_mode.clone(),
+            tls: prepared.as_ref().is_some_and(|source| source.tls.is_some()),
         });
         prepared
     } else {
@@ -2873,6 +3141,8 @@ async fn start_server_daemon(
     let child_password: Option<String> = daemon_password_handoff(&password, &mut args);
 
     append_physical_daemon_args(&mut args, &ha_config.physical, ha_config.token_file.as_deref());
+    // Spec P2.2: certificate paths, not secrets (the keys stay in their files).
+    args.extend(ha_config.replication_tls.daemon_args());
 
     // Add HA options
     args.push("--replication-role".to_string());
@@ -2990,8 +3260,12 @@ async fn start_server_daemon(
         }
         if ha_config.allow_insecure_remote && ha_config.token_file.is_some() {
             eprintln!(
-                "--allow-insecure-replication-remote has no effect in this release: the replication port is \
-                 loopback-only until TLS replication."
+                "{}",
+                insecure_replication_banner(if ha_config.role.eq_ignore_ascii_case("standby") {
+                    "standby"
+                } else {
+                    "primary"
+                })
             );
         }
 
@@ -3231,16 +3505,94 @@ fn configure_ha_node(ha_config: &HAConfig, listen: &str, port: u16) -> Result<Ha
     })
 }
 
-/// Spec P2.1: where a primary's replication port listens. Loopback only
-/// until TLS replication (spec P2.2): `--listen`'s own address when that is a
-/// loopback one, else `127.0.0.1` — a wildcard or remote `--listen` opens the
-/// PostgreSQL port to the network, never the plaintext replication token.
-fn replication_listen_address(pg_listen: std::net::IpAddr, port: u16) -> std::net::SocketAddr {
-    if pg_listen.is_loopback() {
+/// Spec P2.1 / P2.2: where a primary's replication port listens. `--listen`'s
+/// own address when that is loopback, or when the port may be remote
+/// (`remote`: it serves TLS, or plaintext over the network was explicitly
+/// allowed); otherwise `127.0.0.1` — a wildcard or remote `--listen` without
+/// either opens the PostgreSQL port to the network, never a plaintext
+/// replication token.
+fn replication_listen_address(pg_listen: std::net::IpAddr, port: u16, remote: bool) -> std::net::SocketAddr {
+    if pg_listen.is_loopback() || remote {
         std::net::SocketAddr::new(pg_listen, port)
     } else {
         std::net::SocketAddr::from(([127, 0, 0, 1], port))
     }
+}
+
+/// Spec P2.2: whether a primary's replication port may bind a non-loopback
+/// address: it serves TLS, or plaintext over the network was allowed.
+fn replication_remote_allowed(ha_config: &HAConfig) -> bool {
+    ha_config.replication_tls.tls_enabled || ha_config.allow_insecure_remote
+}
+
+/// Spec P2.2: the one warning a plaintext replication opt-in prints.
+fn insecure_replication_banner(side: &str) -> String {
+    format!(
+        "INSECURE DEVELOPMENT OVERRIDE: this {side}'s replication connection may carry its token in plaintext \
+         over a non-loopback network (--allow-insecure-replication-remote); use --replication-tls / --primary-tls"
+    )
+}
+
+/// Spec P2.2: a primary's replication-port TLS. The certificate and key are
+/// `[replication] tls_cert_path` / `tls_key_path`, else the PostgreSQL pair
+/// (`--tls-cert` / `--tls-key`, or `[server] tls_cert_path` /
+/// `tls_key_path` with `[server] tls_enabled`); with neither the start is
+/// refused, naming the keys. The files are loaded here, so a bad one refuses
+/// the start too. `None` without `tls_enabled`, and on every role but primary
+/// (a standby serves no replication port: cascading is not supported).
+#[cfg(feature = "ha-tier1")]
+fn resolve_replication_server_tls(
+    ha_config: &HAConfig,
+    tls_cert: Option<&PathBuf>,
+    tls_key: Option<&PathBuf>,
+    tls_post_quantum: bool,
+    server: &heliosdb_nano::config::ServerConfig,
+) -> Result<Option<heliosdb_nano::replication::physical_tls::ReplicationServerTls>> {
+    use heliosdb_nano::replication::physical_tls::ReplicationServerTls;
+    let settings = &ha_config.replication_tls;
+    if !settings.tls_enabled {
+        return Ok(None);
+    }
+    if !ha_config.role.eq_ignore_ascii_case("primary") {
+        tracing::warn!(
+            "--replication-tls ([replication] tls_enabled) has no effect on a {}: only a primary serves the \
+             replication port (a standby's TLS to its primary is --primary-tls)",
+            ha_config.role
+        );
+        return Ok(None);
+    }
+    let (cert_path, key_path) =
+        match (
+            settings.tls_cert_path.as_ref(),
+            settings.tls_key_path.as_ref(),
+            tls_cert,
+            tls_key,
+        ) {
+            (Some(cert), Some(key), _, _) | (None, None, Some(cert), Some(key)) => (cert.clone(), key.clone()),
+            (None, None, _, _) => match (server.tls_enabled, &server.tls_cert_path, &server.tls_key_path) {
+                (true, Some(cert), Some(key)) => (cert.clone(), key.clone()),
+                _ => {
+                    return Err(Error::config(
+                        "--replication-tls ([replication] tls_enabled) needs a certificate and key: set \
+                     [replication] tls_cert_path and tls_key_path (--replication-tls-cert / --replication-tls-key), \
+                     or the PostgreSQL pair (--tls-cert / --tls-key, or [server] tls_cert_path / tls_key_path with \
+                     [server] tls_enabled)",
+                    ))
+                }
+            },
+            _ => return Err(Error::config(
+                "[replication] tls_cert_path and tls_key_path (--replication-tls-cert / --replication-tls-key) must \
+                 be set together",
+            )),
+        };
+    let tls = ReplicationServerTls {
+        cert_path,
+        key_path,
+        ca_path: settings.tls_ca_path.clone(),
+        post_quantum: settings.tls_post_quantum.unwrap_or(tls_post_quantum),
+    };
+    tls.acceptor()?;
+    Ok(Some(tls))
 }
 
 /// Spec P2.1: what a primary's `/health` lists as `standbys` — every standby
@@ -3406,8 +3758,8 @@ fn classify_standby_directory(path: &std::path::Path) -> StandbyLayout {
 }
 
 /// Spec P2.1: the addresses of `--primary-host`, the primary's replication
-/// port. Loopback only until TLS replication (spec P2.2), like the listener
-/// it names; at most 16, deduplicated, resolved once at startup.
+/// port: at most 16, deduplicated, resolved once at startup. Whether they may
+/// be reached, and how, is [`replication_transport`]'s.
 #[cfg(feature = "ha-tier1")]
 fn resolve_replication_sources(primary_host: &str) -> Result<Vec<std::net::SocketAddr>> {
     use std::net::ToSocketAddrs;
@@ -3415,24 +3767,116 @@ fn resolve_replication_sources(primary_host: &str) -> Result<Vec<std::net::Socke
     let resolved = primary_host
         .to_socket_addrs()
         .map_err(|e| Error::config(format!("cannot resolve --primary-host {primary_host}: {e}")))?;
+    dedup_replication_sources(primary_host, resolved)
+}
+
+#[cfg(feature = "ha-tier1")]
+fn dedup_replication_sources(
+    primary_host: &str,
+    resolved: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Result<Vec<std::net::SocketAddr>> {
     let mut sources = Vec::new();
     for address in resolved {
-        if !address.ip().is_loopback() {
-            return Err(Error::config(format!(
-                "--primary-host {primary_host} resolves to {address}: the replication port is loopback-only until \
-                 TLS replication; reach a remote primary through an authenticated tunnel ending on loopback"
-            )));
-        }
         if !sources.contains(&address) {
             sources.push(address);
         }
     }
     if sources.is_empty() || sources.len() > 16 {
         return Err(Error::config(format!(
-            "--primary-host {primary_host} must resolve to between 1 and 16 loopback addresses"
+            "--primary-host {primary_host} must resolve to between 1 and 16 addresses"
         )));
     }
     Ok(sources)
+}
+
+/// Spec P2.2: how a receiver reaches `primary_host` (resolved to `sources`).
+/// TLS when `[replication] primary_tls` says so — by default exactly when an
+/// address is not loopback — with the CA, server name and client certificate
+/// of `[replication]`; the files are loaded once here, so a bad one refuses
+/// the start (and are read again at every connection). A non-loopback
+/// address without TLS is refused unless `allow_insecure_remote`, which then
+/// prints the INSECURE warning.
+#[cfg(feature = "ha-tier1")]
+fn replication_transport(
+    primary_host: &str,
+    sources: &[std::net::SocketAddr],
+    settings: &ReplicationTlsSettings,
+    allow_insecure_remote: bool,
+    post_quantum: bool,
+) -> Result<heliosdb_nano::replication::physical_tls::ReplicationTransport> {
+    use heliosdb_nano::replication::physical_tls::{endpoint_host, ReplicationClientTls, ReplicationTransport};
+    let remote = sources.iter().find(|address| !address.ip().is_loopback());
+    let tls = settings.primary_tls.unwrap_or(remote.is_some());
+    if let (Some(address), false) = (remote, tls) {
+        if !allow_insecure_remote {
+            return Err(Error::config(format!(
+                "--primary-host {primary_host} resolves to {address}: a non-loopback replication port is reached \
+                 over TLS (--primary-tls, the default for a non-loopback primary) or, in plaintext, only with \
+                 --allow-insecure-replication-remote; or reach it through an authenticated tunnel ending on \
+                 loopback"
+            )));
+        }
+        tracing::warn!("{}", insecure_replication_banner("standby"));
+    }
+    if settings.primary_tls_insecure_skip_verify {
+        if !allow_insecure_remote {
+            return Err(Error::config(
+                "--primary-tls-insecure-skip-verify accepts any certificate; it is only honoured together with \
+                 --allow-insecure-replication-remote",
+            ));
+        }
+        tracing::warn!(
+            "INSECURE DEVELOPMENT OVERRIDE: --primary-tls-insecure-skip-verify: the primary's certificate is NOT \
+             verified"
+        );
+    }
+    if !tls {
+        return Ok(ReplicationTransport {
+            tls: None,
+            allow_insecure_remote,
+        });
+    }
+    let server_name = settings
+        .primary_tls_server_name
+        .clone()
+        .unwrap_or_else(|| endpoint_host(primary_host).to_string());
+    let client_identity = match (
+        &settings.primary_tls_client_cert_path,
+        &settings.primary_tls_client_key_path,
+    ) {
+        (Some(cert), Some(key)) => Some((cert.clone(), key.clone())),
+        (None, None) => None,
+        _ => {
+            return Err(Error::config(
+                "--primary-client-cert and --primary-client-key must be given together",
+            ))
+        }
+    };
+    let client = ReplicationClientTls::new(
+        &server_name,
+        settings.primary_tls_ca_path.clone(),
+        client_identity,
+        settings.primary_tls_insecure_skip_verify,
+        post_quantum,
+    )?;
+    client.connector()?;
+    info!(
+        "replication to {primary_host} over TLS (server name {server_name}{}{})",
+        if client.presents_client_certificate() {
+            ", client certificate"
+        } else {
+            ""
+        },
+        if settings.primary_tls_ca_path.is_some() {
+            ""
+        } else {
+            ", system trust store"
+        }
+    );
+    Ok(ReplicationTransport {
+        tls: Some(client),
+        allow_insecure_remote,
+    })
 }
 
 /// Everything the standby's supervisor needs.
@@ -3445,6 +3889,8 @@ struct StandbyPlan {
     /// `--primary-host` as given, and its addresses (the primary's replication port).
     primary: String,
     sources: Vec<std::net::SocketAddr>,
+    /// Spec P2.2: TLS (or not) to those addresses.
+    transport: heliosdb_nano::replication::physical_tls::ReplicationTransport,
     token: heliosdb_nano::replication::physical_wire::TransferToken,
     /// What this standby's `Hello` announces.
     identity: heliosdb_nano::replication::physical_wire::ReceiverIdentity,
@@ -3463,6 +3909,7 @@ impl StandbyPlan {
         heliosdb_nano::replication::physical_receiver::ReceiverOptions {
             config: self.config.clone(),
             sources: self.sources.clone(),
+            transport: self.transport.clone(),
             token: self.token.clone(),
             identity: self.identity.clone(),
             start,
@@ -3517,6 +3964,7 @@ impl StandbyRuntime {
         config: &Config,
         listen: &str,
         port: u16,
+        post_quantum: bool,
     ) -> Result<Self> {
         use heliosdb_nano::replication::physical_wire::{PeerRole, ReceiverIdentity, WireSyncMode};
         use heliosdb_nano::standby_posture::{install_standby, PostureTracker};
@@ -3533,6 +3981,13 @@ impl StandbyRuntime {
             .clone()
             .ok_or_else(|| Error::config("standby role requires --primary-host or [replication] primary_host"))?;
         let sources = resolve_replication_sources(&primary)?;
+        let transport = replication_transport(
+            &primary,
+            &sources,
+            &ha_config.replication_tls,
+            ha_config.allow_insecure_remote,
+            post_quantum,
+        )?;
         let tracker = std::sync::Arc::new(PostureTracker::new(
             primary.clone(),
             ha_config.sync_mode.clone(),
@@ -3550,6 +4005,7 @@ impl StandbyRuntime {
             config: config.clone(),
             primary,
             sources,
+            transport,
             token,
             identity: ReceiverIdentity {
                 node_id: node.node_id,
@@ -3729,15 +4185,20 @@ async fn forward_receiver_progress(
 }
 
 /// Bootstrap failures worth asking the primary again for: it is unreachable,
-/// timed out, failed on its side, or refused with a code that says "later"
-/// (too many sessions, not serving). An authentication or protocol refusal,
-/// and a local storage refusal, are not.
+/// timed out, failed on its side, failed its TLS handshake (spec P2.2: a
+/// wrong CA or certificate is a transport failure — the next attempt reads
+/// the CA file again), or refused with a code that says "later" (too many
+/// sessions, not serving). An authentication or protocol refusal, and a
+/// local storage refusal, are not. A retried bootstrap resumes its download
+/// from the progress record.
 #[cfg(feature = "ha-tier1")]
 fn bootstrap_retryable(error: &heliosdb_nano::replication::physical_receiver::ReceiverError) -> bool {
     use heliosdb_nano::replication::physical_receiver::ReceiverError;
     use heliosdb_nano::replication::physical_wire::WireError;
     match error {
-        ReceiverError::Wire(WireError::Io(_) | WireError::Timeout | WireError::Source(_) | WireError::Poisoned) => true,
+        ReceiverError::Wire(
+            WireError::Io(_) | WireError::Timeout | WireError::Tls(_) | WireError::Source(_) | WireError::Poisoned,
+        ) => true,
         ReceiverError::Wire(WireError::Refused(refusal)) => refusal.code.retryable(),
         _ => false,
     }
@@ -3766,6 +4227,7 @@ async fn bootstrap_physical_standby(
         let (progress, observed) = tokio::sync::watch::channel(ReceiverStatus::Connecting {
             history: None,
             after: None,
+            last_error: None,
         });
         let forward = tokio::spawn(forward_receiver_progress(
             observed,
@@ -3923,6 +4385,7 @@ async fn run_physical_standby(
     let (progress, observed) = tokio::sync::watch::channel(ReceiverStatus::Connecting {
         history: Some(history),
         after: None,
+        last_error: None,
     });
     let forward = tokio::spawn(forward_receiver_progress(
         observed,
@@ -5469,16 +5932,25 @@ impl PhysicalSourceArgs {
 
 #[derive(clap::Args, Debug)]
 struct ResyncArgs {
-    /// The primary's replication port, reached through loopback or an authenticated tunnel.
+    /// The primary's replication port: over TLS for a non-loopback primary
+    /// (--primary-tls and the other standby TLS flags apply), or plaintext on
+    /// loopback.
     #[arg(long)]
     primary_host: String,
-    /// Absent destination for a fresh snapshot. Existing data is never overwritten.
+    /// Absent destination for a fresh snapshot. Existing data is never
+    /// overwritten; an interrupted download into it is resumed (spec P2.2).
     #[arg(short, long)]
     data_dir: PathBuf,
     #[arg(short, long)]
     config: Option<PathBuf>,
     #[command(flatten)]
     physical: PhysicalTransferArgs,
+    #[command(flatten)]
+    primary_tls: PrimaryTlsArgs,
+    /// Plaintext to a non-loopback primary, token included: isolated
+    /// development only.
+    #[arg(long)]
+    allow_insecure_replication_remote: bool,
     /// Pin source dataset UUID; mandatory when resuming an installed physical replica.
     #[arg(long)]
     expected_history: Option<uuid::Uuid>,
@@ -5730,6 +6202,13 @@ struct PreparedPhysicalSource {
     /// kernel reaps a standby whose host vanished. Keepalive only — no idle
     /// timeout, since a standby of an idle primary sends only heartbeats.
     tcp_keepalive: Option<heliosdb_nano::protocol::postgres::timeouts::TcpKeepaliveSettings>,
+    /// Spec P2.2: the TLS acceptor when the port serves TLS; every accepted
+    /// connection completes its handshake before its session starts.
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    /// Spec P2.2: bootstrap copies' exports, leased past their sessions so an
+    /// interrupted download resumes; swept every `lease_sweep`.
+    leases: heliosdb_nano::replication::physical_source::ExportLeases,
+    lease_sweep: std::time::Duration,
 }
 
 /// How many connections past `[replication.physical] max_sessions` a source
@@ -5749,10 +6228,11 @@ async fn prepare_physical_source(
     node: &HaNode,
     pg_addr: std::net::SocketAddr,
     storage: &heliosdb_nano::storage::StorageEngine,
+    server_tls: Option<&heliosdb_nano::replication::physical_tls::ReplicationServerTls>,
 ) -> Result<Option<PreparedPhysicalSource>> {
     use heliosdb_nano::replication::ha_state::ha_state;
-    use heliosdb_nano::replication::physical_source::{SourceWorkLimiter, StandbyRegistryObserver};
-    use heliosdb_nano::replication::physical_wire::{bind_loopback, SourceContext, SourceIdentity};
+    use heliosdb_nano::replication::physical_source::{ExportLeases, SourceWorkLimiter, StandbyRegistryObserver};
+    use heliosdb_nano::replication::physical_wire::{bind_replication, SourceContext, SourceIdentity};
     let config = &ha_config.physical;
     if !config.enabled {
         if !ha_config.sync_mode.eq_ignore_ascii_case("async") {
@@ -5783,25 +6263,33 @@ async fn prepare_physical_source(
     let token = node.auth.clone().ok_or_else(|| {
         Error::config("physical source requires --replication-token-file or [replication] token_file")
     })?;
-    let address = replication_listen_address(pg_addr.ip(), ha_config.replication_port);
-    if !pg_addr.ip().is_loopback() {
+    // Spec P2.2: the port binds on --listen's address when it serves TLS (or
+    // plaintext over the network was explicitly allowed); otherwise it stays
+    // on loopback, whatever --listen opens.
+    let acceptor = server_tls
+        .map(heliosdb_nano::replication::physical_tls::ReplicationServerTls::acceptor)
+        .transpose()?;
+    let address = replication_listen_address(
+        pg_addr.ip(),
+        ha_config.replication_port,
+        acceptor.is_some() || ha_config.allow_insecure_remote,
+    );
+    if !address.ip().is_loopback() && acceptor.is_none() {
+        tracing::warn!("{}", insecure_replication_banner("primary"));
+    } else if !pg_addr.ip().is_loopback() && address.ip().is_loopback() {
         info!(
-            "the replication port listens on {address} only: it stays on loopback until TLS replication, \
-             whatever --listen opens; reach it from another host through an authenticated tunnel"
+            "the replication port listens on {address} only: it stays on loopback without TLS, whatever --listen \
+             opens; serve standbys on other hosts with --replication-tls"
         );
     }
-    if ha_config.allow_insecure_remote {
-        tracing::warn!(
-            "--allow-insecure-replication-remote has no effect in this release: the replication port listens on \
-             loopback only ({address})"
-        );
-    }
-    let listener = bind_loopback(address).await.map_err(|e| {
-        Error::network(format!(
-            "Cannot bind the replication listener {address} (NPHYS002): {e}. Use distinct PostgreSQL --port and \
-             --replication-port endpoints; a standby's --primary-host names this port."
-        ))
-    })?;
+    let listener = bind_replication(address, acceptor.is_some(), ha_config.allow_insecure_remote)
+        .await
+        .map_err(|e| {
+            Error::network(format!(
+                "Cannot bind the replication listener {address} (NPHYS002): {e}. Use distinct PostgreSQL --port \
+                 and --replication-port endpoints; a standby's --primary-host names this port."
+            ))
+        })?;
     let db = storage.db();
     let state = ha_state();
     state.set_history(Some(history));
@@ -5819,8 +6307,17 @@ async fn prepare_physical_source(
             pg_port: pg_addr.port(),
         },
         observer: std::sync::Arc::new(StandbyRegistryObserver::new(&db)),
+        tls: acceptor.is_some(),
     });
-    info!("Replication port listening on {address} (NPHYS002, dataset history {history})");
+    info!(
+        "Replication port listening on {address} (NPHYS002, {}, dataset history {history})",
+        match server_tls {
+            Some(tls) if tls.mutual() => "TLS, client certificates required",
+            Some(_) => "TLS",
+            None => "plaintext",
+        }
+    );
+    let lease_secs = ha_config.replication_tls.snapshot_export_lease_secs;
     Ok(Some(PreparedPhysicalSource {
         listener,
         address,
@@ -5835,7 +6332,29 @@ async fn prepare_physical_source(
             &storage.config().server,
         )
         .tcp_keepalive,
+        tls: acceptor,
+        leases: ExportLeases::new(
+            std::time::Duration::from_secs(lease_secs),
+            ha_config.replication_tls.snapshot_export_max_leases,
+        ),
+        // Half the lease, between 1 s and a minute: an expired lease stops
+        // pinning SST files soon after it runs out.
+        lease_sweep: std::time::Duration::from_secs((lease_secs / 2).clamp(1, 60)),
     }))
+}
+
+/// Spec P2.2: a replication connection whose TLS handshake failed: logged
+/// with its peer and counted (a shutdown during the handshake is neither).
+#[cfg(feature = "ha-tier1")]
+fn log_replication_handshake_failure(
+    peer: std::net::SocketAddr,
+    error: &heliosdb_nano::replication::physical_wire::WireError,
+) {
+    if matches!(error, heliosdb_nano::replication::physical_wire::WireError::Shutdown) {
+        return;
+    }
+    let failures = heliosdb_nano::replication::physical_tls::note_handshake_failure();
+    tracing::warn!("replication TLS handshake from {peer} failed ({failures} so far): {error}");
 }
 
 /// Directly owned by main, never detached. The listener is bound before readiness;
@@ -5847,7 +6366,9 @@ async fn serve_physical_source(
     source: Option<PreparedPhysicalSource>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    use heliosdb_nano::replication::physical_wire::{refuse_session, serve_session, Refusal, RefuseCode};
+    use heliosdb_nano::replication::physical_wire::{
+        accept_replication, refuse_session, serve_session, Refusal, RefuseCode,
+    };
     let Some(source) = source else {
         while !*shutdown.borrow() {
             if shutdown.changed().await.is_err() {
@@ -5862,6 +6383,10 @@ async fn serve_physical_source(
     let mut refusing = tokio::task::JoinSet::new();
     let limits = physical_wire_limits(&source.config);
     let max_sessions = source.config.max_sessions;
+    let acceptor = source.tls.clone();
+    // Spec P2.2: leased exports whose lease ran out stop pinning SST files.
+    let mut lease_sweep = tokio::time::interval(source.lease_sweep);
+    lease_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result = loop {
         if *shutdown.borrow() {
             break Ok(());
@@ -5873,15 +6398,33 @@ async fn serve_physical_source(
                 if let Some(Err(error)) = completed { tracing::warn!("replication session task failed: {error}"); }
             }
             _ = refusing.join_next(), if !refusing.is_empty() => {}
+            _ = lease_sweep.tick() => {
+                let expired = source.leases.expire(std::time::Instant::now());
+                if !expired.is_empty() {
+                    info!("replication: {} leased snapshot export(s) expired and were removed", expired.len());
+                    // Removing a checkpoint directory is file-system work.
+                    let _ = tokio::task::spawn_blocking(move || drop(expired)).await;
+                }
+            }
             accepted = source.listener.accept(), if sessions.len() < max_sessions || refusing.len() < REFUSING_SESSIONS => {
+                // Spec P2.2: peers on other hosts are served (the listener is
+                // bound remotely only over TLS or with the plaintext opt-in);
+                // every peer still authenticates with the token.
                 let (stream, peer) = match accepted { Ok(value) => value, Err(error) => break Err(Error::network(format!("replication accept failed: {error}"))) };
-                if !peer.ip().is_loopback() { continue; }
                 if let Err(error) = heliosdb_nano::protocol::postgres::timeouts::apply_tcp_keepalive(&stream, &source.tcp_keepalive) {
                     tracing::warn!("Failed to enable TCP keepalive for the replication session from {peer}: {error}");
                 }
-                let stop = session_shutdown.clone();
+                let mut stop = session_shutdown.clone();
+                let acceptor = acceptor.clone();
                 if sessions.len() >= max_sessions {
                     refusing.spawn(async move {
+                        let stream = match accept_replication(stream, acceptor.as_ref(), &limits, &mut stop).await {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                log_replication_handshake_failure(peer, &error);
+                                return;
+                            }
+                        };
                         let refusal = Refusal::new(
                             RefuseCode::TooManySessions,
                             format!("this primary already serves {max_sessions} replication sessions ([replication.physical] max_sessions)"),
@@ -5896,11 +6439,21 @@ async fn serve_physical_source(
                 let export = source.export_dir.clone();
                 let history = source.history;
                 let work = source.work.clone();
+                let leases = source.leases.clone();
                 let token = token.clone();
                 let context = source.context.clone();
                 sessions.spawn(async move {
+                    // No `Refuse` frame can precede a handshake: a failed one
+                    // is logged with its peer and counted.
+                    let stream = match accept_replication(stream, acceptor.as_ref(), &limits, &mut stop).await {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            log_replication_handshake_failure(peer, &error);
+                            return;
+                        }
+                    };
                     let result = serve_session(stream, &token, limits, stop, &context, Some(peer),
-                        move |request| heliosdb_nano::replication::physical_source::open_primary_session(db, history, export, limits.transfer, request, work)
+                        move |request| heliosdb_nano::replication::physical_source::open_primary_session(db, history, export, limits.transfer, request, work, leases)
                     ).await;
                     if let Err(error) = result { tracing::warn!("replication session from {peer} ended: {error}"); }
                 });
@@ -5946,7 +6499,13 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
             Config::default()
         };
         args.physical.apply(&mut config.replication);
+        args.primary_tls.apply(&mut config.replication);
+        if args.allow_insecure_replication_remote {
+            config.replication.allow_insecure_remote = true;
+        }
+        config.replication.validate()?;
         let replication = config.replication.clone();
+        let tls_settings = ReplicationTlsSettings::from_config(&replication);
         let mut physical = replication.physical;
         physical.validate()?;
         if !(1..=60_000).contains(&args.poll_interval_ms)
@@ -5977,20 +6536,16 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
         .map_err(|_| Error::network("physical source DNS lookup timed out"))?
         .map_err(|e| Error::network(e.to_string()))?
         .collect::<Vec<_>>();
-        if resolved.is_empty() || resolved.iter().any(|address| !address.ip().is_loopback()) {
-            return Err(Error::config("initial physical transfer supports loopback only; use an authenticated tunnel to the remote primary, not plaintext over a remote network"));
-        }
-        let mut sources = Vec::new();
-        for address in resolved {
-            if !sources.contains(&address) {
-                sources.push(address);
-            }
-        }
-        if sources.len() > 16 {
-            return Err(Error::config(
-                "physical source hostname resolves to more than 16 addresses",
-            ));
-        }
+        let sources = dedup_replication_sources(&args.primary_host, resolved)?;
+        // Spec P2.2: TLS to a non-loopback primary (the default there), or
+        // the explicit plaintext opt-in.
+        let transport = replication_transport(
+            &args.primary_host,
+            &sources,
+            &tls_settings,
+            replication.allow_insecure_remote,
+            tls_settings.tls_post_quantum.unwrap_or(true),
+        )?;
         let token =
             heliosdb_nano::replication::read_replication_token(replication.token_file.as_ref().ok_or_else(|| {
                 Error::config("resync requires --replication-token-file or [replication] token_file")
@@ -6019,6 +6574,7 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
         let options = ReceiverOptions {
             config,
             sources,
+            transport,
             token,
             identity,
             start,
@@ -6038,6 +6594,7 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
         let (progress, mut statuses) = tokio::sync::watch::channel(ReceiverStatus::Connecting {
             history: None,
             after: None,
+            last_error: None,
         });
         println!("Physical receiver only: no SQL listener or serving-readiness publication. Strict hydration/publication is a separate prerequisite.");
         let receiver = run_receiver(options, shutdown, progress);
@@ -6200,38 +6757,160 @@ mod physical_cli_tests {
         assert_eq!(replication_port, Some(27741));
         assert_eq!(primary_host.as_deref(), Some("127.0.0.1:27741"));
     }
-    /// The replication port stays on loopback whatever `--listen` opens (spec
-    /// P2.1, until TLS replication).
+    /// Spec P2.2: the replication port stays on loopback whatever `--listen`
+    /// opens, unless it serves TLS (or plaintext over the network was
+    /// allowed): then it binds `--listen`'s address.
     #[test]
-    fn replication_port_listens_on_loopback_only() {
+    fn replication_port_listens_on_loopback_unless_remote_is_allowed() {
         use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        for remote in [false, true] {
+            assert_eq!(
+                replication_listen_address(IpAddr::V6(Ipv6Addr::LOCALHOST), 6000, remote),
+                "[::1]:6000".parse().unwrap()
+            );
+            assert_eq!(
+                replication_listen_address(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 6000, remote),
+                "127.0.0.2:6000".parse().unwrap()
+            );
+        }
         assert_eq!(
-            replication_listen_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5433),
+            replication_listen_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5433, false),
             "127.0.0.1:5433".parse().unwrap()
         );
         assert_eq!(
-            replication_listen_address(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 5433),
+            replication_listen_address(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 5433, false),
             "127.0.0.1:5433".parse().unwrap()
         );
         assert_eq!(
-            replication_listen_address(IpAddr::V6(Ipv6Addr::LOCALHOST), 6000),
-            "[::1]:6000".parse().unwrap()
+            replication_listen_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5433, true),
+            "0.0.0.0:5433".parse().unwrap()
         );
         assert_eq!(
-            replication_listen_address(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 6000),
-            "127.0.0.2:6000".parse().unwrap()
+            replication_listen_address(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)), 5433, true),
+            "10.0.0.7:5433".parse().unwrap()
         );
     }
     #[cfg(feature = "ha-tier1")]
     #[test]
-    fn a_standby_primary_host_must_resolve_to_loopback() {
+    fn a_standby_primary_host_resolves_to_between_one_and_sixteen_addresses() {
         assert_eq!(
             resolve_replication_sources("127.0.0.1:27741").unwrap(),
             vec!["127.0.0.1:27741".parse().unwrap()]
         );
-        for refused in ["192.0.2.1:5433", "127.0.0.1:0", "127.0.0.1"] {
+        assert_eq!(
+            resolve_replication_sources("192.0.2.1:5433").unwrap(),
+            vec!["192.0.2.1:5433".parse().unwrap()]
+        );
+        for refused in ["127.0.0.1:0", "127.0.0.1"] {
             assert!(resolve_replication_sources(refused).is_err(), "{refused}");
         }
+    }
+    /// Spec P2.2, the standby rule: a non-loopback primary is reached over
+    /// TLS — the default there — or, plaintext, only with the opt-in; loopback
+    /// stays plaintext unless TLS is asked for.
+    #[cfg(feature = "ha-tier1")]
+    #[test]
+    fn a_non_loopback_primary_needs_tls_or_the_plaintext_opt_in() {
+        let remote: Vec<std::net::SocketAddr> = vec!["192.0.2.1:5433".parse().unwrap()];
+        let loopback: Vec<std::net::SocketAddr> = vec!["127.0.0.1:5433".parse().unwrap()];
+        let defaults = ReplicationTlsSettings::from_config(&heliosdb_nano::config::ReplicationConfig::default());
+        let plaintext = ReplicationTlsSettings {
+            primary_tls: Some(false),
+            ..defaults.clone()
+        };
+        let error = replication_transport("192.0.2.1:5433", &remote, &plaintext, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("--primary-host 192.0.2.1:5433 resolves to 192.0.2.1:5433")
+                && error.contains("--allow-insecure-replication-remote"),
+            "{error}"
+        );
+        let opted_in = replication_transport("192.0.2.1:5433", &remote, &plaintext, true, true).unwrap();
+        assert!(opted_in.tls.is_none() && opted_in.allow_insecure_remote);
+        let on_loopback = replication_transport("127.0.0.1:5433", &loopback, &defaults, false, true).unwrap();
+        assert!(on_loopback.tls.is_none(), "loopback stays plaintext by default");
+        // TLS is the default for a remote primary; with no CA named and no
+        // system trust store it would be refused at start, so name a CA file
+        // that does not exist: the refusal proves TLS was chosen.
+        let missing_ca = ReplicationTlsSettings {
+            primary_tls_ca_path: Some(PathBuf::from("/nonexistent/ca.pem")),
+            ..defaults.clone()
+        };
+        let error = replication_transport("192.0.2.1:5433", &remote, &missing_ca, false, true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("replication TLS"), "{error}");
+        let insecure = ReplicationTlsSettings {
+            primary_tls_insecure_skip_verify: true,
+            ..defaults
+        };
+        assert!(replication_transport("192.0.2.1:5433", &remote, &insecure, false, true).is_err());
+        let skipping = replication_transport("192.0.2.1:5433", &remote, &insecure, true, true).unwrap();
+        assert!(skipping.tls.is_some_and(|tls| tls.insecure_skip_verify()));
+    }
+    /// Spec P2.2: every replication TLS flag parses and reaches the config,
+    /// and survives the daemon re-exec.
+    #[test]
+    fn replication_tls_flags_reach_the_config_and_survive_daemon_reexec() {
+        let cli = Cli::try_parse_from([
+            "nano",
+            "start",
+            "--replication-tls",
+            "--replication-tls-cert",
+            "/c.pem",
+            "--replication-tls-key",
+            "/k.pem",
+            "--replication-tls-ca",
+            "/ca.pem",
+            "--replication-tls-post-quantum=false",
+            "--primary-tls=false",
+            "--primary-ca",
+            "/pca.pem",
+            "--primary-server-name",
+            "db.example",
+            "--primary-client-cert",
+            "/cc.pem",
+            "--primary-client-key",
+            "/ck.pem",
+            "--snapshot-export-lease-secs",
+            "7",
+            "--snapshot-export-max-leases",
+            "3",
+        ])
+        .unwrap();
+        let Commands::Start { replication_tls, .. } = cli.command else {
+            panic!("wrong command")
+        };
+        let mut config = heliosdb_nano::config::ReplicationConfig::default();
+        replication_tls.apply(&mut config);
+        config.validate().unwrap();
+        let settings = ReplicationTlsSettings::from_config(&config);
+        assert!(settings.tls_enabled);
+        assert_eq!(settings.tls_ca_path, Some(PathBuf::from("/ca.pem")));
+        assert_eq!(settings.tls_post_quantum, Some(false));
+        assert_eq!(settings.primary_tls, Some(false));
+        assert_eq!(settings.primary_tls_server_name.as_deref(), Some("db.example"));
+        assert_eq!(settings.snapshot_export_lease_secs, 7);
+        assert_eq!(settings.snapshot_export_max_leases, 3);
+        let mut argv = vec!["nano".to_string(), "start".to_string()];
+        argv.extend(settings.daemon_args());
+        let Commands::Start { replication_tls, .. } = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("wrong command")
+        };
+        let mut child = heliosdb_nano::config::ReplicationConfig::default();
+        replication_tls.apply(&mut child);
+        let forwarded = ReplicationTlsSettings::from_config(&child);
+        assert_eq!(format!("{forwarded:?}"), format!("{settings:?}"));
+        // A bare --primary-tls means true.
+        let Commands::Start { replication_tls, .. } =
+            Cli::try_parse_from(["nano", "start", "--primary-tls"]).unwrap().command
+        else {
+            panic!("wrong command")
+        };
+        let mut bare = heliosdb_nano::config::ReplicationConfig::default();
+        replication_tls.apply(&mut bare);
+        assert_eq!(bare.primary_tls, Some(true));
     }
     #[cfg(all(feature = "ha-tier1", unix))]
     #[test]

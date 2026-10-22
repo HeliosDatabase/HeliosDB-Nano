@@ -27,11 +27,9 @@ redo window, default 0).
   default 5433) is the single replication port, and a standby's
   `--primary-host` names it; a standby pointed at a PostgreSQL or HTTP port is
   told so. `NPHYS001` peers are refused with a typed `Version` refusal naming
-  both versions, and a 4.41.x native peer is told to upgrade. The replication
-  port stays loopback-only until TLS replication (spec P2.2), whatever
-  `--listen` opens; `--allow-insecure-replication-remote` /
-  `[replication] allow_insecure_remote` are accepted but have no effect yet (a
-  WARN says so).
+  both versions, and a 4.41.x native peer is told to upgrade. Without TLS the
+  replication port stays on loopback whatever `--listen` opens (see "Added —
+  TLS replication and resumable snapshot" for remote standbys).
 - **Removed: the separate physical endpoint.** `--physical-replication-listen`,
   `[replication.physical] listen` and its derived default (the replication port
   + 7) are gone; the replication port is the one port.
@@ -104,6 +102,87 @@ redo window, default 0).
   drops the `"physical"` port key (the `"replication"` port is the one port)
   and adds `"standbys"`, the number of standbys the primary's `/health` lists.
 
+### Added — TLS replication and resumable snapshot
+- **Remote standbys over TLS** (spec P2.2) on the one replication port; the
+  protocol is unchanged inside the TLS stream, and the token is still required
+  in every mode. Primary: `--replication-tls` (`[replication] tls_enabled`) with
+  `--replication-tls-cert` / `--replication-tls-key` (`tls_cert_path` /
+  `tls_key_path`; default: the PostgreSQL `--tls-cert` / `--tls-key` pair, or
+  `[server] tls_cert_path` / `tls_key_path` with `[server] tls_enabled`; with
+  neither the start is refused naming the keys), `--replication-tls-ca`
+  (`tls_ca_path`: mutual TLS, every standby presents a client certificate from
+  that CA) and `--replication-tls-post-quantum[=BOOL]` (`tls_post_quantum`,
+  default: follows `--tls-post-quantum`). Standby: `--primary-tls[=BOOL]`
+  (`primary_tls`, default on for a non-loopback `--primary-host`),
+  `--primary-ca` (`primary_tls_ca_path`, default the system trust store),
+  `--primary-server-name` (`primary_tls_server_name`, default the host of
+  `--primary-host`; an IP is verified as an IP subject alternative name),
+  `--primary-client-cert` / `--primary-client-key`
+  (`primary_tls_client_cert_path` / `primary_tls_client_key_path`) and
+  `--primary-tls-insecure-skip-verify` (`primary_tls_insecure_skip_verify`,
+  honoured only with `allow_insecure_remote`, warned). The certificate files
+  are loaded at start, so a bad one refuses the start; a standby reads its CA
+  and client certificate again at every connection attempt (rotation without a
+  restart). Every flag is forwarded through the daemon re-exec, and `resync`
+  takes the standby flags too.
+- **The listener rule replaces loopback-only.** A plaintext replication port
+  binds on loopback; it binds `--listen`'s non-loopback address only with
+  `--replication-tls` or `--allow-insecure-replication-remote`, and then
+  accepts peers from any address (the per-peer loopback filter is gone). A
+  standby reaches a non-loopback primary over TLS, or in plaintext only with
+  `--allow-insecure-replication-remote`. `--allow-insecure-replication-remote`
+  (`[replication] allow_insecure_remote`) now does what it says, and prints an
+  `INSECURE DEVELOPMENT OVERRIDE` warning once.
+- **A TLS failure is a transport failure.** A wrong CA, an untrusted or
+  misnamed certificate, or a refused client certificate leave a standby
+  `connecting` / `reconnecting` with backoff and the reason `tls: …` — never
+  `needs_recovery`. The primary logs every failed handshake with its peer and
+  counts it.
+- **`tls`, `reason`, `progress` in the replication block.** `/health`, `/ready`
+  and `heliosdb_standby_status` add three fields after the eleven frozen ones
+  (unchanged names and types, for HeliosDB Proxy): `tls` (the session is on
+  TLS, on both roles; capability bit `CAP_TLS` in `Hello` / `HelloOk`),
+  `reason` (a `needs_recovery` reason, or the last connection failure while
+  connecting) and `progress` (a downloading standby's `held/total bytes`).
+- **A resumable bootstrap copy.** A download stages into one sibling of the
+  data directory, `.nano-resync-<hash>`, and records its fsynced progress in
+  `NANO-PHYSICAL-PARTIAL.json` (after every completed file, and every 8 MiB
+  inside one). A transport error during the download reconnects and continues
+  instead of failing it; a restarted standby (or `resync`) resumes the same
+  snapshot, adopting the staging directory only through a verified record
+  (same snapshot and manifest digest, strict file census, complete files
+  re-hashed, the file in progress cut back to its recorded length). Anything
+  else deletes the staging directory — only one that carries this receiver's
+  marker — and starts over, saying why. The record is removed before the copy
+  is verified and installed, so an installed standby carries no extra file.
+- **Export leases.** The primary keeps a bootstrap copy's checkpoint export for
+  `[replication] snapshot_export_lease_secs` (`--snapshot-export-lease-secs`,
+  default 3600, 0..=604800) after its session ends, keyed by snapshot id, and
+  at most `snapshot_export_max_leases` (`--snapshot-export-max-leases`, default
+  4, oldest dropped first); `Open` may name the snapshot a resumed download
+  belongs to. A leased checkpoint hard-links the primary's SST files and pins
+  their disk space while it is kept; it is offered again only while the WAL
+  after its checkpoint is still retained.
+- **`scripts/regress/nano-physical-pair.sh --tls`** generates a throwaway CA
+  with `openssl` and runs the pair over TLS (remembered for the state
+  directory; the PostgreSQL ports are unchanged); its JSON summary adds
+  `"tls"`.
+
+### Fixed — replication (fireproof, plan §D5)
+- **`enable_lockfree_ingestion` is refused on every HA role.** It writes rows
+  straight into the store from its own worker, bypassing the logical WAL, MVCC
+  versions and indexes; its WAL now lives in `<data dir>/lockfree_wal`
+  instead of `data/lockfree_wal` relative to the process's working directory.
+- **An HNSW graph dump is loaded only when it is the one its sidecar
+  describes.** The `vecsnap:` sidecar records the SHA-256 of both dump files;
+  a missing or different file (another checkpoint's, a partial copy) is
+  rebuilt from rows instead of loaded under the wrong row mappings. Sidecars
+  written before this change are rebuilt from rows once.
+- `--dump-on-shutdown` stays refused on a standby (now tested), and the
+  removed logical segment store is part of the removed-symbol source scan.
+- Documented: a standby needs its primary's dataset key, and there is no key
+  rotation command (rotation with standbys attached is unsupported until P5).
+
 ### Fixed — replication
 - **The standby's heartbeat no longer resets the primary's record of it.** The
   native heartbeat reported applied and flushed positions of 0 every 5 seconds,
@@ -140,9 +219,21 @@ redo window, default 0).
   `tests/wal_segment_recovery_tests.rs` with its fixture. Their scenarios that
   still apply run on the physical pair (`physical_standby_serving`,
   `physical_standby_refusals`, `ha_integration`, `replication_restart_gap`).
-- The multi-container lab under `tests/docker` is out of service until remote
-  replication over TLS (spec P2.2); `docs/guides/ha_testing.md` describes how to
-  test HA instead.
+- The multi-container lab under `tests/docker` is out of service (not yet
+  brought up to date for remote standbys over TLS);
+  `docs/guides/ha_testing.md` describes how to test HA instead.
+- Added for spec P2.2: `tests/physical_standby_tls.rs` (a TLS pair on the
+  loopback aliases `127.0.0.2` / `127.0.0.3` with `tls: true` on both roles;
+  mutual TLS; a wrong CA is `reconnecting` with a `tls:` reason, keeps serving
+  and recovers when the CA file is right again; plaintext over the network
+  refused without the opt-in on both sides and accepted with it; the token is
+  still required over TLS), `tests/physical_snapshot_resume.rs` (built with
+  `--features internal-tests`: a bootstrap killed at ~30 % and ~70 % resumes
+  the same snapshot fetching only what its record did not hold, and a new
+  snapshot after the lease expired starts over), `tests/physical_standby_fireproof.rs`
+  (lock-free ingestion refusal and WAL path, a stale or missing HNSW dump is
+  rebuilt from rows, `--dump-on-shutdown` on a standby), and
+  `tests/support/tls_certs.rs` (openssl-generated test certificates).
 
 ### Replication
 - **A primary restart no longer breaks its standby** (field finding J). A clean
