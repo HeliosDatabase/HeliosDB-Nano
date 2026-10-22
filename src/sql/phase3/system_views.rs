@@ -1788,6 +1788,10 @@ impl SystemViewRegistry {
                     status_column("sync_mode", DataType::Text, false),
                     status_column("last_ack_sequence", DataType::Int8, true),
                     status_column("epoch", DataType::Int8, false),
+                    // Spec P2.2, additive after the frozen eleven.
+                    status_column("tls", DataType::Boolean, false),
+                    status_column("reason", DataType::Text, true),
+                    status_column("progress", DataType::Text, true),
                 ],
             },
             description: "Replication posture of this node (standby readiness, cursor, lag)".to_string(),
@@ -6162,6 +6166,9 @@ impl SystemViewRegistry {
                 Value::Int8(i64::try_from(sequence).unwrap_or(i64::MAX))
             }),
             Value::Int8(i64::try_from(block.epoch).unwrap_or(i64::MAX)),
+            Value::Boolean(block.tls),
+            optional_text(block.reason),
+            optional_text(block.progress),
         ])
     }
 

@@ -39,10 +39,33 @@ pub struct Daemon {
     log: PathBuf,
 }
 
+/// How [`Daemon::spawn_with`] starts a daemon beyond its arguments (spec
+/// P2.2): another `--listen` address (a loopback alias such as `127.0.0.2`,
+/// or `0.0.0.0`), and extra environment variables (test hooks).
+#[derive(Default)]
+pub struct SpawnOptions<'a> {
+    /// `--listen`; `127.0.0.1` when `None`.
+    pub listen: Option<&'a str>,
+    pub env: Vec<(&'a str, String)>,
+}
+
 impl Daemon {
     /// `start` with trust auth on loopback, `token`, `args`, and an optional
     /// TOML `config`. Each spawn has its own log (`<name>.log`).
     pub fn spawn(dir: &Path, name: &str, data: &Path, token: &Path, args: &[String], config: Option<&str>) -> Self {
+        Self::spawn_with(dir, name, data, token, args, config, &SpawnOptions::default())
+    }
+
+    /// [`Self::spawn`] with another `--listen` address and extra environment.
+    pub fn spawn_with(
+        dir: &Path,
+        name: &str,
+        data: &Path,
+        token: &Path,
+        args: &[String],
+        config: Option<&str>,
+        options: &SpawnOptions<'_>,
+    ) -> Self {
         let log = dir.join(format!("{name}.log"));
         let file = std::fs::File::create(&log).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_heliosdb-nano"));
@@ -50,7 +73,7 @@ impl Daemon {
             .arg("start")
             .arg("--data-dir")
             .arg(data)
-            .args(["--listen", "127.0.0.1", "--auth", "trust"])
+            .args(["--listen", options.listen.unwrap_or("127.0.0.1"), "--auth", "trust"])
             .arg("--replication-token-file")
             .arg(token)
             .args(args)
@@ -59,6 +82,9 @@ impl Daemon {
             .stdin(Stdio::null())
             .stdout(Stdio::from(file.try_clone().unwrap()))
             .stderr(Stdio::from(file));
+        for (key, value) in &options.env {
+            command.env(key, value);
+        }
         if let Some(config) = config {
             let path = dir.join(format!("{name}.toml"));
             std::fs::write(&path, config).unwrap();
@@ -312,9 +338,14 @@ pub async fn wait_listed(http_port: u16, at_least: u64, budget: Duration, daemon
 // ---------------------------------------------------------------------------
 
 pub async fn connect(port: u16) -> tokio_postgres::Client {
+    connect_to("127.0.0.1", port).await
+}
+
+/// [`connect`] to a PostgreSQL listener on `host` (a loopback alias, spec P2.2).
+pub async fn connect_to(host: &str, port: u16) -> tokio_postgres::Client {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let url = format!("host=127.0.0.1 port={port} user=postgres dbname=postgres connect_timeout=2");
+        let url = format!("host={host} port={port} user=postgres dbname=postgres connect_timeout=2");
         match tokio_postgres::connect(&url, NoTls).await {
             Ok((client, connection)) => {
                 tokio::spawn(connection);
@@ -374,10 +405,15 @@ pub async fn ids(client: &tokio_postgres::Client) -> Result<Vec<i32>, String> {
 
 /// Poll a fresh connection until the standby shows `want`; returns the last observation.
 pub async fn settle(port: u16, want: &[i32], budget: Duration) -> Result<Vec<i32>, String> {
+    settle_on("127.0.0.1", port, want, budget).await
+}
+
+/// [`settle`] on a PostgreSQL listener on `host`.
+pub async fn settle_on(host: &str, port: u16, want: &[i32], budget: Duration) -> Result<Vec<i32>, String> {
     let deadline = Instant::now() + budget;
     loop {
         let seen = match tokio_postgres::connect(
-            &format!("host=127.0.0.1 port={port} user=postgres dbname=postgres connect_timeout=2"),
+            &format!("host={host} port={port} user=postgres dbname=postgres connect_timeout=2"),
             NoTls,
         )
         .await

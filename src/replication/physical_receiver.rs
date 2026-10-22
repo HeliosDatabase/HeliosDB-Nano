@@ -19,12 +19,23 @@
 //! a typed code: [`RefuseCode::retryable`] ones are retried with backoff,
 //! `AuthFailed` a few times, and every other one stops the receiver, which
 //! the serving standby reports as `needs_recovery`.
+//!
+//! Spec P2.2: the session runs over the receiver's [`ReplicationTransport`]
+//! — TLS to a remote source, plaintext on loopback — and a TLS failure is a
+//! transport failure (retried with backoff, its reason reported while
+//! connecting). A snapshot download that is interrupted — a transport error,
+//! a killed process — continues where its durable progress record says, from
+//! the same leased export of the source (`checkpoint_transfer`, "Resumable
+//! download"); transport errors during a download reconnect instead of
+//! failing it.
 
 use super::checkpoint_transfer::{
-    ClosedPhysicalStage, PhysicalStage, ReceiverStaging, ReopenedPhysicalStage, TransferLimits,
+    partial_snapshot, CheckpointManifest, ClosedPhysicalStage, PhysicalStage, ReceiverStaging, ReopenedPhysicalStage,
+    StagingStart, TransferLimits,
 };
 use super::physical::{Durability, LocalWriter, PhysicalBatch, PhysicalCursor, MAX_BATCH_BYTES};
 use super::physical_applier::PhysicalApplier;
+use super::physical_tls::{ReplicationStream, ReplicationTransport};
 use super::physical_wire::{
     now_millis, BatchSink, Heartbeat, PhysicalClient, PollSummary, ReceiverIdentity, RefuseCode, SourceSessionInfo,
     TransferToken, WireError, WireLimits,
@@ -51,10 +62,12 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 /// Acknowledgements of durable progress are coalesced to one per this
 /// interval, so a stream of small polls does not double the round trips.
 pub const ACK_COALESCE: Duration = Duration::from_millis(50);
-use tokio::{
-    net::TcpStream,
-    sync::{mpsc, oneshot, watch},
-};
+/// `internal-tests` builds only: a receiver whose download has received at
+/// least this many bytes SIGKILLs its own process — the "standby killed
+/// mid-download" of the resumable-download tests (spec P2.2), at an exact
+/// point instead of a timing race.
+pub const KILL_DOWNLOAD_AT_ENV: &str = "HELIOSDB_NANO_TEST_KILL_DOWNLOAD_AT";
+use tokio::sync::{mpsc, oneshot, watch};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -75,13 +88,17 @@ fn storage(error: impl std::fmt::Display) -> ReceiverError {
 
 #[derive(Clone, Debug)]
 pub enum ReceiverStart {
-    /// Destination must be absent. A failed download retains its private sibling.
+    /// Destination must be absent. A failed download retains its private
+    /// sibling with its progress record, and the next `Snapshot` into the
+    /// same target resumes it — adopted only through a verified record of the
+    /// same snapshot, else deleted and started over (spec P2.2).
     Snapshot {
         target: PathBuf,
         expected_history: Option<Uuid>,
     },
     /// Only a fully initialized physical stage with a valid durable cursor.
-    /// Existing partial downloads and logical replicas are never adopted.
+    /// Logical replicas are never adopted; a partial download is resumed by
+    /// `Snapshot`, never by this.
     Resume { path: PathBuf, history: Uuid },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,14 +107,17 @@ pub enum ReceiverMode {
     Follow,
 }
 
-/// Loopback is deliberate: use an authenticated tunnel for remote sources until
-/// a reviewed TLS transport is provided. Token and mode have no implicit default.
+/// Token, transport and mode have no implicit default. A source on a
+/// non-loopback address needs TLS, or the explicit plaintext opt-in (spec
+/// P2.2, [`ReplicationTransport::allows`]).
 pub struct ReceiverOptions {
     /// The node's configuration. Its storage section decides the RocksDB
     /// options of every open of the receiver's store, so the stage runs with
     /// the same options as the engine that serves it (and as the primary).
     pub config: Config,
     pub sources: Vec<SocketAddr>,
+    /// How every connection reaches a source: TLS or plaintext.
+    pub transport: ReplicationTransport,
     pub token: TransferToken,
     /// What every `Hello` of this receiver announces.
     pub identity: ReceiverIdentity,
@@ -123,16 +143,16 @@ impl ReceiverOptions {
                 "invalid physical receiver identity or heartbeat interval".into(),
             ));
         }
-        if self.sources.is_empty()
-            || self.sources.len() > 16
-            || self
-                .sources
-                .iter()
-                .any(|source| !source.ip().is_loopback() || source.port() == 0)
-        {
+        if self.sources.is_empty() || self.sources.len() > 16 || self.sources.iter().any(|source| source.port() == 0) {
             return Err(ReceiverError::Invalid(
-                "physical receiver requires a loopback tunnel endpoint".into(),
+                "physical receiver requires 1 to 16 source endpoints with a port".into(),
             ));
+        }
+        if let Some(source) = self.sources.iter().find(|source| !self.transport.allows(source)) {
+            return Err(ReceiverError::Invalid(format!(
+                "physical receiver: the source {source} is not loopback; reaching it needs TLS (--primary-tls) or \
+                 the plaintext opt-in (--allow-insecure-replication-remote)"
+            )));
         }
         let transfer = self.wire.transfer;
         if self.poll_byte_limit == 0
@@ -182,15 +202,15 @@ pub type ServingAttach =
 
 #[derive(Clone, Debug)]
 pub enum ReceiverStatus {
+    /// `last_error`: why the previous connection attempt failed, while the
+    /// receiver retries (spec P2.2: a TLS failure reads `tls: …`).
     Connecting {
         history: Option<Uuid>,
         after: Option<u64>,
+        last_error: Option<String>,
     },
-    Downloading {
-        path: PathBuf,
-        received: u64,
-        total: u64,
-    },
+    /// `received` counts every byte the download holds, resumed ones included.
+    Downloading { path: PathBuf, received: u64, total: u64 },
     /// `session` numbers the receiver's connections (1 for the first, one
     /// more per reconnect), so an observer can tell a poll of the streaming
     /// session from the first poll of a new one even when the `Connecting` in
@@ -202,23 +222,25 @@ pub enum ReceiverStatus {
     /// readers of the store see). `source_barrier` is the last physical
     /// barrier observed: the session's connect barrier or a poll's, reported
     /// when the poll announces it, before its groups are applied.
+    ///
+    /// `tls` (here and in `CaughtUp`): the session is on TLS, both ends said
+    /// so (spec P2.2, `CAP_TLS`).
     Applying {
         path: PathBuf,
         cursor: PhysicalCursor,
         source_barrier: Option<u64>,
         session: u64,
+        tls: bool,
     },
     /// Raw physical files installed only. This is not a serving/readiness signal.
-    Installed {
-        path: PathBuf,
-        cursor: PhysicalCursor,
-    },
+    Installed { path: PathBuf, cursor: PhysicalCursor },
     /// Exact physical progress at the last sampled durable source barrier only.
     CaughtUp {
         path: PathBuf,
         cursor: PhysicalCursor,
         source_barrier: u64,
         session: u64,
+        tls: bool,
     },
     Stopped {
         path: Option<PathBuf>,
@@ -246,14 +268,30 @@ impl Position {
     }
 }
 
+/// What a `Begin` did (spec P2.2): where each manifest file's download
+/// continues, and whether the staging directory was new, resumed, or
+/// started over.
+#[derive(Clone, Debug)]
+struct DownloadStart {
+    offsets: Vec<u64>,
+    start: StagingStart,
+}
+
 type Reply<T> = oneshot::Sender<Result<T>>;
 enum Command {
+    /// The snapshot an interrupted download into `target` belongs to: the
+    /// live download's, else its staging directory's progress record's.
+    Inspect {
+        target: PathBuf,
+        reply: Reply<Option<Uuid>>,
+    },
+    /// Start — or continue — the download of `manifest` into `target`.
     Begin {
         target: PathBuf,
         manifest: Vec<u8>,
         history: Uuid,
         limits: TransferLimits,
-        reply: Reply<()>,
+        reply: Reply<DownloadStart>,
     },
     Append {
         index: u32,
@@ -436,6 +474,13 @@ fn worker_loop(
         }
         let mut stop = false;
         match command {
+            Command::Inspect { target, reply } => {
+                let snapshot = match &state {
+                    State::Download(stage) => Some(stage.snapshot_id()),
+                    _ => partial_snapshot(&target),
+                };
+                let _ = reply.send(Ok(snapshot));
+            }
             Command::Begin {
                 target,
                 manifest,
@@ -443,15 +488,7 @@ fn worker_loop(
                 limits,
                 reply,
             } => {
-                let result = if matches!(state, State::Empty) {
-                    ReceiverStaging::begin(&target, &manifest, history, limits)
-                        .map(|stage| {
-                            state = State::Download(stage);
-                        })
-                        .map_err(storage)
-                } else {
-                    Err(storage("snapshot cannot replace existing worker state"))
-                };
+                let result = begin_download(&mut state, &target, &manifest, history, limits);
                 stop = result.is_err();
                 record_position(&state, &last);
                 let _ = reply.send(result);
@@ -601,6 +638,68 @@ fn worker_loop(
         }
     }
 }
+/// The worker's `Begin` (spec P2.2). A live download of the same snapshot —
+/// a reconnect inside one run — continues as it is; any other start goes
+/// through the staging directory on disk, which
+/// `ReceiverStaging::begin_or_resume` adopts only through a verified progress
+/// record (another snapshot's is deleted and started over).
+fn begin_download(
+    state: &mut State,
+    target: &Path,
+    manifest: &[u8],
+    history: Uuid,
+    limits: TransferLimits,
+) -> Result<DownloadStart> {
+    match std::mem::replace(state, State::Empty) {
+        State::Empty => {}
+        State::Download(stage) => {
+            let same = CheckpointManifest::decode(manifest, &limits).is_ok_and(|decoded| stage.holds(&decoded));
+            if same {
+                let offsets = stage.progress().to_vec();
+                let held: u64 = offsets.iter().sum();
+                *state = State::Download(stage);
+                return Ok(DownloadStart {
+                    offsets,
+                    start: StagingStart::Resumed {
+                        held,
+                        redownload: Vec::new(),
+                    },
+                });
+            }
+            // Another snapshot: its record on disk says so, and the staging
+            // directory is started over below.
+        }
+        other => {
+            *state = other;
+            return Err(storage("snapshot cannot replace existing worker state"));
+        }
+    }
+    let (stage, start) = ReceiverStaging::begin_or_resume(target, manifest, history, limits).map_err(storage)?;
+    let offsets = stage.progress().to_vec();
+    *state = State::Download(stage);
+    Ok(DownloadStart { offsets, start })
+}
+
+/// `internal-tests` builds only ([`KILL_DOWNLOAD_AT_ENV`]): SIGKILL this
+/// process once the download holds `received` bytes past the configured mark.
+#[cfg(all(feature = "internal-tests", unix))]
+fn kill_download_hook(received: u64) {
+    static KILL_AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let kill_at = KILL_AT.get_or_init(|| {
+        std::env::var(KILL_DOWNLOAD_AT_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+    });
+    if kill_at.is_some_and(|kill_at| received >= kill_at) {
+        tracing::warn!("{KILL_DOWNLOAD_AT_ENV}: killing this process with {received} bytes downloaded");
+        // SAFETY: kill(2) of this very process with a standard signal; no
+        // pointers, no preconditions.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGKILL);
+        }
+    }
+}
+
 /// fsync the live stage's deferred groups before it is closed — or left to
 /// close with the process, when a serving database still shares its writer.
 /// `LocalWriter::close` syncs too, but only once it owns the handle.
@@ -625,6 +724,7 @@ struct Sink<'a> {
     /// The durable cursor the poll started from.
     cursor: &'a PhysicalCursor,
     session: u64,
+    tls: bool,
 }
 #[async_trait]
 impl BatchSink for Sink<'_> {
@@ -635,6 +735,7 @@ impl BatchSink for Sink<'_> {
                 cursor: self.cursor.clone(),
                 source_barrier: Some(summary.durable_barrier),
                 session: self.session,
+                tls: self.tls,
             });
         }
         Ok(())
@@ -665,11 +766,12 @@ async fn wait_or_stop(delay: Duration, shutdown: &mut watch::Receiver<bool>) -> 
         }
     }
 }
-/// Worth reconnecting for: a transport failure, or a source that refused
-/// with a code that says "later" ([`RefuseCode::retryable`]).
+/// Worth reconnecting for: a transport failure — a TLS failure included
+/// (spec P2.2: a wrong CA or certificate says nothing about the data) — or a
+/// source that refused with a code that says "later" ([`RefuseCode::retryable`]).
 fn retryable(error: &WireError) -> bool {
     match error {
-        WireError::Io(_) | WireError::Timeout => true,
+        WireError::Io(_) | WireError::Timeout | WireError::Tls(_) => true,
         WireError::Refused(refusal) => refusal.code.retryable(),
         _ => false,
     }
@@ -722,7 +824,7 @@ impl Acknowledgements {
         }
     }
 }
-fn check_session_barrier(client: &PhysicalClient<TcpStream>, known_barrier: u64) -> Result<u64> {
+fn check_session_barrier(client: &PhysicalClient<ReplicationStream>, known_barrier: u64) -> Result<u64> {
     session_barrier(client.session_info(), known_barrier)
 }
 fn session_barrier(info: Option<&SourceSessionInfo>, known_barrier: u64) -> Result<u64> {
@@ -751,7 +853,8 @@ async fn connect(
     cursor: Option<&PhysicalCursor>,
     attempts: &mut u32,
     serving: bool,
-) -> Result<PhysicalClient<TcpStream>> {
+    lost: Option<String>,
+) -> Result<PhysicalClient<ReplicationStream>> {
     // A fresh snapshot names the history it was pinned to, if any.
     let snapshot_history = match &options.start {
         ReceiverStart::Snapshot { expected_history, .. } => *expected_history,
@@ -759,6 +862,10 @@ async fn connect(
     };
     let mut auth_failures = 0_u32;
     let mut delay = options.reconnect_delay;
+    // Why the previous attempt failed — at first, why the session this
+    // connection replaces was lost — reported while retrying (spec P2.2: a
+    // TLS failure is visible on `/health` as the posture's reason).
+    let mut previous_error: Option<String> = lost;
     loop {
         let mut last_error = None;
         // These are the actual authenticated connections, never readiness probes.
@@ -770,10 +877,15 @@ async fn connect(
             }
             let history = cursor.map(PhysicalCursor::history);
             let after = cursor.map(PhysicalCursor::source_sequence);
-            progress.send_replace(ReceiverStatus::Connecting { history, after });
+            progress.send_replace(ReceiverStatus::Connecting {
+                history,
+                after,
+                last_error: previous_error.clone(),
+            });
             let result = if let Some(cursor) = cursor {
-                PhysicalClient::connect_resume_loopback(
+                PhysicalClient::connect_resume_replication(
                     *source,
+                    &options.transport,
                     &options.token,
                     &options.identity,
                     options.wire,
@@ -784,13 +896,29 @@ async fn connect(
                 .await
             } else {
                 let hello = options.identity.hello(snapshot_history, None);
-                PhysicalClient::connect_loopback(*source, &options.token, hello, options.wire, shutdown.clone()).await
+                PhysicalClient::connect_replication(
+                    *source,
+                    &options.transport,
+                    &options.token,
+                    hello,
+                    options.wire,
+                    shutdown.clone(),
+                )
+                .await
             };
+            if let Err(error) = &result {
+                if !matches!(error, WireError::Shutdown) {
+                    previous_error = Some(error.to_string());
+                }
+                if matches!(error, WireError::Tls(_)) {
+                    tracing::warn!("the TLS connection to the physical source at {source} failed: {error}");
+                }
+            }
             match result {
                 Ok(client) => {
                     let ok = client.hello_ok();
                     tracing::info!(
-                        "Standby dataset history verified: {} (primary node {}, epoch {}, replication endpoint {})",
+                        "Standby dataset history verified: {} (primary node {}, epoch {}, replication endpoint {}, {})",
                         ok.history,
                         ok.node_id,
                         ok.epoch,
@@ -798,7 +926,8 @@ async fn connect(
                             source.to_string()
                         } else {
                             ok.physical_endpoint.clone()
-                        }
+                        },
+                        if client.tls() { "TLS" } else { "plaintext" }
                     );
                     return Ok(client);
                 }
@@ -821,6 +950,13 @@ async fn connect(
             return Err(error.into());
         }
         *attempts = attempts.saturating_add(1);
+        // The round failed: say why for the whole backoff, not only from the
+        // next attempt on.
+        progress.send_replace(ReceiverStatus::Connecting {
+            history: cursor.map(PhysicalCursor::history),
+            after: cursor.map(PhysicalCursor::source_sequence),
+            last_error: previous_error.clone(),
+        });
         if wait_or_stop(delay, shutdown).await {
             return Err(WireError::Shutdown.into());
         }
@@ -836,14 +972,14 @@ async fn connect(
 #[allow(clippy::too_many_arguments)]
 async fn reconnect(
     error: WireError,
-    client: PhysicalClient<TcpStream>,
+    client: PhysicalClient<ReplicationStream>,
     options: &ReceiverOptions,
     shutdown: &mut watch::Receiver<bool>,
     progress: &watch::Sender<ReceiverStatus>,
     worker: &Worker,
     reconnects: &mut u32,
     serving: bool,
-) -> Result<PhysicalClient<TcpStream>> {
+) -> Result<PhysicalClient<ReplicationStream>> {
     // Discard poisoned framing before reconnect. FIFO drain is essential: a
     // sink deadline may have expired while its durable apply was still
     // completing on the owned worker.
@@ -869,10 +1005,183 @@ async fn reconnect(
         return Err(WireError::Shutdown.into());
     }
     *reconnects = reconnects.saturating_add(1);
+    let lost = error.to_string();
+    progress.send_replace(ReceiverStatus::Connecting {
+        history: Some(durable.history()),
+        after: Some(durable.source_sequence()),
+        last_error: Some(lost.clone()),
+    });
     if wait_or_stop(options.reconnect_delay, shutdown).await {
         return Err(WireError::Shutdown.into());
     }
-    connect(options, shutdown, progress, Some(&durable), reconnects, serving).await
+    connect(
+        options,
+        shutdown,
+        progress,
+        Some(&durable),
+        reconnects,
+        serving,
+        Some(lost),
+    )
+    .await
+}
+
+/// A snapshot download's transport failure (spec P2.2): reconnect with the
+/// usual backoff and continue from the bytes held, instead of failing the
+/// download — unless it is not worth retrying, or a non-serving receiver ran
+/// out of reconnects (its next run resumes from the progress record).
+async fn retry_download(
+    error: WireError,
+    options: &ReceiverOptions,
+    shutdown: &mut watch::Receiver<bool>,
+    reconnects: &mut u32,
+    serving: bool,
+) -> Result<()> {
+    if !retryable(&error) || (!serving && *reconnects >= options.max_reconnects) {
+        return Err(error.into());
+    }
+    *reconnects = reconnects.saturating_add(1);
+    tracing::warn!("the snapshot download was interrupted ({error}); reconnecting to continue from the bytes held");
+    if wait_or_stop(options.reconnect_delay, shutdown).await {
+        return Err(WireError::Shutdown.into());
+    }
+    Ok(())
+}
+
+/// Download the source's snapshot into `target` (spec P2.2: resumable) and
+/// open it as the initial stage; returns the session the download finished
+/// on, which continues with physical polls.
+#[allow(clippy::too_many_arguments)]
+async fn download_snapshot(
+    options: &ReceiverOptions,
+    shutdown: &mut watch::Receiver<bool>,
+    progress: &watch::Sender<ReceiverStatus>,
+    worker: &Worker,
+    target: &Path,
+    expected_history: Option<Uuid>,
+    reconnects: &mut u32,
+    serving: bool,
+) -> Result<PhysicalClient<ReplicationStream>> {
+    // Bytes this run fetched from the source (resumed bytes are not fetched).
+    let mut fetched = 0_u64;
+    loop {
+        let mut client = connect(options, shutdown, progress, None, reconnects, serving, None).await?;
+        let preferred = worker
+            .request(|reply| Command::Inspect {
+                target: target.to_path_buf(),
+                reply,
+            })
+            .await?;
+        let manifest: CheckpointManifest = match client.fetch_manifest_preferring(expected_history, preferred).await {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                drop(client);
+                retry_download(error, options, shutdown, reconnects, serving).await?;
+                continue;
+            }
+        };
+        let manifest_bytes = serde_json::to_vec(&manifest).map_err(storage)?;
+        let begun = worker
+            .request(|reply| Command::Begin {
+                target: target.to_path_buf(),
+                manifest: manifest_bytes,
+                history: manifest.history,
+                limits: options.wire.transfer,
+                reply,
+            })
+            .await?;
+        let mut received: u64 = begun.offsets.iter().sum();
+        match &begun.start {
+            StagingStart::Fresh => tracing::info!(
+                "downloading snapshot {} of {}: {} bytes in {} files",
+                manifest.snapshot_id,
+                manifest.history,
+                manifest.total_bytes,
+                manifest.files.len()
+            ),
+            StagingStart::Resumed { held, redownload } => tracing::info!(
+                "resuming the download of snapshot {}: {held} of {} bytes already held and verified{}",
+                manifest.snapshot_id,
+                manifest.total_bytes,
+                if redownload.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "; downloading again, after a digest mismatch: {}",
+                        redownload.join(", ")
+                    )
+                }
+            ),
+            StagingStart::StartedOver { reason } => tracing::warn!(
+                "the snapshot download is starting over with snapshot {}: {reason}",
+                manifest.snapshot_id
+            ),
+        }
+        let path = worker
+            .position()
+            .await?
+            .path
+            .ok_or_else(|| storage("download path missing"))?;
+        progress.send_replace(ReceiverStatus::Downloading {
+            path: path.clone(),
+            received,
+            total: manifest.total_bytes,
+        });
+        let mut interrupted = None;
+        'files: for (index, file) in manifest.files.iter().enumerate() {
+            let mut offset = begun.offsets.get(index).copied().unwrap_or(0);
+            while offset < file.size {
+                if stopped(shutdown) {
+                    return Err(WireError::Shutdown.into());
+                }
+                let length = (file.size - offset).min(options.wire.transfer.max_chunk_bytes as u64) as u32;
+                let bytes = match client.read_chunk(index as u32, offset, length).await {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        interrupted = Some(error);
+                        break 'files;
+                    }
+                };
+                let count = bytes.len() as u64;
+                worker
+                    .request(|reply| Command::Append {
+                        index: index as u32,
+                        offset,
+                        bytes,
+                        reply,
+                    })
+                    .await?;
+                // Progress since the last reconnect: the budget starts again.
+                *reconnects = 0;
+                offset += count;
+                received += count;
+                fetched += count;
+                progress.send_replace(ReceiverStatus::Downloading {
+                    path: path.clone(),
+                    received,
+                    total: manifest.total_bytes,
+                });
+                #[cfg(all(feature = "internal-tests", unix))]
+                kill_download_hook(received);
+            }
+        }
+        if let Some(error) = interrupted {
+            drop(client);
+            retry_download(error, options, shutdown, reconnects, serving).await?;
+            continue;
+        }
+        if stopped(shutdown) {
+            return Err(WireError::Shutdown.into());
+        }
+        tracing::info!(
+            "the download of snapshot {} is complete: {} bytes, {fetched} fetched by this run, {} resumed",
+            manifest.snapshot_id,
+            manifest.total_bytes,
+            manifest.total_bytes.saturating_sub(fetched)
+        );
+        worker.request(|reply| Command::Open { reply }).await?;
+        return Ok(client);
+    }
 }
 
 /// Runs actual snapshot download and physical replay. Any failure retains owned
@@ -979,57 +1288,17 @@ async fn run_inner(
             target,
             expected_history,
         } => {
-            let mut client = connect(options, shutdown, progress, None, &mut reconnects, serving).await?;
-            let manifest = client.fetch_manifest(*expected_history).await?;
-            let manifest_bytes = serde_json::to_vec(&manifest).map_err(storage)?;
-            worker
-                .request(|reply| Command::Begin {
-                    target: target.clone(),
-                    manifest: manifest_bytes,
-                    history: manifest.history,
-                    limits: options.wire.transfer,
-                    reply,
-                })
-                .await?;
-            let path = worker
-                .position()
-                .await?
-                .path
-                .ok_or_else(|| storage("download path missing"))?;
-            let mut received = 0_u64;
-            progress.send_replace(ReceiverStatus::Downloading {
-                path: path.clone(),
-                received,
-                total: manifest.total_bytes,
-            });
-            for (index, file) in manifest.files.iter().enumerate() {
-                let mut offset = 0_u64;
-                while offset < file.size {
-                    let length = (file.size - offset).min(options.wire.transfer.max_chunk_bytes as u64) as u32;
-                    let bytes = client.read_chunk(index as u32, offset, length).await?;
-                    let count = bytes.len() as u64;
-                    worker
-                        .request(|reply| Command::Append {
-                            index: index as u32,
-                            offset,
-                            bytes,
-                            reply,
-                        })
-                        .await?;
-                    offset += count;
-                    received += count;
-                    progress.send_replace(ReceiverStatus::Downloading {
-                        path: path.clone(),
-                        received,
-                        total: manifest.total_bytes,
-                    });
-                }
-            }
-            if stopped(shutdown) {
-                return Err(WireError::Shutdown.into());
-            }
-            worker.request(|reply| Command::Open { reply }).await?;
-            client
+            download_snapshot(
+                options,
+                shutdown,
+                progress,
+                worker,
+                target,
+                *expected_history,
+                &mut reconnects,
+                serving,
+            )
+            .await?
         }
         ReceiverStart::Resume { path, history } => {
             if stopped(shutdown) {
@@ -1044,7 +1313,16 @@ async fn run_inner(
                 })
                 .await?;
             let (_, cursor) = worker.position().await?.initialized()?;
-            connect(options, shutdown, progress, Some(&cursor), &mut reconnects, serving).await?
+            connect(
+                options,
+                shutdown,
+                progress,
+                Some(&cursor),
+                &mut reconnects,
+                serving,
+                None,
+            )
+            .await?
         }
     };
     let mut observed_barrier = check_session_barrier(&client, 0)?;
@@ -1081,11 +1359,13 @@ async fn run_inner(
         // Every reported cursor is durable: the previous poll's groups were
         // synced before this one starts. The barrier is the last physical one
         // observed (the session's connect barrier, or the previous poll's).
+        let tls = client.tls();
         progress.send_replace(ReceiverStatus::Applying {
             path: path.clone(),
             cursor: cursor.clone(),
             source_barrier: Some(observed_barrier),
             session,
+            tls,
         });
         let mut sink = Sink {
             worker,
@@ -1093,6 +1373,7 @@ async fn run_inner(
             path: &path,
             cursor: &cursor,
             session,
+            tls,
         };
         let outcome = client
             .poll(cursor.source_sequence(), options.poll_byte_limit, &mut sink)
@@ -1144,6 +1425,7 @@ async fn run_inner(
                 cursor: durable,
                 source_barrier: Some(summary.durable_barrier),
                 session,
+                tls,
             });
             continue;
         }
@@ -1152,6 +1434,7 @@ async fn run_inner(
             cursor: durable.clone(),
             source_barrier: summary.durable_barrier,
             session,
+            tls,
         });
         if stopped(shutdown) {
             return Err(WireError::Shutdown.into());
@@ -1176,7 +1459,16 @@ async fn run_inner(
                 })
                 .await?;
             let (_, durable) = worker.position().await?.initialized()?;
-            client = connect(options, shutdown, progress, Some(&durable), &mut reconnects, serving).await?;
+            client = connect(
+                options,
+                shutdown,
+                progress,
+                Some(&durable),
+                &mut reconnects,
+                serving,
+                None,
+            )
+            .await?;
             session += 1;
             observed_barrier = check_session_barrier(&client, observed_barrier)?;
             acks = Acknowledgements::new();
@@ -1224,8 +1516,9 @@ async fn run_inner(
 )]
 mod tests {
     use super::super::{
+        checkpoint_transfer::{staging_path_for, PHYSICAL_PARTIAL_FILE},
         history::load_or_create_primary_history,
-        physical_source::{open_primary_session, SourceWorkLimiter},
+        physical_source::{open_primary_session, ExportLeases, SourceWorkLimiter},
         physical_wire::{
             serve_session, OpenRequest, PeerRole, PhysicalSource, SourceContext, SourceIdentity, SourceSessionInfo,
             WireSyncMode,
@@ -1233,12 +1526,28 @@ mod tests {
     };
     use super::*;
     use rocksdb::{Options, DB};
-    use std::{future::Future, pin::Pin, sync::atomic::AtomicUsize};
+    use std::{
+        future::Future,
+        pin::Pin,
+        sync::atomic::{AtomicU64, AtomicUsize},
+    };
+
+    /// What the harness's sources served, across sessions.
+    #[derive(Default)]
+    struct Served {
+        /// Chunks served so far (1-based count) and the bytes in them.
+        chunks: AtomicUsize,
+        bytes: AtomicU64,
+        /// Fail this chunk (1-based, across sessions) once, ending its
+        /// session as a dropped connection would; 0: never.
+        fail_chunk: AtomicUsize,
+    }
 
     struct FaultSource {
         inner: Arc<dyn PhysicalSource>,
         corrupt: bool,
         disconnect_once: Arc<AtomicBool>,
+        served: Arc<Served>,
     }
     #[async_trait]
     impl PhysicalSource for FaultSource {
@@ -1251,7 +1560,17 @@ mod tests {
             offset: u64,
             length: u32,
         ) -> super::super::physical_wire::Result<Vec<u8>> {
+            let number = self.served.chunks.fetch_add(1, Ordering::SeqCst) + 1;
+            if self
+                .served
+                .fail_chunk
+                .compare_exchange(number, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Err(WireError::Source("injected chunk transport failure".into()));
+            }
             let mut bytes = self.inner.read_chunk(index, offset, length).await?;
+            self.served.bytes.fetch_add(bytes.len() as u64, Ordering::SeqCst);
             if self.corrupt {
                 if let Some(first) = bytes.first_mut() {
                     *first ^= 1;
@@ -1277,7 +1596,10 @@ mod tests {
         shutdown: watch::Sender<bool>,
         thread: Option<thread::JoinHandle<()>>,
         snapshots: Arc<AtomicUsize>,
+        /// `OpenRequest::SnapshotOf`: a receiver resuming a download.
+        snapshot_ofs: Arc<AtomicUsize>,
         resumes: Arc<AtomicUsize>,
+        served: Arc<Served>,
     }
     impl SourceHarness {
         fn start(db: Arc<DB>, history: Uuid, parent: PathBuf, corrupt: bool) -> Self {
@@ -1290,10 +1612,15 @@ mod tests {
             let address = listener.local_addr().unwrap();
             let (shutdown, mut stop) = watch::channel(false);
             let snapshots = Arc::new(AtomicUsize::new(0));
+            let snapshot_ofs = Arc::new(AtomicUsize::new(0));
             let resumes = Arc::new(AtomicUsize::new(0));
+            let served = Arc::new(Served::default());
             let observed_snapshots = snapshots.clone();
+            let observed_snapshot_ofs = snapshot_ofs.clone();
             let observed_resumes = resumes.clone();
+            let observed_served = served.clone();
             let work = SourceWorkLimiter::new(2).unwrap();
+            let leases = ExportLeases::new(Duration::from_secs(3600), 4);
             let context = Arc::new(SourceContext::unobserved(SourceIdentity {
                 node_id: Uuid::new_v4(),
                 history,
@@ -1317,13 +1644,19 @@ mod tests {
                                 let (io,_)=accepted.unwrap();
                                 let db=db.clone();let parent=parent.clone();let stop=stop.clone();
                                 let snapshots=observed_snapshots.clone();let resumes=observed_resumes.clone();
+                                let snapshot_ofs=observed_snapshot_ofs.clone();let served=observed_served.clone();
                                 let disconnect_once=disconnect_once.clone();
                                 let work=work.clone();
+                                let leases=leases.clone();
                                 let context=context.clone();
                                 sessions.spawn(async move {
                                     serve_session(io,&fixture_token(),wire_limits(),stop,&context,None,move |request|async move {
-                                        match request {OpenRequest::Snapshot=>{snapshots.fetch_add(1,Ordering::SeqCst);},OpenRequest::Resume{..}=>{resumes.fetch_add(1,Ordering::SeqCst);}}
-                                        let source=open_primary_session(db.clone(),history,parent,TransferLimits::default(),request,work).await?;
+                                        match request {
+                                            OpenRequest::Snapshot=>{snapshots.fetch_add(1,Ordering::SeqCst);},
+                                            OpenRequest::SnapshotOf{..}=>{snapshot_ofs.fetch_add(1,Ordering::SeqCst);},
+                                            OpenRequest::Resume{..}=>{resumes.fetch_add(1,Ordering::SeqCst);},
+                                        }
+                                        let source=open_primary_session(db.clone(),history,parent,TransferLimits::default(),request,work,leases).await?;
                                         if matches!(request,OpenRequest::Snapshot) {
                                             // Write AFTER the checkpoint: receiving this value proves
                                             // the continuation stream was consumed, not only file copy.
@@ -1331,7 +1664,7 @@ mod tests {
                                                 .await.map_err(|e|WireError::Source(e.to_string()))?
                                                 .map_err(|e|WireError::Source(e.to_string()))?;
                                         }
-                                        Ok(Arc::new(FaultSource{inner:source,corrupt,disconnect_once}) as Arc<dyn PhysicalSource>)
+                                        Ok(Arc::new(FaultSource{inner:source,corrupt,disconnect_once,served}) as Arc<dyn PhysicalSource>)
                                     }).await
                                 });
                             }
@@ -1348,7 +1681,9 @@ mod tests {
                 shutdown,
                 thread: Some(thread),
                 snapshots,
+                snapshot_ofs,
                 resumes,
+                served,
             }
         }
     }
@@ -1383,6 +1718,7 @@ mod tests {
         ReceiverOptions {
             config: Config::default(),
             sources: vec![source.address],
+            transport: ReplicationTransport::default(),
             token: fixture_token(),
             identity: ReceiverIdentity {
                 node_id: Uuid::new_v4(),
@@ -1405,6 +1741,7 @@ mod tests {
         watch::channel(ReceiverStatus::Connecting {
             history: None,
             after: None,
+            last_error: None,
         })
     }
     async fn complete(future: impl Future<Output = Result<ClosedPhysicalStage>>) -> ClosedPhysicalStage {
@@ -1797,5 +2134,128 @@ mod tests {
         assert_eq!(installed.path, target);
         assert_eq!(installed.cursor.source_sequence(), 2);
         assert_eq!(source.snapshots.load(Ordering::SeqCst), 1);
+    }
+
+    /// The installed copy's manifest total and file count.
+    fn installed_total(target: &Path) -> (u64, usize) {
+        let bytes = std::fs::read(target.join(super::super::checkpoint_transfer::PHYSICAL_MANIFEST_FILE)).unwrap();
+        let manifest = CheckpointManifest::decode(&bytes, &TransferLimits::default()).unwrap();
+        (manifest.total_bytes, manifest.files.len())
+    }
+
+    /// Spec P2.2: a transport failure in the middle of a download reconnects
+    /// and continues — from the same leased export, without fetching a byte
+    /// twice — instead of failing the download.
+    #[tokio::test]
+    async fn a_download_interrupted_by_the_transport_reconnects_and_continues() {
+        let root = tempfile::tempdir().unwrap();
+        let (db, history) = primary(root.path());
+        let source = SourceHarness::start(db, history, root.path().to_path_buf(), false);
+        source.served.fail_chunk.store(3, Ordering::SeqCst);
+        let target = root.path().join("interrupted");
+        let (_stop, shutdown) = watch::channel(false);
+        let (progress, _) = status();
+        let installed = complete(run_receiver(
+            options(
+                &source,
+                ReceiverStart::Snapshot {
+                    target: target.clone(),
+                    expected_history: Some(history),
+                },
+                ReceiverMode::InstallOnce,
+            ),
+            shutdown,
+            progress,
+        ))
+        .await;
+        assert_eq!(installed.path, target);
+        assert_eq!(
+            source.served.fail_chunk.load(Ordering::SeqCst),
+            0,
+            "the failure was injected"
+        );
+        assert_eq!(source.snapshots.load(Ordering::SeqCst), 1, "one export");
+        assert_eq!(
+            source.snapshot_ofs.load(Ordering::SeqCst),
+            1,
+            "the reconnect asked for the same snapshot"
+        );
+        let (total, _) = installed_total(&target);
+        assert_eq!(
+            source.served.bytes.load(Ordering::SeqCst),
+            total,
+            "every byte fetched exactly once"
+        );
+        assert!(
+            !target.join(PHYSICAL_PARTIAL_FILE).exists(),
+            "an installed copy carries no record"
+        );
+        let raw = DB::open_for_read_only(&Options::default(), &target, false).unwrap();
+        assert_eq!(raw.get(b"seed").unwrap(), Some(b"original".to_vec()));
+        assert_eq!(raw.get(b"stream-only").unwrap(), Some(b"after-checkpoint".to_vec()));
+    }
+
+    /// Spec P2.2: a receiver that gave up mid-download (here: no reconnects
+    /// allowed) leaves its staging directory and progress record behind; the
+    /// next download into the same target resumes it from the same export.
+    #[tokio::test]
+    async fn the_next_download_into_the_same_target_resumes_an_abandoned_one() {
+        let root = tempfile::tempdir().unwrap();
+        let (db, history) = primary(root.path());
+        let source = SourceHarness::start(db, history, root.path().to_path_buf(), false);
+        source.served.fail_chunk.store(2, Ordering::SeqCst);
+        let target = root.path().join("abandoned");
+        let (_stop, shutdown) = watch::channel(false);
+        let (progress, _) = status();
+        let mut first = options(
+            &source,
+            ReceiverStart::Snapshot {
+                target: target.clone(),
+                expected_history: Some(history),
+            },
+            ReceiverMode::InstallOnce,
+        );
+        first.max_reconnects = 0;
+        let failed = tokio::time::timeout(Duration::from_secs(30), run_receiver(first, shutdown.clone(), progress))
+            .await
+            .unwrap();
+        assert!(failed.is_err(), "the first run gives up");
+        assert!(!target.exists());
+        let staging = staging_path_for(&target).unwrap();
+        let record: super::super::checkpoint_transfer::PartialRecord =
+            serde_json::from_slice(&std::fs::read(staging.join(PHYSICAL_PARTIAL_FILE)).unwrap()).unwrap();
+        let held: u64 = record.files.iter().map(|file| file.bytes_done).sum();
+        assert!(held > 0, "the first file was recorded complete: {record:?}");
+        let fetched_before = source.served.bytes.load(Ordering::SeqCst);
+        assert_eq!(held, fetched_before, "the record covers everything received");
+
+        let (progress, _) = status();
+        let installed = complete(run_receiver(
+            options(
+                &source,
+                ReceiverStart::Snapshot {
+                    target: target.clone(),
+                    expected_history: Some(history),
+                },
+                ReceiverMode::InstallOnce,
+            ),
+            shutdown,
+            progress,
+        ))
+        .await;
+        assert_eq!(
+            installed.snapshot_id, record.snapshot_id,
+            "the same snapshot was installed"
+        );
+        assert_eq!(source.snapshots.load(Ordering::SeqCst), 1);
+        assert_eq!(source.snapshot_ofs.load(Ordering::SeqCst), 1);
+        let (total, _) = installed_total(&target);
+        assert_eq!(
+            source.served.bytes.load(Ordering::SeqCst),
+            total,
+            "the resumed run fetched only what the first did not"
+        );
+        assert!(!staging.exists(), "the staging directory became the target");
+        assert!(!target.join(PHYSICAL_PARTIAL_FILE).exists());
     }
 }

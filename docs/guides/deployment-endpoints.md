@@ -87,18 +87,49 @@ any standby is registered or receives anything. A wrong token is answered with a
 typed refusal (`AuthFailed`); the standby retries it three times in all (a token
 file being replaced on both nodes), then stays up in `needs_recovery`.
 
-## Loopback only until TLS replication
+## Remote replication: TLS
 
-The replication connection is plaintext, so in this release the replication port
-**always listens on loopback**: on `--listen`'s address when that is a loopback
-address, otherwise on `127.0.0.1`, whatever `--listen` opens for PostgreSQL (a log
-line says so). A standby's `--primary-host` must resolve to loopback too. Reach a
-primary on another host through an authenticated tunnel that ends on loopback at
-both sides, for example `ssh -N -L 127.0.0.1:5433:127.0.0.1:5433 primary.example`
-on the standby host. Remote replication over TLS is spec P2.2.
-`--allow-insecure-replication-remote` (or `[replication] allow_insecure_remote =
-true`) is accepted and preserved in daemon mode, but changes nothing yet; a
-startup WARN says so.
+A standby on another host reaches the replication port over TLS (spec P2.2):
+
+```bash
+# Primary: the replication port binds --listen's address, over TLS.
+heliosdb-nano start --data-dir /srv/nano/primary --listen 10.0.0.5 --port 5432 \
+  --replication-role primary --replication-port 5433 --replication-token-file replication.token \
+  --replication-tls --replication-tls-cert repl.crt --replication-tls-key repl.key
+# Standby: TLS is the default for a non-loopback --primary-host.
+heliosdb-nano start --data-dir /srv/nano/standby --listen 10.0.0.6 --port 5432 \
+  --replication-role standby --primary-host 10.0.0.5:5433 --primary-ca repl-ca.crt \
+  --replication-token-file replication.token
+```
+
+- **Where the port binds.** Without TLS the replication port **listens on
+  loopback**: on `--listen`'s address when that is loopback, otherwise on
+  `127.0.0.1`, whatever `--listen` opens for PostgreSQL (a log line says so). With
+  `--replication-tls` it binds `--listen`'s address. The certificate and key are
+  `--replication-tls-cert` / `--replication-tls-key`, else the PostgreSQL pair
+  (`--tls-cert` / `--tls-key`); `--replication-tls-ca` requires every standby to
+  present a client certificate issued by that CA (mutual TLS).
+- **The standby.** A non-loopback `--primary-host` is reached over TLS by
+  default (`--primary-tls[=BOOL]`), verified against `--primary-ca` (or the
+  system trust store) and the host part of `--primary-host`
+  (`--primary-server-name` overrides it; an IP is verified as an IP subject
+  alternative name). `--primary-client-cert` / `--primary-client-key` present a
+  client certificate.
+- **The token is still required** over TLS, mutual TLS included: TLS is the
+  transport, the token is the authentication.
+- **Plaintext over the network** is refused on both sides unless
+  `--allow-insecure-replication-remote` (or `[replication] allow_insecure_remote =
+  true`) says otherwise: isolated development only, announced with an
+  `INSECURE DEVELOPMENT OVERRIDE` warning and preserved in daemon mode. An
+  authenticated tunnel ending on loopback at both sides
+  (`ssh -N -L 127.0.0.1:5433:127.0.0.1:5433 primary.example`) remains an
+  alternative.
+
+Every flag has a flat `[replication]` key (`tls_enabled`, `tls_cert_path`,
+`tls_key_path`, `tls_ca_path`, `tls_post_quantum`, `primary_tls`,
+`primary_tls_ca_path`, `primary_tls_server_name`, `primary_tls_client_cert_path`,
+`primary_tls_client_key_path`, `primary_tls_insecure_skip_verify`); see
+[the physical standby guide](physical-standby.md#remote-standbys-tls).
 
 ## HTTP and trust authentication
 

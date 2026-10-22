@@ -736,9 +736,9 @@ fn replication_token_file() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, path)
 }
 
-/// Spec P2.1: the replication port is loopback-only until TLS replication
-/// (P2.2), whatever `--listen` opens: a wildcard PostgreSQL listener does not
-/// put the plaintext replication token on the network.
+/// Spec P2.1 / P2.2: without TLS (or the plaintext opt-in) the replication
+/// port stays on loopback whatever `--listen` opens: a wildcard PostgreSQL
+/// listener does not put the plaintext replication token on the network.
 #[test]
 #[cfg(feature = "ha-tier1")]
 fn a_wildcard_listen_keeps_the_replication_port_on_loopback() {
@@ -782,12 +782,13 @@ fn a_wildcard_listen_keeps_the_replication_port_on_loopback() {
     .unwrap();
 }
 
-/// `--allow-insecure-replication-remote` is reserved for remote replication
-/// over TLS (P2.2): accepted, forwarded through the daemon re-exec, and said
-/// to change nothing yet — never silently ignored.
+/// Spec P2.2: `--allow-insecure-replication-remote` lets the plaintext
+/// replication port bind `--listen`'s non-loopback address: accepted,
+/// forwarded through the daemon re-exec, and always announced with an
+/// INSECURE warning (it used to be reserved and change nothing).
 #[test]
 #[cfg(feature = "ha-tier1")]
-fn the_insecure_remote_opt_in_says_it_has_no_effect_yet() {
+fn the_insecure_remote_opt_in_binds_the_listen_address_and_warns() {
     for daemon in [false, true] {
         let pg = reserve("0.0.0.0");
         let replication = reserve("127.0.0.1");
@@ -819,9 +820,17 @@ fn the_insecure_remote_opt_in_says_it_has_no_effect_yet() {
             assert!(!server.worker_pids.is_empty(), "daemon PID missing");
         } else {
             server.wait_ready();
+            assert!(
+                server
+                    .logs()
+                    .contains(&format!("Replication port listening on 0.0.0.0:{replication_port}")),
+                "{}",
+                server.logs()
+            );
         }
         assert!(
-            server.logs().contains("has no effect in this release"),
+            server.logs().contains("INSECURE DEVELOPMENT OVERRIDE")
+                && server.logs().contains("--allow-insecure-replication-remote"),
             "{}",
             server.logs()
         );

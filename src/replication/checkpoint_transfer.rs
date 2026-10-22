@@ -5,6 +5,23 @@
 //! Every RocksDB open of a receiver's directory uses the engine's options
 //! (`StorageEngine::build_db_options`), so the stage and a standby serving it
 //! run with the primary's prefix extractor, filters, cache and compression.
+//!
+//! # Resumable download (spec P2.2)
+//!
+//! A download stages into one private sibling of its target,
+//! `.nano-resync-<hash of the target's name>`, and keeps its progress there in
+//! [`PHYSICAL_PARTIAL_FILE`]: the snapshot, the manifest's digest, and per
+//! file the bytes that are fsynced. The record is rewritten (temporary file,
+//! rename, fsync) after every completed file and after at most
+//! [`PARTIAL_RECORD_INTERVAL`] bytes inside a file. A later download for the
+//! same target adopts that staging directory ONLY through a verified record
+//! ([`ReceiverStaging::begin_or_resume`]): the same snapshot and manifest
+//! digest, a strict file census, every complete file re-hashed (a mismatch is
+//! downloaded again), the file in progress truncated to its recorded length.
+//! Anything else deletes the staging directory — one this receiver created,
+//! never anything else — and starts over, saying why. The record is removed
+//! before the completed download is verified and opened, so an installed
+//! standby carries no extra file; installation is unchanged.
 
 use super::physical::{
     Durability, LocalWriter, PhysicalBatch, PhysicalCursor, PhysicalError, StagedPhysicalReplica, LOCAL_CF,
@@ -23,7 +40,19 @@ use uuid::Uuid;
 
 pub const PHYSICAL_MARKER_FILE: &str = "NANO-PHYSICAL-REPLICA.json";
 pub const PHYSICAL_MANIFEST_FILE: &str = "NANO-PHYSICAL-MANIFEST.json";
+/// Spec P2.2: a download's progress record, in its staging directory only.
+pub const PHYSICAL_PARTIAL_FILE: &str = "NANO-PHYSICAL-PARTIAL.json";
+/// The record's temporary file while it is rewritten.
+const PHYSICAL_PARTIAL_TEMP_FILE: &str = "NANO-PHYSICAL-PARTIAL.json.tmp";
+/// Inside one file, the progress record is rewritten after at most this many
+/// newly received bytes (and always when the file completes): the most a
+/// resumed download fetches again for the file it was killed in.
+pub const PARTIAL_RECORD_INTERVAL: u64 = 8 * 1024 * 1024;
+/// A download's staging directory is this prefix and a hash of its target's name.
+pub const STAGING_PREFIX: &str = ".nano-resync-";
+const STAGING_MODE: &str = "physical-staging-not-serving";
 pub const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+const MAX_PARTIAL_BYTES: usize = 2 * MAX_MANIFEST_BYTES;
 pub const MAX_CHUNK_BYTES: usize = 1024 * 1024;
 const MAX_FILES: usize = 2048;
 const MAX_TOTAL_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
@@ -664,25 +693,284 @@ impl StageOwner {
     }
 }
 
-/// Failed/interrupted receivers intentionally retain their private sibling
-/// directory. Nothing here removes, resets, or adopts an existing user path.
+/// One file of a [`PartialRecord`]: the manifest's entry and the bytes of it
+/// that are fsynced in the staging directory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialFile {
+    pub name: String,
+    pub size: u64,
+    pub sha256: [u8; 32],
+    pub bytes_done: u64,
+}
+
+/// Spec P2.2: a download's progress, [`PHYSICAL_PARTIAL_FILE`] in its staging
+/// directory. It only ever claims bytes that were fsynced before it was
+/// written.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PartialRecord {
+    pub format: u32,
+    pub snapshot_id: Uuid,
+    /// SHA-256 of the manifest's canonical encoding.
+    pub manifest_sha256: [u8; 32],
+    pub history: Uuid,
+    pub files: Vec<PartialFile>,
+}
+
+impl PartialRecord {
+    fn new(manifest: &CheckpointManifest, manifest_sha256: [u8; 32], done: &[u64]) -> Self {
+        Self {
+            format: 1,
+            snapshot_id: manifest.snapshot_id,
+            manifest_sha256,
+            history: manifest.history,
+            files: manifest
+                .files
+                .iter()
+                .zip(done)
+                .map(|(file, done)| PartialFile {
+                    name: file.name.clone(),
+                    size: file.size,
+                    sha256: file.sha256,
+                    bytes_done: *done,
+                })
+                .collect(),
+        }
+    }
+
+    /// Why this record cannot continue a download of `manifest`; `None` when
+    /// it can.
+    fn disagreement(&self, manifest: &CheckpointManifest, manifest_sha256: &[u8; 32]) -> Option<String> {
+        if self.format != 1 {
+            return Some(format!("the partial download record has format {}", self.format));
+        }
+        if self.snapshot_id != manifest.snapshot_id {
+            return Some(format!(
+                "the primary now serves snapshot {}; the partial download belongs to snapshot {} (its export \
+                 lease expired, or the primary restarted)",
+                manifest.snapshot_id, self.snapshot_id
+            ));
+        }
+        if &self.manifest_sha256 != manifest_sha256 || self.history != manifest.history {
+            return Some(format!(
+                "the manifest of snapshot {} differs from the one the partial download recorded",
+                manifest.snapshot_id
+            ));
+        }
+        let same_files = self.files.len() == manifest.files.len()
+            && self.files.iter().zip(&manifest.files).all(|(recorded, file)| {
+                recorded.name == file.name
+                    && recorded.size == file.size
+                    && recorded.sha256 == file.sha256
+                    // `recorded.size == file.size` held above, so the bound
+                    // is the manifest's size as well.
+                    && recorded.bytes_done <= recorded.size
+            });
+        (!same_files).then(|| "the partial download record disagrees with the manifest's files".to_string())
+    }
+}
+
+/// What [`ReceiverStaging::begin_or_resume`] did with the target's staging
+/// directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StagingStart {
+    /// There was none: a new download.
+    Fresh,
+    /// A verified partial download of the same snapshot continues: `held`
+    /// bytes are kept; the complete files listed in `redownload` failed their
+    /// digest and are fetched again.
+    Resumed { held: u64, redownload: Vec<String> },
+    /// The staging directory could not be adopted, was deleted, and the
+    /// download starts over: `reason`.
+    StartedOver { reason: String },
+}
+
+/// Why an existing staging directory is not adopted.
+enum Adoption {
+    /// It is this receiver's and may be deleted: start over.
+    StartOver(String),
+    /// It cannot be judged safely (not an owned directory): refused, kept.
+    Refused(TransferError),
+}
+
+impl From<TransferError> for Adoption {
+    fn from(error: TransferError) -> Self {
+        Self::StartOver(error.to_string())
+    }
+}
+
+impl From<std::io::Error> for Adoption {
+    fn from(error: std::io::Error) -> Self {
+        Self::StartOver(format!("the staging directory cannot be read: {error}"))
+    }
+}
+
+/// The staging directory of a download into `target` (absolute): a fixed
+/// sibling, so an interrupted download is found again.
+fn staging_path_of(target: &Path) -> Result<PathBuf> {
+    let parent = target.parent().ok_or_else(|| invalid("target has no parent"))?;
+    let name = target.file_name().ok_or_else(|| invalid("target has no file name"))?;
+    let digest = Sha256::digest(name.as_encoded_bytes());
+    let hash = hex::encode(digest.get(..16).unwrap_or(&[]));
+    Ok(parent.join(format!("{STAGING_PREFIX}{hash}")))
+}
+
+/// The staging directory a download into `target` uses (spec P2.2).
+pub fn staging_path_for(target: &Path) -> Result<PathBuf> {
+    staging_path_of(&absolute_path(target)?)
+}
+
+/// The snapshot an interrupted download into `target` belongs to, from its
+/// progress record, if there is one. Reads only; [`ReceiverStaging::begin_or_resume`]
+/// decides whether that download is adopted.
+pub fn partial_snapshot(target: &Path) -> Option<Uuid> {
+    let staging = staging_path_for(target).ok()?;
+    let bytes = read_small(&staging.join(PHYSICAL_PARTIAL_FILE), MAX_PARTIAL_BYTES).ok()?;
+    let record: PartialRecord = serde_json::from_slice(&bytes).ok()?;
+    (record.format == 1 && !record.snapshot_id.is_nil()).then_some(record.snapshot_id)
+}
+
+fn staging_marker(manifest: &CheckpointManifest, encoded: &[u8]) -> Result<Vec<u8>> {
+    serde_json::to_vec(&PhysicalMarker {
+        format: 1,
+        mode: STAGING_MODE.into(),
+        snapshot_id: manifest.snapshot_id,
+        history: manifest.history,
+        checkpoint_sequence: manifest.checkpoint_sequence,
+        storage_identity: manifest.storage_identity.clone(),
+        manifest_sha256: Sha256::digest(encoded).into(),
+    })
+    .map_err(|error| invalid(error.to_string()))
+}
+
+/// Delete a staging directory this receiver created — empty, or carrying a
+/// staging marker — and nothing else.
+fn remove_staging(path: &Path) -> Result<()> {
+    let directory = OwnedDirectory::capture(path)?;
+    let empty = fs::read_dir(&directory.path)?.next().is_none();
+    if !empty {
+        let ours = read_small(&directory.path.join(PHYSICAL_MARKER_FILE), 4096)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PhysicalMarker>(&bytes).ok())
+            .is_some_and(|marker| marker.format == 1 && marker.mode == STAGING_MODE);
+        if !ours {
+            return Err(invalid(format!(
+                "{} carries no staging marker of a physical receiver; it is not deleted: move it aside or choose \
+                 another target",
+                directory.path.display()
+            )));
+        }
+    }
+    fs::remove_dir_all(&directory.path)?;
+    if let Some(parent) = directory.path.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// Write `record` atomically: temporary file, fsync, rename, fsync the directory.
+fn write_partial_record(directory: &Path, record: &PartialRecord) -> Result<()> {
+    let bytes = serde_json::to_vec(record).map_err(|error| invalid(error.to_string()))?;
+    if bytes.len() > MAX_PARTIAL_BYTES {
+        return Err(invalid("partial download record byte limit"));
+    }
+    let temporary = directory.join(PHYSICAL_PARTIAL_TEMP_FILE);
+    match fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    create_file(&temporary, &bytes)?;
+    fs::rename(&temporary, directory.join(PHYSICAL_PARTIAL_FILE))?;
+    sync_dir(directory)
+}
+
+/// Remove the progress record (and a temporary left by a crash).
+fn remove_partial_record(directory: &Path) -> Result<()> {
+    for name in [PHYSICAL_PARTIAL_FILE, PHYSICAL_PARTIAL_TEMP_FILE] {
+        match fs::remove_file(directory.join(name)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    sync_dir(directory)
+}
+
+/// A download's private staging sibling. Failed/interrupted receivers retain
+/// it, with its progress record, for the next download into the same target
+/// ([`Self::begin_or_resume`]); nothing here removes, resets, or adopts any
+/// other path.
 pub struct ReceiverStaging {
     owner: StageOwner,
     received: Vec<u64>,
+    /// Per file, the bytes the progress record claims (all fsynced).
+    recorded: Vec<u64>,
+    manifest_sha256: [u8; 32],
     limits: TransferLimits,
     poisoned: bool,
 }
 impl ReceiverStaging {
+    /// A download into `target`, which must be absent: a resumed one when its
+    /// staging directory holds a verified partial download of this manifest,
+    /// else a new one ([`Self::begin_or_resume`], whose outcome is dropped).
     pub fn begin(target: &Path, manifest_bytes: &[u8], expected_history: Uuid, limits: TransferLimits) -> Result<Self> {
+        Self::begin_or_resume(target, manifest_bytes, expected_history, limits).map(|(stage, _)| stage)
+    }
+
+    /// Spec P2.2. `target` must be absent. Its staging directory, if one
+    /// exists, is adopted only through a verified progress record of the SAME
+    /// snapshot and manifest: every file the record marks complete is hashed
+    /// again (a mismatch is downloaded again), the file in progress is
+    /// truncated to its recorded length. No record, another snapshot or
+    /// manifest, an unreadable record, a file whose size disagrees, or an
+    /// unexpected file: the staging directory is deleted and the download
+    /// starts over ([`StagingStart::StartedOver`] says why). A path there that
+    /// is not this receiver's staging directory is refused and kept.
+    pub fn begin_or_resume(
+        target: &Path,
+        manifest_bytes: &[u8],
+        expected_history: Uuid,
+        limits: TransferLimits,
+    ) -> Result<(Self, StagingStart)> {
         let manifest = CheckpointManifest::decode(manifest_bytes, &limits)?;
         if expected_history.is_nil() || manifest.history != expected_history {
             return Err(invalid("unexpected snapshot history"));
         }
         let target = absolute_path(target)?;
-        let parent = OwnedDirectory::capture(target.parent().ok_or_else(|| invalid("target has no parent"))?)?;
-        refuse_database_ancestors(&parent.path)?;
+        let parent_path = target
+            .parent()
+            .ok_or_else(|| invalid("target has no parent"))?
+            .to_path_buf();
+        refuse_database_ancestors(&OwnedDirectory::capture(&parent_path)?.path)?;
         absent(&target)?;
-        let path = parent.path.join(format!(".nano-resync-{}", Uuid::new_v4()));
+        let path = staging_path_of(&target)?;
+        let mut start = StagingStart::Fresh;
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => match Self::resume(&path, &parent_path, &target, &manifest, limits) {
+                Ok((stage, held, redownload)) => return Ok((stage, StagingStart::Resumed { held, redownload })),
+                Err(Adoption::Refused(error)) => return Err(error),
+                Err(Adoption::StartOver(reason)) => {
+                    remove_staging(&path)?;
+                    start = StagingStart::StartedOver { reason };
+                }
+            },
+        }
+        let stage = Self::create(path, &parent_path, target, manifest, limits)?;
+        Ok((stage, start))
+    }
+
+    fn create(
+        path: PathBuf,
+        parent_path: &Path,
+        target: PathBuf,
+        manifest: CheckpointManifest,
+        limits: TransferLimits,
+    ) -> Result<Self> {
+        let parent = OwnedDirectory::capture(parent_path)?;
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -692,24 +980,16 @@ impl ReceiverStaging {
         builder.create(&path)?;
         let directory = OwnedDirectory::capture(&path)?;
         let encoded = manifest.encoded()?;
-        let marker = serde_json::to_vec(&PhysicalMarker {
-            format: 1,
-            mode: "physical-staging-not-serving".into(),
-            snapshot_id: manifest.snapshot_id,
-            history: manifest.history,
-            checkpoint_sequence: manifest.checkpoint_sequence,
-            storage_identity: manifest.storage_identity.clone(),
-            manifest_sha256: Sha256::digest(&encoded).into(),
-        })
-        .map_err(|error| invalid(error.to_string()))?;
+        let manifest_sha256: [u8; 32] = Sha256::digest(&encoded).into();
+        let marker = staging_marker(&manifest, &encoded)?;
         create_file(&path.join(PHYSICAL_MARKER_FILE), &marker)?;
         create_file(&path.join(PHYSICAL_MANIFEST_FILE), &encoded)?;
         for file in &manifest.files {
             create_file(&path.join(&file.name), &[])?;
         }
-        sync_dir(&path)?;
-        sync_dir(&parent.path)?;
         let received = vec![0; manifest.files.len()];
+        write_partial_record(&path, &PartialRecord::new(&manifest, manifest_sha256, &received))?;
+        sync_dir(&parent.path)?;
         Ok(Self {
             owner: StageOwner {
                 directory,
@@ -718,13 +998,153 @@ impl ReceiverStaging {
                 manifest,
                 marker,
             },
+            recorded: received.clone(),
             received,
+            manifest_sha256,
             limits,
             poisoned: false,
         })
     }
+
+    /// Adopt the existing staging directory `path` for `manifest`, or say why
+    /// not (see [`Self::begin_or_resume`]).
+    fn resume(
+        path: &Path,
+        parent_path: &Path,
+        target: &Path,
+        manifest: &CheckpointManifest,
+        limits: TransferLimits,
+    ) -> std::result::Result<(Self, u64, Vec<String>), Adoption> {
+        let directory = OwnedDirectory::capture(path).map_err(Adoption::Refused)?;
+        let record_bytes = match read_small(&directory.path.join(PHYSICAL_PARTIAL_FILE), MAX_PARTIAL_BYTES) {
+            Ok(bytes) => bytes,
+            Err(TransferError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Adoption::StartOver(
+                    "the staging directory holds no partial download record (an older or completed attempt)".into(),
+                ))
+            }
+            Err(error) => {
+                return Err(Adoption::StartOver(format!(
+                    "the partial download record is unreadable: {error}"
+                )))
+            }
+        };
+        let record: PartialRecord = serde_json::from_slice(&record_bytes)
+            .map_err(|error| Adoption::StartOver(format!("the partial download record is unreadable: {error}")))?;
+        let encoded = manifest.encoded()?;
+        let manifest_sha256: [u8; 32] = Sha256::digest(&encoded).into();
+        if let Some(reason) = record.disagreement(manifest, &manifest_sha256) {
+            return Err(Adoption::StartOver(reason));
+        }
+        let marker = staging_marker(manifest, &encoded)?;
+        if read_small(&directory.path.join(PHYSICAL_MARKER_FILE), 4096)
+            .ok()
+            .as_ref()
+            != Some(&marker)
+            || read_small(&directory.path.join(PHYSICAL_MANIFEST_FILE), MAX_MANIFEST_BYTES)
+                .ok()
+                .as_ref()
+                != Some(&encoded)
+        {
+            return Err(Adoption::StartOver(
+                "the staging marker or saved manifest differs from the partial download record".into(),
+            ));
+        }
+        // Strict census: the manifest's files, the marker, the saved manifest
+        // and the record (its temporary, left by a crash, is removed).
+        let mut expected: HashSet<&str> = manifest.files.iter().map(|file| file.name.as_str()).collect();
+        expected.extend([PHYSICAL_MARKER_FILE, PHYSICAL_MANIFEST_FILE, PHYSICAL_PARTIAL_FILE]);
+        for entry in fs::read_dir(&directory.path)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| Adoption::StartOver("a staging file name is not UTF-8".into()))?;
+            if name == PHYSICAL_PARTIAL_TEMP_FILE {
+                fs::remove_file(entry.path())?;
+                continue;
+            }
+            if !expected.contains(name.as_str()) {
+                return Err(Adoption::StartOver(format!(
+                    "unexpected file {name} in the staging directory"
+                )));
+            }
+            valid_regular(&fs::symlink_metadata(entry.path())?, u64::MAX, true)?;
+        }
+        let mut done = Vec::with_capacity(manifest.files.len());
+        let mut redownload = Vec::new();
+        for (file, recorded) in manifest.files.iter().zip(&record.files) {
+            let file_path = directory.path.join(&file.name);
+            let on_disk = fs::symlink_metadata(&file_path)?.len();
+            if on_disk < recorded.bytes_done || on_disk > file.size {
+                return Err(Adoption::StartOver(format!(
+                    "file sizes disagree: {} holds {on_disk} bytes, the record says {} of {}",
+                    file.name, recorded.bytes_done, file.size
+                )));
+            }
+            let keep = if recorded.bytes_done == file.size {
+                let (digest, _) = fingerprint_file(&file_path, file.size, true)?;
+                if digest == file.sha256 {
+                    file.size
+                } else {
+                    redownload.push(file.name.clone());
+                    0
+                }
+            } else {
+                recorded.bytes_done
+            };
+            if keep != on_disk {
+                let output = open_regular(&file_path, file.size, true, true)?;
+                output.set_len(keep)?;
+                output.sync_all()?;
+            }
+            done.push(keep);
+        }
+        let parent = OwnedDirectory::capture(parent_path).map_err(Adoption::Refused)?;
+        let held: u64 = done.iter().sum();
+        let stage = Self {
+            owner: StageOwner {
+                directory,
+                parent,
+                target: target.to_path_buf(),
+                manifest: manifest.clone(),
+                marker,
+            },
+            recorded: done.clone(),
+            received: done,
+            manifest_sha256,
+            limits,
+            poisoned: false,
+        };
+        stage.owner.verify()?;
+        stage.write_partial()?;
+        Ok((stage, held, redownload))
+    }
+
+    fn write_partial(&self) -> Result<()> {
+        write_partial_record(
+            &self.owner.directory.path,
+            &PartialRecord::new(&self.owner.manifest, self.manifest_sha256, &self.recorded),
+        )
+    }
+
     pub fn staging_path(&self) -> &Path {
         &self.owner.directory.path
+    }
+    /// The snapshot this download belongs to.
+    pub fn snapshot_id(&self) -> Uuid {
+        self.owner.manifest.snapshot_id
+    }
+    /// Whether `manifest` is the one this download continues.
+    pub fn holds(&self, manifest: &CheckpointManifest) -> bool {
+        manifest.snapshot_id == self.owner.manifest.snapshot_id
+            && manifest
+                .encoded()
+                .is_ok_and(|encoded| <[u8; 32]>::from(Sha256::digest(&encoded)) == self.manifest_sha256)
+    }
+    /// Per manifest file, the bytes received so far: where the download continues.
+    pub fn progress(&self) -> &[u64] {
+        &self.received
     }
     pub fn append_chunk(&mut self, file_index: u32, offset: u64, bytes: &[u8]) -> Result<()> {
         if self.poisoned {
@@ -765,6 +1185,18 @@ impl ReceiverStaging {
                 .get_mut(index)
                 .ok_or_else(|| invalid("unknown file progress index"))?;
             *slot = end;
+            // Spec P2.2: record the progress after every completed file and
+            // after at most `PARTIAL_RECORD_INTERVAL` bytes inside one, and
+            // only bytes that are fsynced first.
+            let recorded = self
+                .recorded
+                .get_mut(index)
+                .ok_or_else(|| invalid("unknown file progress index"))?;
+            if end == size || end.saturating_sub(*recorded) >= PARTIAL_RECORD_INTERVAL {
+                output.sync_data()?;
+                *recorded = end;
+                self.write_partial()?;
+            }
             Ok(())
         })();
         if outcome.is_err() {
@@ -773,6 +1205,8 @@ impl ReceiverStaging {
         outcome
     }
     /// `config` supplies the storage options every open of the receiver uses.
+    /// The progress record is removed first: a complete download is verified
+    /// whole below, and an installed standby carries no extra file.
     pub fn finish_download(self, config: &Config) -> Result<VerifiedCheckpoint> {
         if self.poisoned
             || self
@@ -783,6 +1217,8 @@ impl ReceiverStaging {
         {
             return Err(invalid("incomplete or failed checkpoint download"));
         }
+        self.owner.verify()?;
+        remove_partial_record(&self.owner.directory.path)?;
         self.owner.verify_download()?;
         for file in &self.owner.manifest.files {
             open_regular(&self.owner.directory.path.join(&file.name), file.size, true, false)?.sync_all()?;
@@ -1526,5 +1962,290 @@ mod tests {
         fs::hard_link(path.join("CURRENT"), other.path().join("aliased-current")).unwrap();
         assert!(ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).is_err());
         assert!(other.path().join("aliased-current").is_file());
+    }
+
+    // --- spec P2.2: resumable download ------------------------------------
+
+    fn read_record(staging: &Path) -> PartialRecord {
+        serde_json::from_slice(&fs::read(staging.join(PHYSICAL_PARTIAL_FILE)).unwrap()).unwrap()
+    }
+
+    /// Append every chunk of the files `take` selects (all of a file), then
+    /// `partial` bytes of the file after them.
+    fn append_files(receiver: &mut ReceiverStaging, export: &OnlineCheckpointExport, take: usize, partial: u64) {
+        for (index, file) in export.manifest.files.iter().enumerate() {
+            let limit = match index.cmp(&take) {
+                std::cmp::Ordering::Less => file.size,
+                std::cmp::Ordering::Equal => partial.min(file.size),
+                std::cmp::Ordering::Greater => 0,
+            };
+            let mut offset = receiver.progress()[index];
+            while offset < limit {
+                let length = (limit - offset).min(997) as u32;
+                let bytes = export.read_chunk(index as u32, offset, length).unwrap();
+                receiver.append_chunk(index as u32, offset, &bytes).unwrap();
+                offset += bytes.len() as u64;
+            }
+        }
+    }
+
+    /// The record round-trips, claims only completed files (a part of a file
+    /// below the record interval is not claimed), and a download into the
+    /// same target continues from it: the unclaimed tail is truncated, and
+    /// the finished copy installs with no record left behind.
+    #[test]
+    fn a_partial_download_is_resumed_through_its_verified_record() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, history) = primary(root.path());
+        let export = export(&source, history, root.path());
+        let manifest_bytes = export.manifest_bytes().unwrap();
+        let target = root.path().join("resumed");
+        let (mut receiver, start) =
+            ReceiverStaging::begin_or_resume(&target, &manifest_bytes, history, TransferLimits::default()).unwrap();
+        assert_eq!(start, StagingStart::Fresh);
+        let staging = receiver.staging_path().to_path_buf();
+        assert_eq!(staging, staging_path_for(&target).unwrap());
+        assert!(staging
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(STAGING_PREFIX));
+        let files = export.manifest.files.clone();
+        let last = files.len() - 1;
+        let half = files[last].size / 2;
+        assert!(half > 0, "the fixture's last file has a middle");
+        append_files(&mut receiver, &export, last, half);
+
+        let record = read_record(&staging);
+        assert_eq!(
+            record,
+            PartialRecord::new(&export.manifest, receiver.manifest_sha256, &record_done(&files, last))
+        );
+        let bytes = serde_json::to_vec(&record).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<PartialRecord>(&bytes).unwrap(),
+            record,
+            "round trip"
+        );
+        assert_eq!(record.snapshot_id, export.manifest.snapshot_id);
+        assert_eq!(record.files[last].bytes_done, 0, "half a small file is not claimed");
+        assert_eq!(fs::metadata(staging.join(&files[last].name)).unwrap().len(), half);
+        assert_eq!(partial_snapshot(&target), Some(export.manifest.snapshot_id));
+        drop(receiver); // the process died
+
+        let (mut receiver, start) =
+            ReceiverStaging::begin_or_resume(&target, &manifest_bytes, history, TransferLimits::default()).unwrap();
+        let held: u64 = files[..last].iter().map(|file| file.size).sum();
+        assert_eq!(
+            start,
+            StagingStart::Resumed {
+                held,
+                redownload: Vec::new()
+            }
+        );
+        assert_eq!(receiver.progress()[last], 0);
+        assert_eq!(
+            fs::metadata(staging.join(&files[last].name)).unwrap().len(),
+            0,
+            "the unclaimed tail was truncated"
+        );
+        assert!(receiver.holds(&export.manifest));
+        append_files(&mut receiver, &export, files.len(), 0);
+        let installed = receiver
+            .finish_download(&config())
+            .unwrap()
+            .open(&config())
+            .unwrap()
+            .publish()
+            .unwrap();
+        assert_eq!(installed.path, target);
+        assert!(!target.join(PHYSICAL_PARTIAL_FILE).exists());
+        assert!(!target.join(PHYSICAL_PARTIAL_TEMP_FILE).exists());
+        assert!(!staging.exists());
+        assert_eq!(partial_snapshot(&target), None);
+        let db = open_receiver(&target);
+        assert_eq!(db.get(b"seed").unwrap(), Some(b"old".to_vec()));
+    }
+
+    /// The bytes the record claims after `append_files(.., take, small)`.
+    fn record_done(files: &[CheckpointFile], take: usize) -> Vec<u64> {
+        files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| if index < take { file.size } else { 0 })
+            .collect()
+    }
+
+    /// The resume decision table: another snapshot, an unreadable record, a
+    /// file shorter than recorded, no record, or an unexpected file delete
+    /// the staging directory and start over, saying why; a complete file
+    /// whose digest no longer matches is downloaded again; a directory at the
+    /// staging path that is not a staging directory is refused and kept.
+    #[test]
+    fn the_resume_decision_table() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, history) = primary(root.path());
+        let export = export(&source, history, root.path());
+        let manifest_bytes = export.manifest_bytes().unwrap();
+        let files = export.manifest.files.clone();
+        let sized = files.iter().position(|file| file.size > 1).unwrap();
+        let begin = |target: &Path, manifest: &[u8]| {
+            ReceiverStaging::begin_or_resume(target, manifest, history, TransferLimits::default()).unwrap()
+        };
+        // A complete download, abandoned before it was finished.
+        let abandoned = |name: &str| {
+            let target = root.path().join(name);
+            let (mut receiver, _) = begin(&target, &manifest_bytes);
+            append_files(&mut receiver, &export, files.len(), 0);
+            let staging = receiver.staging_path().to_path_buf();
+            drop(receiver);
+            (target, staging)
+        };
+        let started_over = |start: StagingStart, why: &str| match start {
+            StagingStart::StartedOver { reason } => assert!(reason.contains(why), "{why}: {reason}"),
+            other => panic!("{why}: expected a start over, got {other:?}"),
+        };
+
+        // Same snapshot and manifest: resumed, everything held.
+        let (target, _) = abandoned("same");
+        let (receiver, start) = begin(&target, &manifest_bytes);
+        assert_eq!(
+            start,
+            StagingStart::Resumed {
+                held: export.manifest.total_bytes,
+                redownload: Vec::new()
+            }
+        );
+        assert!(receiver
+            .progress()
+            .iter()
+            .zip(&files)
+            .all(|(done, file)| *done == file.size));
+
+        // Another snapshot (the lease expired: a new export).
+        let (target, staging) = abandoned("other-snapshot");
+        let newer = OnlineCheckpointExport::create(&source, history, root.path(), TransferLimits::default()).unwrap();
+        let (receiver, start) = begin(&target, &newer.manifest_bytes().unwrap());
+        started_over(start, "now serves snapshot");
+        assert_eq!(receiver.snapshot_id(), newer.manifest.snapshot_id);
+        assert!(receiver.progress().iter().all(|done| *done == 0), "a new download");
+        assert_eq!(read_record(&staging).snapshot_id, newer.manifest.snapshot_id);
+
+        // An unreadable record.
+        let (target, staging) = abandoned("corrupt-record");
+        fs::write(staging.join(PHYSICAL_PARTIAL_FILE), b"{").unwrap();
+        started_over(begin(&target, &manifest_bytes).1, "unreadable");
+
+        // A file shorter than the record claims.
+        let (target, staging) = abandoned("short-file");
+        OpenOptions::new()
+            .write(true)
+            .open(staging.join(&files[sized].name))
+            .unwrap()
+            .set_len(files[sized].size - 1)
+            .unwrap();
+        started_over(begin(&target, &manifest_bytes).1, "file sizes disagree");
+
+        // No record at all.
+        let (target, staging) = abandoned("no-record");
+        fs::remove_file(staging.join(PHYSICAL_PARTIAL_FILE)).unwrap();
+        started_over(begin(&target, &manifest_bytes).1, "no partial download record");
+
+        // A file nobody downloaded.
+        let (target, staging) = abandoned("extra-file");
+        fs::write(staging.join("stray"), b"x").unwrap();
+        started_over(begin(&target, &manifest_bytes).1, "unexpected file stray");
+        assert!(
+            !staging.join("stray").exists(),
+            "the started-over directory is a new one"
+        );
+
+        // A complete file whose content no longer matches its digest.
+        let (target, staging) = abandoned("bad-digest");
+        let path = staging.join(&files[sized].name);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[0] ^= 1;
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&bytes)
+            .unwrap();
+        let (receiver, start) = begin(&target, &manifest_bytes);
+        assert_eq!(
+            start,
+            StagingStart::Resumed {
+                held: export.manifest.total_bytes - files[sized].size,
+                redownload: vec![files[sized].name.clone()]
+            }
+        );
+        assert_eq!(receiver.progress()[sized], 0);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+
+        // Not a staging directory: refused, never deleted.
+        let target = root.path().join("foreign");
+        let staging = staging_path_for(&target).unwrap();
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("user-data"), b"keep").unwrap();
+        assert!(
+            ReceiverStaging::begin_or_resume(&target, &manifest_bytes, history, TransferLimits::default()).is_err()
+        );
+        assert_eq!(fs::read(staging.join("user-data")).unwrap(), b"keep");
+    }
+
+    /// Inside one file the record is rewritten after at most
+    /// `PARTIAL_RECORD_INTERVAL` new bytes, and only for fsynced bytes.
+    #[test]
+    fn the_record_follows_a_large_file_every_interval() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, history) = primary(root.path());
+        // One large, incompressible SST.
+        let mut value = vec![0_u8; 1024];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        for row in 0..20_000_u32 {
+            for byte in &mut value {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                *byte = state as u8;
+            }
+            source.put(format!("row{row:08}"), &value).unwrap();
+        }
+        source.flush().unwrap();
+        let export = export(&source, history, root.path());
+        let (large, file) = export
+            .manifest
+            .files
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, file)| file.size)
+            .unwrap();
+        assert!(file.size > PARTIAL_RECORD_INTERVAL + 1024 * 1024, "{} bytes", file.size);
+        let target = root.path().join("large");
+        let (mut receiver, _) = ReceiverStaging::begin_or_resume(
+            &target,
+            &export.manifest_bytes().unwrap(),
+            history,
+            TransferLimits::default(),
+        )
+        .unwrap();
+        let staging = receiver.staging_path().to_path_buf();
+        let mut offset = 0;
+        let mut checked = false;
+        while offset < file.size {
+            let bytes = export.read_chunk(large as u32, offset, MAX_CHUNK_BYTES as u32).unwrap();
+            receiver.append_chunk(large as u32, offset, &bytes).unwrap();
+            offset += bytes.len() as u64;
+            let done = read_record(&staging).files[large].bytes_done;
+            assert!(
+                done <= offset && offset - done < PARTIAL_RECORD_INTERVAL,
+                "{done} of {offset}"
+            );
+            if done > 0 && done < file.size {
+                checked = true;
+            }
+        }
+        assert!(checked, "the record advanced inside the file");
+        assert_eq!(read_record(&staging).files[large].bytes_done, file.size);
     }
 }

@@ -9,15 +9,23 @@
 //! ([`Refusal`]): a history it is not, WAL it no longer retains, a shutdown —
 //! so the receiver can tell "come back later" from "rebuild me" instead of
 //! reconnecting forever.
+//!
+//! Spec P2.2: a snapshot session's checkpoint export outlives the session
+//! that opened it by an [`ExportLeases`] lease, keyed by snapshot id, so a
+//! receiver whose download was interrupted opens the SAME snapshot again
+//! (`OpenRequest::SnapshotOf`) and resumes it. A leased checkpoint is hard
+//! links to the primary's SST files: it pins their disk space while it is
+//! kept, which is why leases expire and are bounded in number.
 
 use super::checkpoint_transfer::{validate_primary_source, OnlineCheckpointExport, TransferLimits};
 use super::ha_state::{ha_state, StandbyHandle, StandbyRegistration, StandbyState, SyncMode};
-use super::physical::{poll_source, PhysicalError, PhysicalPoll, MAX_BATCH_BYTES};
+use super::physical::{poll_source, wal_retains_after, PhysicalError, PhysicalPoll, MAX_BATCH_BYTES};
 use super::physical_wire::{
     Heartbeat, Hello, ObservedSession, OpenRequest, PeerRole, PhysicalSource, Refusal, RefuseCode, Result,
     SessionObserver, SourceSessionInfo, WireError, WireSyncMode,
 };
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use rocksdb::DB;
 use std::{
     net::SocketAddr,
@@ -26,6 +34,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Weak,
     },
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -161,13 +170,202 @@ impl SourceWorkLimiter {
     }
 }
 
+/// One leased export (see [`ExportLeases`]).
+struct LeaseEntry {
+    export: Arc<OnlineCheckpointExport>,
+    /// Sessions serving it now.
+    holders: usize,
+    /// When it was leased (the order "oldest dropped" follows).
+    leased_at: Instant,
+    /// When its last session ended; `None` while one holds it.
+    idle_since: Option<Instant>,
+}
+
+struct LeaseTable {
+    lease: Duration,
+    max_leases: usize,
+    entries: Vec<LeaseEntry>,
+}
+
+impl LeaseTable {
+    /// Remove every entry idle for longer than the lease; returns them (their
+    /// checkpoint directories are removed when the last reference drops, so
+    /// the caller drops them outside the lock, on a blocking thread).
+    fn expire(&mut self, now: Instant) -> Vec<Arc<OnlineCheckpointExport>> {
+        let lease = self.lease;
+        let mut expired = Vec::new();
+        self.entries.retain(|entry| {
+            let keep = entry
+                .idle_since
+                .is_none_or(|idle| now.saturating_duration_since(idle) < lease);
+            if !keep {
+                expired.push(Arc::clone(&entry.export));
+            }
+            keep
+        });
+        expired
+    }
+}
+
+/// Spec P2.2: the primary's leased checkpoint exports, shared by every
+/// replication session of its port. A snapshot session's export is leased
+/// for `lease` after the last session using it ends, keyed by snapshot id; a
+/// receiver that reconnects with `OpenRequest::SnapshotOf` gets the same
+/// export back while the lease holds. At most `max_leases` are kept (the
+/// oldest is dropped first; a session still using a dropped export keeps it
+/// until it ends). A leased checkpoint pins the SST files it hard-links.
+#[derive(Clone)]
+pub struct ExportLeases(Arc<Mutex<LeaseTable>>);
+
+/// A session's hold on a leased export; its drop starts the lease.
+struct LeaseHold {
+    leases: ExportLeases,
+    export: Arc<OnlineCheckpointExport>,
+}
+
+impl Drop for LeaseHold {
+    fn drop(&mut self) {
+        let snapshot = self.export.manifest().snapshot_id;
+        let mut table = self.leases.0.lock();
+        if let Some(entry) = table
+            .entries
+            .iter_mut()
+            .find(|entry| entry.export.manifest().snapshot_id == snapshot)
+        {
+            entry.holders = entry.holders.saturating_sub(1);
+            if entry.holders == 0 {
+                entry.idle_since = Some(Instant::now());
+            }
+        }
+    }
+}
+
+impl ExportLeases {
+    /// `lease`: how long an export outlives its last session; `max_leases`
+    /// (at least 1): how many are kept.
+    pub fn new(lease: Duration, max_leases: usize) -> Self {
+        Self(Arc::new(Mutex::new(LeaseTable {
+            lease,
+            max_leases: max_leases.max(1),
+            entries: Vec::new(),
+        })))
+    }
+
+    /// The snapshot ids leased now (diagnostics and tests).
+    pub fn leased(&self) -> Vec<Uuid> {
+        self.0
+            .lock()
+            .entries
+            .iter()
+            .map(|entry| entry.export.manifest().snapshot_id)
+            .collect()
+    }
+
+    /// Drop every export whose lease ran out by `now`. The caller drops the
+    /// returned exports — removing their checkpoint directories — off the
+    /// async runtime.
+    pub fn expire(&self, now: Instant) -> Vec<Arc<OnlineCheckpointExport>> {
+        self.0.lock().expire(now)
+    }
+
+    /// The leased export `snapshot`, held for a new session, if its lease
+    /// still holds.
+    fn reuse(&self, snapshot: Uuid, now: Instant) -> (Option<LeaseHold>, Vec<Arc<OnlineCheckpointExport>>) {
+        let mut table = self.0.lock();
+        let expired = table.expire(now);
+        let found = table
+            .entries
+            .iter_mut()
+            .find(|entry| entry.export.manifest().snapshot_id == snapshot)
+            .map(|entry| {
+                entry.holders += 1;
+                entry.idle_since = None;
+                Arc::clone(&entry.export)
+            });
+        drop(table);
+        let hold = found.map(|export| LeaseHold {
+            leases: self.clone(),
+            export,
+        });
+        (hold, expired)
+    }
+
+    /// Forget the export `snapshot` (it can no longer be served).
+    fn forget(&self, snapshot: Uuid) -> Option<Arc<OnlineCheckpointExport>> {
+        let mut table = self.0.lock();
+        let position = table
+            .entries
+            .iter()
+            .position(|entry| entry.export.manifest().snapshot_id == snapshot)?;
+        Some(table.entries.remove(position).export)
+    }
+
+    /// Lease a new export, held by the session that created it. Returns the
+    /// hold and the exports dropped to stay within `max_leases`.
+    fn lease(
+        &self,
+        export: Arc<OnlineCheckpointExport>,
+        now: Instant,
+    ) -> (LeaseHold, Vec<Arc<OnlineCheckpointExport>>) {
+        let mut table = self.0.lock();
+        let mut dropped = table.expire(now);
+        table.entries.push(LeaseEntry {
+            export: Arc::clone(&export),
+            holders: 1,
+            leased_at: now,
+            idle_since: None,
+        });
+        while table.entries.len() > table.max_leases {
+            // Oldest first, preferring one no session uses.
+            let victim = table
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.holders == 0)
+                .min_by_key(|(_, entry)| entry.leased_at)
+                .or_else(|| {
+                    table
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, entry)| entry.leased_at)
+                })
+                .map(|(index, _)| index);
+            match victim {
+                Some(index) => dropped.push(table.entries.remove(index).export),
+                None => break,
+            }
+        }
+        drop(table);
+        (
+            LeaseHold {
+                leases: self.clone(),
+                export,
+            },
+            dropped,
+        )
+    }
+}
+
 struct PrimarySession {
     db: Arc<DB>,
     history: Uuid,
     storage_identity: String,
     info: SourceSessionInfo,
-    export: Option<Arc<OnlineCheckpointExport>>,
+    /// A snapshot session's export, held through its lease.
+    export: Option<LeaseHold>,
     work: SourceWorkLimiter,
+}
+
+/// A leased export the session may serve again: the same dataset and store,
+/// its files intact, and the WAL past its cut still retained (else the
+/// receiver would download it only to be refused `WalPruned`).
+fn reusable(db: &DB, export: &OnlineCheckpointExport, history: Uuid, storage_identity: &str) -> bool {
+    let manifest = export.manifest();
+    manifest.history == history
+        && manifest.storage_identity == storage_identity
+        && export.manifest_bytes().is_ok()
+        && wal_retains_after(db, manifest.checkpoint_sequence).unwrap_or(false)
 }
 
 /// Open one source session. Resume does not inspect/create `export_parent`,
@@ -175,7 +373,9 @@ struct PrimarySession {
 /// proves a contiguous prefix and durable source barrier; later polls recheck
 /// continuity independently. Missing WAL always fails rather than reseeding.
 ///
-/// A snapshot lease retains files, not WAL. The caller owns listener admission,
+/// A snapshot session serves the export `leases` still holds for an
+/// `OpenRequest::SnapshotOf` (spec P2.2), or a new one, which it leases. A
+/// snapshot lease retains files, not WAL. The caller owns listener admission,
 /// simultaneous export caps, retention policy and disk budgets.
 pub async fn open_primary_session(
     db: Arc<DB>,
@@ -184,17 +384,60 @@ pub async fn open_primary_session(
     limits: TransferLimits,
     request: OpenRequest,
     work: SourceWorkLimiter,
+    leases: ExportLeases,
 ) -> Result<Arc<dyn PhysicalSource>> {
     let session_work = work.clone();
     work.run(move || {
         let storage_identity = validate_primary_source(&db, expected_history).map_err(source_error)?;
+        // Dropped (checkpoint directories removed) at the end of this
+        // blocking job, never under the lease lock.
+        let mut released = Vec::new();
         let (info, export) = match request {
-            OpenRequest::Snapshot => {
-                let export = Arc::new(
-                    OnlineCheckpointExport::create(&db, expected_history, &export_parent, limits)
-                        .map_err(source_error)?,
-                );
-                (SourceSessionInfo::Snapshot(export.manifest().clone()), Some(export))
+            OpenRequest::Snapshot | OpenRequest::SnapshotOf { .. } => {
+                let reused = match request {
+                    OpenRequest::SnapshotOf { snapshot } => {
+                        let (reused, expired) = leases.reuse(snapshot, Instant::now());
+                        released.extend(expired);
+                        match reused {
+                            Some(reused) if reusable(&db, &reused.export, expected_history, &storage_identity) => {
+                                tracing::info!(
+                                    "replication: serving the leased snapshot {snapshot} again (a resumed download)"
+                                );
+                                Some(reused)
+                            }
+                            Some(stale) => {
+                                tracing::info!(
+                                    "replication: the leased snapshot {snapshot} can no longer be served (its WAL \
+                                     or files are gone); exporting a new one"
+                                );
+                                drop(stale);
+                                released.extend(leases.forget(snapshot));
+                                None
+                            }
+                            None => {
+                                tracing::info!(
+                                    "replication: the snapshot {snapshot} a receiver resumes is no longer leased; \
+                                     exporting a new one"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                let hold = match reused {
+                    Some(hold) => hold,
+                    None => {
+                        let export = Arc::new(
+                            OnlineCheckpointExport::create(&db, expected_history, &export_parent, limits)
+                                .map_err(source_error)?,
+                        );
+                        let (hold, dropped) = leases.lease(export, Instant::now());
+                        released.extend(dropped);
+                        hold
+                    }
+                };
+                (SourceSessionInfo::Snapshot(hold.export.manifest().clone()), Some(hold))
             }
             OpenRequest::Resume { history, after } => {
                 if history != expected_history {
@@ -217,6 +460,7 @@ pub async fn open_primary_session(
         if validate_primary_source(&db, expected_history).map_err(source_error)? != storage_identity {
             return Err(source_error("primary storage identity changed during session creation"));
         }
+        drop(released);
         Ok(Arc::new(PrimarySession {
             db,
             history: expected_history,
@@ -238,7 +482,8 @@ impl PhysicalSource for PrimarySession {
     async fn read_chunk(&self, file_index: u32, offset: u64, length: u32) -> Result<Vec<u8>> {
         let export = self
             .export
-            .clone()
+            .as_ref()
+            .map(|hold| Arc::clone(&hold.export))
             .ok_or_else(|| source_error("resume sessions have no checkpoint chunks"))?;
         // Owning the Arc inside the blocking closure keeps immutable files alive
         // if the socket owner cancels or drops the surrounding session future.
@@ -339,6 +584,10 @@ mod tests {
         (db, history)
     }
 
+    fn leases() -> ExportLeases {
+        ExportLeases::new(Duration::from_secs(3600), 4)
+    }
+
     #[tokio::test]
     async fn source_resume_keeps_older_cursor_without_creating_a_new_checkpoint() {
         let root = tempfile::tempdir().unwrap();
@@ -351,6 +600,7 @@ mod tests {
             TransferLimits::default(),
             OpenRequest::Snapshot,
             work.clone(),
+            leases(),
         )
         .await
         .unwrap();
@@ -372,6 +622,7 @@ mod tests {
             TransferLimits::default(),
             OpenRequest::Resume { history, after: cut },
             work.clone(),
+            leases(),
         )
         .await
         .unwrap();
@@ -418,6 +669,7 @@ mod tests {
                 TransferLimits::default(),
                 request,
                 work.clone(),
+                leases(),
             )
             .await;
             assert!(
@@ -433,11 +685,132 @@ mod tests {
             TransferLimits::default(),
             OpenRequest::Resume { history, after: 1 },
             work.clone(),
+            leases(),
         )
         .await
         .unwrap();
         std::fs::write(db.path().join(PRIMARY_HISTORY_FILE), b"{}").unwrap();
         assert!(source.poll(1, MAX_BATCH_BYTES).await.is_err());
+    }
+
+    async fn snapshot(
+        db: &Arc<DB>,
+        history: Uuid,
+        root: &std::path::Path,
+        request: OpenRequest,
+        work: &SourceWorkLimiter,
+        leases: &ExportLeases,
+    ) -> (Arc<dyn PhysicalSource>, Uuid) {
+        let session = open_primary_session(
+            db.clone(),
+            history,
+            root.to_path_buf(),
+            TransferLimits::default(),
+            request,
+            work.clone(),
+            leases.clone(),
+        )
+        .await
+        .unwrap();
+        let id = session.session_info().session_id();
+        (session, id)
+    }
+
+    /// The checkpoint directories under the export parent.
+    fn exports(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("nano-checkpoint-")
+            })
+            .count()
+    }
+
+    /// Spec P2.2: a snapshot session's export outlives the session by its
+    /// lease, and `SnapshotOf` gets the same export back; once the lease ran
+    /// out the export (and its checkpoint directory) is gone and the same
+    /// request gets a new snapshot.
+    #[tokio::test]
+    async fn a_leased_export_serves_the_same_snapshot_until_its_lease_expires() {
+        let root = tempfile::tempdir().unwrap();
+        let (db, history) = primary(root.path());
+        let work = SourceWorkLimiter::new(2).unwrap();
+        let leases = ExportLeases::new(Duration::from_secs(3600), 4);
+        let (first, id) = snapshot(&db, history, root.path(), OpenRequest::Snapshot, &work, &leases).await;
+        let manifest = first.session_info().manifest().unwrap().clone();
+        let chunk = first.read_chunk(0, 0, 1).await.unwrap();
+        drop(first);
+        assert_eq!(leases.leased(), vec![id], "kept after its session ended");
+        assert_eq!(exports(root.path()), 1);
+        // A held export never expires, however late it is.
+        let (again, again_id) = snapshot(
+            &db,
+            history,
+            root.path(),
+            OpenRequest::SnapshotOf { snapshot: id },
+            &work,
+            &leases,
+        )
+        .await;
+        assert_eq!(again_id, id, "the reconnecting receiver gets the same snapshot");
+        assert_eq!(
+            serde_json::to_vec(again.session_info().manifest().unwrap()).unwrap(),
+            serde_json::to_vec(&manifest).unwrap(),
+            "byte for byte the same manifest"
+        );
+        assert_eq!(again.read_chunk(0, 0, 1).await.unwrap(), chunk);
+        assert!(leases.expire(Instant::now() + Duration::from_secs(7200)).is_empty());
+        assert_eq!(exports(root.path()), 1, "one export, shared");
+        drop(again);
+        let expired = leases.expire(Instant::now() + Duration::from_secs(7200));
+        assert_eq!(expired.len(), 1);
+        drop(expired);
+        assert!(leases.leased().is_empty());
+        assert_eq!(
+            exports(root.path()),
+            0,
+            "an expired export's checkpoint directory is removed"
+        );
+        let (fresh, fresh_id) = snapshot(
+            &db,
+            history,
+            root.path(),
+            OpenRequest::SnapshotOf { snapshot: id },
+            &work,
+            &leases,
+        )
+        .await;
+        assert_ne!(fresh_id, id, "an expired lease gets a new snapshot");
+        assert_eq!(leases.leased(), vec![fresh_id]);
+        drop(fresh);
+    }
+
+    /// At most `max_leases` exports are kept: the oldest goes first.
+    #[tokio::test]
+    async fn leased_exports_are_bounded_and_the_oldest_is_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let (db, history) = primary(root.path());
+        let work = SourceWorkLimiter::new(2).unwrap();
+        let leases = ExportLeases::new(Duration::from_secs(3600), 2);
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let (session, id) = snapshot(&db, history, root.path(), OpenRequest::Snapshot, &work, &leases).await;
+            drop(session);
+            ids.push(id);
+        }
+        assert_eq!(leases.leased(), ids[1..].to_vec());
+        assert_eq!(exports(root.path()), 2, "the dropped export's directory is gone");
+        // A lease of 0 keeps an export only while a session uses it.
+        let none = ExportLeases::new(Duration::ZERO, 4);
+        let (session, _) = snapshot(&db, history, root.path(), OpenRequest::Snapshot, &work, &none).await;
+        assert!(none.expire(Instant::now()).is_empty(), "held");
+        drop(session);
+        assert_eq!(none.expire(Instant::now()).len(), 1);
     }
 
     #[tokio::test]

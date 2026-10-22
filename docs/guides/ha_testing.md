@@ -10,13 +10,16 @@ wrong.
 ## The multi-container lab is out of service
 
 The Docker lab under `tests/docker` (the compose cluster, its images and its
-tutorial scripts) is **out of service** until remote replication over TLS (spec
-P2.2). It starts each standby in its own container, which needs a replication
-port reachable from another host, and the replication port is loopback-only in
-this release. It also exercised features that no longer exist: the observer
-node, transparent write routing from standbys, and the native replication
-channel. Do not use it to test this release; test with the suites and the pair
-fixture below, on one host.
+tutorial scripts) is **out of service**. It starts each standby in its own
+container, which needs remote replication: that exists now (TLS on the
+replication port, spec P2.2), but the lab has not been brought up to date for
+it, and it also exercised features that no longer exist: the observer node,
+transparent write routing from standbys, and the native replication channel.
+Do not use it to test this release; test with the suites and the pair fixture
+below (`--tls` runs the pair over TLS), on one host. `tests/physical_standby_tls.rs`
+covers remote replication on the loopback aliases `127.0.0.2` / `127.0.0.3`,
+and `tests/physical_snapshot_resume.rs` (built with `--features internal-tests`)
+the resumable bootstrap copy.
 
 ## Automated suites
 
@@ -181,9 +184,16 @@ A standby that stays up after a refusal logs that it remains in posture
 - **"--primary-host must name the primary's --replication-port".** The standby
   points at the primary's PostgreSQL or HTTP port. Use the primary's
   `--replication-port`.
-- **"--primary-host ... resolves to ...: the replication port is loopback-only".**
-  The standby names a remote address. Replication is loopback-only until TLS
-  replication (P2.2); use an authenticated tunnel ending on loopback.
+- **"--primary-host ... resolves to ...: a non-loopback replication port is reached over TLS".**
+  The standby names a remote address with `--primary-tls=false` and no
+  `--allow-insecure-replication-remote`. Use TLS (the default for a remote
+  primary), or an authenticated tunnel ending on loopback.
+- **The standby keeps reconnecting with `"reason": "tls: …"`.** Its CA does not
+  match the primary's certificate (`UnknownIssuer`), the certificate does not
+  name the `--primary-host` host (`NotValidForName`; set
+  `--primary-server-name`), or a mutual-TLS primary wants a client certificate.
+  The standby re-reads its CA and client certificate at every attempt: fix the
+  files and it recovers by itself.
 - **The primary lists no standbys.** It serves no replication port without a
   replication token, in memory, or with `--physical-replication=false`; its
   startup log says so.

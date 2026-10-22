@@ -4070,12 +4070,30 @@ impl StorageEngine {
         if self.is_physical_standby() {
             return Err(Error::physical_standby_write_refused("enable_lockfree_ingestion"));
         }
-        // Determine WAL path
+        // Spec P2.2 (plan §D5): refused on every HA role. Lock-free ingestion
+        // writes rows straight into the store from its own worker, bypassing
+        // the logical WAL, MVCC versions, indexes and row counters; on a
+        // primary its rows would reach a physical standby as raw keys that no
+        // derived state follows, and nothing recovers its own WAL.
+        let role = self.config.replication.role.trim();
+        if !role.is_empty() && !role.eq_ignore_ascii_case("standalone") {
+            return Err(Error::config(format!(
+                "enable_lockfree_ingestion is refused on a node with [replication] role = \"{role}\": lock-free \
+                 ingestion bypasses the logical WAL, MVCC and indexes that replication and recovery rely on; load \
+                 the data through SQL (COPY or multi-row INSERT) instead"
+            )));
+        }
+        // The lock-free WAL lives inside the data directory (never relative to
+        // the process's working directory).
         let wal_path = if let Some(ref temp) = self._temp_dir {
             temp.path().join("lockfree_wal")
         } else {
-            // Use same parent as main DB
-            std::path::PathBuf::from("data/lockfree_wal")
+            self.config
+                .storage
+                .path
+                .clone()
+                .unwrap_or_else(|| self.db.path().to_path_buf())
+                .join("lockfree_wal")
         };
 
         // Create directory if needed

@@ -39,8 +39,12 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `--auth <mode>` | `trust` | `trust\|password\|md5\|scram-sha-256` | `heliosdb-nano-server` |
 | `--password <s>` | — | Admin password seed (non-trust) | `heliosdb-nano-server` |
 | `--replication-role <r>` | `standalone` | `standalone\|primary\|standby` (standby = read-only physical replica) | `heliosdb-nano-server` |
-| `--replication-port <n>` | `5433` | THE replication port (`NPHYS002`) a primary serves its standbys on — bootstrap copy, physical WAL, heartbeats/ACKs on one connection; loopback only until P2.2; unused on a standby | `heliosdb-nano-server` |
-| `--primary-host <hp>` | — | Standby: the primary's `--replication-port` (must resolve to loopback) | `heliosdb-nano-server` |
+| `--replication-port <n>` | `5433` | THE replication port (`NPHYS002`) a primary serves its standbys on — bootstrap copy, physical WAL, heartbeats/ACKs on one connection; binds `--listen`'s address with `--replication-tls`, else loopback; unused on a standby | `heliosdb-nano-server` |
+| `--primary-host <hp>` | — | Standby: the primary's `--replication-port`; a non-loopback one is reached over TLS (`--primary-tls`, the default there) | `heliosdb-nano-server` |
+| `--replication-tls` / `--replication-tls-cert <f>` / `--replication-tls-key <f>` / `--replication-tls-ca <f>` | off | Primary: TLS on the replication port (cert/key default to `--tls-cert`/`--tls-key`); `-ca` = mutual TLS; token still required | `heliosdb-nano-server` |
+| `--primary-tls[=BOOL]` / `--primary-ca <f>` / `--primary-server-name <n>` / `--primary-client-cert <f>` / `--primary-client-key <f>` | TLS on for a remote primary | Standby: TLS to the primary, its CA (default: system trust store), the name to verify, the mutual-TLS client certificate | `heliosdb-nano-server` |
+| `--allow-insecure-replication-remote` | off | Plaintext replication over a non-loopback network (dev only; INSECURE warning) | `heliosdb-nano-server` |
+| `--snapshot-export-lease-secs <n>` / `--snapshot-export-max-leases <n>` | `3600` / `4` | Primary: how long an interrupted bootstrap copy can resume the same snapshot | `heliosdb-nano-server` |
 | `--replication-token-file <f>` | — | Owner-only 32-byte token; same file on primary and standbys; required for a primary to serve its replication port | `heliosdb-nano-server` |
 | `--physical-replication=false` | on for a primary with a token | Turn the primary's replication port off | `heliosdb-nano-server` |
 | `--replication-startup-timeout-secs <n>` | `30` | Standby: wait for streaming before listeners open (not ready) | `heliosdb-nano-server` |

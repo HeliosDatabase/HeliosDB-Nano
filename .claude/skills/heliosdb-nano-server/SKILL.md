@@ -76,14 +76,20 @@ log_path   = "./logs/audit.jsonl"
 
 [replication]                # HA replication (docs/guides/physical-standby.md)
 role                = "primary"   # standalone | primary | standby
-replication_port    = 5433        # THE replication port (NPHYS002), loopback only for now
+replication_port    = 5433        # THE replication port (NPHYS002); loopback unless tls_enabled
 token_file          = "/etc/heliosdb/replication.token"
 sync_mode           = "async"     # async | semi-sync | sync (primary: what a commit waits for)
 min_acks            = 1           # standbys that must acknowledge (1..=64)
 sync_timeout_ms     = 10000
 sync_timeout_action = "warn"      # warn | fail
+# tls_enabled      = true         # primary: TLS on the replication port (binds --listen's address)
+# tls_cert_path    = "/etc/heliosdb/repl.crt"   # else the [server]/--tls-cert pair
+# tls_key_path     = "/etc/heliosdb/repl.key"
+# tls_ca_path      = "/etc/heliosdb/standby-ca.crt"   # mutual TLS: standbys present a client cert
+# snapshot_export_lease_secs = 3600   # an interrupted bootstrap copy resumes within this
 # standby only:
 # primary_host     = "127.0.0.1:5433"
+# primary_tls_ca_path = "/etc/heliosdb/repl-ca.crt"   # TLS is the default for a non-loopback primary
 # max_standby_lag  = "30s"
 # on_unrecoverable = "stay-up"    # stay-up | exit
 ```
@@ -123,7 +129,7 @@ PGSSLMODE=require psql -h db.example.com -p 5432 -U heliosdb
 ```
 
 ### Recipe 4: HA Tier-1 — primary + physical standby
-A standby is a read-only **physical replica**: it applies the primary's RocksDB write groups over ONE replication connection to the primary's `--replication-port`. Full guide: `docs/guides/physical-standby.md`. The replication port is **loopback-only** until TLS replication (spec P2.2), so both run on one host (a remote primary needs an authenticated tunnel ending on loopback).
+A standby is a read-only **physical replica**: it applies the primary's RocksDB write groups over ONE replication connection to the primary's `--replication-port`. Full guide: `docs/guides/physical-standby.md`. On one host the connection is plaintext on loopback (below); a standby on **another host** uses TLS (Recipe 4b). An interrupted bootstrap copy resumes where it stopped (the primary leases the snapshot for `snapshot_export_lease_secs`, default 1 h).
 ```bash
 install -d -m 700 /srv/nano                       # owner-only parent of both data dirs
 head -c 32 /dev/urandom > /srv/nano/replication.token && chmod 600 /srv/nano/replication.token
@@ -154,7 +160,25 @@ curl -s http://127.0.0.1:8080/health     # primary: "standbys":[{…,"applied":"
 psql -h 127.0.0.1 -p 5442 -c "SELECT heliosdb_require_ready(), pg_is_in_recovery()"
 ```
 Sync tuning lives in `[replication]`: `min_acks`, `sync_timeout_ms`, `sync_timeout_action = "warn" | "fail"` (`fail` errors a commit that IS durable on the primary — never blind-retry it).
-**No failover or promotion yet** (plan phase P5): `SWITCHOVER` is refused and a standby's data directory cannot be reopened as a primary. A standby in `needs_recovery` (history mismatch, pruned WAL, wrong token, protocol version) stays up refusing data reads with SQLSTATE 55000; rebuild it by stopping it and starting it on a new, empty data directory (keep the old one aside). Loopback test pair: `scripts/regress/nano-physical-pair.sh --binary <path> --start`.
+**No failover or promotion yet** (plan phase P5): `SWITCHOVER` is refused and a standby's data directory cannot be reopened as a primary. A standby in `needs_recovery` (history mismatch, pruned WAL, wrong token, protocol version) stays up refusing data reads with SQLSTATE 55000; rebuild it by stopping it and starting it on a new, empty data directory (keep the old one aside). A TLS failure (wrong CA, bad certificate) is NOT `needs_recovery`: the standby keeps reconnecting with `"reason": "tls: …"` on `/health`. Loopback test pair: `scripts/regress/nano-physical-pair.sh --binary <path> --start` (add `--tls` for a TLS pair).
+
+### Recipe 4b: Remote standby over TLS
+```bash
+# Primary (10.0.0.5): --replication-tls binds the replication port on --listen's address.
+heliosdb-nano start --data-dir /srv/nano/primary --listen 10.0.0.5 --port 5432 \
+    --replication-role primary --replication-port 5433 \
+    --replication-token-file /srv/nano/replication.token \
+    --replication-tls --replication-tls-cert /etc/heliosdb/repl.crt --replication-tls-key /etc/heliosdb/repl.key
+#   add --replication-tls-ca /etc/heliosdb/standby-ca.crt for mutual TLS
+# Standby (another host): TLS is the default for a non-loopback --primary-host.
+heliosdb-nano start --data-dir /srv/nano/standby --listen 10.0.0.6 --port 5432 \
+    --replication-role standby --primary-host 10.0.0.5:5433 \
+    --primary-ca /etc/heliosdb/repl-ca.crt \
+    --replication-token-file /srv/nano/replication.token
+#   mutual TLS: --primary-client-cert standby.crt --primary-client-key standby.key
+curl -s http://127.0.0.1:8080/health | grep '"tls":true'
+```
+The token is still required over TLS. The certificate must name the `--primary-host` host (an IP is checked as an IP SAN; `--primary-server-name` overrides). Plaintext over a network needs `--allow-insecure-replication-remote` on both sides (dev only, INSECURE warning). A standby re-reads its CA/client cert at every reconnect; the primary loads its cert at start. Give a standby the primary's encryption key; there is no key rotation command, and rotation with standbys attached is unsupported until P5.
 
 ### Recipe 5: Active-active (Tier 2, requires `--features ha-tier2`)
 ```bash
@@ -224,6 +248,6 @@ WantedBy=multi-user.target
 - `heliosdb-nano-observability` — `/health`, slow-query log, `\stats`, tracing.
 - `heliosdb-nano-backup` — combine `--dump-schedule` with daemon mode.
 - `docs/guides/physical-standby.md` — physical standby: start, readiness, Proxy contract, sync modes, rebuild, limits.
-- `docs/guides/ha_testing.md` — HA test suites and the loopback pair fixture (the `tests/docker` lab is out of service until P2.2).
+- `docs/guides/ha_testing.md` — HA test suites and the pair fixture (the `tests/docker` lab is still out of service).
 - `docs/guides/audit.md` — audit-log configuration.
 - `config.example.toml` — full TOML config schema.

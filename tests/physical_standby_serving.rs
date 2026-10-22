@@ -407,6 +407,9 @@ const FROZEN_FIELDS: [&str; 11] = [
     "epoch",
 ];
 
+/// Spec P2.2 added these after the frozen eleven (additive only).
+const ADDED_FIELDS: [&str; 3] = ["tls", "reason", "progress"];
+
 fn assert_frozen_block(block: &serde_json::Value) {
     let keys: BTreeSet<&str> = block
         .as_object()
@@ -416,9 +419,10 @@ fn assert_frozen_block(block: &serde_json::Value) {
         .collect();
     assert_eq!(
         keys,
-        FROZEN_FIELDS.into_iter().collect::<BTreeSet<_>>(),
-        "frozen field set: {block}"
+        FROZEN_FIELDS.into_iter().chain(ADDED_FIELDS).collect::<BTreeSet<_>>(),
+        "frozen field set, plus the additive P2.2 fields: {block}"
     );
+    assert!(block["tls"].is_boolean(), "{block}");
     lsn(block["cursor"].as_str().unwrap());
     lsn(block["primary_cursor"].as_str().unwrap());
     assert!(block["lag_bytes"].is_u64(), "{block}");

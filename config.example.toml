@@ -421,9 +421,9 @@ role = "standalone" # standalone | primary | standby
 
 # THE replication port, NOT the PostgreSQL, MySQL, or HTTP listener port. A
 # primary serves its standbys here: the bootstrap copy, the physical WAL, and
-# the heartbeats/acknowledgements, one connection per standby. Loopback only in
-# this release (a remote primary is reached through an authenticated tunnel).
-# "port" is accepted as an alias; do not specify both names.
+# the heartbeats/acknowledgements, one connection per standby. It binds on
+# --listen's address with tls_enabled (or allow_insecure_remote), else on
+# loopback. "port" is accepted as an alias; do not specify both names.
 replication_port = 5433
 
 # Standby: how long its listeners wait for it to stream before they open anyway
@@ -433,7 +433,8 @@ replication_port = 5433
 startup_timeout_secs = 30
 
 # Required when the effective role is standby: the PRIMARY's replication port,
-# DNS:port, IPv4:port, or [IPv6]:port (it must resolve to loopback).
+# DNS:port, IPv4:port, or [IPv6]:port. A non-loopback primary is reached over
+# TLS (primary_tls below).
 # primary_host = "127.0.0.1:5433"
 # Informational only; a primary accepts connecting standbys and dials nobody.
 standby_hosts = [] # e.g. ["standby.example:5433", "[2001:db8::2]:5433"]
@@ -471,10 +472,43 @@ logical_wal_retention_entries = 0
 # CLI --replication-token-file overrides this value.
 # token_file = "/etc/heliosdb/replication.token"
 
-# Reserved for remote replication over TLS: the replication port is loopback
-# only in this release, so this changes nothing yet.
-# CLI --allow-insecure-replication-remote turns it on.
+# Plaintext replication over a NON-loopback network, token included: a primary
+# binds its replication port on --listen's address without TLS, a standby
+# connects to a non-loopback primary without TLS. Isolated development only (an
+# INSECURE warning is printed). CLI --allow-insecure-replication-remote.
 # allow_insecure_remote = true
+
+# PRIMARY: TLS on the replication port (spec P2.2). The token is still
+# required. Certificate/key default to the [server] pair (--tls-cert/--tls-key);
+# tls_ca_path makes every standby present a client certificate (mutual TLS).
+# CLI --replication-tls, --replication-tls-cert, --replication-tls-key,
+# --replication-tls-ca, --replication-tls-post-quantum[=BOOL].
+# tls_enabled = true
+# tls_cert_path = "/etc/heliosdb/repl.crt"
+# tls_key_path = "/etc/heliosdb/repl.key"
+# tls_ca_path = "/etc/heliosdb/standby-ca.crt"
+# tls_post_quantum = true   # default: follows [server] tls_post_quantum
+
+# STANDBY: TLS to the primary. primary_tls defaults to on for a non-loopback
+# primary_host and off on loopback; the CA defaults to the system trust store
+# and the server name to primary_host's host (an IP is checked as an IP SAN).
+# CLI --primary-tls[=BOOL], --primary-ca, --primary-server-name,
+# --primary-client-cert, --primary-client-key,
+# --primary-tls-insecure-skip-verify (only with allow_insecure_remote).
+# primary_tls = true
+# primary_tls_ca_path = "/etc/heliosdb/repl-ca.crt"
+# primary_tls_server_name = "primary.example"
+# primary_tls_client_cert_path = "/etc/heliosdb/standby.crt"
+# primary_tls_client_key_path = "/etc/heliosdb/standby.key"
+# primary_tls_insecure_skip_verify = false
+
+# PRIMARY: an interrupted bootstrap copy resumes from the same snapshot while
+# its export is leased: this long after the session ends (0..=604800 s), at
+# most snapshot_export_max_leases of them (1..=64). A leased checkpoint
+# hard-links the primary's SST files and pins their disk space.
+# CLI --snapshot-export-lease-secs, --snapshot-export-max-leases.
+# snapshot_export_lease_secs = 3600
+# snapshot_export_max_leases = 4
 
 # ============================================================================
 # PERFORMANCE CONFIGURATION

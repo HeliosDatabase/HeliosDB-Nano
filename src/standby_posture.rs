@@ -148,6 +148,13 @@ pub struct StandbySnapshot {
     /// placeholder and nothing is ready.
     pub store_attached: bool,
     pub max_standby_lag: Duration,
+    /// Spec P2.2: the current (or last) replication session is on TLS, both
+    /// ends said so.
+    pub tls: bool,
+    /// Spec P2.2: why the receiver's last connection attempt failed while it
+    /// is connecting or reconnecting (a TLS failure reads `tls: …`); cleared
+    /// once a session delivers again.
+    pub last_error: Option<String>,
 }
 
 impl StandbySnapshot {
@@ -223,12 +230,24 @@ impl StandbySnapshot {
             sync_mode: self.sync_mode.clone(),
             last_ack_sequence: self.last_ack_sequence,
             epoch: self.epoch,
+            tls: self.tls,
+            reason: match &self.posture {
+                StandbyPosture::NeedsRecovery { reason, .. } => Some(reason.clone()),
+                StandbyPosture::Connecting | StandbyPosture::Reconnecting { .. } => self.last_error.clone(),
+                _ => None,
+            },
+            progress: match &self.posture {
+                StandbyPosture::Recovering { progress, .. } => Some(progress.clone()),
+                _ => None,
+            },
         }
     }
 }
 
 /// The one field set `/health`'s `replication` object, `/ready`'s body and
-/// the `heliosdb_standby_status` view share (§D8: frozen).
+/// the `heliosdb_standby_status` view share (§D8). The first eleven fields
+/// are frozen for HeliosDB Proxy (names and types); spec P2.2 ADDED `tls`,
+/// `reason` and `progress` after them.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ReplicationBlock {
     pub role: String,
@@ -244,6 +263,16 @@ pub struct ReplicationBlock {
     pub sync_mode: String,
     pub last_ack_sequence: Option<u64>,
     pub epoch: u64,
+    /// Spec P2.2: the replication session is on TLS (a standby: its session
+    /// to the primary; a primary: its replication port serves TLS).
+    pub tls: bool,
+    /// Spec P2.2: why a standby is not streaming — the reason of a
+    /// `needs_recovery`, or the last connection failure while `connecting` /
+    /// `reconnecting` (e.g. `tls: invalid peer certificate: UnknownIssuer`).
+    pub reason: Option<String>,
+    /// Spec P2.2: a `recovering` standby's download progress,
+    /// `"<bytes held>/<bytes total> bytes"`.
+    pub progress: Option<String>,
 }
 
 /// A live reader of the standby's applied cursor, exact to the batch (the
@@ -366,12 +395,30 @@ impl PostureTracker {
             epoch: EPOCH,
             store_attached: false,
             max_standby_lag,
+            tls: false,
+            last_error: None,
         });
         Self {
             tx,
             live: Arc::new(RwLock::new(None)),
             machine: Mutex::new(Machine::default()),
         }
+    }
+
+    /// Spec P2.2: what the receiver reports about its transport — why its
+    /// last connection attempt failed (`Some` while it retries), and whether
+    /// the current session is on TLS (`Some` once a session delivers).
+    pub fn note_transport(&self, last_error: Option<String>, tls: Option<bool>) {
+        self.tx.send_if_modified(|snapshot| {
+            let before = (snapshot.last_error.clone(), snapshot.tls);
+            if let Some(error) = last_error {
+                snapshot.last_error = Some(error);
+            }
+            if let Some(tls) = tls {
+                snapshot.tls = tls;
+            }
+            (snapshot.last_error.clone(), snapshot.tls) != before
+        });
     }
 
     pub fn handle(&self) -> PostureHandle {
@@ -422,6 +469,11 @@ impl PostureTracker {
     #[cfg(feature = "ha-tier1")]
     pub fn observe(&self, status: &crate::replication::physical_receiver::ReceiverStatus) {
         use crate::replication::physical_receiver::ReceiverStatus as Status;
+        match status {
+            Status::Connecting { last_error, .. } => self.note_transport(last_error.clone(), None),
+            Status::Applying { tls, .. } | Status::CaughtUp { tls, .. } => self.note_transport(None, Some(*tls)),
+            _ => {}
+        }
         let event = match status {
             Status::Connecting { after, .. } => ReceiverEvent::Connecting { after: *after },
             Status::Downloading { received, total, .. } => ReceiverEvent::Downloading {
@@ -481,6 +533,8 @@ impl PostureTracker {
                     };
                 }
                 ReceiverEvent::Downloading { received, total } => {
+                    // A session delivers: the connection failure is history.
+                    snapshot.last_error = None;
                     snapshot.posture = StandbyPosture::Recovering {
                         mode: "bootstrap",
                         progress: format!("{received}/{total} bytes"),
@@ -499,6 +553,7 @@ impl PostureTracker {
                     session,
                 } => {
                     machine.ever_connected = true;
+                    snapshot.last_error = None;
                     // The session's cursor already reached a barrier the
                     // same session reported: it caught up, and its
                     // `CaughtUp` was overwritten (the receiver polls again at
@@ -547,6 +602,7 @@ impl PostureTracker {
                     session,
                 } => {
                     machine.ever_connected = true;
+                    snapshot.last_error = None;
                     machine.note_barrier(session, Some(barrier));
                     machine.streaming_session = Some(session);
                     machine.reconnect_since = None;
@@ -580,12 +636,20 @@ pub struct PrimaryStatus {
     /// This node's replication port (`NPHYS002`), when it serves one.
     pub endpoint: Option<String>,
     pub sync_mode: String,
+    /// Spec P2.2: the replication port serves TLS.
+    pub tls: bool,
 }
 
 impl PrimaryStatus {
     pub fn block(&self) -> ReplicationBlock {
         let cursor = self.engine.upgrade().map_or(0, |engine| engine_sequence(&engine));
-        primary_block(self.role, cursor, self.endpoint.clone(), self.sync_mode.clone())
+        primary_block(
+            self.role,
+            cursor,
+            self.endpoint.clone(),
+            self.sync_mode.clone(),
+            self.tls,
+        )
     }
 }
 
@@ -630,7 +694,7 @@ fn engine_sequence(engine: &StorageEngine) -> u64 {
     engine.db().latest_sequence_number()
 }
 
-fn primary_block(role: &str, cursor: u64, primary: Option<String>, sync_mode: String) -> ReplicationBlock {
+fn primary_block(role: &str, cursor: u64, primary: Option<String>, sync_mode: String, tls: bool) -> ReplicationBlock {
     ReplicationBlock {
         role: role.to_string(),
         state: "streaming".to_string(),
@@ -643,6 +707,9 @@ fn primary_block(role: &str, cursor: u64, primary: Option<String>, sync_mode: St
         sync_mode,
         last_ack_sequence: None,
         epoch: EPOCH,
+        tls,
+        reason: None,
+        progress: None,
     }
 }
 
@@ -728,9 +795,13 @@ pub fn status_block(engine: &StorageEngine) -> ReplicationBlock {
     let node = NODE.read().clone();
     match node {
         Some(NodeStatus::Standby(handle)) => handle.snapshot().block(),
-        Some(NodeStatus::Primary(status)) => {
-            primary_block(status.role, engine_sequence(engine), status.endpoint, status.sync_mode)
-        }
+        Some(NodeStatus::Primary(status)) => primary_block(
+            status.role,
+            engine_sequence(engine),
+            status.endpoint,
+            status.sync_mode,
+            status.tls,
+        ),
         None => match embedded_standby_cursor(Some(engine)) {
             // An embedded standby: no receiver, so no posture to report.
             Some(cursor) => ReplicationBlock {
@@ -745,8 +816,11 @@ pub fn status_block(engine: &StorageEngine) -> ReplicationBlock {
                 sync_mode: "async".to_string(),
                 last_ack_sequence: None,
                 epoch: EPOCH,
+                tls: false,
+                reason: None,
+                progress: None,
             },
-            None => primary_block("standalone", engine_sequence(engine), None, "async".to_string()),
+            None => primary_block("standalone", engine_sequence(engine), None, "async".to_string(), false),
         },
     }
 }
@@ -1072,5 +1146,65 @@ mod tests {
                 progress: "10/40 bytes".into()
             }
         );
+        assert_eq!(posture.snapshot().block().progress.as_deref(), Some("10/40 bytes"));
+    }
+
+    /// Spec P2.2: the block gains `tls`, `reason` and `progress` after the
+    /// frozen fields. A failed connection's reason shows while the standby
+    /// (re)connects and goes once a session delivers; a session's TLS shows.
+    #[test]
+    fn the_block_reports_tls_and_why_the_standby_is_not_streaming() {
+        let posture = tracker();
+        let t0 = Instant::now();
+        posture.attach_store(3, Arc::new(|| None));
+        posture.apply_event(
+            ReceiverEvent::CaughtUp {
+                cursor: 3,
+                barrier: 3,
+                session: 1,
+            },
+            t0,
+        );
+        posture.note_transport(None, Some(true));
+        let block = posture.snapshot().block();
+        assert!(
+            block.tls && block.reason.is_none() && block.progress.is_none(),
+            "{block:?}"
+        );
+
+        posture.apply_event(ReceiverEvent::Connecting { after: Some(3) }, t0);
+        posture.note_transport(Some("tls: invalid peer certificate: UnknownIssuer".into()), None);
+        let snapshot = posture.snapshot();
+        assert_eq!(
+            snapshot.posture.state(),
+            "reconnecting",
+            "a TLS failure is not needs_recovery"
+        );
+        assert_eq!(
+            snapshot.block().reason.as_deref(),
+            Some("tls: invalid peer certificate: UnknownIssuer")
+        );
+        assert!(snapshot.ready_at(t0), "within max_standby_lag it still serves");
+
+        posture.apply_event(
+            ReceiverEvent::Applying {
+                cursor: 3,
+                barrier: Some(5),
+                session: 2,
+            },
+            t0,
+        );
+        assert!(
+            posture.snapshot().block().reason.is_none(),
+            "a delivering session clears it"
+        );
+
+        posture.needs_recovery("physical replication history mismatch");
+        assert_eq!(
+            posture.snapshot().block().reason.as_deref(),
+            Some("physical replication history mismatch")
+        );
+        let primary = primary_block("primary", 7, Some("127.0.0.1:5433".into()), "async".into(), true);
+        assert!(primary.tls && primary.reason.is_none());
     }
 }
