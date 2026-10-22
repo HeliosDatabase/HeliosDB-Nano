@@ -43,9 +43,9 @@
 //! session's connect barrier, a poll's announced durable barrier (reported
 //! before its batches are applied, so it stays current through a long poll),
 //! a caught-up poll's barrier. It never moves back, and it is kept across
-//! reconnects until a new barrier arrives. The native v3 control channel's
-//! positions are logical WAL LSNs — another number space — and never feed it
-//! ([`PostureTracker::observe_native_handshake`]).
+//! reconnects until a new barrier arrives. Physical sequences only: since
+//! spec P2.1 there is no other channel, and no logical WAL LSN, to confuse it
+//! with.
 //!
 //! # Where it lives
 //!
@@ -133,19 +133,14 @@ pub struct StandbySnapshot {
     /// The last physical durable barrier the primary reported (module
     /// documentation); 0 until one is observed. Physical sequences only.
     pub primary_cursor: u64,
-    /// The primary's LOGICAL WAL LSN as of the native v3 control channel's
-    /// last handshake: a diagnostic in another number space, never compared
-    /// with `cursor` or `primary_cursor` and not part of the replication
-    /// block. `None` until a handshake is observed.
-    pub native_primary_lsn: Option<u64>,
     /// When a poll last reached the primary's barrier.
     pub last_caught_up: Option<Instant>,
     /// The physical source this standby follows (`host:port`).
     pub primary: String,
     pub sync_mode: String,
     /// The sequence this standby last reported durable to its primary: the
-    /// `after` of its next poll, which is how the primary learns a physical
-    /// standby's position until physical ACKs arrive (plan §D3.6, phase P2).
+    /// durable cursor its polls start from, which its heartbeats acknowledge
+    /// (spec P2.1, plan §D3.6).
     pub last_ack_sequence: Option<u64>,
     pub epoch: u64,
     /// Whether a serving store is attached (`EmbeddedDatabase::with_physical_standby`
@@ -364,7 +359,6 @@ impl PostureTracker {
             posture: StandbyPosture::Connecting,
             cursor: 0,
             primary_cursor: 0,
-            native_primary_lsn: None,
             last_caught_up: None,
             primary,
             sync_mode,
@@ -416,18 +410,6 @@ impl PostureTracker {
                     since: Instant::now(),
                 };
             }
-        });
-    }
-
-    /// The native v3 control channel completed a handshake in which the
-    /// primary reported `primary_logical_lsn`, its LOGICAL WAL position. Kept
-    /// as [`StandbySnapshot::native_primary_lsn`] only: it changes no physical
-    /// position, no posture and no readiness.
-    pub fn observe_native_handshake(&self, primary_logical_lsn: u64) {
-        self.tx.send_if_modified(|snapshot| {
-            let changed = snapshot.native_primary_lsn != Some(primary_logical_lsn);
-            snapshot.native_primary_lsn = Some(primary_logical_lsn);
-            changed
         });
     }
 
@@ -588,14 +570,14 @@ impl PostureTracker {
 // Node status: what this process is, for the SQL surface and HTTP.
 // -------------------------------------------------------------------------
 
-/// What a primary (or observer) reports.
+/// What a primary reports.
 #[derive(Clone)]
 pub struct PrimaryStatus {
-    /// `"primary"` or `"observer"`.
+    /// `"primary"`.
     pub role: &'static str,
     /// The engine whose physical sequence is this node's cursor.
     pub engine: Weak<StorageEngine>,
-    /// This node's physical source endpoint, when it serves one.
+    /// This node's replication port (`NPHYS002`), when it serves one.
     pub endpoint: Option<String>,
     pub sync_mode: String,
 }
@@ -621,7 +603,7 @@ pub fn install_standby(handle: PostureHandle) {
     *NODE.write() = Some(NodeStatus::Standby(handle));
 }
 
-/// This process is a primary (or observer) reporting `status`.
+/// This process is a primary reporting `status`.
 pub fn install_primary(status: PrimaryStatus) {
     *NODE.write() = Some(NodeStatus::Primary(status));
 }
@@ -952,21 +934,17 @@ mod tests {
         );
     }
 
-    /// Field finding: a reconnecting standby reported `primary 0/C97` while
-    /// its primary's physical sequence was 0/46EB. `primary_cursor` is the
-    /// last PHYSICAL barrier: a native handshake's logical LSN never moves it,
-    /// a reconnect keeps it, and only a physical barrier advances it.
+    /// Field finding: a reconnecting standby reported `primary 0/C97` — the
+    /// native v3 channel's LOGICAL LSN — while its primary's physical sequence
+    /// was 0/46EB. `primary_cursor` is the last PHYSICAL barrier: a reconnect
+    /// keeps it, and only a physical barrier advances it (spec P2.1 removed
+    /// the channel that reported the other number space).
     #[test]
-    fn primary_cursor_is_the_last_physical_barrier_never_a_native_lsn() {
+    fn primary_cursor_is_the_last_physical_barrier() {
         let posture = tracker();
         let t0 = Instant::now();
-        // Before any physical barrier: a native handshake changes nothing.
-        posture.observe_native_handshake(0xC97);
-        let snapshot = posture.snapshot();
-        assert_eq!(snapshot.primary_cursor, 0);
-        assert_eq!(snapshot.block().primary_cursor, "0/0");
-        assert_eq!(snapshot.native_primary_lsn, Some(0xC97));
-        assert_eq!(snapshot.posture, StandbyPosture::Connecting);
+        assert_eq!(posture.snapshot().primary_cursor, 0);
+        assert_eq!(posture.snapshot().block().primary_cursor, "0/0");
 
         posture.attach_store(0x4000, Arc::new(|| None));
         posture.apply_event(
@@ -978,17 +956,12 @@ mod tests {
             t0,
         );
         posture.apply_event(ReceiverEvent::Connecting { after: Some(0x46EB) }, t0);
-        assert_eq!(posture.snapshot().posture.state(), "reconnecting");
-        assert_eq!(posture.snapshot().primary_cursor, 0x46EB, "kept across the reconnect");
-
-        // The native channel reconnects first and reports its logical LSN.
-        posture.observe_native_handshake(0xC97);
         let snapshot = posture.snapshot();
-        assert_eq!(snapshot.primary_cursor, 0x46EB);
+        assert_eq!(snapshot.posture.state(), "reconnecting");
+        assert_eq!(snapshot.primary_cursor, 0x46EB, "kept across the reconnect");
         assert_eq!(snapshot.cursor, 0x46EB);
         assert_eq!(snapshot.block().primary_cursor, "0/46EB");
         assert_eq!(snapshot.lag_bytes(), 0);
-        assert_eq!(snapshot.posture.state(), "reconnecting");
 
         // A physical barrier (the new session's, or a poll's) advances it ...
         posture.apply_event(
@@ -1022,7 +995,6 @@ mod tests {
             t0,
         );
         assert_eq!(posture.snapshot().primary_cursor, 0x5000);
-        assert_eq!(posture.snapshot().native_primary_lsn, Some(0xC97));
     }
 
     /// The receiver polls again at once after a poll that carried groups, so

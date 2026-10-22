@@ -2401,7 +2401,6 @@ impl SystemViewRegistry {
                     HARole::Primary => "Primary",
                     HARole::Standby => "Standby",
                     HARole::Standalone => "Standalone",
-                    HARole::Observer => "Observer",
                 };
 
                 let alias = get_alias(config.node_id);
@@ -2437,7 +2436,7 @@ impl SystemViewRegistry {
                     Value::Boolean(true), // Connected standbys are healthy
                     Value::String(health_msg.unwrap_or_else(|| "Connected".to_string())),
                     Value::Int8(0),
-                    Value::Int8(standby.apply_lsn as i64),
+                    Value::Int8(standby.applied_seq as i64),
                     Value::Int8(standby.lag_ms as i64),
                     Value::Int4(priority as i32),
                     Value::Int4(weight as i32),
@@ -2476,7 +2475,6 @@ impl SystemViewRegistry {
                             HARole::Primary => "Primary",
                             HARole::Standby => "Standby",
                             HARole::Standalone => "Standalone",
-                            HARole::Observer => "Observer",
                         }
                     } else if ha_registry.get_standbys().iter().any(|s| s.node_id == node_id) {
                         "Standby"
@@ -2521,7 +2519,7 @@ impl SystemViewRegistry {
             let healthy_standbys = standbys.iter().filter(|_| true).count() as i32; // All connected are healthy
 
             let current_lsn = ha_registry.get_lsn();
-            let oldest_lsn = standbys.iter().map(|s| s.apply_lsn).min().unwrap_or(current_lsn);
+            let oldest_lsn = standbys.iter().map(|s| s.applied_seq).min().unwrap_or(current_lsn);
             let max_lag = standbys.iter().map(|s| s.lag_ms).max().unwrap_or(0);
 
             let cluster_state = match ha_registry.get_role() {
@@ -2534,7 +2532,6 @@ impl SystemViewRegistry {
                 }
                 HARole::Standby => "standby",
                 HARole::Standalone => "standalone",
-                HARole::Observer => "observer",
             };
 
             let (primary_node, primary_alias) = if let Some(config) = ha_registry.get_config() {

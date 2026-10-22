@@ -23,6 +23,9 @@ mod mv_scheduler;
 mod mv_system_views;
 mod mvcc;
 mod prefix_decode;
+// Spec P2.1: the commit path's wait for standby acknowledgements of the
+// physical sequence, and the slot an unconfirmed commit is reported in.
+pub mod replication_wait;
 pub mod statistics;
 mod stats;
 mod tde;

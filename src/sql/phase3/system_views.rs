@@ -5961,7 +5961,7 @@ impl SystemViewRegistry {
                 .map(|dt| Value::Timestamp(dt))
                 .unwrap_or(Value::Null);
             let last_heartbeat = Utc
-                .timestamp_opt(standby.last_heartbeat, 0)
+                .timestamp_opt(standby.last_seen, 0)
                 .single()
                 .map(|dt| Value::Timestamp(dt))
                 .unwrap_or(Value::Null);
@@ -5971,9 +5971,10 @@ impl SystemViewRegistry {
                 Value::String(standby.address.clone()),
                 Value::String(standby.state.as_str().to_string()),
                 Value::String(standby.sync_mode.as_str().to_string()),
-                Value::Int8(standby.current_lsn as i64),
-                Value::Int8(standby.flush_lsn as i64),
-                Value::Int8(standby.apply_lsn as i64),
+                // Physical sequences (spec P2.1): received = applied, flushed = durable.
+                Value::Int8(standby.applied_seq as i64),
+                Value::Int8(standby.durable_seq as i64),
+                Value::Int8(standby.applied_seq as i64),
                 Value::Int8(standby.lag_bytes as i64),
                 Value::Int8(standby.lag_ms as i64),
                 connected_at,

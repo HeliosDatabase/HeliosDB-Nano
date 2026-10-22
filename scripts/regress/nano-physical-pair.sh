@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
 # nano-physical-pair.sh — a HeliosDB-Nano primary and its PHYSICAL standby on
-# loopback (spec P1.3 §5, docs/plans/specs/P1_3_standby_start_posture_pgwire.md).
+# loopback (spec P1.3 §5, docs/plans/specs/P1_3_standby_start_posture_pgwire.md;
+# spec P2.1: one replication connection, docs/guides/physical-standby.md).
 #
 # The pair HeliosDB Proxy's lab and the live probes run against:
-#   primary  PostgreSQL 127.0.0.1:27721  (writes; physical source 127.0.0.1:27742)
-#   standby  PostgreSQL 127.0.0.1:27722  (read-only physical replica)
+#   primary  PostgreSQL 127.0.0.1:27721  (writes; replication port 127.0.0.1:27741)
+#   standby  PostgreSQL 127.0.0.1:27722  (read-only physical replica of it)
 # both with trust auth, so Proxy's health and topology logins (postgres /
 # postgres, application_name heliosdb-proxy-health / helios-topology) are
 # accepted in every posture. The standby is bootstrapped from the primary into
@@ -20,6 +21,8 @@
 #   --load N [--duration S]    N single-row INSERTs per second on the primary for S seconds
 #                              (default 10); prints the measured ops/s
 #   --kill primary|standby     SIGKILL one side
+#   --pause primary|standby    SIGSTOP one side (a paused standby holds up sync commits)
+#   --resume primary|standby   SIGCONT one side
 #   --restart primary|standby|both
 #                              start a side that is not running (after --kill), and wait for it
 #   --stop                     SIGTERM both sides
@@ -28,15 +31,19 @@
 # Options:
 #   --dir DIR                  state directory: data, logs, token, pids (default ./nano-physical-pair)
 #   --primary-port P           default 27721      --standby-port P        default 27722
-#   --replication-port P       default 27741      --physical-port P       default 27742
+#   --replication-port P       default 27741 (the primary's ONE replication port)
 #   --primary-http-port P      default 27751      --standby-http-port P   default 27752
 #   --max-standby-lag D        the standby's [replication] max_standby_lag (default 30s)
+#   --sync-mode M              the primary's [replication] sync_mode: async | semi-sync | sync
+#                              (default async); --min-acks N, --sync-timeout-ms MS and
+#                              --sync-timeout-action warn|fail tune it
 #   --timeout S                how long --start / --restart wait for readiness (default 120)
 #
 # Every invocation ends with one JSON line on stdout:
 #   {"ports":{...},"pids":{"primary":N|null,"standby":N|null},"ops_per_s":X|null,
-#    "ready":{"primary":CODE|null,"standby":CODE|null}}
-# where ready.* is the HTTP status of GET /ready (200 ready, 503 not ready).
+#    "ready":{"primary":CODE|null,"standby":CODE|null},"standbys":N|null}
+# where ready.* is the HTTP status of GET /ready (200 ready, 503 not ready) and
+# standbys is how many standbys the primary's /health lists.
 # Proxy's lag threshold: lag_bytes is "write operations behind" (the physical
 # sequence delta), so at the measured ops/s a max_lag_bytes of ops_per_s * 30
 # allows about 30 s of lag (1000 ops/s -> 30000).
@@ -54,16 +61,19 @@ DIR="./nano-physical-pair"
 PG_P=27721
 PG_S=27722
 REPL_P=27741
-PHYS_P=27742
 HTTP_P=27751
 HTTP_S=27752
 MAX_LAG="30s"
+SYNC_MODE="async"
+MIN_ACKS=1
+SYNC_TIMEOUT_MS=10000
+SYNC_TIMEOUT_ACTION="warn"
 TIMEOUT=120
 DURATION=10
 ACTIONS=()
 
 usage() {
-    sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,52p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 die() {
@@ -78,17 +88,20 @@ while [ $# -gt 0 ]; do
         --primary-port) PG_P="${2:?}"; shift 2 ;;
         --standby-port) PG_S="${2:?}"; shift 2 ;;
         --replication-port) REPL_P="${2:?}"; shift 2 ;;
-        --physical-port) PHYS_P="${2:?}"; shift 2 ;;
         --primary-http-port) HTTP_P="${2:?}"; shift 2 ;;
         --standby-http-port) HTTP_S="${2:?}"; shift 2 ;;
         --max-standby-lag) MAX_LAG="${2:?}"; shift 2 ;;
+        --sync-mode) SYNC_MODE="${2:?}"; shift 2 ;;
+        --min-acks) MIN_ACKS="${2:?}"; shift 2 ;;
+        --sync-timeout-ms) SYNC_TIMEOUT_MS="${2:?}"; shift 2 ;;
+        --sync-timeout-action) SYNC_TIMEOUT_ACTION="${2:?}"; shift 2 ;;
         --timeout) TIMEOUT="${2:?}"; shift 2 ;;
         --duration) DURATION="${2:?}"; shift 2 ;;
         --start | --stop | --status) ACTIONS+=("${1#--}"); shift ;;
         --load) ACTIONS+=("load:${2:?--load needs a rate}"); shift 2 ;;
-        --kill)
-            case "${2:-}" in primary | standby) ;; *) die "--kill primary|standby" ;; esac
-            ACTIONS+=("kill:$2"); shift 2 ;;
+        --kill | --pause | --resume)
+            case "${2:-}" in primary | standby) ;; *) die "$1 primary|standby" ;; esac
+            ACTIONS+=("${1#--}:$2"); shift 2 ;;
         --restart)
             case "${2:-}" in primary | standby | both) ;; *) die "--restart primary|standby|both" ;; esac
             ACTIONS+=("restart:$2"); shift 2 ;;
@@ -116,6 +129,8 @@ if [ ! -f "$TOKEN" ]; then
 fi
 chmod 600 "$TOKEN"
 printf '[replication]\nmax_standby_lag = "%s"\n' "$MAX_LAG" >"$DIR/standby.toml"
+printf '[replication]\nsync_mode = "%s"\nmin_acks = %s\nsync_timeout_ms = %s\nsync_timeout_action = "%s"\n' \
+    "$SYNC_MODE" "$MIN_ACKS" "$SYNC_TIMEOUT_MS" "$SYNC_TIMEOUT_ACTION" >"$DIR/primary.toml"
 
 cat >"$HELPER" <<'PY'
 """Wire helpers for nano-physical-pair.sh: HTTP status, PostgreSQL simple query, paced load."""
@@ -128,6 +143,14 @@ def http_code(port, path):
             return response.status
     except urllib.error.HTTPError as error:
         return error.code
+    except Exception:
+        return None
+
+
+def standby_count(port):
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as response:
+            return len(json.load(response).get("standbys", []))
     except Exception:
         return None
 
@@ -245,6 +268,9 @@ if __name__ == "__main__":
     if command == "http-code":
         code = http_code(int(args[0]), args[1])
         print("null" if code is None else code)
+    elif command == "standby-count":
+        count = standby_count(int(args[0]))
+        print("null" if count is None else count)
     elif command == "wait-http":
         sys.exit(wait_http(int(args[0]), args[1], int(args[2]), float(args[3])))
     elif command == "wait-pg":
@@ -267,9 +293,8 @@ pid_of() {
 start_primary() {
     pid_of primary >/dev/null && return 0
     nohup "$BIN" start --data-dir "$DIR/primary" --listen 127.0.0.1 --port "$PG_P" --auth trust \
-        --replication-role primary --replication-port "$REPL_P" \
-        --physical-replication-listen "127.0.0.1:$PHYS_P" --replication-token-file "$TOKEN" \
-        --http-port "$HTTP_P" </dev/null >>"$DIR/primary.log" 2>&1 &
+        --replication-role primary --replication-port "$REPL_P" --replication-token-file "$TOKEN" \
+        --http-port "$HTTP_P" --config "$DIR/primary.toml" </dev/null >>"$DIR/primary.log" 2>&1 &
     echo $! >"$DIR/primary.pid"
     python3 "$HELPER" wait-pg "$PG_P" "$TIMEOUT" || die "primary did not accept connections; see $DIR/primary.log"
 }
@@ -277,8 +302,7 @@ start_primary() {
 start_standby() {
     pid_of standby >/dev/null && return 0
     nohup "$BIN" start --data-dir "$DIR/standby" --listen 127.0.0.1 --port "$PG_S" --auth trust \
-        --replication-role standby --primary-host "127.0.0.1:$REPL_P" \
-        --physical-replication-listen "127.0.0.1:$PHYS_P" --replication-token-file "$TOKEN" \
+        --replication-role standby --primary-host "127.0.0.1:$REPL_P" --replication-token-file "$TOKEN" \
         --http-port "$HTTP_S" --config "$DIR/standby.toml" </dev/null >>"$DIR/standby.log" 2>&1 &
     echo $! >"$DIR/standby.pid"
 }
@@ -297,9 +321,18 @@ kill_side() {
     rm -f "$DIR/$1.pid"
 }
 
+signal_side() {
+    local pid
+    if pid="$(pid_of "$2")"; then
+        kill "-$1" "$pid"
+    fi
+}
+
 stop_side() {
     local pid
     if pid="$(pid_of "$1")"; then
+        # A paused side handles SIGTERM only once it runs again.
+        kill -CONT "$pid" 2>/dev/null || true
         kill -TERM "$pid"
         for _ in $(seq 1 200); do
             kill -0 "$pid" 2>/dev/null || break
@@ -311,14 +344,15 @@ stop_side() {
 }
 
 summary() {
-    local p s ops rp rs
+    local p s ops rp rs count
     p="$(pid_of primary || echo null)"
     s="$(pid_of standby || echo null)"
     ops="$(cat "$OPS_FILE" 2>/dev/null || echo null)"
     rp="$(python3 "$HELPER" http-code "$HTTP_P" /ready)"
     rs="$(python3 "$HELPER" http-code "$HTTP_S" /ready)"
-    printf '{"ports":{"primary":%s,"standby":%s,"replication":%s,"physical":%s,"primary_http":%s,"standby_http":%s},"pids":{"primary":%s,"standby":%s},"ops_per_s":%s,"ready":{"primary":%s,"standby":%s},"dir":"%s"}\n' \
-        "$PG_P" "$PG_S" "$REPL_P" "$PHYS_P" "$HTTP_P" "$HTTP_S" "$p" "$s" "$ops" "$rp" "$rs" "$DIR"
+    count="$(python3 "$HELPER" standby-count "$HTTP_P")"
+    printf '{"ports":{"primary":%s,"standby":%s,"replication":%s,"primary_http":%s,"standby_http":%s},"pids":{"primary":%s,"standby":%s},"ops_per_s":%s,"ready":{"primary":%s,"standby":%s},"standbys":%s,"sync_mode":"%s","dir":"%s"}\n' \
+        "$PG_P" "$PG_S" "$REPL_P" "$HTTP_P" "$HTTP_S" "$p" "$s" "$ops" "$rp" "$rs" "$count" "$SYNC_MODE" "$DIR"
 }
 
 for action in "${ACTIONS[@]}"; do
@@ -338,6 +372,8 @@ for action in "${ACTIONS[@]}"; do
             python3 "$HELPER" load "$PG_P" "$rate" "$DURATION" >"$OPS_FILE.tmp" && mv "$OPS_FILE.tmp" "$OPS_FILE"
             ;;
         kill:*) kill_side "${action#kill:}" ;;
+        pause:*) signal_side STOP "${action#pause:}" ;;
+        resume:*) signal_side CONT "${action#resume:}" ;;
         restart:primary) start_primary ;;
         restart:standby)
             start_standby

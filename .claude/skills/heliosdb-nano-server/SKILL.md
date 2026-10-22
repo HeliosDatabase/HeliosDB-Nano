@@ -1,6 +1,6 @@
 ---
 name: heliosdb-nano-server
-description: Run HeliosDB-Nano as a server (daemon mode) with TLS, authentication, HA replication, and user management. Covers `heliosdb-nano start | stop | status`, TOML configuration sections, the four authentication modes (trust / password / md5 / scram-sha-256), TLS cert/key wiring, the four HA replication roles (standalone / primary / standby / observer), the three sync modes (async / semi-sync / sync), and per-user account creation. Use this when the user wants a long-running database process, multi-client access over the network, or any HA setup.
+description: Run HeliosDB-Nano as a server (daemon mode) with TLS, authentication, HA replication, and user management. Covers `heliosdb-nano start | stop | status`, TOML configuration sections, the four authentication modes (trust / password / md5 / scram-sha-256), TLS cert/key wiring, the three HA replication roles (standalone / primary / physical standby, one replication port), the three sync modes (async / semi-sync / sync), and per-user account creation. Use this when the user wants a long-running database process, multi-client access over the network, or any HA setup.
 allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(systemctl *), Read
 ---
 
@@ -24,9 +24,9 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(systemctl *), Read
 | status | CLI | `heliosdb-nano status --pid-file ./heliosdb.pid` |
 | TLS | CLI | `--tls-cert ./certs/srv.crt --tls-key ./certs/srv.key` |
 | auth | CLI | `--auth scram-sha-256 --password 'admin-secret'` |
-| HA primary | CLI | `--replication-role primary --standby-hosts 'host1:5433,host2:5433' --sync-mode semi-sync` |
-| HA standby | CLI | `--replication-role standby --primary-host primary:5433` |
-| HA observer | CLI | `--replication-role observer --observer-hosts '…'` |
+| HA primary | CLI | `--replication-role primary --replication-port 5433 --replication-token-file ./replication.token --sync-mode semi-sync` |
+| HA standby | CLI | `--replication-role standby --primary-host 127.0.0.1:5433 --replication-token-file ./replication.token` (`--primary-host` = the primary's replication port) |
+| HA readiness | HTTP / SQL | `curl :8081/ready` (200 ready, 503 not) · `SELECT heliosdb_require_ready()` · primary's `/health` lists `standbys` |
 | MySQL listener | CLI | `--mysql --mysql-listen 127.0.0.1:3306` |
 | Unix socket (PG) | CLI | `--pg-socket-dir /tmp` |
 | Unix socket (MySQL) | CLI | `--mysql-socket /tmp/heliosdb-mysql.sock` |
@@ -74,9 +74,18 @@ timeout_ms                 = 5000
 enabled    = true
 log_path   = "./logs/audit.jsonl"
 
-[sync]                       # HA replication knobs
-heartbeat_secs = 5
-fail_after     = 3
+[replication]                # HA replication (docs/guides/physical-standby.md)
+role                = "primary"   # standalone | primary | standby
+replication_port    = 5433        # THE replication port (NPHYS002), loopback only for now
+token_file          = "/etc/heliosdb/replication.token"
+sync_mode           = "async"     # async | semi-sync | sync (primary: what a commit waits for)
+min_acks            = 1           # standbys that must acknowledge (1..=64)
+sync_timeout_ms     = 10000
+sync_timeout_action = "warn"      # warn | fail
+# standby only:
+# primary_host     = "127.0.0.1:5433"
+# max_standby_lag  = "30s"
+# on_unrecoverable = "stay-up"    # stay-up | exit
 ```
 
 ## Recipes
@@ -113,30 +122,39 @@ Client:
 PGSSLMODE=require psql -h db.example.com -p 5432 -U heliosdb
 ```
 
-### Recipe 4: HA Tier-1 — primary + warm standby
-**Primary (host A):**
+### Recipe 4: HA Tier-1 — primary + physical standby
+A standby is a read-only **physical replica**: it applies the primary's RocksDB write groups over ONE replication connection to the primary's `--replication-port`. Full guide: `docs/guides/physical-standby.md`. The replication port is **loopback-only** until TLS replication (spec P2.2), so both run on one host (a remote primary needs an authenticated tunnel ending on loopback).
+```bash
+install -d -m 700 /srv/nano                       # owner-only parent of both data dirs
+head -c 32 /dev/urandom > /srv/nano/replication.token && chmod 600 /srv/nano/replication.token
+```
+**Primary:**
 ```bash
 heliosdb-nano start \
-    --data-dir ./data-primary \
+    --data-dir /srv/nano/primary --port 5432 --http-port 8080 \
     --replication-role primary \
     --replication-port 5433 \
-    --standby-hosts 'hostB:5433' \
+    --replication-token-file /srv/nano/replication.token \
     --sync-mode semi-sync \
-    --daemon --pid-file ./primary.pid
+    --daemon --pid-file /srv/nano/primary.pid
 ```
-**Standby (host B):**
+**Standby** (absent or empty data dir → bootstraps a verified copy, then follows; restart → resumes at its cursor):
 ```bash
 heliosdb-nano start \
-    --data-dir ./data-standby \
+    --data-dir /srv/nano/standby --port 5442 --http-port 8081 \
     --replication-role standby \
-    --primary-host hostA:5433 \
-    --daemon --pid-file ./standby.pid
+    --primary-host 127.0.0.1:5433 \
+    --replication-token-file /srv/nano/replication.token \
+    --daemon --pid-file /srv/nano/standby.pid
 ```
-Verify via REPL on either node:
+Verify:
+```bash
+curl -s http://127.0.0.1:8081/ready      # 200 when streaming; body = state, cursor, lag
+curl -s http://127.0.0.1:8080/health     # primary: "standbys":[{…,"applied":"0/1F4",…}]
+psql -h 127.0.0.1 -p 5442 -c "SELECT heliosdb_require_ready(), pg_is_in_recovery()"
 ```
-heliosdb> \replication
-```
-Failover: stop the primary, promote the standby (`--replication-role primary`), restart.
+Sync tuning lives in `[replication]`: `min_acks`, `sync_timeout_ms`, `sync_timeout_action = "warn" | "fail"` (`fail` errors a commit that IS durable on the primary — never blind-retry it).
+**No failover or promotion yet** (plan phase P5): `SWITCHOVER` is refused and a standby's data directory cannot be reopened as a primary. A standby in `needs_recovery` (history mismatch, pruned WAL, wrong token, protocol version) stays up refusing data reads with SQLSTATE 55000; rebuild it by stopping it and starting it on a new, empty data directory (keep the old one aside). Loopback test pair: `scripts/regress/nano-physical-pair.sh --binary <path> --start`.
 
 ### Recipe 5: Active-active (Tier 2, requires `--features ha-tier2`)
 ```bash
@@ -195,7 +213,9 @@ WantedBy=multi-user.target
 - **TLS requires *both* `--tls-cert` and `--tls-key`** — passing one without the other refuses to start.
 - **`--auth password|md5|scram-sha-256` requires `--password`** for the seed admin account.
 - **`--port` defaults to 5432**, which collides with PostgreSQL. On a host running both, set `--port 5433` (or stop PG).
-- **Standby write-forwarding** uses env var `HELIOSDB_PRIMARY_PG_PORT` (default 5432) to know which primary port to forward to.
+- **Standbys never forward writes.** Writes, DDL and `nextval()` on a standby fail with SQLSTATE 25006; connect to the primary to write. A standby refuses `--mysql`/`--mysql-socket`, and its HTTP port serves only `/`, `/health`, `/ready`, `/version`.
+- **`--primary-host` is the primary's replication port**, never its PostgreSQL or HTTP port (the standby says so if you get it wrong). Both nodes need the same 32-byte, mode-0600 `--replication-token-file`; a primary without one (or in memory) serves no replication port, and then no commit ever waits for a standby.
+- **A 4.41.x logical standby directory is refused** ("rebuilt once: start with a new, empty data directory"). There is no in-place conversion.
 - **Don't expose `0.0.0.0:5432` without TLS+auth**. Trust auth on a public bind is a wide-open database.
 - **Daemon mode keeps a PID file**; if the file disappears (e.g., `/var/run` cleared on reboot) `stop` and `status` cannot find the process. Use `pkill -f heliosdb-nano` as a fallback and inspect the data dir for stale lock files.
 
@@ -203,6 +223,7 @@ WantedBy=multi-user.target
 - `heliosdb-nano-deploy` — Docker/compose, Fly.io, Railway, Render specifics.
 - `heliosdb-nano-observability` — `/health`, slow-query log, `\stats`, tracing.
 - `heliosdb-nano-backup` — combine `--dump-schedule` with daemon mode.
-- `docs/guides/ha_cluster_tutorial.md` — full HA topology guide.
+- `docs/guides/physical-standby.md` — physical standby: start, readiness, Proxy contract, sync modes, rebuild, limits.
+- `docs/guides/ha_testing.md` — HA test suites and the loopback pair fixture (the `tests/docker` lab is out of service until P2.2).
 - `docs/guides/audit.md` — audit-log configuration.
 - `config.example.toml` — full TOML config schema.

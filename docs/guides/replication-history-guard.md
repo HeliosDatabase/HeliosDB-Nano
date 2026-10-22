@@ -1,106 +1,112 @@
-# Native replication history guard
+# Replication history guard
 
-The CLI primary and standby use native protocol version 3 to compare a dataset
-history UUID before a receiver accepts WAL. This UUID is independent of
+A primary and its [physical standby](physical-standby.md) compare a dataset
+**history id** before the standby accepts anything, on the one replication
+connection (`NPHYS002`). The history id is a UUID of the dataset, independent of
 `--node-id`: reusing a node name or UUID does not authorize another dataset.
-Legacy native peers are refused. Upgrade both endpoints together.
+Both ends must run this release; a 4.41.x native-protocol peer and an `NPHYS001`
+peer are refused.
 
-This guard prevents a receiver from silently attaching to a different primary
-history. It does **not** provide online resync, a snapshot boundary, complete WAL
-retention, or protection against a deliberate fork made by copying an entire
-primary directory. A verified handshake means identity was checked; it does not
-mean catch-up completed.
+This guard prevents a standby from silently following a different primary
+history. It does **not** protect against a deliberate fork made by copying an
+entire primary directory, and it is not fencing: a verified history means the
+standby follows the right dataset, not that it is caught up. Whether it is
+caught up is its posture (`/ready`, `heliosdb_standby_status`).
 
-Since 4.41.1 a standby stores its applied position durably, in the same write as
-each replicated row, and on reconnect the primary catches it up from its
-persisted logical WAL. The standby opens its SQL listener only after it has
-caught up. The primary's checkpoint (which advances every 1000 entries or 30
-seconds by default, and at a clean shutdown) is only its crash-recovery floor: a
-primary also keeps the newest `[replication] logical_wal_retention_entries`
-entries below it (default 100000) for standbys. A restarted primary, a standby
-outage shorter than that window, and a new standby on a primary whose whole
-history still fits the window are all caught up. A standby that needs an entry
-older than the window is refused with a terminal "full resync required" error
-naming the LSN history was pruned through, rather than served with missing rows.
-Each retained entry carries the row images of one change, so size the window for
-your write rate and the longest standby outage you want to survive.
+## The primary's history
 
 For a disk primary, `NANO-PRIMARY-HISTORY.json` is created or validated after
-RocksDB has acquired its database lock and before the native listener starts.
-The record includes RocksDB's storage identity, so recreating the database while
-retaining only the history record is refused. A memory primary gets a fresh
-history UUID on each process start.
+RocksDB has acquired its database lock and before the replication port starts
+listening. The record includes RocksDB's storage identity, so recreating the
+database while retaining only the history record is refused. Every `HelloOk` the
+primary sends carries its history. An in-memory primary serves no replication
+port, so it has no standbys to guard.
 
-A disk standby's **final data directory must not already exist on its first
-startup**. The CLI claims that leaf before opening RocksDB. Even an existing empty
-directory is not proof of a fresh receiver. Existing receivers must have a valid
-`NANO-STANDBY-BINDING.json` matching their RocksDB identity. Corrupt, missing,
-ambiguous primary/receiver, or mismatched records are refused; the CLI does not
-repair, delete, reset or replace them. Preserve rejected directories and inspect
-the error. Do not remove marker files to bypass refusal.
+## The standby's history
 
-A fresh receiver binds durably to its first verified primary before accepting WAL
-or announcing readiness. Every reconnect verifies the same binding. A terminal
-history/protocol/metadata failure stops the CLI's replication and listener tasks
-and returns an error; it does not keep serving as a healthy standby. Initial
-verification (including DNS) is bounded by `[replication] startup_timeout_secs`,
-default 30, with an allowed range of 1 through 3600 seconds. Explicit
-`--replication-startup-timeout-secs` overrides the file value; the file overrides
-the default. The same value bounds each native connection/handshake attempt.
-Daemon standby startup allows this verification window plus the existing
-5-second startup allowance; standalone/primary/observer daemon startup retains
-its 5-second readiness deadline. The resolved value is passed to the daemon child.
-A failed first startup can leave a new unbound directory; preserve it and use a
-new unused path rather than silently adopting it on retry.
+A standby learns its history from the copy it installs. While it bootstraps, its
+`Hello` names no history, and the verified checkpoint it downloads carries the
+primary's history into its physical replica marker (`NANO-PHYSICAL-REPLICA.json`).
+From then on every session's `Hello` names that history, and a primary with
+another one answers `Refuse { HistoryMismatch }`. The standby then stays up in
+posture `needs_recovery`, refusing data reads with SQLSTATE `55000` that names
+the mismatch (or exits, with `[replication] on_unrecoverable = "exit"`). It never
+serves rows of another history and never re-binds itself to one; adopting a new
+history is always a rebuild into a new, empty directory.
+
+A standby's data directory is classified before anything is opened:
+
+- absent, or an existing empty directory: bootstrapped from the primary;
+- an installed physical standby: resumed at its durable cursor, under its history;
+- a 4.41.x logical standby (it carries `NANO-STANDBY-BINDING.json`): refused with
+  the conversion note ("this directory is a logical standby from 4.41.x; physical
+  standbys are rebuilt once ..."). See
+  [converting a 4.41.x logical standby](physical-standby.md#converting-a-441x-logical-standby);
+- a primary's data directory (it carries `NANO-PRIMARY-HISTORY.json`): refused;
+- anything else that is not empty: refused.
+
+Corrupt, ambiguous or mismatched identity records are refused. The CLI does not
+repair, delete, reset or replace them. Preserve a rejected directory and read the
+error. Do not remove marker files to get past a refusal: the marker is what lets
+the standby prove which dataset its rows belong to.
+
+A bootstrap copy is verified and renamed into place only when it is complete, so
+an interrupted bootstrap never leaves a half-installed standby; the next start
+downloads the copy again from the beginning.
+
+## Startup budget
+
+`[replication] startup_timeout_secs` (default 30, range 1 through 3600) bounds
+how long a standby's listeners wait for it to stream, including DNS. When it runs
+out, the listeners open anyway and the posture decides what they serve: probes
+and status answer, data reads are refused with `55000` until the standby is
+ready. Explicit `--replication-startup-timeout-secs` overrides the file value;
+the file overrides the default. A daemon standby's parent allows this budget plus
+its usual 5-second startup allowance, and the resolved value is passed to the
+daemon child.
 
 ## Standby interface restrictions
 
-Transparent PostgreSQL write forwarding is disabled for guarded CLI standbys in
-**all** sync modes. Connect directly to the primary for writes. Native protocol
-history verification cannot authorize a separate PostgreSQL endpoint, so this
-restriction stays set for the process lifetime, including reconnects or local
-role/read-only flag changes.
+A standby never forwards writes, in any sync mode. Connect to the primary to
+write. On a standby, writes, DDL and `nextval()` are refused with SQLSTATE
+`25006`, on the PostgreSQL simple and extended protocols and the Unix socket
+alike; `COPY FROM` is refused.
 
-The standby HTTP listener exposes only `/`, `/health`, and `/version`. Writable
-REST, auth, realtime and MCP routes are not mounted, even when MCP is compiled
-in or explicitly configured. MySQL TCP and Unix-socket options are rejected
-before opening storage. PostgreSQL TCP and Unix sockets remain available after
-history verification.
+The standby HTTP listener exposes only `/`, `/health`, `/ready` and `/version`.
+Writable REST, auth, realtime and MCP routes are not mounted, even when MCP is
+compiled in or explicitly configured. MySQL TCP and Unix-socket options are
+rejected before storage opens.
 
-These restrictions are **not a complete standby read-only security boundary**.
-Existing extended-query, COPY and other local execution paths have not been
-certified by this history guard. The bounded claim is rejection of unrelated
-native history and disabled transparent forwarding, not universal prevention of
-local writes, safe promotion or automatic recovery.
+Below the SQL guard, the standby's storage engine is opened in a mode whose write
+gate refuses every write the engine would make on its own. The replication
+applier is the only writer. A write that reached the store some other way would
+poison it: the standby would stop in `needs_recovery` instead of serving a copy
+that no longer matches the primary.
 
 ## Promotion is refused
 
 The SQL `SWITCHOVER TO '<node>'` statement is **refused, not initiated**. It
-performs the same checks it always did — the target must resolve, this node must
-be the primary, and the target must be a connected standby — and then returns an
+performs the same checks it always did (the target must resolve, this node must
+be the primary, and the target must be a connected standby) and then returns an
 error. No successful switchover is claimed, because none of the required runtime
-exists.
+exists yet. A standby's data directory is also refused as a primary or standalone
+database, so restarting a standby with `--replication-role primary` does not
+promote it.
 
-Native catch-up repair is **not** promotion. Raw physical resync remains
-**NON-SERVING**, and a retained standby binding still refuses an implicit primary
-reopen. A safe promotion needs, at minimum:
+A safe promotion needs, at minimum:
 
 - durable fencing **and** write admission of the OLD primary (best-effort
   connection attempts are not fencing);
-- a complete durable source boundary — a defined cut of the source WAL the
-  promoted node has durably received;
-- an explicit new history/epoch for the promoted dataset; and
+- a complete durable source boundary: a defined cut of the source WAL the
+  promoted node has durably applied;
+- an explicit new epoch for the promoted dataset, carried by every session (the
+  `Fence` frame and the `EpochStale` refusal are reserved for it today); and
 - catalog, auth and session serving publication and routing enabled only after
   the new primary is proven writable.
 
-None of the in-process helpers meet that bar, and none of them are wired into the
-refusal path: `RoleManager` only mutates an in-memory role, `WalApplicator::promote`
-only stops application/logging, and the legacy failover path continues after a
-failed election and best-effort fencing. They are not a safe promotion
-implementation. Do not wire them, remove the existing guards, redirect writes to a
-standby, speculate an automatic takeover, or treat raw resync as accepted.
+That is plan phase P5. Until it ships there is no automatic or manual takeover;
+do not redirect writes to a standby or treat a standby's directory as a primary.
 
-The [offline snapshot helper](offline-reseed.md) remains an inspection/recovery
-procedure. Its output is not authorized as a streaming receiver by this guard;
-copying or editing identity records does not create a coherent snapshot-to-WAL
-boundary.
+The [offline snapshot helper](offline-reseed.md) remains an inspection and
+recovery procedure. Its output carries no physical replica marker, so a standby
+start refuses it; copying or editing identity records does not create a standby.

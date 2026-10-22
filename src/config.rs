@@ -339,7 +339,8 @@ impl Config {
     }
 }
 
-/// Native WAL replication configuration for the `start` command.
+/// Replication configuration for the `start` command (spec P2.1: one
+/// replication connection per standby, physical only).
 ///
 /// Explicit CLI arguments override individual fields from this section. Endpoint
 /// validation checks syntax without DNS/network access; connection attempts resolve
@@ -347,52 +348,64 @@ impl Config {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReplicationConfig {
-    /// standalone, primary, standby, or observer (case-insensitive).
+    /// standalone, primary, or standby (case-insensitive).
     pub role: String,
-    /// Native replication listener port, separate from PostgreSQL and HTTP.
+    /// THE replication port (protocol `NPHYS002`): a primary serves its
+    /// standbys here — snapshot copies, physical WAL, heartbeats and
+    /// acknowledgements on one connection each. Loopback only until TLS
+    /// replication (spec P2.2). Separate from PostgreSQL and HTTP.
     #[serde(alias = "port")]
     pub replication_port: u16,
-    /// Initial standby history verification window, including DNS, in seconds (1..=3600).
+    /// How long a standby's listeners wait for it to stream before they open
+    /// anyway (not ready), including DNS, in seconds (1..=3600).
     pub startup_timeout_secs: u64,
-    /// Primary native replication endpoint, required for standby startup.
+    /// The primary's replication port (`host:port`), required for a standby.
     pub primary_host: Option<String>,
-    /// Standby native replication endpoints.
+    /// Standby endpoints (informational).
     pub standby_hosts: Vec<String>,
-    /// Observer native replication endpoints.
-    pub observer_hosts: Vec<String>,
-    /// async, semi-sync (alias semisync), or sync (case-insensitive).
+    /// async, semi-sync (alias semisync), or sync (case-insensitive). On a
+    /// primary: what a commit waits for — `semi-sync`, `min_acks` standbys
+    /// hold it durably; `sync`, `min_acks` standbys have applied it.
     pub sync_mode: String,
-    /// Default-off authenticated physical transfer endpoint and bounded RocksDB WAL retention.
+    /// How many standbys must acknowledge a commit in sync/semi-sync mode
+    /// (1..=64). Default 1.
+    pub min_acks: usize,
+    /// How long a sync/semi-sync commit waits for its acknowledgements, in
+    /// milliseconds (1..=86400000). Default 10000.
+    pub sync_timeout_ms: u64,
+    /// What a commit does when its acknowledgements do not arrive in time:
+    /// `"warn"` (default) commits with a WARN and the primary commits
+    /// asynchronously until `min_acks` standbys acknowledge again; `"fail"`
+    /// reports the commit to its PostgreSQL-wire client as an error — the
+    /// commit is already durable on the primary, like PostgreSQL's cancelled
+    /// synchronous commit, so a blind retry writes it twice.
+    pub sync_timeout_action: String,
+    /// The replication port's source settings and bounded RocksDB WAL retention.
     pub physical: PhysicalReplicationConfig,
     /// Stable node UUID; generated at startup if absent.
     pub node_id: Option<String>,
-    /// Path to the one owner-only 32-byte token file that authenticates BOTH the
-    /// native logical channel and the physical transfer channel. When set, a
-    /// primary REQUIRES every standby to present the same token before it is
-    /// registered or receives any WAL, and a standby presents it to the primary.
-    /// The token bytes are NEVER read from TOML or the environment.
+    /// Path to the owner-only 32-byte token file that authenticates the
+    /// replication connection. A primary REQUIRES every standby to present the
+    /// same token before it is registered or receives anything, and a standby
+    /// presents it to the primary. The token bytes are NEVER read from TOML or
+    /// the environment.
     ///
     /// SECURITY CONTRACT (bounded): the token is sent as a raw bearer over the
-    /// **plaintext** native replication channel (no TLS, no primary-to-standby
-    /// proof). It is only a network-path control for a loopback listener or a
-    /// protected tunnel. A non-loopback listener with a configured token is
-    /// refused unless `allow_insecure_remote = true` explicitly acknowledges the
-    /// plaintext risk.
+    /// **plaintext** replication connection (no TLS, no primary-to-standby
+    /// proof, until spec P2.2). It is only a network-path control for the
+    /// loopback listener; reach a remote primary through an authenticated tunnel.
     #[serde(default)]
     pub token_file: Option<std::path::PathBuf>,
-    /// Explicit acknowledgment that the replication token crosses a non-loopback
-    /// (plaintext) network. Default false: a token on a non-loopback listener is
-    /// refused. Modeled on the PostgreSQL `--allow-insecure-trust` opt-in; set
-    /// via `--allow-insecure-replication-remote`.
+    /// Acknowledgment that the replication token may cross a non-loopback
+    /// (plaintext) network. Reserved for remote replication (spec P2.2): the
+    /// replication port is loopback-only in this release, so it changes
+    /// nothing yet. Set via `--allow-insecure-replication-remote`.
     #[serde(default)]
     pub allow_insecure_remote: bool,
-    /// How many logical-WAL entries a PRIMARY keeps below its checkpoint, so a
-    /// standby that was behind when the primary restarted (or that was down for
-    /// a while) can still catch up. The checkpoint stays the redo floor; this
-    /// is only history kept for standbys. A standby that needs an entry older
-    /// than the window is refused with "full resync required". Ignored unless
-    /// `role = "primary"`. 0 deletes every entry at each checkpoint (the
-    /// 4.41.1 behaviour). Default 100000.
+    /// How many logical-WAL entries a PRIMARY keeps below its checkpoint: its
+    /// own redo window. No standby reads the logical WAL (a standby follows
+    /// the physical WAL), so this is not standby history. Ignored unless
+    /// `role = "primary"`. Default 0: every entry is deleted at each checkpoint.
     pub logical_wal_retention_entries: u64,
     /// How long a physical standby that has lost its primary keeps reporting
     /// itself READY (spec P1.3): `/ready`, `heliosdb_require_ready()` and the
@@ -426,8 +439,10 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("startup_timeout_secs", &self.startup_timeout_secs)
             .field("primary_host", &self.primary_host)
             .field("standby_hosts", &self.standby_hosts)
-            .field("observer_hosts", &self.observer_hosts)
             .field("sync_mode", &self.sync_mode)
+            .field("min_acks", &self.min_acks)
+            .field("sync_timeout_ms", &self.sync_timeout_ms)
+            .field("sync_timeout_action", &self.sync_timeout_action)
             .field("physical", &self.physical)
             .field("node_id", &self.node_id)
             .field("token_file", &self.token_file)
@@ -448,8 +463,10 @@ impl Default for ReplicationConfig {
             startup_timeout_secs: 30,
             primary_host: None,
             standby_hosts: Vec::new(),
-            observer_hosts: Vec::new(),
             sync_mode: "async".to_string(),
+            min_acks: Self::DEFAULT_MIN_ACKS,
+            sync_timeout_ms: Self::DEFAULT_SYNC_TIMEOUT_MS,
+            sync_timeout_action: Self::SYNC_TIMEOUT_WARN.to_string(),
             node_id: None,
             token_file: None,
             allow_insecure_remote: false,
@@ -461,8 +478,20 @@ impl Default for ReplicationConfig {
 }
 
 impl ReplicationConfig {
-    /// Default history window a primary keeps below its logical-WAL checkpoint.
-    pub const DEFAULT_LOGICAL_WAL_RETENTION_ENTRIES: u64 = 100_000;
+    /// Default redo window a primary keeps below its logical-WAL checkpoint
+    /// (spec P2.1: no standby reads it, so none).
+    pub const DEFAULT_LOGICAL_WAL_RETENTION_ENTRIES: u64 = 0;
+    /// Default `min_acks`.
+    pub const DEFAULT_MIN_ACKS: usize = 1;
+    /// Upper bound accepted for `min_acks` (the most sessions a source serves).
+    pub const MAX_MIN_ACKS: usize = 64;
+    /// Default `sync_timeout_ms`.
+    pub const DEFAULT_SYNC_TIMEOUT_MS: u64 = 10_000;
+    /// Upper bound accepted for `sync_timeout_ms`: one day.
+    pub const MAX_SYNC_TIMEOUT_MS: u64 = 86_400_000;
+    /// `sync_timeout_action` values.
+    pub const SYNC_TIMEOUT_WARN: &str = "warn";
+    pub const SYNC_TIMEOUT_FAIL: &str = "fail";
     /// Upper bound accepted for `logical_wal_retention_entries`.
     pub const MAX_LOGICAL_WAL_RETENTION_ENTRIES: u64 = 100_000_000;
     /// Default `max_standby_lag`.
@@ -498,9 +527,8 @@ impl ReplicationConfig {
             .eq_ignore_ascii_case(Self::ON_UNRECOVERABLE_EXIT)
     }
 
-    /// The window the storage engine should apply: the configured value on a
-    /// primary, 0 everywhere else (a standalone node or a standby has no
-    /// standby to keep history for).
+    /// The redo window the storage engine should apply: the configured value
+    /// on a primary, 0 everywhere else.
     pub fn effective_logical_wal_retention(&self) -> u64 {
         if self.role.eq_ignore_ascii_case("primary") {
             self.logical_wal_retention_entries
@@ -511,13 +539,19 @@ impl ReplicationConfig {
 
     /// Validate configured values without requiring role-dependent CLI arguments.
     pub fn validate(&self) -> crate::Result<()> {
-        if !matches!(
-            self.role.to_ascii_lowercase().as_str(),
-            "standalone" | "primary" | "standby" | "observer"
-        ) {
-            return Err(crate::Error::config(
-                "replication.role must be standalone, primary, standby, or observer",
-            ));
+        match self.role.to_ascii_lowercase().as_str() {
+            "standalone" | "primary" | "standby" => {}
+            "observer" => {
+                return Err(crate::Error::config(
+                    "replication.role 'observer' was removed with the native v3 replication channel; fencing \
+                     returns with promotion support. Use standalone, primary, or standby",
+                ))
+            }
+            _ => {
+                return Err(crate::Error::config(
+                    "replication.role must be standalone, primary, or standby",
+                ))
+            }
         }
         if !matches!(
             self.sync_mode.to_ascii_lowercase().as_str(),
@@ -525,6 +559,26 @@ impl ReplicationConfig {
         ) {
             return Err(crate::Error::config(
                 "replication.sync_mode must be async, semi-sync, or sync",
+            ));
+        }
+        if !(1..=Self::MAX_MIN_ACKS).contains(&self.min_acks) {
+            return Err(crate::Error::config(format!(
+                "replication.min_acks must be between 1 and {}",
+                Self::MAX_MIN_ACKS
+            )));
+        }
+        if !(1..=Self::MAX_SYNC_TIMEOUT_MS).contains(&self.sync_timeout_ms) {
+            return Err(crate::Error::config(format!(
+                "replication.sync_timeout_ms must be between 1 and {}",
+                Self::MAX_SYNC_TIMEOUT_MS
+            )));
+        }
+        let action = self.sync_timeout_action.trim();
+        if !action.eq_ignore_ascii_case(Self::SYNC_TIMEOUT_WARN)
+            && !action.eq_ignore_ascii_case(Self::SYNC_TIMEOUT_FAIL)
+        {
+            return Err(crate::Error::config(
+                "replication.sync_timeout_action must be \"warn\" or \"fail\"",
             ));
         }
         if self.logical_wal_retention_entries > Self::MAX_LOGICAL_WAL_RETENTION_ENTRIES {
@@ -555,7 +609,6 @@ impl ReplicationConfig {
         for (key, endpoints) in [
             ("primary_host", self.primary_host.iter().collect::<Vec<_>>()),
             ("standby_hosts", self.standby_hosts.iter().collect()),
-            ("observer_hosts", self.observer_hosts.iter().collect()),
         ] {
             for endpoint in endpoints {
                 validate_replication_endpoint(endpoint)
@@ -2571,9 +2624,44 @@ mod tests {
         assert_eq!(config.replication.sync_mode, "async");
         assert!(config.replication.primary_host.is_none());
         assert!(config.replication.standby_hosts.is_empty());
-        assert!(config.replication.observer_hosts.is_empty());
         assert!(config.replication.node_id.is_none());
+        assert_eq!(config.replication.min_acks, 1);
+        assert_eq!(config.replication.sync_timeout_ms, 10_000);
+        assert_eq!(config.replication.sync_timeout_action, "warn");
+        assert_eq!(
+            config.replication.logical_wal_retention_entries, 0,
+            "the primary's redo window only"
+        );
         config.validate().unwrap();
+    }
+
+    /// Spec P2.1: the synchronous-replication settings are bounded, and the
+    /// removed observer role and native-only keys are refused, not ignored.
+    #[test]
+    fn sync_settings_are_bounded_and_removed_keys_are_refused() {
+        let config =
+            Config::from_toml_str("[replication]\nmin_acks = 2\nsync_timeout_ms = 1500\nsync_timeout_action = 'FAIL'")
+                .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.replication.min_acks, 2);
+        assert_eq!(config.replication.sync_timeout_ms, 1500);
+        for invalid in [
+            "min_acks = 0",
+            "min_acks = 65",
+            "sync_timeout_ms = 0",
+            "sync_timeout_ms = 86400001",
+            "sync_timeout_action = 'retry'",
+            "role = 'observer'",
+        ] {
+            let config = Config::from_toml_str(&format!("[replication]\n{invalid}")).unwrap();
+            assert!(config.validate().is_err(), "accepted {invalid}");
+        }
+        for removed in [
+            "[replication]\nobserver_hosts = ['observer.example:7433']",
+            "[replication.physical]\nlisten = '127.0.0.1:5440'",
+        ] {
+            assert!(Config::from_toml_str(removed).is_err(), "accepted {removed}");
+        }
     }
 
     #[test]
@@ -2603,8 +2691,10 @@ mod tests {
             startup_timeout_secs = 17
             primary_host = "primary.example:6433"
             standby_hosts = ["10.0.0.2:6433", "[::1]:6433"]
-            observer_hosts = ["observer.example:7433"]
             sync_mode = "semi-sync"
+            min_acks = 3
+            sync_timeout_ms = 2500
+            sync_timeout_action = "fail"
             node_id = "550e8400-e29b-41d4-a716-446655440000"
             "#,
         )
@@ -2620,8 +2710,10 @@ mod tests {
             Some("primary.example:6433")
         );
         assert_eq!(decoded.replication.standby_hosts, ["10.0.0.2:6433", "[::1]:6433"]);
-        assert_eq!(decoded.replication.observer_hosts, ["observer.example:7433"]);
         assert_eq!(decoded.replication.sync_mode, "semi-sync");
+        assert_eq!(decoded.replication.min_acks, 3);
+        assert_eq!(decoded.replication.sync_timeout_ms, 2500);
+        assert_eq!(decoded.replication.sync_timeout_action, "fail");
         assert_eq!(
             decoded.replication.node_id.as_deref(),
             Some("550e8400-e29b-41d4-a716-446655440000")
@@ -2653,7 +2745,7 @@ mod tests {
             "node_id = 'not-a-uuid'",
             "primary_host = 'localhost'",
             "standby_hosts = ['localhost:0']",
-            "observer_hosts = ['http://localhost:5433']",
+            "standby_hosts = ['http://localhost:5433']",
         ] {
             let config = Config::from_toml_str(&format!("[replication]\n{invalid}")).unwrap();
             assert!(config.validate().is_err(), "accepted {invalid}");
@@ -3322,8 +3414,11 @@ redirect_uri = "http://localhost:8080/auth/v1/callback"
     }
 }
 
-/// Physical transfer source. The initial transport is authenticated plaintext
-/// on loopback only; use an authenticated tunnel for peers.
+/// The replication port's source side on a primary: snapshot exports and
+/// the bounded RocksDB WAL retention a physical standby continues from. The
+/// port itself is `[replication] replication_port` (spec P2.1: one port,
+/// protocol `NPHYS002`); the transport is authenticated plaintext on loopback
+/// only until TLS replication (P2.2) — use an authenticated tunnel for peers.
 ///
 /// `enabled` is the source's explicit switch; `start --replication-role
 /// primary` with a replication token turns it on by itself (spec P1.3: a
@@ -3333,19 +3428,12 @@ redirect_uri = "http://localhost:8080/auth/v1/callback"
 #[serde(default, deny_unknown_fields)]
 pub struct PhysicalReplicationConfig {
     pub enabled: bool,
-    /// On a primary, where its physical source listens; on a physical
-    /// standby, where it finds its primary's (both nodes name the same
-    /// endpoint). A literal loopback `IP:port`. Empty (the default) derives
-    /// it from the native replication endpoint, so a pair configured only
-    /// with `--replication-port` / `--primary-host` finds its physical channel
-    /// without another setting: [`Self::resolved_listen`], `127.0.0.1:<native
-    /// port + 7>` — `127.0.0.1:5440` for the default native port 5433, the
-    /// address this setting always defaulted to.
-    pub listen: String,
     /// Existing private directory, disjoint from the live source database.
     pub export_dir: Option<std::path::PathBuf>,
     pub wal_retention_secs: u64,
     pub wal_retention_size_mb: u64,
+    /// Concurrent replication sessions (standby follow and bootstrap copies);
+    /// a connection beyond them is refused with `TooManySessions` and retried.
     pub max_sessions: usize,
     pub max_files: usize,
     pub max_file_bytes: u64,
@@ -3359,7 +3447,6 @@ impl Default for PhysicalReplicationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            listen: String::new(),
             export_dir: None,
             wal_retention_secs: 3600,
             wal_retention_size_mb: 1024,
@@ -3375,41 +3462,9 @@ impl Default for PhysicalReplicationConfig {
 }
 
 impl PhysicalReplicationConfig {
-    /// The port offset of a derived [`Self::listen`] from the native
-    /// replication port (5433 + 7 = 5440, the historical default).
-    pub const DERIVED_PORT_OFFSET: u16 = 7;
-
-    /// The physical endpoint: [`Self::listen`] when set, else
-    /// `127.0.0.1:<native_port + 7>`. `native_port` is this node's
-    /// replication port on a primary and the port of `primary_host` on a
-    /// standby, so both ends derive the same address.
-    pub fn resolved_listen(&self, native_port: u16) -> crate::Result<std::net::SocketAddr> {
-        if self.listen.trim().is_empty() {
-            let port = native_port.checked_add(Self::DERIVED_PORT_OFFSET).ok_or_else(|| {
-                crate::Error::config(format!(
-                    "cannot derive replication.physical.listen from native port {native_port}; set it explicitly"
-                ))
-            })?;
-            return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
-        }
-        let address: std::net::SocketAddr = self
-            .listen
-            .parse()
-            .map_err(|_| crate::Error::config("replication.physical.listen must be a literal loopback IP:port"))?;
-        if !address.ip().is_loopback() || address.port() == 0 {
-            return Err(crate::Error::config("replication.physical.listen requires loopback and a nonzero port; remote transfer requires an authenticated tunnel"));
-        }
-        Ok(address)
-    }
-
     /// Pure validation permits CLI overrides to supply paths after file loading.
     /// Enabled-role, persistent-storage and file ownership checks run before open.
     pub fn validate(&self) -> crate::Result<()> {
-        if !self.listen.trim().is_empty() {
-            // The derived form needs the native port, which the caller
-            // supplies; only an explicit address can be checked here.
-            self.resolved_listen(0)?;
-        }
         for (name, value, minimum, maximum) in [
             ("wal_retention_secs", self.wal_retention_secs, 60, 86400),
             ("wal_retention_size_mb", self.wal_retention_size_mb, 64, 65536),
@@ -3449,11 +3504,9 @@ mod physical_config_tests {
         config.validate().unwrap();
     }
     #[test]
-    fn physical_config_is_strict_and_loopback_only() {
-        let config: ReplicationConfig = toml::from_str(
-            "[physical]\nenabled=true\nwal_retention_secs=60\nwal_retention_size_mb=64\nlisten='[::1]:5440'",
-        )
-        .unwrap();
+    fn physical_config_is_strict_and_bounded() {
+        let config: ReplicationConfig =
+            toml::from_str("[physical]\nenabled=true\nwal_retention_secs=60\nwal_retention_size_mb=64").unwrap();
         config.validate().unwrap();
         for text in [
             "[physical]\nunknown=true",
@@ -3475,36 +3528,19 @@ mod physical_config_tests {
             ("max_file_bytes", "68719476737"),
             ("frame_timeout_secs", "0"),
             ("operation_timeout_secs", "3601"),
-            ("listen", "'0.0.0.0:5440'"),
-            ("listen", "'127.0.0.1:0'"),
-            ("listen", "'localhost:5440'"),
         ] {
             let config: ReplicationConfig = toml::from_str(&format!("[physical]\n{field}={value}")).unwrap();
             assert!(config.validate().is_err(), "{field}={value}");
         }
     }
+    /// Spec P2.1: the physical endpoint is the replication port; the separate
+    /// `listen` (and its "+7" derived default) is gone, and refused.
     #[test]
-    fn physical_listen_derives_from_the_native_port_unless_set() {
-        let derived = PhysicalReplicationConfig::default();
-        derived.validate().unwrap();
-        assert_eq!(
-            derived.resolved_listen(5433).unwrap(),
-            "127.0.0.1:5440".parse::<std::net::SocketAddr>().unwrap(),
-            "the historical default endpoint for the default native port"
-        );
-        assert_eq!(
-            derived.resolved_listen(27741).unwrap(),
-            "127.0.0.1:27748".parse::<std::net::SocketAddr>().unwrap()
-        );
-        assert!(derived.resolved_listen(u16::MAX).is_err());
-        let explicit = PhysicalReplicationConfig {
-            listen: "[::1]:6000".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            explicit.resolved_listen(5433).unwrap(),
-            "[::1]:6000".parse::<std::net::SocketAddr>().unwrap()
-        );
+    fn the_physical_section_has_no_endpoint_of_its_own() {
+        for text in ["[physical]\nlisten='127.0.0.1:5440'", "[physical]\nlisten=''"] {
+            assert!(toml::from_str::<ReplicationConfig>(text).is_err(), "{text}");
+        }
+        PhysicalReplicationConfig::default().validate().unwrap();
     }
     #[test]
     fn standby_posture_settings_default_and_validate() {

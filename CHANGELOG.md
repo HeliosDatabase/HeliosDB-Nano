@@ -7,6 +7,143 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — BREAKING: one replication connection, physical standbys only
+
+A standby is a read-only **physical replica** of its primary
+(`docs/guides/physical-standby.md`), and it now follows its primary over ONE
+connection. There is no compatibility with 4.41.x replication: upgrade the
+primary and its standbys together, and rebuild each 4.41.x standby once by
+starting it on a new, empty data directory. Its old directory is refused with a
+message that says so; keep it until the new standby is verified. Data can also
+be moved over the PostgreSQL wire. This supersedes the two logical-standby
+entries under "Replication" below: the logical standby, its native reader and
+its history window are removed (the window's key remains only as the primary's
+redo window, default 0).
+
+- **One replication connection, protocol `NPHYS002`.** The bootstrap copy, the
+  physical WAL and the control plane (identity, dataset history, epoch,
+  heartbeats, acknowledgements) share one connection per standby, so they can no
+  longer disagree. `[replication] replication_port` (`--replication-port`,
+  default 5433) is the single replication port, and a standby's
+  `--primary-host` names it; a standby pointed at a PostgreSQL or HTTP port is
+  told so. `NPHYS001` peers are refused with a typed `Version` refusal naming
+  both versions, and a 4.41.x native peer is told to upgrade. The replication
+  port stays loopback-only until TLS replication (spec P2.2), whatever
+  `--listen` opens; `--allow-insecure-replication-remote` /
+  `[replication] allow_insecure_remote` are accepted but have no effect yet (a
+  WARN says so).
+- **Removed: the separate physical endpoint.** `--physical-replication-listen`,
+  `[replication.physical] listen` and its derived default (the replication port
+  + 7) are gone; the replication port is the one port.
+- **Removed: the native v3 replication listener and channel** (protocol v3 on
+  the replication port) and the standby's native client.
+- **Removed: the logical standby** — the WAL applicator and its forwarder, the
+  primary's logical WAL as a standby's catch-up source, the `replication_wal/`
+  segment store, and the "full resync required" handshake refusal, which typed
+  refusal codes replace.
+- **Removed: transparent write forwarding** from standbys and its
+  `HELIOSDB_PRIMARY_PG_PORT` environment variable. A standby refuses writes with
+  SQLSTATE 25006; connect to the primary to write.
+- **Removed: the observer role**, `--observer-hosts` and
+  `[replication] observer_hosts`. `--replication-role observer` is an error
+  naming the removal; an `observer_hosts` key is an unknown key.
+- **Removed: the failover watcher and the split-brain protector**, which only
+  spoke the native v3 channel and were never wired to a safe promotion. Fencing
+  returns with promotion in plan phase P5; until then `SWITCHOVER` stays refused.
+- **`[replication] logical_wal_retention_entries`** is now only the primary's
+  own redo window below its checkpoint, default **0** (was 100000). No standby
+  reads the logical WAL.
+
+### Added — the replication connection's control plane and synchronous replication
+- **Control frames** on `NPHYS002`: `Hello` / `HelloOk` (node id, role, dataset
+  history, epoch, durable cursor, capabilities, PostgreSQL port, sync mode;
+  the primary answers with its history, epoch and barrier), `Refuse`,
+  `Heartbeat` (the standby's applied and durable sequence: THE acknowledgement,
+  sent every 5 s when idle and after every durable advance, coalesced to one per
+  50 ms), `HeartbeatAck`, and `Fence` (reserved for promotion, refused by both
+  sides now). A wrong token is `Refuse { AuthFailed }`; `NPHYS001`'s kind 13 is
+  retired.
+- **Typed refusal codes mapped to the standby's posture.** `HistoryMismatch`,
+  `Gap`, `WalPruned`, `EpochStale` and `Version` put the standby in
+  `needs_recovery` (it stays up and refuses data reads with SQLSTATE 55000
+  naming the reason, or exits with `on_unrecoverable = "exit"`); `AuthFailed` is
+  retried, 3 attempts in all, then `needs_recovery`; `TooManySessions`,
+  `SourceNotServing` and transport errors mean `reconnecting`, with a backoff
+  from 1 s doubling to 5 s. A connection beyond `[replication.physical]
+  max_sessions` is answered `TooManySessions` instead of waiting unanswered.
+- **A standby registry on the primary**, fed by each standby's `Hello` and
+  heartbeats, with applied and durable sequences that only move forward.
+- **Synchronous replication on the physical sequence.** A commit reads the
+  primary's RocksDB sequence right after its data write and waits until
+  `[replication] min_acks` standbys (default 1, 1..=64) acknowledge it:
+  `semi-sync` = durable on that many standbys of this dataset, `sync` = applied
+  (visible to their readers). Only a serving standby that follows the primary
+  counts; a bootstrap copy or an offline `resync` receiver never does. A
+  returned semi-sync or sync commit is already readable on the standby.
+  `[replication] sync_timeout_ms` (default 10000) bounds the wait, and
+  `[replication] sync_timeout_action` decides what follows: `"warn"` (default)
+  commits with a WARN and then commits asynchronously until `min_acks` standbys
+  acknowledge the sequence that timed out (a primary whose standby is gone pays
+  the timeout once, not per commit); `"fail"` reports SQLSTATE 25000
+  ("synchronous replication not confirmed") to the PostgreSQL-wire client for a
+  commit that IS durable on the primary, like PostgreSQL's cancelled synchronous
+  commit — do not retry it blindly. Embedded, MySQL-wire and REST writes only
+  log it. A primary that serves no replication port never waits, and warns at
+  startup if `sync_mode` asks it to.
+- **A primary's `/health` lists its standbys** beside the unchanged replication
+  block: node id, address, PostgreSQL port, history, state (`streaming` /
+  `bootstrapping`), sync mode, whether it counts for sync, applied and durable
+  positions (LSN text and numbers), lag and last seen. `pg_replication_standbys`
+  reads the same registry.
+- **Accepted replication sockets keep `SO_KEEPALIVE`** (GH#28, which the removed
+  native listener had), with the `[server] tcp_keepalives_*` timers and never an
+  idle timeout.
+- **`scripts/regress/nano-physical-pair.sh`**: `--sync-mode`, `--min-acks`,
+  `--sync-timeout-ms`, `--sync-timeout-action` (the primary's settings) and
+  `--pause` / `--resume primary|standby` (SIGSTOP / SIGCONT). Its JSON summary
+  drops the `"physical"` port key (the `"replication"` port is the one port)
+  and adds `"standbys"`, the number of standbys the primary's `/health` lists.
+
+### Fixed — replication
+- **The standby's heartbeat no longer resets the primary's record of it.** The
+  native heartbeat reported applied and flushed positions of 0 every 5 seconds,
+  and the primary copied them into the watermark its synchronous commits waited
+  on.
+- **A refused standby is told why.** A session the primary would not serve
+  (pruned WAL, wrong token) was dropped without a word, read as a lost socket,
+  and kept the standby `reconnecting` forever; it is now a typed refusal and
+  `needs_recovery`.
+- **Synchronous commits wait for the standby.** A sync or semi-sync commit
+  waited on a logical acknowledgement the standby sent before applying
+  anything, so it returned at once even with the standby stopped; `min_acks`
+  was ignored and a timeout only warned.
+
+### Tests
+- Added: `tests/physical_standby_sync.rs` (a sync INSERT blocks while the
+  standby is stopped; `min_acks = 2` with one standby under `warn` and `fail`;
+  heartbeat-only traffic never regresses the primary's recorded sequences; the
+  primary's `/health` lists the standby), `tests/physical_standby_refusals.rs`
+  (`HistoryMismatch`, `WalPruned`, `AuthFailed`, an `NPHYS001` client; the
+  standby stays up in `needs_recovery`), `tests/logical_standby_removed.rs` (a
+  source scan that fails if a removed replication flag, module or symbol
+  returns to the code, tests, fixture, guides or skills), and
+  `tests/support/physical_pair.rs` (the shared real-daemon pair harness).
+- Rewritten for the physical pair: `tests/ha_integration.rs` (start order,
+  restarts of either and both sides, sync and semi-sync waits, lag reporting)
+  and `tests/txn_replication_sync.rs` (an explicit transaction's commit waits on
+  the physical sequence).
+- Deleted with the native channel and the logical standby: `tests/ha_tests/`,
+  `tests/replication_catchup_transport.rs`,
+  `tests/replication_history_transport.rs`,
+  `tests/replication_listener_startup.rs`, `tests/native_replication_auth.rs`,
+  `tests/wal_applicator_fail_closed.rs`, and
+  `tests/wal_segment_recovery_tests.rs` with its fixture. Their scenarios that
+  still apply run on the physical pair (`physical_standby_serving`,
+  `physical_standby_refusals`, `ha_integration`, `replication_restart_gap`).
+- The multi-container lab under `tests/docker` is out of service until remote
+  replication over TLS (spec P2.2); `docs/guides/ha_testing.md` describes how to
+  test HA instead.
+
 ### Replication
 - **A primary restart no longer breaks its standby** (field finding J). A clean
   primary restart checkpointed the logical WAL and deleted every entry up to the

@@ -90,10 +90,12 @@ poisoning) — neither reachable by unit tests.
 
 ### 3. Full integration suite — ALWAYS `--no-fail-fast`
 ```bash
-cargo test --tests --no-fail-fast -- --skip ha_tests::streaming_tests --skip lock_management
+cargo test --tests --no-fail-fast -- --skip lock_management
 ```
-(the two skips are documented pre-existing flakes on constrained runners — never add new
-ones without written justification in the commit message).
+(the skip is a documented pre-existing flake on constrained runners — never add new ones
+without written justification in the commit message. The second one, `ha_tests::streaming_tests`,
+went with the native v3 replication channel in spec P2.1; `ha_integration` now runs a
+physical pair and is not skipped).
 **Why `--no-fail-fast` is load-bearing:** cargo stops scheduling test binaries after the
 first failing TARGET. On 2026-07-16, run 1 died at `f…` and run 2 at `i…` — suites `j…z`
 had NEVER RUN until the `--no-fail-fast` pass, which then surfaced four more findings in
@@ -137,7 +139,7 @@ files contributing 232 / 0; the only `EMPTY:` lines were the expected `code-grap
 CI still only compiles it (`feature-gated-compile`); executing it remains a local duty.
 
 ```bash
-cargo test --features internal-tests --tests --no-fail-fast -- --skip ha_tests::streaming_tests --skip lock_management
+cargo test --features internal-tests --tests --no-fail-fast -- --skip lock_management
 ```
 
 **History, kept because it is the point of §3b:** as of 2026-08-17 this suite had never run

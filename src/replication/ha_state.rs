@@ -1,21 +1,30 @@
 //! HA State Registry
 //!
-//! Provides global state tracking for High Availability monitoring.
-//! This module maintains information about:
-//! - Current node's HA configuration and role
-//! - Connected standbys (when running as primary)
-//! - Primary connection status (when running as standby)
-//! - Replication lag and performance metrics
+//! Process-global state of this node's replication role:
+//! - its HA configuration and role (the system views read it);
+//! - on a primary, the **standby registry**: every receiver session its
+//!   replication port serves, with the physical sequences each standby has
+//!   applied and made durable (spec P2.1 §2);
+//! - the synchronous-replication wait a primary's commit path runs on the
+//!   physical sequence of its write ([`HAStateRegistry::wait_for_sequence`]).
+//!
+//! # Why the registry is the commit path's
+//!
+//! Sync and semi-sync replication are only real if a commit waits for a
+//! standby to hold the PHYSICAL sequence that covers it. The registry is
+//! written by the replication sessions (`physical_source`, from each
+//! standby's `Hello` and heartbeats) and read by the commit path, so both
+//! name the same number: the RocksDB sequence of the primary's write. Both
+//! recorded sequences only move forward (`fetch_max`): a late or stale
+//! heartbeat can never regress the watermark a commit is waiting on — the
+//! native v3 channel's heartbeats reset it to 0 every few seconds.
 
-use super::wal_replicator::{Lsn, WalEntry, WalEntryType};
-use crate::storage::WalOperation;
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    RwLock,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    Arc, RwLock,
 };
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// Global HA state registry instance
@@ -32,7 +41,6 @@ pub enum HARole {
     Standalone,
     Primary,
     Standby,
-    Observer,
 }
 
 impl HARole {
@@ -41,7 +49,6 @@ impl HARole {
             HARole::Standalone => "standalone",
             HARole::Primary => "primary",
             HARole::Standby => "standby",
-            HARole::Observer => "observer",
         }
     }
 
@@ -49,7 +56,6 @@ impl HARole {
         match s.to_lowercase().as_str() {
             "primary" => HARole::Primary,
             "standby" => HARole::Standby,
-            "observer" => HARole::Observer,
             _ => HARole::Standalone,
         }
     }
@@ -81,6 +87,36 @@ impl SyncMode {
     }
 }
 
+/// What a commit does when its standbys did not acknowledge it within
+/// `[replication] sync_timeout_ms` (`sync_timeout_action`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncTimeoutAction {
+    /// Commit with a WARN, then commit asynchronously until enough standbys
+    /// acknowledge again (the default).
+    Warn,
+    /// Report the commit as failed to its client — it is already durable on
+    /// this primary, like a cancelled synchronous commit in PostgreSQL.
+    Fail,
+}
+
+impl SyncTimeoutAction {
+    /// `warn` or `fail` (validated by `ReplicationConfig::validate`).
+    pub fn from_str(value: &str) -> Self {
+        if value.trim().eq_ignore_ascii_case("fail") {
+            Self::Fail
+        } else {
+            Self::Warn
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+}
+
 /// Node configuration
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -92,6 +128,12 @@ pub struct NodeConfig {
     pub sync_mode: SyncMode,
     pub primary_host: Option<String>,
     pub started_at: i64,
+    /// `[replication] min_acks`: how many standbys must acknowledge a commit.
+    pub min_acks: usize,
+    /// `[replication] sync_timeout_ms`.
+    pub sync_timeout: Duration,
+    /// `[replication] sync_timeout_action`.
+    pub sync_timeout_action: SyncTimeoutAction,
 }
 
 impl Default for NodeConfig {
@@ -108,45 +150,193 @@ impl Default for NodeConfig {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64,
+            min_acks: 1,
+            sync_timeout: Duration::from_secs(10),
+            sync_timeout_action: SyncTimeoutAction::Warn,
         }
     }
 }
 
-/// Connected standby information
+/// A standby as the primary's registry reports it (a snapshot).
 #[derive(Debug, Clone)]
 pub struct StandbyInfo {
     pub node_id: Uuid,
+    /// The peer address of its replication session.
     pub address: String,
-    pub connected_at: i64,
-    pub last_heartbeat: i64,
+    /// The dataset history its `Hello` named; `None` while it bootstraps.
+    pub history: Option<Uuid>,
+    /// Its PostgreSQL port (0 when it serves none).
+    pub pg_port: u16,
+    /// The sync mode it was configured with (informational: this primary's
+    /// own sync mode decides what a commit waits for).
     pub sync_mode: SyncMode,
-    pub current_lsn: u64,
-    pub flush_lsn: u64,
-    pub apply_lsn: u64,
+    /// The highest physical source sequence it reported applied.
+    pub applied_seq: u64,
+    /// The highest physical source sequence it reported durable.
+    pub durable_seq: u64,
+    /// Unix seconds when its (first live) session was admitted.
+    pub connected_at: i64,
+    /// Unix seconds of its last `Hello` or heartbeat.
+    pub last_seen: i64,
+    /// This primary's physical sequence minus `applied_seq`: write operations behind.
     pub lag_bytes: u64,
+    /// Milliseconds since it last reported holding everything this primary
+    /// had written at that moment (0 while it does).
     pub lag_ms: u64,
     pub state: StandbyState,
+    /// Whether it counts toward `min_acks`: a serving standby following this
+    /// primary, not a bootstrap copy or an offline `resync` receiver.
+    pub counts_for_sync: bool,
 }
 
 /// Standby connection state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StandbyState {
-    Connecting,
+    /// Downloading its first copy (a snapshot session).
+    Bootstrapping,
+    /// Following this primary (a resumed session).
     Streaming,
-    CatchingUp,
-    Synced,
-    Disconnected,
 }
 
 impl StandbyState {
     pub fn as_str(&self) -> &'static str {
         match self {
-            StandbyState::Connecting => "connecting",
+            StandbyState::Bootstrapping => "bootstrapping",
             StandbyState::Streaming => "streaming",
-            StandbyState::CatchingUp => "catching_up",
-            StandbyState::Synced => "synced",
-            StandbyState::Disconnected => "disconnected",
         }
+    }
+}
+
+/// What a replication session registers when it admits a standby's `Hello`.
+#[derive(Debug, Clone)]
+pub struct StandbyRegistration {
+    pub node_id: Uuid,
+    pub address: String,
+    pub history: Option<Uuid>,
+    pub pg_port: u16,
+    pub sync_mode: SyncMode,
+    /// The durable cursor the standby opened its session at.
+    pub cursor: Option<u64>,
+    pub state: StandbyState,
+    pub counts_for_sync: bool,
+}
+
+/// One registered standby. The sequences are atomics so a heartbeat records
+/// without the registry's write lock, and only ever move forward.
+#[derive(Debug)]
+struct StandbyEntry {
+    node_id: Uuid,
+    address: String,
+    history: Option<Uuid>,
+    pg_port: u16,
+    sync_mode: SyncMode,
+    state: StandbyState,
+    counts_for_sync: bool,
+    connected_at: i64,
+    applied: AtomicU64,
+    durable: AtomicU64,
+    /// Unix milliseconds.
+    last_seen: AtomicU64,
+    /// Unix milliseconds of the last ack at or past the primary's sequence.
+    caught_up_at: AtomicU64,
+    /// Live sessions of this entry (a reconnect can overlap the session it replaces).
+    sessions: AtomicUsize,
+}
+
+impl StandbyEntry {
+    fn applied(&self) -> u64 {
+        self.applied.load(Ordering::Acquire)
+    }
+
+    fn durable(&self) -> u64 {
+        self.durable.load(Ordering::Acquire)
+    }
+}
+
+/// The primary's sequence source, for lag and the views.
+pub type SequenceSource = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// The standby registry and the notification every waiting commit sleeps
+/// on. Shared by its [`HAStateRegistry`] and every [`StandbyHandle`], so a
+/// handle reports to the registry that issued it.
+struct StandbyRegistry {
+    standbys: parking_lot::RwLock<HashMap<Uuid, Arc<StandbyEntry>>>,
+    sequence_source: parking_lot::RwLock<Option<SequenceSource>>,
+    /// Bumped on every acknowledgement and registry change, under this lock,
+    /// so a waiter cannot miss the notification it waits for.
+    generation: parking_lot::Mutex<u64>,
+    changed: parking_lot::Condvar,
+}
+
+impl StandbyRegistry {
+    fn primary_sequence(&self) -> u64 {
+        self.sequence_source.read().as_ref().map_or(0, |source| source())
+    }
+
+    fn record_ack(&self, entry: &StandbyEntry, applied: u64, durable: u64) {
+        let now = now_millis();
+        entry.applied.fetch_max(applied, Ordering::AcqRel);
+        entry.durable.fetch_max(durable, Ordering::AcqRel);
+        entry.last_seen.fetch_max(now, Ordering::AcqRel);
+        if entry.applied() >= self.primary_sequence() {
+            entry.caught_up_at.fetch_max(now, Ordering::AcqRel);
+        }
+        self.notify();
+    }
+
+    fn end_session(&self, entry: &Arc<StandbyEntry>) {
+        {
+            // Under the lock `register_standby` joins entries under, so a
+            // session joining this entry cannot race its removal.
+            let mut standbys = self.standbys.write();
+            if entry.sessions.fetch_sub(1, Ordering::AcqRel) == 1
+                && standbys
+                    .get(&entry.node_id)
+                    .is_some_and(|registered| Arc::ptr_eq(registered, entry))
+            {
+                standbys.remove(&entry.node_id);
+            }
+        }
+        self.notify();
+    }
+
+    fn notify(&self) {
+        *self.generation.lock() += 1;
+        self.changed.notify_all();
+    }
+}
+
+/// A registered standby session. Dropping it ends the session's
+/// registration; the standby leaves the registry with its last session.
+pub struct StandbyHandle {
+    registry: Arc<StandbyRegistry>,
+    entry: Arc<StandbyEntry>,
+}
+
+impl std::fmt::Debug for StandbyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StandbyHandle")
+            .field("entry", &self.entry)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StandbyHandle {
+    pub fn node_id(&self) -> Uuid {
+        self.entry.node_id
+    }
+
+    /// Record an acknowledgement (a heartbeat). Monotonic: values below what
+    /// was already recorded change nothing, and the durable sequence is never
+    /// recorded above the applied one.
+    pub fn record_ack(&self, applied: u64, durable: u64) {
+        self.registry.record_ack(&self.entry, applied, durable.min(applied));
+    }
+}
+
+impl Drop for StandbyHandle {
+    fn drop(&mut self) {
+        self.registry.end_session(&self.entry);
     }
 }
 
@@ -201,18 +391,57 @@ pub struct ReplicationMetrics {
     pub last_replication: Option<i64>,
 }
 
+/// A commit its standbys did not acknowledge within the timeout, under
+/// `sync_timeout_action = "fail"`. The commit is durable on this primary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncUnconfirmed {
+    pub sequence: u64,
+    pub acknowledged: usize,
+    pub min_acks: usize,
+    pub mode: SyncMode,
+    pub timeout: Duration,
+}
+
+impl std::fmt::Display for SyncUnconfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: {} of {} required standbys acknowledged physical sequence {} within {} ms ({}); the commit is \
+             durable on this primary but may not be on any standby",
+            crate::error::SYNC_REPLICATION_UNCONFIRMED,
+            self.acknowledged,
+            self.min_acks,
+            self.sequence,
+            self.timeout.as_millis(),
+            self.mode.as_str()
+        )
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+}
+
 /// HA State Registry
 pub struct HAStateRegistry {
     config: RwLock<NodeConfig>,
-    standbys: RwLock<HashMap<Uuid, StandbyInfo>>,
+    registry: Arc<StandbyRegistry>,
     primary: RwLock<Option<PrimaryInfo>>,
     metrics: RwLock<ReplicationMetrics>,
     current_lsn: RwLock<u64>,
     is_read_only: RwLock<bool>,
-    /// CLI history guards never authorize SQL forwarding to an unverified PG endpoint.
+    /// Set for a guarded physical standby process ([`Self::disable_forwarding`]).
     forwarding_disabled: AtomicBool,
-    /// WAL broadcast sender for replication (primary only)
-    wal_broadcast_tx: RwLock<Option<broadcast::Sender<WalEntry>>>,
+    /// This primary's dataset history: semi-sync counts only standbys of it.
+    history: parking_lot::RwLock<Option<Uuid>>,
+    /// Set once this primary serves its replication port: a primary that
+    /// serves none has no standby to wait for, whatever its sync mode says.
+    serving: AtomicBool,
+    /// `warn` mode only: the sequence whose wait timed out, while commits
+    /// run asynchronously until enough standbys acknowledge it (0 = none).
+    degraded_at: AtomicU64,
 }
 
 impl HAStateRegistry {
@@ -220,13 +449,20 @@ impl HAStateRegistry {
     pub fn new() -> Self {
         Self {
             config: RwLock::new(NodeConfig::default()),
-            standbys: RwLock::new(HashMap::new()),
+            registry: Arc::new(StandbyRegistry {
+                standbys: parking_lot::RwLock::new(HashMap::new()),
+                sequence_source: parking_lot::RwLock::new(None),
+                generation: parking_lot::Mutex::new(0),
+                changed: parking_lot::Condvar::new(),
+            }),
             primary: RwLock::new(None),
             metrics: RwLock::new(ReplicationMetrics::default()),
             current_lsn: RwLock::new(0),
             is_read_only: RwLock::new(false),
             forwarding_disabled: AtomicBool::new(false),
-            wal_broadcast_tx: RwLock::new(None),
+            history: parking_lot::RwLock::new(None),
+            serving: AtomicBool::new(false),
+            degraded_at: AtomicU64::new(0),
         }
     }
 
@@ -243,11 +479,14 @@ impl HAStateRegistry {
         if let Ok(mut ro) = self.is_read_only.write() {
             *ro = read_only;
         }
+        self.degraded_at.store(0, Ordering::Release);
     }
 
-    /// Permanently disable transparent forwarding for this process. Dataset
-    /// identity is verified on the replication protocol, not PostgreSQL SQL.
-    /// Role/read-only changes must not silently undo this restriction.
+    /// Mark this process a guarded physical standby, permanently: every
+    /// PostgreSQL session is a standby session whose writes are refused
+    /// (25006) in every posture. Role/read-only changes must not silently undo
+    /// this restriction. (The name predates spec P2.1, which removed the write
+    /// forwarding it used to switch off; no write is ever forwarded now.)
     pub fn disable_forwarding(&self) {
         self.forwarding_disabled.store(true, Ordering::Release);
     }
@@ -278,42 +517,236 @@ impl HAStateRegistry {
         }
     }
 
-    // ========== Standby Management (Primary Role) ==========
-
-    /// Register a connected standby
-    pub fn register_standby(&self, info: StandbyInfo) {
-        if let Ok(mut standbys) = self.standbys.write() {
-            standbys.insert(info.node_id, info);
-        }
+    /// This primary's dataset history (semi-sync counts only its standbys).
+    pub fn set_history(&self, history: Option<Uuid>) {
+        *self.history.write() = history;
     }
 
-    /// Update standby status
-    pub fn update_standby(&self, node_id: Uuid, update: impl FnOnce(&mut StandbyInfo)) {
-        if let Ok(mut standbys) = self.standbys.write() {
-            if let Some(standby) = standbys.get_mut(&node_id) {
-                update(standby);
+    pub fn history(&self) -> Option<Uuid> {
+        *self.history.read()
+    }
+
+    /// Where this primary's physical sequence is read (lag, views).
+    pub fn set_sequence_source(&self, source: Option<SequenceSource>) {
+        *self.registry.sequence_source.write() = source;
+    }
+
+    /// Whether this primary serves its replication port. Only then does a
+    /// commit wait for standbys: one that serves none has nobody to wait for.
+    pub fn set_replication_serving(&self, serving: bool) {
+        self.serving.store(serving, Ordering::Release);
+        self.registry.notify();
+    }
+
+    /// Whether a commit on this node may have to wait for standbys: a
+    /// primary that serves its replication port in sync or semi-sync mode.
+    /// The commit path asks this before reading its physical sequence.
+    pub fn sync_wait_enabled(&self) -> bool {
+        self.serving.load(Ordering::Acquire)
+            && self
+                .config
+                .read()
+                .map(|config| config.role == HARole::Primary && config.sync_mode != SyncMode::Async)
+                .unwrap_or(false)
+    }
+
+    // ========== Standby registry (primary role) ==========
+
+    /// Register a standby session (its `Hello` was admitted). A session of a
+    /// standby already registered under the same node id and history joins
+    /// its entry — the recorded sequences only move forward; a session with
+    /// another history (a rebuilt standby) replaces it.
+    pub fn register_standby(&self, registration: StandbyRegistration) -> StandbyHandle {
+        let now = now_millis();
+        let cursor = registration.cursor.unwrap_or(0);
+        let entry = {
+            let mut standbys = self.registry.standbys.write();
+            match standbys.get(&registration.node_id) {
+                Some(existing)
+                    if existing.history == registration.history
+                        && existing.state == registration.state
+                        && existing.counts_for_sync == registration.counts_for_sync =>
+                {
+                    existing.sessions.fetch_add(1, Ordering::AcqRel);
+                    Arc::clone(existing)
+                }
+                _ => {
+                    let entry = Arc::new(StandbyEntry {
+                        node_id: registration.node_id,
+                        address: registration.address,
+                        history: registration.history,
+                        pg_port: registration.pg_port,
+                        sync_mode: registration.sync_mode,
+                        state: registration.state,
+                        counts_for_sync: registration.counts_for_sync,
+                        connected_at: (now / 1000) as i64,
+                        applied: AtomicU64::new(0),
+                        durable: AtomicU64::new(0),
+                        last_seen: AtomicU64::new(now),
+                        caught_up_at: AtomicU64::new(now),
+                        sessions: AtomicUsize::new(1),
+                    });
+                    standbys.insert(registration.node_id, Arc::clone(&entry));
+                    entry
+                }
             }
-        }
-    }
-
-    /// Remove a standby
-    pub fn remove_standby(&self, node_id: Uuid) {
-        if let Ok(mut standbys) = self.standbys.write() {
-            standbys.remove(&node_id);
+        };
+        // The cursor a standby opens at is durable on it: its first ack.
+        self.registry.record_ack(&entry, cursor, cursor);
+        StandbyHandle {
+            registry: Arc::clone(&self.registry),
+            entry,
         }
     }
 
     /// Get all standbys
     pub fn get_standbys(&self) -> Vec<StandbyInfo> {
-        self.standbys
+        let primary = self.registry.primary_sequence();
+        let now = now_millis();
+        let mut standbys: Vec<StandbyInfo> = self
+            .registry
+            .standbys
             .read()
-            .map(|s| s.values().cloned().collect())
-            .unwrap_or_default()
+            .values()
+            .map(|entry| {
+                let applied = entry.applied();
+                StandbyInfo {
+                    node_id: entry.node_id,
+                    address: entry.address.clone(),
+                    history: entry.history,
+                    pg_port: entry.pg_port,
+                    sync_mode: entry.sync_mode,
+                    applied_seq: applied,
+                    durable_seq: entry.durable(),
+                    connected_at: entry.connected_at,
+                    last_seen: (entry.last_seen.load(Ordering::Acquire) / 1000) as i64,
+                    lag_bytes: primary.saturating_sub(applied),
+                    lag_ms: if applied >= primary {
+                        0
+                    } else {
+                        now.saturating_sub(entry.caught_up_at.load(Ordering::Acquire))
+                    },
+                    state: entry.state,
+                    counts_for_sync: entry.counts_for_sync,
+                }
+            })
+            .collect();
+        standbys.sort_by_key(|standby| standby.node_id);
+        standbys
     }
 
     /// Get standby count
     pub fn standby_count(&self) -> usize {
-        self.standbys.read().map(|s| s.len()).unwrap_or(0)
+        self.registry.standbys.read().len()
+    }
+
+    /// How many standbys acknowledged `sequence` the way `mode` requires.
+    fn acknowledgements(&self, mode: SyncMode, sequence: u64) -> usize {
+        let history = self.history();
+        self.registry
+            .standbys
+            .read()
+            .values()
+            .filter(|entry| {
+                // Only a serving standby that follows THIS dataset counts: a
+                // bootstrap copy or an offline receiver serves nobody.
+                let ours = match history {
+                    Some(history) => entry.history == Some(history),
+                    None => entry.history.is_some(),
+                };
+                entry.counts_for_sync
+                    && ours
+                    && match mode {
+                        SyncMode::SemiSync => entry.durable() >= sequence,
+                        SyncMode::Sync => entry.applied() >= sequence,
+                        SyncMode::Async => true,
+                    }
+            })
+            .count()
+    }
+
+    /// Spec P2.1 §2: block (bounded) until enough standbys hold `sequence`,
+    /// the physical sequence the caller read right after its write.
+    ///
+    /// * `semi-sync`: `min_acks` standbys of this dataset report it durable;
+    /// * `sync`: `min_acks` standbys report it applied (visible to their readers);
+    /// * `async`, a node that is not a primary, or a primary that serves no
+    ///   replication port: returns at once.
+    ///
+    /// After `sync_timeout_ms` the commit returns. `warn`: Ok, with a WARN,
+    /// and later commits run asynchronously until `min_acks` standbys
+    /// acknowledge the sequence that timed out (so a primary whose standby is
+    /// gone pays the timeout once, not on every commit). `fail`: the
+    /// [`SyncUnconfirmed`] error, for a commit that is durable on this primary.
+    pub fn wait_for_sequence(&self, sequence: u64) -> std::result::Result<(), SyncUnconfirmed> {
+        if !self.serving.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Ok(config) = self.config.read().map(|config| config.clone()) else {
+            return Ok(());
+        };
+        if config.role != HARole::Primary || config.sync_mode == SyncMode::Async {
+            return Ok(());
+        }
+        let min_acks = config.min_acks.max(1);
+        if config.sync_timeout_action == SyncTimeoutAction::Warn {
+            let degraded_at = self.degraded_at.load(Ordering::Acquire);
+            if degraded_at != 0 {
+                if self.acknowledgements(config.sync_mode, degraded_at) < min_acks {
+                    return Ok(());
+                }
+                if self
+                    .degraded_at
+                    .compare_exchange(degraded_at, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    tracing::info!(
+                        "synchronous replication resumed: {min_acks} standby(s) acknowledged physical sequence \
+                         {degraded_at} again"
+                    );
+                }
+            }
+        }
+        let deadline = Instant::now() + config.sync_timeout;
+        let mut generation = self.registry.generation.lock();
+        let acknowledged = loop {
+            let acknowledged = self.acknowledgements(config.sync_mode, sequence);
+            if acknowledged >= min_acks {
+                return Ok(());
+            }
+            if Instant::now() >= deadline || !self.serving.load(Ordering::Acquire) {
+                break acknowledged;
+            }
+            // Re-checked under the lock every acknowledgement takes.
+            let _ = self.registry.changed.wait_until(&mut generation, deadline);
+        };
+        drop(generation);
+        if !self.serving.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let unconfirmed = SyncUnconfirmed {
+            sequence,
+            acknowledged,
+            min_acks,
+            mode: config.sync_mode,
+            timeout: config.sync_timeout,
+        };
+        match config.sync_timeout_action {
+            SyncTimeoutAction::Warn => {
+                if self
+                    .degraded_at
+                    .compare_exchange(0, sequence.max(1), Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    tracing::warn!(
+                        "{unconfirmed}; sync_timeout_action = \"warn\": the commit returns, and commits run \
+                         asynchronously until {min_acks} standby(s) acknowledge physical sequence {sequence}"
+                    );
+                }
+                Ok(())
+            }
+            SyncTimeoutAction::Fail => Err(unconfirmed),
+        }
     }
 
     // ========== Primary Connection (Standby Role) ==========
@@ -355,8 +788,12 @@ impl HAStateRegistry {
         }
     }
 
-    /// Get current LSN
+    /// The node's position: on a primary serving its replication port, its
+    /// physical sequence; otherwise the value last set.
     pub fn get_lsn(&self) -> u64 {
+        if let Some(source) = self.registry.sequence_source.read().as_ref() {
+            return source();
+        }
         self.current_lsn.read().map(|l| *l).unwrap_or(0)
     }
 
@@ -426,212 +863,6 @@ impl HAStateRegistry {
     pub fn record_reconnect(&self) {
         self.update_metrics(|m| m.reconnect_count += 1);
     }
-
-    // ========== WAL Broadcasting (Primary Role) ==========
-
-    /// Set the WAL broadcast sender (called by StreamingServer)
-    pub fn set_wal_broadcast(&self, tx: broadcast::Sender<WalEntry>) {
-        if let Ok(mut wal_tx) = self.wal_broadcast_tx.write() {
-            *wal_tx = Some(tx);
-        }
-    }
-
-    /// Clear the WAL broadcast sender
-    pub fn clear_wal_broadcast(&self) {
-        if let Ok(mut wal_tx) = self.wal_broadcast_tx.write() {
-            *wal_tx = None;
-        }
-    }
-
-    /// Check if WAL broadcasting is enabled
-    pub fn has_wal_broadcast(&self) -> bool {
-        self.wal_broadcast_tx.read().map(|tx| tx.is_some()).unwrap_or(false)
-    }
-
-    /// Broadcast a WAL entry to standbys (called by storage engine)
-    /// Returns the LSN if broadcast was successful, None if no broadcast channel
-    pub fn broadcast_wal_entry(&self, entry: WalEntry) -> Option<Lsn> {
-        if let Ok(tx_guard) = self.wal_broadcast_tx.read() {
-            if let Some(ref tx) = *tx_guard {
-                let lsn = entry.lsn;
-                let data_len = entry.data.len() as u64;
-
-                // Broadcast to all subscribers
-                match tx.send(entry) {
-                    Ok(receiver_count) => {
-                        tracing::info!(
-                            "broadcast_wal_entry: LSN={} sent to {} receivers, data_len={}",
-                            lsn,
-                            receiver_count,
-                            data_len
-                        );
-                        // Update metrics
-                        self.record_replication(1, data_len);
-                        return Some(lsn);
-                    }
-                    Err(e) => {
-                        tracing::warn!("broadcast_wal_entry: LSN={} send failed: {}", lsn, e);
-                    }
-                }
-            } else {
-                tracing::warn!("broadcast_wal_entry: No broadcast channel configured");
-            }
-        } else {
-            tracing::warn!("broadcast_wal_entry: Failed to acquire read lock");
-        }
-        None
-    }
-
-    /// Wait for synchronous replication based on configured sync mode
-    /// Returns Ok(()) if sync mode is Async or when required ACKs received
-    /// Returns Err if timeout waiting for standbys
-    pub fn wait_for_sync(&self, lsn: u64, timeout_ms: u64) -> std::result::Result<(), String> {
-        let config = match self.get_config() {
-            Some(c) => c,
-            None => return Ok(()), // No config, treat as async
-        };
-
-        match config.sync_mode {
-            SyncMode::Async => Ok(()), // No waiting needed
-            SyncMode::SemiSync | SyncMode::Sync => {
-                // Wait for at least one standby to reach this LSN
-                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-
-                loop {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(format!("Timeout waiting for standby ACK for LSN {}", lsn));
-                    }
-
-                    // Check if any standby has reached this LSN
-                    // "Faster-safe" approach: wait for flush_lsn (data received by standby)
-                    // for both SemiSync and Sync modes. This is faster because we don't wait
-                    // for the standby to apply the entry, but still safe because the data
-                    // has reached the standby's WAL buffer and will survive primary crash.
-                    let standbys = self.get_standbys();
-                    tracing::debug!("wait_for_sync: Checking {} standbys for LSN={}", standbys.len(), lsn);
-                    for s in &standbys {
-                        tracing::debug!(
-                            "wait_for_sync: Standby {} flush_lsn={} apply_lsn={}",
-                            s.node_id,
-                            s.flush_lsn,
-                            s.apply_lsn
-                        );
-                    }
-                    let acked = standbys.iter().any(|s| s.flush_lsn >= lsn);
-
-                    if acked {
-                        tracing::info!("wait_for_sync: LSN {} acked by standby", lsn);
-                        return Ok(());
-                    }
-
-                    // Short sleep before retry
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-            }
-        }
-    }
-
-    /// Broadcast a WAL operation from storage engine
-    /// Converts WalOperation to replication WalEntry and broadcasts
-    pub fn broadcast_wal_operation(&self, lsn: u64, operation: &WalOperation) -> Option<Lsn> {
-        let role = self.get_role();
-        tracing::info!(
-            "broadcast_wal_operation: LSN={}, role={:?}, op={:?}",
-            lsn,
-            role,
-            std::mem::discriminant(operation)
-        );
-
-        // Only broadcast if we're the primary
-        if role != HARole::Primary {
-            tracing::info!("broadcast_wal_operation: Skipping - not primary (role={:?})", role);
-            return None;
-        }
-
-        // Convert storage WalOperation to replication WalEntry
-        let entry = wal_operation_to_entry(lsn, operation);
-
-        self.broadcast_wal_entry(entry)
-    }
-}
-
-/// Convert a storage [`WalOperation`] into the replication wire entry.
-///
-/// Shared by live broadcast and by catch-up from the persisted logical WAL so
-/// both paths encode an operation identically.
-pub fn wal_operation_to_entry(lsn: u64, operation: &WalOperation) -> WalEntry {
-    let (entry_type, data) = match operation {
-        // DML operations
-        WalOperation::Insert { .. } => (WalEntryType::Insert, serialize_operation(operation)),
-        WalOperation::Update { .. } => (WalEntryType::Update, serialize_operation(operation)),
-        WalOperation::Delete { .. } => (WalEntryType::Delete, serialize_operation(operation)),
-        WalOperation::Truncate { .. } => (WalEntryType::Delete, serialize_operation(operation)),
-
-        // Table DDL
-        WalOperation::CreateTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::DropTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::RenameTable { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::AlterColumnStorage { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-        // Index operations
-        WalOperation::CreateIndex { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::DropIndex { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-        // Trigger operations
-        WalOperation::CreateTrigger { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::DropTrigger { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-        // Function/Procedure operations
-        WalOperation::CreateFunction { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::DropFunction { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::CreateProcedure { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::DropProcedure { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-        // Materialized view operations
-        WalOperation::CreateMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::DropMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::RefreshMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-        // Constraint operations
-        WalOperation::AddConstraint { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::DropConstraint { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-        // GH#36: the remaining schema-changing DDL.
-        WalOperation::AlterTableSchema { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::CreateView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::DropView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::CreateSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::AlterSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-        WalOperation::DropSequence { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-
-        // Transaction control
-        WalOperation::Begin { .. } => (WalEntryType::TxBegin, serialize_operation(operation)),
-        WalOperation::Commit { .. } => (WalEntryType::TxCommit, serialize_operation(operation)),
-        WalOperation::Abort { .. } => (WalEntryType::TxRollback, serialize_operation(operation)),
-
-        // HA replication operations
-        WalOperation::UpdateCounter { .. } => (WalEntryType::Update, serialize_operation(operation)),
-    };
-
-    let checksum = crc32fast::hash(&data);
-    WalEntry {
-        lsn,
-        tx_id: None, // Individual operations don't have tx_id
-        entry_type,
-        data,
-        checksum,
-    }
-}
-
-/// Serialize a WalOperation to bytes for replication
-fn serialize_operation(operation: &WalOperation) -> Vec<u8> {
-    match bincode::serialize(operation) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!("Failed to serialize WAL operation: {}", e);
-            Vec::new()
-        }
-    }
 }
 
 impl Default for HAStateRegistry {
@@ -641,8 +872,58 @@ impl Default for HAStateRegistry {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    // Every test builds its own registry: a test that armed the process-global
+    // `ha_state()` as a primary would make every commit of the tests running
+    // beside it wait for standbys (see `tests/txn_replication_sync.rs`).
+
+    fn registration(node_id: Uuid, history: Option<Uuid>, cursor: Option<u64>) -> StandbyRegistration {
+        StandbyRegistration {
+            node_id,
+            address: "127.0.0.1:1".to_string(),
+            history,
+            pg_port: 5432,
+            sync_mode: SyncMode::Async,
+            cursor,
+            state: StandbyState::Streaming,
+            counts_for_sync: true,
+        }
+    }
+
+    fn standby(registry: &HAStateRegistry, node_id: Uuid) -> Option<StandbyInfo> {
+        registry
+            .get_standbys()
+            .into_iter()
+            .find(|standby| standby.node_id == node_id)
+    }
+
+    fn armed(
+        mode: SyncMode,
+        min_acks: usize,
+        timeout_ms: u64,
+        action: SyncTimeoutAction,
+        history: Uuid,
+    ) -> HAStateRegistry {
+        let registry = HAStateRegistry::new();
+        rearm(&registry, mode, min_acks, timeout_ms, action);
+        registry.set_history(Some(history));
+        registry.set_replication_serving(true);
+        registry
+    }
+
+    fn rearm(registry: &HAStateRegistry, mode: SyncMode, min_acks: usize, timeout_ms: u64, action: SyncTimeoutAction) {
+        registry.set_config(NodeConfig {
+            role: HARole::Primary,
+            sync_mode: mode,
+            min_acks,
+            sync_timeout: Duration::from_millis(timeout_ms),
+            sync_timeout_action: action,
+            ..Default::default()
+        });
+    }
 
     #[test]
     fn test_ha_state_registry() {
@@ -651,6 +932,9 @@ mod tests {
         // Test default config
         let config = registry.get_config().unwrap();
         assert_eq!(config.role, HARole::Standalone);
+        assert_eq!(config.min_acks, 1);
+        assert_eq!(config.sync_timeout, Duration::from_secs(10));
+        assert_eq!(config.sync_timeout_action, SyncTimeoutAction::Warn);
 
         // Test setting config
         registry.set_config(NodeConfig {
@@ -664,34 +948,147 @@ mod tests {
         registry.set_lsn(100);
         assert_eq!(registry.get_lsn(), 100);
         assert_eq!(registry.increment_lsn(), 101);
+        registry.set_sequence_source(Some(Arc::new(|| 7)));
+        assert_eq!(registry.get_lsn(), 7, "a serving primary reports its physical sequence");
+        assert_eq!(SyncTimeoutAction::from_str(" FAIL "), SyncTimeoutAction::Fail);
+        assert_eq!(SyncTimeoutAction::from_str("warn"), SyncTimeoutAction::Warn);
+    }
+
+    /// Spec P2.1: the registry's sequences only move forward. A late or stale
+    /// heartbeat — the native v3 channel's reported 0 every few seconds — can
+    /// never regress what a commit is waiting on.
+    #[test]
+    fn registry_sequences_are_monotonic_and_durable_never_exceeds_applied() {
+        let registry = HAStateRegistry::new();
+        let primary = Arc::new(AtomicU64::new(30));
+        let source = Arc::clone(&primary);
+        registry.set_sequence_source(Some(Arc::new(move || source.load(Ordering::Acquire))));
+        let node = Uuid::new_v4();
+        let history = Some(Uuid::new_v4());
+        let handle = registry.register_standby(registration(node, history, Some(10)));
+        let info = standby(&registry, node).unwrap();
+        assert_eq!(
+            (info.applied_seq, info.durable_seq),
+            (10, 10),
+            "the session's cursor is its first ack"
+        );
+        assert_eq!(info.lag_bytes, 20);
+        handle.record_ack(20, 15);
+        handle.record_ack(0, 0);
+        handle.record_ack(12, 12);
+        let info = standby(&registry, node).unwrap();
+        assert_eq!((info.applied_seq, info.durable_seq), (20, 15));
+        handle.record_ack(25, 99);
+        let info = standby(&registry, node).unwrap();
+        assert_eq!(
+            (info.applied_seq, info.durable_seq),
+            (25, 25),
+            "durable is recorded at most at applied"
+        );
+        handle.record_ack(30, 30);
+        assert_eq!(standby(&registry, node).unwrap().lag_bytes, 0);
+        assert_eq!(standby(&registry, node).unwrap().lag_ms, 0);
+        // A second session of the same standby (a reconnect overlapping the
+        // first) joins the entry; its older cursor moves nothing back.
+        let second = registry.register_standby(registration(node, history, Some(5)));
+        assert_eq!(standby(&registry, node).unwrap().applied_seq, 30);
+        assert_eq!(registry.standby_count(), 1);
+        drop(handle);
+        assert_eq!(
+            standby(&registry, node).unwrap().applied_seq,
+            30,
+            "the entry lives while a session does"
+        );
+        drop(second);
+        assert!(standby(&registry, node).is_none());
+        // A rebuilt standby (another history) under the same id starts over.
+        let old = registry.register_standby(registration(node, history, Some(50)));
+        let rebuilt = registry.register_standby(registration(node, Some(Uuid::new_v4()), Some(3)));
+        assert_eq!(standby(&registry, node).unwrap().applied_seq, 3);
+        drop(old);
+        assert_eq!(
+            standby(&registry, node).unwrap().applied_seq,
+            3,
+            "the replaced entry's last session leaves the new one in place"
+        );
+        drop(rebuilt);
+        assert_eq!(registry.standby_count(), 0);
     }
 
     #[test]
-    fn test_standby_management() {
-        let registry = HAStateRegistry::new();
-        let standby_id = Uuid::new_v4();
-
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
-
-        registry.register_standby(StandbyInfo {
-            node_id: standby_id,
-            address: "192.168.1.10:5433".to_string(),
-            connected_at: now,
-            last_heartbeat: now,
-            sync_mode: SyncMode::SemiSync,
-            current_lsn: 100,
-            flush_lsn: 100,
-            apply_lsn: 100,
-            lag_bytes: 0,
-            lag_ms: 0,
-            state: StandbyState::Streaming,
+    fn semi_sync_waits_for_durable_and_sync_for_applied_from_min_acks_standbys_of_this_dataset() {
+        let history = Uuid::new_v4();
+        let registry = Arc::new(armed(SyncMode::SemiSync, 1, 200, SyncTimeoutAction::Fail, history));
+        assert!(registry.sync_wait_enabled());
+        let other = registry.register_standby(registration(Uuid::new_v4(), Some(Uuid::new_v4()), Some(100)));
+        let bootstrap = registry.register_standby(StandbyRegistration {
+            state: StandbyState::Bootstrapping,
+            counts_for_sync: false,
+            ..registration(Uuid::new_v4(), Some(history), Some(100))
         });
+        let ours = registry.register_standby(registration(Uuid::new_v4(), Some(history), Some(5)));
+        ours.record_ack(30, 20);
+        assert!(registry.wait_for_sequence(20).is_ok());
+        let failed = registry.wait_for_sequence(21).unwrap_err();
+        assert_eq!(
+            (failed.acknowledged, failed.min_acks),
+            (0, 1),
+            "another dataset's standby and a bootstrap copy never count"
+        );
+        rearm(&registry, SyncMode::Sync, 1, 200, SyncTimeoutAction::Fail);
+        assert!(registry.wait_for_sequence(30).is_ok(), "sync counts applied");
+        assert!(registry.wait_for_sequence(31).is_err());
+        // An acknowledgement that arrives while the commit waits releases it.
+        rearm(&registry, SyncMode::SemiSync, 1, 5_000, SyncTimeoutAction::Fail);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            ours.record_ack(40, 40);
+            ours
+        });
+        let started = Instant::now();
+        assert!(registry.wait_for_sequence(40).is_ok());
+        assert!(started.elapsed() < Duration::from_secs(4), "{:?}", started.elapsed());
+        let ours = releaser.join().unwrap();
+        drop((ours, other, bootstrap));
+        registry.set_replication_serving(false);
+        assert!(!registry.sync_wait_enabled());
+        assert!(
+            registry.wait_for_sequence(u64::MAX).is_ok(),
+            "a primary that serves no replication port never waits"
+        );
+        registry.set_replication_serving(true);
+        rearm(&registry, SyncMode::Async, 1, 5_000, SyncTimeoutAction::Fail);
+        assert!(registry.wait_for_sequence(u64::MAX).is_ok(), "async never waits");
+    }
 
-        assert_eq!(registry.standby_count(), 1);
-
-        let standbys = registry.get_standbys();
-        assert_eq!(standbys.len(), 1);
-        assert_eq!(standbys[0].node_id, standby_id);
+    #[test]
+    fn min_acks_shortfall_warns_once_then_runs_async_until_acknowledged_or_fails_every_time() {
+        let history = Uuid::new_v4();
+        let registry = armed(SyncMode::SemiSync, 2, 100, SyncTimeoutAction::Warn, history);
+        let one = registry.register_standby(registration(Uuid::new_v4(), Some(history), Some(10)));
+        let started = Instant::now();
+        assert!(registry.wait_for_sequence(10).is_ok(), "warn commits");
+        assert!(started.elapsed() >= Duration::from_millis(90), "it waited the timeout");
+        let started = Instant::now();
+        assert!(registry.wait_for_sequence(11).is_ok());
+        assert!(
+            started.elapsed() < Duration::from_millis(90),
+            "degraded: later commits do not pay the timeout again"
+        );
+        // Two standbys hold the sequence that timed out: waits resume.
+        let two = registry.register_standby(registration(Uuid::new_v4(), Some(history), Some(10)));
+        let started = Instant::now();
+        assert!(registry.wait_for_sequence(12).is_ok());
+        assert!(started.elapsed() >= Duration::from_millis(90), "synchronous again");
+        rearm(&registry, SyncMode::SemiSync, 2, 100, SyncTimeoutAction::Fail);
+        drop(two);
+        // `fail` never degrades: every short commit pays the timeout and fails.
+        for (sequence, acknowledged) in [(10, 1), (10, 1), (11, 0)] {
+            let failed = registry.wait_for_sequence(sequence).unwrap_err();
+            assert_eq!((failed.acknowledged, failed.min_acks), (acknowledged, 2));
+            assert!(failed.to_string().contains(crate::error::SYNC_REPLICATION_UNCONFIRMED));
+        }
+        drop(one);
     }
 
     #[test]

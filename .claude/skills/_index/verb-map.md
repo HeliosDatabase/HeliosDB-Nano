@@ -20,6 +20,7 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `dump` | Backup to file (zstd/gzip/brotli/none) | `heliosdb-nano-backup` |
 | `restore` | Restore from backup file | `heliosdb-nano-backup` |
 | `code-graph hook` | Git-hook source indexer (`code-graph` feature) | `heliosdb-nano-code-graph` |
+| `resync` | Offline physical receiver: copies (and follows, unless `--once`) a primary's `--replication-port` into an absent dir; never serves SQL | `heliosdb-nano-server` |
 
 ## CLI flags (`heliosdb-nano start …`)
 
@@ -37,12 +38,14 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `--tls-cert <f>` / `--tls-key <f>` | — | TLS in transit (PEM) | `heliosdb-nano-server` |
 | `--auth <mode>` | `trust` | `trust\|password\|md5\|scram-sha-256` | `heliosdb-nano-server` |
 | `--password <s>` | — | Admin password seed (non-trust) | `heliosdb-nano-server` |
-| `--replication-role <r>` | `standalone` | `standalone\|primary\|standby\|observer` | `heliosdb-nano-server` |
-| `--replication-port <n>` | `5433` | WAL streaming port | `heliosdb-nano-server` |
-| `--primary-host <hp>` | — | Standby's primary target | `heliosdb-nano-server` |
-| `--standby-hosts <list>` | — | Primary's standby list | `heliosdb-nano-server` |
-| `--observer-hosts <list>` | — | Split-brain protection | `heliosdb-nano-server` |
-| `--sync-mode <m>` | `async` | `async\|semi-sync\|sync` | `heliosdb-nano-server` |
+| `--replication-role <r>` | `standalone` | `standalone\|primary\|standby` (standby = read-only physical replica) | `heliosdb-nano-server` |
+| `--replication-port <n>` | `5433` | THE replication port (`NPHYS002`) a primary serves its standbys on — bootstrap copy, physical WAL, heartbeats/ACKs on one connection; loopback only until P2.2; unused on a standby | `heliosdb-nano-server` |
+| `--primary-host <hp>` | — | Standby: the primary's `--replication-port` (must resolve to loopback) | `heliosdb-nano-server` |
+| `--replication-token-file <f>` | — | Owner-only 32-byte token; same file on primary and standbys; required for a primary to serve its replication port | `heliosdb-nano-server` |
+| `--physical-replication=false` | on for a primary with a token | Turn the primary's replication port off | `heliosdb-nano-server` |
+| `--replication-startup-timeout-secs <n>` | `30` | Standby: wait for streaming before listeners open (not ready) | `heliosdb-nano-server` |
+| `--standby-hosts <list>` | — | Informational only (a primary dials nobody) | `heliosdb-nano-server` |
+| `--sync-mode <m>` | `async` | Primary: what a commit waits for — `async`, `semi-sync` (durable on `min_acks` standbys), `sync` (applied on them) | `heliosdb-nano-server` |
 | `--http-port <n>` | `8080` | `/health` endpoint port | `heliosdb-nano-observability` |
 | `--node-id <uuid>` | auto | Cluster node identifier | `heliosdb-nano-server` |
 | `--mysql` | false | Enable MySQL-wire listener | `heliosdb-nano-connect`, `-server` |
@@ -155,6 +158,11 @@ See `_index/feature-matrix.md` (or `Cargo.toml:189-299`) for the full table mapp
 
 | Source | Purpose | Skill |
 |--------|---------|-------|
-| `config.toml` (`[storage] [server] [encryption] [performance] [session] [locks] [materialized_views] [vector] [audit] [optimizer] [compression] [sync]`) | Runtime knobs | `heliosdb-nano-server` |
-| Env `HELIOSDB_PRIMARY_PG_PORT` | Standby's forwarded write target | `heliosdb-nano-server` |
+| `config.toml` (`[storage] [server] [encryption] [performance] [session] [locks] [materialized_views] [vector] [audit] [optimizer] [compression] [replication] [sync]`) | Runtime knobs | `heliosdb-nano-server` |
+| `[replication] min_acks` | Standbys that must acknowledge a sync/semi-sync commit (default `1`, `1..=64`) | `heliosdb-nano-server` |
+| `[replication] sync_timeout_ms` | How long a commit waits for its acknowledgements (default `10000`) | `heliosdb-nano-server` |
+| `[replication] sync_timeout_action` | `warn` (default: commit with a WARN, then async until standbys catch up) \| `fail` (PG client gets SQLSTATE 25000 for a commit that IS durable on the primary) | `heliosdb-nano-server` |
+| `[replication] max_standby_lag` / `on_unrecoverable` | Standby: how long it stays ready without its primary (default `30s`) / `stay-up` (default) or `exit` on a refusal | `heliosdb-nano-server` |
+| HTTP `GET /ready` | 200 iff ready (a primary, or a standby streaming or reconnecting within `max_standby_lag`), else 503; body = replication block | `heliosdb-nano-server`, `-observability` |
+| HTTP `GET /health` | Liveness + `replication` block; on a primary also `standbys` (node_id, applied/durable LSN, lag, last_seen) | `heliosdb-nano-server`, `-observability` |
 | Env `RUST_LOG` | Tracing level | `heliosdb-nano-observability` |

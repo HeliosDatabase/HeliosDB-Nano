@@ -410,53 +410,70 @@ mysql_tls_enabled = false
 mysql_tls_post_quantum = true
 
 # ============================================================================
-# NATIVE WAL REPLICATION CONFIGURATION
+# REPLICATION CONFIGURATION (physical standbys, one port: NPHYS002)
 # ============================================================================
 [replication]
 # Explicit start-command CLI flags override individual values below, including
 # values equal to CLI defaults. Unspecified fields retain these file values.
 # Unknown keys in this section are rejected to catch configuration mistakes.
-role = "standalone" # standalone | primary | standby | observer
+# See docs/guides/physical-standby.md.
+role = "standalone" # standalone | primary | standby
 
-# Native WAL protocol port, NOT the PostgreSQL, MySQL, or HTTP listener port.
+# THE replication port, NOT the PostgreSQL, MySQL, or HTTP listener port. A
+# primary serves its standbys here: the bootstrap copy, the physical WAL, and
+# the heartbeats/acknowledgements, one connection per standby. Loopback only in
+# this release (a remote primary is reached through an authenticated tunnel).
 # "port" is accepted as an alias; do not specify both names.
 replication_port = 5433
 
-# Standby DNS + initial history verification budget, 1..=3600 seconds.
+# Standby: how long its listeners wait for it to stream before they open anyway
+# (not ready, SQLSTATE 55000 for data reads), 1..=3600 seconds.
 # CLI --replication-startup-timeout-secs overrides this value.
 # Daemon parent allows this budget plus its usual 5-second startup allowance.
 startup_timeout_secs = 30
 
-# Required when the effective role is standby. Use a native WAL
-# endpoint: DNS:port, IPv4:port, or [IPv6]:port; ports must be nonzero.
-# primary_host = "primary.example:5433"
-# Peer lists are retained like the equivalent CLI flags; this build's tier-1
-# streaming server accepts connecting standbys and does not dial these lists.
+# Required when the effective role is standby: the PRIMARY's replication port,
+# DNS:port, IPv4:port, or [IPv6]:port (it must resolve to loopback).
+# primary_host = "127.0.0.1:5433"
+# Informational only; a primary accepts connecting standbys and dials nobody.
 standby_hosts = [] # e.g. ["standby.example:5433", "[2001:db8::2]:5433"]
-observer_hosts = [] # e.g. ["observer.example:5433"]
+
+# PRIMARY: what a commit waits for. async = nothing; semi-sync = min_acks
+# standbys hold it durably (fsynced); sync = min_acks standbys have applied it
+# (visible to their readers).
 sync_mode = "async" # async | semi-sync (alias semisync) | sync
+min_acks = 1 # 1..=64
+sync_timeout_ms = 10000 # 1..=86400000
+# What a commit does when its acknowledgements do not arrive within
+# sync_timeout_ms: "warn" commits with a WARN, and the primary then commits
+# asynchronously until min_acks standbys acknowledge again; "fail" reports the
+# commit to its PostgreSQL client as an error ("synchronous replication not
+# confirmed") — the commit is already durable on the primary, like a cancelled
+# synchronous commit in PostgreSQL, so do not blindly retry it.
+sync_timeout_action = "warn" # warn | fail
 # node_id = "550e8400-e29b-41d4-a716-446655440000" # UUID; generated if omitted
 
-# PRIMARY only: logical-WAL entries kept below the checkpoint so a standby that
-# was behind when the primary restarted, or was down for a while, can still
-# catch up. A standby that needs an older entry is refused with "full resync
-# required". Each entry holds the row images of one change: size the window for
-# your write rate and the longest standby outage to survive. 0 keeps nothing
-# (every checkpoint deletes up to itself). Ignored on other roles. Default 100000.
-logical_wal_retention_entries = 100000
+# PRIMARY only: logical-WAL entries kept below the checkpoint as the primary's
+# own redo window. No standby reads the logical WAL. 0 keeps nothing (every
+# checkpoint deletes up to itself). Ignored on other roles. Default 0.
+logical_wal_retention_entries = 0
 
-# One owner-only 32-byte token file authenticating BOTH the native logical
-# channel and the physical transfer channel. Put the identical file on the
-# primary and every standby. The token bytes are never read from TOML or the
-# environment — only this path is:
+# How long a standby that lost its primary still reports itself ready.
+# max_standby_lag = "30s"
+# What a standby does on a refusal it cannot resolve (history mismatch, pruned
+# WAL, ...): "stay-up" (needs_recovery) or "exit".
+# on_unrecoverable = "stay-up"
+
+# The owner-only 32-byte token file authenticating the replication connection.
+# Put the identical file on the primary and every standby. The token bytes are
+# never read from TOML or the environment — only this path is:
 #   head -c 32 /dev/urandom > replication.token && chmod 600 replication.token
 # CLI --replication-token-file overrides this value.
 # token_file = "/etc/heliosdb/replication.token"
 
-# Acknowledge that the replication token crosses a NON-loopback (plaintext)
-# native listener. Default false: a token on a non-loopback listener is refused.
-# CLI --allow-insecure-replication-remote turns this on; the token is a bearer
-# secret sent in clear, so prefer a loopback listener or an authenticated tunnel.
+# Reserved for remote replication over TLS: the replication port is loopback
+# only in this release, so this changes nothing yet.
+# CLI --allow-insecure-replication-remote turns it on.
 # allow_insecure_remote = true
 
 # ============================================================================

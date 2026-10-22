@@ -1099,7 +1099,12 @@ where
     /// PostgreSQL client ever talks to.
     pub(super) async fn dispatch_message(&mut self, msg: FrontendMessage) -> Result<()> {
         let wait_for_sync = Self::message_requires_sync_after_error(&msg);
-        if let Err(e) = self.handle_message(msg).await {
+        // Spec P2.1: each message is one client request with its own slot
+        // for a commit its standbys did not confirm (`sync_timeout_action =
+        // "fail"`), turned into this request's error where it would have
+        // reported success (`send_command_complete`, `close_implicit_block`).
+        let handled = crate::storage::replication_wait::report_scope(self.handle_message(msg)).await;
+        if let Err(e) = handled {
             tracing::error!("Error handling message: {}", e);
             self.send_error_for_query(&e, wait_for_sync).await?;
             if wait_for_sync {
@@ -1792,6 +1797,11 @@ where
                 }
             }
             return Err(e);
+        }
+        // Spec P2.1: the batch committed, but its standbys did not confirm it
+        // (`sync_timeout_action = "fail"`): the batch's error, not a rollback.
+        if let Some(unconfirmed) = crate::storage::replication_wait::take_unconfirmed() {
+            return Err(Error::transaction(unconfirmed));
         }
         Ok(())
     }
@@ -2572,12 +2582,14 @@ where
             return self.send_failed_transaction_error().await;
         }
 
-        // Transparent write forwarding for standbys (HeliosProxy feature)
-        // DML operations are forwarded to primary, DQL executes locally
+        // A standby never runs a write. On a physical standby the guard above
+        // (`reject_guarded_standby_statement`) already refused it; this covers a
+        // process whose HA role says standby without that guard. Spec P2.1: the
+        // transparent forwarding of writes to the primary is gone with the
+        // native replication channel — a client writes to the primary itself.
         #[cfg(feature = "ha-tier1")]
         {
-            use crate::replication::ha_state::{ha_state, SyncMode};
-            use crate::replication::query_forwarder::{query_forwarder, ForwardedResult};
+            use crate::replication::ha_state::ha_state;
 
             if ha_state().is_read_only() {
                 let is_write = starts_with_icase(trimmed, "INSERT")
@@ -2589,86 +2601,16 @@ where
                     || starts_with_icase(trimmed, "TRUNCATE");
 
                 if is_write {
-                    if ha_state().forwarding_disabled() {
-                        self.send_error(
-                            "ERROR",
-                            "25006",
-                            "transparent forwarding is disabled for a history-guarded standby",
-                            None,
-                            Some("Connect directly to the primary for write operations.".to_string()),
-                        )
-                        .await?;
-                        self.send_ready_for_query().await?;
-                        return Ok(());
-                    }
-                    // Check sync mode - only forward in Sync or SemiSync mode
-                    let config = ha_state().get_config();
-                    let sync_mode = config.as_ref().map(|c| c.sync_mode).unwrap_or(SyncMode::Async);
-
-                    if matches!(sync_mode, SyncMode::Sync | SyncMode::SemiSync) {
-                        // Forward write to primary transparently
-                        if let Some(forwarder) = query_forwarder() {
-                            match forwarder.forward_query(query) {
-                                Ok(ForwardedResult::Command { tag, .. }) => {
-                                    self.send_command_complete(&tag).await?;
-                                    self.send_ready_for_query().await?;
-                                    return Ok(());
-                                }
-                                Ok(ForwardedResult::Rows { columns, rows }) => {
-                                    // Send forwarded row results (for RETURNING clauses)
-                                    self.send_forwarded_rows(&columns, &rows).await?;
-                                    self.send_ready_for_query().await?;
-                                    return Ok(());
-                                }
-                                Ok(ForwardedResult::Error {
-                                    severity,
-                                    code,
-                                    message,
-                                    detail,
-                                    hint,
-                                }) => {
-                                    self.send_error(&severity, &code, &message, detail, hint).await?;
-                                    self.send_ready_for_query().await?;
-                                    return Ok(());
-                                }
-                                Err(e) => {
-                                    self.send_error(
-                                        "ERROR",
-                                        "08006",
-                                        &format!("Failed to forward query to primary: {}", e),
-                                        None,
-                                        Some("Check primary connectivity".to_string()),
-                                    )
-                                    .await?;
-                                    self.send_ready_for_query().await?;
-                                    return Ok(());
-                                }
-                            }
-                        } else {
-                            // Forwarder not initialized - reject write
-                            self.send_error(
-                                "ERROR",
-                                "25006",
-                                "cannot execute write operations: primary connection not established",
-                                None,
-                                Some("Standby is still connecting to primary".to_string()),
-                            )
-                            .await?;
-                            self.send_ready_for_query().await?;
-                            return Ok(());
-                        }
-                    } else {
-                        // Async mode - reject writes (traditional read-only standby)
-                        self.send_error(
-                            "ERROR",
-                            "25006",
-                            "cannot execute write operations in read-only mode (async standby)",
-                            None,
-                            Some("Connect to the primary for write operations, or configure sync mode for transparent routing.".to_string()),
-                        ).await?;
-                        self.send_ready_for_query().await?;
-                        return Ok(());
-                    }
+                    self.send_error(
+                        "ERROR",
+                        "25006",
+                        "cannot execute write operations on a standby",
+                        None,
+                        Some("Connect directly to the primary for write operations.".to_string()),
+                    )
+                    .await?;
+                    self.send_ready_for_query().await?;
+                    return Ok(());
                 }
             }
         }
@@ -3156,43 +3098,6 @@ where
                 .map_err(|e| Error::network(format!("Failed to send query rows: {}", e)))?;
             self.write_buf.clear();
         }
-        Ok(())
-    }
-
-    /// Send forwarded query results from primary (for transparent routing)
-    #[cfg(feature = "ha-tier1")]
-    async fn send_forwarded_rows(
-        &mut self,
-        columns: &[crate::replication::query_forwarder::ColumnInfo],
-        rows: &[Vec<Option<String>>],
-    ) -> Result<()> {
-        use crate::protocol::postgres::messages::FieldDescription;
-
-        // Send RowDescription
-        let fields: Vec<FieldDescription> = columns
-            .iter()
-            .map(|col| FieldDescription {
-                name: col.name.clone(),
-                table_oid: 0,
-                column_attr_num: 0,
-                data_type_oid: col.type_oid,
-                data_type_size: -1,
-                type_modifier: -1,
-                format_code: 0, // Text format
-            })
-            .collect();
-        self.send_message(BackendMessage::RowDescription { fields }).await?;
-
-        // Send DataRows
-        for row in rows {
-            let values: Vec<Option<Vec<u8>>> = row.iter().map(|v| v.as_ref().map(|s| s.as_bytes().to_vec())).collect();
-            self.send_message(BackendMessage::DataRow { values }).await?;
-        }
-
-        // Send CommandComplete
-        let tag = format!("SELECT {}", rows.len());
-        self.send_command_complete(&tag).await?;
-
         Ok(())
     }
 
@@ -3807,6 +3712,12 @@ where
     }
 
     pub(super) async fn send_command_complete(&mut self, tag: &str) -> Result<()> {
+        // Spec P2.1: a statement whose commit its standbys did not confirm
+        // under `sync_timeout_action = "fail"` ends with that error instead of
+        // its CommandComplete. The commit itself stands (it is durable here).
+        if let Some(unconfirmed) = crate::storage::replication_wait::take_unconfirmed() {
+            return Err(Error::transaction(unconfirmed));
+        }
         self.send_message(BackendMessage::CommandComplete { tag: tag.to_string() })
             .await
     }

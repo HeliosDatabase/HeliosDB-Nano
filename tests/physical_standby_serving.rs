@@ -3,9 +3,10 @@
 //! (`docs/plans/specs/P1_3_standby_start_posture_pgwire.md`, plan §D8).
 //!
 //! Real managed daemons, real wire, as in `tests/replication_restart_gap.rs`:
-//! a primary (which serves its physical source because it has a replication
+//! a primary (which serves its replication port because it has a replication
 //! token) and a standby bootstrapped from it into a directory that does not
-//! exist yet. Then:
+//! exist yet. Spec P2.1: the standby's `--primary-host` IS the primary's
+//! `--replication-port` — one port, one connection. Then:
 //!
 //! * the standby reaches `/ready` 200 and serves exactly the primary's rows;
 //! * the probes answer as specified — `heliosdb_require_ready()`,
@@ -161,15 +162,7 @@ fn pair() -> Pair {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
-    let (pg_p, repl_p, phys_p, http_p, pg_s, http_s) = (
-        free_port(),
-        free_port(),
-        free_port(),
-        free_port(),
-        free_port(),
-        free_port(),
-    );
-    let physical = format!("127.0.0.1:{phys_p}");
+    let (pg_p, repl_p, http_p, pg_s, http_s) = (free_port(), free_port(), free_port(), free_port(), free_port());
     let primary_args = vec![
         "--port".into(),
         pg_p.to_string(),
@@ -177,8 +170,6 @@ fn pair() -> Pair {
         "primary".into(),
         "--replication-port".into(),
         repl_p.to_string(),
-        "--physical-replication-listen".into(),
-        physical.clone(),
         "--http-port".into(),
         http_p.to_string(),
     ];
@@ -189,8 +180,6 @@ fn pair() -> Pair {
         "standby".into(),
         "--primary-host".into(),
         format!("127.0.0.1:{repl_p}"),
-        "--physical-replication-listen".into(),
-        physical,
         "--http-port".into(),
         http_s.to_string(),
         "--replication-startup-timeout-secs".into(),

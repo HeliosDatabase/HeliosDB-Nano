@@ -2,9 +2,9 @@
 //!
 //! # What this file pins
 //!
-//! Anything built on the `wal:entries:` log — HA replication
-//! (`ha_state::broadcast_wal_operation`), a CDC consumer, point-in-time
-//! recovery, and the checkpoint-bounded open-time replay added in 57c808b —
+//! Anything built on the `wal:entries:` log — a CDC consumer, point-in-time
+//! recovery, and the checkpoint-bounded open-time replay added in 57c808b
+//! (spec P2.1: HA standbys follow the physical WAL, no longer this log) —
 //! can only reconstruct the right end state if every DDL statement leaves an
 //! entry behind. A statement that changes the catalog and logs NOTHING makes a
 //! replica silently diverge: no error, no gap in the LSN sequence, just a
@@ -14,10 +14,8 @@
 //! on this tree, ON THE TEXT FAMILY: `Catalog::rename_table_inner`
 //! (src/storage/catalog.rs:2085) calls `StorageEngine::log_rename_table`
 //! (src/storage/engine.rs:9944), which appends `WalOperation::RenameTable`
-//! (src/storage/wal.rs:143); both replay drivers apply it
-//! (src/storage/engine.rs:10486 and :10965) and
-//! `ha_state::broadcast_wal_operation` classifies it as a SchemaChange
-//! (src/replication/ha_state.rs:545). Those tests are the regression guard.
+//! (src/storage/wal.rs:143), and both replay drivers apply it
+//! (src/storage/engine.rs:10486 and :10965). Those tests are the regression guard.
 //!
 //! It is FIXED ONLY ON THE TEXT FAMILY, and that is not a nitpick: the params
 //! family (PG extended protocol — psycopg / JDBC / sqlx / node-postgres — and

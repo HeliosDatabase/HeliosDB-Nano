@@ -2165,8 +2165,10 @@ pub struct StorageEngine {
 /// Minimum free disk space threshold (100 MB)
 const MIN_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Outcome of reading the primary's logical WAL for a standby (see
-/// [`StorageEngine::logical_wal_catchup`]).
+/// Outcome of reading the primary's logical WAL after a position (see
+/// [`StorageEngine::logical_wal_catchup`]). Spec P2.1: no standby reads it any
+/// more — standbys follow the physical WAL — so this inspects the primary's
+/// own redo history.
 #[derive(Debug)]
 pub enum LogicalCatchup {
     /// Entries strictly after the requested LSN, oldest first (may be empty).
@@ -4595,7 +4597,9 @@ impl StorageEngine {
     }
 
     /// Fast DML can skip the logical-WAL keyspace in standalone relaxed mode,
-    /// but strict logical WAL and HA primaries still need append+broadcast.
+    /// but strict logical WAL and HA primaries still need the append: spec
+    /// P2.1 — the append path is where a sync/semi-sync primary's write waits
+    /// for its standbys to acknowledge its physical sequence.
     pub fn fast_dml_requires_logical_wal(&self) -> bool {
         if !self.is_wal_enabled() {
             return false;
@@ -12028,26 +12032,28 @@ impl StorageEngine {
         result
     }
 
-    /// Read the logical WAL a standby is missing, for catch-up.
+    /// Read the logical WAL (this node's own redo history) after `after_lsn`.
     ///
-    /// `Pruned` means entries after `after_lsn` were deleted (the position is
-    /// below the history floor); the standby needs a full resync and must NOT
-    /// be told it is caught up.
+    /// Spec P2.1: no standby is served from it — a standby follows the
+    /// physical WAL — but crash replay reads it, so a reader can check that it
+    /// describes exactly what committed. `Pruned` means entries after
+    /// `after_lsn` were deleted (the position is below the history floor):
+    /// the reader must NOT be told it holds everything.
     pub fn logical_wal_catchup(&self, after_lsn: u64) -> Result<LogicalCatchup> {
         let Some(wal) = &self.wal else {
             return Ok(LogicalCatchup::Unavailable);
         };
         let wal = wal.read();
         // Only history below the publisher's watermark is complete: an entry above it
-        // may still be waiting on a lower, unresolved LSN, and a standby that skipped
-        // past that gap would drop the late entry as "already applied".
+        // may still be waiting on a lower, unresolved LSN.
         let latest = wal.published_lsn();
         if after_lsn > latest {
             return Ok(LogicalCatchup::StandbyAhead { latest });
         }
         // The history floor, not the checkpoint: entries kept under the
-        // checkpoint for standbys (`[replication] logical_wal_retention_entries`)
-        // can still be served. Only a position below what was deleted cannot.
+        // checkpoint (`[replication] logical_wal_retention_entries`, the
+        // primary's redo window) can still be read. Only a position below what
+        // was deleted cannot.
         let pruned_through = wal.pruned_through()?;
         if after_lsn < pruned_through {
             return Ok(LogicalCatchup::Pruned { pruned_through });

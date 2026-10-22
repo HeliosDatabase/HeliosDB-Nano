@@ -1,10 +1,10 @@
 //! Shared replication token loading.
 //!
-//! One owner-only 32-byte file authenticates **both** replication channels:
-//! the native logical channel (`streaming`) and the physical transfer channel
-//! (`physical_wire`). Every check lives here so both channels — and the tests
-//! — share exactly one loader. The token is never read from TOML or the
-//! environment; only the path is configured.
+//! One owner-only 32-byte file authenticates the replication connection
+//! (`physical_wire`, protocol `NPHYS002`): the primary checks it, its standbys
+//! present it. Every check lives here so both sides — and the tests — share
+//! exactly one loader. The token is never read from TOML or the environment;
+//! only the path is configured.
 //!
 //! Procedure (identical on primary and standby):
 //! `head -c 32 /dev/urandom > replication.token && chmod 600 replication.token`

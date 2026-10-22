@@ -22,26 +22,25 @@
 #![cfg(feature = "ha-tier1")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use heliosdb_nano::replication::ha_state::{ha_state, HARole, NodeConfig, StandbyInfo, StandbyState, SyncMode};
+use heliosdb_nano::replication::ha_state::{ha_state, HARole, NodeConfig, StandbyRegistration, StandbyState, SyncMode};
 use heliosdb_nano::sql::{Executor, LogicalPlan, Parser};
 use heliosdb_nano::{DataType, EmbeddedDatabase, Tuple, Value};
 use uuid::Uuid;
 
 const TABLE: &str = "promotion_refusal_guard";
 
-fn mock_standby(node_id: Uuid) -> StandbyInfo {
-    StandbyInfo {
+/// A connected standby as a replication session registers it from its
+/// `Hello` (spec P2.1); it stays registered while the handle lives.
+fn mock_standby(node_id: Uuid) -> StandbyRegistration {
+    StandbyRegistration {
         node_id,
         address: "127.0.0.1:0".to_string(),
-        connected_at: 0,
-        last_heartbeat: 0,
+        history: Some(Uuid::new_v4()),
+        pg_port: 0,
         sync_mode: SyncMode::Async,
-        current_lsn: 0,
-        flush_lsn: 0,
-        apply_lsn: 0,
-        lag_bytes: 0,
-        lag_ms: 0,
+        cursor: Some(0),
         state: StandbyState::Streaming,
+        counts_for_sync: true,
     }
 }
 
@@ -69,7 +68,7 @@ fn switchover_refuses_and_changes_nothing() {
         role: HARole::Primary,
         ..NodeConfig::default()
     });
-    ha_state().register_standby(mock_standby(standby_id));
+    let standby = ha_state().register_standby(mock_standby(standby_id));
     assert_eq!(ha_state().get_role(), HARole::Primary);
     assert!(!ha_state().is_read_only());
 
@@ -103,7 +102,7 @@ fn switchover_refuses_and_changes_nothing() {
     let rows_after: Vec<Tuple> = db.query(&select, &[]).expect("rows after");
     let catalog_after: Vec<Tuple> = db.query(&catalog_sql, &[]).expect("catalog after");
 
-    ha_state().remove_standby(standby_id);
+    drop(standby);
     ha_state().set_config(NodeConfig::default());
 
     let err = refusal.expect_err("SWITCHOVER must be refused, not reported as initiated");

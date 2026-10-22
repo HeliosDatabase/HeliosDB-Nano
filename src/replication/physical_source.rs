@@ -1,24 +1,78 @@
-//! EXTERNAL DRAFT: owned live-primary provider for physical Snapshot/Resume.
-//! The wire owner invokes this factory only AFTER authenticating and validating
-//! OpenRequest. Blocking jobs own every referenced DB/checkpoint until completion.
-//! Cancellation never publishes a receiver or modifies an existing destination.
+//! The live primary's side of a replication session: the physical
+//! Snapshot/Resume provider, and the standby registry every session reports
+//! to (spec P2.1 §2).
+//!
+//! The wire owner invokes the provider factory only AFTER authenticating the
+//! receiver and accepting its `Hello`. Blocking jobs own every referenced
+//! DB/checkpoint until completion. Cancellation never publishes a receiver or
+//! modifies an existing destination. A provider that will not serve says why
+//! ([`Refusal`]): a history it is not, WAL it no longer retains, a shutdown —
+//! so the receiver can tell "come back later" from "rebuild me" instead of
+//! reconnecting forever.
 
 use super::checkpoint_transfer::{validate_primary_source, OnlineCheckpointExport, TransferLimits};
-use super::physical::{poll_source, PhysicalPoll, MAX_BATCH_BYTES};
-use super::physical_wire::{OpenRequest, PhysicalSource, Result, SourceSessionInfo, WireError};
+use super::ha_state::{ha_state, StandbyHandle, StandbyRegistration, StandbyState, SyncMode};
+use super::physical::{poll_source, PhysicalError, PhysicalPoll, MAX_BATCH_BYTES};
+use super::physical_wire::{
+    Heartbeat, Hello, ObservedSession, OpenRequest, PeerRole, PhysicalSource, Refusal, RefuseCode, Result,
+    SessionObserver, SourceSessionInfo, WireError, WireSyncMode,
+};
 use async_trait::async_trait;
 use rocksdb::DB;
 use std::{
+    net::SocketAddr,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Weak,
     },
 };
 use uuid::Uuid;
 
 fn source_error(error: impl std::fmt::Display) -> WireError {
     WireError::Source(error.to_string())
+}
+
+fn not_serving(reason: &str) -> WireError {
+    WireError::Refused(Refusal::new(RefuseCode::SourceNotServing, reason))
+}
+
+/// A poll's failure as the receiver must hear it: a WAL it no longer has, a
+/// hole, a receiver ahead of it — each a refusal the receiver needs recovery
+/// for. Anything else is a source-side failure (retried).
+fn poll_error(db: &DB, error: PhysicalError) -> WireError {
+    match error {
+        PhysicalError::Pruned { wanted, oldest } => WireError::Refused(Refusal::new(
+            RefuseCode::WalPruned {
+                oldest: oldest.unwrap_or_else(|| db.latest_sequence_number().saturating_add(1)),
+            },
+            format!(
+                "the receiver needs sequence {wanted}; this primary's physical WAL no longer holds it (retention \
+                 [replication.physical] wal_retention_secs / wal_retention_size_mb): rebuild the standby from a \
+                 new, empty data directory"
+            ),
+        )),
+        PhysicalError::Gap { expected, observed } => WireError::Refused(Refusal::new(
+            RefuseCode::Gap {
+                expected,
+                have_from: observed,
+                have_to: db.latest_sequence_number(),
+            },
+            "this primary's physical WAL is not contiguous from the receiver's cursor",
+        )),
+        PhysicalError::Ahead { after, barrier } => WireError::Refused(Refusal::new(
+            RefuseCode::HistoryMismatch,
+            format!(
+                "the receiver is at sequence {after}, ahead of this primary's {barrier}: this primary is not the \
+                 dataset the receiver followed (restored from an older copy?)"
+            ),
+        )),
+        PhysicalError::HistoryMismatch => WireError::Refused(Refusal::new(
+            RefuseCode::HistoryMismatch,
+            "the receiver follows another dataset history",
+        )),
+        other => source_error(other),
+    }
 }
 
 /// One shared budget per source endpoint, retained by all its providers.
@@ -75,12 +129,23 @@ impl SourceWorkLimiter {
         T: Send + 'static,
         F: FnOnce() -> Result<T> + Send + 'static,
     {
+        // Draining = the primary is shutting down: the receiver comes back.
         if self.0.draining.load(Ordering::Acquire) {
-            return Err(source_error("source work admission is draining"));
+            return Err(not_serving(
+                "source work admission is draining: the primary is shutting down",
+            ));
         }
-        let permit = self.0.slots.clone().acquire_owned().await.map_err(source_error)?;
+        let permit = self
+            .0
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| not_serving("source work admission closed: the primary is shutting down"))?;
         if self.0.draining.load(Ordering::Acquire) {
-            return Err(source_error("source work admission is draining"));
+            return Err(not_serving(
+                "source work admission is draining: the primary is shutting down",
+            ));
         }
         tokio::task::spawn_blocking(move || {
             let permit = permit; // Also retained through result cleanup after cancellation.
@@ -133,9 +198,11 @@ pub async fn open_primary_session(
             }
             OpenRequest::Resume { history, after } => {
                 if history != expected_history {
-                    return Err(source_error("resume history differs from live primary"));
+                    return Err(poll_error(&db, PhysicalError::HistoryMismatch));
                 }
-                let initial = poll_source(&db, history, after, MAX_BATCH_BYTES).map_err(source_error)?;
+                // The first bounded poll proves the receiver's cursor is still
+                // served: retained, contiguous, not ahead of this primary.
+                let initial = poll_source(&db, history, after, MAX_BATCH_BYTES).map_err(|e| poll_error(&db, e))?;
                 (
                     SourceSessionInfo::Resume {
                         session_id: Uuid::new_v4(),
@@ -189,13 +256,69 @@ impl PhysicalSource for PrimarySession {
                 if validate_primary_source(&db, history).map_err(source_error)? != storage_identity {
                     return Err(source_error("primary storage identity changed before poll"));
                 }
-                let poll = poll_source(&db, history, after, byte_limit).map_err(source_error)?;
+                let poll = poll_source(&db, history, after, byte_limit).map_err(|e| poll_error(&db, e))?;
                 if validate_primary_source(&db, history).map_err(source_error)? != storage_identity {
                     return Err(source_error("primary storage identity changed during poll"));
                 }
                 Ok(poll)
             })
             .await
+    }
+}
+
+/// Spec P2.1 §2: the primary's standby registry as its replication sessions
+/// see it — `ha_state()`'s, the one the commit path's sync wait reads. Every
+/// admitted session registers its standby from the `Hello` and records each
+/// heartbeat (= acknowledgement) into it; the session's end unregisters it.
+pub struct StandbyRegistryObserver {
+    db: Weak<DB>,
+}
+
+impl StandbyRegistryObserver {
+    /// `db` is the primary's store (its physical sequence is the barrier).
+    pub fn new(db: &Arc<DB>) -> Self {
+        Self { db: Arc::downgrade(db) }
+    }
+}
+
+/// One admitted session, registered while it lives.
+struct RegisteredSession(StandbyHandle);
+
+impl ObservedSession for RegisteredSession {
+    fn heartbeat(&mut self, heartbeat: &Heartbeat) {
+        self.0
+            .record_ack(heartbeat.applied_sequence, heartbeat.durable_sequence);
+    }
+}
+
+impl SessionObserver for StandbyRegistryObserver {
+    fn barrier(&self) -> u64 {
+        self.db.upgrade().map_or(0, |db| db.latest_sequence_number())
+    }
+
+    fn admit(&self, peer: Option<SocketAddr>, hello: &Hello) -> Box<dyn ObservedSession> {
+        // A resumed session follows this primary from a durable cursor; a
+        // snapshot session is still installing its copy. Only a serving
+        // standby that follows counts toward `min_acks`.
+        let following = hello.cursor.is_some();
+        Box::new(RegisteredSession(ha_state().register_standby(StandbyRegistration {
+            node_id: hello.node_id,
+            address: peer.map_or_else(|| "unknown".to_string(), |peer| peer.to_string()),
+            history: hello.history,
+            pg_port: hello.pg_port,
+            sync_mode: match hello.sync_mode {
+                WireSyncMode::Async => SyncMode::Async,
+                WireSyncMode::SemiSync => SyncMode::SemiSync,
+                WireSyncMode::Sync => SyncMode::Sync,
+            },
+            cursor: hello.cursor,
+            state: if following {
+                StandbyState::Streaming
+            } else {
+                StandbyState::Bootstrapping
+            },
+            counts_for_sync: following && hello.role == PeerRole::Standby,
+        })))
     }
 }
 
@@ -279,6 +402,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let (db, history) = primary(root.path());
         let work = SourceWorkLimiter::new(2).unwrap();
+        // Spec P2.1: both are refusals the receiver needs recovery for — a
+        // cursor ahead of the primary means the primary is not its dataset.
         for request in [
             OpenRequest::Resume {
                 history: Uuid::new_v4(),
@@ -286,7 +411,7 @@ mod tests {
             },
             OpenRequest::Resume { history, after: 2 },
         ] {
-            assert!(open_primary_session(
+            let refused = open_primary_session(
                 db.clone(),
                 history,
                 root.path().to_path_buf(),
@@ -294,8 +419,12 @@ mod tests {
                 request,
                 work.clone(),
             )
-            .await
-            .is_err());
+            .await;
+            assert!(
+                matches!(&refused, Err(WireError::Refused(refusal)) if refusal.code == RefuseCode::HistoryMismatch),
+                "{request:?}: {:?}",
+                refused.err()
+            );
         }
         let source = open_primary_session(
             db.clone(),

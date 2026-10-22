@@ -1,6 +1,13 @@
 # HeliosDB Nano HA Cluster - Docker Compose
 # 4-node cluster: 1 primary + 3 standbys (one per sync mode) + 1 observer
 #
+# OUT OF SERVICE (spec P2.1): this lab drove the native v3 replication
+# channel and transparent write routing, both removed. A physical standby
+# follows its primary's one replication port, loopback-only until TLS
+# replication (spec P2.2), so standbys in other containers cannot reach it
+# yet, and the observer role is gone. Use scripts/regress/nano-physical-pair.sh
+# and docs/guides/physical-standby.md.
+#
 # Standby sync modes:
 #   - standby-sync:     sync mode     - transparent write routing (full sync)
 #   - standby-semisync: semi-sync mode - transparent write routing
@@ -76,7 +83,6 @@ services:
       HELIOSDB_DATA_DIR: /data
       HELIOSDB_LOG_LEVEL: info
       HELIOSDB_PRIMARY_HOST: primary:5433
-      HELIOSDB_PRIMARY_PG_PORT: 5432
       HELIOSDB_SYNC_MODE: sync
     volumes:
       - standby-sync-data:/data
@@ -110,7 +116,6 @@ services:
       HELIOSDB_DATA_DIR: /data
       HELIOSDB_LOG_LEVEL: info
       HELIOSDB_PRIMARY_HOST: primary:5433
-      HELIOSDB_PRIMARY_PG_PORT: 5432
       HELIOSDB_SYNC_MODE: semi-sync
     volumes:
       - standby-semisync-data:/data

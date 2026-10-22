@@ -1069,7 +1069,7 @@ pub(super) fn handle_switchover_check(_executor: &Executor, target_node: &str) -
     let standbys = ha_registry.get_standbys();
     if let Some(standby) = standbys.iter().find(|s| s.node_id == target_uuid) {
         target_healthy = true;
-        target_lsn = standby.apply_lsn;
+        target_lsn = standby.applied_seq;
 
         let lag = primary_lsn.saturating_sub(target_lsn);
         if lag > 0 {
@@ -1136,7 +1136,6 @@ pub(super) fn handle_cluster_status(_executor: &Executor) -> Result<Box<dyn Phys
             HARole::Primary => "primary",
             HARole::Standby => "standby",
             HARole::Standalone => "standalone",
-            HARole::Observer => "observer",
         };
 
         tuples.push(Tuple::new(vec![
@@ -1157,7 +1156,7 @@ pub(super) fn handle_cluster_status(_executor: &Executor) -> Result<Box<dyn Phys
             Value::String("standby".to_string()),
             Value::String(standby.address.clone()),
             Value::Boolean(true), // Connected standbys are healthy
-            Value::Int8(standby.apply_lsn as i64),
+            Value::Int8(standby.applied_seq as i64),
             Value::Int8(standby.lag_ms as i64),
             Value::Int4(0), // Priority not stored in StandbyInfo yet
         ]));
@@ -1334,7 +1333,6 @@ pub(super) fn handle_show_topology(_executor: &Executor) -> Result<Box<dyn Physi
             HARole::Primary => "Primary",
             HARole::Standby => "Standby",
             HARole::Standalone => "Standalone",
-            HARole::Observer => "Observer",
         };
 
         let alias = get_alias(config.node_id);
@@ -1370,7 +1368,7 @@ pub(super) fn handle_show_topology(_executor: &Executor) -> Result<Box<dyn Physi
             Value::Boolean(true),                   // Connected standbys are healthy
             Value::String(health_msg.unwrap_or_else(|| "Connected".to_string())),
             Value::Int8(0), // last seen
-            Value::Int8(standby.apply_lsn as i64),
+            Value::Int8(standby.applied_seq as i64),
             Value::Int8(standby.lag_ms as i64),
             Value::Int4(priority as i32),
             Value::Int4(weight as i32),
