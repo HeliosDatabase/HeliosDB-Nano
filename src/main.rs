@@ -19,6 +19,9 @@ use tracing::info;
 #[derive(Debug, Clone)]
 struct HAConfig {
     physical: heliosdb_nano::config::PhysicalReplicationConfig,
+    /// Spec P3.1: `[replication.archive]`, CLI > TOML > defaults; `dir` is
+    /// resolved (absolute) for a node with an HA role and a data directory.
+    archive: heliosdb_nano::config::ArchiveConfig,
     role: String,
     /// THE replication port (`NPHYS002`): a primary serves its standbys here.
     replication_port: u16,
@@ -265,6 +268,118 @@ impl ReplicationTlsArgs {
             replication.snapshot_export_max_leases = value;
         }
         self.primary.apply(replication);
+    }
+}
+
+/// Spec P3.1: `[replication.archive]` on the command line. Every field is an
+/// `Option`, so an absent flag never clobbers a config-file value.
+#[derive(clap::Args, Debug, Default)]
+struct ArchiveStartArgs {
+    /// Archive this node's WAL into sealed segment files kept for the
+    /// recovery window (default on for a primary with a replication token
+    /// and for a standby; `--archive=false` turns it off).
+    #[arg(
+        long = "archive",
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_name = "BOOL"
+    )]
+    archive: Option<bool>,
+    /// The archive directory (default: <data dir>.archive beside the data
+    /// directory, created owner-only; never inside it).
+    #[arg(long, value_name = "DIR")]
+    archive_dir: Option<PathBuf>,
+    /// Seal a segment before it would pass this size (4KiB..=4GiB, default
+    /// 64MiB; a larger single write group gets a segment of its own).
+    #[arg(long, value_name = "SIZE")]
+    archive_segment_max_bytes: Option<String>,
+    /// Seal a non-empty segment older than this (1..=86400 s, default 300).
+    #[arg(long, value_name = "SECONDS")]
+    archive_segment_max_secs: Option<u64>,
+    /// PRIMARY: how often the archiver reads the store's WAL (10..=60000 ms,
+    /// default 1000).
+    #[arg(long, value_name = "MS")]
+    archive_poll_ms: Option<u64>,
+    /// fsync the open segment each time this much was appended (4KiB..=4GiB,
+    /// default 8MiB), and at every seal.
+    #[arg(long, value_name = "SIZE")]
+    archive_fsync_bytes: Option<String>,
+    /// The recovery window: segments older than this are pruned (seconds or
+    /// <n>[s|m|h|d|w], 1s..=3650d, default 7d).
+    #[arg(long, value_name = "DURATION")]
+    archive_recovery_window: Option<String>,
+    /// Upper bound of the archive's bytes, or "unlimited" (default); over it
+    /// the oldest segments are pruned even inside the window (WARN: the window
+    /// is shortened).
+    #[arg(long, value_name = "SIZE")]
+    archive_max_bytes: Option<String>,
+    /// Free space kept on the archive's filesystem: a percentage ("10%",
+    /// default) or a size; below it the oldest segments are pruned. The
+    /// primary's writes never wait for the archive.
+    #[arg(long, value_name = "RESERVE")]
+    archive_disk_reserve: Option<String>,
+    /// How often the pruner runs (1..=86400 s, default 60; also after every
+    /// seal).
+    #[arg(long, value_name = "SECONDS")]
+    archive_prune_interval_secs: Option<u64>,
+}
+
+impl ArchiveStartArgs {
+    fn apply(self, archive: &mut heliosdb_nano::config::ArchiveConfig) {
+        if let Some(value) = self.archive {
+            archive.enabled = value;
+        }
+        if let Some(value) = self.archive_dir {
+            archive.dir = Some(value);
+        }
+        if let Some(value) = self.archive_segment_max_bytes {
+            archive.segment_max_bytes = value;
+        }
+        if let Some(value) = self.archive_segment_max_secs {
+            archive.segment_max_secs = value;
+        }
+        if let Some(value) = self.archive_poll_ms {
+            archive.poll_ms = value;
+        }
+        if let Some(value) = self.archive_fsync_bytes {
+            archive.fsync_bytes = value;
+        }
+        if let Some(value) = self.archive_recovery_window {
+            archive.recovery_window = value;
+        }
+        if let Some(value) = self.archive_max_bytes {
+            archive.max_bytes = value;
+        }
+        if let Some(value) = self.archive_disk_reserve {
+            archive.disk_reserve = value;
+        }
+        if let Some(value) = self.archive_prune_interval_secs {
+            archive.prune_interval_secs = value;
+        }
+    }
+}
+
+/// The flags that reproduce the resolved `[replication.archive]` in a daemon
+/// child (which also re-reads the forwarded `--config`; flags win there too).
+fn append_archive_daemon_args(args: &mut Vec<String>, archive: &heliosdb_nano::config::ArchiveConfig) {
+    args.push(format!("--archive={}", archive.enabled));
+    if let Some(dir) = &archive.dir {
+        args.push("--archive-dir".to_string());
+        args.push(dir.display().to_string());
+    }
+    for (flag, value) in [
+        ("--archive-segment-max-bytes", archive.segment_max_bytes.clone()),
+        ("--archive-segment-max-secs", archive.segment_max_secs.to_string()),
+        ("--archive-poll-ms", archive.poll_ms.to_string()),
+        ("--archive-fsync-bytes", archive.fsync_bytes.clone()),
+        ("--archive-recovery-window", archive.recovery_window.clone()),
+        ("--archive-max-bytes", archive.max_bytes.clone()),
+        ("--archive-disk-reserve", archive.disk_reserve.clone()),
+        ("--archive-prune-interval-secs", archive.prune_interval_secs.to_string()),
+    ] {
+        args.push(flag.to_string());
+        args.push(value);
     }
 }
 
@@ -964,6 +1079,10 @@ struct Cli {
 enum Commands {
     /// Install/follow a closed physical receiver; never exposes SQL or serving readiness.
     Resync(ResyncArgs),
+    /// Inspect and maintain a WAL archive (archived segments, spec P3.1)
+    /// offline: list, verify, gaps, prune. Reads the files only and takes no
+    /// database lock.
+    Archive(ArchiveArgs),
     /// Start the database server
     Start {
         /// Data directory (required unless --memory is used)
@@ -1137,6 +1256,10 @@ enum Commands {
 
         #[command(flatten)]
         replication_tls: ReplicationTlsArgs,
+
+        // ========== Archived WAL (spec P3.1) ==========
+        #[command(flatten)]
+        archive_args: ArchiveStartArgs,
 
         // ========== MySQL Protocol Options ==========
         /// Enable MySQL protocol listener
@@ -1451,6 +1574,7 @@ async fn run(cli: Cli) -> Result<()> {
             node_id,
             allow_insecure_replication_remote,
             replication_tls,
+            archive_args,
             mysql,
             mysql_listen,
             mysql_socket,
@@ -1568,6 +1692,7 @@ async fn run(cli: Cli) -> Result<()> {
                 replication.allow_insecure_remote = true;
             }
             replication_tls.apply(&mut replication);
+            archive_args.apply(&mut replication.archive);
             // Read before `apply` consumes the flags: only an explicit
             // `--physical-replication=false` keeps a primary's physical source off.
             let explicit_physical = physical.physical_replication;
@@ -1591,6 +1716,16 @@ async fn run(cli: Cli) -> Result<()> {
                     "standby role requires --primary-host or [replication] primary_host".to_string(),
                 ));
             }
+            // Spec P3.1: an HA node with a data directory archives its WAL
+            // beside it. The directory is resolved (and refused inside the data
+            // directory or on the export directory) before anything opens, and
+            // forwarded resolved to a daemon child.
+            if replication.role != "standalone" && replication.archive.enabled && !memory {
+                let dir = replication
+                    .archive
+                    .resolve_dir(&resolved_data_dir, replication.physical.export_dir.as_deref())?;
+                replication.archive.dir = Some(dir);
+            }
             #[cfg(not(feature = "ha-tier1"))]
             if replication.role != "standalone" {
                 return Err(Error::config(
@@ -1608,6 +1743,7 @@ async fn run(cli: Cli) -> Result<()> {
             // Build HA configuration
             let ha_config = HAConfig {
                 physical: replication.physical,
+                archive: replication.archive,
                 role: replication.role,
                 replication_port: replication.replication_port,
                 startup_timeout_secs: replication.startup_timeout_secs,
@@ -1701,6 +1837,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Resync(args) => run_physical_resync(args).await,
+        Commands::Archive(args) => run_archive_command(args),
         Commands::Stop { ref pid_file } => stop_server(pid_file),
         Commands::Status { ref pid_file } => check_server_status(pid_file),
         Commands::Init { ref data_dir } => init_database(data_dir),
@@ -1935,6 +2072,7 @@ async fn start_server(
 
     db_config.replication = heliosdb_nano::config::ReplicationConfig {
         physical: ha_config.physical.clone(),
+        archive: ha_config.archive.clone(),
         role: ha_config.role.clone(),
         replication_port: ha_config.replication_port,
         startup_timeout_secs: ha_config.startup_timeout_secs,
@@ -2338,6 +2476,19 @@ async fn start_server(
             );
         }
         println!("      - HTTP health port: {}", ha_config.http_port);
+        // Spec P3.1: where this node's archived WAL goes (a primary archives
+        // beside its replication port, a standby what it applies).
+        let archiving = ha_config.archive.enabled && (guarded_standby || ha_config.physical.enabled);
+        match (&ha_config.archive.dir, archiving) {
+            (Some(dir), true) => println!(
+                "      - WAL archive: {} (recovery window {}, max {}, disk reserve {})",
+                dir.display(),
+                ha_config.archive.recovery_window,
+                ha_config.archive.max_bytes,
+                ha_config.archive.disk_reserve
+            ),
+            _ => println!("      - WAL archive: off"),
+        }
     }
 
     // Create PostgreSQL server with appropriate auth configuration
@@ -2442,6 +2593,8 @@ async fn start_server(
                                 ready: block.ready,
                                 block: serde_json::to_value(block).ok()?,
                                 standbys: primary_node.then(primary_standbys_report),
+                                // Spec P3.1: a sibling object, never inside the block.
+                                archive: Some(archive_health_report()),
                             })
                         });
                         status
@@ -3143,6 +3296,8 @@ async fn start_server_daemon(
     append_physical_daemon_args(&mut args, &ha_config.physical, ha_config.token_file.as_deref());
     // Spec P2.2: certificate paths, not secrets (the keys stay in their files).
     args.extend(ha_config.replication_tls.daemon_args());
+    // Spec P3.1: the archive's keys, resolved (its directory absolute).
+    append_archive_daemon_args(&mut args, &ha_config.archive);
 
     // Add HA options
     args.push("--replication-role".to_string());
@@ -3595,6 +3750,27 @@ fn resolve_replication_server_tls(
     Ok(Some(tls))
 }
 
+/// Spec P3.1: `/health`'s `archive` object — this node's WAL archive
+/// (`enabled`, `segments`, `bytes_retained`, `effective_window_secs`,
+/// `shortened`, `gaps`), a sibling of the frozen `replication` block.
+fn archive_health_report() -> serde_json::Value {
+    #[cfg(feature = "ha-tier1")]
+    {
+        heliosdb_nano::replication::archive_catalog::health_json()
+    }
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        serde_json::json!({
+            "enabled": false,
+            "segments": 0,
+            "bytes_retained": 0,
+            "effective_window_secs": 0,
+            "shortened": false,
+            "gaps": 0,
+        })
+    }
+}
+
 /// Spec P2.1: what a primary's `/health` lists as `standbys` — every standby
 /// its replication port serves, with the physical sequences it acknowledged
 /// (as PostgreSQL LSN text and as numbers), its lag and when it was last seen.
@@ -3896,6 +4072,55 @@ struct StandbyPlan {
     identity: heliosdb_nano::replication::physical_wire::ReceiverIdentity,
     wire: heliosdb_nano::replication::physical_wire::WireLimits,
     tracker: std::sync::Arc<heliosdb_nano::standby_posture::PostureTracker>,
+    /// Spec P3.1: the standby's WAL archive, started once its binding is
+    /// known; `None` with `--archive=false`.
+    archive: Option<StandbyArchivePlan>,
+}
+
+/// Spec P3.1: what a standby's WAL archiver needs once its binding (the
+/// history it follows) is known.
+#[cfg(feature = "ha-tier1")]
+struct StandbyArchivePlan {
+    settings: heliosdb_nano::replication::archiver::ArchiveSettings,
+    node_id: uuid::Uuid,
+    /// The dataset key (`[encryption]`): an encrypted dataset's frames are
+    /// sealed with it, as on the primary.
+    key_manager: Option<std::sync::Arc<heliosdb_nano::crypto::KeyManager>>,
+}
+
+/// Spec P3.1: a standby archives every batch it applies, unless
+/// `--archive=false`. It never fails the start: an unusable configuration is
+/// said once and the standby runs without an archive.
+#[cfg(feature = "ha-tier1")]
+fn standby_archive_plan(ha_config: &HAConfig, config: &Config, node_id: uuid::Uuid) -> Option<StandbyArchivePlan> {
+    use heliosdb_nano::replication::archiver::{dataset_key, ArchiveSettings};
+    let archive = &ha_config.archive;
+    if !archive.enabled {
+        info!("the WAL archive is off on this standby (--archive=false / [replication.archive] enabled = false)");
+        return None;
+    }
+    let Some(dir) = archive.dir.clone() else {
+        tracing::warn!("the WAL archive is off on this standby: no archive directory was resolved");
+        return None;
+    };
+    let settings = match ArchiveSettings::from_config(archive, dir) {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!("the WAL archive is off on this standby: {error}");
+            return None;
+        }
+    };
+    match dataset_key(config) {
+        Ok(key_manager) => Some(StandbyArchivePlan {
+            settings,
+            node_id,
+            key_manager,
+        }),
+        Err(error) => {
+            tracing::warn!("the WAL archive is off on this standby: the dataset key cannot be loaded ({error})");
+            None
+        }
+    }
 }
 
 #[cfg(feature = "ha-tier1")]
@@ -3920,6 +4145,8 @@ impl StandbyPlan {
             reconnect_delay: STANDBY_RECONNECT_DELAY,
             max_reconnects,
             heartbeat_interval: STANDBY_HEARTBEAT_INTERVAL,
+            // Set by the serving receiver's start once the binding is known.
+            archive: None,
         }
     }
 
@@ -4016,6 +4243,7 @@ impl StandbyRuntime {
             },
             wire: physical_wire_limits(&ha_config.physical),
             tracker,
+            archive: standby_archive_plan(ha_config, config, node.node_id),
         };
         let (stop, shutdown) = tokio::sync::watch::channel(false);
         let (store_tx, store) = tokio::sync::watch::channel(None);
@@ -4382,6 +4610,21 @@ async fn run_physical_standby(
         }
     };
 
+    // Spec P3.1: the standby archives every batch it applies, filed under its
+    // binding (the history it follows).
+    let (archive, feed) = match plan.archive.as_ref() {
+        Some(archive) => {
+            let (service, feed) = heliosdb_nano::replication::archiver::start_standby(
+                archive.settings.clone(),
+                history,
+                archive.node_id,
+                archive.key_manager.clone(),
+            );
+            (Some(service), Some(feed))
+        }
+        None => (None, None),
+    };
+
     let (progress, observed) = tokio::sync::watch::channel(ReceiverStatus::Connecting {
         history: Some(history),
         after: None,
@@ -4391,7 +4634,7 @@ async fn run_physical_standby(
         observed,
         std::sync::Arc::clone(&plan.tracker),
     ));
-    let options = plan.receiver_options(
+    let mut options = plan.receiver_options(
         ReceiverStart::Resume {
             path: plan.data_dir.clone(),
             history,
@@ -4399,9 +4642,17 @@ async fn run_physical_standby(
         ReceiverMode::Follow,
         1000,
     );
+    options.archive = feed;
     let attach = standby_serving_attach(plan.config.clone(), std::sync::Arc::clone(&plan.tracker), store.clone());
     let result = run_serving_receiver(options, attach, shutdown.clone(), progress).await;
     let _ = forward.await;
+    // The receiver has stopped offering batches: the archiver archives what
+    // it was handed, seals its open segment and stops.
+    if let Some(archive) = archive {
+        if let Err(error) = tokio::task::spawn_blocking(move || archive.shutdown()).await {
+            tracing::warn!("the WAL archiver did not stop cleanly: {error}");
+        }
+    }
     let stopping = *shutdown.borrow();
     match result {
         Ok(closed) => info!(
@@ -5970,6 +6221,361 @@ struct ResyncArgs {
     poll_byte_limit: usize,
 }
 
+/// Spec P3.1: where `archive` finds the directory — `--archive-dir`, else
+/// `[replication.archive] dir` of `--config`, else `<data dir>.archive` beside
+/// `--data-dir` (or `--config`'s `[storage] path`): the daemon's own rule.
+#[derive(clap::Args, Debug, Default, Clone)]
+struct ArchiveLocationArgs {
+    /// The archive directory.
+    #[arg(long, value_name = "DIR")]
+    archive_dir: Option<PathBuf>,
+    /// The node's data directory: its archive is <data dir>.archive beside it
+    /// unless [replication.archive] dir names another.
+    #[arg(short, long, value_name = "DIR")]
+    data_dir: Option<PathBuf>,
+    /// The node's config file: its [replication.archive], [storage] path and
+    /// [encryption] key supply the defaults.
+    #[arg(short, long, value_name = "FILE")]
+    config: Option<PathBuf>,
+}
+
+/// `heliosdb-nano archive …` (spec P3.1 §5).
+#[derive(clap::Args, Debug)]
+struct ArchiveArgs {
+    #[command(subcommand)]
+    action: ArchiveAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum ArchiveAction {
+    /// One line per archived segment: state, history/epoch, sequences,
+    /// write groups, bytes, observed times (unix seconds), path. Open segments
+    /// are listed as `open`.
+    List {
+        #[command(flatten)]
+        location: ArchiveLocationArgs,
+        /// One JSON object per line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify every segment's header and footer (magic, both hashes, size,
+    /// name, history and epoch of its directory); --deep also re-hashes the
+    /// whole file and decodes every frame. Exits 1 naming the first failing
+    /// file (--keep-going lists every one).
+    Verify {
+        #[command(flatten)]
+        location: ArchiveLocationArgs,
+        /// Re-hash every file and decode every frame. The frames of an
+        /// encrypted dataset's segments need the dataset key (--key-file, or
+        /// --config's [encryption]).
+        #[arg(long)]
+        deep: bool,
+        /// The dataset key file (32 raw bytes or 64 hex characters).
+        #[arg(long, value_name = "FILE")]
+        key_file: Option<PathBuf>,
+        /// Report every failing file instead of stopping at the first.
+        #[arg(long)]
+        keep_going: bool,
+    },
+    /// The sequence intervals the archive lacks, and why.
+    Gaps {
+        #[command(flatten)]
+        location: ArchiveLocationArgs,
+        /// Only the gaps that end at or after this sequence.
+        #[arg(long, value_name = "SEQ")]
+        from: Option<u64>,
+    },
+    /// Apply the retention policy ([replication.archive] recovery_window,
+    /// max_bytes, disk_reserve) while no node runs on the archive. Refused
+    /// while one does: a running node prunes its own archive.
+    Prune {
+        #[command(flatten)]
+        location: ArchiveLocationArgs,
+        /// Say what would be pruned; remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Instead of [replication.archive] recovery_window.
+        #[arg(long, value_name = "DURATION")]
+        recovery_window: Option<String>,
+        /// Instead of [replication.archive] max_bytes.
+        #[arg(long, value_name = "SIZE")]
+        max_bytes: Option<String>,
+        /// Instead of [replication.archive] disk_reserve.
+        #[arg(long, value_name = "RESERVE")]
+        disk_reserve: Option<String>,
+    },
+}
+
+/// Spec P3.1 §5: the offline `archive` commands. They read the files only;
+/// `prune` takes the archive directory's lock, which a running node holds.
+fn run_archive_command(args: ArchiveArgs) -> Result<()> {
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        let _ = args;
+        return Err(Error::config("archive requires the ha-tier1 feature"));
+    }
+    #[cfg(feature = "ha-tier1")]
+    {
+        match args.action {
+            ArchiveAction::List { location, json } => archive_list(&location, json),
+            ArchiveAction::Verify {
+                location,
+                deep,
+                key_file,
+                keep_going,
+            } => archive_verify(&location, deep, key_file, keep_going),
+            ArchiveAction::Gaps { location, from } => archive_gaps(&location, from),
+            ArchiveAction::Prune {
+                location,
+                dry_run,
+                recovery_window,
+                max_bytes,
+                disk_reserve,
+            } => archive_prune(&location, dry_run, recovery_window, max_bytes, disk_reserve),
+        }
+    }
+}
+
+/// The archive directory `location` names, and the node's configuration
+/// when `--config` was given.
+#[cfg(feature = "ha-tier1")]
+fn resolve_archive_location(location: &ArchiveLocationArgs) -> Result<(PathBuf, Option<Config>)> {
+    let config = location.config.as_ref().map(Config::from_file).transpose()?;
+    if let Some(dir) = &location.archive_dir {
+        return Ok((dir.clone(), config));
+    }
+    let archive = config
+        .as_ref()
+        .map(|config| config.replication.archive.clone())
+        .unwrap_or_default();
+    if let Some(dir) = &archive.dir {
+        return Ok((dir.clone(), config));
+    }
+    let data_dir = location
+        .data_dir
+        .clone()
+        .or_else(|| config.as_ref().and_then(|config| config.storage.path.clone()));
+    match data_dir {
+        Some(data_dir) => Ok((archive.resolve_dir(&data_dir, None)?, config)),
+        None => Err(Error::config(
+            "archive: name the archive with --archive-dir, or give --data-dir / --config to derive it \
+             (<data dir>.archive)",
+        )),
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+fn scan_archive(dir: &std::path::Path) -> Result<heliosdb_nano::replication::archive_catalog::ArchiveCatalog> {
+    use heliosdb_nano::replication::archive_catalog::{ArchiveCatalog, PartialPolicy};
+    ArchiveCatalog::scan(dir, PartialPolicy::Leave)
+        .map(|(catalog, _)| catalog)
+        .map_err(|e| Error::io(format!("cannot read the archive directory {}: {e}", dir.display())))
+}
+
+/// Unix seconds as RFC 3339 text, for `archive list`.
+#[cfg(feature = "ha-tier1")]
+fn rfc3339(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0).map_or_else(|| secs.to_string(), |at| at.to_rfc3339())
+}
+
+#[cfg(feature = "ha-tier1")]
+fn archive_list(location: &ArchiveLocationArgs, json: bool) -> Result<()> {
+    let (dir, _) = resolve_archive_location(location)?;
+    let catalog = scan_archive(&dir)?;
+    for entry in catalog.entries() {
+        let info = entry.info.as_ref();
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "state": entry.state_name(),
+                    "path": entry.path.display().to_string(),
+                    "history": entry.history.map(|history| history.to_string()),
+                    "epoch": entry.epoch,
+                    "first_sequence": entry.first_sequence,
+                    "last_sequence": entry.last_sequence,
+                    "batches": info.map(|info| info.batch_count()),
+                    "bytes": entry.file_bytes,
+                    "first_observed_at": info.map(|info| info.first_observed_at()),
+                    "last_observed_at": info.map(|info| info.last_observed_at()),
+                    "sealed_at": info.and_then(|info| info.sealed_at),
+                    "sealed_frames": info.map(|info| info.sealed_frames()),
+                    "sha256": info.map(|info| info.sha256_hex()),
+                    "reason": entry.reason(),
+                })
+            );
+            continue;
+        }
+        match info {
+            Some(info) => println!(
+                "available  {}/{}  {}..{}  {} write groups  {} bytes  observed {} .. {}{}  {}",
+                info.history(),
+                info.epoch(),
+                info.first_sequence(),
+                info.last_sequence(),
+                info.batch_count(),
+                info.file_bytes,
+                rfc3339(info.first_observed_at()),
+                rfc3339(info.last_observed_at()),
+                if info.sealed_frames() {
+                    "  sealed with the dataset key"
+                } else {
+                    ""
+                },
+                info.path.display()
+            ),
+            None => println!(
+                "corrupt    {}: {}",
+                entry.path.display(),
+                entry.reason().unwrap_or("unreadable")
+            ),
+        }
+    }
+    for open in catalog.open_segments() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({ "state": "open", "path": open.display().to_string() })
+            );
+        } else {
+            println!(
+                "open       {} (being written, or left by a crash: its node seals or repairs it at its next start)",
+                open.display()
+            );
+        }
+    }
+    if !json {
+        println!(
+            "{} segment(s), {} bytes in {}",
+            catalog.segment_count(),
+            catalog.bytes_retained(),
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ha-tier1")]
+fn archive_verify(
+    location: &ArchiveLocationArgs,
+    deep: bool,
+    key_file: Option<PathBuf>,
+    keep_going: bool,
+) -> Result<()> {
+    use heliosdb_nano::crypto::KeyManager;
+    let (dir, config) = resolve_archive_location(location)?;
+    let key = match key_file {
+        Some(path) => Some(KeyManager::from_source(&heliosdb_nano::config::KeySource::File(path))?),
+        None => match &config {
+            Some(config) if config.encryption.enabled => Some(KeyManager::from_source(&config.encryption.key_source)?),
+            _ => None,
+        },
+    };
+    let catalog = scan_archive(&dir)?;
+    let (mut checked, mut failed) = (0_usize, 0_usize);
+    for entry in catalog.entries() {
+        checked += 1;
+        let outcome = match &entry.info {
+            Some(info) if deep => info.verify_deep(key.as_ref()).map_err(|error| error.to_string()),
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "segment {}: {}",
+                entry.path.display(),
+                entry.reason().unwrap_or("unreadable")
+            )),
+        };
+        match outcome {
+            Ok(()) => println!("ok      {}", entry.path.display()),
+            Err(reason) => {
+                failed += 1;
+                println!("FAILED  {reason}");
+                if !keep_going {
+                    println!("verify stopped at the first failure ({checked} checked); --keep-going reports them all");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+    for open in catalog.open_segments() {
+        println!("skipped {} (an open segment, not sealed yet)", open.display());
+    }
+    println!(
+        "{checked} segment(s) verified{} in {}: {failed} failed",
+        if deep {
+            " (header, footer, file hash, every frame)"
+        } else {
+            " (header and footer)"
+        },
+        dir.display()
+    );
+    if failed > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "ha-tier1")]
+fn archive_gaps(location: &ArchiveLocationArgs, from: Option<u64>) -> Result<()> {
+    let (dir, _) = resolve_archive_location(location)?;
+    let catalog = scan_archive(&dir)?;
+    let gaps: Vec<_> = catalog
+        .gaps()
+        .into_iter()
+        .filter(|gap| from.is_none_or(|from| gap.to_sequence >= from))
+        .collect();
+    for gap in &gaps {
+        println!(
+            "{}/{}  {}..{}  {}",
+            gap.history, gap.epoch, gap.from_sequence, gap.to_sequence, gap.reason
+        );
+    }
+    println!("{} gap(s) in {}", gaps.len(), dir.display());
+    Ok(())
+}
+
+#[cfg(feature = "ha-tier1")]
+fn archive_prune(
+    location: &ArchiveLocationArgs,
+    dry_run: bool,
+    recovery_window: Option<String>,
+    max_bytes: Option<String>,
+    disk_reserve: Option<String>,
+) -> Result<()> {
+    use heliosdb_nano::replication::archiver::{prune_offline, ArchiveSettings};
+    let (dir, config) = resolve_archive_location(location)?;
+    let mut archive = config.map(|config| config.replication.archive).unwrap_or_default();
+    if let Some(value) = recovery_window {
+        archive.recovery_window = value;
+    }
+    if let Some(value) = max_bytes {
+        archive.max_bytes = value;
+    }
+    if let Some(value) = disk_reserve {
+        archive.disk_reserve = value;
+    }
+    let settings = ArchiveSettings::from_config(&archive, dir.clone())?;
+    let pruned = prune_offline(&settings, dry_run)?;
+    let verb = if dry_run { "would prune" } else { "pruned" };
+    for segment in &pruned {
+        println!(
+            "{verb} {} ({}, {} bytes)",
+            segment.path.display(),
+            segment.reason.as_str(),
+            segment.bytes
+        );
+    }
+    println!(
+        "{} segment(s) {verb}, {} bytes, in {} (recovery_window {}, max_bytes {}, disk_reserve {})",
+        pruned.len(),
+        pruned.iter().map(|segment| segment.bytes).sum::<u64>(),
+        dir.display(),
+        archive.recovery_window,
+        archive.max_bytes,
+        archive.disk_reserve
+    );
+    Ok(())
+}
+
 fn append_physical_daemon_args(
     args: &mut Vec<String>,
     config: &heliosdb_nano::config::PhysicalReplicationConfig,
@@ -6209,6 +6815,39 @@ struct PreparedPhysicalSource {
     /// interrupted download resumes; swept every `lease_sweep`.
     leases: heliosdb_nano::replication::physical_source::ExportLeases,
     lease_sweep: std::time::Duration,
+    /// Spec P3.1: the primary's WAL archiver, started with the source and
+    /// stopped (its open segment sealed) when the source stops, before the
+    /// store closes. `None` with `--archive=false`.
+    archive: Option<heliosdb_nano::replication::archiver::ArchiveService>,
+}
+
+/// Spec P3.1: start a primary's WAL archiver beside its replication port. It
+/// never fails the start: an unusable configuration is said once and the
+/// primary runs without an archive.
+#[cfg(feature = "ha-tier1")]
+fn start_primary_archive(
+    ha_config: &HAConfig,
+    storage: &heliosdb_nano::storage::StorageEngine,
+    history: uuid::Uuid,
+    node_id: uuid::Uuid,
+) -> Option<heliosdb_nano::replication::archiver::ArchiveService> {
+    use heliosdb_nano::replication::archiver::{start_primary, ArchiveSettings};
+    let archive = &ha_config.archive;
+    if !archive.enabled {
+        info!("the WAL archive is off on this primary (--archive=false / [replication.archive] enabled = false)");
+        return None;
+    }
+    let Some(dir) = archive.dir.clone() else {
+        tracing::warn!("the WAL archive is off on this primary: no archive directory was resolved");
+        return None;
+    };
+    match ArchiveSettings::from_config(archive, dir) {
+        Ok(settings) => Some(start_primary(settings, storage, history, node_id)),
+        Err(error) => {
+            tracing::warn!("the WAL archive is off on this primary: {error}");
+            None
+        }
+    }
 }
 
 /// How many connections past `[replication.physical] max_sessions` a source
@@ -6318,6 +6957,9 @@ async fn prepare_physical_source(
         }
     );
     let lease_secs = ha_config.replication_tls.snapshot_export_lease_secs;
+    let work = SourceWorkLimiter::new(config.max_sessions).map_err(|e| Error::config(e.to_string()))?;
+    // Spec P3.1: started last, once nothing can fail the source any more.
+    let archive = start_primary_archive(ha_config, storage, history, node.node_id);
     Ok(Some(PreparedPhysicalSource {
         listener,
         address,
@@ -6326,7 +6968,7 @@ async fn prepare_physical_source(
         history,
         export_dir: config.export_dir.clone().expect("validated export path"),
         config: config.clone(),
-        work: SourceWorkLimiter::new(config.max_sessions).map_err(|e| Error::config(e.to_string()))?,
+        work,
         context,
         tcp_keepalive: heliosdb_nano::protocol::postgres::timeouts::ConnectionTimeouts::from_server_config(
             &storage.config().server,
@@ -6340,6 +6982,7 @@ async fn prepare_physical_source(
         // Half the lease, between 1 s and a minute: an expired lease stops
         // pinning SST files soon after it runs out.
         lease_sweep: std::time::Duration::from_secs((lease_secs / 2).clamp(1, 60)),
+        archive,
     }))
 }
 
@@ -6369,7 +7012,7 @@ async fn serve_physical_source(
     use heliosdb_nano::replication::physical_wire::{
         accept_replication, refuse_session, serve_session, Refusal, RefuseCode,
     };
-    let Some(source) = source else {
+    let Some(mut source) = source else {
         while !*shutdown.borrow() {
             if shutdown.changed().await.is_err() {
                 break;
@@ -6377,6 +7020,9 @@ async fn serve_physical_source(
         }
         return Ok(());
     };
+    // Spec P3.1: the archiver runs on its own thread; it is stopped (its open
+    // segment sealed) with the source, before the store closes.
+    let archive = source.archive.take();
     let token = std::sync::Arc::new(source.token);
     let (session_stop, session_shutdown) = tokio::sync::watch::channel(false);
     let mut sessions = tokio::task::JoinSet::new();
@@ -6472,6 +7118,11 @@ async fn serve_physical_source(
         .drain()
         .await
         .map_err(|e| Error::network(format!("physical source work drain failed: {e}")));
+    if let Some(archive) = archive {
+        if let Err(error) = tokio::task::spawn_blocking(move || archive.shutdown()).await {
+            tracing::warn!("the WAL archiver did not stop cleanly: {error}");
+        }
+    }
     match result {
         Err(error) => Err(error),
         Ok(()) => drained,
@@ -6589,6 +7240,8 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
             reconnect_delay: Duration::from_millis(args.reconnect_delay_ms),
             max_reconnects: args.max_reconnects,
             heartbeat_interval: Duration::from_secs(5),
+            // An offline receiver follows no serving binding: nothing to archive.
+            archive: None,
         };
         let (stop, shutdown) = tokio::sync::watch::channel(false);
         let (progress, mut statuses) = tokio::sync::watch::channel(ReceiverStatus::Connecting {
@@ -6912,6 +7565,99 @@ mod physical_cli_tests {
         replication_tls.apply(&mut bare);
         assert_eq!(bare.primary_tls, Some(true));
     }
+    /// Spec P3.1: every archive flag reaches `[replication.archive]` and
+    /// survives the daemon re-exec; the `archive` subcommands parse.
+    #[test]
+    fn archive_flags_reach_the_config_and_survive_daemon_reexec() {
+        let cli = Cli::try_parse_from([
+            "nano",
+            "start",
+            "--archive=false",
+            "--archive-dir",
+            "/srv/archive",
+            "--archive-segment-max-bytes",
+            "1MiB",
+            "--archive-segment-max-secs",
+            "9",
+            "--archive-poll-ms",
+            "50",
+            "--archive-fsync-bytes",
+            "64KiB",
+            "--archive-recovery-window",
+            "2d",
+            "--archive-max-bytes",
+            "16GiB",
+            "--archive-disk-reserve",
+            "5%",
+            "--archive-prune-interval-secs",
+            "7",
+        ])
+        .unwrap();
+        let Commands::Start { archive_args, .. } = cli.command else {
+            panic!("wrong command")
+        };
+        let mut config = heliosdb_nano::config::ArchiveConfig::default();
+        archive_args.apply(&mut config);
+        config.validate().unwrap();
+        assert!(!config.enabled);
+        assert_eq!(config.dir, Some(PathBuf::from("/srv/archive")));
+        assert_eq!(config.segment_max_bytes, "1MiB");
+        assert_eq!(config.segment_max_secs, 9);
+        assert_eq!(config.poll_ms, 50);
+        assert_eq!(config.fsync_bytes, "64KiB");
+        assert_eq!(config.recovery_window_secs().unwrap(), 2 * 86_400);
+        assert_eq!(config.max_bytes, "16GiB");
+        assert_eq!(config.disk_reserve, "5%");
+        assert_eq!(config.prune_interval_secs, 7);
+        let mut argv = vec!["nano".to_string(), "start".to_string()];
+        append_archive_daemon_args(&mut argv, &config);
+        let Commands::Start { archive_args, .. } = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("wrong command")
+        };
+        let mut child = heliosdb_nano::config::ArchiveConfig::default();
+        archive_args.apply(&mut child);
+        assert_eq!(child, config);
+        // A bare --archive means true; no flag keeps the file's value.
+        let Commands::Start { archive_args, .. } = Cli::try_parse_from(["nano", "start", "--archive"]).unwrap().command
+        else {
+            panic!("wrong command")
+        };
+        let mut bare = heliosdb_nano::config::ArchiveConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        archive_args.apply(&mut bare);
+        assert!(bare.enabled);
+        for argv in [
+            vec!["nano", "archive", "list", "--archive-dir", "/a", "--json"],
+            vec![
+                "nano",
+                "archive",
+                "verify",
+                "--deep",
+                "--key-file",
+                "/k",
+                "--keep-going",
+                "-d",
+                "/data",
+            ],
+            vec!["nano", "archive", "gaps", "--from", "7", "-c", "/c.toml"],
+            vec![
+                "nano",
+                "archive",
+                "prune",
+                "--dry-run",
+                "--max-bytes",
+                "1GiB",
+                "--archive-dir",
+                "/a",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(argv.clone()).is_ok(), "{argv:?}");
+        }
+        assert!(Cli::try_parse_from(["nano", "archive", "rewrite"]).is_err());
+    }
+
     #[cfg(all(feature = "ha-tier1", unix))]
     #[test]
     fn token_file_rejects_world_readable_links_and_wrong_length() {

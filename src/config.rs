@@ -384,6 +384,10 @@ pub struct ReplicationConfig {
     pub sync_timeout_action: String,
     /// The replication port's source settings and bounded RocksDB WAL retention.
     pub physical: PhysicalReplicationConfig,
+    /// Spec P3.1: `[replication.archive]` — the archived WAL segments every
+    /// HA node (a primary with a replication token, and a standby) seals
+    /// beside its data directory, and the recovery window they are kept for.
+    pub archive: ArchiveConfig,
     /// Stable node UUID; generated at startup if absent.
     pub node_id: Option<String>,
     /// Path to the owner-only 32-byte token file that authenticates the
@@ -508,6 +512,7 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("sync_timeout_ms", &self.sync_timeout_ms)
             .field("sync_timeout_action", &self.sync_timeout_action)
             .field("physical", &self.physical)
+            .field("archive", &self.archive)
             .field("node_id", &self.node_id)
             .field("token_file", &self.token_file)
             .field("allow_insecure_remote", &self.allow_insecure_remote)
@@ -539,6 +544,7 @@ impl Default for ReplicationConfig {
         Self {
             role: "standalone".to_string(),
             physical: PhysicalReplicationConfig::default(),
+            archive: ArchiveConfig::default(),
             replication_port: 5433,
             startup_timeout_secs: 30,
             primary_host: None,
@@ -771,6 +777,7 @@ impl ReplicationConfig {
             }
         }
         self.physical.validate()?;
+        self.archive.validate()?;
         self.validate_tls()?;
         if let Some(node_id) = &self.node_id {
             uuid::Uuid::parse_str(node_id)
@@ -3644,6 +3651,486 @@ impl PhysicalReplicationConfig {
             ));
         }
         Ok(())
+    }
+}
+
+/// Spec P3.1: how much free space `[replication.archive] disk_reserve` keeps
+/// on the archive's filesystem — a share of the filesystem's size, or a byte
+/// count. Below it the pruner removes the oldest archived segments, inside the
+/// recovery window if it must: the window is shortened, the primary's writes
+/// never wait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskReserve {
+    /// A percentage of the filesystem's total size, 0..=99.
+    Percent(u8),
+    /// A byte count.
+    Bytes(u64),
+}
+
+impl DiskReserve {
+    /// The reserve in bytes on a filesystem of `filesystem_bytes` total size.
+    pub fn bytes_of(&self, filesystem_bytes: u64) -> u64 {
+        match self {
+            Self::Percent(percent) => {
+                u64::try_from(u128::from(filesystem_bytes) * u128::from(*percent) / 100).unwrap_or(u64::MAX)
+            }
+            Self::Bytes(bytes) => *bytes,
+        }
+    }
+}
+
+impl std::fmt::Display for DiskReserve {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Percent(percent) => write!(f, "{percent}%"),
+            Self::Bytes(bytes) => write!(f, "{bytes} bytes"),
+        }
+    }
+}
+
+/// Parse a disk reserve: a whole percentage of the filesystem's size
+/// (`"10%"`, 0..=99) or a byte size in [`parse_byte_size`]'s syntax
+/// (`"2GiB"`). The error quotes the value; callers add the setting name.
+pub fn parse_disk_reserve(raw: &str) -> crate::Result<DiskReserve> {
+    let s = raw.trim();
+    let invalid = || {
+        crate::Error::config(format!(
+            "invalid disk reserve '{raw}': expected a percentage of the filesystem's size (\"10%\", 0..=99) or a \
+             byte size (\"2GiB\")"
+        ))
+    };
+    if let Some(digits) = s.strip_suffix('%') {
+        let digits = digits.trim();
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(invalid());
+        }
+        let percent: u8 = digits.parse().map_err(|_| invalid())?;
+        if percent > 99 {
+            return Err(invalid());
+        }
+        return Ok(DiskReserve::Percent(percent));
+    }
+    parse_byte_size(s).map(DiskReserve::Bytes).map_err(|_| invalid())
+}
+
+/// `[replication.archive]` (spec P3.1, plan §D4): the archived WAL. Every
+/// write group a node applies — a primary's own, a standby's from its primary
+/// — is sealed into rotating, self-describing segment files
+/// (`<dir>/<history>/<epoch>/<first>-<last>.hseg`), kept for the recovery
+/// window, bounded by `max_bytes` and the disk reserve, and pruned oldest
+/// first. Archiving runs beside the write path, never in it: a full disk or a
+/// slow archive shortens the recovery window (WARN, `heliosdb_recovery_window`)
+/// and never stalls a commit.
+///
+/// Sizes are strings (`"64MiB"`, [`parse_byte_size`]); every key has a
+/// `start` flag (`--archive*`), which wins over the file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArchiveConfig {
+    /// Archive on this node. Default true; it applies only to a node with a
+    /// data directory and an HA role — a primary serving its replication port
+    /// (a replication token), or a standby. `--archive=false`.
+    pub enabled: bool,
+    /// The archive directory. Default `<data dir>.archive`, beside the data
+    /// directory (created owner-only); never inside the data directory, never
+    /// the physical export directory. `--archive-dir`.
+    pub dir: Option<std::path::PathBuf>,
+    /// A segment is sealed before it would grow past this size (a single write
+    /// group larger than it gets a segment of its own; groups are never
+    /// split). 4KiB..=4GiB, default "64MiB". `--archive-segment-max-bytes`.
+    pub segment_max_bytes: String,
+    /// A non-empty segment older than this many seconds is sealed. 1..=86400,
+    /// default 300. `--archive-segment-max-secs`.
+    pub segment_max_secs: u64,
+    /// How often a primary's archiver asks its store for new write groups, in
+    /// milliseconds. 10..=60000, default 1000. `--archive-poll-ms`.
+    pub poll_ms: u64,
+    /// The open segment is fsynced every time this much was appended since
+    /// its last fsync, and at every seal. 4KiB..=4GiB, default "8MiB".
+    /// `--archive-fsync-bytes`.
+    pub fsync_bytes: String,
+    /// The recovery window: sealed segments whose newest write group was
+    /// observed longer ago than this are pruned. Seconds or `<n>[s|m|h|d|w]`,
+    /// 1s..=3650d, default "7d". `--archive-recovery-window`.
+    pub recovery_window: String,
+    /// Upper bound of the bytes the archive keeps; over it the oldest segments
+    /// are pruned even inside the window (which is then shortened). A byte
+    /// size or "unlimited" (default). `--archive-max-bytes`.
+    pub max_bytes: String,
+    /// Free space kept on the archive's filesystem: below it the oldest
+    /// segments are pruned, inside the window if they must. A percentage of
+    /// the filesystem's size or a byte size, default "10%".
+    /// `--archive-disk-reserve`.
+    pub disk_reserve: String,
+    /// How often the pruner runs (it also runs after every seal). 1..=86400
+    /// seconds, default 60. `--archive-prune-interval-secs`.
+    pub prune_interval_secs: u64,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: None,
+            segment_max_bytes: Self::DEFAULT_SEGMENT_MAX_BYTES.to_string(),
+            segment_max_secs: Self::DEFAULT_SEGMENT_MAX_SECS,
+            poll_ms: Self::DEFAULT_POLL_MS,
+            fsync_bytes: Self::DEFAULT_FSYNC_BYTES.to_string(),
+            recovery_window: Self::DEFAULT_RECOVERY_WINDOW.to_string(),
+            max_bytes: Self::DEFAULT_MAX_BYTES.to_string(),
+            disk_reserve: Self::DEFAULT_DISK_RESERVE.to_string(),
+            prune_interval_secs: Self::DEFAULT_PRUNE_INTERVAL_SECS,
+        }
+    }
+}
+
+impl ArchiveConfig {
+    pub const DEFAULT_SEGMENT_MAX_BYTES: &str = "64MiB";
+    pub const DEFAULT_SEGMENT_MAX_SECS: u64 = 300;
+    pub const DEFAULT_POLL_MS: u64 = 1000;
+    pub const DEFAULT_FSYNC_BYTES: &str = "8MiB";
+    pub const DEFAULT_RECOVERY_WINDOW: &str = "7d";
+    pub const DEFAULT_MAX_BYTES: &str = "unlimited";
+    pub const DEFAULT_DISK_RESERVE: &str = "10%";
+    pub const DEFAULT_PRUNE_INTERVAL_SECS: u64 = 60;
+    /// Bounds of `segment_max_bytes` and `fsync_bytes`.
+    pub const MIN_SEGMENT_BYTES: u64 = 4096;
+    pub const MAX_SEGMENT_BYTES: u64 = 1 << 32;
+    pub const MAX_SEGMENT_SECS: u64 = 86_400;
+    pub const MIN_POLL_MS: u64 = 10;
+    pub const MAX_POLL_MS: u64 = 60_000;
+    /// Upper bound of `recovery_window`: ten years.
+    pub const MAX_RECOVERY_WINDOW_SECS: u64 = 3650 * 86_400;
+    pub const MAX_PRUNE_INTERVAL_SECS: u64 = 86_400;
+    /// The default directory is the data directory's path plus this suffix.
+    pub const DEFAULT_DIR_SUFFIX: &str = ".archive";
+
+    fn size(key: &str, raw: &str) -> crate::Result<u64> {
+        let value = parse_byte_size(raw)
+            .map_err(|error| crate::Error::config(format!("replication.archive.{key}: {error}")))?;
+        if !(Self::MIN_SEGMENT_BYTES..=Self::MAX_SEGMENT_BYTES).contains(&value) {
+            return Err(crate::Error::config(format!(
+                "replication.archive.{key} must be between {} and {} bytes (got '{raw}')",
+                Self::MIN_SEGMENT_BYTES,
+                Self::MAX_SEGMENT_BYTES
+            )));
+        }
+        Ok(value)
+    }
+
+    /// `segment_max_bytes` in bytes.
+    pub fn segment_max_bytes_value(&self) -> crate::Result<u64> {
+        Self::size("segment_max_bytes", &self.segment_max_bytes)
+    }
+
+    /// `fsync_bytes` in bytes.
+    pub fn fsync_bytes_value(&self) -> crate::Result<u64> {
+        Self::size("fsync_bytes", &self.fsync_bytes)
+    }
+
+    /// `recovery_window` in seconds.
+    pub fn recovery_window_secs(&self) -> crate::Result<u64> {
+        let secs = parse_retention_duration_secs(&self.recovery_window).map_err(|_| {
+            crate::Error::config(format!(
+                "invalid replication.archive.recovery_window '{}': expected seconds or <n>[s|m|h|d|w], e.g. \"7d\"",
+                self.recovery_window
+            ))
+        })?;
+        if !(1..=Self::MAX_RECOVERY_WINDOW_SECS).contains(&secs) {
+            return Err(crate::Error::config(format!(
+                "replication.archive.recovery_window must be between 1s and {}s (got '{}')",
+                Self::MAX_RECOVERY_WINDOW_SECS,
+                self.recovery_window
+            )));
+        }
+        Ok(secs)
+    }
+
+    /// `max_bytes`: `None` for "unlimited".
+    pub fn max_bytes_value(&self) -> crate::Result<Option<u64>> {
+        let value = parse_byte_size_or_unlimited(&self.max_bytes)
+            .map_err(|error| crate::Error::config(format!("replication.archive.max_bytes: {error}")))?;
+        if value == Some(0) {
+            return Err(crate::Error::config(
+                "replication.archive.max_bytes must be at least 1 byte, or \"unlimited\"",
+            ));
+        }
+        Ok(value)
+    }
+
+    /// `disk_reserve`, parsed.
+    pub fn disk_reserve_value(&self) -> crate::Result<DiskReserve> {
+        parse_disk_reserve(&self.disk_reserve)
+            .map_err(|error| crate::Error::config(format!("replication.archive.disk_reserve: {error}")))
+    }
+
+    /// Check every key without touching the file system (the directory is
+    /// checked against the data directory by [`Self::resolve_dir`] at start).
+    pub fn validate(&self) -> crate::Result<()> {
+        self.segment_max_bytes_value()?;
+        self.fsync_bytes_value()?;
+        self.recovery_window_secs()?;
+        self.max_bytes_value()?;
+        self.disk_reserve_value()?;
+        for (name, value, minimum, maximum) in [
+            ("segment_max_secs", self.segment_max_secs, 1, Self::MAX_SEGMENT_SECS),
+            ("poll_ms", self.poll_ms, Self::MIN_POLL_MS, Self::MAX_POLL_MS),
+            (
+                "prune_interval_secs",
+                self.prune_interval_secs,
+                1,
+                Self::MAX_PRUNE_INTERVAL_SECS,
+            ),
+        ] {
+            if !(minimum..=maximum).contains(&value) {
+                return Err(crate::Error::config(format!(
+                    "replication.archive.{name} must be between {minimum} and {maximum}"
+                )));
+            }
+        }
+        if self.dir.as_ref().is_some_and(|dir| dir.as_os_str().is_empty()) {
+            return Err(crate::Error::config(
+                "replication.archive.dir is empty; omit it for the default <data dir>.archive",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The archive directory of a node whose data directory is `data_dir`:
+    /// `dir` when set, else `<data dir>.archive` beside it; absolute either
+    /// way. Refused when it is the data directory or inside it (a data
+    /// directory holds only its store, and a physical standby refuses any
+    /// other file there) or when it is the physical export directory
+    /// `export_dir`. The directory is not created here.
+    pub fn resolve_dir(
+        &self,
+        data_dir: &std::path::Path,
+        export_dir: Option<&std::path::Path>,
+    ) -> crate::Result<std::path::PathBuf> {
+        let data = absolute_path(data_dir)?;
+        let dir = match &self.dir {
+            Some(dir) => absolute_path(dir)?,
+            None => {
+                let (Some(parent), Some(name)) = (data.parent(), data.file_name()) else {
+                    return Err(crate::Error::config(
+                        "cannot derive the archive directory from the data directory; set [replication.archive] dir \
+                         (--archive-dir)",
+                    ));
+                };
+                let mut leaf = name.to_os_string();
+                leaf.push(Self::DEFAULT_DIR_SUFFIX);
+                parent.join(leaf)
+            }
+        };
+        let resolved = resolve_existing_prefix(&dir);
+        if resolved.starts_with(resolve_existing_prefix(&data)) {
+            return Err(crate::Error::config(format!(
+                "replication.archive.dir {} is inside the data directory {}: a data directory holds only its store \
+                 (a physical standby refuses any other file there); use a sibling, such as the default \
+                 <data dir>.archive",
+                dir.display(),
+                data.display()
+            )));
+        }
+        if let Some(export) = export_dir {
+            if resolve_existing_prefix(&absolute_path(export)?) == resolved {
+                return Err(crate::Error::config(format!(
+                    "replication.archive.dir {} is the physical export directory ([replication.physical] \
+                     export_dir): checkpoints and archived segments need directories of their own",
+                    dir.display()
+                )));
+            }
+        }
+        Ok(dir)
+    }
+}
+
+/// `path` made absolute against the working directory.
+fn absolute_path(path: &std::path::Path) -> crate::Result<std::path::PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|error| crate::Error::config(format!("cannot resolve {}: {error}", path.display())))?;
+    Ok(cwd.join(path))
+}
+
+/// `path` with its longest existing ancestor canonicalized (symlinks and `..`
+/// resolved) and the rest appended as written, so two spellings of one
+/// location compare equal whether or not it exists yet.
+fn resolve_existing_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(mut resolved) = existing.canonicalize() {
+            for part in rest.iter().rev() {
+                resolved.push(part);
+            }
+            return resolved;
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                rest.push(name.to_os_string());
+                existing = parent.to_path_buf();
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod archive_config_tests {
+    use super::*;
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// Spec P3.1: the archive is on by default with a seven-day window,
+    /// 64 MiB / 300 s segments, no byte cap and a 10 % disk reserve.
+    #[test]
+    fn archive_defaults_are_on_with_a_seven_day_window() {
+        let config = ReplicationConfig::default();
+        config.validate().unwrap();
+        let archive = &config.archive;
+        assert!(archive.enabled);
+        assert!(archive.dir.is_none());
+        assert_eq!(archive.segment_max_bytes_value().unwrap(), 64 * MIB);
+        assert_eq!(archive.segment_max_secs, 300);
+        assert_eq!(archive.poll_ms, 1000);
+        assert_eq!(archive.fsync_bytes_value().unwrap(), 8 * MIB);
+        assert_eq!(archive.recovery_window_secs().unwrap(), 7 * 86_400);
+        assert_eq!(archive.max_bytes_value().unwrap(), None);
+        assert_eq!(archive.disk_reserve_value().unwrap(), DiskReserve::Percent(10));
+        assert_eq!(archive.prune_interval_secs, 60);
+        // `Debug` names every key, nested under the replication section.
+        let rendered = format!("{config:?}");
+        for key in [
+            "archive",
+            "enabled",
+            "dir",
+            "segment_max_bytes",
+            "segment_max_secs",
+            "poll_ms",
+            "fsync_bytes",
+            "recovery_window",
+            "max_bytes",
+            "disk_reserve",
+            "prune_interval_secs",
+        ] {
+            assert!(rendered.contains(key), "{key} missing from {rendered}");
+        }
+    }
+
+    #[test]
+    fn archive_config_is_strict_and_bounded() {
+        let config: ReplicationConfig = toml::from_str(
+            "[archive]\nenabled = false\ndir = '/srv/archive'\nsegment_max_bytes = '4KiB'\nsegment_max_secs = 1\n\
+             poll_ms = 10\nfsync_bytes = '1GiB'\nrecovery_window = '2s'\nmax_bytes = '16GiB'\n\
+             disk_reserve = '2GiB'\nprune_interval_secs = 1",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert!(!config.archive.enabled);
+        assert_eq!(config.archive.segment_max_bytes_value().unwrap(), 4096);
+        assert_eq!(config.archive.recovery_window_secs().unwrap(), 2);
+        assert_eq!(config.archive.max_bytes_value().unwrap(), Some(16 * 1024 * MIB));
+        assert_eq!(
+            config.archive.disk_reserve_value().unwrap(),
+            DiskReserve::Bytes(2 * 1024 * MIB)
+        );
+        assert!(
+            toml::from_str::<ReplicationConfig>("[archive]\nunknown = 1").is_err(),
+            "unknown keys are refused"
+        );
+        for (field, value) in [
+            ("segment_max_bytes", "'4095'"),
+            ("segment_max_bytes", "'5GiB'"),
+            ("segment_max_bytes", "'big'"),
+            ("segment_max_secs", "0"),
+            ("segment_max_secs", "86401"),
+            ("poll_ms", "9"),
+            ("poll_ms", "60001"),
+            ("fsync_bytes", "'1'"),
+            ("recovery_window", "'0'"),
+            ("recovery_window", "'soon'"),
+            ("recovery_window", "'3651d'"),
+            ("max_bytes", "'0'"),
+            ("max_bytes", "'lots'"),
+            ("disk_reserve", "'100%'"),
+            ("disk_reserve", "'ten percent'"),
+            ("prune_interval_secs", "0"),
+            ("dir", "''"),
+        ] {
+            let config: ReplicationConfig = toml::from_str(&format!("[archive]\n{field} = {value}")).unwrap();
+            let error = config.validate().expect_err(&format!("{field} = {value}")).to_string();
+            assert!(error.contains("replication.archive"), "{field} = {value}: {error}");
+        }
+    }
+
+    #[test]
+    fn disk_reserve_takes_a_percentage_or_a_byte_size() {
+        assert_eq!(parse_disk_reserve("10%").unwrap(), DiskReserve::Percent(10));
+        assert_eq!(parse_disk_reserve(" 0 % ").unwrap(), DiskReserve::Percent(0));
+        assert_eq!(parse_disk_reserve("99%").unwrap(), DiskReserve::Percent(99));
+        assert_eq!(parse_disk_reserve("2GiB").unwrap(), DiskReserve::Bytes(2 * 1024 * MIB));
+        assert_eq!(parse_disk_reserve("4096").unwrap(), DiskReserve::Bytes(4096));
+        for raw in ["", "%", "100%", "-1%", "1.5%", "10%%", "ten", "5PB"] {
+            let error = parse_disk_reserve(raw).expect_err(raw).to_string();
+            assert!(error.contains("invalid disk reserve"), "{raw}: {error}");
+        }
+        assert_eq!(DiskReserve::Percent(10).bytes_of(1000), 100);
+        assert_eq!(DiskReserve::Percent(50).bytes_of(u64::MAX), u64::MAX / 2);
+        assert_eq!(DiskReserve::Bytes(7).bytes_of(1000), 7);
+        assert_eq!(DiskReserve::Percent(10).to_string(), "10%");
+    }
+
+    /// Spec P3.1: `<data dir>.archive` by default; a directory inside the data
+    /// directory, or the export directory, is refused naming the key.
+    #[test]
+    fn the_archive_directory_defaults_beside_the_data_directory_and_never_inside_it() {
+        let root = tempfile::tempdir().unwrap();
+        let data = root.path().join("node");
+        let config = ArchiveConfig::default();
+        assert_eq!(
+            config.resolve_dir(&data, None).unwrap(),
+            root.path().join("node.archive")
+        );
+        std::fs::create_dir(&data).unwrap();
+        assert_eq!(
+            config.resolve_dir(&data, None).unwrap(),
+            root.path().join("node.archive")
+        );
+        for inside in [data.clone(), data.join("archive"), data.join("x").join("..").join("y")] {
+            let config = ArchiveConfig {
+                dir: Some(inside.clone()),
+                ..ArchiveConfig::default()
+            };
+            let error = config.resolve_dir(&data, None).expect_err("inside").to_string();
+            assert!(
+                error.contains("replication.archive.dir") && error.contains("inside the data directory"),
+                "{}: {error}",
+                inside.display()
+            );
+        }
+        let export = root.path().join("node.physical-export");
+        std::fs::create_dir(&export).unwrap();
+        let config = ArchiveConfig {
+            dir: Some(export.clone()),
+            ..ArchiveConfig::default()
+        };
+        let error = config
+            .resolve_dir(&data, Some(&export))
+            .expect_err("export")
+            .to_string();
+        assert!(error.contains("physical export directory"), "{error}");
+        let sibling = ArchiveConfig {
+            dir: Some(root.path().join("elsewhere")),
+            ..ArchiveConfig::default()
+        };
+        assert_eq!(
+            sibling.resolve_dir(&data, Some(&export)).unwrap(),
+            root.path().join("elsewhere")
+        );
     }
 }
 

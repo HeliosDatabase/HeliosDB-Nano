@@ -50,6 +50,45 @@ pub fn free_bytes(path: &Path) -> io::Result<u64> {
     ))
 }
 
+/// Total size of the filesystem holding `path`: `statvfs`'s
+/// `f_blocks * f_frsize` (`f_bsize` when `f_frsize` is 0, as in
+/// [`free_bytes`]). Spec P3.1: a percentage disk reserve
+/// (`[replication.archive] disk_reserve = "10%"`) is a share of this.
+// The `statvfs` field widths differ by platform (32-bit on macOS), so the
+// widening is a no-op only on some.
+#[allow(clippy::useless_conversion)]
+#[cfg(unix)]
+pub fn total_bytes(path: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `c_path` is a NUL-terminated string that outlives the call and
+    // `stat` is writable storage of exactly the type `statvfs` fills in.
+    if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `statvfs` returned 0, so it initialised every field of `stat`.
+    let stat = unsafe { stat.assume_init() };
+    let fragment = if stat.f_frsize == 0 {
+        stat.f_bsize
+    } else {
+        stat.f_frsize
+    };
+    Ok(u64::from(stat.f_blocks).saturating_mul(u64::from(fragment)))
+}
+
+/// Without `statvfs` there is no portable measurement.
+#[cfg(not(unix))]
+pub fn total_bytes(path: &Path) -> io::Result<u64> {
+    let _ = path;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "filesystem size measurement requires statvfs",
+    ))
+}
+
 #[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -76,5 +115,16 @@ mod tests {
         let path = Path::new(std::ffi::OsStr::from_bytes(b"bad\0path"));
         let err = free_bytes(path).expect_err("a NUL byte cannot reach statvfs");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+    }
+
+    /// Spec P3.1: the filesystem's size bounds its free space, and a missing
+    /// path is an error, not a zero-sized filesystem.
+    #[test]
+    fn the_filesystem_size_bounds_its_free_space() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let total = total_bytes(dir.path()).expect("statvfs on a fresh tempdir");
+        assert!(total > 0);
+        assert!(free_bytes(dir.path()).unwrap() <= total);
+        assert!(total_bytes(&dir.path().join("does-not-exist")).is_err());
     }
 }

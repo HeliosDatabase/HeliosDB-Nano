@@ -24,6 +24,14 @@ pub struct SystemViewSchema {
     pub description: String,
 }
 
+/// A unix-seconds instant as a TIMESTAMP value (NULL when absent or out of
+/// range).
+fn unix_timestamp(secs: Option<i64>) -> Value {
+    use chrono::{TimeZone, Utc};
+    secs.and_then(|secs| Utc.timestamp_opt(secs, 0).single())
+        .map_or(Value::Null, Value::Timestamp)
+}
+
 /// A plain column of a status view: no key, no default, no storage mode.
 fn status_column(name: &str, data_type: DataType, nullable: bool) -> Column {
     Column {
@@ -1814,6 +1822,67 @@ impl SystemViewRegistry {
                 ],
             },
             description: "Control data of this node's last checkpoint (replication epoch as timeline_id)".to_string(),
+        });
+
+        // Spec P3.1 §5: this node's archived WAL — the catalog of its sealed
+        // segment files (RMAN's catalog of archived redo logs), the intervals
+        // it lacks, and its recovery window. Process-wide state, like the
+        // standby status; empty / `disabled` on a node that archives nothing.
+        self.register_view(SystemViewSchema {
+            name: "heliosdb_archived_wal".to_string(),
+            schema: Schema {
+                columns: vec![
+                    status_column("history", DataType::Text, true),
+                    status_column("epoch", DataType::Int8, true),
+                    status_column("first_sequence", DataType::Int8, true),
+                    status_column("last_sequence", DataType::Int8, true),
+                    status_column("batches", DataType::Int8, true),
+                    status_column("bytes", DataType::Int8, false),
+                    status_column("first_observed_at", DataType::Timestamp, true),
+                    status_column("last_observed_at", DataType::Timestamp, true),
+                    status_column("sealed_at", DataType::Timestamp, true),
+                    status_column("state", DataType::Text, false),
+                    status_column("path", DataType::Text, false),
+                    status_column("sha256", DataType::Text, true),
+                ],
+            },
+            description: "Archived WAL segments of this node (one row per file; state available or corrupt)"
+                .to_string(),
+        });
+        self.register_view(SystemViewSchema {
+            name: "heliosdb_archive_gaps".to_string(),
+            schema: Schema {
+                columns: vec![
+                    status_column("history", DataType::Text, false),
+                    status_column("epoch", DataType::Int8, false),
+                    status_column("from_sequence", DataType::Int8, false),
+                    status_column("to_sequence", DataType::Int8, false),
+                    status_column("reason", DataType::Text, false),
+                ],
+            },
+            description: "Sequence intervals this node's WAL archive does not hold".to_string(),
+        });
+        self.register_view(SystemViewSchema {
+            name: "heliosdb_recovery_window".to_string(),
+            schema: Schema {
+                columns: vec![
+                    status_column("enabled", DataType::Boolean, false),
+                    status_column("archive_dir", DataType::Text, true),
+                    status_column("configured_window_secs", DataType::Int8, false),
+                    status_column("effective_window_secs", DataType::Int8, false),
+                    status_column("oldest_retained_at", DataType::Timestamp, true),
+                    status_column("newest_sealed_at", DataType::Timestamp, true),
+                    status_column("segments", DataType::Int8, false),
+                    status_column("bytes_retained", DataType::Int8, false),
+                    status_column("max_bytes", DataType::Int8, true),
+                    status_column("disk_reserve_bytes", DataType::Int8, false),
+                    status_column("free_bytes", DataType::Int8, true),
+                    status_column("pruned_inside_window_total", DataType::Int8, false),
+                    status_column("shortened", DataType::Boolean, false),
+                    status_column("state", DataType::Text, false),
+                ],
+            },
+            description: "This node's WAL recovery window: configured, effective, and why they differ".to_string(),
         });
 
         // heliosdb_art_indexes - ART index information
@@ -4120,6 +4189,10 @@ impl SystemViewRegistry {
             // Spec P1.3: this node's replication posture and control data.
             "heliosdb_standby_status" => Ok(vec![Self::execute_heliosdb_standby_status(storage)]),
             "pg_control_checkpoint" => Ok(vec![Self::execute_pg_control_checkpoint(storage)]),
+            // Spec P3.1: this node's archived WAL.
+            "heliosdb_archived_wal" => Ok(Self::execute_heliosdb_archived_wal()),
+            "heliosdb_archive_gaps" => Ok(Self::execute_heliosdb_archive_gaps()),
+            "heliosdb_recovery_window" => Ok(vec![Self::execute_heliosdb_recovery_window()]),
             // ART index monitoring
             "heliosdb_art_indexes" => Self::execute_heliosdb_art_indexes(storage),
             // SIMD capabilities
@@ -6169,6 +6242,110 @@ impl SystemViewRegistry {
             Value::Boolean(block.tls),
             optional_text(block.reason),
             optional_text(block.progress),
+        ])
+    }
+
+    /// `heliosdb_archived_wal` (spec P3.1): one row per file of this node's
+    /// archive, as its catalog lists it.
+    #[cfg(feature = "ha-tier1")]
+    fn execute_heliosdb_archived_wal() -> Vec<Tuple> {
+        let int = |value: Option<u64>| {
+            value.map_or(Value::Null, |value| {
+                Value::Int8(i64::try_from(value).unwrap_or(i64::MAX))
+            })
+        };
+        crate::replication::archive_catalog::archived_wal_rows()
+            .into_iter()
+            .map(|row| {
+                Tuple::new(vec![
+                    row.history
+                        .map_or(Value::Null, |history| Value::String(history.to_string())),
+                    int(row.epoch),
+                    int(row.first_sequence),
+                    int(row.last_sequence),
+                    int(row.batches),
+                    Value::Int8(i64::try_from(row.bytes).unwrap_or(i64::MAX)),
+                    unix_timestamp(row.first_observed_at),
+                    unix_timestamp(row.last_observed_at),
+                    unix_timestamp(row.sealed_at),
+                    Value::String(row.state.to_string()),
+                    Value::String(row.path),
+                    row.sha256.map_or(Value::Null, Value::String),
+                ])
+            })
+            .collect()
+    }
+
+    /// Without `ha-tier1` no node archives anything.
+    #[cfg(not(feature = "ha-tier1"))]
+    fn execute_heliosdb_archived_wal() -> Vec<Tuple> {
+        Vec::new()
+    }
+
+    /// `heliosdb_archive_gaps` (spec P3.1): the intervals this node's archive
+    /// lacks.
+    #[cfg(feature = "ha-tier1")]
+    fn execute_heliosdb_archive_gaps() -> Vec<Tuple> {
+        crate::replication::archive_catalog::archive_gap_rows()
+            .into_iter()
+            .map(|gap| {
+                Tuple::new(vec![
+                    Value::String(gap.history.to_string()),
+                    Value::Int8(i64::try_from(gap.epoch).unwrap_or(i64::MAX)),
+                    Value::Int8(i64::try_from(gap.from_sequence).unwrap_or(i64::MAX)),
+                    Value::Int8(i64::try_from(gap.to_sequence).unwrap_or(i64::MAX)),
+                    Value::String(gap.reason),
+                ])
+            })
+            .collect()
+    }
+
+    #[cfg(not(feature = "ha-tier1"))]
+    fn execute_heliosdb_archive_gaps() -> Vec<Tuple> {
+        Vec::new()
+    }
+
+    /// `heliosdb_recovery_window` (spec P3.1): one row; `disabled` on a node
+    /// that archives nothing.
+    #[cfg(feature = "ha-tier1")]
+    fn execute_heliosdb_recovery_window() -> Tuple {
+        let row = crate::replication::archive_catalog::recovery_window_row();
+        let int = |value: u64| Value::Int8(i64::try_from(value).unwrap_or(i64::MAX));
+        Tuple::new(vec![
+            Value::Boolean(row.enabled),
+            row.archive_dir.map_or(Value::Null, Value::String),
+            int(row.configured_window_secs),
+            int(row.effective_window_secs),
+            unix_timestamp(row.oldest_retained_at),
+            unix_timestamp(row.newest_sealed_at),
+            int(row.segments),
+            int(row.bytes_retained),
+            row.max_bytes.map_or(Value::Null, int),
+            int(row.disk_reserve_bytes),
+            row.free_bytes.map_or(Value::Null, int),
+            int(row.pruned_inside_window_total),
+            Value::Boolean(row.shortened),
+            Value::String(row.state.to_string()),
+        ])
+    }
+
+    #[cfg(not(feature = "ha-tier1"))]
+    fn execute_heliosdb_recovery_window() -> Tuple {
+        Tuple::new(vec![
+            Value::Boolean(false),
+            Value::Null,
+            Value::Int8(0),
+            Value::Int8(0),
+            Value::Null,
+            Value::Null,
+            Value::Int8(0),
+            Value::Int8(0),
+            Value::Null,
+            Value::Int8(0),
+            Value::Null,
+            Value::Int8(0),
+            Value::Boolean(false),
+            Value::String("disabled".to_string()),
         ])
     }
 

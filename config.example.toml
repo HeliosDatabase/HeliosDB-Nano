@@ -510,6 +510,30 @@ logical_wal_retention_entries = 0
 # snapshot_export_lease_secs = 3600
 # snapshot_export_max_leases = 4
 
+# ARCHIVED WAL AND THE RECOVERY WINDOW (spec P3.1; Oracle: archived redo logs
+# kept for a RECOVERY WINDOW). A primary serving its replication port, and every
+# standby, seals each write group it applies into rotating, self-describing
+# segment files <dir>/<history>/<epoch>/<first>-<last>.hseg (sealed with the
+# dataset key when [encryption] is on), kept for recovery_window, bounded by
+# max_bytes and disk_reserve, pruned oldest first. The archive NEVER holds a
+# write back: when it must prune inside the window it WARNs once ("recovery
+# window shortened to ...") and heliosdb_recovery_window says so.
+# Inspect it with SELECT * FROM heliosdb_archived_wal / heliosdb_archive_gaps /
+# heliosdb_recovery_window, or offline with `heliosdb-nano archive list|verify|
+# gaps|prune`. Every key has a start flag (--archive, --archive-dir,
+# --archive-segment-max-bytes, ...), which wins over this file.
+# [replication.archive]
+# enabled = true                 # --archive=false turns it off
+# dir = "/var/lib/heliosdb/data.archive"   # default: <data dir>.archive, beside (never inside) the data directory
+# segment_max_bytes = "64MiB"    # 4KiB..=4GiB; a larger single write group gets a segment of its own
+# segment_max_secs = 300         # seal a non-empty segment this old (1..=86400)
+# poll_ms = 1000                 # PRIMARY: how often the archiver reads the store's WAL (10..=60000)
+# fsync_bytes = "8MiB"           # fsync the open segment every this many bytes, and at every seal
+# recovery_window = "7d"         # seconds or <n>[s|m|h|d|w], 1s..=3650d
+# max_bytes = "unlimited"        # or a size, e.g. "16GiB"
+# disk_reserve = "10%"           # free space kept on the archive's filesystem: a percentage or a size
+# prune_interval_secs = 60       # 1..=86400; the pruner also runs after every seal
+
 # ============================================================================
 # PERFORMANCE CONFIGURATION
 # ============================================================================

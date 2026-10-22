@@ -8,7 +8,8 @@ mod branch;
 mod catalog;
 mod copy_marker;
 mod dirty_tracker;
-mod disk;
+// Spec P3.1: the WAL archiver measures its filesystem with the same helper.
+pub(crate) mod disk;
 pub mod dump;
 mod engine;
 mod gin_index;
@@ -28,7 +29,9 @@ mod prefix_decode;
 pub mod replication_wait;
 pub mod statistics;
 mod stats;
-mod tde;
+// Spec P3.1: archived WAL segments of an encrypted dataset are sealed with
+// the dataset key through the same codec.
+pub(crate) mod tde;
 pub mod time_travel;
 mod transaction;
 mod vector_index;

@@ -439,8 +439,10 @@ pub fn wal_retains_after(db: &DB, after: u64) -> Result<bool> {
 }
 
 /// The first sequence of the oldest write group the source's WAL still
-/// holds; `None` when it holds none. Read only on the error path above.
-fn oldest_retained_sequence(db: &DB) -> Result<Option<u64>> {
+/// holds; `None` when it holds none. Read on the error path above, and by the
+/// WAL archiver (spec P3.1) to name the interval its archive lacks when the
+/// store no longer holds it.
+pub fn oldest_retained_sequence(db: &DB) -> Result<Option<u64>> {
     // Sequences start at 1, so nothing is skipped from 0.
     let mut iterator = db.get_updates_since(0)?;
     for entry in iterator.by_ref() {

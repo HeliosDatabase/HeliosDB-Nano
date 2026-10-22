@@ -8,12 +8,14 @@ cannot serve it.
 
 This guide covers starting a pair, remote standbys over TLS, readiness, the
 PostgreSQL-wire contract that HeliosDB Proxy relies on, the replication
-connection, synchronous replication, rebuilding a standby (and resuming an
-interrupted copy), and the limits of this release. The design is
-`docs/plans/PHYSICAL_STANDBY_REPLICATION.md`; the one-connection protocol is
-spec P2.1 (`docs/plans/specs/P2_1_single_connection_control_plane.md`), TLS
-and the resumable copy are spec P2.2
-(`docs/plans/specs/P2_2_tls_remote_resumable.md`).
+connection, synchronous replication, the archived WAL and its recovery window,
+rebuilding a standby (and resuming an interrupted copy), and the limits of this
+release. The design is `docs/plans/PHYSICAL_STANDBY_REPLICATION.md`; the
+one-connection protocol is spec P2.1
+(`docs/plans/specs/P2_1_single_connection_control_plane.md`), TLS and the
+resumable copy are spec P2.2 (`docs/plans/specs/P2_2_tls_remote_resumable.md`),
+the archive is spec P3.1
+(`docs/plans/specs/P3_1_archive_segments_recovery_window.md`).
 
 ## What a physical standby is
 
@@ -55,15 +57,18 @@ ships. "P3", "P4" and "P5" are phases of the physical standby plan.
 | Online redo | The RocksDB WAL (`*.log`) |
 | Redo transport | The replication connection (`NPHYS002`) to the primary's `replication_port`, over TLS for a remote standby. The standby pulls write groups |
 | Redo apply (MRP) | The physical applier: each write group is applied verbatim and fsynced, then the standby's in-memory indexes are updated |
-| Archived redo | The RocksDB WAL archive a primary keeps for its standbys, bounded by `[replication.physical] wal_retention_secs` and `wal_retention_size_mb`. No catalog. Sealed archive segments arrive in P3 |
-| `LOG_ARCHIVE_DEST_n`, `archive_command` | Not yet (P3) |
-| RMAN catalog, `V$ARCHIVED_LOG` | Not yet (P3) |
-| FAL (gap fetch) | None. A standby whose next sequence the primary no longer retains is refused (`WalPruned`) and is rebuilt |
-| `RECOVERY WINDOW OF n DAYS` | `wal_retention_secs` (60..86400, default 3600). A multi-day recovery window arrives with the archive in P3 |
-| `DB_RECOVERY_FILE_DEST_SIZE` | `wal_retention_size_mb` (64..65536, default 1024) |
+| Archived redo log | An **archived WAL segment**: `<archive>/<history>/<epoch>/<first>-<last>.hseg`, a sealed, checksummed file of whole write groups (see [Archived WAL and the recovery window](#archived-wal-and-the-recovery-window)). The primary's own RocksDB WAL retention (`[replication.physical] wal_retention_secs`, `wal_retention_size_mb`) only covers the archiver's lag and a reconnecting standby |
+| `LOG_ARCHIVE_DEST_n` | `[replication.archive] dir` (`--archive-dir`, default `<data dir>.archive`). Every primary serving its replication port and every standby archives; `--archive=false` turns it off |
+| RMAN catalog, `V$ARCHIVED_LOG` | The `heliosdb_archived_wal` view (and `heliosdb-nano archive list`): one row per segment file. No catalog database: the files describe themselves |
+| `V$ARCHIVE_GAP` | The `heliosdb_archive_gaps` view, `heliosdb-nano archive gaps` |
+| `RMAN> CROSSCHECK`, `VALIDATE ARCHIVELOG` | `heliosdb-nano archive verify` (header and footer), `archive verify --deep` (every byte and every frame) |
+| `DELETE OBSOLETE` | The pruner of a running node; `heliosdb-nano archive prune` offline |
+| FAL (gap fetch) | None. A standby whose next sequence the primary no longer retains is refused (`WalPruned`) and is rebuilt; recovering it from archived segments arrives in P3.2 |
+| `RECOVERY WINDOW OF n DAYS` | `[replication.archive] recovery_window` (default `"7d"`); `heliosdb_recovery_window` shows the configured and the effective window |
+| `DB_RECOVERY_FILE_DEST_SIZE` | `[replication.archive] max_bytes` (default `"unlimited"`) and `disk_reserve` (default `"10%"` of the filesystem). Unlike Oracle, a full archive never stops the primary: it shortens the window |
 | `DUPLICATE … FOR STANDBY FROM ACTIVE DATABASE` | The **bootstrap copy**: a standby started on an empty directory downloads a verified checkpoint of the primary, then follows it. An interrupted copy resumes (like RMAN's restartable duplicate) |
 | `RECOVER STANDBY DATABASE FROM SERVICE` | Not yet (P4, incremental rebuild). Today a rebuild is a full bootstrap copy into a new directory |
-| Managed recovery from archived logs | Not yet (P3) |
+| Managed recovery from archived logs | Not yet (P3.2: `standby recover --from-archive`, archive-only standbys) |
 | Datafile block, block SCN, block change tracking | None: one key-value space with no per-key sequence. P4 compares key ranges by digest |
 | Incarnation, `RESETLOGS` | The dataset **history id** (`NANO-PRIMARY-HISTORY.json`) plus the **epoch** (`timeline_id`, 1 until promotion arrives in P5) |
 | Protection modes | `[replication] sync_mode`: `async` is Maximum Performance; `semi-sync` with `sync_timeout_action = "warn"` behaves like Maximum Availability. Maximum Protection has no equivalent (`fail` reports an error but never stops the primary) |
@@ -455,6 +460,166 @@ replication block:
 - A standby is listed while it has a session and leaves the list when its
   connection ends. The SQL view `pg_replication_standbys` reads the same
   registry.
+- Both roles' `/health` also carry an `archive` object (next section), beside
+  the replication block, never inside it.
+
+## Archived WAL and the recovery window
+
+Every write group a node applies is also **archived**: sealed into rotating,
+self-describing segment files beside its data directory and kept for a
+**recovery window** (default 7 days), bounded by disk. This is the database's
+archived redo. A primary serving its replication port archives its own writes;
+every standby archives the write groups it applies, so a standby's segments
+hold, frame for frame, the bytes its primary archived for the same sequences.
+Nothing reads the archive back yet: recovering a standby from segments
+(`standby recover --from-archive`, archive-only standbys, gap fill from the
+primary's archive) arrives in P3.2. Until then the archive is the record an
+operator can list, verify and copy.
+
+| Oracle | HeliosDB-Nano |
+|---|---|
+| Archived redo log | A segment, `<dir>/<history>/<epoch>/<first:020>-<last:020>.hseg` |
+| `LOG_ARCHIVE_DEST_n` | `[replication.archive] dir` / `--archive-dir` (default `<data dir>.archive`) |
+| RMAN catalog / `V$ARCHIVED_LOG` | `SELECT * FROM heliosdb_archived_wal`, `heliosdb-nano archive list` |
+| `V$ARCHIVE_GAP` | `SELECT * FROM heliosdb_archive_gaps`, `heliosdb-nano archive gaps` |
+| `CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 7 DAYS` | `recovery_window = "7d"`; `SELECT * FROM heliosdb_recovery_window` |
+| `RMAN> CROSSCHECK` / `VALIDATE ARCHIVELOG ALL` | `heliosdb-nano archive verify` / `archive verify --deep` |
+| `DELETE OBSOLETE` | The running node's pruner; `heliosdb-nano archive prune` offline |
+| `DB_RECOVERY_FILE_DEST_SIZE` | `max_bytes`, `disk_reserve` (a full archive shortens the window, it never stops the primary) |
+
+### Segments
+
+A segment is sealed when it would pass `segment_max_bytes` (default 64 MiB; a
+single write group never splits, so a larger one gets a segment of its own) or
+when it is older than `segment_max_secs` (default 300). Its header names the
+dataset history, the epoch, the first sequence, the node and (for an encrypted
+dataset) which dataset key sealed it; its footer the last sequence, the number
+of write groups, when the first and the last were **observed** by the archiver
+(RocksDB records no commit time, so nothing here is called one), and a SHA-256
+over the whole file. Each frame is one write group exactly as the replication
+connection carries it, digest included, so every frame is verified on its own.
+On an encrypted dataset every frame is sealed with the dataset key: keys inside
+a write group are plaintext data, so the whole frame is sealed. Files are mode
+0600 in 0700 directories.
+
+A segment being written is `<first>-open.hseg.partial`; it is sealed by writing
+its footer, fsyncing and renaming it. The frames are fsynced at every seal and
+every `fsync_bytes` (default 8 MiB) in between: the archive's durability is
+secondary to the store's own WAL, which keeps everything the archiver has not
+read yet for `[replication.physical] wal_retention_secs`. After a crash the
+next start repairs the open segment — every intact frame is kept, the torn tail
+is cut, the rest is sealed (`archive: repaired the open segment …`) — and the
+archive continues right after it.
+
+An empty archive on a primary that already holds data starts at the primary's
+current position: take a snapshot (a standby's bootstrap copy is one) for the
+history before it. When the archive lacks an interval the store no longer holds
+(the node was down longer than `wal_retention_secs`, say), the archiver logs
+`archive gap <from>..<to>: the store no longer holds it`, lists it in
+`heliosdb_archive_gaps`, and continues from what the store still has.
+
+### The recovery window, and why it can be shortened
+
+Every `prune_interval_secs` (default 60) and after each seal, the pruner:
+
+1. removes segments whose newest write group was observed before
+   `now - recovery_window` — expected, silent;
+2. removes the oldest segments while the archive holds more than `max_bytes`;
+3. removes the oldest segments while the filesystem's free space is below
+   `disk_reserve` (a percentage of the filesystem's size, or a size),
+   measured again after each removal.
+
+Steps 2 and 3 remove segments the window still covers: the recovery window is
+**shortened**. The primary's writes are never held back for the archive —
+there is no check in the write path and no back-pressure. Instead the node
+warns once per episode, `recovery window shortened to <effective>: <reason>`,
+counts `pruned_inside_window_total`, and `heliosdb_recovery_window` shows
+`shortened = true`, state `shortened`. When everything that was pruned would
+have expired anyway the episode ends (`recovery window restored to …`, INFO);
+a later shortening warns again. A shortened window means the archive reaches
+back less far than configured: raise `max_bytes`, free disk space or move the
+archive to a larger filesystem.
+
+The newest sealed segment and corrupt files are never pruned (removing a corrupt
+file is the operator's call). A segment a connected standby still needs is
+skipped by steps 2 and 3 while it is inside the window; beyond the window it is
+pruned, and that standby, if it falls that far behind, needs recovery.
+
+`heliosdb_recovery_window` (one row): `enabled`, `archive_dir`,
+`configured_window_secs`, `effective_window_secs` (now minus the oldest retained
+observation), `oldest_retained_at`, `newest_sealed_at`, `segments`,
+`bytes_retained`, `max_bytes`, `disk_reserve_bytes`, `free_bytes`,
+`pruned_inside_window_total`, `shortened`, and `state`: `ok`, `shortened`, `gap`
+(the archive lacks an interval) or `disabled`.
+
+`/health` carries the summary as a sibling of the replication block:
+
+```json
+{"status":"ok","replication":{...},
+ "archive":{"enabled":true,"segments":42,"bytes_retained":187654321,
+            "effective_window_secs":604211,"shortened":false,"gaps":0}}
+```
+
+### Settings
+
+`[replication.archive]` in the config file; each key has a `start` flag, which
+wins over the file:
+
+| Key | Flag | Default | |
+|---|---|---|---|
+| `enabled` | `--archive[=BOOL]` | `true` | applies to a primary serving its replication port and to a standby |
+| `dir` | `--archive-dir` | `<data dir>.archive` | refused inside the data directory and on the physical export directory |
+| `segment_max_bytes` | `--archive-segment-max-bytes` | `"64MiB"` | 4KiB..=4GiB |
+| `segment_max_secs` | `--archive-segment-max-secs` | `300` | 1..=86400 |
+| `poll_ms` | `--archive-poll-ms` | `1000` | a primary's archiver reads its WAL this often (10..=60000) |
+| `fsync_bytes` | `--archive-fsync-bytes` | `"8MiB"` | 4KiB..=4GiB |
+| `recovery_window` | `--archive-recovery-window` | `"7d"` | seconds, or a number with one of the suffixes s, m, h, d, w; 1s..=3650d |
+| `max_bytes` | `--archive-max-bytes` | `"unlimited"` | or a size |
+| `disk_reserve` | `--archive-disk-reserve` | `"10%"` | a percentage of the filesystem (0..99) or a size |
+| `prune_interval_secs` | `--archive-prune-interval-secs` | `60` | 1..=86400 |
+
+Each node archives into its own directory: the archiver holds a lock
+(`archiver.lock`) on it, and a second node pointed at the same directory runs
+without an archive and says so.
+
+### The `archive` command
+
+Offline: it reads the files only and takes no database lock.
+
+```bash
+heliosdb-nano archive list   --data-dir /var/lib/heliosdb/data      # or --archive-dir DIR, --config FILE; --json
+heliosdb-nano archive verify --archive-dir /backup/archive           # header and footer of every segment
+heliosdb-nano archive verify --archive-dir /backup/archive --deep --key-file /etc/heliosdb/dataset.key
+heliosdb-nano archive gaps   --archive-dir /backup/archive --from 1048576
+heliosdb-nano archive prune  --data-dir /var/lib/heliosdb/data --dry-run
+```
+
+- `--archive-dir` defaults like the node's own: `[replication.archive] dir` of
+  `--config`, else `<data dir>.archive` beside `--data-dir` (or the config's
+  `[storage] path`).
+- `verify` checks every segment's header and footer (magic, both hashes, the
+  size, the name, the history and epoch of its directory); `--deep` also
+  re-hashes each file and decodes every frame, which on an encrypted dataset
+  needs the dataset key (`--key-file`, or the config's `[encryption]`). It exits
+  1 and names the first failing file; `--keep-going` lists all of them.
+- `gaps` lists the intervals the archive lacks and why: a hole between
+  segments, a corrupt segment, or what the archiver recorded.
+- `prune` applies the configured policy (`--recovery-window`, `--max-bytes`,
+  `--disk-reserve` override it) and is refused while a node runs on the
+  directory — a running node prunes its own archive. `--dry-run` changes
+  nothing.
+- A directory of segments copied from another host is just a directory to
+  `list` and `verify`: a segment filed under the wrong history or epoch is
+  named (`other history`, `other epoch`), never trusted.
+
+### Design note: no catalog database
+
+The plan sketched catalog rows in the node-local column family. They are not
+needed: a segment's header and footer describe it completely and names sort in
+sequence order, so the catalog is rebuilt by scanning the directory — at start,
+by the `archive` command, on another host — and kept in memory while the node
+runs. A primary has no node-local column family to keep one in, and a catalog
+that could disagree with its files would only be one more thing to repair.
 
 ## Refusals and rebuild
 
@@ -471,9 +636,12 @@ continues over a hole. To rebuild it:
    primary and then follows it.
 
 A rebuild is a full copy today. An incremental rebuild that ships only the
-changed key ranges arrives in plan phase P4, and recovery from archived WAL in
-P3. An interrupted bootstrap copy is never installed (the copy is verified and
-renamed into place only when complete); it is resumed.
+changed key ranges arrives in plan phase P4, and recovery from archived WAL
+segments in P3.2 (the segments are already written, see above). An interrupted
+bootstrap copy is never installed (the copy is verified and renamed into place
+only when complete); it is resumed. The old standby's archive directory
+(`<data dir>.archive`) belongs to the old directory: move it aside with it, or
+give the new standby its own `--archive-dir`.
 
 ### Resuming an interrupted copy
 
@@ -571,7 +739,9 @@ scripts/regress/nano-physical-pair.sh --binary target/release/heliosdb-nano --di
   unchanged; TLS is on the replication port only.
 - Every run ends with one JSON line: ports, pids, `ops_per_s`, the `/ready`
   status of each side, `standbys`, the number of standbys the primary's
-  `/health` lists, and `tls`, whether the standby's session is on TLS.
+  `/health` lists, `tls`, whether the standby's session is on TLS, and
+  `archive`, the primary's archived segments and bytes (`{"segments":N,
+  "bytes":N}`, from its `/health`).
 
 The test suites are listed in the [HA testing guide](ha_testing.md).
 
@@ -594,9 +764,11 @@ The test suites are listed in the [HA testing guide](ha_testing.md).
   write.
 - **No cascading.** A standby cannot serve other standbys.
 - **One primary per standby.**
-- **Full-copy rebuilds** (incremental rebuild P4, archive recovery P3); an
-  interrupted copy resumes from its progress record while the primary still
-  leases its snapshot.
+- **Full-copy rebuilds** (incremental rebuild P4, recovery from archived
+  segments P3.2); an interrupted copy resumes from its progress record while the
+  primary still leases its snapshot.
+- **The archive is written, not yet read.** Segments are sealed, verified,
+  listed and pruned; replaying them into a standby arrives in P3.2.
 - **The multi-container lab under `tests/docker` is still out of service**: it
   has not yet been brought up to date for remote physical standbys over TLS;
   see the [HA testing guide](ha_testing.md).
