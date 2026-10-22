@@ -261,25 +261,29 @@ fn check_source_key(key: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn take_slice<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
-    let mut length = 0_u32;
-    let mut ended = false;
+/// A RocksDB varint32: a slice length, or a column-family id.
+fn take_varint32(input: &mut &[u8]) -> Result<u32> {
+    let mut value = 0_u32;
     for shift in (0..35).step_by(7) {
         let (&byte, rest) = input.split_first().ok_or_else(|| invalid("truncated length"))?;
         *input = rest;
         if shift == 28 && byte > 15 {
             return Err(invalid("length overflow"));
         }
-        length |= u32::from(byte & 127) << shift;
+        value |= u32::from(byte & 127) << shift;
         if byte < 128 {
-            ended = true;
-            break;
+            return Ok(value);
         }
     }
-    if !ended || length as usize > input.len() {
+    Err(invalid("truncated value"))
+}
+
+fn take_slice<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
+    let length = take_varint32(input)? as usize;
+    if length > input.len() {
         return Err(invalid("truncated value"));
     }
-    let (value, rest) = input.split_at(length as usize);
+    let (value, rest) = input.split_at(length);
     *input = rest;
     Ok(value)
 }
@@ -295,7 +299,8 @@ pub struct PhysicalPoll {
 }
 
 /// Refuse to read a receiver's store as a source: its WAL carries its own
-/// node-local writes, and cascading is not supported.
+/// node-local writes. A standby that serves a downstream standby (spec P3.2
+/// §4) reads its store through [`poll_source_cascade`], which strips them.
 ///
 /// A writable RocksDB open must name every column family, so the live handle
 /// alone settles it for any store opened for writing; the MANIFEST
@@ -453,6 +458,397 @@ pub fn oldest_retained_sequence(db: &DB) -> Result<Option<u64>> {
     }
     iterator.status()?;
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Cascading source (spec P3.2 §4): a physical standby serving its store.
+// ---------------------------------------------------------------------------
+
+/// The node-local family of a receiver's store that may serve as a cascading
+/// source. Its MANIFEST must list exactly the default and the node-local
+/// family: RocksDB names a family in a WAL record by a numeric id this crate
+/// cannot read back from a handle, so "every non-default record belongs to
+/// the node-local family" holds only when there is no third family.
+fn cascade_local_family(db: &DB) -> Result<&ColumnFamily> {
+    let local = db.cf_handle(LOCAL_CF).ok_or_else(|| {
+        invalid("a cascading source must be a physical standby's store, opened with its node-local family")
+    })?;
+    let mut families = DB::list_cf(&Options::default(), db.path())?;
+    families.sort();
+    let mut expected = vec!["default".to_string(), LOCAL_CF.to_string()];
+    expected.sort();
+    if families != expected {
+        return Err(invalid(format!(
+            "a cascading source's store must hold exactly the default and the '{LOCAL_CF}' column families, not \
+             {families:?}"
+        )));
+    }
+    Ok(local)
+}
+
+/// A receiver's cursor as its store holds it NOW, while its writer may be
+/// writing: one read of the cursor key, whose value is written in the same
+/// write group as the data it accounts for, so the pair (source sequence,
+/// local sequence) it carries is always consistent. Unlike the cursor a
+/// writer adopts, it is not compared with the store's latest sequence — a
+/// write landing between the two reads would make that comparison fail.
+fn live_cursor(db: &DB, local: &ColumnFamily) -> Result<PhysicalCursor> {
+    let bytes = db
+        .get_cf(local, CURSOR_KEY)?
+        .ok_or_else(|| invalid("missing physical receiver cursor"))?;
+    decode_cursor(&bytes)
+}
+
+/// Decode and validate a receiver cursor as its node-local family stores it
+/// (the value of [`CURSOR_KEY`]): a bounded JSON record whose fields must be
+/// consistent with one another. Says nothing about which store it belongs to.
+pub fn decode_cursor(bytes: &[u8]) -> Result<PhysicalCursor> {
+    if bytes.len() > 2048 {
+        return Err(invalid("oversized durable cursor"));
+    }
+    let cursor: PhysicalCursor = serde_json::from_slice(bytes).map_err(|_| invalid("malformed durable cursor"))?;
+    cursor.validate()?;
+    Ok(cursor)
+}
+
+/// The source sequence a cascading source serves up to: the cursor its own
+/// store holds (spec P3.2 §4). Reported as the barrier of every cascaded
+/// session, in the PRIMARY's sequence numbers.
+pub fn receiver_source_barrier(db: &DB) -> Result<u64> {
+    let local = cascade_local_family(db)?;
+    Ok(live_cursor(db, local)?.source_sequence)
+}
+
+/// Where a cascading source last found the records of its own WAL that
+/// follow a source sequence: `source sequence -> local sequence of the end of
+/// the record that brought the store to it`. A downstream receiver asks in
+/// the PRIMARY's numbering while the store's WAL is read in its own, and the
+/// two drift apart by one per applied group (module documentation of
+/// [`poll_source_cascade`]); without a hint the first poll of a session reads
+/// the retained WAL from its oldest record. Bounded: the oldest positions are
+/// forgotten first.
+#[derive(Debug, Default)]
+pub struct CascadeHint {
+    positions: std::collections::BTreeMap<u64, u64>,
+}
+
+impl CascadeHint {
+    const MAX_POSITIONS: usize = 4096;
+
+    fn note(&mut self, source: u64, local_end: u64) {
+        self.positions.insert(source, local_end);
+        while self.positions.len() > Self::MAX_POSITIONS {
+            if self.positions.pop_first().is_none() {
+                break;
+            }
+        }
+    }
+
+    /// The local sequence to start reading at for a receiver at `after`:
+    /// the end of the last known record at or below it (0, the oldest
+    /// retained record, when none is known). Records between it and `after`
+    /// are read and skipped.
+    fn start_for(&self, after: u64) -> u64 {
+        self.positions
+            .range(..=after)
+            .next_back()
+            .map_or(0, |(_, local)| *local)
+    }
+}
+
+/// The column-family id of a column-family record: never the default
+/// family's (0), whose records carry no id.
+fn expect_nondefault_family(input: &mut &[u8]) -> Result<()> {
+    if take_varint32(input)? == 0 {
+        return Err(invalid("a column-family record addressed to the default family"));
+    }
+    Ok(())
+}
+
+/// One record of a receiver's own WAL, split for a cascading source.
+struct ReceiverRecord {
+    /// The default-family records, byte for byte and in batch order (the
+    /// primary's write group, without the receiver's additions).
+    kept: Vec<u8>,
+    /// Sequence-consuming default-family records.
+    kept_count: u32,
+    /// Every sequence-consuming record, node-local ones included: what the
+    /// record occupied of the store's own sequence.
+    total: u32,
+    /// The last receiver cursor the record wrote (its `put_cf`).
+    cursor: Option<PhysicalCursor>,
+}
+
+/// Split a receiver's WAL record into the default-family records it carried
+/// verbatim and the node-local ones its writer added. Every column-family
+/// record is node-local ([`cascade_local_family`] proved the store holds no
+/// third family); a column-family opcode naming the default family, or any
+/// opcode the source walker does not know, is refused.
+fn split_receiver_record(raw: &[u8]) -> Result<ReceiverRecord> {
+    if !(12..=MAX_BATCH_BYTES).contains(&raw.len()) {
+        return Err(invalid("batch byte limit/header"));
+    }
+    let count = u32::from_le_bytes(
+        raw.get(8..12)
+            .and_then(|slice| slice.try_into().ok())
+            .ok_or_else(|| invalid("batch header too short"))?,
+    );
+    let body = raw.get(12..).ok_or_else(|| invalid("batch header too short"))?;
+    let mut input = body;
+    let mut record = ReceiverRecord {
+        kept: Vec::with_capacity(body.len()),
+        kept_count: 0,
+        total: 0,
+        cursor: None,
+    };
+    while let Some((&tag, rest)) = input.split_first() {
+        let start = body.len() - input.len();
+        input = rest;
+        // (keep it, does it consume a sequence number)
+        let (keep, sequenced) = match tag {
+            // kTypeDeletion / kTypeSingleDeletion.
+            0 | 7 => {
+                check_source_key(take_slice(&mut input)?)?;
+                (true, true)
+            }
+            // kTypeValue.
+            1 => {
+                check_source_key(take_slice(&mut input)?)?;
+                let _value = take_slice(&mut input)?;
+                (true, true)
+            }
+            // kTypeLogData: the primary's blob; consumes no sequence number.
+            3 => {
+                let _blob = take_slice(&mut input)?;
+                (true, false)
+            }
+            // kTypeRangeDeletion.
+            15 => {
+                let _start = take_slice(&mut input)?;
+                let _end = take_slice(&mut input)?;
+                (true, true)
+            }
+            // kTypeColumnFamilyDeletion / kTypeColumnFamilySingleDeletion.
+            4 | 8 => {
+                expect_nondefault_family(&mut input)?;
+                let _key = take_slice(&mut input)?;
+                (false, true)
+            }
+            // kTypeColumnFamilyValue: the receiver cursor, or node-local state.
+            5 => {
+                expect_nondefault_family(&mut input)?;
+                let key = take_slice(&mut input)?;
+                let value = take_slice(&mut input)?;
+                if key == CURSOR_KEY {
+                    record.cursor = Some(decode_cursor(value)?);
+                }
+                (false, true)
+            }
+            // kTypeColumnFamilyRangeDeletion.
+            14 => {
+                expect_nondefault_family(&mut input)?;
+                let _start = take_slice(&mut input)?;
+                let _end = take_slice(&mut input)?;
+                (false, true)
+            }
+            _ => {
+                return Err(invalid(format!(
+                    "unsupported RocksDB write opcode {tag} in a receiver's WAL"
+                )))
+            }
+        };
+        if sequenced {
+            record.total += 1;
+            if keep {
+                record.kept_count += 1;
+            }
+            if record.total > count {
+                return Err(invalid("batch operation count mismatch"));
+            }
+        }
+        if keep {
+            let end = body.len() - input.len();
+            let bytes = body.get(start..end).ok_or_else(|| invalid("record bounds"))?;
+            record.kept.extend_from_slice(bytes);
+        }
+    }
+    if record.total != count {
+        return Err(invalid("batch operation count mismatch"));
+    }
+    Ok(record)
+}
+
+/// [`poll_source`] for a CASCADING source (spec P3.2 §4, opt-in with
+/// `[replication.physical] cascade = true`): a physical standby serving its
+/// own store to a downstream standby.
+///
+/// # Why not `poll_source`
+///
+/// A standby's WAL is its primary's write groups plus its own node-local
+/// writes: every applied group also carries the `put_cf` of the receiver
+/// cursor into [`LOCAL_CF`], and node-local state
+/// ([`LocalWriter::write_local`]) is written there too. Shipped as they are,
+/// those records would be refused downstream (`validate_raw_batch` refuses
+/// every column-family opcode) — and would plant this standby's progress in
+/// another store. So every record addressed to the node-local family is
+/// STRIPPED, the default-family records are kept byte for byte, and the group
+/// is re-framed with the primary's first sequence and its digest recomputed:
+/// the result is byte for byte the primary's raw write group, digest
+/// included.
+///
+/// # The sequence invariant
+///
+/// The served sequence numbers are the PRIMARY's, never this store's own. A
+/// stripped record occupied a sequence number here, never at the primary:
+/// this store's RocksDB sequence runs ahead of its source sequence by one per
+/// applied group (the cursor put: `local_operations = last - first + 2` in
+/// [`LocalWriter::apply_source_with`]) and by `n + 1` per node-local batch of
+/// `n` operations ([`LocalWriter::write_local`]). The group a record carried
+/// is therefore named by the cursor it wrote — `last_first_sequence ..=
+/// source_sequence`, the primary's span — and a record that carried no group
+/// (a node-local batch, the initial cursor) is skipped. A downstream receiver
+/// keeps its own accounting unchanged: it applies the primary's groups and
+/// adds its own cursor put, `last - first + 2` local sequences per group,
+/// exactly as if it followed the primary itself, and it could follow the
+/// primary directly from the same cursor.
+///
+/// The durable barrier is this store's durable cursor (its source sequence),
+/// read before the WAL is fsynced. A record the store holds from before it
+/// became a receiver (its checkpoint's own WAL, at or below the snapshot cut)
+/// carries no cursor and is skipped. A WAL that no longer holds the group
+/// after `after` is [`PhysicalError::Pruned`], as from a primary.
+pub fn poll_source_cascade(
+    db: &DB,
+    history: Uuid,
+    after: u64,
+    byte_limit: usize,
+    hint: &mut CascadeHint,
+) -> Result<PhysicalPoll> {
+    check_history(history)?;
+    if byte_limit == 0 || byte_limit > MAX_BATCH_BYTES {
+        return Err(invalid("invalid poll byte limit"));
+    }
+    let local = cascade_local_family(db)?;
+    let current = live_cursor(db, local)?;
+    if current.history != history {
+        return Err(PhysicalError::HistoryMismatch);
+    }
+    let barrier = current.source_sequence;
+    let local_barrier = current.local_sequence;
+    if after > barrier {
+        return Err(PhysicalError::Ahead { after, barrier });
+    }
+    // The cursor was read first; the fsync covers every write it accounts for.
+    db.flush_wal(true)?;
+    let mut result = PhysicalPoll {
+        batches: Vec::new(),
+        through: after,
+        durable_barrier: barrier,
+    };
+    if after == barrier {
+        return Ok(result);
+    }
+    let mut iterator = db.get_updates_since(hint.start_for(after))?;
+    let mut bytes = 0_usize;
+    // The first group the retained WAL showed: where it starts, when the
+    // group after `after` is missing.
+    let mut oldest_seen: Option<u64> = None;
+    loop {
+        let Some(entry) = iterator.next() else {
+            iterator.status()?;
+            break;
+        };
+        let (local_first, batch) = entry?;
+        if local_first > local_barrier {
+            break;
+        }
+        if batch.is_empty() {
+            continue;
+        }
+        let record = split_receiver_record(batch.data())?;
+        let local_end = local_first
+            .checked_add(u64::from(record.total).saturating_sub(1))
+            .ok_or_else(|| invalid("receiver-local sequence overflow"))?;
+        let Some(cursor) = record.cursor else {
+            // The checkpoint this receiver was built from may still hold its
+            // own WAL: those groups are at or below the snapshot cut.
+            if local_end <= current.snapshot_sequence {
+                continue;
+            }
+            return Err(invalid("a receiver WAL record past the snapshot cut carries no cursor"));
+        };
+        if cursor.history != history {
+            return Err(PhysicalError::HistoryMismatch);
+        }
+        hint.note(cursor.source_sequence, local_end);
+        if record.kept_count == 0 {
+            // Node-local state only: nothing of the primary's.
+            continue;
+        }
+        let last = cursor.source_sequence;
+        let first = cursor
+            .last_first_sequence
+            .ok_or_else(|| invalid("a receiver record carries a group but its cursor names none"))?;
+        if last.checked_sub(first).and_then(|span| span.checked_add(1)) != Some(u64::from(record.kept_count)) {
+            return Err(invalid(
+                "a receiver record's cursor disagrees with the write group it carries",
+            ));
+        }
+        let oldest = *oldest_seen.get_or_insert(first);
+        if last <= result.through {
+            continue;
+        }
+        if first != result.through + 1 {
+            if result.through == after && first > after + 1 && oldest == first {
+                return Err(PhysicalError::Pruned {
+                    wanted: after + 1,
+                    oldest: Some(first),
+                });
+            }
+            return Err(PhysicalError::Gap {
+                expected: result.through + 1,
+                observed: first,
+            });
+        }
+        let mut raw = Vec::with_capacity(12 + record.kept.len());
+        raw.extend_from_slice(&first.to_le_bytes());
+        raw.extend_from_slice(&record.kept_count.to_le_bytes());
+        raw.extend_from_slice(&record.kept);
+        if raw.len() > byte_limit {
+            return Err(invalid("single source batch exceeds poll byte limit"));
+        }
+        if bytes + raw.len() > byte_limit {
+            break;
+        }
+        let digest = Sha256::digest(&raw).into();
+        let batch = PhysicalBatch::decode(history, first, raw, digest)?;
+        if batch.last > barrier {
+            return Err(invalid("source barrier cuts a batch"));
+        }
+        bytes += batch.raw.len();
+        result.through = batch.last;
+        result.batches.push(batch);
+        if result.through == barrier {
+            break;
+        }
+    }
+    if result.through == after {
+        return Err(match oldest_seen {
+            Some(first) if first > after + 1 => PhysicalError::Pruned {
+                wanted: after + 1,
+                oldest: Some(first),
+            },
+            Some(_) => PhysicalError::Gap {
+                expected: after + 1,
+                observed: barrier,
+            },
+            None => PhysicalError::Pruned {
+                wanted: after + 1,
+                oldest: None,
+            },
+        });
+    }
+    Ok(result)
 }
 
 /// SHA-256 over every key/value pair of one column family whose key starts
@@ -698,21 +1094,36 @@ impl LocalWriter {
     /// `create_cf` needs `&mut DB` — so the family is created here, before the
     /// handle is shared. The caller proves manifest/history integrity and holds
     /// the DB lock.
-    pub fn from_checkpoint(mut db: DB, history: Uuid, checkpoint_sequence: u64) -> Result<Self> {
+    pub fn from_checkpoint(db: DB, history: Uuid, checkpoint_sequence: u64) -> Result<Self> {
+        Self::from_checkpoint_at(db, history, checkpoint_sequence, checkpoint_sequence)
+    }
+
+    /// [`Self::from_checkpoint`] for a checkpoint whose store's own sequence
+    /// (`store_sequence`, its `latest_sequence_number`) runs ahead of the
+    /// source sequence it holds (`source_sequence`, in the primary's
+    /// numbering). A checkpoint of a primary has the two equal. A CASCADED
+    /// export (spec P3.2 §4) is a physical standby's store: its sequence
+    /// counts that standby's cursor writes too, while its replicated keyspace
+    /// is the primary's at `source_sequence`. The receiver's cursor starts at
+    /// `source_sequence`, so it continues in the primary's numbering — from
+    /// its cascading source, or from the primary itself — and its own
+    /// accounting starts at `store_sequence + 1`.
+    pub fn from_checkpoint_at(mut db: DB, history: Uuid, source_sequence: u64, store_sequence: u64) -> Result<Self> {
         check_history(history)?;
-        if db.latest_sequence_number() != checkpoint_sequence
+        if source_sequence > store_sequence
+            || db.latest_sequence_number() != store_sequence
             || db.cf_handle(LOCAL_CF).is_some()
             || db.get(LEGACY_CURSOR_KEY)?.is_some()
         {
             return Err(invalid("checkpoint sequence mismatch or existing receiver cursor"));
         }
-        check_local_advance(checkpoint_sequence, 1)?;
+        check_local_advance(store_sequence, 1)?;
         let cursor = PhysicalCursor {
             format: FORMAT,
             history,
-            snapshot_sequence: checkpoint_sequence,
-            source_sequence: checkpoint_sequence,
-            local_sequence: checkpoint_sequence + 1,
+            snapshot_sequence: source_sequence,
+            source_sequence,
+            local_sequence: store_sequence + 1,
             last_first_sequence: None,
             last_digest: None,
         };
@@ -721,7 +1132,7 @@ impl LocalWriter {
         db.create_cf(LOCAL_CF, &StorageEngine::local_cf_options())?;
         // Creating a family is a MANIFEST edit, not a write. Should it ever
         // move the sequence, the cut no longer matches the checkpoint.
-        if db.latest_sequence_number() != checkpoint_sequence {
+        if db.latest_sequence_number() != store_sequence {
             return Err(invalid(
                 "creating the node-local column family moved the checkpoint sequence",
             ));
@@ -970,8 +1381,19 @@ impl StagedPhysicalReplica {
     /// Initialize only a validated, independently copied physical checkpoint.
     /// The caller proves manifest/history integrity and holds the DB lock.
     pub fn from_checkpoint(db: DB, history: Uuid, checkpoint_sequence: u64) -> Result<Self> {
+        Self::from_checkpoint_at(db, history, checkpoint_sequence, checkpoint_sequence)
+    }
+
+    /// [`LocalWriter::from_checkpoint_at`]: a cascaded checkpoint, whose store
+    /// sequence runs ahead of its source sequence.
+    pub fn from_checkpoint_at(db: DB, history: Uuid, source_sequence: u64, store_sequence: u64) -> Result<Self> {
         Ok(Self {
-            writer: Arc::new(LocalWriter::from_checkpoint(db, history, checkpoint_sequence)?),
+            writer: Arc::new(LocalWriter::from_checkpoint_at(
+                db,
+                history,
+                source_sequence,
+                store_sequence,
+            )?),
         })
     }
 
@@ -1625,5 +2047,146 @@ mod tests {
             <[u8; 32]>::from(Sha256::digest(b""))
         );
         assert!(range_digest(&db, Some("missing"), b"").is_err());
+    }
+
+    /// A receiver built from a checkpoint of `source` at its current sequence.
+    fn receiver_of(source: &DB, path: &std::path::Path, history: Uuid) -> (StagedPhysicalReplica, u64) {
+        Checkpoint::new(source).unwrap().create_checkpoint(path).unwrap();
+        let copy = open(path);
+        let cut = copy.latest_sequence_number();
+        (StagedPhysicalReplica::from_checkpoint(copy, history, cut).unwrap(), cut)
+    }
+
+    /// Spec P3.2 §4, §5: a standby serving its store strips its node-local
+    /// records and re-frames each group with the primary's sequences, so a
+    /// cascaded group is byte for byte the primary's (digest included) for
+    /// the same span, and a downstream receiver fed only cascaded groups holds
+    /// the primary's default column family.
+    #[test]
+    fn cascade_stripping_yields_the_primarys_groups_and_digest_for_the_same_span() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"seed", b"keep").unwrap();
+        source.put(b"range-a", b"1").unwrap();
+        source.put(b"range-b", b"2").unwrap();
+        let history = Uuid::new_v4();
+        let (upstream, cut) = receiver_of(&source, &root.path().join("upstream"), history);
+        let (downstream, downstream_cut) = receiver_of(&source, &root.path().join("downstream"), history);
+        assert_eq!(cut, downstream_cut);
+        // Groups of every shape the walker keeps.
+        let mut batch = WriteBatch::default();
+        batch.put(b"a", b"1");
+        batch.put(b"b", b"2");
+        source.write(batch).unwrap();
+        let mut batch = WriteBatch::default();
+        batch.delete(b"seed");
+        batch.delete_range(&b"range-"[..], &b"range."[..]);
+        source.write(batch).unwrap();
+        source.put(b"c", b"3").unwrap();
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        assert_eq!(polled.batches.len(), 3);
+        let writer = Arc::clone(upstream.writer());
+        for (index, batch) in polled.batches.iter().enumerate() {
+            assert!(upstream.apply(batch).unwrap());
+            if index == 0 {
+                // Node-local state between two groups: never shipped.
+                let mut local = LocalBatch::new();
+                local.put(b"posture", b"streaming");
+                writer.write_local(local).unwrap();
+            }
+        }
+        assert!(
+            writer.db().latest_sequence_number() > polled.through,
+            "the upstream's own sequence runs ahead of its source sequence"
+        );
+        // An ordinary source refuses a receiver's store.
+        assert!(poll_source(writer.db(), history, cut, MAX_BATCH_BYTES).is_err());
+
+        let mut hint = CascadeHint::default();
+        let cascaded = poll_source_cascade(writer.db(), history, cut, MAX_BATCH_BYTES, &mut hint).unwrap();
+        assert_eq!(cascaded.through, polled.through);
+        assert_eq!(
+            cascaded.durable_barrier, polled.through,
+            "the barrier is the source cursor"
+        );
+        assert_eq!(cascaded.batches.len(), polled.batches.len());
+        for (ours, theirs) in cascaded.batches.iter().zip(&polled.batches) {
+            assert_eq!(ours.first_sequence(), theirs.first_sequence());
+            assert_eq!(ours.last_sequence(), theirs.last_sequence());
+            assert_eq!(ours.digest(), theirs.digest(), "the primary's digest for the same span");
+            assert_eq!(ours.data(), theirs.data());
+        }
+        // A receiver in the middle continues from the hint.
+        let middle = polled.batches[0].last_sequence();
+        let rest = poll_source_cascade(writer.db(), history, middle, MAX_BATCH_BYTES, &mut hint).unwrap();
+        assert_eq!(rest.batches.len(), 2);
+        assert_eq!(rest.batches[0].first_sequence(), middle + 1);
+        // Caught up, ahead, inside a group, another history.
+        let caught_up = poll_source_cascade(writer.db(), history, polled.through, MAX_BATCH_BYTES, &mut hint).unwrap();
+        assert!(caught_up.batches.is_empty());
+        assert!(matches!(
+            poll_source_cascade(writer.db(), history, polled.through + 1, MAX_BATCH_BYTES, &mut hint),
+            Err(PhysicalError::Ahead { .. })
+        ));
+        assert!(matches!(
+            poll_source_cascade(
+                writer.db(),
+                history,
+                cut + 1,
+                MAX_BATCH_BYTES,
+                &mut CascadeHint::default()
+            ),
+            Err(PhysicalError::Gap { .. })
+        ));
+        assert!(matches!(
+            poll_source_cascade(writer.db(), Uuid::new_v4(), cut, MAX_BATCH_BYTES, &mut hint),
+            Err(PhysicalError::HistoryMismatch)
+        ));
+        // The barrier helper agrees.
+        assert_eq!(receiver_source_barrier(writer.db()).unwrap(), polled.through);
+
+        // A downstream receiver fed only the cascaded groups holds the
+        // primary's default column family, and keeps its own accounting.
+        for batch in &cascaded.batches {
+            assert!(downstream.apply(batch).unwrap());
+        }
+        assert_eq!(
+            range_digest(downstream.writer().db(), None, b"").unwrap(),
+            range_digest(&source, None, b"").unwrap()
+        );
+        let downstream_cursor = downstream.cursor();
+        assert_eq!(downstream_cursor.source_sequence(), polled.through);
+        assert_eq!(
+            downstream.writer().db().latest_sequence_number(),
+            downstream_cursor.local_sequence()
+        );
+    }
+
+    /// Spec P3.2 §4: a cascaded checkpoint's store sequence runs ahead of the
+    /// source sequence it holds; its receiver starts at the source sequence
+    /// and accounts from the store's.
+    #[test]
+    fn a_receiver_from_a_cascaded_checkpoint_starts_at_the_source_sequence() {
+        let root = TempDir::new().unwrap();
+        let db = open(root.path());
+        for index in 0..5 {
+            db.put(format!("k{index}"), b"v").unwrap();
+        }
+        let store = db.latest_sequence_number();
+        let history = Uuid::new_v4();
+        // The source cut may not be past the store's own sequence.
+        let refused = StagedPhysicalReplica::from_checkpoint_at(db, history, store + 1, store);
+        assert!(refused.is_err());
+        let db = open(root.path());
+        let receiver = StagedPhysicalReplica::from_checkpoint_at(db, history, 3, store).unwrap();
+        let cursor = receiver.cursor();
+        assert_eq!(cursor.snapshot_sequence(), 3);
+        assert_eq!(cursor.source_sequence(), 3);
+        assert_eq!(cursor.local_sequence(), store + 1);
+        let mut batch = WriteBatch::default();
+        batch.put(b"next", b"group");
+        assert!(receiver.apply(&encoded(history, 4, batch)).unwrap());
+        assert_eq!(receiver.cursor().source_sequence(), 4);
+        assert_eq!(receiver.cursor().local_sequence(), store + 3);
     }
 }

@@ -56,6 +56,10 @@ struct HAConfig {
     max_standby_lag: std::time::Duration,
     /// Spec P1.3: `[replication] on_unrecoverable = "exit"`.
     exit_on_unrecoverable: bool,
+    /// Spec P3.2 §3: an archive-only standby's segment directories
+    /// (`--source archive --archive-source DIR…`), absolute; `None` for a
+    /// standby that follows its primary (and every other role).
+    archive_sources: Option<Vec<PathBuf>>,
 }
 
 /// Spec P2.2: the `[replication]` TLS keys and the snapshot export lease,
@@ -360,6 +364,44 @@ impl ArchiveStartArgs {
     }
 }
 
+/// Spec P3.2 §3: where a standby gets its write groups, on the command line.
+#[derive(clap::Args, Debug, Default)]
+struct StandbySourceArgs {
+    /// STANDBY: where its write groups come from: `primary` (default; its
+    /// --primary-host) or `archive` — archived WAL segments as they appear in
+    /// --archive-source, with no replication connection at all.
+    #[arg(long = "source", value_name = "primary|archive")]
+    source: Option<String>,
+    /// STANDBY with --source archive: a directory segments appear in
+    /// (operator copies, NFS, rsync); repeat it for several.
+    #[arg(long = "archive-source", value_name = "DIR")]
+    archive_source: Vec<PathBuf>,
+}
+
+impl StandbySourceArgs {
+    fn apply(self, replication: &mut heliosdb_nano::config::ReplicationConfig) {
+        if let Some(value) = self.source {
+            replication.source = value;
+        }
+        if !self.archive_source.is_empty() {
+            replication.archive_source = self.archive_source;
+        }
+    }
+}
+
+/// The flags that reproduce a resolved archive-only standby in a daemon
+/// child (spec P3.2 §3).
+fn append_standby_source_daemon_args(args: &mut Vec<String>, archive_sources: Option<&[PathBuf]>) {
+    if let Some(sources) = archive_sources {
+        args.push("--source".to_string());
+        args.push("archive".to_string());
+        for source in sources {
+            args.push("--archive-source".to_string());
+            args.push(source.display().to_string());
+        }
+    }
+}
+
 /// The flags that reproduce the resolved `[replication.archive]` in a daemon
 /// child (which also re-reads the forwarded `--config`; flags win there too).
 fn append_archive_daemon_args(args: &mut Vec<String>, archive: &heliosdb_nano::config::ArchiveConfig) {
@@ -381,6 +423,50 @@ fn append_archive_daemon_args(args: &mut Vec<String>, archive: &heliosdb_nano::c
         args.push(flag.to_string());
         args.push(value);
     }
+}
+
+/// Spec P3.2 §3: the directories of an archive-only standby, absolute — or
+/// `None` when this node follows a primary (or is no standby). `--source
+/// archive` belongs to a standby with persistent storage and needs at least
+/// one `--archive-source`; an `--archive-source` without it is refused rather
+/// than silently ignored.
+fn resolve_archive_sources(
+    replication: &heliosdb_nano::config::ReplicationConfig,
+    memory: bool,
+) -> Result<Option<Vec<PathBuf>>> {
+    if !replication.follows_archive() {
+        if !replication.archive_source.is_empty() {
+            return Err(Error::config(
+                "--archive-source ([replication] archive_source) lists the directories of an archive-only standby: \
+                 add --source archive",
+            ));
+        }
+        return Ok(None);
+    }
+    if !replication.role.eq_ignore_ascii_case("standby") {
+        return Err(Error::config(
+            "--source archive is a standby's (managed recovery from archived WAL): add --replication-role standby",
+        ));
+    }
+    if memory {
+        return Err(Error::config(
+            "an archive-only standby requires persistent storage: remove --memory and give it a --data-dir",
+        ));
+    }
+    if replication.archive_source.is_empty() {
+        return Err(Error::config(
+            "--source archive needs at least one --archive-source DIR: a directory archived WAL segments appear in",
+        ));
+    }
+    let cwd = std::env::current_dir().map_err(|e| Error::io(format!("cannot resolve --archive-source: {e}")))?;
+    let mut sources: Vec<PathBuf> = Vec::new();
+    for dir in &replication.archive_source {
+        let absolute = if dir.is_absolute() { dir.clone() } else { cwd.join(dir) };
+        if !sources.contains(&absolute) {
+            sources.push(absolute);
+        }
+    }
+    Ok(Some(sources))
 }
 
 /// Standbys receive their full verification window plus the ordinary startup allowance.
@@ -1079,6 +1165,13 @@ struct Cli {
 enum Commands {
     /// Install/follow a closed physical receiver; never exposes SQL or serving readiness.
     Resync(ResyncArgs),
+    /// Advance a STOPPED physical standby from archived WAL segments copied
+    /// into one or more directories (spec P3.2; Oracle: RECOVER STANDBY
+    /// DATABASE). Every segment is verified before anything is applied; the
+    /// groups go through the same apply path as a live standby's. Exits 0 when
+    /// the standby reached the newest segment (or --through), 2 with the
+    /// missing range when the segments stop short of it.
+    Recover(RecoverArgs),
     /// Inspect and maintain a WAL archive (archived segments, spec P3.1)
     /// offline: list, verify, gaps, prune. Reads the files only and takes no
     /// database lock.
@@ -1204,6 +1297,10 @@ enum Commands {
         /// --allow-insecure-replication-remote
         #[arg(long)]
         primary_host: Option<String>,
+
+        // ========== Standby source (spec P3.2) ==========
+        #[command(flatten)]
+        standby_source: StandbySourceArgs,
 
         /// Standby hosts (informational, comma-separated host:port)
         #[arg(long)]
@@ -1564,6 +1661,7 @@ async fn run(cli: Cli) -> Result<()> {
             replication_port,
             replication_startup_timeout_secs,
             primary_host,
+            standby_source,
             standby_hosts,
             sync_mode,
             http_port,
@@ -1678,6 +1776,7 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(value) = primary_host {
                 replication.primary_host = Some(value);
             }
+            standby_source.apply(&mut replication);
             if let Some(value) = standby_hosts {
                 replication.standby_hosts = split_hosts(&value);
             }
@@ -1711,9 +1810,14 @@ async fn run(cli: Cli) -> Result<()> {
                 memory,
                 &resolved_data_dir,
             )?;
-            if replication.role == "standby" && replication.primary_host.is_none() {
+            // Spec P3.2 §3: an archive-only standby follows directories of
+            // segments, resolved absolute (a daemon child runs elsewhere).
+            let archive_sources = resolve_archive_sources(&replication, memory)?;
+            if replication.role == "standby" && archive_sources.is_none() && replication.primary_host.is_none() {
                 return Err(Error::config(
-                    "standby role requires --primary-host or [replication] primary_host".to_string(),
+                    "standby role requires --primary-host or [replication] primary_host (or --source archive with \
+                     --archive-source DIR)"
+                        .to_string(),
                 ));
             }
             // Spec P3.1: an HA node with a data directory archives its WAL
@@ -1765,6 +1869,7 @@ async fn run(cli: Cli) -> Result<()> {
                 replication_tls,
                 max_standby_lag,
                 exit_on_unrecoverable,
+                archive_sources,
             };
 
             // GH#28: connection-lifetime overrides (CLI > config file > default).
@@ -1837,6 +1942,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Commands::Resync(args) => run_physical_resync(args).await,
+        Commands::Recover(args) => run_recover(args).await,
         Commands::Archive(args) => run_archive_command(args),
         Commands::Stop { ref pid_file } => stop_server(pid_file),
         Commands::Status { ref pid_file } => check_server_status(pid_file),
@@ -2039,7 +2145,10 @@ async fn start_server(
                 "a physical standby requires persistent storage: remove --memory and give it a --data-dir",
             ));
         }
-        if ha_config.token_file.is_none() {
+        // An archive-only standby (spec P3.2 §3) opens no replication
+        // connection, so it needs no token — unless it serves downstream
+        // standbys (cascade), which is checked where that port is set up.
+        if ha_config.token_file.is_none() && ha_config.archive_sources.is_none() {
             return Err(Error::config(
                 "a physical standby requires --replication-token-file or [replication] token_file: the token its \
                  primary's physical source accepts",
@@ -2051,6 +2160,12 @@ async fn start_server(
                  store, and a dump file there would stop it from reopening; dump the primary instead",
             ));
         }
+    } else if ha_config.physical.cascade {
+        tracing::warn!(
+            "[replication.physical] cascade = true has no effect on a {}: only a standby cascades (a primary serves \
+             its standbys anyway)",
+            ha_config.role
+        );
     }
 
     // Print startup banner
@@ -2102,6 +2217,13 @@ async fn start_server(
         logical_wal_retention_entries: db_config.replication.logical_wal_retention_entries,
         max_standby_lag: db_config.replication.max_standby_lag.clone(),
         on_unrecoverable: db_config.replication.on_unrecoverable.clone(),
+        source: if ha_config.archive_sources.is_some() {
+            heliosdb_nano::config::ReplicationConfig::SOURCE_ARCHIVE
+        } else {
+            heliosdb_nano::config::ReplicationConfig::SOURCE_PRIMARY
+        }
+        .to_string(),
+        archive_source: ha_config.archive_sources.clone().unwrap_or_default(),
     };
 
     // CLI flags win over the config file for storage location/mode.
@@ -2342,6 +2464,10 @@ async fn start_server(
     };
     #[cfg(not(feature = "ha-tier1"))]
     let standby_db: Option<Arc<EmbeddedDatabase>> = None;
+    // Spec P3.2 §4: a cascading standby's export copies are opened with this
+    // node's storage options (taken before the configuration is moved).
+    #[cfg(feature = "ha-tier1")]
+    let cascade_config = (guarded_standby && ha_config.physical.cascade).then(|| db_config.clone());
 
     // Open database (in-memory mode avoids disk I/O for all operations)
     let db = if let Some(db) = standby_db {
@@ -2458,10 +2584,26 @@ async fn start_server(
             );
         }
         if guarded_standby {
-            println!(
-                "      - Physical primary: {}",
-                ha_config.primary_host.as_deref().unwrap_or("none")
-            );
+            match &ha_config.archive_sources {
+                Some(sources) => println!(
+                    "      - Archive source (no replication connection): {}",
+                    sources
+                        .iter()
+                        .map(|source| source.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None => println!(
+                    "      - Physical primary: {}",
+                    ha_config.primary_host.as_deref().unwrap_or("none")
+                ),
+            }
+            if ha_config.physical.cascade {
+                println!(
+                    "      - Cascading: serves downstream standbys on replication port {}",
+                    ha_config.replication_port
+                );
+            }
             println!(
                 "      - Max standby lag: {}",
                 banner_duration(ha_config.max_standby_lag)
@@ -2528,6 +2670,27 @@ async fn start_server(
     } else {
         None
     };
+    // Spec P3.2 §4: a cascading standby binds its replication port now (a
+    // conflict refuses the start) and serves it once its store is attached.
+    #[cfg(feature = "ha-tier1")]
+    let cascade_plan = match (cascade_config.as_ref(), standby_runtime.as_ref()) {
+        (Some(config), Some(runtime)) => {
+            prepare_cascade_source(
+                &ha_config,
+                &data_dir,
+                config,
+                pg_addr,
+                replication_server_tls.as_ref(),
+                runtime.store_watch(),
+            )
+            .await?
+        }
+        _ => None,
+    };
+    #[cfg(feature = "ha-tier1")]
+    let cascading = cascade_plan.is_some();
+    #[cfg(not(feature = "ha-tier1"))]
+    let cascading = false;
 
     // Start HTTP endpoint (health checks, plus MCP routes when compiled in).
     //
@@ -2583,7 +2746,9 @@ async fn start_server(
                 let policy = std::sync::Arc::clone(&http_auth_policy);
                 // Spec P1.3: a replication node's `/health` carries its
                 // replication block and `/ready` answers its readiness. Spec
-                // P2.1: a primary's `/health` also lists its standbys.
+                // P2.1: a primary's `/health` also lists its standbys; spec
+                // P3.2 §4: so does a cascading standby (its downstreams),
+                // which also says `cascade: true`.
                 let primary_node = ha_role == "primary";
                 let replication_status: Option<heliosdb_nano::api::ReplicationStatus> =
                     (ha_role != "standalone").then(|| {
@@ -2592,9 +2757,10 @@ async fn start_server(
                             Some(heliosdb_nano::api::ReplicationReport {
                                 ready: block.ready,
                                 block: serde_json::to_value(block).ok()?,
-                                standbys: primary_node.then(primary_standbys_report),
+                                standbys: (primary_node || cascading).then(primary_standbys_report),
                                 // Spec P3.1: a sibling object, never inside the block.
                                 archive: Some(archive_health_report()),
+                                cascade: cascading.then_some(true),
                             })
                         });
                         status
@@ -2937,10 +3103,13 @@ async fn start_server(
     // there cannot tear the database listener down.
     #[cfg(feature = "ha-tier1")]
     let (physical_stop, physical_shutdown) = tokio::sync::watch::channel(false);
+    // A primary serves its own store; a cascading standby its store, once
+    // attached (spec P3.2 §4); any other node only waits for the shutdown.
     #[cfg(feature = "ha-tier1")]
-    let physical_service = serve_physical_source(physical_source, physical_shutdown);
-    #[cfg(feature = "ha-tier1")]
-    tokio::pin!(physical_service);
+    let mut physical_service: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>> = match cascade_plan {
+        Some(plan) => Box::pin(serve_cascade_source(plan, physical_shutdown)),
+        None => Box::pin(serve_physical_source(physical_source, physical_shutdown)),
+    };
     #[cfg(feature = "ha-tier1")]
     let mut physical_finished = false;
 
@@ -3298,6 +3467,8 @@ async fn start_server_daemon(
     args.extend(ha_config.replication_tls.daemon_args());
     // Spec P3.1: the archive's keys, resolved (its directory absolute).
     append_archive_daemon_args(&mut args, &ha_config.archive);
+    // Spec P3.2: an archive-only standby's directories, absolute.
+    append_standby_source_daemon_args(&mut args, ha_config.archive_sources.as_deref());
 
     // Add HA options
     args.push("--replication-role".to_string());
@@ -3693,8 +3864,9 @@ fn insecure_replication_banner(side: &str) -> String {
 /// (`--tls-cert` / `--tls-key`, or `[server] tls_cert_path` /
 /// `tls_key_path` with `[server] tls_enabled`); with neither the start is
 /// refused, naming the keys. The files are loaded here, so a bad one refuses
-/// the start too. `None` without `tls_enabled`, and on every role but primary
-/// (a standby serves no replication port: cascading is not supported).
+/// the start too. `None` without `tls_enabled`, and on every role but a
+/// primary or a cascading standby (spec P3.2 §4) — the only nodes that serve
+/// a replication port.
 #[cfg(feature = "ha-tier1")]
 fn resolve_replication_server_tls(
     ha_config: &HAConfig,
@@ -3708,10 +3880,12 @@ fn resolve_replication_server_tls(
     if !settings.tls_enabled {
         return Ok(None);
     }
-    if !ha_config.role.eq_ignore_ascii_case("primary") {
+    let cascading = ha_config.role.eq_ignore_ascii_case("standby") && ha_config.physical.cascade;
+    if !ha_config.role.eq_ignore_ascii_case("primary") && !cascading {
         tracing::warn!(
-            "--replication-tls ([replication] tls_enabled) has no effect on a {}: only a primary serves the \
-             replication port (a standby's TLS to its primary is --primary-tls)",
+            "--replication-tls ([replication] tls_enabled) has no effect on a {}: only a primary (or a cascading \
+             standby, [replication.physical] cascade = true) serves the replication port (a standby's TLS to its \
+             primary is --primary-tls)",
             ha_config.role
         );
         return Ok(None);
@@ -3798,6 +3972,8 @@ fn primary_standbys_report() -> serde_json::Value {
                         "lag_bytes": standby.lag_bytes,
                         "lag_secs": standby.lag_ms as f64 / 1000.0,
                         "last_seen": standby.last_seen,
+                        // Spec P3.2 §1: where its last poll was served from.
+                        "source": standby.source,
                     })
                 })
                 .collect(),
@@ -4195,6 +4371,9 @@ impl StandbyRuntime {
     ) -> Result<Self> {
         use heliosdb_nano::replication::physical_wire::{PeerRole, ReceiverIdentity, WireSyncMode};
         use heliosdb_nano::standby_posture::{install_standby, PostureTracker};
+        if let Some(sources) = &ha_config.archive_sources {
+            return Self::start_archive(ha_config, sources, data_dir, config, listen, port);
+        }
         // Every PostgreSQL session of this process is a standby session: the
         // write guard (25006) holds in every posture.
         heliosdb_nano::replication::ha_state::ha_state().disable_forwarding();
@@ -4257,6 +4436,63 @@ impl StandbyRuntime {
             supervisor: Some(supervisor),
             exit_on_unrecoverable: ha_config.exit_on_unrecoverable,
         })
+    }
+
+    /// Spec P3.2 §3: an archive-only standby — managed recovery from
+    /// archived WAL. No replication connection, no token: it applies the
+    /// segments that appear in `sources` and serves reads meanwhile; its
+    /// posture (`recovering`, mode `archive`) names `archive:<dirs>` as its
+    /// primary.
+    fn start_archive(
+        ha_config: &HAConfig,
+        sources: &[PathBuf],
+        data_dir: &std::path::Path,
+        config: &Config,
+        listen: &str,
+        port: u16,
+    ) -> Result<Self> {
+        use heliosdb_nano::replication::archive_recovery::describe_sources;
+        use heliosdb_nano::standby_posture::{install_standby, PostureTracker};
+        heliosdb_nano::replication::ha_state::ha_state().disable_forwarding();
+        let node = configure_ha_node(ha_config, listen, port)?;
+        let described = describe_sources(sources);
+        // The posture's `primary`: `archive:<dir>[,<dir>…]` (spec P3.2 §3).
+        let source = [heliosdb_nano::standby_posture::ARCHIVE_MODE, ":", described.as_str()].concat();
+        let tracker = std::sync::Arc::new(PostureTracker::new(
+            source,
+            ha_config.sync_mode.clone(),
+            ha_config.max_standby_lag,
+        ));
+        let posture = tracker.handle();
+        install_standby(tracker.handle());
+        info!("Archive-only standby following the archived WAL segments in {described}; no replication connection");
+        let plan = ArchiveStandbyPlan {
+            data_dir: data_dir.to_path_buf(),
+            config: config.clone(),
+            sources: sources.to_vec(),
+            limits: physical_wire_limits(&ha_config.physical).transfer,
+            poll_interval: std::time::Duration::from_millis(ha_config.archive.poll_ms),
+            tracker,
+            archive: standby_archive_plan(ha_config, config, node.node_id),
+        };
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let (store_tx, store) = tokio::sync::watch::channel(None);
+        let (refusal_tx, refusal) = tokio::sync::watch::channel(None);
+        let supervisor = tokio::spawn(supervise_archive_standby(plan, store_tx, refusal_tx, shutdown));
+        Ok(Self {
+            posture,
+            store,
+            refusal,
+            stop,
+            supervisor: Some(supervisor),
+            exit_on_unrecoverable: ha_config.exit_on_unrecoverable,
+        })
+    }
+
+    /// The serving database, once attached (spec P3.2 §4: a cascading
+    /// standby's replication port serves its store from then on).
+    fn store_watch(&self) -> tokio::sync::watch::Receiver<Option<std::sync::Arc<EmbeddedDatabase>>> {
+        self.store.clone()
     }
 
     /// Wait until the standby streams, a refusal arrives, `budget` runs out,
@@ -4664,6 +4900,125 @@ async fn run_physical_standby(
         // fsynced its applied groups before it stopped).
         Err(error) if stopping => tracing::debug!("physical standby receiver stopped: {error}"),
         Err(error) => plan.refuse(&refusal, format!("the physical receiver stopped: {error}")),
+    }
+}
+
+/// Spec P3.2 §2-§3: segments carry write groups, not a base: a standby is
+/// built from a snapshot of its primary, and segments advance it.
+#[cfg(feature = "ha-tier1")]
+const SEGMENTS_NEED_A_SNAPSHOT: &str = "a standby starts from a snapshot of the primary (`start` bootstraps it); \
+     segments advance it";
+
+/// Everything an archive-only standby's supervisor needs (spec P3.2 §3).
+#[cfg(feature = "ha-tier1")]
+struct ArchiveStandbyPlan {
+    data_dir: PathBuf,
+    config: Config,
+    sources: Vec<PathBuf>,
+    limits: heliosdb_nano::replication::checkpoint_transfer::TransferLimits,
+    poll_interval: std::time::Duration,
+    tracker: std::sync::Arc<heliosdb_nano::standby_posture::PostureTracker>,
+    /// Its own WAL archive (it archives what it applies, as every standby).
+    archive: Option<StandbyArchivePlan>,
+}
+
+/// Until the start path asks the standby to stop (or drops its runtime).
+#[cfg(feature = "ha-tier1")]
+async fn stop_requested(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// The supervisor of an archive-only standby (spec P3.2 §3): classify the
+/// directory (it must be an installed physical standby: segments cannot build
+/// one), start its own archive, then run the follower
+/// (`archive_recovery::run_archive_standby`) on a blocking thread until
+/// shutdown. A follower that cannot continue at all becomes the posture's
+/// `needs_recovery` and a refusal for the start path.
+#[cfg(feature = "ha-tier1")]
+async fn supervise_archive_standby(
+    plan: ArchiveStandbyPlan,
+    store: tokio::sync::watch::Sender<Option<std::sync::Arc<EmbeddedDatabase>>>,
+    refusal: tokio::sync::watch::Sender<Option<String>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use heliosdb_nano::replication::archive_recovery::{run_archive_standby, ArchiveStandbyOptions};
+    let refuse = |reason: String| {
+        tracing::error!("physical standby needs recovery: {reason}");
+        plan.tracker.needs_recovery(reason.clone());
+        refusal.send_replace(Some(reason));
+    };
+    let history = match classify_standby_directory(&plan.data_dir) {
+        StandbyLayout::Physical { history } => history,
+        StandbyLayout::Fresh { .. } => {
+            refuse(format!(
+                "{SEGMENTS_NEED_A_SNAPSHOT}: {} is not an installed physical standby yet; start it once following its \
+                 primary (--source primary), then switch it to --source archive",
+                plan.data_dir.display()
+            ));
+            return;
+        }
+        StandbyLayout::Refused(reason) => {
+            refuse(reason);
+            return;
+        }
+    };
+    let (archive, feed) = match plan.archive.as_ref() {
+        Some(archive) => {
+            let (service, feed) = heliosdb_nano::replication::archiver::start_standby(
+                archive.settings.clone(),
+                history,
+                archive.node_id,
+                archive.key_manager.clone(),
+            );
+            (Some(service), Some(feed))
+        }
+        None => (None, None),
+    };
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let attach = standby_serving_attach(plan.config.clone(), std::sync::Arc::clone(&plan.tracker), store.clone());
+    let options = ArchiveStandbyOptions {
+        data_dir: plan.data_dir.clone(),
+        history,
+        sources: plan.sources.clone(),
+        config: plan.config.clone(),
+        limits: plan.limits,
+        poll_interval: plan.poll_interval,
+    };
+    let tracker = std::sync::Arc::clone(&plan.tracker);
+    let worker_stop = std::sync::Arc::clone(&stop);
+    let mut worker =
+        tokio::task::spawn_blocking(move || run_archive_standby(options, attach, &tracker, feed, &worker_stop));
+    let finished = tokio::select! {
+        result = &mut worker => Some(result),
+        () = stop_requested(&mut shutdown) => None,
+    };
+    let result = match finished {
+        Some(result) => result,
+        None => {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            worker.await
+        }
+    };
+    // The follower has stopped offering batches: the archiver archives what
+    // it was handed, seals its open segment and stops.
+    if let Some(archive) = archive {
+        if let Err(error) = tokio::task::spawn_blocking(move || archive.shutdown()).await {
+            tracing::warn!("the WAL archiver did not stop cleanly: {error}");
+        }
+    }
+    let stopping = *shutdown.borrow();
+    match result {
+        Ok(Ok(())) => info!("archive-only standby stopped"),
+        Ok(Err(reason)) if stopping => tracing::debug!("archive-only standby stopped: {reason}"),
+        Ok(Err(reason)) => refuse(format!("the archive-only standby stopped: {reason}")),
+        Err(error) => refuse(format!("the archive-only standby's worker failed: {error}")),
     }
 }
 
@@ -6819,6 +7174,11 @@ struct PreparedPhysicalSource {
     /// stopped (its open segment sealed) when the source stops, before the
     /// store closes. `None` with `--archive=false`.
     archive: Option<heliosdb_nano::replication::archiver::ArchiveService>,
+    /// Spec P3.2 §4: a primary's own store, or a cascading standby's.
+    kind: heliosdb_nano::replication::physical_source::SourceKind,
+    /// Spec P3.2 §1: the WAL archive a receiver's gap is filled from when the
+    /// store's WAL no longer holds it; `None` without an archive.
+    fill: Option<heliosdb_nano::replication::archive_chain::ArchiveFill>,
 }
 
 /// Spec P3.1: start a primary's WAL archiver beside its replication port. It
@@ -6960,6 +7320,9 @@ async fn prepare_physical_source(
     let work = SourceWorkLimiter::new(config.max_sessions).map_err(|e| Error::config(e.to_string()))?;
     // Spec P3.1: started last, once nothing can fail the source any more.
     let archive = start_primary_archive(ha_config, storage, history, node.node_id);
+    // Spec P3.2 §1: the archive fills a standby's gap the WAL no longer
+    // holds (its frames sealed with the dataset key when encrypted).
+    let fill = archive_fill(ha_config, storage.config(), archive.is_some());
     Ok(Some(PreparedPhysicalSource {
         listener,
         address,
@@ -6983,7 +7346,239 @@ async fn prepare_physical_source(
         // pinning SST files soon after it runs out.
         lease_sweep: std::time::Duration::from_secs((lease_secs / 2).clamp(1, 60)),
         archive,
+        kind: heliosdb_nano::replication::physical_source::SourceKind::Primary,
+        fill,
     }))
+}
+
+/// Spec P3.2 §1: where a replication port fills a receiver's gap from — this
+/// node's own WAL archive (its in-memory catalog), opened with the dataset
+/// key. `None` when the node keeps no archive. A key that cannot be loaded
+/// leaves a sealed archive unreadable: said once, and the gap is refused as
+/// before.
+#[cfg(feature = "ha-tier1")]
+fn archive_fill(
+    ha_config: &HAConfig,
+    config: &Config,
+    archiving: bool,
+) -> Option<heliosdb_nano::replication::archive_chain::ArchiveFill> {
+    use heliosdb_nano::replication::archive_chain::ArchiveFill;
+    if !archiving || !ha_config.archive.enabled {
+        return None;
+    }
+    match heliosdb_nano::replication::archiver::dataset_key(config) {
+        Ok(key) => Some(ArchiveFill::installed(key)),
+        Err(error) => {
+            tracing::warn!(
+                "archive: the dataset key cannot be loaded ({error}); a standby's gap is not filled from the archive"
+            );
+            None
+        }
+    }
+}
+
+/// Spec P3.2 §4: a cascading standby's replication port, bound at start (a
+/// port conflict refuses the start, as on a primary); its sessions are served
+/// once the standby's store is attached ([`serve_cascade_source`]).
+#[cfg(feature = "ha-tier1")]
+struct CascadePlan {
+    listener: tokio::net::TcpListener,
+    address: std::net::SocketAddr,
+    token: heliosdb_nano::replication::physical_wire::TransferToken,
+    node_id: uuid::Uuid,
+    pg_port: u16,
+    data_dir: PathBuf,
+    export_dir: PathBuf,
+    /// The node's configuration: a cascaded export's copy is opened with its
+    /// storage options.
+    config: std::sync::Arc<Config>,
+    physical: heliosdb_nano::config::PhysicalReplicationConfig,
+    tls: Option<tokio_rustls::TlsAcceptor>,
+    tcp_keepalive: Option<heliosdb_nano::protocol::postgres::timeouts::TcpKeepaliveSettings>,
+    lease: std::time::Duration,
+    max_leases: usize,
+    fill: Option<heliosdb_nano::replication::archive_chain::ArchiveFill>,
+    store: tokio::sync::watch::Receiver<Option<std::sync::Arc<EmbeddedDatabase>>>,
+}
+
+/// Spec P3.2 §4: prepare a standby's cascading port (`[replication.physical]
+/// cascade = true`): its token (the downstream standbys authenticate with
+/// it), its private export directory (default `<data dir>.physical-export`)
+/// and its listener, on `--listen`'s address with TLS (or the plaintext
+/// opt-in), else on loopback. `None`, said once, when the standby has no
+/// token: it then serves no downstream.
+#[cfg(feature = "ha-tier1")]
+async fn prepare_cascade_source(
+    ha_config: &HAConfig,
+    data_dir: &std::path::Path,
+    config: &Config,
+    pg_addr: std::net::SocketAddr,
+    server_tls: Option<&heliosdb_nano::replication::physical_tls::ReplicationServerTls>,
+    store: tokio::sync::watch::Receiver<Option<std::sync::Arc<EmbeddedDatabase>>>,
+) -> Result<Option<CascadePlan>> {
+    use heliosdb_nano::replication::physical_wire::bind_replication;
+    let Some(token_file) = ha_config.token_file.as_deref() else {
+        tracing::warn!(
+            "[replication.physical] cascade = true has no effect: this standby has no replication token \
+             (--replication-token-file), which its downstream standbys must present"
+        );
+        return Ok(None);
+    };
+    let token = heliosdb_nano::replication::read_replication_token(token_file)?;
+    let node_id = heliosdb_nano::replication::ha_state::ha_state()
+        .get_config()
+        .map_or_else(uuid::Uuid::new_v4, |node| node.node_id);
+    let export_dir = match &ha_config.physical.export_dir {
+        Some(dir) => dir.clone(),
+        None => default_physical_export_dir(data_dir)?,
+    };
+    validate_private_export(&export_dir)?;
+    let export = export_dir.canonicalize().map_err(|e| Error::io(e.to_string()))?;
+    if let Ok(store_dir) = data_dir.canonicalize() {
+        if export.starts_with(&store_dir) || store_dir.starts_with(&export) {
+            return Err(Error::config(
+                "physical export_dir and the cascading standby's data directory must be disjoint",
+            ));
+        }
+    }
+    let acceptor = server_tls
+        .map(heliosdb_nano::replication::physical_tls::ReplicationServerTls::acceptor)
+        .transpose()?;
+    let address = replication_listen_address(
+        pg_addr.ip(),
+        ha_config.replication_port,
+        acceptor.is_some() || ha_config.allow_insecure_remote,
+    );
+    if !address.ip().is_loopback() && acceptor.is_none() {
+        tracing::warn!("{}", insecure_replication_banner("cascading standby"));
+    }
+    let listener = bind_replication(address, acceptor.is_some(), ha_config.allow_insecure_remote)
+        .await
+        .map_err(|e| {
+            Error::network(format!(
+                "Cannot bind the cascading standby's replication listener {address} (NPHYS002): {e}. Use distinct \
+                 PostgreSQL --port and --replication-port endpoints; a downstream standby's --primary-host names this \
+                 port."
+            ))
+        })?;
+    info!(
+        "Cascading replication port listening on {address} (NPHYS002, {}); downstream standbys are served once this \
+         standby's store is attached",
+        match server_tls {
+            Some(tls) if tls.mutual() => "TLS, client certificates required",
+            Some(_) => "TLS",
+            None => "plaintext",
+        }
+    );
+    let lease_secs = ha_config.replication_tls.snapshot_export_lease_secs;
+    Ok(Some(CascadePlan {
+        listener,
+        address,
+        token,
+        node_id,
+        pg_port: pg_addr.port(),
+        data_dir: data_dir.to_path_buf(),
+        export_dir,
+        config: std::sync::Arc::new(config.clone()),
+        physical: ha_config.physical.clone(),
+        tls: acceptor,
+        tcp_keepalive: heliosdb_nano::protocol::postgres::timeouts::ConnectionTimeouts::from_server_config(
+            &config.server,
+        )
+        .tcp_keepalive,
+        lease: std::time::Duration::from_secs(lease_secs),
+        max_leases: ha_config.replication_tls.snapshot_export_max_leases,
+        fill: archive_fill(ha_config, config, true),
+        store,
+    }))
+}
+
+/// Spec P3.2 §4: serve a cascading standby's replication port. Waits for the
+/// store (its history is the standby's binding, read from its marker), then
+/// serves it like a primary's port — snapshots are cascaded exports, polls
+/// strip the node-local records, and both use the primary's sequence numbers
+/// — registering the downstream standbys in this node's registry (listed on
+/// `/health`). A failure is logged and the standby keeps serving reads: only
+/// the shutdown ends this future.
+#[cfg(feature = "ha-tier1")]
+async fn serve_cascade_source(plan: CascadePlan, mut shutdown: tokio::sync::watch::Receiver<bool>) -> Result<()> {
+    use heliosdb_nano::replication::checkpoint_transfer::physical_stage_history;
+    use heliosdb_nano::replication::physical::receiver_source_barrier;
+    use heliosdb_nano::replication::physical_source::{
+        ExportLeases, SourceKind, SourceWorkLimiter, StandbyRegistryObserver,
+    };
+    use heliosdb_nano::replication::physical_wire::{SourceContext, SourceIdentity};
+    let mut store = plan.store.clone();
+    let database = loop {
+        let attached = store.borrow_and_update().clone();
+        if let Some(database) = attached {
+            break database;
+        }
+        tokio::select! {
+            changed = store.changed() => if changed.is_err() { return Ok(()); },
+            () = stop_requested(&mut shutdown) => return Ok(()),
+        }
+    };
+    let db = database.storage.db();
+    drop(database);
+    let prepared = (|| -> Result<PreparedPhysicalSource> {
+        let history = physical_stage_history(&plan.data_dir).map_err(|e| Error::config(e.to_string()))?;
+        let barrier_db = std::sync::Arc::downgrade(&db);
+        let barrier = move || {
+            barrier_db
+                .upgrade()
+                .and_then(|db| receiver_source_barrier(&db).ok())
+                .unwrap_or(0)
+        };
+        // Lag of the downstream standbys is measured against this standby's
+        // applied source sequence.
+        let sequence = barrier.clone();
+        heliosdb_nano::replication::ha_state::ha_state()
+            .set_sequence_source(Some(std::sync::Arc::new(move || sequence())));
+        let context = std::sync::Arc::new(SourceContext {
+            identity: SourceIdentity {
+                node_id: plan.node_id,
+                history,
+                epoch: heliosdb_nano::standby_posture::EPOCH,
+                physical_endpoint: plan.address.to_string(),
+                pg_port: plan.pg_port,
+            },
+            observer: std::sync::Arc::new(StandbyRegistryObserver::with_barrier(Box::new(barrier))),
+            tls: plan.tls.is_some(),
+        });
+        let work = SourceWorkLimiter::new(plan.physical.max_sessions).map_err(|e| Error::config(e.to_string()))?;
+        info!(
+            "Cascading standby serves history {history} on {} to downstream standbys",
+            plan.address
+        );
+        Ok(PreparedPhysicalSource {
+            listener: plan.listener,
+            address: plan.address,
+            token: plan.token,
+            db,
+            history,
+            export_dir: plan.export_dir,
+            config: plan.physical,
+            work,
+            context,
+            tcp_keepalive: plan.tcp_keepalive,
+            tls: plan.tls,
+            leases: ExportLeases::new(plan.lease, plan.max_leases),
+            lease_sweep: std::time::Duration::from_secs((plan.lease.as_secs() / 2).clamp(1, 60)),
+            archive: None,
+            kind: SourceKind::Cascade { config: plan.config },
+            fill: plan.fill,
+        })
+    })();
+    let outcome = match prepared {
+        Ok(prepared) => serve_physical_source(Some(prepared), shutdown.clone()).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = outcome {
+        tracing::error!("the cascading replication port stopped: {error}; this standby keeps serving reads");
+        stop_requested(&mut shutdown).await;
+    }
+    Ok(())
 }
 
 /// Spec P2.2: a replication connection whose TLS handshake failed: logged
@@ -7088,6 +7683,8 @@ async fn serve_physical_source(
                 let leases = source.leases.clone();
                 let token = token.clone();
                 let context = source.context.clone();
+                let kind = source.kind.clone();
+                let fill = source.fill.clone();
                 sessions.spawn(async move {
                     // No `Refuse` frame can precede a handshake: a failed one
                     // is logged with its peer and counted.
@@ -7099,7 +7696,19 @@ async fn serve_physical_source(
                         }
                     };
                     let result = serve_session(stream, &token, limits, stop, &context, Some(peer),
-                        move |request| heliosdb_nano::replication::physical_source::open_primary_session(db, history, export, limits.transfer, request, work, leases)
+                        move |request| async move {
+                            use heliosdb_nano::replication::physical_source::{
+                                open_cascade_session, open_primary_session_with, SourceKind,
+                            };
+                            match kind {
+                                SourceKind::Primary => {
+                                    open_primary_session_with(db, history, export, limits.transfer, request, work, leases, fill).await
+                                }
+                                SourceKind::Cascade { config } => {
+                                    open_cascade_session(db, history, export, limits.transfer, request, work, leases, fill, config).await
+                                }
+                            }
+                        }
                     ).await;
                     if let Err(error) = result { tracing::warn!("replication session from {peer} ended: {error}"); }
                 });
@@ -7279,6 +7888,221 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
         println!("Physical state retained closed at {} (snapshot {}, history {}, source sequence {}). This is not SQL readiness.",
             closed.path.display(), closed.snapshot_id, closed.cursor.history(), closed.cursor.source_sequence());
         Ok(())
+    }
+}
+
+/// `heliosdb-nano recover` (spec P3.2 §2).
+#[derive(clap::Args, Debug)]
+struct RecoverArgs {
+    /// The STOPPED physical standby to advance: an installed one (segments
+    /// carry write groups, not a base; `start` bootstraps a standby).
+    #[arg(short, long, value_name = "DIR")]
+    data_dir: PathBuf,
+    /// A directory holding archived WAL segments — any node's archive of the
+    /// same dataset history, or copies of its files; repeat it for several.
+    /// Byte-identical copies count once.
+    #[arg(long = "from-archive", value_name = "SEGDIR", required = true)]
+    from_archive: Vec<PathBuf>,
+    /// Stop after the last write group that ends at or before this sequence
+    /// (default: as far as the segments go).
+    #[arg(long, value_name = "SEQ")]
+    through: Option<u64>,
+    /// What follows: `primary` follows the primary from the new cursor, as
+    /// `start --replication-role standby` would (the default with
+    /// --primary-host); `stop` exits.
+    #[arg(long, value_name = "primary|stop")]
+    then: Option<String>,
+    /// The primary's replication port (host:port), for --then primary.
+    #[arg(long)]
+    primary_host: Option<String>,
+    /// The node's config file: its storage options, its [encryption] (an
+    /// encrypted dataset's segments are sealed with the dataset key), and the
+    /// `start` settings --then primary runs with.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    /// Arguments after `--` are passed to `start` when the standby goes on to
+    /// follow its primary (--then primary): its ports, token file, TLS, ...
+    #[arg(last = true, value_name = "START_ARGS")]
+    start_args: Vec<String>,
+}
+
+/// Spec P3.2 §2: `recover` works on a STOPPED standby. A node running on the
+/// directory holds RocksDB's `LOCK` (an fcntl lock); it is asked for with
+/// `F_GETLK`, which takes nothing — so the probe never disturbs a lock this
+/// process takes later — and names the process holding it.
+#[cfg(feature = "ha-tier1")]
+fn refuse_running_node(data_dir: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let lock = data_dir.join("LOCK");
+        let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(&lock) else {
+            return Ok(());
+        };
+        // SAFETY: an all-zero `flock` is a valid value of the plain C struct.
+        let mut probe: libc::flock = unsafe { std::mem::zeroed() };
+        probe.l_type = libc::F_WRLCK as libc::c_short;
+        probe.l_whence = libc::SEEK_SET as libc::c_short;
+        // SAFETY: fcntl(2) F_GETLK on a descriptor this function owns, with a
+        // pointer to a live, initialized `flock` it only writes into.
+        let answered = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut probe) };
+        if answered == 0 && probe.l_type != libc::F_UNLCK as libc::c_short {
+            return Err(Error::config(format!(
+                "recover refused: {} is in use by a running node (process {} holds its LOCK); stop it first: recover \
+                 works on a stopped standby",
+                data_dir.display(),
+                probe.l_pid
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = data_dir;
+    }
+    Ok(())
+}
+
+/// `heliosdb-nano recover` (spec P3.2 §2): offline; refuses a running node,
+/// an empty or non-standby directory, and a chain with a corrupt or foreign
+/// segment (nothing applied). Exits 2 with the missing range when the
+/// segments stop short (unless it goes on to follow the primary, which may
+/// hold the range); with --then primary it then runs `start` as a standby of
+/// --primary-host from the new cursor.
+async fn run_recover(args: RecoverArgs) -> Result<()> {
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        let _ = args;
+        return Err(Error::config("recover requires the ha-tier1 feature"));
+    }
+    #[cfg(feature = "ha-tier1")]
+    {
+        use heliosdb_nano::replication::archive_recovery::{recover_from_archive, RecoverError, RecoverOptions};
+        let follow = match args.then.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Some("primary") => true,
+            Some("stop") => false,
+            None => args.primary_host.is_some(),
+            Some(other) => return Err(Error::config(format!("--then must be primary or stop, not '{other}'"))),
+        };
+        if follow && args.primary_host.is_none() {
+            return Err(Error::config(
+                "--then primary needs --primary-host: the primary the recovered standby goes on to follow",
+            ));
+        }
+        if !follow && !args.start_args.is_empty() {
+            return Err(Error::config(
+                "the arguments after -- are start's, for --then primary; this recovery stops when it is done",
+            ));
+        }
+        if args.start_args.iter().any(|arg| {
+            arg == "--password"
+                || arg.starts_with("--password=")
+                || arg == "--mcp-token"
+                || arg.starts_with("--mcp-token=")
+        }) {
+            return Err(Error::config(
+                "a literal --password / --mcp-token is not passed on to start: use --password-file, \
+                 HELIOSDB_PASSWORD_FILE / HELIOSDB_PASSWORD or HELIOSDB_MCP_TOKEN",
+            ));
+        }
+        let mut config = match &args.config {
+            Some(path) => Config::from_file(path.clone())?,
+            None => Config::default(),
+        };
+        config.storage.path = Some(args.data_dir.clone());
+        config.storage.memory_only = false;
+        refuse_running_node(&args.data_dir)?;
+        let history = match classify_standby_directory(&args.data_dir) {
+            StandbyLayout::Physical { history } => history,
+            StandbyLayout::Fresh { .. } => {
+                return Err(Error::config(format!(
+                    "recover refused: {} holds no standby: {SEGMENTS_NEED_A_SNAPSHOT}",
+                    args.data_dir.display()
+                )))
+            }
+            StandbyLayout::Refused(reason) => return Err(Error::config(format!("recover refused: {reason}"))),
+        };
+        for source in &args.from_archive {
+            if !source.is_dir() {
+                return Err(Error::config(format!(
+                    "recover refused: --from-archive {} is not a directory",
+                    source.display()
+                )));
+            }
+        }
+        let limits = physical_wire_limits(&config.replication.physical).transfer;
+        let data_dir = args.data_dir.clone();
+        let sources = args.from_archive.clone();
+        let through = args.through;
+        let recover_config = config.clone();
+        println!(
+            "recover: advancing the physical standby {} (history {history}) from the segments in {}",
+            data_dir.display(),
+            heliosdb_nano::replication::archive_recovery::describe_sources(&sources)
+        );
+        let outcome = tokio::task::spawn_blocking(move || {
+            let options = RecoverOptions {
+                data_dir: &data_dir,
+                history,
+                sources: &sources,
+                through,
+                config: &recover_config,
+                limits,
+            };
+            recover_from_archive(&options, &mut |line| println!("{line}"))
+        })
+        .await
+        .map_err(|error| Error::io(format!("recover: the recovery worker failed: {error}")))?;
+        let report = match outcome {
+            Ok(report) => report,
+            Err(error @ RecoverError::Refused(_)) => return Err(Error::config(error.to_string())),
+            Err(error) => return Err(Error::storage(error.to_string())),
+        };
+        println!(
+            "recover: the standby is at sequence {} (it was at {}; {} write group(s) applied, {} already held, from {} \
+             segment(s))",
+            report.reached, report.started_at, report.applied, report.skipped, report.segments
+        );
+        if let Some((from, to)) = report.missing {
+            println!(
+                "needs recovery: archive gap: sequences {from}..{to} are in none of the given directories (the newest \
+                 segment found ends at {})",
+                report
+                    .newest
+                    .map_or_else(|| "none".to_string(), |newest| newest.to_string())
+            );
+            if !follow {
+                // Everything was closed and fsynced by the recovery.
+                std::process::exit(2);
+            }
+            println!("recover: following the primary next: it may still hold that range");
+        }
+        if !follow {
+            return Ok(());
+        }
+        let primary_host = args.primary_host.unwrap_or_default();
+        println!(
+            "recover: following the primary {primary_host} from sequence {}, as `start --replication-role standby` would",
+            report.reached
+        );
+        let mut argv: Vec<OsString> = vec![
+            "heliosdb-nano".into(),
+            "start".into(),
+            "--data-dir".into(),
+            args.data_dir.into_os_string(),
+            "--replication-role".into(),
+            "standby".into(),
+            "--primary-host".into(),
+            primary_host.into(),
+        ];
+        if let Some(path) = args.config {
+            argv.push("--config".into());
+            argv.push(path.into_os_string());
+        }
+        argv.extend(args.start_args.into_iter().map(OsString::from));
+        let cli = Cli::try_parse_from(argv)
+            .map_err(|error| Error::config(format!("the start arguments after -- are not valid: {error}")))?;
+        let follow_primary: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>> = Box::pin(run(cli));
+        follow_primary.await
     }
 }
 

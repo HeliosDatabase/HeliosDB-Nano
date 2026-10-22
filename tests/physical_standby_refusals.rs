@@ -163,8 +163,11 @@ async fn pruned_wal_is_refused_as_wal_pruned() {
     let p = pair();
     // The smallest retention there is; the purge itself is simulated below,
     // because RocksDB purges archived WAL on its own clock (every ten minutes
-    // with a size limit set), far longer than a test.
-    let retention = "[replication.physical]\nwal_retention_secs = 60\nwal_retention_size_mb = 64\n";
+    // with a size limit set), far longer than a test. Spec P3.2: with its WAL
+    // archive on, the primary would serve the gap from it instead
+    // (`tests/physical_archive_recovery.rs`); off, the gap is refused.
+    let retention = "[replication.physical]\nwal_retention_secs = 60\nwal_retention_size_mb = 64\n\
+                     [replication.archive]\nenabled = false\n";
     let primary_data = p.dir.path().join("primary");
     let standby_data = p.dir.path().join("standby");
     let mut primary = Daemon::spawn(
@@ -233,6 +236,12 @@ async fn pruned_wal_is_refused_as_wal_pruned() {
         client_refusal(&standby).contains("rebuild the standby"),
         "the refusal says what to do: {}",
         client_refusal(&standby)
+    );
+    // Spec P3.2 §1: it names both floors.
+    let refusal = client_refusal(&standby);
+    assert!(
+        refusal.contains("RocksDB holds") && refusal.contains("the WAL archive is off"),
+        "{refusal}"
     );
 }
 

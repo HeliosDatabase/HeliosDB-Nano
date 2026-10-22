@@ -311,3 +311,120 @@ async fn prune_is_refused_while_a_node_archives_into_the_directory() {
     let output = cli(&["prune", "--dry-run", "--data-dir", text(&data).as_str()]);
     assert!(output.status.success(), "{}", stderr(&output));
 }
+
+// ---------------------------------------------------------------------------
+// `heliosdb-nano recover` (spec P3.2 §2, §5): argument validation, the
+// refusals before anything is opened, the running-node refusal. Its exit
+// codes on real segments (0, 2 with the missing range, 1 on a corrupt one)
+// are in `tests/physical_archive_recovery.rs`.
+// ---------------------------------------------------------------------------
+
+fn recover_cli(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_heliosdb-nano"))
+        .arg("recover")
+        .args(args)
+        .env("RUST_LOG", "warn")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn recover_validates_its_arguments_and_refuses_what_is_not_a_standby() {
+    let root = tempfile::tempdir().unwrap();
+    let segments = root.path().join("segments");
+    std::fs::create_dir_all(&segments).unwrap();
+    let segments = text(&segments);
+
+    // --from-archive is required: a usage error (clap's exit code 2).
+    let output = recover_cli(&["--data-dir", text(&root.path().join("standby")).as_str()]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("--from-archive"), "{}", stderr(&output));
+
+    // --then names what follows.
+    let empty = root.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let empty = text(&empty);
+    let output = recover_cli(&["--data-dir", &empty, "--from-archive", &segments, "--then", "later"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("--then must be primary or stop"),
+        "{}",
+        stderr(&output)
+    );
+    let output = recover_cli(&["--data-dir", &empty, "--from-archive", &segments, "--then", "primary"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("needs --primary-host"), "{}", stderr(&output));
+    let output = recover_cli(&[
+        "--data-dir",
+        &empty,
+        "--from-archive",
+        &segments,
+        "--",
+        "--port",
+        "5555",
+    ]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("for --then primary"), "{}", stderr(&output));
+
+    // An empty or absent data directory: segments carry write groups, not a
+    // base; nothing is created.
+    for data in [empty.clone(), text(&root.path().join("absent"))] {
+        let output = recover_cli(&["--data-dir", &data, "--from-archive", &segments]);
+        assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+        assert!(
+            stderr(&output).contains("a standby starts from a snapshot of the primary"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert!(!root.path().join("absent").exists());
+
+    // A primary's directory is never recovered over.
+    let primary = root.path().join("primary");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::write(
+        primary.join(heliosdb_nano::replication::history::PRIMARY_HISTORY_FILE),
+        "{}",
+    )
+    .unwrap();
+    let output = recover_cli(&["--data-dir", text(&primary).as_str(), "--from-archive", &segments]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("primary's dataset identity"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// Spec P3.2 §2: `recover` works on a STOPPED standby; a running one holds
+/// its directory and is named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recover_is_refused_while_a_node_runs_on_the_directory() {
+    let pair = pair();
+    let dir = pair.dir.path();
+    let _primary = Daemon::spawn(
+        dir,
+        "primary",
+        &dir.join("primary"),
+        &pair.token,
+        &pair.primary_args,
+        None,
+    );
+    let _ = connect(pair.pg_p).await;
+    let standby_data = dir.join("standby");
+    let mut standby = Daemon::spawn(dir, "standby", &standby_data, &pair.token, &pair.standby_args, None);
+    wait_http(pair.http_s, "/ready", 200, Duration::from_secs(90), &standby).await;
+    let segments = dir.join("segments");
+    std::fs::create_dir_all(&segments).unwrap();
+    let output = recover_cli(&[
+        "--data-dir",
+        text(&standby_data).as_str(),
+        "--from-archive",
+        text(&segments).as_str(),
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    let refusal = stderr(&output);
+    assert!(refusal.contains("in use by a running node"), "{refusal}");
+    assert!(standby.alive(), "the running standby is untouched");
+    wait_http(pair.http_s, "/ready", 200, Duration::from_secs(30), &standby).await;
+}

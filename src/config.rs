@@ -495,6 +495,18 @@ pub struct ReplicationConfig {
     /// process exits with the reason, for supervisors that rebuild a standby
     /// on exit. Ignored unless `role = "standby"`.
     pub on_unrecoverable: String,
+    /// Spec P3.2 §3: where a STANDBY gets its write groups. `"primary"`
+    /// (default): from its primary's replication port (`primary_host`).
+    /// `"archive"`: from archived WAL segments that appear in
+    /// `archive_source` — managed recovery from archived logs, with no
+    /// replication connection at all; the standby serves reads meanwhile and
+    /// is ready while the segment holding its cursor is at most
+    /// `max_standby_lag` old. `--source`.
+    pub source: String,
+    /// Spec P3.2 §3: the directories an archive-only standby
+    /// (`source = "archive"`) applies segments from, as they appear
+    /// (operator copies, NFS, rsync). `--archive-source DIR`, repeatable.
+    pub archive_source: Vec<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for ReplicationConfig {
@@ -535,6 +547,8 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("logical_wal_retention_entries", &self.logical_wal_retention_entries)
             .field("max_standby_lag", &self.max_standby_lag)
             .field("on_unrecoverable", &self.on_unrecoverable)
+            .field("source", &self.source)
+            .field("archive_source", &self.archive_source)
             .finish()
     }
 }
@@ -572,6 +586,8 @@ impl Default for ReplicationConfig {
             logical_wal_retention_entries: Self::DEFAULT_LOGICAL_WAL_RETENTION_ENTRIES,
             max_standby_lag: Self::DEFAULT_MAX_STANDBY_LAG.to_string(),
             on_unrecoverable: Self::ON_UNRECOVERABLE_STAY_UP.to_string(),
+            source: Self::SOURCE_PRIMARY.to_string(),
+            archive_source: Vec::new(),
         }
     }
 }
@@ -609,6 +625,17 @@ impl ReplicationConfig {
     pub const DEFAULT_SNAPSHOT_EXPORT_MAX_LEASES: usize = 4;
     /// Upper bound accepted for `snapshot_export_max_leases`.
     pub const MAX_SNAPSHOT_EXPORT_MAX_LEASES: usize = 64;
+    /// `source` values (spec P3.2 §3).
+    pub const SOURCE_PRIMARY: &str = "primary";
+    pub const SOURCE_ARCHIVE: &str = "archive";
+    /// Most `archive_source` directories.
+    pub const MAX_ARCHIVE_SOURCES: usize = 16;
+
+    /// Whether a standby follows archived segments rather than a primary
+    /// (`source = "archive"`, validated by [`Self::validate`]).
+    pub fn follows_archive(&self) -> bool {
+        self.source.trim().eq_ignore_ascii_case(Self::SOURCE_ARCHIVE)
+    }
 
     /// Whether a standby connects to its primary over TLS: `primary_tls` when
     /// set, else on exactly when the primary's address is not loopback.
@@ -766,6 +793,18 @@ impl ReplicationConfig {
             return Err(crate::Error::config(
                 "replication.replication_port must be between 1 and 65535",
             ));
+        }
+        let source = self.source.trim();
+        if !source.eq_ignore_ascii_case(Self::SOURCE_PRIMARY) && !source.eq_ignore_ascii_case(Self::SOURCE_ARCHIVE) {
+            return Err(crate::Error::config(
+                "replication.source must be \"primary\" or \"archive\"",
+            ));
+        }
+        if self.archive_source.len() > Self::MAX_ARCHIVE_SOURCES {
+            return Err(crate::Error::config(format!(
+                "replication.archive_source names at most {} directories",
+                Self::MAX_ARCHIVE_SOURCES
+            )));
         }
         for (key, endpoints) in [
             ("primary_host", self.primary_host.iter().collect::<Vec<_>>()),
@@ -3604,6 +3643,15 @@ pub struct PhysicalReplicationConfig {
     pub max_chunk_bytes: usize,
     pub frame_timeout_secs: u64,
     pub operation_timeout_secs: u64,
+    /// Spec P3.2 §4: a STANDBY with `cascade = true` serves its own store on
+    /// its replication port (`[replication] replication_port`) like a primary:
+    /// a downstream standby bootstraps from it and follows it, in the
+    /// primary's sequence numbers and history. Its node-local records are
+    /// stripped from what it serves, and what its WAL no longer holds comes
+    /// from its own WAL archive. Needs a replication token (the downstream's
+    /// authentication) and a private `export_dir` (default `<data
+    /// dir>.physical-export`). Ignored on a primary. Default false.
+    pub cascade: bool,
 }
 
 impl Default for PhysicalReplicationConfig {
@@ -3620,6 +3668,7 @@ impl Default for PhysicalReplicationConfig {
             max_chunk_bytes: 1024 * 1024,
             frame_timeout_secs: 30,
             operation_timeout_secs: 120,
+            cascade: false,
         }
     }
 }

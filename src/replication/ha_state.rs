@@ -187,6 +187,10 @@ pub struct StandbyInfo {
     /// Whether it counts toward `min_acks`: a serving standby following this
     /// primary, not a bootstrap copy or an offline `resync` receiver.
     pub counts_for_sync: bool,
+    /// Spec P3.2 §1: where its last poll was served from — `"wal"` (this
+    /// node's RocksDB WAL) or `"archive"` (its WAL archive, filling a gap the
+    /// WAL no longer holds).
+    pub source: &'static str,
 }
 
 /// Standby connection state
@@ -241,6 +245,8 @@ struct StandbyEntry {
     caught_up_at: AtomicU64,
     /// Live sessions of this entry (a reconnect can overlap the session it replaces).
     sessions: AtomicUsize,
+    /// Spec P3.2 §1: its last poll was served from the WAL archive.
+    from_archive: AtomicBool,
 }
 
 impl StandbyEntry {
@@ -331,6 +337,12 @@ impl StandbyHandle {
     /// recorded above the applied one.
     pub fn record_ack(&self, applied: u64, durable: u64) {
         self.registry.record_ack(&self.entry, applied, durable.min(applied));
+    }
+
+    /// Spec P3.2 §1: the session's last poll was served from the WAL archive
+    /// (`true`) or from this node's own WAL (`false`).
+    pub fn note_source(&self, from_archive: bool) {
+        self.entry.from_archive.store(from_archive, Ordering::Release);
     }
 }
 
@@ -585,6 +597,7 @@ impl HAStateRegistry {
                         last_seen: AtomicU64::new(now),
                         caught_up_at: AtomicU64::new(now),
                         sessions: AtomicUsize::new(1),
+                        from_archive: AtomicBool::new(false),
                     });
                     standbys.insert(registration.node_id, Arc::clone(&entry));
                     entry
@@ -628,6 +641,11 @@ impl HAStateRegistry {
                     },
                     state: entry.state,
                     counts_for_sync: entry.counts_for_sync,
+                    source: if entry.from_archive.load(Ordering::Acquire) {
+                        "archive"
+                    } else {
+                        "wal"
+                    },
                 }
             })
             .collect();

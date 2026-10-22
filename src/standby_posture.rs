@@ -29,6 +29,14 @@
 //! | `reconnecting` | a streaming session was lost; kept until a new session catches up | while disconnected for at most `[replication] max_standby_lag` |
 //! | `needs_recovery` | a refusal the receiver cannot resolve by itself (history mismatch, gap, poison, a directory it may not adopt); sticky until restart | no |
 //!
+//! Spec P3.2 §3: an ARCHIVE-ONLY standby (`--source archive`) has no receiver
+//! and never streams. While it applies segments its posture is `recovering`
+//! with mode `archive` and progress `"<cursor> of <newest>"`; it is ready
+//! while the segment holding its cursor was observed (by the archiver that
+//! wrote it) at most `max_standby_lag` ago, else `catching_up`. A gap in its
+//! directories is `needs_recovery` naming the range — not sticky: it resumes
+//! by itself when the missing segment appears ([`PostureTracker::archive_progress`]).
+//!
 //! Readiness also needs a serving store: a standby that is still installing
 //! its first copy is never ready, whatever its receiver reports.
 //!
@@ -74,6 +82,9 @@ use crate::storage::StorageEngine;
 /// (plan §D7, phase P5): `pg_control_checkpoint().timeline_id` and the
 /// `epoch` field of the replication block.
 pub const EPOCH: u64 = 1;
+
+/// The `recovering` mode of an archive-only standby (spec P3.2 §3).
+pub const ARCHIVE_MODE: &str = "archive";
 
 /// PostgreSQL's LSN text for a physical sequence: `HI/LO` in hex, `HI` the
 /// upper and `LO` the lower 32 bits (§D8).
@@ -167,6 +178,11 @@ impl StandbySnapshot {
                 StandbyPosture::Reconnecting { since, .. } => {
                     now.saturating_duration_since(*since) <= self.max_standby_lag
                 }
+                // Spec P3.2 §3: an archive-only standby is as current as the
+                // segment holding its cursor.
+                StandbyPosture::Recovering { mode, .. } if *mode == ARCHIVE_MODE => self
+                    .last_caught_up
+                    .is_some_and(|at| now.saturating_duration_since(at) <= self.max_standby_lag),
                 _ => false,
             }
     }
@@ -357,6 +373,9 @@ struct Machine {
     /// highest barrier it reported before that event.
     session: Option<u64>,
     session_barrier: Option<u64>,
+    /// Spec P3.2 §3: the `needs_recovery` posture is an archive-only
+    /// standby's gap, which a new segment resolves (not a sticky refusal).
+    archive_blocked: bool,
 }
 
 impl Machine {
@@ -449,8 +468,12 @@ impl PostureTracker {
     /// restart (or a later recovery mode) leaves it.
     pub fn needs_recovery(&self, reason: impl Into<String>) {
         let reason = reason.into();
+        let mut machine = self.machine.lock();
+        // A refusal replaces an archive-only standby's gap (spec P3.2 §3),
+        // which is not sticky; it then is.
+        let archive_gap = std::mem::replace(&mut machine.archive_blocked, false);
         self.tx.send_modify(|snapshot| {
-            if !matches!(snapshot.posture, StandbyPosture::NeedsRecovery { .. }) {
+            if archive_gap || !matches!(snapshot.posture, StandbyPosture::NeedsRecovery { .. }) {
                 snapshot.posture = StandbyPosture::NeedsRecovery {
                     reason,
                     position: snapshot.cursor,
@@ -458,6 +481,80 @@ impl PostureTracker {
                 };
             }
         });
+    }
+
+    /// Spec P3.2 §3: an archive-only standby has applied its directories'
+    /// segments through `cursor`, of the `newest` sequence they hold; the
+    /// segment holding `cursor` was last observed at `observed_at` (unix
+    /// seconds, the clock of the archiver that wrote it; `None` when no
+    /// segment holds it) and it is `now`. Its lag is the time since then:
+    /// within `max_standby_lag` the posture is `recovering` (mode `archive`,
+    /// progress `"<cursor> of <newest>"`) and ready, beyond it
+    /// `catching_up`. Leaves an archive gap (a new segment closed it), never a
+    /// refusal ([`Self::needs_recovery`] stays sticky).
+    pub fn archive_progress(&self, cursor: u64, newest: u64, observed_at: Option<i64>, now: i64) {
+        let mut machine = self.machine.lock();
+        let archive_gap = machine.archive_blocked;
+        self.tx.send_modify(|snapshot| {
+            if matches!(snapshot.posture, StandbyPosture::NeedsRecovery { .. }) && !archive_gap {
+                return;
+            }
+            snapshot.cursor = snapshot.cursor.max(cursor);
+            snapshot.primary_cursor = snapshot.primary_cursor.max(newest).max(snapshot.cursor);
+            snapshot.last_ack_sequence = Some(snapshot.cursor);
+            snapshot.last_caught_up = observed_at.and_then(|at| {
+                let age = u64::try_from(now.saturating_sub(at)).unwrap_or(0);
+                Instant::now().checked_sub(Duration::from_secs(age))
+            });
+            snapshot.last_error = None;
+            let ready = snapshot
+                .last_caught_up
+                .is_some_and(|at| at.elapsed() <= snapshot.max_standby_lag);
+            snapshot.posture = if ready {
+                StandbyPosture::Recovering {
+                    mode: ARCHIVE_MODE,
+                    progress: format!("{} of {}", snapshot.cursor, snapshot.primary_cursor),
+                }
+            } else {
+                StandbyPosture::CatchingUp {
+                    cursor: snapshot.cursor,
+                    barrier: snapshot.primary_cursor,
+                }
+            };
+        });
+        machine.archive_blocked = false;
+    }
+
+    /// Spec P3.2 §3: an archive-only standby cannot continue — a gap in its
+    /// directories, or a segment it may not apply — named by `reason`. It
+    /// stays up in `needs_recovery` and resumes by itself once the directories
+    /// change ([`Self::archive_progress`]). A refusal posted by
+    /// [`Self::needs_recovery`] is never replaced.
+    pub fn archive_blocked(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        let mut machine = self.machine.lock();
+        let archive_gap = machine.archive_blocked;
+        let mut blocked = false;
+        self.tx.send_if_modified(|snapshot| {
+            match &snapshot.posture {
+                StandbyPosture::NeedsRecovery { .. } if !archive_gap => return false,
+                StandbyPosture::NeedsRecovery { reason: current, .. } if *current == reason => {
+                    blocked = true;
+                    return false;
+                }
+                _ => {}
+            }
+            blocked = true;
+            snapshot.posture = StandbyPosture::NeedsRecovery {
+                reason,
+                position: snapshot.cursor,
+                since: Instant::now(),
+            };
+            true
+        });
+        if blocked {
+            machine.archive_blocked = true;
+        }
     }
 
     /// The posture as of now (for the start path's own decisions).
@@ -1206,5 +1303,66 @@ mod tests {
         );
         let primary = primary_block("primary", 7, Some("127.0.0.1:5433".into()), "async".into(), true);
         assert!(primary.tls && primary.reason.is_none());
+    }
+
+    /// Spec P3.2 §3: an archive-only standby is `recovering` (mode
+    /// `archive`) and ready while the segment holding its cursor is recent,
+    /// `catching_up` and not ready once it is older than `max_standby_lag`; a
+    /// gap is `needs_recovery` naming the range and resolves by itself, while
+    /// a refusal stays.
+    #[test]
+    fn an_archive_only_standby_is_ready_while_its_segment_is_recent_and_a_gap_is_not_sticky() {
+        let posture = PostureTracker::new("archive:/srv/segments".into(), "async".into(), Duration::from_secs(30));
+        posture.attach_store(10, Arc::new(|| None));
+        let now = 1_000_000_i64;
+        posture.archive_progress(20, 40, Some(now - 5), now);
+        let snapshot = posture.snapshot();
+        assert_eq!(
+            snapshot.posture,
+            StandbyPosture::Recovering {
+                mode: ARCHIVE_MODE,
+                progress: "20 of 40".into()
+            }
+        );
+        assert!(snapshot.ready());
+        let block = snapshot.block();
+        assert_eq!(block.state, "recovering");
+        assert_eq!(block.progress.as_deref(), Some("20 of 40"));
+        assert_eq!(block.primary.as_deref(), Some("archive:/srv/segments"));
+        assert!(
+            block.lag_secs.is_some_and(|lag| (5.0..30.0).contains(&lag)),
+            "{block:?}"
+        );
+        assert_eq!(block.lag_bytes, 20);
+
+        // The cursor's segment is older than max_standby_lag: catching up.
+        posture.archive_progress(40, 40, Some(now - 600), now);
+        let snapshot = posture.snapshot();
+        assert_eq!(
+            snapshot.posture,
+            StandbyPosture::CatchingUp {
+                cursor: 40,
+                barrier: 40
+            }
+        );
+        assert!(!snapshot.ready());
+
+        // A gap: needs_recovery naming it, until the segment appears.
+        posture.archive_blocked("archive gap 41..50: no segment in /srv/segments holds it");
+        let snapshot = posture.snapshot();
+        assert_eq!(snapshot.posture.state(), "needs_recovery");
+        assert!(snapshot.not_ready_message().contains("archive gap 41..50"));
+        posture.archive_progress(60, 60, Some(now), now);
+        assert!(posture.snapshot().ready(), "resumed once the segment appeared");
+
+        // A refusal is sticky: archive progress does not leave it.
+        posture.needs_recovery("the physical writer is poisoned");
+        posture.archive_progress(61, 61, Some(now), now);
+        assert_eq!(posture.snapshot().posture.state(), "needs_recovery");
+        posture.archive_blocked("archive gap 62..70");
+        assert!(posture
+            .snapshot()
+            .not_ready_message()
+            .contains("the physical writer is poisoned"));
     }
 }

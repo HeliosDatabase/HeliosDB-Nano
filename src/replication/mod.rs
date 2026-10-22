@@ -17,7 +17,11 @@
 //! only spoke v3 are gone; fencing and promotion return on the physical
 //! protocol (plan phase P5). Spec P3.1 archives every write group, on both
 //! roles, into sealed segment files kept for a recovery window
-//! ([`archiver`], [`archive_segment`], [`archive_catalog`]).
+//! ([`archiver`], [`archive_segment`], [`archive_catalog`]). Spec P3.2 reads
+//! them back ([`archive_chain`], [`archive_recovery`]): a primary fills a
+//! standby's gap from its archive, `heliosdb-nano recover` advances a stopped
+//! standby from copied segments, a standby may follow a directory of segments
+//! alone (`--source archive`), and a standby may serve another (cascading).
 //!
 //! # Feature Flags
 //!
@@ -39,6 +43,12 @@ pub use ha_state::{
 // catalog the views and the `archive` CLI read.
 #[cfg(feature = "ha-tier1")]
 pub mod archive_catalog;
+// Spec P3.2: reading archived segments back — gap fill, recovery chains,
+// `recover`, the archive-only standby.
+#[cfg(feature = "ha-tier1")]
+pub mod archive_chain;
+#[cfg(feature = "ha-tier1")]
+pub mod archive_recovery;
 #[cfg(feature = "ha-tier1")]
 pub mod archive_segment;
 #[cfg(feature = "ha-tier1")]

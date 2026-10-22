@@ -567,6 +567,10 @@ pub struct ReplicationReport {
     /// `shortened`, `gaps`), beside (never inside) the frozen block. `/ready`
     /// does not carry it.
     pub archive: Option<serde_json::Value>,
+    /// Spec P3.2 §4: `Some(true)` on a cascading standby — `/health`'s
+    /// top-level `cascade`, beside (never inside) the frozen block; its
+    /// downstream standbys are then listed as `standbys`.
+    pub cascade: Option<bool>,
 }
 
 /// What a replication node reports (spec P1.3, P2.1). Read-only and
@@ -620,6 +624,9 @@ async fn guard(
                     }
                     if let Some(archive) = report.archive {
                         object.insert("archive".to_string(), archive);
+                    }
+                    if let Some(cascade) = report.cascade {
+                        object.insert("cascade".to_string(), serde_json::Value::Bool(cascade));
                     }
                 }
                 (StatusCode::OK, axum::Json(body)).into_response()
@@ -1150,6 +1157,7 @@ mod tests {
                     block: serde_json::json!({ "role": "standby", "ready": ready }),
                     standbys: listed.clone(),
                     archive: Some(archived.clone()),
+                    cascade: (!ready).then_some(true),
                 })
             });
             let app = attach_http_auth_with_replication(
@@ -1176,6 +1184,9 @@ mod tests {
                 body["replication"].get("archive").is_none(),
                 "the frozen block stays as it was"
             );
+            // Spec P3.2 §4: a cascading standby says so, beside the block.
+            assert_eq!(body.get("cascade"), (!ready).then_some(&serde_json::Value::Bool(true)));
+            assert!(body["replication"].get("cascade").is_none());
             let readiness = app
                 .clone()
                 .oneshot(HttpRequest::builder().uri("/ready").body(Body::empty()).unwrap())

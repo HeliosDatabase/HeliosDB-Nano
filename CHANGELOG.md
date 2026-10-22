@@ -181,8 +181,8 @@ Oracle's archived redo for HeliosDB (`docs/guides/physical-standby.md`,
   sequences. A crash leaves at most an open `.hseg.partial`, repaired and sealed
   at the next start with every intact frame. Default directory
   `<data dir>.archive` beside the data directory (owner-only; refused inside it
-  or on the physical export directory). Recovering a standby from segments
-  arrives in P3.2.
+  or on the physical export directory). Recovering a standby from segments:
+  see the P3.2 entry below.
 - **The recovery window.** Sealed segments are kept for
   `[replication.archive] recovery_window` (default `"7d"`), bounded by
   `max_bytes` (default `"unlimited"`) and `disk_reserve` (default `"10%"` of
@@ -211,6 +211,56 @@ Oracle's archived redo for HeliosDB (`docs/guides/physical-standby.md`,
   the policy and is refused while a node archives into the directory.
 - **`scripts/regress/nano-physical-pair.sh --status`** adds
   `"archive":{"segments":N,"bytes":N}` from the primary's `/health`.
+
+### Added — recovering a standby from archived WAL (spec P3.2)
+The archive is read back (`docs/guides/physical-standby.md`, "Recovering from
+archived WAL"; Oracle: FAL, `RECOVER STANDBY DATABASE`, managed recovery from
+archived logs, cascaded standbys).
+- **Gap fill from the primary's archive.** A standby away longer than the
+  primary's RocksDB WAL retention is no longer refused when the primary's WAL
+  archive covers the gap: the primary serves the missing write groups from its
+  sealed segments of the current history and epoch on the same replication
+  connection — ordinary batches, no protocol change — bounded by the poll's
+  byte limit and never past the WAL's floor, then from its WAL again
+  (re-checked at every poll). `/health`'s `standbys[]` entries gain `"source":
+  "archive" | "wal"`; the frozen `replication` block is unchanged. Groups past
+  the sealed segments are served once their segment is sealed (the standby is
+  told to come back). `WalPruned` is still sent when the archive cannot cover
+  the gap either, and its reason now names the first missing range and both
+  floors (where the archive and the RocksDB WAL start).
+- **`heliosdb-nano recover --data-dir DIR --from-archive SEGDIR…`** advances a
+  stopped standby from segments copied into one or more directories (matched
+  by history, epoch and interval wherever they are; byte-identical copies count
+  once). Every segment of the chain is verified deep before anything is
+  applied — a corrupt segment, or one of another dataset among the copies, is
+  named and nothing is applied — then every write group goes through the live
+  standby's apply path. `--through SEQ`; exit 2 with the missing range when the
+  segments stop short; a re-run is a no-op; `--then primary` (default with
+  `--primary-host`) goes on to follow the primary as `start` would, arguments
+  after `--` passed to `start`. Refused on a running node's directory (naming
+  the process), on an empty or absent one ("a standby starts from a snapshot of
+  the primary (`start` bootstraps it); segments advance it") and on a
+  primary's.
+- **Archive-only standbys: `start --replication-role standby --source archive
+  --archive-source DIR…`** apply the segments that appear in the directories
+  and serve reads, with no replication connection (no token or
+  `--primary-host` needed). Posture `recovering` (mode `archive`, progress
+  `"<cursor> of <newest>"`), ready while the segment holding the cursor is at
+  most `max_standby_lag` old, else `catching_up`; a missing segment is
+  `needs_recovery` naming the range and resolves by itself when it appears.
+  `heliosdb_standby_status.primary` reads `archive:<dir>`. New `[replication]
+  source` (`"primary"` | `"archive"`) and `archive_source` keys.
+- **Cascading standbys (opt-in, `[replication.physical] cascade = false` by
+  default).** A standby with `cascade = true` serves its store on its own
+  `replication_port` like a primary: its WAL with every record of its
+  node-local column family stripped and each group re-framed with the
+  primary's sequence numbers (byte for byte, digest included, the primary's
+  group), its bootstrap copies with the node-local family dropped from the
+  copy; what its WAL no longer holds comes from its own archive. Downstream
+  standbys see the primary's history, epoch and sequences. Its `/health` says
+  `"cascade": true` and lists them. A checkpoint manifest gains an optional
+  `store_sequence` (a cascaded export's own RocksDB sequence; absent, and the
+  manifest unchanged byte for byte, for a primary's export).
 
 ### Fixed — replication (fireproof, plan §D5)
 - **`enable_lockfree_ingestion` is refused on every HA role.** It writes rows
@@ -288,6 +338,21 @@ Oracle's archived redo for HeliosDB (`docs/guides/physical-standby.md`,
   `tests/archive_cli_tests.rs` (`archive list | verify | gaps | prune` on a
   prepared directory with a corrupt and a misfiled segment and a hole; `prune`
   refused under a running node).
+- Added for spec P3.2: `tests/physical_archive_recovery.rs` (a standby away
+  while its primary's WAL is pruned under it catches up from the primary's
+  archive with every row and no bootstrap, listed `source: "wal"` again; with
+  the archive off it is refused `WalPruned` naming both floors; `recover` from
+  segments copied to a third directory — a corrupt one applies nothing, a
+  missing one exits 2 with the range, the full set reaches the primary's
+  default-column-family digest at that sequence, a re-run is a no-op, and the
+  standby then resumes from its primary; an encrypted dataset needs the key;
+  an archive-only standby fed a directory: ready while current, `catching_up`
+  past `max_standby_lag`, `needs_recovery` on a missing segment and back when
+  it appears; a cascade primary → A → B with B's rows and default-column-family
+  digest equal to the primary's) and `recover` argument validation and its
+  running-node refusal in `tests/archive_cli_tests.rs`.
+  `tests/physical_standby_refusals.rs`'s `WalPruned` case now turns the
+  primary's archive off (with it on, the gap is filled) and checks both floors.
 
 ### Replication
 - **A primary restart no longer breaks its standby** (field finding J). A clean
