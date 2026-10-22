@@ -55,12 +55,42 @@ overrides a configured primary; explicit `--standby-hosts ''` clears its configu
 peer list. Host endpoints accept DNS names, IPv4, or bracketed IPv6 with a nonzero
 port. Unknown replication keys and invalid values are errors. `standby_hosts` is
 informational: a primary accepts the standbys that connect to it and dials none.
-`--replication-port` has no effect on a standby.
+`--replication-port` has no effect on a standby, except a cascading one (below).
 
-The replication port is served only by a persistent primary with a replication
+The replication port is served by a persistent primary with a replication
 token; `--physical-replication=false` turns it off. A primary that serves no
 replication port never waits for standbys, whatever `sync_mode` says, and warns
 at startup.
+
+## Cascading standbys: a standby's replication port
+
+A standby with `[replication.physical] cascade = true` (spec P3.2) serves its
+own store to downstream standbys on ITS `--replication-port`, in the primary's
+history and sequence numbers. That port is the standby's third endpoint, beside
+its PostgreSQL and HTTP ports, so give it a port of its own on every host that
+runs more than one node:
+
+```bash
+# Standby A follows the primary and serves B on 127.0.0.1:5443.
+heliosdb-nano start --data-dir /srv/nano/standby-a --listen 127.0.0.1 \
+  --port 5442 --replication-role standby --primary-host 127.0.0.1:5433 \
+  --replication-port 5443 --replication-token-file replication.token \
+  --http-port 0 --config cascade.toml          # [replication.physical] cascade = true
+# Standby B follows A: its --primary-host is A's replication port.
+heliosdb-nano start --data-dir /srv/nano/standby-b --listen 127.0.0.1 \
+  --port 5452 --replication-role standby --primary-host 127.0.0.1:5443 \
+  --replication-token-file replication.token --http-port 0
+```
+
+The same rules as a primary's port apply: it is bound at start (a conflict
+refuses the start), it listens on loopback unless `--replication-tls` (or the
+plaintext opt-in), and every downstream presents the same token. A cascading
+standby needs a private export directory for the bootstrap copies it serves
+(`[replication.physical] export_dir`, default `<data dir>.physical-export`).
+
+An archive-only standby (`--source archive --archive-source DIR`) opens no
+replication connection: it needs neither `--primary-host` nor, unless it
+cascades, a token.
 
 ## One replication secret
 

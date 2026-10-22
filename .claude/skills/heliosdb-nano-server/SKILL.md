@@ -28,6 +28,9 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(systemctl *), Read
 | HA standby | CLI | `--replication-role standby --primary-host 127.0.0.1:5433 --replication-token-file ./replication.token` (`--primary-host` = the primary's replication port) |
 | HA readiness | HTTP / SQL | `curl :8081/ready` (200 ready, 503 not) · `SELECT heliosdb_require_ready()` · primary's `/health` lists `standbys` |
 | archived WAL | CLI / SQL | `heliosdb-nano archive list\|verify [--deep]\|gaps\|prune [--dry-run] --data-dir ./mydata` · `SELECT * FROM heliosdb_recovery_window` (also `heliosdb_archived_wal`, `heliosdb_archive_gaps`) · `/health` → `"archive":{…}` |
+| recover a standby from segments | CLI | `heliosdb-nano recover --data-dir ./standby --from-archive /srv/segments [--through SEQ] [--then primary --primary-host H:5433 -- <start args>]` (stopped standby; exit 2 = archive gap, range printed) |
+| archive-only standby | CLI | `--replication-role standby --source archive --archive-source /srv/segments` (no replication connection, no token needed) |
+| cascading standby | TOML | `[replication.physical] cascade = true` on a standby + its own `--replication-port`; downstream `--primary-host` = that port |
 | MySQL listener | CLI | `--mysql --mysql-listen 127.0.0.1:3306` |
 | Unix socket (PG) | CLI | `--pg-socket-dir /tmp` |
 | Unix socket (MySQL) | CLI | `--mysql-socket /tmp/heliosdb-mysql.sock` |
@@ -93,6 +96,11 @@ sync_timeout_action = "warn"      # warn | fail
 # primary_tls_ca_path = "/etc/heliosdb/repl-ca.crt"   # TLS is the default for a non-loopback primary
 # max_standby_lag  = "30s"
 # on_unrecoverable = "stay-up"    # stay-up | exit
+# source           = "primary"    # primary | archive (spec P3.2: archive-only standby, --source)
+# archive_source   = ["/srv/segments"]   # --archive-source DIR (repeatable), with source = "archive"
+
+# [replication.physical]
+# cascade = true                  # STANDBY: serve downstream standbys on its replication_port (P3.2)
 
 [replication.archive]        # archived WAL + recovery window (both roles; spec P3.1)
 # enabled             = true            # --archive=false
@@ -172,7 +180,7 @@ curl -s http://127.0.0.1:8080/health     # primary: "standbys":[{…,"applied":"
 psql -h 127.0.0.1 -p 5442 -c "SELECT heliosdb_require_ready(), pg_is_in_recovery()"
 ```
 Sync tuning lives in `[replication]`: `min_acks`, `sync_timeout_ms`, `sync_timeout_action = "warn" | "fail"` (`fail` errors a commit that IS durable on the primary — never blind-retry it).
-**No failover or promotion yet** (plan phase P5): `SWITCHOVER` is refused and a standby's data directory cannot be reopened as a primary. A standby in `needs_recovery` (history mismatch, pruned WAL, wrong token, protocol version) stays up refusing data reads with SQLSTATE 55000; rebuild it by stopping it and starting it on a new, empty data directory (keep the old one aside). A TLS failure (wrong CA, bad certificate) is NOT `needs_recovery`: the standby keeps reconnecting with `"reason": "tls: …"` on `/health`. Loopback test pair: `scripts/regress/nano-physical-pair.sh --binary <path> --start` (add `--tls` for a TLS pair).
+**No failover or promotion yet** (plan phase P5): `SWITCHOVER` is refused and a standby's data directory cannot be reopened as a primary. A standby in `needs_recovery` (history mismatch, pruned WAL, wrong token, protocol version) stays up refusing data reads with SQLSTATE 55000. A pruned WAL is first filled from the primary's WAL archive automatically (Recipe 4d); only a gap neither holds is refused (the reason names the range and both floors). Recover it from copied segments (`heliosdb-nano recover`, Recipe 4d), or rebuild it by stopping it and starting it on a new, empty data directory (keep the old one aside). A TLS failure (wrong CA, bad certificate) is NOT `needs_recovery`: the standby keeps reconnecting with `"reason": "tls: …"` on `/health`. Loopback test pair: `scripts/regress/nano-physical-pair.sh --binary <path> --start` (add `--tls` for a TLS pair).
 
 ### Recipe 4b: Remote standby over TLS
 ```bash
@@ -193,7 +201,7 @@ curl -s http://127.0.0.1:8080/health | grep '"tls":true'
 The token is still required over TLS. The certificate must name the `--primary-host` host (an IP is checked as an IP SAN; `--primary-server-name` overrides). Plaintext over a network needs `--allow-insecure-replication-remote` on both sides (dev only, INSECURE warning). A standby re-reads its CA/client cert at every reconnect; the primary loads its cert at start. Give a standby the primary's encryption key; there is no key rotation command, and rotation with standbys attached is unsupported until P5.
 
 ### Recipe 4c: Archived WAL and the recovery window
-Every primary serving its replication port and every standby seals each write group it applies into `<data dir>.archive/<history>/<epoch>/<first>-<last>.hseg` (Oracle: archived redo logs; on by default). Segments are kept for `--archive-recovery-window` (default `7d`), bounded by `--archive-max-bytes` and `--archive-disk-reserve` (default `10%`). A full archive **never stalls the primary**: pruning inside the window shortens it, with one WARN (`recovery window shortened to …`) and `shortened = true`. Recovery FROM the archive arrives in P3.2.
+Every primary serving its replication port and every standby seals each write group it applies into `<data dir>.archive/<history>/<epoch>/<first>-<last>.hseg` (Oracle: archived redo logs; on by default). Segments are kept for `--archive-recovery-window` (default `7d`), bounded by `--archive-max-bytes` and `--archive-disk-reserve` (default `10%`). A full archive **never stalls the primary**: pruning inside the window shortens it, with one WARN (`recovery window shortened to …`) and `shortened = true`. Recovery FROM the archive: Recipe 4d.
 ```bash
 psql -h 127.0.0.1 -p 5432 -c "SELECT configured_window_secs, effective_window_secs, segments, bytes_retained, shortened, state FROM heliosdb_recovery_window"
 heliosdb-nano archive list   --data-dir /srv/nano/primary            # one line per segment (available / corrupt)
@@ -202,6 +210,18 @@ heliosdb-nano archive gaps   --data-dir /srv/nano/primary
 heliosdb-nano archive prune  --data-dir /srv/nano/primary --dry-run  # a real prune is refused while the node runs
 ```
 Each node needs its own archive directory (the archiver locks it). Moving a standby's data directory aside for a rebuild? Move its `<data dir>.archive` with it.
+
+### Recipe 4d: Recovering a standby from archived WAL (spec P3.2)
+- **Gap fill (automatic, Oracle FAL).** A standby away longer than the primary's RocksDB WAL retention is served the missing write groups from the primary's archive on its replication connection; the primary logs `serving a receiver … from the WAL archive`, its `/health` `standbys[]` entry shows `"source":"archive"`, then `"wal"`. Only a gap the archive cannot cover is refused `WalPruned` (range + both floors named).
+- **`recover` (Oracle `RECOVER STANDBY DATABASE`).** On a STOPPED standby (a running one is refused, naming its pid), from segments copied into any directories (any node of the same history; copies dedupe by SHA-256). Every segment is verified deep BEFORE anything is applied; a corrupt or foreign one is named, exit 1, nothing applied. Exit 2 + `needs recovery: archive gap: sequences S..T` when the segments stop short. Re-run = no-op. An empty data dir is refused: a standby starts from a snapshot of the primary.
+```bash
+heliosdb-nano stop --pid-file /srv/nano/standby.pid
+heliosdb-nano recover --data-dir /srv/nano/standby --from-archive /srv/copied-segments --config standby.toml
+heliosdb-nano recover --data-dir /srv/nano/standby --from-archive /srv/copied-segments \
+    --then primary --primary-host 127.0.0.1:5433 -- --port 5442 --replication-token-file /srv/nano/replication.token
+```
+- **Archive-only standby (managed recovery from archived logs).** `--source archive --archive-source DIR` (repeatable): no replication connection, posture `recovering` (mode `archive`, progress `"<cursor> of <newest>"`), ready while the segment holding its cursor is ≤ `max_standby_lag` old (else `catching_up`); a missing segment → `needs_recovery` naming the range, resumes when it appears. `heliosdb_standby_status.primary` = `archive:<dir>`. The data dir must already be an installed standby.
+- **Cascading standby.** `[replication.physical] cascade = true` + `--replication-port 5443` on standby A; standby B uses `--primary-host 127.0.0.1:5443`. A strips its node-local records and serves the primary's groups/sequence numbers; A's `/health` has `"cascade":true` and lists B.
 
 ### Recipe 5: Active-active (Tier 2, requires `--features ha-tier2`)
 ```bash

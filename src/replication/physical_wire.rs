@@ -933,6 +933,32 @@ pub trait PhysicalSource: Send + Sync {
     fn session_info(&self) -> &SourceSessionInfo;
     async fn read_chunk(&self, file_index: u32, offset: u64, length: u32) -> Result<Vec<u8>>;
     async fn poll(&self, after: u64, byte_limit: usize) -> Result<PhysicalPoll>;
+    /// Where the last successful [`Self::poll`] read its groups from (spec
+    /// P3.2 §1): the store's own WAL, or the WAL archive a source fills a
+    /// receiver's gap from. The receiver cannot tell — the frames are the
+    /// same — but the source's registry reports it.
+    fn poll_origin(&self) -> PollOrigin {
+        PollOrigin::Wal
+    }
+}
+
+/// Where a source read the groups of a poll from (spec P3.2 §1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PollOrigin {
+    /// The store's own RocksDB WAL.
+    Wal,
+    /// Archived WAL segments: the store's WAL no longer held them.
+    Archive,
+}
+
+impl PollOrigin {
+    /// `"wal"` or `"archive"`, as `/health` reports it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Wal => "wal",
+            Self::Archive => "archive",
+        }
+    }
 }
 
 /// Apply each validated physical batch with its progress (the cursor in the
@@ -982,6 +1008,10 @@ pub trait ObservedSession: Send {
     /// this session delivered; the observer keeps the maxima, so a late or
     /// stale heartbeat can never move a recorded position back.
     fn heartbeat(&mut self, heartbeat: &Heartbeat);
+
+    /// A poll was served from `origin` (spec P3.2 §1). Does nothing by
+    /// default.
+    fn served(&mut self, _origin: PollOrigin) {}
 }
 
 /// A source without a registry: a test fixture, or an export nobody waits on.
@@ -1674,6 +1704,7 @@ where
                         })
                     }
                 };
+                observed.served(source_session.poll_origin());
                 let count = u32::try_from(poll.batches.len()).map_err(|_| invalid("too many physical batches"))?;
                 let summary = PollSummary {
                     through: poll.through,
@@ -2350,6 +2381,7 @@ mod tests {
                 storage_identity: identity,
                 files,
                 total_bytes: data.iter().map(|v| v.len() as u64).sum(),
+                store_sequence: None,
             };
             let mut native = rocksdb::WriteBatch::default();
             native.put(b"after", b"continued");

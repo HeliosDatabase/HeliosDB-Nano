@@ -16,14 +16,35 @@
 //! (`OpenRequest::SnapshotOf`) and resumes it. A leased checkpoint is hard
 //! links to the primary's SST files: it pins their disk space while it is
 //! kept, which is why leases expire and are bounded in number.
+//!
+//! Spec P3.2 §1: a receiver whose next groups the store's WAL no longer holds
+//! is served them from the WAL archive instead ([`ArchiveFill`], Oracle's FAL
+//! gap fetch), on the same connection and in the same frames, until its
+//! cursor reaches what the WAL still holds; the switch is re-checked at every
+//! poll. Only when the archive cannot cover the gap either is it refused
+//! `WalPruned`, naming the missing range and both floors.
+//!
+//! Spec P3.2 §4: the same sessions serve a CASCADING standby's store
+//! ([`SourceKind::Cascade`]): its WAL with its node-local records stripped
+//! (`physical::poll_source_cascade`), its exports made the primary's
+//! (`OnlineCheckpointExport::create_cascaded`), in the primary's sequence
+//! numbers.
 
-use super::checkpoint_transfer::{validate_primary_source, OnlineCheckpointExport, TransferLimits};
+use super::archive_chain::{ArchiveFill, ArchiveTail, TailError};
+use super::checkpoint_transfer::{
+    validate_cascade_source, validate_primary_source, OnlineCheckpointExport, TransferLimits,
+};
 use super::ha_state::{ha_state, StandbyHandle, StandbyRegistration, StandbyState, SyncMode};
-use super::physical::{poll_source, wal_retains_after, PhysicalError, PhysicalPoll, MAX_BATCH_BYTES};
+use super::physical::{
+    poll_source, poll_source_cascade, receiver_source_barrier, wal_retains_after, CascadeHint, PhysicalBatch,
+    PhysicalError, PhysicalPoll, MAX_BATCH_BYTES,
+};
 use super::physical_wire::{
-    Heartbeat, Hello, ObservedSession, OpenRequest, PeerRole, PhysicalSource, Refusal, RefuseCode, Result,
+    Heartbeat, Hello, ObservedSession, OpenRequest, PeerRole, PhysicalSource, PollOrigin, Refusal, RefuseCode, Result,
     SessionObserver, SourceSessionInfo, WireError, WireSyncMode,
 };
+use crate::standby_posture::EPOCH;
+use crate::Config;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rocksdb::DB;
@@ -32,7 +53,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Weak,
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -46,28 +67,103 @@ fn not_serving(reason: &str) -> WireError {
     WireError::Refused(Refusal::new(RefuseCode::SourceNotServing, reason))
 }
 
+/// What a replication port serves its sessions from.
+#[derive(Clone)]
+pub enum SourceKind {
+    /// A primary's own store.
+    Primary,
+    /// Spec P3.2 §4: a physical standby's store, cascaded to a downstream
+    /// standby (`[replication.physical] cascade = true`). `config` supplies
+    /// the storage options a cascaded export's copy is opened with.
+    Cascade { config: Arc<Config> },
+}
+
+impl SourceKind {
+    /// The source's storage identity, revalidated against `history`.
+    fn validate(&self, db: &DB, history: Uuid) -> Result<String> {
+        match self {
+            Self::Primary => validate_primary_source(db, history),
+            Self::Cascade { .. } => validate_cascade_source(db, history),
+        }
+        .map_err(source_error)
+    }
+
+    /// A new checkpoint export of the source.
+    fn export(
+        &self,
+        db: &DB,
+        history: Uuid,
+        export_parent: &std::path::Path,
+        limits: TransferLimits,
+    ) -> Result<OnlineCheckpointExport> {
+        match self {
+            Self::Primary => OnlineCheckpointExport::create(db, history, export_parent, limits),
+            Self::Cascade { config } => {
+                OnlineCheckpointExport::create_cascaded(db, history, export_parent, limits, config)
+            }
+        }
+        .map_err(source_error)
+    }
+
+    /// The source's barrier, in the primary's sequence numbers: a primary's
+    /// written sequence, a cascading standby's applied source sequence.
+    fn barrier(&self, db: &DB) -> u64 {
+        match self {
+            Self::Primary => db.latest_sequence_number(),
+            Self::Cascade { .. } => receiver_source_barrier(db).unwrap_or(0),
+        }
+    }
+
+    /// One poll of the source's own WAL.
+    fn poll(
+        &self,
+        db: &DB,
+        history: Uuid,
+        after: u64,
+        byte_limit: usize,
+        hint: &Mutex<CascadeHint>,
+    ) -> std::result::Result<PhysicalPoll, PhysicalError> {
+        match self {
+            Self::Primary => poll_source(db, history, after, byte_limit),
+            Self::Cascade { .. } => poll_source_cascade(db, history, after, byte_limit, &mut hint.lock()),
+        }
+    }
+
+    /// Whether the source's WAL still holds the group after `after`.
+    fn retains_after(&self, db: &DB, history: Uuid, after: u64, hint: &Mutex<CascadeHint>) -> bool {
+        match self {
+            Self::Primary => wal_retains_after(db, after).unwrap_or(false),
+            Self::Cascade { .. } => self.poll(db, history, after, MAX_BATCH_BYTES, hint).is_ok(),
+        }
+    }
+
+    /// The source, as a refusal names it.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Primary => "this primary",
+            Self::Cascade { .. } => "this cascading standby",
+        }
+    }
+}
+
 /// A poll's failure as the receiver must hear it: a WAL it no longer has, a
 /// hole, a receiver ahead of it — each a refusal the receiver needs recovery
-/// for. Anything else is a source-side failure (retried).
-fn poll_error(db: &DB, error: PhysicalError) -> WireError {
+/// for. Anything else is a source-side failure (retried). `barrier` is the
+/// source's, in the primary's sequence numbers. A pruned WAL reaches here only
+/// when no archive was asked ([`poll_or_fill`] names both floors otherwise).
+fn poll_error(barrier: u64, kind: &SourceKind, error: PhysicalError) -> WireError {
     match error {
-        PhysicalError::Pruned { wanted, oldest } => WireError::Refused(Refusal::new(
-            RefuseCode::WalPruned {
-                oldest: oldest.unwrap_or_else(|| db.latest_sequence_number().saturating_add(1)),
-            },
-            format!(
-                "the receiver needs sequence {wanted}; this primary's physical WAL no longer holds it (retention \
-                 [replication.physical] wal_retention_secs / wal_retention_size_mb): rebuild the standby from a \
-                 new, empty data directory"
-            ),
-        )),
+        PhysicalError::Pruned { wanted, oldest } => pruned_refusal(kind, wanted, oldest, barrier, None),
         PhysicalError::Gap { expected, observed } => WireError::Refused(Refusal::new(
             RefuseCode::Gap {
                 expected,
                 have_from: observed,
-                have_to: db.latest_sequence_number(),
+                have_to: barrier,
             },
-            "this primary's physical WAL is not contiguous from the receiver's cursor",
+            format!(
+                "{}'s physical WAL is not contiguous from the receiver's cursor",
+                kind.name()
+            ),
         )),
         PhysicalError::Ahead { after, barrier } => WireError::Refused(Refusal::new(
             RefuseCode::HistoryMismatch,
@@ -82,6 +178,135 @@ fn poll_error(db: &DB, error: PhysicalError) -> WireError {
         )),
         other => source_error(other),
     }
+}
+
+/// Spec P3.2 §1: the refusal of a receiver whose next groups are in neither
+/// the source's RocksDB WAL nor its WAL archive. It names the first missing
+/// range and both floors — where the archive starts and where the WAL starts
+/// — so an operator knows which copied segments would bridge it.
+fn pruned_refusal(
+    kind: &SourceKind,
+    wanted: u64,
+    wal_floor: Option<u64>,
+    barrier: u64,
+    archive: Option<&ArchiveTail>,
+) -> WireError {
+    let oldest = wal_floor.unwrap_or_else(|| barrier.saturating_add(1));
+    let until = oldest.saturating_sub(1).max(wanted);
+    let from = archive
+        .and_then(|tail| tail.reach(wanted))
+        .map_or(wanted, |reach| reach.saturating_add(1));
+    let to = archive
+        .and_then(|tail| tail.next_first_after(from))
+        .map_or(until, |first| first.saturating_sub(1).min(until));
+    let wal = match wal_floor {
+        Some(floor) => format!("from {floor}"),
+        None => format!("nothing before {oldest}"),
+    };
+    let archived = match archive {
+        None => "nothing (the WAL archive is off on this node)".to_string(),
+        Some(tail) => match (tail.floor(), tail.unavailable()) {
+            (Some(floor), _) => format!("from {floor}"),
+            (None, Some(why)) => format!("nothing ({why})"),
+            (None, None) => "nothing of this history".to_string(),
+        },
+    };
+    WireError::Refused(Refusal::new(
+        RefuseCode::WalPruned { oldest },
+        format!(
+            "the receiver needs sequence {wanted}; sequences {from}..{to} are in neither {source}'s RocksDB WAL nor \
+             its WAL archive (the archive holds {archived}, RocksDB holds {wal}; retention: [replication.physical] \
+             wal_retention_secs / wal_retention_size_mb, [replication.archive] recovery_window): rebuild the standby \
+             from a new, empty data directory, or recover it from archived segments that cover the range \
+             (heliosdb-nano recover --from-archive)",
+            source = kind.name()
+        ),
+    ))
+}
+
+/// Spec P3.2 §1: a tail read's failure as the receiver must hear it. A
+/// segment that does not verify, or a cursor that is not one of its group
+/// boundaries, cannot be served from this archive: the receiver needs
+/// recovery, told which file. A group larger than its poll is a source-side
+/// failure, as from the WAL.
+fn tail_error(error: TailError, oldest: u64) -> WireError {
+    match error {
+        TailError::Oversized { .. } => source_error(error),
+        TailError::Segment(_) | TailError::Boundary { .. } => WireError::Refused(Refusal::new(
+            RefuseCode::WalPruned { oldest },
+            format!(
+                "the WAL this receiver needs is pruned and the archive copy cannot be served: {error}; recover the \
+                 standby from verified segments (heliosdb-nano recover --from-archive) or rebuild it"
+            ),
+        )),
+    }
+}
+
+/// One poll as the session serves it (spec P3.2 §1): `attempt` is the poll of
+/// the source's own WAL; when that WAL no longer holds the group after
+/// `after` and the archive holds a contiguous run of this history's current
+/// epoch from it to the WAL's floor, the groups come from the archive —
+/// bounded by `byte_limit`, never past the WAL's floor, so the next poll is
+/// served from the WAL again once the cursor reaches it. Returns where the
+/// groups came from.
+///
+/// The archive's groups past its sealed segments are still in the segment
+/// being written: a receiver needing them is told to come back
+/// (`SourceNotServing`, retried) rather than refused, unless the archive
+/// records the range as missing.
+#[allow(clippy::too_many_arguments)]
+fn poll_or_fill(
+    attempt: std::result::Result<PhysicalPoll, PhysicalError>,
+    kind: &SourceKind,
+    db: &DB,
+    fill: Option<&ArchiveFill>,
+    history: Uuid,
+    after: u64,
+    byte_limit: usize,
+) -> Result<(PhysicalPoll, PollOrigin)> {
+    let (wanted, wal_floor) = match attempt {
+        Ok(poll) => return Ok((poll, PollOrigin::Wal)),
+        Err(PhysicalError::Pruned { wanted, oldest }) => (wanted, oldest),
+        Err(error) => return Err(poll_error(kind.barrier(db), kind, error)),
+    };
+    let barrier = kind.barrier(db);
+    let Some(fill) = fill else {
+        return Err(pruned_refusal(kind, wanted, wal_floor, barrier, None));
+    };
+    // As `poll_source` does: the barrier a poll reports is durable.
+    db.flush_wal(true).map_err(source_error)?;
+    let tail = fill.tail(history, EPOCH);
+    let oldest = wal_floor.unwrap_or_else(|| barrier.saturating_add(1));
+    // The archive serves up to the WAL's floor; the WAL the rest.
+    let until = oldest.saturating_sub(1).min(barrier);
+    let reach = tail.reach(wanted);
+    if reach.is_none_or(|reach| reach < until) {
+        let from = reach.map_or(wanted, |reach| reach.saturating_add(1));
+        let unsealed = tail.archived_through() >= until
+            && tail.next_first_after(from.saturating_sub(1)).is_none()
+            && !tail.records_missing(from, until);
+        if unsealed {
+            return Err(not_serving(&format!(
+                "sequences {from}..{until} are in this node's WAL archive but not in a sealed segment yet; the \
+                 receiver is served once it is sealed"
+            )));
+        }
+        return Err(pruned_refusal(kind, wanted, wal_floor, barrier, Some(&tail)));
+    }
+    let batches = tail
+        .read(after, byte_limit, until)
+        .map_err(|error| tail_error(error, oldest))?;
+    let Some(through) = batches.last().map(PhysicalBatch::last_sequence) else {
+        return Err(pruned_refusal(kind, wanted, wal_floor, barrier, Some(&tail)));
+    };
+    Ok((
+        PhysicalPoll {
+            batches,
+            through,
+            durable_barrier: barrier,
+        },
+        PollOrigin::Archive,
+    ))
 }
 
 /// One shared budget per source endpoint, retained by all its providers.
@@ -347,7 +572,7 @@ impl ExportLeases {
     }
 }
 
-struct PrimarySession {
+struct SourceSession {
     db: Arc<DB>,
     history: Uuid,
     storage_identity: String,
@@ -355,17 +580,38 @@ struct PrimarySession {
     /// A snapshot session's export, held through its lease.
     export: Option<LeaseHold>,
     work: SourceWorkLimiter,
+    kind: SourceKind,
+    /// Spec P3.2 §1: where a gap the WAL no longer holds is served from.
+    fill: Option<ArchiveFill>,
+    /// A cascading session's positions in its store's own WAL.
+    hint: Arc<Mutex<CascadeHint>>,
+    /// The last poll was served from the archive.
+    from_archive: Arc<AtomicBool>,
 }
 
 /// A leased export the session may serve again: the same dataset and store,
-/// its files intact, and the WAL past its cut still retained (else the
-/// receiver would download it only to be refused `WalPruned`).
-fn reusable(db: &DB, export: &OnlineCheckpointExport, history: Uuid, storage_identity: &str) -> bool {
+/// its files intact, and the groups past its cut still served — from the WAL,
+/// or from the archive (else the receiver would download it only to be
+/// refused `WalPruned`).
+fn reusable(
+    db: &DB,
+    kind: &SourceKind,
+    fill: Option<&ArchiveFill>,
+    export: &OnlineCheckpointExport,
+    history: Uuid,
+    storage_identity: &str,
+) -> bool {
     let manifest = export.manifest();
+    let cut = manifest.checkpoint_sequence;
+    let continued = kind.retains_after(db, history, cut, &Mutex::new(CascadeHint::default()))
+        || fill.is_some_and(|fill| {
+            let tail = fill.tail(history, EPOCH);
+            tail.reach(cut.saturating_add(1)).is_some()
+        });
     manifest.history == history
         && manifest.storage_identity == storage_identity
         && export.manifest_bytes().is_ok()
-        && wal_retains_after(db, manifest.checkpoint_sequence).unwrap_or(false)
+        && continued
 }
 
 /// Open one source session. Resume does not inspect/create `export_parent`,
@@ -386,9 +632,95 @@ pub async fn open_primary_session(
     work: SourceWorkLimiter,
     leases: ExportLeases,
 ) -> Result<Arc<dyn PhysicalSource>> {
+    open_source_session(
+        db,
+        expected_history,
+        export_parent,
+        limits,
+        request,
+        work,
+        leases,
+        SourceKind::Primary,
+        None,
+    )
+    .await
+}
+
+/// [`open_primary_session`] of a primary that archives its WAL (spec P3.2
+/// §1): a receiver whose next groups its RocksDB WAL no longer holds is
+/// served them from `fill`.
+#[allow(clippy::too_many_arguments)]
+pub async fn open_primary_session_with(
+    db: Arc<DB>,
+    expected_history: Uuid,
+    export_parent: PathBuf,
+    limits: TransferLimits,
+    request: OpenRequest,
+    work: SourceWorkLimiter,
+    leases: ExportLeases,
+    fill: Option<ArchiveFill>,
+) -> Result<Arc<dyn PhysicalSource>> {
+    open_source_session(
+        db,
+        expected_history,
+        export_parent,
+        limits,
+        request,
+        work,
+        leases,
+        SourceKind::Primary,
+        fill,
+    )
+    .await
+}
+
+/// Spec P3.2 §4: a session of a CASCADING standby, serving its own store
+/// (`db`, its writer's handle) to a downstream standby of the same history:
+/// snapshots are cascaded exports (opened with `config`'s storage options),
+/// polls strip the node-local records, and both are in the primary's sequence
+/// numbers. `fill` is the standby's own WAL archive.
+#[allow(clippy::too_many_arguments)]
+pub async fn open_cascade_session(
+    db: Arc<DB>,
+    expected_history: Uuid,
+    export_parent: PathBuf,
+    limits: TransferLimits,
+    request: OpenRequest,
+    work: SourceWorkLimiter,
+    leases: ExportLeases,
+    fill: Option<ArchiveFill>,
+    config: Arc<Config>,
+) -> Result<Arc<dyn PhysicalSource>> {
+    open_source_session(
+        db,
+        expected_history,
+        export_parent,
+        limits,
+        request,
+        work,
+        leases,
+        SourceKind::Cascade { config },
+        fill,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_source_session(
+    db: Arc<DB>,
+    expected_history: Uuid,
+    export_parent: PathBuf,
+    limits: TransferLimits,
+    request: OpenRequest,
+    work: SourceWorkLimiter,
+    leases: ExportLeases,
+    kind: SourceKind,
+    fill: Option<ArchiveFill>,
+) -> Result<Arc<dyn PhysicalSource>> {
     let session_work = work.clone();
     work.run(move || {
-        let storage_identity = validate_primary_source(&db, expected_history).map_err(source_error)?;
+        let storage_identity = kind.validate(&db, expected_history)?;
+        let hint = Arc::new(Mutex::new(CascadeHint::default()));
         // Dropped (checkpoint directories removed) at the end of this
         // blocking job, never under the lease lock.
         let mut released = Vec::new();
@@ -399,7 +731,16 @@ pub async fn open_primary_session(
                         let (reused, expired) = leases.reuse(snapshot, Instant::now());
                         released.extend(expired);
                         match reused {
-                            Some(reused) if reusable(&db, &reused.export, expected_history, &storage_identity) => {
+                            Some(reused)
+                                if reusable(
+                                    &db,
+                                    &kind,
+                                    fill.as_ref(),
+                                    &reused.export,
+                                    expected_history,
+                                    &storage_identity,
+                                ) =>
+                            {
                                 tracing::info!(
                                     "replication: serving the leased snapshot {snapshot} again (a resumed download)"
                                 );
@@ -428,10 +769,7 @@ pub async fn open_primary_session(
                 let hold = match reused {
                     Some(hold) => hold,
                     None => {
-                        let export = Arc::new(
-                            OnlineCheckpointExport::create(&db, expected_history, &export_parent, limits)
-                                .map_err(source_error)?,
-                        );
+                        let export = Arc::new(kind.export(&db, expected_history, &export_parent, limits)?);
                         let (hold, dropped) = leases.lease(export, Instant::now());
                         released.extend(dropped);
                         hold
@@ -441,11 +779,13 @@ pub async fn open_primary_session(
             }
             OpenRequest::Resume { history, after } => {
                 if history != expected_history {
-                    return Err(poll_error(&db, PhysicalError::HistoryMismatch));
+                    return Err(poll_error(kind.barrier(&db), &kind, PhysicalError::HistoryMismatch));
                 }
                 // The first bounded poll proves the receiver's cursor is still
-                // served: retained, contiguous, not ahead of this primary.
-                let initial = poll_source(&db, history, after, MAX_BATCH_BYTES).map_err(|e| poll_error(&db, e))?;
+                // served: retained (by the WAL, or by the archive), contiguous,
+                // not ahead of this source.
+                let attempt = kind.poll(&db, history, after, MAX_BATCH_BYTES, &hint);
+                let (initial, _) = poll_or_fill(attempt, &kind, &db, fill.as_ref(), history, after, MAX_BATCH_BYTES)?;
                 (
                     SourceSessionInfo::Resume {
                         session_id: Uuid::new_v4(),
@@ -457,26 +797,39 @@ pub async fn open_primary_session(
                 )
             }
         };
-        if validate_primary_source(&db, expected_history).map_err(source_error)? != storage_identity {
-            return Err(source_error("primary storage identity changed during session creation"));
+        if kind.validate(&db, expected_history)? != storage_identity {
+            return Err(source_error("source storage identity changed during session creation"));
         }
         drop(released);
-        Ok(Arc::new(PrimarySession {
+        Ok(Arc::new(SourceSession {
             db,
             history: expected_history,
             storage_identity,
             info,
             export,
             work: session_work,
+            kind,
+            fill,
+            hint,
+            // Nothing served yet: the first poll says where it came from.
+            from_archive: Arc::new(AtomicBool::new(false)),
         }) as Arc<dyn PhysicalSource>)
     })
     .await
 }
 
 #[async_trait]
-impl PhysicalSource for PrimarySession {
+impl PhysicalSource for SourceSession {
     fn session_info(&self) -> &SourceSessionInfo {
         &self.info
+    }
+
+    fn poll_origin(&self) -> PollOrigin {
+        if self.from_archive.load(Ordering::Acquire) {
+            PollOrigin::Archive
+        } else {
+            PollOrigin::Wal
+        }
     }
 
     async fn read_chunk(&self, file_index: u32, offset: u64, length: u32) -> Result<Vec<u8>> {
@@ -496,14 +849,38 @@ impl PhysicalSource for PrimarySession {
         let db = self.db.clone();
         let history = self.history;
         let storage_identity = self.storage_identity.clone();
+        let kind = self.kind.clone();
+        let fill = self.fill.clone();
+        let hint = Arc::clone(&self.hint);
+        let from_archive = Arc::clone(&self.from_archive);
         self.work
             .run(move || {
-                if validate_primary_source(&db, history).map_err(source_error)? != storage_identity {
-                    return Err(source_error("primary storage identity changed before poll"));
+                if kind.validate(&db, history)? != storage_identity {
+                    return Err(source_error("source storage identity changed before poll"));
                 }
-                let poll = poll_source(&db, history, after, byte_limit).map_err(|e| poll_error(&db, e))?;
-                if validate_primary_source(&db, history).map_err(source_error)? != storage_identity {
-                    return Err(source_error("primary storage identity changed during poll"));
+                // Re-checked at every poll: the WAL first, the archive only
+                // for what the WAL no longer holds.
+                let attempt = kind.poll(&db, history, after, byte_limit, &hint);
+                let (poll, origin) = poll_or_fill(attempt, &kind, &db, fill.as_ref(), history, after, byte_limit)?;
+                if kind.validate(&db, history)? != storage_identity {
+                    return Err(source_error("source storage identity changed during poll"));
+                }
+                let archived = origin == PollOrigin::Archive;
+                if from_archive.swap(archived, Ordering::AcqRel) != archived {
+                    if archived {
+                        tracing::info!(
+                            "replication: serving a receiver at sequence {after} from the WAL archive: {}'s RocksDB \
+                             WAL no longer holds sequence {} (through {} this poll)",
+                            kind.name(),
+                            after.saturating_add(1),
+                            poll.through
+                        );
+                    } else {
+                        tracing::info!(
+                            "replication: the receiver at sequence {after} is served from {}'s RocksDB WAL again",
+                            kind.name()
+                        );
+                    }
                 }
                 Ok(poll)
             })
@@ -515,14 +892,26 @@ impl PhysicalSource for PrimarySession {
 /// see it — `ha_state()`'s, the one the commit path's sync wait reads. Every
 /// admitted session registers its standby from the `Hello` and records each
 /// heartbeat (= acknowledgement) into it; the session's end unregisters it.
+///
+/// Spec P3.2 §4: a cascading standby keeps the same registry of its
+/// downstream standbys; its barrier is its applied source sequence.
 pub struct StandbyRegistryObserver {
-    db: Weak<DB>,
+    barrier: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl StandbyRegistryObserver {
     /// `db` is the primary's store (its physical sequence is the barrier).
     pub fn new(db: &Arc<DB>) -> Self {
-        Self { db: Arc::downgrade(db) }
+        let db = Arc::downgrade(db);
+        Self::with_barrier(Box::new(move || {
+            db.upgrade().map_or(0, |db| db.latest_sequence_number())
+        }))
+    }
+
+    /// A registry whose barrier is read from `barrier` — a cascading
+    /// standby's applied source sequence (spec P3.2 §4).
+    pub fn with_barrier(barrier: Box<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        Self { barrier }
     }
 }
 
@@ -534,11 +923,15 @@ impl ObservedSession for RegisteredSession {
         self.0
             .record_ack(heartbeat.applied_sequence, heartbeat.durable_sequence);
     }
+
+    fn served(&mut self, origin: PollOrigin) {
+        self.0.note_source(origin == PollOrigin::Archive);
+    }
 }
 
 impl SessionObserver for StandbyRegistryObserver {
     fn barrier(&self) -> u64 {
-        self.db.upgrade().map_or(0, |db| db.latest_sequence_number())
+        (self.barrier)()
     }
 
     fn admit(&self, peer: Option<SocketAddr>, hello: &Hello) -> Box<dyn ObservedSession> {
@@ -958,5 +1351,143 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    /// Seal `batches` into one segment of `archive` (the archiver's layout).
+    fn archive_groups(archive: &std::path::Path, history: Uuid, batches: &[PhysicalBatch]) {
+        use crate::replication::archive_segment::{segment_dir, unix_now, OpenSegment, SegmentHeader};
+        let header = SegmentHeader {
+            flags: 0,
+            history,
+            epoch: EPOCH,
+            first_sequence: batches[0].first_sequence(),
+            created_at: unix_now(),
+            node_id: Uuid::new_v4(),
+            key_check: [0; 32],
+        };
+        let mut open = OpenSegment::create(&segment_dir(archive, history, EPOCH), header).unwrap();
+        for batch in batches {
+            open.append(batch, unix_now(), None).unwrap();
+        }
+        open.seal().unwrap();
+    }
+
+    /// A primary whose groups 1..=7 were written, archived as `split` says,
+    /// then flushed out of its WAL (what retention does), and one more group
+    /// (8) written after: its WAL holds from 8 only.
+    fn pruned_primary(root: &std::path::Path, split: &[std::ops::Range<usize>]) -> (Arc<DB>, Uuid) {
+        let path = root.join("primary");
+        let history = {
+            let (db, history) = primary(root);
+            for index in 0..6 {
+                db.put(format!("k{index}"), b"v").unwrap();
+            }
+            let polled = poll_source(&db, history, 0, MAX_BATCH_BYTES).unwrap();
+            assert_eq!(polled.through, 7);
+            for range in split {
+                archive_groups(&root.join("archive"), history, &polled.batches[range.clone()]);
+            }
+            db.flush().unwrap();
+            history
+        };
+        // Every archived WAL file and every log but the newest goes.
+        if let Ok(entries) = std::fs::read_dir(path.join("archive")) {
+            for entry in entries {
+                std::fs::remove_file(entry.unwrap().path()).unwrap();
+            }
+        }
+        let mut logs: Vec<_> = std::fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "log"))
+            .collect();
+        logs.sort();
+        logs.pop();
+        for log in logs {
+            std::fs::remove_file(log).unwrap();
+        }
+        let mut options = Options::default();
+        options.set_wal_ttl_seconds(3600);
+        let db = Arc::new(DB::open(&options, &path).unwrap());
+        db.put(b"after", b"purge").unwrap();
+        assert_eq!(db.latest_sequence_number(), 8);
+        (db, history)
+    }
+
+    async fn resume_at(
+        db: &Arc<DB>,
+        history: Uuid,
+        root: &std::path::Path,
+        after: u64,
+        fill: Option<ArchiveFill>,
+    ) -> Result<Arc<dyn PhysicalSource>> {
+        open_primary_session_with(
+            db.clone(),
+            history,
+            root.to_path_buf(),
+            TransferLimits::default(),
+            OpenRequest::Resume { history, after },
+            SourceWorkLimiter::new(2).unwrap(),
+            leases(),
+            fill,
+        )
+        .await
+    }
+
+    /// Spec P3.2 §1: a receiver whose next groups the WAL no longer holds is
+    /// served them from the archive, up to the WAL's floor, then from the WAL
+    /// again; the session says where each poll came from.
+    #[tokio::test]
+    async fn a_pruned_wal_is_served_from_the_archive_up_to_the_wal_floor_then_from_the_wal() {
+        let root = tempfile::tempdir().unwrap();
+        let (db, history) = pruned_primary(root.path(), std::slice::from_ref(&(0..7)));
+        let fill = ArchiveFill::directory(root.path().join("archive"), None);
+        let session = resume_at(&db, history, root.path(), 2, Some(fill)).await.unwrap();
+        match session.session_info() {
+            SourceSessionInfo::Resume { durable_barrier, .. } => assert_eq!(*durable_barrier, 8),
+            _ => panic!("a resume session"),
+        }
+        assert_eq!(session.poll_origin(), PollOrigin::Wal, "nothing served yet");
+        let archived = session.poll(2, MAX_BATCH_BYTES).await.unwrap();
+        assert_eq!(archived.batches.first().unwrap().first_sequence(), 3);
+        assert_eq!(archived.through, 7, "the archive serves up to the WAL's floor");
+        assert_eq!(archived.durable_barrier, 8);
+        assert_eq!(session.poll_origin(), PollOrigin::Archive);
+        let live = session.poll(7, MAX_BATCH_BYTES).await.unwrap();
+        assert_eq!(live.batches.len(), 1);
+        assert_eq!(live.batches[0].first_sequence(), 8);
+        assert_eq!(session.poll_origin(), PollOrigin::Wal, "back on the WAL");
+    }
+
+    /// Spec P3.2 §1: without an archive, or with a hole in it, the receiver
+    /// is refused `WalPruned`, naming the missing range and both floors.
+    #[tokio::test]
+    async fn a_gap_neither_the_wal_nor_the_archive_holds_is_refused_naming_both_floors() {
+        let root = tempfile::tempdir().unwrap();
+        // Groups 1..=3 and 6..=7 archived: 4..=5 are nowhere.
+        let (db, history) = pruned_primary(root.path(), &[0..3, 5..7]);
+        let refusal = |result: Result<Arc<dyn PhysicalSource>>| match result {
+            Err(WireError::Refused(refusal)) => refusal,
+            Err(other) => panic!("not a refusal: {other}"),
+            Ok(_) => panic!("served"),
+        };
+        let off = refusal(resume_at(&db, history, root.path(), 2, None).await);
+        assert_eq!(off.code, RefuseCode::WalPruned { oldest: 8 });
+        assert!(off.reason.contains("sequences 3..7"), "{}", off.reason);
+        assert!(off.reason.contains("RocksDB holds from 8"), "{}", off.reason);
+        assert!(off.reason.contains("the WAL archive is off"), "{}", off.reason);
+        assert!(off.reason.contains("rebuild the standby"), "{}", off.reason);
+
+        let fill = ArchiveFill::directory(root.path().join("archive"), None);
+        let hole = refusal(resume_at(&db, history, root.path(), 2, Some(fill.clone())).await);
+        assert_eq!(hole.code, RefuseCode::WalPruned { oldest: 8 });
+        assert!(hole.reason.contains("sequences 4..5"), "{}", hole.reason);
+        assert!(hole.reason.contains("the archive holds from 1"), "{}", hole.reason);
+        assert!(hole.reason.contains("RocksDB holds from 8"), "{}", hole.reason);
+        // Past the hole, the archive covers the rest: served.
+        let session = resume_at(&db, history, root.path(), 5, Some(fill)).await.unwrap();
+        let archived = session.poll(5, MAX_BATCH_BYTES).await.unwrap();
+        assert_eq!(archived.batches[0].first_sequence(), 6);
+        assert_eq!(archived.through, 7);
     }
 }

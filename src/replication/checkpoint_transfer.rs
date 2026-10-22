@@ -24,7 +24,8 @@
 //! standby carries no extra file; installation is unchanged.
 
 use super::physical::{
-    Durability, LocalWriter, PhysicalBatch, PhysicalCursor, PhysicalError, StagedPhysicalReplica, LOCAL_CF,
+    decode_cursor, Durability, LocalWriter, PhysicalBatch, PhysicalCursor, PhysicalError, StagedPhysicalReplica,
+    CURSOR_KEY, LOCAL_CF,
 };
 use crate::{storage::StorageEngine, Config};
 use rocksdb::{checkpoint::Checkpoint, ColumnFamilyDescriptor, Options, DB};
@@ -124,18 +125,36 @@ pub struct CheckpointManifest {
     pub format: u32,
     pub snapshot_id: Uuid,
     pub history: Uuid,
+    /// The source sequence the checkpoint holds, in the PRIMARY's numbering:
+    /// where its receiver's cursor starts.
     pub checkpoint_sequence: u64,
     pub storage_identity: String,
     pub files: Vec<CheckpointFile>,
     pub total_bytes: u64,
+    /// Spec P3.2 §4: the checkpoint store's own RocksDB sequence when it runs
+    /// ahead of `checkpoint_sequence` — a CASCADED export, taken from a
+    /// physical standby, whose sequence also counts that standby's cursor
+    /// writes. Absent (and not serialized, so a primary's manifest is
+    /// unchanged byte for byte) when the two are equal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_sequence: Option<u64>,
 }
 impl CheckpointManifest {
+    /// The store sequence a downloaded copy must open at
+    /// ([`Self::store_sequence`] when set, else `checkpoint_sequence`).
+    pub fn opened_sequence(&self) -> u64 {
+        self.store_sequence.unwrap_or(self.checkpoint_sequence)
+    }
+
     pub fn validate(&self, limits: &TransferLimits) -> Result<()> {
         limits.validate()?;
         if self.format != 1
             || self.snapshot_id.is_nil()
             || self.history.is_nil()
             || self.checkpoint_sequence > MAX_SEQUENCE
+            || self
+                .store_sequence
+                .is_some_and(|store| store <= self.checkpoint_sequence || store > MAX_SEQUENCE)
             || self.files.is_empty()
             || self.files.len() > limits.max_files
             || !valid_identity(&self.storage_identity)
@@ -346,12 +365,14 @@ fn sync_dir(path: &Path) -> Result<()> {
 /// `StorageEngine::build_db_options`. Never creates a store.
 ///
 /// One exception to the engine's options: a receiver retains no archived WAL.
-/// It is never a WAL source — its own records carry node-local writes and are
-/// refused as source batches, and cascading is not supported — and with a
-/// retention window RocksDB moves obsolete logs into an `archive/` directory,
-/// which the stage file census refuses. Everything that decides how data is
-/// laid out and read (compression, table format, filters, prefix extractor,
-/// memtables) is the engine's.
+/// Its own records carry node-local writes and are refused as ordinary source
+/// batches; a cascading standby (spec P3.2 §4) serves its LIVE WAL, stripped
+/// (`physical::poll_source_cascade`), and what that no longer holds from its
+/// own WAL archive (`[replication.archive]`). With a retention window RocksDB
+/// would move obsolete logs into an `archive/` directory, which the stage
+/// file census refuses. Everything that decides how data is laid out and read
+/// (compression, table format, filters, prefix extractor, memtables) is the
+/// engine's.
 fn receiver_options(config: &Config, path: &Path) -> Result<(Options, Vec<ColumnFamilyDescriptor>)> {
     let (mut options, families) = StorageEngine::build_db_options(config, path)
         .map_err(|error| invalid(format!("receiver storage options: {error}")))?;
@@ -422,6 +443,87 @@ pub fn validate_primary_source(db: &DB, expected_history: Uuid) -> Result<String
     source_identity(db, expected_history).map(|(_, identity)| identity)
 }
 
+/// Spec P3.2 §4: a cascading source is an installed physical standby — its
+/// directory carries the physical marker of `expected_history` and no
+/// primary or logical-standby marker — never a primary's directory.
+fn cascade_source_identity(db: &DB, expected_history: Uuid) -> Result<(OwnedDirectory, String)> {
+    if expected_history.is_nil() {
+        return Err(invalid("nil expected source history"));
+    }
+    let directory = OwnedDirectory::capture(db.path())?;
+    absent(&directory.path.join(PRIMARY_MARKER))?;
+    absent(&directory.path.join(STANDBY_MARKER))?;
+    if physical_stage_history(&directory.path)? != expected_history {
+        return Err(invalid(
+            "the cascading standby's physical marker names another dataset history",
+        ));
+    }
+    let storage_identity = identity(&directory.path)?;
+    directory.verify()?;
+    Ok((directory, storage_identity))
+}
+
+/// [`validate_primary_source`] for a cascading source (spec P3.2 §4): a
+/// physical standby following `expected_history`. Returns its storage
+/// identity (its primary's: a standby's IDENTITY is a copy).
+pub fn validate_cascade_source(db: &DB, expected_history: Uuid) -> Result<String> {
+    cascade_source_identity(db, expected_history).map(|(_, identity)| identity)
+}
+
+/// Spec P3.2 §4: make the checkpoint copy at `path` of a physical standby's
+/// store the primary's. The cursor in its node-local family names the
+/// source sequence the copy is at (it is written in the same write group as
+/// the data it accounts for, so the copy's last write is its cursor's); the
+/// family is then dropped from the copy, which leaves the default column
+/// family — the primary's at that source sequence — alone. Returns that
+/// source sequence and the copy's own RocksDB sequence (`None` when equal),
+/// proven on a read-only reopen. Opened with `config`'s storage options, so
+/// whatever the open flushes is written as the engine writes it.
+fn strip_node_local_family(path: &Path, config: &Config, expected_history: Uuid) -> Result<(u64, Option<u64>)> {
+    let (options, families) = receiver_options(config, path)?;
+    let mut copy = DB::open_cf_descriptors(&options, path, families)?;
+    let cursor = {
+        let local = copy
+            .cf_handle(LOCAL_CF)
+            .ok_or_else(|| invalid("the standby's checkpoint has no node-local column family"))?;
+        let bytes = copy
+            .get_cf(local, CURSOR_KEY)?
+            .ok_or_else(|| invalid("the standby's checkpoint holds no receiver cursor"))?;
+        decode_cursor(&bytes)?
+    };
+    if cursor.history() != expected_history {
+        return Err(invalid(
+            "the standby's checkpoint cursor follows another dataset history",
+        ));
+    }
+    let store = copy.latest_sequence_number();
+    if cursor.local_sequence() != store {
+        return Err(invalid(
+            "the standby's store was written outside its physical writer: its checkpoint cannot be served",
+        ));
+    }
+    copy.drop_cf(LOCAL_CF)?;
+    drop(copy);
+    if DB::list_cf(&Options::default(), path)?
+        .iter()
+        .any(|family| family == LOCAL_CF)
+    {
+        return Err(invalid(
+            "the node-local column family survived its drop from the checkpoint copy",
+        ));
+    }
+    let reopened = DB::open_for_read_only(&Options::default(), path, false)?;
+    let reopened_sequence = reopened.latest_sequence_number();
+    drop(reopened);
+    if reopened_sequence != store {
+        return Err(invalid(
+            "the checkpoint copy's sequence moved while its node-local family was dropped",
+        ));
+    }
+    let source = cursor.source_sequence();
+    Ok((source, (store != source).then_some(store)))
+}
+
 fn fingerprint_file(path: &Path, expected_size: u64, single_link: bool) -> Result<([u8; 32], Metadata)> {
     let mut file = open_regular(path, expected_size, single_link, false)?;
     let before = file.metadata()?;
@@ -473,6 +575,69 @@ impl OnlineCheckpointExport {
     pub fn create(db: &DB, expected_history: Uuid, export_parent: &Path, limits: TransferLimits) -> Result<Self> {
         limits.validate()?;
         let (source, storage_identity) = source_identity(db, expected_history)?;
+        Self::export(
+            db,
+            &source,
+            storage_identity,
+            expected_history,
+            export_parent,
+            limits,
+            None,
+            || source_identity(db, expected_history).map(|(_, identity)| identity),
+        )
+    }
+
+    /// Spec P3.2 §4: the export of a CASCADING source — a physical standby
+    /// (`[replication.physical] cascade = true`) serving a downstream
+    /// standby. `db` is the standby's live store (its writer's handle), bound
+    /// to `expected_history` by its physical marker and IDENTITY.
+    ///
+    /// The checkpoint copy is made the primary's: the cursor its node-local
+    /// family holds names the source sequence the copy is at, then the family
+    /// is dropped from the COPY (`DB::drop_cf`), so what is shipped is the
+    /// primary's default column family alone — byte for byte the primary's at
+    /// that source sequence — and the downstream creates a family of its own.
+    /// The manifest's `checkpoint_sequence` is that source sequence (the
+    /// primary's numbering, which the downstream continues in) and its
+    /// `store_sequence` the copy's own RocksDB sequence, which runs ahead of
+    /// it by this standby's cursor writes. `config` supplies the storage
+    /// options the copy is opened with to drop the family.
+    pub fn create_cascaded(
+        db: &DB,
+        expected_history: Uuid,
+        export_parent: &Path,
+        limits: TransferLimits,
+        config: &Config,
+    ) -> Result<Self> {
+        limits.validate()?;
+        let (source, storage_identity) = cascade_source_identity(db, expected_history)?;
+        Self::export(
+            db,
+            &source,
+            storage_identity,
+            expected_history,
+            export_parent,
+            limits,
+            Some(config),
+            || cascade_source_identity(db, expected_history).map(|(_, identity)| identity),
+        )
+    }
+
+    /// The export of [`Self::create`] and [`Self::create_cascaded`]:
+    /// checkpoint, IDENTITY, the cut (made the primary's for a cascaded
+    /// export), the census and the manifest. `revalidate` re-reads the
+    /// source's identity after the copy was made.
+    #[allow(clippy::too_many_arguments)]
+    fn export(
+        db: &DB,
+        source: &OwnedDirectory,
+        storage_identity: String,
+        expected_history: Uuid,
+        export_parent: &Path,
+        limits: TransferLimits,
+        cascade: Option<&Config>,
+        revalidate: impl Fn() -> Result<String>,
+    ) -> Result<Self> {
         let parent = OwnedDirectory::capture(export_parent)?;
         if fs::canonicalize(&parent.path)?.starts_with(fs::canonicalize(&source.path)?) {
             return Err(invalid("checkpoint export parent is inside source DB"));
@@ -483,6 +648,8 @@ impl OnlineCheckpointExport {
         let path = lease.path().join("checkpoint");
         Checkpoint::new(db)?.create_checkpoint(&path)?;
         // The pinned Checkpoint API omits external IDENTITY and Nano markers.
+        // Written before any writable open of the copy: RocksDB would invent
+        // an IDENTITY of its own for a directory without one.
         match fs::symlink_metadata(path.join("IDENTITY")) {
             Ok(_) => (),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -493,9 +660,18 @@ impl OnlineCheckpointExport {
         if identity(&path)? != storage_identity {
             return Err(invalid("checkpoint IDENTITY differs from source"));
         }
-        let checkpoint = DB::open_for_read_only(&Options::default(), &path, false)?;
-        let cut = checkpoint.latest_sequence_number();
-        drop(checkpoint);
+        let (cut, store_sequence) = match cascade {
+            None => {
+                let checkpoint = DB::open_for_read_only(&Options::default(), &path, false)?;
+                let cut = checkpoint.latest_sequence_number();
+                drop(checkpoint);
+                (cut, None)
+            }
+            Some(config) => strip_node_local_family(&path, config, expected_history)?,
+        };
+        if identity(&path)? != storage_identity {
+            return Err(invalid("checkpoint IDENTITY changed while the copy was opened"));
+        }
         let directory = OwnedDirectory::capture(&path)?;
         let mut files = Vec::new();
         let mut total_bytes = 0_u64;
@@ -539,6 +715,7 @@ impl OnlineCheckpointExport {
             storage_identity,
             files,
             total_bytes,
+            store_sequence,
         };
         manifest.validate(&limits)?;
         let mut fingerprints = Vec::with_capacity(manifest.files.len());
@@ -549,8 +726,7 @@ impl OnlineCheckpointExport {
         }
         manifest.encoded()?;
         // History metadata must not have changed during snapshot creation.
-        let (_, current_identity) = source_identity(db, expected_history)?;
-        if current_identity != manifest.storage_identity {
+        if revalidate()? != manifest.storage_identity {
             return Err(invalid("source identity changed"));
         }
         directory.verify()?;
@@ -1227,7 +1403,9 @@ impl ReceiverStaging {
         // Prove exact source cut BEFORE opening writable storage or adding a cursor.
         let (options, families) = receiver_options(config, &self.owner.directory.path)?;
         let checkpoint = DB::open_cf_descriptors_read_only(&options, &self.owner.directory.path, families, false)?;
-        if checkpoint.latest_sequence_number() != self.owner.manifest.checkpoint_sequence {
+        // A cascaded export's store runs ahead of the source sequence it holds
+        // (spec P3.2 §4): the copy opens at its store sequence.
+        if checkpoint.latest_sequence_number() != self.owner.manifest.opened_sequence() {
             return Err(invalid("downloaded checkpoint cut mismatch"));
         }
         drop(checkpoint);
@@ -1262,10 +1440,11 @@ impl VerifiedCheckpoint {
         if identity(&self.owner.directory.path)? != self.owner.manifest.storage_identity {
             return Err(invalid("RocksDB repaired/replaced snapshot identity during open"));
         }
-        let replica = StagedPhysicalReplica::from_checkpoint(
+        let replica = StagedPhysicalReplica::from_checkpoint_at(
             db,
             self.owner.manifest.history,
             self.owner.manifest.checkpoint_sequence,
+            self.owner.manifest.opened_sequence(),
         )?;
         Ok(PhysicalStage {
             owner: self.owner,

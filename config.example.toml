@@ -465,6 +465,14 @@ logical_wal_retention_entries = 0
 # WAL, ...): "stay-up" (needs_recovery) or "exit".
 # on_unrecoverable = "stay-up"
 
+# STANDBY: where its write groups come from (spec P3.2). "primary" (default)
+# follows primary_host. "archive" applies archived WAL segments as they appear
+# in archive_source and never opens a replication connection (Oracle: managed
+# recovery from archived logs); it is ready while the segment holding its cursor
+# is at most max_standby_lag old. CLI --source, --archive-source DIR (repeatable).
+# source = "primary"
+# archive_source = ["/srv/heliosdb/segments"]
+
 # The owner-only 32-byte token file authenticating the replication connection.
 # Put the identical file on the primary and every standby. The token bytes are
 # never read from TOML or the environment — only this path is:
@@ -533,6 +541,18 @@ logical_wal_retention_entries = 0
 # max_bytes = "unlimited"        # or a size, e.g. "16GiB"
 # disk_reserve = "10%"           # free space kept on the archive's filesystem: a percentage or a size
 # prune_interval_secs = 60       # 1..=86400; the pruner also runs after every seal
+#
+# A standby away longer than the primary's RocksDB WAL retention is served the
+# groups it missed from the primary's archive on its replication connection
+# (spec P3.2); `heliosdb-nano recover --data-dir DIR --from-archive SEGDIR`
+# advances a stopped standby from segments copied by hand.
+
+# CASCADING STANDBY (spec P3.2): a standby with cascade = true serves its own
+# store on its replication_port to downstream standbys (same token), in the
+# primary's history and sequence numbers; what its WAL no longer holds comes
+# from its own archive. Off by default.
+# [replication.physical]
+# cascade = true
 
 # ============================================================================
 # PERFORMANCE CONFIGURATION

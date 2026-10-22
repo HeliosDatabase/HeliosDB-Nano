@@ -25,6 +25,7 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `archive verify [--deep] [--key-file f] [--keep-going]` | Offline: header + footer of every segment; `--deep` re-hashes files and decodes every frame (dataset key for an encrypted dataset); exit 1 naming the first failing file | `heliosdb-nano-server` |
 | `archive gaps [--from SEQ]` | Offline: sequence intervals the archive lacks, and why | `heliosdb-nano-server` |
 | `archive prune [--dry-run] [--recovery-window d] [--max-bytes s] [--disk-reserve r]` | Offline: apply the retention policy; refused while a node archives into the directory | `heliosdb-nano-server` |
+| `recover --data-dir d --from-archive SEGDIR… [--through SEQ] [--then primary\|stop] [--primary-host hp] [--config f] [-- <start args>]` | Offline (spec P3.2; Oracle `RECOVER STANDBY DATABASE`): advance a STOPPED physical standby from copied archived segments — every segment verified deep before anything is applied, applied through the live standby's apply path; exit 2 naming the archive gap; refused on a running node's dir, an empty dir, a primary's; `--then primary` goes on as `start` | `heliosdb-nano-server` |
 
 ## CLI flags (`heliosdb-nano start …`)
 
@@ -43,8 +44,9 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `--auth <mode>` | `trust` | `trust\|password\|md5\|scram-sha-256` | `heliosdb-nano-server` |
 | `--password <s>` | — | Admin password seed (non-trust) | `heliosdb-nano-server` |
 | `--replication-role <r>` | `standalone` | `standalone\|primary\|standby` (standby = read-only physical replica) | `heliosdb-nano-server` |
-| `--replication-port <n>` | `5433` | THE replication port (`NPHYS002`) a primary serves its standbys on — bootstrap copy, physical WAL, heartbeats/ACKs on one connection; binds `--listen`'s address with `--replication-tls`, else loopback; unused on a standby | `heliosdb-nano-server` |
-| `--primary-host <hp>` | — | Standby: the primary's `--replication-port`; a non-loopback one is reached over TLS (`--primary-tls`, the default there) | `heliosdb-nano-server` |
+| `--replication-port <n>` | `5433` | THE replication port (`NPHYS002`) a primary serves its standbys on — bootstrap copy, physical WAL, heartbeats/ACKs on one connection; binds `--listen`'s address with `--replication-tls`, else loopback; on a standby only with `[replication.physical] cascade = true` (it then serves downstream standbys) | `heliosdb-nano-server` |
+| `--primary-host <hp>` | — | Standby: the primary's `--replication-port` (or a cascading standby's); a non-loopback one is reached over TLS (`--primary-tls`, the default there) | `heliosdb-nano-server` |
+| `--source primary\|archive` / `--archive-source <d>` (repeatable) | `primary` | Standby (spec P3.2): `archive` = archive-only standby applying the segments that appear in the directories, no replication connection (Oracle managed recovery from archived logs) | `heliosdb-nano-server` |
 | `--replication-tls` / `--replication-tls-cert <f>` / `--replication-tls-key <f>` / `--replication-tls-ca <f>` | off | Primary: TLS on the replication port (cert/key default to `--tls-cert`/`--tls-key`); `-ca` = mutual TLS; token still required | `heliosdb-nano-server` |
 | `--primary-tls[=BOOL]` / `--primary-ca <f>` / `--primary-server-name <n>` / `--primary-client-cert <f>` / `--primary-client-key <f>` | TLS on for a remote primary | Standby: TLS to the primary, its CA (default: system trust store), the name to verify, the mutual-TLS client certificate | `heliosdb-nano-server` |
 | `--allow-insecure-replication-remote` | off | Plaintext replication over a non-loopback network (dev only; INSECURE warning) | `heliosdb-nano-server` |
@@ -175,6 +177,8 @@ See `_index/feature-matrix.md` (or `Cargo.toml:189-299`) for the full table mapp
 | `[replication] sync_timeout_ms` | How long a commit waits for its acknowledgements (default `10000`) | `heliosdb-nano-server` |
 | `[replication] sync_timeout_action` | `warn` (default: commit with a WARN, then async until standbys catch up) \| `fail` (PG client gets SQLSTATE 25000 for a commit that IS durable on the primary) | `heliosdb-nano-server` |
 | `[replication] max_standby_lag` / `on_unrecoverable` | Standby: how long it stays ready without its primary (default `30s`) / `stay-up` (default) or `exit` on a refusal | `heliosdb-nano-server` |
-| HTTP `GET /ready` | 200 iff ready (a primary, or a standby streaming or reconnecting within `max_standby_lag`), else 503; body = replication block | `heliosdb-nano-server`, `-observability` |
-| HTTP `GET /health` | Liveness + `replication` block; on a primary also `standbys` (node_id, applied/durable LSN, lag, last_seen) | `heliosdb-nano-server`, `-observability` |
+| `[replication] source` / `archive_source` | Standby (spec P3.2): `primary` (default) or `archive` — follow the segments that appear in the `archive_source` directories, no replication connection (`--source`, `--archive-source`) | `heliosdb-nano-server` |
+| `[replication.physical] cascade` | Standby (spec P3.2): serve downstream standbys on its own `replication_port`, in the primary's history and sequence numbers (default `false`) | `heliosdb-nano-server` |
+| HTTP `GET /ready` | 200 iff ready (a primary, or a standby streaming or reconnecting within `max_standby_lag`, or an archive-only standby whose cursor's segment is within it), else 503; body = replication block | `heliosdb-nano-server`, `-observability` |
+| HTTP `GET /health` | Liveness + `replication` block; on a primary (and a cascading standby, which also says `cascade: true`) also `standbys` (node_id, applied/durable LSN, lag, last_seen, `source`: `wal`\|`archive`) | `heliosdb-nano-server`, `-observability` |
 | Env `RUST_LOG` | Tracing level | `heliosdb-nano-observability` |

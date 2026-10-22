@@ -63,12 +63,14 @@ ships. "P3", "P4" and "P5" are phases of the physical standby plan.
 | `V$ARCHIVE_GAP` | The `heliosdb_archive_gaps` view, `heliosdb-nano archive gaps` |
 | `RMAN> CROSSCHECK`, `VALIDATE ARCHIVELOG` | `heliosdb-nano archive verify` (header and footer), `archive verify --deep` (every byte and every frame) |
 | `DELETE OBSOLETE` | The pruner of a running node; `heliosdb-nano archive prune` offline |
-| FAL (gap fetch) | None. A standby whose next sequence the primary no longer retains is refused (`WalPruned`) and is rebuilt; recovering it from archived segments arrives in P3.2 |
+| FAL (gap fetch) | **Gap fill**: a standby whose next sequence the primary's RocksDB WAL no longer holds is served it from the primary's WAL archive, on the same replication connection, until the WAL holds the rest (see [Recovering from archived WAL](#recovering-from-archived-wal)). Only a gap the archive cannot cover either is refused (`WalPruned`, naming the range and both floors) |
 | `RECOVERY WINDOW OF n DAYS` | `[replication.archive] recovery_window` (default `"7d"`); `heliosdb_recovery_window` shows the configured and the effective window |
 | `DB_RECOVERY_FILE_DEST_SIZE` | `[replication.archive] max_bytes` (default `"unlimited"`) and `disk_reserve` (default `"10%"` of the filesystem). Unlike Oracle, a full archive never stops the primary: it shortens the window |
 | `DUPLICATE … FOR STANDBY FROM ACTIVE DATABASE` | The **bootstrap copy**: a standby started on an empty directory downloads a verified checkpoint of the primary, then follows it. An interrupted copy resumes (like RMAN's restartable duplicate) |
 | `RECOVER STANDBY DATABASE FROM SERVICE` | Not yet (P4, incremental rebuild). Today a rebuild is a full bootstrap copy into a new directory |
-| Managed recovery from archived logs | Not yet (P3.2: `standby recover --from-archive`, archive-only standbys) |
+| `RECOVER STANDBY DATABASE` (from archived logs) | `heliosdb-nano recover --data-dir DIR --from-archive SEGDIR…`: a stopped standby advanced from copied segments |
+| Managed recovery from archived logs | `start --replication-role standby --source archive --archive-source DIR…`: an **archive-only standby**, no replication connection |
+| Cascaded standby (a standby redo-transport source) | `[replication.physical] cascade = true` on a standby: it serves its own store on its `replication_port` to downstream standbys |
 | Datafile block, block SCN, block change tracking | None: one key-value space with no per-key sequence. P4 compares key ranges by digest |
 | Incarnation, `RESETLOGS` | The dataset **history id** (`NANO-PRIMARY-HISTORY.json`) plus the **epoch** (`timeline_id`, 1 until promotion arrives in P5) |
 | Protection modes | `[replication] sync_mode`: `async` is Maximum Performance; `semi-sync` with `sync_timeout_action = "warn"` behaves like Maximum Availability. Maximum Protection has no equivalent (`fail` reports an error but never stops the primary) |
@@ -460,8 +462,12 @@ replication block:
 - A standby is listed while it has a session and leaves the list when its
   connection ends. The SQL view `pg_replication_standbys` reads the same
   registry.
+- `source` is where its last poll was served from: `wal` (the primary's
+  RocksDB WAL) or `archive` (its WAL archive, filling a gap the WAL no longer
+  holds; see [Recovering from archived WAL](#recovering-from-archived-wal)).
 - Both roles' `/health` also carry an `archive` object (next section), beside
-  the replication block, never inside it.
+  the replication block, never inside it. A cascading standby's `/health` also
+  says `"cascade": true` and lists its downstream standbys as `standbys`.
 
 ## Archived WAL and the recovery window
 
@@ -471,10 +477,9 @@ self-describing segment files beside its data directory and kept for a
 archived redo. A primary serving its replication port archives its own writes;
 every standby archives the write groups it applies, so a standby's segments
 hold, frame for frame, the bytes its primary archived for the same sequences.
-Nothing reads the archive back yet: recovering a standby from segments
-(`standby recover --from-archive`, archive-only standbys, gap fill from the
-primary's archive) arrives in P3.2. Until then the archive is the record an
-operator can list, verify and copy.
+The archive is read back to fill a reconnecting standby's gap, by `heliosdb-nano
+recover`, and by archive-only standbys: see [Recovering from archived
+WAL](#recovering-from-archived-wal).
 
 | Oracle | HeliosDB-Nano |
 |---|---|
@@ -621,6 +626,179 @@ by the `archive` command, on another host — and kept in memory while the node
 runs. A primary has no node-local column family to keep one in, and a catalog
 that could disagree with its files would only be one more thing to repair.
 
+## Recovering from archived WAL
+
+A segment carries write groups — deltas — numbered with the primary's
+sequences, and every node of one dataset history archives the same groups at
+the same boundaries. That makes the archive a second source a standby can be
+advanced from, besides its primary's replication connection:
+
+| Oracle | HeliosDB-Nano |
+|---|---|
+| FAL (fetch archive log: the primary ships a standby's gap from its archived logs) | **Gap fill**, automatic: the primary serves a reconnecting standby what its RocksDB WAL no longer holds from its WAL archive, on the same connection |
+| `RECOVER STANDBY DATABASE` (until a sequence: `UNTIL SEQUENCE`) | `heliosdb-nano recover --data-dir DIR --from-archive SEGDIR… [--through SEQ]`, on a stopped standby |
+| Managed recovery from archived logs (`ALTER DATABASE RECOVER MANAGED STANDBY DATABASE`, logs shipped by hand) | `start --replication-role standby --source archive --archive-source DIR…`: an archive-only standby |
+| Cascaded standby | `[replication.physical] cascade = true` on a standby |
+
+Every path applies a group exactly as a standby following its primary does: the
+same verbatim write with the cursor in the same write group, the same rule that
+a group must start right after the cursor, the same update of the standby's
+in-memory indexes. A standby advanced from segments cannot be told apart from
+one that streamed them, and it can go on following its primary from where the
+segments left it. Only segments of the standby's own history and of the current
+epoch are ever read.
+
+### Gap fill from the primary's archive
+
+A standby away longer than the primary's RocksDB WAL retention
+(`[replication.physical] wal_retention_secs`) no longer needs a rebuild. When it
+reconnects, the primary finds that its WAL starts after the standby's cursor
+and serves the missing groups from its WAL archive instead: a contiguous run of
+sealed segments of the current history and epoch that reaches from the
+standby's next sequence to the WAL's floor. Each poll stays bounded by the
+standby's byte limit and never goes past the WAL's floor; every poll checks
+again, so once the standby's cursor reaches what the WAL still holds it is
+served from the WAL. The standby sees ordinary batches — nothing changes on its
+side, and nothing on the wire. The primary logs
+`replication: serving a receiver at sequence N from the WAL archive …` and,
+later, `… is served from this primary's RocksDB WAL again`; its `/health` lists
+the standby with `"source": "archive"` while that lasts, then `"wal"`.
+
+Groups past the archive's sealed segments are still in its open segment: a
+standby that needs them is told to come back (`SourceNotServing`, retried) and is
+served once the segment is sealed (`segment_max_secs`, default 300). When the
+archive cannot cover the gap either — it was pruned past the recovery window,
+the archive is off, or it records a hole there — the standby is refused
+`WalPruned` and goes to `needs_recovery`, and the refusal names the first
+missing range and both floors:
+
+> WAL pruned: … the receiver needs sequence 1043; sequences 1043..1820 are in
+> neither this primary's RocksDB WAL nor its WAL archive (the archive holds from
+> 1821, RocksDB holds from 2405; …): rebuild the standby …, or recover it from
+> archived segments that cover the range (heliosdb-nano recover --from-archive)
+
+Archive and WAL retention cooperate: the archive's `recovery_window` (default 7
+days) decides how long a standby may be away; the WAL's own retention only has
+to cover the archiver's lag.
+
+### `heliosdb-nano recover`
+
+Advance a STOPPED standby from segments copied into one or more directories —
+from the primary, from another standby of the same history, from a backup —
+with or without a reachable primary:
+
+```bash
+# Gather segments (any node's archive of the same history; copies may overlap).
+mkdir /srv/recover && cp /backup/primary.archive/*/1/*.hseg /srv/recover/
+heliosdb-nano archive verify --archive-dir /srv/recover --deep --key-file /etc/heliosdb/dataset.key
+heliosdb-nano recover --data-dir /var/lib/heliosdb/standby --from-archive /srv/recover --config standby.toml
+```
+
+- **Offline.** A node running on the data directory holds its RocksDB lock, and
+  `recover` refuses with the process that holds it: stop the standby first.
+- **A standby, not a new one.** The data directory must be an installed physical
+  standby. An empty or absent one is refused — *a standby starts from a snapshot
+  of the primary (`start` bootstraps it); segments advance it* — and so is a
+  primary's or a 4.41.x logical standby's directory.
+- **Chain.** Starting after the standby's cursor, segments are matched by what
+  their header and footer say (history, epoch, first and last sequence) wherever
+  they are: in an archiver's `<history>/<epoch>/` layout or loose in the
+  directory. Byte-identical copies (same SHA-256) count once; overlapping
+  segments of different nodes are fine. Open (`.partial`) segments and files an
+  archiver set aside as `.corrupt` are skipped and listed.
+- **Verified before anything is applied.** Every segment of the chain is
+  verified deep — the whole file against its SHA-256, every frame's digest,
+  contiguity, history, epoch, and that a write group starts exactly at the
+  cursor. A corrupt segment, or a segment of another dataset among the copies,
+  is named and nothing is applied (exit 1). An encrypted dataset's segments are
+  sealed: `--config` must name the dataset key (`[encryption]`).
+- **Applied as a standby applies.** One line per segment. Every write group is
+  one durable write: a crash or an interrupt leaves the standby at a consistent
+  cursor, and running the command again continues from it — groups already
+  applied are skipped by sequence, so a re-run is a no-op.
+- **Ends with the position reached.** `--through SEQ` stops after the last group
+  that ends at or before `SEQ`. When the segments stop short of `--through`, or
+  of the newest segment found, the command prints the missing range —
+  `needs recovery: archive gap: sequences S..T are in none of the given
+  directories` — and exits **2** (everything before the gap is applied).
+- **`--then primary|stop`.** With `--then primary` (the default when
+  `--primary-host` is given) the standby goes on to follow its primary from the
+  new cursor, exactly as `start --replication-role standby` would; arguments
+  after `--` are passed to `start` (its ports, token file, TLS). The primary may
+  still hold a range the segments lacked. `--then stop` (the default otherwise)
+  exits 0.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | the standby reached the newest segment found (or `--through`) |
+| 1 | refused, nothing applied: a running node, not a standby, a corrupt or foreign segment, a missing key; or a failure part-way (the message names the durable position) |
+| 2 | applied up to an archive gap, which is printed; also clap's exit code for a usage error |
+
+### Archive-only standby (`--source archive`)
+
+```bash
+heliosdb-nano start --data-dir /var/lib/heliosdb/standby --port 5442 --http-port 8081 \
+  --replication-role standby --source archive --archive-source /srv/shipped-segments
+```
+
+Managed recovery from archived logs: the standby opens no replication
+connection at all (it needs no token and no `--primary-host`). It serves
+read-only SQL and applies the segments that appear in its `--archive-source`
+directories — copied by an operator, rsync or a shared filesystem — each
+verified deep before it is applied. Its data directory must already be an
+installed physical standby (start it once following its primary). It archives
+what it applies into its own archive, as every standby does.
+
+- **Posture.** While it applies, `recovering` with mode `archive` and progress
+  `"<cursor> of <newest>"`; `streaming` is never reached.
+  `heliosdb_standby_status.primary` and `/health`'s `replication.primary` read
+  `archive:<dir>[,<dir>…]`; `pg_last_wal_replay_lsn()` is the applied cursor.
+- **Readiness.** `lag_secs` is the time since the segment holding the cursor
+  was last observed by the archiver that wrote it. `/ready` is 200 while it is
+  at most `[replication] max_standby_lag`, else 503 with state `catching_up`.
+  Segments are only visible once sealed, so give an archive-only standby a
+  `max_standby_lag` larger than its primary's `segment_max_secs` plus the
+  shipping interval.
+- **Gaps.** A segment missing from the directories leaves it in
+  `needs_recovery`, naming the range (`archive gap S..T: no segment in … holds
+  it`); it stays up (`on_unrecoverable` does not apply to a gap) and resumes by
+  itself as soon as the segment appears. A corrupt segment, or one of another
+  dataset, blocks it the same way, named, until it is moved out. Ship segments
+  atomically (copy to a temporary name, then rename to `….hseg`; rsync does
+  this by default): a file caught half-copied fails its verification and blocks
+  the standby until the copy completes.
+- `--source primary` (the default) is the ordinary standby.
+
+### Cascading standbys
+
+```toml
+# standby A: follows the primary, serves standby B on its own replication port
+[replication]
+replication_port = 5443
+[replication.physical]
+cascade = true
+```
+
+A standby with `cascade = true` serves its replication port like a primary
+(same token; TLS with `--replication-tls`, or loopback): a downstream standby
+bootstraps from it (`--primary-host` = the cascading standby's
+`replication_port`) and follows it. What it serves is the primary's:
+
+- its WAL records are stripped of everything the standby wrote into its own
+  node-local column family (its cursor, its posture), re-framed with the
+  primary's sequence numbers and digest — byte for byte the primary's write
+  groups;
+- its bootstrap copies are its store with the node-local column family dropped
+  from the copy: the primary's default column family at the standby's cursor;
+- the downstream standby therefore sees the primary's history, epoch and
+  sequence numbers, and could follow the primary itself from the same cursor.
+
+What the cascading standby's own WAL no longer holds (a standby keeps no
+archived WAL) is served from its own WAL archive, as a primary fills a gap. Its
+`/health` says `"cascade": true` and lists its downstream standbys; it needs a
+private export directory (`[replication.physical] export_dir`, default `<data
+dir>.physical-export`). Cascading is off by default.
+
 ## Refusals and rebuild
 
 A standby in `needs_recovery` names its reason in its log, in `/ready`, in the
@@ -635,9 +813,12 @@ continues over a hole. To rebuild it:
    existing empty directory). It bootstraps a fresh, verified copy from the
    primary and then follows it.
 
-A rebuild is a full copy today. An incremental rebuild that ships only the
-changed key ranges arrives in plan phase P4, and recovery from archived WAL
-segments in P3.2 (the segments are already written, see above). An interrupted
+Before a rebuild, a standby can often be recovered from archived WAL instead:
+the primary fills its gap from its archive by itself when it can, and
+`heliosdb-nano recover --from-archive` advances it from copied segments (see
+[Recovering from archived WAL](#recovering-from-archived-wal)). A rebuild is a
+full copy today; an incremental rebuild that ships only the changed key ranges
+arrives in plan phase P4. An interrupted
 bootstrap copy is never installed (the copy is verified and renamed into place
 only when complete); it is resumed. The old standby's archive directory
 (`<data dir>.archive`) belongs to the old directory: move it aside with it, or
@@ -685,9 +866,12 @@ can continue streaming; otherwise the standby gets a fresh snapshot.
 
 Before rebuilding, consider why it was refused:
 
-- `WalPruned`: the standby was away longer than the primary keeps WAL for it.
-  Raise `[replication.physical] wal_retention_secs` (at most 86400) and
-  `wal_retention_size_mb` on the primary to survive longer outages.
+- `WalPruned`: the standby was away longer than the primary keeps WAL AND
+  archived WAL for it; the refusal names the missing range and where the
+  archive and the WAL start. Segments covering the range (another standby's
+  archive, a backup) recover it with `heliosdb-nano recover --from-archive`.
+  To survive longer outages, keep the primary's archive on and raise its
+  `[replication.archive] recovery_window` (and the disk it may use).
 - `HistoryMismatch`: the primary's endpoint now serves another dataset, for
   example a primary that was recreated. Decide which history to keep before
   rebuilding; see [recovering after a primary is recreated](offline-reseed.md)
@@ -762,13 +946,23 @@ The test suites are listed in the [HA testing guide](ha_testing.md).
   a standby's data directory cannot be opened as a primary or standalone
   database. Writes are never routed through a standby: connect to the primary to
   write.
-- **No cascading.** A standby cannot serve other standbys.
+- **Cascading is opt-in** (`[replication.physical] cascade = true`) and one
+  level is what the tests cover; a downstream standby of a cascading standby
+  that falls behind both the cascading standby's live WAL and its archive is
+  refused like any other.
 - **One primary per standby.**
-- **Full-copy rebuilds** (incremental rebuild P4, recovery from archived
-  segments P3.2); an interrupted copy resumes from its progress record while the
-  primary still leases its snapshot.
-- **The archive is written, not yet read.** Segments are sealed, verified,
-  listed and pruned; replaying them into a standby arrives in P3.2.
+- **Full-copy rebuilds** (incremental rebuild P4); a standby that only missed
+  archived groups is recovered from them instead (gap fill, `recover`). An
+  interrupted copy resumes from its progress record while the primary still
+  leases its snapshot.
+- **Archived groups need a base.** Segments advance an installed standby; a
+  standby is not built from segments alone (P4 adds base-plus-segments).
+- **A primary's close-time writes are archived at its next start.** The
+  row-counter and index-snapshot writes a primary makes while it shuts down
+  happen after its archiver stopped; its next start archives them from its WAL.
+  A primary that was down longer than its WAL retention records them as an
+  archive gap (`heliosdb_archive_gaps`), which a standby needing that range
+  cannot be filled across.
 - **The multi-container lab under `tests/docker` is still out of service**: it
   has not yet been brought up to date for remote physical standbys over TLS;
   see the [HA testing guide](ha_testing.md).
