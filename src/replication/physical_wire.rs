@@ -1699,6 +1699,20 @@ async fn read_frame<R: AsyncRead + Unpin>(
     })
     .await
 }
+
+/// Spec P4.1b: a frame whose payload is at most this large is written as ONE
+/// buffer, header and payload together, so a control frame (a `ChunkRequest`,
+/// a `LeafChunkRequest`, a `PollRequest`, a heartbeat, a planning re-ask)
+/// leaves in one TCP segment and, over TLS, one record. Written as two, the
+/// payload of a request would wait under Nagle's algorithm for the ACK of its
+/// 16-byte header, which the peer, with nothing to send, delays (up to 40 ms
+/// on Linux) — once per round trip of a request/response session. This holds
+/// whatever the socket's `TCP_NODELAY` (set by [`accept_replication`] and
+/// [`PhysicalClient::connect_replication`]): with it, two writes would still be
+/// two segments. A larger payload (a chunk, a batch) follows its header
+/// without being copied.
+const SMALL_FRAME_BYTES: usize = 64 * 1024;
+
 async fn write_frame<W: AsyncWrite + Unpin>(
     io: &mut W,
     kind: Kind,
@@ -1715,8 +1729,17 @@ async fn write_frame<W: AsyncWrite + Unpin>(
         header[8..10].copy_from_slice(&VERSION.to_be_bytes());
         header[10..12].copy_from_slice(&(kind as u16).to_be_bytes());
         header[12..16].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-        io.write_all(&header).await?;
-        io.write_all(payload).await?;
+        if payload.len() <= SMALL_FRAME_BYTES {
+            // The buffer may hold the token (`Auth`): wiped when dropped, and
+            // sized once so it is never reallocated (leaving a copy behind).
+            let mut frame: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(HEADER_BYTES + payload.len()));
+            frame.extend_from_slice(&header);
+            frame.extend_from_slice(payload);
+            io.write_all(frame.as_slice()).await?;
+        } else {
+            io.write_all(&header).await?;
+            io.write_all(payload).await?;
+        }
         io.flush().await?;
         Ok(())
     })
@@ -1916,16 +1939,20 @@ pub async fn bind_replication(address: SocketAddr, tls: bool, allow_insecure_rem
     Ok(TcpListener::bind(address).await?)
 }
 
-/// The source's side of one accepted connection: the TLS handshake when the
-/// listener serves TLS (`acceptor`), bounded by the frame deadline and the
-/// shutdown watch. A failed handshake is [`WireError::Tls`]: nothing was read
-/// from the peer, and no `Refuse` frame can be sent before a handshake.
+/// The source's side of one accepted connection: `TCP_NODELAY` (spec P4.1b),
+/// then the TLS handshake when the listener serves TLS (`acceptor`), bounded
+/// by the frame deadline and the shutdown watch. A failed handshake is
+/// [`WireError::Tls`]: nothing was read from the peer, and no `Refuse` frame
+/// can be sent before a handshake.
 pub async fn accept_replication(
     stream: TcpStream,
     acceptor: Option<&TlsAcceptor>,
     limits: &WireLimits,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<ReplicationStream> {
+    // Before the handshake: every answer of this request/response session
+    // leaves at once instead of waiting for the receiver's delayed ACK.
+    stream.set_nodelay(true)?;
     let Some(acceptor) = acceptor else {
         return Ok(ReplicationStream::Plain(stream));
     };
@@ -3058,7 +3085,8 @@ impl PhysicalClient<ReplicationStream> {
     /// authenticate. Spec P2.2: a non-loopback `address` needs TLS or the
     /// plaintext opt-in; over TLS the source's certificate is verified before
     /// the token is sent, the `Hello` carries [`CAP_TLS`], and a handshake or
-    /// alert failure is [`WireError::Tls`].
+    /// alert failure is [`WireError::Tls`]. The socket sets `TCP_NODELAY`
+    /// before anything is sent (spec P4.1b).
     pub async fn connect_replication(
         address: SocketAddr,
         transport: &ReplicationTransport,
@@ -3078,6 +3106,10 @@ impl PhysicalClient<ReplicationStream> {
             Ok(TcpStream::connect(address).await?)
         })
         .await?;
+        // Before the handshake and the token: one request is in flight at a
+        // time, so Nagle's algorithm would hold each behind the source's
+        // delayed ACK.
+        stream.set_nodelay(true)?;
         let Some(tls) = &transport.tls else {
             return Self::authenticate(ReplicationStream::Plain(stream), token, hello, limits, shutdown).await;
         };
@@ -5397,5 +5429,130 @@ mod tests {
         );
         drop(client);
         assert!(run.await.unwrap().unwrap(), "no open was sent");
+    }
+
+    // --- spec P4.1b: TCP_NODELAY and one-write frames -----------------------
+
+    /// A writer that takes every buffer whole and counts the writes and
+    /// flushes it is given: one `write_all` is exactly one `poll_write`.
+    #[derive(Default)]
+    struct WriteRecorder {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+    impl AsyncWrite for WriteRecorder {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            this.writes += 1;
+            this.bytes.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.get_mut().flushes += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Spec P4.1b §2.2: a frame whose payload is at most `SMALL_FRAME_BYTES`
+    /// reaches the transport in ONE write; a larger one as its header, then
+    /// its payload. The bytes are the same either way (the `NPHYS002` header,
+    /// then the payload) and decode to the same frame.
+    #[tokio::test]
+    async fn a_small_frame_is_one_write_and_a_large_one_two() {
+        let (_shutdown, mut rx) = watch::channel(false);
+        for (kind, length, writes) in [
+            (Kind::Close, 0, 1),
+            (Kind::ChunkRequest, 32, 1),
+            (Kind::Chunk, SMALL_FRAME_BYTES, 1),
+            (Kind::Chunk, SMALL_FRAME_BYTES + 1, 2),
+            (Kind::Chunk, CHUNK_META + MAX_CHUNK_BYTES, 2),
+        ] {
+            let payload: Vec<u8> = (0..=u8::MAX).cycle().take(length).collect();
+            let mut recorder = WriteRecorder::default();
+            write_frame(&mut recorder, kind, &payload, &limits(), &mut rx)
+                .await
+                .unwrap();
+            assert_eq!(recorder.writes, writes, "{kind:?} with {length} payload bytes");
+            assert_eq!(recorder.flushes, 1, "{kind:?}: every frame is flushed");
+            let mut wire = header(kind, u32::try_from(length).unwrap());
+            wire.extend(&payload);
+            assert_eq!(recorder.bytes, wire, "{kind:?}: the bytes on the wire are unchanged");
+            let mut reader = recorder.bytes.as_slice();
+            let frame = read_frame(&mut reader, &[kind], &limits(), &mut rx).await.unwrap();
+            assert_eq!(frame.kind, kind);
+            assert_eq!(frame.payload, payload, "{kind:?}");
+            assert!(reader.is_empty(), "{kind:?}: one frame, nothing after it");
+        }
+    }
+
+    /// Spec P4.1b §2.1: both ends of a real loopback session set
+    /// `TCP_NODELAY` before anything is sent — the source in
+    /// [`accept_replication`], the receiver in
+    /// [`PhysicalClient::connect_replication`]. Asserted on the `TcpStream`
+    /// each side's plaintext `ReplicationStream` wraps, after the receiver
+    /// authenticated; the TLS branch of both functions hands the same socket,
+    /// after the same call, to its handshake (this module has no TLS
+    /// fixture).
+    #[tokio::test]
+    async fn both_ends_of_a_replication_session_set_nodelay() {
+        let listener = bind_replication("127.0.0.1:0".parse().unwrap(), false, false)
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let source = Arc::new(MockSource::new());
+        let history = source.manifest.history;
+        let (_shutdown, rx) = watch::channel(false);
+        let mut server_rx = rx.clone();
+        let run = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let stream = accept_replication(socket, None, &limits(), &mut server_rx).await?;
+            let ReplicationStream::Plain(accepted) = &stream else {
+                panic!("a listener without an acceptor serves plaintext");
+            };
+            let nodelay = accepted.nodelay()?;
+            let context = SourceContext::unobserved(identity(history));
+            serve_session(
+                stream,
+                &token(),
+                limits(),
+                server_rx,
+                &context,
+                None,
+                move |_| async move { Ok(source as Arc<dyn PhysicalSource>) },
+            )
+            .await?;
+            Ok::<_, WireError>(nodelay)
+        });
+        let client = PhysicalClient::connect_replication(
+            address,
+            &ReplicationTransport::default(),
+            &token(),
+            fresh(),
+            limits(),
+            rx,
+        )
+        .await
+        .unwrap();
+        let ReplicationStream::Plain(connected) = &client.io else {
+            panic!("a loopback transport without TLS is plaintext");
+        };
+        assert!(connected.nodelay().unwrap(), "the receiver's end sets TCP_NODELAY");
+        assert!(!client.tls());
+        client.close().await.unwrap();
+        assert!(run.await.unwrap().unwrap(), "the source's end sets TCP_NODELAY");
     }
 }

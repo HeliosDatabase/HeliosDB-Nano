@@ -1668,6 +1668,8 @@ mod tests {
                             Some(_result)=sessions.join_next(),if !sessions.is_empty()=>{},
                             accepted=listener.accept()=>{
                                 let (io,_)=accepted.unwrap();
+                                // As `accept_replication` does (spec P4.1b).
+                                io.set_nodelay(true).unwrap();
                                 let db=db.clone();let parent=parent.clone();let stop=stop.clone();
                                 let snapshots=observed_snapshots.clone();let resumes=observed_resumes.clone();
                                 let snapshot_ofs=observed_snapshot_ofs.clone();let served=observed_served.clone();

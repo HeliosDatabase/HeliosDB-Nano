@@ -345,6 +345,11 @@ Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.
   waited on a logical acknowledgement the standby sent before applying
   anything, so it returned at once even with the standby stopped; `min_acks`
   was ignored and a timeout only warned.
+- **Replication sockets set `TCP_NODELAY` and send control frames in one
+  write** (spec P4.1b). Checkpoint downloads and fast-forward leaf transfers
+  no longer stall ~40 ms per 1 MiB chunk, the payload of each request having
+  waited behind the peer's delayed ACK of its header (loopback copy 15 MB/s →
+  MEASURED_AFTER_FIX MB/s). The bytes on the wire are unchanged (`NPHYS002`).
 
 ### Tests
 - Added: `tests/physical_standby_sync.rs` (a sync INSERT blocks while the

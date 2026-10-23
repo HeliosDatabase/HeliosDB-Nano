@@ -1058,6 +1058,25 @@ impl Ladder<'_> {
                 tally.leaves_deleted_only += 1;
             }
         }
+        // At debug level, where the differences are: the first differing
+        // leaves by their start key (the key family tells whether a change was
+        // clustered or spread over the keyspace; row ids are decimal text, so a
+        // numeric range is only contiguous in key order inside one prefix band).
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for index in differing.iter().take(64) {
+                if let Some(leaf) = plan.leaves.get(*index as usize) {
+                    let start: String = String::from_utf8_lossy(&leaf.start).chars().take(48).collect();
+                    tracing::debug!(
+                        "recover: leaf {index} differs: starts at {start:?}, {} keys, {} on the primary",
+                        leaf.keys,
+                        format_bytes(leaf.bytes)
+                    );
+                }
+            }
+            if differing.len() > 64 {
+                tracing::debug!("recover: … and {} more differing leaves", differing.len() - 64);
+            }
+        }
         progress(&format!(
             "recover: {} leaves, {}; {} differ ({}), {} to ship",
             format_count(tally.leaves_total),
