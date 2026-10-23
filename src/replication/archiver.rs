@@ -25,9 +25,12 @@
 //! own [`physical::FlushMemo`] (spec P4.1d) skips it while the barrier has not
 //! moved. RocksDB's own WAL retention (`[replication.physical]
 //! wal_retention_secs`) covers the archiver's lag. A standby's applier hands
-//! batches over a queue bounded in bytes
-//! ([`MAX_QUEUED_BYTES`]); when the archiver falls that far behind, batches
-//! are left out of the archive (a gap, WARN) rather than slowing the applier.
+//! batches over a queue bounded in bytes ([`MAX_QUEUED_BYTES`]; a larger
+//! single group is queued alone). A batch that does not fit waits a bounded
+//! time for room — so a large write group offered behind small ones, during
+//! a bulk load, is archived — and only an archiver that stays that far behind
+//! has batches left out of the archive (a gap, WARN), without further waits
+//! until it has caught up, rather than slowing the applier.
 //!
 //! # Retention: the recovery window
 //!
@@ -76,8 +79,14 @@ use crate::crypto::KeyManager;
 pub const LOCK_FILE: &str = "archiver.lock";
 
 /// How far (in bytes) a standby's archiver may fall behind its applier
-/// before batches are left out of the archive instead of queued.
+/// before an offer waits for room (a bounded wait, [`ArchiveFeed::offer`]),
+/// and then leaves its batch out of the archive. A single group larger than
+/// this is queued alone, once the queue has drained.
 pub const MAX_QUEUED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How long one offer may wait for the queue to make room, unless the
+/// receiver sets its own bound ([`ArchiveFeed::with_max_wait`]).
+pub const DEFAULT_FEED_WAIT: Duration = Duration::from_secs(30);
 
 /// How far a primary's archiver reads its store's WAL per poll: a coalescing
 /// target (spec P4.1c), so a larger write group still arrives whole, alone.
@@ -1209,6 +1218,17 @@ fn run_primary(
                 status.disable(reason);
                 break;
             }
+            Err(error @ PhysicalError::GroupTooLarge { .. }) => {
+                // Never archivable, so never retried: the archive ends before
+                // the group, said once, instead of failing at it every poll.
+                let reason = format!(
+                    "{error}; the archive cannot continue past it (load bulk data in smaller statements, then \
+                     move this archive aside and start a new one)"
+                );
+                error!("archive: the WAL archive is off on this node: {reason}");
+                status.disable(reason);
+                break;
+            }
             Err(error) => {
                 session.complaint.note(&format!(
                     "archive: cannot read the store's WAL after sequence {cursor}: {error}"
@@ -1235,10 +1255,22 @@ fn run_primary(
 /// What a standby's applier and its archiver share.
 struct FeedState {
     queued_bytes: AtomicU64,
+    /// The most the queue holds before an offer waits for room
+    /// ([`MAX_QUEUED_BYTES`]; smaller in tests).
+    max_queued: u64,
     dropped: AtomicU64,
     closed: AtomicBool,
+    /// An offer's wait for room ran out: the archiver is not keeping up, so
+    /// offers do not wait again (they leave their batch out at once) until
+    /// the queue has drained.
+    stalled: AtomicBool,
     sealed: bool,
     key_check: OnceLock<[u8; 32]>,
+    /// Signalled whenever the archiver takes a batch off the queue, and
+    /// when the feed closes; `drain_lock` orders it with a waiting offer's
+    /// check, so no signal is lost.
+    drained: Condvar,
+    drain_lock: Mutex<()>,
 }
 
 fn queued_size(batch: &PhysicalBatch) -> u64 {
@@ -1246,17 +1278,68 @@ fn queued_size(batch: &PhysicalBatch) -> u64 {
 }
 
 impl FeedState {
+    fn new(sealed: bool, max_queued: u64) -> Self {
+        Self {
+            queued_bytes: AtomicU64::new(0),
+            max_queued,
+            dropped: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            stalled: AtomicBool::new(false),
+            sealed,
+            key_check: OnceLock::new(),
+            drained: Condvar::new(),
+            drain_lock: Mutex::new(()),
+        }
+    }
+
+    /// The archiver took `batch` off the queue.
     fn received(&self, batch: &PhysicalBatch) {
         let bytes = queued_size(batch);
-        let _ = self
+        let before = self
             .queued_bytes
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                 Some(queued.saturating_sub(bytes))
-            });
+            })
+            .unwrap_or(0);
+        if before.saturating_sub(bytes) == 0 {
+            self.stalled.store(false, Ordering::Release);
+        }
+        let _ordered = self.drain_lock.lock();
+        self.drained.notify_all();
     }
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
+        let _ordered = self.drain_lock.lock();
+        self.drained.notify_all();
+    }
+
+    /// Whether a batch of `bytes` may join the queue now: within the bound,
+    /// or alone in an empty queue (a group larger than the bound).
+    fn fits(&self, bytes: u64) -> bool {
+        let queued = self.queued_bytes.load(Ordering::Acquire);
+        if queued == 0 {
+            self.stalled.store(false, Ordering::Release);
+            return true;
+        }
+        queued.saturating_add(bytes) <= self.max_queued
+    }
+
+    /// Wait until a batch of `bytes` fits, the feed closes, or `deadline`
+    /// passes. Returns whether it fits.
+    fn wait_for_room(&self, bytes: u64, deadline: Instant) -> bool {
+        let mut ordered = self.drain_lock.lock();
+        loop {
+            if self.closed.load(Ordering::Acquire) {
+                return false;
+            }
+            if self.fits(bytes) {
+                return true;
+            }
+            if self.drained.wait_until(&mut ordered, deadline).timed_out() {
+                return !self.closed.load(Ordering::Acquire) && self.fits(bytes);
+            }
+        }
     }
 }
 
@@ -1266,14 +1349,42 @@ impl FeedState {
 pub struct ArchiveFeed {
     state: Arc<FeedState>,
     sender: Arc<Mutex<mpsc::Sender<PhysicalBatch>>>,
+    /// The longest one offer waits for room ([`DEFAULT_FEED_WAIT`]).
+    max_wait: Duration,
 }
 
 impl ArchiveFeed {
-    /// Queue `batch`, applied to `store`, for the archiver — without
-    /// waiting: when the archiver is [`MAX_QUEUED_BYTES`] behind, or gone,
-    /// the batch is left out of the archive (it then records a gap) and
-    /// false is returned. The applier never waits for the archive.
+    /// This feed with offers waiting at most `wait` for room. A receiver
+    /// sets it below its operation timeout, which bounds the whole apply of
+    /// a poll (its archive offers included).
+    pub fn with_max_wait(mut self, wait: Duration) -> Self {
+        self.max_wait = wait;
+        self
+    }
+
+    /// The longest one offer waits for room.
+    pub fn max_wait(&self) -> Duration {
+        self.max_wait
+    }
+
+    /// Queue `batch`, applied to `store`, for the archiver, waiting at most
+    /// [`Self::max_wait`] for room ([`Self::offer_until`]).
     pub fn offer(&self, batch: &PhysicalBatch, store: &DB) -> bool {
+        self.offer_until(batch, store, Instant::now() + self.max_wait)
+    }
+
+    /// Queue `batch`, applied to `store`, for the archiver. A batch that
+    /// fits the queue — within [`MAX_QUEUED_BYTES`], or alone when the
+    /// queue is empty, so a write group larger than the bound is archived
+    /// too — is queued at once. One that does not fit waits, until
+    /// `deadline`, for the archiver to make room: a large group offered
+    /// behind small ones (a bulk load) is archived rather than left out.
+    /// When the wait runs out the archiver is not keeping up: the batch is
+    /// left out of the archive (which then records a gap), with a WARN
+    /// naming it, false is returned, and later offers do not wait again
+    /// until the queue has drained — so the applier is never held up by a
+    /// stalled archiver more than once. False too when the archiver is gone.
+    pub fn offer_until(&self, batch: &PhysicalBatch, store: &DB, deadline: Instant) -> bool {
         let state = &self.state;
         if state.closed.load(Ordering::Acquire) {
             return false;
@@ -1282,18 +1393,27 @@ impl ArchiveFeed {
             let _ = state.key_check.set(key_check_of(store));
         }
         let bytes = queued_size(batch);
-        let queued = state.queued_bytes.load(Ordering::Acquire);
-        if queued > 0 && queued.saturating_add(bytes) > MAX_QUEUED_BYTES {
-            let dropped = state.dropped.fetch_add(1, Ordering::AcqRel) + 1;
-            if dropped.is_power_of_two() {
-                warn!(
-                    "archive: the archiver is {queued} bytes behind this standby's applier; write group {}..{} is \
-                     not archived ({dropped} so far): the archive will show a gap",
-                    batch.first_sequence(),
-                    batch.last_sequence()
-                );
+        if !state.fits(bytes) {
+            let stalled = state.stalled.load(Ordering::Acquire);
+            if stalled || !state.wait_for_room(bytes, deadline) {
+                if state.closed.load(Ordering::Acquire) {
+                    return false;
+                }
+                state.stalled.store(true, Ordering::Release);
+                let queued = state.queued_bytes.load(Ordering::Acquire);
+                let dropped = state.dropped.fetch_add(1, Ordering::AcqRel) + 1;
+                // Every drop after a wait is said; while stalled, every
+                // power of two.
+                if !stalled || dropped.is_power_of_two() {
+                    warn!(
+                        "archive: the archiver is {queued} bytes behind this standby's applier; write group {}..{} \
+                         ({bytes} bytes) is not archived ({dropped} so far): the archive will show a gap",
+                        batch.first_sequence(),
+                        batch.last_sequence()
+                    );
+                }
+                return false;
             }
-            return false;
         }
         state.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
         if self.sender.lock().send(batch.clone()).is_err() {
@@ -1444,16 +1564,11 @@ pub fn start_standby(
 ) -> (ArchiveService, ArchiveFeed) {
     let status = install_status(&settings);
     let (sender, receiver) = mpsc::channel();
-    let state = Arc::new(FeedState {
-        queued_bytes: AtomicU64::new(0),
-        dropped: AtomicU64::new(0),
-        closed: AtomicBool::new(false),
-        sealed: key_manager.is_some(),
-        key_check: OnceLock::new(),
-    });
+    let state = Arc::new(FeedState::new(key_manager.is_some(), MAX_QUEUED_BYTES));
     let feed = ArchiveFeed {
         state: Arc::clone(&state),
         sender: Arc::new(Mutex::new(sender)),
+        max_wait: DEFAULT_FEED_WAIT,
     };
     let service = spawn_archiver(status, move |status, stop| {
         run_standby(settings, history, node_id, key_manager, receiver, state, status, stop);
@@ -2021,23 +2136,20 @@ mod tests {
         assert_eq!(left[0].last_sequence(), batches[5].last_sequence());
     }
 
-    /// Spec P3.1 §3: the standby's hand-off never waits: past
-    /// `MAX_QUEUED_BYTES` behind, batches are left out (counted).
+    /// Spec P3.1 §3: the standby's hand-off waits for its archiver at most
+    /// a bounded time: past `MAX_QUEUED_BYTES` behind, a batch that does not
+    /// fit is left out (counted) once the wait runs out.
     #[test]
-    fn a_standby_feed_never_waits_for_its_archiver() {
+    fn a_standby_feed_waits_a_bounded_time_for_its_archiver() {
         let root = TempDir::new().unwrap();
         let store = source(&root.path().join("store"));
         let (sender, receiver) = mpsc::channel();
-        let state = Arc::new(FeedState {
-            queued_bytes: AtomicU64::new(MAX_QUEUED_BYTES - 10),
-            dropped: AtomicU64::new(0),
-            closed: AtomicBool::new(false),
-            sealed: false,
-            key_check: OnceLock::new(),
-        });
+        let state = Arc::new(FeedState::new(false, MAX_QUEUED_BYTES));
+        state.queued_bytes.store(MAX_QUEUED_BYTES - 10, Ordering::Release);
         let feed = ArchiveFeed {
             state: Arc::clone(&state),
             sender: Arc::new(Mutex::new(sender)),
+            max_wait: Duration::from_millis(50),
         };
         let (_, batches) = batches(2, 1);
         assert!(!feed.offer(&batches[0], &store), "over the bound: left out");
@@ -2051,5 +2163,62 @@ mod tests {
         drop(receiver);
         assert!(!feed.offer(&batches[1], &store), "the archiver is gone");
         assert!(!feed.offer(&batches[1], &store));
+    }
+
+    /// Review P4.1d: with a queue bound of one batch, a batch that does not
+    /// fit waits for the archiver to make room and is then archived, not
+    /// left out — a large write group offered behind small ones during a
+    /// bulk load. When the archiver makes no room before the deadline the
+    /// batch is left out, and the next one is left out at once (the feed is
+    /// stalled, the applier is held up once), until the queue has drained.
+    #[test]
+    fn a_standby_feed_waits_for_room_and_stops_waiting_once_stalled() {
+        let root = TempDir::new().unwrap();
+        let store = source(&root.path().join("store"));
+        let (_, batches) = batches(4, 1);
+        let (sender, receiver) = mpsc::channel();
+        let state = Arc::new(FeedState::new(false, queued_size(&batches[0])));
+        let feed = ArchiveFeed {
+            state: Arc::clone(&state),
+            sender: Arc::new(Mutex::new(sender)),
+            max_wait: Duration::from_secs(30),
+        };
+        assert!(feed.offer(&batches[0], &store), "an empty queue takes it");
+
+        // The archiver takes the first batch 100 ms later: the second offer
+        // waits for it, and is queued.
+        let started = Instant::now();
+        let archiver = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                let batch = receiver.recv().unwrap();
+                state.received(&batch);
+                (receiver, batch)
+            })
+        };
+        assert!(feed.offer(&batches[1], &store), "queued once the archiver made room");
+        assert!(started.elapsed() >= Duration::from_millis(100), "it waited for room");
+        assert_eq!(feed.dropped(), 0);
+        let (receiver, taken) = archiver.join().unwrap();
+        assert_eq!(taken.first_sequence(), batches[0].first_sequence());
+
+        // Nobody makes room: the wait runs out and the batch is left out...
+        let deadline = Instant::now() + Duration::from_millis(100);
+        assert!(!feed.offer_until(&batches[2], &store, deadline));
+        assert!(Instant::now() >= deadline, "it waited until its deadline");
+        assert_eq!(feed.dropped(), 1);
+        // ...and, stalled, the next one is left out without a second wait.
+        let started = Instant::now();
+        assert!(!feed.offer_until(&batches[3], &store, Instant::now() + Duration::from_secs(30)));
+        assert!(started.elapsed() < Duration::from_secs(10), "no second wait");
+        assert_eq!(feed.dropped(), 2);
+
+        // Once the archiver drained the queue, offers are queued again.
+        let queued = receiver.recv().unwrap();
+        assert_eq!(queued.first_sequence(), batches[1].first_sequence());
+        state.received(&queued);
+        assert!(feed.offer(&batches[3], &store));
+        assert_eq!(receiver.recv().unwrap().first_sequence(), batches[3].first_sequence());
     }
 }

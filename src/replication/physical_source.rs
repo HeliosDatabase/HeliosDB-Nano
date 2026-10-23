@@ -147,13 +147,20 @@ impl SourceKind {
         }
     }
 
-    /// Whether the source's WAL still holds the group after `after`.
-    fn retains_after(&self, db: &DB, history: Uuid, after: u64, hint: &Mutex<CascadeHint>) -> bool {
+    /// Whether the source's WAL still holds the group after `after`. A
+    /// cascading source probes with a poll, under the session's memo
+    /// `flushed` (spec P4.1d).
+    fn retains_after(
+        &self,
+        db: &DB,
+        history: Uuid,
+        after: u64,
+        hint: &Mutex<CascadeHint>,
+        flushed: &FlushMemo,
+    ) -> bool {
         match self {
             Self::Primary => wal_retains_after(db, after).unwrap_or(false),
-            Self::Cascade { .. } => self
-                .poll(db, history, after, PROBE_POLL_BYTES, hint, &FlushMemo::new())
-                .is_ok(),
+            Self::Cascade { .. } => self.poll(db, history, after, PROBE_POLL_BYTES, hint, flushed).is_ok(),
         }
     }
 
@@ -176,8 +183,8 @@ impl SourceKind {
 }
 
 /// A poll's failure as the receiver must hear it: a WAL it no longer has, a
-/// hole, a receiver ahead of it — each a refusal the receiver needs recovery
-/// for. Anything else is a source-side failure (retried). `barrier` is the
+/// hole, a receiver ahead of it, a write group too large for any frame — each
+/// a refusal the receiver needs recovery for. Anything else is a source-side failure (retried). `barrier` is the
 /// source's, in the primary's sequence numbers. A pruned WAL reaches here only
 /// when no archive was asked ([`poll_or_fill`] names both floors otherwise).
 fn poll_error(barrier: u64, kind: &SourceKind, error: PhysicalError) -> WireError {
@@ -204,6 +211,20 @@ fn poll_error(barrier: u64, kind: &SourceKind, error: PhysicalError) -> WireErro
         PhysicalError::HistoryMismatch => WireError::Refused(Refusal::new(
             RefuseCode::HistoryMismatch,
             "the receiver follows another dataset history",
+        )),
+        // Never servable, so never retried: the receiver needs recovery past
+        // the group (a fast-forward or a full copy).
+        PhysicalError::GroupTooLarge { first, bytes, limit } => WireError::Refused(Refusal::new(
+            RefuseCode::GroupTooLarge {
+                first,
+                bytes: u64::try_from(bytes).unwrap_or(u64::MAX),
+            },
+            format!(
+                "{}'s write group at sequence {first} is {bytes} bytes, more than the {limit} one replication frame \
+                 can carry: it cannot be replicated; recover the standby past it (heliosdb-nano recover \
+                 --from-primary) and load bulk data in smaller statements",
+                kind.name()
+            ),
         )),
         other => source_error(other),
     }
@@ -292,6 +313,7 @@ fn poll_or_fill(
     history: Uuid,
     after: u64,
     byte_limit: usize,
+    flushed: &FlushMemo,
 ) -> Result<(PhysicalPoll, PollOrigin)> {
     let (wanted, wal_floor) = match attempt {
         Ok(poll) => return Ok((poll, PollOrigin::Wal)),
@@ -302,8 +324,10 @@ fn poll_or_fill(
     let Some(fill) = fill else {
         return Err(pruned_refusal(kind, wanted, wal_floor, barrier, None));
     };
-    // As `poll_source` does: the barrier a poll reports is durable.
-    db.flush_wal(true).map_err(source_error)?;
+    // As `poll_source` does: the barrier a poll reports is durable — the
+    // barrier was sampled above, and the session's memo fsyncs once per
+    // barrier (spec P4.1d).
+    flushed.flush(db, barrier).map_err(source_error)?;
     let tail = fill.tail(history, EPOCH);
     let oldest = wal_floor.unwrap_or_else(|| barrier.saturating_add(1));
     // The archive serves up to the WAL's floor; the WAL the rest.
@@ -701,6 +725,8 @@ struct SourceSession {
 /// its files intact, and the groups past its cut still served — from the WAL,
 /// or from the archive (else the receiver would download it only to be
 /// refused `WalPruned`).
+/// `flushed` is the session's memo (spec P4.1d): a cascading source's probe
+/// fsyncs only when its barrier moved.
 fn reusable(
     db: &DB,
     kind: &SourceKind,
@@ -708,10 +734,11 @@ fn reusable(
     export: &OnlineCheckpointExport,
     history: Uuid,
     storage_identity: &str,
+    flushed: &FlushMemo,
 ) -> bool {
     let manifest = export.manifest();
     let cut = manifest.checkpoint_sequence;
-    let continued = kind.retains_after(db, history, cut, &Mutex::new(CascadeHint::default()))
+    let continued = kind.retains_after(db, history, cut, &Mutex::new(CascadeHint::default()), flushed)
         || fill.is_some_and(|fill| {
             let tail = fill.tail(history, EPOCH);
             tail.reach(cut.saturating_add(1)).is_some()
@@ -864,6 +891,8 @@ struct ExportRequest<'a> {
     /// preferred snapshot, any leased export it can use (reusable, its cut
     /// past the receiver) is served rather than a new checkpoint taken.
     fast_forward_after: Option<u64>,
+    /// The session's memo of the barrier its polls fsynced (spec P4.1d).
+    flushed: &'a FlushMemo,
 }
 
 /// Spec P4.1 §3.2: a fast-forward that names no snapshot takes the newest
@@ -891,6 +920,7 @@ fn reuse_any_export(
                 &export,
                 request.expected_history,
                 request.storage_identity,
+                request.flushed,
             )
         {
             continue;
@@ -931,6 +961,7 @@ fn leased_export(
                         &reused.export,
                         request.expected_history,
                         request.storage_identity,
+                        request.flushed,
                     ) =>
                 {
                     tracing::info!(
@@ -1012,6 +1043,7 @@ async fn open_source_session(
                 limits,
                 purpose: "a resumed download",
                 fast_forward_after: None,
+                flushed: &flushed,
             };
             let (info, export) = match request {
                 OpenRequest::Snapshot | OpenRequest::SnapshotOf { .. } => {
@@ -1089,8 +1121,16 @@ async fn open_source_session(
                     // served: retained (by the WAL, or by the archive), contiguous,
                     // not ahead of this source. One group proves it.
                     let attempt = kind.poll(&db, history, after, PROBE_POLL_BYTES, &hint, &flushed);
-                    let (initial, _) =
-                        poll_or_fill(attempt, &kind, &db, fill.as_ref(), history, after, PROBE_POLL_BYTES)?;
+                    let (initial, _) = poll_or_fill(
+                        attempt,
+                        &kind,
+                        &db,
+                        fill.as_ref(),
+                        history,
+                        after,
+                        PROBE_POLL_BYTES,
+                        &flushed,
+                    )?;
                     (
                         SourceSessionInfo::Resume {
                             session_id: Uuid::new_v4(),
@@ -1188,7 +1228,8 @@ impl PhysicalSource for SourceSession {
                 // Re-checked at every poll: the WAL first, the archive only
                 // for what the WAL no longer holds.
                 let attempt = kind.poll(&db, history, after, byte_limit, &hint, &flushed);
-                let (poll, origin) = poll_or_fill(attempt, &kind, &db, fill.as_ref(), history, after, byte_limit)?;
+                let (poll, origin) =
+                    poll_or_fill(attempt, &kind, &db, fill.as_ref(), history, after, byte_limit, &flushed)?;
                 if kind.validate(&db, history)? != storage_identity {
                     return Err(source_error("source storage identity changed during poll"));
                 }
@@ -1353,6 +1394,31 @@ mod tests {
 
     fn leases() -> ExportLeases {
         ExportLeases::new(Duration::from_secs(3600), 4)
+    }
+
+    /// Review P4.1d: a write group larger than one frame can carry reaches
+    /// the receiver as a typed refusal it does not retry (it needs recovery
+    /// past the group), naming the group's sequence and size — not as the
+    /// "source not serving" a malformed batch would be, retried forever.
+    #[test]
+    fn a_group_too_large_for_a_frame_is_refused_by_name_and_never_retried() {
+        let error = PhysicalError::GroupTooLarge {
+            first: 41,
+            bytes: MAX_BATCH_BYTES + 1,
+            limit: MAX_BATCH_BYTES,
+        };
+        let WireError::Refused(refusal) = poll_error(100, &SourceKind::Primary, error) else {
+            panic!("not a refusal");
+        };
+        assert_eq!(
+            refusal.code,
+            RefuseCode::GroupTooLarge {
+                first: 41,
+                bytes: (MAX_BATCH_BYTES + 1) as u64,
+            }
+        );
+        assert!(refusal.code.needs_recovery() && !refusal.code.retryable());
+        assert!(refusal.reason.contains("sequence 41"), "{}", refusal.reason);
     }
 
     #[tokio::test]

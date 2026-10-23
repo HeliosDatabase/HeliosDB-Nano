@@ -351,9 +351,11 @@ Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.
   states the primary passed through, and the standby's indexes lag its store
   by at most one run. A serving standby polls up to 32 MiB at a time (was
   8 MiB). The primary, a cascading standby and the archiver fsync their WAL
-  for a poll only when its barrier moved since their last one. Streaming
-  rate: MEASURED_AFTER_FIX (before: ~3 MB/s of WAL on disk, ~4 MB/s and
-  ~10 000 sequences/s on `/dev/shm`).
+  for a poll only when its barrier moved since their last one. Measured (200 000
+  rows of ~1 KB in 1 000-row statements, loopback): a streaming standby went
+  from ~4 to ~31 MB/s of WAL on a RAM disk (10 000 → 86 000 sequences/s) and
+  from ~3 to ~7 MB/s on rotating disks; a restarted standby caught up at
+  15.7 MB/s of WAL on disk instead of 2.9.
 - **One 20 000-row statement stalled every physical standby and the archive
   for good** (spec P4.1c). A write group larger than the standby's poll limit
   (8 MiB; such a statement of ~900-byte rows is ~80 MiB) was refused as
@@ -373,6 +375,18 @@ Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.
   a target too, a larger group getting a segment of its own, sealed at once.
   The frame bounds changed, so the protocol is now `NPHYS003`: run the same
   release on both nodes (an `NPHYS002` build is refused by version).
+  Review follow-ups in the same change: a group larger than a frame can carry
+  is refused by name (`GroupTooLarge`, `needs_recovery`, never retried; the
+  archiver disables itself with the reason; `recover --from-primary`
+  fast-forwards past it) instead of a generic error retried forever; the
+  coalescing target a standby may request is capped at 256 MiB
+  (`resync --poll-byte-limit` too, was 64 MiB); the source waits one operation
+  timeout plus one frame timeout for a receiver's next request, since a
+  receiver is silent while it applies a run; a standby's archive feed waits a
+  bounded time for room instead of dropping a group larger than its queue
+  (the drop, with the range, happens only after the wait runs out); an index
+  name moved from one table to another inside one run is registered on its
+  new table; a segment frame is written without an extra copy of the group.
 - **The standby's heartbeat no longer resets the primary's record of it.** The
   native heartbeat reported applied and flushed positions of 0 every 5 seconds,
   and the primary copied them into the watermark its synchronous commits waited
@@ -386,10 +400,13 @@ Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.
   anything, so it returned at once even with the standby stopped; `min_acks`
   was ignored and a timeout only warned.
 - **Replication sockets set `TCP_NODELAY` and send control frames in one
-  write** (spec P4.1b). Checkpoint downloads and fast-forward leaf transfers
-  no longer stall ~40 ms per 1 MiB chunk, the payload of each request having
-  waited behind the peer's delayed ACK of its header (loopback copy 15 MB/s →
-  MEASURED_AFTER_FIX MB/s). The bytes on the wire are unchanged by it.
+  write** (spec P4.1b). Each request's payload could wait behind the peer's
+  delayed ACK of its header (up to ~40 ms per round trip); a correctness fix
+  of the frame and socket behaviour. It produced no measurable rate change on
+  loopback: the checkpoint download and the leaf transfer are bound by fsync
+  latency (one fsync per 8 MiB of download, about two per 4 MiB leaf), and
+  streaming was bound by the per-group apply cost fixed in P4.1d. The bytes on
+  the wire are unchanged by it.
 
 ### Tests
 - Added: `tests/physical_standby_sync.rs` (a sync INSERT blocks while the

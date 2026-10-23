@@ -54,7 +54,7 @@
 //! | `MetaIndex` delete | `drop_index` (memory only) + vector hook |
 //! | `Data` | new image decoded with the post-run schema (`decode_stored_row`, the scan's decode); `stage_replicated_row(old, new).commit()` per row, a key swapped between rows inside the run resolved by removing every refused row's old keys before adding the new ones; vector hook; row-id counter raised to the row id; `publish_live_replay_visibility`; decode failure → the table is re-derived |
 //! | `TableConstraints` | constraints cache; new UNIQUE / FK indexes (`register_unique_constraint_indexes`, `create_fk_index`) registered and backfilled; a constraint that disappeared, or a set more than one batch of the run wrote → the table is re-derived |
-//! | `MetaIndex` put | ART family: `register_index_definition` + backfill of that index (a definition more than one batch of the run wrote: the table it is registered on and the one it names are re-derived); vector family: vector hook |
+//! | `MetaIndex` put | ART family: `register_index_definition` + backfill of that index (a definition more than one batch of the run wrote: its registration is dropped and the table it names re-derived, which registers it); vector family: vector hook |
 //! | `Snapshot` | `ingest_snapshot_record` + `raise_timestamp`; delete → `forget_snapshots` (the run's deletions at once) + `clear_cache` |
 //! | `VersionIdx` / `Version` / `Vmeta` | timestamp raised past `u64::MAX - rev` and past a COPY marker's timestamp; COPY markers ingested / forgotten; the table's cached `AS OF` answers invalidated |
 //! | `Counter` | `raise_row_counter_to(decoded value)` |
@@ -424,8 +424,9 @@ impl PhysicalApplier {
     /// twice) to the one it has after the last. A table schema, constraint
     /// set or index definition that more than one batch of the run wrote or
     /// deleted is not published from that net change alone — it can hide a
-    /// DROP and a CREATE of the same name in between: the table (for an
-    /// index, its tables) is re-derived from the durable records instead.
+    /// DROP and a CREATE of the same name in between: the table is re-derived
+    /// from the durable records instead (for an index, its registration is
+    /// dropped and the table its final definition names re-derived).
     ///
     /// `Err` before the first write means nothing of the run was applied. A
     /// write that fails after earlier batches of the run were written leaves
@@ -502,7 +503,7 @@ impl PhysicalApplier {
                 Ok(false) => {}
                 Err(error) => {
                     if written > 0 {
-                        self.rederive_failed_run(&touched, &mut state);
+                        self.rederive_failed_run(&touched, written, &mut state);
                     }
                     return Err(error.into());
                 }
@@ -551,21 +552,42 @@ impl PhysicalApplier {
     /// store is a state the primary passed through. The run's publication
     /// was planned for all of it, though — its post-run images, schemas and
     /// timestamps include batches that never reached the store — so it is
-    /// not run. Instead, as for a row that does not decode, every table the
-    /// run touched is re-derived from the store as it is (one that cannot be
-    /// stays pending, holding the census, its readers on scans), and the
-    /// rest of the derived state — the snapshot map and timestamps, row
-    /// counters, the branch registry, the caches and the listener's
-    /// registries — is marked suspect and re-derived in full at the next
-    /// idle poll ([`Self::run_pending_rebuilds`]; a receiver that stops on
-    /// the error re-hydrates at its next start instead).
-    fn rederive_failed_run(&self, touched: &Touched, state: &mut ApplierState) {
-        let tables: BTreeSet<String> = touched.held_tables().into_iter().collect();
-        self.rederive_tables(tables.clone(), &tables, state);
-        self.defer_full_rebuild(
-            state,
-            "a run of write groups failed part-way; its publication is replaced by a re-derivation",
-        );
+    /// not run. Instead, as for a row that does not decode, the derived
+    /// state is re-derived from the store as it is, now, under the replay
+    /// guard the run holds — the receiver stops on the error, so a deferred
+    /// re-derivation would never run:
+    ///
+    /// * a run that touched the catalog, index definitions or keys no table
+    ///   can be named for: the whole derived state (`rebuild_all_locked`:
+    ///   every table, the snapshot map and timestamps, the version-GC
+    ///   horizon, the branch registry, every cache, the listener);
+    /// * any other run: every table it touched (one that cannot be re-derived
+    ///   stays pending, holding the census, its readers on scans), and the
+    ///   rest — the snapshot map and timestamps, row counters, caches — is
+    ///   marked suspect and re-derived in full at the next idle poll
+    ///   ([`Self::run_pending_rebuilds`]); a receiver that stops on the error
+    ///   re-hydrates at its next start instead.
+    ///
+    /// `written` batches count as applied.
+    fn rederive_failed_run(&self, touched: &Touched, written: u64, state: &mut ApplierState) {
+        self.stats.lock().batches += written;
+        if touched.holds_every_table() || touched.touches_catalog() {
+            if let Err(e) = self.rebuild_all_locked(state) {
+                warn!(
+                    "physical applier: re-deriving the whole derived state after a failed run failed ({}); it \
+                     stays suspect",
+                    e
+                );
+                self.defer_full_rebuild(state, "a failed run's re-derivation failed");
+            }
+        } else {
+            let tables: BTreeSet<String> = touched.held_tables().into_iter().collect();
+            self.rederive_tables(tables.clone(), &tables, state);
+            self.defer_full_rebuild(
+                state,
+                "a run of write groups failed part-way; its publication is replaced by a re-derivation",
+            );
+        }
         self.stats.lock().pending_tables = state.pending.len();
     }
 
@@ -856,11 +878,22 @@ impl PhysicalApplier {
                         // Spec P4.1d: written and deleted by different batches
                         // of the run (DROP INDEX, then CREATE INDEX of the same
                         // name): a registration of the name may be the old
-                        // definition's. The table it is registered on and the
-                        // one the final definition names are re-derived from
-                        // the durable records, which registers the final one.
-                        if let Some((_, table)) = art.index_kind_and_table(name) {
-                            work.rederive.insert(table);
+                        // definition's, possibly on another table. It is
+                        // dropped first, as a deleted definition's is (above):
+                        // the re-derivation of the table the final definition
+                        // names then registers it there — it would leave a
+                        // name another table still holds, and that table's
+                        // own re-derivation would drop it again.
+                        if let Some((kind, table)) = art.index_kind_and_table(name) {
+                            if let Err(e) = art.drop_index(name) {
+                                debug!("physical applier: dropping index '{}': {}", name, e);
+                            }
+                            if kind != ArtIndexType::Manual {
+                                // It may have been a constraint's index on
+                                // that table (a name a record later took):
+                                // that table's own records re-mint it.
+                                work.rederive.insert(table);
+                            }
                         }
                         if let Ok(Some(definition)) = self.engine.catalog().get_index_definition(name) {
                             work.rederive.insert(definition.table_name);
@@ -1705,7 +1738,8 @@ struct Touched {
     /// and a CREATE of the same name in between.
     redefined_tables: BTreeSet<String>,
     /// Index definitions more than one batch of the run wrote or deleted:
-    /// their tables are re-derived, which registers the final definition.
+    /// the name's registration is dropped and the table the final definition
+    /// names is re-derived, which registers it there.
     redefined_indexes: BTreeSet<String>,
     data: BTreeMap<String, BTreeMap<u64, RowKey>>,
     meta_tables: BTreeSet<String>,
@@ -2667,6 +2701,61 @@ mod tests {
             let stats = as_a_run.applier.stats();
             assert_eq!(stats.batches, run.len() as u64, "{stats:?}");
             assert_eq!(stats.rebuilds, 0, "{stats:?}");
+            assert!(!stats.derived_state_suspect, "{stats:?}");
+        }
+
+        /// Review P4.1d: an index name dropped on one table and created on
+        /// another inside one run is registered on the new table, backfilled
+        /// with its rows, and gone from the old one — with the new table
+        /// sorting BEFORE the old one, so its re-derivation runs first and
+        /// would have found the name still held by the old table.
+        #[test]
+        fn an_index_name_moved_to_a_table_that_sorts_first_in_one_run_is_registered_on_it() {
+            let primary = Primary::new(&[
+                "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
+                "CREATE TABLE accounts (id INT PRIMARY KEY, owner TEXT)",
+                "INSERT INTO users VALUES (1, 'ann'), (2, 'bob')",
+                "INSERT INTO accounts VALUES (1, 'x'), (2, 'y'), (3, 'z')",
+                "CREATE INDEX moved ON users (name)",
+            ]);
+            let standby = primary.standby("standby", None);
+            let owner = |standby: &Standby| {
+                standby
+                    .engine
+                    .art_indexes()
+                    .index_kind_and_table("moved")
+                    .map(|(_, table)| table)
+            };
+            assert_eq!(owner(&standby).as_deref(), Some("users"), "precondition");
+            primary.run(&["DROP INDEX moved", "CREATE INDEX moved ON accounts (owner)"]);
+            let run = primary.groups_after(standby.cursor());
+            let definition = b"meta:index:moved".as_slice();
+            let writes = run
+                .iter()
+                .filter(|batch| {
+                    decode_raw_batch(batch.data()).unwrap().iter().any(|op| match op {
+                        RawOp::Put { key, .. } | RawOp::Delete { key } => *key == definition,
+                        RawOp::DeleteRange { .. } => false,
+                    })
+                })
+                .count();
+            assert!(writes >= 2, "precondition: two groups of the run write the definition");
+
+            standby.applier.apply_run(&run, Durability::Synced).unwrap();
+            let art = standby.engine.art_indexes();
+            assert_eq!(
+                owner(&standby).as_deref(),
+                Some("accounts"),
+                "registered on the new table"
+            );
+            assert_eq!(art.index_entry_count("moved"), Some(3), "backfilled with its rows");
+            assert_eq!(art.find_column_index("accounts", "owner").as_deref(), Some("moved"));
+            assert!(
+                art.find_column_index("users", "name").is_none(),
+                "gone from the old table"
+            );
+            let stats = standby.applier.stats();
+            assert_eq!(stats.pending_tables, 0, "{stats:?}");
             assert!(!stats.derived_state_suspect, "{stats:?}");
         }
     }

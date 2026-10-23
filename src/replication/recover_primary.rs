@@ -691,7 +691,10 @@ impl Ladder<'_> {
             };
             if let WireError::Refused(refusal) = &error {
                 match &refusal.code {
-                    RefuseCode::WalPruned { .. } | RefuseCode::Gap { .. } => {
+                    // A write group too large for any frame cannot be
+                    // streamed either: the standby is advanced past it like
+                    // one the WAL no longer holds.
+                    RefuseCode::WalPruned { .. } | RefuseCode::Gap { .. } | RefuseCode::GroupTooLarge { .. } => {
                         return Ok(Probe::Behind(refusal.to_string()))
                     }
                     RefuseCode::HistoryMismatch | RefuseCode::EpochStale { .. } => {

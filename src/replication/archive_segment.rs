@@ -364,11 +364,22 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// digest(32) | raw` — byte for byte what `physical_wire` sends.
 pub fn encode_batch_payload(batch: &PhysicalBatch) -> Vec<u8> {
     let mut payload = Vec::with_capacity(FRAME_META + batch.data().len());
-    payload.extend_from_slice(batch.history().as_bytes());
-    payload.extend_from_slice(&batch.first_sequence().to_be_bytes());
-    payload.extend_from_slice(&batch.digest());
+    payload.extend_from_slice(&batch_meta(batch));
     payload.extend_from_slice(batch.data());
     payload
+}
+
+/// The `history | first | digest` prefix of [`encode_batch_payload`], alone.
+fn batch_meta(batch: &PhysicalBatch) -> [u8; FRAME_META] {
+    let history = batch.history();
+    let first = batch.first_sequence().to_be_bytes();
+    let digest = batch.digest();
+    let fields = history.as_bytes().iter().chain(&first).chain(&digest);
+    let mut meta = [0_u8; FRAME_META];
+    for (to, from) in meta.iter_mut().zip(fields) {
+        *to = *from;
+    }
+    meta
 }
 
 /// Decode a wire `Batch` payload through [`PhysicalBatch::decode`], which
@@ -921,32 +932,48 @@ impl OpenSegment {
                 ),
             ));
         }
-        let payload = encode_batch_payload(batch);
-        let payload = if self.header.sealed() {
+        // A write group may be gigabytes (spec P4.1c): it is never joined with
+        // its length word into one buffer. Unsealed, the frame is written from
+        // the batch itself (metadata, then the raw group); sealed, the one
+        // plaintext copy is consumed by the sealing, so it is freed before the
+        // sealed payload is written.
+        let sealed = if self.header.sealed() {
             let key = key.ok_or_else(|| refuse(&self.path, SEALED_WITHOUT_KEY))?;
-            crate::storage::tde::seal(Some(key), &payload)
-                .map_err(|error| refuse(&self.path, format!("cannot seal the frame: {error}")))?
-                .into_owned()
+            Some(
+                crate::storage::tde::seal_owned(Some(key), encode_batch_payload(batch))
+                    .map_err(|error| refuse(&self.path, format!("cannot seal the frame: {error}")))?,
+            )
         } else {
-            payload
+            None
         };
-        if payload.len() > MAX_FRAME_LEN {
+        let meta = batch_meta(batch);
+        let parts: [&[u8]; 2] = match &sealed {
+            Some(payload) => [payload.as_slice(), &[]],
+            None => [&meta, batch.data()],
+        };
+        let payload_len: usize = parts.iter().map(|part| part.len()).sum();
+        if payload_len > MAX_FRAME_LEN {
             return Err(refuse(
                 &self.path,
-                format!("a frame of {} bytes exceeds the format's limit", payload.len()),
+                format!("a frame of {payload_len} bytes exceeds the format's limit"),
             ));
         }
-        let length = u32::try_from(payload.len())
+        let length = u32::try_from(payload_len)
             .map_err(|_| refuse(&self.path, "a frame longer than 4 GiB cannot be archived"))?;
-        let mut frame = Vec::with_capacity(4 + payload.len());
-        frame.extend_from_slice(&length.to_be_bytes());
-        frame.extend_from_slice(&payload);
-        if let Err(error) = self.file.write_all(&frame) {
+        let word = length.to_be_bytes();
+        let written = self
+            .file
+            .write_all(&word)
+            .and_then(|()| parts.iter().try_for_each(|part| self.file.write_all(part)));
+        if let Err(error) = written {
             self.failed = true;
             return Err(io_refuse(&self.path, "cannot append a frame", &error));
         }
-        self.hasher.update(&frame);
-        let added = frame.len() as u64;
+        self.hasher.update(word);
+        for part in parts {
+            self.hasher.update(part);
+        }
+        let added = (word.len() + payload_len) as u64;
         self.body_bytes += added;
         self.unsynced_bytes += added;
         if self.batch_count == 0 {

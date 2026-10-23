@@ -363,7 +363,7 @@ peer that stalls does. The session is request/response, driven by the standby
 | `Open` | R to S | `snapshot`, `snapshot of <id>` (a resumed download: the leased export it belongs to, else a fresh one), or `resume {history, after}` |
 | `Manifest` / `ResumeInfo` | S to R | the session the primary opened |
 | `ChunkRequest` / `Chunk` | R to S / S to R | one bounded, digested piece of a checkpoint file |
-| `PollRequest` | R to S | session, the sequence to continue after, a byte limit (a coalescing target: the poll's first write group travels whatever its size, later ones only within the limit) |
+| `PollRequest` | R to S | session, the sequence to continue after, a byte limit of at most 256 MiB (a coalescing target: the poll's first write group travels whatever its size, later ones only within the limit) |
 | `PollStart`, `Batch`*, `PollEnd` | S to R | a contiguous interval of write groups, one `Batch` per write group, never split |
 | `Heartbeat` | R to S | applied sequence, durable sequence, received-at time. This is **the acknowledgement**: one frame, two triggers (every 5 s when idle, and after a poll advanced the durable cursor, coalesced to at most one per 50 ms) |
 | `HeartbeatAck` | S to R | the primary's barrier and clock |
@@ -1103,17 +1103,25 @@ The test suites are listed in the [HA testing guide](ha_testing.md).
 - **A write group travels and is applied whole.** A statement or a
   transaction is one RocksDB write group on the primary, and it reaches each
   standby, the archive, a cascaded standby and `recover --from-archive` as one
-  unit, applied as one batch, never split. So a standby and every archiver
-  must hold the largest write group the primary commits in memory, once (a
-  single 1 000 000-row statement of ~900-byte rows is ~4 GiB). The poll limit
-  (32 MiB on a serving standby) only decides how many small write groups
-  travel together: a larger one travels alone. A serving standby holds one
-  poll twice while it applies it — its frames, then its decoded run — so
-  allow about 64 MiB for it on top of the largest write group. The bound is
-  what one frame can say, 4 GiB less 4 KiB of raw write group; a larger one
-  cannot be replicated or archived (the standby and the archiver stop before
-  it, `batch byte limit`), so load bulk data in statements of tens of
-  thousands of rows.
+  unit, applied as one batch, never split. So every node it passes through
+  holds the largest write group the primary commits in memory, several times
+  over while it moves it: the primary once per reader of its WAL (each
+  standby session's poll copy, the archiver's poll copy) and again while the
+  archiver encodes it (and seals it, with an encrypted archive); a standby
+  twice (the received group, and the write batch it applies), plus the copy
+  its own archive queues. Size memory for a few times the largest group (a
+  single 1 000 000-row statement of ~900-byte rows is about a gigabyte). The poll
+  limit (32 MiB on a serving standby; at most 256 MiB, `resync
+  --poll-byte-limit`) only decides how many small write groups travel
+  together: a larger one travels alone. A serving standby holds one poll
+  twice while it applies it — its frames, then its decoded run — so allow
+  about 64 MiB for it on top of that. The bound is what one frame can say,
+  4 GiB less 4 KiB of raw write group: a larger one cannot be replicated or
+  archived. A standby that reaches it is refused with `GroupTooLarge`, naming
+  the group's sequence and size, and goes to `needs_recovery` (recover it past
+  the group with `recover --from-primary`); the primary's archiver turns off
+  with that reason in `heliosdb_recovery_window`. Load bulk data in
+  statements of tens of thousands of rows.
 - **An incremental rebuild reads everything once.** `recover --from-primary`
   ships only the leaves that differ, but both sides digest their whole
   datasets to find them (no change-tracking map yet), and a change spread

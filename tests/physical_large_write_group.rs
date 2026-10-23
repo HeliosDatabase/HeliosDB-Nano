@@ -2,11 +2,13 @@
 //! (`tests/support/physical_pair.rs`).
 //!
 //! * one `INSERT INTO t SELECT i, repeat('x', 900) || i FROM
-//!   generate_series(1, 20000) i` — ONE write group of ~80 MiB, more than
-//!   twice a serving standby's 32 MiB poll limit — reaches a standby (A)
-//!   whole: it settles at the primary's sequence with the primary's default
-//!   column family, and its `/health` never reports the old refusal ("exceeds poll
-//!   byte limit"); the small writes after it follow;
+//!   generate_series(1, 50000) i` — ONE write group of about 45 MiB raw,
+//!   larger than a serving standby's poll limit (`STANDBY_POLL_BYTES`, 32 MiB,
+//!   checked against the group's segment) — reaches a standby (A) whole: it
+//!   settles at the primary's sequence with the primary's default column
+//!   family, and its `/health` never reports the old refusal ("exceeds poll
+//!   byte limit") nor `reconnecting` (a source session that gave up waiting
+//!   while the standby applied the group); the small writes after it follow;
 //! * the primary's archive seals the group into a segment of its own (one
 //!   write group, larger than `segment_max_bytes`), contiguous with the rest,
 //!   and it deep-verifies;
@@ -18,8 +20,8 @@
 //!   group's `Batch` frame half received has applied nothing of it, resumes
 //!   from its cursor and settles at the primary's state.
 //!
-//! The 100 000-row variant (~400 MiB) is left to the live probe: it costs
-//! more memory and time than the default tier affords.
+//! Larger statements are left to the live probe: they cost more memory and
+//! time than the default tier affords.
 //!
 //! Red on the base of this change (P4.1b): the standby stopped at the group,
 //! `reconnecting` forever ("single source batch exceeds poll byte limit"),
@@ -33,16 +35,19 @@ mod physical_pair;
 
 use heliosdb_nano::replication::archive_segment::SegmentInfo;
 use heliosdb_nano::replication::physical::{decode_cursor, range_digest, CURSOR_KEY, LOCAL_CF};
+use heliosdb_nano::replication::physical_receiver::STANDBY_POLL_BYTES;
 use physical_pair::*;
 use rocksdb::{Options, DB};
 use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-/// The statement of the defect: one write group of 20 000 rows of ~900 bytes.
-const BIG_INSERT: &str = "INSERT INTO t SELECT i, repeat('x', 900) || i FROM generate_series(1, 20000) i";
-/// A serving standby's poll limit (`STANDBY_POLL_BYTES` in `main.rs`).
-const STANDBY_POLL_BYTES: u64 = 32 * 1024 * 1024;
+/// The statement of the defect: one write group of 50 000 rows of ~900 bytes,
+/// larger than a serving standby's poll limit ([`STANDBY_POLL_BYTES`], the
+/// constant `main.rs` serves with).
+const BIG_INSERT: &str = "INSERT INTO t SELECT i, repeat('x', 900) || i FROM generate_series(1, 50000) i";
+/// The rows of `BIG_INSERT`; the small writes around it use ids past them.
+const BIG_ROWS: i32 = 50_000;
 /// Small segments, sealed every second: the group is far larger than one.
 const ARCHIVE: &str = "[replication.archive]\nsegment_max_bytes = \"4MiB\"\nsegment_max_secs = 1\n";
 /// What a standby may take to apply the group.
@@ -93,6 +98,9 @@ async fn follow(http_port: u16, through: u64, daemon: &Daemon) {
             let reason = block["reason"].as_str().unwrap_or_default();
             assert!(!reason.contains("exceeds poll byte limit"), "the defect: {block}");
             assert_ne!(block["state"], "needs_recovery", "{block}; {}", daemon.tail(12));
+            // A source session that gave up waiting for the next request
+            // while the standby applied the group shows up as a reconnect.
+            assert_ne!(block["state"], "reconnecting", "{block}; {}", daemon.tail(12));
             if block["cursor"].as_str().is_some_and(|cursor| lsn(cursor) >= through) {
                 return;
             }
@@ -113,8 +121,9 @@ fn assert_never_refused(daemon: &Daemon) {
     assert!(!log.contains("cannot read the store's WAL"), "{}", daemon.tail(20));
 }
 
-/// Spec P4.1c §3: one ~80 MiB write group reaches a standby, a cascaded
-/// standby, the archive (a segment of its own) and `recover --from-archive`.
+/// Spec P4.1c §3: one write group larger than the standby's poll limit
+/// reaches a standby, a cascaded standby, the archive (a segment of its own)
+/// and `recover --from-archive`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_large_write_group_reaches_every_standby_the_archive_and_recovery() {
     let pair = pair();
@@ -130,8 +139,8 @@ async fn one_large_write_group_reaches_every_standby_the_archive_and_recovery() 
     );
     let writer = connect(pair.pg_p).await;
     create_table(&writer).await;
-    assert_eq!(insert(&writer, 20_001..=20_010, "before").await, 0);
-    let before: Vec<i32> = (20_001..=20_010).collect();
+    assert_eq!(insert(&writer, BIG_ROWS + 1..=BIG_ROWS + 10, "before").await, 0);
+    let before: Vec<i32> = (BIG_ROWS + 1..=BIG_ROWS + 10).collect();
 
     // A follows the primary and cascades, on a replication port of its own.
     let repl_a = free_port();
@@ -180,9 +189,9 @@ async fn one_large_write_group_reaches_every_standby_the_archive_and_recovery() 
     // The write group, then small ones after it.
     let start = primary_sequence(&writer).await;
     writer.batch_execute(BIG_INSERT).await.unwrap();
-    assert_eq!(insert(&writer, 20_011..=20_020, "after").await, 0);
+    assert_eq!(insert(&writer, BIG_ROWS + 11..=BIG_ROWS + 20, "after").await, 0);
     let through = primary_sequence(&writer).await;
-    let want: Vec<i32> = (1..=20_020).collect();
+    let want: Vec<i32> = (1..=BIG_ROWS + 20).collect();
 
     follow(pair.http_s, through, &standby_a).await;
     follow(http_c, through, &standby_c).await;
@@ -210,8 +219,9 @@ async fn one_large_write_group_reaches_every_standby_the_archive_and_recovery() 
         .max_by_key(|segment| segment.file_bytes)
         .unwrap_or_else(|| panic!("no segment past {start}: {segments:?}"));
     assert!(
-        own.file_bytes > STANDBY_POLL_BYTES,
-        "precondition: the statement's write group is larger than the standby's poll limit: {own:?}"
+        own.file_bytes > STANDBY_POLL_BYTES as u64,
+        "precondition: the statement's write group is larger than the standby's poll limit ({STANDBY_POLL_BYTES} \
+         bytes): {own:?}"
     );
     assert_eq!(
         own.batch_count(),
@@ -283,7 +293,7 @@ async fn a_standby_killed_with_the_group_in_flight_resumes_from_its_cursor() {
     );
     let writer = connect(pair.pg_p).await;
     create_table(&writer).await;
-    assert_eq!(insert(&writer, 20_001..=20_010, "before").await, 0);
+    assert_eq!(insert(&writer, BIG_ROWS + 1..=BIG_ROWS + 10, "before").await, 0);
     let standby_data = dir.join("standby");
     // Killed once a Batch frame of at least the poll limit is half received.
     let hooked = SpawnOptions {
@@ -327,7 +337,7 @@ async fn a_standby_killed_with_the_group_in_flight_resumes_from_its_cursor() {
     // The restart resumes from the cursor and settles.
     let mut restarted = Daemon::spawn(&dir, "standby-2", &standby_data, &pair.token, &pair.standby_args, None);
     follow(pair.http_s, through, &restarted).await;
-    let want: Vec<i32> = (1..=20_010).collect();
+    let want: Vec<i32> = (1..=BIG_ROWS + 10).collect();
     assert_eq!(settle(pair.pg_s, &want, Duration::from_secs(60)).await, Ok(want));
     let log = restarted.log();
     assert!(

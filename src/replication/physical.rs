@@ -73,9 +73,6 @@ const MAX_FAST_FORWARD_LEAVES: usize = 1 << 24;
 /// only bound on its size; how many groups travel together is a poll's byte
 /// limit, a coalescing target ([`poll_source`]).
 pub const MAX_BATCH_BYTES: usize = u32::MAX as usize - 4096;
-/// RocksDB's own operation-count width (a raw batch's count field is a
-/// `u32`): every count a source batch can carry is accepted (spec P4.1c).
-const MAX_BATCH_OPERATIONS: u32 = u32::MAX;
 /// A node-local batch ([`LocalWriter::write_local`]) is never a source
 /// group: it keeps the bound every batch had before spec P4.1c, far below
 /// the count field's width (its cursor put is one more operation).
@@ -121,6 +118,17 @@ pub enum PhysicalError {
     Ahead { after: u64, barrier: u64 },
     #[error("physical replication history mismatch")]
     HistoryMismatch,
+    /// The source's next write group (starting at `first`) is `bytes` raw
+    /// bytes, more than one replication or archive frame can carry
+    /// ([`MAX_BATCH_BYTES`]): it can be neither served nor archived, and no
+    /// retry changes that. Refused before the group is copied; a receiver is
+    /// told so by a typed refusal (it needs recovery past the group), and the
+    /// archiver turns off with the reason.
+    #[error(
+        "write group at sequence {first} is {bytes} bytes, more than the {limit} bytes one replication or archive \
+         frame can carry"
+    )]
+    GroupTooLarge { first: u64, bytes: usize, limit: usize },
     #[error("physical receiver must be reopened after an uncertain storage failure")]
     Poisoned,
     /// The directory cannot be continued in place; only a fresh resync can
@@ -271,9 +279,9 @@ pub(crate) fn walk_raw_batch<'a>(raw: &'a [u8], mut visit: impl FnMut(RawOp<'a>)
             "empty batch: a write group with no operations is never a source batch",
         ));
     }
-    // Spec P4.1c: every count the field can hold is accepted
-    // ([`MAX_BATCH_OPERATIONS`] is RocksDB's own width). The walk below proves
-    // it against the records, which the byte bound above bounds.
+    // Spec P4.1c: every count the field can hold (RocksDB's own `u32`
+    // width) is accepted. The walk below proves it against the records,
+    // which the byte bound above bounds.
     let count_wanted = u64::from(count);
     let mut input = raw.get(12..).ok_or_else(|| invalid("batch header too short"))?;
     let mut observed = 0_u64;
@@ -392,7 +400,7 @@ fn refuse_receiver_source(db: &DB) -> Result<()> {
 }
 
 /// Spec P4.1d: the highest durable barrier one source's polls have fsynced
-/// the WAL for — `0` until its first poll. [`poll_source`] and
+/// the WAL for — `0` until its first poll — and how many fsyncs they made. [`poll_source`] and
 /// [`poll_source_cascade`] fsync only when the barrier they sampled is above
 /// it, so a source polled again and again at an idle barrier (a caught-up
 /// standby every poll interval, the archiver every `poll_ms`) pays one fsync
@@ -409,11 +417,16 @@ fn refuse_receiver_source(db: &DB) -> Result<()> {
 /// by its writer), and that window is closed once per barrier.
 ///
 /// One memo belongs to one source and one store — the primary's session, a
-/// cascading standby's session, the archiver each own theirs — and is never
-/// shared across stores: another store's barrier says nothing about this
-/// one's WAL.
+/// cascading standby's session (its probes and its archive gap fill
+/// included), the archiver each own theirs — and is never shared across
+/// stores: another store's barrier says nothing about this one's WAL.
 #[derive(Debug, Default)]
-pub struct FlushMemo(AtomicU64);
+pub struct FlushMemo {
+    /// The highest barrier fsynced.
+    barrier: AtomicU64,
+    /// The fsyncs this memo's polls made.
+    fsyncs: AtomicU64,
+}
 
 impl FlushMemo {
     /// A memo that has fsynced nothing yet: the next poll fsyncs.
@@ -424,7 +437,12 @@ impl FlushMemo {
     /// The highest barrier a poll of this memo fsynced the WAL for: every
     /// write at or below it was durable when that poll returned.
     pub fn last_flushed(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
+        self.barrier.load(Ordering::Acquire)
+    }
+
+    /// How many times this memo's polls fsynced the WAL.
+    pub fn fsyncs(&self) -> u64 {
+        self.fsyncs.load(Ordering::Acquire)
     }
 
     /// Whether a poll that sampled `barrier` has anything to make durable:
@@ -436,12 +454,13 @@ impl FlushMemo {
     /// fsync `db`'s WAL for a poll that sampled `barrier` BEFORE this call,
     /// unless this memo already covers it. Returns whether it fsynced. A
     /// failed fsync leaves the memo where it was, so the next poll retries.
-    fn flush(&self, db: &DB, barrier: u64) -> Result<bool> {
+    pub(crate) fn flush(&self, db: &DB, barrier: u64) -> Result<bool> {
         if !self.needs_flush(barrier) {
             return Ok(false);
         }
         db.flush_wal(true)?;
-        self.0.fetch_max(barrier, Ordering::AcqRel);
+        self.barrier.fetch_max(barrier, Ordering::AcqRel);
+        self.fsyncs.fetch_add(1, Ordering::AcqRel);
         Ok(true)
     }
 }
@@ -523,6 +542,16 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize, memo: 
         // only within the limit (spec P4.1c).
         if !result.batches.is_empty() && bytes.saturating_add(batch.size_in_bytes()) > byte_limit {
             break;
+        }
+        // Past what one frame can carry it can never be served: refused by
+        // name, before it is copied, not as a malformed batch a caller would
+        // retry forever.
+        if batch.size_in_bytes() > MAX_BATCH_BYTES {
+            return Err(PhysicalError::GroupTooLarge {
+                first,
+                bytes: batch.size_in_bytes(),
+                limit: MAX_BATCH_BYTES,
+            });
         }
         let raw = batch.data().to_vec();
         let digest = Sha256::digest(&raw).into();
@@ -959,6 +988,13 @@ pub fn poll_source_cascade(
         // its size; a later one joins it only within the limit.
         if !result.batches.is_empty() && bytes.saturating_add(framed) > byte_limit {
             break;
+        }
+        if framed > MAX_BATCH_BYTES {
+            return Err(PhysicalError::GroupTooLarge {
+                first,
+                bytes: framed,
+                limit: MAX_BATCH_BYTES,
+            });
         }
         let mut raw = Vec::with_capacity(framed);
         raw.extend_from_slice(&first.to_le_bytes());
@@ -3122,9 +3158,9 @@ mod tests {
     /// fsynced. Two polls at the same barrier fsync once: the first moves the
     /// memo to the barrier, the second finds the barrier covered and leaves
     /// the memo where it was; a write moves the barrier and the next poll
-    /// fsyncs again. Read through the memo's value, which only an fsync moves,
-    /// and the decision the polls take (`FlushMemo::flush`), for a primary and
-    /// for a cascading source alike.
+    /// fsyncs again. Read through the memo's fsync count — one after the two
+    /// polls, not two — and its barrier, for a primary and for a cascading
+    /// source alike.
     #[test]
     fn two_polls_at_the_same_barrier_fsync_the_wal_once() {
         let root = TempDir::new().unwrap();
@@ -3135,7 +3171,7 @@ mod tests {
         source.put(b"a", b"1").unwrap();
 
         let memo = FlushMemo::new();
-        assert_eq!(memo.last_flushed(), 0, "nothing fsynced yet");
+        assert_eq!((memo.last_flushed(), memo.fsyncs()), (0, 0), "nothing fsynced yet");
         let barrier = source.latest_sequence_number();
         assert!(memo.needs_flush(barrier));
         let first = poll_source(&source, history, cut, MAX_BATCH_BYTES, &memo).unwrap();
@@ -3149,10 +3185,11 @@ mod tests {
         assert!(second.batches.is_empty());
         assert_eq!(second.durable_barrier, barrier);
         assert_eq!(memo.last_flushed(), barrier, "the second poll did not move the memo");
+        assert_eq!(memo.fsyncs(), 1, "two polls at the same barrier, one fsync");
         // The polls' decision: an fsync for a barrier above the memo only.
         assert!(!memo.flush(&source, barrier).unwrap(), "covered: no fsync");
         assert!(!memo.flush(&source, barrier - 1).unwrap(), "below: no fsync");
-        assert_eq!(memo.last_flushed(), barrier);
+        assert_eq!((memo.last_flushed(), memo.fsyncs()), (barrier, 1));
 
         source.put(b"b", b"2").unwrap();
         let moved = source.latest_sequence_number();
@@ -3160,10 +3197,11 @@ mod tests {
         let third = poll_source(&source, history, second.through, MAX_BATCH_BYTES, &memo).unwrap();
         assert_eq!((third.through, third.durable_barrier), (moved, moved));
         assert_eq!(memo.last_flushed(), moved, "a moved barrier is fsynced again");
+        assert_eq!(memo.fsyncs(), 2);
         // A memo of its own fsyncs at its first poll, as every poll did before.
         let fresh = FlushMemo::new();
         assert!(fresh.flush(&source, moved).unwrap());
-        assert_eq!(fresh.last_flushed(), moved);
+        assert_eq!((fresh.last_flushed(), fresh.fsyncs()), (moved, 1));
 
         // A cascading source: the same rule over its cursor's source sequence.
         for batch in &first.batches {
@@ -3195,5 +3233,6 @@ mod tests {
             barrier,
             "an idle cascaded poll did not move the memo"
         );
+        assert_eq!(cascade.fsyncs(), 1, "two cascaded polls at the same barrier, one fsync");
     }
 }

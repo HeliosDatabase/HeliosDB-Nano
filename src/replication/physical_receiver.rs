@@ -34,12 +34,12 @@ use super::checkpoint_transfer::{
     partial_snapshot, CheckpointManifest, ClosedPhysicalStage, PhysicalStage, ReceiverStaging, ReopenedPhysicalStage,
     StagingStart, TransferLimits,
 };
-use super::physical::{Durability, LocalWriter, PhysicalBatch, PhysicalCursor, MAX_BATCH_BYTES};
+use super::physical::{Durability, LocalWriter, PhysicalBatch, PhysicalCursor};
 use super::physical_applier::PhysicalApplier;
 use super::physical_tls::{ReplicationStream, ReplicationTransport};
 use super::physical_wire::{
     now_millis, BatchSink, Heartbeat, PhysicalClient, PollSummary, ReceiverIdentity, RefuseCode, SourceSessionInfo,
-    TransferToken, WireError, WireLimits,
+    TransferToken, WireError, WireLimits, MAX_POLL_BYTES,
 };
 use crate::Config;
 use async_trait::async_trait;
@@ -63,6 +63,14 @@ const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(5);
 /// Acknowledgements of durable progress are coalesced to one per this
 /// interval, so a stream of small polls does not double the round trips.
 pub const ACK_COALESCE: Duration = Duration::from_millis(50);
+/// A serving standby's poll byte limit: how many bytes of small write groups
+/// one poll gathers (spec P4.1c: a coalescing target — a larger write group
+/// still travels, alone in its poll). Spec P4.1d: the size of one applier run
+/// (`physical_wire::APPLY_CHUNK_BYTES`), so a poll of small groups is one round
+/// trip, one hop to the worker and one publication; it costs one poll held
+/// twice in memory (its frames, then its decoded run). `main.rs` and the
+/// tests that need it read it from here.
+pub const STANDBY_POLL_BYTES: usize = 32 * 1024 * 1024;
 /// `internal-tests` builds only: a receiver whose download has received at
 /// least this many bytes SIGKILLs its own process — the "standby killed
 /// mid-download" of the resumable-download tests (spec P2.2), at an exact
@@ -125,7 +133,7 @@ pub struct ReceiverOptions {
     pub start: ReceiverStart,
     pub mode: ReceiverMode,
     pub wire: WireLimits,
-    /// How many bytes of write groups one poll gathers (`1..=MAX_BATCH_BYTES`).
+    /// How many bytes of write groups one poll gathers (`1..=MAX_POLL_BYTES`).
     /// Spec P4.1c: a coalescing target, not a ceiling — a write group larger
     /// than it still arrives, alone in its poll, and is applied as one batch.
     pub poll_byte_limit: usize,
@@ -164,7 +172,7 @@ impl ReceiverOptions {
         }
         let transfer = self.wire.transfer;
         if self.poll_byte_limit == 0
-            || self.poll_byte_limit > MAX_BATCH_BYTES
+            || self.poll_byte_limit > MAX_POLL_BYTES
             || self.poll_interval.is_zero()
             || self.poll_interval > Duration::from_secs(3600)
             || self.reconnect_delay.is_zero()
@@ -653,8 +661,9 @@ fn worker_loop(
 /// `apply_with` per group did.
 ///
 /// Spec P3.1: the serving standby archives what it applied — handed over
-/// without waiting, after the apply, one offer per group in order, never a
-/// retransmission it already held. A run that failed part-way offers the
+/// after the apply, one offer per group in order, never a retransmission it
+/// already held; the run's offers wait at most the feed's bound together
+/// for the archiver to make room (`ArchiveFeed::offer_until`). A run that failed part-way offers the
 /// groups it did write (they are in the store, and stay there), so the
 /// archive holds every group the store holds.
 fn apply_run(
@@ -672,12 +681,16 @@ fn apply_run(
                 .map_err(storage)
                 .and_then(|()| applier.apply_run(batches, durability).map(|_| ()).map_err(storage));
             if let Some(feed) = archive {
+                // One wait budget for the run's offers together: the run's
+                // apply and its offers share the client's one operation
+                // timeout (the feed's bound is set below it).
+                let deadline = Instant::now() + feed.max_wait();
                 let through = stage.cursor().source_sequence();
                 for batch in batches
                     .iter()
                     .filter(|batch| batch.last_sequence() > before && batch.last_sequence() <= through)
                 {
-                    feed.offer(batch, stage.writer().db());
+                    feed.offer_until(batch, stage.writer().db(), deadline);
                 }
             }
             applied
@@ -1302,7 +1315,17 @@ async fn run_receiver_with(
     let serving = attach.is_some();
     // Only a serving standby archives (spec P3.1): a bootstrap copy or an
     // offline `resync` follows no binding the archive could be filed under.
-    let archive = if serving { options.archive.clone() } else { None };
+    // An offer may wait for the archiver to make room (a large write group
+    // behind small ones), within half the operation timeout that bounds the
+    // whole apply of a run.
+    let archive = if serving {
+        options
+            .archive
+            .clone()
+            .map(|feed| feed.with_max_wait(options.wire.operation_timeout / 2))
+    } else {
+        None
+    };
     let worker = Worker::spawn(options.config.clone(), attach, archive)?;
     let outcome = run_inner(&options, &mut shutdown, &progress, &worker, serving).await;
     match outcome {
@@ -1811,7 +1834,7 @@ mod tests {
             start,
             mode,
             wire: wire_limits(),
-            poll_byte_limit: MAX_BATCH_BYTES,
+            poll_byte_limit: MAX_POLL_BYTES,
             poll_interval: Duration::from_millis(10),
             reconnect_delay: Duration::from_millis(10),
             max_reconnects: 3,
@@ -2436,7 +2459,7 @@ mod tests {
             session: 1,
             tls: false,
         };
-        let summary = client.poll(after, MAX_BATCH_BYTES, &mut sink).await.unwrap();
+        let summary = client.poll(after, MAX_POLL_BYTES, &mut sink).await.unwrap();
         client.close().await.unwrap();
         summary
     }

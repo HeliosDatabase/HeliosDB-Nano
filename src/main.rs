@@ -4028,18 +4028,14 @@ const LEGACY_LOGICAL_STANDBY_REFUSAL: &str = "this directory is a logical standb
 #[cfg(feature = "ha-tier1")]
 const STANDBY_BOOTSTRAP_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 /// A serving standby's receiver cadence: poll interval, reconnect delay, and
-/// the bytes of small write groups one poll gathers (spec P4.1c: a coalescing
-/// target — a larger write group still travels, alone in its poll). Spec
-/// P4.1d: 32 MiB, the size of one applier run
-/// (`physical_wire::APPLY_CHUNK_BYTES`), so a poll of small groups is one
-/// round trip, one hop to the receiver's worker and one publication; it costs
-/// one poll held twice in memory (its frames, then its decoded run).
+/// the bytes of small write groups one poll gathers
+/// (`physical_receiver::STANDBY_POLL_BYTES`, 32 MiB: spec P4.1c, P4.1d).
 #[cfg(feature = "ha-tier1")]
 const STANDBY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(feature = "ha-tier1")]
 const STANDBY_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(feature = "ha-tier1")]
-const STANDBY_POLL_BYTES: usize = 32 * 1024 * 1024;
+const STANDBY_POLL_BYTES: usize = heliosdb_nano::replication::physical_receiver::STANDBY_POLL_BYTES;
 /// Spec P2.1: how often an idle standby sends its primary a heartbeat. Every
 /// durable advance is acknowledged sooner (`physical_receiver::ACK_COALESCE`).
 #[cfg(feature = "ha-tier1")]
@@ -7778,6 +7774,7 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
         use heliosdb_nano::replication::physical_receiver::{
             run_receiver, ReceiverMode, ReceiverOptions, ReceiverStart, ReceiverStatus,
         };
+        use heliosdb_nano::replication::physical_wire::MAX_POLL_BYTES;
         use std::time::Duration;
         // The whole file, not only its replication section: the receiver opens
         // its store with the storage options the standby engine will serve it
@@ -7800,11 +7797,12 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
         if !(1..=60_000).contains(&args.poll_interval_ms)
             || !(1..=60_000).contains(&args.reconnect_delay_ms)
             || args.max_reconnects > 1000
-            || !(1..=67_108_864).contains(&args.poll_byte_limit)
+            || !(1..=MAX_POLL_BYTES).contains(&args.poll_byte_limit)
         {
-            return Err(Error::config(
-                "resync requires poll/reconnect intervals 1..=60000 ms, retries 0..=1000, and poll bytes 1..=67108864",
-            ));
+            return Err(Error::config(format!(
+                "resync requires poll/reconnect intervals 1..=60000 ms, retries 0..=1000, and poll bytes \
+                 1..={MAX_POLL_BYTES}"
+            )));
         }
         if args.expected_history.is_some_and(|id| id.is_nil()) {
             return Err(Error::config("expected history must not be nil"));

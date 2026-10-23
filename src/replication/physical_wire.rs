@@ -268,6 +268,12 @@ pub enum RefuseCode {
     /// The peers speak different protocol versions, or a feature this
     /// release does not serve (fencing).
     Version,
+    /// The write group starting at source sequence `first` is `bytes` raw
+    /// bytes, more than one replication or archive frame can carry
+    /// (`MAX_BATCH_BYTES`): it can never be served, so asking again cannot
+    /// help. The receiver needs recovery past it (a fast-forward or a full
+    /// copy from the primary).
+    GroupTooLarge { first: u64, bytes: u64 },
 }
 
 impl RefuseCode {
@@ -281,6 +287,7 @@ impl RefuseCode {
             Self::TooManySessions => 6,
             Self::SourceNotServing => 7,
             Self::Version => 8,
+            Self::GroupTooLarge { .. } => 9,
         }
     }
 
@@ -295,6 +302,7 @@ impl RefuseCode {
             Self::TooManySessions => "TooManySessions",
             Self::SourceNotServing => "SourceNotServing",
             Self::Version => "Version",
+            Self::GroupTooLarge { .. } => "GroupTooLarge",
         }
     }
 
@@ -303,7 +311,12 @@ impl RefuseCode {
     pub fn needs_recovery(&self) -> bool {
         matches!(
             self,
-            Self::HistoryMismatch | Self::Gap { .. } | Self::WalPruned { .. } | Self::EpochStale { .. } | Self::Version
+            Self::HistoryMismatch
+                | Self::Gap { .. }
+                | Self::WalPruned { .. }
+                | Self::EpochStale { .. }
+                | Self::Version
+                | Self::GroupTooLarge { .. }
         )
     }
 
@@ -338,6 +351,11 @@ impl std::fmt::Display for RefuseCode {
             Self::TooManySessions => f.write_str("too many sessions"),
             Self::SourceNotServing => f.write_str("source not serving"),
             Self::Version => f.write_str("protocol version"),
+            Self::GroupTooLarge { first, bytes } => write!(
+                f,
+                "write group too large: the group at sequence {first} is {bytes} bytes, more than the \
+                 {MAX_BATCH_BYTES} one frame can carry"
+            ),
         }
     }
 }
@@ -381,6 +399,10 @@ impl Refusal {
                 bytes.extend(have.to_be_bytes());
                 bytes.extend(want.to_be_bytes());
             }
+            RefuseCode::GroupTooLarge { first, bytes: size } => {
+                bytes.extend(first.to_be_bytes());
+                bytes.extend(size.to_be_bytes());
+            }
             _ => {}
         }
         // `new` bounds the reason; a struct literal may not have.
@@ -419,6 +441,13 @@ impl Refusal {
             6 => (RefuseCode::TooManySessions, 0),
             7 => (RefuseCode::SourceNotServing, 0),
             8 => (RefuseCode::Version, 0),
+            9 => (
+                RefuseCode::GroupTooLarge {
+                    first: u64_at(bytes, 2)?,
+                    bytes: u64_at(bytes, 10)?,
+                },
+                16,
+            ),
             _ => return Err(invalid("unknown refusal code")),
         };
         let length = usize::from(u16_at(bytes, 2 + fields)?);
@@ -1414,6 +1443,14 @@ impl PollOrigin {
 /// never split (spec P4.1c).
 pub const APPLY_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 
+/// The largest coalescing target a receiver may ask a poll for (its
+/// `PollRequest` byte limit; `ReceiverOptions::poll_byte_limit`; `resync
+/// --poll-byte-limit`). It bounds how many write groups one poll gathers —
+/// what a source reads and holds, and a receiver takes, per round trip — not
+/// how large one group may be: the first group of a poll travels whatever its
+/// size (spec P4.1c), up to `MAX_BATCH_BYTES`.
+pub const MAX_POLL_BYTES: usize = 256 * 1024 * 1024;
+
 /// Apply each validated physical batch with its progress (the cursor in the
 /// same write) before returning; a sink may defer the fsync of a poll's
 /// batches to the poll's end, which its owner then performs before it reports
@@ -1748,7 +1785,36 @@ async fn read_frame<R: AsyncRead + Unpin>(
     limits: &WireLimits,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Frame> {
-    let (kind, length) = bounded(shutdown, limits.frame_timeout, async {
+    read_frame_within(io, allowed, limits, limits.frame_timeout, shutdown).await
+}
+
+/// [`read_frame`], waiting up to `header_wait` for the frame's header to
+/// arrive (its payload steps keep the frame timeout). A source waits this
+/// long for a receiver's next request: the receiver applies (and fsyncs) a
+/// whole poll before it sends one.
+async fn read_frame_within<R: AsyncRead + Unpin>(
+    io: &mut R,
+    allowed: &[Kind],
+    limits: &WireLimits,
+    header_wait: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Frame> {
+    let (kind, length) = read_frame_header(io, allowed, header_wait, shutdown).await?;
+    let mut payload = vec![0; length];
+    read_payload_steps(io, &mut payload, kind, length, 0, limits, shutdown).await?;
+    Ok(Frame { kind, payload })
+}
+
+/// A frame's header, its kind among `allowed` and its length within the
+/// kind's bounds — both checked before anything is allocated for it —
+/// waiting up to `wait` for it to arrive.
+async fn read_frame_header<R: AsyncRead + Unpin>(
+    io: &mut R,
+    allowed: &[Kind],
+    wait: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(Kind, usize)> {
+    bounded(shutdown, wait, async {
         let mut header = [0u8; HEADER_BYTES];
         io.read_exact(&mut header).await?;
         if let Err(error) = check_header(&header) {
@@ -1771,12 +1837,23 @@ async fn read_frame<R: AsyncRead + Unpin>(
         }
         Ok((kind, length))
     })
-    .await?;
-    let mut payload = vec![0; length];
-    // Spec P4.1c: one deadline per step of the payload, not one for the
-    // whole frame (`FRAME_IO_STEP`).
-    let mut read = 0_usize;
-    for step in payload.chunks_mut(FRAME_IO_STEP) {
+    .await
+}
+
+/// Fill `buffer`, the part of a `kind` frame's `length`-byte payload that
+/// starts `offset` bytes into it. Spec P4.1c: one deadline per step of the
+/// payload, not one for the whole frame (`FRAME_IO_STEP`).
+async fn read_payload_steps<R: AsyncRead + Unpin>(
+    io: &mut R,
+    buffer: &mut [u8],
+    kind: Kind,
+    length: usize,
+    offset: usize,
+    limits: &WireLimits,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let mut read = offset;
+    for step in buffer.chunks_mut(FRAME_IO_STEP) {
         bounded(shutdown, limits.frame_timeout, async {
             io.read_exact(step).await?;
             Ok(())
@@ -1785,7 +1862,33 @@ async fn read_frame<R: AsyncRead + Unpin>(
         read += step.len();
         kill_mid_batch_hook(kind, length, read);
     }
-    Ok(Frame { kind, payload })
+    Ok(())
+}
+
+/// One `Batch` frame of a poll, as its metadata (`history | first | digest`)
+/// and its raw write group in a buffer of its own, so the group — up to
+/// gigabytes (spec P4.1c) — is never moved to drop the metadata in front of
+/// it. A frame whose raw group is longer than `max_raw` (what is left of the
+/// poll's byte limit, for a batch after the first) is refused from its
+/// header, before anything is allocated for it.
+async fn read_batch_frame<R: AsyncRead + Unpin>(
+    io: &mut R,
+    max_raw: usize,
+    limits: &WireLimits,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<([u8; BATCH_META], Vec<u8>)> {
+    let (kind, length) = read_frame_header(io, &[Kind::Batch], limits.frame_timeout, shutdown).await?;
+    let raw_length = length
+        .checked_sub(BATCH_META)
+        .ok_or_else(|| invalid("batch payload truncated"))?;
+    if raw_length > max_raw {
+        return Err(invalid("physical response history/sequence/byte mismatch"));
+    }
+    let mut meta = [0_u8; BATCH_META];
+    read_payload_steps(io, &mut meta, kind, length, 0, limits, shutdown).await?;
+    let mut raw = vec![0; raw_length];
+    read_payload_steps(io, &mut raw, kind, length, BATCH_META, limits, shutdown).await?;
+    Ok((meta, raw))
 }
 
 /// Spec P4.1b: a frame whose payload is at most this large is written as ONE
@@ -2044,7 +2147,10 @@ impl PollSummary {
             || self.durable_barrier > MAX_SOURCE_SEQUENCE
             || (self.batches == 0 && self.through != self.durable_barrier)
             || (self.batches == 0) != (self.through == after)
-            || self.batches as usize > byte_limit / 12
+            // Every batch after the first fits the limit (12 bytes at least
+            // each); the first travels whatever its size, so one batch is
+            // always a legal poll, even under a limit below 12 bytes.
+            || (self.batches > 1 && self.batches as usize > byte_limit / 12)
         {
             return Err(invalid("inconsistent physical poll summary"));
         }
@@ -2268,8 +2374,14 @@ where
     // The leaf files this session announced, newest last, with their sizes:
     // a leaf chunk request must name one of them.
     let mut ready_leaves: std::collections::VecDeque<(u32, u64)> = std::collections::VecDeque::new();
+    // Between two requests the receiver works: it applies (and fsyncs) the
+    // whole poll it was just sent — up to its byte limit of write groups, or
+    // one larger group — before it sends the next one, and its apply is
+    // bounded by its operation timeout. So the wait for a request's header is
+    // that plus a frame timeout; every other frame keeps the frame timeout.
+    let request_wait = limits.operation_timeout.saturating_add(limits.frame_timeout);
     loop {
-        let request = read_frame(&mut io, allowed, &limits, &mut shutdown).await?;
+        let request = read_frame_within(&mut io, allowed, &limits, request_wait, &mut shutdown).await?;
         match request.kind {
             Kind::LeafDigestsRequest => {
                 let snapshot = fast_forward.ok_or_else(|| invalid("leaf digests require a fast-forward session"))?;
@@ -2402,7 +2514,7 @@ where
                 if after < info.initial_after()
                     || after > MAX_SOURCE_SEQUENCE
                     || byte_limit == 0
-                    || byte_limit > MAX_BATCH_BYTES
+                    || byte_limit > MAX_POLL_BYTES
                 {
                     return Err(invalid("invalid physical continuation request"));
                 }
@@ -3084,11 +3196,11 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             if after < info.initial_after()
                 || after > MAX_SOURCE_SEQUENCE
                 || byte_limit == 0
-                || byte_limit > MAX_BATCH_BYTES
+                || byte_limit > MAX_POLL_BYTES
             {
                 return Err(invalid("invalid physical continuation request"));
             }
-            // MAX_BATCH_BYTES is below u32::MAX by construction (spec P4.1c).
+            // MAX_POLL_BYTES is far below u32::MAX.
             let limit_field =
                 u32::try_from(byte_limit).map_err(|_| invalid("invalid physical continuation request"))?;
             let mut request = Vec::with_capacity(28);
@@ -3124,27 +3236,32 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             let mut run: Vec<PhysicalBatch> = Vec::new();
             let mut run_bytes = 0usize;
             for index in 0..summary.batches {
-                let mut frame = read_frame(&mut self.io, &[Kind::Batch], &self.limits, &mut self.shutdown).await?;
-                let history = uuid_at(&frame.payload, 0)?;
-                let first = u64_at(&frame.payload, 16)?;
-                let digest: [u8; 32] = frame
-                    .payload
+                // Spec P4.1c: only the poll's first batch may exceed the
+                // limit. A later one that would take the poll past it is
+                // refused from its frame header, before its payload is
+                // allocated or read.
+                let max_raw = if index == 0 {
+                    usize::MAX
+                } else {
+                    byte_limit.saturating_sub(bytes)
+                };
+                let (meta, raw) = read_batch_frame(&mut self.io, max_raw, &self.limits, &mut self.shutdown).await?;
+                let history = uuid_at(&meta, 0)?;
+                let first = u64_at(&meta, 16)?;
+                let digest: [u8; 32] = meta
                     .get(24..56)
                     .and_then(|slice| slice.try_into().ok())
                     .ok_or_else(|| invalid("batch payload truncated"))?;
-                frame.payload.drain(..BATCH_META);
                 bytes = bytes
-                    .checked_add(frame.payload.len())
+                    .checked_add(raw.len())
                     .ok_or_else(|| invalid("batch byte overflow"))?;
-                // Spec P4.1c: only the poll's first batch may exceed the limit.
                 if history != info.history()
                     || cursor.checked_add(1) != Some(first)
                     || (bytes > byte_limit && index > 0)
                 {
                     return Err(invalid("physical response history/sequence/byte mismatch"));
                 }
-                let batch =
-                    PhysicalBatch::decode(history, first, frame.payload, digest).map_err(|e| invalid(e.to_string()))?;
+                let batch = PhysicalBatch::decode(history, first, raw, digest).map_err(|e| invalid(e.to_string()))?;
                 if batch.last_sequence() > summary.through {
                     return Err(invalid("batch crosses advertised barrier"));
                 }
@@ -3581,6 +3698,10 @@ mod tests {
             RefuseCode::TooManySessions,
             RefuseCode::SourceNotServing,
             RefuseCode::Version,
+            RefuseCode::GroupTooLarge {
+                first: 7,
+                bytes: u64::MAX,
+            },
         ] {
             for reason in ["", "why", &"é".repeat(MAX_REASON_BYTES)] {
                 let refusal = Refusal::new(code.clone(), reason);
@@ -3961,6 +4082,7 @@ mod tests {
             RefuseCode::WalPruned { oldest: 1 },
             RefuseCode::EpochStale { have: 1, want: 2 },
             RefuseCode::Version,
+            RefuseCode::GroupTooLarge { first: 1, bytes: 2 },
         ] {
             assert!(code.needs_recovery() && !code.retryable(), "{code:?}");
         }
@@ -3998,7 +4120,7 @@ mod tests {
             );
         }
         let mut sink = Sink::default();
-        let summary = client.poll(10, MAX_BATCH_BYTES, &mut sink).await.unwrap();
+        let summary = client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap();
         assert_eq!(
             summary,
             PollSummary {
@@ -4008,7 +4130,7 @@ mod tests {
             }
         );
         assert_eq!(sink.received, vec![(source.manifest.history, 11, 11)]);
-        let empty = client.poll(11, MAX_BATCH_BYTES, &mut sink).await.unwrap();
+        let empty = client.poll(11, MAX_POLL_BYTES, &mut sink).await.unwrap();
         assert_eq!(empty.batches, 0);
         client.close().await.unwrap();
         run.await.unwrap().unwrap();
@@ -4098,7 +4220,7 @@ mod tests {
         let ack = client.heartbeat(at_checkpoint).await.unwrap();
         assert_eq!(ack.barrier, 42);
         assert!(ack.now > 0);
-        client.poll(10, MAX_BATCH_BYTES, &mut Sink::default()).await.unwrap();
+        client.poll(10, MAX_POLL_BYTES, &mut Sink::default()).await.unwrap();
         let after_poll = Heartbeat {
             applied_sequence: 11,
             durable_sequence: 11,
@@ -4283,7 +4405,7 @@ mod tests {
             .await
             .unwrap();
         let mut sink = Sink::default();
-        let outcome = client.poll(10, MAX_BATCH_BYTES, &mut sink).await;
+        let outcome = client.poll(10, MAX_POLL_BYTES, &mut sink).await;
         let code = RefuseCode::Gap {
             expected: 11,
             have_from: 13,
@@ -4564,6 +4686,25 @@ mod tests {
         }
         .validate(10, 1024)
         .is_ok());
+        // Review P4.1d: one batch is a legal poll under any limit, even one
+        // below the 12 bytes of a batch header (`resync --poll-byte-limit 1`);
+        // a second batch still needs room for its header.
+        for limit in [1, 11] {
+            assert!(PollSummary {
+                through: 11,
+                durable_barrier: 11,
+                batches: 1
+            }
+            .validate(10, limit)
+            .is_ok());
+            assert!(PollSummary {
+                through: 12,
+                durable_barrier: 12,
+                batches: 2
+            }
+            .validate(10, limit)
+            .is_err());
+        }
         assert!(TransferToken::new([0; 32]).is_err());
     }
 
@@ -4613,14 +4754,14 @@ mod tests {
             let mut sink = Sink::default();
             assert!(
                 matches!(
-                    client.poll(10, MAX_BATCH_BYTES, &mut sink).await,
+                    client.poll(10, MAX_POLL_BYTES, &mut sink).await,
                     Err(WireError::Protocol(_))
                 ),
                 "{fault}"
             );
             assert!(sink.received.is_empty(), "{fault}");
             assert!(matches!(
-                client.poll(10, MAX_BATCH_BYTES, &mut sink).await,
+                client.poll(10, MAX_POLL_BYTES, &mut sink).await,
                 Err(WireError::Poisoned)
             ));
             drop(client);
@@ -4647,11 +4788,11 @@ mod tests {
             .unwrap();
         client.fetch_manifest(None).await.unwrap();
         assert!(matches!(
-            client.poll(10, MAX_BATCH_BYTES, &mut FailedSink).await,
+            client.poll(10, MAX_POLL_BYTES, &mut FailedSink).await,
             Err(WireError::Source(_))
         ));
         assert!(matches!(
-            client.poll(10, MAX_BATCH_BYTES, &mut Sink::default()).await,
+            client.poll(10, MAX_POLL_BYTES, &mut Sink::default()).await,
             Err(WireError::Poisoned)
         ));
         drop(client);
@@ -4740,7 +4881,7 @@ mod tests {
             .unwrap();
         assert!(client.manifest().is_none());
         let mut sink = Sink::default();
-        assert_eq!(client.poll(10, MAX_BATCH_BYTES, &mut sink).await.unwrap().through, 11);
+        assert_eq!(client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap().through, 11);
         assert_eq!(sink.received, vec![(history, 11, 11)]);
         assert_eq!(source.chunks.load(Ordering::SeqCst), 0);
         client.close().await.unwrap();
@@ -4759,7 +4900,7 @@ mod tests {
             .unwrap();
         client.fetch_manifest(Some(history)).await.unwrap();
         let mut sink = Sink::default();
-        let durable = client.poll(10, MAX_BATCH_BYTES, &mut sink).await.unwrap().through;
+        let durable = client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap().through;
         drop(client); // transport interruption after the sink owns sequence 11
         assert!(run.await.unwrap().is_err());
         let resumed = Arc::new(resume_source(&source, durable));
@@ -4768,7 +4909,7 @@ mod tests {
         let mut client = PhysicalClient::connect_resume(io, &token(), &receiver(), limits(), rx, history, durable)
             .await
             .unwrap();
-        let summary = client.poll(durable, MAX_BATCH_BYTES, &mut sink).await.unwrap();
+        let summary = client.poll(durable, MAX_POLL_BYTES, &mut sink).await.unwrap();
         assert_eq!(summary.batches, 0);
         assert_eq!(sink.received, vec![(history, 11, 11)]);
         client.close().await.unwrap();
@@ -4982,7 +5123,7 @@ mod tests {
             .await
             .unwrap();
         let mut sink = Sink::default();
-        assert!(client.poll(10, MAX_BATCH_BYTES, &mut sink).await.is_err());
+        assert!(client.poll(10, MAX_POLL_BYTES, &mut sink).await.is_err());
         assert!(sink.received.is_empty());
         assert!(matches!(run.await.unwrap(), Err(WireError::Protocol(_))));
         // A repeated earlier request may not lower a barrier already learned
@@ -5032,12 +5173,12 @@ mod tests {
             .unwrap();
         let mut sink = Sink::default();
         assert!(matches!(
-            client.poll(10, MAX_BATCH_BYTES, &mut sink).await,
+            client.poll(10, MAX_POLL_BYTES, &mut sink).await,
             Err(WireError::Protocol(_))
         ));
         assert!(sink.received.is_empty());
         assert!(matches!(
-            client.poll(10, MAX_BATCH_BYTES, &mut sink).await,
+            client.poll(10, MAX_POLL_BYTES, &mut sink).await,
             Err(WireError::Poisoned)
         ));
         run.await.unwrap().unwrap();
@@ -6007,5 +6148,106 @@ mod tests {
         ));
         drop(client);
         let _ = run.await.unwrap();
+    }
+
+    // --- review of spec P4.1d -------------------------------------------------
+
+    /// A source waits for a receiver's next request as long as the receiver
+    /// may take to apply the poll it was sent — its operation timeout — plus
+    /// a frame timeout (`limits()`: 3 s + 2 s), not one frame timeout: a
+    /// receiver that sends its next poll 4 s after the last one (applying a
+    /// large write group) is still served. One that waits 6 s is not.
+    /// (Paused time: the waits pass at once, timers in order.)
+    #[tokio::test(start_paused = true)]
+    async fn a_source_waits_for_the_next_request_while_the_receiver_applies() {
+        for (pause, served) in [(Duration::from_secs(4), true), (Duration::from_secs(6), false)] {
+            let source = Arc::new(MockSource::new());
+            let history = source.manifest.history;
+            let (_shutdown, rx) = watch::channel(false);
+            let (io, peer) = duplex(64 * 1024);
+            let run = tokio::spawn(server(peer, source, Arc::new(AtomicUsize::new(0)), rx.clone()));
+            let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx)
+                .await
+                .unwrap();
+            client.fetch_manifest(Some(history)).await.unwrap();
+            let mut sink = Sink::default();
+            assert_eq!(client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap().through, 11);
+            // The receiver applies the poll (and fsyncs it) before it asks again.
+            tokio::time::sleep(pause).await;
+            let next = client.poll(11, MAX_POLL_BYTES, &mut sink).await;
+            if served {
+                assert_eq!(next.unwrap().batches, 0, "{pause:?}");
+                client.close().await.unwrap();
+                run.await.unwrap().unwrap();
+            } else {
+                assert!(next.is_err(), "{pause:?}");
+                assert!(
+                    matches!(run.await.unwrap(), Err(WireError::Timeout)),
+                    "the source gave up waiting after {pause:?}"
+                );
+            }
+        }
+    }
+
+    /// Review P4.1d: a poll's second `Batch` frame whose header announces
+    /// more than what is left of the poll's limit is refused from its header,
+    /// before its payload is allocated or awaited — here a header announcing
+    /// 3 GiB that no payload follows: refused at once (a protocol error),
+    /// not after a frame timeout.
+    #[tokio::test]
+    async fn a_later_batch_header_past_the_poll_limit_is_refused_before_its_payload() {
+        const LIMIT: usize = 1024;
+        let source = MockSource::new();
+        let history = source.manifest.history;
+        let manifest = serde_json::to_vec(&source.manifest).unwrap();
+        let first = sized_batch(history, 11, 64);
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, mut peer) = duplex(64 * 1024);
+        let mut peer_rx = rx.clone();
+        let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+        let run = tokio::spawn(async move {
+            raw_accept(&mut peer, history, &mut peer_rx).await?;
+            read_frame(&mut peer, &[Kind::Open], &limits(), &mut peer_rx).await?;
+            write_frame(&mut peer, Kind::Manifest, &manifest, &limits(), &mut peer_rx).await?;
+            read_frame(&mut peer, &[Kind::PollRequest], &limits(), &mut peer_rx).await?;
+            let summary = PollSummary {
+                through: 12,
+                durable_barrier: 12,
+                batches: 2,
+            };
+            write_frame(&mut peer, Kind::PollStart, &summary.encode(), &limits(), &mut peer_rx).await?;
+            let mut payload = first.history().as_bytes().to_vec();
+            payload.extend(first.first_sequence().to_be_bytes());
+            payload.extend(first.digest());
+            payload.extend(first.data());
+            write_frame(&mut peer, Kind::Batch, &payload, &limits(), &mut peer_rx).await?;
+            let announced = u32::try_from(BATCH_META + 3 * 1024 * 1024 * 1024).unwrap();
+            peer.write_all(&header(Kind::Batch, announced)).await?;
+            peer.flush().await?;
+            let _ = sent_tx.send(());
+            // Hold the connection open, sending nothing more.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<_, WireError>(())
+        });
+        let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx)
+            .await
+            .unwrap();
+        client.fetch_manifest(Some(history)).await.unwrap();
+        let mut sink = Sink::default();
+        let started = tokio::time::Instant::now();
+        let outcome = client.poll(10, LIMIT, &mut sink).await;
+        assert!(
+            matches!(&outcome, Err(WireError::Protocol(_))),
+            "refused from the header: {:?}",
+            outcome.err()
+        );
+        assert!(
+            started.elapsed() < limits().frame_timeout,
+            "not after waiting for a payload"
+        );
+        assert!(sink.received.is_empty(), "nothing of the poll reached the sink");
+        sent_rx.await.unwrap();
+        drop(client);
+        run.abort();
     }
 }
