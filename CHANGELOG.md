@@ -356,6 +356,16 @@ Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.
   from ~4 to ~31 MB/s of WAL on a RAM disk (10 000 → 86 000 sequences/s) and
   from ~3 to ~7 MB/s on rotating disks; a restarted standby caught up at
   15.7 MB/s of WAL on disk instead of 2.9.
+- **`recover --from-archive` fsynced and published once per write group**
+  (spec P4.1e). It applied a segment's groups one at a time, each fsynced and
+  decoded, pre-read and published alone, so a chain of hundreds of thousands of
+  small groups (about seven per inserted row) took tens of minutes; the
+  archive-only standby (`--source archive`) published per group too. Both now
+  apply a segment's groups in runs of at most 32 MiB, as a streaming standby
+  applies a poll, and fsync the standby's WAL once per segment; a crash
+  mid-segment still leaves a consistent cursor and a re-run continues from it.
+  The final `recover` line reports the elapsed time and the archive bytes per
+  second.
 - **One 20 000-row statement stalled every physical standby and the archive
   for good** (spec P4.1c). A write group larger than the standby's poll limit
   (8 MiB; such a statement of ~900-byte rows is ~80 MiB) was refused as

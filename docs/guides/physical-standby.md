@@ -726,13 +726,18 @@ heliosdb-nano recover --data-dir /var/lib/heliosdb/standby --from-archive /srv/r
   cursor. A corrupt segment, or a segment of another dataset among the copies,
   is named and nothing is applied (exit 1). An encrypted dataset's segments are
   sealed: `--config` must name the dataset key (`[encryption]`).
-- **Applied as a standby applies.** One line per segment. Every write group is
-  one durable write: a crash or an interrupt leaves the standby at a consistent
-  cursor, and running the command again continues from it — groups already
+- **Applied as a standby applies.** One line per segment. A segment's write
+  groups are applied in runs of at most 32 MiB, as a streaming standby applies
+  a poll, and the standby's WAL is fsynced once per segment. Every write group
+  and the cursor that accounts for it are one write: a crash or an interrupt
+  leaves the standby at a consistent cursor (the last one fsynced, or a later
+  one), and running the command again continues from it — groups already
   applied are skipped by sequence, so a re-run is a no-op.
-- **Ends with the position reached.** `--through SEQ` stops after the last group
-  that ends at or before `SEQ`. When the segments stop short of `--through`, or
-  of the newest segment found, the command prints the missing range —
+- **Ends with the position reached** and how fast: the last line gives the
+  elapsed time and the archive bytes per second. `--through SEQ` stops after
+  the last group that ends at or before `SEQ`. When the segments stop short of
+  `--through`, or of the newest segment found, the command prints the missing
+  range —
   `needs recovery: archive gap: sequences S..T are in none of the given
   directories` — and exits **2** (everything before the gap is applied).
 - **`--then primary|stop`.** With `--then primary` (the default when

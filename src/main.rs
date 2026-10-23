@@ -8288,9 +8288,16 @@ async fn recover_from_archive_command(
         }
         Err(error) => return Err(Error::storage(error.to_string())),
     };
+    // Spec P4.1e: how fast, in archive bytes (the chain's segment files).
+    let seconds = report.elapsed.as_secs_f64();
+    let rate = if seconds > 0.0 {
+        report.archive_bytes as f64 / 1_000_000.0 / seconds
+    } else {
+        0.0
+    };
     println!(
         "recover: the standby is at sequence {} (it was at {}; {} write group(s) applied, {} already held, from {} \
-         segment(s))",
+         segment(s)) in {seconds:.1} s, {rate:.1} MB/s of archive",
         report.reached, report.started_at, report.applied, report.skipped, report.segments
     );
     if let Some((from, to)) = report.missing {

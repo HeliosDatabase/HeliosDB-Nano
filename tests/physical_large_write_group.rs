@@ -42,9 +42,16 @@ use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-/// The statement of the defect: one write group of 50 000 rows of ~900 bytes,
-/// larger than a serving standby's poll limit ([`STANDBY_POLL_BYTES`], the
-/// constant `main.rs` serves with).
+/// The statement of the defect: one write group of 50 000 rows of ~900 bytes
+/// (~45 MiB raw), larger than a serving standby's poll limit
+/// ([`STANDBY_POLL_BYTES`], the constant `main.rs` serves with). The primary
+/// also commits a few small write groups of its own per inserted row (the
+/// versioned copy, the snapshot record): with them the chain past the cut
+/// holds ~544 000 sequences, which every standby and `recover
+/// --from-archive` apply in runs (spec P4.1d, P4.1e). Values are kept below
+/// the 1 KiB compression threshold (`[compression] min_size_bytes`), so the
+/// group's size follows the rows' raw size; fewer, wider rows could be
+/// compressed below the poll limit.
 const BIG_INSERT: &str = "INSERT INTO t SELECT i, repeat('x', 900) || i FROM generate_series(1, 50000) i";
 /// The rows of `BIG_INSERT`; the small writes around it use ids past them.
 const BIG_ROWS: i32 = 50_000;

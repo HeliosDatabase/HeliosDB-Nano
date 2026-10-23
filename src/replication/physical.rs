@@ -1384,6 +1384,10 @@ pub struct LocalWriter {
     durable_source: AtomicU64,
     durable_local: AtomicU64,
     poisoned: AtomicBool,
+    /// The WAL fsyncs this writer made: synced writes and [`Self::sync`]s
+    /// that had something to make durable (spec P4.1e: counted, so a test
+    /// can tell one fsync per segment from one per group).
+    fsyncs: AtomicU64,
 }
 
 impl LocalWriter {
@@ -1454,7 +1458,15 @@ impl LocalWriter {
             durable_local: AtomicU64::new(cursor.local_sequence),
             cursor: Mutex::new(cursor),
             poisoned: AtomicBool::new(false),
+            fsyncs: AtomicU64::new(0),
         }
+    }
+
+    /// The WAL fsyncs this writer made since it was opened: every synced
+    /// write, and every [`Self::sync`] that had deferred writes to make
+    /// durable.
+    pub fn fsyncs(&self) -> u64 {
+        self.fsyncs.load(Ordering::Acquire)
     }
 
     /// Reopen a receiver at its durable cursor without Nano logical recovery
@@ -1518,6 +1530,7 @@ impl LocalWriter {
                 self.poison();
                 return Err(error.into());
             }
+            self.fsyncs.fetch_add(1, Ordering::AcqRel);
             self.mark_durable(&cursor);
         }
         Ok(cursor.source_sequence)
@@ -1565,6 +1578,7 @@ impl LocalWriter {
         }
         if durability == Durability::Synced {
             // The fsync covered every earlier deferred write too.
+            self.fsyncs.fetch_add(1, Ordering::AcqRel);
             self.mark_durable(cursor);
         }
         Ok(())
