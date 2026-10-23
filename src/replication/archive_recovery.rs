@@ -62,6 +62,12 @@ pub enum RecoverError {
     /// Applying stopped part-way; every group before it is durable.
     #[error("recover stopped at sequence {reached}: {reason}; re-run the command to continue from there")]
     Failed { reached: u64, reason: String },
+    /// Spec P4.1 §1: the standby needs a full copy of its primary that was
+    /// not applied — refused by `--no-full-copy`, or completed beside an
+    /// occupied data directory without `--replace`. The reason names what to
+    /// do. `recover` exits 3.
+    #[error("{0}")]
+    FullCopyPending(String),
 }
 
 /// What [`recover_from_archive`] does.

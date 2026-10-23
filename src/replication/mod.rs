@@ -22,6 +22,11 @@
 //! standby's gap from its archive, `heliosdb-nano recover` advances a stopped
 //! standby from copied segments, a standby may follow a directory of segments
 //! alone (`--source archive`), and a standby may serve another (cascading).
+//! Spec P4.1 rebuilds a standby from its primary
+//! ([`recover_primary`], `heliosdb-nano recover --from-primary`): the tail
+//! when the primary still serves it, else an incremental fast-forward that
+//! ships only the key ranges that differ ([`fast_forward`]), else a full
+//! copy.
 //!
 //! # Feature Flags
 //!
@@ -55,6 +60,10 @@ pub mod archive_segment;
 pub mod archiver;
 #[cfg(feature = "ha-tier1")]
 pub mod checkpoint_transfer;
+// Spec P4.1: `recover --from-primary` — the recovery ladder and the
+// incremental fast-forward's leaves.
+#[cfg(feature = "ha-tier1")]
+pub mod fast_forward;
 #[cfg(feature = "ha-tier1")]
 pub mod history;
 #[cfg(feature = "ha-tier1")]
@@ -71,6 +80,8 @@ pub mod physical_tls;
 pub mod physical_vector;
 #[cfg(feature = "ha-tier1")]
 pub mod physical_wire;
+#[cfg(feature = "ha-tier1")]
+pub mod recover_primary;
 // Spec P1.3: the posture lives at the crate root (`crate::standby_posture`),
 // compiled in every build because the SQL layer asks it whether this node is
 // in recovery; re-exported here beside the receiver it is derived from.

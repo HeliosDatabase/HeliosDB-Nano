@@ -10,17 +10,31 @@
 //! These primitives do not publish changes to a serving `StorageEngine`: its
 //! catalog, indexes and caches require a separate publication protocol, which
 //! `replication::physical_applier` implements on top of [`LocalWriter`].
+//!
+//! Spec P4.1 §4: an incremental fast-forward from the primary
+//! (`recover --from-primary`) replaces key ranges of the default column
+//! family wholesale — range deletions and ingested SST files — whose
+//! sequence cost RocksDB decides. It writes through its own
+//! [`FastForwardWriter`], never through the [`LocalWriter`], and the
+//! durable [`FastForwardRecord`] it keeps in [`LOCAL_CF`] makes every other
+//! open of the directory refuse it ([`PhysicalError::FastForwardInterrupted`])
+//! until the fast-forward has re-cut the stage.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use rocksdb::{ColumnFamily, Direction, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB};
+use rocksdb::{
+    ColumnFamily, Direction, IngestExternalFileOptions, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions,
+    DB,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::storage::StorageEngine;
+use crate::Config;
 
 /// The node-local column family, owned by `storage::keyspace` (the engine
 /// refuses every open mode but the standby's on a directory that holds it).
@@ -36,10 +50,35 @@ pub const CURSOR_KEY: &[u8] = b"cursor";
 /// refused as receiver-local progress, and the engine refuses to open a store
 /// holding it (`storage::engine`).
 const LEGACY_CURSOR_KEY: &[u8] = b"__nano_physical_replica_cursor_v1";
+/// Spec P4.1 §4: the record of a fast-forward in progress, a key INSIDE
+/// [`LOCAL_CF`] like the cursor. While it exists the directory is a mix of
+/// two cuts and nothing but the fast-forward may open it.
+pub const FAST_FORWARD_KEY: &[u8] = b"ff:dirty";
+/// Spec P4.1 §4: one key per leaf the fast-forward in progress has replaced,
+/// `FAST_FORWARD_DONE_PREFIX ‖ leaf (u32, big-endian)` → the cut (u64,
+/// big-endian), in [`LOCAL_CF`]. Written with each batch, so a batch costs a
+/// write of its own leaves only; cleared with the record.
+pub const FAST_FORWARD_DONE_PREFIX: &[u8] = b"ff:done:";
+/// The first key past every [`FAST_FORWARD_DONE_PREFIX`] key.
+const FAST_FORWARD_DONE_END: &[u8] = b"ff:done;";
+/// The record's bound: a few fixed fields.
+const MAX_FAST_FORWARD_RECORD_BYTES: usize = 4096;
+const MAX_FAST_FORWARD_LEAVES: usize = 1 << 24;
 pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
 const MAX_BATCH_OPERATIONS: u32 = 1_000_000;
 // RocksDB encodes its sequence into the high 56 bits of an internal key.
 const MAX_SEQUENCE: u64 = (1_u64 << 56) - 1;
+
+/// The operator's remedy for a directory a fast-forward left between two
+/// cuts (spec P4.1 §4): the same command finishes it. `data_dir` and
+/// `primary_host` are the directory and the primary's replication port as
+/// the caller knows them.
+pub fn fast_forward_remedy(from: u64, to: u64, data_dir: &str, primary_host: &str) -> String {
+    format!(
+        "fast-forward from the primary interrupted at sequence {from}→{to}: run `heliosdb-nano recover \
+         --from-primary --data-dir {data_dir} --primary-host {primary_host}` to finish it"
+    )
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PhysicalError {
@@ -68,6 +107,17 @@ pub enum PhysicalError {
     /// rebuild it. Nothing was modified.
     #[error("physical replication requires a full resync: {0}")]
     FullResyncRequired(&'static str),
+    /// Spec P4.1 §4: a fast-forward from the primary (source sequence
+    /// `from` → `to`) stopped before it re-cut the stage: the default column
+    /// family holds ranges of both cuts, so the cursor accounts for nothing.
+    /// Only `recover --from-primary` may open the directory, and finishes it.
+    /// The text is [`fast_forward_remedy`]'s with the directory as `D` and
+    /// the primary as `H`; a caller that knows both names them.
+    #[error(
+        "fast-forward from the primary interrupted at sequence {from}→{to}: run `heliosdb-nano recover \
+         --from-primary --data-dir D --primary-host H` to finish it"
+    )]
+    FastForwardInterrupted { from: u64, to: u64 },
 }
 
 type Result<T> = std::result::Result<T, PhysicalError>;
@@ -921,12 +971,18 @@ impl PhysicalCursor {
         self.local_sequence
     }
 
+    /// The source and local sequences are two counters of two stores: a
+    /// receiver built from a checkpoint starts with the local one ahead,
+    /// but a fast-forwarded one (spec P4.1 §4) takes the primary's position
+    /// with its own counter, which may be behind it. Only the local counter's
+    /// agreement with the store (`latest_sequence_number`) is a safety
+    /// property, and the writers check it.
     fn validate(&self) -> Result<()> {
         check_history(self.history)?;
         if self.format != FORMAT
             || self.snapshot_sequence > self.source_sequence
             || self.source_sequence > MAX_SEQUENCE
-            || self.local_sequence <= self.source_sequence
+            || self.local_sequence == 0
             || self.local_sequence > MAX_SEQUENCE
         {
             return Err(invalid("invalid durable cursor"));
@@ -969,6 +1025,10 @@ fn read_cursor(db: &DB) -> Result<PhysicalCursor> {
             )
         });
     };
+    // Spec P4.1 §4: before the sequence equality, which an interrupted
+    // fast-forward breaks by construction — it would otherwise read as a
+    // store modified outside physical replication.
+    refuse_interrupted_fast_forward(db, local)?;
     let bytes = db
         .get_cf(local, CURSOR_KEY)?
         .ok_or_else(|| invalid("missing physical receiver cursor"))?;
@@ -981,6 +1041,116 @@ fn read_cursor(db: &DB) -> Result<PhysicalCursor> {
         return Err(invalid("receiver was modified outside physical replication"));
     }
     Ok(cursor)
+}
+
+/// [`PhysicalError::FastForwardInterrupted`] when the store carries a
+/// fast-forward record. A record that cannot be decoded still means a
+/// fast-forward was in progress, and is refused too.
+fn refuse_interrupted_fast_forward(db: &DB, local: &ColumnFamily) -> Result<()> {
+    let Some(bytes) = db.get_cf(local, FAST_FORWARD_KEY)? else {
+        return Ok(());
+    };
+    let record = FastForwardRecord::decode(&bytes).map_err(|error| {
+        invalid(format!(
+            "the store carries an unreadable fast-forward record ({error}): a fast-forward from the primary was \
+             interrupted; run `heliosdb-nano recover --from-primary` on it to finish it"
+        ))
+    })?;
+    Err(PhysicalError::FastForwardInterrupted {
+        from: record.from,
+        to: record.to,
+    })
+}
+
+/// The fast-forward record a receiver's store holds, if any (spec P4.1 §4).
+/// `None` for a handle opened without [`LOCAL_CF`].
+pub fn fast_forward_record(db: &DB) -> Result<Option<FastForwardRecord>> {
+    let Some(local) = db.cf_handle(LOCAL_CF) else {
+        return Ok(None);
+    };
+    db.get_cf(local, FAST_FORWARD_KEY)?
+        .map(|bytes| FastForwardRecord::decode(&bytes))
+        .transpose()
+}
+
+/// Spec P4.1 §4: the durable record of an incremental fast-forward in
+/// progress, the value of [`FAST_FORWARD_KEY`] in [`LOCAL_CF`]. It is
+/// written before the first default-column-family write of a fast-forward
+/// and deleted by the write that re-cuts the cursor, so a store carrying it
+/// is never taken for a consistent stage. It holds what the fast-forward is
+/// (its cut and plan) only: the leaves of `snapshot_id`'s plan already
+/// replaced are keys of their own ([`FAST_FORWARD_DONE_PREFIX`],
+/// [`FastForwardWriter::mark_done`]), so a batch never rewrites the record.
+/// A re-run against the same snapshot skips those leaves; a new cut clears
+/// them with the record it writes ([`FastForwardWriter::start_record`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FastForwardRecord {
+    pub format: u32,
+    pub history: Uuid,
+    /// The primary's export the leaves come from.
+    pub snapshot_id: Uuid,
+    /// The source sequence the standby was at (its cursor's, unchanged until
+    /// the re-cut).
+    pub from: u64,
+    /// The cut the standby is fast-forwarded to.
+    pub to: u64,
+    /// The plan's leaf size.
+    pub leaf_bytes: u32,
+}
+
+impl FastForwardRecord {
+    /// A record of a new cut.
+    pub fn new(history: Uuid, snapshot_id: Uuid, from: u64, to: u64, leaf_bytes: u32) -> Self {
+        Self {
+            format: FORMAT,
+            history,
+            snapshot_id,
+            from,
+            to,
+            leaf_bytes,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.format != FORMAT
+            || self.history.is_nil()
+            || self.snapshot_id.is_nil()
+            || self.from >= self.to
+            || self.to > MAX_SEQUENCE
+            || self.leaf_bytes == 0
+        {
+            return Err(invalid("invalid fast-forward record"));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|error| invalid(error.to_string()))?;
+        if bytes.len() > MAX_FAST_FORWARD_RECORD_BYTES {
+            return Err(invalid("oversized fast-forward record"));
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_FAST_FORWARD_RECORD_BYTES {
+            return Err(invalid("oversized fast-forward record"));
+        }
+        let record: Self = serde_json::from_slice(bytes)
+            .map_err(|error| invalid(format!("malformed fast-forward record: {error}")))?;
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+/// The key that marks `leaf` replaced ([`FAST_FORWARD_DONE_PREFIX`]).
+fn done_key(leaf: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(FAST_FORWARD_DONE_PREFIX.len() + 4);
+    key.extend_from_slice(FAST_FORWARD_DONE_PREFIX);
+    key.extend_from_slice(&leaf.to_be_bytes());
+    key
 }
 
 fn sync_options() -> WriteOptions {
@@ -1099,18 +1269,19 @@ impl LocalWriter {
     }
 
     /// [`Self::from_checkpoint`] for a checkpoint whose store's own sequence
-    /// (`store_sequence`, its `latest_sequence_number`) runs ahead of the
+    /// (`store_sequence`, its `latest_sequence_number`) differs from the
     /// source sequence it holds (`source_sequence`, in the primary's
     /// numbering). A checkpoint of a primary has the two equal. A CASCADED
     /// export (spec P3.2 §4) is a physical standby's store: its sequence
-    /// counts that standby's cursor writes too, while its replicated keyspace
-    /// is the primary's at `source_sequence`. The receiver's cursor starts at
-    /// `source_sequence`, so it continues in the primary's numbering — from
-    /// its cascading source, or from the primary itself — and its own
-    /// accounting starts at `store_sequence + 1`.
+    /// counts that standby's own writes, while its replicated keyspace is the
+    /// primary's at `source_sequence` — usually behind the store's counter,
+    /// ahead of it once that standby was fast-forwarded (spec P4.1 §4). The
+    /// receiver's cursor starts at `source_sequence`, so it continues in the
+    /// primary's numbering — from its cascading source, or from the primary
+    /// itself — and its own accounting starts at `store_sequence + 1`.
     pub fn from_checkpoint_at(mut db: DB, history: Uuid, source_sequence: u64, store_sequence: u64) -> Result<Self> {
         check_history(history)?;
-        if source_sequence > store_sequence
+        if source_sequence > MAX_SEQUENCE
             || db.latest_sequence_number() != store_sequence
             || db.cf_handle(LOCAL_CF).is_some()
             || db.get(LEGACY_CURSOR_KEY)?.is_some()
@@ -1432,8 +1603,283 @@ impl StagedPhysicalReplica {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Incremental fast-forward (spec P4.1 §3.3, §4).
+// ---------------------------------------------------------------------------
+
+/// The writer of an incremental fast-forward from the primary: range
+/// deletions and ingested SST files into the default column family, the
+/// [`FastForwardRecord`], and the re-cut cursor.
+///
+/// It exists beside [`LocalWriter`] because the two account differently.
+/// `LocalWriter` predicts the sequence every write consumes and poisons on
+/// any other outcome; an ingested file consumes zero or one sequence numbers
+/// depending on what it overlaps, so a fast-forward cannot predict its cost.
+/// This writer instead keeps the store refused for every other open while it
+/// works — the record goes in before the first default-family write — and
+/// DERIVES the cursor at the end from the store's observed sequence, in the
+/// one write that also deletes the record ([`Self::recut`]). After that
+/// write `latest_sequence_number == cursor.local_sequence` holds again, and
+/// a `LocalWriter` can adopt the store.
+pub struct FastForwardWriter {
+    db: DB,
+    history: Uuid,
+    /// The cursor as opened, then as re-cut.
+    cursor: Mutex<PhysicalCursor>,
+}
+
+impl FastForwardWriter {
+    /// Open the receiver at `path` exclusively, with the storage options of
+    /// `config` (the receiver's options: no archived WAL). The store must
+    /// hold [`LOCAL_CF`] and a cursor of `history`; the cursor is read
+    /// WITHOUT the sequence equality (an interrupted fast-forward broke it)
+    /// and without the record check — this is the writer that finishes one.
+    pub fn open(path: &Path, config: &Config, history: Uuid) -> Result<Self> {
+        check_history(history)?;
+        if !DB::list_cf(&Options::default(), path)?
+            .iter()
+            .any(|family| family == LOCAL_CF)
+        {
+            return Err(PhysicalError::FullResyncRequired(
+                "the directory has no node-local column family: it predates the node-local namespace or was never \
+                 initialized; rebuild it",
+            ));
+        }
+        let (options, families) = super::checkpoint_transfer::receiver_options(config, path)
+            .map_err(|error| invalid(format!("the receiver's storage options: {error}")))?;
+        let db = DB::open_cf_descriptors(&options, path, families)?;
+        refuse_legacy_cursor(&db)?;
+        let local = local_family(&db)?;
+        let bytes = db
+            .get_cf(local, CURSOR_KEY)?
+            .ok_or_else(|| invalid("missing physical receiver cursor"))?;
+        let cursor = decode_cursor(&bytes)?;
+        if cursor.history != history {
+            return Err(PhysicalError::HistoryMismatch);
+        }
+        Ok(Self {
+            db,
+            history,
+            cursor: Mutex::new(cursor),
+        })
+    }
+
+    pub fn history(&self) -> Uuid {
+        self.history
+    }
+
+    /// The cursor the store was opened at (its source sequence is where the
+    /// fast-forward starts), or the re-cut one after [`Self::recut`].
+    pub fn cursor(&self) -> PhysicalCursor {
+        self.cursor.lock().clone()
+    }
+
+    /// The handle, for the local digest pass. Reads only: every write goes
+    /// through this writer's methods.
+    pub fn db(&self) -> &DB {
+        &self.db
+    }
+
+    fn default_family(&self) -> Result<&ColumnFamily> {
+        self.db
+            .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+            .ok_or_else(|| invalid("the receiver was opened without its default column family handle"))
+    }
+
+    /// Whether the store's sequence is the one the cursor accounts for. It is
+    /// not when a fast-forward was interrupted, or when something wrote the
+    /// store outside its writers: either way the cursor no longer describes
+    /// the default column family, and only a digest pass can tell what does.
+    pub fn accounted(&self) -> bool {
+        self.db.latest_sequence_number() == self.cursor.lock().local_sequence
+    }
+
+    /// The record of the fast-forward in progress, if one is.
+    pub fn record(&self) -> Result<Option<FastForwardRecord>> {
+        fast_forward_record(&self.db)
+    }
+
+    /// Write the record of a NEW cut, synced, before any default-family write
+    /// of it: in the same write group, every leaf an earlier cut marked done
+    /// is forgotten (it was replaced from another snapshot).
+    pub fn start_record(&self, record: &FastForwardRecord) -> Result<()> {
+        if record.history != self.history {
+            return Err(PhysicalError::HistoryMismatch);
+        }
+        let bytes = record.encode()?;
+        let local = local_family(&self.db)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_range_cf(local, FAST_FORWARD_DONE_PREFIX, FAST_FORWARD_DONE_END);
+        batch.put_cf(local, FAST_FORWARD_KEY, bytes);
+        self.db.write_opt(batch, &sync_options())?;
+        Ok(())
+    }
+
+    /// Mark `leaves` replaced at `cut`, synced: one key per leaf, so a batch
+    /// writes its own leaves only, never the whole set.
+    pub fn mark_done(&self, leaves: &[u32], cut: u64) -> Result<()> {
+        if leaves.is_empty() {
+            return Ok(());
+        }
+        let local = local_family(&self.db)?;
+        let mut batch = WriteBatch::default();
+        for &leaf in leaves {
+            if leaf as usize >= MAX_FAST_FORWARD_LEAVES {
+                return Err(invalid(format!(
+                    "leaf {leaf} is past the {MAX_FAST_FORWARD_LEAVES} leaves a fast-forward covers"
+                )));
+            }
+            batch.put_cf(local, done_key(leaf), cut.to_be_bytes());
+        }
+        self.db.write_opt(batch, &sync_options())?;
+        Ok(())
+    }
+
+    /// The leaves marked replaced at `cut` (a key of another cut does not
+    /// count).
+    pub fn done_leaves(&self, cut: u64) -> Result<std::collections::BTreeSet<u32>> {
+        let local = local_family(&self.db)?;
+        let mut read = ReadOptions::default();
+        read.set_total_order_seek(true);
+        read.set_iterate_upper_bound(FAST_FORWARD_DONE_END.to_vec());
+        let mut done = std::collections::BTreeSet::new();
+        let mode = IteratorMode::From(FAST_FORWARD_DONE_PREFIX, Direction::Forward);
+        for item in self.db.iterator_cf_opt(local, read, mode) {
+            let (key, value) = item?;
+            let Some(leaf) = key.strip_prefix(FAST_FORWARD_DONE_PREFIX) else {
+                break;
+            };
+            let leaf: [u8; 4] = leaf
+                .try_into()
+                .map_err(|_| invalid("a malformed fast-forward leaf mark"))?;
+            if value.as_ref() == cut.to_be_bytes().as_slice() {
+                done.insert(u32::from_be_bytes(leaf));
+            }
+        }
+        Ok(done)
+    }
+
+    /// One synced write group of range deletions `[start, end)` over the
+    /// default column family: the leaves of one batch, emptied before their
+    /// primary's files are ingested. The cursor's family is untouched.
+    pub fn delete_ranges(&self, ranges: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let default = self.default_family()?;
+        let mut batch = WriteBatch::default();
+        for (start, end) in ranges {
+            if start >= end {
+                return Err(invalid("an empty or inverted leaf range"));
+            }
+            batch.delete_range_cf(default, start, end);
+        }
+        self.db.write_opt(batch, &sync_options())?;
+        Ok(())
+    }
+
+    /// Ingest the primary's leaf files into the default column family. They
+    /// are COPIED (never moved or hard-linked), so the stage directory never
+    /// shares a file with them and a crash leaves no link behind; a memtable
+    /// overlapping them is flushed first, and they take a sequence above the
+    /// range deletions that emptied their leaves.
+    pub fn ingest(&self, files: &[PathBuf]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut options = IngestExternalFileOptions::default();
+        options.set_move_files(false);
+        options.set_snapshot_consistency(true);
+        options.set_allow_global_seqno(true);
+        options.set_allow_blocking_flush(true);
+        let default = self.default_family()?;
+        self.db
+            .ingest_external_file_cf_opts(default, &options, files.to_vec())?;
+        Ok(())
+    }
+
+    /// Make everything written so far durable in tables: the WAL fsynced and
+    /// both families flushed (step (i) of the re-cut).
+    pub fn flush(&self) -> Result<()> {
+        self.db.flush_wal(true)?;
+        self.db.flush_cf(self.default_family()?)?;
+        self.db.flush_cf(local_family(&self.db)?)?;
+        Ok(())
+    }
+
+    /// Close the store as it is, the record still in it (it stays refused by
+    /// every other open). Closing waits for RocksDB's background work, so the
+    /// directory holds still afterwards: the re-cut takes its census of a
+    /// closed store, then reopens it for the final write.
+    pub fn release(self) {
+        drop(self.db);
+    }
+
+    /// Re-cut the stage at the primary's `sequence` (spec P4.1 §3.3.5 (iv)):
+    /// ONE synced write that puts the cursor `{snapshot: sequence, source:
+    /// sequence, local: the store's sequence after this very write}` and
+    /// deletes the record and every leaf mark. The cursor is derived from the
+    /// observed sequence, never predicted beyond this write's own operations,
+    /// and checked after it.
+    pub fn recut(&self, sequence: u64, snapshot_id: Uuid) -> Result<PhysicalCursor> {
+        // The cursor put, the record delete and the marks' range deletion.
+        const RECUT_OPERATIONS: u64 = 3;
+        if snapshot_id.is_nil() {
+            return Err(invalid("a re-cut names the primary's snapshot"));
+        }
+        let mut current = self.cursor.lock();
+        let local = local_family(&self.db)?;
+        let latest = self.db.latest_sequence_number();
+        check_local_advance(latest, RECUT_OPERATIONS)?;
+        let cursor = PhysicalCursor {
+            format: FORMAT,
+            history: self.history,
+            snapshot_sequence: sequence,
+            source_sequence: sequence,
+            local_sequence: latest + RECUT_OPERATIONS,
+            last_first_sequence: None,
+            last_digest: None,
+        };
+        cursor.validate()?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(local, CURSOR_KEY, encode_cursor(&cursor)?);
+        batch.delete_cf(local, FAST_FORWARD_KEY);
+        batch.delete_range_cf(local, FAST_FORWARD_DONE_PREFIX, FAST_FORWARD_DONE_END);
+        if batch.len() as u64 != RECUT_OPERATIONS {
+            return Err(invalid("the re-cut write does not hold the operations it accounts for"));
+        }
+        self.db.write_opt(batch, &sync_options())?;
+        if self.db.latest_sequence_number() != cursor.local_sequence {
+            return Err(invalid(
+                "the store's sequence moved by more than the re-cut write: it was written outside the fast-forward",
+            ));
+        }
+        *current = cursor.clone();
+        Ok(cursor)
+    }
+
+    /// Flush both families — so the WAL that carried the fast-forward's own
+    /// records (range deletions and record writes, none of them a cursor
+    /// write) becomes obsolete and RocksDB removes it, and a cascading source
+    /// built on this store never reads it — then prove the store is the
+    /// consistent stage a `LocalWriter` adopts (no record, the cursor equal
+    /// to the one in memory, the sequence accounted), and close it.
+    pub fn close(self) -> Result<PhysicalCursor> {
+        self.db.flush_cf(local_family(&self.db)?)?;
+        self.db.flush_cf(self.default_family()?)?;
+        self.db.flush_wal(true)?;
+        let cursor = self.cursor.into_inner();
+        let durable = read_cursor(&self.db)?;
+        if durable != cursor {
+            return Err(invalid("durable receiver cursor changed unexpectedly"));
+        }
+        drop(self.db);
+        Ok(cursor)
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
     use rocksdb::checkpoint::Checkpoint;
@@ -2162,9 +2608,11 @@ mod tests {
         );
     }
 
-    /// Spec P3.2 §4: a cascaded checkpoint's store sequence runs ahead of the
+    /// Spec P3.2 §4: a cascaded checkpoint's store sequence differs from the
     /// source sequence it holds; its receiver starts at the source sequence
-    /// and accounts from the store's.
+    /// and accounts from the store's. Spec P4.1 §4: a fast-forwarded
+    /// cascading source's store runs BEHIND the source sequence it holds,
+    /// and its checkpoint is served the same way.
     #[test]
     fn a_receiver_from_a_cascaded_checkpoint_starts_at_the_source_sequence() {
         let root = TempDir::new().unwrap();
@@ -2174,9 +2622,25 @@ mod tests {
         }
         let store = db.latest_sequence_number();
         let history = Uuid::new_v4();
-        // The source cut may not be past the store's own sequence.
-        let refused = StagedPhysicalReplica::from_checkpoint_at(db, history, store + 1, store);
+        // The store must be at the sequence the caller proved.
+        let refused = StagedPhysicalReplica::from_checkpoint_at(db, history, 3, store + 1);
         assert!(refused.is_err());
+        // A source cut past the store's own counter (a fast-forwarded source).
+        let ahead_root = TempDir::new().unwrap();
+        let ahead = open(ahead_root.path());
+        ahead.put(b"k", b"v").unwrap();
+        let ahead_store = ahead.latest_sequence_number();
+        let receiver = StagedPhysicalReplica::from_checkpoint_at(ahead, history, 1_000, ahead_store).unwrap();
+        assert_eq!(receiver.cursor().source_sequence(), 1_000);
+        assert_eq!(receiver.cursor().local_sequence(), ahead_store + 1);
+        let mut batch = WriteBatch::default();
+        batch.put(b"next", b"group");
+        assert!(receiver.apply(&encoded(history, 1_001, batch)).unwrap());
+        assert_eq!(
+            receiver.writer().db().latest_sequence_number(),
+            receiver.cursor().local_sequence()
+        );
+        drop(receiver);
         let db = open(root.path());
         let receiver = StagedPhysicalReplica::from_checkpoint_at(db, history, 3, store).unwrap();
         let cursor = receiver.cursor();
@@ -2188,5 +2652,210 @@ mod tests {
         assert!(receiver.apply(&encoded(history, 4, batch)).unwrap());
         assert_eq!(receiver.cursor().source_sequence(), 4);
         assert_eq!(receiver.cursor().local_sequence(), store + 3);
+    }
+
+    // --- spec P4.1: the fast-forward record, writer and cursor rule ---------
+
+    /// The record round-trips through its JSON and holds only what the
+    /// fast-forward is (no per-leaf state), and an impossible record (no
+    /// history, an empty interval) is refused.
+    #[test]
+    fn a_fast_forward_record_round_trips_and_holds_only_its_cut() {
+        let history = Uuid::new_v4();
+        let record = FastForwardRecord::new(history, Uuid::new_v4(), 10, 99, 4 * 1024 * 1024);
+        let bytes = record.encode().unwrap();
+        assert!(bytes.len() < 512, "{} bytes", bytes.len());
+        assert!(!String::from_utf8_lossy(&bytes).contains("done"));
+        assert_eq!(FastForwardRecord::decode(&bytes).unwrap(), record);
+        for broken in [
+            FastForwardRecord::new(Uuid::nil(), Uuid::new_v4(), 1, 2, 1),
+            FastForwardRecord::new(history, Uuid::nil(), 1, 2, 1),
+            FastForwardRecord::new(history, Uuid::new_v4(), 2, 2, 1),
+            FastForwardRecord::new(history, Uuid::new_v4(), 1, MAX_SEQUENCE + 1, 1),
+        ] {
+            assert!(broken.encode().is_err(), "{broken:?}");
+        }
+        assert!(FastForwardRecord::decode(b"{\"format\":1}").is_err());
+        assert!(FastForwardRecord::decode(&vec![b' '; MAX_FAST_FORWARD_RECORD_BYTES + 1]).is_err());
+    }
+
+    /// Spec P4.1 §4: the cursor rule is arithmetic, not safety — a
+    /// fast-forwarded cursor's local counter may be behind its source
+    /// sequence; a local counter of 0 is still impossible.
+    #[test]
+    fn a_cursor_whose_local_counter_is_behind_its_source_sequence_is_valid() {
+        let history = Uuid::new_v4();
+        let cursor = PhysicalCursor {
+            format: FORMAT,
+            history,
+            snapshot_sequence: 1_000,
+            source_sequence: 1_000,
+            local_sequence: 7,
+            last_first_sequence: None,
+            last_digest: None,
+        };
+        assert_eq!(decode_cursor(&encode_cursor(&cursor).unwrap()).unwrap(), cursor);
+        let zero = PhysicalCursor {
+            local_sequence: 0,
+            ..cursor.clone()
+        };
+        assert!(decode_cursor(&encode_cursor(&zero).unwrap()).is_err());
+        let past = PhysicalCursor {
+            local_sequence: MAX_SEQUENCE + 1,
+            ..cursor
+        };
+        assert!(decode_cursor(&encode_cursor(&past).unwrap()).is_err());
+    }
+
+    /// Spec P4.1 §4: a store left with a fast-forward record is refused by
+    /// every open that adopts a cursor, BEFORE the sequence equality (which
+    /// the fast-forward's writes broke), naming the interval; only the
+    /// fast-forward's own writer reopens it.
+    #[test]
+    fn an_interrupted_fast_forward_is_refused_before_the_sequence_check() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"k", b"v").unwrap();
+        let history = Uuid::new_v4();
+        let copy_path = root.path().join("copy");
+        let (receiver, cut) = receiver_of(&source, &copy_path, history);
+        receiver.close().unwrap();
+        let writer = FastForwardWriter::open(&copy_path, &Config::default(), history).unwrap();
+        assert!(writer.record().unwrap().is_none());
+        let record = FastForwardRecord::new(history, Uuid::new_v4(), cut, cut + 10, 64 * 1024);
+        assert!(writer.accounted());
+        writer.start_record(&record).unwrap();
+        // A default-family write of the fast-forward: the store's sequence
+        // no longer matches the cursor.
+        writer.delete_ranges(&[(b"a".to_vec(), b"z".to_vec())]).unwrap();
+        assert!(!writer.accounted());
+        drop(writer);
+        let reopened = [
+            StagedPhysicalReplica::resume(open_receiver(&copy_path), history),
+            StagedPhysicalReplica::resume(
+                DB::open_cf_for_read_only(&Options::default(), &copy_path, ["default", LOCAL_CF], false).unwrap(),
+                history,
+            ),
+        ];
+        for resumed in reopened {
+            match resumed {
+                Err(PhysicalError::FastForwardInterrupted { from, to }) => assert_eq!((from, to), (cut, cut + 10)),
+                Err(other) => panic!("not the fast-forward refusal: {other}"),
+                Ok(_) => panic!("an interrupted fast-forward was resumed"),
+            }
+        }
+        let text = PhysicalError::FastForwardInterrupted { from: 1, to: 2 }.to_string();
+        assert!(
+            text.contains("interrupted at sequence 1→2") && text.contains("recover --from-primary"),
+            "{text}"
+        );
+        assert!(fast_forward_remedy(1, 2, "/srv/standby", "db:5440").contains("--data-dir /srv/standby"));
+        let writer = FastForwardWriter::open(&copy_path, &Config::default(), history).unwrap();
+        assert_eq!(writer.record().unwrap(), Some(record));
+        assert_eq!(writer.cursor().source_sequence(), cut, "the cursor is untouched");
+        drop(writer);
+        assert!(matches!(
+            FastForwardWriter::open(&copy_path, &Config::default(), Uuid::new_v4()),
+            Err(PhysicalError::HistoryMismatch)
+        ));
+    }
+
+    /// The SST file of the keys of `source` in `[start, end)`, as a primary
+    /// builds a leaf.
+    fn leaf_file(source: &DB, path: &std::path::Path, start: &[u8], end: &[u8]) {
+        let options = Options::default();
+        let mut writer = rocksdb::SstFileWriter::create(&options);
+        writer.open(path).unwrap();
+        let mut read = ReadOptions::default();
+        read.set_total_order_seek(true);
+        read.set_iterate_upper_bound(end.to_vec());
+        for item in source.iterator_opt(IteratorMode::From(start, Direction::Forward), read) {
+            let (key, value) = item.unwrap();
+            writer.put(key, value).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    /// Spec P4.1 §3.3: range deletions plus ingested leaf files make the
+    /// stale leaf the primary's (updates, inserts and deletes alike), leave
+    /// the other leaves alone, and the re-cut derives a cursor that accounts
+    /// for the store — so an ordinary writer adopts it and continues in the
+    /// primary's numbering.
+    #[test]
+    fn delete_ranges_and_ingest_reach_the_primarys_family_and_the_recut_accounts_for_the_store() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        for index in 0..40_u32 {
+            source.put(format!("a{index:03}"), b"old").unwrap();
+            source.put(format!("n{index:03}"), b"old").unwrap();
+        }
+        let history = Uuid::new_v4();
+        let copy_path = root.path().join("copy");
+        let (receiver, cut) = receiver_of(&source, &copy_path, history);
+        receiver.close().unwrap();
+        // The primary moves on in the second leaf only.
+        source.put(b"n005", b"new").unwrap();
+        source.put(b"n500", b"inserted").unwrap();
+        source.delete(b"n007").unwrap();
+        let target = source.latest_sequence_number();
+        let end = [0xff_u8; 64];
+        let file = root.path().join("1.sst");
+        leaf_file(&source, &file, b"n", &end);
+
+        let snapshot = Uuid::new_v4();
+        let writer = FastForwardWriter::open(&copy_path, &Config::default(), history).unwrap();
+        assert_eq!(writer.cursor().source_sequence(), cut);
+        // An earlier cut's mark is forgotten by the new cut's record.
+        writer.mark_done(&[9], target - 1).unwrap();
+        let record = FastForwardRecord::new(history, snapshot, cut, target, 64 * 1024);
+        writer.start_record(&record).unwrap();
+        assert!(writer.done_leaves(target - 1).unwrap().is_empty());
+        writer.delete_ranges(&[(b"n".to_vec(), end.to_vec())]).unwrap();
+        writer.ingest(std::slice::from_ref(&file)).unwrap();
+        writer.mark_done(&[1, 3], target).unwrap();
+        assert_eq!(
+            writer.done_leaves(target).unwrap().into_iter().collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(
+            writer.done_leaves(target + 1).unwrap().is_empty(),
+            "marks of another cut do not count"
+        );
+        assert!(writer.mark_done(&[1 << 24], target).is_err());
+        assert!(file.exists(), "ingested by copy: the staged file stays where it was");
+        assert_eq!(
+            range_digest(writer.db(), None, b"").unwrap(),
+            range_digest(&source, None, b"").unwrap()
+        );
+        assert_eq!(writer.record().unwrap(), Some(record));
+        writer.flush().unwrap();
+        // The re-cut takes its census of a CLOSED store, then reopens it for
+        // the final write: the record survives the close.
+        writer.release();
+        let writer = FastForwardWriter::open(&copy_path, &Config::default(), history).unwrap();
+        assert!(writer.record().unwrap().is_some());
+        let cursor = writer.recut(target, snapshot).unwrap();
+        assert_eq!((cursor.snapshot_sequence(), cursor.source_sequence()), (target, target));
+        assert_eq!(writer.db().latest_sequence_number(), cursor.local_sequence());
+        assert!(writer.accounted());
+        assert!(writer.record().unwrap().is_none(), "the re-cut removed the record");
+        assert!(writer.done_leaves(target).unwrap().is_empty(), "and the leaf marks");
+        assert_eq!(writer.close().unwrap(), cursor);
+
+        let resumed = StagedPhysicalReplica::resume(open_receiver(&copy_path), history).unwrap();
+        assert_eq!(resumed.cursor(), cursor);
+        source.put(b"after", b"cut").unwrap();
+        let polled = poll_source(&source, history, target, MAX_BATCH_BYTES).unwrap();
+        for batch in &polled.batches {
+            assert!(resumed.apply(batch).unwrap());
+        }
+        assert_eq!(
+            range_digest(resumed.writer().db(), None, b"").unwrap(),
+            range_digest(&source, None, b"").unwrap()
+        );
+        assert_eq!(
+            resumed.writer().db().latest_sequence_number(),
+            resumed.cursor().local_sequence()
+        );
     }
 }

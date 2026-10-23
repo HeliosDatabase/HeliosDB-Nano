@@ -9,6 +9,8 @@
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use heliosdb_nano::replication::archive_catalog::{ArchiveCatalog, PartialPolicy};
+use heliosdb_nano::replication::archive_segment::SegmentInfo;
 use std::{
     collections::BTreeSet,
     io::{Read, Write},
@@ -443,4 +445,153 @@ pub fn census(dir: &Path) -> BTreeSet<(String, u64)> {
             )
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// A standby away past its primary's WAL retention (spec P3.2 §5, P4.1 §5)
+// ---------------------------------------------------------------------------
+
+pub async fn create_table(client: &tokio_postgres::Client) {
+    client
+        .batch_execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .await
+        .unwrap();
+}
+
+/// Insert `ids` one statement each; returns how many failed.
+pub async fn insert(client: &tokio_postgres::Client, ids: std::ops::RangeInclusive<i32>, filler: &str) -> usize {
+    let mut failed = 0;
+    for id in ids {
+        if client
+            .batch_execute(&format!("INSERT INTO t VALUES ({id}, '{filler}')"))
+            .await
+            .is_err()
+        {
+            failed += 1;
+        }
+    }
+    failed
+}
+
+/// Sealed, available segments of an archive directory, in sequence order.
+pub fn sealed(dir: &Path) -> Vec<SegmentInfo> {
+    let Ok((catalog, _)) = ArchiveCatalog::scan(dir, PartialPolicy::Leave) else {
+        return Vec::new();
+    };
+    let mut segments: Vec<SegmentInfo> = catalog.entries().filter_map(|entry| entry.info.clone()).collect();
+    segments.sort_by_key(SegmentInfo::first_sequence);
+    segments
+}
+
+/// Wait until the archive's sealed segments reach `through`.
+pub async fn wait_sealed_through(dir: &Path, through: u64, daemon: &Daemon) -> Vec<SegmentInfo> {
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let segments = sealed(dir);
+        if segments.last().is_some_and(|last| last.last_sequence() >= through) {
+            return segments;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} never sealed through {through}: {:?}; log tail: {}",
+            dir.display(),
+            segments.last().map(SegmentInfo::last_sequence),
+            daemon.tail(12)
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Drop every WAL file the primary archived: what RocksDB's retention does
+/// to the WAL a standby that is away too long still needs. Returns how many
+/// went.
+pub fn prune_archived_wal(primary_data: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(primary_data.join("archive")) else {
+        return 0;
+    };
+    let mut pruned = 0;
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|extension| extension == "log") && std::fs::remove_file(&path).is_ok() {
+            pruned += 1;
+        }
+    }
+    pruned
+}
+
+/// A primary with tiny memtables (each flush makes WAL files obsolete, so
+/// retention can drop them while it runs) and the smallest WAL retention.
+pub fn pruning_primary_config(archive: bool) -> String {
+    format!(
+        "[storage]\nrocksdb_write_buffer_size = 65536\nrocksdb_min_write_buffer_number_to_merge = 1\n\
+         [replication.physical]\nwal_retention_secs = 60\nwal_retention_size_mb = 64\n\
+         [replication.archive]\nenabled = {archive}\nsegment_max_secs = 1\n"
+    )
+}
+
+/// The standby of `pair` follows its primary to row 1 and stops; the primary
+/// writes on until its RocksDB WAL no longer holds the standby's next group
+/// (the archived WAL files removed while it runs, after its own archive —
+/// when on — sealed everything). Returns the primary, its client and the last
+/// row id written.
+pub async fn standby_away_past_retention(pair: &Pair, archive: bool) -> (Daemon, tokio_postgres::Client, i32) {
+    standby_away_past_retention_with(pair, archive, None, &"w".repeat(400)).await
+}
+
+/// [`standby_away_past_retention`] with `extra` TOML appended to the
+/// primary's and the standby's configuration (an `[encryption]` section, say)
+/// and rows of `filler`.
+pub async fn standby_away_past_retention_with(
+    pair: &Pair,
+    archive: bool,
+    extra: Option<&str>,
+    filler: &str,
+) -> (Daemon, tokio_postgres::Client, i32) {
+    let dir = pair.dir.path();
+    let config = format!("{}{}", pruning_primary_config(archive), extra.unwrap_or_default());
+    let primary_data = dir.join("primary");
+    let primary = Daemon::spawn(
+        dir,
+        "primary",
+        &primary_data,
+        &pair.token,
+        &pair.primary_args,
+        Some(config.as_str()),
+    );
+    let writer = connect(pair.pg_p).await;
+    create_table(&writer).await;
+    assert_eq!(insert(&writer, 1..=1, "first").await, 0);
+    let mut standby = Daemon::spawn(
+        dir,
+        "standby-1",
+        &dir.join("standby"),
+        &pair.token,
+        &pair.standby_args,
+        extra,
+    );
+    wait_http(pair.http_s, "/ready", 200, Duration::from_secs(90), &standby).await;
+    assert_eq!(settle(pair.pg_s, &[1], Duration::from_secs(30)).await, Ok(vec![1]));
+    standby.stop();
+
+    // Write until the WAL the standby needs is gone (tiny memtables flush
+    // often; each flush moves WAL files to the retention archive, which
+    // retention empties — here, the test).
+    let mut last = 1;
+    let mut pruned = 0;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while pruned == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "precondition: the primary never archived a WAL file; log tail: {}",
+            primary.tail(12)
+        );
+        assert_eq!(insert(&writer, last + 1..=last + 150, filler).await, 0);
+        last += 150;
+        if archive {
+            let through = primary_sequence(&writer).await;
+            wait_sealed_through(&dir.join("primary.archive"), through, &primary).await;
+        }
+        pruned += prune_archived_wal(&primary_data);
+    }
+    (primary, writer, last)
 }

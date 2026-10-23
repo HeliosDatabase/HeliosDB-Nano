@@ -849,6 +849,11 @@ fn session_barrier(info: Option<&SourceSessionInfo>, known_barrier: u64) -> Resu
     let barrier = match info {
         Some(SourceSessionInfo::Snapshot(manifest)) => manifest.checkpoint_sequence,
         Some(SourceSessionInfo::Resume { durable_barrier, .. }) => *durable_barrier,
+        // A fast-forward session is `recover --from-primary`'s (spec P4.1),
+        // never a receiver's.
+        Some(SourceSessionInfo::FastForward { .. }) => {
+            return Err(storage("a receiver never follows a fast-forward session"))
+        }
         None => return Err(storage("receiver connection has no selected physical session")),
     };
     if barrier < known_barrier {
@@ -1676,6 +1681,7 @@ mod tests {
                                             OpenRequest::Snapshot=>{snapshots.fetch_add(1,Ordering::SeqCst);},
                                             OpenRequest::SnapshotOf{..}=>{snapshot_ofs.fetch_add(1,Ordering::SeqCst);},
                                             OpenRequest::Resume{..}=>{resumes.fetch_add(1,Ordering::SeqCst);},
+                                            OpenRequest::FastForward{..}=>{},
                                         }
                                         let source=open_primary_session(db.clone(),history,parent,TransferLimits::default(),request,work,leases).await?;
                                         if matches!(request,OpenRequest::Snapshot) {

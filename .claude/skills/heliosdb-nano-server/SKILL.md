@@ -29,6 +29,7 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(systemctl *), Read
 | HA readiness | HTTP / SQL | `curl :8081/ready` (200 ready, 503 not) · `SELECT heliosdb_require_ready()` · primary's `/health` lists `standbys` |
 | archived WAL | CLI / SQL | `heliosdb-nano archive list\|verify [--deep]\|gaps\|prune [--dry-run] --data-dir ./mydata` · `SELECT * FROM heliosdb_recovery_window` (also `heliosdb_archived_wal`, `heliosdb_archive_gaps`) · `/health` → `"archive":{…}` |
 | recover a standby from segments | CLI | `heliosdb-nano recover --data-dir ./standby --from-archive /srv/segments [--through SEQ] [--then primary --primary-host H:5433 -- <start args>]` (stopped standby; exit 2 = archive gap, range printed) |
+| recover a standby from the primary | CLI | `heliosdb-nano recover --data-dir ./standby --from-primary --primary-host H:5433 --replication-token-file ./replication.token [--full\|--no-full-copy] [--full-copy-threshold 50] [--leaf-bytes 4MiB] [--replace] [--stage-dir DIR] [--then primary\|stop]` (stopped standby: nothing / incremental fast-forward / full copy; exit 3 = full copy needed, not applied) |
 | archive-only standby | CLI | `--replication-role standby --source archive --archive-source /srv/segments` (no replication connection, no token needed) |
 | cascading standby | TOML | `[replication.physical] cascade = true` on a standby + its own `--replication-port`; downstream `--primary-host` = that port |
 | MySQL listener | CLI | `--mysql --mysql-listen 127.0.0.1:3306` |
@@ -180,7 +181,7 @@ curl -s http://127.0.0.1:8080/health     # primary: "standbys":[{…,"applied":"
 psql -h 127.0.0.1 -p 5442 -c "SELECT heliosdb_require_ready(), pg_is_in_recovery()"
 ```
 Sync tuning lives in `[replication]`: `min_acks`, `sync_timeout_ms`, `sync_timeout_action = "warn" | "fail"` (`fail` errors a commit that IS durable on the primary — never blind-retry it).
-**No failover or promotion yet** (plan phase P5): `SWITCHOVER` is refused and a standby's data directory cannot be reopened as a primary. A standby in `needs_recovery` (history mismatch, pruned WAL, wrong token, protocol version) stays up refusing data reads with SQLSTATE 55000. A pruned WAL is first filled from the primary's WAL archive automatically (Recipe 4d); only a gap neither holds is refused (the reason names the range and both floors). Recover it from copied segments (`heliosdb-nano recover`, Recipe 4d), or rebuild it by stopping it and starting it on a new, empty data directory (keep the old one aside). A TLS failure (wrong CA, bad certificate) is NOT `needs_recovery`: the standby keeps reconnecting with `"reason": "tls: …"` on `/health`. Loopback test pair: `scripts/regress/nano-physical-pair.sh --binary <path> --start` (add `--tls` for a TLS pair).
+**No failover or promotion yet** (plan phase P5): `SWITCHOVER` is refused and a standby's data directory cannot be reopened as a primary. A standby in `needs_recovery` (history mismatch, pruned WAL, wrong token, protocol version) stays up refusing data reads with SQLSTATE 55000. A pruned WAL is first filled from the primary's WAL archive automatically (Recipe 4d); only a gap neither holds is refused (the reason names the range and both floors). Recover it from copied segments (`heliosdb-nano recover --from-archive`, Recipe 4d), or from the primary (`heliosdb-nano recover --from-primary`, Recipe 4e: ships only the key ranges that differ, or a full copy swapped in with `--replace`). A TLS failure (wrong CA, bad certificate) is NOT `needs_recovery`: the standby keeps reconnecting with `"reason": "tls: …"` on `/health`. Loopback test pair: `scripts/regress/nano-physical-pair.sh --binary <path> --start` (add `--tls` for a TLS pair).
 
 ### Recipe 4b: Remote standby over TLS
 ```bash
@@ -222,6 +223,20 @@ heliosdb-nano recover --data-dir /srv/nano/standby --from-archive /srv/copied-se
 ```
 - **Archive-only standby (managed recovery from archived logs).** `--source archive --archive-source DIR` (repeatable): no replication connection, posture `recovering` (mode `archive`, progress `"<cursor> of <newest>"`), ready while the segment holding its cursor is ≤ `max_standby_lag` old (else `catching_up`); a missing segment → `needs_recovery` naming the range, resumes when it appears. `heliosdb_standby_status.primary` = `archive:<dir>`. The data dir must already be an installed standby.
 - **Cascading standby.** `[replication.physical] cascade = true` + `--replication-port 5443` on standby A; standby B uses `--primary-host 127.0.0.1:5443`. A strips its node-local records and serves the primary's groups/sequence numbers; A's `/health` has `"cascade":true` and lists B.
+
+### Recipe 4e: Recovering a standby from the primary (spec P4.1)
+Oracle `RECOVER STANDBY DATABASE FROM SERVICE`. On a STOPPED standby (a running one is refused, naming its pid), over the primary's replication port with the standby's token and TLS flags (as `resync`). The ladder:
+1. **Nothing to copy** — the primary still serves the next write group (WAL or archive): `recover: the primary still serves sequence N…: nothing to copy`.
+2. **Incremental fast-forward** — refused `WalPruned`/`Gap`: both sides digest the keyspace in `--leaf-bytes` leaves (default 4 MiB, SHA-256), only differing leaves travel as SST files (range-delete + ingest, 64 per batch), then the stage is re-cut at the primary's cut `T` (`start` resumes at `T`). Raw bytes: an encrypted dataset needs no key for this.
+3. **Full copy** — another history/epoch (`HistoryMismatch`), `--full`, or differing bytes > `--full-copy-threshold` % (default 50) of the primary's: into an absent/empty dir directly; else into `<dir>.recover-full`, swapped in only with `--replace` (old dir kept as `<dir>.replaced-<UTC>`), otherwise exit 3 printing the two `mv`s (a re-run with `--replace` reuses the copy). `--no-full-copy` → exit 3 with the estimate.
+```bash
+heliosdb-nano stop --pid-file /srv/nano/standby.pid
+heliosdb-nano recover --data-dir /srv/nano/standby --from-primary --primary-host 10.0.0.5:5433 \
+    --replication-token-file /srv/nano/replication.token --primary-ca /etc/heliosdb/repl-ca.crt --then stop
+heliosdb-nano recover --data-dir /srv/nano/standby --from-primary --primary-host 10.0.0.5:5433 \
+    --replication-token-file /srv/nano/replication.token --replace   # allow a full copy to replace the dir
+```
+A fast-forward killed part-way leaves a record: `start` stays up in `needs_recovery` (`/ready` 503) with `fast-forward from the primary interrupted at sequence S→T: run heliosdb-nano recover --from-primary … to finish it`; re-run the same command (it continues the same cut while the primary's export lease holds). Stage dir `--stage-dir` (default `<dir>.recover-stage`, never inside the data dir) needs `2 × leaf × 64` free. Exit codes: 0 done · 1 refused/failed · 2 (`--from-archive` gap / usage) · 3 full copy needed, not applied. The standby's own archive lacks `S+1..T` afterwards; a downstream of a fast-forwarded cascading standby is recovered the same way against it.
 
 ### Recipe 5: Active-active (Tier 2, requires `--features ha-tier2`)
 ```bash

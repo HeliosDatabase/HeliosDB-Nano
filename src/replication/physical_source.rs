@@ -29,19 +29,27 @@
 //! (`physical::poll_source_cascade`), its exports made the primary's
 //! (`OnlineCheckpointExport::create_cascaded`), in the primary's sequence
 //! numbers.
+//!
+//! Spec P4.1 §3.2: a fast-forward session (`OpenRequest::FastForward`,
+//! `recover --from-primary`) is served from a leased checkpoint export like
+//! a snapshot — reused while its lease holds, so a reconnecting fast-forward
+//! continues the same cut — through the export's leaf plan
+//! (`fast_forward::FastForwardPlan`), planned once on a blocking thread of
+//! the work limiter while the session answers "planning".
 
 use super::archive_chain::{ArchiveFill, ArchiveTail, TailError};
 use super::checkpoint_transfer::{
     validate_cascade_source, validate_primary_source, OnlineCheckpointExport, TransferLimits,
 };
+use super::fast_forward::{FastForwardPlan, PlanningGuard};
 use super::ha_state::{ha_state, StandbyHandle, StandbyRegistration, StandbyState, SyncMode};
 use super::physical::{
     poll_source, poll_source_cascade, receiver_source_barrier, wal_retains_after, CascadeHint, PhysicalBatch,
     PhysicalError, PhysicalPoll, MAX_BATCH_BYTES,
 };
 use super::physical_wire::{
-    Heartbeat, Hello, ObservedSession, OpenRequest, PeerRole, PhysicalSource, PollOrigin, Refusal, RefuseCode, Result,
-    SessionObserver, SourceSessionInfo, WireError, WireSyncMode,
+    valid_leaf_bytes, Heartbeat, Hello, LeafDigests, LeafReady, ObservedSession, OpenRequest, PeerRole, PhysicalSource,
+    PollOrigin, Refusal, RefuseCode, Result, SessionObserver, SourceSessionInfo, WireError, WireSyncMode,
 };
 use crate::standby_posture::EPOCH;
 use crate::Config;
@@ -142,6 +150,15 @@ impl SourceKind {
         match self {
             Self::Primary => "this primary",
             Self::Cascade { .. } => "this cascading standby",
+        }
+    }
+
+    /// The node's configuration, when the kind carries it: a fast-forward's
+    /// leaf files are written with its storage options.
+    fn storage_config(&self) -> Option<&Config> {
+        match self {
+            Self::Primary => None,
+            Self::Cascade { config } => Some(config.as_ref()),
         }
     }
 }
@@ -317,6 +334,10 @@ pub struct SourceWorkLimiter(Arc<SourceWorkState>);
 struct SourceWorkState {
     slots: Arc<tokio::sync::Semaphore>,
     max_jobs: u32,
+    /// Spec P4.1 §3.2: a fast-forward's leaf planning runs under this ONE
+    /// slot of its own, never a session's: a long plan cannot take the
+    /// permits streaming standbys' polls need.
+    planning: Arc<tokio::sync::Semaphore>,
     draining: AtomicBool,
 }
 // Field order is deliberate: if the async waiter is canceled, Tokio drops the
@@ -340,12 +361,14 @@ impl SourceWorkLimiter {
         Ok(Self(Arc::new(SourceWorkState {
             slots: Arc::new(tokio::sync::Semaphore::new(max_jobs)),
             max_jobs: max_jobs as u32,
+            planning: Arc::new(tokio::sync::Semaphore::new(1)),
             draining: AtomicBool::new(false),
         })))
     }
     /// Terminal admission stop. Await after joining wire sessions so every
     /// canceled/finished session's actual blocking work releases its resources
-    /// before the source DB owner exits. A timeout is not a completed drain.
+    /// before the source DB owner exits — a leaf planning under way included
+    /// (told to stop, and joined). A timeout is not a completed drain.
     pub async fn drain(&self) -> Result<()> {
         self.0.draining.store(true, Ordering::Release);
         let all = self
@@ -355,6 +378,8 @@ impl SourceWorkLimiter {
             .acquire_many_owned(self.0.max_jobs)
             .await
             .map_err(source_error)?;
+        let planning = self.0.planning.clone().acquire_owned().await.map_err(source_error)?;
+        drop(planning);
         drop(all);
         Ok(())
     }
@@ -392,6 +417,45 @@ impl SourceWorkLimiter {
         .await
         .map_err(source_error)?
         .into_result()
+    }
+
+    /// Spec P4.1 §3.2: run a fast-forward's leaf planning (`guard`), which
+    /// outlives the request that started it (its sessions ask for its
+    /// outcome until it is ready), in a task of its own. The task waits for
+    /// the source's ONE planning slot — never a session's work permit — and
+    /// holds it on the blocking thread until the planning ends, so
+    /// [`Self::drain`] joins it. The planning is told to stop early once the
+    /// limiter drains or `abandoned` answers true. However the task ends —
+    /// draining before it got the slot, the runtime shutting down, a panic —
+    /// the guard is dropped with it and the plan is left failed, never
+    /// planning.
+    fn start_planning<A>(&self, guard: PlanningGuard, abandoned: A) -> Result<()>
+    where
+        A: Fn() -> bool + Send + 'static,
+    {
+        if self.0.draining.load(Ordering::Acquire) {
+            drop(guard);
+            return Err(not_serving(
+                "source work admission is draining: the primary is shutting down",
+            ));
+        }
+        let state = Arc::clone(&self.0);
+        // Not awaited: the planning slot, held by the job, is what joins it.
+        drop(tokio::spawn(async move {
+            let Ok(permit) = state.planning.clone().acquire_owned().await else {
+                return; // The guard drops: the plan fails.
+            };
+            if state.draining.load(Ordering::Acquire) {
+                return;
+            }
+            let _ = tokio::task::spawn_blocking(move || {
+                let _permit = permit; // Released only once the planning ended.
+                let stop = || state.draining.load(Ordering::Acquire) || abandoned();
+                guard.plan(&stop);
+            })
+            .await;
+        }));
+        Ok(())
     }
 }
 
@@ -493,6 +557,32 @@ impl ExportLeases {
         self.0.lock().expire(now)
     }
 
+    /// Whether a session holds the leased export `snapshot` now. An export
+    /// no longer in the table (its lease ran out, or it was dropped to stay
+    /// within `max_leases`) counts as unheld.
+    fn held(&self, snapshot: Uuid) -> bool {
+        self.0
+            .lock()
+            .entries
+            .iter()
+            .any(|entry| entry.export.manifest().snapshot_id == snapshot && entry.holders > 0)
+    }
+
+    /// The leased exports, newest first, after expiring those whose lease
+    /// ran out (returned second). The caller drops both off the lock.
+    fn newest_first(&self, now: Instant) -> (Vec<Arc<OnlineCheckpointExport>>, Vec<Arc<OnlineCheckpointExport>>) {
+        let mut table = self.0.lock();
+        let expired = table.expire(now);
+        let mut entries: Vec<(Instant, Arc<OnlineCheckpointExport>)> = table
+            .entries
+            .iter()
+            .map(|entry| (entry.leased_at, Arc::clone(&entry.export)))
+            .collect();
+        drop(table);
+        entries.sort_by_key(|(leased_at, _)| std::cmp::Reverse(*leased_at));
+        (entries.into_iter().map(|(_, export)| export).collect(), expired)
+    }
+
     /// The leased export `snapshot`, held for a new session, if its lease
     /// still holds.
     fn reuse(&self, snapshot: Uuid, now: Instant) -> (Option<LeaseHold>, Vec<Arc<OnlineCheckpointExport>>) {
@@ -587,6 +677,8 @@ struct SourceSession {
     hint: Arc<Mutex<CascadeHint>>,
     /// The last poll was served from the archive.
     from_archive: Arc<AtomicBool>,
+    /// Spec P4.1: a fast-forward session's leaf plan (its export's).
+    fast_forward: Option<Arc<FastForwardPlan>>,
 }
 
 /// A leased export the session may serve again: the same dataset and store,
@@ -642,6 +734,7 @@ pub async fn open_primary_session(
         leases,
         SourceKind::Primary,
         None,
+        None,
     )
     .await
 }
@@ -670,6 +763,39 @@ pub async fn open_primary_session_with(
         leases,
         SourceKind::Primary,
         fill,
+        None,
+    )
+    .await
+}
+
+/// [`open_primary_session_with`] of a primary whose node configuration is
+/// `storage` (spec P4.1 §3.2): a fast-forward's leaf files are written with
+/// its storage options — the engine's compression, filters and prefix
+/// extractor — so an ingested leaf is laid out as the standby's own tables.
+/// Without it they are written with the default configuration's.
+#[allow(clippy::too_many_arguments)]
+pub async fn open_primary_session_for(
+    db: Arc<DB>,
+    expected_history: Uuid,
+    export_parent: PathBuf,
+    limits: TransferLimits,
+    request: OpenRequest,
+    work: SourceWorkLimiter,
+    leases: ExportLeases,
+    fill: Option<ArchiveFill>,
+    storage: Arc<Config>,
+) -> Result<Arc<dyn PhysicalSource>> {
+    open_source_session(
+        db,
+        expected_history,
+        export_parent,
+        limits,
+        request,
+        work,
+        leases,
+        SourceKind::Primary,
+        fill,
+        Some(storage),
     )
     .await
 }
@@ -701,8 +827,138 @@ pub async fn open_cascade_session(
         leases,
         SourceKind::Cascade { config },
         fill,
+        None,
     )
     .await
+}
+
+/// What [`leased_export`] needs of its session.
+struct ExportRequest<'a> {
+    db: &'a DB,
+    kind: &'a SourceKind,
+    fill: Option<&'a ArchiveFill>,
+    leases: &'a ExportLeases,
+    expected_history: Uuid,
+    storage_identity: &'a str,
+    export_parent: &'a std::path::Path,
+    limits: TransferLimits,
+    /// What a reused export serves, as the log names it.
+    purpose: &'a str,
+    /// A fast-forward of a receiver at this source sequence: with no
+    /// preferred snapshot, any leased export it can use (reusable, its cut
+    /// past the receiver) is served rather than a new checkpoint taken.
+    fast_forward_after: Option<u64>,
+}
+
+/// Spec P4.1 §3.2: a fast-forward that names no snapshot takes the newest
+/// leased export of its history that can still be continued from and whose
+/// cut is past the receiver's `after` — one checkpoint, and one plan, shared
+/// by the standbys recovering at once (and by a bootstrap copy's export) —
+/// held for the session; `None` when there is none.
+fn reuse_any_export(
+    request: &ExportRequest<'_>,
+    after: u64,
+    released: &mut Vec<Arc<OnlineCheckpointExport>>,
+) -> Option<LeaseHold> {
+    let (candidates, expired) = request.leases.newest_first(Instant::now());
+    released.extend(expired);
+    for export in candidates {
+        let manifest = export.manifest();
+        let (snapshot, cut) = (manifest.snapshot_id, manifest.checkpoint_sequence);
+        // Checked before a hold is taken, so a lease it passes over is left
+        // as it was.
+        if cut <= after
+            || !reusable(
+                request.db,
+                request.kind,
+                request.fill,
+                &export,
+                request.expected_history,
+                request.storage_identity,
+            )
+        {
+            continue;
+        }
+        let (reused, expired) = request.leases.reuse(snapshot, Instant::now());
+        released.extend(expired);
+        if let Some(hold) = reused {
+            tracing::info!(
+                "replication: serving the leased snapshot {snapshot} (cut {cut}) to {}",
+                request.purpose
+            );
+            return Some(hold);
+        }
+    }
+    None
+}
+
+/// The export a snapshot or fast-forward session serves: the leased export
+/// `prefer` while its lease holds and it can still be continued from
+/// ([`reusable`]); for a fast-forward naming none, any leased export it can
+/// use ([`reuse_any_export`]); else a new one, which is leased. Exports
+/// dropped by the lease table go to `released`, to be removed off its lock.
+fn leased_export(
+    request: &ExportRequest<'_>,
+    prefer: Option<Uuid>,
+    released: &mut Vec<Arc<OnlineCheckpointExport>>,
+) -> Result<LeaseHold> {
+    let reused = match prefer {
+        Some(snapshot) => {
+            let (reused, expired) = request.leases.reuse(snapshot, Instant::now());
+            released.extend(expired);
+            match reused {
+                Some(reused)
+                    if reusable(
+                        request.db,
+                        request.kind,
+                        request.fill,
+                        &reused.export,
+                        request.expected_history,
+                        request.storage_identity,
+                    ) =>
+                {
+                    tracing::info!(
+                        "replication: serving the leased snapshot {snapshot} again ({})",
+                        request.purpose
+                    );
+                    Some(reused)
+                }
+                Some(stale) => {
+                    tracing::info!(
+                        "replication: the leased snapshot {snapshot} can no longer be served (its WAL or files are \
+                         gone); exporting a new one"
+                    );
+                    drop(stale);
+                    released.extend(request.leases.forget(snapshot));
+                    None
+                }
+                None => {
+                    tracing::info!(
+                        "replication: the snapshot {snapshot} a receiver resumes is no longer leased; exporting a new \
+                         one"
+                    );
+                    None
+                }
+            }
+        }
+        None => request
+            .fast_forward_after
+            .and_then(|after| reuse_any_export(request, after, released)),
+    };
+    match reused {
+        Some(hold) => Ok(hold),
+        None => {
+            let export = Arc::new(request.kind.export(
+                request.db,
+                request.expected_history,
+                request.export_parent,
+                request.limits,
+            )?);
+            let (hold, dropped) = request.leases.lease(export, Instant::now());
+            released.extend(dropped);
+            Ok(hold)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -716,106 +972,158 @@ async fn open_source_session(
     leases: ExportLeases,
     kind: SourceKind,
     fill: Option<ArchiveFill>,
+    storage: Option<Arc<Config>>,
 ) -> Result<Arc<dyn PhysicalSource>> {
     let session_work = work.clone();
-    work.run(move || {
-        let storage_identity = kind.validate(&db, expected_history)?;
-        let hint = Arc::new(Mutex::new(CascadeHint::default()));
-        // Dropped (checkpoint directories removed) at the end of this
-        // blocking job, never under the lease lock.
-        let mut released = Vec::new();
-        let (info, export) = match request {
-            OpenRequest::Snapshot | OpenRequest::SnapshotOf { .. } => {
-                let reused = match request {
-                    OpenRequest::SnapshotOf { snapshot } => {
-                        let (reused, expired) = leases.reuse(snapshot, Instant::now());
-                        released.extend(expired);
-                        match reused {
-                            Some(reused)
-                                if reusable(
-                                    &db,
-                                    &kind,
-                                    fill.as_ref(),
-                                    &reused.export,
-                                    expected_history,
-                                    &storage_identity,
-                                ) =>
-                            {
-                                tracing::info!(
-                                    "replication: serving the leased snapshot {snapshot} again (a resumed download)"
-                                );
-                                Some(reused)
-                            }
-                            Some(stale) => {
-                                tracing::info!(
-                                    "replication: the leased snapshot {snapshot} can no longer be served (its WAL \
-                                     or files are gone); exporting a new one"
-                                );
-                                drop(stale);
-                                released.extend(leases.forget(snapshot));
-                                None
-                            }
-                            None => {
-                                tracing::info!(
-                                    "replication: the snapshot {snapshot} a receiver resumes is no longer leased; \
-                                     exporting a new one"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    _ => None,
-                };
-                let hold = match reused {
-                    Some(hold) => hold,
-                    None => {
-                        let export = Arc::new(kind.export(&db, expected_history, &export_parent, limits)?);
-                        let (hold, dropped) = leases.lease(export, Instant::now());
-                        released.extend(dropped);
-                        hold
-                    }
-                };
-                (SourceSessionInfo::Snapshot(hold.export.manifest().clone()), Some(hold))
-            }
-            OpenRequest::Resume { history, after } => {
-                if history != expected_history {
-                    return Err(poll_error(kind.barrier(&db), &kind, PhysicalError::HistoryMismatch));
+    let leases_for_planning = leases.clone();
+    let session = work
+        .run(move || {
+            let storage_identity = kind.validate(&db, expected_history)?;
+            let hint = Arc::new(Mutex::new(CascadeHint::default()));
+            // Dropped (checkpoint directories removed) at the end of this
+            // blocking job, never under the lease lock.
+            let mut released = Vec::new();
+            let mut fast_forward = None;
+            let exports = ExportRequest {
+                db: &db,
+                kind: &kind,
+                fill: fill.as_ref(),
+                leases: &leases,
+                expected_history,
+                storage_identity: &storage_identity,
+                export_parent: &export_parent,
+                limits,
+                purpose: "a resumed download",
+                fast_forward_after: None,
+            };
+            let (info, export) = match request {
+                OpenRequest::Snapshot | OpenRequest::SnapshotOf { .. } => {
+                    let prefer = match request {
+                        OpenRequest::SnapshotOf { snapshot } => Some(snapshot),
+                        _ => None,
+                    };
+                    let hold = leased_export(&exports, prefer, &mut released)?;
+                    (SourceSessionInfo::Snapshot(hold.export.manifest().clone()), Some(hold))
                 }
-                // The first bounded poll proves the receiver's cursor is still
-                // served: retained (by the WAL, or by the archive), contiguous,
-                // not ahead of this source.
-                let attempt = kind.poll(&db, history, after, MAX_BATCH_BYTES, &hint);
-                let (initial, _) = poll_or_fill(attempt, &kind, &db, fill.as_ref(), history, after, MAX_BATCH_BYTES)?;
-                (
-                    SourceSessionInfo::Resume {
+                OpenRequest::FastForward {
+                    history,
+                    after,
+                    leaf_bytes,
+                    prefer,
+                } => {
+                    if history != expected_history {
+                        return Err(poll_error(kind.barrier(&db), &kind, PhysicalError::HistoryMismatch));
+                    }
+                    if !valid_leaf_bytes(leaf_bytes) {
+                        return Err(WireError::Protocol(format!(
+                        "a fast-forward asked for leaves of {leaf_bytes} bytes, outside the bounds both sides accept"
+                    )));
+                    }
+                    let exports = ExportRequest {
+                        purpose: if prefer.is_some() {
+                            "a resumed fast-forward"
+                        } else {
+                            "a fast-forward"
+                        },
+                        fast_forward_after: Some(after),
+                        ..exports
+                    };
+                    let hold = leased_export(&exports, prefer, &mut released)?;
+                    let cut = hold.export.manifest().checkpoint_sequence;
+                    if after >= cut {
+                        return Err(WireError::Refused(Refusal::new(
+                            RefuseCode::HistoryMismatch,
+                            format!(
+                            "the receiver at {after} is not behind the cut {cut}: {} is not the dataset it followed, \
+                             or there is nothing to fast-forward",
+                            kind.name()
+                        ),
+                        )));
+                    }
+                    let default_config;
+                    let config = match (storage.as_deref(), kind.storage_config()) {
+                        (Some(config), _) | (None, Some(config)) => config,
+                        (None, None) => {
+                            default_config = Config::default();
+                            &default_config
+                        }
+                    };
+                    let (plan, replaced) = hold.export.fast_forward_plan(leaf_bytes, config);
+                    // A replaced plan (another leaf size's, or a failed one)
+                    // is dropped here, off the export's lock; its leaf files
+                    // go with its LAST reference, so a session still
+                    // downloading them keeps them.
+                    drop(replaced);
+                    let info = SourceSessionInfo::FastForward {
                         session_id: Uuid::new_v4(),
+                        snapshot_id: hold.export.manifest().snapshot_id,
                         history,
-                        initial_after: after,
-                        durable_barrier: initial.durable_barrier,
-                    },
-                    None,
-                )
+                        after,
+                        sequence: cut,
+                    };
+                    fast_forward = Some(plan);
+                    (info, Some(hold))
+                }
+                OpenRequest::Resume { history, after } => {
+                    if history != expected_history {
+                        return Err(poll_error(kind.barrier(&db), &kind, PhysicalError::HistoryMismatch));
+                    }
+                    // The first bounded poll proves the receiver's cursor is still
+                    // served: retained (by the WAL, or by the archive), contiguous,
+                    // not ahead of this source.
+                    let attempt = kind.poll(&db, history, after, MAX_BATCH_BYTES, &hint);
+                    let (initial, _) =
+                        poll_or_fill(attempt, &kind, &db, fill.as_ref(), history, after, MAX_BATCH_BYTES)?;
+                    (
+                        SourceSessionInfo::Resume {
+                            session_id: Uuid::new_v4(),
+                            history,
+                            initial_after: after,
+                            durable_barrier: initial.durable_barrier,
+                        },
+                        None,
+                    )
+                }
+            };
+            if kind.validate(&db, expected_history)? != storage_identity {
+                return Err(source_error("source storage identity changed during session creation"));
             }
-        };
-        if kind.validate(&db, expected_history)? != storage_identity {
-            return Err(source_error("source storage identity changed during session creation"));
+            drop(released);
+            Ok(Arc::new(SourceSession {
+                db,
+                history: expected_history,
+                storage_identity,
+                info,
+                export,
+                work: session_work,
+                kind,
+                fill,
+                hint,
+                // Nothing served yet: the first poll says where it came from.
+                from_archive: Arc::new(AtomicBool::new(false)),
+                fast_forward,
+            }))
+        })
+        .await?;
+    // Spec P4.1 §3.2: the first fast-forward session of a plan starts its
+    // planning, in a job that outlives this request and waits for the
+    // source's planning slot; until it ends the session answers "planning".
+    // It stops early when the source drains, or once no session holds the
+    // plan's export any more (nobody would read the plan). Every way the
+    // job can end without a plan leaves it failed (the guard), and the next
+    // session gets a new one.
+    if let Some(plan) = session.fast_forward.as_ref() {
+        if let Some(guard) = plan.begin() {
+            let snapshot = match &session.info {
+                SourceSessionInfo::FastForward { snapshot_id, .. } => *snapshot_id,
+                _ => return Err(source_error("a fast-forward plan on another kind of session")),
+            };
+            session
+                .work
+                .start_planning(guard, move || !leases_for_planning.held(snapshot))?;
         }
-        drop(released);
-        Ok(Arc::new(SourceSession {
-            db,
-            history: expected_history,
-            storage_identity,
-            info,
-            export,
-            work: session_work,
-            kind,
-            fill,
-            hint,
-            // Nothing served yet: the first poll says where it came from.
-            from_archive: Arc::new(AtomicBool::new(false)),
-        }) as Arc<dyn PhysicalSource>)
-    })
-    .await
+    }
+    Ok(session as Arc<dyn PhysicalSource>)
 }
 
 #[async_trait]
@@ -886,6 +1194,49 @@ impl PhysicalSource for SourceSession {
             })
             .await
     }
+
+    /// Spec P4.1 §3.2: from memory — the plan's page, a "planning" page
+    /// while its blocking planning runs, or the refusal its failure gives.
+    async fn leaf_digests(&self, from: u32, count: u32) -> Result<LeafDigests> {
+        let plan = self.plan()?;
+        let snapshot = self.fast_forward_snapshot()?;
+        plan.page(snapshot, from, count).map_err(|reason| {
+            WireError::Refused(Refusal::new(
+                RefuseCode::SourceNotServing,
+                format!("planning the fast-forward's leaves failed: {reason}"),
+            ))
+        })
+    }
+
+    async fn leaf(&self, index: u32) -> Result<LeafReady> {
+        let plan = Arc::clone(self.plan()?);
+        let snapshot = self.fast_forward_snapshot()?;
+        self.work
+            .run(move || plan.leaf(snapshot, index).map_err(source_error))
+            .await
+    }
+
+    async fn read_leaf_chunk(&self, index: u32, offset: u64, length: u32) -> Result<Vec<u8>> {
+        let plan = Arc::clone(self.plan()?);
+        self.work
+            .run(move || plan.read_leaf_chunk(index, offset, length).map_err(source_error))
+            .await
+    }
+}
+
+impl SourceSession {
+    /// A fast-forward session's leaf plan.
+    fn plan(&self) -> Result<&Arc<FastForwardPlan>> {
+        self.fast_forward
+            .as_ref()
+            .ok_or_else(|| source_error("only a fast-forward session has a leaf plan"))
+    }
+
+    fn fast_forward_snapshot(&self) -> Result<Uuid> {
+        self.info
+            .fast_forward_snapshot()
+            .ok_or_else(|| source_error("only a fast-forward session has a leaf plan"))
+    }
 }
 
 /// Spec P2.1 §2: the primary's standby registry as its replication sessions
@@ -937,8 +1288,11 @@ impl SessionObserver for StandbyRegistryObserver {
     fn admit(&self, peer: Option<SocketAddr>, hello: &Hello) -> Box<dyn ObservedSession> {
         // A resumed session follows this primary from a durable cursor; a
         // snapshot session is still installing its copy. Only a serving
-        // standby that follows counts toward `min_acks`.
-        let following = hello.cursor.is_some();
+        // standby that follows counts toward `min_acks`. Spec P4.1: an
+        // offline receiver (`resync`, `recover --from-primary`, role
+        // `Resync`) is rebuilding a copy, whatever cursor it announced: it is
+        // listed as bootstrapping and never counts.
+        let following = hello.cursor.is_some() && hello.role != PeerRole::Resync;
         Box::new(RegisteredSession(ha_state().register_standby(StandbyRegistration {
             node_id: hello.node_id,
             address: peer.map_or_else(|| "unknown".to_string(), |peer| peer.to_string()),
@@ -1489,5 +1843,123 @@ mod tests {
         let archived = session.poll(5, MAX_BATCH_BYTES).await.unwrap();
         assert_eq!(archived.batches[0].first_sequence(), 6);
         assert_eq!(archived.through, 7);
+    }
+
+    async fn fast_forward_at(
+        db: &Arc<DB>,
+        history: Uuid,
+        root: &std::path::Path,
+        after: u64,
+        prefer: Option<Uuid>,
+        work: &SourceWorkLimiter,
+        leases: &ExportLeases,
+    ) -> Result<Arc<dyn PhysicalSource>> {
+        open_primary_session(
+            db.clone(),
+            history,
+            root.to_path_buf(),
+            TransferLimits::default(),
+            OpenRequest::FastForward {
+                history,
+                after,
+                leaf_bytes: super::super::physical_wire::MIN_LEAF_BYTES,
+                prefer,
+            },
+            work.clone(),
+            leases.clone(),
+        )
+        .await
+    }
+
+    /// Spec P4.1 §3.2: a fast-forward session leases an export like a
+    /// snapshot, answers "planning" until its plan is built on a blocking
+    /// thread, then serves leaves whose files, ingested anywhere, hold the
+    /// checkpoint's default column family exactly; a reconnect preferring
+    /// the export gets the same cut; a receiver at the cut is refused.
+    #[tokio::test]
+    async fn a_fast_forward_session_plans_its_export_and_builds_its_leaf_files() {
+        use super::super::physical::range_digest;
+        use super::super::physical_wire::{LeafStatus, MAX_LEAVES};
+        use sha2::Digest as _;
+        let root = tempfile::tempdir().unwrap();
+        let (db, history) = primary(root.path());
+        for index in 0..400_u32 {
+            db.put(format!("row{index:05}"), vec![index as u8; 600]).unwrap();
+        }
+        let cut = db.latest_sequence_number();
+        let work = SourceWorkLimiter::new(2).unwrap();
+        let leases = leases();
+        let refused = fast_forward_at(&db, history, root.path(), cut, None, &work, &leases).await;
+        assert!(
+            matches!(&refused, Err(WireError::Refused(refusal)) if refusal.code == RefuseCode::HistoryMismatch),
+            "{:?}",
+            refused.err()
+        );
+        let session = fast_forward_at(&db, history, root.path(), 1, None, &work, &leases)
+            .await
+            .unwrap();
+        let snapshot_id = session.session_info().fast_forward_snapshot().unwrap();
+        assert!(matches!(
+            session.session_info(),
+            SourceSessionInfo::FastForward { sequence, after: 1, .. } if *sequence == cut
+        ));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let page = loop {
+            let page = session.leaf_digests(0, MAX_LEAVES).await.unwrap();
+            if page.status == LeafStatus::Ready {
+                break page;
+            }
+            assert!(Instant::now() < deadline, "the plan never became ready");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(page.leaf_count >= 3, "{} leaves", page.leaf_count);
+        assert_eq!(page.entries.len(), page.leaf_count as usize);
+        assert!(session.leaf(page.leaf_count).await.is_err(), "past the plan");
+
+        // Every leaf's file, fetched in chunks and ingested into a scratch
+        // store, rebuilds the checkpoint's default column family.
+        let scratch_path = root.path().join("scratch");
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        let scratch = DB::open(&options, &scratch_path).unwrap();
+        for index in 0..page.leaf_count {
+            let ready = session.leaf(index).await.unwrap();
+            assert_eq!(ready.index, index);
+            assert_eq!(session.leaf(index).await.unwrap(), ready, "built once");
+            if ready.size == 0 {
+                continue;
+            }
+            let mut bytes = Vec::new();
+            while (bytes.len() as u64) < ready.size {
+                let length = (ready.size - bytes.len() as u64).min(64 * 1024) as u32;
+                bytes.extend(
+                    session
+                        .read_leaf_chunk(index, bytes.len() as u64, length)
+                        .await
+                        .unwrap(),
+                );
+            }
+            assert_eq!(<[u8; 32]>::from(sha2::Sha256::digest(&bytes)), ready.sha256);
+            let file = root.path().join(format!("fetched-{index}.sst"));
+            std::fs::write(&file, &bytes).unwrap();
+            scratch.ingest_external_file(vec![file]).unwrap();
+        }
+        assert_eq!(
+            range_digest(&scratch, None, b"").unwrap(),
+            range_digest(&db, None, b"").unwrap(),
+            "the leaves hold the cut exactly (nothing was written since)"
+        );
+
+        // A reconnect preferring the export gets the same cut and plan.
+        drop(session);
+        let again = fast_forward_at(&db, history, root.path(), 1, Some(snapshot_id), &work, &leases)
+            .await
+            .unwrap();
+        assert_eq!(again.session_info().fast_forward_snapshot(), Some(snapshot_id));
+        let page_again = again.leaf_digests(0, MAX_LEAVES).await.unwrap();
+        assert_eq!(page_again, page);
+        // Its leaf requests are fast-forward only: a snapshot session has none.
+        let (plain, _) = snapshot(&db, history, root.path(), OpenRequest::Snapshot, &work, &leases).await;
+        assert!(plain.leaf_digests(0, 1).await.is_err());
     }
 }

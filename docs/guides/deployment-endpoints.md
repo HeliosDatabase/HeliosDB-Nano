@@ -92,6 +92,15 @@ An archive-only standby (`--source archive --archive-source DIR`) opens no
 replication connection: it needs neither `--primary-host` nor, unless it
 cascades, a token.
 
+`heliosdb-nano recover --from-primary` (spec P4.1) opens no endpoint of its
+own: it reaches the primary's — or a cascading standby's — replication port
+like a standby does, with the same `--primary-host`, the same token
+(`--replication-token-file`) and the same TLS rules (`--primary-tls`,
+`--primary-ca`, client certificates; plaintext off loopback only with
+`--allow-insecure-replication-remote`). Its fast-forward leaves and full copy
+travel on that one connection, and the source lists it as `bootstrapping` while
+it runs.
+
 ## One replication secret
 
 One owner-only 32-byte token file authenticates the replication connection. Use

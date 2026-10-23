@@ -262,6 +262,61 @@ archived logs, cascaded standbys).
   `store_sequence` (a cascaded export's own RocksDB sequence; absent, and the
   manifest unchanged byte for byte, for a primary's export).
 
+### Added — recovering a standby from the primary (spec P4.1)
+Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.md`,
+"Rebuilding from the primary: `recover --from-primary`").
+- **`heliosdb-nano recover --data-dir DIR --from-primary --primary-host
+  HOST:PORT`** brings a STOPPED standby back by the cheapest safe route and
+  reports which and what it moved: **nothing** when the primary still serves
+  its next write group (from its WAL or archive); an **incremental
+  fast-forward** when it no longer does; a **full copy** when the directory is
+  no replica of the primary's dataset, with `--full`, or when the differing
+  leaves hold more than `--full-copy-threshold` (default 50) percent of the
+  primary's bytes. An absent or empty directory gets the primary's snapshot,
+  as `resync` installs it. `--from-archive` and `--from-primary` are one
+  required, exclusive choice; `--through` belongs to `--from-archive`. Token,
+  TLS and plaintext flags as `resync`'s; `--then primary|stop` as before.
+  Exit codes: 0, 1, 2 (`--from-archive` gap), and **3** when a full copy is
+  needed but was not applied.
+- **The incremental fast-forward.** The primary serves it from a leased
+  checkpoint export at a cut `T` (a re-run within the lease continues the same
+  cut; a fast-forward that names no earlier cut is served a leased export of
+  the same history that can still be continued from, when there is one,
+  instead of a new checkpoint): it digests its default column family in
+  leaves of `--leaf-bytes` (default 4 MiB; SHA-256 over the same framing as
+  `range_digest`), the
+  standby digests its own store against the same boundaries in one scan, and
+  only the differing leaves travel, as SST files built on request. The standby
+  applies them 64 at a time — the leaves' ranges deleted, the files ingested
+  (copied, never moved or linked) — then re-cuts its stage at `T` (manifest,
+  marker, cursor `{T, T}`), so `start` resumes at `T` and tails the rest.
+  Raw bytes travel: an encrypted dataset fast-forwards without its key.
+- **Crash-safe.** A record in the standby's node-local column family is
+  written before the first change and removed by the write that re-cuts the
+  cursor; until then a `start` stays up in `needs_recovery` (`/ready` 503) with
+  "fast-forward from the primary interrupted at sequence S→T: run `heliosdb-nano
+  recover --from-primary --data-dir D --primary-host H` to finish it", and
+  `recover --from-archive`, `resync --resume-existing` and a cascaded export
+  refuse the directory. Running the command again finishes it.
+- **The full copy** goes into an empty directory, or beside an occupied one
+  (`<DIR>.recover-full`, resumable) and is swapped in only with `--replace`,
+  which keeps the old directory as `<DIR>.replaced-<UTC time>`; without it the
+  command exits 3 printing the two `mv` commands, and a re-run with
+  `--replace` uses the completed copy. `--no-full-copy` exits 3 with the
+  estimate instead. The copy needs its size plus 10% free; the leaf stage
+  (`--stage-dir`, default `<DIR>.recover-stage`) one batch, twice over.
+- **Protocol (`NPHYS002`, both nodes on this release).** A source offers
+  `CAP_FAST_FORWARD`; `Open` gains the fast-forward request (29 or 45 bytes)
+  and new frames 21-27 (`FastForwardInfo`, `LeafDigestsRequest`/`LeafDigests`
+  — paged, "planning" while the source scans —, `LeafRequest`/`LeafReady`,
+  `LeafChunkRequest`/`LeafChunk`); each session kind accepts only its own
+  requests. A session of an offline receiver (`resync`, `recover`) is listed
+  in the primary's `/health` as `bootstrapping` whatever its cursor, and never
+  counts toward `min_acks`.
+- A receiver cursor's local sequence may now be behind its source sequence (a
+  fast-forwarded standby keeps its own counter); a cascaded export's
+  `store_sequence` may be below its `checkpoint_sequence` for the same reason.
+
 ### Fixed — replication (fireproof, plan §D5)
 - **`enable_lockfree_ingestion` is refused on every HA role.** It writes rows
   straight into the store from its own worker, bypassing the logical WAL, MVCC
