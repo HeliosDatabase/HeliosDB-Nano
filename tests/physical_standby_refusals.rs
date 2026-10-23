@@ -9,7 +9,8 @@
 //! * another dataset on the primary's endpoints → `HistoryMismatch`;
 //! * the WAL the standby needs pruned away → `WalPruned`;
 //! * the wrong token → `AuthFailed` (after a few attempts);
-//! * an `NPHYS001` client → `Refuse { Version }`, in this protocol's framing.
+//! * an `NPHYS001` or `NPHYS002` client → `Refuse { Version }`, in this
+//!   protocol's framing (`NPHYS003`, spec P4.1c).
 //!
 //! In every case the standby process stays up, `/ready` answers 503 with
 //! `needs_recovery`, and `heliosdb_require_ready()` refuses with SQLSTATE
@@ -279,8 +280,11 @@ fn read_raw_frame(stream: &mut TcpStream) -> ([u8; 16], Vec<u8>) {
     (header, payload)
 }
 
+/// An `NPHYS001` client, and (spec P4.1c) an `NPHYS002` one — the previous
+/// version, whose batch bounds differ — are each answered `Refuse { Version }`
+/// in this protocol's framing, naming both versions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_nphys001_client_is_refused_with_version() {
+async fn an_nphys001_or_nphys002_client_is_refused_with_version() {
     let p = pair();
     let primary = Daemon::spawn(
         p.dir.path(),
@@ -291,29 +295,36 @@ async fn an_nphys001_client_is_refused_with_version() {
         None,
     );
     let _ = connect(p.pg_p).await;
-    let token = std::fs::read(&p.token).unwrap();
-    let repl_p = p.repl_p;
-    let (header, payload) = tokio::task::spawn_blocking(move || {
-        let mut stream =
-            TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], repl_p)), Duration::from_secs(5)).unwrap();
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        // NPHYS001's Auth frame: magic, version 1, kind 1, length 32, the token.
-        let mut auth = b"NPHYS001".to_vec();
-        auth.extend(1_u16.to_be_bytes());
-        auth.extend(1_u16.to_be_bytes());
-        auth.extend(32_u32.to_be_bytes());
-        auth.extend(&token);
-        stream.write_all(&auth).unwrap();
-        read_raw_frame(&mut stream)
-    })
-    .await
-    .unwrap();
-    assert_eq!(&header[..8], b"NPHYS002", "answered in this protocol's framing");
-    assert_eq!(u16::from_be_bytes([header[8], header[9]]), 2);
-    assert_eq!(u16::from_be_bytes([header[10], header[11]]), 17, "a Refuse frame");
-    assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 8, "code Version");
-    let reason = String::from_utf8_lossy(&payload[4..]);
-    assert!(reason.contains("NPHYS001") && reason.contains("NPHYS002"), "{reason}");
+    for (old, version) in [(*b"NPHYS001", 1_u16), (*b"NPHYS002", 2)] {
+        let old_name = String::from_utf8_lossy(&old).into_owned();
+        let token = std::fs::read(&p.token).unwrap();
+        let repl_p = p.repl_p;
+        let (header, payload) = tokio::task::spawn_blocking(move || {
+            let address = SocketAddr::from(([127, 0, 0, 1], repl_p));
+            let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(5)).unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            // The old version's Auth frame: magic, its version, kind 1, length 32, the token.
+            let mut auth = old.to_vec();
+            auth.extend(version.to_be_bytes());
+            auth.extend(1_u16.to_be_bytes());
+            auth.extend(32_u32.to_be_bytes());
+            auth.extend(&token);
+            stream.write_all(&auth).unwrap();
+            read_raw_frame(&mut stream)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            &header[..8],
+            b"NPHYS003",
+            "{old_name}: answered in this protocol's framing"
+        );
+        assert_eq!(u16::from_be_bytes([header[8], header[9]]), 3);
+        assert_eq!(u16::from_be_bytes([header[10], header[11]]), 17, "a Refuse frame");
+        assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 8, "code Version");
+        let reason = String::from_utf8_lossy(&payload[4..]);
+        assert!(reason.contains(&old_name) && reason.contains("NPHYS003"), "{reason}");
+    }
     assert!(
         primary.log_contains_within("protocol version", Duration::from_secs(10)),
         "{}",

@@ -18,7 +18,7 @@
 //!   history uuid | epoch u64 | first_sequence u64 | created_at i64 (unix seconds)
 //!   node_id uuid | key_check [u8; 32] | SHA-256 of the 100 bytes before it
 //! body: frames, each  length u32 | payload
-//!   payload = the NPHYS002 `Batch` payload: history(16) | first u64 | digest(32) | raw
+//!   payload = the NPHYS003 `Batch` payload: history(16) | first u64 | digest(32) | raw
 //!   (sealed segment: the payload sealed as one value with the dataset key)
 //! footer, 112 bytes
 //!   magic "HSEGEND1" | last_sequence u64 | batch_count u64
@@ -75,7 +75,10 @@ pub const FOOTER_LEN: usize = FOOTER_FIELDS_LEN + 32;
 /// sequence, digest.
 pub const FRAME_META: usize = 16 + 8 + 32;
 /// The largest frame payload: the largest batch, plus the AES-GCM framing
-/// of a sealed one.
+/// of a sealed one. Spec P4.1c: [`MAX_BATCH_BYTES`] is the most a `u32`
+/// frame length can carry with these prefixes, so this still fits the
+/// length word; a reader allocates a frame only after checking its length
+/// against it and against the bytes the segment's body has left.
 pub const MAX_FRAME_LEN: usize = FRAME_META + MAX_BATCH_BYTES + crate::crypto::MIN_CIPHERTEXT_LEN;
 pub const SEGMENT_SUFFIX: &str = ".hseg";
 pub const PARTIAL_SUFFIX: &str = ".hseg.partial";
@@ -645,7 +648,9 @@ impl FrameIter<'_> {
             .read_exact(&mut length)
             .map_err(|error| io_refuse(&self.path, "truncated frame length", &error))?;
         let size = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
-        if size == 0 || size > MAX_FRAME_LEN {
+        // Spec P4.1c: a frame may be gigabytes, so a damaged length word is
+        // checked against what the body has left before it is allocated.
+        if size == 0 || size > MAX_FRAME_LEN || u64::from(u32::from_be_bytes(length)) > self.reader.limit() {
             return Err(refuse(&self.path, format!("frame length {size} is out of bounds")));
         }
         let mut payload = vec![0_u8; size];

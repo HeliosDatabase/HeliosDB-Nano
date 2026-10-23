@@ -6,7 +6,7 @@
 //! `docs/plans/PHYSICAL_STANDBY_REPLICATION.md`): it applies the primary's
 //! RocksDB write groups verbatim and serves read-only SQL from them. Spec P2.1
 //! put the whole conversation on ONE connection per standby, protocol
-//! `NPHYS002` on the primary's `[replication] replication_port`
+//! `NPHYS003` on the primary's `[replication] replication_port`
 //! ([`physical_wire`]): the bootstrap copy, the physical WAL, the standby's
 //! identity and history, its heartbeats and the acknowledgements synchronous
 //! commits wait on ([`ha_state::HAStateRegistry::wait_for_sequence`]). Spec

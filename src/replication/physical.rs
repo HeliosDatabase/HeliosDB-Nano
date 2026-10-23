@@ -64,8 +64,28 @@ const FAST_FORWARD_DONE_END: &[u8] = b"ff:done;";
 /// The record's bound: a few fixed fields.
 const MAX_FAST_FORWARD_RECORD_BYTES: usize = 4096;
 const MAX_FAST_FORWARD_LEAVES: usize = 1 << 24;
-pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
-const MAX_BATCH_OPERATIONS: u32 = 1_000_000;
+/// Spec P4.1c: the largest raw write group ONE replication `Batch` frame or
+/// ONE archived segment frame can carry. A representability bound, not a
+/// policy: both frames give their length as a `u32`, and the 4096 bytes kept
+/// back hold every prefix a frame adds to the raw group (the `Batch`
+/// metadata, a segment frame's metadata and its AES-GCM sealing), with slack.
+/// A write group is the unit of atomicity and is never split, so this is the
+/// only bound on its size; how many groups travel together is a poll's byte
+/// limit, a coalescing target ([`poll_source`]).
+pub const MAX_BATCH_BYTES: usize = u32::MAX as usize - 4096;
+/// RocksDB's own operation-count width (a raw batch's count field is a
+/// `u32`): every count a source batch can carry is accepted (spec P4.1c).
+const MAX_BATCH_OPERATIONS: u32 = u32::MAX;
+/// A node-local batch ([`LocalWriter::write_local`]) is never a source
+/// group: it keeps the bound every batch had before spec P4.1c, far below
+/// the count field's width (its cursor put is one more operation).
+const MAX_LOCAL_BATCH_OPERATIONS: usize = 1_000_000;
+/// A receiver's own WAL record as a cascading source reads it: one source
+/// group (at most [`MAX_BATCH_BYTES`]) plus the cursor put its writer adds in
+/// the same write group (a record of a few hundred bytes, [`decode_cursor`]
+/// refuses one over 2 KiB), which the bytes [`MAX_BATCH_BYTES`] keeps back
+/// below `u32::MAX` cover.
+const MAX_RECEIVER_RECORD_BYTES: usize = u32::MAX as usize;
 // RocksDB encodes its sequence into the high 56 bits of an internal key.
 const MAX_SEQUENCE: u64 = (1_u64 << 56) - 1;
 
@@ -251,11 +271,12 @@ pub(crate) fn walk_raw_batch<'a>(raw: &'a [u8], mut visit: impl FnMut(RawOp<'a>)
             "empty batch: a write group with no operations is never a source batch",
         ));
     }
-    if count > MAX_BATCH_OPERATIONS {
-        return Err(invalid("batch operation limit"));
-    }
+    // Spec P4.1c: every count the field can hold is accepted
+    // ([`MAX_BATCH_OPERATIONS`] is RocksDB's own width). The walk below proves
+    // it against the records, which the byte bound above bounds.
+    let count_wanted = u64::from(count);
     let mut input = raw.get(12..).ok_or_else(|| invalid("batch header too short"))?;
-    let mut observed = 0_u32;
+    let mut observed = 0_u64;
     while let Some((&tag, rest)) = input.split_first() {
         input = rest;
         match tag {
@@ -292,11 +313,11 @@ pub(crate) fn walk_raw_batch<'a>(raw: &'a [u8], mut visit: impl FnMut(RawOp<'a>)
             }
             _ => return Err(invalid(format!("unsupported RocksDB write opcode {tag}"))),
         }
-        if observed > count {
+        if observed > count_wanted {
             return Err(invalid("batch operation count mismatch"));
         }
     }
-    if observed != count {
+    if observed != count_wanted {
         return Err(invalid("batch operation count mismatch"));
     }
     Ok(count)
@@ -339,8 +360,8 @@ fn take_slice<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
 }
 
 /// A bounded contiguous part of the durable source interval. `through` can be
-/// below `durable_barrier` when the caller's byte cap is reached. No empty result
-/// is returned across a missing interval.
+/// below `durable_barrier` when the caller's byte limit stopped the poll. No
+/// empty result is returned across a missing interval.
 #[derive(Debug)]
 pub struct PhysicalPoll {
     pub batches: Vec<PhysicalBatch>,
@@ -373,6 +394,13 @@ fn refuse_receiver_source(db: &DB) -> Result<()> {
 /// Poll committed physical changes. The owner must ensure all source writes
 /// retain the RocksDB WAL; this function detects gaps but cannot manufacture a
 /// retention lease. Only use cursors from a completed checkpoint or full batch.
+///
+/// Spec P4.1c: `byte_limit` (`1..=MAX_BATCH_BYTES`) is a coalescing target,
+/// not a ceiling. The first write group of a poll is returned whatever its
+/// size — a group is the unit of atomicity, never split, and one larger than
+/// the limit would otherwise never be served — and a later one joins it only
+/// while the poll's raw bytes stay within the limit. So a limit of one byte
+/// reads exactly one group.
 pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Result<PhysicalPoll> {
     check_history(history)?;
     if byte_limit == 0 || byte_limit > MAX_BATCH_BYTES {
@@ -431,10 +459,9 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Res
                 observed: first,
             });
         }
-        if batch.size_in_bytes() > byte_limit {
-            return Err(invalid("single source batch exceeds poll byte limit"));
-        }
-        if bytes + batch.size_in_bytes() > byte_limit {
+        // The first group travels whatever its size; a later one joins it
+        // only within the limit (spec P4.1c).
+        if !result.batches.is_empty() && bytes.saturating_add(batch.size_in_bytes()) > byte_limit {
             break;
         }
         let raw = batch.data().to_vec();
@@ -635,7 +662,7 @@ struct ReceiverRecord {
 /// third family); a column-family opcode naming the default family, or any
 /// opcode the source walker does not know, is refused.
 fn split_receiver_record(raw: &[u8]) -> Result<ReceiverRecord> {
-    if !(12..=MAX_BATCH_BYTES).contains(&raw.len()) {
+    if !(12..=MAX_RECEIVER_RECORD_BYTES).contains(&raw.len()) {
         return Err(invalid("batch byte limit/header"));
     }
     let count = u32::from_le_bytes(
@@ -860,16 +887,16 @@ pub fn poll_source_cascade(
                 observed: first,
             });
         }
-        let mut raw = Vec::with_capacity(12 + record.kept.len());
+        let framed = record.kept.len().saturating_add(12);
+        // As in `poll_source` (spec P4.1c): the first group travels whatever
+        // its size; a later one joins it only within the limit.
+        if !result.batches.is_empty() && bytes.saturating_add(framed) > byte_limit {
+            break;
+        }
+        let mut raw = Vec::with_capacity(framed);
         raw.extend_from_slice(&first.to_le_bytes());
         raw.extend_from_slice(&record.kept_count.to_le_bytes());
         raw.extend_from_slice(&record.kept);
-        if raw.len() > byte_limit {
-            return Err(invalid("single source batch exceeds poll byte limit"));
-        }
-        if bytes + raw.len() > byte_limit {
-            break;
-        }
         let digest = Sha256::digest(&raw).into();
         let batch = PhysicalBatch::decode(history, first, raw, digest)?;
         if batch.last > barrier {
@@ -1494,7 +1521,7 @@ impl LocalWriter {
         if batch.is_empty() {
             return Ok(());
         }
-        if batch.ops.len() > MAX_BATCH_OPERATIONS as usize {
+        if batch.ops.len() > MAX_LOCAL_BATCH_OPERATIONS {
             return Err(invalid("local batch operation limit"));
         }
         if batch.ops.iter().any(|op| match op {
@@ -2268,7 +2295,13 @@ mod tests {
         let caught_up = poll_source(&source, history, 6, MAX_BATCH_BYTES).unwrap();
         assert!(caught_up.batches.is_empty());
         assert_eq!(caught_up.through, 6);
-        assert!(poll_source(&source, history, 0, 1).is_err());
+        // Spec P4.1c: a limit below the first group's size still serves it,
+        // alone; a limit of 0 or past MAX_BATCH_BYTES is refused.
+        let one = poll_source(&source, history, 0, 1).unwrap();
+        assert_eq!(one.batches.len(), 1);
+        assert_eq!(one.through, 2);
+        assert!(poll_source(&source, history, 0, 0).is_err());
+        assert!(poll_source(&source, history, 0, MAX_BATCH_BYTES + 1).is_err());
     }
 
     /// A `DB::write` of an empty batch is logged as a WAL record with no
@@ -2857,5 +2890,116 @@ mod tests {
             resumed.writer().db().latest_sequence_number(),
             resumed.cursor().local_sequence()
         );
+    }
+
+    // --- spec P4.1c: write groups of any size --------------------------------
+
+    const MIB: usize = 1024 * 1024;
+    /// A serving standby's poll limit (`STANDBY_POLL_BYTES` in `main.rs`).
+    const STANDBY_POLL: usize = 8 * MIB;
+
+    /// One 100 MiB write group (100 puts of 1 MiB values), then two small ones.
+    fn write_large_then_small(source: &DB) {
+        let mut large = WriteBatch::default();
+        for index in 0..100_u32 {
+            large.put(
+                format!("large:{index:03}"),
+                vec![u8::try_from(index % 251).unwrap(); MIB],
+            );
+        }
+        source.write(large).unwrap();
+        source.put(b"small:1", b"one").unwrap();
+        source.put(b"small:2", b"two").unwrap();
+    }
+
+    /// Spec P4.1c §3: the poll byte limit is a coalescing target. A 100 MiB
+    /// write group is served whole and alone by a poll of the standby's 8 MiB
+    /// limit, `through` at its last sequence; the next poll carries the two
+    /// small groups after it together. The group decodes as a transport hands
+    /// it over, and a receiver applies it to the source's exact state.
+    #[test]
+    fn a_write_group_above_the_poll_limit_travels_alone_and_small_ones_coalesce() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"seed", b"keep").unwrap();
+        let history = Uuid::new_v4();
+        let (receiver, cut) = receiver_of(&source, &root.path().join("copy"), history);
+        write_large_then_small(&source);
+
+        let large = poll_source(&source, history, cut, STANDBY_POLL).unwrap();
+        assert_eq!(large.batches.len(), 1, "the large group alone");
+        let group = &large.batches[0];
+        assert!(group.data().len() > 100 * MIB, "{} bytes", group.data().len());
+        assert_eq!((group.first_sequence(), group.last_sequence()), (cut + 1, cut + 100));
+        assert_eq!(large.through, cut + 100, "through at the group's last sequence");
+        assert_eq!(large.durable_barrier, cut + 102);
+        let decoded =
+            PhysicalBatch::decode(history, group.first_sequence(), group.data().to_vec(), group.digest()).unwrap();
+        assert_eq!(decoded.last_sequence(), cut + 100);
+        assert!(receiver.apply(group).unwrap());
+
+        let small = poll_source(&source, history, large.through, STANDBY_POLL).unwrap();
+        assert_eq!(small.batches.len(), 2, "the two small groups together");
+        assert_eq!(small.through, cut + 102);
+        assert_eq!(small.through, small.durable_barrier);
+        for batch in &small.batches {
+            assert!(receiver.apply(batch).unwrap());
+        }
+        assert_eq!(
+            range_digest(receiver.writer().db(), None, b"").unwrap(),
+            range_digest(&source, None, b"").unwrap()
+        );
+        assert_eq!(receiver.cursor().source_sequence(), cut + 102);
+    }
+
+    /// Spec P4.1c §3: the same for a cascading source. A receiver that
+    /// applied the 100 MiB group and the two small ones serves the large one
+    /// alone to a poll of 8 MiB — byte for byte the primary's group, digest
+    /// included — and the two small ones together on the next poll.
+    #[test]
+    fn a_cascading_source_serves_a_write_group_above_the_poll_limit_alone() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"seed", b"keep").unwrap();
+        let history = Uuid::new_v4();
+        let (upstream, cut) = receiver_of(&source, &root.path().join("upstream"), history);
+        write_large_then_small(&source);
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        assert_eq!(polled.batches.len(), 3, "a limit the groups fit: one poll");
+        for batch in &polled.batches {
+            assert!(upstream.apply(batch).unwrap());
+        }
+        let writer = Arc::clone(upstream.writer());
+
+        let mut hint = CascadeHint::default();
+        let large = poll_source_cascade(writer.db(), history, cut, STANDBY_POLL, &mut hint).unwrap();
+        assert_eq!(large.batches.len(), 1, "the large group alone");
+        assert_eq!(large.through, cut + 100);
+        assert_eq!(large.durable_barrier, cut + 102);
+        assert_eq!(large.batches[0].digest(), polled.batches[0].digest());
+        assert_eq!(large.batches[0].data(), polled.batches[0].data());
+
+        let small = poll_source_cascade(writer.db(), history, large.through, STANDBY_POLL, &mut hint).unwrap();
+        assert_eq!(small.batches.len(), 2, "the two small groups together");
+        assert_eq!(small.through, cut + 102);
+        for (ours, theirs) in small.batches.iter().zip(&polled.batches[1..]) {
+            assert_eq!(ours.digest(), theirs.digest());
+            assert_eq!(ours.data(), theirs.data());
+        }
+    }
+
+    /// Spec P4.1c: a raw batch of 2 000 000 operations — twice the bound
+    /// every batch had before — walks with every record visited, and decodes.
+    #[test]
+    fn a_batch_of_two_million_operations_walks_and_decodes() {
+        let mut batch = WriteBatch::default();
+        for index in 0..2_000_000_u32 {
+            batch.delete(index.to_be_bytes());
+        }
+        let mut visited = 0_u32;
+        assert_eq!(walk_raw_batch(batch.data(), |_| visited += 1).unwrap(), 2_000_000);
+        assert_eq!(visited, 2_000_000);
+        let decoded = encoded(Uuid::new_v4(), 1, batch);
+        assert_eq!(decoded.last_sequence(), 2_000_000);
     }
 }

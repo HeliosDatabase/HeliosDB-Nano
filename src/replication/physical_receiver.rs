@@ -12,7 +12,7 @@
 //! The worker's stage owns the receiver's `LocalWriter`; every RocksDB open of
 //! the stage uses the storage options of `ReceiverOptions::config`.
 //!
-//! Spec P2.1: the receiver's control plane rides its one `NPHYS002` session —
+//! Spec P2.1: the receiver's control plane rides its one `NPHYS003` session —
 //! its `Hello` names it (node id, history, durable cursor), it acknowledges
 //! every durable advance with a heartbeat ([`Heartbeat`] = the ACK the
 //! primary's synchronous commits wait on), and a source's refusal arrives as
@@ -125,6 +125,9 @@ pub struct ReceiverOptions {
     pub start: ReceiverStart,
     pub mode: ReceiverMode,
     pub wire: WireLimits,
+    /// How many bytes of write groups one poll gathers (`1..=MAX_BATCH_BYTES`).
+    /// Spec P4.1c: a coalescing target, not a ceiling — a write group larger
+    /// than it still arrives, alone in its poll, and is applied as one batch.
     pub poll_byte_limit: usize,
     pub poll_interval: Duration,
     pub reconnect_delay: Duration,

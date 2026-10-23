@@ -81,7 +81,7 @@ log_path   = "./logs/audit.jsonl"
 
 [replication]                # HA replication (docs/guides/physical-standby.md)
 role                = "primary"   # standalone | primary | standby
-replication_port    = 5433        # THE replication port (NPHYS002); loopback unless tls_enabled
+replication_port    = 5433        # THE replication port (NPHYS003); loopback unless tls_enabled
 token_file          = "/etc/heliosdb/replication.token"
 sync_mode           = "async"     # async | semi-sync | sync (primary: what a commit waits for)
 min_acks            = 1           # standbys that must acknowledge (1..=64)

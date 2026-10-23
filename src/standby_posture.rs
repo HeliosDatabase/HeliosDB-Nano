@@ -730,7 +730,7 @@ pub struct PrimaryStatus {
     pub role: &'static str,
     /// The engine whose physical sequence is this node's cursor.
     pub engine: Weak<StorageEngine>,
-    /// This node's replication port (`NPHYS002`), when it serves one.
+    /// This node's replication port (`NPHYS003`), when it serves one.
     pub endpoint: Option<String>,
     pub sync_mode: String,
     /// Spec P2.2: the replication port serves TLS.

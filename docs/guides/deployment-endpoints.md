@@ -2,7 +2,7 @@
 
 PostgreSQL and replication are different protocols on different ports. A primary
 listens for SQL on `--port` (default 5432) and serves its standbys on ONE
-replication port, `--replication-port` (default 5433, protocol `NPHYS002`): the
+replication port, `--replication-port` (default 5433, protocol `NPHYS003`): the
 bootstrap copy, the physical WAL, heartbeats and acknowledgements all travel over
 one connection per standby. Give the two ports distinct endpoints. A standby's
 `--primary-host` must address the primary's replication port, not its SQL or HTTP

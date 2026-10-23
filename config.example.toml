@@ -410,7 +410,7 @@ mysql_tls_enabled = false
 mysql_tls_post_quantum = true
 
 # ============================================================================
-# REPLICATION CONFIGURATION (physical standbys, one port: NPHYS002)
+# REPLICATION CONFIGURATION (physical standbys, one port: NPHYS003)
 # ============================================================================
 [replication]
 # Explicit start-command CLI flags override individual values below, including

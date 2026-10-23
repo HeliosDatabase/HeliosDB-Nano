@@ -164,9 +164,6 @@ pub enum TailError {
         .path.display()
     )]
     Boundary { path: PathBuf, expected: u64, found: u64 },
-    /// One write group is larger than a poll may carry.
-    #[error("a write group of {bytes} bytes exceeds the poll byte limit of {limit}")]
-    Oversized { bytes: usize, limit: usize },
 }
 
 /// One history's archived segments as a source serves a gap from them
@@ -241,11 +238,12 @@ impl ArchiveTail {
     }
 
     /// The write groups after `after`, in order and contiguous, as a source
-    /// serves them: at most `byte_limit` bytes of raw groups (a single group
-    /// larger than that is refused, as `poll_source` refuses it), none that
-    /// starts after `until`, and only as far as the archive reaches without a
-    /// hole. Every frame is verified as it is read (digest, history, first
-    /// sequence), and the first one must start right after `after`.
+    /// serves them: `byte_limit` is a coalescing target, as for
+    /// `poll_source` (spec P4.1c) — the first group is served whatever its
+    /// size, a later one only while the raw bytes stay within the limit —,
+    /// none that starts after `until`, and only as far as the archive reaches
+    /// without a hole. Every frame is verified as it is read (digest, history,
+    /// first sequence), and the first one must start right after `after`.
     pub fn read(&self, after: u64, byte_limit: usize, until: u64) -> Result<Vec<PhysicalBatch>, TailError> {
         let mut batches = Vec::new();
         let mut bytes = 0_usize;
@@ -268,13 +266,7 @@ impl ArchiveTail {
                     });
                 }
                 let size = batch.data().len();
-                if size > byte_limit {
-                    return Err(TailError::Oversized {
-                        bytes: size,
-                        limit: byte_limit,
-                    });
-                }
-                if bytes + size > byte_limit {
+                if !batches.is_empty() && bytes.saturating_add(size) > byte_limit {
                     break 'segments;
                 }
                 bytes += size;
@@ -545,11 +537,14 @@ mod tests {
         let one = groups[1].data().len();
         let limited = tail.read(after, one * 2, u64::MAX).unwrap();
         assert_eq!(sequences(&limited), sequences(&groups[1..3]));
-        // A single group larger than the limit is refused, as by the WAL.
-        assert!(matches!(
-            tail.read(after, one - 1, u64::MAX),
-            Err(TailError::Oversized { .. })
-        ));
+        // Spec P4.1c: a group larger than the limit is served alone, as by
+        // the WAL — the limit is a coalescing target, not a ceiling.
+        let alone = tail.read(after, one - 1, u64::MAX).unwrap();
+        assert_eq!(sequences(&alone), sequences(&groups[1..2]));
+        assert_eq!(
+            sequences(&tail.read(after, 1, u64::MAX).unwrap()),
+            sequences(&groups[1..2])
+        );
         // A cursor inside a group is not a boundary.
         let inside = groups[1].first_sequence();
         assert!(matches!(

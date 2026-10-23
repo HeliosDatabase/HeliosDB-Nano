@@ -64,7 +64,7 @@ use super::archive_segment::{
     OpenSegment, SegmentError, SegmentHeader, SegmentInfo, SegmentResult, FLAG_SEALED, FOOTER_LEN, FRAME_META,
     HEADER_LEN, KEY_CHECK_KEY,
 };
-use super::physical::{self, PhysicalBatch, PhysicalError, MAX_BATCH_BYTES};
+use super::physical::{self, PhysicalBatch, PhysicalError};
 use crate::config::{ArchiveConfig, DiskReserve};
 use crate::crypto::KeyManager;
 
@@ -77,11 +77,17 @@ pub const LOCK_FILE: &str = "archiver.lock";
 /// before batches are left out of the archive instead of queued.
 pub const MAX_QUEUED_BYTES: u64 = 256 * 1024 * 1024;
 
+/// How far a primary's archiver reads its store's WAL per poll: a coalescing
+/// target (spec P4.1c), so a larger write group still arrives whole, alone.
+/// A poll holds at most this much, or that one larger group.
+const ARCHIVE_POLL_BYTES: usize = 64 * 1024 * 1024;
+
 /// How a node's segments are cut and fsynced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentLimits {
-    /// A segment is sealed before it would grow past this (a larger single
-    /// write group gets a segment of its own).
+    /// A segment is sealed before it would grow past this, and as soon as it
+    /// reaches it. A soft target (spec P4.1c): a single write group larger
+    /// than it gets a segment of its own, never refused for its size.
     pub max_bytes: u64,
     /// A non-empty segment older than this many seconds is sealed.
     pub max_secs: u64,
@@ -244,9 +250,13 @@ impl SegmentWriter {
 
     /// Append `batch`, observed at `now`. A write group the archive already
     /// holds is skipped; one that does not continue the open segment, or
-    /// would grow it past `max_bytes`, seals it first. Returns the segments
-    /// sealed by this call. On an error the open segment must be set aside
-    /// ([`Self::set_aside`]).
+    /// would grow it past `max_bytes`, seals it first, and a segment that
+    /// reached `max_bytes` with it is sealed right after it. Spec P4.1c:
+    /// `max_bytes` is a soft target and a group is never split, so one larger
+    /// than it gets a segment of its own — sealed before it when the open
+    /// segment holds anything, appended, sealed after it — and size never
+    /// refuses a group. Returns the segments sealed by this call. On an error
+    /// the open segment must be set aside ([`Self::set_aside`]).
     pub fn append(&mut self, batch: &PhysicalBatch, now: i64) -> SegmentResult<Vec<SegmentInfo>> {
         if let Some(cursor) = self.cursor {
             if batch.last_sequence() <= cursor {
@@ -287,12 +297,18 @@ impl SegmentWriter {
             self.open = Some(OpenSegment::create(&self.dir, header)?);
         }
         let key = self.key_manager.as_deref();
+        let mut full = false;
         if let Some(open) = self.open.as_mut() {
             open.append(batch, now, key)?;
             self.cursor = Some(batch.last_sequence());
-            if open.unsynced_bytes() >= self.limits.fsync_bytes {
+            full = HEADER_LEN as u64 + open.body_bytes() + FOOTER_LEN as u64 >= limit;
+            // A full segment is sealed (and fsynced) below.
+            if !full && open.unsynced_bytes() >= self.limits.fsync_bytes {
                 open.sync()?;
             }
+        }
+        if full {
+            sealed.extend(self.seal()?);
         }
         Ok(sealed)
     }
@@ -1156,7 +1172,7 @@ fn run_primary(
         let cursor = session.writer.cursor().unwrap_or(start);
         let mut behind = false;
         let mut failed = false;
-        match physical::poll_source(&store, history, cursor, MAX_BATCH_BYTES) {
+        match physical::poll_source(&store, history, cursor, ARCHIVE_POLL_BYTES) {
             Ok(polled) => {
                 for batch in &polled.batches {
                     if !session.append(batch, now) {
@@ -1565,7 +1581,8 @@ mod tests {
         assert_contiguous(&all);
         assert_eq!(all[0].first_sequence(), batches[0].first_sequence());
         assert_eq!(all[3].last_sequence(), batches[9].last_sequence());
-        // A frame larger than the limit gets a segment of its own.
+        // A frame larger than the limit gets a segment of its own, sealed
+        // as soon as it holds it (spec P4.1c).
         let tiny = SegmentLimits { max_bytes: 1, ..LIMITS };
         let mut writer = SegmentWriter::new(
             root.path(),
@@ -1577,10 +1594,101 @@ mod tests {
             tiny,
             Some(batches[9].last_sequence()),
         );
-        assert!(writer.append(&batches[10], 3_000).unwrap().is_empty());
-        let rolled = writer.append(&batches[11], 3_000).unwrap();
-        assert_eq!(rolled.len(), 1);
-        assert_eq!(rolled[0].batch_count(), 1);
+        for batch in &batches[10..12] {
+            let rolled = writer.append(batch, 3_000).unwrap();
+            assert_eq!(rolled.len(), 1);
+            assert_eq!(rolled[0].batch_count(), 1);
+            assert_eq!(rolled[0].first_sequence(), batch.first_sequence());
+        }
+        assert_eq!(writer.seal().unwrap(), None, "nothing left open");
+    }
+
+    /// A small write group, one of 100 MiB (100 puts of 1 MiB values) and
+    /// another small one, as the archiver sees them.
+    fn small_large_small() -> (Uuid, Vec<PhysicalBatch>) {
+        let root = TempDir::new().unwrap();
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.set_wal_ttl_seconds(3600);
+        let db = DB::open(&options, root.path().join("source")).unwrap();
+        db.put(b"small:1", b"one").unwrap();
+        let mut large = WriteBatch::default();
+        for index in 0..100_u32 {
+            large.put(
+                format!("large:{index:03}"),
+                vec![u8::try_from(index % 251).unwrap(); 1 << 20],
+            );
+        }
+        db.write(large).unwrap();
+        db.put(b"small:2", b"two").unwrap();
+        let history = Uuid::new_v4();
+        let polled = physical::poll_source(&db, history, 0, physical::MAX_BATCH_BYTES).unwrap();
+        assert_eq!(polled.batches.len(), 3);
+        (history, polled.batches)
+    }
+
+    /// Spec P4.1c §3: `segment_max_bytes` is a soft target. A 100 MiB write
+    /// group after a small one gets a segment of its own — the open segment
+    /// sealed before it, its own sealed right after it, never refused for its
+    /// size — and reads back equal and deep-verified; with sealed (encrypted)
+    /// frames too.
+    #[test]
+    fn a_write_group_larger_than_a_segment_gets_a_segment_of_its_own() {
+        let (history, groups) = small_large_small();
+        for key in [None, Some(Arc::new(KeyManager::generate_random()))] {
+            let root = TempDir::new().unwrap();
+            let limits = SegmentLimits {
+                max_bytes: 1 << 20,
+                ..LIMITS
+            };
+            let mut writer = SegmentWriter::new(
+                root.path(),
+                history,
+                1,
+                Uuid::new_v4(),
+                key.clone(),
+                [0; 32],
+                limits,
+                None,
+            );
+            assert!(
+                writer.append(&groups[0], 1_000).unwrap().is_empty(),
+                "a small group: the segment stays open"
+            );
+            let sealed = writer.append(&groups[1], 1_000).unwrap();
+            assert_eq!(sealed.len(), 2, "sealed before the large group and after it");
+            assert_eq!(
+                (
+                    sealed[0].first_sequence(),
+                    sealed[0].last_sequence(),
+                    sealed[0].batch_count()
+                ),
+                (groups[0].first_sequence(), groups[0].last_sequence(), 1)
+            );
+            let own = &sealed[1];
+            assert_eq!(
+                (own.first_sequence(), own.last_sequence(), own.batch_count()),
+                (groups[1].first_sequence(), groups[1].last_sequence(), 1)
+            );
+            assert!(own.file_bytes > 100 << 20, "{} bytes", own.file_bytes);
+            assert_eq!(own.sealed_frames(), key.is_some());
+            own.verify_deep(key.as_deref()).unwrap();
+            let read: Vec<PhysicalBatch> = own.frames(key.as_deref()).unwrap().map(Result::unwrap).collect();
+            assert_eq!(read.len(), 1);
+            assert_eq!(read[0].digest(), groups[1].digest());
+            assert_eq!(read[0].data(), groups[1].data());
+            // The next small group opens a new segment.
+            assert!(writer.append(&groups[2], 1_000).unwrap().is_empty());
+            let last = writer.seal().unwrap().unwrap();
+            assert_eq!(last.first_sequence(), groups[2].first_sequence());
+            let mut all = segments(root.path());
+            all.sort_by_key(SegmentInfo::first_sequence);
+            assert_eq!(all.len(), 3);
+            assert_contiguous(&all);
+            for segment in &all {
+                segment.verify_deep(key.as_deref()).unwrap();
+            }
+        }
     }
 
     fn candidate(index: u64, observed: i64, bytes: u64) -> PruneCandidate {

@@ -45,7 +45,7 @@ use super::fast_forward::{FastForwardPlan, PlanningGuard};
 use super::ha_state::{ha_state, StandbyHandle, StandbyRegistration, StandbyState, SyncMode};
 use super::physical::{
     poll_source, poll_source_cascade, receiver_source_barrier, wal_retains_after, CascadeHint, PhysicalBatch,
-    PhysicalError, PhysicalPoll, MAX_BATCH_BYTES,
+    PhysicalError, PhysicalPoll,
 };
 use super::physical_wire::{
     valid_leaf_bytes, Heartbeat, Hello, LeafDigests, LeafReady, ObservedSession, OpenRequest, PeerRole, PhysicalSource,
@@ -74,6 +74,13 @@ fn source_error(error: impl std::fmt::Display) -> WireError {
 fn not_serving(reason: &str) -> WireError {
     WireError::Refused(Refusal::new(RefuseCode::SourceNotServing, reason))
 }
+
+/// The byte limit of a poll that only proves a cursor is served (a resume's
+/// first poll, a cascading source's retention check): the first write group
+/// of a poll travels whatever its size (spec P4.1c), so one byte reads that
+/// group and nothing more — never up to `MAX_BATCH_BYTES` of groups only to
+/// be discarded.
+const PROBE_POLL_BYTES: usize = 1;
 
 /// What a replication port serves its sessions from.
 #[derive(Clone)]
@@ -141,7 +148,7 @@ impl SourceKind {
     fn retains_after(&self, db: &DB, history: Uuid, after: u64, hint: &Mutex<CascadeHint>) -> bool {
         match self {
             Self::Primary => wal_retains_after(db, after).unwrap_or(false),
-            Self::Cascade { .. } => self.poll(db, history, after, MAX_BATCH_BYTES, hint).is_ok(),
+            Self::Cascade { .. } => self.poll(db, history, after, PROBE_POLL_BYTES, hint).is_ok(),
         }
     }
 
@@ -244,11 +251,10 @@ fn pruned_refusal(
 /// Spec P3.2 §1: a tail read's failure as the receiver must hear it. A
 /// segment that does not verify, or a cursor that is not one of its group
 /// boundaries, cannot be served from this archive: the receiver needs
-/// recovery, told which file. A group larger than its poll is a source-side
-/// failure, as from the WAL.
+/// recovery, told which file. (Spec P4.1c: a group larger than the poll's
+/// limit is served alone, as from the WAL, never refused.)
 fn tail_error(error: TailError, oldest: u64) -> WireError {
     match error {
-        TailError::Oversized { .. } => source_error(error),
         TailError::Segment(_) | TailError::Boundary { .. } => WireError::Refused(Refusal::new(
             RefuseCode::WalPruned { oldest },
             format!(
@@ -263,7 +269,8 @@ fn tail_error(error: TailError, oldest: u64) -> WireError {
 /// the source's own WAL; when that WAL no longer holds the group after
 /// `after` and the archive holds a contiguous run of this history's current
 /// epoch from it to the WAL's floor, the groups come from the archive —
-/// bounded by `byte_limit`, never past the WAL's floor, so the next poll is
+/// gathered up to `byte_limit` (a larger group alone, spec P4.1c), never past
+/// the WAL's floor, so the next poll is
 /// served from the WAL again once the cursor reaches it. Returns where the
 /// groups came from.
 ///
@@ -1070,10 +1077,10 @@ async fn open_source_session(
                     }
                     // The first bounded poll proves the receiver's cursor is still
                     // served: retained (by the WAL, or by the archive), contiguous,
-                    // not ahead of this source.
-                    let attempt = kind.poll(&db, history, after, MAX_BATCH_BYTES, &hint);
+                    // not ahead of this source. One group proves it.
+                    let attempt = kind.poll(&db, history, after, PROBE_POLL_BYTES, &hint);
                     let (initial, _) =
-                        poll_or_fill(attempt, &kind, &db, fill.as_ref(), history, after, MAX_BATCH_BYTES)?;
+                        poll_or_fill(attempt, &kind, &db, fill.as_ref(), history, after, PROBE_POLL_BYTES)?;
                     (
                         SourceSessionInfo::Resume {
                             session_id: Uuid::new_v4(),
@@ -1319,6 +1326,7 @@ impl SessionObserver for StandbyRegistryObserver {
 mod tests {
     use super::*;
     use crate::replication::history::{load_or_create_primary_history, PRIMARY_HISTORY_FILE};
+    use crate::replication::physical::MAX_BATCH_BYTES;
     use rocksdb::Options;
 
     fn primary(root: &std::path::Path) -> (Arc<DB>, Uuid) {

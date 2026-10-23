@@ -55,7 +55,7 @@ ships. "P3", "P4" and "P5" are phases of the physical standby plan.
 | Standby `MOUNTED`, not open | No equivalent: a standby that may not serve data reads stays open and refuses them with SQLSTATE `55000` |
 | SCN | The **physical sequence**: the RocksDB sequence number of the primary's writes. Shown as PostgreSQL LSN text, `HI/LO` hex (`hi = seq >> 32`, `lo = seq & 0xFFFFFFFF`) |
 | Online redo | The RocksDB WAL (`*.log`) |
-| Redo transport | The replication connection (`NPHYS002`) to the primary's `replication_port`, over TLS for a remote standby. The standby pulls write groups |
+| Redo transport | The replication connection (`NPHYS003`) to the primary's `replication_port`, over TLS for a remote standby. The standby pulls write groups |
 | Redo apply (MRP) | The physical applier: each write group is applied verbatim and fsynced, then the standby's in-memory indexes are updated |
 | Archived redo log | An **archived WAL segment**: `<archive>/<history>/<epoch>/<first>-<last>.hseg`, a sealed, checksummed file of whole write groups (see [Archived WAL and the recovery window](#archived-wal-and-the-recovery-window)). The primary's own RocksDB WAL retention (`[replication.physical] wal_retention_secs`, `wal_retention_size_mb`) only covers the archiver's lag and a reconnecting standby |
 | `LOG_ARCHIVE_DEST_n` | `[replication.archive] dir` (`--archive-dir`, default `<data dir>.archive`). Every primary serving its replication port and every standby archives; `--archive=false` turns it off |
@@ -174,7 +174,7 @@ before storage opens), and its HTTP listener mounts only `/`, `/health`,
 
 A standby on another host reaches its primary's replication port over TLS. TLS
 is the transport only: the replication token is still required, and checked,
-in every mode, mutual TLS included. The protocol is unchanged (`NPHYS002`
+in every mode, mutual TLS included. The protocol is unchanged (`NPHYS003`
 inside the TLS stream; each side sets the `CAP_TLS` capability bit for its end
 of the session).
 
@@ -329,7 +329,7 @@ HeliosDB Proxy probes nodes over the PostgreSQL wire only; it never fetches
 
 ## The replication connection
 
-One port, one connection per standby, one protocol: `NPHYS002`. That connection
+One port, one connection per standby, one protocol: `NPHYS003`. That connection
 carries the bootstrap copy, the physical WAL, and the control plane (identity,
 dataset history, epoch, heartbeats and acknowledgements). Until this release a
 standby ran a second, native channel for its handshake and acknowledgements. Two
@@ -340,10 +340,12 @@ by physical sequence. On one connection every frame of a session is ordered and
 names physical sequences only, and a primary that will not serve a standby says
 why.
 
-A frame is a 16-byte header, `MAGIC "NPHYS002" (8) | version u16 = 2 | kind u16 |
+A frame is a 16-byte header, `MAGIC "NPHYS003" (8) | version u16 = 3 | kind u16 |
 length u32`, big-endian, then a payload whose size every kind bounds before it is
-allocated. The session is request/response, driven by the standby (R, the
-receiver) against the primary (S, the source):
+allocated. A payload is read and written in steps of 1 MiB, each bounded by the
+frame timeout: a large frame from a peer that keeps sending never times out, a
+peer that stalls does. The session is request/response, driven by the standby
+(R, the receiver) against the primary (S, the source):
 
 | Frame | Direction | Payload |
 |---|---|---|
@@ -355,15 +357,16 @@ receiver) against the primary (S, the source):
 | `Open` | R to S | `snapshot`, `snapshot of <id>` (a resumed download: the leased export it belongs to, else a fresh one), or `resume {history, after}` |
 | `Manifest` / `ResumeInfo` | S to R | the session the primary opened |
 | `ChunkRequest` / `Chunk` | R to S / S to R | one bounded, digested piece of a checkpoint file |
-| `PollRequest` | R to S | session, the sequence to continue after, a byte limit |
-| `PollStart`, `Batch`*, `PollEnd` | S to R | a contiguous interval of write groups |
+| `PollRequest` | R to S | session, the sequence to continue after, a byte limit (a coalescing target: the poll's first write group travels whatever its size, later ones only within the limit) |
+| `PollStart`, `Batch`*, `PollEnd` | S to R | a contiguous interval of write groups, one `Batch` per write group, never split |
 | `Heartbeat` | R to S | applied sequence, durable sequence, received-at time. This is **the acknowledgement**: one frame, two triggers (every 5 s when idle, and after a poll advanced the durable cursor, coalesced to at most one per 50 ms) |
 | `HeartbeatAck` | S to R | the primary's barrier and clock |
 | `Fence` | either | the epoch; reserved for promotion (P5) and refused by both sides now |
 | `Close` / `Closed` | R to S / S to R | orderly end |
 
 Kind 13 of `NPHYS001` (`AuthRejected`) is retired: a wrong token is
-`Refuse { AuthFailed }`. A peer that speaks `NPHYS001` is answered
+`Refuse { AuthFailed }`. A peer that speaks `NPHYS001`, or `NPHYS002` (a
+pre-release build whose write groups were bounded at 64 MiB), is answered
 `Refuse { Version }` naming both versions, and a 4.41.x native peer is told to
 upgrade. A standby pointed at a PostgreSQL or HTTP port gets an error saying
 that `--primary-host` must name the primary's `--replication-port`.
@@ -495,11 +498,14 @@ WAL](#recovering-from-archived-wal).
 
 ### Segments
 
-A segment is sealed when it would pass `segment_max_bytes` (default 64 MiB; a
-single write group never splits, so a larger one gets a segment of its own) or
-when it is older than `segment_max_secs` (default 300). Its header names the
-dataset history, the epoch, the first sequence, the node and (for an encrypted
-dataset) which dataset key sealed it; its footer the last sequence, the number
+A segment is sealed when it would pass `segment_max_bytes` (default 64 MiB), as
+soon as it reaches it, or when it is older than `segment_max_secs` (default
+300). `segment_max_bytes` is a target, not a limit: a single write group never
+splits, so a larger one gets a segment of its own — the open segment is sealed
+before it, and its own right after it — and no write group is ever left out of
+the archive for its size. A segment's header names the dataset history, the
+epoch, the first sequence, the node and (for an encrypted dataset) which
+dataset key sealed it; its footer the last sequence, the number
 of write groups, when the first and the last were **observed** by the archiver
 (RocksDB records no commit time, so nothing here is called one), and a SHA-256
 over the whole file. Each frame is one write group exactly as the replication
@@ -575,7 +581,7 @@ wins over the file:
 |---|---|---|---|
 | `enabled` | `--archive[=BOOL]` | `true` | applies to a primary serving its replication port and to a standby |
 | `dir` | `--archive-dir` | `<data dir>.archive` | refused inside the data directory and on the physical export directory |
-| `segment_max_bytes` | `--archive-segment-max-bytes` | `"64MiB"` | 4KiB..=4GiB |
+| `segment_max_bytes` | `--archive-segment-max-bytes` | `"64MiB"` | 4KiB..=4GiB; a target: a larger write group gets a segment of its own |
 | `segment_max_secs` | `--archive-segment-max-secs` | `300` | 1..=86400 |
 | `poll_ms` | `--archive-poll-ms` | `1000` | a primary's archiver reads its WAL this often (10..=60000) |
 | `fsync_bytes` | `--archive-fsync-bytes` | `"8MiB"` | 4KiB..=4GiB |
@@ -656,8 +662,9 @@ A standby away longer than the primary's RocksDB WAL retention
 reconnects, the primary finds that its WAL starts after the standby's cursor
 and serves the missing groups from its WAL archive instead: a contiguous run of
 sealed segments of the current history and epoch that reaches from the
-standby's next sequence to the WAL's floor. Each poll stays bounded by the
-standby's byte limit and never goes past the WAL's floor; every poll checks
+standby's next sequence to the WAL's floor. Each poll gathers groups up to the
+standby's byte limit (a larger group alone, as from the WAL) and never goes
+past the WAL's floor; every poll checks
 again, so once the standby's cursor reaches what the WAL still holds it is
 served from the WAL. The standby sees ordinary batches — nothing changes on its
 side, and nothing on the wire. The primary logs
@@ -1087,6 +1094,18 @@ The test suites are listed in the [HA testing guide](ha_testing.md).
   that falls behind both the cascading standby's live WAL and its archive is
   refused like any other.
 - **One primary per standby.**
+- **A write group travels and is applied whole.** A statement or a
+  transaction is one RocksDB write group on the primary, and it reaches each
+  standby, the archive, a cascaded standby and `recover --from-archive` as one
+  unit, applied as one batch, never split. So a standby and every archiver
+  must hold the largest write group the primary commits in memory, once (a
+  single 1 000 000-row statement of ~900-byte rows is ~4 GiB). The poll limit
+  (8 MiB on a serving standby) only decides how many small write groups
+  travel together: a larger one travels alone. The bound is what one frame
+  can say, 4 GiB less 4 KiB of raw write group; a larger one cannot be
+  replicated or archived (the standby and the archiver stop before it,
+  `batch byte limit`), so load bulk data in statements of tens of thousands
+  of rows.
 - **An incremental rebuild reads everything once.** `recover --from-primary`
   ships only the leaves that differ, but both sides digest their whole
   datasets to find them (no change-tracking map yet), and a change spread

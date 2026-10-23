@@ -20,14 +20,15 @@ entries under "Replication" below: the logical standby, its native reader and
 its history window are removed (the window's key remains only as the primary's
 redo window, default 0).
 
-- **One replication connection, protocol `NPHYS002`.** The bootstrap copy, the
+- **One replication connection, protocol `NPHYS003`.** The bootstrap copy, the
   physical WAL and the control plane (identity, dataset history, epoch,
   heartbeats, acknowledgements) share one connection per standby, so they can no
   longer disagree. `[replication] replication_port` (`--replication-port`,
   default 5433) is the single replication port, and a standby's
   `--primary-host` names it; a standby pointed at a PostgreSQL or HTTP port is
-  told so. `NPHYS001` peers are refused with a typed `Version` refusal naming
-  both versions, and a 4.41.x native peer is told to upgrade. Without TLS the
+  told so. `NPHYS001` peers (and `NPHYS002` peers of pre-release builds) are
+  refused with a typed `Version` refusal naming both versions, and a 4.41.x
+  native peer is told to upgrade. Without TLS the
   replication port stays on loopback whatever `--listen` opens (see "Added —
   TLS replication and resumable snapshot" for remote standbys).
 - **Removed: the separate physical endpoint.** `--physical-replication-listen`,
@@ -53,7 +54,7 @@ redo window, default 0).
   reads the logical WAL.
 
 ### Added — the replication connection's control plane and synchronous replication
-- **Control frames** on `NPHYS002`: `Hello` / `HelloOk` (node id, role, dataset
+- **Control frames** on `NPHYS003`: `Hello` / `HelloOk` (node id, role, dataset
   history, epoch, durable cursor, capabilities, PostgreSQL port, sync mode;
   the primary answers with its history, epoch and barrier), `Refuse`,
   `Heartbeat` (the standby's applied and durable sequence: THE acknowledgement,
@@ -305,7 +306,7 @@ Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.
   `--replace` uses the completed copy. `--no-full-copy` exits 3 with the
   estimate instead. The copy needs its size plus 10% free; the leaf stage
   (`--stage-dir`, default `<DIR>.recover-stage`) one batch, twice over.
-- **Protocol (`NPHYS002`, both nodes on this release).** A source offers
+- **Protocol (`NPHYS003`, both nodes on this release).** A source offers
   `CAP_FAST_FORWARD`; `Open` gains the fast-forward request (29 or 45 bytes)
   and new frames 21-27 (`FastForwardInfo`, `LeafDigestsRequest`/`LeafDigests`
   — paged, "planning" while the source scans —, `LeafRequest`/`LeafReady`,
@@ -333,6 +334,25 @@ Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.
   rotation command (rotation with standbys attached is unsupported until P5).
 
 ### Fixed — replication
+- **One 20 000-row statement stalled every physical standby and the archive
+  for good** (spec P4.1c). A write group larger than the standby's poll limit
+  (8 MiB; such a statement of ~900-byte rows is ~80 MiB) was refused as
+  "single source batch exceeds poll byte limit": the standby stayed
+  `reconnecting` at that sequence forever, a cascaded standby with it, and the
+  archiver failed at the same group on every poll, so no segment past it was
+  ever sealed and the recovery window silently ended there. Every write group
+  was also capped at 64 MiB (1 000 000 operations) on the wire and in segments.
+  Now a write group — a statement or a transaction, the unit of atomicity —
+  always travels and is applied whole: the poll limit is a coalescing target
+  (a poll's first group travels whatever its size; later ones join it only
+  within the limit), on the primary, a cascading standby, the archive's gap
+  fill and the wire alike; a group may be up to 4 GiB less 4 KiB (what one
+  frame's `u32` length can say) of any number of operations; a frame is read
+  and written in 1 MiB steps, each bounded by the frame timeout, so a large
+  one never times out while its peer keeps sending; and `segment_max_bytes` is
+  a target too, a larger group getting a segment of its own, sealed at once.
+  The frame bounds changed, so the protocol is now `NPHYS003`: run the same
+  release on both nodes (an `NPHYS002` build is refused by version).
 - **The standby's heartbeat no longer resets the primary's record of it.** The
   native heartbeat reported applied and flushed positions of 0 every 5 seconds,
   and the primary copied them into the watermark its synchronous commits waited
@@ -349,15 +369,19 @@ Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.
   write** (spec P4.1b). Checkpoint downloads and fast-forward leaf transfers
   no longer stall ~40 ms per 1 MiB chunk, the payload of each request having
   waited behind the peer's delayed ACK of its header (loopback copy 15 MB/s →
-  MEASURED_AFTER_FIX MB/s). The bytes on the wire are unchanged (`NPHYS002`).
+  MEASURED_AFTER_FIX MB/s). The bytes on the wire are unchanged by it.
 
 ### Tests
 - Added: `tests/physical_standby_sync.rs` (a sync INSERT blocks while the
   standby is stopped; `min_acks = 2` with one standby under `warn` and `fail`;
   heartbeat-only traffic never regresses the primary's recorded sequences; the
   primary's `/health` lists the standby), `tests/physical_standby_refusals.rs`
-  (`HistoryMismatch`, `WalPruned`, `AuthFailed`, an `NPHYS001` client; the
-  standby stays up in `needs_recovery`), `tests/logical_standby_removed.rs` (a
+  (`HistoryMismatch`, `WalPruned`, `AuthFailed`, an `NPHYS001` or `NPHYS002`
+  client; the standby stays up in `needs_recovery`),
+  `tests/physical_large_write_group.rs` (one ~80 MiB write group reaches a
+  standby, a cascaded standby, the archive in a segment of its own and
+  `recover --from-archive`; with `internal-tests`, a standby killed with the
+  group's frame in flight resumes from its cursor), `tests/logical_standby_removed.rs` (a
   source scan that fails if a removed replication flag, module or symbol
   returns to the code, tests, fixture, guides or skills), and
   `tests/support/physical_pair.rs` (the shared real-daemon pair harness).

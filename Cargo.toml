@@ -208,6 +208,9 @@ libc = "0.2"
 bincode = "1.3" # craft legacy v1 columnar batches in typed_batch_tests
 criterion = "0.5"
 proptest = "1.5"
+# Paused time (`start_paused`) for the replication wire's idle-timeout tests
+# (spec P4.1c): no new crate, only tokio's test clock.
+tokio = { version = "1.40", features = ["test-util"] }
 tokio-postgres = "0.7"
 tokio-tungstenite = "0.21"
 

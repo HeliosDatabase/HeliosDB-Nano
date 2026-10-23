@@ -1,4 +1,4 @@
-//! The replication protocol `NPHYS002`: ONE authenticated connection per
+//! The replication protocol `NPHYS003`: ONE authenticated connection per
 //! receiver carries both the physical data (snapshot chunks, RocksDB write
 //! groups) and the control plane — identity, dataset history, epoch,
 //! heartbeats and acknowledgements (spec P2.1,
@@ -43,13 +43,27 @@
 //! | `Close` / `Closed` | R→S / S→R | orderly end |
 //!
 //! Kind 13 (`AuthRejected` of `NPHYS001`) is retired: a wrong token is
-//! `Refuse { AuthFailed }`. A peer that speaks `NPHYS001` is answered with
-//! `Refuse { Version }` and reported as [`WireError::Version`], naming both.
+//! `Refuse { AuthFailed }`. A peer that speaks `NPHYS001` or `NPHYS002` is
+//! answered with `Refuse { Version }` and reported as [`WireError::Version`],
+//! naming both.
 //!
 //! Each session kind has its own requests: a snapshot or resume session
 //! sends chunk and poll requests, a fast-forward session (spec P4.1) the
 //! three leaf requests; any other request is a protocol error that ends the
 //! session. A source offers fast-forward sessions with [`CAP_FAST_FORWARD`].
+//!
+//! # Write groups of any size (spec P4.1c, `NPHYS003`)
+//!
+//! One write group is one `Batch` frame, never split: up to
+//! [`MAX_BATCH_BYTES`] of raw group, the most a `u32` length can say. A
+//! `PollRequest`'s byte limit is a coalescing target, not a ceiling: the
+//! first batch of a poll may exceed it, a later one may not take the poll's
+//! total past it. A payload is read and written in steps of `FRAME_IO_STEP`
+//! (1 MiB), each bounded by the frame timeout: an idle timeout, so a large
+//! frame from a peer that keeps sending never times out, while a peer that
+//! stalls does. `NPHYS002` bounded a batch at 64 MiB and a poll's first batch
+//! by its limit; the version changed with the bounds, so the two refuse each
+//! other by version, not by a late "invalid length".
 //!
 //! # Trust
 //!
@@ -81,9 +95,9 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 /// The protocol this module speaks, as its peers name it.
-pub const PROTOCOL: &str = "NPHYS002";
-const MAGIC: [u8; 8] = *b"NPHYS002";
-const VERSION: u16 = 2;
+pub const PROTOCOL: &str = "NPHYS003";
+const MAGIC: [u8; 8] = *b"NPHYS003";
+const VERSION: u16 = 3;
 /// Every version of this protocol starts its magic with these bytes, so a
 /// peer of another version is told so by name instead of "garbage".
 const MAGIC_FAMILY: &[u8; 5] = b"NPHYS";
@@ -1594,6 +1608,13 @@ impl Kind {
             Self::Chunk => (CHUNK_META + 1..=CHUNK_META + MAX_CHUNK_BYTES).contains(&n),
             Self::PollRequest => n == 28,
             Self::PollStart | Self::PollEnd => n == 20,
+            // Spec P4.1c: one write group of any size `u32` can frame
+            // ([`MAX_BATCH_BYTES`]), so `read_frame` may allocate up to
+            // ~4 GiB for one. The trust boundary: a `Batch` is only ever
+            // allowed in a poll response on a session this receiver opened,
+            // after authentication, from the source it follows — and it is
+            // applied verbatim, so its size is bounded by what that source
+            // committed as one write group. No source ever reads one.
             Self::Batch => (BATCH_META + 12..=BATCH_META + MAX_BATCH_BYTES).contains(&n),
             Self::Hello => n == HELLO_BYTES,
             Self::HelloOk => (HELLO_OK_META..=HELLO_OK_META + MAX_ENDPOINT_BYTES).contains(&n),
@@ -1666,13 +1687,46 @@ fn check_header(header: &[u8; HEADER_BYTES]) -> Result<()> {
     )))
 }
 
+/// Spec P4.1c: a frame's payload is read and written in steps of at most
+/// this many bytes, each bounded by the frame timeout. The timeout is an
+/// idle one: a peer that keeps a large `Batch` frame coming never times out,
+/// however long the whole frame takes, while one that stalls for a frame
+/// timeout does.
+const FRAME_IO_STEP: usize = 1024 * 1024;
+
+/// `internal-tests` builds only: a receiver that reads a `Batch` frame of at
+/// least this many payload bytes SIGKILLs its own process once half of that
+/// payload has arrived — a crash with a large write group in flight, exactly
+/// instead of by timing (spec P4.1c §3).
+pub const KILL_MID_BATCH_ENV: &str = "HELIOSDB_NANO_TEST_KILL_MID_BATCH";
+
+/// Stop part-way through a large `Batch` payload (`internal-tests` only,
+/// [`KILL_MID_BATCH_ENV`]): `read` of its `length` payload bytes arrived.
+fn kill_mid_batch_hook(kind: Kind, length: usize, read: usize) {
+    #[cfg(all(feature = "internal-tests", unix))]
+    {
+        static KILL_AT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let threshold = KILL_AT.get_or_init(|| std::env::var(KILL_MID_BATCH_ENV).ok()?.trim().parse().ok());
+        if kind == Kind::Batch && threshold.is_some_and(|at| length >= at) && read >= length / 2 {
+            tracing::warn!("{KILL_MID_BATCH_ENV}: killing this process {read} bytes into a {length}-byte Batch frame");
+            // SAFETY: kill(2) of this very process with a standard signal; no
+            // pointers, no preconditions.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(all(feature = "internal-tests", unix)))]
+    let _ = (kind, length, read);
+}
+
 async fn read_frame<R: AsyncRead + Unpin>(
     io: &mut R,
     allowed: &[Kind],
     limits: &WireLimits,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Frame> {
-    bounded(shutdown, limits.frame_timeout, async {
+    let (kind, length) = bounded(shutdown, limits.frame_timeout, async {
         let mut header = [0u8; HEADER_BYTES];
         io.read_exact(&mut header).await?;
         if let Err(error) = check_header(&header) {
@@ -1693,11 +1747,23 @@ async fn read_frame<R: AsyncRead + Unpin>(
         if !allowed.contains(&kind) || !kind.valid_size(length) {
             return Err(invalid("unexpected frame or invalid length"));
         }
-        let mut payload = vec![0; length];
-        io.read_exact(&mut payload).await?;
-        Ok(Frame { kind, payload })
+        Ok((kind, length))
     })
-    .await
+    .await?;
+    let mut payload = vec![0; length];
+    // Spec P4.1c: one deadline per step of the payload, not one for the
+    // whole frame (`FRAME_IO_STEP`).
+    let mut read = 0_usize;
+    for step in payload.chunks_mut(FRAME_IO_STEP) {
+        bounded(shutdown, limits.frame_timeout, async {
+            io.read_exact(step).await?;
+            Ok(())
+        })
+        .await?;
+        read += step.len();
+        kill_mid_batch_hook(kind, length, read);
+    }
+    Ok(Frame { kind, payload })
 }
 
 /// Spec P4.1b: a frame whose payload is at most this large is written as ONE
@@ -1710,7 +1776,7 @@ async fn read_frame<R: AsyncRead + Unpin>(
 /// whatever the socket's `TCP_NODELAY` (set by [`accept_replication`] and
 /// [`PhysicalClient::connect_replication`]): with it, two writes would still be
 /// two segments. A larger payload (a chunk, a batch) follows its header
-/// without being copied.
+/// without being copied, in steps of `FRAME_IO_STEP` (spec P4.1c).
 const SMALL_FRAME_BYTES: usize = 64 * 1024;
 
 async fn write_frame<W: AsyncWrite + Unpin>(
@@ -1720,26 +1786,65 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     limits: &WireLimits,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    if !kind.valid_size(payload.len()) {
-        return Err(invalid("outgoing frame exceeds bounds"));
-    }
-    bounded(shutdown, limits.frame_timeout, async {
-        let mut header = [0u8; HEADER_BYTES];
-        header[..8].copy_from_slice(&MAGIC);
-        header[8..10].copy_from_slice(&VERSION.to_be_bytes());
-        header[10..12].copy_from_slice(&(kind as u16).to_be_bytes());
-        header[12..16].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-        if payload.len() <= SMALL_FRAME_BYTES {
+    write_frame_parts(io, kind, &[], payload, limits, shutdown).await
+}
+
+/// [`write_frame`] of a payload given in two parts, a short `meta` prefix
+/// then `body`, sent as one frame without joining them: a `Batch`'s metadata
+/// and its raw write group, which may be gigabytes (spec P4.1c), are never
+/// copied into one buffer. A small frame is still ONE write (spec P4.1b); a
+/// larger one is its header and `meta` in one write, then `body` in steps of
+/// `FRAME_IO_STEP`, each bounded by the frame timeout (an idle timeout), then
+/// a flush.
+async fn write_frame_parts<W: AsyncWrite + Unpin>(
+    io: &mut W,
+    kind: Kind,
+    meta: &[u8],
+    body: &[u8],
+    limits: &WireLimits,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let length = meta
+        .len()
+        .checked_add(body.len())
+        .filter(|length| kind.valid_size(*length))
+        .ok_or_else(|| invalid("outgoing frame exceeds bounds"))?;
+    let length_field = u32::try_from(length).map_err(|_| invalid("outgoing frame exceeds bounds"))?;
+    let mut header = [0u8; HEADER_BYTES];
+    header[..8].copy_from_slice(&MAGIC);
+    header[8..10].copy_from_slice(&VERSION.to_be_bytes());
+    header[10..12].copy_from_slice(&(kind as u16).to_be_bytes());
+    header[12..16].copy_from_slice(&length_field.to_be_bytes());
+    if length <= SMALL_FRAME_BYTES {
+        return bounded(shutdown, limits.frame_timeout, async {
             // The buffer may hold the token (`Auth`): wiped when dropped, and
             // sized once so it is never reallocated (leaving a copy behind).
-            let mut frame: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(HEADER_BYTES + payload.len()));
+            let mut frame: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(HEADER_BYTES + length));
             frame.extend_from_slice(&header);
-            frame.extend_from_slice(payload);
+            frame.extend_from_slice(meta);
+            frame.extend_from_slice(body);
             io.write_all(frame.as_slice()).await?;
-        } else {
-            io.write_all(&header).await?;
-            io.write_all(payload).await?;
-        }
+            io.flush().await?;
+            Ok(())
+        })
+        .await;
+    }
+    let mut head = Vec::with_capacity(HEADER_BYTES + meta.len());
+    head.extend_from_slice(&header);
+    head.extend_from_slice(meta);
+    bounded(shutdown, limits.frame_timeout, async {
+        io.write_all(&head).await?;
+        Ok(())
+    })
+    .await?;
+    for step in body.chunks(FRAME_IO_STEP) {
+        bounded(shutdown, limits.frame_timeout, async {
+            io.write_all(step).await?;
+            Ok(())
+        })
+        .await?;
+    }
+    bounded(shutdown, limits.frame_timeout, async {
         io.flush().await?;
         Ok(())
     })
@@ -2304,14 +2409,17 @@ where
                 summary.validate_since(after, byte_limit, known_barrier)?;
                 let mut cursor = after;
                 let mut bytes = 0usize;
-                for batch in &poll.batches {
+                for (index, batch) in poll.batches.iter().enumerate() {
                     bytes = bytes
                         .checked_add(batch.data().len())
                         .ok_or_else(|| invalid("batch byte overflow"))?;
+                    // Spec P4.1c: the limit is a coalescing target. The
+                    // first batch of a poll may exceed it (a write group is
+                    // never split); a later one may not take the total past it.
                     if batch.history() != info.history()
                         || cursor.checked_add(1) != Some(batch.first_sequence())
                         || batch.last_sequence() > summary.through
-                        || bytes > byte_limit
+                        || (bytes > byte_limit && index > 0)
                     {
                         return Err(invalid("source returned noncontiguous/oversized physical interval"));
                     }
@@ -2323,12 +2431,13 @@ where
                 let summary_bytes = summary.encode();
                 write_frame(&mut io, Kind::PollStart, &summary_bytes, &limits, &mut shutdown).await?;
                 for batch in poll.batches {
-                    let mut payload = Vec::with_capacity(BATCH_META + batch.data().len());
-                    payload.extend(batch.history().as_bytes());
-                    payload.extend(batch.first_sequence().to_be_bytes());
-                    payload.extend(batch.digest());
-                    payload.extend(batch.data());
-                    write_frame(&mut io, Kind::Batch, &payload, &limits, &mut shutdown).await?;
+                    // The metadata and the raw group go out as one frame,
+                    // the group never copied (it may be gigabytes).
+                    let mut meta = Vec::with_capacity(BATCH_META);
+                    meta.extend(batch.history().as_bytes());
+                    meta.extend(batch.first_sequence().to_be_bytes());
+                    meta.extend(batch.digest());
+                    write_frame_parts(&mut io, Kind::Batch, &meta, batch.data(), &limits, &mut shutdown).await?;
                 }
                 write_frame(&mut io, Kind::PollEnd, &summary_bytes, &limits, &mut shutdown).await?;
                 known_barrier = summary.durable_barrier;
@@ -2957,10 +3066,13 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             {
                 return Err(invalid("invalid physical continuation request"));
             }
+            // MAX_BATCH_BYTES is below u32::MAX by construction (spec P4.1c).
+            let limit_field =
+                u32::try_from(byte_limit).map_err(|_| invalid("invalid physical continuation request"))?;
             let mut request = Vec::with_capacity(28);
             request.extend(info.session_id().as_bytes());
             request.extend(after.to_be_bytes());
-            request.extend((byte_limit as u32).to_be_bytes());
+            request.extend(limit_field.to_be_bytes());
             write_frame(
                 &mut self.io,
                 Kind::PollRequest,
@@ -2982,7 +3094,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             sink.begin(summary).await?;
             let mut cursor = after;
             let mut bytes = 0usize;
-            for _ in 0..summary.batches {
+            for index in 0..summary.batches {
                 let mut frame = read_frame(&mut self.io, &[Kind::Batch], &self.limits, &mut self.shutdown).await?;
                 let history = uuid_at(&frame.payload, 0)?;
                 let first = u64_at(&frame.payload, 16)?;
@@ -2995,7 +3107,11 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
                 bytes = bytes
                     .checked_add(frame.payload.len())
                     .ok_or_else(|| invalid("batch byte overflow"))?;
-                if history != info.history() || cursor.checked_add(1) != Some(first) || bytes > byte_limit {
+                // Spec P4.1c: only the poll's first batch may exceed the limit.
+                if history != info.history()
+                    || cursor.checked_add(1) != Some(first)
+                    || (bytes > byte_limit && index > 0)
+                {
                     return Err(invalid("physical response history/sequence/byte mismatch"));
                 }
                 let batch =
@@ -4227,31 +4343,36 @@ mod tests {
     /// Spec P2.1: an `NPHYS001` receiver is answered with `Refuse { Version }`
     /// (in this protocol's framing) and the source reports the refusal; any
     /// other magic is a protocol error that says what the peer looks like.
+    /// Spec P4.1c: so is an `NPHYS002` receiver, whose batch bounds differ.
     #[tokio::test]
     async fn previous_version_is_refused_by_name_and_other_magic_before_export() {
-        let (_shutdown, mut rx) = watch::channel(false);
-        let (mut io, peer) = duplex(256);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let run = tokio::spawn(server(peer, Arc::new(MockSource::new()), calls.clone(), rx.clone()));
-        let mut old = b"NPHYS001".to_vec();
-        old.extend(1_u16.to_be_bytes());
-        old.extend(1_u16.to_be_bytes()); // NPHYS001 Auth
-        old.extend(32_u32.to_be_bytes());
-        old.extend([7; 32]);
-        io.write_all(&old).await.unwrap();
-        let reply = read_frame(&mut io, &[Kind::Refuse], &limits(), &mut rx).await.unwrap();
-        let refusal = Refusal::decode(&reply.payload).unwrap();
-        assert_eq!(refusal.code, RefuseCode::Version);
-        assert!(
-            refusal.reason.contains("NPHYS001") && refusal.reason.contains("NPHYS002"),
-            "{refusal}"
-        );
-        assert_eq!(refused(&run.await.unwrap()), Some(RefuseCode::Version));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!((PROTOCOL, &MAGIC, VERSION), ("NPHYS003", b"NPHYS003", 3));
+        for (old_magic, old_version) in [(*b"NPHYS001", 1_u16), (*b"NPHYS002", 2)] {
+            let old_name = String::from_utf8_lossy(&old_magic).into_owned();
+            let (_shutdown, mut rx) = watch::channel(false);
+            let (mut io, peer) = duplex(256);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let run = tokio::spawn(server(peer, Arc::new(MockSource::new()), calls.clone(), rx.clone()));
+            let mut old = old_magic.to_vec();
+            old.extend(old_version.to_be_bytes());
+            old.extend(1_u16.to_be_bytes()); // the old version's Auth
+            old.extend(32_u32.to_be_bytes());
+            old.extend([7; 32]);
+            io.write_all(&old).await.unwrap();
+            let reply = read_frame(&mut io, &[Kind::Refuse], &limits(), &mut rx).await.unwrap();
+            let refusal = Refusal::decode(&reply.payload).unwrap();
+            assert_eq!(refusal.code, RefuseCode::Version, "{old_name}");
+            assert!(
+                refusal.reason.contains(&old_name) && refusal.reason.contains("NPHYS003"),
+                "{refusal}"
+            );
+            assert_eq!(refused(&run.await.unwrap()), Some(RefuseCode::Version), "{old_name}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{old_name}");
+        }
 
-        // The same version number under another magic, and a bumped version
-        // under this magic.
-        for (magic, version) in [(*b"NPHYS001", VERSION), (MAGIC, 9)] {
+        // The same version number under another magic, the previous
+        // version, and a bumped version under this magic.
+        for (magic, version) in [(*b"NPHYS001", VERSION), (*b"NPHYS002", 2), (MAGIC, 9)] {
             let mut bytes = magic.to_vec();
             bytes.extend(version.to_be_bytes());
             bytes.extend(1_u16.to_be_bytes());
@@ -4260,7 +4381,7 @@ mod tests {
             header.copy_from_slice(&bytes);
             let error = check_header(&header).unwrap_err();
             assert!(matches!(error, WireError::Version { .. }), "{error}");
-            assert!(error.to_string().contains("NPHYS002"), "{error}");
+            assert!(error.to_string().contains("NPHYS003"), "{error}");
         }
         for (garbage, hint) in [
             (b"HTTP/1.1 400 Bad R".to_vec(), "HTTP"),
@@ -5469,17 +5590,20 @@ mod tests {
 
     /// Spec P4.1b §2.2: a frame whose payload is at most `SMALL_FRAME_BYTES`
     /// reaches the transport in ONE write; a larger one as its header, then
-    /// its payload. The bytes are the same either way (the `NPHYS002` header,
-    /// then the payload) and decode to the same frame.
+    /// its payload — spec P4.1c: in steps of at most `FRAME_IO_STEP`. The
+    /// bytes are the same either way (the header, then the payload), one
+    /// flush ends every frame, and they decode to the same frame.
     #[tokio::test]
-    async fn a_small_frame_is_one_write_and_a_large_one_two() {
+    async fn a_small_frame_is_one_write_and_a_large_one_its_header_then_steps() {
         let (_shutdown, mut rx) = watch::channel(false);
         for (kind, length, writes) in [
             (Kind::Close, 0, 1),
             (Kind::ChunkRequest, 32, 1),
             (Kind::Chunk, SMALL_FRAME_BYTES, 1),
             (Kind::Chunk, SMALL_FRAME_BYTES + 1, 2),
-            (Kind::Chunk, CHUNK_META + MAX_CHUNK_BYTES, 2),
+            (Kind::Chunk, FRAME_IO_STEP, 2),
+            (Kind::Chunk, CHUNK_META + MAX_CHUNK_BYTES, 3),
+            (Kind::Batch, 3 * FRAME_IO_STEP + 5, 5),
         ] {
             let payload: Vec<u8> = (0..=u8::MAX).cycle().take(length).collect();
             let mut recorder = WriteRecorder::default();
@@ -5554,5 +5678,288 @@ mod tests {
         assert!(!client.tls());
         client.close().await.unwrap();
         assert!(run.await.unwrap().unwrap(), "the source's end sets TCP_NODELAY");
+    }
+
+    // --- spec P4.1c: write groups of any size -------------------------------
+
+    /// A frame timeout of 1 s, the spec's idle-timeout fixture.
+    fn idle_limits() -> WireLimits {
+        WireLimits {
+            frame_timeout: Duration::from_secs(1),
+            ..limits()
+        }
+    }
+
+    /// A peer sending one `Batch` frame of `steps` × `FRAME_IO_STEP` payload
+    /// bytes, one step every `every`, and once, before step `at`, pausing
+    /// `stall` longer.
+    fn slow_batch_peer(
+        mut peer: DuplexStream,
+        steps: usize,
+        every: Duration,
+        stall: Option<(usize, Duration)>,
+    ) -> tokio::task::JoinHandle<std::io::Result<()>> {
+        tokio::spawn(async move {
+            peer.write_all(&header(Kind::Batch, u32::try_from(steps * FRAME_IO_STEP).unwrap()))
+                .await?;
+            let step = vec![0x5A_u8; FRAME_IO_STEP];
+            for index in 0..steps {
+                if let Some((at, pause)) = stall {
+                    if index == at {
+                        tokio::time::sleep(pause).await;
+                    }
+                }
+                tokio::time::sleep(every).await;
+                peer.write_all(&step).await?;
+            }
+            peer.flush().await
+        })
+    }
+
+    /// Spec P4.1c §3: a payload is read in steps, each bounded by the frame
+    /// timeout — an idle timeout. A 100 MiB `Batch` frame from a peer that
+    /// writes 1 MiB every 200 ms takes twenty frame timeouts of 1 s in all and
+    /// is read whole. (Paused time: the 20 s pass at once, timers in order.)
+    #[tokio::test(start_paused = true)]
+    async fn a_large_frame_from_a_peer_that_keeps_sending_never_times_out() {
+        let (_shutdown, mut rx) = watch::channel(false);
+        let (mut io, peer) = duplex(256 * 1024);
+        let started = tokio::time::Instant::now();
+        let feeder = slow_batch_peer(peer, 100, Duration::from_millis(200), None);
+        let frame = read_frame(&mut io, &[Kind::Batch], &idle_limits(), &mut rx)
+            .await
+            .unwrap();
+        assert_eq!(frame.kind, Kind::Batch);
+        assert_eq!(frame.payload.len(), 100 * FRAME_IO_STEP);
+        assert_eq!(
+            (frame.payload.first(), frame.payload.last()),
+            (Some(&0x5A), Some(&0x5A))
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(20),
+            "the frame took {:?}, twenty frame timeouts",
+            started.elapsed()
+        );
+        feeder.await.unwrap().unwrap();
+    }
+
+    /// Spec P4.1c §3: a peer that stops mid-payload for 2 s fails the read
+    /// with the timeout (1 s): the step it stalled in ran out.
+    #[tokio::test(start_paused = true)]
+    async fn a_large_frame_from_a_peer_that_stalls_mid_payload_times_out() {
+        let (_shutdown, mut rx) = watch::channel(false);
+        let (mut io, peer) = duplex(256 * 1024);
+        let feeder = slow_batch_peer(peer, 100, Duration::ZERO, Some((50, Duration::from_secs(2))));
+        let outcome = read_frame(&mut io, &[Kind::Batch], &idle_limits(), &mut rx).await;
+        assert!(matches!(outcome, Err(WireError::Timeout)), "{:?}", outcome.err());
+        drop(io);
+        assert!(feeder.await.unwrap().is_err(), "the reader is gone");
+    }
+
+    /// Spec P4.1c: writing is stepped the same way. A 100 MiB `Batch` frame
+    /// to a peer that reads 1 MiB every 200 ms is written whole; to a peer
+    /// that stops reading for 2 s half-way, the write fails with the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_large_frame_is_written_to_a_slow_reader_and_times_out_on_a_stalled_one() {
+        let payload = vec![0x5A_u8; 100 * FRAME_IO_STEP];
+        for stall in [false, true] {
+            let (_shutdown, mut rx) = watch::channel(false);
+            let (mut io, mut peer) = duplex(64 * 1024);
+            let reader = tokio::spawn(async move {
+                let mut header = [0_u8; HEADER_BYTES];
+                peer.read_exact(&mut header).await?;
+                let mut step = vec![0_u8; FRAME_IO_STEP];
+                for index in 0..100 {
+                    let pause = if stall && index == 50 {
+                        Duration::from_secs(2)
+                    } else {
+                        Duration::from_millis(200)
+                    };
+                    tokio::time::sleep(pause).await;
+                    peer.read_exact(&mut step).await?;
+                }
+                Ok::<_, std::io::Error>(())
+            });
+            let outcome = write_frame(&mut io, Kind::Batch, &payload, &idle_limits(), &mut rx).await;
+            if stall {
+                assert!(matches!(outcome, Err(WireError::Timeout)), "{:?}", outcome.err());
+                drop(io);
+                assert!(reader.await.unwrap().is_err(), "the writer is gone");
+            } else {
+                outcome.unwrap();
+                reader.await.unwrap().unwrap();
+            }
+        }
+    }
+
+    /// A write group of one put of `value_bytes`, at source sequence `first`.
+    fn sized_batch(history: Uuid, first: u64, value_bytes: usize) -> PhysicalBatch {
+        let mut native = rocksdb::WriteBatch::default();
+        native.put(format!("k{first}"), vec![7_u8; value_bytes]);
+        let mut raw = native.data().to_vec();
+        raw[..8].copy_from_slice(&first.to_le_bytes());
+        let digest = Sha256::digest(&raw).into();
+        PhysicalBatch::decode(history, first, raw, digest).unwrap()
+    }
+
+    /// [`MockSource`]'s snapshot session (cut 10), whose poll at the cut
+    /// returns `batches`.
+    struct BatchesSource {
+        inner: MockSource,
+        batches: Vec<PhysicalBatch>,
+    }
+    #[async_trait]
+    impl PhysicalSource for BatchesSource {
+        fn session_info(&self) -> &SourceSessionInfo {
+            &self.inner.info
+        }
+        async fn read_chunk(&self, index: u32, offset: u64, length: u32) -> Result<Vec<u8>> {
+            self.inner.read_chunk(index, offset, length).await
+        }
+        async fn poll(&self, after: u64, _limit: usize) -> Result<PhysicalPoll> {
+            let barrier = self.batches.last().map_or(after, PhysicalBatch::last_sequence);
+            Ok(PhysicalPoll {
+                batches: if after == 10 { self.batches.clone() } else { Vec::new() },
+                through: if after == 10 { barrier } else { after },
+                durable_barrier: barrier,
+            })
+        }
+    }
+
+    /// Spec P4.1c §3: a poll's byte limit is a coalescing target on the
+    /// wire. A source serves a first batch above the receiver's limit and
+    /// the receiver applies it; a second batch that takes the poll past the
+    /// limit is refused by the source before anything of the poll is sent.
+    #[tokio::test]
+    async fn a_first_batch_above_the_poll_limit_is_served_and_a_second_crossing_it_is_refused() {
+        const LIMIT: usize = 1024;
+        for crossing in [false, true] {
+            let inner = MockSource::new();
+            let history = inner.manifest.history;
+            let batches = if crossing {
+                vec![sized_batch(history, 11, 64), sized_batch(history, 12, 2 * LIMIT)]
+            } else {
+                vec![sized_batch(history, 11, 2 * LIMIT)]
+            };
+            assert!(batches.last().unwrap().data().len() > LIMIT, "precondition");
+            let source = Arc::new(BatchesSource { inner, batches });
+            let (_shutdown, rx) = watch::channel(false);
+            let (client_io, server_io) = duplex(64 * 1024);
+            let server_rx = rx.clone();
+            let run = tokio::spawn(async move {
+                let context = SourceContext::unobserved(identity(history));
+                serve_session(
+                    server_io,
+                    &token(),
+                    limits(),
+                    server_rx,
+                    &context,
+                    None,
+                    move |_| async move { Ok(source as Arc<dyn PhysicalSource>) },
+                )
+                .await
+            });
+            let mut client = PhysicalClient::authenticate(client_io, &token(), fresh(), limits(), rx)
+                .await
+                .unwrap();
+            client.fetch_manifest(Some(history)).await.unwrap();
+            let mut sink = Sink::default();
+            let outcome = client.poll(10, LIMIT, &mut sink).await;
+            if crossing {
+                assert!(outcome.is_err(), "{crossing}");
+                assert!(sink.received.is_empty(), "nothing of the poll was sent");
+                let served = run.await.unwrap();
+                assert!(
+                    matches!(&served, Err(WireError::Protocol(reason)) if reason.contains("oversized")),
+                    "{:?}",
+                    served.err()
+                );
+            } else {
+                let summary = outcome.unwrap();
+                assert_eq!((summary.through, summary.batches), (11, 1));
+                assert_eq!(sink.received, vec![(history, 11, 11)]);
+                client.close().await.unwrap();
+                run.await.unwrap().unwrap();
+            }
+        }
+    }
+
+    /// Spec P4.1c §3: the receiver checks the same rule on its own. From a
+    /// source that sends a first batch above the limit, it applies it; a
+    /// second batch that takes a poll past the limit is refused before the
+    /// sink sees it, and the session is poisoned.
+    #[tokio::test]
+    async fn a_receiver_accepts_a_first_batch_above_its_limit_and_refuses_a_second_crossing_it() {
+        const LIMIT: usize = 1024;
+        let source = MockSource::new();
+        let history = source.manifest.history;
+        let manifest = serde_json::to_vec(&source.manifest).unwrap();
+        let batches = vec![
+            sized_batch(history, 11, 2 * LIMIT),
+            sized_batch(history, 12, 64),
+            sized_batch(history, 13, 2 * LIMIT),
+        ];
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, mut peer) = duplex(64 * 1024);
+        let mut peer_rx = rx.clone();
+        let run = tokio::spawn(async move {
+            raw_accept(&mut peer, history, &mut peer_rx).await?;
+            read_frame(&mut peer, &[Kind::Open], &limits(), &mut peer_rx).await?;
+            write_frame(&mut peer, Kind::Manifest, &manifest, &limits(), &mut peer_rx).await?;
+            let polls = [
+                (
+                    PollSummary {
+                        through: 11,
+                        durable_barrier: 13,
+                        batches: 1,
+                    },
+                    &batches[..1],
+                ),
+                (
+                    PollSummary {
+                        through: 13,
+                        durable_barrier: 13,
+                        batches: 2,
+                    },
+                    &batches[1..],
+                ),
+            ];
+            for (summary, sent) in polls {
+                read_frame(&mut peer, &[Kind::PollRequest], &limits(), &mut peer_rx).await?;
+                write_frame(&mut peer, Kind::PollStart, &summary.encode(), &limits(), &mut peer_rx).await?;
+                for batch in sent {
+                    let mut payload = batch.history().as_bytes().to_vec();
+                    payload.extend(batch.first_sequence().to_be_bytes());
+                    payload.extend(batch.digest());
+                    payload.extend(batch.data());
+                    write_frame(&mut peer, Kind::Batch, &payload, &limits(), &mut peer_rx).await?;
+                }
+                write_frame(&mut peer, Kind::PollEnd, &summary.encode(), &limits(), &mut peer_rx).await?;
+            }
+            Ok::<_, WireError>(())
+        });
+        let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx)
+            .await
+            .unwrap();
+        client.fetch_manifest(Some(history)).await.unwrap();
+        let mut sink = Sink::default();
+        let first = client.poll(10, LIMIT, &mut sink).await.unwrap();
+        assert_eq!((first.through, first.batches), (11, 1), "a first batch above the limit");
+        assert_eq!(sink.received, vec![(history, 11, 11)]);
+        assert!(matches!(
+            client.poll(11, LIMIT, &mut sink).await,
+            Err(WireError::Protocol(_))
+        ));
+        assert_eq!(
+            sink.received,
+            vec![(history, 11, 11), (history, 12, 12)],
+            "the crossing batch never reached the sink"
+        );
+        assert!(matches!(
+            client.poll(11, LIMIT, &mut sink).await,
+            Err(WireError::Poisoned)
+        ));
+        drop(client);
+        let _ = run.await.unwrap();
     }
 }

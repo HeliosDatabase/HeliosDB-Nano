@@ -23,7 +23,7 @@ struct HAConfig {
     /// resolved (absolute) for a node with an HA role and a data directory.
     archive: heliosdb_nano::config::ArchiveConfig,
     role: String,
-    /// THE replication port (`NPHYS002`): a primary serves its standbys here.
+    /// THE replication port (`NPHYS003`): a primary serves its standbys here.
     replication_port: u16,
     startup_timeout_secs: u64,
     /// A standby's primary: the primary's replication port.
@@ -1283,7 +1283,7 @@ enum Commands {
         #[arg(long)]
         replication_role: Option<String>,
 
-        /// THE replication port (protocol NPHYS002, default: 5433): a primary
+        /// THE replication port (protocol NPHYS003, default: 5433): a primary
         /// serves its physical standbys here — the bootstrap copy, the physical
         /// WAL, heartbeats and acknowledgements on one connection each. It
         /// binds on --listen's address with --replication-tls (or
@@ -2576,7 +2576,7 @@ async fn start_server(
                 replication_remote_allowed(&ha_config),
             );
             println!(
-                "      - Replication listener: {address} (NPHYS002, {})",
+                "      - Replication listener: {address} (NPHYS003, {})",
                 if ha_config.replication_tls.tls_enabled && ha_config.replication_tls.tls_ca_path.is_some() {
                     "TLS, client certificates required"
                 } else if ha_config.replication_tls.tls_enabled {
@@ -2654,7 +2654,7 @@ async fn start_server(
     drop(serving_db_tx);
 
     // Spec P2.1: a primary's replication is its ONE replication port
-    // (`NPHYS002`), bound here before any readiness is published; its directly
+    // (`NPHYS003`), bound here before any readiness is published; its directly
     // owned future is polled alongside PostgreSQL only after startup succeeds.
     // A standby's replication belongs to its `StandbyRuntime` (above).
     #[cfg(feature = "ha-tier1")]
@@ -4028,7 +4028,8 @@ const LEGACY_LOGICAL_STANDBY_REFUSAL: &str = "this directory is a logical standb
 #[cfg(feature = "ha-tier1")]
 const STANDBY_BOOTSTRAP_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 /// A serving standby's receiver cadence: poll interval, reconnect delay, and
-/// the bytes one poll may carry.
+/// the bytes of small write groups one poll gathers (spec P4.1c: a coalescing
+/// target — a larger write group still travels, alone in its poll).
 #[cfg(feature = "ha-tier1")]
 const STANDBY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(feature = "ha-tier1")]
@@ -7160,7 +7161,7 @@ fn physical_wire_limits(
     }
 }
 
-/// Spec P2.1: a primary's ONE replication port (`NPHYS002`), bound, with
+/// Spec P2.1: a primary's ONE replication port (`NPHYS003`), bound, with
 /// everything its sessions share.
 #[cfg(feature = "ha-tier1")]
 struct PreparedPhysicalSource {
@@ -7306,7 +7307,7 @@ async fn prepare_physical_source(
         .await
         .map_err(|e| {
             Error::network(format!(
-                "Cannot bind the replication listener {address} (NPHYS002): {e}. Use distinct PostgreSQL --port \
+                "Cannot bind the replication listener {address} (NPHYS003): {e}. Use distinct PostgreSQL --port \
                  and --replication-port endpoints; a standby's --primary-host names this port."
             ))
         })?;
@@ -7330,7 +7331,7 @@ async fn prepare_physical_source(
         tls: acceptor.is_some(),
     });
     info!(
-        "Replication port listening on {address} (NPHYS002, {}, dataset history {history})",
+        "Replication port listening on {address} (NPHYS003, {}, dataset history {history})",
         match server_tls {
             Some(tls) if tls.mutual() => "TLS, client certificates required",
             Some(_) => "TLS",
@@ -7478,13 +7479,13 @@ async fn prepare_cascade_source(
         .await
         .map_err(|e| {
             Error::network(format!(
-                "Cannot bind the cascading standby's replication listener {address} (NPHYS002): {e}. Use distinct \
+                "Cannot bind the cascading standby's replication listener {address} (NPHYS003): {e}. Use distinct \
                  PostgreSQL --port and --replication-port endpoints; a downstream standby's --primary-host names this \
                  port."
             ))
         })?;
     info!(
-        "Cascading replication port listening on {address} (NPHYS002, {}); downstream standbys are served once this \
+        "Cascading replication port listening on {address} (NPHYS003, {}); downstream standbys are served once this \
          standby's store is attached",
         match server_tls {
             Some(tls) if tls.mutual() => "TLS, client certificates required",
