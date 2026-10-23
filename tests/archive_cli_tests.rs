@@ -27,7 +27,7 @@ mod physical_pair;
 
 use heliosdb_nano::replication::archive_segment::{segment_dir, SegmentInfo, HEADER_LEN};
 use heliosdb_nano::replication::archiver::{SegmentLimits, SegmentWriter};
-use heliosdb_nano::replication::physical::{poll_source, PhysicalBatch, MAX_BATCH_BYTES};
+use heliosdb_nano::replication::physical::{poll_source, FlushMemo, PhysicalBatch, MAX_BATCH_BYTES};
 use physical_pair::*;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -44,7 +44,7 @@ fn groups(root: &Path, name: &str, count: u32) -> (Uuid, Vec<PhysicalBatch>) {
         store.put(format!("data:t:{index:04}"), [7_u8; 48]).unwrap();
     }
     let history = Uuid::new_v4();
-    let polled = poll_source(&store, history, 0, MAX_BATCH_BYTES).unwrap();
+    let polled = poll_source(&store, history, 0, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
     assert_eq!(polled.batches.len(), count as usize);
     (history, polled.batches)
 }

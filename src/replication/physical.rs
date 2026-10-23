@@ -391,6 +391,61 @@ fn refuse_receiver_source(db: &DB) -> Result<()> {
     Ok(())
 }
 
+/// Spec P4.1d: the highest durable barrier one source's polls have fsynced
+/// the WAL for — `0` until its first poll. [`poll_source`] and
+/// [`poll_source_cascade`] fsync only when the barrier they sampled is above
+/// it, so a source polled again and again at an idle barrier (a caught-up
+/// standby every poll interval, the archiver every `poll_ms`) pays one fsync
+/// per barrier instead of one per poll.
+///
+/// Why skipping is safe. A poll samples its barrier — the store's latest
+/// sequence, or a cascading source's cursor — BEFORE it fsyncs, and RocksDB
+/// makes a sequence visible only once its write group is in the WAL, so that
+/// fsync covers every write at or below the barrier. A later poll that samples
+/// a barrier no higher has nothing new to make durable: every write it can
+/// serve or report was covered by the earlier fsync. The engine's own commit
+/// path syncs its writes as `wal_sync_mode` says; the poll's fsync only closes
+/// the window for a write that raced the sample (visible, but not yet fsynced
+/// by its writer), and that window is closed once per barrier.
+///
+/// One memo belongs to one source and one store — the primary's session, a
+/// cascading standby's session, the archiver each own theirs — and is never
+/// shared across stores: another store's barrier says nothing about this
+/// one's WAL.
+#[derive(Debug, Default)]
+pub struct FlushMemo(AtomicU64);
+
+impl FlushMemo {
+    /// A memo that has fsynced nothing yet: the next poll fsyncs.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The highest barrier a poll of this memo fsynced the WAL for: every
+    /// write at or below it was durable when that poll returned.
+    pub fn last_flushed(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
+    /// Whether a poll that sampled `barrier` has anything to make durable:
+    /// only a barrier above [`Self::last_flushed`] does.
+    pub fn needs_flush(&self, barrier: u64) -> bool {
+        barrier > self.last_flushed()
+    }
+
+    /// fsync `db`'s WAL for a poll that sampled `barrier` BEFORE this call,
+    /// unless this memo already covers it. Returns whether it fsynced. A
+    /// failed fsync leaves the memo where it was, so the next poll retries.
+    fn flush(&self, db: &DB, barrier: u64) -> Result<bool> {
+        if !self.needs_flush(barrier) {
+            return Ok(false);
+        }
+        db.flush_wal(true)?;
+        self.0.fetch_max(barrier, Ordering::AcqRel);
+        Ok(true)
+    }
+}
+
 /// Poll committed physical changes. The owner must ensure all source writes
 /// retain the RocksDB WAL; this function detects gaps but cannot manufacture a
 /// retention lease. Only use cursors from a completed checkpoint or full batch.
@@ -401,7 +456,11 @@ fn refuse_receiver_source(db: &DB) -> Result<()> {
 /// the limit would otherwise never be served — and a later one joins it only
 /// while the poll's raw bytes stay within the limit. So a limit of one byte
 /// reads exactly one group.
-pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Result<PhysicalPoll> {
+///
+/// Spec P4.1d: the reported barrier is durable — the WAL is fsynced after it
+/// was sampled, unless `memo` (the caller's, one per source) shows an earlier
+/// poll already fsynced it ([`FlushMemo`]).
+pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize, memo: &FlushMemo) -> Result<PhysicalPoll> {
     check_history(history)?;
     if byte_limit == 0 || byte_limit > MAX_BATCH_BYTES {
         return Err(invalid("invalid poll byte limit"));
@@ -414,8 +473,9 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Res
     if after > barrier {
         return Err(PhysicalError::Ahead { after, barrier });
     }
-    // Sample the barrier first; fsync subsequently covers every sampled write.
-    db.flush_wal(true)?;
+    // Sample the barrier first; fsync subsequently covers every sampled write
+    // (once per barrier: `FlushMemo`).
+    memo.flush(db, barrier)?;
     let mut result = PhysicalPoll {
         batches: Vec::new(),
         through: after,
@@ -790,7 +850,12 @@ fn split_receiver_record(raw: &[u8]) -> Result<ReceiverRecord> {
 /// primary directly from the same cursor.
 ///
 /// The durable barrier is this store's durable cursor (its source sequence),
-/// read before the WAL is fsynced. A record the store holds from before it
+/// read before the WAL is fsynced — this standby's own WAL, which holds the
+/// groups and the cursor puts that account for them, fsynced only when the
+/// barrier is above `memo` (spec P4.1d, [`FlushMemo`]: the same rule as
+/// [`poll_source`]; the cursor is written in the same write group as the data
+/// it accounts for, so a barrier that did not move has no group to make
+/// durable). A record the store holds from before it
 /// became a receiver (its checkpoint's own WAL, at or below the snapshot cut)
 /// carries no cursor and is skipped. A WAL that no longer holds the group
 /// after `after` is [`PhysicalError::Pruned`], as from a primary.
@@ -800,6 +865,7 @@ pub fn poll_source_cascade(
     after: u64,
     byte_limit: usize,
     hint: &mut CascadeHint,
+    memo: &FlushMemo,
 ) -> Result<PhysicalPoll> {
     check_history(history)?;
     if byte_limit == 0 || byte_limit > MAX_BATCH_BYTES {
@@ -815,8 +881,9 @@ pub fn poll_source_cascade(
     if after > barrier {
         return Err(PhysicalError::Ahead { after, barrier });
     }
-    // The cursor was read first; the fsync covers every write it accounts for.
-    db.flush_wal(true)?;
+    // The cursor was read first; the fsync covers every write it accounts for
+    // (once per barrier: `FlushMemo`).
+    memo.flush(db, barrier)?;
     let mut result = PhysicalPoll {
         batches: Vec::new(),
         through: after,
@@ -1949,7 +2016,7 @@ mod tests {
         batch.put(b"b", b"second");
         batch.delete(b"seed");
         source.write(batch).unwrap();
-        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(polled.batches.len(), 1);
         assert_eq!(polled.through, cut + 3);
         assert_eq!(polled.through, polled.durable_barrier);
@@ -2001,7 +2068,7 @@ mod tests {
             batch.put(format!("i{index}"), b"w");
             source.write(batch).unwrap();
         }
-        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(polled.batches.len(), 5);
         assert_eq!(polled.through, polled.durable_barrier);
 
@@ -2256,14 +2323,19 @@ mod tests {
         source.put(b"new", b"v").unwrap();
         let history = Uuid::new_v4();
         assert!(matches!(
-            poll_source(&source, history, 0, MAX_BATCH_BYTES),
+            poll_source(&source, history, 0, MAX_BATCH_BYTES, &FlushMemo::new()),
             Err(PhysicalError::Pruned {
                 wanted: 1,
                 oldest: Some(4)
             })
         ));
         // A receiver at 3 needs only what is still retained.
-        assert_eq!(poll_source(&source, history, 3, MAX_BATCH_BYTES).unwrap().through, 4);
+        assert_eq!(
+            poll_source(&source, history, 3, MAX_BATCH_BYTES, &FlushMemo::new())
+                .unwrap()
+                .through,
+            4
+        );
     }
 
     #[test]
@@ -2277,31 +2349,31 @@ mod tests {
             source.write(batch).unwrap();
         }
         let history = Uuid::new_v4();
-        let first = poll_source(&source, history, 0, 30).unwrap();
+        let first = poll_source(&source, history, 0, 30, &FlushMemo::new()).unwrap();
         assert_eq!(first.batches.len(), 1);
         assert_eq!(first.through, 2);
         assert_eq!(first.durable_barrier, 6);
-        let remaining = poll_source(&source, history, first.through, MAX_BATCH_BYTES).unwrap();
+        let remaining = poll_source(&source, history, first.through, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(remaining.batches.len(), 2);
         assert_eq!(remaining.through, 6);
         assert!(matches!(
-            poll_source(&source, history, 1, MAX_BATCH_BYTES),
+            poll_source(&source, history, 1, MAX_BATCH_BYTES, &FlushMemo::new()),
             Err(PhysicalError::Gap { .. })
         ));
         assert!(matches!(
-            poll_source(&source, history, 7, MAX_BATCH_BYTES),
+            poll_source(&source, history, 7, MAX_BATCH_BYTES, &FlushMemo::new()),
             Err(PhysicalError::Ahead { after: 7, barrier: 6 })
         ));
-        let caught_up = poll_source(&source, history, 6, MAX_BATCH_BYTES).unwrap();
+        let caught_up = poll_source(&source, history, 6, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert!(caught_up.batches.is_empty());
         assert_eq!(caught_up.through, 6);
         // Spec P4.1c: a limit below the first group's size still serves it,
         // alone; a limit of 0 or past MAX_BATCH_BYTES is refused.
-        let one = poll_source(&source, history, 0, 1).unwrap();
+        let one = poll_source(&source, history, 0, 1, &FlushMemo::new()).unwrap();
         assert_eq!(one.batches.len(), 1);
         assert_eq!(one.through, 2);
-        assert!(poll_source(&source, history, 0, 0).is_err());
-        assert!(poll_source(&source, history, 0, MAX_BATCH_BYTES + 1).is_err());
+        assert!(poll_source(&source, history, 0, 0, &FlushMemo::new()).is_err());
+        assert!(poll_source(&source, history, 0, MAX_BATCH_BYTES + 1, &FlushMemo::new()).is_err());
     }
 
     /// A `DB::write` of an empty batch is logged as a WAL record with no
@@ -2342,7 +2414,7 @@ mod tests {
             .count();
         assert!(empty_records >= 2, "RocksDB logged {empty_records} empty write groups");
 
-        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(polled.through, cut + 3);
         assert_eq!(polled.durable_barrier, cut + 3);
         assert_eq!(
@@ -2361,7 +2433,7 @@ mod tests {
             receiver.writer().db().get(b"c").unwrap().as_deref(),
             Some(b"3".as_slice())
         );
-        let caught_up = poll_source(&source, history, cut + 3, MAX_BATCH_BYTES).unwrap();
+        let caught_up = poll_source(&source, history, cut + 3, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert!(caught_up.batches.is_empty());
 
         let error = validate_raw_batch(WriteBatch::default().data())
@@ -2377,13 +2449,13 @@ mod tests {
         let root = TempDir::new().unwrap();
         let history = Uuid::new_v4();
         let receiver = StagedPhysicalReplica::from_checkpoint(open(root.path()), history, 0).unwrap();
-        assert!(poll_source(receiver.writer().db(), history, 0, MAX_BATCH_BYTES).is_err());
+        assert!(poll_source(receiver.writer().db(), history, 0, MAX_BATCH_BYTES, &FlushMemo::new()).is_err());
         receiver.close().unwrap();
         // A read-only handle may open only the default family; the MANIFEST
         // still names the node-local one.
         let partial = DB::open_for_read_only(&Options::default(), root.path(), false).unwrap();
         assert!(partial.cf_handle(LOCAL_CF).is_none());
-        assert!(poll_source(&partial, history, 0, MAX_BATCH_BYTES).is_err());
+        assert!(poll_source(&partial, history, 0, MAX_BATCH_BYTES, &FlushMemo::new()).is_err());
         assert!(StagedPhysicalReplica::resume(partial, history).is_err());
         let db = open_receiver(root.path());
         let local = db.latest_sequence_number();
@@ -2562,7 +2634,7 @@ mod tests {
         batch.delete_range(&b"range-"[..], &b"range."[..]);
         source.write(batch).unwrap();
         source.put(b"c", b"3").unwrap();
-        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(polled.batches.len(), 3);
         let writer = Arc::clone(upstream.writer());
         for (index, batch) in polled.batches.iter().enumerate() {
@@ -2579,10 +2651,11 @@ mod tests {
             "the upstream's own sequence runs ahead of its source sequence"
         );
         // An ordinary source refuses a receiver's store.
-        assert!(poll_source(writer.db(), history, cut, MAX_BATCH_BYTES).is_err());
+        assert!(poll_source(writer.db(), history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).is_err());
 
         let mut hint = CascadeHint::default();
-        let cascaded = poll_source_cascade(writer.db(), history, cut, MAX_BATCH_BYTES, &mut hint).unwrap();
+        let cascaded =
+            poll_source_cascade(writer.db(), history, cut, MAX_BATCH_BYTES, &mut hint, &FlushMemo::new()).unwrap();
         assert_eq!(cascaded.through, polled.through);
         assert_eq!(
             cascaded.durable_barrier, polled.through,
@@ -2597,14 +2670,37 @@ mod tests {
         }
         // A receiver in the middle continues from the hint.
         let middle = polled.batches[0].last_sequence();
-        let rest = poll_source_cascade(writer.db(), history, middle, MAX_BATCH_BYTES, &mut hint).unwrap();
+        let rest = poll_source_cascade(
+            writer.db(),
+            history,
+            middle,
+            MAX_BATCH_BYTES,
+            &mut hint,
+            &FlushMemo::new(),
+        )
+        .unwrap();
         assert_eq!(rest.batches.len(), 2);
         assert_eq!(rest.batches[0].first_sequence(), middle + 1);
         // Caught up, ahead, inside a group, another history.
-        let caught_up = poll_source_cascade(writer.db(), history, polled.through, MAX_BATCH_BYTES, &mut hint).unwrap();
+        let caught_up = poll_source_cascade(
+            writer.db(),
+            history,
+            polled.through,
+            MAX_BATCH_BYTES,
+            &mut hint,
+            &FlushMemo::new(),
+        )
+        .unwrap();
         assert!(caught_up.batches.is_empty());
         assert!(matches!(
-            poll_source_cascade(writer.db(), history, polled.through + 1, MAX_BATCH_BYTES, &mut hint),
+            poll_source_cascade(
+                writer.db(),
+                history,
+                polled.through + 1,
+                MAX_BATCH_BYTES,
+                &mut hint,
+                &FlushMemo::new()
+            ),
             Err(PhysicalError::Ahead { .. })
         ));
         assert!(matches!(
@@ -2613,12 +2709,20 @@ mod tests {
                 history,
                 cut + 1,
                 MAX_BATCH_BYTES,
-                &mut CascadeHint::default()
+                &mut CascadeHint::default(),
+                &FlushMemo::new()
             ),
             Err(PhysicalError::Gap { .. })
         ));
         assert!(matches!(
-            poll_source_cascade(writer.db(), Uuid::new_v4(), cut, MAX_BATCH_BYTES, &mut hint),
+            poll_source_cascade(
+                writer.db(),
+                Uuid::new_v4(),
+                cut,
+                MAX_BATCH_BYTES,
+                &mut hint,
+                &FlushMemo::new()
+            ),
             Err(PhysicalError::HistoryMismatch)
         ));
         // The barrier helper agrees.
@@ -2878,7 +2982,7 @@ mod tests {
         let resumed = StagedPhysicalReplica::resume(open_receiver(&copy_path), history).unwrap();
         assert_eq!(resumed.cursor(), cursor);
         source.put(b"after", b"cut").unwrap();
-        let polled = poll_source(&source, history, target, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&source, history, target, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         for batch in &polled.batches {
             assert!(resumed.apply(batch).unwrap());
         }
@@ -2896,24 +3000,24 @@ mod tests {
 
     const MIB: usize = 1024 * 1024;
     /// A serving standby's poll limit (`STANDBY_POLL_BYTES` in `main.rs`).
-    const STANDBY_POLL: usize = 8 * MIB;
+    const STANDBY_POLL: usize = 32 * MIB;
 
     /// One 100 MiB write group (100 puts of 1 MiB values), then two small ones.
     fn write_large_then_small(source: &DB) {
         let mut large = WriteBatch::default();
         for index in 0..100_u32 {
             large.put(
-                format!("large:{index:03}"),
+                format!("data:large:{index:03}"),
                 vec![u8::try_from(index % 251).unwrap(); MIB],
             );
         }
         source.write(large).unwrap();
-        source.put(b"small:1", b"one").unwrap();
-        source.put(b"small:2", b"two").unwrap();
+        source.put(b"data:small:1", b"one").unwrap();
+        source.put(b"data:small:2", b"two").unwrap();
     }
 
     /// Spec P4.1c §3: the poll byte limit is a coalescing target. A 100 MiB
-    /// write group is served whole and alone by a poll of the standby's 8 MiB
+    /// write group is served whole and alone by a poll of the standby's 32 MiB
     /// limit, `through` at its last sequence; the next poll carries the two
     /// small groups after it together. The group decodes as a transport hands
     /// it over, and a receiver applies it to the source's exact state.
@@ -2926,7 +3030,7 @@ mod tests {
         let (receiver, cut) = receiver_of(&source, &root.path().join("copy"), history);
         write_large_then_small(&source);
 
-        let large = poll_source(&source, history, cut, STANDBY_POLL).unwrap();
+        let large = poll_source(&source, history, cut, STANDBY_POLL, &FlushMemo::new()).unwrap();
         assert_eq!(large.batches.len(), 1, "the large group alone");
         let group = &large.batches[0];
         assert!(group.data().len() > 100 * MIB, "{} bytes", group.data().len());
@@ -2938,7 +3042,7 @@ mod tests {
         assert_eq!(decoded.last_sequence(), cut + 100);
         assert!(receiver.apply(group).unwrap());
 
-        let small = poll_source(&source, history, large.through, STANDBY_POLL).unwrap();
+        let small = poll_source(&source, history, large.through, STANDBY_POLL, &FlushMemo::new()).unwrap();
         assert_eq!(small.batches.len(), 2, "the two small groups together");
         assert_eq!(small.through, cut + 102);
         assert_eq!(small.through, small.durable_barrier);
@@ -2954,7 +3058,7 @@ mod tests {
 
     /// Spec P4.1c §3: the same for a cascading source. A receiver that
     /// applied the 100 MiB group and the two small ones serves the large one
-    /// alone to a poll of 8 MiB — byte for byte the primary's group, digest
+    /// alone to a poll of 32 MiB — byte for byte the primary's group, digest
     /// included — and the two small ones together on the next poll.
     #[test]
     fn a_cascading_source_serves_a_write_group_above_the_poll_limit_alone() {
@@ -2964,7 +3068,7 @@ mod tests {
         let history = Uuid::new_v4();
         let (upstream, cut) = receiver_of(&source, &root.path().join("upstream"), history);
         write_large_then_small(&source);
-        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(polled.batches.len(), 3, "a limit the groups fit: one poll");
         for batch in &polled.batches {
             assert!(upstream.apply(batch).unwrap());
@@ -2972,14 +3076,22 @@ mod tests {
         let writer = Arc::clone(upstream.writer());
 
         let mut hint = CascadeHint::default();
-        let large = poll_source_cascade(writer.db(), history, cut, STANDBY_POLL, &mut hint).unwrap();
+        let large = poll_source_cascade(writer.db(), history, cut, STANDBY_POLL, &mut hint, &FlushMemo::new()).unwrap();
         assert_eq!(large.batches.len(), 1, "the large group alone");
         assert_eq!(large.through, cut + 100);
         assert_eq!(large.durable_barrier, cut + 102);
         assert_eq!(large.batches[0].digest(), polled.batches[0].digest());
         assert_eq!(large.batches[0].data(), polled.batches[0].data());
 
-        let small = poll_source_cascade(writer.db(), history, large.through, STANDBY_POLL, &mut hint).unwrap();
+        let small = poll_source_cascade(
+            writer.db(),
+            history,
+            large.through,
+            STANDBY_POLL,
+            &mut hint,
+            &FlushMemo::new(),
+        )
+        .unwrap();
         assert_eq!(small.batches.len(), 2, "the two small groups together");
         assert_eq!(small.through, cut + 102);
         for (ours, theirs) in small.batches.iter().zip(&polled.batches[1..]) {
@@ -3001,5 +3113,87 @@ mod tests {
         assert_eq!(visited, 2_000_000);
         let decoded = encoded(Uuid::new_v4(), 1, batch);
         assert_eq!(decoded.last_sequence(), 2_000_000);
+    }
+
+    // --- spec P4.1d: the WAL is fsynced once per barrier ---------------------
+
+    /// Spec P4.1d §2.3: a poll fsyncs its source's WAL only when the barrier
+    /// it sampled is above its memo, the last barrier the memo's polls
+    /// fsynced. Two polls at the same barrier fsync once: the first moves the
+    /// memo to the barrier, the second finds the barrier covered and leaves
+    /// the memo where it was; a write moves the barrier and the next poll
+    /// fsyncs again. Read through the memo's value, which only an fsync moves,
+    /// and the decision the polls take (`FlushMemo::flush`), for a primary and
+    /// for a cascading source alike.
+    #[test]
+    fn two_polls_at_the_same_barrier_fsync_the_wal_once() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"seed", b"keep").unwrap();
+        let history = Uuid::new_v4();
+        let (upstream, cut) = receiver_of(&source, &root.path().join("upstream"), history);
+        source.put(b"a", b"1").unwrap();
+
+        let memo = FlushMemo::new();
+        assert_eq!(memo.last_flushed(), 0, "nothing fsynced yet");
+        let barrier = source.latest_sequence_number();
+        assert!(memo.needs_flush(barrier));
+        let first = poll_source(&source, history, cut, MAX_BATCH_BYTES, &memo).unwrap();
+        assert_eq!((first.through, first.durable_barrier), (barrier, barrier));
+        assert_eq!(memo.last_flushed(), barrier, "the first poll fsynced its barrier");
+        assert!(
+            !memo.needs_flush(barrier),
+            "a second poll at the same barrier has nothing to make durable"
+        );
+        let second = poll_source(&source, history, first.through, MAX_BATCH_BYTES, &memo).unwrap();
+        assert!(second.batches.is_empty());
+        assert_eq!(second.durable_barrier, barrier);
+        assert_eq!(memo.last_flushed(), barrier, "the second poll did not move the memo");
+        // The polls' decision: an fsync for a barrier above the memo only.
+        assert!(!memo.flush(&source, barrier).unwrap(), "covered: no fsync");
+        assert!(!memo.flush(&source, barrier - 1).unwrap(), "below: no fsync");
+        assert_eq!(memo.last_flushed(), barrier);
+
+        source.put(b"b", b"2").unwrap();
+        let moved = source.latest_sequence_number();
+        assert!(memo.needs_flush(moved));
+        let third = poll_source(&source, history, second.through, MAX_BATCH_BYTES, &memo).unwrap();
+        assert_eq!((third.through, third.durable_barrier), (moved, moved));
+        assert_eq!(memo.last_flushed(), moved, "a moved barrier is fsynced again");
+        // A memo of its own fsyncs at its first poll, as every poll did before.
+        let fresh = FlushMemo::new();
+        assert!(fresh.flush(&source, moved).unwrap());
+        assert_eq!(fresh.last_flushed(), moved);
+
+        // A cascading source: the same rule over its cursor's source sequence.
+        for batch in &first.batches {
+            assert!(upstream.apply_with(batch, Durability::Deferred).unwrap());
+        }
+        let writer = Arc::clone(upstream.writer());
+        let mut hint = CascadeHint::default();
+        let cascade = FlushMemo::new();
+        let served = poll_source_cascade(writer.db(), history, cut, MAX_BATCH_BYTES, &mut hint, &cascade).unwrap();
+        assert_eq!(served.durable_barrier, barrier);
+        assert_eq!(
+            cascade.last_flushed(),
+            barrier,
+            "the cascading source fsynced its own WAL"
+        );
+        assert!(!cascade.needs_flush(barrier));
+        let idle = poll_source_cascade(
+            writer.db(),
+            history,
+            served.through,
+            MAX_BATCH_BYTES,
+            &mut hint,
+            &cascade,
+        )
+        .unwrap();
+        assert!(idle.batches.is_empty());
+        assert_eq!(
+            cascade.last_flushed(),
+            barrier,
+            "an idle cascaded poll did not move the memo"
+        );
     }
 }

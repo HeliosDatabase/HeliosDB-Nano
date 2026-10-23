@@ -4029,13 +4029,17 @@ const LEGACY_LOGICAL_STANDBY_REFUSAL: &str = "this directory is a logical standb
 const STANDBY_BOOTSTRAP_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 /// A serving standby's receiver cadence: poll interval, reconnect delay, and
 /// the bytes of small write groups one poll gathers (spec P4.1c: a coalescing
-/// target — a larger write group still travels, alone in its poll).
+/// target — a larger write group still travels, alone in its poll). Spec
+/// P4.1d: 32 MiB, the size of one applier run
+/// (`physical_wire::APPLY_CHUNK_BYTES`), so a poll of small groups is one
+/// round trip, one hop to the receiver's worker and one publication; it costs
+/// one poll held twice in memory (its frames, then its decoded run).
 #[cfg(feature = "ha-tier1")]
 const STANDBY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(feature = "ha-tier1")]
 const STANDBY_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(feature = "ha-tier1")]
-const STANDBY_POLL_BYTES: usize = 8 * 1024 * 1024;
+const STANDBY_POLL_BYTES: usize = 32 * 1024 * 1024;
 /// Spec P2.1: how often an idle standby sends its primary a heartbeat. Every
 /// durable advance is acknowledged sooner (`physical_receiver::ACK_COALESCE`).
 #[cfg(feature = "ha-tier1")]

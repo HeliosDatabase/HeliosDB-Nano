@@ -2,10 +2,10 @@
 //! (`tests/support/physical_pair.rs`).
 //!
 //! * one `INSERT INTO t SELECT i, repeat('x', 900) || i FROM
-//!   generate_series(1, 20000) i` — ONE write group of ~80 MiB, ten times a
-//!   serving standby's 8 MiB poll limit — reaches a standby (A) whole: it
-//!   settles at the primary's sequence with the primary's default column
-//!   family, and its `/health` never reports the old refusal ("exceeds poll
+//!   generate_series(1, 20000) i` — ONE write group of ~80 MiB, more than
+//!   twice a serving standby's 32 MiB poll limit — reaches a standby (A)
+//!   whole: it settles at the primary's sequence with the primary's default
+//!   column family, and its `/health` never reports the old refusal ("exceeds poll
 //!   byte limit"); the small writes after it follow;
 //! * the primary's archive seals the group into a segment of its own (one
 //!   write group, larger than `segment_max_bytes`), contiguous with the rest,
@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 /// The statement of the defect: one write group of 20 000 rows of ~900 bytes.
 const BIG_INSERT: &str = "INSERT INTO t SELECT i, repeat('x', 900) || i FROM generate_series(1, 20000) i";
 /// A serving standby's poll limit (`STANDBY_POLL_BYTES` in `main.rs`).
-const STANDBY_POLL_BYTES: u64 = 8 * 1024 * 1024;
+const STANDBY_POLL_BYTES: u64 = 32 * 1024 * 1024;
 /// Small segments, sealed every second: the group is far larger than one.
 const ARCHIVE: &str = "[replication.archive]\nsegment_max_bytes = \"4MiB\"\nsegment_max_secs = 1\n";
 /// What a standby may take to apply the group.

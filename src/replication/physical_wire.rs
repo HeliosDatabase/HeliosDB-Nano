@@ -1406,6 +1406,14 @@ impl PollOrigin {
     }
 }
 
+/// The most raw bytes of write groups [`PhysicalClient::poll`] hands its sink
+/// in one [`BatchSink::apply_many`] (spec P4.1d): a poll's validated batches
+/// travel to the sink together, in order, in runs of at most this many bytes
+/// — one run for a poll of a serving standby's limit, which is the same size.
+/// A single batch larger than this is a run of its own: a write group is
+/// never split (spec P4.1c).
+pub const APPLY_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+
 /// Apply each validated physical batch with its progress (the cursor in the
 /// same write) before returning; a sink may defer the fsync of a poll's
 /// batches to the poll's end, which its owner then performs before it reports
@@ -1421,6 +1429,20 @@ pub trait BatchSink: Send {
         Ok(())
     }
     async fn apply(&mut self, batch: PhysicalBatch) -> Result<()>;
+    /// Spec P4.1d: apply a run of validated, contiguous batches, in order —
+    /// a poll's, or a part of it of at most [`APPLY_CHUNK_BYTES`] (a larger
+    /// batch alone). Every batch of the run was validated before any of it
+    /// is handed over. A sink that applies a run as one unit of work (one
+    /// hop to its owner thread, one publication) overrides this; the default
+    /// applies each batch through [`Self::apply`] in order, so every other
+    /// sink keeps working unchanged. An error leaves the batches before the
+    /// failing one applied, as a failed [`Self::apply`] of a later batch did.
+    async fn apply_many(&mut self, batches: Vec<PhysicalBatch>) -> Result<()> {
+        for batch in batches {
+            self.apply(batch).await?;
+        }
+        Ok(())
+    }
 }
 
 /// What a source tells every receiver it admits (`HelloOk`), and checks a
@@ -3094,6 +3116,13 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             sink.begin(summary).await?;
             let mut cursor = after;
             let mut bytes = 0usize;
+            // Spec P4.1d: the poll's validated batches, handed to the sink
+            // together (`apply_many`) — the whole poll at once, or runs of at
+            // most `APPLY_CHUNK_BYTES` in order — instead of one by one. Each
+            // batch is validated below before it joins a run, so nothing of a
+            // run reaches the sink until all of it is validated.
+            let mut run: Vec<PhysicalBatch> = Vec::new();
+            let mut run_bytes = 0usize;
             for index in 0..summary.batches {
                 let mut frame = read_frame(&mut self.io, &[Kind::Batch], &self.limits, &mut self.shutdown).await?;
                 let history = uuid_at(&frame.payload, 0)?;
@@ -3120,7 +3149,19 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
                     return Err(invalid("batch crosses advertised barrier"));
                 }
                 cursor = batch.last_sequence();
-                bounded(&mut self.shutdown, self.limits.operation_timeout, sink.apply(batch)).await?;
+                let size = batch.data().len();
+                if !run.is_empty() && run_bytes.saturating_add(size) > APPLY_CHUNK_BYTES {
+                    // The run is full: hand it over before this batch joins
+                    // the next one.
+                    let full = std::mem::take(&mut run);
+                    run_bytes = 0;
+                    bounded(&mut self.shutdown, self.limits.operation_timeout, sink.apply_many(full)).await?;
+                }
+                run_bytes = run_bytes.saturating_add(size);
+                run.push(batch);
+            }
+            if !run.is_empty() {
+                bounded(&mut self.shutdown, self.limits.operation_timeout, sink.apply_many(run)).await?;
             }
             let end = read_frame(&mut self.io, &[Kind::PollEnd], &self.limits, &mut self.shutdown).await?;
             if PollSummary::decode(&end.payload)? != summary || cursor != summary.through {
@@ -5887,7 +5928,9 @@ mod tests {
     /// Spec P4.1c §3: the receiver checks the same rule on its own. From a
     /// source that sends a first batch above the limit, it applies it; a
     /// second batch that takes a poll past the limit is refused before the
-    /// sink sees it, and the session is poisoned.
+    /// sink sees it — and (spec P4.1d) so is the valid batch before it in the
+    /// same poll, the poll's batches reaching the sink together — and the
+    /// session is poisoned.
     #[tokio::test]
     async fn a_receiver_accepts_a_first_batch_above_its_limit_and_refuses_a_second_crossing_it() {
         const LIMIT: usize = 1024;
@@ -5950,10 +5993,13 @@ mod tests {
             client.poll(11, LIMIT, &mut sink).await,
             Err(WireError::Protocol(_))
         ));
+        // Spec P4.1d: a poll's batches reach the sink as one run once all of
+        // it validated, so neither the crossing batch nor the valid one before
+        // it in the same poll was handed over.
         assert_eq!(
             sink.received,
-            vec![(history, 11, 11), (history, 12, 12)],
-            "the crossing batch never reached the sink"
+            vec![(history, 11, 11)],
+            "nothing of the refused poll reached the sink"
         );
         assert!(matches!(
             client.poll(11, LIMIT, &mut sink).await,

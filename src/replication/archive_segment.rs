@@ -1170,7 +1170,7 @@ pub fn set_aside_corrupt(path: &Path) -> std::io::Result<PathBuf> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 pub(crate) mod tests {
     use super::*;
-    use crate::replication::physical::poll_source;
+    use crate::replication::physical::{poll_source, FlushMemo};
     use tempfile::TempDir;
 
     /// `count` write groups of a fresh RocksDB store, as the archiver would
@@ -1192,7 +1192,7 @@ pub(crate) mod tests {
             db.write(batch).unwrap();
         }
         let history = Uuid::new_v4();
-        let polled = poll_source(&db, history, 0, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&db, history, 0, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(polled.batches.len(), count);
         (history, polled.batches)
     }

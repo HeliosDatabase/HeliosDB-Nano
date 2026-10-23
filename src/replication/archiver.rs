@@ -20,10 +20,12 @@
 //! recovery window — the store never waits for it. A primary's archiver
 //! re-polls at once only while it is behind (a poll stopped at its byte
 //! limit); a poll that reached the store's barrier waits `poll_ms`, so the WAL
-//! fsync every poll makes (`poll_source` flushes the WAL) runs at most once
-//! per interval on a busy primary. RocksDB's own WAL retention
-//! (`[replication.physical] wal_retention_secs`) covers the archiver's lag. A
-//! standby's applier hands batches over a queue bounded in bytes
+//! fsync a poll makes (`poll_source` flushes the WAL) runs at most once per
+//! interval on a busy primary, and not at all on an idle one: the archiver's
+//! own [`physical::FlushMemo`] (spec P4.1d) skips it while the barrier has not
+//! moved. RocksDB's own WAL retention (`[replication.physical]
+//! wal_retention_secs`) covers the archiver's lag. A standby's applier hands
+//! batches over a queue bounded in bytes
 //! ([`MAX_QUEUED_BYTES`]); when the archiver falls that far behind, batches
 //! are left out of the archive (a gap, WARN) rather than slowing the applier.
 //!
@@ -1167,12 +1169,15 @@ fn run_primary(
         session.settings.dir.display()
     );
     let mut failures = 0_u32;
+    // Spec P4.1d: the archiver's own memo of the barrier its polls fsynced,
+    // so an idle store is fsynced once per barrier, not every `poll_ms`.
+    let flushed = physical::FlushMemo::new();
     while !stop.is_stopped() {
         let now = unix_now();
         let cursor = session.writer.cursor().unwrap_or(start);
         let mut behind = false;
         let mut failed = false;
-        match physical::poll_source(&store, history, cursor, ARCHIVE_POLL_BYTES) {
+        match physical::poll_source(&store, history, cursor, ARCHIVE_POLL_BYTES, &flushed) {
             Ok(polled) => {
                 for batch in &polled.batches {
                     if !session.append(batch, now) {
@@ -1611,18 +1616,19 @@ mod tests {
         options.create_if_missing(true);
         options.set_wal_ttl_seconds(3600);
         let db = DB::open(&options, root.path().join("source")).unwrap();
-        db.put(b"small:1", b"one").unwrap();
+        db.put(b"data:small:1", b"one").unwrap();
         let mut large = WriteBatch::default();
         for index in 0..100_u32 {
             large.put(
-                format!("large:{index:03}"),
+                format!("data:large:{index:03}"),
                 vec![u8::try_from(index % 251).unwrap(); 1 << 20],
             );
         }
         db.write(large).unwrap();
-        db.put(b"small:2", b"two").unwrap();
+        db.put(b"data:small:2", b"two").unwrap();
         let history = Uuid::new_v4();
-        let polled = physical::poll_source(&db, history, 0, physical::MAX_BATCH_BYTES).unwrap();
+        let polled =
+            physical::poll_source(&db, history, 0, physical::MAX_BATCH_BYTES, &physical::FlushMemo::new()).unwrap();
         assert_eq!(polled.batches.len(), 3);
         (history, polled.batches)
     }

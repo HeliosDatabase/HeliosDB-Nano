@@ -522,7 +522,9 @@ mod tests {
     use crate::replication::archive_segment::{segment_dir, OpenSegment, SegmentHeader, HEADER_LEN};
     use crate::replication::checkpoint_transfer::{OnlineCheckpointExport, ReceiverStaging};
     use crate::replication::history::load_or_create_primary_history;
-    use crate::replication::physical::{poll_source, range_digest, PhysicalBatch, PhysicalPoll, MAX_BATCH_BYTES};
+    use crate::replication::physical::{
+        poll_source, range_digest, FlushMemo, PhysicalBatch, PhysicalPoll, MAX_BATCH_BYTES,
+    };
     use crate::EmbeddedDatabase;
     use rocksdb::{Options, DB};
 
@@ -611,7 +613,7 @@ mod tests {
                     .execute(&format!("INSERT INTO t VALUES ({id}, 'row {id}')"))
                     .unwrap();
             }
-            poll_source(&self.raw, self.history, self.cut, MAX_BATCH_BYTES).unwrap()
+            poll_source(&self.raw, self.history, self.cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap()
         }
     }
 

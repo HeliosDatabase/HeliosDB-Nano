@@ -334,6 +334,26 @@ Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.
   rotation command (rotation with standbys attached is unsupported until P5).
 
 ### Fixed — replication
+- **A physical standby paid its whole apply cost once per write group**
+  (spec P4.1d). The primary commits a row's keys as several write groups
+  (about seven per row for an `INSERT … SELECT` of 1 000 rows), and the
+  standby handed every group to its applier thread as a command of its own
+  (a oneshot reply and a wake per group), re-checked its directory on disk,
+  and decoded, pre-read and published the group alone: about 48 µs per group,
+  so a standby followed a bulk load at ~3 MB/s of WAL (~4 MB/s and ~10 000
+  sequences/s even on `/dev/shm`) and finished a 3.5-minute load of 1 M rows
+  31 minutes after it. The primary also fsynced its WAL on every poll, even
+  when nothing had been written since the last one. Now a poll's groups reach
+  the applier as one run (at most 32 MiB, or one larger group): one hop to
+  the applier thread, one directory check, one pre-read and one publication
+  per run, still one RocksDB write per group, so the cursor accounting and the
+  byte identity with the primary are unchanged; a reader still sees only
+  states the primary passed through, and the standby's indexes lag its store
+  by at most one run. A serving standby polls up to 32 MiB at a time (was
+  8 MiB). The primary, a cascading standby and the archiver fsync their WAL
+  for a poll only when its barrier moved since their last one. Streaming
+  rate: MEASURED_AFTER_FIX (before: ~3 MB/s of WAL on disk, ~4 MB/s and
+  ~10 000 sequences/s on `/dev/shm`).
 - **One 20 000-row statement stalled every physical standby and the archive
   for good** (spec P4.1c). A write group larger than the standby's poll limit
   (8 MiB; such a statement of ~900-byte rows is ~80 MiB) was refused as

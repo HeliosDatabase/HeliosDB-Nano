@@ -45,7 +45,7 @@ use heliosdb_nano::replication::checkpoint_transfer::{
     OnlineCheckpointExport, PhysicalStage, ReceiverStaging, TransferLimits,
 };
 use heliosdb_nano::replication::history::load_or_create_primary_history;
-use heliosdb_nano::replication::physical::{poll_source, range_digest, MAX_BATCH_BYTES};
+use heliosdb_nano::replication::physical::{poll_source, range_digest, FlushMemo, MAX_BATCH_BYTES};
 use heliosdb_nano::replication::physical_applier::{
     decode_raw_batch, Applied, NoopDerivedStateListener, PhysicalApplier, RawOp, RANGE_ENUMERATION_CAP,
 };
@@ -191,7 +191,14 @@ impl Pair {
     fn apply_through(&self, through: u64) -> Vec<Applied> {
         let mut applied = Vec::new();
         'poll: while self.cursor() < through {
-            let poll = poll_source(&self.raw, self.history, self.cursor(), MAX_BATCH_BYTES).unwrap();
+            let poll = poll_source(
+                &self.raw,
+                self.history,
+                self.cursor(),
+                MAX_BATCH_BYTES,
+                &FlushMemo::new(),
+            )
+            .unwrap();
             assert!(!poll.batches.is_empty(), "the primary has nothing up to {through}");
             for batch in &poll.batches {
                 assert!(
@@ -219,7 +226,14 @@ impl Pair {
         let mut applied = Vec::new();
         let mut spent = Duration::ZERO;
         loop {
-            let poll = poll_source(&self.raw, self.history, self.cursor(), MAX_BATCH_BYTES).unwrap();
+            let poll = poll_source(
+                &self.raw,
+                self.history,
+                self.cursor(),
+                MAX_BATCH_BYTES,
+                &FlushMemo::new(),
+            )
+            .unwrap();
             if poll.batches.is_empty() {
                 return (applied, spent);
             }
@@ -254,7 +268,7 @@ impl Pair {
         let mut groups = Vec::new();
         let mut after = self.cursor();
         loop {
-            let poll = poll_source(&self.raw, self.history, after, MAX_BATCH_BYTES).unwrap();
+            let poll = poll_source(&self.raw, self.history, after, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
             if poll.batches.is_empty() {
                 return groups;
             }
@@ -512,7 +526,14 @@ fn bypassing_the_applier_leaves_the_derived_state_behind() {
     // What a standby did before P1.1: the bytes, and nothing else.
     let reference = pair.reference_at_head();
     'poll: while pair.cursor() < reference.at {
-        let poll = poll_source(&pair.raw, pair.history, pair.cursor(), MAX_BATCH_BYTES).unwrap();
+        let poll = poll_source(
+            &pair.raw,
+            pair.history,
+            pair.cursor(),
+            MAX_BATCH_BYTES,
+            &FlushMemo::new(),
+        )
+        .unwrap();
         for batch in &poll.batches {
             assert!(pair.applier.writer().apply_source(batch).unwrap());
             if batch.last_sequence() == reference.at {
@@ -602,7 +623,14 @@ fn inserts_updates_and_deletes_single_and_multi_row() {
 
     // An exact retransmission publishes nothing.
     pair.run(&["INSERT INTO items VALUES (8, 'eight', 80)"]);
-    let poll = poll_source(&pair.raw, pair.history, pair.cursor(), MAX_BATCH_BYTES).unwrap();
+    let poll = poll_source(
+        &pair.raw,
+        pair.history,
+        pair.cursor(),
+        MAX_BATCH_BYTES,
+        &FlushMemo::new(),
+    )
+    .unwrap();
     for batch in &poll.batches {
         pair.applier.apply(batch).unwrap();
     }
@@ -1087,7 +1115,14 @@ fn a_deleted_snapshot_record_is_forgotten_in_every_form() {
     let mut unseen = WriteBatch::default();
     unseen.delete(record(timestamps[2]));
     pair.raw.write(unseen).unwrap();
-    let poll = poll_source(&pair.raw, pair.history, pair.cursor(), MAX_BATCH_BYTES).unwrap();
+    let poll = poll_source(
+        &pair.raw,
+        pair.history,
+        pair.cursor(),
+        MAX_BATCH_BYTES,
+        &FlushMemo::new(),
+    )
+    .unwrap();
     for batch in &poll.batches {
         assert!(pair.applier.writer().apply_source(batch).unwrap());
     }

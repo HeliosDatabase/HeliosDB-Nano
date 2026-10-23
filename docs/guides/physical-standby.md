@@ -34,11 +34,17 @@ the archive is spec P3.1
   refused with SQLSTATE `25006`. A write that reached the store some other way
   would poison it, and the standby would stop in `needs_recovery` rather than
   serve a copy that differs from the primary.
-- **Current derived state.** After each applied write group the standby updates
-  its in-memory structures (primary-key and unique indexes, vector indexes, the
-  time-travel snapshot map, schema and plan caches), so `COUNT(*)`, index
-  lookups, kNN searches and `AS OF` queries answer as the primary would at the
-  same sequence.
+- **Current derived state.** The standby's applier takes one run (a poll, at
+  most 32 MiB of write groups, or one larger group) under its lock at a time:
+  it writes each group verbatim, then one publication brings the standby's
+  in-memory structures (primary-key and unique indexes, vector indexes, the
+  time-travel snapshot map, schema and plan caches) to the state after the
+  run's last group, so `COUNT(*)`, index lookups, kNN searches and `AS OF`
+  queries answer as the primary would at that sequence. Between two runs a
+  reader sees exactly a state the primary itself could have crashed into
+  (every applied group is complete); while a run is applied, the in-memory
+  structures lag the store by at most that run, and the queries that would
+  read them read the rows instead.
 - **Its own node state stays separate.** The standby keeps its cursor and
   posture in a node-local column family that is never part of the replicated
   keyspace.
@@ -56,7 +62,7 @@ ships. "P3", "P4" and "P5" are phases of the physical standby plan.
 | SCN | The **physical sequence**: the RocksDB sequence number of the primary's writes. Shown as PostgreSQL LSN text, `HI/LO` hex (`hi = seq >> 32`, `lo = seq & 0xFFFFFFFF`) |
 | Online redo | The RocksDB WAL (`*.log`) |
 | Redo transport | The replication connection (`NPHYS003`) to the primary's `replication_port`, over TLS for a remote standby. The standby pulls write groups |
-| Redo apply (MRP) | The physical applier: each write group is applied verbatim and fsynced, then the standby's in-memory indexes are updated |
+| Redo apply (MRP) | The physical applier: each write group is applied verbatim; a poll's groups (at most 32 MiB, or one larger group) are fsynced once and published together, then the standby's in-memory indexes are updated |
 | Archived redo log | An **archived WAL segment**: `<archive>/<history>/<epoch>/<first>-<last>.hseg`, a sealed, checksummed file of whole write groups (see [Archived WAL and the recovery window](#archived-wal-and-the-recovery-window)). The primary's own RocksDB WAL retention (`[replication.physical] wal_retention_secs`, `wal_retention_size_mb`) only covers the archiver's lag and a reconnecting standby |
 | `LOG_ARCHIVE_DEST_n` | `[replication.archive] dir` (`--archive-dir`, default `<data dir>.archive`). Every primary serving its replication port and every standby archives; `--archive=false` turns it off |
 | RMAN catalog, `V$ARCHIVED_LOG` | The `heliosdb_archived_wal` view (and `heliosdb-nano archive list`): one row per segment file. No catalog database: the files describe themselves |
@@ -1100,12 +1106,14 @@ The test suites are listed in the [HA testing guide](ha_testing.md).
   unit, applied as one batch, never split. So a standby and every archiver
   must hold the largest write group the primary commits in memory, once (a
   single 1 000 000-row statement of ~900-byte rows is ~4 GiB). The poll limit
-  (8 MiB on a serving standby) only decides how many small write groups
-  travel together: a larger one travels alone. The bound is what one frame
-  can say, 4 GiB less 4 KiB of raw write group; a larger one cannot be
-  replicated or archived (the standby and the archiver stop before it,
-  `batch byte limit`), so load bulk data in statements of tens of thousands
-  of rows.
+  (32 MiB on a serving standby) only decides how many small write groups
+  travel together: a larger one travels alone. A serving standby holds one
+  poll twice while it applies it — its frames, then its decoded run — so
+  allow about 64 MiB for it on top of the largest write group. The bound is
+  what one frame can say, 4 GiB less 4 KiB of raw write group; a larger one
+  cannot be replicated or archived (the standby and the archiver stop before
+  it, `batch byte limit`), so load bulk data in statements of tens of
+  thousands of rows.
 - **An incremental rebuild reads everything once.** `recover --from-primary`
   ships only the leaves that differ, but both sides digest their whole
   datasets to find them (no change-tracking map yet), and a change spread

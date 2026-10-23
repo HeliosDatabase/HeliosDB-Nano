@@ -316,10 +316,13 @@ enum Command {
         limits: TransferLimits,
         reply: Reply<()>,
     },
-    /// Apply one source group. A poll's groups are applied
+    /// Apply a run of contiguous source groups, in order: a poll's, or a
+    /// part of it of at most `physical_wire::APPLY_CHUNK_BYTES` (spec
+    /// P4.1d), under one stage check and one position record — one hop to
+    /// this thread per run, not per group. A poll's groups are applied
     /// [`Durability::Deferred`] and made durable by one [`Command::Sync`].
     Apply {
-        batch: PhysicalBatch,
+        batches: Vec<PhysicalBatch>,
         durability: Durability,
         reply: Reply<()>,
     },
@@ -471,8 +474,9 @@ fn worker_loop(
     let mut state = State::Empty;
     // Spec P1.3: a serving receiver applies every batch through the applier
     // `attach` builds over the reopened stage, never through the raw stage, so
-    // the serving engine's derived state follows each batch. Dropped before
-    // the stage closes: the applier shares the stage's writer.
+    // the serving engine's derived state follows each batch (published once
+    // per run of a poll's batches, spec P4.1d). Dropped before the stage
+    // closes: the applier shares the stage's writer.
     let mut applier: Option<Arc<PhysicalApplier>> = None;
     while !cancel.load(Ordering::Acquire) {
         let Some(command) = rx.blocking_recv() else {
@@ -561,32 +565,13 @@ fn worker_loop(
                 let _ = reply.send(result);
             }
             Command::Apply {
-                batch,
+                batches,
                 durability,
                 reply,
             } => {
-                let result = match (&mut state, &applier) {
-                    (State::Reopened(stage), Some(applier)) => {
-                        let before = stage.cursor().source_sequence();
-                        let applied = stage
-                            .verify()
-                            .map_err(storage)
-                            .and_then(|()| applier.apply_with(&batch, durability).map(|_| ()).map_err(storage));
-                        // Spec P3.1: the standby archives what it applied —
-                        // handed over without waiting, after the apply, never
-                        // a retransmission it already held.
-                        if let (Ok(()), Some(feed)) = (&applied, &archive) {
-                            if batch.last_sequence() > before {
-                                feed.offer(&batch, stage.writer().db());
-                            }
-                        }
-                        applied
-                    }
-                    (State::Initial(stage), _) => stage.apply_with(&batch, durability).map(|_| ()).map_err(storage),
-                    (State::Reopened(stage), None) => stage.apply_with(&batch, durability).map(|_| ()).map_err(storage),
-                    _ => Err(storage("physical batch outside live stage state")),
-                };
+                let result = apply_run(&state, applier.as_deref(), archive.as_ref(), &batches, durability);
                 stop = result.is_err();
+                // Once per run (spec P4.1d), as the stage check.
                 record_position(&state, &last);
                 let _ = reply.send(result);
             }
@@ -658,6 +643,64 @@ fn worker_loop(
             tracing::error!(%error,"physical receiver cleanup close failed");
         }
     }
+}
+/// The worker's `Apply` (spec P4.1d): a run of a poll's groups under ONE
+/// stage check (the directory, marker and manifest the stage owns — read from
+/// disk, so once per run rather than once per group). A serving stage applies
+/// the run through its applier, which decodes, pre-reads and publishes it as
+/// one unit and writes it one RocksDB write per group; any other live stage
+/// writes it group by group through its writer, exactly as
+/// `apply_with` per group did.
+///
+/// Spec P3.1: the serving standby archives what it applied — handed over
+/// without waiting, after the apply, one offer per group in order, never a
+/// retransmission it already held. A run that failed part-way offers the
+/// groups it did write (they are in the store, and stay there), so the
+/// archive holds every group the store holds.
+fn apply_run(
+    state: &State,
+    applier: Option<&PhysicalApplier>,
+    archive: Option<&ArchiveFeed>,
+    batches: &[PhysicalBatch],
+    durability: Durability,
+) -> Result<()> {
+    match (state, applier) {
+        (State::Reopened(stage), Some(applier)) => {
+            let before = stage.cursor().source_sequence();
+            let applied = stage
+                .verify()
+                .map_err(storage)
+                .and_then(|()| applier.apply_run(batches, durability).map(|_| ()).map_err(storage));
+            if let Some(feed) = archive {
+                let through = stage.cursor().source_sequence();
+                for batch in batches
+                    .iter()
+                    .filter(|batch| batch.last_sequence() > before && batch.last_sequence() <= through)
+                {
+                    feed.offer(batch, stage.writer().db());
+                }
+            }
+            applied
+        }
+        (State::Initial(stage), _) => {
+            stage.verify().map_err(storage)?;
+            apply_through_writer(stage.writer(), batches, durability)
+        }
+        (State::Reopened(stage), None) => {
+            stage.verify().map_err(storage)?;
+            apply_through_writer(stage.writer(), batches, durability)
+        }
+        _ => Err(storage("physical batch outside live stage state")),
+    }
+}
+/// A non-serving stage's run: each group through the stage's writer, in
+/// order (an exact retransmission is a no-op, anything else out of order is
+/// refused), after the caller's one stage check.
+fn apply_through_writer(writer: &LocalWriter, batches: &[PhysicalBatch], durability: Durability) -> Result<()> {
+    for batch in batches {
+        writer.apply_source_with(batch, durability).map_err(storage)?;
+    }
+    Ok(())
 }
 /// The worker's `Begin` (spec P2.2). A live download of the same snapshot —
 /// a reconnect inside one run — continues as it is; any other start goes
@@ -735,7 +778,10 @@ fn sync_before_close(state: &State) {
 
 /// The sink of one poll: every group is applied [`Durability::Deferred`] and
 /// the poll's caller syncs them once ([`Command::Sync`]) before it reports or
-/// acknowledges the cursor. It reports the source's durable barrier as soon
+/// acknowledges the cursor. Spec P4.1d: the poll's groups reach the worker as
+/// ONE [`Command::Apply`] per run the client hands over (`apply_many`: the
+/// whole poll, or runs of at most `physical_wire::APPLY_CHUNK_BYTES`), not
+/// one command per group. It reports the source's durable barrier as soon
 /// as the poll announces it, so the posture's `primary_cursor` is current
 /// while a long poll is still being applied.
 struct Sink<'a> {
@@ -762,9 +808,12 @@ impl BatchSink for Sink<'_> {
         Ok(())
     }
     async fn apply(&mut self, batch: PhysicalBatch) -> super::physical_wire::Result<()> {
+        self.apply_many(vec![batch]).await
+    }
+    async fn apply_many(&mut self, batches: Vec<PhysicalBatch>) -> super::physical_wire::Result<()> {
         self.worker
             .request(|reply| Command::Apply {
-                batch,
+                batches,
                 durability: Durability::Deferred,
                 reply,
             })
@@ -2290,5 +2339,181 @@ mod tests {
         );
         assert!(!staging.exists(), "the staging directory became the target");
         assert!(!target.join(PHYSICAL_PARTIAL_FILE).exists());
+    }
+
+    // --- spec P4.1d: one command per poll -----------------------------------
+
+    /// Each `Command::Apply` a worker received: its batches as
+    /// `(first sequence, last sequence, raw bytes)`, in order.
+    type Applies = Arc<Mutex<Vec<Vec<(u64, u64, usize)>>>>;
+
+    /// A worker (the harness of
+    /// `dropping_worker_waits_for_owned_inflight_command_instead_of_detaching_it`)
+    /// that records every `Command::Apply` it receives and acknowledges it,
+    /// with no stage behind it: exactly what a receiver's sink hands its
+    /// worker thread, one entry per command. Any other command is dropped
+    /// unanswered.
+    fn recording_worker() -> (Worker, Applies) {
+        let (tx, mut rx) = mpsc::channel(1);
+        let applies: Applies = Arc::new(Mutex::new(Vec::new()));
+        let seen = applies.clone();
+        let thread = thread::spawn(move || {
+            while let Some(command) = rx.blocking_recv() {
+                if let Command::Apply {
+                    batches,
+                    durability,
+                    reply,
+                } = command
+                {
+                    let run = batches
+                        .iter()
+                        .map(|batch| (batch.first_sequence(), batch.last_sequence(), batch.data().len()))
+                        .collect();
+                    seen.lock().unwrap().push(run);
+                    let _ = reply.send(if durability == Durability::Deferred {
+                        Ok(())
+                    } else {
+                        Err(storage("a poll's groups are applied deferred"))
+                    });
+                }
+            }
+        });
+        let worker = Worker {
+            tx: Some(tx),
+            cancel: Arc::new(AtomicBool::new(false)),
+            last: Arc::new(Mutex::new(Position::default())),
+            thread: Some(thread),
+        };
+        (worker, applies)
+    }
+
+    /// One poll of `source`'s groups after `after`, on a resumed session,
+    /// into the receiver's own sink over `worker` — what a serving standby's
+    /// loop does for each poll — with a limit every group fits.
+    async fn poll_into(source: &SourceHarness, history: Uuid, after: u64, worker: &Worker) -> PollSummary {
+        let (_stop, shutdown) = watch::channel(false);
+        let identity = ReceiverIdentity {
+            node_id: Uuid::new_v4(),
+            role: PeerRole::Resync,
+            epoch: 1,
+            pg_port: 0,
+            sync_mode: WireSyncMode::Async,
+        };
+        let mut client = PhysicalClient::connect_resume_replication(
+            source.address,
+            &ReplicationTransport::default(),
+            &fixture_token(),
+            &identity,
+            wire_limits(),
+            shutdown,
+            history,
+            after,
+        )
+        .await
+        .unwrap();
+        // The sink reports progress from the cursor the poll starts at.
+        let cursor = super::super::physical::decode_cursor(
+            serde_json::json!({
+                "format": 1,
+                "history": history,
+                "snapshot_sequence": after,
+                "source_sequence": after,
+                "local_sequence": after + 1,
+                "last_first_sequence": null,
+                "last_digest": null,
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let (progress, _) = status();
+        let path = PathBuf::from("recording-worker");
+        let mut sink = Sink {
+            worker,
+            progress: &progress,
+            path: &path,
+            cursor: &cursor,
+            session: 1,
+            tls: false,
+        };
+        let summary = client.poll(after, MAX_BATCH_BYTES, &mut sink).await.unwrap();
+        client.close().await.unwrap();
+        summary
+    }
+
+    /// The recorded commands, checked contiguous from `after` to `through`.
+    fn contiguous(applies: &[Vec<(u64, u64, usize)>], after: u64, through: u64) {
+        let mut next = after + 1;
+        for run in applies {
+            assert!(!run.is_empty(), "an empty command");
+            for &(first, last, _) in run {
+                assert_eq!(first, next, "the poll's groups in order: {applies:?}");
+                next = last + 1;
+            }
+        }
+        assert_eq!(next - 1, through, "every group of the poll");
+    }
+
+    /// Spec P4.1d §3: a poll of many small write groups reaches the
+    /// receiver's worker as ONE `Command::Apply` carrying all of them, in
+    /// order — one hop to the worker thread per poll, where every group was
+    /// one command (one oneshot reply, one wake) before.
+    #[tokio::test]
+    async fn a_poll_of_small_groups_reaches_the_worker_as_one_apply_command() {
+        let root = tempfile::tempdir().unwrap();
+        let (db, history) = primary(root.path());
+        let after = db.latest_sequence_number();
+        for index in 0..50_u32 {
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.put(format!("k{index}"), b"v");
+            batch.put(format!("i{index}"), b"w");
+            db.write(batch).unwrap();
+        }
+        let source = SourceHarness::start(db.clone(), history, root.path().to_path_buf(), false);
+        let (worker, applies) = recording_worker();
+        let summary = poll_into(&source, history, after, &worker).await;
+        drop(worker); // joins the recording thread
+        assert_eq!(summary.batches, 50);
+        assert_eq!(summary.through, db.latest_sequence_number());
+        let applies = applies.lock().unwrap().clone();
+        assert_eq!(applies.len(), 1, "one command for the whole poll: {applies:?}");
+        assert_eq!(applies[0].len(), 50, "carrying every group of it");
+        contiguous(&applies, after, summary.through);
+    }
+
+    /// Spec P4.1d §3: a poll whose groups exceed `APPLY_CHUNK_BYTES` reaches
+    /// the worker in order, as runs of at most that many raw bytes, each cut
+    /// where the next group would have taken it past the chunk: five groups
+    /// of 9 MiB are two commands, of three groups and two.
+    #[tokio::test]
+    async fn a_poll_above_the_apply_chunk_reaches_the_worker_in_ordered_runs_within_it() {
+        use super::super::physical_wire::APPLY_CHUNK_BYTES;
+        const MIB: usize = 1024 * 1024;
+        let root = tempfile::tempdir().unwrap();
+        let (db, history) = primary(root.path());
+        let after = db.latest_sequence_number();
+        for index in 0..5_u8 {
+            db.put(format!("large{index}"), vec![index; 9 * MIB]).unwrap();
+        }
+        let source = SourceHarness::start(db.clone(), history, root.path().to_path_buf(), false);
+        let (worker, applies) = recording_worker();
+        let summary = poll_into(&source, history, after, &worker).await;
+        drop(worker);
+        assert_eq!(summary.batches, 5, "one poll carries all of them");
+        let applies = applies.lock().unwrap().clone();
+        let runs: Vec<usize> = applies.iter().map(Vec::len).collect();
+        assert_eq!(runs, vec![3, 2], "runs of the poll");
+        contiguous(&applies, after, summary.through);
+        let bytes = |run: &[(u64, u64, usize)]| run.iter().map(|&(_, _, bytes)| bytes).sum::<usize>();
+        for run in &applies {
+            let size = bytes(run.as_slice());
+            assert!(size <= APPLY_CHUNK_BYTES, "a run of {size} bytes");
+        }
+        for pair in applies.windows(2) {
+            assert!(
+                bytes(pair[0].as_slice()) + pair[1][0].2 > APPLY_CHUNK_BYTES,
+                "a run is cut only where the next group would not fit"
+            );
+        }
     }
 }

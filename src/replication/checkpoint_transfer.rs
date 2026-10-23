@@ -1557,6 +1557,14 @@ impl PhysicalStage {
         self.owner.verify()?;
         Ok(self.replica.apply_with(batch, durability)?)
     }
+    /// The checks [`Self::apply`] runs before every batch — the private
+    /// directory and its parent are still this stage's, its marker and saved
+    /// manifest unchanged — for a caller that applies a run of batches
+    /// through the stage's writer under one check (spec P4.1d: the receiver
+    /// worker, once per poll).
+    pub fn verify(&self) -> Result<()> {
+        self.owner.verify()
+    }
     /// Install a closed physical stage, never a ready/serving Nano standby.
     /// Ordinary CLI startup must refuse PHYSICAL_MARKER_FILE until its physical
     /// hydration/serving path is implemented and validated independently.
@@ -1957,7 +1965,8 @@ impl ReopenedPhysicalStage {
     /// The checks [`Self::apply`] runs before every batch — the directory is
     /// still this stage's, carries no primary/standby marker and the same
     /// IDENTITY — for a caller that applies through the stage's writer
-    /// itself (a serving standby's `PhysicalApplier`, spec P1.3).
+    /// itself (a serving standby's `PhysicalApplier`, spec P1.3), or applies
+    /// a run of batches under one check (spec P4.1d: once per poll).
     pub fn verify(&self) -> Result<()> {
         verify_existing_stage(&self.owner)
     }
@@ -1999,7 +2008,7 @@ mod tests {
     use super::*;
     use crate::replication::{
         history::load_or_create_primary_history,
-        physical::{poll_source, MAX_BATCH_BYTES},
+        physical::{poll_source, FlushMemo, MAX_BATCH_BYTES},
     };
     use rocksdb::WriteBatch;
     use std::os::unix::fs::symlink;
@@ -2058,7 +2067,7 @@ mod tests {
         batch.put(b"second", b"committed-two");
         batch.delete(b"seed");
         source.write(batch).unwrap();
-        let poll = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        let poll = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(poll.through, cut + 3);
         let target = root.path().join("installed");
         let receiver = download(&export, &target);
@@ -2284,7 +2293,14 @@ mod tests {
         batch.put(b"after-a", b"a");
         batch.put(b"after-b", b"b");
         source.write(batch).unwrap();
-        let poll = poll_source(&source, history, resumed.cursor().source_sequence(), MAX_BATCH_BYTES).unwrap();
+        let poll = poll_source(
+            &source,
+            history,
+            resumed.cursor().source_sequence(),
+            MAX_BATCH_BYTES,
+            &FlushMemo::new(),
+        )
+        .unwrap();
         assert_eq!(poll.batches.len(), 1);
         assert!(resumed.apply(&poll.batches[0]).unwrap());
         assert!(!resumed.apply(&poll.batches[0]).unwrap());
@@ -2305,7 +2321,7 @@ mod tests {
         assert_eq!(again.cursor(), closed.cursor);
         assert!(!again.apply(&poll.batches[0]).unwrap());
         source.put(b"after-c", b"c").unwrap();
-        let later = poll_source(&source, history, 3, MAX_BATCH_BYTES).unwrap();
+        let later = poll_source(&source, history, 3, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         for batch in &later.batches {
             assert!(again.apply(batch).unwrap());
         }

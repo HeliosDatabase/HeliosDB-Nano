@@ -44,8 +44,8 @@ use super::checkpoint_transfer::{
 use super::fast_forward::{FastForwardPlan, PlanningGuard};
 use super::ha_state::{ha_state, StandbyHandle, StandbyRegistration, StandbyState, SyncMode};
 use super::physical::{
-    poll_source, poll_source_cascade, receiver_source_barrier, wal_retains_after, CascadeHint, PhysicalBatch,
-    PhysicalError, PhysicalPoll,
+    poll_source, poll_source_cascade, receiver_source_barrier, wal_retains_after, CascadeHint, FlushMemo,
+    PhysicalBatch, PhysicalError, PhysicalPoll,
 };
 use super::physical_wire::{
     valid_leaf_bytes, Heartbeat, Hello, LeafDigests, LeafReady, ObservedSession, OpenRequest, PeerRole, PhysicalSource,
@@ -129,7 +129,9 @@ impl SourceKind {
         }
     }
 
-    /// One poll of the source's own WAL.
+    /// One poll of the source's own WAL. `flushed` is the session's memo of
+    /// the barrier its polls fsynced (spec P4.1d): the WAL is fsynced only
+    /// when the barrier moved past it.
     fn poll(
         &self,
         db: &DB,
@@ -137,10 +139,11 @@ impl SourceKind {
         after: u64,
         byte_limit: usize,
         hint: &Mutex<CascadeHint>,
+        flushed: &FlushMemo,
     ) -> std::result::Result<PhysicalPoll, PhysicalError> {
         match self {
-            Self::Primary => poll_source(db, history, after, byte_limit),
-            Self::Cascade { .. } => poll_source_cascade(db, history, after, byte_limit, &mut hint.lock()),
+            Self::Primary => poll_source(db, history, after, byte_limit, flushed),
+            Self::Cascade { .. } => poll_source_cascade(db, history, after, byte_limit, &mut hint.lock(), flushed),
         }
     }
 
@@ -148,7 +151,9 @@ impl SourceKind {
     fn retains_after(&self, db: &DB, history: Uuid, after: u64, hint: &Mutex<CascadeHint>) -> bool {
         match self {
             Self::Primary => wal_retains_after(db, after).unwrap_or(false),
-            Self::Cascade { .. } => self.poll(db, history, after, PROBE_POLL_BYTES, hint).is_ok(),
+            Self::Cascade { .. } => self
+                .poll(db, history, after, PROBE_POLL_BYTES, hint, &FlushMemo::new())
+                .is_ok(),
         }
     }
 
@@ -682,6 +687,10 @@ struct SourceSession {
     fill: Option<ArchiveFill>,
     /// A cascading session's positions in its store's own WAL.
     hint: Arc<Mutex<CascadeHint>>,
+    /// Spec P4.1d: the barrier this session's polls last fsynced the store's
+    /// WAL for. Its own: every session of the source keeps one, so a poll
+    /// at a barrier the session already made durable fsyncs nothing.
+    flushed: Arc<FlushMemo>,
     /// The last poll was served from the archive.
     from_archive: Arc<AtomicBool>,
     /// Spec P4.1: a fast-forward session's leaf plan (its export's).
@@ -987,6 +996,7 @@ async fn open_source_session(
         .run(move || {
             let storage_identity = kind.validate(&db, expected_history)?;
             let hint = Arc::new(Mutex::new(CascadeHint::default()));
+            let flushed = Arc::new(FlushMemo::new());
             // Dropped (checkpoint directories removed) at the end of this
             // blocking job, never under the lease lock.
             let mut released = Vec::new();
@@ -1078,7 +1088,7 @@ async fn open_source_session(
                     // The first bounded poll proves the receiver's cursor is still
                     // served: retained (by the WAL, or by the archive), contiguous,
                     // not ahead of this source. One group proves it.
-                    let attempt = kind.poll(&db, history, after, PROBE_POLL_BYTES, &hint);
+                    let attempt = kind.poll(&db, history, after, PROBE_POLL_BYTES, &hint, &flushed);
                     let (initial, _) =
                         poll_or_fill(attempt, &kind, &db, fill.as_ref(), history, after, PROBE_POLL_BYTES)?;
                     (
@@ -1106,6 +1116,7 @@ async fn open_source_session(
                 kind,
                 fill,
                 hint,
+                flushed,
                 // Nothing served yet: the first poll says where it came from.
                 from_archive: Arc::new(AtomicBool::new(false)),
                 fast_forward,
@@ -1167,6 +1178,7 @@ impl PhysicalSource for SourceSession {
         let kind = self.kind.clone();
         let fill = self.fill.clone();
         let hint = Arc::clone(&self.hint);
+        let flushed = Arc::clone(&self.flushed);
         let from_archive = Arc::clone(&self.from_archive);
         self.work
             .run(move || {
@@ -1175,7 +1187,7 @@ impl PhysicalSource for SourceSession {
                 }
                 // Re-checked at every poll: the WAL first, the archive only
                 // for what the WAL no longer holds.
-                let attempt = kind.poll(&db, history, after, byte_limit, &hint);
+                let attempt = kind.poll(&db, history, after, byte_limit, &hint, &flushed);
                 let (poll, origin) = poll_or_fill(attempt, &kind, &db, fill.as_ref(), history, after, byte_limit)?;
                 if kind.validate(&db, history)? != storage_identity {
                     return Err(source_error("source storage identity changed during poll"));
@@ -1744,7 +1756,7 @@ mod tests {
             for index in 0..6 {
                 db.put(format!("k{index}"), b"v").unwrap();
             }
-            let polled = poll_source(&db, history, 0, MAX_BATCH_BYTES).unwrap();
+            let polled = poll_source(&db, history, 0, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
             assert_eq!(polled.through, 7);
             for range in split {
                 archive_groups(&root.join("archive"), history, &polled.batches[range.clone()]);
