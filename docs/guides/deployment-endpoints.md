@@ -2,7 +2,7 @@
 
 PostgreSQL and replication are different protocols on different ports. A primary
 listens for SQL on `--port` (default 5432) and serves its standbys on ONE
-replication port, `--replication-port` (default 5433, protocol `NPHYS002`): the
+replication port, `--replication-port` (default 5433, protocol `NPHYS003`): the
 bootstrap copy, the physical WAL, heartbeats and acknowledgements all travel over
 one connection per standby. Give the two ports distinct endpoints. A standby's
 `--primary-host` must address the primary's replication port, not its SQL or HTTP
@@ -91,6 +91,15 @@ standby needs a private export directory for the bootstrap copies it serves
 An archive-only standby (`--source archive --archive-source DIR`) opens no
 replication connection: it needs neither `--primary-host` nor, unless it
 cascades, a token.
+
+`heliosdb-nano recover --from-primary` (spec P4.1) opens no endpoint of its
+own: it reaches the primary's — or a cascading standby's — replication port
+like a standby does, with the same `--primary-host`, the same token
+(`--replication-token-file`) and the same TLS rules (`--primary-tls`,
+`--primary-ca`, client certificates; plaintext off loopback only with
+`--allow-insecure-replication-remote`). Its fast-forward leaves and full copy
+travel on that one connection, and the source lists it as `bootstrapping` while
+it runs.
 
 ## One replication secret
 

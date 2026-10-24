@@ -10,17 +10,31 @@
 //! These primitives do not publish changes to a serving `StorageEngine`: its
 //! catalog, indexes and caches require a separate publication protocol, which
 //! `replication::physical_applier` implements on top of [`LocalWriter`].
+//!
+//! Spec P4.1 §4: an incremental fast-forward from the primary
+//! (`recover --from-primary`) replaces key ranges of the default column
+//! family wholesale — range deletions and ingested SST files — whose
+//! sequence cost RocksDB decides. It writes through its own
+//! [`FastForwardWriter`], never through the [`LocalWriter`], and the
+//! durable [`FastForwardRecord`] it keeps in [`LOCAL_CF`] makes every other
+//! open of the directory refuse it ([`PhysicalError::FastForwardInterrupted`])
+//! until the fast-forward has re-cut the stage.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use rocksdb::{ColumnFamily, Direction, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB};
+use rocksdb::{
+    ColumnFamily, Direction, IngestExternalFileOptions, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions,
+    DB,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::storage::StorageEngine;
+use crate::Config;
 
 /// The node-local column family, owned by `storage::keyspace` (the engine
 /// refuses every open mode but the standby's on a directory that holds it).
@@ -36,10 +50,52 @@ pub const CURSOR_KEY: &[u8] = b"cursor";
 /// refused as receiver-local progress, and the engine refuses to open a store
 /// holding it (`storage::engine`).
 const LEGACY_CURSOR_KEY: &[u8] = b"__nano_physical_replica_cursor_v1";
-pub const MAX_BATCH_BYTES: usize = 64 * 1024 * 1024;
-const MAX_BATCH_OPERATIONS: u32 = 1_000_000;
+/// Spec P4.1 §4: the record of a fast-forward in progress, a key INSIDE
+/// [`LOCAL_CF`] like the cursor. While it exists the directory is a mix of
+/// two cuts and nothing but the fast-forward may open it.
+pub const FAST_FORWARD_KEY: &[u8] = b"ff:dirty";
+/// Spec P4.1 §4: one key per leaf the fast-forward in progress has replaced,
+/// `FAST_FORWARD_DONE_PREFIX ‖ leaf (u32, big-endian)` → the cut (u64,
+/// big-endian), in [`LOCAL_CF`]. Written with each batch, so a batch costs a
+/// write of its own leaves only; cleared with the record.
+pub const FAST_FORWARD_DONE_PREFIX: &[u8] = b"ff:done:";
+/// The first key past every [`FAST_FORWARD_DONE_PREFIX`] key.
+const FAST_FORWARD_DONE_END: &[u8] = b"ff:done;";
+/// The record's bound: a few fixed fields.
+const MAX_FAST_FORWARD_RECORD_BYTES: usize = 4096;
+const MAX_FAST_FORWARD_LEAVES: usize = 1 << 24;
+/// Spec P4.1c: the largest raw write group ONE replication `Batch` frame or
+/// ONE archived segment frame can carry. A representability bound, not a
+/// policy: both frames give their length as a `u32`, and the 4096 bytes kept
+/// back hold every prefix a frame adds to the raw group (the `Batch`
+/// metadata, a segment frame's metadata and its AES-GCM sealing), with slack.
+/// A write group is the unit of atomicity and is never split, so this is the
+/// only bound on its size; how many groups travel together is a poll's byte
+/// limit, a coalescing target ([`poll_source`]).
+pub const MAX_BATCH_BYTES: usize = u32::MAX as usize - 4096;
+/// A node-local batch ([`LocalWriter::write_local`]) is never a source
+/// group: it keeps the bound every batch had before spec P4.1c, far below
+/// the count field's width (its cursor put is one more operation).
+const MAX_LOCAL_BATCH_OPERATIONS: usize = 1_000_000;
+/// A receiver's own WAL record as a cascading source reads it: one source
+/// group (at most [`MAX_BATCH_BYTES`]) plus the cursor put its writer adds in
+/// the same write group (a record of a few hundred bytes, [`decode_cursor`]
+/// refuses one over 2 KiB), which the bytes [`MAX_BATCH_BYTES`] keeps back
+/// below `u32::MAX` cover.
+const MAX_RECEIVER_RECORD_BYTES: usize = u32::MAX as usize;
 // RocksDB encodes its sequence into the high 56 bits of an internal key.
 const MAX_SEQUENCE: u64 = (1_u64 << 56) - 1;
+
+/// The operator's remedy for a directory a fast-forward left between two
+/// cuts (spec P4.1 §4): the same command finishes it. `data_dir` and
+/// `primary_host` are the directory and the primary's replication port as
+/// the caller knows them.
+pub fn fast_forward_remedy(from: u64, to: u64, data_dir: &str, primary_host: &str) -> String {
+    format!(
+        "fast-forward from the primary interrupted at sequence {from}→{to}: run `heliosdb-nano recover \
+         --from-primary --data-dir {data_dir} --primary-host {primary_host}` to finish it"
+    )
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PhysicalError {
@@ -62,12 +118,34 @@ pub enum PhysicalError {
     Ahead { after: u64, barrier: u64 },
     #[error("physical replication history mismatch")]
     HistoryMismatch,
+    /// The source's next write group (starting at `first`) is `bytes` raw
+    /// bytes, more than one replication or archive frame can carry
+    /// ([`MAX_BATCH_BYTES`]): it can be neither served nor archived, and no
+    /// retry changes that. Refused before the group is copied; a receiver is
+    /// told so by a typed refusal (it needs recovery past the group), and the
+    /// archiver turns off with the reason.
+    #[error(
+        "write group at sequence {first} is {bytes} bytes, more than the {limit} bytes one replication or archive \
+         frame can carry"
+    )]
+    GroupTooLarge { first: u64, bytes: usize, limit: usize },
     #[error("physical receiver must be reopened after an uncertain storage failure")]
     Poisoned,
     /// The directory cannot be continued in place; only a fresh resync can
     /// rebuild it. Nothing was modified.
     #[error("physical replication requires a full resync: {0}")]
     FullResyncRequired(&'static str),
+    /// Spec P4.1 §4: a fast-forward from the primary (source sequence
+    /// `from` → `to`) stopped before it re-cut the stage: the default column
+    /// family holds ranges of both cuts, so the cursor accounts for nothing.
+    /// Only `recover --from-primary` may open the directory, and finishes it.
+    /// The text is [`fast_forward_remedy`]'s with the directory as `D` and
+    /// the primary as `H`; a caller that knows both names them.
+    #[error(
+        "fast-forward from the primary interrupted at sequence {from}→{to}: run `heliosdb-nano recover \
+         --from-primary --data-dir D --primary-host H` to finish it"
+    )]
+    FastForwardInterrupted { from: u64, to: u64 },
 }
 
 type Result<T> = std::result::Result<T, PhysicalError>;
@@ -201,11 +279,12 @@ pub(crate) fn walk_raw_batch<'a>(raw: &'a [u8], mut visit: impl FnMut(RawOp<'a>)
             "empty batch: a write group with no operations is never a source batch",
         ));
     }
-    if count > MAX_BATCH_OPERATIONS {
-        return Err(invalid("batch operation limit"));
-    }
+    // Spec P4.1c: every count the field can hold (RocksDB's own `u32`
+    // width) is accepted. The walk below proves it against the records,
+    // which the byte bound above bounds.
+    let count_wanted = u64::from(count);
     let mut input = raw.get(12..).ok_or_else(|| invalid("batch header too short"))?;
-    let mut observed = 0_u32;
+    let mut observed = 0_u64;
     while let Some((&tag, rest)) = input.split_first() {
         input = rest;
         match tag {
@@ -242,11 +321,11 @@ pub(crate) fn walk_raw_batch<'a>(raw: &'a [u8], mut visit: impl FnMut(RawOp<'a>)
             }
             _ => return Err(invalid(format!("unsupported RocksDB write opcode {tag}"))),
         }
-        if observed > count {
+        if observed > count_wanted {
             return Err(invalid("batch operation count mismatch"));
         }
     }
-    if observed != count {
+    if observed != count_wanted {
         return Err(invalid("batch operation count mismatch"));
     }
     Ok(count)
@@ -289,8 +368,8 @@ fn take_slice<'a>(input: &mut &'a [u8]) -> Result<&'a [u8]> {
 }
 
 /// A bounded contiguous part of the durable source interval. `through` can be
-/// below `durable_barrier` when the caller's byte cap is reached. No empty result
-/// is returned across a missing interval.
+/// below `durable_barrier` when the caller's byte limit stopped the poll. No
+/// empty result is returned across a missing interval.
 #[derive(Debug)]
 pub struct PhysicalPoll {
     pub batches: Vec<PhysicalBatch>,
@@ -320,10 +399,87 @@ fn refuse_receiver_source(db: &DB) -> Result<()> {
     Ok(())
 }
 
+/// Spec P4.1d: the highest durable barrier one source's polls have fsynced
+/// the WAL for — `0` until its first poll — and how many fsyncs they made. [`poll_source`] and
+/// [`poll_source_cascade`] fsync only when the barrier they sampled is above
+/// it, so a source polled again and again at an idle barrier (a caught-up
+/// standby every poll interval, the archiver every `poll_ms`) pays one fsync
+/// per barrier instead of one per poll.
+///
+/// Why skipping is safe. A poll samples its barrier — the store's latest
+/// sequence, or a cascading source's cursor — BEFORE it fsyncs, and RocksDB
+/// makes a sequence visible only once its write group is in the WAL, so that
+/// fsync covers every write at or below the barrier. A later poll that samples
+/// a barrier no higher has nothing new to make durable: every write it can
+/// serve or report was covered by the earlier fsync. The engine's own commit
+/// path syncs its writes as `wal_sync_mode` says; the poll's fsync only closes
+/// the window for a write that raced the sample (visible, but not yet fsynced
+/// by its writer), and that window is closed once per barrier.
+///
+/// One memo belongs to one source and one store — the primary's session, a
+/// cascading standby's session (its probes and its archive gap fill
+/// included), the archiver each own theirs — and is never shared across
+/// stores: another store's barrier says nothing about this one's WAL.
+#[derive(Debug, Default)]
+pub struct FlushMemo {
+    /// The highest barrier fsynced.
+    barrier: AtomicU64,
+    /// The fsyncs this memo's polls made.
+    fsyncs: AtomicU64,
+}
+
+impl FlushMemo {
+    /// A memo that has fsynced nothing yet: the next poll fsyncs.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The highest barrier a poll of this memo fsynced the WAL for: every
+    /// write at or below it was durable when that poll returned.
+    pub fn last_flushed(&self) -> u64 {
+        self.barrier.load(Ordering::Acquire)
+    }
+
+    /// How many times this memo's polls fsynced the WAL.
+    pub fn fsyncs(&self) -> u64 {
+        self.fsyncs.load(Ordering::Acquire)
+    }
+
+    /// Whether a poll that sampled `barrier` has anything to make durable:
+    /// only a barrier above [`Self::last_flushed`] does.
+    pub fn needs_flush(&self, barrier: u64) -> bool {
+        barrier > self.last_flushed()
+    }
+
+    /// fsync `db`'s WAL for a poll that sampled `barrier` BEFORE this call,
+    /// unless this memo already covers it. Returns whether it fsynced. A
+    /// failed fsync leaves the memo where it was, so the next poll retries.
+    pub(crate) fn flush(&self, db: &DB, barrier: u64) -> Result<bool> {
+        if !self.needs_flush(barrier) {
+            return Ok(false);
+        }
+        db.flush_wal(true)?;
+        self.barrier.fetch_max(barrier, Ordering::AcqRel);
+        self.fsyncs.fetch_add(1, Ordering::AcqRel);
+        Ok(true)
+    }
+}
+
 /// Poll committed physical changes. The owner must ensure all source writes
 /// retain the RocksDB WAL; this function detects gaps but cannot manufacture a
 /// retention lease. Only use cursors from a completed checkpoint or full batch.
-pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Result<PhysicalPoll> {
+///
+/// Spec P4.1c: `byte_limit` (`1..=MAX_BATCH_BYTES`) is a coalescing target,
+/// not a ceiling. The first write group of a poll is returned whatever its
+/// size — a group is the unit of atomicity, never split, and one larger than
+/// the limit would otherwise never be served — and a later one joins it only
+/// while the poll's raw bytes stay within the limit. So a limit of one byte
+/// reads exactly one group.
+///
+/// Spec P4.1d: the reported barrier is durable — the WAL is fsynced after it
+/// was sampled, unless `memo` (the caller's, one per source) shows an earlier
+/// poll already fsynced it ([`FlushMemo`]).
+pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize, memo: &FlushMemo) -> Result<PhysicalPoll> {
     check_history(history)?;
     if byte_limit == 0 || byte_limit > MAX_BATCH_BYTES {
         return Err(invalid("invalid poll byte limit"));
@@ -336,8 +492,9 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Res
     if after > barrier {
         return Err(PhysicalError::Ahead { after, barrier });
     }
-    // Sample the barrier first; fsync subsequently covers every sampled write.
-    db.flush_wal(true)?;
+    // Sample the barrier first; fsync subsequently covers every sampled write
+    // (once per barrier: `FlushMemo`).
+    memo.flush(db, barrier)?;
     let mut result = PhysicalPoll {
         batches: Vec::new(),
         through: after,
@@ -381,11 +538,20 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize) -> Res
                 observed: first,
             });
         }
-        if batch.size_in_bytes() > byte_limit {
-            return Err(invalid("single source batch exceeds poll byte limit"));
-        }
-        if bytes + batch.size_in_bytes() > byte_limit {
+        // The first group travels whatever its size; a later one joins it
+        // only within the limit (spec P4.1c).
+        if !result.batches.is_empty() && bytes.saturating_add(batch.size_in_bytes()) > byte_limit {
             break;
+        }
+        // Past what one frame can carry it can never be served: refused by
+        // name, before it is copied, not as a malformed batch a caller would
+        // retry forever.
+        if batch.size_in_bytes() > MAX_BATCH_BYTES {
+            return Err(PhysicalError::GroupTooLarge {
+                first,
+                bytes: batch.size_in_bytes(),
+                limit: MAX_BATCH_BYTES,
+            });
         }
         let raw = batch.data().to_vec();
         let digest = Sha256::digest(&raw).into();
@@ -585,7 +751,7 @@ struct ReceiverRecord {
 /// third family); a column-family opcode naming the default family, or any
 /// opcode the source walker does not know, is refused.
 fn split_receiver_record(raw: &[u8]) -> Result<ReceiverRecord> {
-    if !(12..=MAX_BATCH_BYTES).contains(&raw.len()) {
+    if !(12..=MAX_RECEIVER_RECORD_BYTES).contains(&raw.len()) {
         return Err(invalid("batch byte limit/header"));
     }
     let count = u32::from_le_bytes(
@@ -713,7 +879,12 @@ fn split_receiver_record(raw: &[u8]) -> Result<ReceiverRecord> {
 /// primary directly from the same cursor.
 ///
 /// The durable barrier is this store's durable cursor (its source sequence),
-/// read before the WAL is fsynced. A record the store holds from before it
+/// read before the WAL is fsynced — this standby's own WAL, which holds the
+/// groups and the cursor puts that account for them, fsynced only when the
+/// barrier is above `memo` (spec P4.1d, [`FlushMemo`]: the same rule as
+/// [`poll_source`]; the cursor is written in the same write group as the data
+/// it accounts for, so a barrier that did not move has no group to make
+/// durable). A record the store holds from before it
 /// became a receiver (its checkpoint's own WAL, at or below the snapshot cut)
 /// carries no cursor and is skipped. A WAL that no longer holds the group
 /// after `after` is [`PhysicalError::Pruned`], as from a primary.
@@ -723,6 +894,7 @@ pub fn poll_source_cascade(
     after: u64,
     byte_limit: usize,
     hint: &mut CascadeHint,
+    memo: &FlushMemo,
 ) -> Result<PhysicalPoll> {
     check_history(history)?;
     if byte_limit == 0 || byte_limit > MAX_BATCH_BYTES {
@@ -738,8 +910,9 @@ pub fn poll_source_cascade(
     if after > barrier {
         return Err(PhysicalError::Ahead { after, barrier });
     }
-    // The cursor was read first; the fsync covers every write it accounts for.
-    db.flush_wal(true)?;
+    // The cursor was read first; the fsync covers every write it accounts for
+    // (once per barrier: `FlushMemo`).
+    memo.flush(db, barrier)?;
     let mut result = PhysicalPoll {
         batches: Vec::new(),
         through: after,
@@ -810,16 +983,23 @@ pub fn poll_source_cascade(
                 observed: first,
             });
         }
-        let mut raw = Vec::with_capacity(12 + record.kept.len());
+        let framed = record.kept.len().saturating_add(12);
+        // As in `poll_source` (spec P4.1c): the first group travels whatever
+        // its size; a later one joins it only within the limit.
+        if !result.batches.is_empty() && bytes.saturating_add(framed) > byte_limit {
+            break;
+        }
+        if framed > MAX_BATCH_BYTES {
+            return Err(PhysicalError::GroupTooLarge {
+                first,
+                bytes: framed,
+                limit: MAX_BATCH_BYTES,
+            });
+        }
+        let mut raw = Vec::with_capacity(framed);
         raw.extend_from_slice(&first.to_le_bytes());
         raw.extend_from_slice(&record.kept_count.to_le_bytes());
         raw.extend_from_slice(&record.kept);
-        if raw.len() > byte_limit {
-            return Err(invalid("single source batch exceeds poll byte limit"));
-        }
-        if bytes + raw.len() > byte_limit {
-            break;
-        }
         let digest = Sha256::digest(&raw).into();
         let batch = PhysicalBatch::decode(history, first, raw, digest)?;
         if batch.last > barrier {
@@ -921,12 +1101,18 @@ impl PhysicalCursor {
         self.local_sequence
     }
 
+    /// The source and local sequences are two counters of two stores: a
+    /// receiver built from a checkpoint starts with the local one ahead,
+    /// but a fast-forwarded one (spec P4.1 §4) takes the primary's position
+    /// with its own counter, which may be behind it. Only the local counter's
+    /// agreement with the store (`latest_sequence_number`) is a safety
+    /// property, and the writers check it.
     fn validate(&self) -> Result<()> {
         check_history(self.history)?;
         if self.format != FORMAT
             || self.snapshot_sequence > self.source_sequence
             || self.source_sequence > MAX_SEQUENCE
-            || self.local_sequence <= self.source_sequence
+            || self.local_sequence == 0
             || self.local_sequence > MAX_SEQUENCE
         {
             return Err(invalid("invalid durable cursor"));
@@ -969,6 +1155,10 @@ fn read_cursor(db: &DB) -> Result<PhysicalCursor> {
             )
         });
     };
+    // Spec P4.1 §4: before the sequence equality, which an interrupted
+    // fast-forward breaks by construction — it would otherwise read as a
+    // store modified outside physical replication.
+    refuse_interrupted_fast_forward(db, local)?;
     let bytes = db
         .get_cf(local, CURSOR_KEY)?
         .ok_or_else(|| invalid("missing physical receiver cursor"))?;
@@ -981,6 +1171,116 @@ fn read_cursor(db: &DB) -> Result<PhysicalCursor> {
         return Err(invalid("receiver was modified outside physical replication"));
     }
     Ok(cursor)
+}
+
+/// [`PhysicalError::FastForwardInterrupted`] when the store carries a
+/// fast-forward record. A record that cannot be decoded still means a
+/// fast-forward was in progress, and is refused too.
+fn refuse_interrupted_fast_forward(db: &DB, local: &ColumnFamily) -> Result<()> {
+    let Some(bytes) = db.get_cf(local, FAST_FORWARD_KEY)? else {
+        return Ok(());
+    };
+    let record = FastForwardRecord::decode(&bytes).map_err(|error| {
+        invalid(format!(
+            "the store carries an unreadable fast-forward record ({error}): a fast-forward from the primary was \
+             interrupted; run `heliosdb-nano recover --from-primary` on it to finish it"
+        ))
+    })?;
+    Err(PhysicalError::FastForwardInterrupted {
+        from: record.from,
+        to: record.to,
+    })
+}
+
+/// The fast-forward record a receiver's store holds, if any (spec P4.1 §4).
+/// `None` for a handle opened without [`LOCAL_CF`].
+pub fn fast_forward_record(db: &DB) -> Result<Option<FastForwardRecord>> {
+    let Some(local) = db.cf_handle(LOCAL_CF) else {
+        return Ok(None);
+    };
+    db.get_cf(local, FAST_FORWARD_KEY)?
+        .map(|bytes| FastForwardRecord::decode(&bytes))
+        .transpose()
+}
+
+/// Spec P4.1 §4: the durable record of an incremental fast-forward in
+/// progress, the value of [`FAST_FORWARD_KEY`] in [`LOCAL_CF`]. It is
+/// written before the first default-column-family write of a fast-forward
+/// and deleted by the write that re-cuts the cursor, so a store carrying it
+/// is never taken for a consistent stage. It holds what the fast-forward is
+/// (its cut and plan) only: the leaves of `snapshot_id`'s plan already
+/// replaced are keys of their own ([`FAST_FORWARD_DONE_PREFIX`],
+/// [`FastForwardWriter::mark_done`]), so a batch never rewrites the record.
+/// A re-run against the same snapshot skips those leaves; a new cut clears
+/// them with the record it writes ([`FastForwardWriter::start_record`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FastForwardRecord {
+    pub format: u32,
+    pub history: Uuid,
+    /// The primary's export the leaves come from.
+    pub snapshot_id: Uuid,
+    /// The source sequence the standby was at (its cursor's, unchanged until
+    /// the re-cut).
+    pub from: u64,
+    /// The cut the standby is fast-forwarded to.
+    pub to: u64,
+    /// The plan's leaf size.
+    pub leaf_bytes: u32,
+}
+
+impl FastForwardRecord {
+    /// A record of a new cut.
+    pub fn new(history: Uuid, snapshot_id: Uuid, from: u64, to: u64, leaf_bytes: u32) -> Self {
+        Self {
+            format: FORMAT,
+            history,
+            snapshot_id,
+            from,
+            to,
+            leaf_bytes,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.format != FORMAT
+            || self.history.is_nil()
+            || self.snapshot_id.is_nil()
+            || self.from >= self.to
+            || self.to > MAX_SEQUENCE
+            || self.leaf_bytes == 0
+        {
+            return Err(invalid("invalid fast-forward record"));
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|error| invalid(error.to_string()))?;
+        if bytes.len() > MAX_FAST_FORWARD_RECORD_BYTES {
+            return Err(invalid("oversized fast-forward record"));
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_FAST_FORWARD_RECORD_BYTES {
+            return Err(invalid("oversized fast-forward record"));
+        }
+        let record: Self = serde_json::from_slice(bytes)
+            .map_err(|error| invalid(format!("malformed fast-forward record: {error}")))?;
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+/// The key that marks `leaf` replaced ([`FAST_FORWARD_DONE_PREFIX`]).
+fn done_key(leaf: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(FAST_FORWARD_DONE_PREFIX.len() + 4);
+    key.extend_from_slice(FAST_FORWARD_DONE_PREFIX);
+    key.extend_from_slice(&leaf.to_be_bytes());
+    key
 }
 
 fn sync_options() -> WriteOptions {
@@ -1084,6 +1384,10 @@ pub struct LocalWriter {
     durable_source: AtomicU64,
     durable_local: AtomicU64,
     poisoned: AtomicBool,
+    /// The WAL fsyncs this writer made: synced writes and [`Self::sync`]s
+    /// that had something to make durable (spec P4.1e: counted, so a test
+    /// can tell one fsync per segment from one per group).
+    fsyncs: AtomicU64,
 }
 
 impl LocalWriter {
@@ -1099,18 +1403,19 @@ impl LocalWriter {
     }
 
     /// [`Self::from_checkpoint`] for a checkpoint whose store's own sequence
-    /// (`store_sequence`, its `latest_sequence_number`) runs ahead of the
+    /// (`store_sequence`, its `latest_sequence_number`) differs from the
     /// source sequence it holds (`source_sequence`, in the primary's
     /// numbering). A checkpoint of a primary has the two equal. A CASCADED
     /// export (spec P3.2 §4) is a physical standby's store: its sequence
-    /// counts that standby's cursor writes too, while its replicated keyspace
-    /// is the primary's at `source_sequence`. The receiver's cursor starts at
-    /// `source_sequence`, so it continues in the primary's numbering — from
-    /// its cascading source, or from the primary itself — and its own
-    /// accounting starts at `store_sequence + 1`.
+    /// counts that standby's own writes, while its replicated keyspace is the
+    /// primary's at `source_sequence` — usually behind the store's counter,
+    /// ahead of it once that standby was fast-forwarded (spec P4.1 §4). The
+    /// receiver's cursor starts at `source_sequence`, so it continues in the
+    /// primary's numbering — from its cascading source, or from the primary
+    /// itself — and its own accounting starts at `store_sequence + 1`.
     pub fn from_checkpoint_at(mut db: DB, history: Uuid, source_sequence: u64, store_sequence: u64) -> Result<Self> {
         check_history(history)?;
-        if source_sequence > store_sequence
+        if source_sequence > MAX_SEQUENCE
             || db.latest_sequence_number() != store_sequence
             || db.cf_handle(LOCAL_CF).is_some()
             || db.get(LEGACY_CURSOR_KEY)?.is_some()
@@ -1153,7 +1458,15 @@ impl LocalWriter {
             durable_local: AtomicU64::new(cursor.local_sequence),
             cursor: Mutex::new(cursor),
             poisoned: AtomicBool::new(false),
+            fsyncs: AtomicU64::new(0),
         }
+    }
+
+    /// The WAL fsyncs this writer made since it was opened: every synced
+    /// write, and every [`Self::sync`] that had deferred writes to make
+    /// durable.
+    pub fn fsyncs(&self) -> u64 {
+        self.fsyncs.load(Ordering::Acquire)
     }
 
     /// Reopen a receiver at its durable cursor without Nano logical recovery
@@ -1217,6 +1530,7 @@ impl LocalWriter {
                 self.poison();
                 return Err(error.into());
             }
+            self.fsyncs.fetch_add(1, Ordering::AcqRel);
             self.mark_durable(&cursor);
         }
         Ok(cursor.source_sequence)
@@ -1264,6 +1578,7 @@ impl LocalWriter {
         }
         if durability == Durability::Synced {
             // The fsync covered every earlier deferred write too.
+            self.fsyncs.fetch_add(1, Ordering::AcqRel);
             self.mark_durable(cursor);
         }
         Ok(())
@@ -1323,7 +1638,7 @@ impl LocalWriter {
         if batch.is_empty() {
             return Ok(());
         }
-        if batch.ops.len() > MAX_BATCH_OPERATIONS as usize {
+        if batch.ops.len() > MAX_LOCAL_BATCH_OPERATIONS {
             return Err(invalid("local batch operation limit"));
         }
         if batch.ops.iter().any(|op| match op {
@@ -1432,8 +1747,283 @@ impl StagedPhysicalReplica {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Incremental fast-forward (spec P4.1 §3.3, §4).
+// ---------------------------------------------------------------------------
+
+/// The writer of an incremental fast-forward from the primary: range
+/// deletions and ingested SST files into the default column family, the
+/// [`FastForwardRecord`], and the re-cut cursor.
+///
+/// It exists beside [`LocalWriter`] because the two account differently.
+/// `LocalWriter` predicts the sequence every write consumes and poisons on
+/// any other outcome; an ingested file consumes zero or one sequence numbers
+/// depending on what it overlaps, so a fast-forward cannot predict its cost.
+/// This writer instead keeps the store refused for every other open while it
+/// works — the record goes in before the first default-family write — and
+/// DERIVES the cursor at the end from the store's observed sequence, in the
+/// one write that also deletes the record ([`Self::recut`]). After that
+/// write `latest_sequence_number == cursor.local_sequence` holds again, and
+/// a `LocalWriter` can adopt the store.
+pub struct FastForwardWriter {
+    db: DB,
+    history: Uuid,
+    /// The cursor as opened, then as re-cut.
+    cursor: Mutex<PhysicalCursor>,
+}
+
+impl FastForwardWriter {
+    /// Open the receiver at `path` exclusively, with the storage options of
+    /// `config` (the receiver's options: no archived WAL). The store must
+    /// hold [`LOCAL_CF`] and a cursor of `history`; the cursor is read
+    /// WITHOUT the sequence equality (an interrupted fast-forward broke it)
+    /// and without the record check — this is the writer that finishes one.
+    pub fn open(path: &Path, config: &Config, history: Uuid) -> Result<Self> {
+        check_history(history)?;
+        if !DB::list_cf(&Options::default(), path)?
+            .iter()
+            .any(|family| family == LOCAL_CF)
+        {
+            return Err(PhysicalError::FullResyncRequired(
+                "the directory has no node-local column family: it predates the node-local namespace or was never \
+                 initialized; rebuild it",
+            ));
+        }
+        let (options, families) = super::checkpoint_transfer::receiver_options(config, path)
+            .map_err(|error| invalid(format!("the receiver's storage options: {error}")))?;
+        let db = DB::open_cf_descriptors(&options, path, families)?;
+        refuse_legacy_cursor(&db)?;
+        let local = local_family(&db)?;
+        let bytes = db
+            .get_cf(local, CURSOR_KEY)?
+            .ok_or_else(|| invalid("missing physical receiver cursor"))?;
+        let cursor = decode_cursor(&bytes)?;
+        if cursor.history != history {
+            return Err(PhysicalError::HistoryMismatch);
+        }
+        Ok(Self {
+            db,
+            history,
+            cursor: Mutex::new(cursor),
+        })
+    }
+
+    pub fn history(&self) -> Uuid {
+        self.history
+    }
+
+    /// The cursor the store was opened at (its source sequence is where the
+    /// fast-forward starts), or the re-cut one after [`Self::recut`].
+    pub fn cursor(&self) -> PhysicalCursor {
+        self.cursor.lock().clone()
+    }
+
+    /// The handle, for the local digest pass. Reads only: every write goes
+    /// through this writer's methods.
+    pub fn db(&self) -> &DB {
+        &self.db
+    }
+
+    fn default_family(&self) -> Result<&ColumnFamily> {
+        self.db
+            .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+            .ok_or_else(|| invalid("the receiver was opened without its default column family handle"))
+    }
+
+    /// Whether the store's sequence is the one the cursor accounts for. It is
+    /// not when a fast-forward was interrupted, or when something wrote the
+    /// store outside its writers: either way the cursor no longer describes
+    /// the default column family, and only a digest pass can tell what does.
+    pub fn accounted(&self) -> bool {
+        self.db.latest_sequence_number() == self.cursor.lock().local_sequence
+    }
+
+    /// The record of the fast-forward in progress, if one is.
+    pub fn record(&self) -> Result<Option<FastForwardRecord>> {
+        fast_forward_record(&self.db)
+    }
+
+    /// Write the record of a NEW cut, synced, before any default-family write
+    /// of it: in the same write group, every leaf an earlier cut marked done
+    /// is forgotten (it was replaced from another snapshot).
+    pub fn start_record(&self, record: &FastForwardRecord) -> Result<()> {
+        if record.history != self.history {
+            return Err(PhysicalError::HistoryMismatch);
+        }
+        let bytes = record.encode()?;
+        let local = local_family(&self.db)?;
+        let mut batch = WriteBatch::default();
+        batch.delete_range_cf(local, FAST_FORWARD_DONE_PREFIX, FAST_FORWARD_DONE_END);
+        batch.put_cf(local, FAST_FORWARD_KEY, bytes);
+        self.db.write_opt(batch, &sync_options())?;
+        Ok(())
+    }
+
+    /// Mark `leaves` replaced at `cut`, synced: one key per leaf, so a batch
+    /// writes its own leaves only, never the whole set.
+    pub fn mark_done(&self, leaves: &[u32], cut: u64) -> Result<()> {
+        if leaves.is_empty() {
+            return Ok(());
+        }
+        let local = local_family(&self.db)?;
+        let mut batch = WriteBatch::default();
+        for &leaf in leaves {
+            if leaf as usize >= MAX_FAST_FORWARD_LEAVES {
+                return Err(invalid(format!(
+                    "leaf {leaf} is past the {MAX_FAST_FORWARD_LEAVES} leaves a fast-forward covers"
+                )));
+            }
+            batch.put_cf(local, done_key(leaf), cut.to_be_bytes());
+        }
+        self.db.write_opt(batch, &sync_options())?;
+        Ok(())
+    }
+
+    /// The leaves marked replaced at `cut` (a key of another cut does not
+    /// count).
+    pub fn done_leaves(&self, cut: u64) -> Result<std::collections::BTreeSet<u32>> {
+        let local = local_family(&self.db)?;
+        let mut read = ReadOptions::default();
+        read.set_total_order_seek(true);
+        read.set_iterate_upper_bound(FAST_FORWARD_DONE_END.to_vec());
+        let mut done = std::collections::BTreeSet::new();
+        let mode = IteratorMode::From(FAST_FORWARD_DONE_PREFIX, Direction::Forward);
+        for item in self.db.iterator_cf_opt(local, read, mode) {
+            let (key, value) = item?;
+            let Some(leaf) = key.strip_prefix(FAST_FORWARD_DONE_PREFIX) else {
+                break;
+            };
+            let leaf: [u8; 4] = leaf
+                .try_into()
+                .map_err(|_| invalid("a malformed fast-forward leaf mark"))?;
+            if value.as_ref() == cut.to_be_bytes().as_slice() {
+                done.insert(u32::from_be_bytes(leaf));
+            }
+        }
+        Ok(done)
+    }
+
+    /// One synced write group of range deletions `[start, end)` over the
+    /// default column family: the leaves of one batch, emptied before their
+    /// primary's files are ingested. The cursor's family is untouched.
+    pub fn delete_ranges(&self, ranges: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let default = self.default_family()?;
+        let mut batch = WriteBatch::default();
+        for (start, end) in ranges {
+            if start >= end {
+                return Err(invalid("an empty or inverted leaf range"));
+            }
+            batch.delete_range_cf(default, start, end);
+        }
+        self.db.write_opt(batch, &sync_options())?;
+        Ok(())
+    }
+
+    /// Ingest the primary's leaf files into the default column family. They
+    /// are COPIED (never moved or hard-linked), so the stage directory never
+    /// shares a file with them and a crash leaves no link behind; a memtable
+    /// overlapping them is flushed first, and they take a sequence above the
+    /// range deletions that emptied their leaves.
+    pub fn ingest(&self, files: &[PathBuf]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let mut options = IngestExternalFileOptions::default();
+        options.set_move_files(false);
+        options.set_snapshot_consistency(true);
+        options.set_allow_global_seqno(true);
+        options.set_allow_blocking_flush(true);
+        let default = self.default_family()?;
+        self.db
+            .ingest_external_file_cf_opts(default, &options, files.to_vec())?;
+        Ok(())
+    }
+
+    /// Make everything written so far durable in tables: the WAL fsynced and
+    /// both families flushed (step (i) of the re-cut).
+    pub fn flush(&self) -> Result<()> {
+        self.db.flush_wal(true)?;
+        self.db.flush_cf(self.default_family()?)?;
+        self.db.flush_cf(local_family(&self.db)?)?;
+        Ok(())
+    }
+
+    /// Close the store as it is, the record still in it (it stays refused by
+    /// every other open). Closing waits for RocksDB's background work, so the
+    /// directory holds still afterwards: the re-cut takes its census of a
+    /// closed store, then reopens it for the final write.
+    pub fn release(self) {
+        drop(self.db);
+    }
+
+    /// Re-cut the stage at the primary's `sequence` (spec P4.1 §3.3.5 (iv)):
+    /// ONE synced write that puts the cursor `{snapshot: sequence, source:
+    /// sequence, local: the store's sequence after this very write}` and
+    /// deletes the record and every leaf mark. The cursor is derived from the
+    /// observed sequence, never predicted beyond this write's own operations,
+    /// and checked after it.
+    pub fn recut(&self, sequence: u64, snapshot_id: Uuid) -> Result<PhysicalCursor> {
+        // The cursor put, the record delete and the marks' range deletion.
+        const RECUT_OPERATIONS: u64 = 3;
+        if snapshot_id.is_nil() {
+            return Err(invalid("a re-cut names the primary's snapshot"));
+        }
+        let mut current = self.cursor.lock();
+        let local = local_family(&self.db)?;
+        let latest = self.db.latest_sequence_number();
+        check_local_advance(latest, RECUT_OPERATIONS)?;
+        let cursor = PhysicalCursor {
+            format: FORMAT,
+            history: self.history,
+            snapshot_sequence: sequence,
+            source_sequence: sequence,
+            local_sequence: latest + RECUT_OPERATIONS,
+            last_first_sequence: None,
+            last_digest: None,
+        };
+        cursor.validate()?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(local, CURSOR_KEY, encode_cursor(&cursor)?);
+        batch.delete_cf(local, FAST_FORWARD_KEY);
+        batch.delete_range_cf(local, FAST_FORWARD_DONE_PREFIX, FAST_FORWARD_DONE_END);
+        if batch.len() as u64 != RECUT_OPERATIONS {
+            return Err(invalid("the re-cut write does not hold the operations it accounts for"));
+        }
+        self.db.write_opt(batch, &sync_options())?;
+        if self.db.latest_sequence_number() != cursor.local_sequence {
+            return Err(invalid(
+                "the store's sequence moved by more than the re-cut write: it was written outside the fast-forward",
+            ));
+        }
+        *current = cursor.clone();
+        Ok(cursor)
+    }
+
+    /// Flush both families — so the WAL that carried the fast-forward's own
+    /// records (range deletions and record writes, none of them a cursor
+    /// write) becomes obsolete and RocksDB removes it, and a cascading source
+    /// built on this store never reads it — then prove the store is the
+    /// consistent stage a `LocalWriter` adopts (no record, the cursor equal
+    /// to the one in memory, the sequence accounted), and close it.
+    pub fn close(self) -> Result<PhysicalCursor> {
+        self.db.flush_cf(local_family(&self.db)?)?;
+        self.db.flush_cf(self.default_family()?)?;
+        self.db.flush_wal(true)?;
+        let cursor = self.cursor.into_inner();
+        let durable = read_cursor(&self.db)?;
+        if durable != cursor {
+            return Err(invalid("durable receiver cursor changed unexpectedly"));
+        }
+        drop(self.db);
+        Ok(cursor)
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
     use rocksdb::checkpoint::Checkpoint;
@@ -1476,7 +2066,7 @@ mod tests {
         batch.put(b"b", b"second");
         batch.delete(b"seed");
         source.write(batch).unwrap();
-        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(polled.batches.len(), 1);
         assert_eq!(polled.through, cut + 3);
         assert_eq!(polled.through, polled.durable_barrier);
@@ -1528,7 +2118,7 @@ mod tests {
             batch.put(format!("i{index}"), b"w");
             source.write(batch).unwrap();
         }
-        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(polled.batches.len(), 5);
         assert_eq!(polled.through, polled.durable_barrier);
 
@@ -1783,14 +2373,19 @@ mod tests {
         source.put(b"new", b"v").unwrap();
         let history = Uuid::new_v4();
         assert!(matches!(
-            poll_source(&source, history, 0, MAX_BATCH_BYTES),
+            poll_source(&source, history, 0, MAX_BATCH_BYTES, &FlushMemo::new()),
             Err(PhysicalError::Pruned {
                 wanted: 1,
                 oldest: Some(4)
             })
         ));
         // A receiver at 3 needs only what is still retained.
-        assert_eq!(poll_source(&source, history, 3, MAX_BATCH_BYTES).unwrap().through, 4);
+        assert_eq!(
+            poll_source(&source, history, 3, MAX_BATCH_BYTES, &FlushMemo::new())
+                .unwrap()
+                .through,
+            4
+        );
     }
 
     #[test]
@@ -1804,25 +2399,31 @@ mod tests {
             source.write(batch).unwrap();
         }
         let history = Uuid::new_v4();
-        let first = poll_source(&source, history, 0, 30).unwrap();
+        let first = poll_source(&source, history, 0, 30, &FlushMemo::new()).unwrap();
         assert_eq!(first.batches.len(), 1);
         assert_eq!(first.through, 2);
         assert_eq!(first.durable_barrier, 6);
-        let remaining = poll_source(&source, history, first.through, MAX_BATCH_BYTES).unwrap();
+        let remaining = poll_source(&source, history, first.through, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(remaining.batches.len(), 2);
         assert_eq!(remaining.through, 6);
         assert!(matches!(
-            poll_source(&source, history, 1, MAX_BATCH_BYTES),
+            poll_source(&source, history, 1, MAX_BATCH_BYTES, &FlushMemo::new()),
             Err(PhysicalError::Gap { .. })
         ));
         assert!(matches!(
-            poll_source(&source, history, 7, MAX_BATCH_BYTES),
+            poll_source(&source, history, 7, MAX_BATCH_BYTES, &FlushMemo::new()),
             Err(PhysicalError::Ahead { after: 7, barrier: 6 })
         ));
-        let caught_up = poll_source(&source, history, 6, MAX_BATCH_BYTES).unwrap();
+        let caught_up = poll_source(&source, history, 6, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert!(caught_up.batches.is_empty());
         assert_eq!(caught_up.through, 6);
-        assert!(poll_source(&source, history, 0, 1).is_err());
+        // Spec P4.1c: a limit below the first group's size still serves it,
+        // alone; a limit of 0 or past MAX_BATCH_BYTES is refused.
+        let one = poll_source(&source, history, 0, 1, &FlushMemo::new()).unwrap();
+        assert_eq!(one.batches.len(), 1);
+        assert_eq!(one.through, 2);
+        assert!(poll_source(&source, history, 0, 0, &FlushMemo::new()).is_err());
+        assert!(poll_source(&source, history, 0, MAX_BATCH_BYTES + 1, &FlushMemo::new()).is_err());
     }
 
     /// A `DB::write` of an empty batch is logged as a WAL record with no
@@ -1863,7 +2464,7 @@ mod tests {
             .count();
         assert!(empty_records >= 2, "RocksDB logged {empty_records} empty write groups");
 
-        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(polled.through, cut + 3);
         assert_eq!(polled.durable_barrier, cut + 3);
         assert_eq!(
@@ -1882,7 +2483,7 @@ mod tests {
             receiver.writer().db().get(b"c").unwrap().as_deref(),
             Some(b"3".as_slice())
         );
-        let caught_up = poll_source(&source, history, cut + 3, MAX_BATCH_BYTES).unwrap();
+        let caught_up = poll_source(&source, history, cut + 3, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert!(caught_up.batches.is_empty());
 
         let error = validate_raw_batch(WriteBatch::default().data())
@@ -1898,13 +2499,13 @@ mod tests {
         let root = TempDir::new().unwrap();
         let history = Uuid::new_v4();
         let receiver = StagedPhysicalReplica::from_checkpoint(open(root.path()), history, 0).unwrap();
-        assert!(poll_source(receiver.writer().db(), history, 0, MAX_BATCH_BYTES).is_err());
+        assert!(poll_source(receiver.writer().db(), history, 0, MAX_BATCH_BYTES, &FlushMemo::new()).is_err());
         receiver.close().unwrap();
         // A read-only handle may open only the default family; the MANIFEST
         // still names the node-local one.
         let partial = DB::open_for_read_only(&Options::default(), root.path(), false).unwrap();
         assert!(partial.cf_handle(LOCAL_CF).is_none());
-        assert!(poll_source(&partial, history, 0, MAX_BATCH_BYTES).is_err());
+        assert!(poll_source(&partial, history, 0, MAX_BATCH_BYTES, &FlushMemo::new()).is_err());
         assert!(StagedPhysicalReplica::resume(partial, history).is_err());
         let db = open_receiver(root.path());
         let local = db.latest_sequence_number();
@@ -2083,7 +2684,7 @@ mod tests {
         batch.delete_range(&b"range-"[..], &b"range."[..]);
         source.write(batch).unwrap();
         source.put(b"c", b"3").unwrap();
-        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(polled.batches.len(), 3);
         let writer = Arc::clone(upstream.writer());
         for (index, batch) in polled.batches.iter().enumerate() {
@@ -2100,10 +2701,11 @@ mod tests {
             "the upstream's own sequence runs ahead of its source sequence"
         );
         // An ordinary source refuses a receiver's store.
-        assert!(poll_source(writer.db(), history, cut, MAX_BATCH_BYTES).is_err());
+        assert!(poll_source(writer.db(), history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).is_err());
 
         let mut hint = CascadeHint::default();
-        let cascaded = poll_source_cascade(writer.db(), history, cut, MAX_BATCH_BYTES, &mut hint).unwrap();
+        let cascaded =
+            poll_source_cascade(writer.db(), history, cut, MAX_BATCH_BYTES, &mut hint, &FlushMemo::new()).unwrap();
         assert_eq!(cascaded.through, polled.through);
         assert_eq!(
             cascaded.durable_barrier, polled.through,
@@ -2118,14 +2720,37 @@ mod tests {
         }
         // A receiver in the middle continues from the hint.
         let middle = polled.batches[0].last_sequence();
-        let rest = poll_source_cascade(writer.db(), history, middle, MAX_BATCH_BYTES, &mut hint).unwrap();
+        let rest = poll_source_cascade(
+            writer.db(),
+            history,
+            middle,
+            MAX_BATCH_BYTES,
+            &mut hint,
+            &FlushMemo::new(),
+        )
+        .unwrap();
         assert_eq!(rest.batches.len(), 2);
         assert_eq!(rest.batches[0].first_sequence(), middle + 1);
         // Caught up, ahead, inside a group, another history.
-        let caught_up = poll_source_cascade(writer.db(), history, polled.through, MAX_BATCH_BYTES, &mut hint).unwrap();
+        let caught_up = poll_source_cascade(
+            writer.db(),
+            history,
+            polled.through,
+            MAX_BATCH_BYTES,
+            &mut hint,
+            &FlushMemo::new(),
+        )
+        .unwrap();
         assert!(caught_up.batches.is_empty());
         assert!(matches!(
-            poll_source_cascade(writer.db(), history, polled.through + 1, MAX_BATCH_BYTES, &mut hint),
+            poll_source_cascade(
+                writer.db(),
+                history,
+                polled.through + 1,
+                MAX_BATCH_BYTES,
+                &mut hint,
+                &FlushMemo::new()
+            ),
             Err(PhysicalError::Ahead { .. })
         ));
         assert!(matches!(
@@ -2134,12 +2759,20 @@ mod tests {
                 history,
                 cut + 1,
                 MAX_BATCH_BYTES,
-                &mut CascadeHint::default()
+                &mut CascadeHint::default(),
+                &FlushMemo::new()
             ),
             Err(PhysicalError::Gap { .. })
         ));
         assert!(matches!(
-            poll_source_cascade(writer.db(), Uuid::new_v4(), cut, MAX_BATCH_BYTES, &mut hint),
+            poll_source_cascade(
+                writer.db(),
+                Uuid::new_v4(),
+                cut,
+                MAX_BATCH_BYTES,
+                &mut hint,
+                &FlushMemo::new()
+            ),
             Err(PhysicalError::HistoryMismatch)
         ));
         // The barrier helper agrees.
@@ -2162,9 +2795,11 @@ mod tests {
         );
     }
 
-    /// Spec P3.2 §4: a cascaded checkpoint's store sequence runs ahead of the
+    /// Spec P3.2 §4: a cascaded checkpoint's store sequence differs from the
     /// source sequence it holds; its receiver starts at the source sequence
-    /// and accounts from the store's.
+    /// and accounts from the store's. Spec P4.1 §4: a fast-forwarded
+    /// cascading source's store runs BEHIND the source sequence it holds,
+    /// and its checkpoint is served the same way.
     #[test]
     fn a_receiver_from_a_cascaded_checkpoint_starts_at_the_source_sequence() {
         let root = TempDir::new().unwrap();
@@ -2174,9 +2809,25 @@ mod tests {
         }
         let store = db.latest_sequence_number();
         let history = Uuid::new_v4();
-        // The source cut may not be past the store's own sequence.
-        let refused = StagedPhysicalReplica::from_checkpoint_at(db, history, store + 1, store);
+        // The store must be at the sequence the caller proved.
+        let refused = StagedPhysicalReplica::from_checkpoint_at(db, history, 3, store + 1);
         assert!(refused.is_err());
+        // A source cut past the store's own counter (a fast-forwarded source).
+        let ahead_root = TempDir::new().unwrap();
+        let ahead = open(ahead_root.path());
+        ahead.put(b"k", b"v").unwrap();
+        let ahead_store = ahead.latest_sequence_number();
+        let receiver = StagedPhysicalReplica::from_checkpoint_at(ahead, history, 1_000, ahead_store).unwrap();
+        assert_eq!(receiver.cursor().source_sequence(), 1_000);
+        assert_eq!(receiver.cursor().local_sequence(), ahead_store + 1);
+        let mut batch = WriteBatch::default();
+        batch.put(b"next", b"group");
+        assert!(receiver.apply(&encoded(history, 1_001, batch)).unwrap());
+        assert_eq!(
+            receiver.writer().db().latest_sequence_number(),
+            receiver.cursor().local_sequence()
+        );
+        drop(receiver);
         let db = open(root.path());
         let receiver = StagedPhysicalReplica::from_checkpoint_at(db, history, 3, store).unwrap();
         let cursor = receiver.cursor();
@@ -2188,5 +2839,414 @@ mod tests {
         assert!(receiver.apply(&encoded(history, 4, batch)).unwrap());
         assert_eq!(receiver.cursor().source_sequence(), 4);
         assert_eq!(receiver.cursor().local_sequence(), store + 3);
+    }
+
+    // --- spec P4.1: the fast-forward record, writer and cursor rule ---------
+
+    /// The record round-trips through its JSON and holds only what the
+    /// fast-forward is (no per-leaf state), and an impossible record (no
+    /// history, an empty interval) is refused.
+    #[test]
+    fn a_fast_forward_record_round_trips_and_holds_only_its_cut() {
+        let history = Uuid::new_v4();
+        let record = FastForwardRecord::new(history, Uuid::new_v4(), 10, 99, 4 * 1024 * 1024);
+        let bytes = record.encode().unwrap();
+        assert!(bytes.len() < 512, "{} bytes", bytes.len());
+        assert!(!String::from_utf8_lossy(&bytes).contains("done"));
+        assert_eq!(FastForwardRecord::decode(&bytes).unwrap(), record);
+        for broken in [
+            FastForwardRecord::new(Uuid::nil(), Uuid::new_v4(), 1, 2, 1),
+            FastForwardRecord::new(history, Uuid::nil(), 1, 2, 1),
+            FastForwardRecord::new(history, Uuid::new_v4(), 2, 2, 1),
+            FastForwardRecord::new(history, Uuid::new_v4(), 1, MAX_SEQUENCE + 1, 1),
+        ] {
+            assert!(broken.encode().is_err(), "{broken:?}");
+        }
+        assert!(FastForwardRecord::decode(b"{\"format\":1}").is_err());
+        assert!(FastForwardRecord::decode(&vec![b' '; MAX_FAST_FORWARD_RECORD_BYTES + 1]).is_err());
+    }
+
+    /// Spec P4.1 §4: the cursor rule is arithmetic, not safety — a
+    /// fast-forwarded cursor's local counter may be behind its source
+    /// sequence; a local counter of 0 is still impossible.
+    #[test]
+    fn a_cursor_whose_local_counter_is_behind_its_source_sequence_is_valid() {
+        let history = Uuid::new_v4();
+        let cursor = PhysicalCursor {
+            format: FORMAT,
+            history,
+            snapshot_sequence: 1_000,
+            source_sequence: 1_000,
+            local_sequence: 7,
+            last_first_sequence: None,
+            last_digest: None,
+        };
+        assert_eq!(decode_cursor(&encode_cursor(&cursor).unwrap()).unwrap(), cursor);
+        let zero = PhysicalCursor {
+            local_sequence: 0,
+            ..cursor.clone()
+        };
+        assert!(decode_cursor(&encode_cursor(&zero).unwrap()).is_err());
+        let past = PhysicalCursor {
+            local_sequence: MAX_SEQUENCE + 1,
+            ..cursor
+        };
+        assert!(decode_cursor(&encode_cursor(&past).unwrap()).is_err());
+    }
+
+    /// Spec P4.1 §4: a store left with a fast-forward record is refused by
+    /// every open that adopts a cursor, BEFORE the sequence equality (which
+    /// the fast-forward's writes broke), naming the interval; only the
+    /// fast-forward's own writer reopens it.
+    #[test]
+    fn an_interrupted_fast_forward_is_refused_before_the_sequence_check() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"k", b"v").unwrap();
+        let history = Uuid::new_v4();
+        let copy_path = root.path().join("copy");
+        let (receiver, cut) = receiver_of(&source, &copy_path, history);
+        receiver.close().unwrap();
+        let writer = FastForwardWriter::open(&copy_path, &Config::default(), history).unwrap();
+        assert!(writer.record().unwrap().is_none());
+        let record = FastForwardRecord::new(history, Uuid::new_v4(), cut, cut + 10, 64 * 1024);
+        assert!(writer.accounted());
+        writer.start_record(&record).unwrap();
+        // A default-family write of the fast-forward: the store's sequence
+        // no longer matches the cursor.
+        writer.delete_ranges(&[(b"a".to_vec(), b"z".to_vec())]).unwrap();
+        assert!(!writer.accounted());
+        drop(writer);
+        let reopened = [
+            StagedPhysicalReplica::resume(open_receiver(&copy_path), history),
+            StagedPhysicalReplica::resume(
+                DB::open_cf_for_read_only(&Options::default(), &copy_path, ["default", LOCAL_CF], false).unwrap(),
+                history,
+            ),
+        ];
+        for resumed in reopened {
+            match resumed {
+                Err(PhysicalError::FastForwardInterrupted { from, to }) => assert_eq!((from, to), (cut, cut + 10)),
+                Err(other) => panic!("not the fast-forward refusal: {other}"),
+                Ok(_) => panic!("an interrupted fast-forward was resumed"),
+            }
+        }
+        let text = PhysicalError::FastForwardInterrupted { from: 1, to: 2 }.to_string();
+        assert!(
+            text.contains("interrupted at sequence 1→2") && text.contains("recover --from-primary"),
+            "{text}"
+        );
+        assert!(fast_forward_remedy(1, 2, "/srv/standby", "db:5440").contains("--data-dir /srv/standby"));
+        let writer = FastForwardWriter::open(&copy_path, &Config::default(), history).unwrap();
+        assert_eq!(writer.record().unwrap(), Some(record));
+        assert_eq!(writer.cursor().source_sequence(), cut, "the cursor is untouched");
+        drop(writer);
+        assert!(matches!(
+            FastForwardWriter::open(&copy_path, &Config::default(), Uuid::new_v4()),
+            Err(PhysicalError::HistoryMismatch)
+        ));
+    }
+
+    /// The SST file of the keys of `source` in `[start, end)`, as a primary
+    /// builds a leaf.
+    fn leaf_file(source: &DB, path: &std::path::Path, start: &[u8], end: &[u8]) {
+        let options = Options::default();
+        let mut writer = rocksdb::SstFileWriter::create(&options);
+        writer.open(path).unwrap();
+        let mut read = ReadOptions::default();
+        read.set_total_order_seek(true);
+        read.set_iterate_upper_bound(end.to_vec());
+        for item in source.iterator_opt(IteratorMode::From(start, Direction::Forward), read) {
+            let (key, value) = item.unwrap();
+            writer.put(key, value).unwrap();
+        }
+        writer.finish().unwrap();
+    }
+
+    /// Spec P4.1 §3.3: range deletions plus ingested leaf files make the
+    /// stale leaf the primary's (updates, inserts and deletes alike), leave
+    /// the other leaves alone, and the re-cut derives a cursor that accounts
+    /// for the store — so an ordinary writer adopts it and continues in the
+    /// primary's numbering.
+    #[test]
+    fn delete_ranges_and_ingest_reach_the_primarys_family_and_the_recut_accounts_for_the_store() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        for index in 0..40_u32 {
+            source.put(format!("a{index:03}"), b"old").unwrap();
+            source.put(format!("n{index:03}"), b"old").unwrap();
+        }
+        let history = Uuid::new_v4();
+        let copy_path = root.path().join("copy");
+        let (receiver, cut) = receiver_of(&source, &copy_path, history);
+        receiver.close().unwrap();
+        // The primary moves on in the second leaf only.
+        source.put(b"n005", b"new").unwrap();
+        source.put(b"n500", b"inserted").unwrap();
+        source.delete(b"n007").unwrap();
+        let target = source.latest_sequence_number();
+        let end = [0xff_u8; 64];
+        let file = root.path().join("1.sst");
+        leaf_file(&source, &file, b"n", &end);
+
+        let snapshot = Uuid::new_v4();
+        let writer = FastForwardWriter::open(&copy_path, &Config::default(), history).unwrap();
+        assert_eq!(writer.cursor().source_sequence(), cut);
+        // An earlier cut's mark is forgotten by the new cut's record.
+        writer.mark_done(&[9], target - 1).unwrap();
+        let record = FastForwardRecord::new(history, snapshot, cut, target, 64 * 1024);
+        writer.start_record(&record).unwrap();
+        assert!(writer.done_leaves(target - 1).unwrap().is_empty());
+        writer.delete_ranges(&[(b"n".to_vec(), end.to_vec())]).unwrap();
+        writer.ingest(std::slice::from_ref(&file)).unwrap();
+        writer.mark_done(&[1, 3], target).unwrap();
+        assert_eq!(
+            writer.done_leaves(target).unwrap().into_iter().collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(
+            writer.done_leaves(target + 1).unwrap().is_empty(),
+            "marks of another cut do not count"
+        );
+        assert!(writer.mark_done(&[1 << 24], target).is_err());
+        assert!(file.exists(), "ingested by copy: the staged file stays where it was");
+        assert_eq!(
+            range_digest(writer.db(), None, b"").unwrap(),
+            range_digest(&source, None, b"").unwrap()
+        );
+        assert_eq!(writer.record().unwrap(), Some(record));
+        writer.flush().unwrap();
+        // The re-cut takes its census of a CLOSED store, then reopens it for
+        // the final write: the record survives the close.
+        writer.release();
+        let writer = FastForwardWriter::open(&copy_path, &Config::default(), history).unwrap();
+        assert!(writer.record().unwrap().is_some());
+        let cursor = writer.recut(target, snapshot).unwrap();
+        assert_eq!((cursor.snapshot_sequence(), cursor.source_sequence()), (target, target));
+        assert_eq!(writer.db().latest_sequence_number(), cursor.local_sequence());
+        assert!(writer.accounted());
+        assert!(writer.record().unwrap().is_none(), "the re-cut removed the record");
+        assert!(writer.done_leaves(target).unwrap().is_empty(), "and the leaf marks");
+        assert_eq!(writer.close().unwrap(), cursor);
+
+        let resumed = StagedPhysicalReplica::resume(open_receiver(&copy_path), history).unwrap();
+        assert_eq!(resumed.cursor(), cursor);
+        source.put(b"after", b"cut").unwrap();
+        let polled = poll_source(&source, history, target, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
+        for batch in &polled.batches {
+            assert!(resumed.apply(batch).unwrap());
+        }
+        assert_eq!(
+            range_digest(resumed.writer().db(), None, b"").unwrap(),
+            range_digest(&source, None, b"").unwrap()
+        );
+        assert_eq!(
+            resumed.writer().db().latest_sequence_number(),
+            resumed.cursor().local_sequence()
+        );
+    }
+
+    // --- spec P4.1c: write groups of any size --------------------------------
+
+    const MIB: usize = 1024 * 1024;
+    /// A serving standby's poll limit (`STANDBY_POLL_BYTES` in `main.rs`).
+    const STANDBY_POLL: usize = 32 * MIB;
+
+    /// One 100 MiB write group (100 puts of 1 MiB values), then two small ones.
+    fn write_large_then_small(source: &DB) {
+        let mut large = WriteBatch::default();
+        for index in 0..100_u32 {
+            large.put(
+                format!("data:large:{index:03}"),
+                vec![u8::try_from(index % 251).unwrap(); MIB],
+            );
+        }
+        source.write(large).unwrap();
+        source.put(b"data:small:1", b"one").unwrap();
+        source.put(b"data:small:2", b"two").unwrap();
+    }
+
+    /// Spec P4.1c §3: the poll byte limit is a coalescing target. A 100 MiB
+    /// write group is served whole and alone by a poll of the standby's 32 MiB
+    /// limit, `through` at its last sequence; the next poll carries the two
+    /// small groups after it together. The group decodes as a transport hands
+    /// it over, and a receiver applies it to the source's exact state.
+    #[test]
+    fn a_write_group_above_the_poll_limit_travels_alone_and_small_ones_coalesce() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"seed", b"keep").unwrap();
+        let history = Uuid::new_v4();
+        let (receiver, cut) = receiver_of(&source, &root.path().join("copy"), history);
+        write_large_then_small(&source);
+
+        let large = poll_source(&source, history, cut, STANDBY_POLL, &FlushMemo::new()).unwrap();
+        assert_eq!(large.batches.len(), 1, "the large group alone");
+        let group = &large.batches[0];
+        assert!(group.data().len() > 100 * MIB, "{} bytes", group.data().len());
+        assert_eq!((group.first_sequence(), group.last_sequence()), (cut + 1, cut + 100));
+        assert_eq!(large.through, cut + 100, "through at the group's last sequence");
+        assert_eq!(large.durable_barrier, cut + 102);
+        let decoded =
+            PhysicalBatch::decode(history, group.first_sequence(), group.data().to_vec(), group.digest()).unwrap();
+        assert_eq!(decoded.last_sequence(), cut + 100);
+        assert!(receiver.apply(group).unwrap());
+
+        let small = poll_source(&source, history, large.through, STANDBY_POLL, &FlushMemo::new()).unwrap();
+        assert_eq!(small.batches.len(), 2, "the two small groups together");
+        assert_eq!(small.through, cut + 102);
+        assert_eq!(small.through, small.durable_barrier);
+        for batch in &small.batches {
+            assert!(receiver.apply(batch).unwrap());
+        }
+        assert_eq!(
+            range_digest(receiver.writer().db(), None, b"").unwrap(),
+            range_digest(&source, None, b"").unwrap()
+        );
+        assert_eq!(receiver.cursor().source_sequence(), cut + 102);
+    }
+
+    /// Spec P4.1c §3: the same for a cascading source. A receiver that
+    /// applied the 100 MiB group and the two small ones serves the large one
+    /// alone to a poll of 32 MiB — byte for byte the primary's group, digest
+    /// included — and the two small ones together on the next poll.
+    #[test]
+    fn a_cascading_source_serves_a_write_group_above_the_poll_limit_alone() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"seed", b"keep").unwrap();
+        let history = Uuid::new_v4();
+        let (upstream, cut) = receiver_of(&source, &root.path().join("upstream"), history);
+        write_large_then_small(&source);
+        let polled = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
+        assert_eq!(polled.batches.len(), 3, "a limit the groups fit: one poll");
+        for batch in &polled.batches {
+            assert!(upstream.apply(batch).unwrap());
+        }
+        let writer = Arc::clone(upstream.writer());
+
+        let mut hint = CascadeHint::default();
+        let large = poll_source_cascade(writer.db(), history, cut, STANDBY_POLL, &mut hint, &FlushMemo::new()).unwrap();
+        assert_eq!(large.batches.len(), 1, "the large group alone");
+        assert_eq!(large.through, cut + 100);
+        assert_eq!(large.durable_barrier, cut + 102);
+        assert_eq!(large.batches[0].digest(), polled.batches[0].digest());
+        assert_eq!(large.batches[0].data(), polled.batches[0].data());
+
+        let small = poll_source_cascade(
+            writer.db(),
+            history,
+            large.through,
+            STANDBY_POLL,
+            &mut hint,
+            &FlushMemo::new(),
+        )
+        .unwrap();
+        assert_eq!(small.batches.len(), 2, "the two small groups together");
+        assert_eq!(small.through, cut + 102);
+        for (ours, theirs) in small.batches.iter().zip(&polled.batches[1..]) {
+            assert_eq!(ours.digest(), theirs.digest());
+            assert_eq!(ours.data(), theirs.data());
+        }
+    }
+
+    /// Spec P4.1c: a raw batch of 2 000 000 operations — twice the bound
+    /// every batch had before — walks with every record visited, and decodes.
+    #[test]
+    fn a_batch_of_two_million_operations_walks_and_decodes() {
+        let mut batch = WriteBatch::default();
+        for index in 0..2_000_000_u32 {
+            batch.delete(index.to_be_bytes());
+        }
+        let mut visited = 0_u32;
+        assert_eq!(walk_raw_batch(batch.data(), |_| visited += 1).unwrap(), 2_000_000);
+        assert_eq!(visited, 2_000_000);
+        let decoded = encoded(Uuid::new_v4(), 1, batch);
+        assert_eq!(decoded.last_sequence(), 2_000_000);
+    }
+
+    // --- spec P4.1d: the WAL is fsynced once per barrier ---------------------
+
+    /// Spec P4.1d §2.3: a poll fsyncs its source's WAL only when the barrier
+    /// it sampled is above its memo, the last barrier the memo's polls
+    /// fsynced. Two polls at the same barrier fsync once: the first moves the
+    /// memo to the barrier, the second finds the barrier covered and leaves
+    /// the memo where it was; a write moves the barrier and the next poll
+    /// fsyncs again. Read through the memo's fsync count — one after the two
+    /// polls, not two — and its barrier, for a primary and for a cascading
+    /// source alike.
+    #[test]
+    fn two_polls_at_the_same_barrier_fsync_the_wal_once() {
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"seed", b"keep").unwrap();
+        let history = Uuid::new_v4();
+        let (upstream, cut) = receiver_of(&source, &root.path().join("upstream"), history);
+        source.put(b"a", b"1").unwrap();
+
+        let memo = FlushMemo::new();
+        assert_eq!((memo.last_flushed(), memo.fsyncs()), (0, 0), "nothing fsynced yet");
+        let barrier = source.latest_sequence_number();
+        assert!(memo.needs_flush(barrier));
+        let first = poll_source(&source, history, cut, MAX_BATCH_BYTES, &memo).unwrap();
+        assert_eq!((first.through, first.durable_barrier), (barrier, barrier));
+        assert_eq!(memo.last_flushed(), barrier, "the first poll fsynced its barrier");
+        assert!(
+            !memo.needs_flush(barrier),
+            "a second poll at the same barrier has nothing to make durable"
+        );
+        let second = poll_source(&source, history, first.through, MAX_BATCH_BYTES, &memo).unwrap();
+        assert!(second.batches.is_empty());
+        assert_eq!(second.durable_barrier, barrier);
+        assert_eq!(memo.last_flushed(), barrier, "the second poll did not move the memo");
+        assert_eq!(memo.fsyncs(), 1, "two polls at the same barrier, one fsync");
+        // The polls' decision: an fsync for a barrier above the memo only.
+        assert!(!memo.flush(&source, barrier).unwrap(), "covered: no fsync");
+        assert!(!memo.flush(&source, barrier - 1).unwrap(), "below: no fsync");
+        assert_eq!((memo.last_flushed(), memo.fsyncs()), (barrier, 1));
+
+        source.put(b"b", b"2").unwrap();
+        let moved = source.latest_sequence_number();
+        assert!(memo.needs_flush(moved));
+        let third = poll_source(&source, history, second.through, MAX_BATCH_BYTES, &memo).unwrap();
+        assert_eq!((third.through, third.durable_barrier), (moved, moved));
+        assert_eq!(memo.last_flushed(), moved, "a moved barrier is fsynced again");
+        assert_eq!(memo.fsyncs(), 2);
+        // A memo of its own fsyncs at its first poll, as every poll did before.
+        let fresh = FlushMemo::new();
+        assert!(fresh.flush(&source, moved).unwrap());
+        assert_eq!((fresh.last_flushed(), fresh.fsyncs()), (moved, 1));
+
+        // A cascading source: the same rule over its cursor's source sequence.
+        for batch in &first.batches {
+            assert!(upstream.apply_with(batch, Durability::Deferred).unwrap());
+        }
+        let writer = Arc::clone(upstream.writer());
+        let mut hint = CascadeHint::default();
+        let cascade = FlushMemo::new();
+        let served = poll_source_cascade(writer.db(), history, cut, MAX_BATCH_BYTES, &mut hint, &cascade).unwrap();
+        assert_eq!(served.durable_barrier, barrier);
+        assert_eq!(
+            cascade.last_flushed(),
+            barrier,
+            "the cascading source fsynced its own WAL"
+        );
+        assert!(!cascade.needs_flush(barrier));
+        let idle = poll_source_cascade(
+            writer.db(),
+            history,
+            served.through,
+            MAX_BATCH_BYTES,
+            &mut hint,
+            &cascade,
+        )
+        .unwrap();
+        assert!(idle.batches.is_empty());
+        assert_eq!(
+            cascade.last_flushed(),
+            barrier,
+            "an idle cascaded poll did not move the memo"
+        );
+        assert_eq!(cascade.fsyncs(), 1, "two cascaded polls at the same barrier, one fsync");
     }
 }

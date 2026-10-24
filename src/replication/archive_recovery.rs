@@ -14,15 +14,25 @@
 //!
 //! Both open the standby's store through `ReopenedPhysicalStage::open` — the
 //! marker, manifest, history and durable cursor proven as at every standby
-//! start — and apply every write group through `PhysicalApplier::apply_with`
+//! start — and apply the write groups through `PhysicalApplier::apply_run`
 //! over an engine opened in `PhysicalStandby` mode, exactly as a receiver
-//! applies a group from its primary: the same cursor rules (a group must
-//! start right after the cursor; an already applied one is skipped by
-//! sequence), the same verbatim write with the cursor in the same write
-//! group, the same derived-state publication. A standby recovered from
-//! segments is therefore indistinguishable from one that streamed them, and a
-//! crash mid-recovery resumes from its cursor: every group is one durable
-//! write, and re-running applies only what follows the cursor.
+//! applies a poll from its primary (spec P4.1e, after P4.1d): a segment's
+//! groups are gathered into runs of at most `APPLY_CHUNK_BYTES` (a larger
+//! group is a run of its own), each run decoded, pre-read and published once
+//! and written one RocksDB write per group, with the same cursor rules (a
+//! group must start right after the cursor; an already applied one is
+//! skipped by sequence), the same verbatim write with the cursor in the same
+//! write group, the same derived-state publication. A standby recovered from
+//! segments is therefore indistinguishable from one that streamed them.
+//!
+//! The groups are written deferred and the WAL is fsynced once per segment
+//! (a receiver fsyncs once per poll), not once per group. A crash mid-segment
+//! is still safe: each group and the cursor that accounts for it are one
+//! RocksDB write, so the store reopens at a consistent cursor — the last one
+//! fsynced, or a later one that reached the disk anyway — whose groups are
+//! all applied and none of whose successors is; re-running the command
+//! applies only what follows that cursor (idempotent, as above). A recovery
+//! stopped by an error fsyncs what it applied when the stage is closed.
 //!
 //! # Verify before the first apply
 //!
@@ -32,7 +42,9 @@
 //! digest, contiguity, history, the group boundary at the cursor) before it
 //! applies anything, and refuses — naming the file — a corrupt segment or one
 //! of another dataset among the copies. The archive-only standby verifies each
-//! segment deep before it applies it.
+//! segment deep before it applies it. Gathering runs changes none of it:
+//! every frame is read and checked (its digest, its sequence against the
+//! cursor, `--through`) before the run it joins is handed to the applier.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,9 +57,10 @@ use super::archive_chain::{build_chain, verify_chain, verify_segment_from, Recov
 use super::archive_segment::{unix_now, SegmentInfo};
 use super::archiver::{dataset_key, ArchiveFeed};
 use super::checkpoint_transfer::{ReopenedPhysicalStage, TransferLimits};
-use super::physical::Durability;
+use super::physical::{Durability, PhysicalBatch};
 use super::physical_applier::{NoopDerivedStateListener, PhysicalApplier};
 use super::physical_receiver::ServingAttach;
+use super::physical_wire::APPLY_CHUNK_BYTES;
 use crate::crypto::KeyManager;
 use crate::standby_posture::{PostureTracker, EPOCH};
 use crate::storage::{StorageEngine, WriteGate};
@@ -62,6 +75,12 @@ pub enum RecoverError {
     /// Applying stopped part-way; every group before it is durable.
     #[error("recover stopped at sequence {reached}: {reason}; re-run the command to continue from there")]
     Failed { reached: u64, reason: String },
+    /// Spec P4.1 §1: the standby needs a full copy of its primary that was
+    /// not applied — refused by `--no-full-copy`, or completed beside an
+    /// occupied data directory without `--replace`. The reason names what to
+    /// do. `recover` exits 3.
+    #[error("{0}")]
+    FullCopyPending(String),
 }
 
 /// What [`recover_from_archive`] does.
@@ -98,6 +117,11 @@ pub struct RecoverReport {
     /// The first interval no segment holds, short of `--through` or of the
     /// newest segment.
     pub missing: Option<(u64, u64)>,
+    /// The archive bytes the recovery drew on: the files of the segments of
+    /// its chain.
+    pub archive_bytes: u64,
+    /// How long the recovery took, verification included.
+    pub elapsed: Duration,
 }
 
 fn refused(reason: impl Into<String>) -> RecoverError {
@@ -113,6 +137,7 @@ pub fn recover_from_archive(
     options: &RecoverOptions<'_>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<RecoverReport, RecoverError> {
+    let started = Instant::now();
     let key =
         dataset_key(options.config).map_err(|error| refused(format!("the dataset key cannot be loaded: {error}")))?;
     let stage = ReopenedPhysicalStage::open(options.data_dir, options.history, options.limits, options.config)
@@ -126,7 +151,8 @@ pub fn recover_from_archive(
     let outcome = recover_stage(&stage, options, key.as_deref(), started_at, progress);
     // The engine and its applier are gone: the stage holds the only handle.
     let closed = stage.close();
-    let report = outcome?;
+    let mut report = outcome?;
+    report.elapsed = started.elapsed();
     match closed {
         Ok(closed) if closed.cursor.source_sequence() == report.reached => Ok(report),
         Ok(closed) => Err(RecoverError::Failed {
@@ -172,6 +198,8 @@ fn recover_stage(
         segments: chain.segments.len(),
         newest: chain.newest,
         missing: chain.missing,
+        archive_bytes: chain.segments.iter().map(|segment| segment.file_bytes).sum(),
+        elapsed: Duration::ZERO,
     };
     if chain.segments.is_empty() {
         return Ok(report);
@@ -210,9 +238,73 @@ fn recover_stage(
     applied.map(|()| report)
 }
 
+/// Spec P4.1e: a segment's verified groups gathered into runs for
+/// [`PhysicalApplier::apply_run`], as a receiver gathers a poll's (spec
+/// P4.1d): at most [`APPLY_CHUNK_BYTES`] of raw groups per run, a larger
+/// group a run of its own.
+#[derive(Default)]
+struct Runs {
+    run: Vec<PhysicalBatch>,
+    bytes: usize,
+}
+
+impl Runs {
+    /// Add `batch`. Returns the run it closed when it would have taken that
+    /// run past the chunk: that run is to be applied before `batch`.
+    fn push(&mut self, batch: PhysicalBatch) -> Option<Vec<PhysicalBatch>> {
+        let size = batch.data().len();
+        let full = if !self.run.is_empty() && self.bytes.saturating_add(size) > APPLY_CHUNK_BYTES {
+            Some(self.take())
+        } else {
+            None
+        };
+        self.bytes = self.bytes.saturating_add(size);
+        self.run.push(batch);
+        full
+    }
+
+    /// The run gathered so far (possibly empty), leaving none.
+    fn take(&mut self) -> Vec<PhysicalBatch> {
+        self.bytes = 0;
+        std::mem::take(&mut self.run)
+    }
+
+    /// The last sequence of the gathered groups, if any.
+    fn last_sequence(&self) -> Option<u64> {
+        self.run.last().map(PhysicalBatch::last_sequence)
+    }
+}
+
+/// Hand one run of `info`'s verified groups to `applier`, deferred, after the
+/// stage check a receiver makes once per run (spec P4.1d). An empty run does
+/// nothing.
+fn apply_segment_run(
+    stage: &ReopenedPhysicalStage,
+    applier: &PhysicalApplier,
+    info: &SegmentInfo,
+    run: &[PhysicalBatch],
+) -> Result<(), String> {
+    let (Some(first), Some(last)) = (run.first(), run.last()) else {
+        return Ok(());
+    };
+    stage.verify().map_err(|error| error.to_string())?;
+    applier
+        .apply_run(run, Durability::Deferred)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "segment {}: write groups {}..{}: {error}",
+                info.path.display(),
+                first.first_sequence(),
+                last.last_sequence()
+            )
+        })
+}
+
 /// Apply `chain`'s groups past the cursor through `applier`, one segment at a
-/// time; groups the standby already holds are skipped by sequence, and none
-/// that ends past `through` is applied.
+/// time, in runs (spec P4.1e), fsyncing the WAL once per segment; groups the
+/// standby already holds are skipped by sequence, and none that ends past
+/// `through` is applied.
 fn apply_chain(
     stage: &ReopenedPhysicalStage,
     applier: &PhysicalApplier,
@@ -229,10 +321,14 @@ fn apply_chain(
     for info in &chain.segments {
         let (mut applied, mut skipped) = (0_u64, 0_u64);
         let mut stopped = false;
+        let mut runs = Runs::default();
         for frame in info.frames(key).map_err(|error| failed(error.to_string()))? {
             let batch = frame.map_err(|error| failed(error.to_string()))?;
-            let cursor = applier.writer().cursor().source_sequence();
-            if batch.last_sequence() <= cursor {
+            // What the store holds once the gathered run is applied.
+            let held = runs
+                .last_sequence()
+                .unwrap_or_else(|| applier.writer().cursor().source_sequence());
+            if batch.last_sequence() <= held {
                 skipped += 1;
                 continue;
             }
@@ -240,16 +336,20 @@ fn apply_chain(
                 stopped = true;
                 break;
             }
-            stage.verify().map_err(|error| failed(error.to_string()))?;
-            applier.apply_with(&batch, Durability::Synced).map_err(|error| {
-                failed(format!(
-                    "segment {}: write group {}..{}: {error}",
-                    info.path.display(),
-                    batch.first_sequence(),
-                    batch.last_sequence()
-                ))
-            })?;
-            applied += 1;
+            if let Some(full) = runs.push(batch) {
+                apply_segment_run(stage, applier, info, &full).map_err(&failed)?;
+                applied += full.len() as u64;
+            }
+        }
+        let last = runs.take();
+        apply_segment_run(stage, applier, info, &last).map_err(&failed)?;
+        applied += last.len() as u64;
+        if applied > 0 {
+            // One fsync for the segment's groups (module documentation).
+            applier
+                .writer()
+                .sync()
+                .map_err(|error| failed(format!("segment {}: {error}", info.path.display())))?;
         }
         report.applied += applied;
         report.skipped += skipped;
@@ -468,32 +568,33 @@ impl Follower<'_> {
         Ok(())
     }
 
-    /// Apply one verified segment's groups past the cursor (deferred, one
-    /// fsync for the segment), offering each to the standby's own archive.
+    /// Apply one verified segment's groups past the cursor in runs (spec
+    /// P4.1e; deferred, one fsync for the segment), offering each group to
+    /// the standby's own archive once its run is applied. A stop between
+    /// frames leaves the run gathered so far unapplied (the next start
+    /// applies it from the cursor).
     fn apply_segment(&self, info: &SegmentInfo) -> Result<(), String> {
         let mut applied = 0_u64;
+        let mut runs = Runs::default();
         let frames = info.frames(self.key).map_err(|error| error.to_string())?;
+        let mut stopped = false;
         for frame in frames {
             if self.stop.load(Ordering::Acquire) {
+                stopped = true;
                 break;
             }
             let batch = frame.map_err(|error| error.to_string())?;
-            if batch.last_sequence() <= self.cursor() {
+            let held = runs.last_sequence().unwrap_or_else(|| self.cursor());
+            if batch.last_sequence() <= held {
                 continue;
             }
-            self.stage.verify().map_err(|error| error.to_string())?;
-            self.applier.apply_with(&batch, Durability::Deferred).map_err(|error| {
-                format!(
-                    "segment {}: write group {}..{} could not be applied: {error}",
-                    info.path.display(),
-                    batch.first_sequence(),
-                    batch.last_sequence()
-                )
-            })?;
-            if let Some(feed) = self.archive {
-                feed.offer(&batch, self.applier.writer().db());
+            if let Some(full) = runs.push(batch) {
+                applied += self.apply_and_offer(info, &full)?;
             }
-            applied += 1;
+        }
+        if !stopped {
+            let last = runs.take();
+            applied += self.apply_and_offer(info, &last)?;
         }
         if applied > 0 {
             self.applier.writer().sync().map_err(|error| error.to_string())?;
@@ -507,6 +608,18 @@ impl Follower<'_> {
         }
         Ok(())
     }
+
+    /// Apply one run of a segment's groups, then offer each to the
+    /// standby's own archive. Returns the groups applied.
+    fn apply_and_offer(&self, info: &SegmentInfo, run: &[PhysicalBatch]) -> Result<u64, String> {
+        apply_segment_run(self.stage, self.applier, info, run)?;
+        if let Some(feed) = self.archive {
+            for batch in run {
+                feed.offer(batch, self.applier.writer().db());
+            }
+        }
+        Ok(run.len() as u64)
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -516,7 +629,9 @@ mod tests {
     use crate::replication::archive_segment::{segment_dir, OpenSegment, SegmentHeader, HEADER_LEN};
     use crate::replication::checkpoint_transfer::{OnlineCheckpointExport, ReceiverStaging};
     use crate::replication::history::load_or_create_primary_history;
-    use crate::replication::physical::{poll_source, range_digest, PhysicalBatch, PhysicalPoll, MAX_BATCH_BYTES};
+    use crate::replication::physical::{
+        poll_source, range_digest, FlushMemo, PhysicalBatch, PhysicalPoll, MAX_BATCH_BYTES,
+    };
     use crate::EmbeddedDatabase;
     use rocksdb::{Options, DB};
 
@@ -545,6 +660,60 @@ mod tests {
         config
     }
 
+    /// A physical standby of `raw` installed at `root/name` from a downloaded
+    /// checkpoint (the production path: export, staging, verification,
+    /// publication): its path and cut.
+    fn install(raw: &DB, history: Uuid, root: &Path, config: &Config, name: &str) -> (PathBuf, u64) {
+        let limits = TransferLimits::default();
+        let export = OnlineCheckpointExport::create(raw, history, root, limits).unwrap();
+        let target = root.join(name);
+        let mut staging = ReceiverStaging::begin(&target, &export.manifest_bytes().unwrap(), history, limits).unwrap();
+        for (index, file) in export.manifest().files.iter().enumerate() {
+            let mut offset = 0_u64;
+            while offset < file.size {
+                let chunk = export.read_chunk(index as u32, offset, 64 * 1024).unwrap();
+                staging.append_chunk(index as u32, offset, &chunk).unwrap();
+                offset += chunk.len() as u64;
+            }
+        }
+        let installed = staging
+            .finish_download(config)
+            .unwrap()
+            .open(config)
+            .unwrap()
+            .publish()
+            .unwrap();
+        (installed.path, installed.cursor.source_sequence())
+    }
+
+    /// The applier of an engine serving `stage` (a standby's serving side,
+    /// as `ServingAttach` builds it), hydrated.
+    fn serving(stage: &ReopenedPhysicalStage) -> PhysicalApplier {
+        let path = stage.path().to_path_buf();
+        let engine = StorageEngine::open_physical_standby(
+            &path,
+            &persistent(&path),
+            Arc::clone(stage.writer()),
+            WriteGate::closed("test standby"),
+        )
+        .unwrap();
+        let applier = PhysicalApplier::new(
+            Arc::new(engine),
+            Arc::clone(stage.writer()),
+            Arc::new(NoopDerivedStateListener),
+        )
+        .unwrap();
+        applier.hydrate().unwrap();
+        applier
+    }
+
+    /// The rows of `t` a standby's engine serves, in row order.
+    fn served_rows(applier: &PhysicalApplier) -> Vec<crate::Tuple> {
+        let mut rows = applier.engine().scan_table("t").unwrap();
+        rows.sort_by_key(|row| row.row_id);
+        rows
+    }
+
     /// A Nano primary with a table, and its physical standby installed from
     /// a downloaded checkpoint (the production path: export, staging,
     /// verification, publication).
@@ -567,34 +736,25 @@ mod tests {
             primary.execute("INSERT INTO t VALUES (0, 'seed')").unwrap();
             let raw = primary.storage.db();
             let history = load_or_create_primary_history(raw.path()).unwrap();
-            let limits = TransferLimits::default();
-            let export = OnlineCheckpointExport::create(&raw, history, root.path(), limits).unwrap();
-            let target = root.path().join("standby");
-            let mut staging =
-                ReceiverStaging::begin(&target, &export.manifest_bytes().unwrap(), history, limits).unwrap();
-            for (index, file) in export.manifest().files.iter().enumerate() {
-                let mut offset = 0_u64;
-                while offset < file.size {
-                    let chunk = export.read_chunk(index as u32, offset, 64 * 1024).unwrap();
-                    staging.append_chunk(index as u32, offset, &chunk).unwrap();
-                    offset += chunk.len() as u64;
-                }
-            }
-            let installed = staging
-                .finish_download(&config)
-                .unwrap()
-                .open(&config)
-                .unwrap()
-                .publish()
-                .unwrap();
+            let (standby, cut) = install(&raw, history, root.path(), &config, "standby");
             Self {
                 primary,
                 raw,
                 history,
-                standby: installed.path,
-                cut: installed.cursor.source_sequence(),
+                standby,
+                cut,
                 root,
             }
+        }
+
+        /// Another physical standby of the primary as it is now, installed
+        /// beside the first: its path.
+        fn install(&self, name: &str) -> PathBuf {
+            let mut config = persistent(&self.root.path().join("primary"));
+            config.replication.physical.enabled = true;
+            let (path, cut) = install(&self.raw, self.history, self.root.path(), &config, name);
+            assert_eq!(cut, self.cut, "installed at the first standby's cut");
+            path
         }
 
         /// Insert `ids`, one write group each at least, and return the
@@ -605,7 +765,7 @@ mod tests {
                     .execute(&format!("INSERT INTO t VALUES ({id}, 'row {id}')"))
                     .unwrap();
             }
-            poll_source(&self.raw, self.history, self.cut, MAX_BATCH_BYTES).unwrap()
+            poll_source(&self.raw, self.history, self.cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap()
         }
     }
 
@@ -736,5 +896,77 @@ mod tests {
             report.missing,
             Some((groups[3].first_sequence(), groups[5].last_sequence()))
         );
+    }
+
+    /// Spec P4.1e §3: a segment of 3 000 small write groups is recovered in
+    /// runs with ONE fsync of the standby's WAL — it was one per group — to
+    /// the rows and the default column family of a standby that followed the
+    /// same groups live (`apply_run`, as a receiver applies a poll).
+    #[test]
+    fn a_segment_of_small_groups_is_recovered_with_one_fsync_to_a_live_standbys_state() {
+        let fixture = Fixture::new();
+        let live_path = fixture.install("live");
+        // Single-row inserts until the primary wrote 3 000 groups past the cut.
+        let mut polled = fixture.write(1..1);
+        let mut next = 1;
+        while polled.batches.len() < 3_000 {
+            assert!(next < 20_000, "{} groups from {next} inserts", polled.batches.len());
+            polled = fixture.write(next..next + 200);
+            next += 200;
+        }
+        let groups = polled.batches.len() as u64;
+        let archive = fixture.root.path().join("one-segment");
+        let segment = seal(&archive, fixture.history, &polled.batches);
+        assert_eq!(segment.batch_count(), groups, "one segment holds them all");
+
+        // Recovered, through the module's own path, over a stage whose
+        // writer counts its fsyncs.
+        let config = persistent(&fixture.standby);
+        let limits = TransferLimits::default();
+        let stage = ReopenedPhysicalStage::open(&fixture.standby, fixture.history, limits, &config).unwrap();
+        let sources = vec![archive];
+        let options = RecoverOptions {
+            data_dir: &fixture.standby,
+            history: fixture.history,
+            sources: &sources,
+            through: None,
+            config: &config,
+            limits,
+        };
+        let before = stage.writer().fsyncs();
+        let report = recover_stage(&stage, &options, None, fixture.cut, &mut |_| {}).unwrap();
+        assert_eq!(report.applied, groups);
+        assert_eq!(report.reached, polled.through);
+        assert_eq!(
+            stage.writer().fsyncs() - before,
+            1,
+            "one fsync for the segment, not one per group ({groups} groups)"
+        );
+
+        // Live: the same groups as a receiver applies a poll.
+        let live = ReopenedPhysicalStage::open(&live_path, fixture.history, limits, &persistent(&live_path)).unwrap();
+        {
+            let applier = serving(&live);
+            applier.apply_run(&polled.batches, Durability::Deferred).unwrap();
+            live.writer().sync().unwrap();
+            let recovered = serving(&stage);
+            let rows = served_rows(&recovered);
+            assert!(rows.len() > 1, "{} rows", rows.len());
+            assert_eq!(rows, served_rows(&applier), "the rows a live standby serves");
+        }
+        assert_eq!(
+            fixture.raw.latest_sequence_number(),
+            polled.through,
+            "precondition: the primary wrote nothing since"
+        );
+        let recovered_digest = range_digest(stage.writer().db(), None, b"").unwrap();
+        assert_eq!(
+            recovered_digest,
+            range_digest(live.writer().db(), None, b"").unwrap(),
+            "the default column family of the standby that followed live"
+        );
+        assert_eq!(recovered_digest, range_digest(&fixture.raw, None, b"").unwrap());
+        assert_eq!(stage.close().unwrap().cursor.source_sequence(), polled.through);
+        live.close().unwrap();
     }
 }

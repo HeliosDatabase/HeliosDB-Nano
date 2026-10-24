@@ -2,7 +2,7 @@
 
 High availability in this release is one primary and its
 [physical standbys](physical-standby.md): read-only replicas that apply the
-primary's RocksDB write groups over one replication connection (`NPHYS002`) on
+primary's RocksDB write groups over one replication connection (`NPHYS003`) on
 the primary's replication port. This guide covers the automated suites, manual
 testing with the loopback pair fixture, and what to look at when something is
 wrong.
@@ -38,7 +38,7 @@ real PostgreSQL wire and HTTP:
 |---|---|
 | `physical_standby_serving` | bootstrap into a new directory; `/ready` 200 and the standby serving exactly the primary's rows; the PostgreSQL-wire contract (`heliosdb_require_ready()`, `pg_is_in_recovery()`, both LSN functions, `pg_control_checkpoint()`, `heliosdb_standby_status`, `in_hot_standby`); writes and `nextval` refused with `25006`; SIGKILL of the primary (the standby stays up, ready within `max_standby_lag`, then `55000`) and of the standby (restart resumes from its cursor, no second copy); a 4.41.x logical standby directory refused; `on_unrecoverable = "exit"` |
 | `physical_standby_sync` | `sync`: an INSERT blocks while the standby is stopped (SIGSTOP) and returns once it runs (SIGCONT); `semi-sync` with `min_acks = 2` and one standby, under `warn` (commits with a WARN) and `fail` (the client gets "synchronous replication not confirmed", the row is durable on the primary); 15 s of heartbeat-only traffic never moves the primary's recorded sequences back; the primary's `/health` lists the standby with advancing positions |
-| `physical_standby_refusals` | `HistoryMismatch`, `WalPruned` (small retention), `AuthFailed` (wrong token), and an `NPHYS001` client answered `Refuse { Version }`; in every case the standby stays up, `/ready` answers 503 with `needs_recovery`, and `heliosdb_require_ready()` refuses with `55000` naming the reason |
+| `physical_standby_refusals` | `HistoryMismatch`, `WalPruned` (small retention), `AuthFailed` (wrong token), and an `NPHYS001` or `NPHYS002` client answered `Refuse { Version }`; in every case the standby stays up, `/ready` answers 503 with `needs_recovery`, and `heliosdb_require_ready()` refuses with `55000` naming the reason |
 | `ha_integration` | start order (a standby started before its primary waits, then bootstraps); SIGKILL and restart of the primary, stop and restart of the standby, then both; sync and semi-sync commits readable on the standby at once; lag on the primary's `/health` |
 | `replication_restart_gap` | no silent gap: rows committed while the standby was down arrive after its restart; a standby that joins after the data and DDL exist |
 
@@ -50,6 +50,10 @@ Related targets:
   `physical_standby_derived_state`, `physical_standby_vector`,
   `physical_standby_embedded`: the standby's storage mode, node-local column
   family, derived-state maintenance, vector indexes and embedded use, in-process;
+- `physical_large_write_group`: one ~80 MiB write group (a 20 000-row
+  `INSERT … SELECT`) followed by a standby, a cascaded standby, the archive and
+  `recover --from-archive` (spec P4.1c); with `--features internal-tests`, a
+  standby killed with the group's frame in flight resumes from its cursor;
 - `logical_standby_removed`: a source scan that fails if a removed replication
   flag, module or symbol reappears in the code, tests, fixture, guides or skills;
 - `offline_reseed_tests`: the [offline snapshot helper](offline-reseed.md).
@@ -161,7 +165,7 @@ it again: it bootstraps a new copy.
 Primary:
 
 ```
-Replication port listening on 127.0.0.1:27741 (NPHYS002, dataset history <uuid>)
+Replication port listening on 127.0.0.1:27741 (NPHYS003, dataset history <uuid>)
 ```
 
 Standby, first start and restart:

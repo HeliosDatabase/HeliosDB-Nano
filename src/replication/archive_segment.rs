@@ -18,7 +18,7 @@
 //!   history uuid | epoch u64 | first_sequence u64 | created_at i64 (unix seconds)
 //!   node_id uuid | key_check [u8; 32] | SHA-256 of the 100 bytes before it
 //! body: frames, each  length u32 | payload
-//!   payload = the NPHYS002 `Batch` payload: history(16) | first u64 | digest(32) | raw
+//!   payload = the NPHYS003 `Batch` payload: history(16) | first u64 | digest(32) | raw
 //!   (sealed segment: the payload sealed as one value with the dataset key)
 //! footer, 112 bytes
 //!   magic "HSEGEND1" | last_sequence u64 | batch_count u64
@@ -75,7 +75,10 @@ pub const FOOTER_LEN: usize = FOOTER_FIELDS_LEN + 32;
 /// sequence, digest.
 pub const FRAME_META: usize = 16 + 8 + 32;
 /// The largest frame payload: the largest batch, plus the AES-GCM framing
-/// of a sealed one.
+/// of a sealed one. Spec P4.1c: [`MAX_BATCH_BYTES`] is the most a `u32`
+/// frame length can carry with these prefixes, so this still fits the
+/// length word; a reader allocates a frame only after checking its length
+/// against it and against the bytes the segment's body has left.
 pub const MAX_FRAME_LEN: usize = FRAME_META + MAX_BATCH_BYTES + crate::crypto::MIN_CIPHERTEXT_LEN;
 pub const SEGMENT_SUFFIX: &str = ".hseg";
 pub const PARTIAL_SUFFIX: &str = ".hseg.partial";
@@ -361,11 +364,22 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// digest(32) | raw` — byte for byte what `physical_wire` sends.
 pub fn encode_batch_payload(batch: &PhysicalBatch) -> Vec<u8> {
     let mut payload = Vec::with_capacity(FRAME_META + batch.data().len());
-    payload.extend_from_slice(batch.history().as_bytes());
-    payload.extend_from_slice(&batch.first_sequence().to_be_bytes());
-    payload.extend_from_slice(&batch.digest());
+    payload.extend_from_slice(&batch_meta(batch));
     payload.extend_from_slice(batch.data());
     payload
+}
+
+/// The `history | first | digest` prefix of [`encode_batch_payload`], alone.
+fn batch_meta(batch: &PhysicalBatch) -> [u8; FRAME_META] {
+    let history = batch.history();
+    let first = batch.first_sequence().to_be_bytes();
+    let digest = batch.digest();
+    let fields = history.as_bytes().iter().chain(&first).chain(&digest);
+    let mut meta = [0_u8; FRAME_META];
+    for (to, from) in meta.iter_mut().zip(fields) {
+        *to = *from;
+    }
+    meta
 }
 
 /// Decode a wire `Batch` payload through [`PhysicalBatch::decode`], which
@@ -645,7 +659,9 @@ impl FrameIter<'_> {
             .read_exact(&mut length)
             .map_err(|error| io_refuse(&self.path, "truncated frame length", &error))?;
         let size = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
-        if size == 0 || size > MAX_FRAME_LEN {
+        // Spec P4.1c: a frame may be gigabytes, so a damaged length word is
+        // checked against what the body has left before it is allocated.
+        if size == 0 || size > MAX_FRAME_LEN || u64::from(u32::from_be_bytes(length)) > self.reader.limit() {
             return Err(refuse(&self.path, format!("frame length {size} is out of bounds")));
         }
         let mut payload = vec![0_u8; size];
@@ -916,32 +932,48 @@ impl OpenSegment {
                 ),
             ));
         }
-        let payload = encode_batch_payload(batch);
-        let payload = if self.header.sealed() {
+        // A write group may be gigabytes (spec P4.1c): it is never joined with
+        // its length word into one buffer. Unsealed, the frame is written from
+        // the batch itself (metadata, then the raw group); sealed, the one
+        // plaintext copy is consumed by the sealing, so it is freed before the
+        // sealed payload is written.
+        let sealed = if self.header.sealed() {
             let key = key.ok_or_else(|| refuse(&self.path, SEALED_WITHOUT_KEY))?;
-            crate::storage::tde::seal(Some(key), &payload)
-                .map_err(|error| refuse(&self.path, format!("cannot seal the frame: {error}")))?
-                .into_owned()
+            Some(
+                crate::storage::tde::seal_owned(Some(key), encode_batch_payload(batch))
+                    .map_err(|error| refuse(&self.path, format!("cannot seal the frame: {error}")))?,
+            )
         } else {
-            payload
+            None
         };
-        if payload.len() > MAX_FRAME_LEN {
+        let meta = batch_meta(batch);
+        let parts: [&[u8]; 2] = match &sealed {
+            Some(payload) => [payload.as_slice(), &[]],
+            None => [&meta, batch.data()],
+        };
+        let payload_len: usize = parts.iter().map(|part| part.len()).sum();
+        if payload_len > MAX_FRAME_LEN {
             return Err(refuse(
                 &self.path,
-                format!("a frame of {} bytes exceeds the format's limit", payload.len()),
+                format!("a frame of {payload_len} bytes exceeds the format's limit"),
             ));
         }
-        let length = u32::try_from(payload.len())
+        let length = u32::try_from(payload_len)
             .map_err(|_| refuse(&self.path, "a frame longer than 4 GiB cannot be archived"))?;
-        let mut frame = Vec::with_capacity(4 + payload.len());
-        frame.extend_from_slice(&length.to_be_bytes());
-        frame.extend_from_slice(&payload);
-        if let Err(error) = self.file.write_all(&frame) {
+        let word = length.to_be_bytes();
+        let written = self
+            .file
+            .write_all(&word)
+            .and_then(|()| parts.iter().try_for_each(|part| self.file.write_all(part)));
+        if let Err(error) = written {
             self.failed = true;
             return Err(io_refuse(&self.path, "cannot append a frame", &error));
         }
-        self.hasher.update(&frame);
-        let added = frame.len() as u64;
+        self.hasher.update(word);
+        for part in parts {
+            self.hasher.update(part);
+        }
+        let added = (word.len() + payload_len) as u64;
         self.body_bytes += added;
         self.unsynced_bytes += added;
         if self.batch_count == 0 {
@@ -1165,7 +1197,7 @@ pub fn set_aside_corrupt(path: &Path) -> std::io::Result<PathBuf> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 pub(crate) mod tests {
     use super::*;
-    use crate::replication::physical::poll_source;
+    use crate::replication::physical::{poll_source, FlushMemo};
     use tempfile::TempDir;
 
     /// `count` write groups of a fresh RocksDB store, as the archiver would
@@ -1187,7 +1219,7 @@ pub(crate) mod tests {
             db.write(batch).unwrap();
         }
         let history = Uuid::new_v4();
-        let polled = poll_source(&db, history, 0, MAX_BATCH_BYTES).unwrap();
+        let polled = poll_source(&db, history, 0, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(polled.batches.len(), count);
         (history, polled.batches)
     }

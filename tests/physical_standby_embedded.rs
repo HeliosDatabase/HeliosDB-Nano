@@ -48,7 +48,7 @@ use heliosdb_nano::replication::checkpoint_transfer::{
     OnlineCheckpointExport, PhysicalStage, ReceiverStaging, TransferLimits,
 };
 use heliosdb_nano::replication::history::load_or_create_primary_history;
-use heliosdb_nano::replication::physical::{poll_source, MAX_BATCH_BYTES};
+use heliosdb_nano::replication::physical::{poll_source, FlushMemo, MAX_BATCH_BYTES};
 use heliosdb_nano::replication::physical_applier::{DerivedStateListener, NoopDerivedStateListener, PhysicalApplier};
 use heliosdb_nano::storage::lockfree::LockFreeIngestionConfig;
 use heliosdb_nano::storage::{StorageEngine, WriteGate};
@@ -221,7 +221,7 @@ impl Standby {
         let mut applied = 0;
         loop {
             let after = applier.writer().cursor().source_sequence();
-            let poll = poll_source(&self.raw, self.history, after, MAX_BATCH_BYTES).unwrap();
+            let poll = poll_source(&self.raw, self.history, after, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
             if poll.batches.is_empty() {
                 return applied;
             }

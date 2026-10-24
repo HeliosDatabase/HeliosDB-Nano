@@ -23,11 +23,13 @@
 //! before the completed download is verified and opened, so an installed
 //! standby carries no extra file; installation is unchanged.
 
+use super::fast_forward::FastForwardPlan;
 use super::physical::{
-    decode_cursor, Durability, LocalWriter, PhysicalBatch, PhysicalCursor, PhysicalError, StagedPhysicalReplica,
-    CURSOR_KEY, LOCAL_CF,
+    decode_cursor, fast_forward_record, Durability, FastForwardRecord, LocalWriter, PhysicalBatch, PhysicalCursor,
+    PhysicalError, StagedPhysicalReplica, CURSOR_KEY, FAST_FORWARD_KEY, LOCAL_CF,
 };
 use crate::{storage::StorageEngine, Config};
+use parking_lot::Mutex;
 use rocksdb::{checkpoint::Checkpoint, ColumnFamilyDescriptor, Options, DB};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -36,11 +38,17 @@ use std::{
     fs::{self, File, Metadata, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 use uuid::Uuid;
 
 pub const PHYSICAL_MARKER_FILE: &str = "NANO-PHYSICAL-REPLICA.json";
 pub const PHYSICAL_MANIFEST_FILE: &str = "NANO-PHYSICAL-MANIFEST.json";
+/// Spec P4.1 §4: the marker's and the manifest's temporary files while a
+/// fast-forward re-cuts the stage ([`recut_stage`]). A crash can leave one
+/// behind; the re-run removes it.
+pub const PHYSICAL_MARKER_TEMP_FILE: &str = "NANO-PHYSICAL-REPLICA.json.tmp";
+pub const PHYSICAL_MANIFEST_TEMP_FILE: &str = "NANO-PHYSICAL-MANIFEST.json.tmp";
 /// Spec P2.2: a download's progress record, in its staging directory only.
 pub const PHYSICAL_PARTIAL_FILE: &str = "NANO-PHYSICAL-PARTIAL.json";
 /// The record's temporary file while it is rewritten.
@@ -131,10 +139,11 @@ pub struct CheckpointManifest {
     pub storage_identity: String,
     pub files: Vec<CheckpointFile>,
     pub total_bytes: u64,
-    /// Spec P3.2 §4: the checkpoint store's own RocksDB sequence when it runs
-    /// ahead of `checkpoint_sequence` — a CASCADED export, taken from a
-    /// physical standby, whose sequence also counts that standby's cursor
-    /// writes. Absent (and not serialized, so a primary's manifest is
+    /// Spec P3.2 §4: the checkpoint store's own RocksDB sequence when it
+    /// differs from `checkpoint_sequence` — a CASCADED export, taken from a
+    /// physical standby, whose sequence counts that standby's own writes
+    /// (ahead of the source sequence; behind it after a fast-forward, spec
+    /// P4.1). Absent (and not serialized, so a primary's manifest is
     /// unchanged byte for byte) when the two are equal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_sequence: Option<u64>,
@@ -152,9 +161,12 @@ impl CheckpointManifest {
             || self.snapshot_id.is_nil()
             || self.history.is_nil()
             || self.checkpoint_sequence > MAX_SEQUENCE
+            // Set only when the two differ: a cascaded store's counter runs
+            // ahead of the source sequence it holds, or behind it once that
+            // standby was fast-forwarded (spec P4.1 §4).
             || self
                 .store_sequence
-                .is_some_and(|store| store <= self.checkpoint_sequence || store > MAX_SEQUENCE)
+                .is_some_and(|store| store == self.checkpoint_sequence || store > MAX_SEQUENCE)
             || self.files.is_empty()
             || self.files.len() > limits.max_files
             || !valid_identity(&self.storage_identity)
@@ -372,8 +384,9 @@ fn sync_dir(path: &Path) -> Result<()> {
 /// would move obsolete logs into an `archive/` directory, which the stage
 /// file census refuses. Everything that decides how data is laid out and read
 /// (compression, table format, filters, prefix extractor, memtables) is the
-/// engine's.
-fn receiver_options(config: &Config, path: &Path) -> Result<(Options, Vec<ColumnFamilyDescriptor>)> {
+/// engine's. The fast-forward's writer (`physical::FastForwardWriter`, spec
+/// P4.1) opens the stage with these options too.
+pub(crate) fn receiver_options(config: &Config, path: &Path) -> Result<(Options, Vec<ColumnFamilyDescriptor>)> {
     let (mut options, families) = StorageEngine::build_db_options(config, path)
         .map_err(|error| invalid(format!("receiver storage options: {error}")))?;
     options.set_wal_ttl_seconds(0);
@@ -486,6 +499,16 @@ fn strip_node_local_family(path: &Path, config: &Config, expected_history: Uuid)
         let local = copy
             .cf_handle(LOCAL_CF)
             .ok_or_else(|| invalid("the standby's checkpoint has no node-local column family"))?;
+        // Spec P4.1 §4: a store a fast-forward left between two cuts is no
+        // one cut of the primary's: never served.
+        if let Some(bytes) = copy.get_cf(local, FAST_FORWARD_KEY)? {
+            let record = FastForwardRecord::decode(&bytes)?;
+            return Err(PhysicalError::FastForwardInterrupted {
+                from: record.from,
+                to: record.to,
+            }
+            .into());
+        }
         let bytes = copy
             .get_cf(local, CURSOR_KEY)?
             .ok_or_else(|| invalid("the standby's checkpoint holds no receiver cursor"))?;
@@ -562,12 +585,18 @@ fn fingerprint_file(path: &Path, expected_size: u64, single_link: bool) -> Resul
 
 /// Snapshot-file lease only. Dropping it removes its own private TempDir;
 /// archived WAL retention is not extended by this value.
+///
+/// Spec P4.1 §3.2: an export also serves incremental fast-forwards from its
+/// checkpoint, through one leaf plan at a time ([`Self::fast_forward_plan`]),
+/// whose leaf files live inside the lease directory and go with it.
 pub struct OnlineCheckpointExport {
-    _lease: tempfile::TempDir,
+    lease: tempfile::TempDir,
     directory: OwnedDirectory,
     manifest: CheckpointManifest,
     fingerprints: Vec<Metadata>,
     limits: TransferLimits,
+    /// The leaf plan of the last fast-forward session, keyed by its leaf size.
+    fast_forward: Mutex<Option<Arc<FastForwardPlan>>>,
 }
 impl OnlineCheckpointExport {
     /// `db` must be the exclusively opened live primary. Bind caller history to
@@ -733,15 +762,54 @@ impl OnlineCheckpointExport {
         parent.verify()?;
         sync_dir(&path)?;
         Ok(Self {
-            _lease: lease,
+            lease,
             directory,
             manifest,
             fingerprints,
             limits,
+            fast_forward: Mutex::new(None),
         })
     }
     pub fn manifest(&self) -> &CheckpointManifest {
         &self.manifest
+    }
+    /// The checkpoint directory: what a fast-forward's leaves are read from.
+    pub fn checkpoint_path(&self) -> &Path {
+        &self.directory.path
+    }
+    /// Spec P4.1 §3.2: the export's leaf plan for `leaf_bytes`, created (not
+    /// yet planned: [`FastForwardPlan::begin`]) on the first fast-forward
+    /// session that asks for that size. A plan of another size, or one whose
+    /// planning failed or was orphaned (its planning claim dropped without a
+    /// plan: [`FastForwardPlan::is_failed`]), is replaced — returned second,
+    /// so the caller drops it off the lock — and a session still holding it
+    /// keeps it until it ends. Each plan writes its leaf files into a
+    /// directory of its own, removed when its last reference drops, so a
+    /// replaced plan's files never disappear under a session still reading
+    /// them and never mix with its successor's. The leaf files are written
+    /// with `config`'s storage options, the engine's.
+    pub fn fast_forward_plan(
+        &self,
+        leaf_bytes: u32,
+        config: &Config,
+    ) -> (Arc<FastForwardPlan>, Option<Arc<FastForwardPlan>>) {
+        let mut slot = self.fast_forward.lock();
+        if let Some(plan) = slot
+            .as_ref()
+            .filter(|plan| plan.leaf_bytes() == leaf_bytes && !plan.is_failed())
+        {
+            return (Arc::clone(plan), None);
+        }
+        let plan = Arc::new(FastForwardPlan::new(
+            leaf_bytes,
+            self.directory.path.clone(),
+            self.lease
+                .path()
+                .join(format!("leaves-{leaf_bytes}-{}", Uuid::new_v4().simple())),
+            config.clone(),
+        ));
+        let replaced = slot.replace(Arc::clone(&plan));
+        (plan, replaced)
     }
     pub fn manifest_bytes(&self) -> Result<Vec<u8>> {
         self.directory.verify()?;
@@ -1051,14 +1119,22 @@ fn write_partial_record(directory: &Path, record: &PartialRecord) -> Result<()> 
     if bytes.len() > MAX_PARTIAL_BYTES {
         return Err(invalid("partial download record byte limit"));
     }
-    let temporary = directory.join(PHYSICAL_PARTIAL_TEMP_FILE);
+    replace_atomically(directory, PHYSICAL_PARTIAL_TEMP_FILE, PHYSICAL_PARTIAL_FILE, &bytes)
+}
+
+/// Replace `directory/name` with `bytes` atomically: a fresh `temporary`
+/// (any left by a crash is removed first), fsynced, renamed over `name`, the
+/// directory fsynced. A reader sees the old file or the new one, never a
+/// part of either.
+fn replace_atomically(directory: &Path, temporary: &str, name: &str, bytes: &[u8]) -> Result<()> {
+    let temporary = directory.join(temporary);
     match fs::remove_file(&temporary) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    create_file(&temporary, &bytes)?;
-    fs::rename(&temporary, directory.join(PHYSICAL_PARTIAL_FILE))?;
+    create_file(&temporary, bytes)?;
+    fs::rename(&temporary, directory.join(name))?;
     sync_dir(directory)
 }
 
@@ -1481,6 +1557,14 @@ impl PhysicalStage {
         self.owner.verify()?;
         Ok(self.replica.apply_with(batch, durability)?)
     }
+    /// The checks [`Self::apply`] runs before every batch — the private
+    /// directory and its parent are still this stage's, its marker and saved
+    /// manifest unchanged — for a caller that applies a run of batches
+    /// through the stage's writer under one check (spec P4.1d: the receiver
+    /// worker, once per poll).
+    pub fn verify(&self) -> Result<()> {
+        self.owner.verify()
+    }
     /// Install a closed physical stage, never a ready/serving Nano standby.
     /// Ordinary CLI startup must refuse PHYSICAL_MARKER_FILE until its physical
     /// hydration/serving path is implemented and validated independently.
@@ -1567,31 +1651,7 @@ fn load_existing_stage(path: &Path, expected_history: Uuid, limits: &TransferLim
     // After progress, original SST/WAL hashes are intentionally stale. Check
     // the owned directory's current file types/names instead, before RocksDB
     // can follow any of its control files. Do not remove or repair extras.
-    for entry in fs::read_dir(&directory.path)? {
-        let entry = entry?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| invalid("non-UTF8 stage file"))?;
-        if !(valid_file_name(&name)
-            || name == PHYSICAL_MARKER_FILE
-            || name == PHYSICAL_MANIFEST_FILE
-            || name == "LOCK"
-            || name == "LOG"
-            || name.starts_with("LOG.old."))
-        {
-            return Err(invalid(format!("unexpected existing physical stage file {name}")));
-        }
-        valid_regular(&fs::symlink_metadata(entry.path())?, u64::MAX, true)?;
-    }
-    let current = read_small(&directory.path.join("CURRENT"), 256)?;
-    let current = std::str::from_utf8(&current)
-        .map_err(|_| invalid("existing CURRENT is not UTF8"))?
-        .trim_end_matches('\n');
-    if !current.starts_with("MANIFEST-") || !valid_file_name(current) {
-        return Err(invalid("existing CURRENT references an invalid manifest"));
-    }
-    open_regular(&directory.path.join(current), u64::MAX, true, false)?;
+    census_stage_files(&directory.path, false)?;
     let owner = StageOwner {
         target: directory.path.clone(), // Existing path: never passed to rename.
         directory,
@@ -1603,6 +1663,225 @@ fn load_existing_stage(path: &Path, expected_history: Uuid, limits: &TransferLim
     Ok(owner)
 }
 
+/// The census of an existing stage's files, before RocksDB may follow any of
+/// its control files: only RocksDB's own names, the marker and the saved
+/// manifest (and, for a directory a fast-forward re-cuts, their temporaries:
+/// `recut_temporaries`), `LOCK` and the `LOG` files — each a regular file with
+/// one link — and a `CURRENT` that names a manifest present as such a file.
+fn census_stage_files(path: &Path, recut_temporaries: bool) -> Result<()> {
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| invalid("non-UTF8 stage file"))?;
+        let temporary = name == PHYSICAL_MARKER_TEMP_FILE || name == PHYSICAL_MANIFEST_TEMP_FILE;
+        if !(valid_file_name(&name)
+            || name == PHYSICAL_MARKER_FILE
+            || name == PHYSICAL_MANIFEST_FILE
+            || name == "LOCK"
+            || name == "LOG"
+            || name.starts_with("LOG.old.")
+            || (recut_temporaries && temporary))
+        {
+            return Err(invalid(format!("unexpected existing physical stage file {name}")));
+        }
+        valid_regular(&fs::symlink_metadata(entry.path())?, u64::MAX, true)?;
+    }
+    let current = read_small(&path.join("CURRENT"), 256)?;
+    let current = std::str::from_utf8(&current)
+        .map_err(|_| invalid("existing CURRENT is not UTF8"))?
+        .trim_end_matches('\n');
+    if !current.starts_with("MANIFEST-") || !valid_file_name(current) {
+        return Err(invalid("existing CURRENT references an invalid manifest"));
+    }
+    open_regular(&path.join(current), u64::MAX, true, false)?;
+    Ok(())
+}
+
+/// Spec P4.1 §3.3: the checks the fast-forward makes before it opens a
+/// standby's store — the directory may be between two cuts, so its marker
+/// and manifest are not compared and a re-cut temporary is tolerated, but
+/// RocksDB follows its `CURRENT` only after the same census as
+/// [`ReopenedPhysicalStage::open`]'s: an owned directory, not nested in a
+/// database, carrying no primary or logical-standby marker.
+pub fn check_stage_files(path: &Path) -> Result<()> {
+    let directory = OwnedDirectory::capture(path)?;
+    let parent = OwnedDirectory::capture(directory.path.parent().ok_or_else(|| invalid("stage has no parent"))?)?;
+    refuse_database_ancestors(&parent.path)?;
+    absent(&directory.path.join(PRIMARY_MARKER))?;
+    absent(&directory.path.join(STANDBY_MARKER))?;
+    census_stage_files(&directory.path, true)?;
+    directory.verify()
+}
+
+/// Spec P4.1 §4: the record of the fast-forward that left the standby at
+/// `path` between two cuts, if one did — read from a read-only open, after
+/// [`check_stage_files`]. `None` when the directory carries none, or cannot
+/// be read at all (the caller's own error then says why). Used to name the
+/// interrupted fast-forward where a stage open fails for a reason it causes
+/// (a marker that disagrees with a re-cut manifest).
+pub fn interrupted_fast_forward(path: &Path, config: &Config) -> Option<FastForwardRecord> {
+    check_stage_files(path).ok()?;
+    if !DB::list_cf(&Options::default(), path)
+        .ok()?
+        .iter()
+        .any(|family| family == LOCAL_CF)
+    {
+        return None;
+    }
+    let (options, families) = receiver_options(config, path).ok()?;
+    let readonly = DB::open_cf_descriptors_read_only(&options, path, families, false).ok()?;
+    fast_forward_record(&readonly).ok().flatten()
+}
+
+/// Spec P4.1 §3.3.5: the census of a fast-forwarded stage as the manifest
+/// its re-cut writes: every file RocksDB keeps in `path` (not `LOCK`, the
+/// `LOG` files, the marker, the saved manifest or their temporaries), with
+/// its real size and SHA-256, at the cut `checkpoint_sequence` of the
+/// primary's `snapshot_id`. The store must be flushed and CLOSED: closing
+/// waits for RocksDB's background work, so no compaction can replace a
+/// file while it is hashed, and one pass is the census.
+pub fn stage_census_manifest(
+    path: &Path,
+    history: Uuid,
+    snapshot_id: Uuid,
+    checkpoint_sequence: u64,
+    limits: &TransferLimits,
+) -> Result<CheckpointManifest> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let name = entry?
+            .file_name()
+            .into_string()
+            .map_err(|_| invalid("non-UTF8 stage file"))?;
+        if outside_census(&name) {
+            continue;
+        }
+        if !valid_file_name(&name) {
+            return Err(invalid(format!("unexpected file {name} in the fast-forwarded stage")));
+        }
+        names.push(name);
+    }
+    names.sort();
+    let mut files = Vec::with_capacity(names.len());
+    let mut total_bytes = 0_u64;
+    for name in names {
+        let file = path.join(&name);
+        let size = fs::symlink_metadata(&file)?.len();
+        let (sha256, _) = fingerprint_file(&file, size, true)?;
+        total_bytes = total_bytes
+            .checked_add(size)
+            .ok_or_else(|| invalid("stage size overflow"))?;
+        files.push(CheckpointFile { name, size, sha256 });
+    }
+    let manifest = CheckpointManifest {
+        format: 1,
+        snapshot_id,
+        history,
+        checkpoint_sequence,
+        storage_identity: identity(path)?,
+        files,
+        total_bytes,
+        store_sequence: None,
+    };
+    manifest.validate(limits).map_err(|error| {
+        invalid(format!(
+            "the stage's limits refuse its re-cut manifest ({error}): {} files, {} bytes; raise \
+             [replication.physical] max_files / max_file_bytes / max_total_bytes (--physical-max-*) and re-run",
+            manifest.files.len(),
+            manifest.total_bytes
+        ))
+    })?;
+    Ok(manifest)
+}
+
+/// The files a re-cut's census leaves out: `LOCK`, the `LOG` files, the
+/// marker, the saved manifest and their temporaries.
+fn outside_census(name: &str) -> bool {
+    matches!(
+        name,
+        "LOCK"
+            | "LOG"
+            | PHYSICAL_MARKER_FILE
+            | PHYSICAL_MANIFEST_FILE
+            | PHYSICAL_MARKER_TEMP_FILE
+            | PHYSICAL_MANIFEST_TEMP_FILE
+    ) || name.starts_with("LOG.old.")
+}
+
+/// Spec P4.1 §3.3.5, before a fast-forward applies anything: the files of
+/// the stage at `path` as the re-cut's census would count them, against the
+/// transfer limits its manifest must satisfy ([`CheckpointManifest::validate`]:
+/// the number of files, each file's size, their total). A stage the census
+/// would already refuse is refused HERE, before its data directory is
+/// touched, rather than after every leaf was applied. Sizes only, no hashing;
+/// a file that disappears meanwhile (a compaction) is not counted. The files
+/// the fast-forward adds can still take the stage over the limits.
+pub fn check_stage_limits(path: &Path, limits: &TransferLimits) -> Result<()> {
+    limits.validate()?;
+    let (mut files, mut total, mut largest) = (0_usize, 0_u64, 0_u64);
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| invalid("non-UTF8 stage file"))?;
+        if outside_census(&name) {
+            continue;
+        }
+        let size = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        files += 1;
+        total = total.saturating_add(size);
+        largest = largest.max(size);
+    }
+    if files > limits.max_files || total > limits.max_total_bytes || largest > limits.max_file_bytes {
+        return Err(invalid(format!(
+            "the stage's limits would refuse its re-cut manifest: it holds {files} files (at most {}), {total} \
+             bytes (at most {}), the largest {largest} bytes (at most {}); this run applied nothing — raise \
+             [replication.physical] max_files / max_file_bytes / max_total_bytes (--physical-max-*) and re-run",
+            limits.max_files, limits.max_total_bytes, limits.max_file_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// Spec P4.1 §3.3.5 (ii)-(iii): re-cut the stage at `path` to `manifest` —
+/// the manifest rewritten first, then the marker naming its digest, each
+/// atomically (temporary, fsync, rename, directory fsync). The only writer of
+/// these two files besides staging. Until the marker is rewritten the two
+/// disagree, so a stage open refuses the directory; the fast-forward's
+/// record (removed only after this) names why.
+pub fn recut_stage(path: &Path, manifest: &CheckpointManifest) -> Result<()> {
+    recut_stage_with(path, manifest, &mut || {})
+}
+
+/// [`recut_stage`], calling `after_manifest` between the two files (a test
+/// hook stops the process there).
+pub fn recut_stage_with(path: &Path, manifest: &CheckpointManifest, after_manifest: &mut dyn FnMut()) -> Result<()> {
+    let directory = OwnedDirectory::capture(path)?;
+    let encoded = manifest.encoded()?;
+    let marker = staging_marker(manifest, &encoded)?;
+    replace_atomically(
+        &directory.path,
+        PHYSICAL_MANIFEST_TEMP_FILE,
+        PHYSICAL_MANIFEST_FILE,
+        &encoded,
+    )?;
+    after_manifest();
+    replace_atomically(
+        &directory.path,
+        PHYSICAL_MARKER_TEMP_FILE,
+        PHYSICAL_MARKER_FILE,
+        &marker,
+    )?;
+    directory.verify()
+}
+
 /// Resume a previously initialized physical stage, never a partial download or
 /// ordinary Nano dataset. This owner can apply and close; it cannot rename,
 /// overwrite, rebind history, reset progress, or publish serving readiness.
@@ -1612,8 +1891,25 @@ pub struct ReopenedPhysicalStage {
 }
 impl ReopenedPhysicalStage {
     /// `config` supplies the storage options every open of the receiver uses.
+    ///
+    /// Spec P4.1 §4: a directory a fast-forward left between two cuts is
+    /// refused with [`PhysicalError::FastForwardInterrupted`] — by the cursor
+    /// read below, or, when the re-cut had already rewritten the manifest but
+    /// not the marker (so they disagree), by the record itself.
     pub fn open(path: &Path, expected_history: Uuid, limits: TransferLimits, config: &Config) -> Result<Self> {
-        let owner = load_existing_stage(path, expected_history, &limits)?;
+        let owner = match load_existing_stage(path, expected_history, &limits) {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Err(match interrupted_fast_forward(path, config) {
+                    Some(record) => PhysicalError::FastForwardInterrupted {
+                        from: record.from,
+                        to: record.to,
+                    }
+                    .into(),
+                    None => error,
+                })
+            }
+        };
         // The file census above vetted every name before RocksDB follows
         // CURRENT. A stage without the node-local family keeps its cursor in
         // the default one (it predates the namespace) or was never
@@ -1669,7 +1965,8 @@ impl ReopenedPhysicalStage {
     /// The checks [`Self::apply`] runs before every batch — the directory is
     /// still this stage's, carries no primary/standby marker and the same
     /// IDENTITY — for a caller that applies through the stage's writer
-    /// itself (a serving standby's `PhysicalApplier`, spec P1.3).
+    /// itself (a serving standby's `PhysicalApplier`, spec P1.3), or applies
+    /// a run of batches under one check (spec P4.1d: once per poll).
     pub fn verify(&self) -> Result<()> {
         verify_existing_stage(&self.owner)
     }
@@ -1706,12 +2003,12 @@ fn rename_noreplace(source: &Path, target: &Path) -> Result<()> {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
     use super::*;
     use crate::replication::{
         history::load_or_create_primary_history,
-        physical::{poll_source, MAX_BATCH_BYTES},
+        physical::{poll_source, FlushMemo, MAX_BATCH_BYTES},
     };
     use rocksdb::WriteBatch;
     use std::os::unix::fs::symlink;
@@ -1770,7 +2067,7 @@ mod tests {
         batch.put(b"second", b"committed-two");
         batch.delete(b"seed");
         source.write(batch).unwrap();
-        let poll = poll_source(&source, history, cut, MAX_BATCH_BYTES).unwrap();
+        let poll = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         assert_eq!(poll.through, cut + 3);
         let target = root.path().join("installed");
         let receiver = download(&export, &target);
@@ -1996,7 +2293,14 @@ mod tests {
         batch.put(b"after-a", b"a");
         batch.put(b"after-b", b"b");
         source.write(batch).unwrap();
-        let poll = poll_source(&source, history, resumed.cursor().source_sequence(), MAX_BATCH_BYTES).unwrap();
+        let poll = poll_source(
+            &source,
+            history,
+            resumed.cursor().source_sequence(),
+            MAX_BATCH_BYTES,
+            &FlushMemo::new(),
+        )
+        .unwrap();
         assert_eq!(poll.batches.len(), 1);
         assert!(resumed.apply(&poll.batches[0]).unwrap());
         assert!(!resumed.apply(&poll.batches[0]).unwrap());
@@ -2017,7 +2321,7 @@ mod tests {
         assert_eq!(again.cursor(), closed.cursor);
         assert!(!again.apply(&poll.batches[0]).unwrap());
         source.put(b"after-c", b"c").unwrap();
-        let later = poll_source(&source, history, 3, MAX_BATCH_BYTES).unwrap();
+        let later = poll_source(&source, history, 3, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
         for batch in &later.batches {
             assert!(again.apply(batch).unwrap());
         }
@@ -2056,6 +2360,78 @@ mod tests {
         let reopened = ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).unwrap();
         assert_eq!(reopened.cursor().snapshot_sequence(), 1);
         reopened.close().unwrap();
+    }
+
+    /// Spec P4.1 §3.3.5, §4: a fast-forwarded stage is re-cut at the new
+    /// cut — manifest, then marker, then the cursor write that removes the
+    /// record — and reopens at it; a stage left between the manifest and
+    /// the marker is refused naming the interrupted fast-forward, as is one
+    /// whose record is still there.
+    #[test]
+    fn a_recut_stage_reopens_at_its_new_cut_and_an_unfinished_one_names_the_fast_forward() {
+        use crate::replication::physical::FastForwardWriter;
+        let root = tempfile::tempdir().unwrap();
+        let (source, history, path, manifest) = installed_fixture(root.path());
+        source.put(b"later", b"value").unwrap();
+        let cut = source.latest_sequence_number();
+        let snapshot = Uuid::new_v4();
+        let record = FastForwardRecord::new(history, snapshot, manifest.checkpoint_sequence, cut, 64 * 1024);
+        let interrupted =
+            |path: &Path| match ReopenedPhysicalStage::open(path, history, TransferLimits::default(), &config()) {
+                Err(TransferError::Physical(PhysicalError::FastForwardInterrupted { from, to })) => (from, to),
+                Err(other) => panic!("not the fast-forward refusal: {other}"),
+                Ok(_) => panic!("an unfinished fast-forward was reopened"),
+            };
+
+        // The limits pre-check counts the files the census would.
+        check_stage_limits(&path, &TransferLimits::default()).unwrap();
+        let one_file = TransferLimits {
+            max_files: 1,
+            ..TransferLimits::default()
+        };
+        let refused = check_stage_limits(&path, &one_file).unwrap_err().to_string();
+        assert!(refused.contains("at most 1)"), "{refused}");
+
+        let writer = FastForwardWriter::open(&path, &config(), history).unwrap();
+        writer.start_record(&record).unwrap();
+        writer.flush().unwrap();
+        writer.release();
+        assert_eq!(interrupted(&path), (manifest.checkpoint_sequence, cut));
+        assert_eq!(
+            interrupted_fast_forward(&path, &config()).map(|found| found.to),
+            Some(cut)
+        );
+
+        // Killed after the manifest: marker and manifest disagree.
+        let recut = stage_census_manifest(&path, history, snapshot, cut, &TransferLimits::default()).unwrap();
+        assert_eq!(recut.checkpoint_sequence, cut);
+        assert!(recut.files.iter().any(|file| file.name == "CURRENT"));
+        replace_atomically(
+            &path,
+            PHYSICAL_MANIFEST_TEMP_FILE,
+            PHYSICAL_MANIFEST_FILE,
+            &recut.encoded().unwrap(),
+        )
+        .unwrap();
+        assert!(load_existing_stage(&path, history, &TransferLimits::default()).is_err());
+        assert_eq!(interrupted(&path), (manifest.checkpoint_sequence, cut));
+
+        // The re-run re-cuts: manifest, marker (the store closed), then the
+        // store reopened — its record still there — for the cursor.
+        recut_stage(&path, &recut).unwrap();
+        assert_eq!(interrupted(&path), (manifest.checkpoint_sequence, cut));
+        let writer = FastForwardWriter::open(&path, &config(), history).unwrap();
+        assert_eq!(writer.record().unwrap(), Some(record));
+        let cursor = writer.recut(cut, snapshot).unwrap();
+        assert_eq!(writer.close().unwrap(), cursor);
+        assert_eq!(interrupted_fast_forward(&path, &config()), None);
+        let reopened = ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).unwrap();
+        assert_eq!(reopened.cursor().snapshot_sequence(), cut);
+        assert_eq!(reopened.cursor().source_sequence(), cut);
+        reopened.close().unwrap();
+        // No temporary is left behind.
+        assert!(!path.join(PHYSICAL_MANIFEST_TEMP_FILE).exists());
+        assert!(!path.join(PHYSICAL_MARKER_TEMP_FILE).exists());
     }
 
     #[test]

@@ -91,6 +91,10 @@ const ALLOW: &[(&str, &str)] = &[
     // --- Keys, but not of the engine's keyspace ---
     // `vacuum_table`: a compact_range bound for a `t:` family nothing writes.
     ("src/storage/engine.rs", "t:"),
+    // `physical::FAST_FORWARD_KEY` (spec P4.1): the record of a fast-forward
+    // in progress, a node-local key of the `__nano_local` family, like the
+    // receiver cursor — never in the replicated default family.
+    ("src/replication/physical.rs", "ff:"),
     // OfflineQueue's own private RocksDB (and src/sync is not compiled).
     ("src/sync/offline_queue.rs", "queue:"),
     // --- Unit-test fixtures written to scratch stores, never by the engine ---

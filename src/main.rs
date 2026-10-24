@@ -23,7 +23,7 @@ struct HAConfig {
     /// resolved (absolute) for a node with an HA role and a data directory.
     archive: heliosdb_nano::config::ArchiveConfig,
     role: String,
-    /// THE replication port (`NPHYS002`): a primary serves its standbys here.
+    /// THE replication port (`NPHYS003`): a primary serves its standbys here.
     replication_port: u16,
     startup_timeout_secs: u64,
     /// A standby's primary: the primary's replication port.
@@ -1165,12 +1165,17 @@ struct Cli {
 enum Commands {
     /// Install/follow a closed physical receiver; never exposes SQL or serving readiness.
     Resync(ResyncArgs),
-    /// Advance a STOPPED physical standby from archived WAL segments copied
-    /// into one or more directories (spec P3.2; Oracle: RECOVER STANDBY
-    /// DATABASE). Every segment is verified before anything is applied; the
-    /// groups go through the same apply path as a live standby's. Exits 0 when
-    /// the standby reached the newest segment (or --through), 2 with the
-    /// missing range when the segments stop short of it.
+    /// Recover a STOPPED physical standby. --from-archive: advance it from
+    /// archived WAL segments copied into one or more directories (spec P3.2;
+    /// Oracle: RECOVER STANDBY DATABASE); every segment is verified before
+    /// anything is applied, and the groups go through the same apply path as
+    /// a live standby's. --from-primary: rebuild it from its primary by the
+    /// cheapest safe route — nothing when the primary still serves its next
+    /// write group, else only the key ranges that differ, else a full copy
+    /// (spec P4.1; Oracle: RECOVER STANDBY DATABASE FROM SERVICE). Exits 0 on
+    /// success, 1 on an error, 2 with the missing range when the segments
+    /// stop short, 3 when a full copy is needed but was not applied
+    /// (--no-full-copy, or an occupied directory without --replace).
     Recover(RecoverArgs),
     /// Inspect and maintain a WAL archive (archived segments, spec P3.1)
     /// offline: list, verify, gaps, prune. Reads the files only and takes no
@@ -1278,7 +1283,7 @@ enum Commands {
         #[arg(long)]
         replication_role: Option<String>,
 
-        /// THE replication port (protocol NPHYS002, default: 5433): a primary
+        /// THE replication port (protocol NPHYS003, default: 5433): a primary
         /// serves its physical standbys here — the bootstrap copy, the physical
         /// WAL, heartbeats and acknowledgements on one connection each. It
         /// binds on --listen's address with --replication-tls (or
@@ -2571,7 +2576,7 @@ async fn start_server(
                 replication_remote_allowed(&ha_config),
             );
             println!(
-                "      - Replication listener: {address} (NPHYS002, {})",
+                "      - Replication listener: {address} (NPHYS003, {})",
                 if ha_config.replication_tls.tls_enabled && ha_config.replication_tls.tls_ca_path.is_some() {
                     "TLS, client certificates required"
                 } else if ha_config.replication_tls.tls_enabled {
@@ -2649,7 +2654,7 @@ async fn start_server(
     drop(serving_db_tx);
 
     // Spec P2.1: a primary's replication is its ONE replication port
-    // (`NPHYS002`), bound here before any readiness is published; its directly
+    // (`NPHYS003`), bound here before any readiness is published; its directly
     // owned future is polled alongside PostgreSQL only after startup succeeds.
     // A standby's replication belongs to its `StandbyRuntime` (above).
     #[cfg(feature = "ha-tier1")]
@@ -4023,13 +4028,14 @@ const LEGACY_LOGICAL_STANDBY_REFUSAL: &str = "this directory is a logical standb
 #[cfg(feature = "ha-tier1")]
 const STANDBY_BOOTSTRAP_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 /// A serving standby's receiver cadence: poll interval, reconnect delay, and
-/// the bytes one poll may carry.
+/// the bytes of small write groups one poll gathers
+/// (`physical_receiver::STANDBY_POLL_BYTES`, 32 MiB: spec P4.1c, P4.1d).
 #[cfg(feature = "ha-tier1")]
 const STANDBY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(feature = "ha-tier1")]
 const STANDBY_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 #[cfg(feature = "ha-tier1")]
-const STANDBY_POLL_BYTES: usize = 8 * 1024 * 1024;
+const STANDBY_POLL_BYTES: usize = heliosdb_nano::replication::physical_receiver::STANDBY_POLL_BYTES;
 /// Spec P2.1: how often an idle standby sends its primary a heartbeat. Every
 /// durable advance is acknowledged sooner (`physical_receiver::ACK_COALESCE`).
 #[cfg(feature = "ha-tier1")]
@@ -4899,7 +4905,20 @@ async fn run_physical_standby(
         // receiver cannot close it; it closes with the process (the receiver
         // fsynced its applied groups before it stopped).
         Err(error) if stopping => tracing::debug!("physical standby receiver stopped: {error}"),
-        Err(error) => plan.refuse(&refusal, format!("the physical receiver stopped: {error}")),
+        Err(error) => {
+            let mut reason = format!("the physical receiver stopped: {error}");
+            // Spec P4.1 §4: an interrupted fast-forward is named with this
+            // standby's directory and primary, so the remedy is the exact
+            // command to run.
+            if reason.contains("fast-forward from the primary interrupted") {
+                if let Some(remedy) =
+                    interrupted_fast_forward_reason(&plan.data_dir, &plan.config, Some(plan.primary.as_str())).await
+                {
+                    reason = remedy;
+                }
+            }
+            plan.refuse(&refusal, reason);
+        }
     }
 }
 
@@ -7142,7 +7161,7 @@ fn physical_wire_limits(
     }
 }
 
-/// Spec P2.1: a primary's ONE replication port (`NPHYS002`), bound, with
+/// Spec P2.1: a primary's ONE replication port (`NPHYS003`), bound, with
 /// everything its sessions share.
 #[cfg(feature = "ha-tier1")]
 struct PreparedPhysicalSource {
@@ -7179,6 +7198,9 @@ struct PreparedPhysicalSource {
     /// Spec P3.2 §1: the WAL archive a receiver's gap is filled from when the
     /// store's WAL no longer holds it; `None` without an archive.
     fill: Option<heliosdb_nano::replication::archive_chain::ArchiveFill>,
+    /// Spec P4.1 §3.2: the node's configuration, whose storage options a
+    /// fast-forward's leaf files are written with.
+    storage: std::sync::Arc<Config>,
 }
 
 /// Spec P3.1: start a primary's WAL archiver beside its replication port. It
@@ -7285,7 +7307,7 @@ async fn prepare_physical_source(
         .await
         .map_err(|e| {
             Error::network(format!(
-                "Cannot bind the replication listener {address} (NPHYS002): {e}. Use distinct PostgreSQL --port \
+                "Cannot bind the replication listener {address} (NPHYS003): {e}. Use distinct PostgreSQL --port \
                  and --replication-port endpoints; a standby's --primary-host names this port."
             ))
         })?;
@@ -7309,7 +7331,7 @@ async fn prepare_physical_source(
         tls: acceptor.is_some(),
     });
     info!(
-        "Replication port listening on {address} (NPHYS002, {}, dataset history {history})",
+        "Replication port listening on {address} (NPHYS003, {}, dataset history {history})",
         match server_tls {
             Some(tls) if tls.mutual() => "TLS, client certificates required",
             Some(_) => "TLS",
@@ -7348,6 +7370,7 @@ async fn prepare_physical_source(
         archive,
         kind: heliosdb_nano::replication::physical_source::SourceKind::Primary,
         fill,
+        storage: std::sync::Arc::new(storage.config().clone()),
     }))
 }
 
@@ -7456,13 +7479,13 @@ async fn prepare_cascade_source(
         .await
         .map_err(|e| {
             Error::network(format!(
-                "Cannot bind the cascading standby's replication listener {address} (NPHYS002): {e}. Use distinct \
+                "Cannot bind the cascading standby's replication listener {address} (NPHYS003): {e}. Use distinct \
                  PostgreSQL --port and --replication-port endpoints; a downstream standby's --primary-host names this \
                  port."
             ))
         })?;
     info!(
-        "Cascading replication port listening on {address} (NPHYS002, {}); downstream standbys are served once this \
+        "Cascading replication port listening on {address} (NPHYS003, {}); downstream standbys are served once this \
          standby's store is attached",
         match server_tls {
             Some(tls) if tls.mutual() => "TLS, client certificates required",
@@ -7566,6 +7589,7 @@ async fn serve_cascade_source(plan: CascadePlan, mut shutdown: tokio::sync::watc
             leases: ExportLeases::new(plan.lease, plan.max_leases),
             lease_sweep: std::time::Duration::from_secs((plan.lease.as_secs() / 2).clamp(1, 60)),
             archive: None,
+            storage: std::sync::Arc::clone(&plan.config),
             kind: SourceKind::Cascade { config: plan.config },
             fill: plan.fill,
         })
@@ -7685,6 +7709,7 @@ async fn serve_physical_source(
                 let context = source.context.clone();
                 let kind = source.kind.clone();
                 let fill = source.fill.clone();
+                let storage = source.storage.clone();
                 sessions.spawn(async move {
                     // No `Refuse` frame can precede a handshake: a failed one
                     // is logged with its peer and counted.
@@ -7698,11 +7723,11 @@ async fn serve_physical_source(
                     let result = serve_session(stream, &token, limits, stop, &context, Some(peer),
                         move |request| async move {
                             use heliosdb_nano::replication::physical_source::{
-                                open_cascade_session, open_primary_session_with, SourceKind,
+                                open_cascade_session, open_primary_session_for, SourceKind,
                             };
                             match kind {
                                 SourceKind::Primary => {
-                                    open_primary_session_with(db, history, export, limits.transfer, request, work, leases, fill).await
+                                    open_primary_session_for(db, history, export, limits.transfer, request, work, leases, fill, storage).await
                                 }
                                 SourceKind::Cascade { config } => {
                                     open_cascade_session(db, history, export, limits.transfer, request, work, leases, fill, config).await
@@ -7749,6 +7774,7 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
         use heliosdb_nano::replication::physical_receiver::{
             run_receiver, ReceiverMode, ReceiverOptions, ReceiverStart, ReceiverStatus,
         };
+        use heliosdb_nano::replication::physical_wire::MAX_POLL_BYTES;
         use std::time::Duration;
         // The whole file, not only its replication section: the receiver opens
         // its store with the storage options the standby engine will serve it
@@ -7766,16 +7792,17 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
         config.replication.validate()?;
         let replication = config.replication.clone();
         let tls_settings = ReplicationTlsSettings::from_config(&replication);
-        let mut physical = replication.physical;
+        let physical = replication.physical;
         physical.validate()?;
         if !(1..=60_000).contains(&args.poll_interval_ms)
             || !(1..=60_000).contains(&args.reconnect_delay_ms)
             || args.max_reconnects > 1000
-            || !(1..=67_108_864).contains(&args.poll_byte_limit)
+            || !(1..=MAX_POLL_BYTES).contains(&args.poll_byte_limit)
         {
-            return Err(Error::config(
-                "resync requires poll/reconnect intervals 1..=60000 ms, retries 0..=1000, and poll bytes 1..=67108864",
-            ));
+            return Err(Error::config(format!(
+                "resync requires poll/reconnect intervals 1..=60000 ms, retries 0..=1000, and poll bytes \
+                 1..={MAX_POLL_BYTES}"
+            )));
         }
         if args.expected_history.is_some_and(|id| id.is_nil()) {
             return Err(Error::config("expected history must not be nil"));
@@ -7810,6 +7837,11 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
             heliosdb_nano::replication::read_replication_token(replication.token_file.as_ref().ok_or_else(|| {
                 Error::config("resync requires --replication-token-file or [replication] token_file")
             })?)?;
+        // Spec P4.1 §4: what a refused resume names, should the directory be
+        // one a fast-forward left between two cuts.
+        let resumed_dir = args.resume_existing.then(|| args.data_dir.clone());
+        let probe_config = config.clone();
+        let primary_host = args.primary_host.clone();
         let start = if args.resume_existing {
             ReceiverStart::Resume {
                 path: args.data_dir,
@@ -7880,31 +7912,55 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
                 }
             }
         };
-        let closed = result.map_err(|e| {
-            Error::network(format!(
-                "physical resync stopped: {e}; retained files were not overwritten or auto-reseeded"
-            ))
-        })?;
+        let closed = match result {
+            Ok(closed) => closed,
+            Err(error) => {
+                if let Some(dir) = resumed_dir.filter(|_| error.to_string().contains("fast-forward from the primary")) {
+                    if let Some(remedy) =
+                        interrupted_fast_forward_reason(&dir, &probe_config, Some(primary_host.as_str())).await
+                    {
+                        return Err(Error::config(format!("resync --resume-existing refused: {remedy}")));
+                    }
+                }
+                return Err(Error::network(format!(
+                    "physical resync stopped: {error}; retained files were not overwritten or auto-reseeded"
+                )));
+            }
+        };
         println!("Physical state retained closed at {} (snapshot {}, history {}, source sequence {}). This is not SQL readiness.",
             closed.path.display(), closed.snapshot_id, closed.cursor.history(), closed.cursor.source_sequence());
         Ok(())
     }
 }
 
-/// `heliosdb-nano recover` (spec P3.2 §2).
+/// `heliosdb-nano recover` (spec P3.2 §2, spec P4.1 §1).
 #[derive(clap::Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("recover_source")
+        .required(true)
+        .multiple(false)
+        .args(["from_archive", "from_primary"])
+))]
 struct RecoverArgs {
-    /// The STOPPED physical standby to advance: an installed one (segments
-    /// carry write groups, not a base; `start` bootstraps a standby).
+    /// The STOPPED physical standby to recover. --from-archive: an installed
+    /// one (segments carry write groups, not a base; `start` bootstraps a
+    /// standby). --from-primary: any standby directory, or an absent or
+    /// empty one (the primary's snapshot is installed there).
     #[arg(short, long, value_name = "DIR")]
     data_dir: PathBuf,
     /// A directory holding archived WAL segments — any node's archive of the
     /// same dataset history, or copies of its files; repeat it for several.
     /// Byte-identical copies count once.
-    #[arg(long = "from-archive", value_name = "SEGDIR", required = true)]
+    #[arg(long = "from-archive", value_name = "SEGDIR")]
     from_archive: Vec<PathBuf>,
-    /// Stop after the last write group that ends at or before this sequence
-    /// (default: as far as the segments go).
+    /// Spec P4.1: recover from the primary (--primary-host): nothing when it
+    /// still serves the standby's next write group; else only the key ranges
+    /// that differ (an incremental fast-forward); else a full copy (Oracle:
+    /// RECOVER STANDBY DATABASE FROM SERVICE).
+    #[arg(long, requires = "primary_host", conflicts_with = "through")]
+    from_primary: bool,
+    /// --from-archive: stop after the last write group that ends at or
+    /// before this sequence (default: as far as the segments go).
     #[arg(long, value_name = "SEQ")]
     through: Option<u64>,
     /// What follows: `primary` follows the primary from the new cursor, as
@@ -7912,18 +7968,67 @@ struct RecoverArgs {
     /// --primary-host); `stop` exits.
     #[arg(long, value_name = "primary|stop")]
     then: Option<String>,
-    /// The primary's replication port (host:port), for --then primary.
+    /// The primary's replication port (host:port): what --from-primary
+    /// recovers from, and what --then primary follows.
     #[arg(long)]
     primary_host: Option<String>,
+    /// --from-primary: skip the probe and the digest pass; make a full copy.
+    #[arg(long, requires = "from_primary")]
+    full: bool,
+    /// --from-primary: never fall through to a full copy; exit 3 with the
+    /// estimate when one is needed.
+    #[arg(long, requires = "from_primary", conflicts_with = "full")]
+    no_full_copy: bool,
+    /// --from-primary: above this percentage of the primary's bytes in
+    /// differing leaves, a full copy is made instead (1..=100).
+    #[arg(
+        long,
+        value_name = "PCT",
+        default_value_t = 50,
+        value_parser = clap::value_parser!(u8).range(1..=100)
+    )]
+    full_copy_threshold: u8,
+    /// --from-primary: the leaf size both sides digest the keyspace in
+    /// (64KiB..=256MiB).
+    #[arg(long, value_name = "SIZE", default_value = "4MiB", value_parser = parse_leaf_bytes)]
+    leaf_bytes: u32,
+    /// --from-primary: a full copy may replace an occupied data directory;
+    /// the old one is kept as <DIR>.replaced-<UTC time>.
+    #[arg(long, requires = "from_primary")]
+    replace: bool,
+    /// --from-primary: where leaf files wait to be ingested (default
+    /// <DIR>.recover-stage; created owner-only, removed when done; never
+    /// inside the data directory).
+    #[arg(long, value_name = "DIR", requires = "from_primary")]
+    stage_dir: Option<PathBuf>,
     /// The node's config file: its storage options, its [encryption] (an
-    /// encrypted dataset's segments are sealed with the dataset key), and the
-    /// `start` settings --then primary runs with.
+    /// encrypted dataset's segments are sealed with the dataset key), its
+    /// [replication] token and TLS settings, and the `start` settings --then
+    /// primary runs with.
     #[arg(short, long)]
     config: Option<PathBuf>,
+    #[command(flatten)]
+    physical: PhysicalTransferArgs,
+    #[command(flatten)]
+    primary_tls: PrimaryTlsArgs,
+    /// Plaintext to a non-loopback primary, token included: isolated
+    /// development only.
+    #[arg(long)]
+    allow_insecure_replication_remote: bool,
     /// Arguments after `--` are passed to `start` when the standby goes on to
     /// follow its primary (--then primary): its ports, token file, TLS, ...
     #[arg(last = true, value_name = "START_ARGS")]
     start_args: Vec<String>,
+}
+
+/// `--leaf-bytes`: a byte size (`4MiB`, `65536`) within the bounds both
+/// sides of a fast-forward accept.
+fn parse_leaf_bytes(raw: &str) -> std::result::Result<u32, String> {
+    let bytes = heliosdb_nano::config::parse_byte_size(raw).map_err(|error| error.to_string())?;
+    u32::try_from(bytes)
+        .ok()
+        .filter(|bytes| (64 * 1024..=256 * 1024 * 1024).contains(bytes))
+        .ok_or_else(|| format!("--leaf-bytes {raw} is outside 64KiB..=256MiB"))
 }
 
 /// Spec P3.2 §2: `recover` works on a STOPPED standby. A node running on the
@@ -7962,12 +8067,40 @@ fn refuse_running_node(data_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// `heliosdb-nano recover` (spec P3.2 §2): offline; refuses a running node,
-/// an empty or non-standby directory, and a chain with a corrupt or foreign
-/// segment (nothing applied). Exits 2 with the missing range when the
-/// segments stop short (unless it goes on to follow the primary, which may
-/// hold the range); with --then primary it then runs `start` as a standby of
-/// --primary-host from the new cursor.
+/// The text a directory a fast-forward left between two cuts is refused
+/// with, naming the directory and the primary (spec P4.1 §4); `None` when
+/// the directory carries no fast-forward record. Reads the store read-only,
+/// on a blocking thread.
+#[cfg(feature = "ha-tier1")]
+async fn interrupted_fast_forward_reason(
+    data_dir: &std::path::Path,
+    config: &Config,
+    primary_host: Option<&str>,
+) -> Option<String> {
+    let path = data_dir.to_path_buf();
+    let config = config.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        heliosdb_nano::replication::checkpoint_transfer::interrupted_fast_forward(&path, &config)
+    })
+    .await
+    .ok()??;
+    Some(heliosdb_nano::replication::physical::fast_forward_remedy(
+        record.from,
+        record.to,
+        &data_dir.display().to_string(),
+        primary_host.unwrap_or("<the primary's replication port>"),
+    ))
+}
+
+/// `heliosdb-nano recover` (spec P3.2 §2, spec P4.1 §1-§2): offline; refuses
+/// a running node. `--from-archive` refuses an empty or non-standby
+/// directory and a chain with a corrupt or foreign segment (nothing
+/// applied), and exits 2 with the missing range when the segments stop
+/// short (unless it goes on to follow the primary, which may hold the
+/// range). `--from-primary` takes the ladder (tail, fast-forward, full copy)
+/// and exits 3 when a full copy is needed but not applied (`--no-full-copy`,
+/// or an occupied directory without `--replace`). With --then primary it
+/// then runs `start` as a standby of --primary-host from the new cursor.
 async fn run_recover(args: RecoverArgs) -> Result<()> {
     #[cfg(not(feature = "ha-tier1"))]
     {
@@ -7976,7 +8109,6 @@ async fn run_recover(args: RecoverArgs) -> Result<()> {
     }
     #[cfg(feature = "ha-tier1")]
     {
-        use heliosdb_nano::replication::archive_recovery::{recover_from_archive, RecoverError, RecoverOptions};
         let follow = match args.then.as_deref().map(str::to_ascii_lowercase).as_deref() {
             Some("primary") => true,
             Some("stop") => false,
@@ -8004,106 +8136,312 @@ async fn run_recover(args: RecoverArgs) -> Result<()> {
                  HELIOSDB_PASSWORD_FILE / HELIOSDB_PASSWORD or HELIOSDB_MCP_TOKEN",
             ));
         }
-        let mut config = match &args.config {
+        let RecoverArgs {
+            data_dir,
+            from_archive,
+            from_primary,
+            through,
+            then: _,
+            primary_host,
+            full,
+            no_full_copy,
+            full_copy_threshold,
+            leaf_bytes,
+            replace,
+            stage_dir,
+            config: config_path,
+            physical,
+            primary_tls,
+            allow_insecure_replication_remote,
+            start_args,
+        } = args;
+        let mut config = match &config_path {
             Some(path) => Config::from_file(path.clone())?,
             None => Config::default(),
         };
-        config.storage.path = Some(args.data_dir.clone());
+        config.storage.path = Some(data_dir.clone());
         config.storage.memory_only = false;
-        refuse_running_node(&args.data_dir)?;
-        let history = match classify_standby_directory(&args.data_dir) {
-            StandbyLayout::Physical { history } => history,
-            StandbyLayout::Fresh { .. } => {
-                return Err(Error::config(format!(
-                    "recover refused: {} holds no standby: {SEGMENTS_NEED_A_SNAPSHOT}",
-                    args.data_dir.display()
-                )))
-            }
-            StandbyLayout::Refused(reason) => return Err(Error::config(format!("recover refused: {reason}"))),
-        };
-        for source in &args.from_archive {
-            if !source.is_dir() {
-                return Err(Error::config(format!(
-                    "recover refused: --from-archive {} is not a directory",
-                    source.display()
-                )));
-            }
+        physical.apply(&mut config.replication);
+        primary_tls.apply(&mut config.replication);
+        if allow_insecure_replication_remote {
+            config.replication.allow_insecure_remote = true;
         }
-        let limits = physical_wire_limits(&config.replication.physical).transfer;
-        let data_dir = args.data_dir.clone();
-        let sources = args.from_archive.clone();
-        let through = args.through;
-        let recover_config = config.clone();
-        println!(
-            "recover: advancing the physical standby {} (history {history}) from the segments in {}",
-            data_dir.display(),
-            heliosdb_nano::replication::archive_recovery::describe_sources(&sources)
-        );
-        let outcome = tokio::task::spawn_blocking(move || {
-            let options = RecoverOptions {
-                data_dir: &data_dir,
-                history,
-                sources: &sources,
+        refuse_running_node(&data_dir)?;
+        let reached = if from_primary {
+            let host = primary_host
+                .clone()
+                .ok_or_else(|| Error::config("--from-primary needs --primary-host"))?;
+            recover_from_primary_command(
+                &data_dir,
+                config,
+                &host,
+                PrimaryRecoverFlags {
+                    full,
+                    no_full_copy,
+                    full_copy_threshold,
+                    leaf_bytes,
+                    replace,
+                    stage_dir,
+                },
+            )
+            .await?
+        } else {
+            recover_from_archive_command(
+                &data_dir,
+                config,
+                from_archive,
                 through,
-                config: &recover_config,
-                limits,
-            };
-            recover_from_archive(&options, &mut |line| println!("{line}"))
-        })
-        .await
-        .map_err(|error| Error::io(format!("recover: the recovery worker failed: {error}")))?;
-        let report = match outcome {
-            Ok(report) => report,
-            Err(error @ RecoverError::Refused(_)) => return Err(Error::config(error.to_string())),
-            Err(error) => return Err(Error::storage(error.to_string())),
+                primary_host.as_deref(),
+                follow,
+            )
+            .await?
         };
-        println!(
-            "recover: the standby is at sequence {} (it was at {}; {} write group(s) applied, {} already held, from {} \
-             segment(s))",
-            report.reached, report.started_at, report.applied, report.skipped, report.segments
-        );
-        if let Some((from, to)) = report.missing {
-            println!(
-                "needs recovery: archive gap: sequences {from}..{to} are in none of the given directories (the newest \
-                 segment found ends at {})",
-                report
-                    .newest
-                    .map_or_else(|| "none".to_string(), |newest| newest.to_string())
-            );
-            if !follow {
-                // Everything was closed and fsynced by the recovery.
-                std::process::exit(2);
-            }
-            println!("recover: following the primary next: it may still hold that range");
-        }
         if !follow {
             return Ok(());
         }
-        let primary_host = args.primary_host.unwrap_or_default();
+        let primary_host = primary_host.unwrap_or_default();
         println!(
-            "recover: following the primary {primary_host} from sequence {}, as `start --replication-role standby` would",
-            report.reached
+            "recover: following the primary {primary_host} from sequence {reached}, as `start --replication-role \
+             standby` would"
         );
         let mut argv: Vec<OsString> = vec![
             "heliosdb-nano".into(),
             "start".into(),
             "--data-dir".into(),
-            args.data_dir.into_os_string(),
+            data_dir.into_os_string(),
             "--replication-role".into(),
             "standby".into(),
             "--primary-host".into(),
             primary_host.into(),
         ];
-        if let Some(path) = args.config {
+        if let Some(path) = config_path {
             argv.push("--config".into());
             argv.push(path.into_os_string());
         }
-        argv.extend(args.start_args.into_iter().map(OsString::from));
+        argv.extend(start_args.into_iter().map(OsString::from));
         let cli = Cli::try_parse_from(argv)
             .map_err(|error| Error::config(format!("the start arguments after -- are not valid: {error}")))?;
         let follow_primary: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>> = Box::pin(run(cli));
         follow_primary.await
     }
+}
+
+/// `recover --from-archive` (spec P3.2 §2); returns the sequence reached.
+#[cfg(feature = "ha-tier1")]
+async fn recover_from_archive_command(
+    data_dir: &std::path::Path,
+    config: Config,
+    sources: Vec<PathBuf>,
+    through: Option<u64>,
+    primary_host: Option<&str>,
+    follow: bool,
+) -> Result<u64> {
+    use heliosdb_nano::replication::archive_recovery::{recover_from_archive, RecoverError, RecoverOptions};
+    let history = match classify_standby_directory(data_dir) {
+        StandbyLayout::Physical { history } => history,
+        StandbyLayout::Fresh { .. } => {
+            return Err(Error::config(format!(
+                "recover refused: {} holds no standby: {SEGMENTS_NEED_A_SNAPSHOT}",
+                data_dir.display()
+            )))
+        }
+        StandbyLayout::Refused(reason) => return Err(Error::config(format!("recover refused: {reason}"))),
+    };
+    for source in &sources {
+        if !source.is_dir() {
+            return Err(Error::config(format!(
+                "recover refused: --from-archive {} is not a directory",
+                source.display()
+            )));
+        }
+    }
+    let limits = physical_wire_limits(&config.replication.physical).transfer;
+    let path = data_dir.to_path_buf();
+    let recover_config = config.clone();
+    println!(
+        "recover: advancing the physical standby {} (history {history}) from the segments in {}",
+        data_dir.display(),
+        heliosdb_nano::replication::archive_recovery::describe_sources(&sources)
+    );
+    let outcome = tokio::task::spawn_blocking(move || {
+        let options = RecoverOptions {
+            data_dir: &path,
+            history,
+            sources: &sources,
+            through,
+            config: &recover_config,
+            limits,
+        };
+        recover_from_archive(&options, &mut |line| println!("{line}"))
+    })
+    .await
+    .map_err(|error| Error::io(format!("recover: the recovery worker failed: {error}")))?;
+    let report = match outcome {
+        Ok(report) => report,
+        Err(error @ RecoverError::Refused(_)) => {
+            // Spec P4.1 §4: a directory a fast-forward left between two cuts
+            // is finished by the fast-forward, never advanced from segments.
+            if let Some(reason) = interrupted_fast_forward_reason(data_dir, &config, primary_host).await {
+                return Err(Error::config(format!("recover refused: {reason}")));
+            }
+            return Err(Error::config(error.to_string()));
+        }
+        Err(error) => return Err(Error::storage(error.to_string())),
+    };
+    // Spec P4.1e: how fast, in archive bytes (the chain's segment files).
+    let seconds = report.elapsed.as_secs_f64();
+    let rate = if seconds > 0.0 {
+        report.archive_bytes as f64 / 1_000_000.0 / seconds
+    } else {
+        0.0
+    };
+    println!(
+        "recover: the standby is at sequence {} (it was at {}; {} write group(s) applied, {} already held, from {} \
+         segment(s)) in {seconds:.1} s, {rate:.1} MB/s of archive",
+        report.reached, report.started_at, report.applied, report.skipped, report.segments
+    );
+    if let Some((from, to)) = report.missing {
+        println!(
+            "needs recovery: archive gap: sequences {from}..{to} are in none of the given directories (the newest \
+             segment found ends at {})",
+            report
+                .newest
+                .map_or_else(|| "none".to_string(), |newest| newest.to_string())
+        );
+        if !follow {
+            // Everything was closed and fsynced by the recovery.
+            std::process::exit(2);
+        }
+        println!("recover: following the primary next: it may still hold that range");
+    }
+    Ok(report.reached)
+}
+
+/// The `recover --from-primary` flags that shape the ladder.
+#[cfg(feature = "ha-tier1")]
+struct PrimaryRecoverFlags {
+    full: bool,
+    no_full_copy: bool,
+    full_copy_threshold: u8,
+    leaf_bytes: u32,
+    replace: bool,
+    stage_dir: Option<PathBuf>,
+}
+
+/// `recover --from-primary` (spec P4.1): the ladder against `primary_host`;
+/// prints its progress and the summary line, exits 3 when a full copy is
+/// needed but was not applied, and returns the sequence reached.
+#[cfg(feature = "ha-tier1")]
+async fn recover_from_primary_command(
+    data_dir: &std::path::Path,
+    config: Config,
+    primary_host: &str,
+    flags: PrimaryRecoverFlags,
+) -> Result<u64> {
+    use heliosdb_nano::replication::archive_recovery::RecoverError;
+    use heliosdb_nano::replication::recover_primary::{
+        canonical_path, format_bytes, format_count, format_percent, recover_from_primary, DirectoryState,
+        PrimaryRecoverOptions, RecoverRoute,
+    };
+    config.replication.validate()?;
+    config.replication.physical.validate()?;
+    // A `..` or a symlink in --data-dir is resolved here, once: the stage
+    // checks refuse both in the paths they are given.
+    let canonical = canonical_path(data_dir).map_err(|error| Error::config(error.to_string()))?;
+    let data_dir = canonical.as_path();
+    let layout = match classify_standby_directory(data_dir) {
+        StandbyLayout::Physical { history } => DirectoryState::Physical { history },
+        StandbyLayout::Fresh { empty_existing } => DirectoryState::Fresh { empty_existing },
+        StandbyLayout::Refused(reason) => return Err(Error::config(format!("recover refused: {reason}"))),
+    };
+    let stage_dir = match flags.stage_dir {
+        Some(dir) => dir,
+        None => {
+            let name = data_dir.file_name().ok_or_else(|| {
+                Error::config(
+                    "recover --from-primary: the data directory has no name to place its stage beside; set \
+                     --stage-dir",
+                )
+            })?;
+            let mut stage = name.to_os_string();
+            stage.push(".recover-stage");
+            data_dir.with_file_name(stage)
+        }
+    };
+    let tls_settings = ReplicationTlsSettings::from_config(&config.replication);
+    let sources = resolve_replication_sources(primary_host)?;
+    let transport = replication_transport(
+        primary_host,
+        &sources,
+        &tls_settings,
+        config.replication.allow_insecure_remote,
+        tls_settings.tls_post_quantum.unwrap_or(true),
+    )?;
+    let token =
+        heliosdb_nano::replication::read_replication_token(config.replication.token_file.as_ref().ok_or_else(
+            || Error::config("recover --from-primary requires --replication-token-file or [replication] token_file"),
+        )?)?;
+    let wire = physical_wire_limits(&config.replication.physical);
+    let options = PrimaryRecoverOptions {
+        data_dir: data_dir.to_path_buf(),
+        layout,
+        config: config.clone(),
+        primary_host: primary_host.to_string(),
+        sources,
+        transport,
+        token,
+        wire,
+        full: flags.full,
+        no_full_copy: flags.no_full_copy,
+        full_copy_threshold: flags.full_copy_threshold,
+        leaf_bytes: flags.leaf_bytes,
+        replace: flags.replace,
+        stage_dir,
+    };
+    println!(
+        "recover: recovering the standby {} from the primary at {primary_host}",
+        data_dir.display()
+    );
+    let report = match recover_from_primary(&options, &mut |line| println!("{line}")).await {
+        Ok(report) => report,
+        Err(RecoverError::FullCopyPending(reason)) => {
+            // Route 3 was needed but not applied: nothing of the data
+            // directory changed (a completed copy stays beside it).
+            println!("recover: {reason}");
+            std::process::exit(3);
+        }
+        Err(error @ RecoverError::Refused(_)) => return Err(Error::config(error.to_string())),
+        Err(error) => return Err(Error::storage(error.to_string())),
+    };
+    let seconds = report.duration.as_secs_f64();
+    match report.route {
+        RecoverRoute::Tail => println!(
+            "recover: the standby is at sequence {} (nothing copied; {seconds:.1} s)",
+            format_count(report.to)
+        ),
+        RecoverRoute::FastForward => println!(
+            "recover: the standby is at sequence {} (from {}; {} of {} leaves replaced, {} shipped, {} of {}; \
+             {seconds:.1} s)",
+            format_count(report.to),
+            format_count(report.from),
+            format_count(report.leaves_differing),
+            format_count(report.leaves_total),
+            format_bytes(report.bytes_shipped),
+            format_percent(report.bytes_shipped, report.bytes_total),
+            format_bytes(report.bytes_total)
+        ),
+        RecoverRoute::FullCopy => println!(
+            "recover: the standby is at sequence {} (a full copy of the primary, {}{}; {seconds:.1} s)",
+            format_count(report.to),
+            format_bytes(report.bytes_total),
+            report
+                .replaced
+                .as_ref()
+                .map(|replaced| format!("; the old directory is {}", replaced.display()))
+                .unwrap_or_default()
+        ),
+    }
+    Ok(report.to)
 }
 
 #[cfg(test)]

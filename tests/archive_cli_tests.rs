@@ -27,7 +27,7 @@ mod physical_pair;
 
 use heliosdb_nano::replication::archive_segment::{segment_dir, SegmentInfo, HEADER_LEN};
 use heliosdb_nano::replication::archiver::{SegmentLimits, SegmentWriter};
-use heliosdb_nano::replication::physical::{poll_source, PhysicalBatch, MAX_BATCH_BYTES};
+use heliosdb_nano::replication::physical::{poll_source, FlushMemo, PhysicalBatch, MAX_BATCH_BYTES};
 use physical_pair::*;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -44,7 +44,7 @@ fn groups(root: &Path, name: &str, count: u32) -> (Uuid, Vec<PhysicalBatch>) {
         store.put(format!("data:t:{index:04}"), [7_u8; 48]).unwrap();
     }
     let history = Uuid::new_v4();
-    let polled = poll_source(&store, history, 0, MAX_BATCH_BYTES).unwrap();
+    let polled = poll_source(&store, history, 0, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
     assert_eq!(polled.batches.len(), count as usize);
     (history, polled.batches)
 }
@@ -427,4 +427,165 @@ async fn recover_is_refused_while_a_node_runs_on_the_directory() {
     assert!(refusal.contains("in use by a running node"), "{refusal}");
     assert!(standby.alive(), "the running standby is untouched");
     wait_http(pair.http_s, "/ready", 200, Duration::from_secs(30), &standby).await;
+}
+
+// ---------------------------------------------------------------------------
+// `heliosdb-nano recover --from-primary` (spec P4.1 §1, §5): the source group,
+// the flags that belong to it, their bounds, and the refusals before any
+// connection. The routes and their exit codes (0; 1; 3 when a full copy is
+// needed but not applied) on real daemons are in
+// `tests/physical_fast_forward.rs`.
+// ---------------------------------------------------------------------------
+
+/// Clap's usage errors (exit 2) for the source group and the flags of
+/// `--from-primary`; nothing is created.
+#[test]
+fn recover_from_primary_validates_its_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let data = text(&root.path().join("standby"));
+    let segments = root.path().join("segments");
+    std::fs::create_dir_all(&segments).unwrap();
+    let segments = text(&segments);
+    let primary = ["--from-primary", "--primary-host", "127.0.0.1:1"];
+    let with_primary = |extra: &[&'static str]| -> Vec<String> {
+        let mut argv = vec!["--data-dir".to_string(), data.clone()];
+        argv.extend(primary.iter().map(|arg| arg.to_string()));
+        argv.extend(extra.iter().map(|arg| arg.to_string()));
+        argv
+    };
+    let with_archive = |extra: &[&'static str]| -> Vec<String> {
+        let mut argv = vec![
+            "--data-dir".to_string(),
+            data.clone(),
+            "--from-archive".to_string(),
+            segments.clone(),
+        ];
+        argv.extend(extra.iter().map(|arg| arg.to_string()));
+        argv
+    };
+    for (argv, names) in [
+        // One source, exactly.
+        (with_archive(&primary), "--from-primary"),
+        // --from-primary needs the primary.
+        (
+            vec!["--data-dir".to_string(), data.clone(), "--from-primary".to_string()],
+            "--primary-host",
+        ),
+        // --through belongs to --from-archive.
+        (with_primary(&["--through", "7"]), "--through"),
+        // The ladder's flags belong to --from-primary.
+        (with_archive(&["--full"]), "--from-primary"),
+        (with_archive(&["--no-full-copy"]), "--from-primary"),
+        (with_archive(&["--replace"]), "--from-primary"),
+        (with_archive(&["--stage-dir", "/nonexistent/stage"]), "--from-primary"),
+        // --full and --no-full-copy contradict each other.
+        (with_primary(&["--full", "--no-full-copy"]), "--no-full-copy"),
+        // Bounds.
+        (with_primary(&["--leaf-bytes", "1KiB"]), "64KiB"),
+        (with_primary(&["--leaf-bytes", "512MiB"]), "256MiB"),
+        (with_primary(&["--full-copy-threshold", "0"]), "--full-copy-threshold"),
+        (with_primary(&["--full-copy-threshold", "101"]), "--full-copy-threshold"),
+    ] {
+        let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let output = recover_cli(&args);
+        assert_eq!(output.status.code(), Some(2), "{argv:?}: {}", stderr(&output));
+        assert!(stderr(&output).contains(names), "{argv:?}: {}", stderr(&output));
+    }
+    assert!(!root.path().join("standby").exists(), "nothing was created");
+}
+
+/// The refusals before anything is written (exit 1): a primary's directory,
+/// a stage directory inside the data directory, no token, and a primary that
+/// cannot be reached — named, with a fresh directory left absent.
+#[test]
+fn recover_from_primary_refuses_before_writing_anything() {
+    let root = tempfile::tempdir().unwrap();
+    let token = text(&token_file(root.path(), "replication.token", 0x42));
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let host = closed.local_addr().unwrap().to_string();
+    drop(closed);
+
+    // A primary's directory is never recovered over, whatever the source.
+    let primary = root.path().join("primary");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::write(
+        primary.join(heliosdb_nano::replication::history::PRIMARY_HISTORY_FILE),
+        "{}",
+    )
+    .unwrap();
+    let primary = text(&primary);
+    let output = recover_cli(&[
+        "--data-dir",
+        &primary,
+        "--from-primary",
+        "--primary-host",
+        &host,
+        "--replication-token-file",
+        &token,
+        "--then",
+        "stop",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("primary's dataset identity"),
+        "{}",
+        stderr(&output)
+    );
+
+    // The stage directory never lies inside the data directory.
+    let absent = root.path().join("absent");
+    let absent_text = text(&absent);
+    let inside = text(&absent.join("stage"));
+    let output = recover_cli(&[
+        "--data-dir",
+        &absent_text,
+        "--from-primary",
+        "--primary-host",
+        &host,
+        "--replication-token-file",
+        &token,
+        "--stage-dir",
+        &inside,
+        "--then",
+        "stop",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("inside the data directory"),
+        "{}",
+        stderr(&output)
+    );
+
+    // No token: refused before any connection.
+    let output = recover_cli(&[
+        "--data-dir",
+        &absent_text,
+        "--from-primary",
+        "--primary-host",
+        &host,
+        "--then",
+        "stop",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    assert!(
+        stderr(&output).contains("--replication-token-file"),
+        "{}",
+        stderr(&output)
+    );
+
+    // Nothing listens there: named, and nothing is created.
+    let output = recover_cli(&[
+        "--data-dir",
+        &absent_text,
+        "--from-primary",
+        "--primary-host",
+        &host,
+        "--replication-token-file",
+        &token,
+        "--then",
+        "stop",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", stdout(&output));
+    assert!(stderr(&output).contains(&host), "{}", stderr(&output));
+    assert!(!absent.exists(), "a fresh directory stays absent");
 }

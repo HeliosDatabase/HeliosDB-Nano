@@ -2,10 +2,10 @@
 
 A primary and its [physical standby](physical-standby.md) compare a dataset
 **history id** before the standby accepts anything, on the one replication
-connection (`NPHYS002`). The history id is a UUID of the dataset, independent of
+connection (`NPHYS003`). The history id is a UUID of the dataset, independent of
 `--node-id`: reusing a node name or UUID does not authorize another dataset.
 Both ends must run this release; a 4.41.x native-protocol peer and an `NPHYS001`
-peer are refused.
+or `NPHYS002` peer are refused.
 
 This guard prevents a standby from silently following a different primary
 history. It does **not** protect against a deliberate fork made by copying an

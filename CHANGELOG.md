@@ -20,14 +20,15 @@ entries under "Replication" below: the logical standby, its native reader and
 its history window are removed (the window's key remains only as the primary's
 redo window, default 0).
 
-- **One replication connection, protocol `NPHYS002`.** The bootstrap copy, the
+- **One replication connection, protocol `NPHYS003`.** The bootstrap copy, the
   physical WAL and the control plane (identity, dataset history, epoch,
   heartbeats, acknowledgements) share one connection per standby, so they can no
   longer disagree. `[replication] replication_port` (`--replication-port`,
   default 5433) is the single replication port, and a standby's
   `--primary-host` names it; a standby pointed at a PostgreSQL or HTTP port is
-  told so. `NPHYS001` peers are refused with a typed `Version` refusal naming
-  both versions, and a 4.41.x native peer is told to upgrade. Without TLS the
+  told so. `NPHYS001` peers (and `NPHYS002` peers of pre-release builds) are
+  refused with a typed `Version` refusal naming both versions, and a 4.41.x
+  native peer is told to upgrade. Without TLS the
   replication port stays on loopback whatever `--listen` opens (see "Added —
   TLS replication and resumable snapshot" for remote standbys).
 - **Removed: the separate physical endpoint.** `--physical-replication-listen`,
@@ -53,7 +54,7 @@ redo window, default 0).
   reads the logical WAL.
 
 ### Added — the replication connection's control plane and synchronous replication
-- **Control frames** on `NPHYS002`: `Hello` / `HelloOk` (node id, role, dataset
+- **Control frames** on `NPHYS003`: `Hello` / `HelloOk` (node id, role, dataset
   history, epoch, durable cursor, capabilities, PostgreSQL port, sync mode;
   the primary answers with its history, epoch and barrier), `Refuse`,
   `Heartbeat` (the standby's applied and durable sequence: THE acknowledgement,
@@ -262,6 +263,61 @@ archived logs, cascaded standbys).
   `store_sequence` (a cascaded export's own RocksDB sequence; absent, and the
   manifest unchanged byte for byte, for a primary's export).
 
+### Added — recovering a standby from the primary (spec P4.1)
+Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.md`,
+"Rebuilding from the primary: `recover --from-primary`").
+- **`heliosdb-nano recover --data-dir DIR --from-primary --primary-host
+  HOST:PORT`** brings a STOPPED standby back by the cheapest safe route and
+  reports which and what it moved: **nothing** when the primary still serves
+  its next write group (from its WAL or archive); an **incremental
+  fast-forward** when it no longer does; a **full copy** when the directory is
+  no replica of the primary's dataset, with `--full`, or when the differing
+  leaves hold more than `--full-copy-threshold` (default 50) percent of the
+  primary's bytes. An absent or empty directory gets the primary's snapshot,
+  as `resync` installs it. `--from-archive` and `--from-primary` are one
+  required, exclusive choice; `--through` belongs to `--from-archive`. Token,
+  TLS and plaintext flags as `resync`'s; `--then primary|stop` as before.
+  Exit codes: 0, 1, 2 (`--from-archive` gap), and **3** when a full copy is
+  needed but was not applied.
+- **The incremental fast-forward.** The primary serves it from a leased
+  checkpoint export at a cut `T` (a re-run within the lease continues the same
+  cut; a fast-forward that names no earlier cut is served a leased export of
+  the same history that can still be continued from, when there is one,
+  instead of a new checkpoint): it digests its default column family in
+  leaves of `--leaf-bytes` (default 4 MiB; SHA-256 over the same framing as
+  `range_digest`), the
+  standby digests its own store against the same boundaries in one scan, and
+  only the differing leaves travel, as SST files built on request. The standby
+  applies them 64 at a time — the leaves' ranges deleted, the files ingested
+  (copied, never moved or linked) — then re-cuts its stage at `T` (manifest,
+  marker, cursor `{T, T}`), so `start` resumes at `T` and tails the rest.
+  Raw bytes travel: an encrypted dataset fast-forwards without its key.
+- **Crash-safe.** A record in the standby's node-local column family is
+  written before the first change and removed by the write that re-cuts the
+  cursor; until then a `start` stays up in `needs_recovery` (`/ready` 503) with
+  "fast-forward from the primary interrupted at sequence S→T: run `heliosdb-nano
+  recover --from-primary --data-dir D --primary-host H` to finish it", and
+  `recover --from-archive`, `resync --resume-existing` and a cascaded export
+  refuse the directory. Running the command again finishes it.
+- **The full copy** goes into an empty directory, or beside an occupied one
+  (`<DIR>.recover-full`, resumable) and is swapped in only with `--replace`,
+  which keeps the old directory as `<DIR>.replaced-<UTC time>`; without it the
+  command exits 3 printing the two `mv` commands, and a re-run with
+  `--replace` uses the completed copy. `--no-full-copy` exits 3 with the
+  estimate instead. The copy needs its size plus 10% free; the leaf stage
+  (`--stage-dir`, default `<DIR>.recover-stage`) one batch, twice over.
+- **Protocol (`NPHYS003`, both nodes on this release).** A source offers
+  `CAP_FAST_FORWARD`; `Open` gains the fast-forward request (29 or 45 bytes)
+  and new frames 21-27 (`FastForwardInfo`, `LeafDigestsRequest`/`LeafDigests`
+  — paged, "planning" while the source scans —, `LeafRequest`/`LeafReady`,
+  `LeafChunkRequest`/`LeafChunk`); each session kind accepts only its own
+  requests. A session of an offline receiver (`resync`, `recover`) is listed
+  in the primary's `/health` as `bootstrapping` whatever its cursor, and never
+  counts toward `min_acks`.
+- A receiver cursor's local sequence may now be behind its source sequence (a
+  fast-forwarded standby keeps its own counter); a cascaded export's
+  `store_sequence` may be below its `checkpoint_sequence` for the same reason.
+
 ### Fixed — replication (fireproof, plan §D5)
 - **`enable_lockfree_ingestion` is refused on every HA role.** It writes rows
   straight into the store from its own worker, bypassing the logical WAL, MVCC
@@ -278,6 +334,69 @@ archived logs, cascaded standbys).
   rotation command (rotation with standbys attached is unsupported until P5).
 
 ### Fixed — replication
+- **A physical standby paid its whole apply cost once per write group**
+  (spec P4.1d). The primary commits a row's keys as several write groups
+  (about seven per row for an `INSERT … SELECT` of 1 000 rows), and the
+  standby handed every group to its applier thread as a command of its own
+  (a oneshot reply and a wake per group), re-checked its directory on disk,
+  and decoded, pre-read and published the group alone: about 48 µs per group,
+  so a standby followed a bulk load at ~3 MB/s of WAL (~4 MB/s and ~10 000
+  sequences/s even on `/dev/shm`) and finished a 3.5-minute load of 1 M rows
+  31 minutes after it. The primary also fsynced its WAL on every poll, even
+  when nothing had been written since the last one. Now a poll's groups reach
+  the applier as one run (at most 32 MiB, or one larger group): one hop to
+  the applier thread, one directory check, one pre-read and one publication
+  per run, still one RocksDB write per group, so the cursor accounting and the
+  byte identity with the primary are unchanged; a reader still sees only
+  states the primary passed through, and the standby's indexes lag its store
+  by at most one run. A serving standby polls up to 32 MiB at a time (was
+  8 MiB). The primary, a cascading standby and the archiver fsync their WAL
+  for a poll only when its barrier moved since their last one. Measured (200 000
+  rows of ~1 KB in 1 000-row statements, loopback): a streaming standby went
+  from ~4 to ~31 MB/s of WAL on a RAM disk (10 000 → 86 000 sequences/s) and
+  from ~3 to ~7 MB/s on rotating disks; a restarted standby caught up at
+  15.7 MB/s of WAL on disk instead of 2.9.
+- **`recover --from-archive` fsynced and published once per write group**
+  (spec P4.1e). It applied a segment's groups one at a time, each fsynced and
+  decoded, pre-read and published alone, so a chain of hundreds of thousands of
+  small groups (about seven per inserted row) took tens of minutes; the
+  archive-only standby (`--source archive`) published per group too. Both now
+  apply a segment's groups in runs of at most 32 MiB, as a streaming standby
+  applies a poll, and fsync the standby's WAL once per segment; a crash
+  mid-segment still leaves a consistent cursor and a re-run continues from it.
+  The final `recover` line reports the elapsed time and the archive bytes per
+  second.
+- **One 20 000-row statement stalled every physical standby and the archive
+  for good** (spec P4.1c). A write group larger than the standby's poll limit
+  (8 MiB; such a statement of ~900-byte rows is ~80 MiB) was refused as
+  "single source batch exceeds poll byte limit": the standby stayed
+  `reconnecting` at that sequence forever, a cascaded standby with it, and the
+  archiver failed at the same group on every poll, so no segment past it was
+  ever sealed and the recovery window silently ended there. Every write group
+  was also capped at 64 MiB (1 000 000 operations) on the wire and in segments.
+  Now a write group — a statement or a transaction, the unit of atomicity —
+  always travels and is applied whole: the poll limit is a coalescing target
+  (a poll's first group travels whatever its size; later ones join it only
+  within the limit), on the primary, a cascading standby, the archive's gap
+  fill and the wire alike; a group may be up to 4 GiB less 4 KiB (what one
+  frame's `u32` length can say) of any number of operations; a frame is read
+  and written in 1 MiB steps, each bounded by the frame timeout, so a large
+  one never times out while its peer keeps sending; and `segment_max_bytes` is
+  a target too, a larger group getting a segment of its own, sealed at once.
+  The frame bounds changed, so the protocol is now `NPHYS003`: run the same
+  release on both nodes (an `NPHYS002` build is refused by version).
+  Review follow-ups in the same change: a group larger than a frame can carry
+  is refused by name (`GroupTooLarge`, `needs_recovery`, never retried; the
+  archiver disables itself with the reason; `recover --from-primary`
+  fast-forwards past it) instead of a generic error retried forever; the
+  coalescing target a standby may request is capped at 256 MiB
+  (`resync --poll-byte-limit` too, was 64 MiB); the source waits one operation
+  timeout plus one frame timeout for a receiver's next request, since a
+  receiver is silent while it applies a run; a standby's archive feed waits a
+  bounded time for room instead of dropping a group larger than its queue
+  (the drop, with the range, happens only after the wait runs out); an index
+  name moved from one table to another inside one run is registered on its
+  new table; a segment frame is written without an extra copy of the group.
 - **The standby's heartbeat no longer resets the primary's record of it.** The
   native heartbeat reported applied and flushed positions of 0 every 5 seconds,
   and the primary copied them into the watermark its synchronous commits waited
@@ -290,14 +409,26 @@ archived logs, cascaded standbys).
   waited on a logical acknowledgement the standby sent before applying
   anything, so it returned at once even with the standby stopped; `min_acks`
   was ignored and a timeout only warned.
+- **Replication sockets set `TCP_NODELAY` and send control frames in one
+  write** (spec P4.1b). Each request's payload could wait behind the peer's
+  delayed ACK of its header (up to ~40 ms per round trip); a correctness fix
+  of the frame and socket behaviour. It produced no measurable rate change on
+  loopback: the checkpoint download and the leaf transfer are bound by fsync
+  latency (one fsync per 8 MiB of download, about two per 4 MiB leaf), and
+  streaming was bound by the per-group apply cost fixed in P4.1d. The bytes on
+  the wire are unchanged by it.
 
 ### Tests
 - Added: `tests/physical_standby_sync.rs` (a sync INSERT blocks while the
   standby is stopped; `min_acks = 2` with one standby under `warn` and `fail`;
   heartbeat-only traffic never regresses the primary's recorded sequences; the
   primary's `/health` lists the standby), `tests/physical_standby_refusals.rs`
-  (`HistoryMismatch`, `WalPruned`, `AuthFailed`, an `NPHYS001` client; the
-  standby stays up in `needs_recovery`), `tests/logical_standby_removed.rs` (a
+  (`HistoryMismatch`, `WalPruned`, `AuthFailed`, an `NPHYS001` or `NPHYS002`
+  client; the standby stays up in `needs_recovery`),
+  `tests/physical_large_write_group.rs` (one ~80 MiB write group reaches a
+  standby, a cascaded standby, the archive in a segment of its own and
+  `recover --from-archive`; with `internal-tests`, a standby killed with the
+  group's frame in flight resumes from its cursor), `tests/logical_standby_removed.rs` (a
   source scan that fails if a removed replication flag, module or symbol
   returns to the code, tests, fixture, guides or skills), and
   `tests/support/physical_pair.rs` (the shared real-daemon pair harness).

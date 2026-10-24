@@ -350,7 +350,7 @@ impl Config {
 pub struct ReplicationConfig {
     /// standalone, primary, or standby (case-insensitive).
     pub role: String,
-    /// THE replication port (protocol `NPHYS002`): a primary serves its
+    /// THE replication port (protocol `NPHYS003`): a primary serves its
     /// standbys here — snapshot copies, physical WAL, heartbeats and
     /// acknowledgements on one connection each. It binds on `--listen`'s
     /// address only when that is loopback, or with `tls_enabled` /
@@ -3619,7 +3619,7 @@ redirect_uri = "http://localhost:8080/auth/v1/callback"
 /// The replication port's source side on a primary: snapshot exports and
 /// the bounded RocksDB WAL retention a physical standby continues from. The
 /// port itself is `[replication] replication_port` (spec P2.1: one port,
-/// protocol `NPHYS002`); its transport is TLS (`[replication] tls_enabled`,
+/// protocol `NPHYS003`); its transport is TLS (`[replication] tls_enabled`,
 /// spec P2.2) or token-authenticated plaintext on loopback.
 ///
 /// `enabled` is the source's explicit switch; `start --replication-role

@@ -41,7 +41,7 @@ use heliosdb_nano::replication::checkpoint_transfer::{
     OnlineCheckpointExport, PhysicalStage, ReceiverStaging, TransferLimits,
 };
 use heliosdb_nano::replication::history::load_or_create_primary_history;
-use heliosdb_nano::replication::physical::{poll_source, MAX_BATCH_BYTES};
+use heliosdb_nano::replication::physical::{poll_source, FlushMemo, MAX_BATCH_BYTES};
 #[cfg(feature = "vector-persist")]
 use heliosdb_nano::replication::physical_applier::{decode_raw_batch, RawOp};
 use heliosdb_nano::replication::physical_applier::{DerivedStateListener, NoopVectorHook, PhysicalApplier, VectorHook};
@@ -168,7 +168,14 @@ impl Standby {
     /// Apply everything the primary has.
     fn sync(&self) {
         loop {
-            let poll = poll_source(&self.raw, self.history, self.cursor(), MAX_BATCH_BYTES).unwrap();
+            let poll = poll_source(
+                &self.raw,
+                self.history,
+                self.cursor(),
+                MAX_BATCH_BYTES,
+                &FlushMemo::new(),
+            )
+            .unwrap();
             if poll.batches.is_empty() {
                 return;
             }
@@ -184,7 +191,14 @@ impl Standby {
     /// return its records as `(deleted, key)`; `None` when there is none.
     #[cfg(feature = "vector-persist")]
     fn step(&self) -> Option<Vec<(bool, Vec<u8>)>> {
-        let poll = poll_source(&self.raw, self.history, self.cursor(), MAX_BATCH_BYTES).unwrap();
+        let poll = poll_source(
+            &self.raw,
+            self.history,
+            self.cursor(),
+            MAX_BATCH_BYTES,
+            &FlushMemo::new(),
+        )
+        .unwrap();
         let batch = poll.batches.into_iter().next()?;
         let records = decode_raw_batch(batch.data())
             .unwrap()

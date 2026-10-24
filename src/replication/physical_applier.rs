@@ -15,47 +15,59 @@
 //! line with the keys the batch touched — or the standby keeps answering from
 //! the state it had when it opened.
 //!
-//! # How (per batch, one thread, under the engine's replay guard)
+//! # How (per run, one thread, under the engine's replay guard)
 //!
-//! 1. **Decode** the raw batch ([`decode_raw_batch`]: the same record walker
-//!    that validates it) and classify every key (`storage::keyspace`). A range
-//!    deletion is enumerated against the store before it is applied (at most
-//!    [`RANGE_ENUMERATION_CAP`] keys; beyond that the table is re-derived, and
-//!    a range that is not one table's rows defers a full re-derivation, which
-//!    also forgets every snapshot left without a record).
+//! A run is one batch ([`PhysicalApplier::apply_with`]) or the contiguous
+//! batches of a receiver's poll ([`PhysicalApplier::apply_run`], spec P4.1d:
+//! at most `physical_wire::APPLY_CHUNK_BYTES` of them, or one larger batch).
+//! The steps below run once per run, not once per batch — the guard, the
+//! decode-and-classify pass, the pre-read, the publication — except the
+//! writes, which stay one per batch.
+//!
+//! 1. **Decode** every raw batch of the run ([`decode_raw_batch`]: the same
+//!    record walker that validates it) and classify every key
+//!    (`storage::keyspace`). A range deletion is enumerated against the store
+//!    before the run's first write (at most [`RANGE_ENUMERATION_CAP`] keys;
+//!    beyond that the table is re-derived, and a range that is not one
+//!    table's rows defers a full re-derivation, which also forgets every
+//!    snapshot left without a record); a key an earlier batch of the run
+//!    writes into a later one's range is noted by its own record.
 //! 2. **Pre-read**, before anything changes: the old image of every touched
-//!    row of an indexed table, decoded with the pre-batch schema (an index
-//!    removal must name the key the row actually held), and the pre-batch
-//!    schemas and constraint sets of touched tables. Then the census hold
-//!    (below), and the row-cache / committed-write-watermark invalidation of
-//!    every touched row — invalidated before the new bytes are visible.
-//! 3. **Apply** verbatim through [`LocalWriter::apply_source_with`]: one
-//!    write of the source bytes plus the node-local cursor (fsynced, or —
-//!    from a receiver's poll — deferred to one fsync per poll). The applier never
-//!    writes to RocksDB in any other way.
-//! 4. **Publish**, in this order:
+//!    row of an indexed table, decoded with the pre-run schema (an index
+//!    removal must name the key the row actually held), and the pre-run
+//!    schemas and constraint sets of touched tables. A row several batches
+//!    of the run touch is read once, as it was before the first of them.
+//!    Then the census hold (below), and the row-cache /
+//!    committed-write-watermark invalidation of every touched row —
+//!    invalidated before the new bytes are visible.
+//! 3. **Apply** verbatim through [`LocalWriter::apply_source_with`]: per
+//!    batch, in order, one write of the source bytes plus the node-local
+//!    cursor (fsynced, or — from a receiver's poll — deferred to one fsync
+//!    per poll). The applier never writes to RocksDB in any other way.
+//! 4. **Publish**, once for the run, from each key's pre-run to its post-run
+//!    value, in this order:
 //!
 //! | Key class | Publication |
 //! |---|---|
 //! | `Dict` | `forget_cached_dictionaries` — first, so the rows below decode against the new entries |
-//! | `MetaTable` | schema/constraints/statistics/row caches of the table; then by schema change: dropped → `drop_table_indexes` + vector hook; created → registered and backfilled (step 5); pure column rename → `rename_column_in_indexes`; columns appended → nothing, or the new UNIQUE flags registered and backfilled; anything else → the table is re-derived; `pg_temp_*` → `note_temp_table_present` |
+//! | `MetaTable` | schema/constraints/statistics/row caches of the table; then by schema change: dropped → `drop_table_indexes` + vector hook; created → registered and backfilled (step 5); pure column rename → `rename_column_in_indexes`; columns appended → nothing, or the new UNIQUE flags registered and backfilled; anything else, or a schema more than one batch of the run wrote → the table is re-derived; `pg_temp_*` → `note_temp_table_present` |
 //! | `MetaIndex` delete | `drop_index` (memory only) + vector hook |
-//! | `Data` | new image decoded with the post-batch schema (`decode_stored_row`, the scan's decode); `stage_replicated_row(old, new).commit()` per row, a key swapped between rows inside the batch resolved by removing every refused row's old keys before adding the new ones; vector hook; row-id counter raised to the row id; `publish_live_replay_visibility`; decode failure → the table is re-derived |
-//! | `TableConstraints` | constraints cache; new UNIQUE / FK indexes (`register_unique_constraint_indexes`, `create_fk_index`) registered and backfilled; a constraint that disappeared → the table is re-derived |
-//! | `MetaIndex` put | ART family: `register_index_definition` + backfill of that index; vector family: vector hook |
-//! | `Snapshot` | `ingest_snapshot_record` + `raise_timestamp`; delete → `forget_snapshots` (the batch's deletions at once) + `clear_cache` |
+//! | `Data` | new image decoded with the post-run schema (`decode_stored_row`, the scan's decode); `stage_replicated_row(old, new).commit()` per row, a key swapped between rows inside the run resolved by removing every refused row's old keys before adding the new ones; vector hook; row-id counter raised to the row id; `publish_live_replay_visibility`; decode failure → the table is re-derived |
+//! | `TableConstraints` | constraints cache; new UNIQUE / FK indexes (`register_unique_constraint_indexes`, `create_fk_index`) registered and backfilled; a constraint that disappeared, or a set more than one batch of the run wrote → the table is re-derived |
+//! | `MetaIndex` put | ART family: `register_index_definition` + backfill of that index (a definition more than one batch of the run wrote: its registration is dropped and the table it names re-derived, which registers it); vector family: vector hook |
+//! | `Snapshot` | `ingest_snapshot_record` + `raise_timestamp`; delete → `forget_snapshots` (the run's deletions at once) + `clear_cache` |
 //! | `VersionIdx` / `Version` / `Vmeta` | timestamp raised past `u64::MAX - rev` and past a COPY marker's timestamp; COPY markers ingested / forgotten; the table's cached `AS OF` answers invalidated |
 //! | `Counter` | `raise_row_counter_to(decoded value)` |
 //! | `VgcWatermark` | `set_gc_low_watermark` + `raise_timestamp` |
 //! | `Branch` / `Git` | `reload_branch_manager` (retried on the next batch while a registry names metadata not yet arrived) |
 //! | `Statistics`, `Columnar*`, branch rows | statistics / row caches of the table |
-//! | `Vidx` | vector hook (`on_vidx_record` per key, then `on_batch_published` once per batch) |
+//! | `Vidx` | vector hook (`on_vidx_record` per key, then `on_batch_published` once per run) |
 //! | catalog classes (`Meta*`, `TableConstraints`, `Trigger*`, `ViewMeta`, `Statistics`, `Compression`) | [`DerivedStateListener::on_catalog_change`]; schema generation bumped once |
 //! | `Cas` | nothing to invalidate (content-addressed by hash); only retries a pending re-derivation |
 //! | logical WAL, cursors, durable index snapshots, TDE / elision sentinels, `vgc:anchor`, legacy counters, MV deltas, sync change log | nothing: no derived state reads them on a standby |
 //! | `Unknown` | WARN once per prefix; `derived_state_suspect` set (sticky) and a full re-derivation deferred to [`PhysicalApplier::run_pending_rebuilds`] |
 //!
-//! 5. **Re-derive** the tables the batch created and those it queued:
+//! 5. **Re-derive** the tables the run created and those it queued:
 //!    drop the table's ART registrations, register them again from the durable
 //!    records exactly as an open would (`register_index_definition`,
 //!    `register_table_indexes`) and backfill them by scan
@@ -65,25 +77,36 @@
 //!
 //! # Readers during publication
 //!
-//! Readers do not take the replay guard. Between step 3 and the end of step 5
-//! a touched table's index can lag its rows by one batch (a fresh row not yet
-//! in the PK index, `pk_index_len` one batch behind). The applier therefore
-//! holds the engine's uncommitted-write census for every table it publishes
-//! (for all tables when a batch touches index definitions or unknown keys),
-//! from before the apply until the publication is done — the same gate a
-//! transaction's eager index writes take — so every miss-based and cardinality
-//! fast path declines to the planner, which reads row storage and is exact. A
-//! PENDING table keeps its hold until its re-derivation succeeds. The index
-//! never advertises a row the store lacks: rows are applied first.
+//! Readers do not take the replay guard. Between the run's first write and
+//! the end of step 5 a touched table's index can lag its rows by one run (a
+//! fresh row not yet in the PK index, `pk_index_len` one run behind). The
+//! applier therefore holds the engine's uncommitted-write census for every
+//! table it publishes (for all tables when a run touches index definitions
+//! or unknown keys), from before the first write until the publication is
+//! done — the same gate a transaction's eager index writes take — so every
+//! miss-based and cardinality fast path declines to the planner, which reads
+//! row storage and is exact. A PENDING table keeps its hold until its
+//! re-derivation succeeds. The index never advertises a row the store lacks:
+//! rows are applied first.
 //!
 //! # Consistency
 //!
-//! One [`PhysicalBatch`] is one primary write group, so publishing per batch
-//! exposes exactly the states a primary passes through; DDL that spans write
-//! groups (a column-storage migration's rows then its schema; RENAME COLUMN's
-//! schema and index definitions, then its constraint records) converges when
-//! its last group is published. DROP TABLE deletes everything the table owns
-//! in one group (spec P1.1b).
+//! One [`PhysicalBatch`] is one primary write group, applied whole, so the
+//! store only ever holds states a primary passes through; a run is published
+//! at the state after its last group. Between two runs a reader sees exactly
+//! a state the primary itself could have crashed into — every applied group
+//! complete — and publication lags the store by at most one run (a poll: at
+//! most `physical_wire::APPLY_CHUNK_BYTES` of groups, or one larger group)
+//! instead of one group. DDL that spans write groups (a column-storage
+//! migration's rows then its schema; RENAME COLUMN's schema and index
+//! definitions, then its constraint records) converges when its last group is
+//! published. DROP TABLE deletes everything the table owns in one group (spec
+//! P1.1b). A run's publication compares each key's value before the run with
+//! its value after it; a table schema, constraint set or index definition
+//! more than one group of the run wrote — where that net change could hide a
+//! DROP and a CREATE of the same name — has its table re-derived instead. A run whose write fails after some
+//! of its groups were written keeps them (complete, durable groups of the
+//! primary) and re-derives the tables it touched instead of publishing.
 //!
 //! What this module does not do: the SQL layer's registries and caches
 //! (functions, triggers, plan caches) are the [`DerivedStateListener`]'s
@@ -127,7 +150,8 @@ pub enum ApplierError {
     #[error(transparent)]
     Physical(#[from] PhysicalError),
     /// The engine could not be read or its derived state built. From
-    /// `apply`, only before the batch was applied: nothing was written.
+    /// `apply` and `apply_run`, only before the first batch was written:
+    /// nothing was.
     #[error("physical applier: {0}")]
     Engine(#[from] crate::Error),
 }
@@ -183,8 +207,9 @@ pub trait VectorHook: Send + Sync {
         false
     }
 
-    /// One row of `table` changed: `old` decoded before the batch, `new`
-    /// after it, both shaped to the post-batch `schema`.
+    /// One row of `table` changed: `old` decoded before the batch (of a run:
+    /// before its first batch), `new` after it (after the run's last), both
+    /// shaped to the post-batch `schema`. Called once per row per run.
     fn on_row(
         &self,
         _engine: &StorageEngine,
@@ -196,16 +221,17 @@ pub trait VectorHook: Send + Sync {
     ) {
     }
 
-    /// One `__vidx:` record changed; `value` is its post-batch value (`None`
-    /// when deleted). Called in key order, after every other hook of the
-    /// batch's publication but [`Self::on_batch_published`].
+    /// One `__vidx:` record changed; `value` is its post-batch (post-run)
+    /// value (`None` when deleted). Called in key order, after every other
+    /// hook of the publication but [`Self::on_batch_published`].
     fn on_vidx_record(&self, _engine: &StorageEngine, _key: &[u8], _value: Option<&[u8]>) {}
 
-    /// The publication of one applied batch is complete: every hook above
-    /// has been called for it, and the batch's re-derivations (step 5, which
-    /// call [`Self::on_table_rederived`]) are next. Lets a hook publish the
-    /// batch's records as one unit, as the primary changed them in one write
-    /// group.
+    /// The publication of one applied batch — or of one run of batches, a
+    /// receiver's poll (spec P4.1d) — is complete: every hook above has been
+    /// called for it, and its re-derivations (step 5, which call
+    /// [`Self::on_table_rederived`]) are next. Lets a hook publish the
+    /// records as one unit: the state after the run's last write group, one
+    /// the primary passed through.
     fn on_batch_published(&self, _engine: &StorageEngine) {}
 
     /// A vector-family `meta:index:` definition was written or deleted.
@@ -229,12 +255,15 @@ pub struct NoopVectorHook;
 
 impl VectorHook for NoopVectorHook {}
 
-/// What one [`PhysicalApplier::apply`] did.
+/// What one [`PhysicalApplier::apply`] (or [`PhysicalApplier::apply_run`])
+/// did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Applied {
-    /// The batch's last source sequence: the cursor after it.
+    /// The batch's (the run's last batch's) last source sequence: the cursor
+    /// after it.
     pub source_sequence: u64,
-    /// Distinct `data:` keys published (0 for a retransmission).
+    /// Distinct `data:` keys published (0 for a retransmission): a key
+    /// several batches of a run touched counts once.
     pub rows: usize,
     /// Tables whose derived state fell back to a re-derivation in this call.
     pub tables_rebuilt: Vec<String>,
@@ -373,41 +402,89 @@ impl PhysicalApplier {
     /// ([`LocalWriter::apply_source_with`]). The publication is the same
     /// either way: a deferred group is applied (it and its cursor are in the
     /// store), only not yet fsynced; the receiver syncs once per poll.
+    /// [`Self::apply_run`] over this one batch.
     pub fn apply_with(&self, batch: &PhysicalBatch, durability: Durability) -> Result<Applied> {
+        self.apply_run(std::slice::from_ref(batch), durability)
+    }
+
+    /// Spec P4.1d: apply a run of contiguous batches — a receiver's poll —
+    /// as ONE unit of work: the replay guard taken once; every batch decoded;
+    /// ONE pre-read over the union of the keys they touch, before the first
+    /// write; the batches written one RocksDB write each, in order, through
+    /// [`LocalWriter::apply_source_with`] exactly as [`Self::apply_with`]
+    /// writes one (each with its own cursor put: the writer's accounting does
+    /// not depend on the run); then ONE publication over the union, with the
+    /// post-run schemas, by the same per-class rules. The result's
+    /// `source_sequence` is the last batch's; `rows` counts each `data:` key
+    /// once, however many batches of the run touched it.
+    ///
+    /// A row touched by several batches of the run is published once, from
+    /// the image it had before the FIRST of them (the pre-read runs before
+    /// any batch is written, as a single batch's does for a key it writes
+    /// twice) to the one it has after the last. A table schema, constraint
+    /// set or index definition that more than one batch of the run wrote or
+    /// deleted is not published from that net change alone — it can hide a
+    /// DROP and a CREATE of the same name in between: the table is re-derived
+    /// from the durable records instead (for an index, its registration is
+    /// dropped and the table its final definition names re-derived).
+    ///
+    /// `Err` before the first write means nothing of the run was applied. A
+    /// write that fails after earlier batches of the run were written leaves
+    /// those written — each is a complete write group the primary made
+    /// durable, and the cursor accounts for it — and replaces the run's
+    /// publication with the re-derivation path (`rederive_failed_run`), as a
+    /// row that does not decode does; the error is returned.
+    pub fn apply_run(&self, batches: &[PhysicalBatch], durability: Durability) -> Result<Applied> {
         let _replay = self.engine.replay_guard();
         let mut state = self.state.lock();
 
         // An exact retransmission changes nothing, and anything else at or
         // below the cursor is refused by the writer; neither needs a plan.
-        if batch.last_sequence() <= self.writer.cursor().source_sequence() {
+        // Only a run's first batches can be at or below the cursor: the rest
+        // follow them contiguously.
+        let cursor = self.writer.cursor().source_sequence();
+        let stale = batches
+            .iter()
+            .take_while(|batch| batch.last_sequence() <= cursor)
+            .count();
+        for batch in batches.get(..stale).unwrap_or_default() {
             if self.writer.apply_source_with(batch, durability)? {
                 // Unreachable through `apply_source`'s own rules; if it ever
                 // happens, the batch was applied without a publication.
                 self.defer_full_rebuild(&mut state, "a batch at or below the cursor was applied");
             }
+        }
+        let run = batches.get(stale..).unwrap_or_default();
+        let Some(last) = run.last() else {
             return Ok(Applied {
-                source_sequence: batch.last_sequence(),
+                source_sequence: batches.last().map_or(cursor, PhysicalBatch::last_sequence),
                 ..Applied::default()
             });
-        }
+        };
 
-        // 1. Decode and classify; enumerate range deletions while the keys
-        //    they remove still exist.
+        // 1. Decode and classify every batch of the run; enumerate range
+        //    deletions while the keys they remove still exist — against the
+        //    store before the run's first write (a key an earlier batch of the
+        //    run writes into a later one's range is noted by its own record).
         let mut touched = Touched::default();
-        for op in decode_raw_batch(batch.data())? {
-            match op {
-                RawOp::Put { key, .. } => touched.note(key, true),
-                RawOp::Delete { key } => touched.note(key, false),
-                RawOp::DeleteRange { start, end } => self.enumerate_range(start, end, &mut touched)?,
+        for (index, batch) in run.iter().enumerate() {
+            touched.batch = index;
+            for op in decode_raw_batch(batch.data())? {
+                match op {
+                    RawOp::Put { key, .. } => touched.note(key, true),
+                    RawOp::Delete { key } => touched.note(key, false),
+                    RawOp::DeleteRange { start, end } => self.enumerate_range(start, end, &mut touched)?,
+                }
             }
         }
 
-        // 2. Pre-read, census hold, invalidate before visible.
+        // 2. Pre-read (the images before the run), census hold, invalidate
+        //    before visible.
         let mut work = self.pre_read(&touched, &state)?;
         let held = touched.held_tables();
         let every_table = touched.holds_every_table();
-        // A batch that touches no table's rows or catalog (sequence state,
-        // the logical WAL) leaves every index exact: no hold.
+        // A run that touches no table's rows or catalog (sequence state, the
+        // logical WAL) leaves every index exact: no hold.
         let _hold =
             (every_table || !held.is_empty()).then(|| self.engine.write_census().hold_for_replay(held, every_table));
         for (table, rows) in &touched.data {
@@ -417,10 +494,24 @@ impl PhysicalApplier {
             }
         }
 
-        // 3. Apply verbatim.
-        if !self.writer.apply_source_with(batch, durability)? {
+        // 3. Apply verbatim: one write per batch, in order.
+        let mut written = 0_u64;
+        for batch in run {
+            match self.writer.apply_source_with(batch, durability) {
+                Ok(true) => written += 1,
+                // An exact retransmission of the batch before it: nothing changed.
+                Ok(false) => {}
+                Err(error) => {
+                    if written > 0 {
+                        self.rederive_failed_run(&touched, written, &mut state);
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        if written == 0 {
             return Ok(Applied {
-                source_sequence: batch.last_sequence(),
+                source_sequence: last.last_sequence(),
                 ..Applied::default()
             });
         }
@@ -430,10 +521,10 @@ impl PhysicalApplier {
             self.engine.bump_schema_generation();
         }
 
-        // 4. Publish.
+        // 4. Publish, once for the run.
         self.publish(&touched, &mut work, &mut state);
 
-        // 5. Re-derive what the batch created or queued.
+        // 5. Re-derive what the run created or queued.
         let mut attempt: BTreeSet<String> = work.register.iter().chain(&work.rederive).cloned().collect();
         if touched.fixes_decoding {
             attempt.extend(state.pending.keys().cloned());
@@ -444,15 +535,60 @@ impl PhysicalApplier {
         let rows: usize = touched.data.values().map(BTreeMap::len).sum();
         {
             let mut stats = self.stats.lock();
-            stats.batches += 1;
+            stats.batches += written;
             stats.rows += rows as u64;
             stats.pending_tables = state.pending.len();
         }
         Ok(Applied {
-            source_sequence: batch.last_sequence(),
+            source_sequence: last.last_sequence(),
             rows,
             tables_rebuilt,
         })
+    }
+
+    /// Spec P4.1d: a run whose write failed after some of its batches were
+    /// written. Those stay written: each is a complete write group the
+    /// primary made durable, and the writer's cursor accounts for it, so the
+    /// store is a state the primary passed through. The run's publication
+    /// was planned for all of it, though — its post-run images, schemas and
+    /// timestamps include batches that never reached the store — so it is
+    /// not run. Instead, as for a row that does not decode, the derived
+    /// state is re-derived from the store as it is, now, under the replay
+    /// guard the run holds — the receiver stops on the error, so a deferred
+    /// re-derivation would never run:
+    ///
+    /// * a run that touched the catalog, index definitions or keys no table
+    ///   can be named for: the whole derived state (`rebuild_all_locked`:
+    ///   every table, the snapshot map and timestamps, the version-GC
+    ///   horizon, the branch registry, every cache, the listener);
+    /// * any other run: every table it touched (one that cannot be re-derived
+    ///   stays pending, holding the census, its readers on scans), and the
+    ///   rest — the snapshot map and timestamps, row counters, caches — is
+    ///   marked suspect and re-derived in full at the next idle poll
+    ///   ([`Self::run_pending_rebuilds`]); a receiver that stops on the error
+    ///   re-hydrates at its next start instead.
+    ///
+    /// `written` batches count as applied.
+    fn rederive_failed_run(&self, touched: &Touched, written: u64, state: &mut ApplierState) {
+        self.stats.lock().batches += written;
+        if touched.holds_every_table() || touched.touches_catalog() {
+            if let Err(e) = self.rebuild_all_locked(state) {
+                warn!(
+                    "physical applier: re-deriving the whole derived state after a failed run failed ({}); it \
+                     stays suspect",
+                    e
+                );
+                self.defer_full_rebuild(state, "a failed run's re-derivation failed");
+            }
+        } else {
+            let tables: BTreeSet<String> = touched.held_tables().into_iter().collect();
+            self.rederive_tables(tables.clone(), &tables, state);
+            self.defer_full_rebuild(
+                state,
+                "a run of write groups failed part-way; its publication is replaced by a re-derivation",
+            );
+        }
+        self.stats.lock().pending_tables = state.pending.len();
     }
 
     /// Re-derive one table's ART indexes from the durable records and a scan
@@ -698,6 +834,12 @@ impl PhysicalApplier {
                 (None, Some(_)) => {
                     work.register.insert(table.clone());
                 }
+                // Spec P4.1d: written by more than one batch of the run — a
+                // DROP and a CREATE of the same name could sit in between,
+                // which the net change does not show.
+                (Some(_), Some(_)) if touched.redefined_tables.contains(table) => {
+                    work.rederive.insert(table.clone());
+                }
                 (Some(pre), Some(post)) => match classify_schema_change(&pre, &post) {
                     SchemaChange::Unchanged | SchemaChange::Appended { unique_added: false } => {}
                     SchemaChange::Renamed { old, new } => {
@@ -718,7 +860,7 @@ impl PhysicalApplier {
     }
 
     /// `meta:index:` deletes, before rows are staged: a dropped index is not
-    /// maintained for this batch's rows. Puts are kept for after staging.
+    /// maintained for this run's rows. Puts are kept for after staging.
     fn publish_index_deletes(&self, touched: &Touched, work: &mut BatchWork, state: &mut ApplierState) {
         let art = self.engine.art_indexes();
         for name in &touched.index_definitions {
@@ -732,6 +874,31 @@ impl PhysicalApplier {
                     self.vector.on_index_definition(&self.engine, name, true);
                 }
                 Ok(Some(_)) => {
+                    if touched.redefined_indexes.contains(name) {
+                        // Spec P4.1d: written and deleted by different batches
+                        // of the run (DROP INDEX, then CREATE INDEX of the same
+                        // name): a registration of the name may be the old
+                        // definition's, possibly on another table. It is
+                        // dropped first, as a deleted definition's is (above):
+                        // the re-derivation of the table the final definition
+                        // names then registers it there — it would leave a
+                        // name another table still holds, and that table's
+                        // own re-derivation would drop it again.
+                        if let Some((kind, table)) = art.index_kind_and_table(name) {
+                            if let Err(e) = art.drop_index(name) {
+                                debug!("physical applier: dropping index '{}': {}", name, e);
+                            }
+                            if kind != ArtIndexType::Manual {
+                                // It may have been a constraint's index on
+                                // that table (a name a record later took):
+                                // that table's own records re-mint it.
+                                work.rederive.insert(table);
+                            }
+                        }
+                        if let Ok(Some(definition)) = self.engine.catalog().get_index_definition(name) {
+                            work.rederive.insert(definition.table_name);
+                        }
+                    }
                     work.index_puts.insert(name.clone());
                 }
                 Err(e) => {
@@ -903,7 +1070,10 @@ impl PhysicalApplier {
                 continue;
             }
             let pre = work.pre_constraints.get(table).and_then(Option::as_ref);
-            if constraints_were_removed(pre, post.as_ref()) {
+            // Spec P4.1d: a constraint set more than one batch of the run
+            // wrote is re-derived: a constraint dropped and added again under
+            // its name in between is invisible to the net comparison.
+            if touched.redefined_tables.contains(table) || constraints_were_removed(pre, post.as_ref()) {
                 work.rederive.insert(table.clone());
                 continue;
             }
@@ -1551,11 +1721,26 @@ struct BatchWork {
     dropped: BTreeSet<String>,
 }
 
-/// Every key a batch touched, sorted by what publishing it involves. Keys are
-/// deduplicated: publication reads each one's post-batch value, which is the
-/// net effect of all of the batch's records on it.
+/// Every key a batch — or a run of batches (spec P4.1d) — touched, sorted by
+/// what publishing it involves. Keys are deduplicated: publication reads each
+/// one's post-run value, which is the net effect of all of the run's records
+/// on it.
 #[derive(Default)]
 struct Touched {
+    /// The batch of the run whose records are being noted (0 for a run of
+    /// one batch).
+    batch: usize,
+    /// The last batch of the run that wrote or deleted each table schema,
+    /// constraint set and index definition, by key.
+    definition_batches: BTreeMap<Vec<u8>, usize>,
+    /// Tables whose schema or constraint set more than one batch of the run
+    /// wrote or deleted: re-derived, since the net change can hide a DROP
+    /// and a CREATE of the same name in between.
+    redefined_tables: BTreeSet<String>,
+    /// Index definitions more than one batch of the run wrote or deleted:
+    /// the name's registration is dropped and the table the final definition
+    /// names is re-derived, which registers it there.
+    redefined_indexes: BTreeSet<String>,
     data: BTreeMap<String, BTreeMap<u64, RowKey>>,
     meta_tables: BTreeSet<String>,
     index_definitions: BTreeSet<String>,
@@ -1635,6 +1820,9 @@ impl Touched {
                 self.fixes_decoding = true;
                 match suffix(key, b"meta:table:") {
                     Some(table) => {
+                        if self.rewritten_by_another_batch(key) {
+                            self.redefined_tables.insert(table.clone());
+                        }
                         self.meta_tables.insert(table);
                     }
                     None => self.unknown.push(key.to_vec()),
@@ -1645,6 +1833,9 @@ impl Touched {
                 self.fixes_decoding = true;
                 match suffix(key, b"meta:index:") {
                     Some(name) => {
+                        if self.rewritten_by_another_batch(key) {
+                            self.redefined_indexes.insert(name.clone());
+                        }
                         self.index_definitions.insert(name);
                     }
                     None => self.unknown.push(key.to_vec()),
@@ -1655,6 +1846,9 @@ impl Touched {
                 // `constraint:` keys (no caller today) are the listener's only.
                 if let Some(table) = suffix(key, b"table_constraints:") {
                     self.fixes_decoding = true;
+                    if self.rewritten_by_another_batch(key) {
+                        self.redefined_tables.insert(table.clone());
+                    }
                     self.constraints.insert(table);
                 }
             }
@@ -1745,7 +1939,17 @@ impl Touched {
         }
     }
 
-    /// The tables whose indexes this batch's publication may leave behind
+    /// Spec P4.1d: whether a batch of the run before the current one wrote
+    /// or deleted the definition `key` too. Records the current batch as the
+    /// last that did. Never true for a run of one batch.
+    fn rewritten_by_another_batch(&mut self, key: &[u8]) -> bool {
+        match self.definition_batches.insert(key.to_vec(), self.batch) {
+            Some(previous) => previous != self.batch,
+            None => false,
+        }
+    }
+
+    /// The tables whose indexes this run's publication may leave behind
     /// their rows for a moment.
     fn held_tables(&self) -> Vec<String> {
         let mut tables: BTreeSet<&String> = self.data.keys().collect();
@@ -2059,5 +2263,500 @@ mod tests {
         assert!(touched.touches_catalog());
         assert!(!touched.holds_every_table());
         assert_eq!(touched.held_tables(), vec!["users".to_string()]);
+    }
+
+    /// Spec P4.1d: a schema, constraint set or index definition that two
+    /// batches of a run write is marked redefined (its net change could hide
+    /// a DROP and a CREATE of the same name); one batch writing it twice is
+    /// that group's own net change, as before runs existed.
+    #[test]
+    fn a_definition_two_batches_of_a_run_write_is_marked_redefined() {
+        let mut touched = Touched::default();
+        touched.note(b"meta:table:users", false);
+        touched.note(b"meta:table:users", true);
+        touched.note(b"meta:index:by_name", true);
+        touched.note(b"meta:table:kept", true);
+        assert!(touched.redefined_tables.is_empty() && touched.redefined_indexes.is_empty());
+        touched.batch = 1;
+        touched.note(b"meta:table:users", true);
+        touched.note(b"table_constraints:orders", true);
+        touched.note(b"meta:index:by_name", false);
+        touched.batch = 2;
+        touched.note(b"table_constraints:orders", true);
+        touched.note(b"data:kept:1", true);
+        assert_eq!(
+            touched.redefined_tables,
+            BTreeSet::from(["orders".to_string(), "users".to_string()])
+        );
+        assert_eq!(touched.redefined_indexes, BTreeSet::from(["by_name".to_string()]));
+        assert!(touched.meta_tables.contains("kept") && !touched.redefined_tables.contains("kept"));
+    }
+
+    /// Spec P4.1d §3: runs of batches through a real standby — a primary
+    /// `EmbeddedDatabase`, its checkpoint downloaded into a stage, the stage's
+    /// writer under `StorageEngine::open_physical_standby` and an applier
+    /// (the production path up to the first cursor, as in
+    /// `tests/physical_standby_derived_state.rs`).
+    #[cfg(target_os = "linux")]
+    mod runs {
+        use super::super::*;
+        use crate::replication::checkpoint_transfer::{
+            OnlineCheckpointExport, PhysicalStage, ReceiverStaging, TransferLimits,
+        };
+        use crate::replication::history::load_or_create_primary_history;
+        use crate::replication::physical::{poll_source, range_digest, FlushMemo, MAX_BATCH_BYTES};
+        use crate::storage::WriteGate;
+        use crate::{Config, EmbeddedDatabase};
+        use rocksdb::{WriteBatch, DB};
+        use std::path::Path;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use uuid::Uuid;
+
+        fn primary_config(path: &Path) -> Config {
+            let mut config = Config::default();
+            config.storage.path = Some(path.to_path_buf());
+            config.storage.memory_only = false;
+            config.replication.physical.enabled = true;
+            config
+        }
+
+        /// A primary. Fields drop in declaration order, the directory last.
+        struct Primary {
+            raw: Arc<DB>,
+            database: EmbeddedDatabase,
+            history: Uuid,
+            root: tempfile::TempDir,
+        }
+
+        impl Primary {
+            fn new(setup: &[&str]) -> Self {
+                let root = tempfile::tempdir().unwrap();
+                let database = EmbeddedDatabase::with_config(primary_config(&root.path().join("primary"))).unwrap();
+                let raw = database.storage.db();
+                let primary = Self {
+                    history: load_or_create_primary_history(raw.path()).unwrap(),
+                    raw,
+                    database,
+                    root,
+                };
+                primary.run(setup);
+                primary
+            }
+
+            fn run(&self, statements: &[&str]) {
+                for sql in statements {
+                    self.database
+                        .execute(sql)
+                        .map_err(|e| format!("primary `{sql}`: {e}"))
+                        .unwrap();
+                }
+            }
+
+            /// A physical standby staged from the primary as it is now, into
+            /// `name` under the primary's directory; `hook` replaces the
+            /// applier's vector hook.
+            fn standby(&self, name: &str, hook: Option<Arc<dyn VectorHook>>) -> Standby {
+                let root = self.root.path();
+                let config = primary_config(&root.join("primary"));
+                let limits = TransferLimits::default();
+                let export = OnlineCheckpointExport::create(&self.raw, self.history, root, limits).unwrap();
+                let mut receiver = ReceiverStaging::begin(
+                    &root.join(name),
+                    &export.manifest_bytes().unwrap(),
+                    self.history,
+                    limits,
+                )
+                .unwrap();
+                for (index, file) in export.manifest().files.iter().enumerate() {
+                    let mut offset = 0;
+                    while offset < file.size {
+                        let bytes = export.read_chunk(index as u32, offset, 64 * 1024).unwrap();
+                        receiver.append_chunk(index as u32, offset, &bytes).unwrap();
+                        offset += bytes.len() as u64;
+                    }
+                }
+                let stage = receiver.finish_download(&config).unwrap().open(&config).unwrap();
+                let path = stage.staging_path().to_path_buf();
+                let engine = Arc::new(
+                    StorageEngine::open_physical_standby(
+                        &path,
+                        &primary_config(&path),
+                        Arc::clone(stage.writer()),
+                        WriteGate::closed("physical standby"),
+                    )
+                    .unwrap(),
+                );
+                let mut applier = PhysicalApplier::new(
+                    Arc::clone(&engine),
+                    Arc::clone(stage.writer()),
+                    Arc::new(NoopDerivedStateListener),
+                )
+                .unwrap();
+                if let Some(hook) = hook {
+                    applier = applier.with_vector_hook(hook);
+                }
+                applier.hydrate().unwrap();
+                Standby {
+                    applier,
+                    engine,
+                    _stage: stage,
+                }
+            }
+
+            /// Every write group of the primary past `after`, in order.
+            fn groups_after(&self, mut after: u64) -> Vec<PhysicalBatch> {
+                let mut groups = Vec::new();
+                loop {
+                    let poll = poll_source(&self.raw, self.history, after, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
+                    if poll.batches.is_empty() {
+                        return groups;
+                    }
+                    after = poll.through;
+                    groups.extend(poll.batches);
+                }
+            }
+        }
+
+        /// A standby. The applier and the engine release the writer before
+        /// the stage that owns it.
+        struct Standby {
+            applier: PhysicalApplier,
+            engine: Arc<StorageEngine>,
+            _stage: PhysicalStage,
+        }
+
+        impl Standby {
+            fn cursor(&self) -> u64 {
+                self.applier.writer().cursor().source_sequence()
+            }
+
+            fn digest(&self) -> [u8; 32] {
+                range_digest(self.applier.writer().db(), None, b"").unwrap()
+            }
+        }
+
+        /// The `data:{table}:` keys one batch's records write or delete.
+        fn row_keys(batch: &PhysicalBatch, table: &str) -> BTreeSet<Vec<u8>> {
+            let prefix = format!("data:{table}:").into_bytes();
+            decode_raw_batch(batch.data())
+                .unwrap()
+                .into_iter()
+                .filter_map(|op| match op {
+                    RawOp::Put { key, .. } | RawOp::Delete { key } => key.starts_with(&prefix).then(|| key.to_vec()),
+                    RawOp::DeleteRange { .. } => None,
+                })
+                .collect()
+        }
+
+        /// What a publication tells the vector hook: every row change it
+        /// stages, and every publication it completes.
+        #[derive(Default)]
+        struct Counting {
+            rows: Mutex<Vec<(String, u64, bool, bool)>>,
+            published: AtomicUsize,
+        }
+
+        impl VectorHook for Counting {
+            fn wants_rows(&self, _engine: &StorageEngine, _table: &str) -> bool {
+                true
+            }
+
+            fn on_row(
+                &self,
+                _engine: &StorageEngine,
+                table: &str,
+                row_id: u64,
+                _schema: &Schema,
+                old: Option<&Tuple>,
+                new: Option<&Tuple>,
+            ) {
+                self.rows
+                    .lock()
+                    .push((table.to_string(), row_id, old.is_some(), new.is_some()));
+            }
+
+            fn on_batch_published(&self, _engine: &StorageEngine) {
+                self.published.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// `table`'s ART indexes, entry for entry, by kind and columns.
+        fn census(engine: &StorageEngine, table: &str) -> BTreeMap<(String, Vec<String>), Vec<(Vec<u8>, u64)>> {
+            let art = engine.art_indexes();
+            let mut census = BTreeMap::new();
+            for (name, kind, columns) in art.list_table_indexes(table) {
+                let mut entries = art.index_range_scan(&name, None, None, None);
+                entries.sort();
+                census.insert((format!("{kind:?}"), columns), entries);
+            }
+            census
+        }
+
+        fn rows_of(engine: &StorageEngine, table: &str) -> Vec<Tuple> {
+            let mut rows = engine.scan_table(table).unwrap();
+            rows.sort_by_key(|row| row.row_id);
+            rows
+        }
+
+        /// Spec P4.1d §3: the groups of an INSERT, an UPDATE and a DELETE of
+        /// one row, applied as one run, publish that row ONCE — from its image
+        /// before the first of them (absent) to its final one (absent) — in
+        /// one publication, and leave every index at the final state: the row
+        /// is in none of them, the row the run did not touch still is.
+        #[test]
+        fn a_run_over_an_insert_update_and_delete_of_one_row_publishes_the_final_state_once() {
+            let primary = Primary::new(&[
+                "CREATE TABLE t (id INT PRIMARY KEY, v TEXT)",
+                "CREATE INDEX t_v ON t (v)",
+                "INSERT INTO t VALUES (2, 'two')",
+            ]);
+            let hook = Arc::new(Counting::default());
+            let standby = primary.standby("standby", Some(hook.clone() as Arc<dyn VectorHook>));
+            let before = standby.applier.stats();
+            primary.run(&[
+                "INSERT INTO t VALUES (1, 'one')",
+                "UPDATE t SET v = 'uno' WHERE id = 1",
+                "DELETE FROM t WHERE id = 1",
+            ]);
+            let run = primary.groups_after(standby.cursor());
+            let per_batch: Vec<BTreeSet<Vec<u8>>> = run.iter().map(|batch| row_keys(batch, "t")).collect();
+            let distinct: BTreeSet<Vec<u8>> = per_batch.iter().flatten().cloned().collect();
+            let touching = per_batch.iter().filter(|keys| !keys.is_empty()).count();
+            assert!(
+                touching >= 3,
+                "the three statements wrote t's rows in {touching} of {} groups",
+                run.len()
+            );
+            assert!(
+                touching > distinct.len(),
+                "precondition: a row more than one group of the run touches"
+            );
+
+            let applied = standby.applier.apply_run(&run, Durability::Synced).unwrap();
+            assert_eq!(applied.source_sequence, run.last().unwrap().last_sequence());
+            assert_eq!(standby.cursor(), applied.source_sequence);
+            assert_eq!(
+                applied.rows,
+                distinct.len(),
+                "each row the run touched is published once"
+            );
+            assert!(applied.tables_rebuilt.is_empty(), "{applied:?}");
+            assert_eq!(hook.published.load(Ordering::SeqCst), 1, "one publication for the run");
+            let changes: Vec<(String, u64, bool, bool)> = hook
+                .rows
+                .lock()
+                .iter()
+                .filter(|change| change.0 == "t")
+                .cloned()
+                .collect();
+            assert_eq!(changes.len(), distinct.len(), "{changes:?}");
+            assert!(
+                changes.iter().all(|&(_, _, old, new)| !old && !new),
+                "absent before the run's first group and after its last: {changes:?}"
+            );
+            let stats = standby.applier.stats();
+            assert_eq!(stats.batches - before.batches, run.len() as u64, "every group written");
+            assert_eq!(stats.rows - before.rows, distinct.len() as u64);
+            assert_eq!(stats.rebuilds, 0, "{stats:?}");
+            assert_eq!(stats.pending_tables, 0, "{stats:?}");
+            assert!(!stats.derived_state_suspect, "{stats:?}");
+
+            let engine = &standby.engine;
+            let art = engine.art_indexes();
+            assert_eq!(art.pk_index_len("t"), Some(1));
+            assert_eq!(engine.get_row_by_pk("t", &Value::Int4(1)).unwrap(), None);
+            let kept = engine.get_row_by_pk("t", &Value::Int4(2)).unwrap().unwrap();
+            assert_eq!(engine.count_table_rows("t").unwrap(), 1);
+            let on_v = art.find_column_index("t", "v").unwrap();
+            let entries = art.index_range_scan(&on_v, None, None, None);
+            assert_eq!(
+                entries.iter().map(|(_, row_id)| Some(*row_id)).collect::<Vec<_>>(),
+                vec![kept.row_id],
+                "only the untouched row is in the index on v"
+            );
+        }
+
+        /// Spec P4.1d §3: a run whose middle group carries a row that does
+        /// not decode sends that row's table to the re-derivation path (re-
+        /// derived, or — the scan meets the same row — left pending, its
+        /// readers on scans), while the tables of the groups before and after
+        /// it are published row by row; once the row is gone the pending
+        /// table is re-derived.
+        #[test]
+        fn a_row_that_does_not_decode_mid_run_rederives_its_table_and_the_rest_is_published() {
+            let primary = Primary::new(&[
+                "CREATE TABLE alpha (id INT PRIMARY KEY, v TEXT)",
+                "CREATE TABLE beta (id INT PRIMARY KEY, v TEXT)",
+                "CREATE TABLE gamma (id INT PRIMARY KEY, v TEXT)",
+                "INSERT INTO beta VALUES (1, 'kept')",
+            ]);
+            let standby = primary.standby("standby", None);
+            primary.run(&["INSERT INTO alpha VALUES (1, 'first')"]);
+            // A `beta` row no schema decodes, written below the engine.
+            primary.raw.put(b"data:beta:999", b"\xff\xff\xffnot a row").unwrap();
+            primary.run(&["INSERT INTO gamma VALUES (1, 'third')"]);
+            let run = primary.groups_after(standby.cursor());
+            let middle = run
+                .iter()
+                .position(|batch| row_keys(batch, "beta").contains(b"data:beta:999".as_slice()))
+                .unwrap();
+            assert!(
+                middle > 0 && middle + 1 < run.len(),
+                "precondition: groups before and after it"
+            );
+
+            let applied = standby.applier.apply_run(&run, Durability::Synced).unwrap();
+            assert_eq!(standby.cursor(), applied.source_sequence);
+            assert_eq!(applied.source_sequence, run.last().unwrap().last_sequence());
+            let stats = standby.applier.stats();
+            assert!(
+                applied.tables_rebuilt == vec!["beta".to_string()] || stats.pending_tables == 1,
+                "beta went to the re-derivation path: {applied:?} {stats:?}"
+            );
+            assert!(
+                !applied
+                    .tables_rebuilt
+                    .iter()
+                    .any(|table| table == "alpha" || table == "gamma"),
+                "{applied:?}"
+            );
+            for table in ["alpha", "gamma"] {
+                assert_eq!(standby.engine.art_indexes().pk_index_len(table), Some(1), "{table}");
+                assert!(
+                    standby.engine.get_row_by_pk(table, &Value::Int4(1)).unwrap().is_some(),
+                    "the {table} row of the run is published"
+                );
+            }
+
+            // Once the row is gone, `beta` is re-derived and exact again.
+            let mut delete = WriteBatch::default();
+            delete.delete(b"data:beta:999");
+            primary.raw.write(delete).unwrap();
+            for batch in primary.groups_after(standby.cursor()) {
+                standby.applier.apply(&batch).unwrap();
+            }
+            standby.applier.run_pending_rebuilds().unwrap();
+            let stats = standby.applier.stats();
+            assert_eq!(stats.pending_tables, 0, "{stats:?}");
+            assert!(stats.rebuilds >= 1, "{stats:?}");
+            assert_eq!(standby.engine.art_indexes().pk_index_len("beta"), Some(1));
+            assert!(standby.engine.get_row_by_pk("beta", &Value::Int4(1)).unwrap().is_some());
+        }
+
+        /// Spec P4.1d §3: byte identity of the store does not depend on the
+        /// run size. Two standbys staged at the same cut, one applying the
+        /// primary's groups one by one and one as a single run, hold the same
+        /// default column family — the primary's — and the same derived
+        /// state.
+        #[test]
+        fn a_run_leaves_the_store_byte_identical_to_applying_its_batches_one_by_one() {
+            let primary = Primary::new(&[
+                "CREATE TABLE items (id INT PRIMARY KEY, name TEXT, qty INT)",
+                "INSERT INTO items VALUES (1, 'one', 10), (2, 'two', 20), (3, 'three', 30)",
+            ]);
+            let one_by_one = primary.standby("one-by-one", None);
+            let as_a_run = primary.standby("as-a-run", None);
+            assert_eq!(one_by_one.cursor(), as_a_run.cursor(), "staged at the same cut");
+            primary.run(&[
+                "INSERT INTO items VALUES (4, 'four', 40)",
+                "UPDATE items SET qty = qty + 1 WHERE id <= 2",
+                "DELETE FROM items WHERE id = 3",
+                "CREATE INDEX items_name ON items (name)",
+                "INSERT INTO items VALUES (5, 'five', 50)",
+                "UPDATE items SET name = 'FOUR' WHERE id = 4",
+            ]);
+            let run = primary.groups_after(as_a_run.cursor());
+            assert!(run.len() > 1, "{} groups", run.len());
+            for batch in &run {
+                one_by_one.applier.apply(batch).unwrap();
+            }
+            as_a_run.applier.apply_run(&run, Durability::Synced).unwrap();
+            assert_eq!(one_by_one.cursor(), as_a_run.cursor());
+            assert_eq!(
+                primary.raw.latest_sequence_number(),
+                as_a_run.cursor(),
+                "precondition: the primary wrote nothing since"
+            );
+            assert_eq!(
+                one_by_one.digest(),
+                as_a_run.digest(),
+                "the same bytes, whatever the run size"
+            );
+            assert_eq!(
+                as_a_run.digest(),
+                range_digest(&primary.raw, None, b"").unwrap(),
+                "the primary's default column family"
+            );
+            let (single, whole) = (&one_by_one.engine, &as_a_run.engine);
+            assert_eq!(rows_of(single, "items"), rows_of(whole, "items"));
+            assert_eq!(
+                single.art_indexes().pk_index_len("items"),
+                whole.art_indexes().pk_index_len("items")
+            );
+            assert_eq!(census(single, "items"), census(whole, "items"));
+            assert!(
+                whole.art_indexes().find_column_index("items", "name").is_some(),
+                "the index the run created is registered"
+            );
+            let stats = as_a_run.applier.stats();
+            assert_eq!(stats.batches, run.len() as u64, "{stats:?}");
+            assert_eq!(stats.rebuilds, 0, "{stats:?}");
+            assert!(!stats.derived_state_suspect, "{stats:?}");
+        }
+
+        /// Review P4.1d: an index name dropped on one table and created on
+        /// another inside one run is registered on the new table, backfilled
+        /// with its rows, and gone from the old one — with the new table
+        /// sorting BEFORE the old one, so its re-derivation runs first and
+        /// would have found the name still held by the old table.
+        #[test]
+        fn an_index_name_moved_to_a_table_that_sorts_first_in_one_run_is_registered_on_it() {
+            let primary = Primary::new(&[
+                "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
+                "CREATE TABLE accounts (id INT PRIMARY KEY, owner TEXT)",
+                "INSERT INTO users VALUES (1, 'ann'), (2, 'bob')",
+                "INSERT INTO accounts VALUES (1, 'x'), (2, 'y'), (3, 'z')",
+                "CREATE INDEX moved ON users (name)",
+            ]);
+            let standby = primary.standby("standby", None);
+            let owner = |standby: &Standby| {
+                standby
+                    .engine
+                    .art_indexes()
+                    .index_kind_and_table("moved")
+                    .map(|(_, table)| table)
+            };
+            assert_eq!(owner(&standby).as_deref(), Some("users"), "precondition");
+            primary.run(&["DROP INDEX moved", "CREATE INDEX moved ON accounts (owner)"]);
+            let run = primary.groups_after(standby.cursor());
+            let definition = b"meta:index:moved".as_slice();
+            let writes = run
+                .iter()
+                .filter(|batch| {
+                    decode_raw_batch(batch.data()).unwrap().iter().any(|op| match op {
+                        RawOp::Put { key, .. } | RawOp::Delete { key } => *key == definition,
+                        RawOp::DeleteRange { .. } => false,
+                    })
+                })
+                .count();
+            assert!(writes >= 2, "precondition: two groups of the run write the definition");
+
+            standby.applier.apply_run(&run, Durability::Synced).unwrap();
+            let art = standby.engine.art_indexes();
+            assert_eq!(
+                owner(&standby).as_deref(),
+                Some("accounts"),
+                "registered on the new table"
+            );
+            assert_eq!(art.index_entry_count("moved"), Some(3), "backfilled with its rows");
+            assert_eq!(art.find_column_index("accounts", "owner").as_deref(), Some("moved"));
+            assert!(
+                art.find_column_index("users", "name").is_none(),
+                "gone from the old table"
+            );
+            let stats = standby.applier.stats();
+            assert_eq!(stats.pending_tables, 0, "{stats:?}");
+            assert!(!stats.derived_state_suspect, "{stats:?}");
+        }
     }
 }

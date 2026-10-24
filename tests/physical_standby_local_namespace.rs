@@ -33,7 +33,8 @@ use heliosdb_nano::replication::checkpoint_transfer::{
 };
 use heliosdb_nano::replication::history::load_or_create_primary_history;
 use heliosdb_nano::replication::physical::{
-    poll_source, range_digest, LocalBatch, PhysicalError, StagedPhysicalReplica, CURSOR_KEY, LOCAL_CF, MAX_BATCH_BYTES,
+    poll_source, range_digest, FlushMemo, LocalBatch, PhysicalError, StagedPhysicalReplica, CURSOR_KEY, LOCAL_CF,
+    MAX_BATCH_BYTES,
 };
 use heliosdb_nano::storage::StorageEngine;
 use heliosdb_nano::{Config, EmbeddedDatabase};
@@ -104,7 +105,14 @@ fn stage(source: &DB, history: Uuid, root: &Path, target: &str, config: &Config)
 fn catch_up(stage: &mut PhysicalStage, source: &DB, history: Uuid, through: u64) -> usize {
     let mut applied = 0;
     'poll: while stage.cursor().source_sequence() < through {
-        let poll = poll_source(source, history, stage.cursor().source_sequence(), MAX_BATCH_BYTES).unwrap();
+        let poll = poll_source(
+            source,
+            history,
+            stage.cursor().source_sequence(),
+            MAX_BATCH_BYTES,
+            &FlushMemo::new(),
+        )
+        .unwrap();
         assert!(!poll.batches.is_empty(), "the source has nothing up to {through}");
         for batch in &poll.batches {
             assert!(
@@ -240,7 +248,14 @@ fn owned_writes_keep_the_cursor_invariant_and_never_touch_the_copied_keyspace() 
     }
 
     source.put(b"after-checkpoint", b"source write").unwrap();
-    let poll = poll_source(&source, history, writer.cursor().source_sequence(), MAX_BATCH_BYTES).unwrap();
+    let poll = poll_source(
+        &source,
+        history,
+        writer.cursor().source_sequence(),
+        MAX_BATCH_BYTES,
+        &FlushMemo::new(),
+    )
+    .unwrap();
     assert_eq!(poll.batches.len(), 1);
     assert!(writer.apply_source(&poll.batches[0]).unwrap());
     accounted("apply_source");
@@ -271,7 +286,14 @@ fn owned_writes_keep_the_cursor_invariant_and_never_touch_the_copied_keyspace() 
     // A raw default-family write between two steps poisons the next one.
     writer.db().put(b"stray", b"not through the writer").unwrap();
     source.put(b"after-stray", b"source write").unwrap();
-    let poll = poll_source(&source, history, cursor.source_sequence(), MAX_BATCH_BYTES).unwrap();
+    let poll = poll_source(
+        &source,
+        history,
+        cursor.source_sequence(),
+        MAX_BATCH_BYTES,
+        &FlushMemo::new(),
+    )
+    .unwrap();
     let error = writer.apply_source(&poll.batches[0]).unwrap_err();
     assert!(
         error.to_string().contains("modified outside physical replication"),

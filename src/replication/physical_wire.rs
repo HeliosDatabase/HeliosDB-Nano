@@ -1,4 +1,4 @@
-//! The replication protocol `NPHYS002`: ONE authenticated connection per
+//! The replication protocol `NPHYS003`: ONE authenticated connection per
 //! receiver carries both the physical data (snapshot chunks, RocksDB write
 //! groups) and the control plane — identity, dataset history, epoch,
 //! heartbeats and acknowledgements (spec P2.1,
@@ -29,19 +29,41 @@
 //! | `Hello` | R→S | [`Hello`]: node id, role, history, epoch, durable cursor, capabilities, PG port, sync mode |
 //! | `HelloOk` | S→R | [`HelloOk`]: node id, history, epoch, barrier, capabilities, replication endpoint, PG port |
 //! | `Refuse` | S→R | [`Refusal`]: a [`RefuseCode`] and a reason; the session ends |
-//! | `Open` | R→S | snapshot (optionally preferring a leased snapshot id: a resumed download, spec P2.2), or resume `{history, after}` |
-//! | `Manifest` / `ResumeInfo` | S→R | the session the source opened |
+//! | `Open` | R→S | snapshot (optionally preferring a leased snapshot id: a resumed download, spec P2.2), resume `{history, after}`, or fast-forward `{history, after, leaf bytes, preferred snapshot}` (spec P4.1) |
+//! | `Manifest` / `ResumeInfo` / `FastForwardInfo` | S→R | the session the source opened |
 //! | `ChunkRequest` / `Chunk` | R→S / S→R | one bounded, digested piece of a checkpoint file |
 //! | `PollRequest` | R→S | `{session, after, byte limit}` |
 //! | `PollStart`, `Batch`*, `PollEnd` | S→R | a contiguous physical interval |
+//! | `LeafDigestsRequest` / `LeafDigests` | R→S / S→R | one page of the source's leaf plan ([`LeafDigests`]) |
+//! | `LeafRequest` / `LeafReady` | R→S / S→R | one leaf's SST file, built: its size and SHA-256 ([`LeafReady`]) |
+//! | `LeafChunkRequest` / `LeafChunk` | R→S / S→R | one bounded, digested piece of a leaf file |
 //! | `Heartbeat` | R→S | [`Heartbeat`] = the ACK: applied and durable sequence |
 //! | `HeartbeatAck` | S→R | [`HeartbeatAck`]: the source's sequence and clock |
 //! | `Fence` | either | [`Fence`]: reserved for promotion (P5); refused by both sides now |
 //! | `Close` / `Closed` | R→S / S→R | orderly end |
 //!
 //! Kind 13 (`AuthRejected` of `NPHYS001`) is retired: a wrong token is
-//! `Refuse { AuthFailed }`. A peer that speaks `NPHYS001` is answered with
-//! `Refuse { Version }` and reported as [`WireError::Version`], naming both.
+//! `Refuse { AuthFailed }`. A peer that speaks `NPHYS001` or `NPHYS002` is
+//! answered with `Refuse { Version }` and reported as [`WireError::Version`],
+//! naming both.
+//!
+//! Each session kind has its own requests: a snapshot or resume session
+//! sends chunk and poll requests, a fast-forward session (spec P4.1) the
+//! three leaf requests; any other request is a protocol error that ends the
+//! session. A source offers fast-forward sessions with [`CAP_FAST_FORWARD`].
+//!
+//! # Write groups of any size (spec P4.1c, `NPHYS003`)
+//!
+//! One write group is one `Batch` frame, never split: up to
+//! [`MAX_BATCH_BYTES`] of raw group, the most a `u32` length can say. A
+//! `PollRequest`'s byte limit is a coalescing target, not a ceiling: the
+//! first batch of a poll may exceed it, a later one may not take the poll's
+//! total past it. A payload is read and written in steps of `FRAME_IO_STEP`
+//! (1 MiB), each bounded by the frame timeout: an idle timeout, so a large
+//! frame from a peer that keeps sending never times out, while a peer that
+//! stalls does. `NPHYS002` bounded a batch at 64 MiB and a poll's first batch
+//! by its limit; the version changed with the bounds, so the two refuse each
+//! other by version, not by a late "invalid length".
 //!
 //! # Trust
 //!
@@ -73,9 +95,9 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 /// The protocol this module speaks, as its peers name it.
-pub const PROTOCOL: &str = "NPHYS002";
-const MAGIC: [u8; 8] = *b"NPHYS002";
-const VERSION: u16 = 2;
+pub const PROTOCOL: &str = "NPHYS003";
+const MAGIC: [u8; 8] = *b"NPHYS003";
+const VERSION: u16 = 3;
 /// Every version of this protocol starts its magic with these bytes, so a
 /// peer of another version is told so by name instead of "garbage".
 const MAGIC_FAMILY: &[u8; 5] = b"NPHYS";
@@ -115,9 +137,65 @@ pub const CAP_FENCE: u64 = 1 << 1;
 /// receiver in its `Hello` and by the source in its `HelloOk`; a session is on
 /// TLS (`/health` `"tls": true`) when both set it.
 pub const CAP_TLS: u64 = 1 << 2;
+/// Spec P4.1 §3.1: the source serves incremental fast-forward sessions
+/// (`OpenRequest::FastForward` and the leaf frames). A receiver does not
+/// start one with a source whose `HelloOk` lacks it.
+pub const CAP_FAST_FORWARD: u64 = 1 << 3;
 /// What this release offers on every session ([`CAP_TLS`] is added per
 /// session, by its transport).
-pub const CAPABILITIES: u64 = CAP_HEARTBEAT;
+pub const CAPABILITIES: u64 = CAP_HEARTBEAT | CAP_FAST_FORWARD;
+
+/// Spec P4.1 §3.1: the bounds of a fast-forward's leaf size (`--leaf-bytes`),
+/// checked by both sides.
+pub const MIN_LEAF_BYTES: u32 = 64 * 1024;
+pub const MAX_LEAF_BYTES: u32 = 256 * 1024 * 1024;
+/// At most this many leaves partition a source's keyspace; a larger store is
+/// fast-forwarded with larger leaves.
+pub const MAX_LEAVES: u32 = 1 << 24;
+/// Where the replicated keyspace ends: the last leaf ends here on both sides.
+/// No key of the engine's keyspace reaches it.
+pub const LEAF_END: [u8; 64] = [0xff; 64];
+/// The bound of one `LeafDigests` frame: the source pages its plan.
+pub const MAX_LEAF_DIGESTS_BYTES: usize = 1024 * 1024;
+/// `LeafDigests` header: snapshot id 16, status 1, leaf count 4, total bytes
+/// 8, first leaf 4, entry count 4.
+pub const LEAF_DIGESTS_HEADER_BYTES: usize = 37;
+/// One `LeafDigests` entry without its start key: key length 2, bytes 8,
+/// keys 4, digest 32.
+pub const LEAF_ENTRY_META_BYTES: usize = 46;
+/// The longest key a leaf may start at: its length is a `u16` on the wire.
+pub const MAX_LEAF_START_BYTES: usize = u16::MAX as usize;
+/// `FastForwardInfo`: session id 16, snapshot id 16, cut 8.
+const FAST_FORWARD_INFO_BYTES: usize = 40;
+/// `LeafDigestsRequest`: snapshot id 16, first leaf 4, count 4.
+const LEAF_DIGESTS_REQUEST_BYTES: usize = 24;
+/// `LeafRequest`: snapshot id 16, leaf 4.
+const LEAF_REQUEST_BYTES: usize = 20;
+/// `LeafReady`: snapshot id 16, leaf 4, size 8, SHA-256 32.
+const LEAF_READY_BYTES: usize = 60;
+/// `Open` of a fast-forward: tag 1, history 16, cursor 8, leaf bytes 4, and
+/// the preferred snapshot 16 when one is named.
+const OPEN_FAST_FORWARD_BYTES: usize = 29;
+const OPEN_FAST_FORWARD_OF_BYTES: usize = 45;
+/// How often a client re-asks a source that is still planning its leaves.
+const LEAF_PLANNING_RETRY: Duration = Duration::from_millis(300);
+/// A client waits for a source's leaf plan at most this many operation
+/// deadlines in all.
+const LEAF_PLANNING_DEADLINES: u32 = 30;
+/// The leaves a server remembers as built for its chunk requests; a client
+/// downloads one leaf at a time.
+const READY_LEAVES_REMEMBERED: usize = 256;
+
+/// Whether `leaf_bytes` is a leaf size both sides accept.
+pub fn valid_leaf_bytes(leaf_bytes: u32) -> bool {
+    (MIN_LEAF_BYTES..=MAX_LEAF_BYTES).contains(&leaf_bytes)
+}
+
+/// SHA-256 of nothing: the digest of an empty leaf, and the file digest a
+/// `LeafReady` of size 0 carries.
+pub fn empty_sha256() -> [u8; 32] {
+    Sha256::digest(b"").into()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
@@ -190,6 +268,12 @@ pub enum RefuseCode {
     /// The peers speak different protocol versions, or a feature this
     /// release does not serve (fencing).
     Version,
+    /// The write group starting at source sequence `first` is `bytes` raw
+    /// bytes, more than one replication or archive frame can carry
+    /// (`MAX_BATCH_BYTES`): it can never be served, so asking again cannot
+    /// help. The receiver needs recovery past it (a fast-forward or a full
+    /// copy from the primary).
+    GroupTooLarge { first: u64, bytes: u64 },
 }
 
 impl RefuseCode {
@@ -203,6 +287,7 @@ impl RefuseCode {
             Self::TooManySessions => 6,
             Self::SourceNotServing => 7,
             Self::Version => 8,
+            Self::GroupTooLarge { .. } => 9,
         }
     }
 
@@ -217,6 +302,7 @@ impl RefuseCode {
             Self::TooManySessions => "TooManySessions",
             Self::SourceNotServing => "SourceNotServing",
             Self::Version => "Version",
+            Self::GroupTooLarge { .. } => "GroupTooLarge",
         }
     }
 
@@ -225,7 +311,12 @@ impl RefuseCode {
     pub fn needs_recovery(&self) -> bool {
         matches!(
             self,
-            Self::HistoryMismatch | Self::Gap { .. } | Self::WalPruned { .. } | Self::EpochStale { .. } | Self::Version
+            Self::HistoryMismatch
+                | Self::Gap { .. }
+                | Self::WalPruned { .. }
+                | Self::EpochStale { .. }
+                | Self::Version
+                | Self::GroupTooLarge { .. }
         )
     }
 
@@ -260,6 +351,11 @@ impl std::fmt::Display for RefuseCode {
             Self::TooManySessions => f.write_str("too many sessions"),
             Self::SourceNotServing => f.write_str("source not serving"),
             Self::Version => f.write_str("protocol version"),
+            Self::GroupTooLarge { first, bytes } => write!(
+                f,
+                "write group too large: the group at sequence {first} is {bytes} bytes, more than the \
+                 {MAX_BATCH_BYTES} one frame can carry"
+            ),
         }
     }
 }
@@ -303,6 +399,10 @@ impl Refusal {
                 bytes.extend(have.to_be_bytes());
                 bytes.extend(want.to_be_bytes());
             }
+            RefuseCode::GroupTooLarge { first, bytes: size } => {
+                bytes.extend(first.to_be_bytes());
+                bytes.extend(size.to_be_bytes());
+            }
             _ => {}
         }
         // `new` bounds the reason; a struct literal may not have.
@@ -341,6 +441,13 @@ impl Refusal {
             6 => (RefuseCode::TooManySessions, 0),
             7 => (RefuseCode::SourceNotServing, 0),
             8 => (RefuseCode::Version, 0),
+            9 => (
+                RefuseCode::GroupTooLarge {
+                    first: u64_at(bytes, 2)?,
+                    bytes: u64_at(bytes, 10)?,
+                },
+                16,
+            ),
             _ => return Err(invalid("unknown refusal code")),
         };
         let length = usize::from(u16_at(bytes, 2 + fields)?);
@@ -689,6 +796,234 @@ impl Fence {
     }
 }
 
+/// Whether a source's leaf plan can be served yet (spec P4.1 §3.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeafStatus {
+    Ready,
+    /// The source still scans its checkpoint: the receiver asks again.
+    Planning,
+}
+
+impl LeafStatus {
+    fn code(self) -> u8 {
+        match self {
+            Self::Ready => 0,
+            Self::Planning => 1,
+        }
+    }
+
+    fn decode(code: u8) -> Result<Self> {
+        match code {
+            0 => Ok(Self::Ready),
+            1 => Ok(Self::Planning),
+            _ => Err(invalid("unknown leaf plan status")),
+        }
+    }
+}
+
+/// One leaf of a source's plan (spec P4.1 §3.2): the keys from `start` up to
+/// the next leaf's start (the last one up to [`LEAF_END`]), their key and
+/// value bytes, how many, and the SHA-256 of their `len(k) ‖ k ‖ len(v) ‖ v`
+/// framing in key order — `physical::range_digest`'s.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafEntry {
+    pub start: Vec<u8>,
+    pub bytes: u64,
+    pub keys: u32,
+    pub digest: [u8; 32],
+}
+
+impl LeafEntry {
+    /// The bytes this entry takes in a `LeafDigests` frame.
+    pub fn encoded_len(&self) -> usize {
+        LEAF_ENTRY_META_BYTES + self.start.len()
+    }
+}
+
+/// One page of a source's leaf plan, `entries` being leaves `from..`. While
+/// the source plans, a page says so and carries nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafDigests {
+    pub snapshot_id: Uuid,
+    pub status: LeafStatus,
+    pub leaf_count: u32,
+    pub total_bytes: u64,
+    pub from: u32,
+    pub entries: Vec<LeafEntry>,
+}
+
+impl LeafDigests {
+    /// The answer of a source still planning.
+    pub fn planning(snapshot_id: Uuid) -> Self {
+        Self {
+            snapshot_id,
+            status: LeafStatus::Planning,
+            leaf_count: 0,
+            total_bytes: 0,
+            from: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.snapshot_id.is_nil() {
+            return Err(invalid("a leaf page names no snapshot"));
+        }
+        if self.status == LeafStatus::Planning {
+            if self.leaf_count != 0 || self.total_bytes != 0 || self.from != 0 || !self.entries.is_empty() {
+                return Err(invalid("a leaf page of a source still planning carries leaves"));
+            }
+            return Ok(());
+        }
+        let available = self
+            .leaf_count
+            .checked_sub(self.from)
+            .ok_or_else(|| invalid("a leaf page starts past the plan"))?;
+        if self.leaf_count == 0 || self.leaf_count > MAX_LEAVES || self.entries.len() > available as usize {
+            return Err(invalid("a leaf page disagrees with its plan's leaf count"));
+        }
+        let mut previous: Option<&[u8]> = None;
+        for (offset, entry) in self.entries.iter().enumerate() {
+            let first = u64::from(self.from) + offset as u64 == 0;
+            if entry.start.len() > MAX_LEAF_START_BYTES
+                || entry.start.as_slice() >= &LEAF_END[..]
+                || first != entry.start.is_empty()
+                || entry.bytes > self.total_bytes
+                || previous.is_some_and(|previous| previous >= entry.start.as_slice())
+            {
+                return Err(invalid(
+                    "a leaf page's boundaries are out of order, outside the keyspace, or not starting at the empty key",
+                ));
+            }
+            previous = Some(entry.start.as_slice());
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let count = u32::try_from(self.entries.len()).map_err(|_| invalid("too many leaves in one page"))?;
+        let size = LEAF_DIGESTS_HEADER_BYTES + self.entries.iter().map(LeafEntry::encoded_len).sum::<usize>();
+        if size > MAX_LEAF_DIGESTS_BYTES {
+            return Err(invalid("a leaf page exceeds its frame bound"));
+        }
+        let mut bytes = Vec::with_capacity(size);
+        bytes.extend(self.snapshot_id.as_bytes());
+        bytes.push(self.status.code());
+        bytes.extend(self.leaf_count.to_be_bytes());
+        bytes.extend(self.total_bytes.to_be_bytes());
+        bytes.extend(self.from.to_be_bytes());
+        bytes.extend(count.to_be_bytes());
+        for entry in &self.entries {
+            bytes.extend((entry.start.len() as u16).to_be_bytes());
+            bytes.extend(&entry.start);
+            bytes.extend(entry.bytes.to_be_bytes());
+            bytes.extend(entry.keys.to_be_bytes());
+            bytes.extend(entry.digest);
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if !(LEAF_DIGESTS_HEADER_BYTES..=MAX_LEAF_DIGESTS_BYTES).contains(&bytes.len()) {
+            return Err(invalid("a leaf page has the wrong size"));
+        }
+        let count = u32_at(bytes, 33)? as usize;
+        if count > (bytes.len() - LEAF_DIGESTS_HEADER_BYTES) / LEAF_ENTRY_META_BYTES {
+            return Err(invalid("a leaf page claims more leaves than it holds"));
+        }
+        let mut entries = Vec::with_capacity(count);
+        let mut offset = LEAF_DIGESTS_HEADER_BYTES;
+        for _ in 0..count {
+            let length = usize::from(u16_at(bytes, offset)?);
+            let start = bytes
+                .get(offset + 2..offset + 2 + length)
+                .ok_or_else(|| invalid("frame truncated"))?
+                .to_vec();
+            offset += 2 + length;
+            let digest: [u8; 32] = bytes
+                .get(offset + 12..offset + 44)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or_else(|| invalid("frame truncated"))?;
+            entries.push(LeafEntry {
+                start,
+                bytes: u64_at(bytes, offset)?,
+                keys: u32_at(bytes, offset + 8)?,
+                digest,
+            });
+            offset += 44;
+        }
+        if offset != bytes.len() {
+            return Err(invalid("a leaf page's length disagrees with its frame"));
+        }
+        let page = Self {
+            snapshot_id: uuid_at(bytes, 0)?,
+            status: LeafStatus::decode(byte_at(bytes, 16)?)?,
+            leaf_count: u32_at(bytes, 17)?,
+            total_bytes: u64_at(bytes, 21)?,
+            from: u32_at(bytes, 29)?,
+            entries,
+        };
+        page.validate()?;
+        Ok(page)
+    }
+}
+
+/// A source's leaf plan in full, as a client fetched it page by page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeafPlan {
+    pub snapshot_id: Uuid,
+    pub total_bytes: u64,
+    pub leaves: Vec<LeafEntry>,
+}
+
+/// The source built leaf `index`'s SST file: `size` bytes whose SHA-256 is
+/// `sha256`. Size 0: the source holds no key in the leaf, and there is no
+/// file (the receiver only deletes the range).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LeafReady {
+    pub snapshot_id: Uuid,
+    pub index: u32,
+    pub size: u64,
+    pub sha256: [u8; 32],
+}
+
+impl LeafReady {
+    fn validate(&self) -> Result<()> {
+        if self.snapshot_id.is_nil() || self.index >= MAX_LEAVES || (self.size == 0 && self.sha256 != empty_sha256()) {
+            return Err(invalid("invalid leaf file announcement"));
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut bytes = Vec::with_capacity(LEAF_READY_BYTES);
+        bytes.extend(self.snapshot_id.as_bytes());
+        bytes.extend(self.index.to_be_bytes());
+        bytes.extend(self.size.to_be_bytes());
+        bytes.extend(self.sha256);
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != LEAF_READY_BYTES {
+            return Err(invalid("a leaf file announcement has the wrong size"));
+        }
+        let ready = Self {
+            snapshot_id: uuid_at(bytes, 0)?,
+            index: u32_at(bytes, 16)?,
+            size: u64_at(bytes, 20)?,
+            sha256: bytes
+                .get(28..60)
+                .and_then(|slice| slice.try_into().ok())
+                .ok_or_else(|| invalid("frame truncated"))?,
+        };
+        ready.validate()?;
+        Ok(ready)
+    }
+}
+
 /// Explicit 256-bit fixture/operator token. Never Debug/Display or serialized.
 /// Operators must generate random bytes; all-zero placeholders are refused.
 #[derive(Clone)]
@@ -773,10 +1108,43 @@ pub enum OpenRequest {
         history: Uuid,
         after: u64,
     },
+    /// Spec P4.1 §3.1: an incremental fast-forward of a receiver of
+    /// `history` at `after` (`recover --from-primary`): the source serves
+    /// its leaf plan of `leaf_bytes` leaves over a checkpoint export —
+    /// `prefer`'s while it still leases it (a resumed fast-forward), else a
+    /// new one.
+    FastForward {
+        history: Uuid,
+        after: u64,
+        leaf_bytes: u32,
+        prefer: Option<Uuid>,
+    },
 }
 impl OpenRequest {
     fn encode(self) -> Result<Vec<u8>> {
         match self {
+            Self::FastForward {
+                history,
+                after,
+                leaf_bytes,
+                prefer,
+            } => {
+                if history.is_nil()
+                    || after > MAX_SOURCE_SEQUENCE
+                    || !valid_leaf_bytes(leaf_bytes)
+                    || prefer.is_some_and(|snapshot| snapshot.is_nil())
+                {
+                    return Err(invalid("invalid fast-forward identity/cursor/leaf size"));
+                }
+                let mut bytes = vec![if prefer.is_some() { 4 } else { 3 }];
+                bytes.extend(history.as_bytes());
+                bytes.extend(after.to_be_bytes());
+                bytes.extend(leaf_bytes.to_be_bytes());
+                if let Some(snapshot) = prefer {
+                    bytes.extend(snapshot.as_bytes());
+                }
+                Ok(bytes)
+            }
             Self::Snapshot => Ok(vec![0]),
             Self::SnapshotOf { snapshot } => {
                 if snapshot.is_nil() {
@@ -807,6 +1175,18 @@ impl OpenRequest {
                 history: uuid_at(bytes, 1)?,
                 after: u64_at(bytes, 17)?,
             },
+            [3, ..] if bytes.len() == OPEN_FAST_FORWARD_BYTES => Self::FastForward {
+                history: uuid_at(bytes, 1)?,
+                after: u64_at(bytes, 17)?,
+                leaf_bytes: u32_at(bytes, 25)?,
+                prefer: None,
+            },
+            [4, ..] if bytes.len() == OPEN_FAST_FORWARD_OF_BYTES => Self::FastForward {
+                history: uuid_at(bytes, 1)?,
+                after: u64_at(bytes, 17)?,
+                leaf_bytes: u32_at(bytes, 25)?,
+                prefer: Some(uuid_at(bytes, 29)?),
+            },
             _ => return Err(invalid("invalid session open request")),
         };
         value.encode()?;
@@ -814,11 +1194,14 @@ impl OpenRequest {
     }
 
     /// The session a receiver may open after `hello`: a snapshot without a
-    /// cursor, or a resume of exactly the history and cursor it announced.
+    /// cursor, or a resume — or a fast-forward — of exactly the history and
+    /// cursor it announced.
     fn agrees_with(self, hello: &Hello) -> bool {
         match self {
             Self::Snapshot | Self::SnapshotOf { .. } => hello.cursor.is_none(),
-            Self::Resume { history, after } => hello.history == Some(history) && hello.cursor == Some(after),
+            Self::Resume { history, after } | Self::FastForward { history, after, .. } => {
+                hello.history == Some(history) && hello.cursor == Some(after)
+            }
         }
     }
 
@@ -841,42 +1224,86 @@ pub enum SourceSessionInfo {
         initial_after: u64,
         durable_barrier: u64,
     },
+    /// Spec P4.1 §3.1: a fast-forward session over the export `snapshot_id`,
+    /// cut at the source sequence `sequence`. Its frame (`FastForwardInfo`)
+    /// carries the session, the snapshot and the cut; `history` and `after`
+    /// are the request's, which the source agreed to.
+    FastForward {
+        session_id: Uuid,
+        snapshot_id: Uuid,
+        history: Uuid,
+        after: u64,
+        sequence: u64,
+    },
 }
 impl SourceSessionInfo {
     pub fn session_id(&self) -> Uuid {
         match self {
             Self::Snapshot(m) => m.snapshot_id,
-            Self::Resume { session_id, .. } => *session_id,
+            Self::Resume { session_id, .. } | Self::FastForward { session_id, .. } => *session_id,
         }
     }
     pub fn history(&self) -> Uuid {
         match self {
             Self::Snapshot(m) => m.history,
-            Self::Resume { history, .. } => *history,
+            Self::Resume { history, .. } | Self::FastForward { history, .. } => *history,
         }
     }
     pub fn initial_after(&self) -> u64 {
         match self {
             Self::Snapshot(m) => m.checkpoint_sequence,
             Self::Resume { initial_after, .. } => *initial_after,
+            Self::FastForward { after, .. } => *after,
         }
     }
     fn initial_barrier(&self) -> u64 {
         match self {
             Self::Snapshot(m) => m.checkpoint_sequence,
             Self::Resume { durable_barrier, .. } => *durable_barrier,
+            Self::FastForward { sequence, .. } => *sequence,
         }
     }
     pub fn manifest(&self) -> Option<&CheckpointManifest> {
         match self {
             Self::Snapshot(m) => Some(m),
-            Self::Resume { .. } => None,
+            Self::Resume { .. } | Self::FastForward { .. } => None,
+        }
+    }
+    /// A fast-forward session's export: what its leaf frames name.
+    pub fn fast_forward_snapshot(&self) -> Option<Uuid> {
+        match self {
+            Self::FastForward { snapshot_id, .. } => Some(*snapshot_id),
+            Self::Snapshot(_) | Self::Resume { .. } => None,
         }
     }
     fn validate(&self, request: OpenRequest, limits: &WireLimits) -> Result<()> {
         match (self, request) {
             (Self::Snapshot(m), OpenRequest::Snapshot | OpenRequest::SnapshotOf { .. }) => {
                 m.validate(&limits.transfer).map_err(|e| invalid(e.to_string()))
+            }
+            // A receiver at or past the cut has nothing to fast-forward: the
+            // source refuses it (`HistoryMismatch`) rather than open this.
+            (
+                Self::FastForward {
+                    session_id,
+                    snapshot_id,
+                    history,
+                    after,
+                    sequence,
+                },
+                OpenRequest::FastForward {
+                    history: expected,
+                    after: requested,
+                    ..
+                },
+            ) if !session_id.is_nil()
+                && !snapshot_id.is_nil()
+                && *history == expected
+                && *after == requested
+                && requested < *sequence
+                && *sequence <= MAX_SOURCE_SEQUENCE =>
+            {
+                Ok(())
             }
             (
                 Self::Resume {
@@ -919,7 +1346,39 @@ impl SourceSessionInfo {
                 bytes.extend(durable_barrier.to_be_bytes());
                 Ok((Kind::ResumeInfo, bytes))
             }
+            Self::FastForward {
+                session_id,
+                snapshot_id,
+                sequence,
+                ..
+            } => {
+                let mut bytes = Vec::with_capacity(FAST_FORWARD_INFO_BYTES);
+                bytes.extend(session_id.as_bytes());
+                bytes.extend(snapshot_id.as_bytes());
+                bytes.extend(sequence.to_be_bytes());
+                Ok((Kind::FastForwardInfo, bytes))
+            }
         }
+    }
+
+    /// The `FastForwardInfo` answer to `request` (spec P4.1 §3.1), decoded
+    /// and checked against it.
+    fn fast_forward_from(payload: &[u8], request: OpenRequest, limits: &WireLimits) -> Result<Self> {
+        let OpenRequest::FastForward { history, after, .. } = request else {
+            return Err(invalid("a fast-forward answer to another session's open"));
+        };
+        if payload.len() != FAST_FORWARD_INFO_BYTES {
+            return Err(invalid("a fast-forward answer has the wrong size"));
+        }
+        let info = Self::FastForward {
+            session_id: uuid_at(payload, 0)?,
+            snapshot_id: uuid_at(payload, 16)?,
+            history,
+            after,
+            sequence: u64_at(payload, 32)?,
+        };
+        info.validate(request, limits)?;
+        Ok(info)
     }
 }
 
@@ -939,6 +1398,21 @@ pub trait PhysicalSource: Send + Sync {
     /// same — but the source's registry reports it.
     fn poll_origin(&self) -> PollOrigin {
         PollOrigin::Wal
+    }
+    /// Spec P4.1 §3.1: up to `count` leaves of a fast-forward session's plan
+    /// from leaf `from` — or a [`LeafStatus::Planning`] page while the plan
+    /// is being built. Paged by the provider; `serve_session` sends at most
+    /// [`MAX_LEAF_DIGESTS_BYTES`]. Only a fast-forward session has a plan.
+    async fn leaf_digests(&self, _from: u32, _count: u32) -> Result<LeafDigests> {
+        Err(invalid("leaf digests require a fast-forward session"))
+    }
+    /// Build leaf `index`'s SST file (once) and announce it.
+    async fn leaf(&self, _index: u32) -> Result<LeafReady> {
+        Err(invalid("leaf files require a fast-forward session"))
+    }
+    /// A piece of a built leaf file.
+    async fn read_leaf_chunk(&self, _index: u32, _offset: u64, _length: u32) -> Result<Vec<u8>> {
+        Err(invalid("leaf files require a fast-forward session"))
     }
 }
 
@@ -961,6 +1435,22 @@ impl PollOrigin {
     }
 }
 
+/// The most raw bytes of write groups [`PhysicalClient::poll`] hands its sink
+/// in one [`BatchSink::apply_many`] (spec P4.1d): a poll's validated batches
+/// travel to the sink together, in order, in runs of at most this many bytes
+/// — one run for a poll of a serving standby's limit, which is the same size.
+/// A single batch larger than this is a run of its own: a write group is
+/// never split (spec P4.1c).
+pub const APPLY_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+
+/// The largest coalescing target a receiver may ask a poll for (its
+/// `PollRequest` byte limit; `ReceiverOptions::poll_byte_limit`; `resync
+/// --poll-byte-limit`). It bounds how many write groups one poll gathers —
+/// what a source reads and holds, and a receiver takes, per round trip — not
+/// how large one group may be: the first group of a poll travels whatever its
+/// size (spec P4.1c), up to `MAX_BATCH_BYTES`.
+pub const MAX_POLL_BYTES: usize = 256 * 1024 * 1024;
+
 /// Apply each validated physical batch with its progress (the cursor in the
 /// same write) before returning; a sink may defer the fsync of a poll's
 /// batches to the poll's end, which its owner then performs before it reports
@@ -976,6 +1466,20 @@ pub trait BatchSink: Send {
         Ok(())
     }
     async fn apply(&mut self, batch: PhysicalBatch) -> Result<()>;
+    /// Spec P4.1d: apply a run of validated, contiguous batches, in order —
+    /// a poll's, or a part of it of at most [`APPLY_CHUNK_BYTES`] (a larger
+    /// batch alone). Every batch of the run was validated before any of it
+    /// is handed over. A sink that applies a run as one unit of work (one
+    /// hop to its owner thread, one publication) overrides this; the default
+    /// applies each batch through [`Self::apply`] in order, so every other
+    /// sink keeps working unchanged. An error leaves the batches before the
+    /// failing one applied, as a failed [`Self::apply`] of a later batch did.
+    async fn apply_many(&mut self, batches: Vec<PhysicalBatch>) -> Result<()> {
+        for batch in batches {
+            self.apply(batch).await?;
+        }
+        Ok(())
+    }
 }
 
 /// What a source tells every receiver it admits (`HelloOk`), and checks a
@@ -1102,6 +1606,14 @@ enum Kind {
     Heartbeat = 18,
     HeartbeatAck = 19,
     Fence = 20,
+    // Spec P4.1 §3.1: the fast-forward session.
+    FastForwardInfo = 21,
+    LeafDigestsRequest = 22,
+    LeafDigests = 23,
+    LeafRequest = 24,
+    LeafReady = 25,
+    LeafChunkRequest = 26,
+    LeafChunk = 27,
 }
 impl Kind {
     fn decode(value: u16) -> Result<Self> {
@@ -1125,6 +1637,13 @@ impl Kind {
             18 => Self::Heartbeat,
             19 => Self::HeartbeatAck,
             20 => Self::Fence,
+            21 => Self::FastForwardInfo,
+            22 => Self::LeafDigestsRequest,
+            23 => Self::LeafDigests,
+            24 => Self::LeafRequest,
+            25 => Self::LeafReady,
+            26 => Self::LeafChunkRequest,
+            27 => Self::LeafChunk,
             _ => return Err(invalid("unknown frame kind")),
         })
     }
@@ -1132,13 +1651,29 @@ impl Kind {
         match self {
             Self::Auth => n == TOKEN_BYTES,
             Self::AuthOk | Self::Close | Self::Closed => n == 0,
-            Self::Open => n == 1 || n == 17 || n == 25,
+            Self::Open => {
+                n == 1 || n == 17 || n == 25 || n == OPEN_FAST_FORWARD_BYTES || n == OPEN_FAST_FORWARD_OF_BYTES
+            }
+            Self::FastForwardInfo => n == FAST_FORWARD_INFO_BYTES,
+            Self::LeafDigestsRequest => n == LEAF_DIGESTS_REQUEST_BYTES,
+            Self::LeafDigests => (LEAF_DIGESTS_HEADER_BYTES..=MAX_LEAF_DIGESTS_BYTES).contains(&n),
+            Self::LeafRequest => n == LEAF_REQUEST_BYTES,
+            Self::LeafReady => n == LEAF_READY_BYTES,
+            Self::LeafChunkRequest => n == 32,
+            Self::LeafChunk => (CHUNK_META + 1..=CHUNK_META + MAX_CHUNK_BYTES).contains(&n),
             Self::ResumeInfo => n == 48,
             Self::Manifest => (1..=MAX_MANIFEST_BYTES).contains(&n),
             Self::ChunkRequest => n == 32,
             Self::Chunk => (CHUNK_META + 1..=CHUNK_META + MAX_CHUNK_BYTES).contains(&n),
             Self::PollRequest => n == 28,
             Self::PollStart | Self::PollEnd => n == 20,
+            // Spec P4.1c: one write group of any size `u32` can frame
+            // ([`MAX_BATCH_BYTES`]), so `read_frame` may allocate up to
+            // ~4 GiB for one. The trust boundary: a `Batch` is only ever
+            // allowed in a poll response on a session this receiver opened,
+            // after authentication, from the source it follows — and it is
+            // applied verbatim, so its size is bounded by what that source
+            // committed as one write group. No source ever reads one.
             Self::Batch => (BATCH_META + 12..=BATCH_META + MAX_BATCH_BYTES).contains(&n),
             Self::Hello => n == HELLO_BYTES,
             Self::HelloOk => (HELLO_OK_META..=HELLO_OK_META + MAX_ENDPOINT_BYTES).contains(&n),
@@ -1211,13 +1746,75 @@ fn check_header(header: &[u8; HEADER_BYTES]) -> Result<()> {
     )))
 }
 
+/// Spec P4.1c: a frame's payload is read and written in steps of at most
+/// this many bytes, each bounded by the frame timeout. The timeout is an
+/// idle one: a peer that keeps a large `Batch` frame coming never times out,
+/// however long the whole frame takes, while one that stalls for a frame
+/// timeout does.
+const FRAME_IO_STEP: usize = 1024 * 1024;
+
+/// `internal-tests` builds only: a receiver that reads a `Batch` frame of at
+/// least this many payload bytes SIGKILLs its own process once half of that
+/// payload has arrived — a crash with a large write group in flight, exactly
+/// instead of by timing (spec P4.1c §3).
+pub const KILL_MID_BATCH_ENV: &str = "HELIOSDB_NANO_TEST_KILL_MID_BATCH";
+
+/// Stop part-way through a large `Batch` payload (`internal-tests` only,
+/// [`KILL_MID_BATCH_ENV`]): `read` of its `length` payload bytes arrived.
+fn kill_mid_batch_hook(kind: Kind, length: usize, read: usize) {
+    #[cfg(all(feature = "internal-tests", unix))]
+    {
+        static KILL_AT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let threshold = KILL_AT.get_or_init(|| std::env::var(KILL_MID_BATCH_ENV).ok()?.trim().parse().ok());
+        if kind == Kind::Batch && threshold.is_some_and(|at| length >= at) && read >= length / 2 {
+            tracing::warn!("{KILL_MID_BATCH_ENV}: killing this process {read} bytes into a {length}-byte Batch frame");
+            // SAFETY: kill(2) of this very process with a standard signal; no
+            // pointers, no preconditions.
+            unsafe {
+                libc::kill(libc::getpid(), libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(all(feature = "internal-tests", unix)))]
+    let _ = (kind, length, read);
+}
+
 async fn read_frame<R: AsyncRead + Unpin>(
     io: &mut R,
     allowed: &[Kind],
     limits: &WireLimits,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Frame> {
-    bounded(shutdown, limits.frame_timeout, async {
+    read_frame_within(io, allowed, limits, limits.frame_timeout, shutdown).await
+}
+
+/// [`read_frame`], waiting up to `header_wait` for the frame's header to
+/// arrive (its payload steps keep the frame timeout). A source waits this
+/// long for a receiver's next request: the receiver applies (and fsyncs) a
+/// whole poll before it sends one.
+async fn read_frame_within<R: AsyncRead + Unpin>(
+    io: &mut R,
+    allowed: &[Kind],
+    limits: &WireLimits,
+    header_wait: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Frame> {
+    let (kind, length) = read_frame_header(io, allowed, header_wait, shutdown).await?;
+    let mut payload = vec![0; length];
+    read_payload_steps(io, &mut payload, kind, length, 0, limits, shutdown).await?;
+    Ok(Frame { kind, payload })
+}
+
+/// A frame's header, its kind among `allowed` and its length within the
+/// kind's bounds — both checked before anything is allocated for it —
+/// waiting up to `wait` for it to arrive.
+async fn read_frame_header<R: AsyncRead + Unpin>(
+    io: &mut R,
+    allowed: &[Kind],
+    wait: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(Kind, usize)> {
+    bounded(shutdown, wait, async {
         let mut header = [0u8; HEADER_BYTES];
         io.read_exact(&mut header).await?;
         if let Err(error) = check_header(&header) {
@@ -1238,12 +1835,75 @@ async fn read_frame<R: AsyncRead + Unpin>(
         if !allowed.contains(&kind) || !kind.valid_size(length) {
             return Err(invalid("unexpected frame or invalid length"));
         }
-        let mut payload = vec![0; length];
-        io.read_exact(&mut payload).await?;
-        Ok(Frame { kind, payload })
+        Ok((kind, length))
     })
     .await
 }
+
+/// Fill `buffer`, the part of a `kind` frame's `length`-byte payload that
+/// starts `offset` bytes into it. Spec P4.1c: one deadline per step of the
+/// payload, not one for the whole frame (`FRAME_IO_STEP`).
+async fn read_payload_steps<R: AsyncRead + Unpin>(
+    io: &mut R,
+    buffer: &mut [u8],
+    kind: Kind,
+    length: usize,
+    offset: usize,
+    limits: &WireLimits,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let mut read = offset;
+    for step in buffer.chunks_mut(FRAME_IO_STEP) {
+        bounded(shutdown, limits.frame_timeout, async {
+            io.read_exact(step).await?;
+            Ok(())
+        })
+        .await?;
+        read += step.len();
+        kill_mid_batch_hook(kind, length, read);
+    }
+    Ok(())
+}
+
+/// One `Batch` frame of a poll, as its metadata (`history | first | digest`)
+/// and its raw write group in a buffer of its own, so the group — up to
+/// gigabytes (spec P4.1c) — is never moved to drop the metadata in front of
+/// it. A frame whose raw group is longer than `max_raw` (what is left of the
+/// poll's byte limit, for a batch after the first) is refused from its
+/// header, before anything is allocated for it.
+async fn read_batch_frame<R: AsyncRead + Unpin>(
+    io: &mut R,
+    max_raw: usize,
+    limits: &WireLimits,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<([u8; BATCH_META], Vec<u8>)> {
+    let (kind, length) = read_frame_header(io, &[Kind::Batch], limits.frame_timeout, shutdown).await?;
+    let raw_length = length
+        .checked_sub(BATCH_META)
+        .ok_or_else(|| invalid("batch payload truncated"))?;
+    if raw_length > max_raw {
+        return Err(invalid("physical response history/sequence/byte mismatch"));
+    }
+    let mut meta = [0_u8; BATCH_META];
+    read_payload_steps(io, &mut meta, kind, length, 0, limits, shutdown).await?;
+    let mut raw = vec![0; raw_length];
+    read_payload_steps(io, &mut raw, kind, length, BATCH_META, limits, shutdown).await?;
+    Ok((meta, raw))
+}
+
+/// Spec P4.1b: a frame whose payload is at most this large is written as ONE
+/// buffer, header and payload together, so a control frame (a `ChunkRequest`,
+/// a `LeafChunkRequest`, a `PollRequest`, a heartbeat, a planning re-ask)
+/// leaves in one TCP segment and, over TLS, one record. Written as two, the
+/// payload of a request would wait under Nagle's algorithm for the ACK of its
+/// 16-byte header, which the peer, with nothing to send, delays (up to 40 ms
+/// on Linux) — once per round trip of a request/response session. This holds
+/// whatever the socket's `TCP_NODELAY` (set by [`accept_replication`] and
+/// [`PhysicalClient::connect_replication`]): with it, two writes would still be
+/// two segments. A larger payload (a chunk, a batch) follows its header
+/// without being copied, in steps of `FRAME_IO_STEP` (spec P4.1c).
+const SMALL_FRAME_BYTES: usize = 64 * 1024;
+
 async fn write_frame<W: AsyncWrite + Unpin>(
     io: &mut W,
     kind: Kind,
@@ -1251,17 +1911,65 @@ async fn write_frame<W: AsyncWrite + Unpin>(
     limits: &WireLimits,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
-    if !kind.valid_size(payload.len()) {
-        return Err(invalid("outgoing frame exceeds bounds"));
+    write_frame_parts(io, kind, &[], payload, limits, shutdown).await
+}
+
+/// [`write_frame`] of a payload given in two parts, a short `meta` prefix
+/// then `body`, sent as one frame without joining them: a `Batch`'s metadata
+/// and its raw write group, which may be gigabytes (spec P4.1c), are never
+/// copied into one buffer. A small frame is still ONE write (spec P4.1b); a
+/// larger one is its header and `meta` in one write, then `body` in steps of
+/// `FRAME_IO_STEP`, each bounded by the frame timeout (an idle timeout), then
+/// a flush.
+async fn write_frame_parts<W: AsyncWrite + Unpin>(
+    io: &mut W,
+    kind: Kind,
+    meta: &[u8],
+    body: &[u8],
+    limits: &WireLimits,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let length = meta
+        .len()
+        .checked_add(body.len())
+        .filter(|length| kind.valid_size(*length))
+        .ok_or_else(|| invalid("outgoing frame exceeds bounds"))?;
+    let length_field = u32::try_from(length).map_err(|_| invalid("outgoing frame exceeds bounds"))?;
+    let mut header = [0u8; HEADER_BYTES];
+    header[..8].copy_from_slice(&MAGIC);
+    header[8..10].copy_from_slice(&VERSION.to_be_bytes());
+    header[10..12].copy_from_slice(&(kind as u16).to_be_bytes());
+    header[12..16].copy_from_slice(&length_field.to_be_bytes());
+    if length <= SMALL_FRAME_BYTES {
+        return bounded(shutdown, limits.frame_timeout, async {
+            // The buffer may hold the token (`Auth`): wiped when dropped, and
+            // sized once so it is never reallocated (leaving a copy behind).
+            let mut frame: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(HEADER_BYTES + length));
+            frame.extend_from_slice(&header);
+            frame.extend_from_slice(meta);
+            frame.extend_from_slice(body);
+            io.write_all(frame.as_slice()).await?;
+            io.flush().await?;
+            Ok(())
+        })
+        .await;
+    }
+    let mut head = Vec::with_capacity(HEADER_BYTES + meta.len());
+    head.extend_from_slice(&header);
+    head.extend_from_slice(meta);
+    bounded(shutdown, limits.frame_timeout, async {
+        io.write_all(&head).await?;
+        Ok(())
+    })
+    .await?;
+    for step in body.chunks(FRAME_IO_STEP) {
+        bounded(shutdown, limits.frame_timeout, async {
+            io.write_all(step).await?;
+            Ok(())
+        })
+        .await?;
     }
     bounded(shutdown, limits.frame_timeout, async {
-        let mut header = [0u8; HEADER_BYTES];
-        header[..8].copy_from_slice(&MAGIC);
-        header[8..10].copy_from_slice(&VERSION.to_be_bytes());
-        header[10..12].copy_from_slice(&(kind as u16).to_be_bytes());
-        header[12..16].copy_from_slice(&(payload.len() as u32).to_be_bytes());
-        io.write_all(&header).await?;
-        io.write_all(payload).await?;
         io.flush().await?;
         Ok(())
     })
@@ -1439,7 +2147,10 @@ impl PollSummary {
             || self.durable_barrier > MAX_SOURCE_SEQUENCE
             || (self.batches == 0 && self.through != self.durable_barrier)
             || (self.batches == 0) != (self.through == after)
-            || self.batches as usize > byte_limit / 12
+            // Every batch after the first fits the limit (12 bytes at least
+            // each); the first travels whatever its size, so one batch is
+            // always a legal poll, even under a limit below 12 bytes.
+            || (self.batches > 1 && self.batches as usize > byte_limit / 12)
         {
             return Err(invalid("inconsistent physical poll summary"));
         }
@@ -1461,16 +2172,20 @@ pub async fn bind_replication(address: SocketAddr, tls: bool, allow_insecure_rem
     Ok(TcpListener::bind(address).await?)
 }
 
-/// The source's side of one accepted connection: the TLS handshake when the
-/// listener serves TLS (`acceptor`), bounded by the frame deadline and the
-/// shutdown watch. A failed handshake is [`WireError::Tls`]: nothing was read
-/// from the peer, and no `Refuse` frame can be sent before a handshake.
+/// The source's side of one accepted connection: `TCP_NODELAY` (spec P4.1b),
+/// then the TLS handshake when the listener serves TLS (`acceptor`), bounded
+/// by the frame deadline and the shutdown watch. A failed handshake is
+/// [`WireError::Tls`]: nothing was read from the peer, and no `Refuse` frame
+/// can be sent before a handshake.
 pub async fn accept_replication(
     stream: TcpStream,
     acceptor: Option<&TlsAcceptor>,
     limits: &WireLimits,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<ReplicationStream> {
+    // Before the handshake: every answer of this request/response session
+    // leaves at once instead of waiting for the receiver's delayed ACK.
+    stream.set_nodelay(true)?;
     let Some(acceptor) = acceptor else {
         return Ok(ReplicationStream::Plain(stream));
     };
@@ -1635,21 +2350,135 @@ where
     let mut delivered = info.initial_after();
     let (kind, bytes) = info.response()?;
     write_frame(&mut io, kind, &bytes, &limits, &mut shutdown).await?;
+    // Spec P4.1 §3.1: each session kind has its own requests. A fast-forward
+    // session reads leaves, never chunks or polls; a snapshot or resume
+    // session never reads leaves. Anything else ends the session.
+    let fast_forward = info.fast_forward_snapshot();
+    let allowed: &[Kind] = if fast_forward.is_some() {
+        &[
+            Kind::LeafDigestsRequest,
+            Kind::LeafRequest,
+            Kind::LeafChunkRequest,
+            Kind::Heartbeat,
+            Kind::Close,
+        ]
+    } else {
+        &[
+            Kind::ChunkRequest,
+            Kind::PollRequest,
+            Kind::Heartbeat,
+            Kind::Fence,
+            Kind::Close,
+        ]
+    };
+    // The leaf files this session announced, newest last, with their sizes:
+    // a leaf chunk request must name one of them.
+    let mut ready_leaves: std::collections::VecDeque<(u32, u64)> = std::collections::VecDeque::new();
+    // Between two requests the receiver works: it applies (and fsyncs) the
+    // whole poll it was just sent — up to its byte limit of write groups, or
+    // one larger group — before it sends the next one, and its apply is
+    // bounded by its operation timeout. So the wait for a request's header is
+    // that plus a frame timeout; every other frame keeps the frame timeout.
+    let request_wait = limits.operation_timeout.saturating_add(limits.frame_timeout);
     loop {
-        let request = read_frame(
-            &mut io,
-            &[
-                Kind::ChunkRequest,
-                Kind::PollRequest,
-                Kind::Heartbeat,
-                Kind::Fence,
-                Kind::Close,
-            ],
-            &limits,
-            &mut shutdown,
-        )
-        .await?;
+        let request = read_frame_within(&mut io, allowed, &limits, request_wait, &mut shutdown).await?;
         match request.kind {
+            Kind::LeafDigestsRequest => {
+                let snapshot = fast_forward.ok_or_else(|| invalid("leaf digests require a fast-forward session"))?;
+                if uuid_at(&request.payload, 0)? != snapshot {
+                    return Err(invalid("leaf digests snapshot/session mismatch"));
+                }
+                let from = u32_at(&request.payload, 16)?;
+                let count = u32_at(&request.payload, 20)?;
+                if count == 0 || count > MAX_LEAVES || from >= MAX_LEAVES {
+                    return Err(invalid("invalid leaf digests request"));
+                }
+                let page = match bounded(
+                    &mut shutdown,
+                    limits.operation_timeout,
+                    source_session.leaf_digests(from, count),
+                )
+                .await
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        return Err(match source_refusal(&error) {
+                            Some(refusal) => refuse(&mut io, refusal, &limits, &mut shutdown).await,
+                            None => error,
+                        })
+                    }
+                };
+                if page.snapshot_id != snapshot
+                    || (page.status == LeafStatus::Ready && (page.from != from || page.entries.len() > count as usize))
+                {
+                    return Err(invalid("the source answered another leaf page than the one asked for"));
+                }
+                write_frame(&mut io, Kind::LeafDigests, &page.encode()?, &limits, &mut shutdown).await?;
+            }
+            Kind::LeafRequest => {
+                let snapshot = fast_forward.ok_or_else(|| invalid("leaf files require a fast-forward session"))?;
+                if uuid_at(&request.payload, 0)? != snapshot {
+                    return Err(invalid("leaf snapshot/session mismatch"));
+                }
+                let index = u32_at(&request.payload, 16)?;
+                if index >= MAX_LEAVES {
+                    return Err(invalid("invalid leaf request"));
+                }
+                let ready = match bounded(&mut shutdown, limits.operation_timeout, source_session.leaf(index)).await {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        return Err(match source_refusal(&error) {
+                            Some(refusal) => refuse(&mut io, refusal, &limits, &mut shutdown).await,
+                            None => error,
+                        })
+                    }
+                };
+                if ready.snapshot_id != snapshot || ready.index != index {
+                    return Err(invalid("the source announced another leaf than the one asked for"));
+                }
+                ready_leaves.retain(|(leaf, _)| *leaf != index);
+                ready_leaves.push_back((index, ready.size));
+                while ready_leaves.len() > READY_LEAVES_REMEMBERED {
+                    ready_leaves.pop_front();
+                }
+                write_frame(&mut io, Kind::LeafReady, &ready.encode()?, &limits, &mut shutdown).await?;
+            }
+            Kind::LeafChunkRequest => {
+                let snapshot = fast_forward.ok_or_else(|| invalid("leaf files require a fast-forward session"))?;
+                if uuid_at(&request.payload, 0)? != snapshot {
+                    return Err(invalid("leaf chunk snapshot/session mismatch"));
+                }
+                let index = u32_at(&request.payload, 16)?;
+                let offset = u64_at(&request.payload, 20)?;
+                let length = u32_at(&request.payload, 28)?;
+                let size = ready_leaves
+                    .iter()
+                    .find(|(leaf, _)| *leaf == index)
+                    .map(|(_, size)| *size)
+                    .ok_or_else(|| invalid("a leaf chunk request before its leaf was announced"))?;
+                if length == 0
+                    || length as usize > limits.transfer.max_chunk_bytes
+                    || offset.checked_add(u64::from(length)).is_none_or(|end| end > size)
+                {
+                    return Err(invalid("leaf chunk request outside the leaf file"));
+                }
+                let bytes = bounded(
+                    &mut shutdown,
+                    limits.operation_timeout,
+                    source_session.read_leaf_chunk(index, offset, length),
+                )
+                .await?;
+                if bytes.len() != length as usize {
+                    return Err(invalid("the source returned a short/oversized leaf chunk"));
+                }
+                let mut payload = Vec::with_capacity(CHUNK_META + bytes.len());
+                payload.extend(snapshot.as_bytes());
+                payload.extend(index.to_be_bytes());
+                payload.extend(offset.to_be_bytes());
+                payload.extend(Sha256::digest(&bytes));
+                payload.extend(bytes);
+                write_frame(&mut io, Kind::LeafChunk, &payload, &limits, &mut shutdown).await?;
+            }
             Kind::ChunkRequest => {
                 let manifest = info.manifest().ok_or_else(|| invalid("chunks require snapshot mode"))?;
                 if uuid_at(&request.payload, 0)? != manifest.snapshot_id {
@@ -1685,7 +2514,7 @@ where
                 if after < info.initial_after()
                     || after > MAX_SOURCE_SEQUENCE
                     || byte_limit == 0
-                    || byte_limit > MAX_BATCH_BYTES
+                    || byte_limit > MAX_POLL_BYTES
                 {
                     return Err(invalid("invalid physical continuation request"));
                 }
@@ -1714,14 +2543,17 @@ where
                 summary.validate_since(after, byte_limit, known_barrier)?;
                 let mut cursor = after;
                 let mut bytes = 0usize;
-                for batch in &poll.batches {
+                for (index, batch) in poll.batches.iter().enumerate() {
                     bytes = bytes
                         .checked_add(batch.data().len())
                         .ok_or_else(|| invalid("batch byte overflow"))?;
+                    // Spec P4.1c: the limit is a coalescing target. The
+                    // first batch of a poll may exceed it (a write group is
+                    // never split); a later one may not take the total past it.
                     if batch.history() != info.history()
                         || cursor.checked_add(1) != Some(batch.first_sequence())
                         || batch.last_sequence() > summary.through
-                        || bytes > byte_limit
+                        || (bytes > byte_limit && index > 0)
                     {
                         return Err(invalid("source returned noncontiguous/oversized physical interval"));
                     }
@@ -1733,12 +2565,13 @@ where
                 let summary_bytes = summary.encode();
                 write_frame(&mut io, Kind::PollStart, &summary_bytes, &limits, &mut shutdown).await?;
                 for batch in poll.batches {
-                    let mut payload = Vec::with_capacity(BATCH_META + batch.data().len());
-                    payload.extend(batch.history().as_bytes());
-                    payload.extend(batch.first_sequence().to_be_bytes());
-                    payload.extend(batch.digest());
-                    payload.extend(batch.data());
-                    write_frame(&mut io, Kind::Batch, &payload, &limits, &mut shutdown).await?;
+                    // The metadata and the raw group go out as one frame,
+                    // the group never copied (it may be gigabytes).
+                    let mut meta = Vec::with_capacity(BATCH_META);
+                    meta.extend(batch.history().as_bytes());
+                    meta.extend(batch.first_sequence().to_be_bytes());
+                    meta.extend(batch.digest());
+                    write_frame_parts(&mut io, Kind::Batch, &meta, batch.data(), &limits, &mut shutdown).await?;
                 }
                 write_frame(&mut io, Kind::PollEnd, &summary_bytes, &limits, &mut shutdown).await?;
                 known_barrier = summary.durable_barrier;
@@ -1852,6 +2685,11 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
     /// ([`CAP_TLS`]).
     pub fn tls(&self) -> bool {
         self.hello_ok.capabilities & self.hello.capabilities & CAP_TLS != 0
+    }
+    /// Spec P4.1: whether the source serves fast-forward sessions
+    /// ([`CAP_FAST_FORWARD`] in its `HelloOk`).
+    pub fn fast_forward(&self) -> bool {
+        self.hello_ok.capabilities & CAP_FAST_FORWARD != 0
     }
     pub fn manifest(&self) -> Option<&CheckpointManifest> {
         self.info.as_ref().and_then(SourceSessionInfo::manifest)
@@ -1978,6 +2816,302 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
         }
         outcome
     }
+    /// Spec P4.1 §3.1: open a fast-forward session for this receiver of
+    /// `history` at `after` (both announced in its `Hello`), with leaves of
+    /// `leaf_bytes`, preferring the export `prefer` (a resumed fast-forward).
+    /// A source without [`CAP_FAST_FORWARD`] is refused here, before anything
+    /// is sent; a receiver at or past the source's cut is refused by the
+    /// source (`HistoryMismatch`).
+    pub async fn open_fast_forward(
+        &mut self,
+        history: Uuid,
+        after: u64,
+        leaf_bytes: u32,
+        prefer: Option<Uuid>,
+    ) -> Result<SourceSessionInfo> {
+        self.check_live()?;
+        if !self.fast_forward() {
+            return Err(WireError::Refused(Refusal::new(
+                RefuseCode::Version,
+                "the primary's release has no fast-forward; use --full",
+            )));
+        }
+        self.poisoned = true;
+        let outcome = async {
+            if self.info.is_some() {
+                return Err(invalid("session already selected"));
+            }
+            let request = OpenRequest::FastForward {
+                history,
+                after,
+                leaf_bytes,
+                prefer,
+            };
+            if !request.agrees_with(&self.hello) {
+                return Err(invalid(
+                    "a fast-forward session announces its history and cursor in its hello",
+                ));
+            }
+            write_frame(
+                &mut self.io,
+                Kind::Open,
+                &request.encode()?,
+                &self.limits,
+                &mut self.shutdown,
+            )
+            .await?;
+            let limits = self.reply_limits();
+            let frame = read_reply(
+                &mut self.io,
+                &[Kind::FastForwardInfo],
+                self.hello.epoch,
+                &limits,
+                &mut self.shutdown,
+            )
+            .await?;
+            let info = SourceSessionInfo::fast_forward_from(&frame.payload, request, &self.limits)?;
+            if info.history() != self.hello_ok.history {
+                return Err(invalid("fast-forward history mismatch"));
+            }
+            self.known_barrier = info.initial_barrier();
+            self.info = Some(info.clone());
+            Ok(info)
+        }
+        .await;
+        if outcome.is_ok() {
+            self.poisoned = false;
+        }
+        outcome
+    }
+    /// The open fast-forward session's export.
+    fn fast_forward_snapshot(&self) -> Result<Uuid> {
+        self.info
+            .as_ref()
+            .and_then(SourceSessionInfo::fast_forward_snapshot)
+            .ok_or_else(|| invalid("leaves require an open fast-forward session"))
+    }
+    /// One page of the source's leaf plan: up to `count` leaves from `from`,
+    /// or a planning page. Answered within the frame deadline.
+    pub async fn leaf_digests(&mut self, from: u32, count: u32) -> Result<LeafDigests> {
+        self.check_live()?;
+        self.poisoned = true;
+        let outcome = async {
+            let snapshot = self.fast_forward_snapshot()?;
+            if count == 0 || count > MAX_LEAVES || from >= MAX_LEAVES {
+                return Err(invalid("invalid leaf digests request"));
+            }
+            let mut request = Vec::with_capacity(LEAF_DIGESTS_REQUEST_BYTES);
+            request.extend(snapshot.as_bytes());
+            request.extend(from.to_be_bytes());
+            request.extend(count.to_be_bytes());
+            write_frame(
+                &mut self.io,
+                Kind::LeafDigestsRequest,
+                &request,
+                &self.limits,
+                &mut self.shutdown,
+            )
+            .await?;
+            let frame = read_reply(
+                &mut self.io,
+                &[Kind::LeafDigests],
+                self.hello.epoch,
+                &self.limits,
+                &mut self.shutdown,
+            )
+            .await?;
+            let page = LeafDigests::decode(&frame.payload)?;
+            if page.snapshot_id != snapshot
+                || (page.status == LeafStatus::Ready && (page.from != from || page.entries.len() > count as usize))
+            {
+                return Err(invalid("the source answered another leaf page than the one asked for"));
+            }
+            Ok(page)
+        }
+        .await;
+        if outcome.is_ok() {
+            self.poisoned = false;
+        }
+        outcome
+    }
+    /// The source's whole leaf plan, page by page (spec P4.1 §3.3.2). While
+    /// the source is still planning it is asked again every 300 ms — each
+    /// ask a frame of its own, so a long plan never runs into a frame
+    /// deadline — for at most `LEAF_PLANNING_DEADLINES` (30) operation
+    /// deadlines in all. The pages must make one plan: leaf 0 at the empty
+    /// key, boundaries in order across pages, the same leaf count
+    /// throughout, the leaves' bytes adding up to the plan's total. Any
+    /// failure, the plan's own included, poisons the client.
+    pub async fn fetch_leaf_digests(&mut self) -> Result<LeafPlan> {
+        let outcome = self.fetch_leaf_plan().await;
+        if outcome.is_err() {
+            self.poisoned = true;
+        }
+        outcome
+    }
+    async fn fetch_leaf_plan(&mut self) -> Result<LeafPlan> {
+        let snapshot = self.fast_forward_snapshot()?;
+        let planning_deadline = self.limits.operation_timeout.saturating_mul(LEAF_PLANNING_DEADLINES);
+        let started = tokio::time::Instant::now();
+        let mut leaves: Vec<LeafEntry> = Vec::new();
+        let mut plan: Option<(u32, u64)> = None;
+        loop {
+            let from = u32::try_from(leaves.len()).map_err(|_| invalid("leaf plan overflow"))?;
+            // Everything that is left; the source pages it.
+            let page = self.leaf_digests(from, MAX_LEAVES.saturating_sub(from).max(1)).await?;
+            if page.status == LeafStatus::Planning {
+                if plan.is_some() {
+                    return Err(invalid(
+                        "the source started planning again in the middle of its leaf plan",
+                    ));
+                }
+                if started.elapsed() >= planning_deadline {
+                    return Err(WireError::Source(format!(
+                        "the source did not finish planning its leaves within {} s ({LEAF_PLANNING_DEADLINES} \
+                         operation deadlines); it may be busy: retry later",
+                        planning_deadline.as_secs()
+                    )));
+                }
+                let wait = async {
+                    tokio::time::sleep(LEAF_PLANNING_RETRY).await;
+                    Ok(())
+                };
+                bounded(&mut self.shutdown, LEAF_PLANNING_RETRY * 2, wait).await?;
+                continue;
+            }
+            let (count, total) = *plan.get_or_insert((page.leaf_count, page.total_bytes));
+            if page.leaf_count != count || page.total_bytes != total {
+                return Err(invalid("the source's leaf plan changed between pages"));
+            }
+            if let (Some(last), Some(first)) = (leaves.last(), page.entries.first()) {
+                if last.start >= first.start {
+                    return Err(invalid("the source's leaf boundaries are out of order across pages"));
+                }
+            }
+            if page.entries.is_empty() && from < count {
+                return Err(invalid("the source sent an empty page inside its leaf plan"));
+            }
+            leaves.extend(page.entries);
+            if leaves.len() >= count as usize {
+                break;
+            }
+        }
+        let (_, total_bytes) = plan.ok_or_else(|| invalid("an empty leaf plan"))?;
+        let mut sum = 0_u64;
+        for leaf in &leaves {
+            sum = sum
+                .checked_add(leaf.bytes)
+                .ok_or_else(|| invalid("leaf plan byte overflow"))?;
+        }
+        if sum != total_bytes || leaves.is_empty() {
+            return Err(invalid("the source's leaves do not add up to its plan's total"));
+        }
+        Ok(LeafPlan {
+            snapshot_id: snapshot,
+            total_bytes,
+            leaves,
+        })
+    }
+    /// Ask the source to build leaf `index`'s SST file; answered once it is
+    /// built (within the operation deadline).
+    pub async fn request_leaf(&mut self, index: u32) -> Result<LeafReady> {
+        self.check_live()?;
+        self.poisoned = true;
+        let outcome = async {
+            let snapshot = self.fast_forward_snapshot()?;
+            if index >= MAX_LEAVES {
+                return Err(invalid("invalid leaf request"));
+            }
+            let mut request = Vec::with_capacity(LEAF_REQUEST_BYTES);
+            request.extend(snapshot.as_bytes());
+            request.extend(index.to_be_bytes());
+            write_frame(
+                &mut self.io,
+                Kind::LeafRequest,
+                &request,
+                &self.limits,
+                &mut self.shutdown,
+            )
+            .await?;
+            let limits = self.reply_limits();
+            let frame = read_reply(
+                &mut self.io,
+                &[Kind::LeafReady],
+                self.hello.epoch,
+                &limits,
+                &mut self.shutdown,
+            )
+            .await?;
+            let ready = LeafReady::decode(&frame.payload)?;
+            if ready.snapshot_id != snapshot || ready.index != index {
+                return Err(invalid("the source announced another leaf than the one asked for"));
+            }
+            Ok(ready)
+        }
+        .await;
+        if outcome.is_ok() {
+            self.poisoned = false;
+        }
+        outcome
+    }
+    /// `length` bytes of leaf `index`'s file from `offset`, digest-checked
+    /// (the whole file's SHA-256 is checked by the caller).
+    pub async fn read_leaf_chunk(&mut self, index: u32, offset: u64, length: u32) -> Result<Vec<u8>> {
+        self.check_live()?;
+        self.poisoned = true;
+        let outcome = async {
+            let snapshot = self.fast_forward_snapshot()?;
+            if length == 0
+                || length as usize > self.limits.transfer.max_chunk_bytes
+                || offset.checked_add(u64::from(length)).is_none()
+            {
+                return Err(invalid("leaf chunk request outside its bounds"));
+            }
+            let mut request = Vec::with_capacity(32);
+            request.extend(snapshot.as_bytes());
+            request.extend(index.to_be_bytes());
+            request.extend(offset.to_be_bytes());
+            request.extend(length.to_be_bytes());
+            write_frame(
+                &mut self.io,
+                Kind::LeafChunkRequest,
+                &request,
+                &self.limits,
+                &mut self.shutdown,
+            )
+            .await?;
+            let mut frame = read_reply(
+                &mut self.io,
+                &[Kind::LeafChunk],
+                self.hello.epoch,
+                &self.limits,
+                &mut self.shutdown,
+            )
+            .await?;
+            let identity_ok = uuid_at(&frame.payload, 0)? == snapshot
+                && u32_at(&frame.payload, 16)? == index
+                && u64_at(&frame.payload, 20)? == offset
+                && frame.payload.len() == CHUNK_META + length as usize;
+            let body = frame
+                .payload
+                .get(CHUNK_META..)
+                .ok_or_else(|| invalid("leaf chunk response truncated"))?;
+            let expected = frame
+                .payload
+                .get(28..60)
+                .ok_or_else(|| invalid("leaf chunk response truncated"))?;
+            if !identity_ok || Sha256::digest(body).as_slice() != expected {
+                return Err(invalid("leaf chunk response identity/length/digest mismatch"));
+            }
+            frame.payload.drain(..CHUNK_META);
+            Ok(frame.payload)
+        }
+        .await;
+        if outcome.is_ok() {
+            self.poisoned = false;
+        }
+        outcome
+    }
     pub async fn connect_resume(
         io: I,
         token: &TransferToken,
@@ -2062,14 +3196,17 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             if after < info.initial_after()
                 || after > MAX_SOURCE_SEQUENCE
                 || byte_limit == 0
-                || byte_limit > MAX_BATCH_BYTES
+                || byte_limit > MAX_POLL_BYTES
             {
                 return Err(invalid("invalid physical continuation request"));
             }
+            // MAX_POLL_BYTES is far below u32::MAX.
+            let limit_field =
+                u32::try_from(byte_limit).map_err(|_| invalid("invalid physical continuation request"))?;
             let mut request = Vec::with_capacity(28);
             request.extend(info.session_id().as_bytes());
             request.extend(after.to_be_bytes());
-            request.extend((byte_limit as u32).to_be_bytes());
+            request.extend(limit_field.to_be_bytes());
             write_frame(
                 &mut self.io,
                 Kind::PollRequest,
@@ -2091,29 +3228,57 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             sink.begin(summary).await?;
             let mut cursor = after;
             let mut bytes = 0usize;
-            for _ in 0..summary.batches {
-                let mut frame = read_frame(&mut self.io, &[Kind::Batch], &self.limits, &mut self.shutdown).await?;
-                let history = uuid_at(&frame.payload, 0)?;
-                let first = u64_at(&frame.payload, 16)?;
-                let digest: [u8; 32] = frame
-                    .payload
+            // Spec P4.1d: the poll's validated batches, handed to the sink
+            // together (`apply_many`) — the whole poll at once, or runs of at
+            // most `APPLY_CHUNK_BYTES` in order — instead of one by one. Each
+            // batch is validated below before it joins a run, so nothing of a
+            // run reaches the sink until all of it is validated.
+            let mut run: Vec<PhysicalBatch> = Vec::new();
+            let mut run_bytes = 0usize;
+            for index in 0..summary.batches {
+                // Spec P4.1c: only the poll's first batch may exceed the
+                // limit. A later one that would take the poll past it is
+                // refused from its frame header, before its payload is
+                // allocated or read.
+                let max_raw = if index == 0 {
+                    usize::MAX
+                } else {
+                    byte_limit.saturating_sub(bytes)
+                };
+                let (meta, raw) = read_batch_frame(&mut self.io, max_raw, &self.limits, &mut self.shutdown).await?;
+                let history = uuid_at(&meta, 0)?;
+                let first = u64_at(&meta, 16)?;
+                let digest: [u8; 32] = meta
                     .get(24..56)
                     .and_then(|slice| slice.try_into().ok())
                     .ok_or_else(|| invalid("batch payload truncated"))?;
-                frame.payload.drain(..BATCH_META);
                 bytes = bytes
-                    .checked_add(frame.payload.len())
+                    .checked_add(raw.len())
                     .ok_or_else(|| invalid("batch byte overflow"))?;
-                if history != info.history() || cursor.checked_add(1) != Some(first) || bytes > byte_limit {
+                if history != info.history()
+                    || cursor.checked_add(1) != Some(first)
+                    || (bytes > byte_limit && index > 0)
+                {
                     return Err(invalid("physical response history/sequence/byte mismatch"));
                 }
-                let batch =
-                    PhysicalBatch::decode(history, first, frame.payload, digest).map_err(|e| invalid(e.to_string()))?;
+                let batch = PhysicalBatch::decode(history, first, raw, digest).map_err(|e| invalid(e.to_string()))?;
                 if batch.last_sequence() > summary.through {
                     return Err(invalid("batch crosses advertised barrier"));
                 }
                 cursor = batch.last_sequence();
-                bounded(&mut self.shutdown, self.limits.operation_timeout, sink.apply(batch)).await?;
+                let size = batch.data().len();
+                if !run.is_empty() && run_bytes.saturating_add(size) > APPLY_CHUNK_BYTES {
+                    // The run is full: hand it over before this batch joins
+                    // the next one.
+                    let full = std::mem::take(&mut run);
+                    run_bytes = 0;
+                    bounded(&mut self.shutdown, self.limits.operation_timeout, sink.apply_many(full)).await?;
+                }
+                run_bytes = run_bytes.saturating_add(size);
+                run.push(batch);
+            }
+            if !run.is_empty() {
+                bounded(&mut self.shutdown, self.limits.operation_timeout, sink.apply_many(run)).await?;
             }
             let end = read_frame(&mut self.io, &[Kind::PollEnd], &self.limits, &mut self.shutdown).await?;
             if PollSummary::decode(&end.payload)? != summary || cursor != summary.through {
@@ -2194,7 +3359,8 @@ impl PhysicalClient<ReplicationStream> {
     /// authenticate. Spec P2.2: a non-loopback `address` needs TLS or the
     /// plaintext opt-in; over TLS the source's certificate is verified before
     /// the token is sent, the `Hello` carries [`CAP_TLS`], and a handshake or
-    /// alert failure is [`WireError::Tls`].
+    /// alert failure is [`WireError::Tls`]. The socket sets `TCP_NODELAY`
+    /// before anything is sent (spec P4.1b).
     pub async fn connect_replication(
         address: SocketAddr,
         transport: &ReplicationTransport,
@@ -2214,6 +3380,10 @@ impl PhysicalClient<ReplicationStream> {
             Ok(TcpStream::connect(address).await?)
         })
         .await?;
+        // Before the handshake and the token: one request is in flight at a
+        // time, so Nagle's algorithm would hold each behind the source's
+        // delayed ACK.
+        stream.set_nodelay(true)?;
         let Some(tls) = &transport.tls else {
             return Self::authenticate(ReplicationStream::Plain(stream), token, hello, limits, shutdown).await;
         };
@@ -2528,6 +3698,10 @@ mod tests {
             RefuseCode::TooManySessions,
             RefuseCode::SourceNotServing,
             RefuseCode::Version,
+            RefuseCode::GroupTooLarge {
+                first: 7,
+                bytes: u64::MAX,
+            },
         ] {
             for reason in ["", "why", &"é".repeat(MAX_REASON_BYTES)] {
                 let refusal = Refusal::new(code.clone(), reason);
@@ -2547,6 +3721,122 @@ mod tests {
         assert_eq!(HeartbeatAck::decode(&ack.encode()).unwrap(), ack);
         let fence = Fence { epoch: 2 };
         assert_eq!(Fence::decode(&fence.encode().unwrap()).unwrap(), fence);
+
+        // Spec P4.1: the fast-forward session's frames (kinds 21-27).
+        let snapshot = Uuid::new_v4();
+        let request = OpenRequest::FastForward {
+            history,
+            after: 10,
+            leaf_bytes: MIN_LEAF_BYTES,
+            prefer: None,
+        };
+        let info = SourceSessionInfo::FastForward {
+            session_id: Uuid::new_v4(),
+            snapshot_id: snapshot,
+            history,
+            after: 10,
+            sequence: 31_897,
+        };
+        let (kind, bytes) = info.response().unwrap();
+        assert_eq!(kind, Kind::FastForwardInfo);
+        assert!(Kind::FastForwardInfo.valid_size(bytes.len()));
+        let decoded = SourceSessionInfo::fast_forward_from(&bytes, request, &limits()).unwrap();
+        assert!(matches!(
+            decoded,
+            SourceSessionInfo::FastForward { snapshot_id, history: h, after: 10, sequence: 31_897, .. }
+                if snapshot_id == snapshot && h == history
+        ));
+        assert_eq!(decoded.session_id(), info.session_id());
+        assert_eq!(decoded.fast_forward_snapshot(), Some(snapshot));
+        assert!(decoded.manifest().is_none());
+        let leaf = |start: &[u8], bytes: u64| LeafEntry {
+            start: start.to_vec(),
+            bytes,
+            keys: 3,
+            digest: [7; 32],
+        };
+        for page in [
+            LeafDigests::planning(snapshot),
+            LeafDigests {
+                snapshot_id: snapshot,
+                status: LeafStatus::Ready,
+                leaf_count: 3,
+                total_bytes: 300,
+                from: 0,
+                entries: vec![leaf(b"", 100), leaf(b"m", 150), leaf(b"t", 50)],
+            },
+            LeafDigests {
+                snapshot_id: snapshot,
+                status: LeafStatus::Ready,
+                leaf_count: 3,
+                total_bytes: 300,
+                from: 2,
+                entries: vec![leaf(&[0xff; 63], 50)],
+            },
+            LeafDigests {
+                snapshot_id: snapshot,
+                status: LeafStatus::Ready,
+                leaf_count: 1,
+                total_bytes: 0,
+                from: 0,
+                entries: vec![LeafEntry {
+                    start: Vec::new(),
+                    bytes: 0,
+                    keys: 0,
+                    digest: empty_sha256(),
+                }],
+            },
+        ] {
+            let bytes = page.encode().unwrap();
+            assert!(Kind::LeafDigests.valid_size(bytes.len()));
+            assert_eq!(LeafDigests::decode(&bytes).unwrap(), page);
+        }
+        for ready in [
+            LeafReady {
+                snapshot_id: snapshot,
+                index: 5,
+                size: 4 * 1024 * 1024,
+                sha256: [9; 32],
+            },
+            LeafReady {
+                snapshot_id: snapshot,
+                index: MAX_LEAVES - 1,
+                size: 0,
+                sha256: empty_sha256(),
+            },
+        ] {
+            let bytes = ready.encode().unwrap();
+            assert!(Kind::LeafReady.valid_size(bytes.len()));
+            assert_eq!(LeafReady::decode(&bytes).unwrap(), ready);
+        }
+        for (kind, valid, too_long) in [
+            (
+                Kind::FastForwardInfo,
+                FAST_FORWARD_INFO_BYTES,
+                FAST_FORWARD_INFO_BYTES + 1,
+            ),
+            (
+                Kind::LeafDigestsRequest,
+                LEAF_DIGESTS_REQUEST_BYTES,
+                LEAF_DIGESTS_REQUEST_BYTES + 1,
+            ),
+            (Kind::LeafDigests, LEAF_DIGESTS_HEADER_BYTES, MAX_LEAF_DIGESTS_BYTES + 1),
+            (Kind::LeafRequest, LEAF_REQUEST_BYTES, LEAF_REQUEST_BYTES + 1),
+            (Kind::LeafReady, LEAF_READY_BYTES, LEAF_READY_BYTES + 1),
+            (Kind::LeafChunkRequest, 32, 33),
+            (
+                Kind::LeafChunk,
+                CHUNK_META + MAX_CHUNK_BYTES,
+                CHUNK_META + MAX_CHUNK_BYTES + 1,
+            ),
+        ] {
+            assert!(kind.valid_size(valid), "{kind:?} {valid}");
+            assert!(!kind.valid_size(too_long), "{kind:?} {too_long}");
+            assert_eq!(Kind::decode(kind as u16).unwrap(), kind);
+        }
+        assert!(!Kind::LeafChunk.valid_size(CHUNK_META), "a leaf chunk carries bytes");
+        assert!(!Kind::LeafDigests.valid_size(LEAF_DIGESTS_HEADER_BYTES - 1));
+        assert!(Kind::decode(28).is_err(), "the next kind is not assigned yet");
     }
 
     #[test]
@@ -2629,6 +3919,155 @@ mod tests {
         assert!(Heartbeat::decode(&[0; HEARTBEAT_BYTES + 1]).is_err());
         assert!(Fence { epoch: 0 }.encode().is_err());
         assert!(Fence::decode(&0_u64.to_be_bytes()).is_err());
+
+        // Spec P4.1: a fast-forward answer that cannot be this session's: a
+        // cut at or before the receiver, a nil session, the wrong size, an
+        // answer to another kind of open.
+        let snapshot = Uuid::new_v4();
+        let request = OpenRequest::FastForward {
+            history,
+            after: 10,
+            leaf_bytes: MIN_LEAF_BYTES,
+            prefer: None,
+        };
+        let answer = |session_id: Uuid, sequence: u64| {
+            SourceSessionInfo::FastForward {
+                session_id,
+                snapshot_id: snapshot,
+                history,
+                after: 10,
+                sequence,
+            }
+            .response()
+            .unwrap()
+            .1
+        };
+        for (bytes, why) in [
+            (answer(Uuid::new_v4(), 10), "a cut at the receiver"),
+            (answer(Uuid::new_v4(), 9), "a cut behind the receiver"),
+            (answer(Uuid::nil(), 11), "a nil session"),
+            (
+                answer(Uuid::new_v4(), MAX_SOURCE_SEQUENCE + 1),
+                "a cut past the sequence space",
+            ),
+            (answer(Uuid::new_v4(), 11)[..39].to_vec(), "the wrong size"),
+        ] {
+            assert!(
+                SourceSessionInfo::fast_forward_from(&bytes, request, &limits()).is_err(),
+                "{why}"
+            );
+        }
+        assert!(SourceSessionInfo::fast_forward_from(
+            &answer(Uuid::new_v4(), 11),
+            OpenRequest::Resume { history, after: 10 },
+            &limits()
+        )
+        .is_err());
+
+        // Leaf pages that cannot be one plan's.
+        let leaf = |start: &[u8]| LeafEntry {
+            start: start.to_vec(),
+            bytes: 1,
+            keys: 1,
+            digest: [1; 32],
+        };
+        let ready = |from: u32, entries: Vec<LeafEntry>| LeafDigests {
+            snapshot_id: snapshot,
+            status: LeafStatus::Ready,
+            leaf_count: 3,
+            total_bytes: 3,
+            from,
+            entries,
+        };
+        for (page, why) in [
+            (ready(0, vec![leaf(b"a")]), "leaf 0 starts at the empty key"),
+            (ready(1, vec![leaf(b"")]), "only leaf 0 starts at the empty key"),
+            (ready(0, vec![leaf(b""), leaf(b"m"), leaf(b"c")]), "boundaries in order"),
+            (
+                ready(0, vec![leaf(b""), leaf(b"m"), leaf(b"m")]),
+                "boundaries strictly in order",
+            ),
+            (ready(1, vec![leaf(&[0xff; 64])]), "a start at the end of the keyspace"),
+            (ready(4, Vec::new()), "a page past the plan"),
+            (
+                ready(2, vec![leaf(b"m"), leaf(b"t")]),
+                "more leaves than the plan holds",
+            ),
+            (
+                LeafDigests {
+                    leaf_count: 0,
+                    ..ready(0, Vec::new())
+                },
+                "a ready plan with no leaf",
+            ),
+            (
+                LeafDigests {
+                    leaf_count: MAX_LEAVES + 1,
+                    ..ready(0, vec![leaf(b"")])
+                },
+                "more leaves than a plan may have",
+            ),
+            (
+                LeafDigests {
+                    status: LeafStatus::Planning,
+                    ..ready(0, vec![leaf(b"")])
+                },
+                "a planning page carries leaves",
+            ),
+            (
+                LeafDigests {
+                    snapshot_id: Uuid::nil(),
+                    ..LeafDigests::planning(snapshot)
+                },
+                "a page of no snapshot",
+            ),
+            (
+                ready(1, vec![leaf(&vec![b'k'; MAX_LEAF_START_BYTES + 1])]),
+                "a start too long for its length field",
+            ),
+        ] {
+            assert!(page.encode().is_err(), "{why}");
+        }
+        let good = ready(0, vec![leaf(b""), leaf(b"m")]).encode().unwrap();
+        assert!(LeafDigests::decode(&good[..good.len() - 1]).is_err(), "truncated");
+        let mut longer = good.clone();
+        longer.push(0);
+        assert!(LeafDigests::decode(&longer).is_err(), "a trailing byte");
+        let mut status = good.clone();
+        status[16] = 2;
+        assert!(LeafDigests::decode(&status).is_err(), "an unknown status");
+        let mut count = good.clone();
+        count[33..37].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(
+            LeafDigests::decode(&count).is_err(),
+            "a count past what the frame holds"
+        );
+        assert!(LeafDigests::decode(&good[..LEAF_DIGESTS_HEADER_BYTES - 1]).is_err());
+
+        // Leaf announcements that cannot be.
+        for ready in [
+            LeafReady {
+                snapshot_id: snapshot,
+                index: 0,
+                size: 0,
+                sha256: [3; 32],
+            },
+            LeafReady {
+                snapshot_id: snapshot,
+                index: MAX_LEAVES,
+                size: 1,
+                sha256: [3; 32],
+            },
+            LeafReady {
+                snapshot_id: Uuid::nil(),
+                index: 0,
+                size: 1,
+                sha256: [3; 32],
+            },
+        ] {
+            assert!(ready.encode().is_err(), "{ready:?}");
+        }
+        assert!(LeafReady::decode(&[0; LEAF_READY_BYTES - 1]).is_err());
     }
 
     #[test]
@@ -2643,6 +4082,7 @@ mod tests {
             RefuseCode::WalPruned { oldest: 1 },
             RefuseCode::EpochStale { have: 1, want: 2 },
             RefuseCode::Version,
+            RefuseCode::GroupTooLarge { first: 1, bytes: 2 },
         ] {
             assert!(code.needs_recovery() && !code.retryable(), "{code:?}");
         }
@@ -2680,7 +4120,7 @@ mod tests {
             );
         }
         let mut sink = Sink::default();
-        let summary = client.poll(10, MAX_BATCH_BYTES, &mut sink).await.unwrap();
+        let summary = client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap();
         assert_eq!(
             summary,
             PollSummary {
@@ -2690,7 +4130,7 @@ mod tests {
             }
         );
         assert_eq!(sink.received, vec![(source.manifest.history, 11, 11)]);
-        let empty = client.poll(11, MAX_BATCH_BYTES, &mut sink).await.unwrap();
+        let empty = client.poll(11, MAX_POLL_BYTES, &mut sink).await.unwrap();
         assert_eq!(empty.batches, 0);
         client.close().await.unwrap();
         run.await.unwrap().unwrap();
@@ -2780,7 +4220,7 @@ mod tests {
         let ack = client.heartbeat(at_checkpoint).await.unwrap();
         assert_eq!(ack.barrier, 42);
         assert!(ack.now > 0);
-        client.poll(10, MAX_BATCH_BYTES, &mut Sink::default()).await.unwrap();
+        client.poll(10, MAX_POLL_BYTES, &mut Sink::default()).await.unwrap();
         let after_poll = Heartbeat {
             applied_sequence: 11,
             durable_sequence: 11,
@@ -2965,7 +4405,7 @@ mod tests {
             .await
             .unwrap();
         let mut sink = Sink::default();
-        let outcome = client.poll(10, MAX_BATCH_BYTES, &mut sink).await;
+        let outcome = client.poll(10, MAX_POLL_BYTES, &mut sink).await;
         let code = RefuseCode::Gap {
             expected: 11,
             have_from: 13,
@@ -3066,31 +4506,36 @@ mod tests {
     /// Spec P2.1: an `NPHYS001` receiver is answered with `Refuse { Version }`
     /// (in this protocol's framing) and the source reports the refusal; any
     /// other magic is a protocol error that says what the peer looks like.
+    /// Spec P4.1c: so is an `NPHYS002` receiver, whose batch bounds differ.
     #[tokio::test]
     async fn previous_version_is_refused_by_name_and_other_magic_before_export() {
-        let (_shutdown, mut rx) = watch::channel(false);
-        let (mut io, peer) = duplex(256);
-        let calls = Arc::new(AtomicUsize::new(0));
-        let run = tokio::spawn(server(peer, Arc::new(MockSource::new()), calls.clone(), rx.clone()));
-        let mut old = b"NPHYS001".to_vec();
-        old.extend(1_u16.to_be_bytes());
-        old.extend(1_u16.to_be_bytes()); // NPHYS001 Auth
-        old.extend(32_u32.to_be_bytes());
-        old.extend([7; 32]);
-        io.write_all(&old).await.unwrap();
-        let reply = read_frame(&mut io, &[Kind::Refuse], &limits(), &mut rx).await.unwrap();
-        let refusal = Refusal::decode(&reply.payload).unwrap();
-        assert_eq!(refusal.code, RefuseCode::Version);
-        assert!(
-            refusal.reason.contains("NPHYS001") && refusal.reason.contains("NPHYS002"),
-            "{refusal}"
-        );
-        assert_eq!(refused(&run.await.unwrap()), Some(RefuseCode::Version));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!((PROTOCOL, &MAGIC, VERSION), ("NPHYS003", b"NPHYS003", 3));
+        for (old_magic, old_version) in [(*b"NPHYS001", 1_u16), (*b"NPHYS002", 2)] {
+            let old_name = String::from_utf8_lossy(&old_magic).into_owned();
+            let (_shutdown, mut rx) = watch::channel(false);
+            let (mut io, peer) = duplex(256);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let run = tokio::spawn(server(peer, Arc::new(MockSource::new()), calls.clone(), rx.clone()));
+            let mut old = old_magic.to_vec();
+            old.extend(old_version.to_be_bytes());
+            old.extend(1_u16.to_be_bytes()); // the old version's Auth
+            old.extend(32_u32.to_be_bytes());
+            old.extend([7; 32]);
+            io.write_all(&old).await.unwrap();
+            let reply = read_frame(&mut io, &[Kind::Refuse], &limits(), &mut rx).await.unwrap();
+            let refusal = Refusal::decode(&reply.payload).unwrap();
+            assert_eq!(refusal.code, RefuseCode::Version, "{old_name}");
+            assert!(
+                refusal.reason.contains(&old_name) && refusal.reason.contains("NPHYS003"),
+                "{refusal}"
+            );
+            assert_eq!(refused(&run.await.unwrap()), Some(RefuseCode::Version), "{old_name}");
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "{old_name}");
+        }
 
-        // The same version number under another magic, and a bumped version
-        // under this magic.
-        for (magic, version) in [(*b"NPHYS001", VERSION), (MAGIC, 9)] {
+        // The same version number under another magic, the previous
+        // version, and a bumped version under this magic.
+        for (magic, version) in [(*b"NPHYS001", VERSION), (*b"NPHYS002", 2), (MAGIC, 9)] {
             let mut bytes = magic.to_vec();
             bytes.extend(version.to_be_bytes());
             bytes.extend(1_u16.to_be_bytes());
@@ -3099,7 +4544,7 @@ mod tests {
             header.copy_from_slice(&bytes);
             let error = check_header(&header).unwrap_err();
             assert!(matches!(error, WireError::Version { .. }), "{error}");
-            assert!(error.to_string().contains("NPHYS002"), "{error}");
+            assert!(error.to_string().contains("NPHYS003"), "{error}");
         }
         for (garbage, hint) in [
             (b"HTTP/1.1 400 Bad R".to_vec(), "HTTP"),
@@ -3241,6 +4686,25 @@ mod tests {
         }
         .validate(10, 1024)
         .is_ok());
+        // Review P4.1d: one batch is a legal poll under any limit, even one
+        // below the 12 bytes of a batch header (`resync --poll-byte-limit 1`);
+        // a second batch still needs room for its header.
+        for limit in [1, 11] {
+            assert!(PollSummary {
+                through: 11,
+                durable_barrier: 11,
+                batches: 1
+            }
+            .validate(10, limit)
+            .is_ok());
+            assert!(PollSummary {
+                through: 12,
+                durable_barrier: 12,
+                batches: 2
+            }
+            .validate(10, limit)
+            .is_err());
+        }
         assert!(TransferToken::new([0; 32]).is_err());
     }
 
@@ -3290,14 +4754,14 @@ mod tests {
             let mut sink = Sink::default();
             assert!(
                 matches!(
-                    client.poll(10, MAX_BATCH_BYTES, &mut sink).await,
+                    client.poll(10, MAX_POLL_BYTES, &mut sink).await,
                     Err(WireError::Protocol(_))
                 ),
                 "{fault}"
             );
             assert!(sink.received.is_empty(), "{fault}");
             assert!(matches!(
-                client.poll(10, MAX_BATCH_BYTES, &mut sink).await,
+                client.poll(10, MAX_POLL_BYTES, &mut sink).await,
                 Err(WireError::Poisoned)
             ));
             drop(client);
@@ -3324,11 +4788,11 @@ mod tests {
             .unwrap();
         client.fetch_manifest(None).await.unwrap();
         assert!(matches!(
-            client.poll(10, MAX_BATCH_BYTES, &mut FailedSink).await,
+            client.poll(10, MAX_POLL_BYTES, &mut FailedSink).await,
             Err(WireError::Source(_))
         ));
         assert!(matches!(
-            client.poll(10, MAX_BATCH_BYTES, &mut Sink::default()).await,
+            client.poll(10, MAX_POLL_BYTES, &mut Sink::default()).await,
             Err(WireError::Poisoned)
         ));
         drop(client);
@@ -3417,7 +4881,7 @@ mod tests {
             .unwrap();
         assert!(client.manifest().is_none());
         let mut sink = Sink::default();
-        assert_eq!(client.poll(10, MAX_BATCH_BYTES, &mut sink).await.unwrap().through, 11);
+        assert_eq!(client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap().through, 11);
         assert_eq!(sink.received, vec![(history, 11, 11)]);
         assert_eq!(source.chunks.load(Ordering::SeqCst), 0);
         client.close().await.unwrap();
@@ -3436,7 +4900,7 @@ mod tests {
             .unwrap();
         client.fetch_manifest(Some(history)).await.unwrap();
         let mut sink = Sink::default();
-        let durable = client.poll(10, MAX_BATCH_BYTES, &mut sink).await.unwrap().through;
+        let durable = client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap().through;
         drop(client); // transport interruption after the sink owns sequence 11
         assert!(run.await.unwrap().is_err());
         let resumed = Arc::new(resume_source(&source, durable));
@@ -3445,7 +4909,7 @@ mod tests {
         let mut client = PhysicalClient::connect_resume(io, &token(), &receiver(), limits(), rx, history, durable)
             .await
             .unwrap();
-        let summary = client.poll(durable, MAX_BATCH_BYTES, &mut sink).await.unwrap();
+        let summary = client.poll(durable, MAX_POLL_BYTES, &mut sink).await.unwrap();
         assert_eq!(summary.batches, 0);
         assert_eq!(sink.received, vec![(history, 11, 11)]);
         client.close().await.unwrap();
@@ -3659,7 +5123,7 @@ mod tests {
             .await
             .unwrap();
         let mut sink = Sink::default();
-        assert!(client.poll(10, MAX_BATCH_BYTES, &mut sink).await.is_err());
+        assert!(client.poll(10, MAX_POLL_BYTES, &mut sink).await.is_err());
         assert!(sink.received.is_empty());
         assert!(matches!(run.await.unwrap(), Err(WireError::Protocol(_))));
         // A repeated earlier request may not lower a barrier already learned
@@ -3709,12 +5173,12 @@ mod tests {
             .unwrap();
         let mut sink = Sink::default();
         assert!(matches!(
-            client.poll(10, MAX_BATCH_BYTES, &mut sink).await,
+            client.poll(10, MAX_POLL_BYTES, &mut sink).await,
             Err(WireError::Protocol(_))
         ));
         assert!(sink.received.is_empty());
         assert!(matches!(
-            client.poll(10, MAX_BATCH_BYTES, &mut sink).await,
+            client.poll(10, MAX_POLL_BYTES, &mut sink).await,
             Err(WireError::Poisoned)
         ));
         run.await.unwrap().unwrap();
@@ -3799,6 +5263,62 @@ mod tests {
         assert!(OpenRequest::decode(&nil).is_err());
         assert!(request.agrees_with(&fresh()));
         assert!(!request.agrees_with(&receiver().hello(Some(preferred), Some(3))));
+
+        // Spec P4.1: a fast-forward open, with and without a preferred
+        // snapshot (29 and 45 bytes), is no snapshot, and agrees only with a
+        // hello that announced its history and cursor.
+        let history = Uuid::new_v4();
+        for (prefer, size) in [(None, 29), (Some(preferred), 45)] {
+            let open = OpenRequest::FastForward {
+                history,
+                after: 3,
+                leaf_bytes: 4 * 1024 * 1024,
+                prefer,
+            };
+            let bytes = open.encode().unwrap();
+            assert_eq!(bytes.len(), size);
+            assert!(Kind::Open.valid_size(bytes.len()));
+            assert_eq!(OpenRequest::decode(&bytes).unwrap(), open);
+            assert!(!open.is_snapshot());
+            assert!(open.agrees_with(&receiver().hello(Some(history), Some(3))));
+            assert!(!open.agrees_with(&receiver().hello(Some(history), Some(4))));
+            assert!(!open.agrees_with(&fresh()));
+        }
+        for leaf_bytes in [MIN_LEAF_BYTES - 1, MAX_LEAF_BYTES + 1] {
+            let open = OpenRequest::FastForward {
+                history,
+                after: 3,
+                leaf_bytes,
+                prefer: None,
+            };
+            assert!(open.encode().is_err(), "{leaf_bytes}");
+        }
+        assert!(OpenRequest::FastForward {
+            history: Uuid::nil(),
+            after: 3,
+            leaf_bytes: MIN_LEAF_BYTES,
+            prefer: None
+        }
+        .encode()
+        .is_err());
+        assert!(OpenRequest::FastForward {
+            history,
+            after: 3,
+            leaf_bytes: MIN_LEAF_BYTES,
+            prefer: Some(Uuid::nil())
+        }
+        .encode()
+        .is_err());
+        let mut mislabelled = OpenRequest::FastForward {
+            history,
+            after: 3,
+            leaf_bytes: MIN_LEAF_BYTES,
+            prefer: Some(preferred),
+        }
+        .encode()
+        .unwrap();
+        mislabelled[0] = 3;
+        assert!(OpenRequest::decode(&mislabelled).is_err(), "tag 3 is the 29-byte form");
 
         let source = Arc::new(MockSource::new());
         let history = source.manifest.history;
@@ -3895,5 +5415,839 @@ mod tests {
             "{:?}",
             outcome.err()
         );
+    }
+
+    // --- spec P4.1: the fast-forward session --------------------------------
+
+    /// A fast-forward provider: a plan of `leaves`, answered "planning" for
+    /// the first `planning` asks and in pages of at most `page` leaves; leaf
+    /// 1 is delete-only, every other leaf's file is `file`.
+    struct LeafSource {
+        info: SourceSessionInfo,
+        leaves: Vec<LeafEntry>,
+        total: u64,
+        planning: AtomicUsize,
+        page: u32,
+        file: Vec<u8>,
+        chunks: AtomicUsize,
+    }
+    impl LeafSource {
+        fn new(history: Uuid, after: u64, sequence: u64) -> Self {
+            let leaves: Vec<LeafEntry> = [&b""[..], b"g", b"p", b"w"]
+                .iter()
+                .enumerate()
+                .map(|(index, start)| LeafEntry {
+                    start: start.to_vec(),
+                    bytes: if index == 1 { 0 } else { 100 },
+                    keys: if index == 1 { 0 } else { 2 },
+                    digest: [index as u8; 32],
+                })
+                .collect();
+            Self {
+                info: SourceSessionInfo::FastForward {
+                    session_id: Uuid::new_v4(),
+                    snapshot_id: Uuid::new_v4(),
+                    history,
+                    after,
+                    sequence,
+                },
+                total: leaves.iter().map(|leaf| leaf.bytes).sum(),
+                leaves,
+                planning: AtomicUsize::new(1),
+                page: 3,
+                file: (0..=255_u8).cycle().take(5000).collect(),
+                chunks: AtomicUsize::new(0),
+            }
+        }
+        fn snapshot(&self) -> Uuid {
+            self.info.fast_forward_snapshot().unwrap()
+        }
+    }
+    #[async_trait]
+    impl PhysicalSource for LeafSource {
+        fn session_info(&self) -> &SourceSessionInfo {
+            &self.info
+        }
+        async fn read_chunk(&self, _: u32, _: u64, _: u32) -> Result<Vec<u8>> {
+            panic!("a fast-forward session reads no checkpoint chunks")
+        }
+        async fn poll(&self, _: u64, _: usize) -> Result<PhysicalPoll> {
+            panic!("a fast-forward session never polls")
+        }
+        async fn leaf_digests(&self, from: u32, count: u32) -> Result<LeafDigests> {
+            if self
+                .planning
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                .is_ok()
+            {
+                return Ok(LeafDigests::planning(self.snapshot()));
+            }
+            let end = (from + count.min(self.page)).min(self.leaves.len() as u32);
+            Ok(LeafDigests {
+                snapshot_id: self.snapshot(),
+                status: LeafStatus::Ready,
+                leaf_count: self.leaves.len() as u32,
+                total_bytes: self.total,
+                from,
+                entries: self.leaves[from as usize..end as usize].to_vec(),
+            })
+        }
+        async fn leaf(&self, index: u32) -> Result<LeafReady> {
+            let (size, sha256) = if index == 1 {
+                (0, empty_sha256())
+            } else {
+                (self.file.len() as u64, Sha256::digest(&self.file).into())
+            };
+            Ok(LeafReady {
+                snapshot_id: self.snapshot(),
+                index,
+                size,
+                sha256,
+            })
+        }
+        async fn read_leaf_chunk(&self, _index: u32, offset: u64, length: u32) -> Result<Vec<u8>> {
+            self.chunks.fetch_add(1, Ordering::SeqCst);
+            Ok(self.file[offset as usize..offset as usize + length as usize].to_vec())
+        }
+    }
+
+    fn serve_leaves(
+        io: DuplexStream,
+        source: Arc<LeafSource>,
+        history: Uuid,
+        rx: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        tokio::spawn(async move {
+            let context = SourceContext::unobserved(identity(history));
+            serve_session(io, &token(), limits(), rx, &context, None, move |open| async move {
+                assert!(matches!(open, OpenRequest::FastForward { .. }), "{open:?}");
+                Ok(source as Arc<dyn PhysicalSource>)
+            })
+            .await
+        })
+    }
+
+    /// Spec P4.1 §3.1: one fast-forward session opens at the source's cut,
+    /// waits out the planning, pages through the plan, and fetches a leaf's
+    /// file (and a delete-only leaf's announcement) — the plan and the file
+    /// arrive exactly as the source holds them.
+    #[tokio::test]
+    async fn a_fast_forward_session_pages_the_plan_and_fetches_leaf_files() {
+        let history = Uuid::new_v4();
+        let source = Arc::new(LeafSource::new(history, 10, 20));
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, peer) = duplex(64 * 1024);
+        let run = serve_leaves(peer, source.clone(), history, rx.clone());
+        let mut client =
+            PhysicalClient::authenticate(io, &token(), receiver().hello(Some(history), Some(10)), limits(), rx)
+                .await
+                .unwrap();
+        assert!(client.fast_forward(), "this release offers fast-forward sessions");
+        let info = client
+            .open_fast_forward(history, 10, MIN_LEAF_BYTES, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            info,
+            SourceSessionInfo::FastForward {
+                sequence: 20,
+                after: 10,
+                ..
+            }
+        ));
+        let plan = client.fetch_leaf_digests().await.unwrap();
+        assert_eq!(plan.snapshot_id, source.snapshot());
+        assert_eq!(
+            plan.leaves, source.leaves,
+            "paged in pages of 3, after one planning answer"
+        );
+        assert_eq!(plan.total_bytes, 300);
+        let empty = client.request_leaf(1).await.unwrap();
+        assert_eq!(empty.size, 0, "a delete-only leaf has no file");
+        let ready = client.request_leaf(2).await.unwrap();
+        assert_eq!(ready.size, source.file.len() as u64);
+        let mut file = Vec::new();
+        while (file.len() as u64) < ready.size {
+            let length = (ready.size - file.len() as u64).min(1024) as u32;
+            file.extend(client.read_leaf_chunk(2, file.len() as u64, length).await.unwrap());
+        }
+        assert_eq!(file, source.file);
+        assert_eq!(<[u8; 32]>::from(Sha256::digest(&file)), ready.sha256);
+        // Heartbeats keep a session alive while the receiver works locally.
+        client
+            .heartbeat(Heartbeat {
+                applied_sequence: 10,
+                durable_sequence: 10,
+                received_at: now_millis(),
+            })
+            .await
+            .unwrap();
+        client.close().await.unwrap();
+        run.await.unwrap().unwrap();
+    }
+
+    /// Spec P4.1 §3.1: a chunk of a leaf the session never announced, or
+    /// past its file, ends the session before the provider reads anything.
+    #[tokio::test]
+    async fn a_leaf_chunk_outside_an_announced_leaf_file_ends_the_session() {
+        for (announce, offset, length) in [(false, 0_u64, 1_u32), (true, 4999, 2), (true, 0, 0)] {
+            let history = Uuid::new_v4();
+            let source = Arc::new(LeafSource::new(history, 10, 20));
+            let (_shutdown, mut rx) = watch::channel(false);
+            let (mut io, peer) = duplex(64 * 1024);
+            let run = serve_leaves(peer, source.clone(), history, rx.clone());
+            raw_open(&mut io, &receiver().hello(Some(history), Some(10)), &mut rx).await;
+            let open = OpenRequest::FastForward {
+                history,
+                after: 10,
+                leaf_bytes: MIN_LEAF_BYTES,
+                prefer: None,
+            };
+            write_frame(&mut io, Kind::Open, &open.encode().unwrap(), &limits(), &mut rx)
+                .await
+                .unwrap();
+            read_frame(&mut io, &[Kind::FastForwardInfo], &limits(), &mut rx)
+                .await
+                .unwrap();
+            if announce {
+                let mut request = source.snapshot().as_bytes().to_vec();
+                request.extend(2_u32.to_be_bytes());
+                write_frame(&mut io, Kind::LeafRequest, &request, &limits(), &mut rx)
+                    .await
+                    .unwrap();
+                read_frame(&mut io, &[Kind::LeafReady], &limits(), &mut rx)
+                    .await
+                    .unwrap();
+            }
+            let mut request = source.snapshot().as_bytes().to_vec();
+            request.extend(2_u32.to_be_bytes());
+            request.extend(offset.to_be_bytes());
+            request.extend(length.to_be_bytes());
+            write_frame(&mut io, Kind::LeafChunkRequest, &request, &limits(), &mut rx)
+                .await
+                .unwrap();
+            assert!(
+                matches!(run.await.unwrap(), Err(WireError::Protocol(_))),
+                "{announce} {offset} {length}"
+            );
+            assert_eq!(source.chunks.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// Spec P4.1 §3.1: each session kind accepts its own requests only: a
+    /// fast-forward session ends on a chunk or poll request, a snapshot
+    /// session on any leaf request — as protocol errors, before any provider
+    /// call.
+    #[tokio::test]
+    async fn each_session_kind_accepts_only_its_own_requests() {
+        for (kind, size) in [
+            (Kind::ChunkRequest, 32),
+            (Kind::PollRequest, 28),
+            (Kind::Fence, FENCE_BYTES),
+        ] {
+            let history = Uuid::new_v4();
+            let source = Arc::new(LeafSource::new(history, 10, 20));
+            let (_shutdown, mut rx) = watch::channel(false);
+            let (mut io, peer) = duplex(64 * 1024);
+            let run = serve_leaves(peer, source.clone(), history, rx.clone());
+            raw_open(&mut io, &receiver().hello(Some(history), Some(10)), &mut rx).await;
+            let open = OpenRequest::FastForward {
+                history,
+                after: 10,
+                leaf_bytes: MIN_LEAF_BYTES,
+                prefer: None,
+            };
+            write_frame(&mut io, Kind::Open, &open.encode().unwrap(), &limits(), &mut rx)
+                .await
+                .unwrap();
+            read_frame(&mut io, &[Kind::FastForwardInfo], &limits(), &mut rx)
+                .await
+                .unwrap();
+            // The header is refused before its payload is read.
+            io.write_all(&header(kind, size as u32)).await.unwrap();
+            assert!(matches!(run.await.unwrap(), Err(WireError::Protocol(_))), "{kind:?}");
+        }
+        for (kind, size) in [
+            (Kind::LeafDigestsRequest, LEAF_DIGESTS_REQUEST_BYTES),
+            (Kind::LeafRequest, LEAF_REQUEST_BYTES),
+            (Kind::LeafChunkRequest, 32),
+        ] {
+            let source = Arc::new(MockSource::new());
+            let (_shutdown, mut rx) = watch::channel(false);
+            let (mut io, peer) = duplex(256);
+            let run = tokio::spawn(server(peer, source.clone(), Arc::new(AtomicUsize::new(0)), rx.clone()));
+            raw_open(&mut io, &fresh(), &mut rx).await;
+            write_frame(&mut io, Kind::Open, &[0], &limits(), &mut rx)
+                .await
+                .unwrap();
+            read_frame(&mut io, &[Kind::Manifest], &limits(), &mut rx)
+                .await
+                .unwrap();
+            io.write_all(&header(kind, size as u32)).await.unwrap();
+            assert!(matches!(run.await.unwrap(), Err(WireError::Protocol(_))), "{kind:?}");
+            assert_eq!(source.chunks.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    /// Spec P4.1 §3.1: a receiver does not open a fast-forward with a source
+    /// whose `HelloOk` lacks [`CAP_FAST_FORWARD`]: refused before anything is
+    /// sent, naming `--full`.
+    #[tokio::test]
+    async fn a_source_without_the_capability_is_never_asked_for_a_fast_forward() {
+        let history = Uuid::new_v4();
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, mut peer) = duplex(256);
+        let mut peer_rx = rx.clone();
+        let run = tokio::spawn(async move {
+            read_frame(&mut peer, &[Kind::Auth], &limits(), &mut peer_rx).await?;
+            write_frame(&mut peer, Kind::AuthOk, &[], &limits(), &mut peer_rx).await?;
+            read_frame(&mut peer, &[Kind::Hello], &limits(), &mut peer_rx).await?;
+            let ok = HelloOk {
+                node_id: Uuid::new_v4(),
+                history,
+                epoch: 1,
+                barrier: 0,
+                capabilities: CAP_HEARTBEAT,
+                physical_endpoint: String::new(),
+                pg_port: 0,
+            };
+            write_frame(&mut peer, Kind::HelloOk, &ok.encode()?, &limits(), &mut peer_rx).await?;
+            // Nothing more arrives: the receiver refused on its own.
+            Ok::<_, WireError>(
+                read_frame(&mut peer, &[Kind::Open], &limits(), &mut peer_rx)
+                    .await
+                    .is_err(),
+            )
+        });
+        let mut client =
+            PhysicalClient::authenticate(io, &token(), receiver().hello(Some(history), Some(10)), limits(), rx)
+                .await
+                .unwrap();
+        assert!(!client.fast_forward());
+        let outcome = client.open_fast_forward(history, 10, MIN_LEAF_BYTES, None).await;
+        assert!(
+            matches!(&outcome, Err(WireError::Refused(refusal)) if refusal.reason.contains("use --full")),
+            "{:?}",
+            outcome.err()
+        );
+        drop(client);
+        assert!(run.await.unwrap().unwrap(), "no open was sent");
+    }
+
+    // --- spec P4.1b: TCP_NODELAY and one-write frames -----------------------
+
+    /// A writer that takes every buffer whole and counts the writes and
+    /// flushes it is given: one `write_all` is exactly one `poll_write`.
+    #[derive(Default)]
+    struct WriteRecorder {
+        bytes: Vec<u8>,
+        writes: usize,
+        flushes: usize,
+    }
+    impl AsyncWrite for WriteRecorder {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            this.writes += 1;
+            this.bytes.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.get_mut().flushes += 1;
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Spec P4.1b §2.2: a frame whose payload is at most `SMALL_FRAME_BYTES`
+    /// reaches the transport in ONE write; a larger one as its header, then
+    /// its payload — spec P4.1c: in steps of at most `FRAME_IO_STEP`. The
+    /// bytes are the same either way (the header, then the payload), one
+    /// flush ends every frame, and they decode to the same frame.
+    #[tokio::test]
+    async fn a_small_frame_is_one_write_and_a_large_one_its_header_then_steps() {
+        let (_shutdown, mut rx) = watch::channel(false);
+        for (kind, length, writes) in [
+            (Kind::Close, 0, 1),
+            (Kind::ChunkRequest, 32, 1),
+            (Kind::Chunk, SMALL_FRAME_BYTES, 1),
+            (Kind::Chunk, SMALL_FRAME_BYTES + 1, 2),
+            (Kind::Chunk, FRAME_IO_STEP, 2),
+            (Kind::Chunk, CHUNK_META + MAX_CHUNK_BYTES, 3),
+            (Kind::Batch, 3 * FRAME_IO_STEP + 5, 5),
+        ] {
+            let payload: Vec<u8> = (0..=u8::MAX).cycle().take(length).collect();
+            let mut recorder = WriteRecorder::default();
+            write_frame(&mut recorder, kind, &payload, &limits(), &mut rx)
+                .await
+                .unwrap();
+            assert_eq!(recorder.writes, writes, "{kind:?} with {length} payload bytes");
+            assert_eq!(recorder.flushes, 1, "{kind:?}: every frame is flushed");
+            let mut wire = header(kind, u32::try_from(length).unwrap());
+            wire.extend(&payload);
+            assert_eq!(recorder.bytes, wire, "{kind:?}: the bytes on the wire are unchanged");
+            let mut reader = recorder.bytes.as_slice();
+            let frame = read_frame(&mut reader, &[kind], &limits(), &mut rx).await.unwrap();
+            assert_eq!(frame.kind, kind);
+            assert_eq!(frame.payload, payload, "{kind:?}");
+            assert!(reader.is_empty(), "{kind:?}: one frame, nothing after it");
+        }
+    }
+
+    /// Spec P4.1b §2.1: both ends of a real loopback session set
+    /// `TCP_NODELAY` before anything is sent — the source in
+    /// [`accept_replication`], the receiver in
+    /// [`PhysicalClient::connect_replication`]. Asserted on the `TcpStream`
+    /// each side's plaintext `ReplicationStream` wraps, after the receiver
+    /// authenticated; the TLS branch of both functions hands the same socket,
+    /// after the same call, to its handshake (this module has no TLS
+    /// fixture).
+    #[tokio::test]
+    async fn both_ends_of_a_replication_session_set_nodelay() {
+        let listener = bind_replication("127.0.0.1:0".parse().unwrap(), false, false)
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let source = Arc::new(MockSource::new());
+        let history = source.manifest.history;
+        let (_shutdown, rx) = watch::channel(false);
+        let mut server_rx = rx.clone();
+        let run = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let stream = accept_replication(socket, None, &limits(), &mut server_rx).await?;
+            let ReplicationStream::Plain(accepted) = &stream else {
+                panic!("a listener without an acceptor serves plaintext");
+            };
+            let nodelay = accepted.nodelay()?;
+            let context = SourceContext::unobserved(identity(history));
+            serve_session(
+                stream,
+                &token(),
+                limits(),
+                server_rx,
+                &context,
+                None,
+                move |_| async move { Ok(source as Arc<dyn PhysicalSource>) },
+            )
+            .await?;
+            Ok::<_, WireError>(nodelay)
+        });
+        let client = PhysicalClient::connect_replication(
+            address,
+            &ReplicationTransport::default(),
+            &token(),
+            fresh(),
+            limits(),
+            rx,
+        )
+        .await
+        .unwrap();
+        let ReplicationStream::Plain(connected) = &client.io else {
+            panic!("a loopback transport without TLS is plaintext");
+        };
+        assert!(connected.nodelay().unwrap(), "the receiver's end sets TCP_NODELAY");
+        assert!(!client.tls());
+        client.close().await.unwrap();
+        assert!(run.await.unwrap().unwrap(), "the source's end sets TCP_NODELAY");
+    }
+
+    // --- spec P4.1c: write groups of any size -------------------------------
+
+    /// A frame timeout of 1 s, the spec's idle-timeout fixture.
+    fn idle_limits() -> WireLimits {
+        WireLimits {
+            frame_timeout: Duration::from_secs(1),
+            ..limits()
+        }
+    }
+
+    /// A peer sending one `Batch` frame of `steps` × `FRAME_IO_STEP` payload
+    /// bytes, one step every `every`, and once, before step `at`, pausing
+    /// `stall` longer.
+    fn slow_batch_peer(
+        mut peer: DuplexStream,
+        steps: usize,
+        every: Duration,
+        stall: Option<(usize, Duration)>,
+    ) -> tokio::task::JoinHandle<std::io::Result<()>> {
+        tokio::spawn(async move {
+            peer.write_all(&header(Kind::Batch, u32::try_from(steps * FRAME_IO_STEP).unwrap()))
+                .await?;
+            let step = vec![0x5A_u8; FRAME_IO_STEP];
+            for index in 0..steps {
+                if let Some((at, pause)) = stall {
+                    if index == at {
+                        tokio::time::sleep(pause).await;
+                    }
+                }
+                tokio::time::sleep(every).await;
+                peer.write_all(&step).await?;
+            }
+            peer.flush().await
+        })
+    }
+
+    /// Spec P4.1c §3: a payload is read in steps, each bounded by the frame
+    /// timeout — an idle timeout. A 100 MiB `Batch` frame from a peer that
+    /// writes 1 MiB every 200 ms takes twenty frame timeouts of 1 s in all and
+    /// is read whole. (Paused time: the 20 s pass at once, timers in order.)
+    #[tokio::test(start_paused = true)]
+    async fn a_large_frame_from_a_peer_that_keeps_sending_never_times_out() {
+        let (_shutdown, mut rx) = watch::channel(false);
+        let (mut io, peer) = duplex(256 * 1024);
+        let started = tokio::time::Instant::now();
+        let feeder = slow_batch_peer(peer, 100, Duration::from_millis(200), None);
+        let frame = read_frame(&mut io, &[Kind::Batch], &idle_limits(), &mut rx)
+            .await
+            .unwrap();
+        assert_eq!(frame.kind, Kind::Batch);
+        assert_eq!(frame.payload.len(), 100 * FRAME_IO_STEP);
+        assert_eq!(
+            (frame.payload.first(), frame.payload.last()),
+            (Some(&0x5A), Some(&0x5A))
+        );
+        assert!(
+            started.elapsed() >= Duration::from_secs(20),
+            "the frame took {:?}, twenty frame timeouts",
+            started.elapsed()
+        );
+        feeder.await.unwrap().unwrap();
+    }
+
+    /// Spec P4.1c §3: a peer that stops mid-payload for 2 s fails the read
+    /// with the timeout (1 s): the step it stalled in ran out.
+    #[tokio::test(start_paused = true)]
+    async fn a_large_frame_from_a_peer_that_stalls_mid_payload_times_out() {
+        let (_shutdown, mut rx) = watch::channel(false);
+        let (mut io, peer) = duplex(256 * 1024);
+        let feeder = slow_batch_peer(peer, 100, Duration::ZERO, Some((50, Duration::from_secs(2))));
+        let outcome = read_frame(&mut io, &[Kind::Batch], &idle_limits(), &mut rx).await;
+        assert!(matches!(outcome, Err(WireError::Timeout)), "{:?}", outcome.err());
+        drop(io);
+        assert!(feeder.await.unwrap().is_err(), "the reader is gone");
+    }
+
+    /// Spec P4.1c: writing is stepped the same way. A 100 MiB `Batch` frame
+    /// to a peer that reads 1 MiB every 200 ms is written whole; to a peer
+    /// that stops reading for 2 s half-way, the write fails with the timeout.
+    #[tokio::test(start_paused = true)]
+    async fn a_large_frame_is_written_to_a_slow_reader_and_times_out_on_a_stalled_one() {
+        let payload = vec![0x5A_u8; 100 * FRAME_IO_STEP];
+        for stall in [false, true] {
+            let (_shutdown, mut rx) = watch::channel(false);
+            let (mut io, mut peer) = duplex(64 * 1024);
+            let reader = tokio::spawn(async move {
+                let mut header = [0_u8; HEADER_BYTES];
+                peer.read_exact(&mut header).await?;
+                let mut step = vec![0_u8; FRAME_IO_STEP];
+                for index in 0..100 {
+                    let pause = if stall && index == 50 {
+                        Duration::from_secs(2)
+                    } else {
+                        Duration::from_millis(200)
+                    };
+                    tokio::time::sleep(pause).await;
+                    peer.read_exact(&mut step).await?;
+                }
+                Ok::<_, std::io::Error>(())
+            });
+            let outcome = write_frame(&mut io, Kind::Batch, &payload, &idle_limits(), &mut rx).await;
+            if stall {
+                assert!(matches!(outcome, Err(WireError::Timeout)), "{:?}", outcome.err());
+                drop(io);
+                assert!(reader.await.unwrap().is_err(), "the writer is gone");
+            } else {
+                outcome.unwrap();
+                reader.await.unwrap().unwrap();
+            }
+        }
+    }
+
+    /// A write group of one put of `value_bytes`, at source sequence `first`.
+    fn sized_batch(history: Uuid, first: u64, value_bytes: usize) -> PhysicalBatch {
+        let mut native = rocksdb::WriteBatch::default();
+        native.put(format!("k{first}"), vec![7_u8; value_bytes]);
+        let mut raw = native.data().to_vec();
+        raw[..8].copy_from_slice(&first.to_le_bytes());
+        let digest = Sha256::digest(&raw).into();
+        PhysicalBatch::decode(history, first, raw, digest).unwrap()
+    }
+
+    /// [`MockSource`]'s snapshot session (cut 10), whose poll at the cut
+    /// returns `batches`.
+    struct BatchesSource {
+        inner: MockSource,
+        batches: Vec<PhysicalBatch>,
+    }
+    #[async_trait]
+    impl PhysicalSource for BatchesSource {
+        fn session_info(&self) -> &SourceSessionInfo {
+            &self.inner.info
+        }
+        async fn read_chunk(&self, index: u32, offset: u64, length: u32) -> Result<Vec<u8>> {
+            self.inner.read_chunk(index, offset, length).await
+        }
+        async fn poll(&self, after: u64, _limit: usize) -> Result<PhysicalPoll> {
+            let barrier = self.batches.last().map_or(after, PhysicalBatch::last_sequence);
+            Ok(PhysicalPoll {
+                batches: if after == 10 { self.batches.clone() } else { Vec::new() },
+                through: if after == 10 { barrier } else { after },
+                durable_barrier: barrier,
+            })
+        }
+    }
+
+    /// Spec P4.1c §3: a poll's byte limit is a coalescing target on the
+    /// wire. A source serves a first batch above the receiver's limit and
+    /// the receiver applies it; a second batch that takes the poll past the
+    /// limit is refused by the source before anything of the poll is sent.
+    #[tokio::test]
+    async fn a_first_batch_above_the_poll_limit_is_served_and_a_second_crossing_it_is_refused() {
+        const LIMIT: usize = 1024;
+        for crossing in [false, true] {
+            let inner = MockSource::new();
+            let history = inner.manifest.history;
+            let batches = if crossing {
+                vec![sized_batch(history, 11, 64), sized_batch(history, 12, 2 * LIMIT)]
+            } else {
+                vec![sized_batch(history, 11, 2 * LIMIT)]
+            };
+            assert!(batches.last().unwrap().data().len() > LIMIT, "precondition");
+            let source = Arc::new(BatchesSource { inner, batches });
+            let (_shutdown, rx) = watch::channel(false);
+            let (client_io, server_io) = duplex(64 * 1024);
+            let server_rx = rx.clone();
+            let run = tokio::spawn(async move {
+                let context = SourceContext::unobserved(identity(history));
+                serve_session(
+                    server_io,
+                    &token(),
+                    limits(),
+                    server_rx,
+                    &context,
+                    None,
+                    move |_| async move { Ok(source as Arc<dyn PhysicalSource>) },
+                )
+                .await
+            });
+            let mut client = PhysicalClient::authenticate(client_io, &token(), fresh(), limits(), rx)
+                .await
+                .unwrap();
+            client.fetch_manifest(Some(history)).await.unwrap();
+            let mut sink = Sink::default();
+            let outcome = client.poll(10, LIMIT, &mut sink).await;
+            if crossing {
+                assert!(outcome.is_err(), "{crossing}");
+                assert!(sink.received.is_empty(), "nothing of the poll was sent");
+                let served = run.await.unwrap();
+                assert!(
+                    matches!(&served, Err(WireError::Protocol(reason)) if reason.contains("oversized")),
+                    "{:?}",
+                    served.err()
+                );
+            } else {
+                let summary = outcome.unwrap();
+                assert_eq!((summary.through, summary.batches), (11, 1));
+                assert_eq!(sink.received, vec![(history, 11, 11)]);
+                client.close().await.unwrap();
+                run.await.unwrap().unwrap();
+            }
+        }
+    }
+
+    /// Spec P4.1c §3: the receiver checks the same rule on its own. From a
+    /// source that sends a first batch above the limit, it applies it; a
+    /// second batch that takes a poll past the limit is refused before the
+    /// sink sees it — and (spec P4.1d) so is the valid batch before it in the
+    /// same poll, the poll's batches reaching the sink together — and the
+    /// session is poisoned.
+    #[tokio::test]
+    async fn a_receiver_accepts_a_first_batch_above_its_limit_and_refuses_a_second_crossing_it() {
+        const LIMIT: usize = 1024;
+        let source = MockSource::new();
+        let history = source.manifest.history;
+        let manifest = serde_json::to_vec(&source.manifest).unwrap();
+        let batches = vec![
+            sized_batch(history, 11, 2 * LIMIT),
+            sized_batch(history, 12, 64),
+            sized_batch(history, 13, 2 * LIMIT),
+        ];
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, mut peer) = duplex(64 * 1024);
+        let mut peer_rx = rx.clone();
+        let run = tokio::spawn(async move {
+            raw_accept(&mut peer, history, &mut peer_rx).await?;
+            read_frame(&mut peer, &[Kind::Open], &limits(), &mut peer_rx).await?;
+            write_frame(&mut peer, Kind::Manifest, &manifest, &limits(), &mut peer_rx).await?;
+            let polls = [
+                (
+                    PollSummary {
+                        through: 11,
+                        durable_barrier: 13,
+                        batches: 1,
+                    },
+                    &batches[..1],
+                ),
+                (
+                    PollSummary {
+                        through: 13,
+                        durable_barrier: 13,
+                        batches: 2,
+                    },
+                    &batches[1..],
+                ),
+            ];
+            for (summary, sent) in polls {
+                read_frame(&mut peer, &[Kind::PollRequest], &limits(), &mut peer_rx).await?;
+                write_frame(&mut peer, Kind::PollStart, &summary.encode(), &limits(), &mut peer_rx).await?;
+                for batch in sent {
+                    let mut payload = batch.history().as_bytes().to_vec();
+                    payload.extend(batch.first_sequence().to_be_bytes());
+                    payload.extend(batch.digest());
+                    payload.extend(batch.data());
+                    write_frame(&mut peer, Kind::Batch, &payload, &limits(), &mut peer_rx).await?;
+                }
+                write_frame(&mut peer, Kind::PollEnd, &summary.encode(), &limits(), &mut peer_rx).await?;
+            }
+            Ok::<_, WireError>(())
+        });
+        let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx)
+            .await
+            .unwrap();
+        client.fetch_manifest(Some(history)).await.unwrap();
+        let mut sink = Sink::default();
+        let first = client.poll(10, LIMIT, &mut sink).await.unwrap();
+        assert_eq!((first.through, first.batches), (11, 1), "a first batch above the limit");
+        assert_eq!(sink.received, vec![(history, 11, 11)]);
+        assert!(matches!(
+            client.poll(11, LIMIT, &mut sink).await,
+            Err(WireError::Protocol(_))
+        ));
+        // Spec P4.1d: a poll's batches reach the sink as one run once all of
+        // it validated, so neither the crossing batch nor the valid one before
+        // it in the same poll was handed over.
+        assert_eq!(
+            sink.received,
+            vec![(history, 11, 11)],
+            "nothing of the refused poll reached the sink"
+        );
+        assert!(matches!(
+            client.poll(11, LIMIT, &mut sink).await,
+            Err(WireError::Poisoned)
+        ));
+        drop(client);
+        let _ = run.await.unwrap();
+    }
+
+    // --- review of spec P4.1d -------------------------------------------------
+
+    /// A source waits for a receiver's next request as long as the receiver
+    /// may take to apply the poll it was sent — its operation timeout — plus
+    /// a frame timeout (`limits()`: 3 s + 2 s), not one frame timeout: a
+    /// receiver that sends its next poll 4 s after the last one (applying a
+    /// large write group) is still served. One that waits 6 s is not.
+    /// (Paused time: the waits pass at once, timers in order.)
+    #[tokio::test(start_paused = true)]
+    async fn a_source_waits_for_the_next_request_while_the_receiver_applies() {
+        for (pause, served) in [(Duration::from_secs(4), true), (Duration::from_secs(6), false)] {
+            let source = Arc::new(MockSource::new());
+            let history = source.manifest.history;
+            let (_shutdown, rx) = watch::channel(false);
+            let (io, peer) = duplex(64 * 1024);
+            let run = tokio::spawn(server(peer, source, Arc::new(AtomicUsize::new(0)), rx.clone()));
+            let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx)
+                .await
+                .unwrap();
+            client.fetch_manifest(Some(history)).await.unwrap();
+            let mut sink = Sink::default();
+            assert_eq!(client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap().through, 11);
+            // The receiver applies the poll (and fsyncs it) before it asks again.
+            tokio::time::sleep(pause).await;
+            let next = client.poll(11, MAX_POLL_BYTES, &mut sink).await;
+            if served {
+                assert_eq!(next.unwrap().batches, 0, "{pause:?}");
+                client.close().await.unwrap();
+                run.await.unwrap().unwrap();
+            } else {
+                assert!(next.is_err(), "{pause:?}");
+                assert!(
+                    matches!(run.await.unwrap(), Err(WireError::Timeout)),
+                    "the source gave up waiting after {pause:?}"
+                );
+            }
+        }
+    }
+
+    /// Review P4.1d: a poll's second `Batch` frame whose header announces
+    /// more than what is left of the poll's limit is refused from its header,
+    /// before its payload is allocated or awaited — here a header announcing
+    /// 3 GiB that no payload follows: refused at once (a protocol error),
+    /// not after a frame timeout.
+    #[tokio::test]
+    async fn a_later_batch_header_past_the_poll_limit_is_refused_before_its_payload() {
+        const LIMIT: usize = 1024;
+        let source = MockSource::new();
+        let history = source.manifest.history;
+        let manifest = serde_json::to_vec(&source.manifest).unwrap();
+        let first = sized_batch(history, 11, 64);
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, mut peer) = duplex(64 * 1024);
+        let mut peer_rx = rx.clone();
+        let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+        let run = tokio::spawn(async move {
+            raw_accept(&mut peer, history, &mut peer_rx).await?;
+            read_frame(&mut peer, &[Kind::Open], &limits(), &mut peer_rx).await?;
+            write_frame(&mut peer, Kind::Manifest, &manifest, &limits(), &mut peer_rx).await?;
+            read_frame(&mut peer, &[Kind::PollRequest], &limits(), &mut peer_rx).await?;
+            let summary = PollSummary {
+                through: 12,
+                durable_barrier: 12,
+                batches: 2,
+            };
+            write_frame(&mut peer, Kind::PollStart, &summary.encode(), &limits(), &mut peer_rx).await?;
+            let mut payload = first.history().as_bytes().to_vec();
+            payload.extend(first.first_sequence().to_be_bytes());
+            payload.extend(first.digest());
+            payload.extend(first.data());
+            write_frame(&mut peer, Kind::Batch, &payload, &limits(), &mut peer_rx).await?;
+            let announced = u32::try_from(BATCH_META + 3 * 1024 * 1024 * 1024).unwrap();
+            peer.write_all(&header(Kind::Batch, announced)).await?;
+            peer.flush().await?;
+            let _ = sent_tx.send(());
+            // Hold the connection open, sending nothing more.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok::<_, WireError>(())
+        });
+        let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx)
+            .await
+            .unwrap();
+        client.fetch_manifest(Some(history)).await.unwrap();
+        let mut sink = Sink::default();
+        let started = tokio::time::Instant::now();
+        let outcome = client.poll(10, LIMIT, &mut sink).await;
+        assert!(
+            matches!(&outcome, Err(WireError::Protocol(_))),
+            "refused from the header: {:?}",
+            outcome.err()
+        );
+        assert!(
+            started.elapsed() < limits().frame_timeout,
+            "not after waiting for a payload"
+        );
+        assert!(sink.received.is_empty(), "nothing of the poll reached the sink");
+        sent_rx.await.unwrap();
+        drop(client);
+        run.abort();
     }
 }
