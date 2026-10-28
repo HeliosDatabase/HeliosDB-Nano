@@ -237,6 +237,14 @@ const SITES: &[(&str, &str, usize, Scan)] = &[
         1,
         Scan::TotalOrder,
     ),
+    // Spec P5.1 §4 step 4b: the promotion writer's reverse walk to the highest
+    // retained `wal:entries:` key (both bounds set, total order).
+    (
+        "src/replication/physical.rs",
+        "highest_logical_entry",
+        1,
+        Scan::TotalOrder,
+    ),
     // The sync change log (`src/sync` is not compiled: `// pub mod sync;`).
     ("src/sync/change_log.rs", "query", 1, Scan::TotalOrder),
     ("src/sync/change_log.rs", "compact", 1, Scan::TotalOrder),

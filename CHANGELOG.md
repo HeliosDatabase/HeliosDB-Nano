@@ -429,6 +429,15 @@ Oracle's `SWITCHOVER` / `FAILOVER TO` and PostgreSQL's timelines
 - `SWITCHOVER TO` / `SWITCHOVER CHECK` stay refused; their messages name
   `heliosdb-nano promote` and `SELECT pg_promote(true, N)` (P5.2, not defined
   in this release).
+- **A standby no longer drops its session during a bulk statement on the
+  primary**: it waited for a poll's `PollStart` one frame timeout (30 s) while
+  the primary may take its operation deadline (120 s) to collect the poll —
+  under a 50 000-row `INSERT … SELECT` in a debug build the standby went
+  `reconnecting` ("physical transfer deadline expired") with its cursor
+  stuck — so it now waits the operation deadline plus a frame timeout, and a
+  poll stops after 65 536 write groups whatever their size (`through` below
+  the barrier: the standby and the archiver poll again at once), so a poll of
+  tiny groups answers within seconds.
 
 ### Fixed — replication (fireproof, plan §D5)
 - **`enable_lockfree_ingestion` is refused on every HA role.** It writes rows

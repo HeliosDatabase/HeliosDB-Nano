@@ -1298,8 +1298,13 @@ The test suites are listed in the [HA testing guide](ha_testing.md).
   single 1 000 000-row statement of ~900-byte rows is about a gigabyte). The poll
   limit (32 MiB on a serving standby; at most 256 MiB, `resync
   --poll-byte-limit`) only decides how many small write groups travel
-  together: a larger one travels alone. A serving standby holds one poll
-  twice while it applies it — its frames, then its decoded run — so allow
+  together: a larger one travels alone. A poll also stops after 65 536 write
+  groups whatever their size, and the standby waits for a poll's first frame
+  as long as the primary may take to collect it (its 120 s operation deadline
+  plus the 30 s frame timeout), so a storm of tiny write groups (a bulk
+  `INSERT … SELECT`) is served in polls that each answer within seconds, the
+  standby asking again at once while it is behind. A serving standby holds
+  one poll twice while it applies it — its frames, then its decoded run — so allow
   about 64 MiB for it on top of that. The bound is what one frame can say,
   4 GiB less 4 KiB of raw write group: a larger one cannot be replicated or
   archived. A standby that reaches it is refused with `GroupTooLarge`, naming

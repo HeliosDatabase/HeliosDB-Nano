@@ -71,8 +71,20 @@ const MAX_FAST_FORWARD_LEAVES: usize = 1 << 24;
 /// metadata, a segment frame's metadata and its AES-GCM sealing), with slack.
 /// A write group is the unit of atomicity and is never split, so this is the
 /// only bound on its size; how many groups travel together is a poll's byte
-/// limit, a coalescing target ([`poll_source`]).
+/// limit, a coalescing target ([`poll_source`]), and [`MAX_POLL_GROUPS`].
 pub const MAX_BATCH_BYTES: usize = u32::MAX as usize - 4096;
+/// The most write groups one poll collects ([`poll_source`],
+/// [`poll_source_cascade`]), whatever its byte limit. A poll costs per group
+/// as much as per byte — each is read from the WAL, validated, copied and
+/// digested before the poll's first frame is sent, and the receiver applies
+/// and accounts for each — so a byte limit alone lets a poll of tiny groups
+/// (a bulk statement commits many of ~100 bytes) gather hundreds of thousands
+/// of them and, in a debug build under a write storm, take longer than the
+/// receiver waits for its answer. 65 536 groups answer within seconds even
+/// there. The poll stops as at its byte limit: `through` at the last group
+/// collected, the barrier unchanged, so the receiver (and the archiver) sees
+/// it is behind and polls again at once.
+pub const MAX_POLL_GROUPS: usize = 65_536;
 /// A node-local batch ([`LocalWriter::write_local`]) is never a source
 /// group: it keeps the bound every batch had before spec P4.1c, far below
 /// the count field's width (its cursor put is one more operation).
@@ -474,7 +486,8 @@ impl FlushMemo {
 /// size — a group is the unit of atomicity, never split, and one larger than
 /// the limit would otherwise never be served — and a later one joins it only
 /// while the poll's raw bytes stay within the limit. So a limit of one byte
-/// reads exactly one group.
+/// reads exactly one group. It also stops after [`MAX_POLL_GROUPS`] groups,
+/// with the same outcome: `through` below the barrier, polled again at once.
 ///
 /// Spec P4.1d: the reported barrier is durable — the WAL is fsynced after it
 /// was sampled, unless `memo` (the caller's, one per source) shows an earlier
@@ -505,7 +518,9 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize, memo: 
     }
     let mut iterator = db.get_updates_since(after)?;
     let mut bytes = 0_usize;
-    while result.through < barrier {
+    // A poll of tiny groups stops at a count too (`MAX_POLL_GROUPS`), so it
+    // answers within seconds; the rest is the next poll's.
+    while result.through < barrier && result.batches.len() < MAX_POLL_GROUPS {
         let Some(entry) = iterator.next() else {
             iterator.status()?;
             // No record at all although the interval is not empty: the WAL
@@ -1008,7 +1023,9 @@ pub fn poll_source_cascade(
         bytes += batch.raw.len();
         result.through = batch.last;
         result.batches.push(batch);
-        if result.through == barrier {
+        // As `poll_source`: at the barrier, or at `MAX_POLL_GROUPS` groups
+        // (the rest is the next poll's).
+        if result.through == barrier || result.batches.len() >= MAX_POLL_GROUPS {
             break;
         }
     }
@@ -3388,6 +3405,62 @@ mod tests {
             assert_eq!(ours.digest(), theirs.digest());
             assert_eq!(ours.data(), theirs.data());
         }
+    }
+
+    /// A poll stops after [`MAX_POLL_GROUPS`] write groups whatever its byte
+    /// limit, exactly as at the limit: of `MAX_POLL_GROUPS + 10` one-put
+    /// groups (a few MiB in all, far inside the limit) the first poll carries
+    /// exactly `MAX_POLL_GROUPS`, `through` at the last one's sequence and the
+    /// barrier past it — the receiver sees it is behind and polls again at
+    /// once — and the next poll carries the 10 left. The same for a cascading
+    /// source serving those groups.
+    #[test]
+    fn a_poll_stops_after_max_poll_groups_and_the_next_one_carries_the_rest() {
+        const LEFT: usize = 10;
+        let root = TempDir::new().unwrap();
+        let source = open(&root.path().join("source"));
+        source.put(b"seed", b"keep").unwrap();
+        let history = Uuid::new_v4();
+        let (upstream, cut) = receiver_of(&source, &root.path().join("upstream"), history);
+        for index in 0..MAX_POLL_GROUPS + LEFT {
+            source.put(format!("data:tiny:{index:06}"), b"v").unwrap();
+        }
+        let bound = u64::try_from(MAX_POLL_GROUPS).unwrap();
+        let barrier = cut + bound + u64::try_from(LEFT).unwrap();
+        assert_eq!(source.latest_sequence_number(), barrier, "one sequence per group");
+
+        let first = poll_source(&source, history, cut, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
+        assert_eq!(first.batches.len(), MAX_POLL_GROUPS);
+        assert_eq!(first.through, cut + bound, "through at the last group collected");
+        assert_eq!(first.batches.last().unwrap().last_sequence(), first.through);
+        assert_eq!(first.durable_barrier, barrier, "the barrier unchanged: behind");
+        let rest = poll_source(&source, history, first.through, MAX_BATCH_BYTES, &FlushMemo::new()).unwrap();
+        assert_eq!(rest.batches.len(), LEFT);
+        assert_eq!(rest.batches[0].first_sequence(), first.through + 1);
+        assert_eq!((rest.through, rest.durable_barrier), (barrier, barrier));
+
+        for batch in first.batches.iter().chain(&rest.batches) {
+            assert!(upstream.apply_with(batch, Durability::Deferred).unwrap());
+        }
+        let writer = Arc::clone(upstream.writer());
+        assert_eq!(writer.sync().unwrap(), barrier);
+        let mut hint = CascadeHint::default();
+        let cascaded =
+            poll_source_cascade(writer.db(), history, cut, MAX_BATCH_BYTES, &mut hint, &FlushMemo::new()).unwrap();
+        assert_eq!(cascaded.batches.len(), MAX_POLL_GROUPS);
+        assert_eq!(cascaded.through, cut + bound);
+        assert_eq!(cascaded.durable_barrier, barrier);
+        let rest = poll_source_cascade(
+            writer.db(),
+            history,
+            cascaded.through,
+            MAX_BATCH_BYTES,
+            &mut hint,
+            &FlushMemo::new(),
+        )
+        .unwrap();
+        assert_eq!(rest.batches.len(), LEFT);
+        assert_eq!((rest.through, rest.durable_barrier), (barrier, barrier));
     }
 
     /// Spec P4.1c: a raw batch of 2 000 000 operations — twice the bound

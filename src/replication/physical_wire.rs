@@ -2010,7 +2010,8 @@ async fn read_frame<R: AsyncRead + Unpin>(
 /// [`read_frame`], waiting up to `header_wait` for the frame's header to
 /// arrive (its payload steps keep the frame timeout). A source waits this
 /// long for a receiver's next request: the receiver applies (and fsyncs) a
-/// whole poll before it sends one.
+/// whole poll before it sends one; a receiver for a poll's `PollStart`
+/// ([`read_reply_within`]): the source collects the whole poll first.
 async fn read_frame_within<R: AsyncRead + Unpin>(
     io: &mut R,
     allowed: &[Kind],
@@ -2205,9 +2206,23 @@ async fn read_reply<R: AsyncRead + Unpin>(
     limits: &WireLimits,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Frame> {
+    read_reply_within(io, expected, limits, limits.frame_timeout, shutdown).await
+}
+
+/// [`read_reply`], waiting up to `header_wait` for the reply's header (its
+/// payload steps keep the frame timeout, as [`read_frame_within`]). A
+/// receiver waits this long for a reply the source works on before it sends
+/// it: a poll's `PollStart` comes after the whole poll was collected.
+async fn read_reply_within<R: AsyncRead + Unpin>(
+    io: &mut R,
+    expected: &[Kind],
+    limits: &WireLimits,
+    header_wait: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Frame> {
     let mut allowed = expected.to_vec();
     allowed.push(Kind::Refuse);
-    let frame = read_frame(io, &allowed, limits, shutdown).await?;
+    let frame = read_frame_within(io, &allowed, limits, header_wait, shutdown).await?;
     match frame.kind {
         Kind::Refuse => Err(WireError::Refused(Refusal::decode(&frame.payload)?)),
         _ => Ok(frame),
@@ -2888,6 +2903,12 @@ where
                 {
                     return Err(invalid("invalid physical continuation request"));
                 }
+                // Collecting the poll — reading, validating and digesting its
+                // write groups, fsyncing the WAL — happens before `PollStart`
+                // is sent and is bounded by the operation timeout. The
+                // receiver waits that plus a frame timeout for `PollStart`
+                // (`PhysicalClient::poll`), so a source still within this
+                // bound is never a deadline on the receiver's side.
                 let poll = match bounded(
                     &mut shutdown,
                     limits.operation_timeout,
@@ -3536,7 +3557,23 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
                 &mut self.shutdown,
             )
             .await?;
-            let frame = read_reply(&mut self.io, &[Kind::PollStart], &self.limits, &mut self.shutdown).await?;
+            // The source sends `PollStart` only once it collected the whole
+            // poll (up to `byte_limit` of write groups, read, validated and
+            // digested, and its WAL fsynced), work it bounds by its operation
+            // timeout (`serve_session`, `Kind::PollRequest`). So the wait for
+            // `PollStart` is that plus a frame timeout: a frame timeout alone
+            // gives up on a source still within its own bound (a poll of many
+            // tiny write groups under a write storm). Every other frame of
+            // the poll keeps the frame timeout: it follows at once.
+            let poll_start_wait = self.limits.operation_timeout.saturating_add(self.limits.frame_timeout);
+            let frame = read_reply_within(
+                &mut self.io,
+                &[Kind::PollStart],
+                &self.limits,
+                poll_start_wait,
+                &mut self.shutdown,
+            )
+            .await?;
             let summary = PollSummary::decode(&frame.payload)?;
             summary.validate_since(after, byte_limit, self.known_barrier)?;
             sink.begin(summary).await?;
@@ -7195,6 +7232,102 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// [`MockSource`] whose poll takes `delay` to collect — as a source
+    /// reading, digesting and fsyncing a storm of tiny write groups does
+    /// before it sends `PollStart`.
+    struct SlowPoll {
+        inner: MockSource,
+        delay: Duration,
+    }
+    #[async_trait]
+    impl PhysicalSource for SlowPoll {
+        fn session_info(&self) -> &SourceSessionInfo {
+            &self.inner.info
+        }
+        async fn read_chunk(&self, index: u32, offset: u64, length: u32) -> Result<Vec<u8>> {
+            self.inner.read_chunk(index, offset, length).await
+        }
+        async fn poll(&self, after: u64, limit: usize) -> Result<PhysicalPoll> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.poll(after, limit).await
+        }
+    }
+
+    /// The mirror of the test above: a receiver waits for `PollStart` as long
+    /// as the source may take to collect the poll — the source's operation
+    /// timeout — plus a frame timeout (`limits()`: 3 s + 2 s), not one frame
+    /// timeout. A source that answers after 2.5 s (past the frame timeout,
+    /// within its own 3 s bound) is not a deadline: its poll is applied. A
+    /// peer that never answers is given up on after the 5 s, not the 2 s.
+    /// (Paused time: the waits pass at once, timers in order.)
+    #[tokio::test(start_paused = true)]
+    async fn a_receiver_waits_for_poll_start_while_the_source_collects_the_poll() {
+        let inner = MockSource::new();
+        let history = inner.manifest.history;
+        let delay = Duration::from_millis(2500);
+        assert!(
+            delay > limits().frame_timeout && delay < limits().operation_timeout,
+            "precondition"
+        );
+        let source = Arc::new(SlowPoll { inner, delay });
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, peer) = duplex(64 * 1024);
+        let server_rx = rx.clone();
+        let run = tokio::spawn(async move {
+            let context = SourceContext::unobserved(identity(history));
+            serve_session(
+                peer,
+                &token(),
+                limits(),
+                server_rx,
+                &context,
+                None,
+                move |_| async move { Ok(source as Arc<dyn PhysicalSource>) },
+            )
+            .await
+        });
+        let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx.clone())
+            .await
+            .unwrap();
+        client.fetch_manifest(Some(history)).await.unwrap();
+        let mut sink = Sink::default();
+        let started = tokio::time::Instant::now();
+        let summary = client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap();
+        assert!(started.elapsed() >= delay, "the poll took {:?}", started.elapsed());
+        assert_eq!((summary.through, summary.batches), (11, 1));
+        assert_eq!(sink.received, vec![(history, 11, 11)]);
+        client.close().await.unwrap();
+        run.await.unwrap().unwrap();
+
+        // A peer that reads the request and never answers it.
+        let silent = MockSource::new();
+        let history = silent.manifest.history;
+        let manifest = serde_json::to_vec(&silent.manifest).unwrap();
+        let (io, mut peer) = duplex(64 * 1024);
+        let mut peer_rx = rx.clone();
+        let stalled = tokio::spawn(async move {
+            raw_accept(&mut peer, history, &mut peer_rx).await?;
+            read_frame(&mut peer, &[Kind::Open], &limits(), &mut peer_rx).await?;
+            write_frame(&mut peer, Kind::Manifest, &manifest, &limits(), &mut peer_rx).await?;
+            read_frame(&mut peer, &[Kind::PollRequest], &limits(), &mut peer_rx).await?;
+            // Hold the connection open, sending nothing more.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<_, WireError>(())
+        });
+        let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx)
+            .await
+            .unwrap();
+        client.fetch_manifest(Some(history)).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let outcome = client.poll(10, MAX_POLL_BYTES, &mut Sink::default()).await;
+        assert!(matches!(outcome, Err(WireError::Timeout)), "{:?}", outcome.err());
+        let waited = started.elapsed();
+        let deadline = limits().operation_timeout + limits().frame_timeout;
+        assert!(waited >= deadline, "gave up after {waited:?}, before {deadline:?}");
+        drop(client);
+        stalled.abort();
     }
 
     /// Review P4.1d: a poll's second `Batch` frame whose header announces

@@ -79,7 +79,13 @@ impl Daemon {
             .arg("--replication-token-file")
             .arg(token)
             .args(args)
-            .env("RUST_LOG", "info")
+            // `HELIOSDB_TEST_DAEMON_LOG` lets a developer raise a daemon's log
+            // filter (e.g. `heliosdb_nano::replication=trace`) without editing
+            // the harness; the daemons' logs stay in the test directory.
+            .env(
+                "RUST_LOG",
+                std::env::var("HELIOSDB_TEST_DAEMON_LOG").unwrap_or_else(|_| "info".to_string()),
+            )
             .env_remove("HELIOSDB_NANO_READY_FILE")
             .stdin(Stdio::null())
             .stdout(Stdio::from(file.try_clone().unwrap()))
