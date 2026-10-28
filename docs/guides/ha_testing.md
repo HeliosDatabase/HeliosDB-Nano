@@ -2,7 +2,7 @@
 
 High availability in this release is one primary and its
 [physical standbys](physical-standby.md): read-only replicas that apply the
-primary's RocksDB write groups over one replication connection (`NPHYS003`) on
+primary's RocksDB write groups over one replication connection (`NPHYS004`) on
 the primary's replication port. This guide covers the automated suites, manual
 testing with the loopback pair fixture, and what to look at when something is
 wrong.
@@ -54,6 +54,19 @@ Related targets:
   `INSERT … SELECT`) followed by a standby, a cascaded standby, the archive and
   `recover --from-archive` (spec P4.1c); with `--features internal-tests`, a
   standby killed with the group's frame in flight resumes from its cursor;
+- `physical_promote`: `heliosdb-nano promote` (spec P5.1) — a graceful
+  promotion fencing the old primary (25006 on its writes, `/ready` 503,
+  `state = fenced`, FATAL 57P01 for its old sessions, `NANO-FENCED.json`), the
+  promoted node at epoch 2 of the same history, a standby of the old primary
+  fast-forwarded to the new one, the fenced primary restarted FENCED as a
+  primary (reads, 25006, `transaction_read_only = on`), refused as a standby
+  and rebuilt with `recover --from-primary --replace`, a forced promotion and
+  the superseded primary fencing itself when an epoch-2 receiver reaches it, a
+  running standby refused, a second promotion of the same epoch refused
+  (`pg_promote` 42883), no logical-WAL replay at the first open (the old
+  primary's checkpoint never advanced, a trigger workload), both epochs'
+  archives; with `--features internal-tests`, a promotion killed after each
+  step and finished by a re-run;
 - `logical_standby_removed`: a source scan that fails if a removed replication
   flag, module or symbol reappears in the code, tests, fixture, guides or skills;
 - `offline_reseed_tests`: the [offline snapshot helper](offline-reseed.md).
@@ -160,12 +173,47 @@ it again: it bootstraps a new copy.
 
 `--stop` ends both sides with SIGTERM.
 
+### The promote drill (spec P5.1)
+
+With the pair running and some rows written (`$D` is the fixture's directory,
+`$B` the binary; the fixture's token is `$D/replication.token`):
+
+```bash
+psql -h 127.0.0.1 -p 27721 -U postgres -c "INSERT INTO t VALUES (1001, 'before')"
+kill -TERM $(cat $D/standby.pid)                     # stop the standby
+psql -h 127.0.0.1 -p 27721 -U postgres -c "INSERT INTO t VALUES (1002, 'tail')"
+$B promote --data-dir $D/standby --primary-host 127.0.0.1:27741 \
+  --replication-token-file $D/replication.token     # fences the primary, tails it, converts
+curl -s http://127.0.0.1:27751/ready; echo          # 503, "state":"fenced"
+psql -h 127.0.0.1 -p 27721 -U postgres -c "INSERT INTO t VALUES (1003, 'x')"   # 25006 write refused
+$B status --data-dir $D/primary                      # role: fenced primary
+$B start --data-dir $D/standby --listen 127.0.0.1 --port 27722 --auth trust \
+  --replication-role primary --replication-port 27742 \
+  --replication-token-file $D/replication.token --http-port 27752 &
+psql -h 127.0.0.1 -p 27722 -U postgres -c "SELECT timeline_id::bigint FROM pg_control_checkpoint()"  # 2
+psql -h 127.0.0.1 -p 27722 -U postgres -c "SELECT count(*) FROM t"          # includes 1002
+```
+
+Then rebuild the old primary as a standby of the new one: stop it (restarted
+as a primary it comes up fenced — reads only, `/ready` 503; as a standby its
+`start` is refused, exit 2), and run `$B recover --from-primary --primary-host
+127.0.0.1:27742 --replace --data-dir $D/primary --replication-token-file
+$D/replication.token`. The forced variant: SIGKILL the primary first;
+`promote` without `--force` exits 2 after `--fence-timeout`, with `--force` it
+promotes and says `NOT fenced (--force)` (`--no-fence` skips contacting the
+primary entirely, for a rehearsal on a cloned directory). Kill a `promote`
+half-way (an `internal-tests` build honours
+`HELIOSDB_NANO_TEST_KILL_PROMOTE_AT=after-epoch`) and every open of the
+directory is refused until `promote` is run again.
+`tests/physical_promote.rs` automates all of it.
+
 ## Log lines
 
 Primary:
 
 ```
-Replication port listening on 127.0.0.1:27741 (NPHYS003, dataset history <uuid>)
+Replication port listening on 127.0.0.1:27741 (NPHYS004, dataset history <uuid>, epoch <n>)
+replication: this primary (history <uuid>, epoch 1) was FENCED by epoch 2 (promotion <uuid>) at its sequence <n>: …
 ```
 
 Standby, first start and restart:

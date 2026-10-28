@@ -111,6 +111,12 @@ fn switchover_refuses_and_changes_nothing() {
         message.contains("unsupported") && message.contains("fencing") && message.contains("no role was changed"),
         "refusal must be an actionable sentence naming unsupported, fencing and no role change, got: {message}"
     );
+    // Spec P5.1 §7: the refusal points at the promotion that exists (offline)
+    // and the one that follows (P5.2), and claims neither ran.
+    assert!(
+        message.contains("heliosdb-nano promote --data-dir") && message.contains("pg_promote(true, N)"),
+        "the refusal names `heliosdb-nano promote` and `pg_promote` (P5.2), got: {message}"
+    );
 
     assert_eq!(
         checked.expect("SWITCHOVER CHECK must execute as real SQL, not fail to parse or validate"),
@@ -166,10 +172,33 @@ fn switchover_refuses_and_changes_nothing() {
         "target_healthy must stay true for a connected standby"
     );
     match check_row.get(6) {
-        Some(Value::String(blockers)) => assert!(
-            blockers.contains("Runtime switchover/promotion is unsupported"),
-            "blockers must name the unsupported runtime, got: {blockers}"
-        ),
+        Some(Value::String(blockers)) => {
+            assert!(
+                blockers.contains("Runtime switchover/promotion is unsupported"),
+                "blockers must name the unsupported runtime, got: {blockers}"
+            );
+            // Spec P5.1 §7.
+            assert!(
+                blockers.contains("use `heliosdb-nano promote` (offline) or `SELECT pg_promote(true, N)` (P5.2)"),
+                "blockers must name the offline promotion and P5.2's pg_promote, got: {blockers}"
+            );
+        }
         other => panic!("blockers must be a String, got: {other:?}"),
     }
+
+    // Spec P5.1 §7, §11.I: `pg_promote` is NOT defined in P5.1 (P5.2 defines
+    // it): an UNDEFINED function — the error the wire answers 42883
+    // undefined_function (it names a function that is not found or unknown;
+    // `tests/physical_promote.rs` asserts the SQLSTATE on a real daemon) —
+    // never another failure that would hide a half-defined one.
+    let missing = db
+        .query("SELECT pg_promote(true, 5)", &[])
+        .expect_err("pg_promote must stay undefined until P5.2");
+    let lower = missing.to_string().to_lowercase();
+    assert!(
+        lower.contains("pg_promote")
+            && lower.contains("function")
+            && (lower.contains("not found") || lower.contains("does not exist") || lower.contains("unknown")),
+        "pg_promote must fail as an undefined function (42883): {missing}"
+    );
 }

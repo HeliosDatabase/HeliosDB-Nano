@@ -21,10 +21,23 @@
 //!    `{snapshot: T, source: T}`), so the standby resumes from `T` through
 //!    the primary's WAL or archive.
 //! 3. **Full copy.** The directory is no replica of this history (another
-//!    history, an older epoch, damaged), `--full` asks for it, or more than
+//!    history, damaged), `--full` asks for it, or more than
 //!    `--full-copy-threshold` of the primary's bytes differ: the resumable
 //!    snapshot download of `resync`, into the directory when it is empty,
 //!    else beside it (`<D>.recover-full`) and swapped in with `--replace`.
+//!
+//! # Epochs (spec P5.1 §6)
+//!
+//! A standby of the same history whose primary was promoted away from it —
+//! the primary answers `EpochStale` at a newer epoch — takes route 2: the
+//! fast-forward re-cuts it at the new primary's checkpoint, in the new
+//! primary's numbering and epoch (its `repl:epoch` arrives with the leaves),
+//! and the summary says what that did to what it held of the old primary. A
+//! primary that answers `SourceStale` is a superseded one: the command
+//! refuses, naming the fix (point `--primary-host` at the current primary).
+//! A primary's own directory — fenced by a promotion, or not (a dead primary
+//! being rebuilt) — of the same history takes route 3 beside it, swapped in
+//! with `--replace`, never anything in place.
 //!
 //! # Crash safety of the fast-forward
 //!
@@ -61,16 +74,17 @@ use super::checkpoint_transfer::{
     check_stage_files, check_stage_limits, partial_snapshot, physical_stage_history, recut_stage_with,
     stage_census_manifest, ReceiverStaging, ReopenedPhysicalStage, StagingStart,
 };
+use super::epoch::{read_directory_epoch, read_epoch, INITIAL_EPOCH};
 use super::fast_forward::{hash_file, local_leaf_digests, BATCH_LEAVES};
 use super::physical::{FastForwardRecord, FastForwardWriter, PhysicalCursor};
 use super::physical_receiver::{run_receiver, ReceiverMode, ReceiverOptions, ReceiverStart, ReceiverStatus};
 use super::physical_tls::{ReplicationStream, ReplicationTransport};
 use super::physical_wire::{
-    now_millis, valid_leaf_bytes, Heartbeat, LeafEntry, LeafPlan, PeerRole, PhysicalClient, ReceiverIdentity,
-    RefuseCode, SourceSessionInfo, TransferToken, WireError, WireLimits, WireSyncMode, LEAF_END,
+    now_millis, valid_leaf_bytes, Heartbeat, LastGroup, LeafEntry, LeafPlan, PeerRole, PhysicalClient,
+    ReceiverIdentity, RefuseCode, SourceSessionInfo, TransferToken, WireError, WireLimits, WireSyncMode, LEAF_END,
 };
-use crate::standby_posture::EPOCH;
 use crate::Config;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// `internal-tests` builds only: `<phase>:<index>` makes `recover
 /// --from-primary` SIGKILL its own process at that point of a fast-forward —
@@ -104,6 +118,15 @@ pub enum DirectoryState {
     Fresh { empty_existing: bool },
     /// An installed physical standby, its marker naming `history`.
     Physical { history: Uuid },
+    /// Spec P5.1 §6: a primary's directory of `history` — a fenced one (it
+    /// carries `NANO-FENCED.json`: a standby was promoted over it), or one
+    /// that is not fenced (an operator rebuilding a dead primary). Only a
+    /// full copy of the current primary rebuilds it, beside it, swapped in
+    /// with `--replace` (the old directory is kept); without `--replace` the
+    /// command exits 3 naming the file. Rewinding it in place is a
+    /// follow-up. Spec §11.G: `epoch` is the epoch its store holds; a source
+    /// at a LOWER epoch is the superseded one, and the recovery is refused.
+    Primary { history: Uuid, fenced: bool, epoch: u64 },
 }
 
 /// What [`recover_from_primary`] does.
@@ -427,7 +450,14 @@ struct Ladder<'a> {
     /// ([`canonical_path`]): every step works on these.
     data_dir: PathBuf,
     stage_dir: PathBuf,
+    /// The ladder's receiver identity; its epoch is [`Self::epoch`]'s.
     identity: ReceiverIdentity,
+    /// Spec P5.1 §6: the epoch the ladder's `Hello`s announce — the
+    /// standby's store's, and once the primary said it is at a newer epoch
+    /// of the same history (`EpochStale`), that one: the fast-forward re-cuts
+    /// the standby at the primary's checkpoint, `repl:epoch` included, so the
+    /// standby IS at the primary's epoch once it is done.
+    epoch: AtomicU64,
     /// Never sent: held so the sessions' shutdown watch stays open.
     _stop: watch::Sender<bool>,
     shutdown: watch::Receiver<bool>,
@@ -454,10 +484,14 @@ pub async fn recover_from_primary(
         identity: ReceiverIdentity {
             node_id: Uuid::new_v4(),
             role: PeerRole::Resync,
-            epoch: EPOCH,
+            epoch: INITIAL_EPOCH,
             pg_port: 0,
             sync_mode: WireSyncMode::Async,
         },
+        // A fresh directory holds no epoch: its snapshot `Hello`s carry no
+        // cursor, so the primary compares none. A standby's is read when its
+        // store is opened.
+        epoch: AtomicU64::new(INITIAL_EPOCH),
         _stop: stop,
         shutdown,
         started: Instant::now(),
@@ -473,6 +507,49 @@ pub async fn recover_from_primary(
                 .await
         }
         DirectoryState::Physical { history } => ladder.physical(history, progress).await,
+        DirectoryState::Primary { history, fenced, epoch } => {
+            // Spec P5.1 §6: route 3 only, beside it, with `--replace`. The
+            // primary must serve the same dataset: a primary's directory of
+            // another history is never replaced by this command.
+            let (primary, source_epoch) = ladder.identify_source().await?;
+            if primary != history {
+                return Err(refused(format!(
+                    "{} is a primary's directory of history {history}; the primary at {} serves {primary}: a \
+                     primary's directory is replaced only by a copy of its own dataset",
+                    ladder.data_dir.display(),
+                    options.primary_host
+                )));
+            }
+            // Spec P5.1 §11.G: never replace a newer primary by an older one.
+            if epoch > source_epoch {
+                return Err(refused(format!(
+                    "{} is a primary's directory at epoch {epoch}; the primary at {} is at epoch {source_epoch}: the \
+                     source is the superseded one — point --primary-host at the current primary",
+                    ladder.data_dir.display(),
+                    options.primary_host
+                )));
+            }
+            let file = if fenced {
+                super::fence::FENCED_FILE
+            } else {
+                super::history::PRIMARY_HISTORY_FILE
+            };
+            let reason = if fenced {
+                format!(
+                    "{} is a fenced primary's directory ({file}): a standby was promoted over it; it is rebuilt as \
+                     a standby of the current primary by a full copy",
+                    ladder.data_dir.display()
+                )
+            } else {
+                format!(
+                    "{} is a primary's directory of this dataset ({file}, not fenced): it is rebuilt as a standby \
+                     of the primary at {} by a full copy (rewinding it in place is not supported)",
+                    ladder.data_dir.display(),
+                    options.primary_host
+                )
+            };
+            ladder.full_copy(CopyInto::Beside, 0, Some(reason), progress).await
+        }
     }
 }
 
@@ -505,6 +582,37 @@ impl Ladder<'_> {
             }
         };
         let from = writer.cursor().source_sequence();
+        // Spec P5.1 §11.F: the probe's resume names the cursor's last group.
+        let last = writer
+            .cursor()
+            .last_group()
+            .map(|(first_sequence, digest)| LastGroup { first_sequence, digest });
+        // Spec P5.1 §6: the ladder announces the standby's own epoch. Spec
+        // §11.G: a record that cannot be read refuses the recovery — a store
+        // that cannot say which epoch it follows must not announce one.
+        let epoch_writer = Arc::clone(&writer);
+        let epoch = run_blocking(move || read_epoch(epoch_writer.db()).map_err(|error| error.to_string())).await;
+        let store_epoch = match epoch {
+            Ok(epoch) => epoch,
+            // A full copy announces no epoch (its snapshot `Hello` carries no
+            // cursor): asked for, it needs none of this store's.
+            Err(error) if self.options.full => {
+                progress(&format!(
+                    "recover: the replication epoch record of {} cannot be read ({error}); the full copy replaces it",
+                    self.data_dir().display()
+                ));
+                INITIAL_EPOCH
+            }
+            Err(error) => {
+                release(writer).await;
+                return Err(refused(format!(
+                    "the replication epoch record of {} cannot be read ({error}): its epoch is unknown, so it is not \
+                     recovered in place; re-run with --full (and --replace) to rebuild it by a full copy beside it",
+                    self.data_dir().display()
+                )));
+            }
+        };
+        self.epoch.store(store_epoch, Ordering::Release);
         let record_writer = Arc::clone(&writer);
         let record = run_blocking(move || record_writer.record().map_err(|error| error.to_string())).await;
         if self.options.full {
@@ -553,7 +661,7 @@ impl Ladder<'_> {
                 None
             }
             Ok(None) => {
-                match self.probe(history, from).await {
+                match self.probe(history, from, last).await {
                     Err(error) => {
                         release(writer).await;
                         return Err(error);
@@ -589,9 +697,61 @@ impl Ladder<'_> {
             }
         };
         match self.fast_forward(writer, history, from, record, progress).await? {
-            Routed::Done(report) => Ok(report),
-            Routed::FullCopy(reason) => self.full_copy(CopyInto::Beside, from, Some(reason), progress).await,
+            Routed::Done(report) => {
+                self.promotion_note(store_epoch, from, progress).await;
+                Ok(report)
+            }
+            Routed::FullCopy(reason) => {
+                // Spec P5.1 §11.G: across a promotion the fast-forward's
+                // full-copy reason says why the standby's position cannot be
+                // continued — it counts in the old primary's numbering.
+                let adopted = self.epoch.load(Ordering::Acquire);
+                let reason = if adopted > store_epoch {
+                    format!(
+                        "{reason} (the primary was promoted to epoch {adopted}; this standby followed epoch \
+                         {store_epoch} to sequence {from} in the old primary's numbering, which the new primary's own \
+                         sequences do not continue)"
+                    )
+                } else {
+                    reason
+                };
+                self.full_copy(CopyInto::Beside, from, Some(reason), progress).await
+            }
         }
+    }
+
+    /// Spec P5.1 §6: after a fast-forward across a promotion, say what the
+    /// re-cut did to what the standby held of the old primary — known from
+    /// the new primary's `repl:epoch` (now the standby's): nothing lost when
+    /// the old primary was fenced first; when it was not (`promote
+    /// --force`), rows it committed after the promotion point are not in the
+    /// new primary and are gone from this standby too.
+    async fn promotion_note(&self, epoch_before: u64, from: u64, progress: &mut dyn FnMut(&str)) {
+        let path = self.data_dir.clone();
+        let Ok(Some(record)) = run_blocking(move || read_directory_epoch(&path).map_err(|e| e.to_string())).await
+        else {
+            return;
+        };
+        if record.epoch <= epoch_before {
+            return;
+        }
+        progress(&match record.old_primary_final_sequence {
+            Some(final_sequence) => format!(
+                "recover: the standby followed epoch {} to sequence {}; the primary was promoted to epoch {} after \
+                 fencing the old primary at its sequence {final_sequence}: nothing it committed is lost",
+                record.previous,
+                format_count(from),
+                record.epoch
+            ),
+            None => format!(
+                "recover: the standby followed epoch {} to sequence {}; the primary was promoted to epoch {} WITHOUT \
+                 fencing the old primary (--force): rows the old primary committed after the promotion are not in \
+                 the new primary, and the re-cut replaced them on this standby too",
+                record.previous,
+                format_count(from),
+                record.epoch
+            ),
+        });
     }
 
     fn report(
@@ -641,12 +801,16 @@ impl Ladder<'_> {
         cursor: Option<u64>,
     ) -> Result<PhysicalClient<ReplicationStream>, WireError> {
         let mut last = None;
+        let identity = ReceiverIdentity {
+            epoch: self.epoch.load(Ordering::Acquire),
+            ..self.identity.clone()
+        };
         for source in &self.options.sources {
             match PhysicalClient::connect_replication(
                 *source,
                 &self.options.transport,
                 &self.options.token,
-                self.identity.hello(history, cursor),
+                identity.hello(history, cursor),
                 self.options.wire,
                 self.shutdown.clone(),
             )
@@ -672,13 +836,14 @@ impl Ladder<'_> {
         false
     }
 
-    /// Step 3: does the primary still serve the standby's next group?
-    async fn probe(&self, history: Uuid, after: u64) -> Result<Probe, RecoverError> {
+    /// Step 3: does the primary still serve the standby's next group — and
+    /// (spec P5.1 §11.F) is the standby's last group `last` the primary's?
+    async fn probe(&self, history: Uuid, after: u64, last: Option<LastGroup>) -> Result<Probe, RecoverError> {
         let mut attempt = 0;
         loop {
             let outcome = async {
                 let mut client = self.connect(Some(history), Some(after)).await?;
-                client.resume(history, after).await?;
+                client.resume(history, after, last).await?;
                 Ok::<_, WireError>(client)
             }
             .await;
@@ -697,6 +862,23 @@ impl Ladder<'_> {
                     RefuseCode::WalPruned { .. } | RefuseCode::Gap { .. } | RefuseCode::GroupTooLarge { .. } => {
                         return Ok(Probe::Behind(refusal.to_string()))
                     }
+                    // Spec P5.1 §11.F: the standby's last group is not the
+                    // primary's (it followed another primary of this epoch):
+                    // the fast-forward re-cuts it at the primary's checkpoint.
+                    RefuseCode::Diverged { .. } => return Ok(Probe::Behind(refusal.to_string())),
+                    // Spec P5.1 §6: the SAME history (the history is checked
+                    // before the epoch) at a newer epoch — a standby was
+                    // promoted. The fast-forward re-cuts this standby at the
+                    // new primary's checkpoint (its numbering, its epoch).
+                    RefuseCode::EpochStale { have, want } if have > want => {
+                        self.adopt_epoch(*have);
+                        return Ok(Probe::Behind(format!(
+                            "the primary was promoted to epoch {have} (this standby followed epoch {want}): the \
+                             standby is re-cut at the new primary's checkpoint; anything it held of the old \
+                             primary past the promotion is replaced"
+                        )));
+                    }
+                    RefuseCode::SourceStale { have, want } => return Err(self.superseded(*have, *want)),
                     RefuseCode::HistoryMismatch | RefuseCode::EpochStale { .. } => {
                         return Ok(Probe::Mismatch(refusal.to_string()))
                     }
@@ -709,15 +891,36 @@ impl Ladder<'_> {
         }
     }
 
+    /// Spec P5.1 §6: from here on the ladder's `Hello`s announce `epoch`, the
+    /// primary's (module documentation of [`Ladder::epoch`]).
+    fn adopt_epoch(&self, epoch: u64) {
+        self.epoch.fetch_max(epoch, Ordering::AcqRel);
+    }
+
+    /// Spec P5.1 §2: the configured primary is a superseded one.
+    fn superseded(&self, have: u64, want: u64) -> RecoverError {
+        refused(format!(
+            "the primary at {} is a superseded primary (epoch {have} < this standby's {want}); point --primary-host \
+             at the current primary",
+            self.options.primary_host
+        ))
+    }
+
     /// The primary's dataset history, from a fresh session's `HelloOk`.
     async fn identify(&self) -> Result<Uuid, RecoverError> {
+        Ok(self.identify_source().await?.0)
+    }
+
+    /// The primary's dataset history and epoch, from a fresh session's
+    /// `HelloOk`.
+    async fn identify_source(&self) -> Result<(Uuid, u64), RecoverError> {
         let mut attempt = 0;
         loop {
             match self.connect(None, None).await {
                 Ok(client) => {
-                    let history = client.hello_ok().history;
+                    let identity = (client.hello_ok().history, client.hello_ok().epoch);
                     let _ = client.close().await;
-                    return Ok(history);
+                    return Ok(identity);
                 }
                 Err(error) => {
                     if !self.retry_later(&error, &mut attempt).await {
@@ -762,11 +965,20 @@ impl Ladder<'_> {
                 Err(error) => error,
             };
             if let WireError::Refused(refusal) = &error {
-                if matches!(
-                    refusal.code,
-                    RefuseCode::HistoryMismatch | RefuseCode::EpochStale { .. }
-                ) {
-                    return Ok(Opened::Mismatch(refusal.to_string()));
+                match &refusal.code {
+                    // Spec P5.1 §6: the same history at a newer epoch (an
+                    // interrupted fast-forward toward a promoted primary skips
+                    // the probe that would have said so): open the session at
+                    // the primary's epoch — the re-cut makes it the standby's.
+                    RefuseCode::EpochStale { have, want } if have > want => {
+                        self.adopt_epoch(*have);
+                        continue;
+                    }
+                    RefuseCode::SourceStale { have, want } => return Err(self.superseded(*have, *want)),
+                    RefuseCode::HistoryMismatch | RefuseCode::EpochStale { .. } => {
+                        return Ok(Opened::Mismatch(refusal.to_string()));
+                    }
+                    _ => {}
                 }
             }
             if !self.retry_later(&error, &mut attempt).await {

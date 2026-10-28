@@ -2153,6 +2153,12 @@ pub struct StorageEngine {
     /// started on this engine. Set once, never cleared: an engine is hydrated
     /// once, by one owner.
     physical_hydration_started: AtomicBool,
+    /// Spec P5.1: the replication epoch the store holds (`repl:epoch`, read
+    /// at every open; absent = 1) and the epoch it was promoted from. A
+    /// standby's applier updates both when an applied batch carries the key
+    /// ([`Self::note_replication_epoch`]).
+    replication_epoch: AtomicU64,
+    replication_previous_epoch: AtomicU64,
     /// RocksDB `LOG` redirect for a READ-ONLY handle (including physical
     /// snapshots): an owned directory OUTSIDE the database, kept alive through
     /// the drop of the engine-owned `StorageEngine`/`DB` handle so the log
@@ -2498,6 +2504,31 @@ impl StorageEngine {
     #[inline]
     pub fn is_physical_standby(&self) -> bool {
         matches!(self.open_mode, OpenMode::PhysicalStandby { .. })
+    }
+
+    /// Spec P5.1: the replication epoch this store holds (`repl:epoch`; 1
+    /// for a store that was never promoted), as read at open and kept
+    /// current by a standby's applier. What every replication surface of the
+    /// node reports and compares: its replication identity, its `Hello`, its
+    /// archive's segment headers, `pg_control_checkpoint().timeline_id`.
+    #[inline]
+    pub fn replication_epoch(&self) -> u64 {
+        self.replication_epoch.load(Ordering::Acquire)
+    }
+
+    /// Spec P5.1: the epoch this store was promoted from
+    /// (`pg_control_checkpoint().prev_timeline_id`; 1 when never promoted).
+    pub fn replication_previous_epoch(&self) -> u64 {
+        self.replication_previous_epoch.load(Ordering::Acquire)
+    }
+
+    /// Spec P5.1: an applied batch carried `repl:epoch` (a standby's
+    /// applier): the cache follows the store. `None` = the key is absent.
+    pub(crate) fn note_replication_epoch(&self, record: Option<&super::replication_epoch::EpochRecord>) {
+        self.replication_previous_epoch
+            .store(super::replication_epoch::previous_of(record), Ordering::Release);
+        self.replication_epoch
+            .store(super::replication_epoch::epoch_of(record), Ordering::Release);
     }
 
     /// Hydrate a physical engine's in-memory derived state from its store,
@@ -2969,6 +3000,40 @@ impl StorageEngine {
                 Err(error) => return Err(Error::storage(format!("physical marker lookup failed: {error}"))),
             }
         }
+        // Spec P5.1 §11.A, before any RocksDB handle exists. A promotion that
+        // was interrupted part-way leaves a store that is neither a standby's
+        // nor a primary's yet: only `heliosdb-nano promote` (whose opens are
+        // raw, outside the engine) finishes it, so the engine opens it in no
+        // mode. A fenced primary's directory opens FENCED in a writable mode,
+        // through every entry point and in every build — `start` in any role,
+        // `repl`, MCP, the embedded API — so a superseded primary can never
+        // come back writable: reads are served, every write is refused with
+        // the fence's text. Its open-time housekeeping writes nothing either
+        // (`writes` below); a read-only mode refuses writes already.
+        if let Some(refusal) = super::replication_records::promotion_open_refusal(&db_path) {
+            return Err(Error::storage(refusal));
+        }
+        let fenced = if mode.engine_may_write() {
+            super::replication_records::fenced_record_at_open(&db_path).map_err(Error::storage)?
+        } else {
+            None
+        };
+        if let Some(record) = &fenced {
+            gate.fence(crate::standby_posture::primary_fenced_write_message(
+                record.fenced_by_epoch,
+                record.fenced_at,
+            ));
+            warn!(
+                "{} is a primary that was fenced at {} by epoch {}: it opens read-only (writes refused); {}",
+                db_path.display(),
+                crate::standby_posture::format_unix_secs(record.fenced_at),
+                record.fenced_by_epoch,
+                super::replication_records::fenced_rebuild_hint(&db_path)
+            );
+        }
+        // Whether this open writes on the engine's behalf: a primary's, unless
+        // it is fenced.
+        let writes = mode.engine_may_write() && fenced.is_none();
 
         // Load the key material BEFORE any RocksDB open. A missing or malformed
         // key must fail without creating a database or taking any handle;
@@ -3025,6 +3090,18 @@ impl StorageEngine {
             }
         };
 
+        // Spec P5.1: the replication epoch is the STORE's (`repl:epoch`,
+        // absent = 1), read in every open mode — the read-only opens of
+        // `recover` and the archive tools included — and cached. A record that
+        // does not decode refuses the open: a store that cannot say which
+        // epoch it is cannot say which primary it follows.
+        let epoch_record = super::replication_epoch::read_epoch_record(&db).map_err(|e| {
+            Error::storage(format!(
+                "{e}: this store's replication epoch cannot be read; rebuild it from its primary \
+                 (`heliosdb-nano recover --from-primary --full --replace`) or restore the directory from a copy"
+            ))
+        })?;
+
         // Also protect interrupted staging before its external marker exists.
         // This key is owned only by replication::physical, never logical WAL.
         if !mode.is_physical()
@@ -3057,8 +3134,9 @@ impl StorageEngine {
             let mut sm = SnapshotManager::new(Arc::clone(&db), Arc::clone(&gate));
             sm.set_key_manager(key_manager.clone());
             // A physical image registers snapshots in memory only: a read-only
-            // COMMIT on it must not write a `snapshot:` key.
-            if mode.is_physical() {
+            // COMMIT on it must not write a `snapshot:` key. Spec P5.1: nor on
+            // a fenced primary, whose gate refuses it.
+            if mode.is_physical() || fenced.is_some() {
                 sm.set_persistence(false);
             }
             Arc::new(sm)
@@ -3118,8 +3196,9 @@ impl StorageEngine {
         };
 
         // Initialize WAL if enabled (only for a primary — every other mode must
-        // not write, and `wal = None` also skips the WAL replay+truncate below).
-        let wal = if mode.engine_may_write() && config.storage.wal_enabled {
+        // not write, and `wal = None` also skips the WAL replay+truncate below;
+        // spec P5.1: a fenced primary writes no WAL entry and replays none).
+        let wal = if writes && config.storage.wal_enabled {
             // Convert config sync mode to WAL sync mode
             let sync_mode = match config.storage.wal_sync_mode {
                 crate::config::WalSyncModeConfig::Sync => WalSyncMode::Sync,
@@ -3192,8 +3271,8 @@ impl StorageEngine {
         let parallel_filter_engine = Arc::new(ParallelFilterEngine::new(ParallelFilterConfig::default()));
 
         // Initialize consolidation worker (primary only — it mutates the filter
-        // index in the background).
-        let consolidation_worker = if !mode.engine_may_write() {
+        // index in the background; never on a fenced primary).
+        let consolidation_worker = if !writes {
             None
         } else {
             let worker = FilterConsolidationWorker::new(
@@ -3252,7 +3331,7 @@ impl StorageEngine {
             Arc::clone(&conflict_registry),
             Arc::clone(&branch_manager),
             Arc::clone(&timestamp),
-            !mode.engine_may_write(),
+            !writes,
         )?;
 
         // Spec P1.2: a standby's persistent vector indexes follow the
@@ -3319,11 +3398,14 @@ impl StorageEngine {
             write_watermarks: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
-            index_snapshots_on_close: Arc::new(AtomicBool::new(!mode.is_physical())),
-            row_counter_flush_on_close: Arc::new(AtomicBool::new(!mode.is_physical())),
+            // Spec P5.1: a fenced primary persists nothing at close either.
+            index_snapshots_on_close: Arc::new(AtomicBool::new(!mode.is_physical() && fenced.is_none())),
+            row_counter_flush_on_close: Arc::new(AtomicBool::new(!mode.is_physical() && fenced.is_none())),
             open_mode: mode,
             last_index_open_report: Arc::new(RwLock::new(None)),
             physical_hydration_started: AtomicBool::new(false),
+            replication_epoch: AtomicU64::new(super::replication_epoch::epoch_of(epoch_record.as_ref())),
+            replication_previous_epoch: AtomicU64::new(super::replication_epoch::previous_of(epoch_record.as_ref())),
             _read_only_log_dir: read_only_log_dir,
         };
 
@@ -3335,7 +3417,7 @@ impl StorageEngine {
         // durably invalidate stale index snapshots. Only a primary has durable
         // snapshots to invalidate: on every other mode the hook could only
         // attempt a write the gate refuses.
-        if engine.open_mode.engine_may_write() {
+        if writes {
             engine.wire_index_snapshot_hooks();
         }
 
@@ -3361,10 +3443,11 @@ impl StorageEngine {
         //
         // Costs one prefix scan of a key range that is empty on every clean
         // start, once per open.
-        if !engine.open_mode.engine_may_write() {
-            // A read-only handle must not write, so it cannot reclaim. Arm the
-            // visibility filter instead: a leftover stays hidden rather than
-            // resurfacing as a permanent, globally-visible table.
+        if !writes {
+            // A read-only handle (or a fenced primary's) must not write, so it
+            // cannot reclaim. Arm the visibility filter instead: a leftover
+            // stays hidden rather than resurfacing as a permanent,
+            // globally-visible table.
             let leftovers = engine
                 .catalog()
                 .list_tables_including_temp()
@@ -3752,6 +3835,9 @@ impl StorageEngine {
             open_mode: OpenMode::Primary,
             last_index_open_report: Arc::new(RwLock::new(None)),
             physical_hydration_started: AtomicBool::new(false),
+            // A fresh in-memory store was never promoted.
+            replication_epoch: AtomicU64::new(super::replication_epoch::INITIAL_EPOCH),
+            replication_previous_epoch: AtomicU64::new(super::replication_epoch::INITIAL_EPOCH),
             _read_only_log_dir: None,
         })
     }

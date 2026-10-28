@@ -1094,6 +1094,14 @@ impl PhysicalCursor {
         self.source_sequence
     }
 
+    /// Spec P5.1 §11.F: the last write group this cursor applied — its first
+    /// source sequence and SHA-256 — which ends at [`Self::source_sequence`];
+    /// `None` at a checkpoint cut (no group applied since). A resume names it,
+    /// and the source verifies its own group ending there is this one.
+    pub fn last_group(&self) -> Option<(u64, [u8; 32])> {
+        self.last_first_sequence.zip(self.last_digest)
+    }
+
     /// The receiver store's own RocksDB sequence after its last write: every
     /// write a receiver makes is accounted here, so `latest_sequence_number`
     /// equals it whenever nothing else touched the store.
@@ -2019,6 +2027,238 @@ impl FastForwardWriter {
         }
         drop(self.db);
         Ok(cursor)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Promotion (spec P5.1 §4 step 4).
+// ---------------------------------------------------------------------------
+
+/// The logical WAL's watermarks around a promotion's conversion
+/// ([`PromotionWriter::write_epoch`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogicalWalFloor {
+    /// `wal:checkpoint` (the redo floor) before and after the conversion.
+    pub checkpoint_before: Option<u64>,
+    pub checkpoint_after: Option<u64>,
+    /// `wal:last_lsn` (the LSN counter) after: the first entry the new
+    /// primary logs is past it, so no LSN is reused.
+    pub last_lsn: u64,
+    /// The highest LSN a retained `wal:entries:` key holds, if any.
+    pub highest_entry: Option<u64>,
+}
+
+/// The writer of a promotion's conversion: it turns a STOPPED physical
+/// standby's store into a primary's, in the order spec P5.1 §4 step 4 gives,
+/// each step checking before it acts so a re-run after a crash finishes the
+/// job (`heliosdb-nano promote`, `replication::promote`).
+///
+/// It lives here, beside [`LocalWriter`] and [`FastForwardWriter`], because it
+/// writes the default column family raw — the one thing outside the write
+/// gate that `tests/write_gate_funnel.rs` allows only in this module and
+/// `checkpoint_transfer`. It is no `LocalWriter`: once the epoch is written
+/// the store is no standby's any more, and the cursor is dropped with the
+/// node-local family.
+///
+/// # The logical WAL (step 4b)
+///
+/// A standby's default family is its primary's byte for byte, the logical
+/// WAL included: `wal:entries:*` up to `wal:last_lsn`, and `wal:checkpoint`,
+/// the redo floor. The first open of the promoted store as a primary runs
+/// `StorageEngine::recover_wal_at_open`, whose decision table REPLAYS every
+/// retained entry above a present checkpoint — the old primary's redo window,
+/// whose effect the physical copy already holds. Replaying it would
+/// re-execute the old primary's DDL and DML on top of their own results (a
+/// `DropTable` of a table that legitimately exists again, a non-idempotent
+/// counter bump). The conversion therefore raises the redo floor to the head
+/// of the log, in the same synced write as the epoch: `wal:checkpoint =
+/// max(wal:checkpoint, wal:last_lsn, highest retained entry)`, and
+/// `wal:last_lsn` to at least that. The decision table's third row then holds
+/// at the first open ("present, `>= max`: already covered; reclaim, do not
+/// replay"), the entries are reclaimed under the retention window without
+/// being re-executed, and the LSN counter continues from the inherited
+/// watermark, so no LSN is reused. Deleting the entries instead was not
+/// chosen: the table already reclaims them, and keeping the history the
+/// retention window promises is what a primary does. A store that retains no
+/// entry is left as it is (an empty log replays nothing, and the engine does
+/// not stamp a checkpoint over an empty log either).
+pub struct PromotionWriter {
+    db: DB,
+}
+
+/// The highest LSN of a retained logical WAL entry (`wal:entries:{lsn:020}`,
+/// zero-padded, so the last key in order is the highest), read by key only.
+fn highest_logical_entry(db: &DB) -> Result<Option<u64>> {
+    const ENTRY_PREFIX: &[u8] = b"wal:entries:";
+    // The first key past every entry: the prefix with its last byte raised.
+    let mut end = ENTRY_PREFIX.to_vec();
+    if let Some(last) = end.last_mut() {
+        *last += 1;
+    }
+    let mut read = ReadOptions::default();
+    read.set_total_order_seek(true);
+    read.set_iterate_lower_bound(ENTRY_PREFIX.to_vec());
+    read.set_iterate_upper_bound(end);
+    for item in db.iterator_opt(IteratorMode::End, read) {
+        let (key, _) = item?;
+        let Some(digits) = key.strip_prefix(ENTRY_PREFIX) else {
+            continue;
+        };
+        // A key that does not parse is reclaimed by the WAL and never
+        // replayed: it cannot raise the floor.
+        if let Some(lsn) = std::str::from_utf8(digits)
+            .ok()
+            .and_then(|text| text.parse::<u64>().ok())
+        {
+            return Ok(Some(lsn));
+        }
+    }
+    Ok(None)
+}
+
+/// A little-endian `u64` watermark of the logical WAL (`storage::wal`
+/// writes them so); `None` when absent.
+fn logical_watermark(db: &DB, key: &[u8]) -> Result<Option<u64>> {
+    match db.get(key)? {
+        None => Ok(None),
+        Some(bytes) => {
+            let bytes: [u8; 8] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| invalid(format!("{} is not an 8-byte watermark", String::from_utf8_lossy(key))))?;
+            Ok(Some(u64::from_le_bytes(bytes)))
+        }
+    }
+}
+
+impl PromotionWriter {
+    /// Open the stopped standby at `path` exclusively, every column family
+    /// it holds included, with the receiver's options of `config` (no WAL
+    /// archive: the WAL the conversion makes obsolete is deleted, never kept
+    /// where a later source read would find the standby's own records).
+    pub fn open(path: &Path, config: &Config) -> Result<Self> {
+        let (options, families) = super::checkpoint_transfer::receiver_options(config, path)
+            .map_err(|error| invalid(format!("the standby's storage options: {error}")))?;
+        let db = DB::open_cf_descriptors(&options, path, families)?;
+        refuse_legacy_cursor(&db)?;
+        Ok(Self { db })
+    }
+
+    /// The store's epoch record (`None` = epoch 1).
+    pub fn epoch_record(&self) -> Result<Option<crate::replication::epoch::EpochRecord>> {
+        crate::replication::epoch::read_epoch_record(&self.db).map_err(|error| invalid(error.to_string()))
+    }
+
+    /// Whether the node-local family (the standby's cursor) is still there.
+    pub fn has_local_family(&self) -> bool {
+        self.db.cf_handle(LOCAL_CF).is_some()
+    }
+
+    /// The standby's cursor, while the node-local family holds one.
+    pub fn cursor(&self) -> Result<Option<PhysicalCursor>> {
+        let Some(local) = self.db.cf_handle(LOCAL_CF) else {
+            return Ok(None);
+        };
+        self.db
+            .get_cf(local, CURSOR_KEY)?
+            .map(|bytes| decode_cursor(&bytes))
+            .transpose()
+    }
+
+    /// The store's RocksDB sequence.
+    pub fn latest_sequence(&self) -> u64 {
+        self.db.latest_sequence_number()
+    }
+
+    /// Step 4a + 4b: ONE synced write group — `repl:epoch` = `record` (the
+    /// first write of the new epoch) and the logical WAL's redo floor raised
+    /// to its head (type documentation). Idempotent: a store that already
+    /// holds `record`'s epoch written by the same node is left as it is (its
+    /// floor was raised by the same write). A store at another epoch than
+    /// `record.previous` is refused: it is not the standby the promotion
+    /// classified.
+    pub fn write_epoch(&self, record: &crate::replication::epoch::EpochRecord) -> Result<LogicalWalFloor> {
+        use crate::replication::epoch::{epoch_of, EPOCH_KEY};
+        let checkpoint_before = logical_watermark(&self.db, b"wal:checkpoint")?;
+        let last_lsn = logical_watermark(&self.db, b"wal:last_lsn")?.unwrap_or(0);
+        let highest_entry = highest_logical_entry(&self.db)?;
+        let mut floor = LogicalWalFloor {
+            checkpoint_before,
+            checkpoint_after: checkpoint_before,
+            last_lsn,
+            highest_entry,
+        };
+        let current = self.epoch_record()?;
+        if let Some(current) = current.as_ref().filter(|current| current.epoch == record.epoch) {
+            if current.node_id != record.node_id {
+                return Err(invalid(format!(
+                    "the store is at epoch {} already, promoted by node {}: another promotion converted it",
+                    current.epoch, current.node_id
+                )));
+            }
+            return Ok(floor);
+        }
+        let epoch = epoch_of(current.as_ref());
+        if epoch != record.previous {
+            return Err(invalid(format!(
+                "the store is at epoch {epoch}, not the {} this promotion starts from",
+                record.previous
+            )));
+        }
+        let bytes = record.encode().map_err(|error| invalid(error.to_string()))?;
+        let mut batch = WriteBatch::default();
+        batch.put(EPOCH_KEY, bytes);
+        if let Some(highest) = highest_entry {
+            let head = highest.max(last_lsn).max(checkpoint_before.unwrap_or(0));
+            if checkpoint_before != Some(head) {
+                batch.put(b"wal:checkpoint", head.to_le_bytes());
+                floor.checkpoint_after = Some(head);
+            }
+            if last_lsn < head {
+                batch.put(b"wal:last_lsn", head.to_le_bytes());
+                floor.last_lsn = head;
+            }
+        }
+        self.db.write_opt(batch, &sync_options())?;
+        Ok(floor)
+    }
+
+    /// Step 4c: drop the node-local family — the cursor, the fast-forward
+    /// marks, the archive catalog go with it. The store is a primary's from
+    /// here on: the engine refuses a store holding the family in every mode
+    /// but the standby's. Nothing to do once it is gone.
+    pub fn drop_local_family(&mut self) -> Result<()> {
+        if self.db.cf_handle(LOCAL_CF).is_some() {
+            self.db.drop_cf(LOCAL_CF)?;
+        }
+        Ok(())
+    }
+
+    /// Step 4d: fsync the WAL, flush the default family (the WAL that carried
+    /// the standby's own records becomes obsolete and is deleted), close the
+    /// store, and prove the node-local family is gone. Returns the store's
+    /// sequence.
+    pub fn close(self) -> Result<u64> {
+        self.db.flush_wal(true)?;
+        let default = self
+            .db
+            .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+            .ok_or_else(|| invalid("the store was opened without its default column family handle"))?;
+        self.db.flush_cf(default)?;
+        let sequence = self.db.latest_sequence_number();
+        let path = self.db.path().to_path_buf();
+        let local = self.db.cf_handle(LOCAL_CF).is_some();
+        drop(self.db);
+        if local
+            || DB::list_cf(&Options::default(), &path)?
+                .iter()
+                .any(|family| family == LOCAL_CF)
+        {
+            return Err(invalid(
+                "the node-local column family survived the promotion's conversion",
+            ));
+        }
+        Ok(sequence)
     }
 }
 
@@ -3248,5 +3488,134 @@ mod tests {
             "an idle cascaded poll did not move the memo"
         );
         assert_eq!(cascade.fsyncs(), 1, "two cascaded polls at the same barrier, one fsync");
+    }
+
+    /// A stopped standby's store as a promotion finds it: the primary's
+    /// logical WAL (entries up to 12 above a checkpoint at 9, the counter at
+    /// 11 — it can trail the highest entry), its node-local cursor.
+    fn standby_store_with_logical_wal(path: &std::path::Path, history: Uuid) {
+        let db = open(path);
+        for lsn in [8_u64, 10, 12] {
+            db.put(format!("wal:entries:{lsn:020}"), b"old primary's entry")
+                .unwrap();
+        }
+        db.put(b"wal:checkpoint", 9_u64.to_le_bytes()).unwrap();
+        db.put(b"wal:last_lsn", 11_u64.to_le_bytes()).unwrap();
+        db.put(b"data:t:1", b"row").unwrap();
+        let sequence = db.latest_sequence_number();
+        let writer = LocalWriter::from_checkpoint(db, history, sequence).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Spec P5.1 §4 step 4: the conversion writes `repl:epoch` and raises the
+    /// logical WAL's redo floor to the head of the log in one write, drops
+    /// the node-local family, and leaves a store the engine opens as a
+    /// primary at the new epoch without replaying the old primary's entries
+    /// (the checkpoint covers every one of them). Re-running every step
+    /// changes nothing more.
+    #[test]
+    fn a_promotion_writes_the_epoch_raises_the_redo_floor_and_drops_the_local_family() {
+        use crate::replication::epoch::{read_epoch_record, EpochRecord, EPOCH_KEY};
+        let dir = TempDir::new().unwrap();
+        let history = Uuid::new_v4();
+        standby_store_with_logical_wal(dir.path(), history);
+        let config = Config::default();
+        let node = Uuid::new_v4();
+        let record = EpochRecord::promotion(1, node, 1_761_000_000, Some(4_242)).unwrap();
+
+        let mut writer = PromotionWriter::open(dir.path(), &config).unwrap();
+        assert!(writer.has_local_family());
+        assert_eq!(writer.cursor().unwrap().unwrap().history(), history);
+        assert_eq!(
+            writer.epoch_record().unwrap(),
+            None,
+            "a never-promoted store is at epoch 1"
+        );
+        let before = writer.latest_sequence();
+        let floor = writer.write_epoch(&record).unwrap();
+        assert_eq!(
+            floor,
+            LogicalWalFloor {
+                checkpoint_before: Some(9),
+                checkpoint_after: Some(12),
+                last_lsn: 12,
+                highest_entry: Some(12),
+            }
+        );
+        assert_eq!(
+            writer.latest_sequence(),
+            before + 3,
+            "one write group: the epoch, the checkpoint and the counter"
+        );
+        writer.drop_local_family().unwrap();
+        assert!(!writer.has_local_family());
+        writer.close().unwrap();
+
+        let db = DB::open_for_read_only(&Options::default(), dir.path(), false).unwrap();
+        assert_eq!(read_epoch_record(&db).unwrap(), Some(record.clone()));
+        assert_eq!(db.get(EPOCH_KEY).unwrap().unwrap(), record.encode().unwrap());
+        assert_eq!(logical_watermark(&db, b"wal:checkpoint").unwrap(), Some(12));
+        assert_eq!(logical_watermark(&db, b"wal:last_lsn").unwrap(), Some(12));
+        drop(db);
+        assert!(!DB::list_cf(&Options::default(), dir.path())
+            .unwrap()
+            .iter()
+            .any(|family| family == LOCAL_CF));
+
+        // A re-run: every step finds its work done.
+        let mut again = PromotionWriter::open(dir.path(), &config).unwrap();
+        let sequence = again.latest_sequence();
+        let floor = again.write_epoch(&record).unwrap();
+        assert_eq!(floor.checkpoint_after, Some(12));
+        again.drop_local_family().unwrap();
+        assert_eq!(again.latest_sequence(), sequence, "a re-run writes nothing");
+        again.close().unwrap();
+
+        // Another node's promotion to the same epoch, or one from another
+        // epoch, is refused.
+        let again = PromotionWriter::open(dir.path(), &config).unwrap();
+        let other = EpochRecord::promotion(1, Uuid::new_v4(), 1, None).unwrap();
+        assert!(again.write_epoch(&other).is_err());
+        let skipping = EpochRecord::promotion(3, node, 1, None).unwrap();
+        assert!(again.write_epoch(&skipping).is_err());
+        drop(again);
+
+        // The first open as a primary: epoch 2 from 1, and the old primary's
+        // entries are at or below the floor — reclaimed, never replayed (an
+        // entry above it would be decoded and replayed, and these values do
+        // not decode).
+        let engine = StorageEngine::open(dir.path(), &config).unwrap();
+        assert_eq!(engine.replication_epoch(), 2);
+        assert_eq!(engine.replication_previous_epoch(), 1);
+        drop(engine);
+    }
+
+    /// A store with no logical WAL entry keeps its watermarks: the floor is
+    /// raised only over entries it covers.
+    #[test]
+    fn a_promotion_of_a_store_without_logical_entries_leaves_the_watermarks() {
+        use crate::replication::epoch::EpochRecord;
+        let dir = TempDir::new().unwrap();
+        let history = Uuid::new_v4();
+        let db = open(dir.path());
+        db.put(b"data:t:1", b"row").unwrap();
+        let sequence = db.latest_sequence_number();
+        LocalWriter::from_checkpoint(db, history, sequence)
+            .unwrap()
+            .close()
+            .unwrap();
+        let writer = PromotionWriter::open(dir.path(), &Config::default()).unwrap();
+        let record = EpochRecord::promotion(1, Uuid::new_v4(), 1, None).unwrap();
+        let floor = writer.write_epoch(&record).unwrap();
+        assert_eq!(
+            floor,
+            LogicalWalFloor {
+                checkpoint_before: None,
+                checkpoint_after: None,
+                last_lsn: 0,
+                highest_entry: None,
+            }
+        );
+        drop(writer);
     }
 }

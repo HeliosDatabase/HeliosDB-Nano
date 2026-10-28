@@ -68,20 +68,33 @@
 //! [`install_primary`]); the SQL functions and views of the PostgreSQL wire
 //! read it through the façade at the bottom of this module, which works in
 //! every build (a binary without `ha-tier1` is never in recovery).
+//!
+//! # The epoch and the fence (spec P5.1)
+//!
+//! Every block's `epoch` is the one the node's STORE holds
+//! (`StorageEngine::replication_epoch`, the `repl:epoch` key): a primary's
+//! engine, a standby's attached store ([`PostureTracker::attach_epoch`]). The
+//! frozen field set is unchanged; only the value became real.
+//!
+//! A primary that a promoted standby fenced reports `state = "fenced"` and
+//! `ready = false` (`/ready` 503), and `heliosdb_require_ready()` answers it
+//! SQLSTATE 55000 ([`require_ready`]). The fence is process-wide like the
+//! node itself ([`note_fenced`], [`fence_status`]); the PostgreSQL wire asks
+//! [`is_fenced`] — one atomic load — before every statement, terminates the
+//! sessions that were open before the fence at their next statement (FATAL
+//! 57P01) and refuses writes on the others (25006).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use tokio::sync::watch;
+use uuid::Uuid;
 
+use crate::storage::replication_epoch::INITIAL_EPOCH;
 use crate::storage::StorageEngine;
-
-/// The replication epoch every node reports until promotion makes it real
-/// (plan §D7, phase P5): `pg_control_checkpoint().timeline_id` and the
-/// `epoch` field of the replication block.
-pub const EPOCH: u64 = 1;
 
 /// The `recovering` mode of an archive-only standby (spec P3.2 §3).
 pub const ARCHIVE_MODE: &str = "archive";
@@ -154,6 +167,10 @@ pub struct StandbySnapshot {
     /// (spec P2.1, plan §D3.6).
     pub last_ack_sequence: Option<u64>,
     pub epoch: u64,
+    /// Spec P5.1: the epoch the store's `repl:epoch` record says the
+    /// dataset was promoted from (`pg_control_checkpoint().prev_timeline_id`;
+    /// [`INITIAL_EPOCH`] when it was never promoted). Not in the frozen block.
+    pub previous_epoch: u64,
     /// Whether a serving store is attached (`EmbeddedDatabase::with_physical_standby`
     /// over the receiver's store). Until then the listeners serve an empty
     /// placeholder and nothing is ready.
@@ -295,20 +312,34 @@ pub struct ReplicationBlock {
 /// receiver's status is only sampled per poll). Set once the store exists.
 pub type LiveCursor = Arc<dyn Fn() -> Option<u64> + Send + Sync>;
 
+/// Spec P5.1: a live reader of the epoch the standby's store holds and the
+/// epoch its record says it was promoted from — `(epoch, previous)`, its
+/// engine's cache of `repl:epoch`, which the applier updates. Set once the
+/// store exists; `None` once the store is gone.
+pub type LiveEpoch = Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync>;
+
 /// A clonable reader of a standby's posture.
 #[derive(Clone)]
 pub struct PostureHandle {
     rx: watch::Receiver<StandbySnapshot>,
     live: Arc<RwLock<Option<LiveCursor>>>,
+    live_epoch: Arc<RwLock<Option<LiveEpoch>>>,
 }
 
 impl PostureHandle {
-    /// The current snapshot, its cursor read from the store when attached.
+    /// The current snapshot, its cursor and epoch read from the store when
+    /// attached.
     pub fn snapshot(&self) -> StandbySnapshot {
         let mut snapshot = self.rx.borrow().clone();
         if let Some(live) = self.live.read().as_ref() {
             if let Some(cursor) = live() {
                 snapshot.cursor = snapshot.cursor.max(cursor);
+            }
+        }
+        if let Some(live) = self.live_epoch.read().as_ref() {
+            if let Some((epoch, previous)) = live() {
+                snapshot.epoch = epoch;
+                snapshot.previous_epoch = previous;
             }
         }
         snapshot
@@ -398,6 +429,7 @@ impl Machine {
 pub struct PostureTracker {
     tx: watch::Sender<StandbySnapshot>,
     live: Arc<RwLock<Option<LiveCursor>>>,
+    live_epoch: Arc<RwLock<Option<LiveEpoch>>>,
     machine: Mutex<Machine>,
 }
 
@@ -411,7 +443,11 @@ impl PostureTracker {
             primary,
             sync_mode,
             last_ack_sequence: None,
-            epoch: EPOCH,
+            // Spec P5.1: until a store is attached the standby holds no
+            // epoch of its own; a directory that holds one reports it as
+            // soon as it is attached ([`Self::attach_epoch`]).
+            epoch: INITIAL_EPOCH,
+            previous_epoch: INITIAL_EPOCH,
             store_attached: false,
             max_standby_lag,
             tls: false,
@@ -420,8 +456,24 @@ impl PostureTracker {
         Self {
             tx,
             live: Arc::new(RwLock::new(None)),
+            live_epoch: Arc::new(RwLock::new(None)),
             machine: Mutex::new(Machine::default()),
         }
+    }
+
+    /// Spec P5.1: the attached store's epoch, as `live` reads it (the
+    /// engine's cache of `repl:epoch`, which the applier keeps current).
+    /// Every snapshot reports it from now on.
+    pub fn attach_epoch(&self, live: LiveEpoch) {
+        if let Some((epoch, previous)) = live() {
+            self.tx.send_if_modified(|snapshot| {
+                let changed = snapshot.epoch != epoch || snapshot.previous_epoch != previous;
+                snapshot.epoch = epoch;
+                snapshot.previous_epoch = previous;
+                changed
+            });
+        }
+        *self.live_epoch.write() = Some(live);
     }
 
     /// Spec P2.2: what the receiver reports about its transport — why its
@@ -444,6 +496,7 @@ impl PostureTracker {
         PostureHandle {
             rx: self.tx.subscribe(),
             live: Arc::clone(&self.live),
+            live_epoch: Arc::clone(&self.live_epoch),
         }
     }
 
@@ -728,9 +781,10 @@ impl PostureTracker {
 pub struct PrimaryStatus {
     /// `"primary"`.
     pub role: &'static str,
-    /// The engine whose physical sequence is this node's cursor.
+    /// The engine whose physical sequence is this node's cursor (and whose
+    /// store's epoch is this node's, spec P5.1).
     pub engine: Weak<StorageEngine>,
-    /// This node's replication port (`NPHYS003`), when it serves one.
+    /// This node's replication port (`NPHYS004`), when it serves one.
     pub endpoint: Option<String>,
     pub sync_mode: String,
     /// Spec P2.2: the replication port serves TLS.
@@ -738,16 +792,56 @@ pub struct PrimaryStatus {
 }
 
 impl PrimaryStatus {
+    /// The block a primary reports; spec P5.1: while a fence is under way or
+    /// once it holds ([`fence_status`], process-wide like the node), its
+    /// `state` is `fencing` or `fenced` and it is not ready.
     pub fn block(&self) -> ReplicationBlock {
-        let cursor = self.engine.upgrade().map_or(0, |engine| engine_sequence(&engine));
-        primary_block(
+        let engine = self.engine.upgrade();
+        let cursor = engine.as_deref().map_or(0, engine_sequence);
+        let epoch = engine
+            .as_deref()
+            .map_or(INITIAL_EPOCH, StorageEngine::replication_epoch);
+        let mut block = primary_block(
             self.role,
             cursor,
+            epoch,
             self.endpoint.clone(),
             self.sync_mode.clone(),
             self.tls,
-        )
+        );
+        if let Some(fence) = fence_status() {
+            fence_block(&mut block, &fence);
+        }
+        block
     }
+}
+
+/// Spec P5.1 §3.2, §11.D: a fencing or fenced primary's block — `state =
+/// "fencing"` from the moment its write gate closed until the fence is
+/// recorded, `"fenced"` after; never ready (`/ready` 503); the fence, or why
+/// it is incomplete, in `reason`. The field set is the frozen one; only
+/// values change.
+fn fence_block(block: &mut ReplicationBlock, fence: &FenceStatus) {
+    block.state = fence.state().to_string();
+    block.ready = false;
+    block.lag_secs = None;
+    block.reason = Some(fence.reason());
+}
+
+/// The `state` a fenced primary reports (spec P5.1: an additive value of the
+/// frozen field).
+pub const FENCED_STATE: &str = "fenced";
+/// Spec P5.1 §11.D: the `state` of a primary whose fence is under way, or
+/// did not complete — writes are refused, it is not ready, and it is not
+/// fenced durably yet.
+pub const FENCING_STATE: &str = "fencing";
+
+/// `2026-10-24T08:15:02Z` for unix seconds `at`.
+pub fn format_unix_secs(at: u64) -> String {
+    i64::try_from(at)
+        .ok()
+        .and_then(|at| chrono::DateTime::from_timestamp(at, 0))
+        .map_or_else(|| format!("{at}s"), |at| at.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 #[derive(Clone)]
@@ -764,7 +858,9 @@ pub fn install_standby(handle: PostureHandle) {
     *NODE.write() = Some(NodeStatus::Standby(handle));
 }
 
-/// This process is a primary reporting `status`.
+/// This process is a primary reporting `status`. A fence this process
+/// already took ([`note_fenced`], [`note_fencing`]) shows in its block: the
+/// fence is process-wide, read when the block is built.
 pub fn install_primary(status: PrimaryStatus) {
     *NODE.write() = Some(NodeStatus::Primary(status));
 }
@@ -787,11 +883,183 @@ pub fn node_block() -> Option<ReplicationBlock> {
     }
 }
 
+// -------------------------------------------------------------------------
+// The fence (spec P5.1 §3.2, §11.D): process-wide; once raised, never lowered.
+// -------------------------------------------------------------------------
+
+/// The fence this process took: which epoch fenced it, when, by which
+/// promotion, and — once it is complete — the last sequence it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FenceStatus {
+    /// This primary's own epoch.
+    pub epoch: u64,
+    /// The epoch of the promoted standby that fenced it (higher).
+    pub by_epoch: u64,
+    /// The promotion that fenced it (its random identity, spec P5.1 §11.C).
+    pub by_node: Uuid,
+    /// Unix seconds.
+    pub at: u64,
+    /// The store's sequence once every write before the fence was durable
+    /// and the fence recorded; `None` while the fence is under way (posture
+    /// `fencing`).
+    pub final_sequence: Option<u64>,
+    /// Spec P5.1 §11.D: why the fence did not complete (the drain, the WAL
+    /// fsync or the record write failed). Writes stay refused and the node
+    /// stays not ready; another fence (the promotion re-run) completes it.
+    pub incomplete: Option<String>,
+}
+
+impl FenceStatus {
+    /// Whether the fence is complete: everything before it durable, the
+    /// record (`NANO-FENCED.json`) written.
+    pub fn complete(&self) -> bool {
+        self.final_sequence.is_some()
+    }
+
+    /// The block's `state`: [`FENCED_STATE`] once complete, else
+    /// [`FENCING_STATE`].
+    pub fn state(&self) -> &'static str {
+        if self.complete() {
+            FENCED_STATE
+        } else {
+            FENCING_STATE
+        }
+    }
+
+    /// The block's `reason`.
+    pub fn reason(&self) -> String {
+        match (&self.incomplete, self.final_sequence) {
+            (Some(why), _) => format!(
+                "fence incomplete (by epoch {}, since {}): {why}; writes stay refused and this node is not ready; \
+                 the promotion that fences it completes the fence when it runs again",
+                self.by_epoch,
+                format_unix_secs(self.at)
+            ),
+            (None, Some(final_sequence)) => format!(
+                "fenced at {} by epoch {} at its sequence {final_sequence}: a standby was promoted; this node serves \
+                 reads only",
+                format_unix_secs(self.at),
+                self.by_epoch
+            ),
+            (None, None) => format!(
+                "fencing by epoch {} since {}: writes are refused while the writes before the fence are made \
+                 durable",
+                self.by_epoch,
+                format_unix_secs(self.at)
+            ),
+        }
+    }
+
+    /// The refusal every write on the fenced primary receives (it starts
+    /// with [`crate::error::PRIMARY_FENCED_WRITE_REFUSED`], SQLSTATE 25006).
+    pub fn write_refusal(&self) -> String {
+        primary_fenced_write_message(self.by_epoch, self.at)
+    }
+
+    /// The FATAL 57P01 text a session opened before the fence is ended with.
+    pub fn termination(&self) -> String {
+        format!(
+            "terminating connection: this primary was fenced by epoch {} at {} (a standby was promoted); \
+             reconnect to the new primary for writes",
+            self.by_epoch,
+            format_unix_secs(self.at)
+        )
+    }
+}
+
+/// The text of [`FenceStatus::write_refusal`], for a fence by `by_epoch` at
+/// `at` (unix seconds): spec P5.1 §3.2's sentence, "write refused: this
+/// primary was fenced at <time> by epoch E+1 (a standby was promoted); …".
+pub fn primary_fenced_write_message(by_epoch: u64, at: u64) -> String {
+    format!(
+        "{} at {} by epoch {by_epoch} (a standby was promoted); it serves reads only — rebuild it as a standby \
+         with `heliosdb-nano recover --from-primary --primary-host <the new primary's replication port> \
+         --replace --data-dir <this node's data directory>`",
+        crate::error::PRIMARY_FENCED_WRITE_REFUSED,
+        format_unix_secs(at)
+    )
+}
+
+/// Raised by [`note_fencing`] (or [`note_fenced`]), never lowered; what the
+/// PostgreSQL wire asks before every statement (one atomic load).
+static FENCED: AtomicBool = AtomicBool::new(false);
+static FENCE: RwLock<Option<FenceStatus>> = RwLock::new(None);
+
+/// Spec P5.1 §11.D: this process's primary closed its write gate for a
+/// fence that is not complete yet — its block reads `fencing`, `/ready`
+/// answers 503, `heliosdb_require_ready()` 55000, writes are refused and the
+/// sessions opened before it are ended at their next statement, exactly as
+/// once it is complete. A fence already complete is kept; an incomplete one
+/// is replaced (the same promotion fencing again).
+pub fn note_fencing(epoch: u64, by_epoch: u64, by_node: Uuid, at: u64) {
+    {
+        let mut fence = FENCE.write();
+        if fence.as_ref().is_some_and(FenceStatus::complete) {
+            return;
+        }
+        *fence = Some(FenceStatus {
+            epoch,
+            by_epoch,
+            by_node,
+            at,
+            final_sequence: None,
+            incomplete: None,
+        });
+    }
+    FENCED.store(true, Ordering::SeqCst);
+}
+
+/// Spec P5.1 §11.D: the fence under way failed (`reason`): the node stays
+/// `fencing`, not ready, writes refused; its `reason` says why.
+pub fn note_fence_incomplete(reason: impl Into<String>) {
+    if let Some(fence) = FENCE.write().as_mut().filter(|fence| !fence.complete()) {
+        fence.incomplete = Some(reason.into());
+    }
+}
+
+/// This process's primary is fenced (spec P5.1 §3.2 step 2): `status`
+/// carries its final sequence. Its block reads `fenced` from now on,
+/// `/ready` answers 503 and `heliosdb_require_ready()` 55000. The first
+/// complete fence wins; returns whether this call recorded it.
+pub fn note_fenced(status: FenceStatus) -> bool {
+    {
+        let mut fence = FENCE.write();
+        if fence.as_ref().is_some_and(FenceStatus::complete) || status.final_sequence.is_none() {
+            return false;
+        }
+        *fence = Some(FenceStatus {
+            incomplete: None,
+            ..status
+        });
+    }
+    FENCED.store(true, Ordering::SeqCst);
+    true
+}
+
+/// Whether this process's primary is fenced or being fenced: writes are
+/// refused and it is not ready.
+#[inline]
+pub fn is_fenced() -> bool {
+    FENCED.load(Ordering::SeqCst)
+}
+
+/// The fence this process took, if any.
+pub fn fence_status() -> Option<FenceStatus> {
+    FENCE.read().clone()
+}
+
 fn engine_sequence(engine: &StorageEngine) -> u64 {
     engine.db().latest_sequence_number()
 }
 
-fn primary_block(role: &str, cursor: u64, primary: Option<String>, sync_mode: String, tls: bool) -> ReplicationBlock {
+fn primary_block(
+    role: &str,
+    cursor: u64,
+    epoch: u64,
+    primary: Option<String>,
+    sync_mode: String,
+    tls: bool,
+) -> ReplicationBlock {
     ReplicationBlock {
         role: role.to_string(),
         state: "streaming".to_string(),
@@ -803,7 +1071,7 @@ fn primary_block(role: &str, cursor: u64, primary: Option<String>, sync_mode: St
         primary,
         sync_mode,
         last_ack_sequence: None,
-        epoch: EPOCH,
+        epoch,
         tls,
         reason: None,
         progress: None,
@@ -862,11 +1130,55 @@ pub fn current_sequence(engine: Option<&StorageEngine>) -> u64 {
     }
 }
 
+/// Spec P5.1: the replication epoch `pg_control_checkpoint().timeline_id`
+/// reports — the one the store serving `engine` holds — and the epoch it was
+/// promoted from (`prev_timeline_id`; equal to it before any promotion, as
+/// PostgreSQL's timeline 1 reports 1 for both).
+pub fn epoch_and_previous(engine: Option<&StorageEngine>) -> (u64, u64) {
+    if let Some(engine) = engine {
+        return (engine.replication_epoch(), engine.replication_previous_epoch());
+    }
+    let node = NODE.read().clone();
+    match node {
+        // The store's record says which epoch it was promoted from (never
+        // guessed as `epoch - 1`).
+        Some(NodeStatus::Standby(handle)) => {
+            let snapshot = handle.snapshot();
+            (snapshot.epoch, snapshot.previous_epoch)
+        }
+        Some(NodeStatus::Primary(status)) => status
+            .engine
+            .upgrade()
+            .map_or((INITIAL_EPOCH, INITIAL_EPOCH), |engine| {
+                (engine.replication_epoch(), engine.replication_previous_epoch())
+            }),
+        None => (INITIAL_EPOCH, INITIAL_EPOCH),
+    }
+}
+
 /// `heliosdb_require_ready()`: `Ok(true)` on a primary or a ready standby,
 /// else the 55000 refusal. `engine` is the session's: a session served by the
 /// placeholder of a standby that had no store when it connected (an engine
 /// that is not a physical standby's) is never ready, whatever the posture.
+/// Spec P5.1: a fenced primary is never ready either.
 pub fn require_ready(engine: Option<&StorageEngine>) -> crate::Result<bool> {
+    if let Some(fence) = fence_status() {
+        return Err(crate::Error::Generic(if fence.complete() {
+            format!(
+                "{} at {} by epoch {} (a standby was promoted; this node serves reads only)",
+                crate::error::PRIMARY_FENCED_NOT_READY,
+                format_unix_secs(fence.at),
+                fence.by_epoch
+            )
+        } else {
+            format!(
+                "{} by epoch {}, and the fence is not complete ({})",
+                crate::error::PRIMARY_FENCED_NOT_READY,
+                fence.by_epoch,
+                fence.reason()
+            )
+        }));
+    }
     match standby() {
         Some(handle) => {
             let mut snapshot = handle.snapshot();
@@ -892,13 +1204,20 @@ pub fn status_block(engine: &StorageEngine) -> ReplicationBlock {
     let node = NODE.read().clone();
     match node {
         Some(NodeStatus::Standby(handle)) => handle.snapshot().block(),
-        Some(NodeStatus::Primary(status)) => primary_block(
-            status.role,
-            engine_sequence(engine),
-            status.endpoint,
-            status.sync_mode,
-            status.tls,
-        ),
+        Some(NodeStatus::Primary(status)) => {
+            let mut block = primary_block(
+                status.role,
+                engine_sequence(engine),
+                engine.replication_epoch(),
+                status.endpoint,
+                status.sync_mode,
+                status.tls,
+            );
+            if let Some(fence) = fence_status() {
+                fence_block(&mut block, &fence);
+            }
+            block
+        }
         None => match embedded_standby_cursor(Some(engine)) {
             // An embedded standby: no receiver, so no posture to report.
             Some(cursor) => ReplicationBlock {
@@ -912,12 +1231,19 @@ pub fn status_block(engine: &StorageEngine) -> ReplicationBlock {
                 primary: None,
                 sync_mode: "async".to_string(),
                 last_ack_sequence: None,
-                epoch: EPOCH,
+                epoch: engine.replication_epoch(),
                 tls: false,
                 reason: None,
                 progress: None,
             },
-            None => primary_block("standalone", engine_sequence(engine), None, "async".to_string(), false),
+            None => primary_block(
+                "standalone",
+                engine_sequence(engine),
+                engine.replication_epoch(),
+                None,
+                "async".to_string(),
+                false,
+            ),
         },
     }
 }
@@ -1301,8 +1627,77 @@ mod tests {
             posture.snapshot().block().reason.as_deref(),
             Some("physical replication history mismatch")
         );
-        let primary = primary_block("primary", 7, Some("127.0.0.1:5433".into()), "async".into(), true);
+        let primary = primary_block(
+            "primary",
+            7,
+            INITIAL_EPOCH,
+            Some("127.0.0.1:5433".into()),
+            "async".into(),
+            true,
+        );
         assert!(primary.tls && primary.reason.is_none());
+    }
+
+    /// Spec P5.1 §1, §3.2, §11.D: the blocks report the store's epoch; a
+    /// primary whose fence is under way reads `fencing`, one whose fence
+    /// failed says "fence incomplete", and a fenced one reads `fenced` —
+    /// never ready, the fence in `reason`, the frozen field set unchanged
+    /// (only values). The process-wide fence is not raised here: a unit test
+    /// must not fence the test process.
+    #[test]
+    fn a_fenced_primary_block_reads_fenced_and_the_epoch_is_the_stores() {
+        let mut block = primary_block("primary", 7, 2, None, "async".into(), false);
+        assert_eq!((block.state.as_str(), block.ready, block.epoch), ("streaming", true, 2));
+        let fields_before = serde_json::to_value(&block).unwrap();
+        let fencing = FenceStatus {
+            epoch: 2,
+            by_epoch: 3,
+            by_node: Uuid::nil(),
+            at: 1_761_000_000,
+            final_sequence: None,
+            incomplete: None,
+        };
+        fence_block(&mut block, &fencing);
+        assert_eq!(
+            (block.state.as_str(), block.ready, block.epoch),
+            (FENCING_STATE, false, 2)
+        );
+        let incomplete = FenceStatus {
+            incomplete: Some("the WAL could not be fsynced".into()),
+            ..fencing.clone()
+        };
+        fence_block(&mut block, &incomplete);
+        let reason = block.reason.clone().unwrap();
+        assert!(
+            block.state == FENCING_STATE && reason.starts_with("fence incomplete") && reason.contains("fsynced"),
+            "{reason}"
+        );
+        let fenced = FenceStatus {
+            final_sequence: Some(9),
+            ..fencing
+        };
+        fence_block(&mut block, &fenced);
+        assert_eq!(
+            (block.state.as_str(), block.ready, block.epoch),
+            (FENCED_STATE, false, 2)
+        );
+        let reason = block.reason.clone().unwrap();
+        assert!(reason.contains("fenced at 2025-10-20T22:40:00Z by epoch 3"), "{reason}");
+        let fields_after = serde_json::to_value(&block).unwrap();
+        let keys = |value: &serde_json::Value| value.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(keys(&fields_before), keys(&fields_after), "the field set is frozen");
+        let refusal = primary_fenced_write_message(3, 1_761_000_000);
+        assert!(
+            refusal.starts_with(&format!(
+                "{} at 2025-10-20T22:40:00Z by epoch 3",
+                crate::error::PRIMARY_FENCED_WRITE_REFUSED
+            )),
+            "spec P5.1 §3.2's sentence, no stray colon: {refusal}"
+        );
+        assert!(refusal.contains("heliosdb-nano recover --from-primary"), "{refusal}");
+        assert!(fenced
+            .termination()
+            .starts_with("terminating connection: this primary was fenced by epoch 3"));
     }
 
     /// Spec P3.2 §3: an archive-only standby is `recovering` (mode

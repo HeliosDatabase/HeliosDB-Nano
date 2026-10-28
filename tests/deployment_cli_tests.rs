@@ -255,7 +255,7 @@ fn http_disabled_ignores_invalid_listen_address() {
 }
 
 /// Spec P2.1: the TOML `replication_port` is the primary's one replication
-/// port (NPHYS003), served once it has a token.
+/// port (NPHYS004), served once it has a token.
 #[test]
 #[cfg(feature = "ha-tier1")]
 fn replication_toml_starts_primary_listener() {

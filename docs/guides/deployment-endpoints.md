@@ -2,7 +2,7 @@
 
 PostgreSQL and replication are different protocols on different ports. A primary
 listens for SQL on `--port` (default 5432) and serves its standbys on ONE
-replication port, `--replication-port` (default 5433, protocol `NPHYS003`): the
+replication port, `--replication-port` (default 5433, protocol `NPHYS004`): the
 bootstrap copy, the physical WAL, heartbeats and acknowledgements all travel over
 one connection per standby. Give the two ports distinct endpoints. A standby's
 `--primary-host` must address the primary's replication port, not its SQL or HTTP
@@ -185,6 +185,21 @@ contains a port. Bare IPv6 addresses are supported; bracket IPv6 when attaching
 a port. HTTP DNS names are not accepted. On a replication node, `/health` carries
 the replication block and `/ready` answers 200 or 503 by readiness; both stay
 public when the HTTP API requires credentials.
+
+The block's `state` on a primary is `streaming`, and (spec P5.1) two more
+values say a promoted standby superseded it:
+
+| `state` | meaning | `/ready` |
+|---|---|---|
+| `fencing` | a fence is under way: the write gate closed, every write is refused, the writes before it are being made durable; or the fence did not complete (`reason` starts with "fence incomplete") | 503 |
+| `fenced` | the fence is recorded (`NANO-FENCED.json`): reads only, for good, until the node is rebuilt as a standby | 503 |
+
+The rule: `/ready` answers 200 only on a primary that is neither `fencing`
+nor `fenced`, and on a standby that is ready by its posture. A load balancer
+or proxy health check that keys on `/ready` therefore takes a superseded
+primary out of the write set the moment its gate closes. The block's `epoch`
+is the node's own store epoch (a fenced primary keeps reporting the epoch it
+was at); the newer epoch that fenced it is in `reason`.
 
 Remote trust authentication remains refused by default. For isolated development,
 `--allow-insecure-trust` explicitly permits PostgreSQL trust on a non-loopback

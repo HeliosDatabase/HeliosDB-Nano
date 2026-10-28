@@ -12,7 +12,7 @@
 //! The worker's stage owns the receiver's `LocalWriter`; every RocksDB open of
 //! the stage uses the storage options of `ReceiverOptions::config`.
 //!
-//! Spec P2.1: the receiver's control plane rides its one `NPHYS003` session —
+//! Spec P2.1: the receiver's control plane rides its one `NPHYS004` session —
 //! its `Hello` names it (node id, history, durable cursor), it acknowledges
 //! every durable advance with a heartbeat ([`Heartbeat`] = the ACK the
 //! primary's synchronous commits wait on), and a source's refusal arrives as
@@ -38,8 +38,8 @@ use super::physical::{Durability, LocalWriter, PhysicalBatch, PhysicalCursor};
 use super::physical_applier::PhysicalApplier;
 use super::physical_tls::{ReplicationStream, ReplicationTransport};
 use super::physical_wire::{
-    now_millis, BatchSink, Heartbeat, PhysicalClient, PollSummary, ReceiverIdentity, RefuseCode, SourceSessionInfo,
-    TransferToken, WireError, WireLimits, MAX_POLL_BYTES,
+    now_millis, BatchSink, Heartbeat, LastGroup, PhysicalClient, PollSummary, ReceiverIdentity, RefuseCode,
+    SourceSessionInfo, TransferToken, WireError, WireLimits, MAX_POLL_BYTES,
 };
 use crate::Config;
 use async_trait::async_trait;
@@ -272,6 +272,11 @@ pub enum ReceiverStatus {
 struct Position {
     path: Option<PathBuf>,
     cursor: Option<PhysicalCursor>,
+    /// Spec P5.1: the live stage's epoch (`repl:epoch` of its store, read
+    /// with the position): what a resumed session's `Hello` announces. `None`
+    /// without a live stage (a record that cannot be read fails the position
+    /// instead, spec §11.G: the receiver does not connect).
+    epoch: Option<u64>,
 }
 impl Position {
     fn initialized(&self) -> Result<(PathBuf, PhysicalCursor)> {
@@ -381,23 +386,46 @@ impl State {
             _ => None,
         }
     }
+    /// Spec P5.1: the live stage's epoch — one point read of its store, made
+    /// only when the owner asks for the position ([`Command::Position`]),
+    /// never on the apply path. `Ok(None)` without a live stage. Spec §11.G:
+    /// a record that cannot be decoded is an error, never epoch 1 — a store
+    /// that cannot say which epoch it follows must not announce one.
+    fn epoch(&self) -> std::result::Result<Option<u64>, String> {
+        match self.writer() {
+            None => Ok(None),
+            Some(writer) => super::epoch::read_epoch(writer.db()).map(Some).map_err(|error| {
+                format!(
+                    "the standby's replication epoch record cannot be read ({error}): it does not connect to a \
+                     source; rebuild it (heliosdb-nano recover --from-primary --full --replace)"
+                )
+            }),
+        }
+    }
+    /// The position as recorded after every command (no epoch: see
+    /// [`Self::epoch`]).
     fn position(&self) -> Position {
+        let epoch = None;
         match self {
             Self::Download(stage) => Position {
                 path: Some(stage.staging_path().to_path_buf()),
                 cursor: None,
+                epoch,
             },
             Self::Initial(stage) => Position {
                 path: Some(stage.staging_path().to_path_buf()),
                 cursor: Some(stage.cursor()),
+                epoch,
             },
             Self::Reopened(stage) => Position {
                 path: Some(stage.path().to_path_buf()),
                 cursor: Some(stage.cursor()),
+                epoch,
             },
             Self::Closed(stage) => Position {
                 path: Some(stage.path.clone()),
                 cursor: Some(stage.cursor.clone()),
+                epoch,
             },
             _ => Position::default(),
         }
@@ -601,7 +629,12 @@ fn worker_loop(
                 let _ = reply.send(result);
             }
             Command::Position { reply } => {
-                let _ = reply.send(Ok(state.position()));
+                let mut position = state.position();
+                let result = state.epoch().map_err(storage).map(|epoch| {
+                    position.epoch = epoch;
+                    position
+                });
+                let _ = reply.send(result);
             }
             Command::Publish { reply } => {
                 let result = match std::mem::replace(&mut state, State::Failed) {
@@ -860,6 +893,26 @@ fn retryable(error: &WireError) -> bool {
     }
 }
 
+/// Spec P5.1 §2: the configured source is a superseded primary (it refused
+/// `SourceStale`). Said once per epoch of that source, at WARN — the receiver
+/// keeps retrying every backoff round, and a WARN per round would bury the
+/// log while the operator fixes `--primary-host`.
+fn warn_superseded_source(source: SocketAddr, refusal: &super::physical_wire::Refusal) {
+    static WARNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let RefuseCode::SourceStale { have, want } = refusal.code else {
+        return;
+    };
+    // `have + 1`: 0 means nothing was warned yet.
+    let marker = have.saturating_add(1);
+    if WARNED.swap(marker, Ordering::AcqRel) != marker {
+        tracing::warn!(
+            "the physical source at {source} is a superseded primary (epoch {have}; this standby follows epoch \
+             {want}): it is not followed; point --primary-host at the current primary. Retrying meanwhile: \
+             {refusal}"
+        );
+    }
+}
+
 /// When this session's next heartbeat (= acknowledgement) is due: every
 /// heartbeat interval, and once a poll has advanced the durable cursor —
 /// coalesced to one per [`ACK_COALESCE`].
@@ -934,11 +987,20 @@ fn session_barrier(info: Option<&SourceSessionInfo>, known_barrier: u64) -> Resu
 /// it; a refusal still stops it (spec P2.1: unless its code is retryable, or
 /// it is one of [`AUTH_ATTEMPTS`] `AuthFailed`s). Rounds back off from
 /// `reconnect_delay` up to [`MAX_RECONNECT_BACKOFF`].
+///
+/// Spec P5.1: a resumed session (`cursor`) announces the epoch its STORE
+/// holds (`epoch`, read with the position) — never a process constant — so a
+/// standby of a promoted primary announces the new epoch. A `SourceStale`
+/// refusal (the configured source is a superseded primary) is retried like
+/// any retryable one, so the posture stays `reconnecting` with the reason and
+/// a corrected `--primary-host` takes effect; it is logged once per epoch.
+#[allow(clippy::too_many_arguments)]
 async fn connect(
     options: &ReceiverOptions,
     shutdown: &mut watch::Receiver<bool>,
     progress: &watch::Sender<ReceiverStatus>,
     cursor: Option<&PhysicalCursor>,
+    epoch: Option<u64>,
     attempts: &mut u32,
     serving: bool,
     lost: Option<String>,
@@ -947,6 +1009,10 @@ async fn connect(
     let snapshot_history = match &options.start {
         ReceiverStart::Snapshot { expected_history, .. } => *expected_history,
         ReceiverStart::Resume { history, .. } => Some(*history),
+    };
+    let identity = ReceiverIdentity {
+        epoch: epoch.unwrap_or(options.identity.epoch),
+        ..options.identity.clone()
     };
     let mut auth_failures = 0_u32;
     let mut delay = options.reconnect_delay;
@@ -975,15 +1041,20 @@ async fn connect(
                     *source,
                     &options.transport,
                     &options.token,
-                    &options.identity,
+                    &identity,
                     options.wire,
                     shutdown.clone(),
                     cursor.history(),
                     cursor.source_sequence(),
+                    // Spec P5.1 §11.F: the source verifies it is the group
+                    // ending at the cursor before it serves the session.
+                    cursor
+                        .last_group()
+                        .map(|(first_sequence, digest)| LastGroup { first_sequence, digest }),
                 )
                 .await
             } else {
-                let hello = options.identity.hello(snapshot_history, None);
+                let hello = identity.hello(snapshot_history, None);
                 PhysicalClient::connect_replication(
                     *source,
                     &options.transport,
@@ -1027,6 +1098,10 @@ async fn connect(
                         "the physical source at {source} refused this receiver's token ({auth_failures} of \
                          {AUTH_ATTEMPTS} attempts): {refusal}"
                     );
+                    last_error = Some(WireError::Refused(refusal));
+                }
+                Err(WireError::Refused(refusal)) if matches!(refusal.code, RefuseCode::SourceStale { .. }) => {
+                    warn_superseded_source(*source, &refusal);
                     last_error = Some(WireError::Refused(refusal));
                 }
                 Err(error) if retryable(&error) => last_error = Some(error),
@@ -1084,11 +1159,12 @@ async fn reconnect(
         .request(|reply| Command::Sync { reply })
         .await
         .map_err(|drain| storage(format!("{error}; cannot drain receiver apply: {drain}")))?;
-    let (_, durable) = worker
+    let position = worker
         .position()
         .await
-        .map_err(|drain| storage(format!("{error}; cannot drain receiver apply: {drain}")))?
-        .initialized()?;
+        .map_err(|drain| storage(format!("{error}; cannot drain receiver apply: {drain}")))?;
+    let epoch = position.epoch;
+    let (_, durable) = position.initialized()?;
     if stopped(shutdown) {
         return Err(WireError::Shutdown.into());
     }
@@ -1107,6 +1183,7 @@ async fn reconnect(
         shutdown,
         progress,
         Some(&durable),
+        epoch,
         reconnects,
         serving,
         Some(lost),
@@ -1153,7 +1230,7 @@ async fn download_snapshot(
     // Bytes this run fetched from the source (resumed bytes are not fetched).
     let mut fetched = 0_u64;
     loop {
-        let mut client = connect(options, shutdown, progress, None, reconnects, serving, None).await?;
+        let mut client = connect(options, shutdown, progress, None, None, reconnects, serving, None).await?;
         let preferred = worker
             .request(|reply| Command::Inspect {
                 target: target.to_path_buf(),
@@ -1413,12 +1490,15 @@ async fn run_inner(
                     reply,
                 })
                 .await?;
-            let (_, cursor) = worker.position().await?.initialized()?;
+            let position = worker.position().await?;
+            let epoch = position.epoch;
+            let (_, cursor) = position.initialized()?;
             connect(
                 options,
                 shutdown,
                 progress,
                 Some(&cursor),
+                epoch,
                 &mut reconnects,
                 serving,
                 None,
@@ -1559,12 +1639,15 @@ async fn run_inner(
                     reply,
                 })
                 .await?;
-            let (_, durable) = worker.position().await?.initialized()?;
+            let position = worker.position().await?;
+            let epoch = position.epoch;
+            let (_, durable) = position.initialized()?;
             client = connect(
                 options,
                 shutdown,
                 progress,
                 Some(&durable),
+                epoch,
                 &mut reconnects,
                 serving,
                 None,
@@ -2431,6 +2514,7 @@ mod tests {
             shutdown,
             history,
             after,
+            None,
         )
         .await
         .unwrap();

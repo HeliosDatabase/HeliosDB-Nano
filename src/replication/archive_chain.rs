@@ -19,7 +19,12 @@
 //! primary's sequences, so the archives of every node of one history hold the
 //! same groups at the same boundaries — whatever their segment boundaries —
 //! and a chain may switch from one node's segments to another's at any group.
-//! Only the current history and epoch are ever read (P5 makes the epoch real).
+//! Only the reader's own history and epoch are ever read. Spec P5.1: the epoch
+//! is the one the reader's store holds (`repl:epoch`); a promotion starts a new
+//! epoch's run of segments (`<history>/<epoch>/`), and a standby of the old
+//! epoch is refused the new one's by name (both epochs said), never chained
+//! across the promotion: the new primary numbers its writes in its own
+//! sequences.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -365,10 +370,25 @@ pub fn build_chain(
                         ));
                     }
                 }
+                // Spec P5.1 §6: the same dataset at another epoch — a
+                // standby was promoted. Named with both epochs: a standby of
+                // the old epoch is recovered from the new primary, never
+                // from segments of an epoch it does not follow.
+                Some(info) if loose && info.history() == history => chain.refused.push(format!(
+                    "segment {path}: another epoch of this dataset: it belongs to epoch {} of history {history}, this \
+                     standby is at epoch {epoch} (a standby was promoted; recover this standby from the current \
+                     primary: heliosdb-nano recover --from-primary)",
+                    info.epoch()
+                )),
                 Some(info) if loose => chain.refused.push(format!(
                     "segment {path}: other dataset: it belongs to history {} epoch {}, this standby follows \
                      history {history} epoch {epoch}",
                     info.history(),
+                    info.epoch()
+                )),
+                Some(info) if info.history() == history => chain.notes.push(format!(
+                    "segment {path}: skipped: it belongs to epoch {} of this dataset; this standby is at epoch \
+                     {epoch}",
                     info.epoch()
                 )),
                 Some(info) => chain.notes.push(format!(
@@ -691,5 +711,63 @@ mod tests {
             refused.contains(&damaged.path.display().to_string()) && refused.contains("file hash"),
             "{refused}"
         );
+    }
+
+    /// Spec P5.1 §6: segments of the same dataset at another epoch are never
+    /// chained for a standby of this one. Copied loose into a directory they
+    /// are refused by name, the message naming both epochs; filed under
+    /// their own epoch's directory they are passed over with a note naming
+    /// both; the standby's own epoch is chained as before.
+    #[test]
+    fn segments_of_another_epoch_are_refused_naming_both_epochs() {
+        let root = TempDir::new().unwrap();
+        let (history, groups) = batches(6, 1);
+        let ours = segment_dir(root.path(), history, 1);
+        seal(&ours, &groups[0..3], Uuid::new_v4());
+        let theirs = segment_dir(root.path(), history, 2);
+        let mut header = SegmentHeader {
+            flags: 0,
+            history,
+            epoch: 2,
+            first_sequence: groups[3].first_sequence(),
+            created_at: unix_now(),
+            node_id: Uuid::new_v4(),
+            key_check: [0; 32],
+        };
+        let mut open = OpenSegment::create(&theirs, header.clone()).unwrap();
+        for batch in &groups[3..6] {
+            open.append(batch, unix_now(), None).unwrap();
+        }
+        open.seal().unwrap();
+
+        // The archive's root: epoch 1 chained, epoch 2 noted with both.
+        let chain = build_chain(&[root.path().to_path_buf()], history, 1, 0, None).unwrap();
+        assert!(chain.refused.is_empty(), "{:?}", chain.refused);
+        assert_eq!(chain.segments.len(), 1);
+        assert_eq!(chain.reached, groups[2].last_sequence());
+        assert!(
+            chain
+                .notes
+                .iter()
+                .any(|note| note.contains("epoch 2 of this dataset") && note.contains("at epoch 1")),
+            "{:?}",
+            chain.notes
+        );
+
+        // The epoch-2 directory itself, given as a source: refused by name.
+        let chain = build_chain(std::slice::from_ref(&theirs), history, 1, 0, None).unwrap();
+        assert_eq!(chain.refused.len(), 1, "{:?}", chain.refused);
+        let refusal = &chain.refused[0];
+        assert!(
+            refusal.contains("another epoch of this dataset")
+                && refusal.contains("epoch 2 of history")
+                && refusal.contains("at epoch 1"),
+            "{refusal}"
+        );
+        // A standby of epoch 2 chains them.
+        header.epoch = 2;
+        let chain = build_chain(&[theirs], history, header.epoch, groups[2].last_sequence(), None).unwrap();
+        assert!(chain.refused.is_empty());
+        assert_eq!(chain.reached, groups[5].last_sequence());
     }
 }

@@ -208,8 +208,9 @@ Steps, each logged on one line:
 
 The first open as a primary: `prepare_physical_source` finds the history file and keeps `H`;
 `replication_epoch()` = E+1; the primary archiver writes `<archive>/<H>/<E+1>/` starting at the
-store's current sequence (the `repl:epoch` write is inside the first segment); the old
-`<H>/<E>/` segments stay until the recovery window prunes them. No new history id is ever minted
+store's current barrier (the `repl:epoch` write itself is not in a segment: it reaches later
+standbys through checkpoints and fast-forward leaves); the old `<H>/<E>/` segments stay until the
+recovery window prunes them. No new history id is ever minted
 by a promotion (a test pins it).
 
 ## 5. What the other nodes see
@@ -315,3 +316,69 @@ bin, full lib, fmt, clippy new-findings), lint, phase gate, pg35, perf smoke, li
 `jlive/promote_probe.sh` (P + S + S2 on real daemons, 1 GB dataset: graceful promote with timing of
 each step, S2 fast-forward, fenced P rebuilt, forced promote after SIGKILL of P, kill mid-promotion
 and re-run), field-J probe unchanged.
+
+## 11. Review follow-ups (2026-10-28; these amend §3, §4, §6, §8 above)
+
+Adversarial review of the first implementation (5 HIGH, 8 MEDIUM) and the first gate run
+(archive recovery flake, a key-literal tripwire, a refusal-text drift) decided the following.
+
+A. **A fenced directory starts fenced, in every build and through every entry point.**
+   `StorageEngine::open` of a directory carrying `NANO-FENCED.json` in a writable mode opens with
+   the write gate already fenced (reason from the record), so `start`, `repl`, MCP serve and the
+   embedded API all serve reads and refuse writes; the posture is `fenced` from the first second.
+   `start --replication-role primary` on it serves reads and replication resume sessions (so an
+   interrupted promotion can still tail it); `--replication-role standby` over it stays refused
+   (rebuild). `NANO-PROMOTION.json` is refused by the engine in every mode except the promote
+   command's own open. This replaces §3.2 step 4's "cannot be started" and closes the `ha-tier1`-only
+   and FIPS-build gaps.
+B. **`promote` proves the tail before it fences.** It opens the resume session after `C` and
+   receives the first poll BEFORE sending `Fence` (inside that session), then tails the remainder
+   through `final`. After a fence, every timeout or I/O error says "the primary may already be
+   fenced by this promotion: re-run `promote` with the same directory (it answers the same
+   `Fenced`); use --force only if it is gone". The fence no longer stops the old primary's archiver:
+   the archiver is asked to archive THROUGH `final` and seal its open segment, then keeps running
+   idle (nothing more is written). New `--no-fence` (implies `--force`; never contacts the primary)
+   for rehearsals on a cloned directory; `--force` help/docs corrected: a reachable primary is still
+   fenced, `--force` only decides what happens when it cannot be.
+C. **A fence request must come from a node of this history with a cursor and name exactly
+   `hello.epoch + 1`**; anything else is `Refuse(Version)`. The promotion identity is a random
+   UUID minted at step 1 and kept in the node-local family (never the configured `node_id`), so
+   two standbys sharing a config cannot both be answered `Fenced`.
+D. **Posture `fencing`** from the moment the gate closes; if the drain, the WAL flush or the record
+   write fails, `/ready` stays 503 with "fence incomplete", sessions are still ended lazily, and the
+   log says a restart undoes an incomplete fence only when no record was written.
+E. **A fenced primary tells clients it is read-only:** `SHOW transaction_read_only` and
+   `default_transaction_read_only` answer `on`, the startup ParameterStatus carries
+   `default_transaction_read_only=on`; `in_hot_standby` stays `off` (it is not a standby). A fenced
+   source refuses `Snapshot`, `SnapshotOf` and `FastForward` opens with `SourceNotServing`
+   ("fenced: bootstrap from the new primary") and keeps serving `Resume`.
+F. **NPHYS004: a resume is verified by content.** `OpenRequest::Resume` carries the cursor's
+   `last_first_sequence` and `last_digest`; the source re-reads the group ending at `after` and
+   refuses a digest mismatch with new `RefuseCode::Diverged{at}` (id 11, needs_recovery → recover
+   route 2); a group the WAL no longer holds is `WalPruned` as today. Cascade sources verify in the
+   translated numbering. This is what makes two `--force` promotions to the same epoch unable to
+   feed each other's standbys. `tests/physical_standby_refusals.rs` refuses NPHYS001-003.
+G. **No fail-open on the epoch:** a store whose `repl:epoch` cannot be decoded refuses to connect
+   (receiver, recover, promote) naming the key. `recover --from-primary --replace` on a primary's
+   directory whose store epoch is HIGHER than the source's is refused naming both ("the source is
+   the superseded one"). The post-`adopt_epoch` full-copy reason names the numbering difference.
+H. **Record files are torn-proof:** `NANO-FENCED.json`, `NANO-PROMOTION.json` and
+   `NANO-PRIMARY-HISTORY.json` are written as `.tmp` + fsync + no-replace rename + directory fsync.
+   An unreadable `NANO-PROMOTION.json` on a store that still holds `__nano_local` at epoch E is
+   discarded with a WARN and the promotion restarts from step 1; every other unreadable record
+   refuses with the file name and the next step.
+I. **Tests:** scenario 3 becomes "a fenced primary starts fenced (reads served, writes 25006,
+   `/ready` 503, state fenced) in the primary role, is refused in the standby role, and is rebuilt
+   with `--replace`"; scenario 8 runs P with the logical-WAL checkpoint interval at 0 (or asserts
+   promote's redo-floor line with `checkpoint_before < highest`) and the trigger workload the spec
+   asked for; scenario 7 asserts the default family digest only (the local family gains the
+   promotion id by design) and that `pg_promote` fails with 42883; a new unit test proves the
+   archiver seals through `final` before `recover --from-archive` can read the segment; a keyspace
+   tripwire-safe wording is used for every error message that mentions a key.
+J. **Known limit, documented:** the fence drains RocksDB calls, not statements: a statement whose
+   first write landed before the fence and whose later write was refused is reported 25006, exactly
+   as a crash at that point would be; its first writes are inside `final` and therefore on the new
+   primary.
+K. **Docs:** `deployment-endpoints.md` gains `state=fencing|fenced` and the `/ready` rule; every
+   `PromoteError::Failed` names the next command; `standby_store_epoch` reads the epoch without a
+   full open when the archive is off.

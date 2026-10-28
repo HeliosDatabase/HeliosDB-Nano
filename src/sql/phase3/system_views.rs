@@ -1809,7 +1809,8 @@ impl SystemViewRegistry {
         // pg_control_checkpoint()` is how HeliosDB Proxy reads the
         // replication epoch. A subset of PostgreSQL's columns, one row; the
         // table-function call parses as a relation with arguments and lands
-        // here. `timeline_id` is the epoch (1 until promotion, phase P5).
+        // here. `timeline_id` is the epoch the store holds (spec P5.1: 1
+        // until the first promotion, strictly higher after each one).
         self.register_view(SystemViewSchema {
             name: "pg_control_checkpoint".to_string(),
             schema: Schema {
@@ -6351,16 +6352,21 @@ impl SystemViewRegistry {
 
     /// `pg_control_checkpoint()`: one row whose LSNs are this node's physical
     /// position (a standby's applied cursor, a primary's written sequence) and
-    /// whose `timeline_id` is the replication epoch (spec P1.3).
+    /// whose `timeline_id` is the replication epoch (spec P1.3). Spec P5.1:
+    /// the epoch the store holds (`repl:epoch`, 1 before any promotion), and
+    /// `prev_timeline_id` the epoch it was promoted from (1 when never
+    /// promoted, as PostgreSQL's timeline 1 reports).
     fn execute_pg_control_checkpoint(storage: &StorageEngine) -> Tuple {
-        use crate::standby_posture::{current_sequence, format_lsn, EPOCH};
+        use crate::standby_posture::{current_sequence, epoch_and_previous, format_lsn};
         let lsn = format_lsn(current_sequence(Some(storage)));
-        let epoch = i64::try_from(EPOCH).unwrap_or(i64::MAX);
+        let (epoch, previous) = epoch_and_previous(Some(storage));
+        let epoch = i64::try_from(epoch).unwrap_or(i64::MAX);
+        let previous = i64::try_from(previous).unwrap_or(i64::MAX);
         Tuple::new(vec![
             Value::String(lsn.clone()),
             Value::String(lsn),
             Value::Int8(epoch),
-            Value::Int8(epoch),
+            Value::Int8(previous),
             Value::Boolean(true),
         ])
     }

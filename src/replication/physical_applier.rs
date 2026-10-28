@@ -796,7 +796,48 @@ impl PhysicalApplier {
         self.publish_vector_records(touched);
         self.vector.on_batch_published(&self.engine);
         self.publish_listener(touched);
+        self.publish_epoch(touched);
         self.publish_unknown(touched, state);
+    }
+
+    /// Spec P5.1 §1: an applied run carried `repl:epoch` — the engine's
+    /// cache follows the store, and the posture (which reads that cache)
+    /// with it. Logged at INFO; no derived state. A value that does not
+    /// decode keeps the cached epoch and says so: the next open of the store
+    /// refuses it with the same reason.
+    fn publish_epoch(&self, touched: &Touched) {
+        if !touched.epoch {
+            return;
+        }
+        match crate::replication::epoch::read_epoch_record(self.writer.db()) {
+            Ok(record) => {
+                let before = self.engine.replication_epoch();
+                self.engine.note_replication_epoch(record.as_ref());
+                tracing::info!(
+                    "physical applier: the dataset's replication epoch is now {} (was {before}{})",
+                    self.engine.replication_epoch(),
+                    record
+                        .as_ref()
+                        .map(|record| format!(
+                            "; promoted from {} by node {}, {}",
+                            record.previous,
+                            record.node_id,
+                            if record.fenced {
+                                "the old primary fenced first"
+                            } else {
+                                "the old primary NOT fenced"
+                            }
+                        ))
+                        .unwrap_or_default()
+                );
+            }
+            Err(e) => warn!(
+                "physical applier: the applied replication epoch record cannot be read ({}); this standby keeps \
+                 reporting epoch {}",
+                e,
+                self.engine.replication_epoch()
+            ),
+        }
     }
 
     fn publish_meta_tables(&self, touched: &Touched, work: &mut BatchWork) {
@@ -1757,6 +1798,8 @@ struct Touched {
     column_storage_tables: BTreeSet<String>,
     statistics_tables: BTreeSet<String>,
     vgc_watermark: bool,
+    /// Spec P5.1: the run wrote (or deleted) `repl:epoch`.
+    epoch: bool,
     /// Catalog keys for the listener.
     catalog: BTreeMap<Vec<u8>, KeyClass>,
     unknown: Vec<Vec<u8>>,
@@ -1905,6 +1948,9 @@ impl Touched {
                 }
             }
             KeyClass::VgcWatermark => self.vgc_watermark = true,
+            // Spec P5.1: the dataset's epoch; no derived state, only the
+            // engine's cache of it (what this standby reports and announces).
+            KeyClass::ReplEpoch => self.epoch = true,
             KeyClass::Vidx => {
                 self.vidx.insert(key.to_vec());
             }
@@ -2263,6 +2309,20 @@ mod tests {
         assert!(touched.touches_catalog());
         assert!(!touched.holds_every_table());
         assert_eq!(touched.held_tables(), vec!["users".to_string()]);
+        assert!(!touched.epoch);
+    }
+
+    /// Spec P5.1 §1: `repl:epoch` is a classified key of its own — never an
+    /// unknown one (which would mark the derived state suspect) — and it
+    /// touches no table, catalog key or index.
+    #[test]
+    fn the_replication_epoch_is_noted_as_itself_and_touches_no_derived_state() {
+        let mut touched = Touched::default();
+        touched.note(b"repl:epoch", true);
+        assert!(touched.epoch);
+        assert!(touched.unknown.is_empty());
+        assert!(touched.data.is_empty() && touched.meta_tables.is_empty());
+        assert!(!touched.touches_catalog());
     }
 
     /// Spec P4.1d: a schema, constraint set or index definition that two

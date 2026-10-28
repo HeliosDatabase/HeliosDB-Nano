@@ -133,6 +133,8 @@ const FULL_KEYS: &[&str] = &[
     "branch:pending_gc",
     "git:config",
     "repl:applied_lsn",
+    // Spec P5.1: the stored replication epoch (`replication::epoch::EPOCH_KEY`).
+    "repl:epoch",
 ];
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 //! Shared replication token loading.
 //!
 //! One owner-only 32-byte file authenticates the replication connection
-//! (`physical_wire`, protocol `NPHYS003`): the primary checks it, its standbys
+//! (`physical_wire`, protocol `NPHYS004`): the primary checks it, its standbys
 //! present it. Every check lives here so both sides — and the tests — share
 //! exactly one loader. The token is never read from TOML or the environment;
 //! only the path is configured.

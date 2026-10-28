@@ -24,6 +24,14 @@ mod mv_scheduler;
 mod mv_system_views;
 mod mvcc;
 mod prefix_decode;
+// Spec P5.1: the replication epoch as a stored value (`repl:epoch`), read by
+// the engine at every open in every build (`replication::epoch` re-exports it
+// for the HA code, which a build without an HA feature does not compile).
+pub mod replication_epoch;
+// Spec P5.1 §11.A: the fence and promotion records every engine open reads
+// (a fenced primary's directory opens fenced, an interrupted promotion's in
+// no mode), in every build.
+pub mod replication_records;
 // Spec P2.1: the commit path's wait for standby acknowledgements of the
 // physical sequence, and the slot an unconfirmed commit is reported in.
 pub mod replication_wait;

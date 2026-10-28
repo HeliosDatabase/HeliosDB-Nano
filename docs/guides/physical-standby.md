@@ -61,7 +61,7 @@ ships. "P3", "P4" and "P5" are phases of the physical standby plan.
 | Standby `MOUNTED`, not open | No equivalent: a standby that may not serve data reads stays open and refuses them with SQLSTATE `55000` |
 | SCN | The **physical sequence**: the RocksDB sequence number of the primary's writes. Shown as PostgreSQL LSN text, `HI/LO` hex (`hi = seq >> 32`, `lo = seq & 0xFFFFFFFF`) |
 | Online redo | The RocksDB WAL (`*.log`) |
-| Redo transport | The replication connection (`NPHYS003`) to the primary's `replication_port`, over TLS for a remote standby. The standby pulls write groups |
+| Redo transport | The replication connection (`NPHYS004`) to the primary's `replication_port`, over TLS for a remote standby. The standby pulls write groups |
 | Redo apply (MRP) | The physical applier: each write group is applied verbatim; a poll's groups (at most 32 MiB, or one larger group) are fsynced once and published together, then the standby's in-memory indexes are updated |
 | Archived redo log | An **archived WAL segment**: `<archive>/<history>/<epoch>/<first>-<last>.hseg`, a sealed, checksummed file of whole write groups (see [Archived WAL and the recovery window](#archived-wal-and-the-recovery-window)). The primary's own RocksDB WAL retention (`[replication.physical] wal_retention_secs`, `wal_retention_size_mb`) only covers the archiver's lag and a reconnecting standby |
 | `LOG_ARCHIVE_DEST_n` | `[replication.archive] dir` (`--archive-dir`, default `<data dir>.archive`). Every primary serving its replication port and every standby archives; `--archive=false` turns it off |
@@ -79,10 +79,12 @@ ships. "P3", "P4" and "P5" are phases of the physical standby plan.
 | Cascaded standby (a standby redo-transport source) | `[replication.physical] cascade = true` on a standby: it serves its own store on its `replication_port` to downstream standbys |
 | Datafile block, block SCN | None: one key-value space with no per-key sequence. `recover --from-primary` compares key-range **leaves** (about 4 MiB of keys and values each) by SHA-256 digest |
 | Block change tracking | None yet: the fast-forward's digest pass reads both datasets once, as RMAN does without a change-tracking file |
-| Incarnation, `RESETLOGS` | The dataset **history id** (`NANO-PRIMARY-HISTORY.json`) plus the **epoch** (`timeline_id`, 1 until promotion arrives in P5) |
+| Incarnation, `RESETLOGS` | The dataset **history id** (`NANO-PRIMARY-HISTORY.json`, kept across promotions) plus the **epoch** (`repl:epoch` in the dataset, `pg_control_checkpoint().timeline_id`; 1 until the first promotion, one more per promotion) — see [Promotion and the epoch](#promotion-and-the-epoch) |
 | Protection modes | `[replication] sync_mode`: `async` is Maximum Performance; `semi-sync` with `sync_timeout_action = "warn"` behaves like Maximum Availability. Maximum Protection has no equivalent (`fail` reports an error but never stops the primary) |
 | `NET_TIMEOUT` | `[replication] sync_timeout_ms` |
-| Switchover, failover | Refused until P5 |
+| `SWITCHOVER TO` (graceful) | `heliosdb-nano promote --data-dir DIR` on the stopped standby: the old primary is fenced first and nothing it committed is lost (the SQL `SWITCHOVER` statement stays refused) |
+| `FAILOVER TO` (old primary lost) | `heliosdb-nano promote --data-dir DIR --force`: promotes even when the old primary cannot be fenced (it is fenced all the same if it answers); writes it committed past the standby are lost |
+| Fast-start failover, observer | None: promotion is the operator's (or the orchestration's) decision |
 | `V$DATAGUARD_STATS`, `V$MANAGED_STANDBY` | `/health`, `/ready`, the `heliosdb_standby_status` view; on a primary, the `standbys` list of `/health` and the `pg_replication_standbys` view |
 
 ## Start a pair
@@ -180,7 +182,7 @@ before storage opens), and its HTTP listener mounts only `/`, `/health`,
 
 A standby on another host reaches its primary's replication port over TLS. TLS
 is the transport only: the replication token is still required, and checked,
-in every mode, mutual TLS included. The protocol is unchanged (`NPHYS003`
+in every mode, mutual TLS included. The protocol is unchanged (`NPHYS004`
 inside the TLS stream; each side sets the `CAP_TLS` capability bit for its end
 of the session).
 
@@ -335,7 +337,7 @@ HeliosDB Proxy probes nodes over the PostgreSQL wire only; it never fetches
 
 ## The replication connection
 
-One port, one connection per standby, one protocol: `NPHYS003`. That connection
+One port, one connection per standby, one protocol: `NPHYS004`. That connection
 carries the bootstrap copy, the physical WAL, and the control plane (identity,
 dataset history, epoch, heartbeats and acknowledgements). Until this release a
 standby ran a second, native channel for its handshake and acknowledgements. Two
@@ -346,7 +348,7 @@ by physical sequence. On one connection every frame of a session is ordered and
 names physical sequences only, and a primary that will not serve a standby says
 why.
 
-A frame is a 16-byte header, `MAGIC "NPHYS003" (8) | version u16 = 3 | kind u16 |
+A frame is a 16-byte header, `MAGIC "NPHYS004" (8) | version u16 = 4 | kind u16 |
 length u32`, big-endian, then a payload whose size every kind bounds before it is
 allocated. A payload is read and written in steps of 1 MiB, each bounded by the
 frame timeout: a large frame from a peer that keeps sending never times out, a
@@ -360,20 +362,21 @@ peer that stalls does. The session is request/response, driven by the standby
 | `Hello` | R to S | node id; role `standby` or `resync`; history (none while bootstrapping); epoch; durable cursor (none for a fresh snapshot); capabilities (`CAP_TLS` when the standby's end is TLS); PostgreSQL port; sync mode |
 | `HelloOk` | S to R | node id, history, epoch, barrier (the primary's written sequence), capabilities (`CAP_TLS` when the primary's end is TLS), replication endpoint, PostgreSQL port |
 | `Refuse` | S to R | a code and a reason; the session ends |
-| `Open` | R to S | `snapshot`, `snapshot of <id>` (a resumed download: the leased export it belongs to, else a fresh one), or `resume {history, after}` |
+| `Open` | R to S | `snapshot`, `snapshot of <id>` (a resumed download: the leased export it belongs to, else a fresh one), or `resume {history, after, last write group}` (the group's first sequence and SHA-256, spec P5.1: the primary verifies it is its own) |
 | `Manifest` / `ResumeInfo` | S to R | the session the primary opened |
 | `ChunkRequest` / `Chunk` | R to S / S to R | one bounded, digested piece of a checkpoint file |
 | `PollRequest` | R to S | session, the sequence to continue after, a byte limit of at most 256 MiB (a coalescing target: the poll's first write group travels whatever its size, later ones only within the limit) |
 | `PollStart`, `Batch`*, `PollEnd` | S to R | a contiguous interval of write groups, one `Batch` per write group, never split |
 | `Heartbeat` | R to S | applied sequence, durable sequence, received-at time. This is **the acknowledgement**: one frame, two triggers (every 5 s when idle, and after a poll advanced the durable cursor, coalesced to at most one per 50 ms) |
 | `HeartbeatAck` | S to R | the primary's barrier and clock |
-| `Fence` | either | the epoch; reserved for promotion (P5) and refused by both sides now |
+| `Fence` | R to S | the epoch after the receiver's: `heliosdb-nano promote` fences this primary (spec P5.1), from a standby of this dataset that holds data |
+| `Fenced` | S to R | the epoch it was fenced by and its final sequence: it refuses every write and everything before is durable |
 | `Close` / `Closed` | R to S / S to R | orderly end |
 
 Kind 13 of `NPHYS001` (`AuthRejected`) is retired: a wrong token is
-`Refuse { AuthFailed }`. A peer that speaks `NPHYS001`, or `NPHYS002` (a
-pre-release build whose write groups were bounded at 64 MiB), is answered
-`Refuse { Version }` naming both versions, and a 4.41.x native peer is told to
+`Refuse { AuthFailed }`. A peer that speaks `NPHYS001`, `NPHYS002` (a
+pre-release build whose write groups were bounded at 64 MiB) or `NPHYS003` (whose resume
+carries no last write group), is answered `Refuse { Version }` naming both versions, and a 4.41.x native peer is told to
 upgrade. A standby pointed at a PostgreSQL or HTTP port gets an error saying
 that `--primary-host` must name the primary's `--replication-port`.
 
@@ -384,11 +387,13 @@ that `--primary-host` must name the primary's `--replication-port`.
 | `HistoryMismatch` | the primary is another dataset than the one the standby follows | `needs_recovery` |
 | `Gap { expected, have_from, have_to }` | the primary cannot provide the next sequence contiguously | `needs_recovery` |
 | `WalPruned { oldest }` | the WAL the standby needs is gone; `oldest` is the first sequence still retained | `needs_recovery` |
-| `EpochStale { have, want }` | the epochs differ (possible only once promotion exists, P5) | `needs_recovery` |
-| `Version` | another protocol version, or a feature this release does not serve (fencing) | `needs_recovery` |
+| `EpochStale { have, want }` | the primary is at a newer epoch than the standby (a standby was promoted): recover it from the new primary | `needs_recovery` |
+| `Diverged { at }` | the standby's last write group, ending at `at`, is not the primary's (another primary of the same epoch numbered other writes alike) | `needs_recovery` |
+| `Version` | another protocol version, or a request this source does not serve (a fence it cannot accept) | `needs_recovery` |
 | `AuthFailed` | the token does not match | retried, 3 attempts in all (a token file being replaced on both nodes), then `needs_recovery` |
 | `TooManySessions` | the primary already serves `max_sessions` sessions | `reconnecting`, with backoff |
-| `SourceNotServing` | the primary is shutting down or failing on its side | `reconnecting`, with backoff |
+| `SourceNotServing` | the primary is shutting down or failing on its side, or is fenced and bootstraps nobody (a snapshot or fast-forward of a superseded primary) | `reconnecting`, with backoff |
+| `SourceStale { have, want }` | the source is a superseded primary (a lower epoch than the standby's); it fenced itself | `reconnecting`, with backoff, so a corrected `--primary-host` takes effect |
 | (transport error) | connection refused, reset, timed out | `reconnecting`, with backoff |
 | (TLS failure) | wrong CA, untrusted or misnamed certificate, refused client certificate | `reconnecting` (or `connecting` before the first session), reason `tls: …`, with backoff |
 
@@ -943,6 +948,171 @@ recovered the same way, with `recover --from-primary` against it.
 | 2 | (`--from-archive` only) applied up to an archive gap; also clap's exit code for a usage error |
 | 3 | a full copy is needed but was not applied: `--no-full-copy`, or the data directory is occupied and `--replace` was not given (the completed copy waits beside it) |
 
+## Promotion and the epoch
+
+`heliosdb-nano promote` makes a STOPPED physical standby the primary of its
+dataset. Every promotion raises the dataset's **epoch** by one; the dataset
+**history** stays the same (a promotion never mints a new history id: the
+epoch says which incarnation of the history a node is at).
+
+| Oracle | PostgreSQL | HeliosDB-Nano |
+|---|---|---|
+| Incarnation | Timeline (`timeline_id`) | Epoch: `repl:epoch` in the dataset, `pg_control_checkpoint().timeline_id`, `epoch` of `/health` and `heliosdb_standby_status`, `heliosdb-nano status --data-dir DIR` |
+| `SWITCHOVER TO` | `pg_ctl promote` after a clean stop of the old primary | `promote --data-dir DIR` (the old primary is fenced first) |
+| `FAILOVER TO` | `pg_ctl promote` with the old primary lost | `promote --data-dir DIR --force` (`--no-fence` for a rehearsal on a cloned directory) |
+| Reinstate the old primary | `pg_rewind` | `recover --from-primary --replace` on its directory (a full copy; rewinding in place is a follow-up) |
+| — | `pg_promote(wait, seconds)` | `SELECT pg_promote(true, N)` on a running standby: phase P5.2 (not in this release; the function is not defined yet) |
+
+### What `promote` does
+
+```bash
+# The standby's process is stopped first; its config supplies the defaults.
+heliosdb-nano stop --pid-file /srv/nano/standby.pid
+heliosdb-nano promote --data-dir /srv/nano/standby --config /srv/nano/standby.toml
+# promote: /srv/nano/standby is a stopped physical standby of history 6f1c… at epoch 1, sequence 41 207 (promotion 9d2e…)
+# promote: fencing the primary at 10.0.0.5:5433 (epoch 1 → 2, this standby at sequence 41207)
+# promote: the primary at 10.0.0.5:5433 is fenced by epoch 2 at its sequence 41 993
+# promote: tailed the fenced primary from sequence 41207 through its final sequence 41993
+# promote: recorded the promotion in /srv/nano/standby/NANO-PROMOTION.json
+# promote: wrote epoch 2 into the store; the logical WAL's redo floor is 8 812 (it was 8 790; …); the node-local family is dropped
+# promote: /srv/nano/standby carries the primary's identity of history 6f1c… (inherited, not a new one); …
+# promote: /srv/nano/standby is the primary of history 6f1c… at epoch 2 (from 1; the old primary at
+#   10.0.0.5:5433 was fenced at its sequence 41993 and everything through 41993 is here); start it with
+#   heliosdb-nano start --replication-role primary --data-dir /srv/nano/standby
+heliosdb-nano start --replication-role primary --data-dir /srv/nano/standby --config /srv/nano/primary.toml
+```
+
+1. **Classify.** The directory must be an installed physical standby (its
+   marker and node-local family), stopped (a held RocksDB `LOCK` is refused:
+   "the standby is running: stop it first"), without an interrupted
+   fast-forward (finish it with `recover --from-primary`), and it must reopen
+   as `start` would.
+2. **Fence the old primary — after proving the tail.** As a receiver of the
+   standby's history, epoch and cursor, `promote` connects to the primary's
+   replication port (`--primary-host`, default `[replication] primary_host`;
+   the token and TLS settings as `recover --from-primary` takes them), opens
+   a resume session after the standby's cursor (the primary checks the
+   standby's last write group is its own, see [The epoch on the
+   wire](#the-epoch-on-the-wire)) and receives its first poll: the primary
+   serves this standby, so the tail will work. Only then does it send
+   `Fence { epoch + 1 }`, inside that session. The primary refuses every
+   write from then on (SQLSTATE 25006, "write refused: this primary was
+   fenced at … by epoch 2 …"), makes everything it committed durable,
+   records the fence (`NANO-FENCED.json`), archives and seals its WAL through
+   that point, and answers its final sequence. `promote` then tails it
+   through that sequence, so nothing the old primary committed is lost. A
+   primary that does not answer within `--fence-timeout` (default 30 s), or a
+   tail that does not reach the final sequence within it, stops the promotion
+   (exit 2) — unless `--force`. Once the fence was sent, a timeout or a lost
+   connection says so: "the primary may already be fenced by this promotion:
+   re-run `promote` with the same directory (it answers the same `Fenced`)".
+   A primary that does not serve the standby's cursor (its WAL pruned past
+   it, a diverged history) is not fenced: recover the standby first, or
+   promote with `--force`. A primary already at a newer epoch, or already
+   fenced by another promotion, stops it for good (exit 2): a primary of the
+   new epoch exists; recover this standby from it instead. The fence names
+   the promotion by a random identity `promote` keeps in the standby's
+   node-local family — never the configured `node_id`, so two standbys that
+   share a configuration cannot both be answered `Fenced`.
+3. **Record.** `NANO-PROMOTION.json` is written whole (a temporary file,
+   fsynced, then renamed without replacing) before the store changes. While
+   it exists every open of the directory is refused — `start` in any role,
+   `recover`, `resync`, `repl`, the embedded API: "promotion interrupted:
+   finish it with `heliosdb-nano promote --data-dir DIR`". Running `promote`
+   again finishes it from where it stopped; every step checks before it acts.
+   A record that cannot be read, on a store the conversion has not touched
+   yet, is discarded with a WARNING and the promotion starts again.
+4. **Convert.** `repl:epoch` (the new epoch, the epoch it came from, when, by
+   which promotion, whether the old primary was fenced and at which sequence) is
+   written as the first write of the new epoch; in the same write the logical
+   WAL's redo floor is raised to its head, so the first open as a primary
+   replays none of the old primary's logical entries and reuses no LSN; the
+   node-local family (cursor, fast-forward marks) is dropped.
+5. **Identity.** `NANO-PRIMARY-HISTORY.json` names the inherited history; the
+   physical marker and manifest are removed.
+6. The record is removed and the summary printed. `--then start` starts the
+   node as a primary right away (arguments after `--` go to `start`).
+
+`--force` is an operator's attestation that the old primary is down or
+isolated. It does not skip the fence: a primary that answers is fenced all
+the same. It decides what happens when the fence cannot be had (no answer
+within `--fence-timeout`) or the tail cannot reach the final sequence: the
+promotion goes on, says `WARNING: … writes committed on it after sequence C
+are lost`, and records `fenced = false` in `repl:epoch`. `--no-fence` (which
+implies `--force`) never contacts the old primary at all — for a rehearsal on
+a cloned standby directory; a running old primary is then NOT fenced. Fencing
+a node that cannot be reached is the operator's job (STONITH: power it off,
+cut its network, revoke its storage); nothing in HeliosDB can make an
+unreachable node stop.
+
+A fence drains RocksDB calls, not statements: a multi-statement transaction
+or a long statement whose first writes landed before the fence and whose next
+write was refused reports SQLSTATE 25006, exactly as a crash at that moment
+would end it; the writes it made before the fence are inside the final
+sequence, and therefore on the new primary.
+
+### The epoch on the wire
+
+A standby that holds data announces its store's epoch in every `Hello`; a
+fresh one holds none and takes its primary's with its copy. Both ends compare:
+
+| what meets what | result |
+|---|---|
+| a receiver BEHIND the source's epoch | `EpochStale` (needs recovery): a standby of the old primary pointed at the new one — `recover --from-primary` fast-forwards it (same history: route 2) |
+| a receiver AHEAD of the source's epoch | the source is a superseded primary: it **fences itself** on the spot (read-only, `NANO-FENCED.json`, `state = fenced`) and refuses `SourceStale`; the receiver stays `reconnecting` with that reason and retries, so correcting its `--primary-host` takes effect |
+| a resuming receiver whose last write group is not the source's | `Diverged` (needs recovery): the same history and epoch, other writes under the same sequence numbers (two `--force` promotions to one epoch) — `recover --from-primary` re-cuts it (route 2) |
+
+So an old primary that was NOT fenced (`promote --force`, a partition) stops
+writing the moment any node of the new epoch reaches it. Until then two nodes
+may accept writes; HeliosDB Proxy sends writes to the strictly highest
+`timeline_id` and to neither on a tie.
+
+A sequence number alone does not say which writes a standby holds: after a
+promotion each primary numbers its own writes. So a resume carries the
+standby's last applied write group — its first sequence and SHA-256, from its
+cursor — and the source re-reads its own group ending at the cursor (from its
+WAL or its archive) before it serves the session; a group no longer held is
+`WalPruned` as before. This is protocol `NPHYS004`: an `NPHYS003` peer is
+refused by version, so primary and standbys move to this release together.
+A fence is accepted only from a standby of the same dataset that holds data,
+and only for the epoch after its own.
+
+### What the other nodes see
+
+- **The fenced old primary** serves reads (its sessions opened before the
+  fence are ended at their next statement with FATAL `57P01`; new ones are
+  admitted read-only), answers `/ready` 503, `/health` `state = "fencing"`
+  while the fence is under way and `"fenced"` once it is recorded,
+  `heliosdb_require_ready()` SQLSTATE 55000, and tells clients it is
+  read-only: `SHOW transaction_read_only` and `default_transaction_read_only`
+  answer `on`, and the startup ParameterStatus carries
+  `default_transaction_read_only=on` (`in_hot_standby` stays `off`: it is no
+  standby), so libpq's `target_session_attrs=read-write` skips it. Its
+  archiver archived and sealed its WAL through the final sequence and keeps
+  running, idle. Its replication port keeps serving resume sessions but
+  bootstraps nobody (a snapshot or fast-forward is refused
+  `SourceNotServing`, "fenced: bootstrap from the new primary"). The fence
+  is durable: restarted — as a primary, standalone, through `repl`, MCP or
+  the embedded API, in any build — the directory opens fenced from its first
+  second (reads served, every write refused). Started as a standby it is
+  refused (exit 2, the rebuild command named). Rebuild it as a standby of the
+  new primary: `heliosdb-nano recover --from-primary --primary-host NEW:PORT
+  --replace --data-dir DIR` (a full copy; the old directory is kept as
+  `DIR.replaced-<UTC>`). If the fence could not complete (the WAL fsync or
+  the record write failed), the node stays `fencing` with "fence incomplete"
+  in its reason and keeps refusing writes; no record was written, so only a
+  restart of the node undoes it — re-run the promotion instead.
+- **Standbys of the old primary** keep streaming from it while it is fenced.
+  Pointed at the new primary they are refused `EpochStale` (`needs_recovery`,
+  naming `recover --from-primary`); `recover --from-primary` re-cuts them at
+  the new primary's checkpoint (route 2: only the leaves that differ travel)
+  and they stream at the new epoch.
+- **Archives.** The new primary archives under `<archive>/<history>/<epoch>/`;
+  the previous epoch's segments stay beside them until the recovery window
+  prunes them (`archive list` shows both). `recover --from-archive` reads one
+  epoch: the standby's own; segments of another epoch of the same dataset are
+  refused naming both epochs.
+
 ## Refusals and rebuild
 
 A standby in `needs_recovery` names its reason in its log, in `/ready`, in the
@@ -1096,10 +1266,20 @@ The test suites are listed in the [HA testing guide](ha_testing.md).
   caller and re-encrypts nothing); rotating the key while standbys are attached
   is not supported until promotion and fencing arrive (P5), which add the
   control-plane check that every standby holds the new key first.
-- **No promotion or failover** until plan phase P5. `SWITCHOVER` is refused, and
-  a standby's data directory cannot be opened as a primary or standalone
-  database. Writes are never routed through a standby: connect to the primary to
-  write.
+- **Promotion is offline.** `heliosdb-nano promote` promotes a STOPPED standby
+  (see [Promotion and the epoch](#promotion-and-the-epoch)); the online form,
+  `SELECT pg_promote(true, N)` on a running standby, arrives with P5.2, and
+  the SQL `SWITCHOVER` statement stays refused. A standby's data directory is
+  otherwise never opened as a primary or standalone database. Writes are never
+  routed through a standby: connect to the primary to write. There is no
+  automatic failover: promoting is the operator's decision, and fencing an
+  unreachable old primary (STONITH) is the operator's job.
+- **A fenced primary is rebuilt, not rewound.** Rejoining a fenced (or dead)
+  old primary as a standby is a full copy of the new primary
+  (`recover --from-primary --replace`); rewinding it in place is a follow-up.
+- **Sessions of a fenced primary end lazily.** A session opened before the
+  fence is ended (FATAL `57P01`) at its next statement, not at once; pushing
+  the termination to idle sessions arrives with P5.2.
 - **Cascading is opt-in** (`[replication.physical] cascade = true`) and one
   level is what the tests cover; a downstream standby of a cascading standby
   that falls behind both the cascading standby's live WAL and its archive is

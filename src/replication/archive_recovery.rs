@@ -57,12 +57,13 @@ use super::archive_chain::{build_chain, verify_chain, verify_segment_from, Recov
 use super::archive_segment::{unix_now, SegmentInfo};
 use super::archiver::{dataset_key, ArchiveFeed};
 use super::checkpoint_transfer::{ReopenedPhysicalStage, TransferLimits};
+use super::epoch::read_epoch;
 use super::physical::{Durability, PhysicalBatch};
 use super::physical_applier::{NoopDerivedStateListener, PhysicalApplier};
 use super::physical_receiver::ServingAttach;
 use super::physical_wire::APPLY_CHUNK_BYTES;
 use crate::crypto::KeyManager;
-use crate::standby_posture::{PostureTracker, EPOCH};
+use crate::standby_posture::PostureTracker;
 use crate::storage::{StorageEngine, WriteGate};
 use crate::Config;
 
@@ -178,7 +179,10 @@ fn recover_stage(
     started_at: u64,
     progress: &mut dyn FnMut(&str),
 ) -> Result<RecoverReport, RecoverError> {
-    let chain = build_chain(options.sources, options.history, EPOCH, started_at, options.through)
+    // Spec P5.1: the chain is the standby's own epoch's (its store's).
+    let epoch = read_epoch(stage.writer().db())
+        .map_err(|error| refused(format!("the standby's replication epoch cannot be read: {error}")))?;
+    let chain = build_chain(options.sources, options.history, epoch, started_at, options.through)
         .map_err(|error| refused(error.to_string()))?;
     for note in &chain.notes {
         progress(&format!("recover: {note}"));
@@ -519,7 +523,15 @@ impl Follower<'_> {
     /// One scan of the directories and the segments it found applied.
     fn round(&mut self) -> Result<(), String> {
         let cursor = self.cursor();
-        let chain = match build_chain(self.sources, self.history, EPOCH, cursor, None) {
+        // Spec P5.1: the standby's own epoch, as its store holds it now.
+        let epoch = match read_epoch(self.applier.writer().db()) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                self.blocked(format!("the standby's replication epoch cannot be read: {error}"));
+                return Ok(());
+            }
+        };
+        let chain = match build_chain(self.sources, self.history, epoch, cursor, None) {
             Ok(chain) => chain,
             Err(error) => {
                 self.blocked(error.to_string());
@@ -640,13 +652,17 @@ mod tests {
         let header = SegmentHeader {
             flags: 0,
             history,
-            epoch: EPOCH,
+            epoch: crate::replication::epoch::INITIAL_EPOCH,
             first_sequence: batches[0].first_sequence(),
             created_at: unix_now(),
             node_id: Uuid::new_v4(),
             key_check: [0; 32],
         };
-        let mut open = OpenSegment::create(&segment_dir(archive, history, EPOCH), header).unwrap();
+        let mut open = OpenSegment::create(
+            &segment_dir(archive, history, crate::replication::epoch::INITIAL_EPOCH),
+            header,
+        )
+        .unwrap();
         for batch in batches {
             open.append(batch, unix_now(), None).unwrap();
         }
