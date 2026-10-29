@@ -3,7 +3,7 @@
 //!
 //! # Why
 //!
-//! Through P2.1 the one replication port (now `NPHYS003`) was plaintext and
+//! Through P2.1 the one replication port (now `NPHYS004`) was plaintext and
 //! therefore loopback-only: its bearer token would otherwise cross the network
 //! in the clear. Every real deployment needs a standby on another host. The
 //! framing is already generic over `AsyncRead + AsyncWrite`

@@ -9,8 +9,8 @@
 //! * another dataset on the primary's endpoints → `HistoryMismatch`;
 //! * the WAL the standby needs pruned away → `WalPruned`;
 //! * the wrong token → `AuthFailed` (after a few attempts);
-//! * an `NPHYS001` or `NPHYS002` client → `Refuse { Version }`, in this
-//!   protocol's framing (`NPHYS003`, spec P4.1c).
+//! * an `NPHYS001`, `NPHYS002` or `NPHYS003` client → `Refuse { Version }`,
+//!   in this protocol's framing (`NPHYS004`, spec P5.1 §11.F).
 //!
 //! In every case the standby process stays up, `/ready` answers 503 with
 //! `needs_recovery`, and `heliosdb_require_ready()` refuses with SQLSTATE
@@ -280,9 +280,10 @@ fn read_raw_frame(stream: &mut TcpStream) -> ([u8; 16], Vec<u8>) {
     (header, payload)
 }
 
-/// An `NPHYS001` client, and (spec P4.1c) an `NPHYS002` one — the previous
-/// version, whose batch bounds differ — are each answered `Refuse { Version }`
-/// in this protocol's framing, naming both versions.
+/// An `NPHYS001` client, (spec P4.1c) an `NPHYS002` one, whose batch bounds
+/// differ, and (spec P5.1 §11.F) an `NPHYS003` one — the previous version,
+/// whose resume carries no last write group — are each answered `Refuse {
+/// Version }` in this protocol's framing, naming both versions.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_nphys001_or_nphys002_client_is_refused_with_version() {
     let p = pair();
@@ -295,7 +296,7 @@ async fn an_nphys001_or_nphys002_client_is_refused_with_version() {
         None,
     );
     let _ = connect(p.pg_p).await;
-    for (old, version) in [(*b"NPHYS001", 1_u16), (*b"NPHYS002", 2)] {
+    for (old, version) in [(*b"NPHYS001", 1_u16), (*b"NPHYS002", 2), (*b"NPHYS003", 3)] {
         let old_name = String::from_utf8_lossy(&old).into_owned();
         let token = std::fs::read(&p.token).unwrap();
         let repl_p = p.repl_p;
@@ -316,14 +317,14 @@ async fn an_nphys001_or_nphys002_client_is_refused_with_version() {
         .unwrap();
         assert_eq!(
             &header[..8],
-            b"NPHYS003",
+            b"NPHYS004",
             "{old_name}: answered in this protocol's framing"
         );
-        assert_eq!(u16::from_be_bytes([header[8], header[9]]), 3);
+        assert_eq!(u16::from_be_bytes([header[8], header[9]]), 4);
         assert_eq!(u16::from_be_bytes([header[10], header[11]]), 17, "a Refuse frame");
         assert_eq!(u16::from_be_bytes([payload[0], payload[1]]), 8, "code Version");
         let reason = String::from_utf8_lossy(&payload[4..]);
-        assert!(reason.contains(&old_name) && reason.contains("NPHYS003"), "{reason}");
+        assert!(reason.contains(&old_name) && reason.contains("NPHYS004"), "{reason}");
     }
     assert!(
         primary.log_contains_within("protocol version", Duration::from_secs(10)),

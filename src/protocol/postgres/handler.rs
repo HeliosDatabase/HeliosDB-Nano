@@ -558,6 +558,12 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     /// connection, or when this handler was constructed without going
     /// through the listener's TLS negotiation (embedders, tests).
     tls_kx_group: Option<String>,
+    /// Spec P5.1 §3.2 step 5: this connection was opened after this
+    /// process's primary was fenced (`standby_posture::is_fenced` when it
+    /// was constructed). One opened before the fence is ended with FATAL
+    /// 57P01 at its next statement; one opened after is served reads only.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+    admitted_after_fence: bool,
 }
 
 /// GH#28: what the listener decided for this connection at accept time.
@@ -663,6 +669,7 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             policy,
             idle_guc_overridden: false,
             tls_kx_group: None,
+            admitted_after_fence: crate::standby_posture::is_fenced(),
         }
     }
 }
@@ -695,6 +702,7 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
             policy,
             idle_guc_overridden: false,
             tls_kx_group: None,
+            admitted_after_fence: crate::standby_posture::is_fenced(),
         }
     }
 }
@@ -772,6 +780,7 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             policy,
             idle_guc_overridden: false,
             tls_kx_group: None,
+            admitted_after_fence: crate::standby_posture::is_fenced(),
         }
     }
 }
@@ -790,6 +799,7 @@ where
             policy: ConnectionPolicy::embedded_default(&database),
             idle_guc_overridden: false,
             tls_kx_group: None,
+            admitted_after_fence: crate::standby_posture::is_fenced(),
             session_id: database
                 .create_wire_session("pg_wire_test")
                 .expect("wire session creation is infallible"),
@@ -1027,6 +1037,17 @@ where
         }
 
         Ok(())
+    }
+
+    /// Whether this session is read-only, as `transaction_read_only` and the
+    /// startup `default_transaction_read_only` report it: on a physical
+    /// standby (every posture), and (spec P5.1 §11.E) on a primary a promoted
+    /// standby fenced — the posture's fence, or the engine's write gate,
+    /// which a fenced directory's open fences with no posture to say so.
+    fn session_is_read_only(&self) -> bool {
+        crate::standby_posture::in_recovery(Some(self.database.storage.as_ref()))
+            || crate::standby_posture::is_fenced()
+            || self.database.storage.write_gate().is_fenced()
     }
 
     /// GH#28: this connection's effective policy — the session's `SET`
@@ -1445,6 +1466,14 @@ where
             let hot_standby = crate::standby_posture::in_recovery(Some(self.database.storage.as_ref()));
             self.send_parameter_status("in_hot_standby", if hot_standby { "on" } else { "off" })
                 .await?;
+            // Spec P5.1 §11.E: PostgreSQL 14's other GUC_REPORT of the
+            // read-write decision. `on` on a standby and on a fenced primary
+            // (which is NOT in hot standby: `in_hot_standby` stays `off`), so
+            // libpq's `target_session_attrs=read-write` skips a superseded
+            // primary without a query.
+            let read_only = self.session_is_read_only();
+            self.send_parameter_status("default_transaction_read_only", if read_only { "on" } else { "off" })
+                .await?;
 
             // Item 10: advertise the helios.* opt-in capabilities so a
             // capability-probing client (HeliosProxy) auto-enables only what
@@ -1830,6 +1859,51 @@ where
         }
         #[cfg(feature = "ha-tier1")]
         {
+            // Spec P5.1 §3.2 step 5: a primary a promoted standby fenced (one
+            // atomic load on every other node). A session opened before the
+            // fence is terminated at its next statement — FATAL 57P01, the
+            // code a proxy reconnects on — so no client keeps believing it
+            // talks to the primary; one opened after it is served reads, and
+            // its writes are refused 25006 before the engine (whose fenced
+            // write gate is the backstop).
+            if crate::standby_posture::is_fenced() {
+                let Some(fence) = crate::standby_posture::fence_status() else {
+                    return Ok(false);
+                };
+                if !self.admitted_after_fence {
+                    let message = fence.termination();
+                    let budget = self.teardown_write_budget();
+                    let _ = tokio::time::timeout(budget, async {
+                        let _ = self
+                            .send_error_message(
+                                "FATAL",
+                                crate::network::protocol::sqlstate::ADMIN_SHUTDOWN,
+                                &message,
+                                None,
+                                None,
+                            )
+                            .await;
+                        let _ = self.flush().await;
+                    })
+                    .await;
+                    return Err(Error::network(message));
+                }
+                if !guarded_standby_statement_allowed(query) {
+                    self.send_standby_refusal(
+                        extended,
+                        "25006",
+                        &fence.write_refusal(),
+                        Some(
+                            "This primary was superseded by a promoted standby: connect to the new primary for \
+                             writes."
+                                .into(),
+                        ),
+                    )
+                    .await?;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
             if !crate::replication::ha_state::ha_state().forwarding_disabled() {
                 return Ok(false);
             }
@@ -4016,8 +4090,11 @@ where
             // Spec P1.3: on a physical standby it is "on" — the truth there,
             // every write is refused — so `target_session_attrs=read-write`
             // skips a standby exactly as it skips a PostgreSQL hot standby.
+            //
+            // Spec P5.1 §11.E: so it is on a primary a promoted standby fenced
+            // (the session resolver answers first, from the engine's gate too).
             "transaction_read_only" | "default_transaction_read_only" => {
-                if crate::standby_posture::in_recovery(None) {
+                if crate::standby_posture::in_recovery(None) || crate::standby_posture::is_fenced() {
                     "on".to_string()
                 } else {
                     "off".to_string()
@@ -4117,6 +4194,17 @@ where
                 format_guc_duration_ms(self.policy.timeouts.authentication_timeout.as_millis() as u64)
             }
             "max_connections" => self.policy.max_connections.to_string(),
+            // Spec P5.1 §11.E: read-only is the truth on a standby, and on a
+            // primary a promoted standby fenced — its write gate refuses every
+            // write (also when the gate was fenced at open, with no posture to
+            // say so: a build without HA, an embedder).
+            "transaction_read_only" | "default_transaction_read_only" => {
+                if self.session_is_read_only() {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            }
             // HDB-009: identity reporting, answered per SESSION. The static
             // table cannot answer these — it has no idea who this connection
             // is — and used to return an empty string for both.
@@ -5573,9 +5661,19 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
                 // physical standby (`Error::physical_standby_write_refused`) —
                 // what PostgreSQL reports for a write on a hot standby.
                 sqlstate::READ_ONLY_SQL_TRANSACTION // 25006
+            } else if message.starts_with(crate::error::PRIMARY_FENCED_WRITE_REFUSED) {
+                // Spec P5.1: a write on a primary a promoted standby fenced
+                // (`Error::primary_fenced_write_refused`): read-only from
+                // here on, like a hot standby.
+                sqlstate::READ_ONLY_SQL_TRANSACTION // 25006
             } else {
                 sqlstate::INVALID_TRANSACTION_STATE // 25000
             }
+        }
+        // Spec P5.1: the write gate's fence refusal, wrapped by a storage
+        // site on its way out (`Error::is_primary_fenced_write_refusal`).
+        Error::Storage(message) if message.contains(crate::error::PRIMARY_FENCED_WRITE_REFUSED) => {
+            sqlstate::READ_ONLY_SQL_TRANSACTION // 25006
         }
         Error::Protocol(_) => sqlstate::PROTOCOL_VIOLATION, // 08P01
         Error::QueryTimeout(_) | Error::QueryCancelled(_) => sqlstate::QUERY_CANCELED, // 57014
@@ -5589,6 +5687,10 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
         // 55000 is what a proxy's health check keys on, never XX000. Anchored
         // on the emitter's const (marker-const discipline).
         Error::Generic(message) if message.starts_with(crate::error::STANDBY_NOT_READY) => {
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE // 55000
+        }
+        // Spec P5.1: `heliosdb_require_ready()` on a fenced primary.
+        Error::Generic(message) if message.starts_with(crate::error::PRIMARY_FENCED_NOT_READY) => {
             sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE // 55000
         }
         _ => sqlstate::INTERNAL_ERROR, // XX000
@@ -5790,6 +5892,14 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     // backend. Anchored on the emitter's const (marker-const discipline).
     if message.contains(crate::error::STANDBY_NOT_READY) {
         return sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE; // 55000
+    }
+    // Spec P5.1: a fenced primary — not ready (55000), and read-only for
+    // every write (25006) — however the executor wrapped the refusal.
+    if message.contains(crate::error::PRIMARY_FENCED_NOT_READY) {
+        return sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE; // 55000
+    }
+    if message.contains(crate::error::PRIMARY_FENCED_WRITE_REFUSED) {
+        return sqlstate::READ_ONLY_SQL_TRANSACTION; // 25006
     }
     // sprinter d03de7fc3b22: a tenant that has spent its `max_qps` budget (or its
     // `max_storage_bytes`) is OUT OF A RESOURCE, not broken. PostgreSQL has no
@@ -6263,6 +6373,7 @@ mod failed_transaction_state_tests {
                 policy: ConnectionPolicy::embedded_default(&db),
                 idle_guc_overridden: false,
                 tls_kx_group: None,
+                admitted_after_fence: crate::standby_posture::is_fenced(),
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),
@@ -6358,6 +6469,7 @@ mod show_branches_wire_tests {
                 policy: ConnectionPolicy::embedded_default(&db),
                 idle_guc_overridden: false,
                 tls_kx_group: None,
+                admitted_after_fence: crate::standby_posture::is_fenced(),
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),
@@ -6992,6 +7104,7 @@ mod md5_auth_wire_tests {
                 policy: ConnectionPolicy::embedded_default(&db),
                 idle_guc_overridden: false,
                 tls_kx_group: None,
+                admitted_after_fence: crate::standby_posture::is_fenced(),
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),

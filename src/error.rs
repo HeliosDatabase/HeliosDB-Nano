@@ -126,6 +126,21 @@ pub const PHYSICAL_STANDBY_WRITE_REFUSED: &str = "writes are not permitted on a 
 /// what a proxy's health check keys on, and no other message may claim it.
 pub const STANDBY_NOT_READY: &str = "standby is not ready";
 
+/// Spec P5.1 §3.2: the prefix of the refusal every write receives on a
+/// primary that a promoted standby fenced — from the storage write gate
+/// (`WriteGate::fence`) and from the PostgreSQL wire's statement guard, which
+/// refuses it before the engine is reached. The full text names when, by
+/// which epoch, and the command that rebuilds the node. One shared const
+/// because the wire maps it to `25006 read_only_sql_transaction`, like a write
+/// on a standby, and [`Error::is_primary_fenced_write_refusal`] recognises it.
+pub const PRIMARY_FENCED_WRITE_REFUSED: &str = "write refused: this primary was fenced";
+
+/// Spec P5.1 §3.2: the prefix of `heliosdb_require_ready()`'s answer on a
+/// fenced primary. Mapped to `55000 object_not_in_prerequisite_state`, the
+/// code a proxy's health check takes a node out of its set on, like a standby
+/// that is not ready.
+pub const PRIMARY_FENCED_NOT_READY: &str = "primary is fenced";
+
 /// Spec P2.1: the prefix of the error a client receives for a commit its
 /// standbys did not acknowledge within `[replication] sync_timeout_ms` under
 /// `sync_timeout_action = "fail"` (`replication::ha_state::SyncUnconfirmed`).
@@ -329,6 +344,30 @@ impl Error {
     pub fn is_physical_standby_write_refusal(&self) -> bool {
         match self {
             Error::Transaction(message) => message.starts_with(PHYSICAL_STANDBY_WRITE_REFUSED),
+            _ => false,
+        }
+    }
+
+    /// Spec P5.1: a write refused on a fenced primary. `message` is the
+    /// fence's full text and starts with [`PRIMARY_FENCED_WRITE_REFUSED`]; a
+    /// message that does not is prefixed with it, so the wire always maps the
+    /// error to SQLSTATE 25006. A `Transaction` variant for the reason
+    /// [`Error::physical_standby_write_refused`] gives.
+    pub fn primary_fenced_write_refused(message: impl Into<String>) -> Self {
+        let message = message.into();
+        if message.starts_with(PRIMARY_FENCED_WRITE_REFUSED) {
+            Error::Transaction(message)
+        } else {
+            Error::Transaction(format!("{PRIMARY_FENCED_WRITE_REFUSED}: {message}"))
+        }
+    }
+
+    /// True for [`Error::primary_fenced_write_refused`], and for an error a
+    /// storage site wrapped around one.
+    pub fn is_primary_fenced_write_refusal(&self) -> bool {
+        match self {
+            Error::Transaction(message) => message.starts_with(PRIMARY_FENCED_WRITE_REFUSED),
+            Error::Storage(message) => message.contains(PRIMARY_FENCED_WRITE_REFUSED),
             _ => false,
         }
     }

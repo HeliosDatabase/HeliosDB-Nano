@@ -6,7 +6,7 @@
 //! `docs/plans/PHYSICAL_STANDBY_REPLICATION.md`): it applies the primary's
 //! RocksDB write groups verbatim and serves read-only SQL from them. Spec P2.1
 //! put the whole conversation on ONE connection per standby, protocol
-//! `NPHYS003` on the primary's `[replication] replication_port`
+//! `NPHYS004` on the primary's `[replication] replication_port`
 //! ([`physical_wire`]): the bootstrap copy, the physical WAL, the standby's
 //! identity and history, its heartbeats and the acknowledgements synchronous
 //! commits wait on ([`ha_state::HAStateRegistry::wait_for_sequence`]). Spec
@@ -27,12 +27,19 @@
 //! when the primary still serves it, else an incremental fast-forward that
 //! ships only the key ranges that differ ([`fast_forward`]), else a full
 //! copy.
+//! Spec P5.1 makes the replication epoch a stored value ([`epoch`]), fences
+//! a superseded primary on the replication protocol ([`fence`]) and promotes
+//! a stopped standby offline ([`promote`], `heliosdb-nano promote`).
 //!
 //! # Feature Flags
 //!
 //! - `ha-tier1`: Warm standby replication
 
 pub mod config;
+// Spec P5.1: the replication epoch as a stored value (`repl:epoch`), owned by
+// the storage layer (the engine reads it at every open, in every build) and
+// re-exported here for the code that writes and compares it.
+pub mod epoch;
 
 // HA State Registry (available for all HA features)
 #[cfg(feature = "ha-tier1")]
@@ -64,6 +71,10 @@ pub mod checkpoint_transfer;
 // incremental fast-forward's leaves.
 #[cfg(feature = "ha-tier1")]
 pub mod fast_forward;
+// Spec P5.1: fencing a superseded primary (`fence_self`, `NANO-FENCED.json`)
+// and the offline promotion of a stopped standby (`heliosdb-nano promote`).
+#[cfg(feature = "ha-tier1")]
+pub mod fence;
 #[cfg(feature = "ha-tier1")]
 pub mod history;
 #[cfg(feature = "ha-tier1")]
@@ -80,6 +91,8 @@ pub mod physical_tls;
 pub mod physical_vector;
 #[cfg(feature = "ha-tier1")]
 pub mod physical_wire;
+#[cfg(feature = "ha-tier1")]
+pub mod promote;
 #[cfg(feature = "ha-tier1")]
 pub mod recover_primary;
 // Spec P1.3: the posture lives at the crate root (`crate::standby_posture`),

@@ -1013,12 +1013,18 @@ pub(super) fn handle_switchover(_executor: &Executor, target_node: &str) -> Resu
         .unwrap_or_else(|| target_node.to_string());
 
     // Refuse truthfully. The preconditions above pass, but this build has no
-    // runtime promotion/switchover, so a success status here would be a lie.
-    // The detailed requirements are the operator contract in
+    // runtime switchover from SQL, so a success status here would be a lie.
+    // Spec P5.1: the promotion exists offline (`heliosdb-nano promote`, which
+    // fences this primary over its replication port first); the refusal
+    // names it. SQL `SWITCHOVER` stays refused until fencing is proven live
+    // (plan); `pg_promote` arrives with P5.2. The operator contract is in
     // docs/guides/replication-history-guard.md.
     Err(Error::switchover(format!(
-        "Switchover refused: runtime switchover/promotion is unsupported, durable old-primary fencing is not \
-         implemented, and no role was changed (target {} / {}).",
+        "Switchover refused: runtime switchover from SQL is unsupported in this release and no role was changed \
+         (target {} / {}). Promote the target offline instead: stop it, then run `heliosdb-nano promote \
+         --data-dir <its data directory>` — it applies old-primary fencing to this node first (over its \
+         replication port), tails it through its final sequence and starts the next epoch; `SELECT \
+         pg_promote(true, N)` on a running standby follows in P5.2.",
         display_name, target_uuid
     )))
 }
@@ -1058,7 +1064,11 @@ pub(super) fn handle_switchover_check(_executor: &Executor, target_node: &str) -
     let mut target_lsn: u64 = 0;
     let primary_lsn = ha_registry.get_lsn();
     let mut warnings = Vec::new();
-    let mut blockers = vec!["Runtime switchover/promotion is unsupported".to_string()];
+    let mut blockers = vec![
+        "Runtime switchover/promotion is unsupported: use `heliosdb-nano promote` (offline) or `SELECT \
+         pg_promote(true, N)` (P5.2)"
+            .to_string(),
+    ];
 
     // Check if this node is primary
     if ha_registry.get_role() != crate::replication::ha_state::HARole::Primary {

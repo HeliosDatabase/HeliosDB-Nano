@@ -30,6 +30,7 @@ allowed-tools: Bash(heliosdb-nano *), Bash(psql *), Bash(systemctl *), Read
 | archived WAL | CLI / SQL | `heliosdb-nano archive list\|verify [--deep]\|gaps\|prune [--dry-run] --data-dir ./mydata` · `SELECT * FROM heliosdb_recovery_window` (also `heliosdb_archived_wal`, `heliosdb_archive_gaps`) · `/health` → `"archive":{…}` |
 | recover a standby from segments | CLI | `heliosdb-nano recover --data-dir ./standby --from-archive /srv/segments [--through SEQ] [--then primary --primary-host H:5433 -- <start args>]` (stopped standby; exit 2 = archive gap, range printed) |
 | recover a standby from the primary | CLI | `heliosdb-nano recover --data-dir ./standby --from-primary --primary-host H:5433 --replication-token-file ./replication.token [--full\|--no-full-copy] [--full-copy-threshold 50] [--leaf-bytes 4MiB] [--replace] [--stage-dir DIR] [--then primary\|stop]` (stopped standby: nothing / incremental fast-forward / full copy; exit 3 = full copy needed, not applied) |
+| promote a standby (switchover / failover) | CLI | `heliosdb-nano promote --data-dir ./standby [--primary-host H:5433 --replication-token-file ./replication.token] [--fence-timeout 30] [--force] [--no-fence] [--then start\|stop]` (stopped standby; proves the tail, fences the old primary, tails it, epoch + 1, same history; exit 2 = refused) · `heliosdb-nano status --data-dir DIR` (role, epoch, fence) |
 | archive-only standby | CLI | `--replication-role standby --source archive --archive-source /srv/segments` (no replication connection, no token needed) |
 | cascading standby | TOML | `[replication.physical] cascade = true` on a standby + its own `--replication-port`; downstream `--primary-host` = that port |
 | MySQL listener | CLI | `--mysql --mysql-listen 127.0.0.1:3306` |
@@ -81,7 +82,7 @@ log_path   = "./logs/audit.jsonl"
 
 [replication]                # HA replication (docs/guides/physical-standby.md)
 role                = "primary"   # standalone | primary | standby
-replication_port    = 5433        # THE replication port (NPHYS003); loopback unless tls_enabled
+replication_port    = 5433        # THE replication port (NPHYS004); loopback unless tls_enabled
 token_file          = "/etc/heliosdb/replication.token"
 sync_mode           = "async"     # async | semi-sync | sync (primary: what a commit waits for)
 min_acks            = 1           # standbys that must acknowledge (1..=64)
@@ -181,7 +182,7 @@ curl -s http://127.0.0.1:8080/health     # primary: "standbys":[{…,"applied":"
 psql -h 127.0.0.1 -p 5442 -c "SELECT heliosdb_require_ready(), pg_is_in_recovery()"
 ```
 Sync tuning lives in `[replication]`: `min_acks`, `sync_timeout_ms`, `sync_timeout_action = "warn" | "fail"` (`fail` errors a commit that IS durable on the primary — never blind-retry it).
-**No failover or promotion yet** (plan phase P5): `SWITCHOVER` is refused and a standby's data directory cannot be reopened as a primary. A standby in `needs_recovery` (history mismatch, pruned WAL, wrong token, protocol version) stays up refusing data reads with SQLSTATE 55000. A pruned WAL is first filled from the primary's WAL archive automatically (Recipe 4d); only a gap neither holds is refused (the reason names the range and both floors). Recover it from copied segments (`heliosdb-nano recover --from-archive`, Recipe 4d), or from the primary (`heliosdb-nano recover --from-primary`, Recipe 4e: ships only the key ranges that differ, or a full copy swapped in with `--replace`). A TLS failure (wrong CA, bad certificate) is NOT `needs_recovery`: the standby keeps reconnecting with `"reason": "tls: …"` on `/health`. Loopback test pair: `scripts/regress/nano-physical-pair.sh --binary <path> --start` (add `--tls` for a TLS pair).
+**Promotion is offline and explicit** (Recipe 4f): `heliosdb-nano promote` on a STOPPED standby; the SQL `SWITCHOVER` stays refused, `pg_promote()` is not defined yet (P5.2), there is no automatic failover, and a standby's data directory cannot otherwise be reopened as a primary. A standby in `needs_recovery` (history mismatch, pruned WAL, wrong token, protocol version) stays up refusing data reads with SQLSTATE 55000. A pruned WAL is first filled from the primary's WAL archive automatically (Recipe 4d); only a gap neither holds is refused (the reason names the range and both floors). Recover it from copied segments (`heliosdb-nano recover --from-archive`, Recipe 4d), or from the primary (`heliosdb-nano recover --from-primary`, Recipe 4e: ships only the key ranges that differ, or a full copy swapped in with `--replace`). A TLS failure (wrong CA, bad certificate) is NOT `needs_recovery`: the standby keeps reconnecting with `"reason": "tls: …"` on `/health`. Loopback test pair: `scripts/regress/nano-physical-pair.sh --binary <path> --start` (add `--tls` for a TLS pair).
 
 ### Recipe 4b: Remote standby over TLS
 ```bash
@@ -237,6 +238,23 @@ heliosdb-nano recover --data-dir /srv/nano/standby --from-primary --primary-host
     --replication-token-file /srv/nano/replication.token --replace   # allow a full copy to replace the dir
 ```
 A fast-forward killed part-way leaves a record: `start` stays up in `needs_recovery` (`/ready` 503) with `fast-forward from the primary interrupted at sequence S→T: run heliosdb-nano recover --from-primary … to finish it`; re-run the same command (it continues the same cut while the primary's export lease holds). Stage dir `--stage-dir` (default `<dir>.recover-stage`, never inside the data dir) needs `2 × leaf × 64` free. Exit codes: 0 done · 1 refused/failed · 2 (`--from-archive` gap / usage) · 3 full copy needed, not applied. The standby's own archive lacks `S+1..T` afterwards; a downstream of a fast-forwarded cascading standby is recovered the same way against it.
+Spec P5.1: a standby of a promoted primary's OLD epoch (`EpochStale`, same history) takes route 2 against the new primary; a superseded primary (`SourceStale`) is refused ("point --primary-host at the current primary"); a fenced primary's directory (`NANO-FENCED.json`) or a primary's of the same history is rebuilt by a full copy with `--replace` (exit 3 without it).
+
+### Recipe 4f: Promoting a standby (spec P5.1)
+Oracle `SWITCHOVER` (graceful) / `FAILOVER TO` (`--force`); PostgreSQL timelines. On a STOPPED physical standby; the primary address, token and TLS default to the standby's config.
+```bash
+heliosdb-nano stop --pid-file /srv/nano/standby.pid
+heliosdb-nano promote --data-dir /srv/nano/standby --config /srv/nano/standby.toml   # fences the old primary first
+# promote: /srv/nano/standby is the primary of history <H> at epoch 2 (from 1; the old primary at 10.0.0.5:5433
+#   was fenced at its sequence F and everything through F is here); start it with heliosdb-nano start --replication-role primary …
+heliosdb-nano start --replication-role primary --data-dir /srv/nano/standby --replication-port 5433 …
+heliosdb-nano promote --data-dir /srv/nano/standby --force       # old primary dead/isolated: promote anyway (a primary that answers is still fenced; writes past the standby lost)
+heliosdb-nano promote --data-dir /tmp/clone-of-standby --no-fence # rehearsal on a CLONED dir: never contacts the primary
+heliosdb-nano status --data-dir /srv/nano/old-primary             # role: fenced primary, epoch, fence
+```
+- **The fence** (sent only after a resume session proved the primary serves the standby's cursor): the old primary refuses every write from then on (25006 "write refused: this primary was fenced at …"), serves reads, `/ready` 503, `/health` `state = "fencing"` then `"fenced"`, `heliosdb_require_ready()` 55000, `SHOW transaction_read_only` = `on`, its pre-fence sessions end with FATAL 57P01 at their next statement, its archive is sealed through the final sequence. `NANO-FENCED.json` makes every later open of the directory FENCED (restarted as a primary it serves reads only; as a standby `start` is refused, exit 2) — rebuild it: `recover --from-primary --primary-host <new> --replace --data-dir <old>`. Unreachable without `--force` → exit 2 after `--fence-timeout` (30 s); a timeout AFTER the fence was sent says the primary may already be fenced — re-run `promote` (same `Fenced`). Already fenced by another promotion, or a primary at a newer epoch → exit 2 (a primary of that epoch exists: recover from it instead). An unfenced old primary fences itself when any epoch-2 node reaches it; STONITH is the operator's.
+- **The epoch** (`repl:epoch`, `pg_control_checkpoint().timeline_id`, `/health` `epoch`) goes up by one; the history id is inherited (never a new one). The first open replays none of the old primary's logical WAL. Archives: `<archive>/<history>/<epoch>/`. Protocol `NPHYS004`: a resume carries its last write group, a mismatch is `Diverged` (recover with `--from-primary`); upgrade primary and standbys together.
+- **Interrupted** (killed half-way): `NANO-PROMOTION.json` stays; every open of the dir (`start` any role, `recover`, `resync`, `repl`) is refused with `promotion interrupted: finish it with heliosdb-nano promote --data-dir D`; re-run `promote`. A running standby is refused (`stop it first`). `SELECT pg_promote(true, N)` (online) arrives with P5.2.
 
 ### Recipe 5: Active-active (Tier 2, requires `--features ha-tier2`)
 ```bash

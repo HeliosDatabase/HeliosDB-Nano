@@ -318,6 +318,127 @@ Oracle's `RECOVER STANDBY DATABASE FROM SERVICE` (`docs/guides/physical-standby.
   fast-forwarded standby keeps its own counter); a cascaded export's
   `store_sequence` may be below its `checkpoint_sequence` for the same reason.
 
+### Added — promotion, fencing and the epoch (spec P5.1)
+Oracle's `SWITCHOVER` / `FAILOVER TO` and PostgreSQL's timelines
+(`docs/guides/physical-standby.md`, "Promotion and the epoch").
+- **`heliosdb-nano promote --data-dir DIR`** makes a STOPPED physical standby
+  the primary of its dataset at the next epoch. It fences the old primary
+  first over its replication port (`--primary-host`, default the standby's
+  `[replication] primary_host`; token and TLS as `recover --from-primary`),
+  tails it through the final sequence the fence reports — nothing the old
+  primary committed is lost — then converts the store and gives the
+  directory the primary's identity with the INHERITED history id (a
+  promotion never mints a history). The tail is proven before the fence: a
+  resume session after the standby's cursor and its first poll, then
+  `Fence` inside that session. `--fence-timeout SECS` (default 30) bounds
+  the fence and the tail; `--force` promotes even when the old primary
+  cannot be fenced or tailed (down or isolated: writes it committed past the
+  standby are lost, said as a WARNING, and recorded) — a primary that
+  answers is fenced all the same; `--no-fence` (implies `--force`) never
+  contacts it, for a rehearsal on a cloned directory; `--then start` starts
+  the node as a primary. A running standby, a directory that is no standby,
+  an interrupted fast-forward, a primary already at a newer epoch or already
+  fenced by another promotion, a primary that does not serve the standby's
+  cursor, and an unanswered fence without `--force` are refused (exit 2); a
+  failure part-way exits 1 naming the re-run that finishes it. After a fence
+  was sent, a timeout says the primary may already be fenced by this
+  promotion (a re-run is answered the same `Fenced`). The fence names the
+  promotion by a random identity kept in the standby, never the configured
+  `node_id`. Interrupted at any step, it is finished by running it again.
+- **The epoch is a stored value**: the key `repl:epoch` in the replicated
+  keyspace, written by the promoted node as the first write of its epoch
+  (JSON: epoch, previous epoch, time, node, whether the old primary was
+  fenced and at which sequence); absent = epoch 1. Every replication surface
+  reports and compares the epoch its store holds: the replication handshake,
+  the archive's segment headers and `<archive>/<history>/<epoch>/` layout,
+  `recover`, `pg_control_checkpoint()` (`timeline_id` = epoch,
+  `prev_timeline_id` = the epoch it was promoted from), `/health`,
+  `heliosdb_standby_status`, and the new **`heliosdb-nano status --data-dir
+  DIR`** (role, epoch, and a fence or interrupted promotion the directory
+  carries). A segment header of epoch 0 is refused.
+- **Fencing.** A primary that is fenced — by a promoting standby's `Fence`,
+  or by the handshake of any receiver of a newer epoch — refuses every write
+  (SQLSTATE 25006, "write refused: this primary was fenced at … by epoch …",
+  in its write gate and on the PostgreSQL wire), makes every earlier write
+  durable, records the fence in **`NANO-FENCED.json`**, has its archiver
+  archive and seal its WAL through the final sequence (the archiver keeps
+  running, idle), logs one ERROR line, and keeps serving reads and resume
+  sessions on its replication port (a snapshot or fast-forward of it is
+  refused `SourceNotServing`: "fenced: bootstrap from the new primary").
+  `/ready` answers 503, `/health` reports `state = "fencing"` while the fence
+  is under way (or did not complete: "fence incomplete") and `"fenced"` once
+  it is recorded (added values of the frozen field),
+  `heliosdb_require_ready()` raises 55000, `SHOW transaction_read_only` /
+  `default_transaction_read_only` answer `on` and the startup ParameterStatus
+  carries `default_transaction_read_only` (`in_hot_standby` stays `off`), and
+  a session opened before the fence is ended with FATAL 57P01 at its next
+  statement. A fenced directory opens FENCED in every build and through every
+  entry point (`start` as a primary or standalone, `repl`, MCP, the embedded
+  API); `start --replication-role standby` refuses it (exit 2, naming
+  `recover --from-primary --replace`). A fence only accepts a standby of the
+  same dataset that holds data, naming the epoch after its own. Known limit:
+  the fence drains RocksDB calls, not statements — a statement whose first
+  write landed before the fence and whose next one was refused reports 25006,
+  as a crash there would; its first writes are on the new primary.
+- **`NANO-PROMOTION.json`**, the record of a promotion in progress: while it
+  exists every open of the directory but `promote`'s own is refused (`start`
+  in any role, `recover`, `resync`, `repl`, the embedded API) with
+  "promotion interrupted: finish it with `heliosdb-nano promote --data-dir
+  D`" (exit 2 from the CLI). An unreadable record on a store the conversion
+  has not touched is discarded with a WARNING and the promotion restarts.
+- **Node records are written whole**: `NANO-FENCED.json`,
+  `NANO-PROMOTION.json`, `NANO-PRIMARY-HISTORY.json` (and the standby
+  binding) are written to a temporary file, fsynced, renamed into place
+  without replacing (`renameat2(RENAME_NOREPLACE)` on Linux), the directory
+  fsynced: a crash leaves the record complete or absent.
+- **The first open as a primary replays none of the old primary's logical
+  WAL**: the conversion raises the logical WAL's redo floor to its head in the
+  same write as the epoch, and the LSN counter continues from it.
+- **`recover --from-primary` learns epochs**: a standby of the same history
+  whose primary was promoted away from it (`EpochStale`) is fast-forwarded to
+  the new primary (route 2) and told what the promotion did to what it held;
+  a superseded primary (`SourceStale`) is refused naming the fix; a fenced
+  primary's directory, or a primary's of the same history, is rebuilt as a
+  standby by a full copy with `--replace` (exit 3 without it), and refused
+  when the source is at a LOWER epoch than the directory (the source is the
+  superseded one). A store whose epoch record cannot be decoded is never
+  connected or recovered in place (no fallback to epoch 1).
+  `recover --from-archive` refuses segments of another epoch of the dataset,
+  naming both epochs.
+- **Protocol `NPHYS004`** (an `NPHYS003` peer is refused `Version`: move the
+  primary and its standbys together). A resume `Open` carries the receiver's
+  last applied write group (first sequence and SHA-256); the source re-reads
+  its own group ending at the cursor (WAL or archive) and refuses a mismatch
+  with the new **`Diverged { at }`** (code 11, needs recovery:
+  `recover --from-primary` fast-forwards it) — two primaries of one epoch
+  (two `--force` promotions) can no longer feed each other's standbys. A
+  cascading standby verifies in its primary's numbering. A primary offers
+  `CAP_FENCE`; `Fence { epoch }` is accepted after `HelloOk` and before
+  `Open`, and between two requests of a snapshot or resume session, from a
+  receiver of this history that holds data and for exactly the epoch after
+  its own, and is answered by the new frame **`Fenced { epoch,
+  final_sequence }`** (kind 29, 16 bytes); the session goes on. A repeated
+  fence by the same promotion answers the same; another promotion's, or any
+  other fence, is refused `Version`. A receiver that holds data is compared
+  by epoch in both directions: behind the source it is refused `EpochStale`
+  (needs recovery); ahead of it the source fences itself and refuses the new
+  **`SourceStale`** (code 10, retryable: the standby stays `reconnecting`
+  with the reason and keeps retrying, so a corrected `--primary-host` takes
+  effect). A fresh snapshot receiver is never compared. A source no longer
+  answers with a `Fence`.
+- `SWITCHOVER TO` / `SWITCHOVER CHECK` stay refused; their messages name
+  `heliosdb-nano promote` and `SELECT pg_promote(true, N)` (P5.2, not defined
+  in this release).
+- **A standby no longer drops its session during a bulk statement on the
+  primary**: it waited for a poll's `PollStart` one frame timeout (30 s) while
+  the primary may take its operation deadline (120 s) to collect the poll —
+  under a 50 000-row `INSERT … SELECT` in a debug build the standby went
+  `reconnecting` ("physical transfer deadline expired") with its cursor
+  stuck — so it now waits the operation deadline plus a frame timeout, and a
+  poll stops after 65 536 write groups whatever their size (`through` below
+  the barrier: the standby and the archiver poll again at once), so a poll of
+  tiny groups answers within seconds.
+
 ### Fixed — replication (fireproof, plan §D5)
 - **`enable_lockfree_ingestion` is refused on every HA role.** It writes rows
   straight into the store from its own worker, bypassing the logical WAL, MVCC

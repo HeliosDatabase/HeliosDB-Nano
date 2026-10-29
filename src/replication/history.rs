@@ -231,6 +231,113 @@ pub fn load_or_create_primary_history(path: &Path) -> HistoryResult<Uuid> {
     }
 }
 
+/// Spec P5.1 §4 step 5: give a promoted standby's directory the primary's
+/// dataset identity — `NANO-PRIMARY-HISTORY.json` naming the INHERITED
+/// `history_id` (a promotion continues the dataset's history, it never mints
+/// one: that is the point of the epoch) and the store's RocksDB `IDENTITY`,
+/// which a standby carries byte for byte from its primary. The caller holds
+/// the directory (the promotion's exclusive open, or a stopped node).
+///
+/// Idempotent: a record already there that names the same history and
+/// storage identity is accepted (a promotion re-run after a crash); one that
+/// names anything else is refused. A standby binding in the directory is
+/// refused like [`load_or_create_primary_history`] refuses it.
+pub fn write_primary_history(path: &Path, history_id: Uuid) -> HistoryResult<()> {
+    validate_id(history_id)?;
+    let directory = OwnedDirectory::capture(checked_absolute_path(path)?)?;
+    refuse_marker(
+        &directory.path,
+        STANDBY_BINDING_FILE,
+        "the directory carries a logical standby binding; it is not a physical standby's",
+    )?;
+    let storage_identity = read_storage_identity(&directory.path)?;
+    match read_record::<PrimaryRecord>(&directory.path.join(PRIMARY_HISTORY_FILE)) {
+        Ok(record) => {
+            validate_format(record.format)?;
+            if record.history_id != history_id {
+                return Err(HistoryError::Mismatch {
+                    expected: history_id,
+                    actual: record.history_id,
+                });
+            }
+            if record.storage_identity != storage_identity {
+                return Err(invalid(
+                    "the directory's primary history record names another RocksDB IDENTITY than its store",
+                ));
+            }
+            directory.verify()
+        }
+        Err(HistoryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => write_new_record(
+            &directory,
+            PRIMARY_HISTORY_FILE,
+            &PrimaryRecord {
+                format: FORMAT_VERSION,
+                history_id,
+                storage_identity,
+            },
+        ),
+        Err(error) => Err(error),
+    }
+}
+
+/// Spec P5.1 §6: the dataset history a primary's directory names, read only
+/// (`None` without the record) — what `recover --from-primary` compares with
+/// the primary's before it rebuilds a primary's directory as a standby.
+pub fn read_primary_history(path: &Path) -> HistoryResult<Option<Uuid>> {
+    match read_record_in::<PrimaryRecord>(path, PRIMARY_HISTORY_FILE)? {
+        Some(record) => {
+            validate_format(record.format)?;
+            validate_id(record.history_id)?;
+            Ok(Some(record.history_id))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Spec P5.1: write `record` as the file `name` of the directory `dir` —
+/// created new (an existing file is an error), the file and the directory
+/// fsynced — with the checks the history records get (no symlink in the
+/// path, the directory unchanged while it is written). The writer of
+/// `NANO-FENCED.json` and `NANO-PROMOTION.json`.
+pub(crate) fn write_new_record_in<T: Serialize>(dir: &Path, name: &str, record: &T) -> HistoryResult<()> {
+    let directory = OwnedDirectory::capture(checked_absolute_path(dir)?)?;
+    write_new_record(&directory, name, record)
+}
+
+/// Spec P5.1: the record `name` of `dir`, `None` when there is none. A file
+/// that is there but does not decode is an error: a fence or a promotion
+/// record that cannot be read still means one happened.
+pub(crate) fn read_record_in<T: serde::de::DeserializeOwned>(dir: &Path, name: &str) -> HistoryResult<Option<T>> {
+    match read_record::<T>(&dir.join(name)) {
+        Ok(record) => Ok(Some(record)),
+        Err(HistoryError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Spec P5.1: remove the file `name` of `dir` (with its `.tmp` sibling and
+/// any temporary a crashed [`write_new_record_in`] left) and fsync the
+/// directory; a file that is not there is fine.
+pub(crate) fn remove_record_in(dir: &Path, name: &str) -> HistoryResult<()> {
+    let directory = OwnedDirectory::capture(checked_absolute_path(dir)?)?;
+    let mut files = vec![name.to_string(), format!("{name}.tmp")];
+    for entry in fs::read_dir(&directory.path)? {
+        let entry = entry?;
+        if let Some(file) = entry.file_name().to_str().filter(|file| is_temporary_of(file, name)) {
+            files.push(file.to_string());
+        }
+    }
+    for file in files {
+        match fs::remove_file(directory.path.join(&file)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    directory.verify()?;
+    sync_directory(&directory.path)
+}
+
 impl OwnedDirectory {
     fn capture(path: PathBuf) -> HistoryResult<Self> {
         reject_symlink_components(&path)?;
@@ -409,6 +516,16 @@ fn validate_storage_identity(root: &Path, expected: &str) -> HistoryResult<()> {
     Ok(())
 }
 
+/// Write `record` as the file `name` of `directory`, whole or not at all
+/// (spec P5.1 §11.H): it is written to a private temporary sibling, fsynced,
+/// then published under `name` by a rename that never replaces (an existing
+/// record is `AlreadyExists`, exactly as `create_new` was), and the directory
+/// is fsynced. A crash leaves either no record or the complete one — never a
+/// torn file that a later reader takes for "the record exists but does not
+/// decode". The temporary name is unique per writer, so two writers racing
+/// for the same record never write into each other's file: one publishes,
+/// the other gets `AlreadyExists`. A temporary a crash left behind is
+/// removed by [`remove_record_in`].
 fn write_new_record<T: Serialize>(directory: &OwnedDirectory, name: &str, record: &T) -> HistoryResult<()> {
     directory.verify()?;
     let mut bytes =
@@ -417,6 +534,8 @@ fn write_new_record<T: Serialize>(directory: &OwnedDirectory, name: &str, record
     if bytes.len() as u64 > MAX_METADATA_BYTES {
         return Err(invalid("history record exceeds size limit"));
     }
+    let target = directory.path.join(name);
+    let temporary = directory.path.join(temporary_name(name));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -424,11 +543,87 @@ fn write_new_record<T: Serialize>(directory: &OwnedDirectory, name: &str, record
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(directory.path.join(name))?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
+    let written = (|| -> HistoryResult<()> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        directory.verify()?;
+        publish_noreplace(&temporary, &target)?;
+        Ok(())
+    })();
+    if written.is_err() {
+        // Never left behind by a failed write (the rename either happened or
+        // the temporary is still there).
+        let _ = fs::remove_file(&temporary);
+    }
+    written?;
     directory.verify()?;
     sync_directory(&directory.path)?;
+    Ok(())
+}
+
+/// The private temporary sibling of record `name` this writer uses: hidden,
+/// and unique per process and call.
+fn temporary_name(name: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    format!(
+        ".{name}.{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Whether `file` is a temporary [`temporary_name`] made for record `name`:
+/// exactly `.{name}.{pid}-{n}.tmp`.
+fn is_temporary_of(file: &str, name: &str) -> bool {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    file.strip_prefix('.')
+        .and_then(|rest| rest.strip_prefix(name))
+        .and_then(|rest| rest.strip_prefix('.'))
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(pid, n)| digits(pid) && digits(n))
+}
+
+/// Publish `source` as `target` atomically, never replacing `target`
+/// (`AlreadyExists` when it is there). Linux: `renameat2(RENAME_NOREPLACE)`.
+/// Elsewhere — and on a Linux filesystem that does not implement the flag —
+/// a hard link (which fails on an existing target) and the temporary's
+/// removal: for that instant the record has two links, which a reader
+/// refuses as it refuses any hard-linked record, never reading a partial
+/// one.
+fn publish_noreplace(source: &Path, target: &Path) -> HistoryResult<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let from = CString::new(source.as_os_str().as_bytes()).map_err(|_| invalid("NUL in a record path"))?;
+        let to = CString::new(target.as_os_str().as_bytes()).map_err(|_| invalid("NUL in a record path"))?;
+        // SAFETY: renameat2(2) with two NUL-terminated paths this function
+        // owns for the duration of the call; no other pointer is passed.
+        let renamed = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if renamed == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+        ) {
+            return Err(error.into());
+        }
+    }
+    fs::hard_link(source, target)?;
+    fs::remove_file(source)?;
     Ok(())
 }
 
@@ -538,6 +733,48 @@ mod tests {
                 .filter(|won| *won)
                 .count(),
             1
+        );
+    }
+
+    /// Spec P5.1 §11.H: a record is published whole by a rename that never
+    /// replaces: the file appears complete or not at all, a second write is
+    /// `AlreadyExists` and leaves the first untouched, no temporary is left
+    /// behind, and the temporary a crash before the rename would leave is
+    /// neither the record nor kept by `remove_record_in`.
+    #[test]
+    fn a_record_is_published_whole_and_never_over_another() {
+        let root = TempDir::new().unwrap();
+        let dir = root.path();
+        let first = serde_json::json!({"format": 1, "n": 1});
+        write_new_record_in(dir, "NANO-TEST.json", &first).unwrap();
+        let written = fs::read(dir.join("NANO-TEST.json")).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&written).unwrap(), first);
+        assert_eq!(
+            fs::metadata(dir.join("NANO-TEST.json")).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let second = write_new_record_in(dir, "NANO-TEST.json", &serde_json::json!({"n": 2})).unwrap_err();
+        assert!(
+            matches!(&second, HistoryError::Io(error) if error.kind() == std::io::ErrorKind::AlreadyExists),
+            "{second:?}"
+        );
+        assert_eq!(fs::read(dir.join("NANO-TEST.json")).unwrap(), written);
+        let names = || {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(), vec!["NANO-TEST.json".to_string()], "no temporary is left");
+        // What a crash between the temporary and the rename leaves.
+        let stray = temporary_name("NANO-TEST.json");
+        assert!(is_temporary_of(&stray, "NANO-TEST.json") && !is_temporary_of(&stray, "NANO-TEST"));
+        fs::write(dir.join(&stray), b"{\"format\"").unwrap();
+        remove_record_in(dir, "NANO-TEST.json").unwrap();
+        assert!(names().is_empty(), "{:?}", names());
+        assert_eq!(
+            read_record_in::<serde_json::Value>(dir, "NANO-TEST.json").unwrap(),
+            None
         );
     }
 

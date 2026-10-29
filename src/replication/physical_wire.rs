@@ -1,4 +1,4 @@
-//! The replication protocol `NPHYS003`: ONE authenticated connection per
+//! The replication protocol `NPHYS004`: ONE authenticated connection per
 //! receiver carries both the physical data (snapshot chunks, RocksDB write
 //! groups) and the control plane — identity, dataset history, epoch,
 //! heartbeats and acknowledgements (spec P2.1,
@@ -29,7 +29,7 @@
 //! | `Hello` | R→S | [`Hello`]: node id, role, history, epoch, durable cursor, capabilities, PG port, sync mode |
 //! | `HelloOk` | S→R | [`HelloOk`]: node id, history, epoch, barrier, capabilities, replication endpoint, PG port |
 //! | `Refuse` | S→R | [`Refusal`]: a [`RefuseCode`] and a reason; the session ends |
-//! | `Open` | R→S | snapshot (optionally preferring a leased snapshot id: a resumed download, spec P2.2), resume `{history, after}`, or fast-forward `{history, after, leaf bytes, preferred snapshot}` (spec P4.1) |
+//! | `Open` | R→S | snapshot (optionally preferring a leased snapshot id: a resumed download, spec P2.2), resume `{history, after, last write group}` (spec P5.1 §11.F), or fast-forward `{history, after, leaf bytes, preferred snapshot}` (spec P4.1) |
 //! | `Manifest` / `ResumeInfo` / `FastForwardInfo` | S→R | the session the source opened |
 //! | `ChunkRequest` / `Chunk` | R→S / S→R | one bounded, digested piece of a checkpoint file |
 //! | `PollRequest` | R→S | `{session, after, byte limit}` |
@@ -39,18 +39,66 @@
 //! | `LeafChunkRequest` / `LeafChunk` | R→S / S→R | one bounded, digested piece of a leaf file |
 //! | `Heartbeat` | R→S | [`Heartbeat`] = the ACK: applied and durable sequence |
 //! | `HeartbeatAck` | S→R | [`HeartbeatAck`]: the source's sequence and clock |
-//! | `Fence` | either | [`Fence`]: reserved for promotion (P5); refused by both sides now |
+//! | `Fence` | R→S | [`Fence`]: a promoting standby fences this source by a higher epoch (spec P5.1) |
+//! | `Fenced` | S→R | [`Fenced`]: the source is fenced, at its final sequence |
 //! | `Close` / `Closed` | R→S / S→R | orderly end |
 //!
 //! Kind 13 (`AuthRejected` of `NPHYS001`) is retired: a wrong token is
-//! `Refuse { AuthFailed }`. A peer that speaks `NPHYS001` or `NPHYS002` is
-//! answered with `Refuse { Version }` and reported as [`WireError::Version`],
-//! naming both.
+//! `Refuse { AuthFailed }`. A peer that speaks `NPHYS001`, `NPHYS002` or
+//! `NPHYS003` is answered with `Refuse { Version }` and reported as
+//! [`WireError::Version`], naming both.
 //!
 //! Each session kind has its own requests: a snapshot or resume session
 //! sends chunk and poll requests, a fast-forward session (spec P4.1) the
 //! three leaf requests; any other request is a protocol error that ends the
 //! session. A source offers fast-forward sessions with [`CAP_FAST_FORWARD`].
+//!
+//! # Epochs and fencing (spec P5.1 §2-§3)
+//!
+//! Both ends check the dataset history first, then the epoch of a receiver
+//! that holds data (a `Hello` with a cursor; a fresh snapshot receiver holds
+//! no epoch, takes the source's with its copy, and is never compared):
+//!
+//! | side | comparison | action |
+//! |---|---|---|
+//! | source | `hello.epoch < identity.epoch` | `Refuse { EpochStale }`: the receiver follows a superseded epoch; it needs recovery |
+//! | source | `hello.epoch > identity.epoch` | this source is the superseded one: it fences itself ([`SourceFence`]), then `Refuse { SourceStale }` (retryable: the receiver keeps retrying, so a corrected `--primary-host` takes effect) |
+//! | receiver | `hello_ok.epoch > hello.epoch` | `EpochStale` |
+//! | receiver | `hello_ok.epoch < hello.epoch` | `SourceStale` |
+//!
+//! A source that can be fenced (a primary) offers [`CAP_FENCE`]. A receiver
+//! fences it with `Fence { epoch }` after `HelloOk` and before `Open`, or
+//! between two requests of a snapshot or resume session (never inside a
+//! fast-forward); the source answers `Fenced { epoch, final_sequence }` once
+//! it refuses every write, made the earlier ones durable and recorded the
+//! fence on disk. The session goes on: a fenced source keeps serving resume
+//! sessions — the promoting standby tails it through its final sequence —
+//! but bootstraps nobody (spec P5.1 §11.E): a snapshot or fast-forward open
+//! is refused `SourceNotServing` ("fenced: bootstrap from the new primary").
+//! Spec P5.1 §11.C: a fence must come from a receiver of THIS history that
+//! holds data (its `Hello` carries the history and a cursor) and name
+//! exactly the epoch after the receiver's (`hello.epoch + 1`, which the
+//! handshake made the source's own + 1); anything else is `Refuse {
+//! Version }`. A second fence by the promotion that applied the first answers
+//! the same `Fenced`; a fence by another one is refused (`Version`, naming
+//! the epoch and promotion that fenced it first).
+//!
+//! # A resume is verified by content (spec P5.1 §11.F, `NPHYS004`)
+//!
+//! A cursor is a NUMBER in its primary's numbering; after a promotion two
+//! primaries of the same history and epoch (two `--force` promotions, say)
+//! number different writes alike, and a standby of one could resume from
+//! the other at "the same" sequence and silently apply the wrong groups. So
+//! a resume carries the receiver's last applied write group — its first
+//! sequence and SHA-256, from its durable cursor — and the source re-reads
+//! the group ending at `after` (from its WAL, or its archive) before it
+//! serves the session: a different digest or boundary is `Refuse { Diverged
+//! { at } }` (needs recovery: `recover --from-primary` fast-forwards it), a
+//! group no longer held is `WalPruned` as before. A cascading standby
+//! verifies in the translated (its primary's) numbering. A cursor at a
+//! checkpoint cut names no group (it has applied none since the cut) and is
+//! resumed unverified, as before. The `Open` frame changed shape for this,
+//! so the protocol is `NPHYS004`: an `NPHYS003` peer is refused by version.
 //!
 //! # Write groups of any size (spec P4.1c, `NPHYS003`)
 //!
@@ -94,10 +142,11 @@ use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-/// The protocol this module speaks, as its peers name it.
-pub const PROTOCOL: &str = "NPHYS003";
-const MAGIC: [u8; 8] = *b"NPHYS003";
-const VERSION: u16 = 3;
+/// The protocol this module speaks, as its peers name it. Spec P5.1 §11.F:
+/// `NPHYS004` (a resume carries its last write group).
+pub const PROTOCOL: &str = "NPHYS004";
+const MAGIC: [u8; 8] = *b"NPHYS004";
+const VERSION: u16 = 4;
 /// Every version of this protocol starts its magic with these bytes, so a
 /// peer of another version is told so by name instead of "garbage".
 const MAGIC_FAMILY: &[u8; 5] = b"NPHYS";
@@ -125,13 +174,17 @@ const REFUSE_META_MAX: usize = 2 + 24 + 2;
 const HEARTBEAT_BYTES: usize = 24;
 const HEARTBEAT_ACK_BYTES: usize = 16;
 const FENCE_BYTES: usize = 8;
+/// `Fenced`: the epoch it was fenced by 8, its final sequence 8.
+const FENCED_BYTES: usize = 16;
 /// A drained payload of a peer this source refuses is at most this large.
 const MAX_DRAIN_BYTES: usize = 64 * 1024;
 
 /// The receiver sends `Heartbeat` frames and the source answers them: the
 /// acknowledgement channel synchronous replication waits on.
 pub const CAP_HEARTBEAT: u64 = 1;
-/// Reserved for fencing at promotion (P5). Never offered by this release.
+/// Spec P5.1 §3.1: the source can be fenced (`Fence` / `Fenced`): a primary
+/// that serves its replication port. Set in `HelloOk` by a source that has a
+/// [`SourceFence`]; a cascading standby offers none (it is no primary).
 pub const CAP_FENCE: u64 = 1 << 1;
 /// Spec P2.2: this side's end of the session is TLS. Set per session, by the
 /// receiver in its `Hello` and by the source in its `HelloOk`; a session is on
@@ -177,6 +230,10 @@ const LEAF_READY_BYTES: usize = 60;
 /// the preferred snapshot 16 when one is named.
 const OPEN_FAST_FORWARD_BYTES: usize = 29;
 const OPEN_FAST_FORWARD_OF_BYTES: usize = 45;
+/// Spec P5.1 §11.F: `Open` of a resume: tag 1, history 16, cursor 8, a flag
+/// 1 and the receiver's last write group — its first sequence 8 and SHA-256
+/// 32 (zeros with the flag 0: a cursor at a checkpoint cut).
+const OPEN_RESUME_BYTES: usize = 66;
 /// How often a client re-asks a source that is still planning its leaves.
 const LEAF_PLANNING_RETRY: Duration = Duration::from_millis(300);
 /// A client waits for a source's leaf plan at most this many operation
@@ -265,8 +322,9 @@ pub enum RefuseCode {
     TooManySessions,
     /// The source cannot serve now: shutting down, or failing on its side.
     SourceNotServing,
-    /// The peers speak different protocol versions, or a feature this
-    /// release does not serve (fencing).
+    /// The peers speak different protocol versions, or a request this source
+    /// does not serve (a fence of a source that cannot be fenced, or one that
+    /// names no higher epoch than the source's or a fence already applied).
     Version,
     /// The write group starting at source sequence `first` is `bytes` raw
     /// bytes, more than one replication or archive frame can carry
@@ -274,6 +332,19 @@ pub enum RefuseCode {
     /// help. The receiver needs recovery past it (a fast-forward or a full
     /// copy from the primary).
     GroupTooLarge { first: u64, bytes: u64 },
+    /// Spec P5.1 §2: the SOURCE is the stale side — it is at epoch `have`,
+    /// below the receiver's `want`: a superseded primary (it fenced itself on
+    /// this very `Hello`). Retryable: the receiver keeps reconnecting, so
+    /// pointing it at the current primary takes effect without a restart.
+    SourceStale { have: u64, want: u64 },
+    /// Spec P5.1 §11.F: the receiver's last applied write group, which ends
+    /// at its cursor `at`, is not this source's group ending there: the
+    /// same history and epoch, but another numbering of other writes (the
+    /// receiver followed another primary of this epoch — two forced
+    /// promotions). Resuming would apply this source's groups onto data they
+    /// do not continue; the receiver needs recovery (a fast-forward re-cuts
+    /// it at this source's checkpoint).
+    Diverged { at: u64 },
 }
 
 impl RefuseCode {
@@ -288,6 +359,8 @@ impl RefuseCode {
             Self::SourceNotServing => 7,
             Self::Version => 8,
             Self::GroupTooLarge { .. } => 9,
+            Self::SourceStale { .. } => 10,
+            Self::Diverged { .. } => 11,
         }
     }
 
@@ -303,6 +376,8 @@ impl RefuseCode {
             Self::SourceNotServing => "SourceNotServing",
             Self::Version => "Version",
             Self::GroupTooLarge { .. } => "GroupTooLarge",
+            Self::SourceStale { .. } => "SourceStale",
+            Self::Diverged { .. } => "Diverged",
         }
     }
 
@@ -317,14 +392,21 @@ impl RefuseCode {
                 | Self::EpochStale { .. }
                 | Self::Version
                 | Self::GroupTooLarge { .. }
+                | Self::Diverged { .. }
         )
     }
 
     /// The source may serve this receiver later: reconnect with backoff
     /// (posture `reconnecting`). `AuthFailed` is neither: a receiver retries
     /// it a few times (a token file being replaced), then needs recovery.
+    /// Spec P5.1: `SourceStale` is retried — the receiver is right, its
+    /// configured source is a superseded primary, and the fix (pointing it at
+    /// the current primary) is the operator's, taken up at the next attempt.
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::TooManySessions | Self::SourceNotServing)
+        matches!(
+            self,
+            Self::TooManySessions | Self::SourceNotServing | Self::SourceStale { .. }
+        )
     }
 }
 
@@ -355,6 +437,14 @@ impl std::fmt::Display for RefuseCode {
                 f,
                 "write group too large: the group at sequence {first} is {bytes} bytes, more than the \
                  {MAX_BATCH_BYTES} one frame can carry"
+            ),
+            Self::SourceStale { have, want } => write!(
+                f,
+                "superseded source: the source is at epoch {have}, the receiver at {want}"
+            ),
+            Self::Diverged { at } => write!(
+                f,
+                "diverged: the receiver's write group ending at sequence {at} is not the source's"
             ),
         }
     }
@@ -394,8 +484,10 @@ impl Refusal {
                 bytes.extend(have_from.to_be_bytes());
                 bytes.extend(have_to.to_be_bytes());
             }
-            RefuseCode::WalPruned { oldest } => bytes.extend(oldest.to_be_bytes()),
-            RefuseCode::EpochStale { have, want } => {
+            RefuseCode::WalPruned { oldest } | RefuseCode::Diverged { at: oldest } => {
+                bytes.extend(oldest.to_be_bytes())
+            }
+            RefuseCode::EpochStale { have, want } | RefuseCode::SourceStale { have, want } => {
                 bytes.extend(have.to_be_bytes());
                 bytes.extend(want.to_be_bytes());
             }
@@ -448,6 +540,14 @@ impl Refusal {
                 },
                 16,
             ),
+            10 => (
+                RefuseCode::SourceStale {
+                    have: u64_at(bytes, 2)?,
+                    want: u64_at(bytes, 10)?,
+                },
+                16,
+            ),
+            11 => (RefuseCode::Diverged { at: u64_at(bytes, 2)? }, 8),
             _ => return Err(invalid("unknown refusal code")),
         };
         let length = usize::from(u16_at(bytes, 2 + fields)?);
@@ -768,9 +868,11 @@ impl HeartbeatAck {
     }
 }
 
-/// Reserved for promotion (P5): "everything below this epoch is fenced".
-/// Defined now so its frame has a kind and a codec; refused by both sides in
-/// this release.
+/// Spec P5.1 §3.1, receiver → source: "a standby of this dataset is being
+/// promoted to `epoch`: stop writing". Sent by `heliosdb-nano promote` to
+/// the primary it follows, after `HelloOk` and before `Open` (or between two
+/// requests of a snapshot or resume session). The source answers [`Fenced`]
+/// once it is fenced, or refuses (`Version`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fence {
     pub epoch: u64,
@@ -793,6 +895,49 @@ impl Fence {
             return Err(invalid("fence epoch zero"));
         }
         Ok(Self { epoch })
+    }
+}
+
+/// Spec P5.1 §3.1, source → receiver: this source is fenced by `epoch` —
+/// it refuses every write, every write before the fence is durable, and the
+/// fence is recorded on its disk — and holds everything through
+/// `final_sequence` (its own numbering). A promoting standby tails it through
+/// that sequence before it converts its store: nothing the old primary
+/// committed is lost.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fenced {
+    /// The epoch the source was fenced by (the first fence's: a repeated
+    /// fence by the same node answers the same `Fenced`).
+    pub epoch: u64,
+    pub final_sequence: u64,
+}
+
+impl Fenced {
+    fn validate(&self) -> Result<()> {
+        if self.epoch < 2 || self.final_sequence > MAX_SOURCE_SEQUENCE {
+            return Err(invalid("invalid fence acknowledgement"));
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut bytes = Vec::with_capacity(FENCED_BYTES);
+        bytes.extend(self.epoch.to_be_bytes());
+        bytes.extend(self.final_sequence.to_be_bytes());
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != FENCED_BYTES {
+            return Err(invalid("fence acknowledgement has the wrong size"));
+        }
+        let fenced = Self {
+            epoch: u64_at(bytes, 0)?,
+            final_sequence: u64_at(bytes, 8)?,
+        };
+        fenced.validate()?;
+        Ok(fenced)
     }
 }
 
@@ -1092,6 +1237,17 @@ impl WireLimits {
     }
 }
 
+/// Spec P5.1 §11.F: a receiver's last applied write group — its first
+/// sequence and its SHA-256 (`PhysicalBatch::digest`), as its durable cursor
+/// records them. It ends at the cursor. A resume carries it, and the source
+/// verifies its own group ending there is this one before it serves the
+/// session (`RefuseCode::Diverged` otherwise).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LastGroup {
+    pub first_sequence: u64,
+    pub digest: [u8; 32],
+}
+
 /// Explicit session choice, sent only after authentication. Resume never creates
 /// a new checkpoint and pins the receiver's already durable physical history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1104,9 +1260,13 @@ pub enum OpenRequest {
     SnapshotOf {
         snapshot: Uuid,
     },
+    /// A resume after `after`. Spec P5.1 §11.F: `last` is the receiver's
+    /// last applied write group, which ends at `after` — `None` for a cursor
+    /// at a checkpoint cut, which has applied no group since.
     Resume {
         history: Uuid,
         after: u64,
+        last: Option<LastGroup>,
     },
     /// Spec P4.1 §3.1: an incremental fast-forward of a receiver of
     /// `history` at `after` (`recover --from-primary`): the source serves
@@ -1154,13 +1314,20 @@ impl OpenRequest {
                 bytes.extend(snapshot.as_bytes());
                 Ok(bytes)
             }
-            Self::Resume { history, after } => {
-                if history.is_nil() || after > MAX_SOURCE_SEQUENCE {
-                    return Err(invalid("invalid resume identity/cursor"));
+            Self::Resume { history, after, last } => {
+                if history.is_nil()
+                    || after > MAX_SOURCE_SEQUENCE
+                    || last.is_some_and(|last| last.first_sequence == 0 || last.first_sequence > after)
+                {
+                    return Err(invalid("invalid resume identity/cursor/last write group"));
                 }
-                let mut bytes = vec![1];
+                let mut bytes = Vec::with_capacity(OPEN_RESUME_BYTES);
+                bytes.push(1);
                 bytes.extend(history.as_bytes());
                 bytes.extend(after.to_be_bytes());
+                bytes.push(u8::from(last.is_some()));
+                bytes.extend(last.map_or(0, |last| last.first_sequence).to_be_bytes());
+                bytes.extend(last.map_or([0; 32], |last| last.digest));
                 Ok(bytes)
             }
         }
@@ -1171,10 +1338,23 @@ impl OpenRequest {
             [2, ..] if bytes.len() == 17 => Self::SnapshotOf {
                 snapshot: uuid_at(bytes, 1)?,
             },
-            [1, ..] if bytes.len() == 25 => Self::Resume {
-                history: uuid_at(bytes, 1)?,
-                after: u64_at(bytes, 17)?,
-            },
+            [1, ..] if bytes.len() == OPEN_RESUME_BYTES => {
+                let first_sequence = u64_at(bytes, 26)?;
+                let digest: [u8; 32] = bytes
+                    .get(34..66)
+                    .and_then(|digest| digest.try_into().ok())
+                    .ok_or_else(|| invalid("frame truncated"))?;
+                let last = match byte_at(bytes, 25)? {
+                    0 if first_sequence == 0 && digest == [0; 32] => None,
+                    1 => Some(LastGroup { first_sequence, digest }),
+                    _ => return Err(invalid("malformed resume last write group")),
+                };
+                Self::Resume {
+                    history: uuid_at(bytes, 1)?,
+                    after: u64_at(bytes, 17)?,
+                    last,
+                }
+            }
             [3, ..] if bytes.len() == OPEN_FAST_FORWARD_BYTES => Self::FastForward {
                 history: uuid_at(bytes, 1)?,
                 after: u64_at(bytes, 17)?,
@@ -1199,7 +1379,7 @@ impl OpenRequest {
     fn agrees_with(self, hello: &Hello) -> bool {
         match self {
             Self::Snapshot | Self::SnapshotOf { .. } => hello.cursor.is_none(),
-            Self::Resume { history, after } | Self::FastForward { history, after, .. } => {
+            Self::Resume { history, after, .. } | Self::FastForward { history, after, .. } => {
                 hello.history == Some(history) && hello.cursor == Some(after)
             }
         }
@@ -1315,6 +1495,7 @@ impl SourceSessionInfo {
                 OpenRequest::Resume {
                     history: expected,
                     after,
+                    ..
                 },
             ) if !session_id.is_nil()
                 && !history.is_nil()
@@ -1534,8 +1715,32 @@ impl SessionObserver for NoSessionObserver {
     }
 }
 
-/// Everything a source's sessions share: its identity, its observer, and its
-/// transport.
+/// Spec P5.1 §3.2: how a source that can be fenced (a primary) fences
+/// itself. The wire calls it for an inbound [`Fence`] and for a `Hello` of a
+/// higher epoch; the owner (`replication::fence::PrimaryFence`) closes the
+/// write gate, makes every earlier write durable, records the fence on disk,
+/// and only then answers. One fence per process: the first one wins.
+#[async_trait]
+pub trait SourceFence: Send + Sync {
+    /// Fence this source by `epoch` on behalf of the receiver `node`.
+    /// `Ok(Fenced)` once it is fenced — also for a repeated fence by the same
+    /// node, which answers the first one's `Fenced`. `Err` is the refusal the
+    /// receiver is sent: a fence of no higher epoch than the source's own, a
+    /// fence by another node than the one that fenced it, or a failure to
+    /// fence (the reason names it).
+    async fn fence(&self, epoch: u64, node: Uuid) -> std::result::Result<Fenced, Refusal>;
+
+    /// Spec P5.1 §11.E: why this source bootstraps nobody any more — it is
+    /// fenced (or its fence is under way) — or `None` while it is a primary
+    /// that may. A fenced source refuses snapshot and fast-forward opens with
+    /// `SourceNotServing` and this reason; it keeps serving resume sessions.
+    fn fenced(&self) -> Option<String> {
+        None
+    }
+}
+
+/// Everything a source's sessions share: its identity, its observer, its
+/// transport, and (a primary's) its fence.
 #[derive(Clone)]
 pub struct SourceContext {
     pub identity: SourceIdentity,
@@ -1544,15 +1749,21 @@ pub struct SourceContext {
     /// [`serve_session`] completed a TLS handshake first; its `HelloOk` then
     /// carries [`CAP_TLS`].
     pub tls: bool,
+    /// Spec P5.1: how this source fences itself; `None` for a source that
+    /// cannot be fenced (a cascading standby: it is no primary). With one,
+    /// every `HelloOk` carries [`CAP_FENCE`].
+    pub fence: Option<Arc<dyn SourceFence>>,
 }
 
 impl SourceContext {
-    /// A plaintext source whose sessions nobody observes.
+    /// A plaintext source whose sessions nobody observes, and that cannot be
+    /// fenced.
     pub fn unobserved(identity: SourceIdentity) -> Self {
         Self {
             identity,
             observer: Arc::new(NoSessionObserver),
             tls: false,
+            fence: None,
         }
     }
 }
@@ -1614,6 +1825,8 @@ enum Kind {
     LeafReady = 25,
     LeafChunkRequest = 26,
     LeafChunk = 27,
+    // 28 is not assigned; spec P5.1 numbers the fence acknowledgement 29.
+    Fenced = 29,
 }
 impl Kind {
     fn decode(value: u16) -> Result<Self> {
@@ -1644,6 +1857,7 @@ impl Kind {
             25 => Self::LeafReady,
             26 => Self::LeafChunkRequest,
             27 => Self::LeafChunk,
+            29 => Self::Fenced,
             _ => return Err(invalid("unknown frame kind")),
         })
     }
@@ -1652,7 +1866,11 @@ impl Kind {
             Self::Auth => n == TOKEN_BYTES,
             Self::AuthOk | Self::Close | Self::Closed => n == 0,
             Self::Open => {
-                n == 1 || n == 17 || n == 25 || n == OPEN_FAST_FORWARD_BYTES || n == OPEN_FAST_FORWARD_OF_BYTES
+                n == 1
+                    || n == 17
+                    || n == OPEN_RESUME_BYTES
+                    || n == OPEN_FAST_FORWARD_BYTES
+                    || n == OPEN_FAST_FORWARD_OF_BYTES
             }
             Self::FastForwardInfo => n == FAST_FORWARD_INFO_BYTES,
             Self::LeafDigestsRequest => n == LEAF_DIGESTS_REQUEST_BYTES,
@@ -1681,6 +1899,7 @@ impl Kind {
             Self::Heartbeat => n == HEARTBEAT_BYTES,
             Self::HeartbeatAck => n == HEARTBEAT_ACK_BYTES,
             Self::Fence => n == FENCE_BYTES,
+            Self::Fenced => n == FENCED_BYTES,
         }
     }
 }
@@ -1791,7 +2010,8 @@ async fn read_frame<R: AsyncRead + Unpin>(
 /// [`read_frame`], waiting up to `header_wait` for the frame's header to
 /// arrive (its payload steps keep the frame timeout). A source waits this
 /// long for a receiver's next request: the receiver applies (and fsyncs) a
-/// whole poll before it sends one.
+/// whole poll before it sends one; a receiver for a poll's `PollStart`
+/// ([`read_reply_within`]): the source collects the whole poll first.
 async fn read_frame_within<R: AsyncRead + Unpin>(
     io: &mut R,
     allowed: &[Kind],
@@ -1977,30 +2197,34 @@ async fn write_frame_parts<W: AsyncWrite + Unpin>(
 }
 
 /// Read one response of the `expected` kinds. A `Refuse` is the session's
-/// end, returned as [`WireError::Refused`]; a `Fence` (promotion, P5) is
-/// refused by this receiver as a stale epoch against `epoch`, its own.
+/// end, returned as [`WireError::Refused`]. Spec P5.1: a source never sends a
+/// `Fence` (only a receiver fences), so one is the protocol error any other
+/// unexpected kind is.
 async fn read_reply<R: AsyncRead + Unpin>(
     io: &mut R,
     expected: &[Kind],
-    epoch: u64,
     limits: &WireLimits,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<Frame> {
+    read_reply_within(io, expected, limits, limits.frame_timeout, shutdown).await
+}
+
+/// [`read_reply`], waiting up to `header_wait` for the reply's header (its
+/// payload steps keep the frame timeout, as [`read_frame_within`]). A
+/// receiver waits this long for a reply the source works on before it sends
+/// it: a poll's `PollStart` comes after the whole poll was collected.
+async fn read_reply_within<R: AsyncRead + Unpin>(
+    io: &mut R,
+    expected: &[Kind],
+    limits: &WireLimits,
+    header_wait: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Frame> {
     let mut allowed = expected.to_vec();
-    allowed.extend([Kind::Refuse, Kind::Fence]);
-    let frame = read_frame(io, &allowed, limits, shutdown).await?;
+    allowed.push(Kind::Refuse);
+    let frame = read_frame_within(io, &allowed, limits, header_wait, shutdown).await?;
     match frame.kind {
         Kind::Refuse => Err(WireError::Refused(Refusal::decode(&frame.payload)?)),
-        Kind::Fence => {
-            let fence = Fence::decode(&frame.payload)?;
-            Err(WireError::Refused(Refusal::new(
-                RefuseCode::EpochStale {
-                    have: fence.epoch,
-                    want: epoch,
-                },
-                "the source sent a fence; this receiver does not follow fencing until promotion support (P5)",
-            )))
-        }
         _ => Ok(frame),
     }
 }
@@ -2045,6 +2269,153 @@ fn source_refusal(error: &WireError) -> Option<Refusal> {
         WireError::Timeout | WireError::Shutdown => None,
         other => Some(Refusal::new(RefuseCode::SourceNotServing, other.to_string())),
     }
+}
+
+/// Spec P5.1 §2, the receiver's half of the epoch policy: what a receiver at
+/// `epoch` holding data answers a source at `source` — `EpochStale` when the
+/// source is AHEAD (a standby was promoted; this receiver needs recovery from
+/// it), `SourceStale` when it is BEHIND (it is a superseded primary; the
+/// receiver keeps retrying) — or `None` when they agree.
+fn receiver_epoch_refusal(epoch: u64, source: u64) -> Option<Refusal> {
+    match source.cmp(&epoch) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(Refusal::new(
+            RefuseCode::EpochStale {
+                have: source,
+                want: epoch,
+            },
+            format!(
+                "the source is at epoch {source} of this dataset, this receiver at epoch {epoch}: a standby was \
+                 promoted; recover this receiver from the new primary (heliosdb-nano recover --from-primary)"
+            ),
+        )),
+        std::cmp::Ordering::Less => Some(Refusal::new(
+            RefuseCode::SourceStale {
+                have: source,
+                want: epoch,
+            },
+            format!(
+                "the source is a superseded primary at epoch {source}; this receiver follows epoch {epoch} of the \
+                 dataset: point it at the current primary"
+            ),
+        )),
+    }
+}
+
+/// Spec P5.1 §2, the source's half: the refusal a source at `identity` gives a
+/// receiver that holds data at `hello.epoch`, fencing itself first when the
+/// receiver is AHEAD — this source is then the superseded one, and the first
+/// node of the newer epoch that talks to it stops it writing. `None` when the
+/// epochs agree.
+async fn source_epoch_refusal(
+    source: &SourceContext,
+    hello: &Hello,
+    limits: &WireLimits,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Option<Refusal> {
+    let ours = source.identity.epoch;
+    let theirs = hello.epoch;
+    match theirs.cmp(&ours) {
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Less => Some(Refusal::new(
+            RefuseCode::EpochStale {
+                have: ours,
+                want: theirs,
+            },
+            format!(
+                "the receiver follows epoch {theirs} of this dataset; this source is at epoch {ours}: run \
+                 `heliosdb-nano recover --from-primary` against this source"
+            ),
+        )),
+        std::cmp::Ordering::Greater => {
+            let fenced = match &source.fence {
+                Some(fence) => {
+                    let outcome = bounded(shutdown, limits.operation_timeout, async {
+                        Ok(fence.fence(theirs, hello.node_id).await)
+                    })
+                    .await;
+                    match outcome {
+                        Ok(Ok(fenced)) => format!(
+                            " (this source is fenced now, by epoch {}, at its sequence {})",
+                            fenced.epoch, fenced.final_sequence
+                        ),
+                        // Fenced earlier by another node of a newer epoch, or
+                        // the fence failed: the refusal is the same.
+                        Ok(Err(refusal)) => format!(" ({})", refusal.reason),
+                        Err(error) => format!(" (fencing this source failed: {error})"),
+                    }
+                }
+                None => String::new(),
+            };
+            Some(Refusal::new(
+                RefuseCode::SourceStale {
+                    have: ours,
+                    want: theirs,
+                },
+                format!(
+                    "this source is a superseded primary at epoch {ours}{fenced}; the receiver follows epoch \
+                     {theirs} of the dataset: point it at the current primary"
+                ),
+            ))
+        }
+    }
+}
+
+/// Spec P5.1 §3.1: answer a receiver's `Fence` (`payload`): `Fenced` once
+/// this source is fenced — the session goes on — else the refusal, which
+/// ends it. A source without a fence (a cascading standby) and a fence of no
+/// higher epoch than the source's are refused `Version`.
+async fn answer_fence<I: AsyncWrite + Unpin>(
+    io: &mut I,
+    source: &SourceContext,
+    hello: &Hello,
+    payload: &[u8],
+    limits: &WireLimits,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<()> {
+    let fence = Fence::decode(payload)?;
+    let ours = source.identity.epoch;
+    let refusal = match &source.fence {
+        None => Refusal::new(
+            RefuseCode::Version,
+            "this source cannot be fenced: it is not a primary (a cascading standby stops with its own primary)",
+        ),
+        Some(_) if fence.epoch <= ours => Refusal::new(
+            RefuseCode::Version,
+            format!(
+                "a fence must name a higher epoch than this source's {ours}; it named {}",
+                fence.epoch
+            ),
+        ),
+        // Spec P5.1 §11.C: only a standby of THIS dataset that holds data —
+        // its `Hello` names the history and a cursor — may fence it, and only
+        // by the epoch after its own (the handshake made that the source's
+        // own + 1). A fresh receiver, or a fence that skips epochs, would let
+        // anything holding the token stop the primary for good.
+        Some(_) if hello.history != Some(source.identity.history) || hello.cursor.is_none() => Refusal::new(
+            RefuseCode::Version,
+            "a fence must come from a standby of this dataset that holds data (a Hello naming the history and a \
+             cursor)",
+        ),
+        Some(_) if Some(fence.epoch) != hello.epoch.checked_add(1) => Refusal::new(
+            RefuseCode::Version,
+            format!(
+                "a fence must name the epoch after the receiver's {} (it named {})",
+                hello.epoch, fence.epoch
+            ),
+        ),
+        Some(fencer) => {
+            let outcome = bounded(shutdown, limits.operation_timeout, async {
+                Ok(fencer.fence(fence.epoch, hello.node_id).await)
+            })
+            .await?;
+            match outcome {
+                Ok(fenced) => return write_frame(io, Kind::Fenced, &fenced.encode()?, limits, shutdown).await,
+                Err(refusal) => refusal,
+            }
+        }
+    };
+    Err(refuse(io, refusal, limits, shutdown).await)
 }
 
 fn byte_at(bytes: &[u8], offset: usize) -> Result<u8> {
@@ -2297,15 +2668,12 @@ where
         );
         return Err(refuse(&mut io, refusal, &limits, &mut shutdown).await);
     }
-    if hello.epoch != identity.epoch {
-        let refusal = Refusal::new(
-            RefuseCode::EpochStale {
-                have: identity.epoch,
-                want: hello.epoch,
-            },
-            "the receiver followed another epoch of this dataset",
-        );
-        return Err(refuse(&mut io, refusal, &limits, &mut shutdown).await);
+    // Spec P5.1 §2: a receiver that holds data (a cursor) is at an epoch of
+    // its own; a fresh snapshot receiver is not, and takes this source's.
+    if hello.cursor.is_some() {
+        if let Some(refusal) = source_epoch_refusal(source, &hello, &limits, &mut shutdown).await {
+            return Err(refuse(&mut io, refusal, &limits, &mut shutdown).await);
+        }
     }
     // Registered from here until this function returns, however it returns.
     let mut observed = source.observer.admit(peer, &hello);
@@ -2314,22 +2682,39 @@ where
         history: identity.history,
         epoch: identity.epoch,
         barrier: source.observer.barrier().min(MAX_SOURCE_SEQUENCE),
-        capabilities: if source.tls {
-            CAPABILITIES | CAP_TLS
-        } else {
-            CAPABILITIES
-        },
+        capabilities: CAPABILITIES
+            | if source.tls { CAP_TLS } else { 0 }
+            | if source.fence.is_some() { CAP_FENCE } else { 0 },
         physical_endpoint: identity.physical_endpoint.clone(),
         pg_port: identity.pg_port,
     };
     write_frame(&mut io, Kind::HelloOk, &ok.encode()?, &limits, &mut shutdown).await?;
-    let open = read_frame(&mut io, &[Kind::Open, Kind::Close], &limits, &mut shutdown).await?;
-    if open.kind == Kind::Close {
-        return close_session(&mut io, &limits, &mut shutdown).await;
-    }
+    // Spec P5.1 §3.1: a promoting standby may fence this source before it
+    // opens a session (or instead of one), as often as it needs to.
+    let open = loop {
+        let frame = read_frame(&mut io, &[Kind::Open, Kind::Fence, Kind::Close], &limits, &mut shutdown).await?;
+        match frame.kind {
+            Kind::Close => return close_session(&mut io, &limits, &mut shutdown).await,
+            Kind::Fence => answer_fence(&mut io, source, &hello, &frame.payload, &limits, &mut shutdown).await?,
+            _ => break frame,
+        }
+    };
     let open = OpenRequest::decode(&open.payload)?;
     if !open.agrees_with(&hello) {
         return Err(invalid("session open request differs from the receiver's hello"));
+    }
+    // Spec P5.1 §11.E: a fenced source is a superseded primary — a copy of it
+    // (a snapshot, a fast-forward's leaves) would bootstrap a standby of the
+    // wrong node. It keeps serving resume sessions: the promoting standby
+    // tails it through its final sequence.
+    if !matches!(open, OpenRequest::Resume { .. }) {
+        if let Some(reason) = source.fence.as_ref().and_then(|fence| fence.fenced()) {
+            let refusal = Refusal::new(
+                RefuseCode::SourceNotServing,
+                format!("this source is a superseded primary, {reason}"),
+            );
+            return Err(refuse(&mut io, refusal, &limits, &mut shutdown).await);
+        }
     }
     // Factory is NEVER invoked for unauthenticated/refused/malformed sessions.
     // Resume providers validate existing source identity/cursor without
@@ -2518,6 +2903,12 @@ where
                 {
                     return Err(invalid("invalid physical continuation request"));
                 }
+                // Collecting the poll — reading, validating and digesting its
+                // write groups, fsyncing the WAL — happens before `PollStart`
+                // is sent and is bounded by the operation timeout. The
+                // receiver waits that plus a frame timeout for `PollStart`
+                // (`PhysicalClient::poll`), so a source still within this
+                // bound is never a deadline on the receiver's side.
                 let poll = match bounded(
                     &mut shutdown,
                     limits.operation_timeout,
@@ -2592,16 +2983,11 @@ where
                 };
                 write_frame(&mut io, Kind::HeartbeatAck, &ack.encode(), &limits, &mut shutdown).await?;
             }
+            // Spec P5.1 §3.1: between two requests of a snapshot or resume
+            // session (a fast-forward session's allowed kinds exclude it).
+            // The session goes on: the fenced source keeps serving it.
             Kind::Fence => {
-                let fence = Fence::decode(&request.payload)?;
-                let refusal = Refusal::new(
-                    RefuseCode::Version,
-                    format!(
-                        "fencing (epoch {}) is not served by this source until promotion support (P5)",
-                        fence.epoch
-                    ),
-                );
-                return Err(refuse(&mut io, refusal, &limits, &mut shutdown).await);
+                answer_fence(&mut io, source, &hello, &request.payload, &limits, &mut shutdown).await?;
             }
             Kind::Close => return close_session(&mut io, &limits, &mut shutdown).await,
             _ => return Err(invalid("unexpected request state")),
@@ -2639,9 +3025,9 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             ..limits
         };
         write_frame(&mut io, Kind::Auth, &token.0[..], &limits, &mut shutdown).await?;
-        read_reply(&mut io, &[Kind::AuthOk], hello.epoch, &reply_limits, &mut shutdown).await?;
+        read_reply(&mut io, &[Kind::AuthOk], &reply_limits, &mut shutdown).await?;
         write_frame(&mut io, Kind::Hello, &hello_bytes, &limits, &mut shutdown).await?;
-        let frame = read_reply(&mut io, &[Kind::HelloOk], hello.epoch, &reply_limits, &mut shutdown).await?;
+        let frame = read_reply(&mut io, &[Kind::HelloOk], &reply_limits, &mut shutdown).await?;
         let hello_ok = HelloOk::decode(&frame.payload)?;
         // The source checked both; a source that did not is refused here.
         if let Some(history) = hello.history.filter(|history| *history != hello_ok.history) {
@@ -2653,14 +3039,13 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
                 ),
             )));
         }
-        if hello_ok.epoch != hello.epoch {
-            return Err(WireError::Refused(Refusal::new(
-                RefuseCode::EpochStale {
-                    have: hello_ok.epoch,
-                    want: hello.epoch,
-                },
-                "the source is at another epoch of this dataset",
-            )));
+        // Spec P5.1 §2, the receiver's half of the policy: only a receiver
+        // that holds data (a cursor) has an epoch to compare; a fresh
+        // snapshot takes the source's with its copy.
+        if hello.cursor.is_some() {
+            if let Some(refusal) = receiver_epoch_refusal(hello.epoch, hello_ok.epoch) {
+                return Err(WireError::Refused(refusal));
+            }
         }
         Ok(Self {
             io,
@@ -2743,14 +3128,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             )
             .await?;
             let limits = self.reply_limits();
-            let frame = read_reply(
-                &mut self.io,
-                &[Kind::Manifest],
-                self.hello.epoch,
-                &limits,
-                &mut self.shutdown,
-            )
-            .await?;
+            let frame = read_reply(&mut self.io, &[Kind::Manifest], &limits, &mut self.shutdown).await?;
             let manifest = CheckpointManifest::decode(&frame.payload, &self.limits.transfer)
                 .map_err(|e| invalid(e.to_string()))?;
             if expected_history.is_some_and(|expected| expected != manifest.history)
@@ -2768,15 +3146,18 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
         }
         outcome
     }
-    /// Select a new wire session for an existing durable physical receiver.
-    pub async fn resume(&mut self, history: Uuid, after: u64) -> Result<SourceSessionInfo> {
+    /// Select a new wire session for an existing durable physical receiver
+    /// at `after`. Spec P5.1 §11.F: `last` is its cursor's last applied write
+    /// group (`None` at a checkpoint cut), which the source verifies against
+    /// its own before it serves the session.
+    pub async fn resume(&mut self, history: Uuid, after: u64, last: Option<LastGroup>) -> Result<SourceSessionInfo> {
         self.check_live()?;
         self.poisoned = true;
         let outcome = async {
             if self.info.is_some() {
                 return Err(invalid("session already selected"));
             }
-            let request = OpenRequest::Resume { history, after };
+            let request = OpenRequest::Resume { history, after, last };
             if !request.agrees_with(&self.hello) {
                 return Err(invalid(
                     "a resumed session announces its history and cursor in its hello",
@@ -2791,14 +3172,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             )
             .await?;
             let limits = self.reply_limits();
-            let frame = read_reply(
-                &mut self.io,
-                &[Kind::ResumeInfo],
-                self.hello.epoch,
-                &limits,
-                &mut self.shutdown,
-            )
-            .await?;
+            let frame = read_reply(&mut self.io, &[Kind::ResumeInfo], &limits, &mut self.shutdown).await?;
             let info = SourceSessionInfo::Resume {
                 session_id: uuid_at(&frame.payload, 0)?,
                 history: uuid_at(&frame.payload, 16)?,
@@ -2861,14 +3235,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             )
             .await?;
             let limits = self.reply_limits();
-            let frame = read_reply(
-                &mut self.io,
-                &[Kind::FastForwardInfo],
-                self.hello.epoch,
-                &limits,
-                &mut self.shutdown,
-            )
-            .await?;
+            let frame = read_reply(&mut self.io, &[Kind::FastForwardInfo], &limits, &mut self.shutdown).await?;
             let info = SourceSessionInfo::fast_forward_from(&frame.payload, request, &self.limits)?;
             if info.history() != self.hello_ok.history {
                 return Err(invalid("fast-forward history mismatch"));
@@ -2912,14 +3279,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
                 &mut self.shutdown,
             )
             .await?;
-            let frame = read_reply(
-                &mut self.io,
-                &[Kind::LeafDigests],
-                self.hello.epoch,
-                &self.limits,
-                &mut self.shutdown,
-            )
-            .await?;
+            let frame = read_reply(&mut self.io, &[Kind::LeafDigests], &self.limits, &mut self.shutdown).await?;
             let page = LeafDigests::decode(&frame.payload)?;
             if page.snapshot_id != snapshot
                 || (page.status == LeafStatus::Ready && (page.from != from || page.entries.len() > count as usize))
@@ -3034,14 +3394,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             )
             .await?;
             let limits = self.reply_limits();
-            let frame = read_reply(
-                &mut self.io,
-                &[Kind::LeafReady],
-                self.hello.epoch,
-                &limits,
-                &mut self.shutdown,
-            )
-            .await?;
+            let frame = read_reply(&mut self.io, &[Kind::LeafReady], &limits, &mut self.shutdown).await?;
             let ready = LeafReady::decode(&frame.payload)?;
             if ready.snapshot_id != snapshot || ready.index != index {
                 return Err(invalid("the source announced another leaf than the one asked for"));
@@ -3080,14 +3433,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
                 &mut self.shutdown,
             )
             .await?;
-            let mut frame = read_reply(
-                &mut self.io,
-                &[Kind::LeafChunk],
-                self.hello.epoch,
-                &self.limits,
-                &mut self.shutdown,
-            )
-            .await?;
+            let mut frame = read_reply(&mut self.io, &[Kind::LeafChunk], &self.limits, &mut self.shutdown).await?;
             let identity_ok = uuid_at(&frame.payload, 0)? == snapshot
                 && u32_at(&frame.payload, 16)? == index
                 && u64_at(&frame.payload, 20)? == offset
@@ -3112,6 +3458,9 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
         }
         outcome
     }
+    /// Authenticate over `io` and resume at `after` naming no last write
+    /// group (as a cursor at a checkpoint cut does). A real receiver names
+    /// its cursor's ([`PhysicalClient::connect_resume_replication`]).
     pub async fn connect_resume(
         io: I,
         token: &TransferToken,
@@ -3123,7 +3472,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
     ) -> Result<Self> {
         let hello = identity.hello(Some(history), Some(after));
         let mut client = Self::authenticate(io, token, hello, limits, shutdown).await?;
-        client.resume(history, after).await?;
+        client.resume(history, after, None).await?;
         Ok(client)
     }
     pub async fn read_chunk(&mut self, index: u32, offset: u64, length: u32) -> Result<Vec<u8>> {
@@ -3150,14 +3499,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
                 &mut self.shutdown,
             )
             .await?;
-            let mut frame = read_reply(
-                &mut self.io,
-                &[Kind::Chunk],
-                self.hello.epoch,
-                &self.limits,
-                &mut self.shutdown,
-            )
-            .await?;
+            let mut frame = read_reply(&mut self.io, &[Kind::Chunk], &self.limits, &mut self.shutdown).await?;
             let identity_ok = uuid_at(&frame.payload, 0)? == manifest.snapshot_id
                 && u32_at(&frame.payload, 16)? == index
                 && u64_at(&frame.payload, 20)? == offset
@@ -3215,11 +3557,20 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
                 &mut self.shutdown,
             )
             .await?;
-            let frame = read_reply(
+            // The source sends `PollStart` only once it collected the whole
+            // poll (up to `byte_limit` of write groups, read, validated and
+            // digested, and its WAL fsynced), work it bounds by its operation
+            // timeout (`serve_session`, `Kind::PollRequest`). So the wait for
+            // `PollStart` is that plus a frame timeout: a frame timeout alone
+            // gives up on a source still within its own bound (a poll of many
+            // tiny write groups under a write storm). Every other frame of
+            // the poll keeps the frame timeout: it follows at once.
+            let poll_start_wait = self.limits.operation_timeout.saturating_add(self.limits.frame_timeout);
+            let frame = read_reply_within(
                 &mut self.io,
                 &[Kind::PollStart],
-                self.hello.epoch,
                 &self.limits,
+                poll_start_wait,
                 &mut self.shutdown,
             )
             .await?;
@@ -3310,15 +3661,63 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
                 &mut self.shutdown,
             )
             .await?;
-            let frame = read_reply(
+            let frame = read_reply(&mut self.io, &[Kind::HeartbeatAck], &self.limits, &mut self.shutdown).await?;
+            HeartbeatAck::decode(&frame.payload)
+        }
+        .await;
+        if outcome.is_ok() {
+            self.poisoned = false;
+        }
+        outcome
+    }
+    /// Whether the source can be fenced ([`CAP_FENCE`] in its `HelloOk`).
+    pub fn fenceable(&self) -> bool {
+        self.hello_ok.capabilities & CAP_FENCE != 0
+    }
+    /// Spec P5.1 §3.1: fence this session's source by `epoch` (a promotion
+    /// to it): after `HelloOk`, before or instead of an `Open`, or between
+    /// two requests of a snapshot or resume session. `Fenced` once the source
+    /// refuses every write and made every earlier one durable; the session
+    /// goes on. Waits up to the operation deadline (the source drains its
+    /// writes and fsyncs). A source without [`CAP_FENCE`] is refused here,
+    /// before anything is sent; a refused fence ends the session
+    /// ([`WireError::Refused`]).
+    pub async fn fence(&mut self, epoch: u64) -> Result<Fenced> {
+        self.check_live()?;
+        if !self.fenceable() {
+            return Err(WireError::Refused(Refusal::new(
+                RefuseCode::Version,
+                "the source offers no fencing (CAP_FENCE): it is not a primary of a release that can be fenced",
+            )));
+        }
+        if self
+            .info
+            .as_ref()
+            .and_then(SourceSessionInfo::fast_forward_snapshot)
+            .is_some()
+        {
+            return Err(invalid("a fast-forward session is never fenced"));
+        }
+        self.poisoned = true;
+        let outcome = async {
+            write_frame(
                 &mut self.io,
-                &[Kind::HeartbeatAck],
-                self.hello.epoch,
+                Kind::Fence,
+                &Fence { epoch }.encode()?,
                 &self.limits,
                 &mut self.shutdown,
             )
             .await?;
-            HeartbeatAck::decode(&frame.payload)
+            let limits = self.reply_limits();
+            let frame = read_reply(&mut self.io, &[Kind::Fenced], &limits, &mut self.shutdown).await?;
+            let fenced = Fenced::decode(&frame.payload)?;
+            if fenced.epoch < epoch {
+                return Err(invalid(format!(
+                    "the source acknowledged a fence by epoch {}, not the {epoch} asked for",
+                    fenced.epoch
+                )));
+            }
+            Ok(fenced)
         }
         .await;
         if outcome.is_ok() {
@@ -3338,7 +3737,8 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
     }
 }
 impl PhysicalClient<ReplicationStream> {
-    /// [`Self::connect_replication`], then `Open { resume }` at `after`.
+    /// [`Self::connect_replication`], then `Open { resume }` at `after`,
+    /// naming the cursor's last write group `last` (spec P5.1 §11.F).
     #[allow(clippy::too_many_arguments)]
     pub async fn connect_resume_replication(
         address: SocketAddr,
@@ -3349,10 +3749,11 @@ impl PhysicalClient<ReplicationStream> {
         shutdown: watch::Receiver<bool>,
         history: Uuid,
         after: u64,
+        last: Option<LastGroup>,
     ) -> Result<Self> {
         let hello = identity.hello(Some(history), Some(after));
         let mut client = Self::connect_replication(address, transport, token, hello, limits, shutdown).await?;
-        client.resume(history, after).await?;
+        client.resume(history, after, last).await?;
         Ok(client)
     }
     /// Connect to a source's replication port over `transport` and
@@ -3702,6 +4103,10 @@ mod tests {
                 first: 7,
                 bytes: u64::MAX,
             },
+            // Spec P5.1 §2: id 10.
+            RefuseCode::SourceStale { have: 1, want: 2 },
+            // Spec P5.1 §11.F: id 11.
+            RefuseCode::Diverged { at: u64::MAX },
         ] {
             for reason in ["", "why", &"é".repeat(MAX_REASON_BYTES)] {
                 let refusal = Refusal::new(code.clone(), reason);
@@ -3711,6 +4116,18 @@ mod tests {
                 assert_eq!(Refusal::decode(&bytes).unwrap(), refusal);
             }
         }
+        let stale = Refusal::new(RefuseCode::SourceStale { have: 3, want: 9 }, "").encode();
+        assert_eq!(
+            u16::from_be_bytes([stale[0], stale[1]]),
+            10,
+            "SourceStale is refusal code 10"
+        );
+        let diverged = Refusal::new(RefuseCode::Diverged { at: 41 }, "").encode();
+        assert_eq!(
+            (u16::from_be_bytes([diverged[0], diverged[1]]), diverged.len()),
+            (11, 2 + 8 + 2),
+            "Diverged is refusal code 11, its sequence 8 bytes"
+        );
         let heartbeat = Heartbeat {
             applied_sequence: 10,
             durable_sequence: 9,
@@ -3721,6 +4138,24 @@ mod tests {
         assert_eq!(HeartbeatAck::decode(&ack.encode()).unwrap(), ack);
         let fence = Fence { epoch: 2 };
         assert_eq!(Fence::decode(&fence.encode().unwrap()).unwrap(), fence);
+        // Spec P5.1 §3.1: kind 29, 16 bytes.
+        for fenced in [
+            Fenced {
+                epoch: 2,
+                final_sequence: 0,
+            },
+            Fenced {
+                epoch: u64::MAX,
+                final_sequence: MAX_SOURCE_SEQUENCE,
+            },
+        ] {
+            let bytes = fenced.encode().unwrap();
+            assert_eq!(bytes.len(), 16);
+            assert!(Kind::Fenced.valid_size(bytes.len()));
+            assert_eq!(Fenced::decode(&bytes).unwrap(), fenced);
+        }
+        assert_eq!(Kind::Fenced as u16, 29);
+        assert_eq!(Kind::decode(29).unwrap(), Kind::Fenced);
 
         // Spec P4.1: the fast-forward session's frames (kinds 21-27).
         let snapshot = Uuid::new_v4();
@@ -3836,7 +4271,8 @@ mod tests {
         }
         assert!(!Kind::LeafChunk.valid_size(CHUNK_META), "a leaf chunk carries bytes");
         assert!(!Kind::LeafDigests.valid_size(LEAF_DIGESTS_HEADER_BYTES - 1));
-        assert!(Kind::decode(28).is_err(), "the next kind is not assigned yet");
+        assert!(Kind::decode(28).is_err(), "kind 28 is not assigned");
+        assert!(Kind::decode(30).is_err(), "the next kind is not assigned yet");
     }
 
     #[test]
@@ -3919,6 +4355,30 @@ mod tests {
         assert!(Heartbeat::decode(&[0; HEARTBEAT_BYTES + 1]).is_err());
         assert!(Fence { epoch: 0 }.encode().is_err());
         assert!(Fence::decode(&0_u64.to_be_bytes()).is_err());
+        // Spec P5.1: a fence acknowledgement of no promotion (epoch below 2),
+        // past the sequence space, or of the wrong size.
+        assert!(Fenced {
+            epoch: 1,
+            final_sequence: 5
+        }
+        .encode()
+        .is_err());
+        assert!(Fenced {
+            epoch: 2,
+            final_sequence: MAX_SOURCE_SEQUENCE + 1
+        }
+        .encode()
+        .is_err());
+        assert!(Fenced::decode(&[0; FENCED_BYTES - 1]).is_err());
+        let mut bytes = Fenced {
+            epoch: 2,
+            final_sequence: 5,
+        }
+        .encode()
+        .unwrap();
+        bytes[0..8].copy_from_slice(&0_u64.to_be_bytes());
+        assert!(Fenced::decode(&bytes).is_err());
+        assert!(!Kind::Fenced.valid_size(FENCED_BYTES + 1));
 
         // Spec P4.1: a fast-forward answer that cannot be this session's: a
         // cut at or before the receiver, a nil session, the wrong size, an
@@ -3959,7 +4419,11 @@ mod tests {
         }
         assert!(SourceSessionInfo::fast_forward_from(
             &answer(Uuid::new_v4(), 11),
-            OpenRequest::Resume { history, after: 10 },
+            OpenRequest::Resume {
+                history,
+                after: 10,
+                last: None
+            },
             &limits()
         )
         .is_err());
@@ -4083,13 +4547,49 @@ mod tests {
             RefuseCode::EpochStale { have: 1, want: 2 },
             RefuseCode::Version,
             RefuseCode::GroupTooLarge { first: 1, bytes: 2 },
+            RefuseCode::Diverged { at: 7 },
         ] {
             assert!(code.needs_recovery() && !code.retryable(), "{code:?}");
         }
-        for code in [RefuseCode::TooManySessions, RefuseCode::SourceNotServing] {
+        // Spec P5.1 §2: a superseded source is retried (the receiver is the
+        // one that is right; the fix is a `--primary-host` change).
+        for code in [
+            RefuseCode::TooManySessions,
+            RefuseCode::SourceNotServing,
+            RefuseCode::SourceStale { have: 1, want: 2 },
+        ] {
             assert!(code.retryable() && !code.needs_recovery(), "{code:?}");
         }
+        // The tables of spec P5.1 §2, by id: needs_recovery = {2,3,4,5,8,9}
+        // and (§11.F) 11, retryable = {6,7,10}, AuthFailed (1) neither.
+        let all = [
+            RefuseCode::AuthFailed,
+            RefuseCode::HistoryMismatch,
+            RefuseCode::Gap {
+                expected: 1,
+                have_from: 2,
+                have_to: 3,
+            },
+            RefuseCode::WalPruned { oldest: 1 },
+            RefuseCode::EpochStale { have: 1, want: 2 },
+            RefuseCode::TooManySessions,
+            RefuseCode::SourceNotServing,
+            RefuseCode::Version,
+            RefuseCode::GroupTooLarge { first: 1, bytes: 2 },
+            RefuseCode::SourceStale { have: 1, want: 2 },
+            RefuseCode::Diverged { at: 7 },
+        ];
+        let needs: Vec<u16> = all
+            .iter()
+            .filter(|code| code.needs_recovery())
+            .map(RefuseCode::id)
+            .collect();
+        let retry: Vec<u16> = all.iter().filter(|code| code.retryable()).map(RefuseCode::id).collect();
+        assert_eq!(needs, vec![2, 3, 4, 5, 8, 9, 11]);
+        assert_eq!(retry, vec![6, 7, 10]);
         assert!(!RefuseCode::AuthFailed.retryable() && !RefuseCode::AuthFailed.needs_recovery());
+        assert_eq!(RefuseCode::SourceStale { have: 1, want: 2 }.name(), "SourceStale");
+        assert_eq!(RefuseCode::Diverged { at: 7 }.name(), "Diverged");
         assert!(Refusal::new(RefuseCode::HistoryMismatch, "x")
             .to_string()
             .contains("history mismatch"));
@@ -4149,6 +4649,7 @@ mod tests {
             identity: identity(source.manifest.history),
             observer: recorder.clone(),
             tls: false,
+            fence: None,
         };
         let (_shutdown, rx) = watch::channel(false);
         let (client_io, server_io) = duplex(256);
@@ -4190,6 +4691,7 @@ mod tests {
             identity: identity(source.manifest.history),
             observer: recorder.clone(),
             tls: false,
+            fence: None,
         };
         let (_shutdown, rx) = watch::channel(false);
         let (client_io, server_io) = duplex(256);
@@ -4264,26 +4766,39 @@ mod tests {
     }
 
     /// Spec P2.1: a source of another dataset (or epoch) refuses the receiver
-    /// right after its `Hello`, with a typed code, before any export.
+    /// right after its `Hello`, with a typed code, before any export. Spec
+    /// P5.1 §2: a receiver behind the source's epoch is `EpochStale`, one
+    /// ahead of it `SourceStale` (this source cannot be fenced: no fence).
     #[tokio::test]
     async fn history_and_epoch_mismatches_are_refused_after_hello_before_export() {
-        for (hello, code) in [
-            (
-                receiver().hello(Some(Uuid::new_v4()), Some(10)),
-                RefuseCode::HistoryMismatch,
-            ),
-            (
-                Hello { epoch: 2, ..fresh() },
-                RefuseCode::EpochStale { have: 1, want: 2 },
-            ),
+        for (case, code) in [
+            (0, RefuseCode::HistoryMismatch),
+            (1, RefuseCode::SourceStale { have: 1, want: 2 }),
+            (2, RefuseCode::EpochStale { have: 3, want: 1 }),
         ] {
             let calls = Arc::new(AtomicUsize::new(0));
             let recorder = Arc::new(Recorder::default());
             let source = Arc::new(MockSource::new());
+            let history = source.manifest.history;
+            let (hello, source_epoch) = match case {
+                0 => (receiver().hello(Some(Uuid::new_v4()), Some(10)), 1),
+                1 => (
+                    Hello {
+                        epoch: 2,
+                        ..receiver().hello(Some(history), Some(10))
+                    },
+                    1,
+                ),
+                _ => (receiver().hello(Some(history), Some(10)), 3),
+            };
             let context = SourceContext {
-                identity: identity(source.manifest.history),
+                identity: SourceIdentity {
+                    epoch: source_epoch,
+                    ..identity(history)
+                },
                 observer: recorder.clone(),
                 tls: false,
+                fence: None,
             };
             let (_shutdown, rx) = watch::channel(false);
             let (client_io, server_io) = duplex(256);
@@ -4435,21 +4950,98 @@ mod tests {
         assert_eq!(refused(&run.await.unwrap()), Some(RefuseCode::TooManySessions));
     }
 
-    /// Fencing arrives with promotion (P5): the frame exists, both sides refuse it.
+    /// A source's fence for the tests: records every call and applies the
+    /// rule `replication::fence::PrimaryFence` applies — the first fence wins,
+    /// a repeated fence by the same node answers the same `Fenced`, another
+    /// node's is refused naming the first.
+    struct MockFence {
+        calls: Mutex<Vec<(u64, Uuid)>>,
+        applied: Mutex<Option<(u64, Uuid)>>,
+        final_sequence: u64,
+    }
+    impl MockFence {
+        fn new(final_sequence: u64) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                applied: Mutex::new(None),
+                final_sequence,
+            })
+        }
+    }
+    #[async_trait]
+    impl SourceFence for MockFence {
+        async fn fence(&self, epoch: u64, node: Uuid) -> std::result::Result<Fenced, Refusal> {
+            self.calls.lock().unwrap().push((epoch, node));
+            let mut applied = self.applied.lock().unwrap();
+            match *applied {
+                Some((by, first)) if first == node => Ok(Fenced {
+                    epoch: by,
+                    final_sequence: self.final_sequence,
+                }),
+                Some((by, first)) => Err(Refusal::new(
+                    RefuseCode::Version,
+                    format!("this primary was already fenced by epoch {by} (node {first})"),
+                )),
+                None => {
+                    *applied = Some((epoch, node));
+                    Ok(Fenced {
+                        epoch,
+                        final_sequence: self.final_sequence,
+                    })
+                }
+            }
+        }
+
+        fn fenced(&self) -> Option<String> {
+            let applied = *self.applied.lock().unwrap();
+            applied.map(|(by, _)| format!("fenced by epoch {by}: bootstrap from the new primary"))
+        }
+    }
+    /// [`server`] for a source at `epoch` that can be fenced by `fence`.
+    async fn fenceable_server(
+        io: DuplexStream,
+        source: Arc<MockSource>,
+        fence: Option<Arc<MockFence>>,
+        epoch: u64,
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let context = SourceContext {
+            identity: SourceIdentity {
+                epoch,
+                ..identity(source.manifest.history)
+            },
+            observer: Arc::new(NoSessionObserver),
+            tls: false,
+            fence: fence.map(|fence| fence as Arc<dyn SourceFence>),
+        };
+        serve_session(io, &token(), limits(), shutdown, &context, None, move |_| async move {
+            Ok(source as Arc<dyn PhysicalSource>)
+        })
+        .await
+    }
+
+    /// Spec P5.1 §3.1: a source that cannot be fenced (a cascading standby)
+    /// offers no `CAP_FENCE`, and a receiver that fences it anyway — before
+    /// its `Open` — is refused `Version`.
     #[tokio::test]
-    async fn fence_is_refused_by_source_and_receiver() {
-        // A receiver that sends one is refused with `Version`.
+    async fn a_source_without_a_fence_offers_none_and_refuses_one() {
         let source = Arc::new(MockSource::new());
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, peer) = duplex(256);
+        let run = tokio::spawn(fenceable_server(peer, source.clone(), None, 1, rx.clone()));
+        let hello = receiver().hello(Some(source.manifest.history), Some(10));
+        let mut client = PhysicalClient::authenticate(io, &token(), hello, limits(), rx)
+            .await
+            .unwrap();
+        assert!(!client.fenceable(), "a source without a fence never offers CAP_FENCE");
+        assert_eq!(client.hello_ok().capabilities & CAP_FENCE, 0);
+        // The client refuses before sending anything...
+        assert_eq!(refused(&client.fence(2).await), Some(RefuseCode::Version));
+        // ...and a raw fence is refused by the source.
         let (_shutdown, mut rx) = watch::channel(false);
         let (mut io, peer) = duplex(256);
-        let run = tokio::spawn(server(peer, source.clone(), Arc::new(AtomicUsize::new(0)), rx.clone()));
+        let run2 = tokio::spawn(fenceable_server(peer, source.clone(), None, 1, rx.clone()));
         raw_open(&mut io, &fresh(), &mut rx).await;
-        write_frame(&mut io, Kind::Open, &[0], &limits(), &mut rx)
-            .await
-            .unwrap();
-        read_frame(&mut io, &[Kind::Manifest], &limits(), &mut rx)
-            .await
-            .unwrap();
         write_frame(
             &mut io,
             Kind::Fence,
@@ -4460,10 +5052,224 @@ mod tests {
         .await
         .unwrap();
         let reply = read_frame(&mut io, &[Kind::Refuse], &limits(), &mut rx).await.unwrap();
-        assert_eq!(Refusal::decode(&reply.payload).unwrap().code, RefuseCode::Version);
+        let refusal = Refusal::decode(&reply.payload).unwrap();
+        assert_eq!(refusal.code, RefuseCode::Version);
+        assert!(refusal.reason.contains("cannot be fenced"), "{refusal}");
+        assert_eq!(refused(&run2.await.unwrap()), Some(RefuseCode::Version));
+        drop(client);
+        let _ = run.await;
+    }
+
+    /// Spec P5.1 §3.1: before `Open` and between two requests of a resume
+    /// session a fence is answered `Fenced { epoch, final_sequence }` and the
+    /// session goes on (the fenced source keeps serving polls); a repeated
+    /// fence by the same node answers the same `Fenced`; a fence that names
+    /// no higher epoch than the source's own is refused `Version`.
+    #[tokio::test]
+    async fn a_fence_is_answered_fenced_and_the_session_goes_on() {
+        let source = Arc::new(resume_source(&MockSource::new(), 10));
+        let history = source.manifest.history;
+        let fence = MockFence::new(77);
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, peer) = duplex(4096);
+        let run = tokio::spawn(fenceable_server(
+            peer,
+            source.clone(),
+            Some(fence.clone()),
+            1,
+            rx.clone(),
+        ));
+        let hello = receiver().hello(Some(history), Some(10));
+        let mut client = PhysicalClient::authenticate(io, &token(), hello, limits(), rx)
+            .await
+            .unwrap();
+        assert!(client.fenceable(), "a primary offers CAP_FENCE");
+        let fenced = client.fence(2).await.unwrap();
+        assert_eq!(
+            fenced,
+            Fenced {
+                epoch: 2,
+                final_sequence: 77
+            }
+        );
+        // The session goes on: open it, poll, fence again (idempotent).
+        client.resume(history, 10, None).await.unwrap();
+        let mut sink = Sink::default();
+        let summary = client.poll(10, 1024, &mut sink).await.unwrap();
+        assert_eq!(summary.through, 11);
+        assert_eq!(sink.received, vec![(history, 11, 11)]);
+        assert_eq!(
+            client.fence(2).await.unwrap(),
+            fenced,
+            "a repeated fence answers the same"
+        );
+        assert_eq!(
+            fence.calls.lock().unwrap().as_slice(),
+            &[(2, receiver().node_id), (2, receiver().node_id)]
+        );
+        client.close().await.unwrap();
+        run.await.unwrap().unwrap();
+
+        // A fence of no higher epoch than the source's own.
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, peer) = duplex(4096);
+        let run = tokio::spawn(fenceable_server(
+            peer,
+            source.clone(),
+            Some(MockFence::new(1)),
+            3,
+            rx.clone(),
+        ));
+        let hello = Hello {
+            epoch: 3,
+            ..receiver().hello(Some(history), Some(10))
+        };
+        let mut client = PhysicalClient::authenticate(io, &token(), hello, limits(), rx)
+            .await
+            .unwrap();
+        let outcome = client.fence(3).await;
+        assert_eq!(refused(&outcome), Some(RefuseCode::Version));
+        let reason = outcome
+            .err()
+            .and_then(|error| error.refusal().map(|refusal| refusal.reason.clone()))
+            .expect("the session is refused");
+        assert!(reason.contains("higher epoch than this source's 3"), "{reason}");
+        assert_eq!(refused(&run.await.unwrap()), Some(RefuseCode::Version));
+    }
+
+    /// Spec P5.1 §11.C: a fence is answered only for a standby of this
+    /// dataset that holds data (a `Hello` with the history and a cursor) and
+    /// only by the epoch after the receiver's; anything else is refused
+    /// `Version` before the source's fence is even asked. Spec §11.E: once
+    /// fenced, the source refuses to bootstrap anyone (a snapshot open is
+    /// `SourceNotServing`, naming the fence) and keeps serving resumes.
+    #[tokio::test]
+    async fn a_fence_must_come_from_a_standby_of_this_dataset_and_a_fenced_source_bootstraps_nobody() {
+        let source = Arc::new(resume_source(&MockSource::new(), 10));
+        let history = source.manifest.history;
+        let fence = MockFence::new(5);
+        let reason_of = |outcome: Result<Fenced>| {
+            outcome
+                .err()
+                .and_then(|error| error.refusal().map(|refusal| refusal.reason.clone()))
+                .expect("the fence is refused")
+        };
+
+        // A fresh receiver (no history, no cursor).
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, peer) = duplex(4096);
+        let run = tokio::spawn(fenceable_server(
+            peer,
+            source.clone(),
+            Some(fence.clone()),
+            1,
+            rx.clone(),
+        ));
+        let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx.clone())
+            .await
+            .unwrap();
+        assert!(client.fenceable());
+        let reason = reason_of(client.fence(2).await);
+        assert!(reason.contains("holds data"), "{reason}");
         assert_eq!(refused(&run.await.unwrap()), Some(RefuseCode::Version));
 
-        // A source that sends one is refused as a stale epoch.
+        // A fence that skips an epoch.
+        let (io, peer) = duplex(4096);
+        let run = tokio::spawn(fenceable_server(
+            peer,
+            source.clone(),
+            Some(fence.clone()),
+            1,
+            rx.clone(),
+        ));
+        let mut client = PhysicalClient::authenticate(
+            io,
+            &token(),
+            receiver().hello(Some(history), Some(10)),
+            limits(),
+            rx.clone(),
+        )
+        .await
+        .unwrap();
+        let reason = reason_of(client.fence(3).await);
+        assert!(reason.contains("the epoch after the receiver's 1"), "{reason}");
+        assert_eq!(refused(&run.await.unwrap()), Some(RefuseCode::Version));
+        assert!(
+            fence.calls.lock().unwrap().is_empty(),
+            "neither request reached the source's fence"
+        );
+
+        // Fenced: a snapshot open is refused, a resume served.
+        *fence.applied.lock().unwrap() = Some((2, Uuid::from_u128(0xF1)));
+        let (io, peer) = duplex(4096);
+        let run = tokio::spawn(fenceable_server(
+            peer,
+            source.clone(),
+            Some(fence.clone()),
+            1,
+            rx.clone(),
+        ));
+        let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx.clone())
+            .await
+            .unwrap();
+        let outcome = client.fetch_manifest(Some(history)).await;
+        assert_eq!(refused(&outcome), Some(RefuseCode::SourceNotServing));
+        let reason = outcome
+            .err()
+            .and_then(|error| error.refusal().map(|refusal| refusal.reason.clone()))
+            .unwrap_or_default();
+        assert!(reason.contains("bootstrap from the new primary"), "{reason}");
+        assert_eq!(refused(&run.await.unwrap()), Some(RefuseCode::SourceNotServing));
+        let (io, peer) = duplex(4096);
+        let run = tokio::spawn(fenceable_server(
+            peer,
+            source.clone(),
+            Some(fence.clone()),
+            1,
+            rx.clone(),
+        ));
+        let mut client = PhysicalClient::connect_resume(io, &token(), &receiver(), limits(), rx, history, 10)
+            .await
+            .unwrap();
+        let mut sink = Sink::default();
+        assert_eq!(client.poll(10, 1024, &mut sink).await.unwrap().through, 11);
+        client.close().await.unwrap();
+        run.await.unwrap().unwrap();
+    }
+
+    /// Spec P5.1 §8 test 7, on the wire: a source fenced by one node refuses
+    /// another node's fence of the same epoch, naming the first.
+    #[tokio::test]
+    async fn a_fence_by_another_node_is_refused_naming_the_first() {
+        let source = Arc::new(MockSource::new());
+        let history = source.manifest.history;
+        let fence = MockFence::new(5);
+        let first = Uuid::from_u128(0xF1);
+        *fence.applied.lock().unwrap() = Some((2, first));
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, peer) = duplex(4096);
+        let run = tokio::spawn(fenceable_server(peer, source, Some(fence), 1, rx.clone()));
+        let hello = receiver().hello(Some(history), Some(10));
+        let mut client = PhysicalClient::authenticate(io, &token(), hello, limits(), rx)
+            .await
+            .unwrap();
+        let outcome = client.fence(2).await;
+        assert_eq!(refused(&outcome), Some(RefuseCode::Version));
+        let reason = outcome
+            .err()
+            .and_then(|error| error.refusal().map(|refusal| refusal.reason.clone()))
+            .expect("the session is refused");
+        assert!(
+            reason.contains("already fenced by epoch 2") && reason.contains(&first.to_string()),
+            "{reason}"
+        );
+        assert_eq!(refused(&run.await.unwrap()), Some(RefuseCode::Version));
+    }
+
+    /// Spec P5.1 §3.1: only a receiver fences. A `Fence` from a source is the
+    /// protocol error any unexpected frame is — no longer read as an epoch.
+    #[tokio::test]
+    async fn a_fence_from_a_source_is_a_protocol_error() {
         let history = Uuid::new_v4();
         let (_shutdown, rx) = watch::channel(false);
         let (io, mut peer) = duplex(256);
@@ -4481,8 +5287,143 @@ mod tests {
         });
         let outcome =
             PhysicalClient::authenticate(io, &token(), receiver().hello(Some(history), Some(1)), limits(), rx).await;
-        assert_eq!(refused(&outcome), Some(RefuseCode::EpochStale { have: 5, want: 1 }));
+        assert!(matches!(outcome, Err(WireError::Protocol(_))), "{:?}", outcome.err());
         run.await.unwrap().unwrap();
+    }
+
+    /// A raw source at `epoch` for the receiver-side rows of the policy.
+    async fn raw_accept_at(
+        peer: &mut DuplexStream,
+        history: Uuid,
+        epoch: u64,
+        rx: &mut watch::Receiver<bool>,
+    ) -> Result<Hello> {
+        read_frame(peer, &[Kind::Auth], &limits(), rx).await?;
+        write_frame(peer, Kind::AuthOk, &[], &limits(), rx).await?;
+        let hello = Hello::decode(&read_frame(peer, &[Kind::Hello], &limits(), rx).await?.payload)?;
+        let ok = HelloOk {
+            node_id: Uuid::new_v4(),
+            history,
+            epoch,
+            barrier: 0,
+            capabilities: CAPABILITIES,
+            physical_endpoint: String::new(),
+            pg_port: 0,
+        };
+        write_frame(peer, Kind::HelloOk, &ok.encode()?, &limits(), rx).await?;
+        Ok(hello)
+    }
+
+    /// Spec P5.1 §8: the four rows of the epoch policy (§2) on an in-process
+    /// source and receiver, and the exemption of a fresh snapshot receiver.
+    #[tokio::test]
+    async fn the_epoch_policy_table_holds_on_both_sides() {
+        let source = Arc::new(MockSource::new());
+        let history = source.manifest.history;
+
+        // Source row 1: the receiver is behind → EpochStale, nothing fenced.
+        let fence = MockFence::new(9);
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, peer) = duplex(4096);
+        let run = tokio::spawn(fenceable_server(
+            peer,
+            source.clone(),
+            Some(fence.clone()),
+            2,
+            rx.clone(),
+        ));
+        let outcome =
+            PhysicalClient::authenticate(io, &token(), receiver().hello(Some(history), Some(10)), limits(), rx).await;
+        assert_eq!(refused(&outcome), Some(RefuseCode::EpochStale { have: 2, want: 1 }));
+        assert!(RefuseCode::EpochStale { have: 2, want: 1 }.needs_recovery());
+        assert_eq!(
+            refused(&run.await.unwrap()),
+            Some(RefuseCode::EpochStale { have: 2, want: 1 })
+        );
+        assert!(
+            fence.calls.lock().unwrap().is_empty(),
+            "a stale receiver never fences its source"
+        );
+
+        // Source row 2: the receiver is ahead → the source fences itself by
+        // the receiver's epoch on behalf of its node, then SourceStale.
+        let fence = MockFence::new(9);
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, peer) = duplex(4096);
+        let run = tokio::spawn(fenceable_server(
+            peer,
+            source.clone(),
+            Some(fence.clone()),
+            1,
+            rx.clone(),
+        ));
+        let hello = Hello {
+            epoch: 2,
+            ..receiver().hello(Some(history), Some(10))
+        };
+        let outcome = PhysicalClient::authenticate(io, &token(), hello, limits(), rx).await;
+        assert_eq!(refused(&outcome), Some(RefuseCode::SourceStale { have: 1, want: 2 }));
+        let reason = outcome
+            .err()
+            .and_then(|error| error.refusal().map(|refusal| refusal.reason.clone()))
+            .expect("the session is refused");
+        assert!(
+            reason.contains("superseded primary at epoch 1") && reason.contains("fenced now"),
+            "{reason}"
+        );
+        assert_eq!(
+            refused(&run.await.unwrap()),
+            Some(RefuseCode::SourceStale { have: 1, want: 2 })
+        );
+        assert_eq!(fence.calls.lock().unwrap().as_slice(), &[(2, receiver().node_id)]);
+
+        // Receiver row 1: the source is ahead → EpochStale.
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, mut peer) = duplex(4096);
+        let mut peer_rx = rx.clone();
+        let run = tokio::spawn(async move { raw_accept_at(&mut peer, history, 3, &mut peer_rx).await });
+        let outcome = PhysicalClient::authenticate(
+            io,
+            &token(),
+            receiver().hello(Some(history), Some(4)),
+            limits(),
+            rx.clone(),
+        )
+        .await;
+        assert_eq!(refused(&outcome), Some(RefuseCode::EpochStale { have: 3, want: 1 }));
+        run.await.unwrap().unwrap();
+
+        // Receiver row 2: the source is behind → SourceStale (retryable).
+        let (io, mut peer) = duplex(4096);
+        let mut peer_rx = rx.clone();
+        let run = tokio::spawn(async move { raw_accept_at(&mut peer, history, 1, &mut peer_rx).await });
+        let hello = Hello {
+            epoch: 4,
+            ..receiver().hello(Some(history), Some(4))
+        };
+        let outcome = PhysicalClient::authenticate(io, &token(), hello, limits(), rx.clone()).await;
+        assert_eq!(refused(&outcome), Some(RefuseCode::SourceStale { have: 1, want: 4 }));
+        assert!(RefuseCode::SourceStale { have: 1, want: 4 }.retryable());
+        run.await.unwrap().unwrap();
+
+        // A fresh snapshot receiver holds no epoch: admitted by a source of
+        // any epoch, and it accepts the source's.
+        let (io, peer) = duplex(4096);
+        let fence = MockFence::new(9);
+        let run = tokio::spawn(fenceable_server(
+            peer,
+            source.clone(),
+            Some(fence.clone()),
+            5,
+            rx.clone(),
+        ));
+        let client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx.clone())
+            .await
+            .unwrap();
+        assert_eq!(client.hello_ok().epoch, 5);
+        client.close().await.unwrap();
+        run.await.unwrap().unwrap();
+        assert!(fence.calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4507,10 +5448,12 @@ mod tests {
     /// (in this protocol's framing) and the source reports the refusal; any
     /// other magic is a protocol error that says what the peer looks like.
     /// Spec P4.1c: so is an `NPHYS002` receiver, whose batch bounds differ.
+    /// Spec P5.1 §11.F: and an `NPHYS003` one, whose resume carries no last
+    /// write group.
     #[tokio::test]
     async fn previous_version_is_refused_by_name_and_other_magic_before_export() {
-        assert_eq!((PROTOCOL, &MAGIC, VERSION), ("NPHYS003", b"NPHYS003", 3));
-        for (old_magic, old_version) in [(*b"NPHYS001", 1_u16), (*b"NPHYS002", 2)] {
+        assert_eq!((PROTOCOL, &MAGIC, VERSION), ("NPHYS004", b"NPHYS004", 4));
+        for (old_magic, old_version) in [(*b"NPHYS001", 1_u16), (*b"NPHYS002", 2), (*b"NPHYS003", 3)] {
             let old_name = String::from_utf8_lossy(&old_magic).into_owned();
             let (_shutdown, mut rx) = watch::channel(false);
             let (mut io, peer) = duplex(256);
@@ -4526,7 +5469,7 @@ mod tests {
             let refusal = Refusal::decode(&reply.payload).unwrap();
             assert_eq!(refusal.code, RefuseCode::Version, "{old_name}");
             assert!(
-                refusal.reason.contains(&old_name) && refusal.reason.contains("NPHYS003"),
+                refusal.reason.contains(&old_name) && refusal.reason.contains("NPHYS004"),
                 "{refusal}"
             );
             assert_eq!(refused(&run.await.unwrap()), Some(RefuseCode::Version), "{old_name}");
@@ -4535,7 +5478,12 @@ mod tests {
 
         // The same version number under another magic, the previous
         // version, and a bumped version under this magic.
-        for (magic, version) in [(*b"NPHYS001", VERSION), (*b"NPHYS002", 2), (MAGIC, 9)] {
+        for (magic, version) in [
+            (*b"NPHYS001", VERSION),
+            (*b"NPHYS002", 2),
+            (*b"NPHYS003", 3),
+            (MAGIC, 9),
+        ] {
             let mut bytes = magic.to_vec();
             bytes.extend(version.to_be_bytes());
             bytes.extend(1_u16.to_be_bytes());
@@ -4544,7 +5492,7 @@ mod tests {
             header.copy_from_slice(&bytes);
             let error = check_header(&header).unwrap_err();
             assert!(matches!(error, WireError::Version { .. }), "{error}");
-            assert!(error.to_string().contains("NPHYS003"), "{error}");
+            assert!(error.to_string().contains("NPHYS004"), "{error}");
         }
         for (garbage, hint) in [
             (b"HTTP/1.1 400 Bad R".to_vec(), "HTTP"),
@@ -4870,7 +5818,14 @@ mod tests {
                 &context,
                 None,
                 move |request| async move {
-                    assert_eq!(request, OpenRequest::Resume { history, after: 10 });
+                    assert_eq!(
+                        request,
+                        OpenRequest::Resume {
+                            history,
+                            after: 10,
+                            last: None
+                        }
+                    );
                     Ok(provider as Arc<dyn PhysicalSource>)
                 },
             )
@@ -4971,7 +5926,11 @@ mod tests {
                 let open = read_frame(&mut peer, &[Kind::Open], &limits(), &mut peer_shutdown).await?;
                 assert_eq!(
                     OpenRequest::decode(&open.payload)?,
-                    OpenRequest::Resume { history, after: 10 }
+                    OpenRequest::Resume {
+                        history,
+                        after: 10,
+                        last: None
+                    }
                 );
                 let info = SourceSessionInfo::Resume {
                     session_id: if fault == "nil" { Uuid::nil() } else { Uuid::new_v4() },
@@ -5037,16 +5996,65 @@ mod tests {
         let history = Uuid::new_v4();
         for (hello, payload) in [
             (fresh(), vec![2]),
-            (fresh(), vec![0; 25]),
+            (fresh(), vec![0; OPEN_RESUME_BYTES]),
+            // A resume of a nil history.
             (fresh(), {
                 let mut bytes = vec![1];
                 bytes.extend([0; 16]);
                 bytes.extend(10_u64.to_be_bytes());
+                bytes.extend([0; 41]);
+                bytes
+            }),
+            // Spec P5.1 §11.F: a last write group flag that is neither 0 nor
+            // 1, a group named with flag 0, and one past the cursor.
+            (receiver().hello(Some(history), Some(10)), {
+                let mut bytes = OpenRequest::Resume {
+                    history,
+                    after: 10,
+                    last: None,
+                }
+                .encode()
+                .unwrap();
+                bytes[25] = 2;
+                bytes
+            }),
+            (receiver().hello(Some(history), Some(10)), {
+                let mut bytes = OpenRequest::Resume {
+                    history,
+                    after: 10,
+                    last: None,
+                }
+                .encode()
+                .unwrap();
+                bytes[26..34].copy_from_slice(&9_u64.to_be_bytes());
+                bytes
+            }),
+            (receiver().hello(Some(history), Some(10)), {
+                let mut bytes = OpenRequest::Resume {
+                    history,
+                    after: 10,
+                    last: Some(LastGroup {
+                        first_sequence: 10,
+                        digest: [7; 32],
+                    }),
+                }
+                .encode()
+                .unwrap();
+                bytes[26..34].copy_from_slice(&11_u64.to_be_bytes());
                 bytes
             }),
             // A well-formed open that disagrees with the hello: a resume of a
             // fresh receiver, and a snapshot of a resuming one.
-            (fresh(), OpenRequest::Resume { history, after: 10 }.encode().unwrap()),
+            (
+                fresh(),
+                OpenRequest::Resume {
+                    history,
+                    after: 10,
+                    last: None,
+                }
+                .encode()
+                .unwrap(),
+            ),
             (receiver().hello(Some(history), Some(10)), vec![0]),
         ] {
             let (_shutdown, mut rx) = watch::channel(false);
@@ -5196,6 +6204,7 @@ mod tests {
                 identity: identity(source.manifest.history),
                 observer: Arc::new(NoSessionObserver),
                 tls: source_tls,
+                fence: None,
             };
             let (_shutdown, rx) = watch::channel(false);
             let (client_io, server_io) = duplex(256);
@@ -5254,9 +6263,45 @@ mod tests {
         assert!(request.is_snapshot() && OpenRequest::Snapshot.is_snapshot());
         assert!(!OpenRequest::Resume {
             history: preferred,
-            after: 1
+            after: 1,
+            last: None
         }
         .is_snapshot());
+        // Spec P5.1 §11.F (`NPHYS004`): a resume carries its last write
+        // group, or none at a checkpoint cut; both round-trip at 66 bytes.
+        for last in [
+            None,
+            Some(LastGroup {
+                first_sequence: 8,
+                digest: [9; 32],
+            }),
+        ] {
+            let resume = OpenRequest::Resume {
+                history: preferred,
+                after: 10,
+                last,
+            };
+            let bytes = resume.encode().unwrap();
+            assert_eq!(bytes.len(), OPEN_RESUME_BYTES);
+            assert!(Kind::Open.valid_size(bytes.len()));
+            assert_eq!(OpenRequest::decode(&bytes).unwrap(), resume);
+        }
+        assert!(
+            !Kind::Open.valid_size(25),
+            "NPHYS003's resume is no frame of this protocol"
+        );
+        for first_sequence in [0, 11] {
+            assert!(OpenRequest::Resume {
+                history: preferred,
+                after: 10,
+                last: Some(LastGroup {
+                    first_sequence,
+                    digest: [0; 32],
+                }),
+            }
+            .encode()
+            .is_err());
+        }
         assert!(OpenRequest::SnapshotOf { snapshot: Uuid::nil() }.encode().is_err());
         let mut nil = vec![2];
         nil.extend([0; 16]);
@@ -6187,6 +7232,102 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// [`MockSource`] whose poll takes `delay` to collect — as a source
+    /// reading, digesting and fsyncing a storm of tiny write groups does
+    /// before it sends `PollStart`.
+    struct SlowPoll {
+        inner: MockSource,
+        delay: Duration,
+    }
+    #[async_trait]
+    impl PhysicalSource for SlowPoll {
+        fn session_info(&self) -> &SourceSessionInfo {
+            &self.inner.info
+        }
+        async fn read_chunk(&self, index: u32, offset: u64, length: u32) -> Result<Vec<u8>> {
+            self.inner.read_chunk(index, offset, length).await
+        }
+        async fn poll(&self, after: u64, limit: usize) -> Result<PhysicalPoll> {
+            tokio::time::sleep(self.delay).await;
+            self.inner.poll(after, limit).await
+        }
+    }
+
+    /// The mirror of the test above: a receiver waits for `PollStart` as long
+    /// as the source may take to collect the poll — the source's operation
+    /// timeout — plus a frame timeout (`limits()`: 3 s + 2 s), not one frame
+    /// timeout. A source that answers after 2.5 s (past the frame timeout,
+    /// within its own 3 s bound) is not a deadline: its poll is applied. A
+    /// peer that never answers is given up on after the 5 s, not the 2 s.
+    /// (Paused time: the waits pass at once, timers in order.)
+    #[tokio::test(start_paused = true)]
+    async fn a_receiver_waits_for_poll_start_while_the_source_collects_the_poll() {
+        let inner = MockSource::new();
+        let history = inner.manifest.history;
+        let delay = Duration::from_millis(2500);
+        assert!(
+            delay > limits().frame_timeout && delay < limits().operation_timeout,
+            "precondition"
+        );
+        let source = Arc::new(SlowPoll { inner, delay });
+        let (_shutdown, rx) = watch::channel(false);
+        let (io, peer) = duplex(64 * 1024);
+        let server_rx = rx.clone();
+        let run = tokio::spawn(async move {
+            let context = SourceContext::unobserved(identity(history));
+            serve_session(
+                peer,
+                &token(),
+                limits(),
+                server_rx,
+                &context,
+                None,
+                move |_| async move { Ok(source as Arc<dyn PhysicalSource>) },
+            )
+            .await
+        });
+        let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx.clone())
+            .await
+            .unwrap();
+        client.fetch_manifest(Some(history)).await.unwrap();
+        let mut sink = Sink::default();
+        let started = tokio::time::Instant::now();
+        let summary = client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap();
+        assert!(started.elapsed() >= delay, "the poll took {:?}", started.elapsed());
+        assert_eq!((summary.through, summary.batches), (11, 1));
+        assert_eq!(sink.received, vec![(history, 11, 11)]);
+        client.close().await.unwrap();
+        run.await.unwrap().unwrap();
+
+        // A peer that reads the request and never answers it.
+        let silent = MockSource::new();
+        let history = silent.manifest.history;
+        let manifest = serde_json::to_vec(&silent.manifest).unwrap();
+        let (io, mut peer) = duplex(64 * 1024);
+        let mut peer_rx = rx.clone();
+        let stalled = tokio::spawn(async move {
+            raw_accept(&mut peer, history, &mut peer_rx).await?;
+            read_frame(&mut peer, &[Kind::Open], &limits(), &mut peer_rx).await?;
+            write_frame(&mut peer, Kind::Manifest, &manifest, &limits(), &mut peer_rx).await?;
+            read_frame(&mut peer, &[Kind::PollRequest], &limits(), &mut peer_rx).await?;
+            // Hold the connection open, sending nothing more.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok::<_, WireError>(())
+        });
+        let mut client = PhysicalClient::authenticate(io, &token(), fresh(), limits(), rx)
+            .await
+            .unwrap();
+        client.fetch_manifest(Some(history)).await.unwrap();
+        let started = tokio::time::Instant::now();
+        let outcome = client.poll(10, MAX_POLL_BYTES, &mut Sink::default()).await;
+        assert!(matches!(outcome, Err(WireError::Timeout)), "{:?}", outcome.err());
+        let waited = started.elapsed();
+        let deadline = limits().operation_timeout + limits().frame_timeout;
+        assert!(waited >= deadline, "gave up after {waited:?}, before {deadline:?}");
+        drop(client);
+        stalled.abort();
     }
 
     /// Review P4.1d: a poll's second `Batch` frame whose header announces

@@ -23,7 +23,7 @@ struct HAConfig {
     /// resolved (absolute) for a node with an HA role and a data directory.
     archive: heliosdb_nano::config::ArchiveConfig,
     role: String,
-    /// THE replication port (`NPHYS003`): a primary serves its standbys here.
+    /// THE replication port (`NPHYS004`): a primary serves its standbys here.
     replication_port: u16,
     startup_timeout_secs: u64,
     /// A standby's primary: the primary's replication port.
@@ -1177,6 +1177,21 @@ enum Commands {
     /// stop short, 3 when a full copy is needed but was not applied
     /// (--no-full-copy, or an occupied directory without --replace).
     Recover(RecoverArgs),
+    /// Promote a STOPPED physical standby to the primary of its dataset at
+    /// the next epoch (spec P5.1; Oracle: SWITCHOVER / FAILOVER TO;
+    /// PostgreSQL: pg_ctl promote). The old primary is fenced first over its
+    /// replication port — once it is proven to serve this standby's cursor;
+    /// it refuses every write from then on — and tailed through its final
+    /// sequence, so nothing it committed is lost. A primary that answers is
+    /// always fenced; --force only promotes anyway when it cannot be fenced
+    /// or tailed (down or isolated: writes it committed after this standby's
+    /// cursor are lost), --no-fence never contacts it (a rehearsal on a
+    /// cloned directory). The dataset history is inherited, never a new one.
+    /// Interrupted, it is finished by running it again. Exits 0 on success, 1
+    /// on an error, 2 when refused (a running standby, no standby, an
+    /// interrupted fast-forward, a primary already superseded, or one that
+    /// did not answer the fence without --force).
+    Promote(PromoteArgs),
     /// Inspect and maintain a WAL archive (archived segments, spec P3.1)
     /// offline: list, verify, gaps, prune. Reads the files only and takes no
     /// database lock.
@@ -1283,7 +1298,7 @@ enum Commands {
         #[arg(long)]
         replication_role: Option<String>,
 
-        /// THE replication port (protocol NPHYS003, default: 5433): a primary
+        /// THE replication port (protocol NPHYS004, default: 5433): a primary
         /// serves its physical standbys here — the bootstrap copy, the physical
         /// WAL, heartbeats and acknowledgements on one connection each. It
         /// binds on --listen's address with --replication-tls (or
@@ -1492,6 +1507,11 @@ enum Commands {
         /// PID file location
         #[arg(long, default_value = "./heliosdb.pid")]
         pid_file: PathBuf,
+        /// Spec P5.1: also report the data directory's replication identity —
+        /// its role, dataset history and epoch, and a fence or an interrupted
+        /// promotion it carries (read-only; the node may be running).
+        #[arg(short, long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
     },
 
     /// Initialize a new database
@@ -1804,6 +1824,17 @@ async fn run(cli: Cli) -> Result<()> {
             replication.role = replication.role.to_ascii_lowercase();
             replication.sync_mode = replication.sync_mode.to_ascii_lowercase();
             replication.validate()?;
+            // Spec P5.1 §4 step 3, §11.A: a directory a promotion was
+            // interrupted in starts in no role; a fenced primary's starts
+            // fenced as a primary (or standalone) — the engine opens it with
+            // its write gate fenced — and never as a standby (it is rebuilt).
+            #[cfg(feature = "ha-tier1")]
+            if !memory {
+                if let Some(reason) = fenced_or_promoting_refusal(&resolved_data_dir, &replication.role) {
+                    eprintln!("Error: start refused: {reason}");
+                    std::process::exit(2);
+                }
+            }
             #[cfg(feature = "ha-tier1")]
             auto_enable_physical_source(&mut replication, explicit_physical, memory, &resolved_data_dir)?;
             #[cfg(not(feature = "ha-tier1"))]
@@ -1948,9 +1979,13 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Resync(args) => run_physical_resync(args).await,
         Commands::Recover(args) => run_recover(args).await,
+        Commands::Promote(args) => run_promote(args).await,
         Commands::Archive(args) => run_archive_command(args),
         Commands::Stop { ref pid_file } => stop_server(pid_file),
-        Commands::Status { ref pid_file } => check_server_status(pid_file),
+        Commands::Status {
+            ref pid_file,
+            ref data_dir,
+        } => check_server_status(pid_file, data_dir.as_deref()),
         Commands::Init { ref data_dir } => init_database(data_dir),
         Commands::Repl {
             data_dir,
@@ -2485,6 +2520,23 @@ async fn start_server(
         Arc::new(EmbeddedDatabase::with_config(db_config)?)
     };
     println!("      Database initialized successfully");
+    // Spec P5.1 §11.A: a fenced primary's directory opened fenced (its write
+    // gate); every surface of the process says so before any listener
+    // accepts a session — read-only, `fenced`, `/ready` 503.
+    #[cfg(feature = "ha-tier1")]
+    if !memory_mode && !guarded_standby && db.storage.write_gate().is_fenced() {
+        match heliosdb_nano::replication::fence::note_fenced_at_open(&db.storage, &data_dir) {
+            Ok(Some(record)) => println!(
+                "      FENCED: this primary was fenced at {} by epoch {} (its last sequence {}): it serves reads and \
+                 replication resume sessions only; every write is refused",
+                heliosdb_nano::standby_posture::format_unix_secs(record.fenced_at),
+                record.fenced_by_epoch,
+                record.final_sequence
+            ),
+            Ok(None) => {}
+            Err(error) => return Err(Error::config(format!("start refused: {error}"))),
+        }
+    }
 
     // Build server config
     let mut pg_config = PgServerConfig::with_address(pg_addr)
@@ -2576,7 +2628,7 @@ async fn start_server(
                 replication_remote_allowed(&ha_config),
             );
             println!(
-                "      - Replication listener: {address} (NPHYS003, {})",
+                "      - Replication listener: {address} (NPHYS004, {})",
                 if ha_config.replication_tls.tls_enabled && ha_config.replication_tls.tls_ca_path.is_some() {
                     "TLS, client certificates required"
                 } else if ha_config.replication_tls.tls_enabled {
@@ -2654,7 +2706,7 @@ async fn start_server(
     drop(serving_db_tx);
 
     // Spec P2.1: a primary's replication is its ONE replication port
-    // (`NPHYS003`), bound here before any readiness is published; its directly
+    // (`NPHYS004`), bound here before any readiness is published; its directly
     // owned future is polled alongside PostgreSQL only after startup succeeds.
     // A standby's replication belongs to its `StandbyRuntime` (above).
     #[cfg(feature = "ha-tier1")]
@@ -2662,6 +2714,11 @@ async fn start_server(
         let node = configure_ha_node(&ha_config, &pg_addr.ip().to_string(), pg_addr.port())?;
         let prepared =
             prepare_physical_source(&ha_config, &node, pg_addr, &db.storage, replication_server_tls.as_ref()).await?;
+        // Spec P5.1 §11.A: configuring the primary role made the node
+        // read-write; a fenced primary stays read-only.
+        if db.storage.write_gate().is_fenced() {
+            heliosdb_nano::replication::ha_state::ha_state().set_read_only(true);
+        }
         // What a primary reports to the SQL probes and `/health`: its written
         // physical sequence, its replication port and whether it serves TLS.
         heliosdb_nano::standby_posture::install_primary(heliosdb_nano::standby_posture::PrimaryStatus {
@@ -3705,7 +3762,97 @@ fn stop_server(pid_file: &PathBuf) -> Result<()> {
     }
 }
 
-fn check_server_status(pid_file: &PathBuf) -> Result<()> {
+/// `heliosdb-nano status`: the process (`--pid-file`), and with `--data-dir`
+/// the directory's replication identity (spec P5.1: its epoch, and a fence
+/// or an interrupted promotion it carries).
+fn check_server_status(pid_file: &PathBuf, data_dir: Option<&std::path::Path>) -> Result<()> {
+    check_process_status(pid_file)?;
+    if let Some(dir) = data_dir {
+        print_replication_identity(dir);
+    }
+    Ok(())
+}
+
+/// Spec P5.1 §1: what `status --data-dir` says about a directory's
+/// replication identity, read without a lock (a running node keeps
+/// running): its role by its markers, its dataset history, the epoch its
+/// store holds — and the fence or the interrupted promotion it carries,
+/// which no running process may hide.
+fn print_replication_identity(dir: &std::path::Path) {
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        println!("Replication: not compiled in (ha-tier1) for {}", dir.display());
+    }
+    #[cfg(feature = "ha-tier1")]
+    {
+        use heliosdb_nano::replication::checkpoint_transfer::{physical_stage_history, PHYSICAL_MARKER_FILE};
+        use heliosdb_nano::replication::epoch::{epoch_of, read_directory_epoch};
+        use heliosdb_nano::replication::fence::{read_fenced_record, FENCED_FILE};
+        use heliosdb_nano::replication::history::PRIMARY_HISTORY_FILE;
+        use heliosdb_nano::replication::promote::{read_promotion_record, PROMOTION_FILE};
+        let carries = |name: &str| std::fs::symlink_metadata(dir.join(name)).is_ok();
+        println!("Replication ({}):", dir.display());
+        let role = if carries(FENCED_FILE) {
+            "fenced primary"
+        } else if carries(PROMOTION_FILE) {
+            "standby being promoted (interrupted)"
+        } else if carries(PHYSICAL_MARKER_FILE) {
+            "physical standby"
+        } else if carries(PRIMARY_HISTORY_FILE) {
+            "primary"
+        } else {
+            "standalone"
+        };
+        println!("  role: {role}");
+        if carries(PHYSICAL_MARKER_FILE) {
+            match physical_stage_history(dir) {
+                Ok(history) => println!("  history: {history}"),
+                Err(error) => println!("  history: unreadable ({error})"),
+            }
+        }
+        match read_directory_epoch(dir) {
+            Ok(record) => {
+                println!("  epoch: {}", epoch_of(record.as_ref()));
+                if let Some(record) = record {
+                    println!(
+                        "  promoted: from epoch {} at {} by node {}, {}",
+                        record.previous,
+                        heliosdb_nano::standby_posture::format_unix_secs(record.promoted_at),
+                        record.node_id,
+                        match record.old_primary_final_sequence {
+                            Some(sequence) => format!("the old primary fenced at its sequence {sequence}"),
+                            None => "the old primary NOT fenced (--force)".to_string(),
+                        }
+                    );
+                }
+            }
+            Err(error) => println!("  epoch: unreadable ({error})"),
+        }
+        match read_fenced_record(dir) {
+            Ok(Some(record)) => println!(
+                "  fenced: at {} by epoch {} (node {}), at its sequence {}",
+                heliosdb_nano::standby_posture::format_unix_secs(record.fenced_at),
+                record.fenced_by_epoch,
+                record.by_node,
+                record.final_sequence
+            ),
+            Ok(None) => {}
+            Err(error) => println!("  fenced: {error}"),
+        }
+        match read_promotion_record(dir) {
+            Ok(Some(record)) => println!(
+                "  promotion interrupted: epoch {} → {}; finish it with `heliosdb-nano promote --data-dir {}`",
+                record.from_epoch,
+                record.to_epoch,
+                dir.display()
+            ),
+            Ok(None) => {}
+            Err(error) => println!("  promotion: {error}"),
+        }
+    }
+}
+
+fn check_process_status(pid_file: &PathBuf) -> Result<()> {
     if !pid_file.exists() {
         println!("Status: NOT RUNNING");
         println!("PID file not found: {}", pid_file.display());
@@ -4422,7 +4569,11 @@ impl StandbyRuntime {
             identity: ReceiverIdentity {
                 node_id: node.node_id,
                 role: PeerRole::Standby,
-                epoch: heliosdb_nano::standby_posture::EPOCH,
+                // Spec P5.1: the default of a standby that holds no store
+                // yet (its bootstrap's `Hello` carries no cursor, so no epoch
+                // is compared); once a store is attached every `Hello`
+                // announces the store's (`physical_receiver::connect`).
+                epoch: heliosdb_nano::replication::epoch::INITIAL_EPOCH,
                 pg_port: port,
                 sync_mode: WireSyncMode::from_config(&ha_config.sync_mode),
             },
@@ -4748,6 +4899,21 @@ async fn bootstrap_physical_standby(
     }
 }
 
+/// Spec P5.1: the epoch an installed standby's store holds (`repl:epoch`;
+/// 1 before any promotion), read without a lock or the engine, before the
+/// receiver opens the store — what its archive files segments under.
+#[cfg(feature = "ha-tier1")]
+async fn standby_store_epoch(data_dir: &std::path::Path) -> std::result::Result<u64, String> {
+    let path = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        heliosdb_nano::replication::epoch::read_directory_epoch(&path)
+            .map(|record| heliosdb_nano::replication::epoch::epoch_of(record.as_ref()))
+            .map_err(|error| format!("the replication epoch of {} cannot be read: {error}", path.display()))
+    })
+    .await
+    .map_err(|error| format!("the epoch reader failed: {error}"))?
+}
+
 /// The serving side of the follow receiver (`physical_receiver::ServingAttach`):
 /// the engine over the stage's writer, the SQL layer over the engine (it
 /// hydrates it), and the applier that reports to that SQL layer — in that
@@ -4789,6 +4955,15 @@ fn standby_serving_attach(
                 writer.cursor().source_sequence(),
                 std::sync::Arc::new(move || live.upgrade().map(|writer| writer.cursor().source_sequence())),
             );
+            // Spec P5.1: the posture reports the store's epoch (and the one
+            // its record says it was promoted from), which the applier keeps
+            // current.
+            let epoch_engine = std::sync::Arc::downgrade(&database.storage);
+            tracker.attach_epoch(std::sync::Arc::new(move || {
+                epoch_engine
+                    .upgrade()
+                    .map(|engine| (engine.replication_epoch(), engine.replication_previous_epoch()))
+            }));
             info!(
                 "Physical standby store at {} attached at source sequence {}",
                 path.display(),
@@ -4853,18 +5028,27 @@ async fn run_physical_standby(
     };
 
     // Spec P3.1: the standby archives every batch it applies, filed under its
-    // binding (the history it follows).
+    // binding (the history it follows) and (spec P5.1) its store's epoch.
+    // Spec P5.1 §11.K: the store's epoch is read only when there is an
+    // archive to file segments under it (a cheap read-only point read).
     let (archive, feed) = match plan.archive.as_ref() {
-        Some(archive) => {
-            let (service, feed) = heliosdb_nano::replication::archiver::start_standby(
-                archive.settings.clone(),
-                history,
-                archive.node_id,
-                archive.key_manager.clone(),
-            );
-            (Some(service), Some(feed))
-        }
         None => (None, None),
+        Some(archive) => match standby_store_epoch(&plan.data_dir).await {
+            Ok(epoch) => {
+                let (service, feed) = heliosdb_nano::replication::archiver::start_standby(
+                    archive.settings.clone(),
+                    history,
+                    epoch,
+                    archive.node_id,
+                    archive.key_manager.clone(),
+                );
+                (Some(service), Some(feed))
+            }
+            Err(reason) => {
+                tracing::warn!("archive: the WAL archive is off on this standby: {reason}");
+                (None, None)
+            }
+        },
     };
 
     let (progress, observed) = tokio::sync::watch::channel(ReceiverStatus::Connecting {
@@ -4988,17 +5172,26 @@ async fn supervise_archive_standby(
             return;
         }
     };
+    // Spec P5.1 §11.K: the store's epoch is read only when there is an
+    // archive to file segments under it (a cheap read-only point read).
     let (archive, feed) = match plan.archive.as_ref() {
-        Some(archive) => {
-            let (service, feed) = heliosdb_nano::replication::archiver::start_standby(
-                archive.settings.clone(),
-                history,
-                archive.node_id,
-                archive.key_manager.clone(),
-            );
-            (Some(service), Some(feed))
-        }
         None => (None, None),
+        Some(archive) => match standby_store_epoch(&plan.data_dir).await {
+            Ok(epoch) => {
+                let (service, feed) = heliosdb_nano::replication::archiver::start_standby(
+                    archive.settings.clone(),
+                    history,
+                    epoch,
+                    archive.node_id,
+                    archive.key_manager.clone(),
+                );
+                (Some(service), Some(feed))
+            }
+            Err(reason) => {
+                tracing::warn!("archive: the WAL archive is off on this standby: {reason}");
+                (None, None)
+            }
+        },
     };
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let attach = standby_serving_attach(plan.config.clone(), std::sync::Arc::clone(&plan.tracker), store.clone());
@@ -7161,7 +7354,7 @@ fn physical_wire_limits(
     }
 }
 
-/// Spec P2.1: a primary's ONE replication port (`NPHYS003`), bound, with
+/// Spec P2.1: a primary's ONE replication port (`NPHYS004`), bound, with
 /// everything its sessions share.
 #[cfg(feature = "ha-tier1")]
 struct PreparedPhysicalSource {
@@ -7191,8 +7384,11 @@ struct PreparedPhysicalSource {
     lease_sweep: std::time::Duration,
     /// Spec P3.1: the primary's WAL archiver, started with the source and
     /// stopped (its open segment sealed) when the source stops, before the
-    /// store closes. `None` with `--archive=false`.
-    archive: Option<heliosdb_nano::replication::archiver::ArchiveService>,
+    /// store closes. `None` with `--archive=false`. Spec P5.1 §11.B: shared
+    /// with the primary's fence, which asks it to archive and seal through
+    /// the final sequence when this primary is fenced; it keeps running,
+    /// idle, until the source stops it.
+    archive: Option<heliosdb_nano::replication::fence::SharedArchive>,
     /// Spec P3.2 §4: a primary's own store, or a cascading standby's.
     kind: heliosdb_nano::replication::physical_source::SourceKind,
     /// Spec P3.2 §1: the WAL archive a receiver's gap is filled from when the
@@ -7248,7 +7444,7 @@ async fn prepare_physical_source(
     ha_config: &HAConfig,
     node: &HaNode,
     pg_addr: std::net::SocketAddr,
-    storage: &heliosdb_nano::storage::StorageEngine,
+    storage: &std::sync::Arc<heliosdb_nano::storage::StorageEngine>,
     server_tls: Option<&heliosdb_nano::replication::physical_tls::ReplicationServerTls>,
 ) -> Result<Option<PreparedPhysicalSource>> {
     use heliosdb_nano::replication::ha_state::ha_state;
@@ -7307,7 +7503,7 @@ async fn prepare_physical_source(
         .await
         .map_err(|e| {
             Error::network(format!(
-                "Cannot bind the replication listener {address} (NPHYS003): {e}. Use distinct PostgreSQL --port \
+                "Cannot bind the replication listener {address} (NPHYS004): {e}. Use distinct PostgreSQL --port \
                  and --replication-port endpoints; a standby's --primary-host names this port."
             ))
         })?;
@@ -7319,19 +7515,36 @@ async fn prepare_physical_source(
         sequence.upgrade().map_or(0, |db| db.latest_sequence_number())
     })));
     state.set_replication_serving(true);
+    // Spec P5.1 §3: this primary can be fenced — by a promoting standby's
+    // `Fence`, or by the `Hello` of a receiver of a newer epoch. The fence
+    // has the archiver archive and seal through its final sequence (the slot
+    // is filled once it is started, below) and records itself in the data
+    // directory; a directory fenced before starts fenced (spec P5.1 §11.A).
+    let archive_slot: heliosdb_nano::replication::fence::SharedArchive =
+        std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let fence = heliosdb_nano::replication::fence::PrimaryFence::new(
+        storage,
+        directory,
+        history,
+        std::sync::Arc::clone(&archive_slot),
+    );
+    let epoch = storage.replication_epoch();
     let context = std::sync::Arc::new(SourceContext {
         identity: SourceIdentity {
             node_id: node.node_id,
             history,
-            epoch: heliosdb_nano::standby_posture::EPOCH,
+            // Spec P5.1: the store's epoch (`repl:epoch`; 1 before any
+            // promotion), compared with every receiver's that holds data.
+            epoch,
             physical_endpoint: address.to_string(),
             pg_port: pg_addr.port(),
         },
         observer: std::sync::Arc::new(StandbyRegistryObserver::new(&db)),
         tls: acceptor.is_some(),
+        fence: Some(std::sync::Arc::new(fence)),
     });
     info!(
-        "Replication port listening on {address} (NPHYS003, {}, dataset history {history})",
+        "Replication port listening on {address} (NPHYS004, {}, dataset history {history}, epoch {epoch})",
         match server_tls {
             Some(tls) if tls.mutual() => "TLS, client certificates required",
             Some(_) => "TLS",
@@ -7341,10 +7554,31 @@ async fn prepare_physical_source(
     let lease_secs = ha_config.replication_tls.snapshot_export_lease_secs;
     let work = SourceWorkLimiter::new(config.max_sessions).map_err(|e| Error::config(e.to_string()))?;
     // Spec P3.1: started last, once nothing can fail the source any more.
-    let archive = start_primary_archive(ha_config, storage, history, node.node_id);
+    let started = start_primary_archive(ha_config, storage, history, node.node_id);
     // Spec P3.2 §1: the archive fills a standby's gap the WAL no longer
     // holds (its frames sealed with the dataset key when encrypted).
-    let fill = archive_fill(ha_config, storage.config(), archive.is_some());
+    let fill = archive_fill(ha_config, storage.config(), started.is_some());
+    let archive = match started {
+        Some(service) => {
+            // Spec P5.1 §11.B: a fenced primary restarted writes nothing; its
+            // archive is completed through what the store holds and sealed,
+            // off the start path (the archiver stays running, idle).
+            if storage.write_gate().is_fenced() {
+                let sealer = service.sealer();
+                let through = storage.db().latest_sequence_number();
+                tokio::task::spawn_blocking(move || {
+                    if let Err(reason) = sealer.seal_through(through, std::time::Duration::from_secs(60)) {
+                        tracing::warn!(
+                            "archive: the fenced primary's WAL archive may end before its sequence {through}: {reason}"
+                        );
+                    }
+                });
+            }
+            *archive_slot.lock() = Some(service);
+            Some(archive_slot)
+        }
+        None => None,
+    };
     Ok(Some(PreparedPhysicalSource {
         listener,
         address,
@@ -7479,13 +7713,13 @@ async fn prepare_cascade_source(
         .await
         .map_err(|e| {
             Error::network(format!(
-                "Cannot bind the cascading standby's replication listener {address} (NPHYS003): {e}. Use distinct \
+                "Cannot bind the cascading standby's replication listener {address} (NPHYS004): {e}. Use distinct \
                  PostgreSQL --port and --replication-port endpoints; a downstream standby's --primary-host names this \
                  port."
             ))
         })?;
     info!(
-        "Cascading replication port listening on {address} (NPHYS003, {}); downstream standbys are served once this \
+        "Cascading replication port listening on {address} (NPHYS004, {}); downstream standbys are served once this \
          standby's store is attached",
         match server_tls {
             Some(tls) if tls.mutual() => "TLS, client certificates required",
@@ -7543,6 +7777,8 @@ async fn serve_cascade_source(plan: CascadePlan, mut shutdown: tokio::sync::watc
         }
     };
     let db = database.storage.db();
+    // Spec P5.1: a cascading standby serves its store's epoch (its primary's).
+    let epoch = database.storage.replication_epoch();
     drop(database);
     let prepared = (|| -> Result<PreparedPhysicalSource> {
         let history = physical_stage_history(&plan.data_dir).map_err(|e| Error::config(e.to_string()))?;
@@ -7562,12 +7798,15 @@ async fn serve_cascade_source(plan: CascadePlan, mut shutdown: tokio::sync::watc
             identity: SourceIdentity {
                 node_id: plan.node_id,
                 history,
-                epoch: heliosdb_nano::standby_posture::EPOCH,
+                epoch,
                 physical_endpoint: plan.address.to_string(),
                 pg_port: plan.pg_port,
             },
             observer: std::sync::Arc::new(StandbyRegistryObserver::with_barrier(Box::new(barrier))),
             tls: plan.tls.is_some(),
+            // A cascading standby is no primary: it cannot be fenced (it
+            // stops with its own primary's fence and promotion).
+            fence: None,
         });
         let work = SourceWorkLimiter::new(plan.physical.max_sessions).map_err(|e| Error::config(e.to_string()))?;
         info!(
@@ -7752,8 +7991,11 @@ async fn serve_physical_source(
         .drain()
         .await
         .map_err(|e| Error::network(format!("physical source work drain failed: {e}")));
-    if let Some(archive) = archive {
-        if let Err(error) = tokio::task::spawn_blocking(move || archive.shutdown()).await {
+    // Spec P5.1 §11.B: a fence seals it through the final sequence but leaves
+    // it running; it is stopped here, as on any primary.
+    let service = archive.and_then(|slot| slot.lock().take());
+    if let Some(service) = service {
+        if let Err(error) = tokio::task::spawn_blocking(move || service.shutdown()).await {
             tracing::warn!("the WAL archiver did not stop cleanly: {error}");
         }
     }
@@ -7840,6 +8082,14 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
         // Spec P4.1 §4: what a refused resume names, should the directory be
         // one a fast-forward left between two cuts.
         let resumed_dir = args.resume_existing.then(|| args.data_dir.clone());
+        // Spec P5.1 §4 step 3: a directory a promotion was interrupted in is
+        // finished by `promote`, never resumed as a standby.
+        if args.resume_existing {
+            if let Some(reason) = heliosdb_nano::replication::promote::refuse_promoting_directory(&args.data_dir) {
+                eprintln!("resync refused: {reason}");
+                std::process::exit(2);
+            }
+        }
         let probe_config = config.clone();
         let primary_host = args.primary_host.clone();
         let start = if args.resume_existing {
@@ -7856,10 +8106,13 @@ async fn run_physical_resync(args: ResyncArgs) -> Result<()> {
             }
         };
         // An offline receiver: it never counts toward a primary's `min_acks`.
+        // Spec P5.1: a fresh snapshot announces no epoch the source compares
+        // (it takes the source's with its copy); a resumed one announces its
+        // store's, which the receiver reads when it reopens the stage.
         let identity = heliosdb_nano::replication::physical_wire::ReceiverIdentity {
             node_id: uuid::Uuid::new_v4(),
             role: heliosdb_nano::replication::physical_wire::PeerRole::Resync,
-            epoch: heliosdb_nano::standby_posture::EPOCH,
+            epoch: heliosdb_nano::replication::epoch::INITIAL_EPOCH,
             pg_port: 0,
             sync_mode: heliosdb_nano::replication::physical_wire::WireSyncMode::Async,
         };
@@ -8031,6 +8284,231 @@ fn parse_leaf_bytes(raw: &str) -> std::result::Result<u32, String> {
         .ok_or_else(|| format!("--leaf-bytes {raw} is outside 64KiB..=256MiB"))
 }
 
+/// `heliosdb-nano promote` (spec P5.1 §4).
+#[derive(clap::Args, Debug)]
+struct PromoteArgs {
+    /// The STOPPED physical standby to promote.
+    #[arg(short, long, value_name = "DIR")]
+    data_dir: PathBuf,
+    /// The standby's config file: its storage options, its [replication]
+    /// primary_host, token_file and TLS settings (the defaults of the flags
+    /// below), and the `start` settings --then start runs with. The
+    /// promotion's identity on the wire is its own random UUID, never the
+    /// configured node_id.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    /// The old primary's replication port (host:port), to fence it; default
+    /// the standby's [replication] primary_host.
+    #[arg(long)]
+    primary_host: Option<String>,
+    #[command(flatten)]
+    physical: PhysicalTransferArgs,
+    #[command(flatten)]
+    primary_tls: PrimaryTlsArgs,
+    /// Plaintext to a non-loopback primary, token included: isolated
+    /// development only.
+    #[arg(long)]
+    allow_insecure_replication_remote: bool,
+    /// How long the old primary may take to answer the fence (connection,
+    /// handshake, the proof that it serves this standby's cursor, `Fenced`),
+    /// and — separately — the tail through its final sequence, in seconds.
+    #[arg(long, value_name = "SECS", default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    fence_timeout: u64,
+    /// Promote even when the old primary cannot be fenced (unreachable within
+    /// --fence-timeout) or not tailed through its final sequence: an
+    /// attestation that it is down or isolated (writes committed on it after
+    /// this standby's cursor are lost; said as a WARNING). A primary that
+    /// answers is still fenced: --force only decides what happens when it
+    /// cannot be. Its own STONITH is the operator's.
+    #[arg(long)]
+    force: bool,
+    /// Never contact the old primary (implies --force): a rehearsal on a
+    /// cloned standby directory. A running old primary is NOT fenced and
+    /// keeps accepting writes.
+    #[arg(long)]
+    no_fence: bool,
+    /// What follows: `stop` exits (the default); `start` starts the promoted
+    /// node as a primary, as `start --replication-role primary` would.
+    #[arg(long, value_name = "start|stop")]
+    then: Option<String>,
+    /// Arguments after `--` are passed to `start` with --then start: its
+    /// ports, token file, TLS, ...
+    #[arg(last = true, value_name = "START_ARGS")]
+    start_args: Vec<String>,
+}
+
+/// Spec P5.1 §4 step 3 and §11.A: why `start` in `role` refuses `data_dir` —
+/// a promotion was interrupted in it (`NANO-PROMOTION.json`: every role), or
+/// it is a fenced primary's (`NANO-FENCED.json`) started as a standby (it is
+/// rebuilt as one, never followed over); `None` otherwise. A fenced
+/// directory started as a primary (or standalone) is served fenced: reads,
+/// resume sessions on its replication port, every write refused.
+#[cfg(feature = "ha-tier1")]
+fn fenced_or_promoting_refusal(data_dir: &std::path::Path, role: &str) -> Option<String> {
+    use heliosdb_nano::replication::fence::{fenced_start_refusal, read_fenced_record, FENCED_FILE};
+    if let Some(reason) = heliosdb_nano::replication::promote::refuse_promoting_directory(data_dir) {
+        return Some(reason);
+    }
+    if role != "standby" || std::fs::symlink_metadata(data_dir.join(FENCED_FILE)).is_err() {
+        return None;
+    }
+    Some(match read_fenced_record(data_dir) {
+        Ok(Some(record)) => fenced_start_refusal(data_dir, &record),
+        Ok(None) | Err(_) => format!(
+            "this directory is a primary that was fenced ({FENCED_FILE}); it is not a standby's and cannot be \
+             started as one; {}",
+            heliosdb_nano::storage::replication_records::fenced_rebuild_hint(data_dir)
+        ),
+    })
+}
+
+/// `heliosdb-nano promote` (spec P5.1 §4): offline; refuses a running node,
+/// a directory that is no physical standby, an interrupted fast-forward, and
+/// a primary that is already superseded or fenced by another node (exit 2);
+/// without `--force`, an old primary that does not answer the fence (exit 2).
+/// A failure part-way exits 1 and leaves the promotion record: a re-run
+/// finishes it. With --then start it then starts the node as a primary.
+async fn run_promote(args: PromoteArgs) -> Result<()> {
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        let _ = args;
+        return Err(Error::config("promote requires the ha-tier1 feature"));
+    }
+    #[cfg(feature = "ha-tier1")]
+    {
+        use heliosdb_nano::replication::promote::{promote, PromoteError, PromoteOptions};
+        let start = match args.then.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            None | Some("stop") => false,
+            Some("start") => true,
+            Some(other) => return Err(Error::config(format!("--then must be start or stop, not '{other}'"))),
+        };
+        if !start && !args.start_args.is_empty() {
+            return Err(Error::config(
+                "the arguments after -- are start's, for --then start; this promotion stops when it is done",
+            ));
+        }
+        if args.start_args.iter().any(|arg| {
+            arg == "--password"
+                || arg.starts_with("--password=")
+                || arg == "--mcp-token"
+                || arg.starts_with("--mcp-token=")
+        }) {
+            return Err(Error::config(
+                "a literal --password / --mcp-token is not passed on to start: use --password-file, \
+                 HELIOSDB_PASSWORD_FILE / HELIOSDB_PASSWORD or HELIOSDB_MCP_TOKEN",
+            ));
+        }
+        let PromoteArgs {
+            data_dir,
+            config: config_path,
+            primary_host,
+            physical,
+            primary_tls,
+            allow_insecure_replication_remote,
+            fence_timeout,
+            force,
+            no_fence,
+            then: _,
+            start_args,
+        } = args;
+        // Spec P5.1 §11.B: --no-fence never contacts the primary, so it
+        // promotes without its final sequence: it implies --force.
+        let force = force || no_fence;
+        let mut config = match &config_path {
+            Some(path) => Config::from_file(path.clone())?,
+            None => Config::default(),
+        };
+        config.storage.path = Some(data_dir.clone());
+        config.storage.memory_only = false;
+        physical.apply(&mut config.replication);
+        primary_tls.apply(&mut config.replication);
+        if allow_insecure_replication_remote {
+            config.replication.allow_insecure_remote = true;
+        }
+        config.replication.validate()?;
+        config.replication.physical.validate()?;
+        let canonical = heliosdb_nano::replication::recover_primary::canonical_path(&data_dir)
+            .map_err(|error| Error::config(error.to_string()))?;
+        let primary_host = primary_host.or_else(|| config.replication.primary_host.clone());
+        let wire = physical_wire_limits(&config.replication.physical);
+        // The old primary's address, transport and token — the standby's own
+        // settings, as `recover --from-primary` resolves them. Without a
+        // primary only --force promotes; --no-fence resolves none.
+        let (sources, transport, token) = match primary_host.as_ref().filter(|_| !no_fence) {
+            Some(host) => {
+                let tls_settings = ReplicationTlsSettings::from_config(&config.replication);
+                let sources = resolve_replication_sources(host)?;
+                let transport = replication_transport(
+                    host,
+                    &sources,
+                    &tls_settings,
+                    config.replication.allow_insecure_remote,
+                    tls_settings.tls_post_quantum.unwrap_or(true),
+                )?;
+                let token = match config.replication.token_file.as_ref() {
+                    Some(file) => Some(heliosdb_nano::replication::read_replication_token(file)?),
+                    None if force => None,
+                    None => {
+                        return Err(Error::config(
+                            "promote fences the old primary: it needs --replication-token-file or [replication] \
+                             token_file (or --force, which does not fence it)",
+                        ))
+                    }
+                };
+                (sources, Some(transport), token)
+            }
+            None => (Vec::new(), None, None),
+        };
+        let options = PromoteOptions {
+            data_dir: canonical.clone(),
+            config: config.clone(),
+            primary_host: primary_host.clone(),
+            sources,
+            transport,
+            token,
+            wire,
+            fence_timeout: std::time::Duration::from_secs(fence_timeout),
+            force,
+            no_fence,
+        };
+        let report = match promote(&options, &mut |line| println!("{line}")).await {
+            Ok(report) => report,
+            Err(PromoteError::Refused(reason)) => {
+                println!("promote refused: {reason}");
+                std::process::exit(2);
+            }
+            Err(error @ PromoteError::Failed(_)) => return Err(Error::storage(error.to_string())),
+        };
+        println!("{}", report.summary());
+        if !start {
+            return Ok(());
+        }
+        println!(
+            "promote: starting {} as the primary of history {} at epoch {}",
+            canonical.display(),
+            report.history,
+            report.to_epoch
+        );
+        let mut argv: Vec<OsString> = vec![
+            "heliosdb-nano".into(),
+            "start".into(),
+            "--data-dir".into(),
+            canonical.into_os_string(),
+            "--replication-role".into(),
+            "primary".into(),
+        ];
+        if let Some(path) = config_path {
+            argv.push("--config".into());
+            argv.push(path.into_os_string());
+        }
+        argv.extend(start_args.into_iter().map(OsString::from));
+        let cli = Cli::try_parse_from(argv)
+            .map_err(|error| Error::config(format!("the start arguments after -- are not valid: {error}")))?;
+        let run_primary: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>> = Box::pin(run(cli));
+        run_primary.await
+    }
+}
+
 /// Spec P3.2 §2: `recover` works on a STOPPED standby. A node running on the
 /// directory holds RocksDB's `LOCK` (an fcntl lock); it is asked for with
 /// `F_GETLK`, which takes nothing — so the probe never disturbs a lock this
@@ -8065,6 +8543,75 @@ fn refuse_running_node(data_dir: &std::path::Path) -> Result<()> {
         let _ = data_dir;
     }
     Ok(())
+}
+
+/// Spec P5.1 §6: the layout of a PRIMARY's data directory for `recover
+/// --from-primary` — a fenced one (`NANO-FENCED.json`), or one of a primary
+/// that is not fenced (`NANO-PRIMARY-HISTORY.json`, no physical marker) —
+/// naming its dataset history and the epoch its store holds (spec §11.G: a
+/// source at a lower epoch is refused); `None` for every other directory
+/// (P4.1's classification applies). A directory carrying a primary's history
+/// record is a primary's whether the record reads or not: one that does not
+/// read is refused with the standby path's own words ("carries a primary's
+/// dataset identity"), the parse problem in parentheses. A fence record or a
+/// store epoch that cannot be read refuses the recovery, naming it.
+#[cfg(feature = "ha-tier1")]
+fn primary_directory_layout(
+    data_dir: &std::path::Path,
+) -> Result<Option<heliosdb_nano::replication::recover_primary::DirectoryState>> {
+    use heliosdb_nano::replication::checkpoint_transfer::PHYSICAL_MARKER_FILE;
+    use heliosdb_nano::replication::epoch::{epoch_of, read_directory_epoch};
+    use heliosdb_nano::replication::fence::{read_fenced_record, FENCED_FILE};
+    use heliosdb_nano::replication::history::{read_primary_history, PRIMARY_HISTORY_FILE};
+    use heliosdb_nano::replication::recover_primary::DirectoryState;
+    let carries = |name: &str| std::fs::symlink_metadata(data_dir.join(name)).is_ok();
+    let store_epoch = || {
+        read_directory_epoch(data_dir)
+            .map(|record| epoch_of(record.as_ref()))
+            .map_err(|error| {
+                Error::config(format!(
+                    "recover refused: the replication epoch of the primary's directory {} cannot be read ({error}); \
+                     its epoch is unknown, so it is not replaced by another primary's copy",
+                    data_dir.display()
+                ))
+            })
+    };
+    if carries(FENCED_FILE) {
+        // Spec P5.1 §11.H: an unreadable record refuses, naming the next step.
+        let record = read_fenced_record(data_dir)
+            .map_err(|error| {
+                Error::config(format!(
+                    "recover refused: {error}; its history cannot be checked, so it is not replaced in place: keep it \
+                     for inspection and rebuild the node from the current primary into a new, empty directory \
+                     (`heliosdb-nano recover --from-primary --primary-host <the current primary> --data-dir <a new \
+                     directory>`)"
+                ))
+            })?
+            .ok_or_else(|| Error::config(format!("recover refused: {FENCED_FILE} vanished while it was read")))?;
+        return Ok(Some(DirectoryState::Primary {
+            history: record.history,
+            fenced: true,
+            epoch: store_epoch()?,
+        }));
+    }
+    if carries(PRIMARY_HISTORY_FILE) && !carries(PHYSICAL_MARKER_FILE) {
+        let identity_refusal = |problem: String| {
+            Error::config(format!(
+                "recover refused: Cannot prepare standby history: {} carries a primary's dataset identity; a standby \
+                 is never built over a primary's data directory ({PRIMARY_HISTORY_FILE} cannot be read: {problem})",
+                data_dir.display()
+            ))
+        };
+        let history = read_primary_history(data_dir)
+            .map_err(|error| identity_refusal(error.to_string()))?
+            .ok_or_else(|| identity_refusal("it vanished while it was read".to_string()))?;
+        return Ok(Some(DirectoryState::Primary {
+            history,
+            fenced: false,
+            epoch: store_epoch()?,
+        }));
+    }
+    Ok(None)
 }
 
 /// The text a directory a fast-forward left between two cuts is refused
@@ -8167,6 +8714,12 @@ async fn run_recover(args: RecoverArgs) -> Result<()> {
             config.replication.allow_insecure_remote = true;
         }
         refuse_running_node(&data_dir)?;
+        // Spec P5.1 §4 step 3: an interrupted promotion is finished by
+        // `promote`, never recovered as a standby.
+        if let Some(reason) = heliosdb_nano::replication::promote::refuse_promoting_directory(&data_dir) {
+            println!("recover refused: {reason}");
+            std::process::exit(2);
+        }
         let reached = if from_primary {
             let host = primary_host
                 .clone()
@@ -8349,10 +8902,16 @@ async fn recover_from_primary_command(
     // checks refuse both in the paths they are given.
     let canonical = canonical_path(data_dir).map_err(|error| Error::config(error.to_string()))?;
     let data_dir = canonical.as_path();
-    let layout = match classify_standby_directory(data_dir) {
-        StandbyLayout::Physical { history } => DirectoryState::Physical { history },
-        StandbyLayout::Fresh { empty_existing } => DirectoryState::Fresh { empty_existing },
-        StandbyLayout::Refused(reason) => return Err(Error::config(format!("recover refused: {reason}"))),
+    // Spec P5.1 §6: a fenced primary's directory, or a primary's of the same
+    // dataset that is not fenced, is rebuilt as a standby by a full copy
+    // (with --replace); every other directory as P4.1 classifies it.
+    let layout = match primary_directory_layout(data_dir)? {
+        Some(layout) => layout,
+        None => match classify_standby_directory(data_dir) {
+            StandbyLayout::Physical { history } => DirectoryState::Physical { history },
+            StandbyLayout::Fresh { empty_existing } => DirectoryState::Fresh { empty_existing },
+            StandbyLayout::Refused(reason) => return Err(Error::config(format!("recover refused: {reason}"))),
+        },
     };
     let stage_dir = match flags.stage_dir {
         Some(dir) => dir,

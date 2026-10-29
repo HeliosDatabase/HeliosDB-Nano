@@ -41,6 +41,7 @@ use super::archive_chain::{ArchiveFill, ArchiveTail, TailError};
 use super::checkpoint_transfer::{
     validate_cascade_source, validate_primary_source, OnlineCheckpointExport, TransferLimits,
 };
+use super::epoch::read_epoch;
 use super::fast_forward::{FastForwardPlan, PlanningGuard};
 use super::ha_state::{ha_state, StandbyHandle, StandbyRegistration, StandbyState, SyncMode};
 use super::physical::{
@@ -48,10 +49,10 @@ use super::physical::{
     PhysicalBatch, PhysicalError, PhysicalPoll,
 };
 use super::physical_wire::{
-    valid_leaf_bytes, Heartbeat, Hello, LeafDigests, LeafReady, ObservedSession, OpenRequest, PeerRole, PhysicalSource,
-    PollOrigin, Refusal, RefuseCode, Result, SessionObserver, SourceSessionInfo, WireError, WireSyncMode,
+    valid_leaf_bytes, Heartbeat, Hello, LastGroup, LeafDigests, LeafReady, ObservedSession, OpenRequest, PeerRole,
+    PhysicalSource, PollOrigin, Refusal, RefuseCode, Result, SessionObserver, SourceSessionInfo, WireError,
+    WireSyncMode,
 };
-use crate::standby_posture::EPOCH;
 use crate::Config;
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -69,6 +70,14 @@ use uuid::Uuid;
 
 fn source_error(error: impl std::fmt::Display) -> WireError {
     WireError::Source(error.to_string())
+}
+
+/// Spec P5.1: the epoch of the store a session serves (`repl:epoch`) — the
+/// epoch its archive fill reads segments of. A receiver that holds data is
+/// at the same epoch (the handshake compared them), so its gap is in this
+/// epoch's run of segments.
+fn store_epoch(db: &DB) -> Result<u64> {
+    read_epoch(db).map_err(source_error)
 }
 
 fn not_serving(reason: &str) -> WireError {
@@ -328,7 +337,7 @@ fn poll_or_fill(
     // barrier was sampled above, and the session's memo fsyncs once per
     // barrier (spec P4.1d).
     flushed.flush(db, barrier).map_err(source_error)?;
-    let tail = fill.tail(history, EPOCH);
+    let tail = fill.tail(history, store_epoch(db)?);
     let oldest = wal_floor.unwrap_or_else(|| barrier.saturating_add(1));
     // The archive serves up to the WAL's floor; the WAL the rest.
     let until = oldest.saturating_sub(1).min(barrier);
@@ -360,6 +369,73 @@ fn poll_or_fill(
         },
         PollOrigin::Archive,
     ))
+}
+
+/// Spec P5.1 §11.F: the refusal of a receiver whose last write group (ending
+/// at `at`) is not this source's.
+fn diverged(kind: &SourceKind, at: u64, why: &str) -> WireError {
+    WireError::Refused(Refusal::new(
+        RefuseCode::Diverged { at },
+        format!(
+            "the receiver's write group ending at sequence {at} is not {}'s ({why}): it followed another primary \
+             of this dataset and epoch (two forced promotions?); recover it from this source (heliosdb-nano \
+             recover --from-primary: a fast-forward re-cuts it at this source's checkpoint)",
+            kind.name()
+        ),
+    ))
+}
+
+/// Spec P5.1 §11.F: re-read the group of this source that starts at
+/// `last.first_sequence` (from its WAL, or its archive, as a poll would) and
+/// check it is the receiver's last group: it ends at `after` and has the
+/// receiver's digest. A cascading source reads it in the translated
+/// numbering (its primary's), which is the receiver's. A group the source no
+/// longer holds is refused as any poll of it would be (`WalPruned`); a
+/// group boundary or digest that differs is `Diverged`.
+#[allow(clippy::too_many_arguments)]
+fn verify_last_group(
+    kind: &SourceKind,
+    db: &DB,
+    fill: Option<&ArchiveFill>,
+    history: Uuid,
+    after: u64,
+    last: LastGroup,
+    hint: &Mutex<CascadeHint>,
+    flushed: &FlushMemo,
+) -> Result<()> {
+    let before = last.first_sequence.saturating_sub(1);
+    let attempt = kind.poll(db, history, before, PROBE_POLL_BYTES, hint, flushed);
+    let poll = match attempt {
+        // Another group boundary here: the source's writes are not the
+        // receiver's.
+        Err(PhysicalError::Gap { .. }) => {
+            return Err(diverged(
+                kind,
+                after,
+                "this source has no write group starting where it does",
+            ))
+        }
+        attempt => poll_or_fill(attempt, kind, db, fill, history, before, PROBE_POLL_BYTES, flushed)?.0,
+    };
+    let Some(group) = poll.batches.first() else {
+        return Err(diverged(kind, after, "this source holds no write group there"));
+    };
+    if group.first_sequence() != last.first_sequence || group.last_sequence() != after {
+        return Err(diverged(
+            kind,
+            after,
+            &format!(
+                "this source's group there spans {}..={}, the receiver's {}..={after}",
+                group.first_sequence(),
+                group.last_sequence(),
+                last.first_sequence
+            ),
+        ));
+    }
+    if group.digest() != last.digest {
+        return Err(diverged(kind, after, "the same sequences hold other writes"));
+    }
+    Ok(())
 }
 
 /// One shared budget per source endpoint, retained by all its providers.
@@ -740,8 +816,7 @@ fn reusable(
     let cut = manifest.checkpoint_sequence;
     let continued = kind.retains_after(db, history, cut, &Mutex::new(CascadeHint::default()), flushed)
         || fill.is_some_and(|fill| {
-            let tail = fill.tail(history, EPOCH);
-            tail.reach(cut.saturating_add(1)).is_some()
+            store_epoch(db).is_ok_and(|epoch| fill.tail(history, epoch).reach(cut.saturating_add(1)).is_some())
         });
     manifest.history == history
         && manifest.storage_identity == storage_identity
@@ -1083,10 +1158,13 @@ async fn open_source_session(
                         return Err(WireError::Refused(Refusal::new(
                             RefuseCode::HistoryMismatch,
                             format!(
-                            "the receiver at {after} is not behind the cut {cut}: {} is not the dataset it followed, \
-                             or there is nothing to fast-forward",
-                            kind.name()
-                        ),
+                                "the receiver at {after} is not behind the cut {cut}: {} is not the dataset it \
+                                 followed, there is nothing to fast-forward, or (spec P5.1) the receiver counts in \
+                                 the numbering of a primary this one superseded — a promoted standby numbers its \
+                                 writes in its own sequences, which do not continue its old primary's — so only a \
+                                 full copy rebuilds it",
+                                kind.name()
+                            ),
                         )));
                     }
                     let default_config;
@@ -1113,7 +1191,7 @@ async fn open_source_session(
                     fast_forward = Some(plan);
                     (info, Some(hold))
                 }
-                OpenRequest::Resume { history, after } => {
+                OpenRequest::Resume { history, after, last } => {
                     if history != expected_history {
                         return Err(poll_error(kind.barrier(&db), &kind, PhysicalError::HistoryMismatch));
                     }
@@ -1131,6 +1209,12 @@ async fn open_source_session(
                         PROBE_POLL_BYTES,
                         &flushed,
                     )?;
+                    // Spec P5.1 §11.F: and the receiver's last group IS this
+                    // source's group ending at its cursor — the same writes,
+                    // not merely the same number.
+                    if let Some(last) = last {
+                        verify_last_group(&kind, &db, fill.as_ref(), history, after, last, &hint, &flushed)?;
+                    }
                     (
                         SourceSessionInfo::Resume {
                             session_id: Uuid::new_v4(),
@@ -1453,7 +1537,11 @@ mod tests {
             history,
             absent_export_parent.clone(),
             TransferLimits::default(),
-            OpenRequest::Resume { history, after: cut },
+            OpenRequest::Resume {
+                history,
+                after: cut,
+                last: None,
+            },
             work.clone(),
             leases(),
         )
@@ -1481,6 +1569,71 @@ mod tests {
         assert_eq!(poll.through, 2);
     }
 
+    /// Spec P5.1 §11.F: a resume that names its last write group is served
+    /// only when that group IS this source's group ending at the cursor — the
+    /// same boundaries and digest. Other writes under the same numbers, or
+    /// another group boundary, are `Diverged { at }`, which the receiver
+    /// needs recovery for (`recover --from-primary` takes route 2 on it).
+    #[tokio::test]
+    async fn a_resume_is_verified_by_the_content_of_its_last_group() {
+        let root = tempfile::tempdir().unwrap();
+        let (db, history) = primary(root.path());
+        db.put(b"two", b"x").unwrap();
+        db.put(b"three", b"y").unwrap();
+        let work = SourceWorkLimiter::new(2).unwrap();
+        // The source's group ending at 2, as a receiver that applied it
+        // records it in its cursor.
+        let group = poll_source(&db, history, 1, 1, &FlushMemo::new())
+            .unwrap()
+            .batches
+            .remove(0);
+        assert_eq!((group.first_sequence(), group.last_sequence()), (2, 2));
+        let open = |last: Option<LastGroup>| {
+            open_primary_session(
+                db.clone(),
+                history,
+                root.path().to_path_buf(),
+                TransferLimits::default(),
+                OpenRequest::Resume {
+                    history,
+                    after: 2,
+                    last,
+                },
+                work.clone(),
+                leases(),
+            )
+        };
+        assert!(open(Some(LastGroup {
+            first_sequence: 2,
+            digest: group.digest(),
+        }))
+        .await
+        .is_ok());
+        for (last, why) in [
+            (
+                LastGroup {
+                    first_sequence: 2,
+                    digest: [0xAB; 32],
+                },
+                "other writes under the same sequence",
+            ),
+            (
+                LastGroup {
+                    first_sequence: 1,
+                    digest: group.digest(),
+                },
+                "another group boundary",
+            ),
+        ] {
+            let Err(WireError::Refused(refusal)) = open(Some(last)).await else {
+                panic!("{why}: served");
+            };
+            assert_eq!(refusal.code, RefuseCode::Diverged { at: 2 }, "{why}");
+            assert!(refusal.code.needs_recovery(), "{why}");
+            assert!(refusal.reason.contains("recover --from-primary"), "{}", refusal.reason);
+        }
+    }
+
     #[tokio::test]
     async fn source_resume_refuses_wrong_history_future_cursor_and_changed_metadata() {
         let root = tempfile::tempdir().unwrap();
@@ -1492,8 +1645,13 @@ mod tests {
             OpenRequest::Resume {
                 history: Uuid::new_v4(),
                 after: 1,
+                last: None,
             },
-            OpenRequest::Resume { history, after: 2 },
+            OpenRequest::Resume {
+                history,
+                after: 2,
+                last: None,
+            },
         ] {
             let refused = open_primary_session(
                 db.clone(),
@@ -1516,7 +1674,11 @@ mod tests {
             history,
             root.path().to_path_buf(),
             TransferLimits::default(),
-            OpenRequest::Resume { history, after: 1 },
+            OpenRequest::Resume {
+                history,
+                after: 1,
+                last: None,
+            },
             work.clone(),
             leases(),
         )
@@ -1796,16 +1958,17 @@ mod tests {
     /// Seal `batches` into one segment of `archive` (the archiver's layout).
     fn archive_groups(archive: &std::path::Path, history: Uuid, batches: &[PhysicalBatch]) {
         use crate::replication::archive_segment::{segment_dir, unix_now, OpenSegment, SegmentHeader};
+        use crate::replication::epoch::INITIAL_EPOCH;
         let header = SegmentHeader {
             flags: 0,
             history,
-            epoch: EPOCH,
+            epoch: INITIAL_EPOCH,
             first_sequence: batches[0].first_sequence(),
             created_at: unix_now(),
             node_id: Uuid::new_v4(),
             key_check: [0; 32],
         };
-        let mut open = OpenSegment::create(&segment_dir(archive, history, EPOCH), header).unwrap();
+        let mut open = OpenSegment::create(&segment_dir(archive, history, INITIAL_EPOCH), header).unwrap();
         for batch in batches {
             open.append(batch, unix_now(), None).unwrap();
         }
@@ -1866,7 +2029,11 @@ mod tests {
             history,
             root.to_path_buf(),
             TransferLimits::default(),
-            OpenRequest::Resume { history, after },
+            OpenRequest::Resume {
+                history,
+                after,
+                last: None,
+            },
             SourceWorkLimiter::new(2).unwrap(),
             leases(),
             fill,

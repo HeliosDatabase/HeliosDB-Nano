@@ -776,30 +776,117 @@ impl ArchiveLock {
     }
 }
 
-/// Interruptible sleep and the stop flag of an archiver thread.
+/// What an archiver thread is told, and what it answers, under one lock.
+#[derive(Default)]
+struct Signals {
+    stopped: bool,
+    /// Spec P5.1 §11.B: the highest sequence a seal was asked through and
+    /// not answered yet ([`ArchiveSealer::seal_through`]).
+    seal_requested: Option<u64>,
+    /// The last answer: every write group through this sequence is in a
+    /// sealed segment (or recorded as a gap the store no longer held).
+    sealed_through: Option<u64>,
+    /// Why the pending seal cannot be answered (a seal that failed).
+    seal_failed: Option<String>,
+    /// The archiver thread has returned (or never started).
+    exited: bool,
+}
+
+/// Interruptible sleep, the stop flag of an archiver thread, and (spec
+/// P5.1 §11.B) its seal requests: one mutex, so a request made while the
+/// thread is about to sleep is never lost — the sleep checks it under the
+/// same lock the requester sets it under.
 #[derive(Default)]
 struct StopSignal {
-    stopped: Mutex<bool>,
+    signals: Mutex<Signals>,
+    /// Wakes the archiver thread (a stop, a seal request).
     wake: Condvar,
+    /// Wakes a requester (a seal answered or failed, the thread gone).
+    answered: Condvar,
 }
 
 impl StopSignal {
     fn stop(&self) {
-        *self.stopped.lock() = true;
+        self.signals.lock().stopped = true;
         self.wake.notify_all();
     }
 
     fn is_stopped(&self) -> bool {
-        *self.stopped.lock()
+        self.signals.lock().stopped
     }
 
-    /// Sleep up to `timeout`; true when stopped.
+    /// Sleep up to `timeout`, or until stopped or a seal is requested; true
+    /// when stopped.
     fn wait(&self, timeout: Duration) -> bool {
-        let mut stopped = self.stopped.lock();
-        if !*stopped {
-            let _ = self.wake.wait_for(&mut stopped, timeout);
+        let mut signals = self.signals.lock();
+        if !signals.stopped && signals.seal_requested.is_none() {
+            let _ = self.wake.wait_for(&mut signals, timeout);
         }
-        *stopped
+        signals.stopped
+    }
+
+    /// The pending seal request, if any.
+    fn seal_request(&self) -> Option<u64> {
+        self.signals.lock().seal_requested
+    }
+
+    /// The archive is sealed through `through`: answer every request at or
+    /// below it.
+    fn answer_seal(&self, through: u64) {
+        let mut signals = self.signals.lock();
+        signals.sealed_through = Some(signals.sealed_through.map_or(through, |sealed| sealed.max(through)));
+        if signals.seal_requested.is_some_and(|requested| requested <= through) {
+            signals.seal_requested = None;
+            signals.seal_failed = None;
+        }
+        self.answered.notify_all();
+    }
+
+    /// The pending seal failed (`reason`); the request stays, so a later
+    /// round may still answer it within the requester's wait.
+    fn fail_seal(&self, reason: String) {
+        self.signals.lock().seal_failed = Some(reason);
+        self.answered.notify_all();
+    }
+
+    /// The archiver thread is gone: no request will be answered any more.
+    fn mark_exited(&self) {
+        self.signals.lock().exited = true;
+        self.answered.notify_all();
+    }
+
+    /// Ask for everything through `through` sealed and wait, at most
+    /// `timeout`, for the answer: the sequence the archive is sealed
+    /// through, or why it is not.
+    fn request_seal(&self, through: u64, timeout: Duration) -> Result<u64, String> {
+        let deadline = Instant::now() + timeout;
+        let mut signals = self.signals.lock();
+        if let Some(sealed) = signals.sealed_through.filter(|sealed| *sealed >= through) {
+            return Ok(sealed);
+        }
+        signals.seal_requested = Some(
+            signals
+                .seal_requested
+                .map_or(through, |requested| requested.max(through)),
+        );
+        signals.seal_failed = None;
+        self.wake.notify_all();
+        loop {
+            if let Some(sealed) = signals.sealed_through.filter(|sealed| *sealed >= through) {
+                return Ok(sealed);
+            }
+            if signals.exited || signals.stopped {
+                return Err("the archiver stopped before it sealed the archive through the sequence".to_string());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(match signals.seal_failed.clone() {
+                    Some(reason) => reason,
+                    None => format!("the archiver did not seal through it within {} s", timeout.as_secs()),
+                });
+            }
+            let _ = self.answered.wait_for(&mut signals, deadline - now);
+        }
     }
 }
 
@@ -809,11 +896,66 @@ pub struct ArchiveService {
     stop: Arc<StopSignal>,
     thread: Option<std::thread::JoinHandle<()>>,
     status: Arc<ArchiveStatus>,
+    /// A primary's archiver answers seal requests ([`ArchiveSealer`]); a
+    /// standby's archives what its receiver applies and is never asked.
+    seals: bool,
+}
+
+/// Spec P5.1 §11.B: asks a running PRIMARY archiver to archive through a
+/// sequence and seal its open segment, without stopping it. The fence of a
+/// superseded primary uses it: everything through the primary's final
+/// sequence is then in sealed segments — what `recover --from-archive` and
+/// another node's archive fill read — while the archiver keeps running,
+/// idle (a fenced primary writes nothing more). Cloneable and independent of
+/// the [`ArchiveService`] that owns the thread, so a waiting fence never
+/// holds the service its node's shutdown stops.
+#[derive(Clone)]
+pub struct ArchiveSealer {
+    stop: Arc<StopSignal>,
+    status: Arc<ArchiveStatus>,
+    seals: bool,
+}
+
+impl ArchiveSealer {
+    /// Archive everything through `sequence` (polling the store's WAL at
+    /// once until the archive's cursor reaches it), seal the open segment,
+    /// and keep running. Blocking — call it off the async runtime — for at
+    /// most `timeout`. `Ok` is the sequence the archive is sealed through
+    /// (at least `sequence`); `Err` says why it is not: the archive is off,
+    /// the archiver stopped, a seal failed, or the time ran out.
+    pub fn seal_through(&self, sequence: u64, timeout: Duration) -> Result<u64, String> {
+        if !self.seals {
+            return Err("a standby's archiver archives what its receiver applies; it is not sealed on request".into());
+        }
+        if let Some(reason) = self.status.disabled_reason() {
+            return Err(format!("the WAL archive is off on this node: {reason}"));
+        }
+        self.stop.request_seal(sequence, timeout).map_err(|reason| {
+            format!(
+                "{reason} (the archive holds up to sequence {}{})",
+                self.status.archived_through(),
+                self.status
+                    .disabled_reason()
+                    .map(|why| format!("; it is off: {why}"))
+                    .unwrap_or_default()
+            )
+        })
+    }
 }
 
 impl ArchiveService {
     pub fn status(&self) -> &Arc<ArchiveStatus> {
         &self.status
+    }
+
+    /// Spec P5.1 §11.B: the handle that asks this archiver to seal through a
+    /// sequence ([`ArchiveSealer`]).
+    pub fn sealer(&self) -> ArchiveSealer {
+        ArchiveSealer {
+            stop: Arc::clone(&self.stop),
+            status: Arc::clone(&self.status),
+            seals: self.seals,
+        }
     }
 
     /// Stop the archiver and wait for it (blocking: call it off the async
@@ -885,6 +1027,7 @@ impl Session {
         settings: ArchiveSettings,
         status: Arc<ArchiveStatus>,
         history: Uuid,
+        epoch: u64,
         node_id: Uuid,
         key_manager: Option<Arc<KeyManager>>,
         key_check: [u8; 32],
@@ -938,7 +1081,9 @@ impl Session {
                 path.display()
             );
         }
-        let epoch = crate::standby_posture::EPOCH;
+        // Spec P5.1: segments are filed under the epoch of the store they
+        // archive (`<dir>/<history>/<epoch>/`); a promoted primary starts a
+        // new epoch's run, the previous epoch's segments stay until pruned.
         let cursor = catalog.last_sequence(history, epoch);
         status.replace_catalog(catalog);
         if let Some(cursor) = cursor {
@@ -1024,12 +1169,23 @@ impl Session {
     }
 
     fn seal_open(&mut self) {
+        let _ = self.try_seal_open();
+    }
+
+    /// [`Self::seal_open`], saying whether the open segment (if any) was
+    /// sealed: a seal request (spec P5.1 §11.B) is answered only then.
+    fn try_seal_open(&mut self) -> Result<(), String> {
         match self.writer.seal() {
-            Ok(Some(info)) => self.sealed(info),
-            Ok(None) => {}
+            Ok(Some(info)) => {
+                self.sealed(info);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
             Err(error) => {
-                self.complaint.note(&format!("archive: cannot seal a segment: {error}"));
+                let reason = format!("archive: cannot seal a segment: {error}");
+                self.complaint.note(&reason);
                 self.set_aside();
+                Err(reason)
             }
         }
     }
@@ -1127,6 +1283,7 @@ fn run_primary(
     settings: ArchiveSettings,
     store: Arc<DB>,
     history: Uuid,
+    epoch: u64,
     node_id: Uuid,
     key_manager: Option<Arc<KeyManager>>,
     status: Arc<ArchiveStatus>,
@@ -1143,6 +1300,7 @@ fn run_primary(
         settings,
         Arc::clone(&status),
         history,
+        epoch,
         node_id,
         key_manager,
         key_check,
@@ -1234,6 +1392,22 @@ fn run_primary(
                     "archive: cannot read the store's WAL after sequence {cursor}: {error}"
                 ));
                 failed = true;
+            }
+        }
+        // Spec P5.1 §11.B: a fence asked for everything through a sequence
+        // to be archived and sealed. Until the cursor reaches it the store
+        // is polled again at once (it holds that sequence: the fence read it
+        // as the store's durable sequence); then the open segment is sealed
+        // and the request answered. The archiver keeps running afterwards.
+        if let Some(through) = stop.seal_request() {
+            let reached = session.writer.cursor().unwrap_or(start);
+            if reached >= through {
+                match session.try_seal_open() {
+                    Ok(()) => stop.answer_seal(reached),
+                    Err(reason) => stop.fail_seal(reason),
+                }
+            } else if !failed && store.latest_sequence_number() > reached {
+                behind = true;
             }
         }
         session.maintain(unix_now());
@@ -1435,6 +1609,7 @@ impl ArchiveFeed {
 fn run_standby(
     settings: ArchiveSettings,
     history: Uuid,
+    epoch: u64,
     node_id: Uuid,
     key_manager: Option<Arc<KeyManager>>,
     batches: mpsc::Receiver<PhysicalBatch>,
@@ -1448,6 +1623,7 @@ fn run_standby(
         settings,
         Arc::clone(&status),
         history,
+        epoch,
         node_id,
         key_manager,
         [0; 32],
@@ -1515,22 +1691,30 @@ fn spawn_archiver(
     let spawned = std::thread::Builder::new().name("nano-wal-archiver".into()).spawn({
         let status = Arc::clone(&status);
         let stop = Arc::clone(&stop);
-        move || body(status, stop)
+        move || {
+            body(status, Arc::clone(&stop));
+            // Spec P5.1 §11.B: a seal requester waiting on this thread
+            // learns it is gone instead of waiting out its bound.
+            stop.mark_exited();
+        }
     });
     match spawned {
         Ok(thread) => ArchiveService {
             stop,
             thread: Some(thread),
             status,
+            seals: false,
         },
         Err(error) => {
             let reason = format!("cannot start the archiver thread: {error}");
             warn!("archive: the WAL archive is off on this node: {reason}");
             status.disable(reason);
+            stop.mark_exited();
             ArchiveService {
                 stop,
                 thread: None,
                 status,
+                seals: false,
             }
         }
     }
@@ -1539,7 +1723,8 @@ fn spawn_archiver(
 /// Start a primary's archiver over `storage` (its store, and its dataset key
 /// when encrypted), for `history`. It never fails the primary: a directory
 /// it cannot use disables the archive, with the reason in
-/// `heliosdb_recovery_window` and the log.
+/// `heliosdb_recovery_window` and the log. Spec P5.1: its segments are filed
+/// under the store's epoch (`StorageEngine::replication_epoch`).
 pub fn start_primary(
     settings: ArchiveSettings,
     storage: &crate::storage::StorageEngine,
@@ -1549,16 +1734,22 @@ pub fn start_primary(
     let status = install_status(&settings);
     let key_manager = storage.key_manager_arc();
     let store = storage.db();
-    spawn_archiver(status, move |status, stop| {
-        run_primary(settings, store, history, node_id, key_manager, status, stop);
-    })
+    let epoch = storage.replication_epoch();
+    let mut service = spawn_archiver(status, move |status, stop| {
+        run_primary(settings, store, history, epoch, node_id, key_manager, status, stop);
+    });
+    // Spec P5.1 §11.B: a primary's archiver is sealed on request (a fence).
+    service.seals = true;
+    service
 }
 
-/// Start a standby's archiver for `history` (its binding); the receiver
-/// hands it every applied batch through the returned feed.
+/// Start a standby's archiver for `history` (its binding) at `epoch` (its
+/// store's, spec P5.1); the receiver hands it every applied batch through
+/// the returned feed.
 pub fn start_standby(
     settings: ArchiveSettings,
     history: Uuid,
+    epoch: u64,
     node_id: Uuid,
     key_manager: Option<Arc<KeyManager>>,
 ) -> (ArchiveService, ArchiveFeed) {
@@ -1571,7 +1762,17 @@ pub fn start_standby(
         max_wait: DEFAULT_FEED_WAIT,
     };
     let service = spawn_archiver(status, move |status, stop| {
-        run_standby(settings, history, node_id, key_manager, receiver, state, status, stop);
+        run_standby(
+            settings,
+            history,
+            epoch,
+            node_id,
+            key_manager,
+            receiver,
+            state,
+            status,
+            stop,
+        );
     });
     if service.thread.is_none() {
         feed.state.close();
@@ -1977,7 +2178,10 @@ mod tests {
 
     impl Running {
         fn start(store: &Arc<DB>, root: &Path, history: Uuid) -> Self {
-            let settings = settings(root);
+            Self::start_with(store, settings(root), history)
+        }
+
+        fn start_with(store: &Arc<DB>, settings: ArchiveSettings, history: Uuid) -> Self {
             let status = Arc::new(ArchiveStatus::new(
                 settings.dir.clone(),
                 settings.recovery_window_secs,
@@ -1987,7 +2191,18 @@ mod tests {
             let stop = Arc::new(StopSignal::default());
             let thread = std::thread::spawn({
                 let (store, status, stop) = (Arc::clone(store), Arc::clone(&status), Arc::clone(&stop));
-                move || run_primary(settings, store, history, Uuid::new_v4(), None, status, stop)
+                move || {
+                    run_primary(
+                        settings,
+                        store,
+                        history,
+                        crate::replication::epoch::INITIAL_EPOCH,
+                        Uuid::new_v4(),
+                        None,
+                        status,
+                        stop,
+                    )
+                }
             });
             Self { status, stop, thread }
         }
@@ -2016,6 +2231,100 @@ mod tests {
             self.thread.join().unwrap();
             self.status
         }
+
+        /// The handle a fence seals this (primary) archiver through.
+        fn sealer(&self) -> ArchiveSealer {
+            ArchiveSealer {
+                stop: Arc::clone(&self.stop),
+                status: Arc::clone(&self.status),
+                seals: true,
+            }
+        }
+    }
+
+    /// Spec P5.1 §11.B: the fence of a superseded primary asks its archiver
+    /// to archive THROUGH the final sequence and seal the open segment. The
+    /// archiver answers on request — not after its poll interval, which is
+    /// far longer than the test — with everything through that sequence in
+    /// SEALED segments: a recovery from the archive (`build_chain`, what
+    /// `recover --from-archive` reads) reaches it. It keeps running, idle,
+    /// and answers the next request too. Red before §11.B: the fence stopped
+    /// the archiver, whose loop ended without a last poll, so the segment it
+    /// sealed could end short of the final sequence.
+    #[test]
+    fn a_seal_request_archives_through_the_sequence_and_seals_without_stopping() {
+        use crate::replication::archive_chain::build_chain;
+        let root = TempDir::new().unwrap();
+        let archive = root.path().join("archive");
+        let store = source(&root.path().join("store"));
+        let history = Uuid::new_v4();
+        let settings = ArchiveSettings {
+            poll_interval: Duration::from_secs(600),
+            ..settings(&archive)
+        };
+        // The archive covers the store from its barrier at the archiver's
+        // start (a snapshot covers the history before it): the groups written
+        // before the start are not archived, and a recovery chain is built
+        // from that cursor. Written BEFORE the thread starts, so the barrier
+        // is known (the thread's start is not ordered with this test's puts).
+        put_groups(&store, 0..3);
+        let start = store.latest_sequence_number();
+        let running = Running::start_with(&store, settings, history);
+        let sealer = running.sealer();
+        assert!(
+            sealer.seal_through(start, Duration::from_secs(20)).unwrap() >= start,
+            "a request already covered is answered at once"
+        );
+
+        // The archiver sleeps its 600 s interval now: only the request makes
+        // it poll the groups written meanwhile, then seal.
+        put_groups(&store, 3..6);
+        let final_sequence = store.latest_sequence_number();
+        let asked = Instant::now();
+        let sealed = sealer.seal_through(final_sequence, Duration::from_secs(20)).unwrap();
+        assert!(sealed >= final_sequence, "{sealed} < {final_sequence}");
+        assert!(
+            asked.elapsed() < Duration::from_secs(20),
+            "answered on request, not after the poll interval"
+        );
+        let mut archived = segments(&archive);
+        archived.sort_by_key(SegmentInfo::first_sequence);
+        assert_contiguous(&archived);
+        assert_eq!(
+            archived.last().map(SegmentInfo::last_sequence),
+            Some(final_sequence),
+            "the final sequence is in a SEALED segment: {archived:?}"
+        );
+        let chain = build_chain(
+            std::slice::from_ref(&archive),
+            history,
+            crate::replication::epoch::INITIAL_EPOCH,
+            start,
+            None,
+        )
+        .unwrap();
+        assert!(chain.refused.is_empty(), "{:?}", chain.refused);
+        assert_eq!(
+            chain.reached, final_sequence,
+            "recovery from the archive reaches it: found {:?} notes {:?} refused {:?} start {start}",
+            chain.found, chain.notes, chain.refused
+        );
+        assert!(!running.thread.is_finished(), "the archiver keeps running after a seal");
+
+        // Still running: a later request is answered the same way, and one
+        // already covered is answered at once.
+        put_groups(&store, 6..8);
+        let later = store.latest_sequence_number();
+        assert!(sealer.seal_through(later, Duration::from_secs(20)).unwrap() >= later);
+        assert!(sealer.seal_through(final_sequence, Duration::from_millis(1)).unwrap() >= later);
+        let status = running.stop();
+        assert!(status.gaps().is_empty(), "{:?}", status.gaps());
+        // A stopped archiver answers nothing more.
+        let stopped = sealer.seal_through(later + 1, Duration::from_secs(1)).unwrap_err();
+        assert!(stopped.contains("stopped"), "{stopped}");
+        // A standby's archiver is never sealed on request.
+        let standby = ArchiveSealer { seals: false, ..sealer };
+        assert!(standby.seal_through(1, Duration::from_secs(1)).is_err());
     }
 
     /// Spec P3.1 §3: an empty archive covers the primary from "now"; a

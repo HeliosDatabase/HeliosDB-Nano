@@ -32,7 +32,9 @@
 /// kept it before that family existed, which the engine and the receiver
 /// refuse. `ReplAppliedLsn` is a logical standby's cursor and still lives in
 /// the default column family (`PHYSICAL_STANDBY_REPLICATION.md` D2). Nothing
-/// else node-local uses the default column family.
+/// else node-local uses the default column family. Spec P5.1: the
+/// replication epoch, [`KeyClass::ReplEpoch`], shares the `repl:` stem but is
+/// the DATASET's, not the node's: replicated like a row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyClass {
     /// `data:{table}:{row_id}` — the current row image.
@@ -148,6 +150,10 @@ pub enum KeyClass {
     WalPrunedThrough,
     /// `repl:applied_lsn` — a logical standby's applied cursor (node-local).
     ReplAppliedLsn,
+    /// `repl:epoch` — the dataset's replication epoch (spec P5.1), written
+    /// once per promotion by the promoted node and replicated like every
+    /// other key: a standby's epoch is its primary's.
+    ReplEpoch,
     /// `__nano_physical_replica_cursor_v1` — where a physical receiver kept
     /// its cursor before [`LOCAL_CF`] (node-local; refused on open).
     PhysicalCursor,
@@ -358,6 +364,8 @@ pub const FIXED_KEYS: &[(&[u8], KeyClass)] = &[
     (b"wal:pruned_through", KeyClass::WalPrunedThrough),
     // storage/engine.rs:11415 `REPLICATION_CURSOR_KEY`
     (b"repl:applied_lsn", KeyClass::ReplAppliedLsn),
+    // storage/replication_epoch.rs `EPOCH_KEY`
+    (b"repl:epoch", KeyClass::ReplEpoch),
     // replication/physical.rs `LEGACY_CURSOR_KEY`
     (b"__nano_physical_replica_cursor_v1", KeyClass::PhysicalCursor),
     // storage/version_gc.rs:67 `LOW_WATERMARK_KEY`
@@ -566,6 +574,7 @@ mod tests {
         (b"wal:checkpoint", KeyClass::WalCheckpoint, None),
         (b"wal:pruned_through", KeyClass::WalPrunedThrough, None),
         (b"repl:applied_lsn", KeyClass::ReplAppliedLsn, None),
+        (b"repl:epoch", KeyClass::ReplEpoch, None),
         (b"__nano_physical_replica_cursor_v1", KeyClass::PhysicalCursor, None),
         (b"vgc:low_watermark", KeyClass::VgcWatermark, None),
         (b"vgc:anchor:00000000001700000000", KeyClass::VgcAnchor, None),
@@ -682,6 +691,8 @@ mod tests {
             b"meta:plain:put",
             b"wal:",
             b"wal:last_lsn_v2",
+            b"repl:epoch_v2",
+            b"repl:",
             b"branch:registry2",
             b"w3_2_elide_used\0",
             b"data",

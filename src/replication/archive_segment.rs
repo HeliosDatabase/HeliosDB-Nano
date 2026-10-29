@@ -242,6 +242,11 @@ impl SegmentHeader {
         if header.history.is_nil() || header.first_sequence == 0 {
             return Err("header names a nil history or sequence 0".into());
         }
+        // Spec P5.1 §1: epochs start at 1 (a dataset never promoted); a
+        // segment of epoch 0 was written by nothing and is filed nowhere.
+        if header.epoch == 0 {
+            return Err("header names epoch 0 (epochs start at 1)".into());
+        }
         Ok(header)
     }
 }
@@ -1279,6 +1284,26 @@ pub(crate) mod tests {
         let index = usize::try_from(offset).unwrap();
         bytes[index] ^= 0x5A;
         std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Spec P5.1 §1: a header of epoch 0 — whose hash is right — is refused
+    /// by its decode; epoch 1 and later decode.
+    #[test]
+    fn a_segment_header_of_epoch_zero_is_refused() {
+        let header = |epoch: u64| SegmentHeader {
+            flags: 0,
+            history: Uuid::new_v4(),
+            epoch,
+            first_sequence: 7,
+            created_at: 1_761_000_000,
+            node_id: Uuid::new_v4(),
+            key_check: [0; 32],
+        };
+        let error = SegmentHeader::decode(&header(0).encode()).unwrap_err();
+        assert!(error.contains("epoch 0"), "{error}");
+        for epoch in [1, 2, u64::MAX] {
+            assert_eq!(SegmentHeader::decode(&header(epoch).encode()).unwrap().epoch, epoch);
+        }
     }
 
     #[test]

@@ -198,7 +198,7 @@ async fn a_tls_pair_streams_and_both_roles_report_tls() {
         Some("t")
     );
     assert!(
-        primary.log_contains_within("(NPHYS003, TLS", Duration::from_secs(10)),
+        primary.log_contains_within("(NPHYS004, TLS", Duration::from_secs(10)),
         "{}",
         primary.tail(12)
     );
