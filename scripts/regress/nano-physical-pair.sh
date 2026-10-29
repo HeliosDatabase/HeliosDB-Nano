@@ -27,12 +27,23 @@
 #   --restart primary|standby|both
 #                              start a side that is not running (after --kill), and wait for it
 #   --stop                     SIGTERM both sides
+#   --promote standby          spec P5.1: stop the standby, promote it with `heliosdb-nano promote`
+#                              (the old primary is FENCED through the live session and stays up:
+#                              reads only, /ready 503, writes refused 25006, pre-fence sessions
+#                              ended FATAL 57P01), and start the promoted node as the PRIMARY on
+#                              the standby's own ports (PG --standby-port, HTTP --standby-http-port,
+#                              replication --standby-replication-port). From then on --restart
+#                              standby starts it as a primary again (its directory carries the
+#                              primary's dataset identity), and --restart primary starts the old
+#                              primary fenced.
 #   --status                   print the summary only
 #
 # Options:
 #   --dir DIR                  state directory: data, logs, token, pids (default ./nano-physical-pair)
 #   --primary-port P           default 27721      --standby-port P        default 27722
 #   --replication-port P       default 27741 (the primary's ONE replication port)
+#   --standby-replication-port P
+#                              default 27742 (the port the standby serves on once promoted)
 #   --primary-http-port P      default 27751      --standby-http-port P   default 27752
 #   --max-standby-lag D        the standby's [replication] max_standby_lag (default 30s)
 #   --sync-mode M              the primary's [replication] sync_mode: async | semi-sync | sync
@@ -49,12 +60,17 @@
 # Every invocation ends with one JSON line on stdout:
 #   {"ports":{...},"pids":{"primary":N|null,"standby":N|null},"ops_per_s":X|null,
 #    "ready":{"primary":CODE|null,"standby":CODE|null},"standbys":N|null,
-#    "tls":true|false|null,"archive":{"segments":N,"bytes":N}|null,...}
+#    "tls":true|false|null,"archive":{"segments":N,"bytes":N}|null,
+#    "nodes":{"primary":{"role":R,"state":S,"epoch":E}|null,"standby":{...}|null},...}
 # where ready.* is the HTTP status of GET /ready (200 ready, 503 not ready),
 # standbys is how many standbys the primary's /health lists, tls is whether
 # the standby's replication session is on TLS (its /health; null when it does
 # not answer), and archive is the primary's archived WAL (spec P3.1: sealed
 # segments and their bytes, from its /health; null when it does not answer).
+# nodes.* is each side's /health replication block (role primary|standby, state
+# streaming|fenced|..., epoch = the replication epoch = pg_control_checkpoint().timeline_id).
+# A fenced old primary keeps its old epoch, answers pg_is_in_recovery() = false,
+# raises 55000 from heliosdb_require_ready(), and SHOW transaction_read_only = on.
 # Proxy's lag threshold: lag_bytes is "write operations behind" (the physical
 # sequence delta), so at the measured ops/s a max_lag_bytes of ops_per_s * 30
 # allows about 30 s of lag (1000 ops/s -> 30000).
@@ -72,6 +88,7 @@ DIR="./nano-physical-pair"
 PG_P=27721
 PG_S=27722
 REPL_P=27741
+REPL_S=27742
 HTTP_P=27751
 HTTP_S=27752
 MAX_LAG="30s"
@@ -100,6 +117,7 @@ while [ $# -gt 0 ]; do
         --primary-port) PG_P="${2:?}"; shift 2 ;;
         --standby-port) PG_S="${2:?}"; shift 2 ;;
         --replication-port) REPL_P="${2:?}"; shift 2 ;;
+        --standby-replication-port) REPL_S="${2:?}"; shift 2 ;;
         --primary-http-port) HTTP_P="${2:?}"; shift 2 ;;
         --standby-http-port) HTTP_S="${2:?}"; shift 2 ;;
         --max-standby-lag) MAX_LAG="${2:?}"; shift 2 ;;
@@ -118,6 +136,9 @@ while [ $# -gt 0 ]; do
         --restart)
             case "${2:-}" in primary | standby | both) ;; *) die "--restart primary|standby|both" ;; esac
             ACTIONS+=("restart:$2"); shift 2 ;;
+        --promote)
+            case "${2:-}" in standby) ;; *) die "--promote standby" ;; esac
+            ACTIONS+=("promote:$2"); shift 2 ;;
         -h | --help) usage; exit 0 ;;
         *) die "unknown argument: $1 (see --help)" ;;
     esac
@@ -214,6 +235,18 @@ def archive_summary(port):
             if not isinstance(archive, dict):
                 return None
             return {"segments": archive.get("segments"), "bytes": archive.get("bytes_retained")}
+    except Exception:
+        return None
+
+
+def posture(port):
+    """The node's /health replication block, reduced to role/state/epoch (null when silent)."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=3) as response:
+            block = json.load(response).get("replication")
+            if not isinstance(block, dict):
+                return None
+            return {"role": block.get("role"), "state": block.get("state"), "epoch": block.get("epoch")}
     except Exception:
         return None
 
@@ -339,6 +372,8 @@ if __name__ == "__main__":
         print("null" if tls is None else ("true" if tls else "false"))
     elif command == "archive":
         print(json.dumps(archive_summary(int(args[0])), separators=(",", ":")))
+    elif command == "posture":
+        print(json.dumps(posture(int(args[0])), separators=(",", ":")))
     elif command == "wait-http":
         sys.exit(wait_http(int(args[0]), args[1], int(args[2]), float(args[3])))
     elif command == "wait-pg":
@@ -368,13 +403,41 @@ start_primary() {
     python3 "$HELPER" wait-pg "$PG_P" "$TIMEOUT" || die "primary did not accept connections; see $DIR/primary.log"
 }
 
+# A promoted standby's directory carries the primary's dataset identity
+# (spec P5.1): it is started as the PRIMARY on the standby's ports from then on.
+standby_is_promoted() {
+    [ -f "$DIR/standby/NANO-PRIMARY-HISTORY.json" ]
+}
+
 start_standby() {
     pid_of standby >/dev/null && return 0
+    if standby_is_promoted; then
+        nohup "$BIN" start --data-dir "$DIR/standby" --listen 127.0.0.1 --port "$PG_S" --auth trust \
+            --replication-role primary --replication-port "$REPL_S" --replication-token-file "$TOKEN" \
+            ${PRIMARY_TLS_ARGS[@]+"${PRIMARY_TLS_ARGS[@]}"} \
+            --http-port "$HTTP_S" --config "$DIR/primary.toml" </dev/null >>"$DIR/standby.log" 2>&1 &
+        echo $! >"$DIR/standby.pid"
+        python3 "$HELPER" wait-pg "$PG_S" "$TIMEOUT" || die "the promoted node did not accept connections; see $DIR/standby.log"
+        return 0
+    fi
     nohup "$BIN" start --data-dir "$DIR/standby" --listen 127.0.0.1 --port "$PG_S" --auth trust \
         --replication-role standby --primary-host "127.0.0.1:$REPL_P" --replication-token-file "$TOKEN" \
         ${STANDBY_TLS_ARGS[@]+"${STANDBY_TLS_ARGS[@]}"} \
         --http-port "$HTTP_S" --config "$DIR/standby.toml" </dev/null >>"$DIR/standby.log" 2>&1 &
     echo $! >"$DIR/standby.pid"
+}
+
+# Spec P5.1: promote the standby. It is stopped first; the fence goes through
+# the live session to the old primary, which stays up fenced; the promoted
+# node then serves as the primary on the standby's ports.
+promote_standby() {
+    standby_is_promoted && die "the standby is already promoted (its directory carries NANO-PRIMARY-HISTORY.json)"
+    stop_side standby
+    "$BIN" promote --data-dir "$DIR/standby" --primary-host "127.0.0.1:$REPL_P" --replication-token-file "$TOKEN" \
+        ${STANDBY_TLS_ARGS[@]+"${STANDBY_TLS_ARGS[@]}"} \
+        --config "$DIR/standby.toml" --fence-timeout "$TIMEOUT" >>"$DIR/promote.log" 2>&1 ||
+        die "promote failed; see $DIR/promote.log"
+    start_standby
 }
 
 wait_standby_ready() {
@@ -423,8 +486,11 @@ summary() {
     count="$(python3 "$HELPER" standby-count "$HTTP_P")"
     tls="$(python3 "$HELPER" replication-tls "$HTTP_S")"
     archive="$(python3 "$HELPER" archive "$HTTP_P")"
-    printf '{"ports":{"primary":%s,"standby":%s,"replication":%s,"primary_http":%s,"standby_http":%s},"pids":{"primary":%s,"standby":%s},"ops_per_s":%s,"ready":{"primary":%s,"standby":%s},"standbys":%s,"tls":%s,"archive":%s,"sync_mode":"%s","dir":"%s"}\n' \
-        "$PG_P" "$PG_S" "$REPL_P" "$HTTP_P" "$HTTP_S" "$p" "$s" "$ops" "$rp" "$rs" "$count" "$tls" "$archive" "$SYNC_MODE" "$DIR"
+    local np ns
+    np="$(python3 "$HELPER" posture "$HTTP_P")"
+    ns="$(python3 "$HELPER" posture "$HTTP_S")"
+    printf '{"ports":{"primary":%s,"standby":%s,"replication":%s,"standby_replication":%s,"primary_http":%s,"standby_http":%s},"pids":{"primary":%s,"standby":%s},"ops_per_s":%s,"ready":{"primary":%s,"standby":%s},"standbys":%s,"tls":%s,"archive":%s,"nodes":{"primary":%s,"standby":%s},"sync_mode":"%s","dir":"%s"}\n' \
+        "$PG_P" "$PG_S" "$REPL_P" "$REPL_S" "$HTTP_P" "$HTTP_S" "$p" "$s" "$ops" "$rp" "$rs" "$count" "$tls" "$archive" "$np" "$ns" "$SYNC_MODE" "$DIR"
 }
 
 for action in "${ACTIONS[@]}"; do
@@ -447,6 +513,7 @@ for action in "${ACTIONS[@]}"; do
         pause:*) signal_side STOP "${action#pause:}" ;;
         resume:*) signal_side CONT "${action#resume:}" ;;
         restart:primary) start_primary ;;
+        promote:standby) promote_standby ;;
         restart:standby)
             start_standby
             wait_standby_ready
