@@ -195,3 +195,68 @@ P5.1 gate scripts + `physical_promote_online` in new_tests/daemon/internal; live
 to S2 fast-forwarded; dead-primary variant; kill-after-record variant); a Proxy drill request to the
 Proxy session (tmux) with the pair fixture `scripts/regress/nano-physical-pair.sh` and
 `[auto_promote]` pointed at `pg_promote`.
+
+## 8. Review follow-ups (2026-10-29; these amend §2, §3 and §5)
+
+Adversarial review of the first implementation (2 critical, 1 high, 7 medium, 9 low) decided:
+
+A. **Drain the sessions BEFORE the fence** (C1). Order of §3 becomes: 1 posture `promoting` →
+   2 publish the placeholder into the serving watch and `terminate_all` (caller exempt) → 3 wait
+   until every session holder of the store is gone, bounded by `wait_seconds` (the receiver keeps
+   applying meanwhile; a statement still inside the engine is waited for, never assumed gone) →
+   4 fence through the live session and catch up to `final` → 5 stop replication → 6 release the
+   store (now only the runtime's own handles remain; a holder that persists here is a bug: ERROR
+   with the holder list) → 7 convert → 8 reopen → 9 answer. A holder that does not go within the
+   budget aborts WHILE THE PRIMARY IS STILL UNFENCED (restore: re-publish the store, posture
+   back, 55000 to the caller naming the sessions). After `Fenced` the promotion never aborts on
+   a release timeout: it keeps waiting, the caller gets `f` when `wait_seconds` runs out, and the
+   promotion finishes.
+B. **`allow` means unreachable, not slow** (C2). `promote_without_fence = allow` applies only
+   while the receiver has no live session to the primary (`connecting`/`reconnecting`, the
+   renewal under the promotion id failing to connect) for `promote_fence_timeout`. Once the
+   receiver is connected, or once `Fence` has been sent, the promotion waits for `Fenced` for at
+   least the source's own bound (DRAIN_TIMEOUT + ARCHIVE_SEAL_TIMEOUT + one frame timeout, ~75 s),
+   independent of `wait_seconds` (`f` covers the caller). Scenario tests assert
+   `repl:epoch.fenced == true` and `old_primary_final_sequence` whenever the primary was alive.
+C. **After `Fenced`, no unfenced go-ahead** (M4). If the catch-up stalls because the primary
+   became unreachable after answering `Fenced`, the promotion aborts naming the facts (the old
+   primary IS fenced at `final`; this standby holds through `held`; re-run `pg_promote` once it
+   is reachable, or `heliosdb-nano promote --force` to accept losing `held+1..=final`); the record
+   is never written with `fenced=false` in that case. A stall with a live session is waited out
+   (the catch-up budget deviation stands: as long as it advances).
+D. **Refusal classification** (H1): only `Version`, `EpochStale`, `SourceStale`,
+   `HistoryMismatch` and `Diverged` are refusals of the fence. `SourceNotServing` (fence
+   incomplete, source draining) is retried on a new session within the budget; the abort message
+   says "re-run `SELECT pg_promote`" and whether the primary is fenced.
+E. **A later `Fence` command is accepted** after the previous `events` channel closed (M1): a
+   re-sent `Fence` is idempotent and a cached `Fenced` is re-reported; the catch-up continues.
+F. **Preflight binds the replication listener** (M2) and hands it to `ServePrimary`; a bind
+   failure refuses the promotion with nothing changed. Preflight has no other side effect: the
+   export directory is created at reopen, not at preflight. The `running` lock is not held
+   across preflight; `run` is wrapped so a panic routes to abort (before the record) or exit 2
+   (after). Exit after the record flushes the logs and uses `libc::_exit(2)`.
+G. **Abort messages** (M3) always name the next command and say whether the old primary is
+   fenced.
+H. **Placeholder sessions answer the always-answered probes** (M6): `pg_is_in_recovery()` = `t`
+   until promoted, `heliosdb_require_ready()` 55000 "promoting", `SHOW` forms; only data
+   statements get 55000 not-ready; FATAL 57P01 goes to sessions that were on the old store
+   (terminate-all), never as the answer to a probe. The second `terminate_all` after the reopen
+   targets only tickets the placeholder served.
+I. **TLS after promotion** (M7): a standby's `[replication] tls_*` / `--replication-tls` settings
+   are the keys it serves with once promoted (the "no effect" warning at standby start is
+   dropped for them, docs say so); preflight refuses a promotion that would serve plaintext when
+   the pair replicated over TLS, naming the keys to configure.
+J. **Restore** is bounded (the supervisor is respawned once the handles are closed or after
+   `wait_seconds`, whichever first, with the holder list logged) and never after
+   `StandbyRuntime::shutdown`; `ReplicationServices` tracks services by id, and `/health`
+   `cascade` reflects a failed restart.
+K. **Tests** (M5): scenarios 1 and 2 assert `fenced`/`final` and run writes on the primary
+   DURING the promotion (the catch-up path `Advanced` → `ReachedFinal` is exercised); a scenario
+   with a long statement in flight on the standby (A: the promotion waits, the primary stays
+   unfenced until the drain completes); `refuse`/`allow` against a primary that is dead BEFORE
+   the call (allow → `t`, fenced=false) and against one that dies AFTER `Fenced` (abort naming
+   `promote --force`); the restore path after a refused promotion (receiver back, cascade back);
+   an extended-protocol `pg_promote` (Describe OID 16, DataRow, CommandComplete, then FATAL after
+   Sync); a cascading standby promoted online; `tests/physical_promote.rs` keeps the 57P01
+   SQLSTATE assertion by capturing the connection future's error; scenario 3's pause is gated on
+   a file, not a timer.
