@@ -1132,6 +1132,40 @@ impl Evaluator {
                 crate::standby_posture::require_ready(crate::sql::sequences::current_engine().as_deref())
                     .map(Value::Boolean)
             }
+            // Spec P5.2 §2: `pg_promote(wait, wait_seconds)` exists, but the
+            // PostgreSQL wire session answers it (`SELECT pg_promote(…)`
+            // alone): the promotion reopens the store this very statement
+            // runs against, which only the session can let go of. Reached
+            // here — inside another statement, or through the embedded API —
+            // it is 55000, never an undefined function.
+            "pg_promote" | "pg_catalog.pg_promote" => Err(Error::Generic(format!(
+                "{}, as `SELECT pg_promote(wait, wait_seconds)` alone with literal arguments (e.g. `SELECT \
+                 pg_promote(true, 60)` on the running standby); not inside another statement, and not by the \
+                 embedded API — offline, a stopped standby is promoted with `heliosdb-nano promote --data-dir <dir>`",
+                crate::error::PG_PROMOTE_SERVER_ONLY
+            ))),
+            // Spec P5.2 §8.K, `internal-tests` builds only: a statement that
+            // stays INSIDE the engine (on its thread, not at an await point)
+            // while the file named by `HELIOSDB_NANO_TEST_HOLD_STATEMENT_FILE`
+            // exists, at most 120 s — the long statement an online promotion
+            // must wait for rather than assume gone. `t` once released.
+            #[cfg(feature = "internal-tests")]
+            "heliosdb_test_hold" => {
+                if let Some(file) =
+                    std::env::var_os("HELIOSDB_NANO_TEST_HOLD_STATEMENT_FILE").map(std::path::PathBuf::from)
+                {
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                    tracing::warn!(
+                        "heliosdb_test_hold(): this statement holds while {} exists",
+                        file.display()
+                    );
+                    while file.exists() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    tracing::warn!("heliosdb_test_hold(): released");
+                }
+                Ok(Value::Boolean(true))
+            }
             // sprinter 7903b7111cb4: `currval('s')` — the value THIS SESSION's
             // last `nextval('s')` (or `setval('s', …)`) returned.
             //

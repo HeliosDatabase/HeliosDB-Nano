@@ -365,6 +365,38 @@ pub async fn connect_to(host: &str, port: u16) -> tokio_postgres::Client {
     }
 }
 
+/// [`connect`], keeping the connection's own future: a FATAL the server
+/// PUSHES — an ErrorResponse no request waits for (spec P5.2 §1) — is what
+/// that future ends with (`Err` with the frame's SQLSTATE), not an error of
+/// any statement.
+pub async fn connect_watched(
+    port: u16,
+) -> (
+    tokio_postgres::Client,
+    tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let url = format!("host=127.0.0.1 port={port} user=postgres dbname=postgres connect_timeout=2");
+        match tokio_postgres::connect(&url, NoTls).await {
+            Ok((client, connection)) => return (client, tokio::spawn(connection)),
+            Err(e) if Instant::now() > deadline => panic!("no connection on {port}: {e}"),
+            Err(_) => tokio::time::sleep(Duration::from_millis(300)).await,
+        }
+    }
+}
+
+/// The error a [`connect_watched`] connection ended with, within `budget`.
+pub async fn connection_end(
+    connection: tokio::task::JoinHandle<Result<(), tokio_postgres::Error>>,
+    budget: Duration,
+) -> Result<(), tokio_postgres::Error> {
+    tokio::time::timeout(budget, connection)
+        .await
+        .unwrap_or_else(|_| panic!("the connection did not end within {budget:?}"))
+        .unwrap()
+}
+
 /// The one value of a one-row, one-column answer (simple protocol: the text
 /// the wire carries).
 pub async fn value(client: &tokio_postgres::Client, sql: &str) -> Option<String> {

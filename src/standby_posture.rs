@@ -82,9 +82,26 @@
 //! node itself ([`note_fenced`], [`fence_status`]); the PostgreSQL wire asks
 //! [`is_fenced`] — one atomic load — before every statement, terminates the
 //! sessions that were open before the fence at their next statement (FATAL
-//! 57P01) and refuses writes on the others (25006).
+//! 57P01) and refuses writes on the others (25006). Spec P5.2 §1: the fence
+//! also PUSHES that termination to every session open before it (the
+//! PostgreSQL wire's session registry), so an idle pooled connection learns
+//! it at once; the next-statement path stays as the backstop.
+//!
+//! # The online promotion (spec P5.2)
+//!
+//! While a standby runs `SELECT pg_promote(…)` its block reads `state =
+//! "promoting"` and `ready = false` ([`note_promoting`]): `/ready` answers
+//! 503, `heliosdb_require_ready()` and data reads 55000. `role` stays
+//! `standby` until the reopened store serves as the primary
+//! ([`install_primary`]); from then on the block is a primary's, at the new
+//! epoch. A session served by the empty placeholder the listeners serve in
+//! between ([`mark_placeholder`]) is a not-ready standby's while the
+//! promotion runs — its probes are answered, its data statements refused
+//! 55000 — and is ended once the node serves as the primary: pushed by the
+//! promotion, and at its next statement as the backstop
+//! ([`placeholder_session_termination`]).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -354,7 +371,9 @@ impl PostureHandle {
     /// must not wait on the applier's writer, whose cursor lock an fsync holds.
     pub fn readiness(&self) -> (bool, bool) {
         let snapshot = self.rx.borrow();
-        (snapshot.ready(), snapshot.store_attached)
+        // Spec P5.2 §3 step 1: a standby being promoted is not ready (one
+        // atomic load when it is not).
+        (snapshot.ready() && !is_promoting(), snapshot.store_attached)
     }
 
     /// Wake on every posture change (the start path's readiness gate).
@@ -511,6 +530,21 @@ impl PostureTracker {
         self.tx.send_modify(|snapshot| {
             snapshot.store_attached = true;
             snapshot.cursor = snapshot.cursor.max(cursor);
+            if !matches!(snapshot.posture, StandbyPosture::NeedsRecovery { .. }) {
+                snapshot.posture = StandbyPosture::Connecting;
+            }
+        });
+    }
+
+    /// Spec P5.2 §3 step 8: the store was released by an online promotion
+    /// that then aborted; the standby reopens it. Not ready (no store) until
+    /// it is attached again ([`Self::attach_store`]).
+    pub fn detach_store(&self) {
+        *self.machine.lock() = Machine::default();
+        *self.live.write() = None;
+        *self.live_epoch.write() = None;
+        self.tx.send_modify(|snapshot| {
+            snapshot.store_attached = false;
             if !matches!(snapshot.posture, StandbyPosture::NeedsRecovery { .. }) {
                 snapshot.posture = StandbyPosture::Connecting;
             }
@@ -878,9 +912,165 @@ pub fn standby() -> Option<PostureHandle> {
 pub fn node_block() -> Option<ReplicationBlock> {
     let node = NODE.read().clone();
     match node? {
-        NodeStatus::Standby(handle) => Some(handle.snapshot().block()),
+        NodeStatus::Standby(handle) => Some(standby_block(&handle)),
         NodeStatus::Primary(status) => Some(status.block()),
     }
+}
+
+/// A standby's block, with the promotion under way (spec P5.2 §3 step 1)
+/// over its posture.
+fn standby_block(handle: &PostureHandle) -> ReplicationBlock {
+    let mut block = handle.snapshot().block();
+    if let Some(promotion) = promotion() {
+        promoting_block(&mut block, &promotion);
+    }
+    block
+}
+
+// -------------------------------------------------------------------------
+// The online promotion (spec P5.2 §3): process-wide, like the node.
+// -------------------------------------------------------------------------
+
+/// The `state` of a standby whose online promotion is under way (an additive
+/// value of the frozen field; `role` stays `standby` until it serves as the
+/// primary, then the block is a primary's).
+pub const PROMOTING_STATE: &str = "promoting";
+
+/// The promotion this standby is running (`SELECT pg_promote(…)`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromotionStatus {
+    /// The epoch the standby is promoted to (its store's + 1).
+    pub to_epoch: u64,
+    /// Unix seconds.
+    pub since: u64,
+    /// Who asked: the backend pid and client address of the caller.
+    pub caller: String,
+}
+
+impl PromotionStatus {
+    /// The block's `reason`.
+    pub fn reason(&self) -> String {
+        format!(
+            "promoting to primary (epoch {}) since {}, asked by {}: this node is not ready until it serves as the \
+             primary",
+            self.to_epoch,
+            format_unix_secs(self.since),
+            self.caller
+        )
+    }
+
+    /// The FATAL 57P01 text every session of the standby is ended with
+    /// (spec P5.2 §1).
+    pub fn termination(&self) -> String {
+        promotion_termination_message(self.to_epoch)
+    }
+}
+
+/// Spec P5.2 §1: "terminating connection: this standby is being promoted to
+/// primary (epoch E+1); reconnect".
+pub fn promotion_termination_message(to_epoch: u64) -> String {
+    format!("terminating connection: this standby is being promoted to primary (epoch {to_epoch}); reconnect")
+}
+
+/// Spec P5.2 §1: the FATAL 57P01 text the sessions of a primary are ended
+/// with when it is fenced by `by_epoch` at `at` (unix seconds) — pushed at
+/// the fence, and at a pre-fence session's next statement.
+pub fn fence_termination_message(by_epoch: u64, at: u64) -> String {
+    format!(
+        "terminating connection: this primary was fenced by epoch {by_epoch} at {} (a standby was promoted); \
+         reconnect to the new primary for writes",
+        format_unix_secs(at)
+    )
+}
+
+static PROMOTING: AtomicBool = AtomicBool::new(false);
+static PROMOTION: RwLock<Option<PromotionStatus>> = RwLock::new(None);
+/// The engine instance of the empty placeholder database a standby's
+/// listeners serve while it has no store (`StorageEngine::instance_id`; 0:
+/// none).
+static PLACEHOLDER_ENGINE: AtomicU64 = AtomicU64::new(0);
+
+/// Spec P5.2 §3 step 1: this standby is being promoted: its block reads
+/// `promoting`, `/ready` answers 503, `heliosdb_require_ready()` 55000, and
+/// its data reads are refused (55000) until it serves as the primary.
+pub fn note_promoting(status: PromotionStatus) {
+    *PROMOTION.write() = Some(status);
+    PROMOTING.store(true, Ordering::SeqCst);
+}
+
+/// The promotion is over: aborted (the standby's posture is its own again)
+/// or done (the node is a primary, whose block never reads it).
+pub fn clear_promoting() {
+    PROMOTING.store(false, Ordering::SeqCst);
+    *PROMOTION.write() = None;
+}
+
+/// Whether an online promotion is under way (one atomic load).
+#[inline]
+pub fn is_promoting() -> bool {
+    PROMOTING.load(Ordering::SeqCst)
+}
+
+/// The online promotion under way, if any.
+pub fn promotion() -> Option<PromotionStatus> {
+    if !is_promoting() {
+        return None;
+    }
+    PROMOTION.read().clone()
+}
+
+/// The 55000 refusal of a standby being promoted (`standby is not ready:
+/// promoting (…)`), what `heliosdb_require_ready()` and the read guard
+/// answer; `None` when no promotion is under way.
+pub fn promoting_not_ready_message() -> Option<String> {
+    promotion().map(|promotion| {
+        format!(
+            "{}: {} ({})",
+            crate::error::STANDBY_NOT_READY,
+            PROMOTING_STATE,
+            promotion.reason()
+        )
+    })
+}
+
+fn promoting_block(block: &mut ReplicationBlock, promotion: &PromotionStatus) {
+    block.state = PROMOTING_STATE.to_string();
+    block.ready = false;
+    block.reason = Some(promotion.reason());
+}
+
+/// Spec P5.2 §3: `engine` serves the empty placeholder of this standby's
+/// listeners (what they serve while there is no store, and while a
+/// promotion reopens it).
+pub fn mark_placeholder(engine: &StorageEngine) {
+    PLACEHOLDER_ENGINE.store(engine.instance_id(), Ordering::SeqCst);
+}
+
+/// Whether `engine` is the placeholder ([`mark_placeholder`]).
+pub fn is_placeholder(engine: &StorageEngine) -> bool {
+    let placeholder = PLACEHOLDER_ENGINE.load(Ordering::SeqCst);
+    placeholder != 0 && placeholder == engine.instance_id()
+}
+
+/// Spec P5.2 §3, §8.H: the FATAL 57P01 a session served by the placeholder
+/// gets at its next statement once this node is no longer a standby — from
+/// the moment the reopened store serves as the primary, when no standby
+/// guard protects that session any more and the empty placeholder must
+/// answer no statement of a primary (writes included). While the standby is
+/// being promoted the placeholder's sessions are NOT ended: they are a
+/// standby's that is not ready — `pg_is_in_recovery()` answers `t`,
+/// `heliosdb_require_ready()` 55000 "promoting", the `SHOW` forms answer and
+/// data statements get 55000 — and the promotion pushes their termination
+/// once it serves as the primary. `None` for every other session.
+pub fn placeholder_session_termination(engine: &StorageEngine) -> Option<String> {
+    if !is_placeholder(engine) || standby().is_some() {
+        return None;
+    }
+    Some(
+        "terminating connection: this standby was promoted to primary; reconnect (the next connection is served by \
+         the primary)"
+            .to_string(),
+    )
 }
 
 // -------------------------------------------------------------------------
@@ -956,14 +1146,11 @@ impl FenceStatus {
         primary_fenced_write_message(self.by_epoch, self.at)
     }
 
-    /// The FATAL 57P01 text a session opened before the fence is ended with.
+    /// The FATAL 57P01 text a session opened before the fence is ended with
+    /// ([`fence_termination_message`]: pushed at the fence, spec P5.2 §1,
+    /// and at its next statement).
     pub fn termination(&self) -> String {
-        format!(
-            "terminating connection: this primary was fenced by epoch {} at {} (a standby was promoted); \
-             reconnect to the new primary for writes",
-            self.by_epoch,
-            format_unix_secs(self.at)
-        )
+        fence_termination_message(self.by_epoch, self.at)
     }
 }
 
@@ -1181,6 +1368,10 @@ pub fn require_ready(engine: Option<&StorageEngine>) -> crate::Result<bool> {
     }
     match standby() {
         Some(handle) => {
+            // Spec P5.2 §3 step 1.
+            if let Some(refusal) = promoting_not_ready_message() {
+                return Err(crate::Error::Generic(refusal));
+            }
             let mut snapshot = handle.snapshot();
             if engine.is_some_and(|engine| !engine.is_physical_standby()) {
                 snapshot.store_attached = false;
@@ -1203,7 +1394,7 @@ pub fn require_ready(engine: Option<&StorageEngine>) -> crate::Result<bool> {
 pub fn status_block(engine: &StorageEngine) -> ReplicationBlock {
     let node = NODE.read().clone();
     match node {
-        Some(NodeStatus::Standby(handle)) => handle.snapshot().block(),
+        Some(NodeStatus::Standby(handle)) => standby_block(&handle),
         Some(NodeStatus::Primary(status)) => {
             let mut block = primary_block(
                 status.role,

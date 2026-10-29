@@ -298,10 +298,20 @@ impl PgServer {
                     tracing::debug!("Accepted connection from {}", addr);
                     self.maybe_warn_utilisation();
 
+                    // Spec P5.2 §1: registered BEFORE its database is chosen,
+                    // so a termination published after this point (a fence,
+                    // a promotion) cannot miss a session served by what the
+                    // node was before it.
+                    let ticket = super::sessions::registry().admit(Some(addr.to_string()));
+                    let ticket_id = ticket.id();
                     let database = match &databases {
                         Some(current) => Arc::clone(&current.borrow()),
                         None => Arc::clone(&self.database),
                     };
+                    // Spec P5.2 §8.A: which database serves it — a promotion
+                    // waits until no session of the standby's store is left,
+                    // and spares the placeholder's.
+                    ticket.serve(database.storage.instance_id());
                     let auth_manager = Arc::clone(&self.auth_manager);
                     let ssl_negotiator = self.ssl_negotiator.clone();
                     // GH#28: ONE absolute authentication deadline, computed here
@@ -313,14 +323,17 @@ impl PgServer {
                     // FIRST so it drops LAST — after the handler's `Drop` has
                     // rolled back and released the session — and it is never
                     // cloned or moved: the slot is released exactly once.
-                    tokio::spawn(async move {
+                    let task = tokio::spawn(async move {
                         let _permit = permit;
                         if let Err(e) =
-                            Self::handle_connection(stream, database, auth_manager, ssl_negotiator, policy).await
+                            Self::handle_connection(stream, database, auth_manager, ssl_negotiator, policy, ticket)
+                                .await
                         {
                             tracing::error!("Connection error from {}: {}", addr, e);
                         }
                     });
+                    // A session that does not end when told is closed with its task.
+                    super::sessions::registry().attach_abort(ticket_id, task.abort_handle());
                 }
                 Err(e) => {
                     tracing::error!("Failed to accept connection: {}", e);
@@ -349,6 +362,7 @@ impl PgServer {
         auth_manager: Arc<AuthManager>,
         ssl_negotiator: Option<Arc<SslNegotiator>>,
         policy: ConnectionPolicy,
+        ticket: super::sessions::SessionTicket,
     ) -> Result<()> {
         let auth_deadline = policy.auth_deadline;
         let negotiate = Self::negotiate(stream, database, auth_manager, ssl_negotiator, policy);
@@ -363,6 +377,7 @@ impl PgServer {
             },
             None => negotiate.await?,
         };
+        handler.attach_session_ticket(ticket);
         handler.handle().await
     }
 

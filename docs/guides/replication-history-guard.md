@@ -85,17 +85,18 @@ that no longer matches the primary.
 
 ## Promotion: the epoch, the fence and the records
 
-A standby becomes a primary only through `heliosdb-nano promote` on its
+A standby becomes a primary only through a promotion asked of it: `SELECT
+pg_promote(true, N)` on the RUNNING standby, or `heliosdb-nano promote` on its
 STOPPED directory (see
-[Promotion and the epoch](physical-standby.md#promotion-and-the-epoch)). A
-standby's data directory is otherwise refused as a primary or standalone
-database, so restarting a standby with `--replication-role primary` does not
-promote it. The SQL `SWITCHOVER TO '<node>'` statement is still **refused, not
-initiated**: it performs the same checks it always did (the target must
+[Promotion and the epoch](physical-standby.md#promotion-and-the-epoch)). Both
+convert the directory the same way, under the same record. A standby's data
+directory is otherwise refused as a primary or standalone database, so
+restarting a standby with `--replication-role primary` does not promote it.
+The SQL `SWITCHOVER TO '<node>'` statement on the primary is still **refused,
+not initiated**: it performs the same checks it always did (the target must
 resolve, this node must be the primary, the target must be a connected
-standby) and returns an error naming `heliosdb-nano promote`; `SWITCHOVER
-CHECK` lists the same as its blocker. `SELECT pg_promote(true, N)` arrives with
-phase P5.2.
+standby) and returns an error naming both forms on the target; `SWITCHOVER
+CHECK` lists the same as its blocker.
 
 A promotion keeps the dataset's **history id** (it is the same dataset) and
 raises its **epoch** by one. The epoch is stored in the dataset itself

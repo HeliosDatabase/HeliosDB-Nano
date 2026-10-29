@@ -23,7 +23,9 @@
 //!    the node read-only (`ha_state`) and `fencing`
 //!    (`standby_posture::note_fencing`, spec §11.D): `/ready` 503,
 //!    `heliosdb_require_ready()` 55000, and the PostgreSQL wire ends every
-//!    session opened before the fence at its next statement (FATAL 57P01).
+//!    session opened before the fence (FATAL 57P01): pushed at once through
+//!    the session registry (spec P5.2 §1), and — the backstop, for a session
+//!    mid-statement — at its next statement.
 //! 2. Waits for the writes that were already past the gate, fsyncs the WAL
 //!    and reads the store's sequence: the final sequence.
 //! 3. Records the fence durably — [`FENCED_FILE`] in the data directory,
@@ -79,12 +81,14 @@ const FORMAT: u32 = crate::storage::replication_records::RECORD_FORMAT;
 /// How long a fence waits for the writes that were past the gate when it
 /// closed (a write stuck on a stalled disk): the fence is then incomplete,
 /// the gate stays closed, and the promoting standby retries or forces.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Public: an online promotion waits for a fence's answer at least this
+/// long plus [`ARCHIVE_SEAL_TIMEOUT`] and one frame (spec P5.2 §8.B).
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Spec P5.1 §11.B: how long a fence waits for the archiver to archive
 /// through the final sequence and seal. Past it the fence still answers —
 /// the archive is the old primary's copy of what the promoted standby already
 /// tails — and a WARNING says how far the archive got.
-const ARCHIVE_SEAL_TIMEOUT: Duration = Duration::from_secs(15);
+pub const ARCHIVE_SEAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The archiver of a primary, shared by the fence (which asks it to seal
 /// through the final sequence) and the replication port (which stops it at
@@ -123,6 +127,30 @@ fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Spec P5.2 §1: push FATAL 57P01 to every PostgreSQL session opened before
+/// the fence by `by_epoch` at `at` (the session registry's termination), and
+/// — on the async runtime, without holding the caller — drain them, closing
+/// those that do not go. Sessions opened after the fence are no targets:
+/// they were told `default_transaction_read_only = on` and are served reads.
+fn push_session_termination(by_epoch: u64, at: u64) {
+    use crate::protocol::postgres::sessions::{registry, TerminateCause, TERMINATE_DRAIN_TIMEOUT};
+    let message = crate::standby_posture::fence_termination_message(by_epoch, at);
+    let (generation, targets) = registry().push(TerminateCause::Fence, message);
+    if targets.is_empty() {
+        return;
+    }
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            let drained = registry().drain(generation, targets, TERMINATE_DRAIN_TIMEOUT).await;
+            info!(
+                "replication: the fence ended {} PostgreSQL session(s) opened before it ({} closed by force, {} \
+                 still open)",
+                drained.targeted, drained.aborted, drained.remaining
+            );
+        });
+    }
 }
 
 /// The fence that was applied, and by whom.
@@ -338,6 +366,12 @@ impl Inner {
         engine.write_gate().fence(primary_fenced_write_message(epoch, at));
         super::ha_state::ha_state().set_read_only(true);
         note_fencing(self.epoch, epoch, node, at);
+        // Spec P5.2 §1: every PostgreSQL session opened before the fence is
+        // ended NOW (FATAL 57P01, pushed), not only at its next statement,
+        // which stays the backstop — an idle pooled connection must not keep
+        // believing it talks to the primary. Not waited for here (this thread
+        // holds the fence's lock); the drain closes what does not go.
+        push_session_termination(epoch, at);
         // Step 2: the writes already past the gate, made durable.
         if !engine.write_gate().wait_for_writes(DRAIN_TIMEOUT) {
             return Err(self.incomplete(

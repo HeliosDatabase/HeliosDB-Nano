@@ -507,6 +507,28 @@ pub struct ReplicationConfig {
     /// (`source = "archive"`) applies segments from, as they appear
     /// (operator copies, NFS, rsync). `--archive-source DIR`, repeatable.
     pub archive_source: Vec<std::path::PathBuf>,
+    /// Spec P5.2 §4, §8.B: what a STANDBY's online promotion (`SELECT
+    /// pg_promote(…)`) does when its primary cannot be REACHED — the receiver
+    /// has no live session to it for `promote_fence_timeout` (it is down, the
+    /// receiver is reconnecting) — before it answered the fence. `"allow"`
+    /// (default): promote anyway, with what this standby holds — Oracle's
+    /// `FAILOVER`, what HeliosDB Proxy's failover needs, as it promotes
+    /// precisely when the primary is dead; writes the old primary committed
+    /// after that are lost, and it is NOT fenced if it still runs (STONITH is
+    /// the operator's: stop it, or the first receiver of the new epoch that
+    /// reaches it fences it). `"refuse"`: the promotion aborts (55000) and the
+    /// standby keeps following — a cluster that promotes by `SWITCHOVER` only
+    /// (graceful, primary reachable); an unreachable primary is then promoted
+    /// past offline with `heliosdb-nano promote --force`. Never applied to a
+    /// primary that answers, however slowly (the promotion waits for its
+    /// fence), nor after it answered `Fenced`. A primary that REFUSES the
+    /// fence always aborts the promotion.
+    pub promote_without_fence: String,
+    /// Spec P5.2 §4, §8.B: how long an online promotion's primary must stay
+    /// unreachable before `promote_without_fence` applies, and before a
+    /// fenced primary lost during the catch-up aborts the promotion. Seconds
+    /// or one `s`/`m`/`h` suffix, 1 s to 1 h. Default `"10s"`.
+    pub promote_fence_timeout: String,
 }
 
 impl std::fmt::Debug for ReplicationConfig {
@@ -549,6 +571,8 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("on_unrecoverable", &self.on_unrecoverable)
             .field("source", &self.source)
             .field("archive_source", &self.archive_source)
+            .field("promote_without_fence", &self.promote_without_fence)
+            .field("promote_fence_timeout", &self.promote_fence_timeout)
             .finish()
     }
 }
@@ -588,6 +612,8 @@ impl Default for ReplicationConfig {
             on_unrecoverable: Self::ON_UNRECOVERABLE_STAY_UP.to_string(),
             source: Self::SOURCE_PRIMARY.to_string(),
             archive_source: Vec::new(),
+            promote_without_fence: Self::PROMOTE_WITHOUT_FENCE_ALLOW.to_string(),
+            promote_fence_timeout: Self::DEFAULT_PROMOTE_FENCE_TIMEOUT.to_string(),
         }
     }
 }
@@ -630,6 +656,40 @@ impl ReplicationConfig {
     pub const SOURCE_ARCHIVE: &str = "archive";
     /// Most `archive_source` directories.
     pub const MAX_ARCHIVE_SOURCES: usize = 16;
+    /// `promote_without_fence` values (spec P5.2 §4).
+    pub const PROMOTE_WITHOUT_FENCE_ALLOW: &str = "allow";
+    pub const PROMOTE_WITHOUT_FENCE_REFUSE: &str = "refuse";
+    /// Default `promote_fence_timeout`.
+    pub const DEFAULT_PROMOTE_FENCE_TIMEOUT: &str = "10s";
+    /// Upper bound accepted for `promote_fence_timeout`.
+    pub const MAX_PROMOTE_FENCE_TIMEOUT_SECS: u64 = 3600;
+
+    /// Whether an online promotion continues when the primary does not
+    /// answer its fence (`promote_without_fence = "allow"`, validated by
+    /// [`Self::validate`]).
+    pub fn promote_allows_unfenced(&self) -> bool {
+        !self
+            .promote_without_fence
+            .trim()
+            .eq_ignore_ascii_case(Self::PROMOTE_WITHOUT_FENCE_REFUSE)
+    }
+
+    /// `promote_fence_timeout` as a duration (1 s to 1 h).
+    pub fn promote_fence_timeout_duration(&self) -> crate::Result<std::time::Duration> {
+        let secs = parse_retention_duration_secs(&self.promote_fence_timeout).map_err(|_| {
+            crate::Error::config(format!(
+                "invalid replication.promote_fence_timeout '{}': expected seconds or <n>[s|m|h], e.g. \"10s\"",
+                self.promote_fence_timeout
+            ))
+        })?;
+        if !(1..=Self::MAX_PROMOTE_FENCE_TIMEOUT_SECS).contains(&secs) {
+            return Err(crate::Error::config(format!(
+                "replication.promote_fence_timeout must be between 1s and {}s",
+                Self::MAX_PROMOTE_FENCE_TIMEOUT_SECS
+            )));
+        }
+        Ok(std::time::Duration::from_secs(secs))
+    }
 
     /// Whether a standby follows archived segments rather than a primary
     /// (`source = "archive"`, validated by [`Self::validate`]).
@@ -806,6 +866,15 @@ impl ReplicationConfig {
                 Self::MAX_ARCHIVE_SOURCES
             )));
         }
+        let without_fence = self.promote_without_fence.trim();
+        if !without_fence.eq_ignore_ascii_case(Self::PROMOTE_WITHOUT_FENCE_ALLOW)
+            && !without_fence.eq_ignore_ascii_case(Self::PROMOTE_WITHOUT_FENCE_REFUSE)
+        {
+            return Err(crate::Error::config(
+                "replication.promote_without_fence must be \"allow\" or \"refuse\"",
+            ));
+        }
+        self.promote_fence_timeout_duration()?;
         for (key, endpoints) in [
             ("primary_host", self.primary_host.iter().collect::<Vec<_>>()),
             ("standby_hosts", self.standby_hosts.iter().collect()),
@@ -4301,6 +4370,34 @@ mod physical_config_tests {
             "max_standby_lag = 'soon'",
             "max_standby_lag = '2d'",
             "on_unrecoverable = 'restart'",
+        ] {
+            let config: ReplicationConfig = toml::from_str(text).unwrap();
+            assert!(config.validate().is_err(), "{text}");
+        }
+    }
+
+    /// Spec P5.2 §4: the online promotion's settings.
+    #[test]
+    fn online_promotion_settings_default_and_validate() {
+        let config = ReplicationConfig::default();
+        assert!(config.promote_allows_unfenced(), "allow by default (failover)");
+        assert_eq!(
+            config.promote_fence_timeout_duration().unwrap(),
+            std::time::Duration::from_secs(10)
+        );
+        let config: ReplicationConfig =
+            toml::from_str("promote_without_fence = 'REFUSE'\npromote_fence_timeout = '2m'").unwrap();
+        config.validate().unwrap();
+        assert!(!config.promote_allows_unfenced());
+        assert_eq!(
+            config.promote_fence_timeout_duration().unwrap(),
+            std::time::Duration::from_secs(120)
+        );
+        for text in [
+            "promote_without_fence = 'sometimes'",
+            "promote_fence_timeout = '0'",
+            "promote_fence_timeout = '2h'",
+            "promote_fence_timeout = 'later'",
         ] {
             let config: ReplicationConfig = toml::from_str(text).unwrap();
             assert!(config.validate().is_err(), "{text}");

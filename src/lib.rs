@@ -340,7 +340,7 @@ pub use crypto::{
 };
 pub use error::{
     Error, Result, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE, NOT_NULL_VIOLATION_MARKER,
-    PHYSICAL_STANDBY_WRITE_REFUSED,
+    PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED,
 };
 pub use storage::StorageEngine;
 pub use types::{
@@ -4248,6 +4248,12 @@ impl EmbeddedDatabase {
             b"PG_CONTROL_CHECKPOINT".as_slice(),
             b"HELIOSDB_REQUIRE_READY".as_slice(),
             b"HELIOSDB_STANDBY_STATUS".as_slice(),
+            // Spec P5.2 §2: a promotion is an action, never a cached row (a
+            // cached `t` would answer a second call without promoting).
+            b"PG_PROMOTE".as_slice(),
+            // `internal-tests`: a statement held inside the engine (spec
+            // P5.2 §8.K) runs every time it is asked.
+            b"HELIOSDB_TEST_HOLD".as_slice(),
             // Spec P3.1: the archive views answer from the archiver's catalog
             // and pruner, which never move the storage generation either — a
             // cached `heliosdb_recovery_window` row kept reporting an archive

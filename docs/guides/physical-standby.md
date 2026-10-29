@@ -315,10 +315,14 @@ HeliosDB Proxy probes nodes over the PostgreSQL wire only; it never fetches
 | `SELECT pg_is_in_recovery()` (also `::text`) | `f` | `t`, in every posture |
 | `SELECT pg_current_wal_lsn()::text` | its written physical sequence, `HI/LO` hex | the same as the replay LSN |
 | `SELECT pg_last_wal_replay_lsn()::text` | NULL | its applied physical sequence, `HI/LO` hex |
-| `SELECT timeline_id::bigint FROM pg_control_checkpoint()` | `1` | `1` (the epoch, until P5) |
+| `SELECT timeline_id::bigint FROM pg_control_checkpoint()` | the store's epoch (`1` before any promotion) | the epoch of the store it follows |
+| `SELECT pg_promote(true, N)` | ERROR `55000`, "this node is already the primary (epoch E)" | `t` once it serves as the primary (`f` if `N` seconds ran out first; the promotion goes on), then the session is closed with FATAL `57P01` — see [Online](#online-select-pg_promotewait-wait_seconds) |
 
 - ParameterStatus `in_hot_standby` is `on` on standby sessions and `off` on a
-  primary. `server_version` is unchanged.
+  primary. `server_version` is unchanged. A node whose role changes while a
+  session is open — a standby promoted, a primary fenced — ends that session
+  with FATAL `57P01` (pushed, also to idle sessions), so a client never keeps
+  a role it read at startup.
 - Because LSNs are physical sequences, Proxy's `lag_bytes` (primary LSN minus
   standby LSN) counts write operations behind. At a load of N writes per second,
   `max_lag_bytes = N * 30` allows about 30 seconds of lag. Nano's own
@@ -821,8 +825,10 @@ bootstraps from it (`--primary-host` = the cascading standby's
 
 What the cascading standby's own WAL no longer holds (a standby keeps no
 archived WAL) is served from its own WAL archive, as a primary fills a gap. Its
-`/health` says `"cascade": true` and lists its downstream standbys; it needs a
-private export directory (`[replication.physical] export_dir`, default `<data
+`/health` says `"cascade": true` while its cascading port serves (an online
+promotion stops it; one that is aborted starts it again, and `cascade` is
+absent if that fails) and lists its downstream standbys; it needs a private
+export directory (`[replication.physical] export_dir`, default `<data
 dir>.physical-export`). Cascading is off by default.
 
 ## Rebuilding from the primary: `recover --from-primary`
@@ -950,20 +956,178 @@ recovered the same way, with `recover --from-primary` against it.
 
 ## Promotion and the epoch
 
-`heliosdb-nano promote` makes a STOPPED physical standby the primary of its
-dataset. Every promotion raises the dataset's **epoch** by one; the dataset
+A standby becomes the primary of its dataset in one of two ways:
+`SELECT pg_promote(wait, wait_seconds)` on a RUNNING standby (online, below),
+or `heliosdb-nano promote` on a STOPPED one (offline). Both use the same
+conversion. Every promotion raises the dataset's **epoch** by one; the dataset
 **history** stays the same (a promotion never mints a new history id: the
 epoch says which incarnation of the history a node is at).
 
 | Oracle | PostgreSQL | HeliosDB-Nano |
 |---|---|---|
 | Incarnation | Timeline (`timeline_id`) | Epoch: `repl:epoch` in the dataset, `pg_control_checkpoint().timeline_id`, `epoch` of `/health` and `heliosdb_standby_status`, `heliosdb-nano status --data-dir DIR` |
-| `SWITCHOVER TO` | `pg_ctl promote` after a clean stop of the old primary | `promote --data-dir DIR` (the old primary is fenced first) |
-| `FAILOVER TO` | `pg_ctl promote` with the old primary lost | `promote --data-dir DIR --force` (`--no-fence` for a rehearsal on a cloned directory) |
+| `SWITCHOVER TO` | `pg_promote(true, N)` with the old primary reachable | `SELECT pg_promote(true, N)` on the running standby, or `promote --data-dir DIR` on a stopped one (the old primary is fenced first) |
+| `FAILOVER TO` | `pg_promote()` with the old primary lost | `SELECT pg_promote(true, N)` with `[replication] promote_without_fence = "allow"` (the default), or `promote --data-dir DIR --force` (`--no-fence` for a rehearsal on a cloned directory) |
 | Reinstate the old primary | `pg_rewind` | `recover --from-primary --replace` on its directory (a full copy; rewinding in place is a follow-up) |
-| — | `pg_promote(wait, seconds)` | `SELECT pg_promote(true, N)` on a running standby: phase P5.2 (not in this release; the function is not defined yet) |
+| — | `pg_promote(wait, seconds)` | `SELECT pg_promote(wait, wait_seconds)` on the running standby's PostgreSQL port |
 
-### What `promote` does
+### Online: `SELECT pg_promote(wait, wait_seconds)`
+
+```sql
+-- on the RUNNING standby's PostgreSQL port
+SELECT pg_promote(true, 60);   -- t once it serves as the primary
+SELECT pg_promote(false, 60);  -- t at once: the promotion was started
+SELECT pg_promote(true);       -- wait_seconds defaults to 60
+SELECT pg_promote();           -- wait defaults to true
+```
+
+One row, one `boolean` column named `pg_promote`, as in PostgreSQL. It is
+answered by the PostgreSQL session itself (simple and extended protocol),
+with literal arguments; through the embedded API, or inside another
+statement, it is refused (SQLSTATE 55000). It is never cached.
+
+- `wait = true` answers `t` once the store was reopened as the primary's and
+  the listeners serve it — a NEW connection then starts with
+  `in_hot_standby = off`, answers `pg_is_in_recovery() = f` and
+  `pg_control_checkpoint().timeline_id = E+1`. If `wait_seconds` (1 to 3600)
+  runs out first it answers `f` and the promotion goes on (PostgreSQL's
+  semantics): poll `pg_is_in_recovery()` on a new connection.
+- `wait = false` answers `t` at once; the promotion runs in the background.
+- Refused with SQLSTATE 55000, nothing changed: on a primary ("this node is
+  already the primary (epoch E)"); on a standby that is not `streaming` (or
+  `reconnecting` within `max_standby_lag`) — `needs_recovery`, `recovering`,
+  `connecting` — or that carries an interrupted fast-forward, naming its
+  posture and the `recover` command; while another promotion runs ("a
+  promotion is in progress since …"); on an archive-only standby (promote it
+  offline); when its replication port cannot be bound, or it would serve it
+  in plaintext where the pair replicates over TLS (see TLS below).
+  `wait_seconds` out of range is 22023.
+- The calling session is answered, then closed (FATAL 57P01): its startup
+  told its client `in_hot_standby = on`. Every OTHER session of the standby's
+  store is ended with FATAL 57P01 before the primary is fenced
+  ("terminating connection: this standby is being promoted to primary (epoch
+  E+1); reconnect") — pushed, so an idle pooled connection redials at once; a
+  session mid-statement finishes its statement and is answered first, and
+  the promotion waits for it (step 3).
+
+What it does, each step logged on one `promote: …` line:
+
+1. **Preflight, then `state = promoting`.** Nothing changes on a refusal: the
+   standby's posture, its store, the primary configuration it would run with
+   (see TLS below) are checked, and the replication port it will serve as the
+   primary is BOUND now — a port in use refuses the promotion. Then `/ready`
+   answers 503, `/health` `state = "promoting"` (`role = "standby"` until
+   step 8, then the primary's block at the new epoch),
+   `heliosdb_require_ready()` and data reads 55000.
+2. **Sessions off the store.** New connections are served the empty
+   placeholder a standby serves before its store exists — they are answered
+   as a standby that is not ready: `pg_is_in_recovery()` is `t`,
+   `heliosdb_require_ready()` 55000 "promoting", `SHOW` answers, data
+   statements 55000 — and every session of the store but the caller's is
+   told to end with FATAL 57P01 (pushed, so an idle pooled connection redials
+   at once).
+3. **Wait for those sessions to be gone**, at most `wait_seconds`, while the
+   receiver keeps applying. A session mid-statement finishes its statement
+   and gets its answer first: a statement is waited for, never cut short
+   (only a connection still authenticating is closed by force). If one is
+   still there when `wait_seconds` runs out, the promotion is ABORTED before
+   the primary was fenced (55000 naming the sessions; re-run with a larger
+   N once their statements end).
+4. **Fence through the live session, then catch up.** The standby's receiver
+   renews its replication session under the promotion's identity (the random
+   UUID the offline `promote` keeps in the node-local family, so a later
+   re-run of the same promotion is answered the same `Fenced`), proves the
+   tail with one poll, sends `Fence { E+1 }`, and keeps following the fenced
+   primary until its durable cursor holds the primary's final sequence.
+   - `promote_without_fence` applies ONLY to a primary that cannot be
+     reached: the receiver has no live session to it (it is down, the
+     renewal cannot connect) for `[replication] promote_fence_timeout`
+     (default `10s`). `"allow"` (default, `FAILOVER`) then promotes with what
+     the standby holds and logs a WARNING naming the last sequence it has
+     (`repl:epoch` records `fenced = false`); `"refuse"` (a cluster promoted
+     by `SWITCHOVER` only) aborts with 55000 "the primary at H did not answer
+     the fence (…)" naming `heliosdb-nano promote --force` and the setting.
+   - A primary that ANSWERS is never promoted past: once it answers, or once
+     the fence was sent, the standby waits for `Fenced` at least the
+     primary's own bound for answering it (its write drain, 30 s, its archive
+     seal, 15 s, and one frame, 30 s: 75 s), whatever `wait_seconds` — the
+     caller gets `f` meanwhile and the promotion goes on. A fence left
+     incomplete (`SourceNotServing`) or a broken session is asked again on a
+     new session; a fence the primary REFUSES (another promotion fenced it,
+     it is at a newer epoch, another dataset) aborts the promotion.
+   - After `Fenced` the promotion never goes ahead unfenced. If the fenced
+     primary becomes unreachable before the standby holds its final
+     sequence, the promotion aborts naming the facts: the old primary IS
+     fenced at its final sequence F, this standby holds through H; re-run
+     `SELECT pg_promote` once it is reachable (it answers the same `Fenced`
+     and the catch-up resumes), or accept losing H+1..=F with `heliosdb-nano
+     promote --force`.
+5. **Replication stops**: the receiver (its in-flight run completes, its
+   cursor is durable), the standby's archiver (its last epoch-E segment is
+   sealed through that cursor), the cascading port if the standby has one.
+6. **The store is closed.** Only the runtime's own handles are left by now;
+   one that persists is a bug, logged at ERROR with the holders — the
+   promotion keeps waiting once the old primary is fenced (and aborts if it
+   is not).
+7. **Conversion** under the record `NANO-PROMOTION.json`, exactly as the
+   offline `promote` converts (below).
+8. **Reopen as the primary**, in the same process: the primary's
+   configuration is the standby's with `replication.role = primary` (its
+   `replication_port`, token, TLS and archive settings; the physical source
+   enabled as a primary start enables it, its export directory created
+   beside the data directory now; the primary WAL retention of
+   `[replication.physical]`); the replication port bound at the preflight
+   (a cascading standby's, its cascading source's until step 5, is bound
+   here) serves the new epoch, the archiver writes
+   `<archive>/<history>/<E+1>/`, `/health` reports `role = "primary"`,
+   `epoch = E+1`. The listeners were never closed; the sessions the
+   placeholder served meanwhile are ended too, so they redial the primary.
+
+Every abort says whether the old primary is fenced (NOT, MAY be — a fence
+was sent and its answer never arrived —, or IS, at its final sequence) and
+names the next command. A failure BEFORE the record restores the standby —
+its store is served again (its receiver never stopped), or, when
+replication had stopped, its receiver starts again once the store is closed
+(after `wait_seconds` at most, the holders logged) and its cascading port
+serves its downstream standbys again — and answers 55000. A failure AFTER it
+(steps 7-8), a panic included, ends the process with exit code 2 and the
+exact command in the log: `start` refuses the directory until `heliosdb-nano
+promote --data-dir DIR` finished the conversion; then `heliosdb-nano start
+--replication-role primary --data-dir DIR`. No half-converted store is ever
+served. The HTTP endpoint of a standby promoted online keeps serving health
+and readiness only (`/health`, `/ready`, `/version`) until its next start; the
+REST/MCP surface is mounted when a node starts as a primary.
+
+**TLS.** A standby's `[replication] tls_enabled` / `tls_cert_path` /
+`tls_key_path` (`--replication-tls`, `--replication-tls-cert`,
+`--replication-tls-key`) are the keys it serves its replication port with
+once it is promoted (no warning is printed for them on a standby that does
+not cascade). A standby that replicates from its primary over TLS
+(`--primary-tls`) and would serve in plaintext once promoted is refused at
+the preflight, naming those keys: configure them (or the PostgreSQL pair)
+and restart it before it is promoted.
+
+Give the standby its own `--replication-port` (`[replication]
+replication_port`): it is the port it serves its standbys on once promoted.
+
+**HeliosDB Proxy.** Proxy promotes by sending exactly `SELECT pg_promote(true,
+N)` to the standby it chose and, right after the `t`, opening a fresh
+connection that must answer `pg_is_in_recovery() = f` (it polls every 500 ms
+within `N`). Point Proxy's promotion at it:
+
+```toml
+# HeliosDB Proxy
+[auto_promote]
+method = "pg_promote"
+```
+
+On the Nano standbys, keep `promote_without_fence = "allow"` for automatic
+failover (Proxy promotes precisely when the primary is gone; stopping a
+partitioned old primary stays the operator's STONITH), or set `"refuse"` when
+only planned switchovers may promote. Proxy routes writes to the node with the
+strictly highest `timeline_id`.
+
+### Offline: what `heliosdb-nano promote` does
 
 ```bash
 # The standby's process is stopped first; its config supplies the defaults.
@@ -1080,8 +1244,10 @@ and only for the epoch after its own.
 ### What the other nodes see
 
 - **The fenced old primary** serves reads (its sessions opened before the
-  fence are ended at their next statement with FATAL `57P01`; new ones are
-  admitted read-only), answers `/ready` 503, `/health` `state = "fencing"`
+  fence are ended with FATAL `57P01` — pushed at the fence, so an idle pooled
+  connection redials at once; a session mid-statement ends at its next
+  statement; new ones are admitted read-only), answers `/ready` 503,
+  `/health` `state = "fencing"`
   while the fence is under way and `"fenced"` once it is recorded,
   `heliosdb_require_ready()` SQLSTATE 55000, and tells clients it is
   read-only: `SHOW transaction_read_only` and `default_transaction_read_only`
@@ -1266,20 +1432,21 @@ The test suites are listed in the [HA testing guide](ha_testing.md).
   caller and re-encrypts nothing); rotating the key while standbys are attached
   is not supported until promotion and fencing arrive (P5), which add the
   control-plane check that every standby holds the new key first.
-- **Promotion is offline.** `heliosdb-nano promote` promotes a STOPPED standby
-  (see [Promotion and the epoch](#promotion-and-the-epoch)); the online form,
-  `SELECT pg_promote(true, N)` on a running standby, arrives with P5.2, and
-  the SQL `SWITCHOVER` statement stays refused. A standby's data directory is
-  otherwise never opened as a primary or standalone database. Writes are never
-  routed through a standby: connect to the primary to write. There is no
-  automatic failover: promoting is the operator's decision, and fencing an
-  unreachable old primary (STONITH) is the operator's job.
+- **Promotion is asked of the standby.** `SELECT pg_promote(true, N)` promotes
+  a RUNNING standby, `heliosdb-nano promote` a STOPPED one (see [Promotion and
+  the epoch](#promotion-and-the-epoch)); the SQL `SWITCHOVER` statement on the
+  primary stays refused. A standby's data directory is otherwise never opened
+  as a primary or standalone database. Writes are never routed through a
+  standby: connect to the primary to write. Nano does not decide to fail over
+  by itself: a promotion is asked (by an operator, or by HeliosDB Proxy's
+  `[auto_promote]`), and fencing an unreachable old primary (STONITH) is the
+  operator's job. An archive-only standby is promoted offline only.
 - **A fenced primary is rebuilt, not rewound.** Rejoining a fenced (or dead)
   old primary as a standby is a full copy of the new primary
   (`recover --from-primary --replace`); rewinding it in place is a follow-up.
-- **Sessions of a fenced primary end lazily.** A session opened before the
-  fence is ended (FATAL `57P01`) at its next statement, not at once; pushing
-  the termination to idle sessions arrives with P5.2.
+- **A standby promoted online serves health only over HTTP** until its next
+  start (`/health`, `/ready`, `/version`); the REST/MCP surface is mounted at
+  the start of a primary. `pg_terminate_backend(pid)` is not implemented yet.
 - **Cascading is opt-in** (`[replication.physical] cascade = true`) and one
   level is what the tests cover; a downstream standby of a cascading standby
   that falls behind both the cascading standby's live WAL and its archive is

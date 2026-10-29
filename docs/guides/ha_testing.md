@@ -63,10 +63,36 @@ Related targets:
   and rebuilt with `recover --from-primary --replace`, a forced promotion and
   the superseded primary fencing itself when an epoch-2 receiver reaches it, a
   running standby refused, a second promotion of the same epoch refused
-  (`pg_promote` 42883), no logical-WAL replay at the first open (the old
-  primary's checkpoint never advanced, a trigger workload), both epochs'
-  archives; with `--features internal-tests`, a promotion killed after each
-  step and finished by a re-run;
+  (`pg_promote` on the new primary 55000), no logical-WAL replay at the first
+  open (the old primary's checkpoint never advanced, a trigger workload), both
+  epochs' archives; with `--features internal-tests`, a promotion killed after
+  each step and finished by a re-run;
+- `physical_promote_online` (spec P5.2, real daemons): `SELECT pg_promote(true,
+  60)` on a running standby while the primary takes writes answers `t`, idle
+  sessions on the standby and on the fenced primary are pushed FATAL 57P01
+  without a statement, a fresh connection sees `in_hot_standby = off`,
+  `pg_is_in_recovery() = f`, `timeline_id = 2`, writes succeed, the old
+  primary is fenced, the standby holds exactly what it holds (every write it
+  acknowledged during the promotion) and `repl:epoch` says fenced at its
+  recorded final sequence, a standby of it is refused `pg_promote`
+  (`needs_recovery`) and fast-forwarded to the new one; Proxy's exact forms
+  (`SELECT pg_promote(true, 5)` → `t`, then a fresh `pg_is_in_recovery()::text`
+  → `false`), also under writes; `wait = false`; a primary dead before the
+  call with `promote_without_fence = "refuse"` (55000 naming the offline
+  command, "NOT fenced", the standby keeps following) and `"allow"` (`t`,
+  `fenced = false`); the fence's push to idle sessions within a second; the
+  extended protocol (Describe `boolean` OID 16, the row, then FATAL 57P01 on
+  the connection after Sync); a cascading standby promoted online (its port
+  serves epoch 2, its cascaded standby recovers from it); with `--features
+  internal-tests`: `f` on a short budget and a second call refused meanwhile
+  (the promotion held on a file), a statement held inside the engine (a
+  budget it outlasts aborts with the primary unfenced and taking writes; one
+  it does not outlast waits, then fences), a primary killed after `Fenced`
+  (the abort names both sequences and `promote --force`; restarted, the
+  re-run is answered the cached `Fenced` and completes), a promotion aborted
+  after its replication stopped (receiver and cascading port back), and a
+  failure (or a kill) after the record ending the process with exit 2,
+  `start` refusing the directory and `promote` finishing it;
 - `logical_standby_removed`: a source scan that fails if a removed replication
   flag, module or symbol reappears in the code, tests, fixture, guides or skills;
 - `offline_reseed_tests`: the [offline snapshot helper](offline-reseed.md).

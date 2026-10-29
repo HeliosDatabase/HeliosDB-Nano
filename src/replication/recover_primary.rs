@@ -745,7 +745,8 @@ impl Ladder<'_> {
             ),
             None => format!(
                 "recover: the standby followed epoch {} to sequence {}; the primary was promoted to epoch {} WITHOUT \
-                 fencing the old primary (--force): rows the old primary committed after the promotion are not in \
+                 fencing the old primary (--force, or `pg_promote` past an unreachable primary with \
+                 promote_without_fence = \"allow\"): rows the old primary committed after the promotion are not in \
                  the new primary, and the re-cut replaced them on this standby too",
                 record.previous,
                 format_count(from),

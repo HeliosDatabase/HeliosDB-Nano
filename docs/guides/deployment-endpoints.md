@@ -194,12 +194,22 @@ values say a promoted standby superseded it:
 | `fencing` | a fence is under way: the write gate closed, every write is refused, the writes before it are being made durable; or the fence did not complete (`reason` starts with "fence incomplete") | 503 |
 | `fenced` | the fence is recorded (`NANO-FENCED.json`): reads only, for good, until the node is rebuilt as a standby | 503 |
 
+On a standby (spec P5.2) one more value says it is being promoted online
+(`SELECT pg_promote(…)`):
+
+| `state` | meaning | `/ready` |
+|---|---|---|
+| `promoting` | the standby is ending its sessions (and waiting for their statements), fencing its primary, closing and converting its store and reopening it as the primary's; `role` stays `standby` and `reason` says since when and who asked. Once it serves as the primary the block is a primary's: `role = "primary"`, `state = "streaming"`, `epoch` one higher. An aborted promotion leaves the standby's own state again | 503 |
+
 The rule: `/ready` answers 200 only on a primary that is neither `fencing`
-nor `fenced`, and on a standby that is ready by its posture. A load balancer
-or proxy health check that keys on `/ready` therefore takes a superseded
-primary out of the write set the moment its gate closes. The block's `epoch`
-is the node's own store epoch (a fenced primary keeps reporting the epoch it
-was at); the newer epoch that fenced it is in `reason`.
+nor `fenced`, and on a standby that is ready by its posture and not
+`promoting`. A load balancer or proxy health check that keys on `/ready`
+therefore takes a superseded primary out of the write set the moment its gate
+closes, and a promoting standby out of the read set until it serves as the
+primary. The block's `epoch` is the node's own store epoch (a fenced primary
+keeps reporting the epoch it was at); the newer epoch that fenced it is in
+`reason`. The field set is unchanged: `promoting`, like `fencing` and
+`fenced`, is a value of `state`.
 
 Remote trust authentication remains refused by default. For isolated development,
 `--allow-insecure-trust` explicitly permits PostgreSQL trust on a non-loopback

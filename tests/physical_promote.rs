@@ -4,7 +4,8 @@
 //! * (1) a graceful promotion: the old primary P is fenced — writes refused
 //!   25006 with the fence's text, `/ready` 503, `/health` state `fenced`,
 //!   `NANO-FENCED.json` on disk, a session opened before the fence ended
-//!   FATAL 57P01 at its next statement — and the promoted standby S holds
+//!   (FATAL 57P01, pushed at the fence since spec P5.2: the idle client's
+//!   connection is closed before it issues anything) — and the promoted standby S holds
 //!   everything through P's final sequence; S starts as the primary of the
 //!   SAME history at epoch 2 (`pg_control_checkpoint`, `/health`), writes,
 //!   and archives under `<H>/2/`;
@@ -25,8 +26,9 @@
 //! * (7) a second promotion of the same epoch is refused: P names the
 //!   promotion that fenced it first, the refused standby's replicated
 //!   (default) family is unchanged — its node-local family gains the
-//!   promotion's identity by design — and `pg_promote` stays undefined
-//!   (42883, P5.2 defines it);
+//!   promotion's identity by design — and `pg_promote` on the new primary
+//!   is refused 55000 "already the primary (epoch 2)" (spec P5.2; it was an
+//!   undefined function, 42883, before);
 //! * (8) the promoted store's first open replays none of the old primary's
 //!   logical WAL: P runs with the logical WAL's checkpoint never advanced
 //!   (interval 0) after a restart left one, so the standby's copy holds
@@ -367,8 +369,9 @@ async fn a_graceful_promotion_fences_the_primary_and_every_node_left_behind_reco
         1,
         "a standby of a never-promoted primary is at epoch 1"
     );
-    // A session opened before the fence.
-    let before_fence = connect(c.pair.pg_p).await;
+    // A session opened before the fence (its connection future kept: the
+    // pushed FATAL ends it, spec P5.2 §1).
+    let (before_fence, before_fence_connection) = connect_watched(c.pair.pg_p).await;
     assert_eq!(value(&before_fence, "SELECT 1").await.as_deref(), Some("1"));
 
     // --- (1) the graceful promotion --------------------------------------
@@ -431,9 +434,23 @@ async fn a_graceful_promotion_fences_the_primary_and_every_node_left_behind_reco
         .await
         .unwrap_err();
     assert_eq!(sqlstate(&ready_check), "55000", "{ready_check}");
-    // The session opened before the fence is ended at its next statement.
-    let ended = before_fence.simple_query("SELECT 1").await.unwrap_err();
-    assert_eq!(sqlstate(&ended), "57P01", "{ended}");
+    // The session opened before the fence is ended with FATAL 57P01. Spec
+    // P5.2 §1: PUSHED at the fence, so this idle client received it with no
+    // request pending — the error its connection future ended with, which
+    // carries the SQLSTATE; a statement now fails without reaching the
+    // server. `tests/physical_promote_online.rs` reads the pushed frame
+    // itself.
+    let ended = connection_end(before_fence_connection, Duration::from_secs(10))
+        .await
+        .expect_err("the pre-fence session is ended by the fence");
+    assert_eq!(sqlstate(&ended), "57P01", "{ended}; {}", c.primary.tail(12));
+    assert!(
+        message(&ended).contains("this primary was fenced by epoch 2"),
+        "{}",
+        message(&ended)
+    );
+    assert!(before_fence.is_closed());
+    assert!(before_fence.simple_query("SELECT 1").await.is_err());
     assert!(
         c.primary
             .log_contains_within("was FENCED by epoch 2", Duration::from_secs(10)),
@@ -554,10 +571,15 @@ async fn a_graceful_promotion_fences_the_primary_and_every_node_left_behind_reco
         "S2's replicated (default-family) keyspace is unchanged"
     );
     assert_eq!(store_epoch(&c.s2_data), 1);
-    // `pg_promote` is P5.2's: undefined here, on the new primary as on any
-    // node (42883 undefined_function).
-    let missing = s.simple_query("SELECT pg_promote(true, 5)").await.unwrap_err();
-    assert_eq!(sqlstate(&missing), "42883", "{missing}");
+    // Spec P5.2 §2: `pg_promote` on a primary — the new one — is refused:
+    // 55000, "this node is already the primary (epoch 2)".
+    let refused = s.simple_query("SELECT pg_promote(true, 5)").await.unwrap_err();
+    assert_eq!(sqlstate(&refused), "55000", "{refused}");
+    assert!(
+        message(&refused).contains("this node is already the primary (epoch 2)"),
+        "{}",
+        message(&refused)
+    );
 
     // (10, continued) an epoch-1 standby recovers from epoch-1 segments
     // still (P's archive: rows 41..=60), and is refused epoch-2 segments

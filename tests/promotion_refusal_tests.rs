@@ -111,11 +111,13 @@ fn switchover_refuses_and_changes_nothing() {
         message.contains("unsupported") && message.contains("fencing") && message.contains("no role was changed"),
         "refusal must be an actionable sentence naming unsupported, fencing and no role change, got: {message}"
     );
-    // Spec P5.1 §7: the refusal points at the promotion that exists (offline)
-    // and the one that follows (P5.2), and claims neither ran.
+    // Spec P5.1 §7, P5.2 §5 (8): the refusal points at both forms of the
+    // promotion asked of the TARGET — online (`pg_promote` on the running
+    // standby) and offline (`heliosdb-nano promote`) — and claims neither ran.
     assert!(
-        message.contains("heliosdb-nano promote --data-dir") && message.contains("pg_promote(true, N)"),
-        "the refusal names `heliosdb-nano promote` and `pg_promote` (P5.2), got: {message}"
+        message.contains("heliosdb-nano promote --data-dir")
+            && message.contains("SELECT pg_promote(true, N)` on the running target standby"),
+        "the refusal names `heliosdb-nano promote` and `pg_promote` on the target, got: {message}"
     );
 
     assert_eq!(
@@ -177,28 +179,35 @@ fn switchover_refuses_and_changes_nothing() {
                 blockers.contains("Runtime switchover/promotion is unsupported"),
                 "blockers must name the unsupported runtime, got: {blockers}"
             );
-            // Spec P5.1 §7.
+            // Spec P5.1 §7, P5.2: both forms.
             assert!(
-                blockers.contains("use `heliosdb-nano promote` (offline) or `SELECT pg_promote(true, N)` (P5.2)"),
-                "blockers must name the offline promotion and P5.2's pg_promote, got: {blockers}"
+                blockers.contains(
+                    "use `heliosdb-nano promote` (offline) or `SELECT pg_promote(true, N)` (online, on the target \
+                     standby)"
+                ),
+                "blockers must name the offline and the online promotion, got: {blockers}"
             );
         }
         other => panic!("blockers must be a String, got: {other:?}"),
     }
 
-    // Spec P5.1 §7, §11.I: `pg_promote` is NOT defined in P5.1 (P5.2 defines
-    // it): an UNDEFINED function — the error the wire answers 42883
-    // undefined_function (it names a function that is not found or unknown;
-    // `tests/physical_promote.rs` asserts the SQLSTATE on a real daemon) —
-    // never another failure that would hide a half-defined one.
-    let missing = db
-        .query("SELECT pg_promote(true, 5)", &[])
-        .expect_err("pg_promote must stay undefined until P5.2");
-    let lower = missing.to_string().to_lowercase();
-    assert!(
-        lower.contains("pg_promote")
-            && lower.contains("function")
-            && (lower.contains("not found") || lower.contains("does not exist") || lower.contains("unknown")),
-        "pg_promote must fail as an undefined function (42883): {missing}"
-    );
+    // Spec P5.2 §2: `pg_promote` EXISTS now — it is no undefined function —
+    // but it is answered by the PostgreSQL wire session (which lets go of the
+    // store the promotion reopens); through the embedded API it is refused
+    // with the server-only message (SQLSTATE 55000 on the wire), naming the
+    // form that works and the offline command.
+    for sql in ["SELECT pg_promote(true, 5)", "SELECT pg_catalog.pg_promote()"] {
+        let refused = db.query(sql, &[]).expect_err("pg_promote is the server session's");
+        let text = refused.to_string();
+        assert!(
+            text.contains(heliosdb_nano::PG_PROMOTE_SERVER_ONLY)
+                && text.contains("SELECT pg_promote(true, 60)")
+                && text.contains("heliosdb-nano promote --data-dir"),
+            "{sql}: pg_promote answers the server-only refusal: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("not found") && !text.to_lowercase().contains("unknown"),
+            "{sql}: pg_promote is no undefined function any more: {text}"
+        );
+    }
 }
