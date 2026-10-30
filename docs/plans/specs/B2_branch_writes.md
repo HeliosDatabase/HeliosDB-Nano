@@ -47,6 +47,41 @@ sees" is still exactly this merge, and nothing in B2 may depend on reading histo
   are allocated for branch inserts (they must never collide with a row id main allocates
   later — confirm the counter is shared and persistent).
 
+## State after B1 (committed before B2 starts)
+
+- The session's branch binding is snapshotted once per statement (`STATEMENT_BRANCH` /
+  `BranchStatementScope`); `active_branch()` / `is_branch_active()` read the snapshot. A
+  statement on a branch holds that branch's drain (`BranchDrains`, src/storage/branch.rs) for
+  its duration; DROP/MERGE close it exclusively. COMMIT re-validates the binding.
+- INTERIM, to be REPLACED by this phase: inside an explicit transaction (or a pending implicit
+  block) on a branch, every statement except transaction control, SET/SHOW/RESET, DISCARD and
+  DEALLOCATE is refused `0A000` ("explicit transactions on a branch are not supported yet"),
+  and `txn_base_tuples` routes branch reads to a path that reads main. Four existing tests were
+  adapted to assert that refusal (tests/branch_data_isolation_test.rs
+  `w2_branch_txn_insert_does_not_poison_shared_secondary_art`,
+  `w2_branch_txn_insert_no_phantom_unique_violation_on_main`,
+  `w2_branch_delete_does_not_strip_secondary_index_on_main`; the lib.rs unit test
+  `branch_scoped_writes_in_explicit_txn_are_not_replicated`) and code-graph indexing on a
+  branch autocommits per statement (src/code_graph/storage.rs). When transactions on a
+  branch work (item 2 below), remove the interim refusal, restore those tests to their
+  in-transaction form (keep the autocommit variants too), and restore code-graph's
+  per-chunk transaction on a branch.
+- `USE BRANCH` / `SET heliosdb.branch` inside a transaction are refused `25001` (keep).
+- B1 also made COPY FROM and `execute_batch` on a branch autocommit chunk by chunk (not
+  atomic) because of the interim refusal; once transactions work on a branch, make both
+  atomic again on a branch (one transaction, as on main) and keep their tests.
+- Pre-existing failure this phase must fix (it fails on the base too; it only runs with
+  `--features code-graph`): tests/code_graph_on_branch.rs
+  `on_branch_routes_lsp_query_to_branch_data` — on a branch, a params-family DELETE of an
+  inherited row followed by an INSERT of the same primary key is refused "Duplicate key …
+  src_pkey" (the INSERT pre-checks main's ART). Run that file with `--features code-graph`.
+- The statement offload (S1, merged): statement execution runs under `block_in_place` on
+  the same thread, so the thread-local branch snapshot and drain hold stay valid; nothing
+  in B2 may move statement work to another thread.
+- `COUNT(*)` on a branch counts the branch's rows; the fast point lookups and the SQL
+  PREPARE/EXECUTE fast path decline on a branch. Still open: the vector kNN fast path
+  (src/sql/executor/mod.rs ~1384) serves branch sessions from main's HNSW (item 5).
+
 ## What to build
 
 1. **One branch view** (a small type in the storage layer, built from the session's binding):
@@ -71,6 +106,11 @@ sees" is still exactly this merge, and nothing in B2 may depend on reading histo
    `get`; the write through `put`), COPY FROM, and explicit transactions (both families).
    Any path you cannot route is REFUSED on a branch with a clear error before it writes
    (fail closed) — never written to main. Lock-free ingestion on a branch: refuse.
+- Inside an explicit transaction on a branch (now that it works — remove B1's interim
+  0A000 refusal): reads see the branch view merged with the transaction's own writes;
+  COMMIT applies them to the branch only (and still re-validates the binding captured at
+  the transaction's first statement, B1); ROLLBACK discards; savepoints behave as on main.
+
 3. **TRUNCATE on a branch** empties `t` on that branch only: tombstone every row the branch
    sees (and drop the branch's own overlay rows for `t`); main and other branches
    untouched; works inside an explicit transaction (rollback restores).
