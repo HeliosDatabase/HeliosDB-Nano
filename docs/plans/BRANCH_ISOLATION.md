@@ -50,7 +50,12 @@ Standing rule: build what the docs promise; honouring it must fail closed.
   semantics; the skill's pitfall line is corrected).
 - **D5 — a branch is a fork.** A branch sees its parent's data as it was at its fork
   point — the `AS OF` anchor, or the creation time when `AS OF` is omitted or `NOW` — and
-  writes to the parent afterwards do not appear (skill recipe 2). Design in phase B4.
+  writes to the parent afterwards do not appear (skill recipe 2). Mechanism (B4):
+  copy-on-write at the parent's write — before a parent changes a row or a table
+  definition a live child sees, the write gate freezes the pre-image (or a tombstone)
+  into the child's overlay, marked as a frozen copy so MERGE never mistakes it for a
+  change. Reads stay a cheap overlay merge and need no history; an `AS OF` anchor in the
+  past is materialized once at creation from version history.
 - **D6 — dropping reclaims.** Dropped and merged branches' rows, tombstones, versions and
   catalog entries are deleted using the key formats they were written with; a dropped
   branch cannot be `USE`d; its name can be reused.
