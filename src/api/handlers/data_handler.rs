@@ -271,6 +271,20 @@ pub async fn insert_data(
     Path((branch_name, table_name)): Path<(String, String)>,
     Json(request): Json<InsertDataRequest>,
 ) -> Result<(StatusCode, Json<InsertDataResponse>), ApiError> {
+    // sprinter ccebc95977f1: the rows go straight to storage, through no
+    // statement entry point, so this request leaves the async worker itself
+    // (`runtime_offload`).
+    crate::runtime_offload::offload_statement(move || insert_data_rows(state, branch_name, table_name, request))
+}
+
+/// The body of [`insert_data`], which runs it through `offload_statement`
+/// (sprinter ccebc95977f1).
+fn insert_data_rows(
+    state: AppState,
+    branch_name: String,
+    table_name: String,
+    request: InsertDataRequest,
+) -> Result<(StatusCode, Json<InsertDataResponse>), ApiError> {
     info!(
         "Inserting {} rows into table '{}' in branch '{}'",
         request.rows.len(),

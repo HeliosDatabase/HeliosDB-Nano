@@ -2926,10 +2926,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let catalog = PgCatalog::with_database(Arc::clone(&self.database));
         // sprinter 1703dba8e82d: the PG interceptor lists tables without
         // entering any engine funnel; publish this connection's temp namespace
-        // around the SYNCHRONOUS call (the guard is `!Send`).
-        let intercepted = {
-            let _temp_ns = self.temp_namespace_guard();
-            catalog.handle_query(sql)
+        // around the SYNCHRONOUS call (the guard is `!Send`). Sprinter
+        // ccebc95977f1: off the async worker (`runtime_offload`) when the
+        // interceptor may answer it.
+        let intercepted = if PgCatalog::may_intercept(sql) {
+            crate::runtime_offload::offload_statement(|| {
+                let _temp_ns = self.temp_namespace_guard();
+                catalog.handle_query(sql)
+            })
+        } else {
+            Ok(None)
         };
         match intercepted {
             Ok(Some((schema, rows))) => {

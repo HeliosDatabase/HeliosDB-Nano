@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — a long statement no longer stalls the server (sprinter ccebc95977f1)
+
+A statement executed synchronously on the async worker that had just been driving the
+network: for the whole statement no other worker polled the I/O driver, so new
+PostgreSQL connections were not accepted, other sessions were not served, timers did not
+fire and the physical replication source sent nothing (standbys flapped `reconnecting`
+past 30 s; `SELECT pg_promote(…)` on a standby waited for a running query). The server
+now hands its worker off for every executed statement (`block_in_place`); primary-key
+point reads and result-cache hits stay on the worker. Cost: about one 10 µs handoff per
+other executed statement — measured on a 32-core host with local clients, short
+range scans lose 6 % of throughput at 1 client and up to 28 % at 32 clients, point reads
+nothing. `HELIOSDB_NANO_STATEMENT_OFFLOAD=off` restores the previous behaviour. The
+embedded library is unchanged unless it opts in.
+
 ### Changed — BREAKING: one replication connection, physical standbys only
 
 A standby is a read-only **physical replica** of its primary

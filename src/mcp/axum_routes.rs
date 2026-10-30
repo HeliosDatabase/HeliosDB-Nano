@@ -140,7 +140,9 @@ pub async fn handle_post(
         }
     }
 
-    let resp = handle_rpc_with_db(state.db.as_ref(), req);
+    // sprinter ccebc95977f1: the dispatch runs its tool synchronously, off
+    // the async worker (`runtime_offload`); the engine calls inside nest.
+    let resp = crate::runtime_offload::offload_statement(|| handle_rpc_with_db(state.db.as_ref(), req));
     Json(resp).into_response()
 }
 
@@ -280,7 +282,8 @@ async fn dispatch_ws_text(socket: &mut WebSocket, state: &McpState, text: &str) 
         }
     }
 
-    let resp = super::rpc::handle_rpc_with_db(state.db.as_ref(), req);
+    // sprinter ccebc95977f1: see the POST route above.
+    let resp = crate::runtime_offload::offload_statement(|| super::rpc::handle_rpc_with_db(state.db.as_ref(), req));
     let json = serde_json::to_string(&resp).unwrap_or_else(|e| {
         format!(r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize: {e}"}}}}"#)
     });

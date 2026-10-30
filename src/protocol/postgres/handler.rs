@@ -2906,7 +2906,8 @@ where
                             .trim()
                             .trim_matches(|c| c == '\'' || c == '"' || c == '`')
                             .to_string();
-                        let rows = self.pragma_table_info(&table)?;
+                        // sprinter ccebc95977f1: a catalog read, off the async worker.
+                        let rows = crate::runtime_offload::offload_statement(|| self.pragma_table_info(&table))?;
                         let schema = Schema::new(vec![
                             crate::Column::new("cid", crate::DataType::Int4),
                             crate::Column::new("name", crate::DataType::Text),
@@ -3180,9 +3181,18 @@ where
         // `.await`s below: the guard is deliberately `!Send` so it cannot be
         // carried over a yield point onto a worker thread this connection has
         // since migrated away from.
-        let intercepted = {
-            let _temp_ns = self.temp_namespace_guard();
-            self.catalog.handle_query(query)?
+        //
+        // sprinter ccebc95977f1: the interceptor's text check runs here, on
+        // the worker; only a statement it may answer reads the catalog, off
+        // the async worker (`runtime_offload`) — every other one goes on to
+        // its single execution handoff below.
+        let intercepted = if PgCatalog::may_intercept(query) {
+            crate::runtime_offload::offload_statement(|| {
+                let _temp_ns = self.temp_namespace_guard();
+                self.catalog.handle_query(query)
+            })?
+        } else {
+            None
         };
         if let Some(result) = intercepted {
             let (schema, rows) = result;
@@ -3755,6 +3765,35 @@ where
                 .await;
         }
 
+        // sprinter ccebc95977f1: decoding the last rows, applying them and
+        // closing the transaction the generic fallback opens all run in ONE
+        // offload (`runtime_offload`) — the fast path, every fallback chunk and
+        // its COMMIT nest inside it, so a COPY pays one handoff.
+        let applied = crate::runtime_offload::offload_statement(|| self.apply_copy_from_rows(&copy, decoder))?;
+        match applied {
+            Ok(total) => {
+                self.send_command_complete(&format!("COPY {total}")).await?;
+                self.send_ready_for_query().await
+            }
+            Err(e) => {
+                self.send_error("ERROR", "XX000", &format!("COPY insert failed: {e}"), None, None)
+                    .await
+            }
+        }
+    }
+
+    /// The synchronous half of `COPY … FROM STDIN`, run in one offload by
+    /// [`Self::handle_copy`] (sprinter ccebc95977f1): flush the decoder,
+    /// apply the rows — the typed fast path or the generic fallback — and
+    /// close the transaction the fallback opened. `Ok(Ok(rows))` when every
+    /// row landed, `Ok(Err(e))` for a failed insert (the client is told
+    /// `COPY insert failed: e`), `Err` when the fallback's own transaction
+    /// cannot begin.
+    fn apply_copy_from_rows(
+        &self,
+        copy: &super::copy::CopyStatement,
+        decoder: super::copy::CopyStreamDecoder,
+    ) -> Result<std::result::Result<usize, Error>> {
         // Flush the decoder into the typed row batch and bulk-insert.
         let rows = {
             let _cps = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::Decode, 0);
@@ -3778,15 +3817,8 @@ where
                 .database
                 .copy_bulk_insert_for_session(self.session_id, &copy.table, &copy.columns, &rows)
             {
-                Some(Ok(_)) => {
-                    self.send_command_complete(&format!("COPY {total}")).await?;
-                    return self.send_ready_for_query().await;
-                }
-                Some(Err(e)) => {
-                    return self
-                        .send_error("ERROR", "XX000", &format!("COPY insert failed: {e}"), None, None)
-                        .await;
-                }
+                Some(Ok(_)) => return Ok(Ok(total)),
+                Some(Err(e)) => return Ok(Err(e)),
                 None => {} // fall back to the generic SQL path
             }
         }
@@ -3862,13 +3894,10 @@ where
                 }
             }
         }
-        if let Some(e) = copy_fallback_err {
-            return self
-                .send_error("ERROR", "XX000", &format!("COPY insert failed: {e}"), None, None)
-                .await;
-        }
-        self.send_command_complete(&format!("COPY {total}")).await?;
-        self.send_ready_for_query().await
+        Ok(match copy_fallback_err {
+            Some(e) => Err(e),
+            None => Ok(total),
+        })
     }
 
     /// COPY ... TO STDOUT (text format) — SELECT the rows and stream each as a

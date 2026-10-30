@@ -116,15 +116,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // `PgConnectionHandler::temp_namespace_guard` documents — the
         // interceptor lists tables without entering any engine funnel, so the
         // per-statement scoped state is not installed yet.
-        let (is_catalog, catalog_schema) = {
-            let _temp_ns = self.temp_namespace_guard();
-            match self.catalog.handle_query(&query) {
-                Ok(Some((schema, _rows))) => (Some(true), Some(schema)),
-                Ok(None) => (Some(false), None),
-                // Probe failed — leave the decision open; Execute keeps the
-                // legacy per-Execute scan for this statement.
-                Err(_) => (None, None),
-            }
+        //
+        // sprinter ccebc95977f1: the interceptor's text check runs here, on
+        // the worker; only a statement it may answer reads the catalog, off
+        // the async worker (`runtime_offload`). The planning below stays on
+        // the worker: a statement takes its one handoff where it executes.
+        let (is_catalog, catalog_schema) = if super::catalog::PgCatalog::may_intercept(&query) {
+            crate::runtime_offload::offload_statement(|| {
+                let _temp_ns = self.temp_namespace_guard();
+                match self.catalog.handle_query(&query) {
+                    Ok(Some((schema, _rows))) => (Some(true), Some(schema)),
+                    Ok(None) => (Some(false), None),
+                    // Probe failed — leave the decision open; Execute keeps the
+                    // legacy per-Execute scan for this statement.
+                    Err(_) => (None, None),
+                }
+            })
+        } else {
+            (Some(false), None)
         };
         // W2.3: for a plain row-returning query, take the Describe schema from
         // the SHARED parameterized plan cache — the very `Arc<LogicalPlan>` the
@@ -494,9 +503,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 // sprinter 1703dba8e82d: same namespace publication as Parse
                 // above, scoped to the synchronous interception only (the
                 // guard is `!Send` and must not cross the `.await`s below).
-                let catalog_result = {
-                    let _temp_ns = self.temp_namespace_guard();
-                    self.catalog.handle_query(&substituted_for_catalog)?
+                // sprinter ccebc95977f1: off the async worker
+                // (`runtime_offload`) when the interceptor may answer it.
+                let catalog_result = if super::catalog::PgCatalog::may_intercept(&substituted_for_catalog) {
+                    crate::runtime_offload::offload_statement(|| {
+                        let _temp_ns = self.temp_namespace_guard();
+                        self.catalog.handle_query(&substituted_for_catalog)
+                    })?
+                } else {
+                    None
                 };
                 if let Some(catalog_result) = catalog_result {
                     // Mark the portal complete and emit DataRows + CommandComplete

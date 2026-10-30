@@ -110,7 +110,8 @@ mod imp {
             if req.method == "initialized" {
                 continue;
             }
-            let resp = handle_rpc_with_db(db.as_ref(), req);
+            // sprinter ccebc95977f1: off the async worker (`runtime_offload`).
+            let resp = crate::runtime_offload::offload_statement(|| handle_rpc_with_db(db.as_ref(), req));
             let mut json = serde_json::to_string(&resp).unwrap_or_default();
             json.push('\n');
             write.write_all(json.as_bytes()).await?;
