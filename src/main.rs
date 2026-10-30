@@ -2264,6 +2264,9 @@ async fn start_server(
         }
         .to_string(),
         archive_source: ha_config.archive_sources.clone().unwrap_or_default(),
+        // Spec P5.2 §4: TOML only, like the settings above.
+        promote_without_fence: db_config.replication.promote_without_fence.clone(),
+        promote_fence_timeout: db_config.replication.promote_fence_timeout.clone(),
     };
 
     // CLI flags win over the config file for storage location/mode.
@@ -2496,7 +2499,11 @@ async fn start_server(
                 return Err(error);
             }
         }
-        let db = runtime.listener_database()?;
+        // Spec P5.2 §3 step 5: everything this function holds — the PgServer,
+        // the HTTP task, `db` itself — holds the placeholder, never the store;
+        // the store reaches the listeners through the serving watch only, so
+        // an online promotion can take it off and close it.
+        let db = runtime.placeholder();
         standby_runtime = Some(runtime);
         Some(db)
     } else {
@@ -2508,6 +2515,10 @@ async fn start_server(
     // node's storage options (taken before the configuration is moved).
     #[cfg(feature = "ha-tier1")]
     let cascade_config = (guarded_standby && ha_config.physical.cascade).then(|| db_config.clone());
+    // Spec P5.2 §3 step 7: the configuration an online promotion derives the
+    // primary's from (taken before it is moved).
+    #[cfg(feature = "ha-tier1")]
+    let standby_config = guarded_standby.then(|| db_config.clone());
 
     // Open database (in-memory mode avoids disk I/O for all operations)
     let db = if let Some(db) = standby_db {
@@ -2696,13 +2707,39 @@ async fn start_server(
     let pg_server = PgServer::with_shared_auth_manager(pg_config, Arc::clone(&db), Arc::clone(&auth_manager))?;
 
     // The database every new connection is served by. Fixed, except on a
-    // standby whose listeners opened on the placeholder before its store was
-    // attached: then it changes once, to the store (spec P1.3).
-    let (serving_db_tx, serving_db_rx) = tokio::sync::watch::channel(Arc::clone(&db));
+    // standby: its listeners open on the placeholder until its store is
+    // attached (spec P1.3), and an online promotion serves the placeholder,
+    // then the reopened primary's store (spec P5.2 §3).
+    #[cfg(feature = "ha-tier1")]
+    let initial_serving = match standby_runtime.as_ref() {
+        Some(runtime) => runtime.listener_database(),
+        None => Arc::clone(&db),
+    };
+    #[cfg(not(feature = "ha-tier1"))]
+    let initial_serving = Arc::clone(&db);
+    let (serving_db_tx, serving_db_rx) = tokio::sync::watch::channel(initial_serving);
     #[cfg(feature = "ha-tier1")]
     let serving_forward = standby_runtime
         .as_ref()
         .map(|runtime| runtime.publish_store(serving_db_tx.clone()));
+    // Spec P5.2 §3: what an online promotion asks of the main loop below
+    // (the replication services are polled there).
+    let (service_requests_tx, mut service_requests) = tokio::sync::mpsc::unbounded_channel::<ServiceRequest>();
+    #[cfg(feature = "ha-tier1")]
+    if let (Some(runtime), Some(config)) = (standby_runtime.as_mut(), standby_config) {
+        runtime.install_promoter(PromoterParts {
+            config,
+            ha_config: ha_config.clone(),
+            tls_cert: tls_cert.clone(),
+            tls_key: tls_key.clone(),
+            tls_post_quantum: ha_config.replication_tls.tls_post_quantum.unwrap_or(tls_post_quantum),
+            serving: serving_db_tx.clone(),
+            services: service_requests_tx.clone(),
+            cascading: cascade_config.is_some(),
+            pg_addr,
+        })?;
+    }
+    drop(service_requests_tx);
     drop(serving_db_tx);
 
     // Spec P2.1: a primary's replication is its ONE replication port
@@ -2712,8 +2749,15 @@ async fn start_server(
     #[cfg(feature = "ha-tier1")]
     let physical_source = if ha_role == "primary" {
         let node = configure_ha_node(&ha_config, &pg_addr.ip().to_string(), pg_addr.port())?;
-        let prepared =
-            prepare_physical_source(&ha_config, &node, pg_addr, &db.storage, replication_server_tls.as_ref()).await?;
+        let prepared = prepare_physical_source(
+            &ha_config,
+            &node,
+            pg_addr,
+            &db.storage,
+            replication_server_tls.as_ref(),
+            None,
+        )
+        .await?;
         // Spec P5.1 §11.A: configuring the primary role made the node
         // read-write; a fenced primary stays read-only.
         if db.storage.write_gate().is_fenced() {
@@ -2801,6 +2845,9 @@ async fn start_server(
                         http_addr
                     );
                 }
+                // Spec P5.2 §3 step 5: on a standby `db` is the placeholder —
+                // its HTTP surface is health-only and reads no database — so
+                // this task never holds the store an online promotion closes.
                 let http_db = Arc::clone(&db);
                 let mcp_token = ha_config.mcp_token.clone();
                 let allow_remote_mcp = ha_config.allow_remote_mcp;
@@ -2811,18 +2858,24 @@ async fn start_server(
                 // P2.1: a primary's `/health` also lists its standbys; spec
                 // P3.2 §4: so does a cascading standby (its downstreams),
                 // which also says `cascade: true`.
-                let primary_node = ha_role == "primary";
+                // Spec P5.2: read at every request — an online promotion
+                // makes a standby (cascading or not) a primary in-process.
                 let replication_status: Option<heliosdb_nano::api::ReplicationStatus> =
                     (ha_role != "standalone").then(|| {
                         let status: heliosdb_nano::api::ReplicationStatus = std::sync::Arc::new(move || {
                             let block = heliosdb_nano::standby_posture::node_block()?;
+                            let primary_now = block.role == "primary";
+                            // Spec P5.2 §8.J: a cascading port a promotion
+                            // stopped (or could not open again) is not
+                            // reported as serving.
+                            let cascading_now = cascading && !primary_now && cascade_serving();
                             Some(heliosdb_nano::api::ReplicationReport {
                                 ready: block.ready,
                                 block: serde_json::to_value(block).ok()?,
-                                standbys: (primary_node || cascading).then(primary_standbys_report),
+                                standbys: (primary_now || cascading_now).then(primary_standbys_report),
                                 // Spec P3.1: a sibling object, never inside the block.
                                 archive: Some(archive_health_report()),
-                                cascade: cascading.then_some(true),
+                                cascade: cascading_now.then_some(true),
                             })
                         });
                         status
@@ -3059,29 +3112,39 @@ async fn start_server(
                             max_connections,
                             &policy,
                         );
+                        // Spec P5.2 §1: registered before its database is
+                        // chosen, like a TCP session: a fence or a promotion
+                        // pushes its termination here too.
+                        let ticket = heliosdb_nano::protocol::postgres::sessions::registry()
+                            .admit(Some(format!("unix socket {}", sock_path.display())));
+                        let ticket_id = ticket.id();
                         let db_clone = Arc::clone(&pg_db.borrow());
+                        // Spec P5.2 §8.A: the database serving it.
+                        ticket.serve(db_clone.storage.instance_id());
                         let auth_clone = Arc::clone(&pg_uds_auth);
-                        let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let _conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let conn_policy = policy.clone();
                         // `_permit` is declared FIRST so it drops LAST — after
                         // the handler's `Drop` has rolled back and released the
                         // session — and it is never cloned: the slot is
                         // released exactly once.
-                        tokio::spawn(async move {
+                        let task = tokio::spawn(async move {
                             let _permit = permit;
                             if let Err(e) =
-                                heliosdb_nano::protocol::postgres::handler::handle_connection_unix_with_timeouts(
+                                heliosdb_nano::protocol::postgres::handler::handle_connection_unix_registered(
                                     db_clone,
                                     stream,
                                     auth_clone,
-                                    conn_id,
                                     conn_policy,
+                                    ticket,
                                 )
                                 .await
                             {
                                 tracing::debug!("PG UDS connection error: {}", e);
                             }
                         });
+                        heliosdb_nano::protocol::postgres::sessions::registry()
+                            .attach_abort(ticket_id, task.abort_handle());
                     }
                     Err(e) => {
                         tracing::error!("PG UDS accept error: {}", e);
@@ -3163,60 +3226,156 @@ async fn start_server(
     // Start server with graceful shutdown handling. The health
     // server runs in its own detached task (see above) so a failure
     // there cannot tear the database listener down.
-    #[cfg(feature = "ha-tier1")]
-    let (physical_stop, physical_shutdown) = tokio::sync::watch::channel(false);
     // A primary serves its own store; a cascading standby its store, once
-    // attached (spec P3.2 §4); any other node only waits for the shutdown.
+    // attached (spec P3.2 §4); any other node serves none. Spec P5.2 §3: in a
+    // set the online promotion adds to (the promoted standby's source) and
+    // removes from (its cascading source); a service that ends unasked ends
+    // the server, as before.
+    let mut services = ReplicationServices::default();
     #[cfg(feature = "ha-tier1")]
-    let mut physical_service: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>> = match cascade_plan {
-        Some(plan) => Box::pin(serve_cascade_source(plan, physical_shutdown)),
-        None => Box::pin(serve_physical_source(physical_source, physical_shutdown)),
-    };
-    #[cfg(feature = "ha-tier1")]
-    let mut physical_finished = false;
-
-    let server_result: Result<()> = tokio::select! {
-        biased;
-        // A standby's refusal ends serving only with `on_unrecoverable =
-        // "exit"`; by default it stays up in `needs_recovery` and this arm
-        // never completes (spec P1.3, field finding J2).
-        error = async {
-            #[cfg(feature = "ha-tier1")]
-            {
-                match standby_runtime.as_ref() {
-                    Some(runtime) => runtime.unrecoverable().await,
-                    // A primary's replication is its source future (below).
-                    None => std::future::pending::<Error>().await,
-                }
-            }
-            #[cfg(not(feature = "ha-tier1"))]
-            { std::future::pending::<Error>().await }
-        } => {
-            tracing::error!("Replication stopped; closing database listeners: {error}");
-            Err(error)
+    match cascade_plan {
+        Some(plan) => {
+            services.start(ServiceKind::Cascade, move |stop| {
+                Box::pin(serve_cascade_source(plan, stop))
+            });
+            note_cascade_serving(true);
         }
-        result = async {
-            #[cfg(feature = "ha-tier1")]
-            { (&mut physical_service).await }
-            #[cfg(not(feature = "ha-tier1"))]
-            { std::future::pending::<Result<()>>().await }
-        } => {
-            #[cfg(feature = "ha-tier1")]
-            { physical_finished = true; }
-            result.and_then(|()| Err(Error::network("physical source stopped unexpectedly")))
-        },
-        result = async {
+        None => {
+            if let Some(prepared) = physical_source {
+                services.start(ServiceKind::Primary, move |stop| {
+                    Box::pin(serve_physical_source(Some(prepared), stop))
+                });
+            }
+        }
+    }
+    let mut requests_open = true;
+    // Spec P5.2 §8.J: what a request prepares, polled with the listeners.
+    let mut preparing = Preparations::new();
+
+    let server_result: Result<()> = {
+        let serve = async {
             if guarded_standby {
-                pg_server.serve_with_listener_dynamic(pg_listener, serving_db_rx.clone()).await
+                pg_server
+                    .serve_with_listener_dynamic(pg_listener, serving_db_rx.clone())
+                    .await
             } else {
                 pg_server.serve_with_listener(pg_listener).await
             }
-        } => result,
-        signal = heliosdb_nano::wait_for_shutdown_signal() => {
-            println!();
-            println!("{}", "Received shutdown signal...".yellow());
-            tracing::info!("{signal} received — running clean shutdown");
-            Ok(())
+        };
+        tokio::pin!(serve);
+        let signal = heliosdb_nano::wait_for_shutdown_signal();
+        tokio::pin!(signal);
+        loop {
+            tokio::select! {
+                biased;
+                // A standby's refusal ends serving only with `on_unrecoverable =
+                // "exit"`; by default it stays up in `needs_recovery` and this arm
+                // never completes (spec P1.3, field finding J2).
+                error = async {
+                    #[cfg(feature = "ha-tier1")]
+                    {
+                        match standby_runtime.as_ref() {
+                            Some(runtime) => runtime.unrecoverable().await,
+                            // A primary's replication is its source future (below).
+                            None => std::future::pending::<Error>().await,
+                        }
+                    }
+                    #[cfg(not(feature = "ha-tier1"))]
+                    { std::future::pending::<Error>().await }
+                } => {
+                    tracing::error!("Replication stopped; closing database listeners: {error}");
+                    break Err(error);
+                }
+                (id, kind, result) = next_replication_service(&mut services) => {
+                    if kind == ServiceKind::Cascade {
+                        note_cascade_serving(false);
+                    }
+                    if let Some(result) = services.ended(id, kind, result) {
+                        break result;
+                    }
+                }
+                prepared = next_prepared(&mut preparing) => match prepared {
+                    #[cfg(feature = "ha-tier1")]
+                    Prepared::Cascade(Ok(Some(plan))) => {
+                        services.start(ServiceKind::Cascade, move |stop| {
+                            Box::pin(serve_cascade_source(plan, stop))
+                        });
+                        note_cascade_serving(true);
+                        info!("the cascading replication port serves downstream standbys again (the promotion was aborted)");
+                    }
+                    #[cfg(feature = "ha-tier1")]
+                    Prepared::Cascade(Ok(None)) => note_cascade_serving(false),
+                    #[cfg(feature = "ha-tier1")]
+                    Prepared::Cascade(Err(error)) => {
+                        note_cascade_serving(false);
+                        tracing::warn!(
+                            "the cascading replication port could not be opened again after the aborted promotion: \
+                             {error}; its downstream standbys reconnect once this standby restarts (/health says \
+                             cascade: absent meanwhile)"
+                        );
+                    }
+                    #[cfg(feature = "ha-tier1")]
+                    Prepared::Primary { prepared, reply } => match prepared {
+                        Ok(source) => {
+                            let endpoint = source.as_ref().map(|source| source.address.to_string());
+                            if let Some(source) = source {
+                                services.start(ServiceKind::Primary, move |stop| {
+                                    Box::pin(serve_physical_source(Some(source), stop))
+                                });
+                            }
+                            let _ = reply.send(Ok(endpoint));
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error.to_string()));
+                        }
+                    },
+                    #[cfg(not(feature = "ha-tier1"))]
+                    never => match never {},
+                },
+                request = service_requests.recv(), if requests_open => match request {
+                    None => requests_open = false,
+                    #[cfg(feature = "ha-tier1")]
+                    Some(ServiceRequest::StopCascade { done }) => {
+                        services.stop(ServiceKind::Cascade, Some(done));
+                        note_cascade_serving(false);
+                    }
+                    #[cfg(feature = "ha-tier1")]
+                    Some(ServiceRequest::RestartCascade) => {
+                        if let (Some(config), Some(runtime)) = (cascade_config.as_ref(), standby_runtime.as_ref()) {
+                            let (ha, dir, config, tls, store) = (
+                                ha_config.clone(),
+                                data_dir.clone(),
+                                config.clone(),
+                                replication_server_tls.clone(),
+                                runtime.store_watch(),
+                            );
+                            preparing.push(Box::pin(async move {
+                                Prepared::Cascade(
+                                    prepare_cascade_source(&ha, &dir, &config, pg_addr, tls.as_ref(), store).await,
+                                )
+                            }));
+                        }
+                    }
+                    #[cfg(feature = "ha-tier1")]
+                    Some(ServiceRequest::ServePrimary { engine, ha, tls, listener, reply }) => {
+                        preparing.push(Box::pin(async move {
+                            Prepared::Primary {
+                                prepared: prepare_promoted_primary(engine, *ha, tls, listener, pg_addr).await,
+                                reply,
+                            }
+                        }));
+                    }
+                    #[cfg(not(feature = "ha-tier1"))]
+                    Some(request) => match request {},
+                },
+                result = &mut serve => break result,
+                signal = &mut signal => {
+                    println!();
+                    println!("{}", "Received shutdown signal...".yellow());
+                    tracing::info!("{signal} received — running clean shutdown");
+                    break Ok(());
+                }
+            }
         }
     };
 
@@ -3232,15 +3391,10 @@ async fn start_server(
     }
     #[cfg(feature = "ha-tier1")]
     let server_result = {
-        let _ = physical_stop.send(true);
         // No commit may wait for a standby the source no longer serves: a
         // waiting one returns now instead of at its timeout.
         heliosdb_nano::replication::ha_state::ha_state().set_replication_serving(false);
-        let cleanup = if physical_finished {
-            Ok(())
-        } else {
-            (&mut physical_service).await
-        };
+        let cleanup = services.shutdown().await;
         if let Some(forward) = serving_forward {
             forward.abort();
             let _ = forward.await;
@@ -3821,7 +3975,9 @@ fn print_replication_identity(dir: &std::path::Path) {
                         record.node_id,
                         match record.old_primary_final_sequence {
                             Some(sequence) => format!("the old primary fenced at its sequence {sequence}"),
-                            None => "the old primary NOT fenced (--force)".to_string(),
+                            None => "the old primary NOT fenced (--force, or pg_promote past an unreachable \
+                                     primary)"
+                                .to_string(),
                         }
                     );
                 }
@@ -4018,7 +4174,10 @@ fn insecure_replication_banner(side: &str) -> String {
 /// refused, naming the keys. The files are loaded here, so a bad one refuses
 /// the start too. `None` without `tls_enabled`, and on every role but a
 /// primary or a cascading standby (spec P3.2 §4) — the only nodes that serve
-/// a replication port.
+/// a replication port. Spec P5.2 §8.I: on a standby that does not cascade
+/// these settings are no mistake: they are the keys it serves its
+/// replication port with once promoted online (`SELECT pg_promote`), so no
+/// warning is said there; the promotion resolves them for the primary role.
 #[cfg(feature = "ha-tier1")]
 fn resolve_replication_server_tls(
     ha_config: &HAConfig,
@@ -4032,7 +4191,15 @@ fn resolve_replication_server_tls(
     if !settings.tls_enabled {
         return Ok(None);
     }
-    let cascading = ha_config.role.eq_ignore_ascii_case("standby") && ha_config.physical.cascade;
+    let standby = ha_config.role.eq_ignore_ascii_case("standby");
+    let cascading = standby && ha_config.physical.cascade;
+    if standby && !cascading {
+        tracing::debug!(
+            "--replication-tls ([replication] tls_enabled): this standby serves no replication port now; it serves \
+             one with these keys once it is promoted online"
+        );
+        return Ok(None);
+    }
     if !ha_config.role.eq_ignore_ascii_case("primary") && !cascading {
         tracing::warn!(
             "--replication-tls ([replication] tls_enabled) has no effect on a {}: only a primary (or a cascading \
@@ -4384,8 +4551,10 @@ fn replication_transport(
     })
 }
 
-/// Everything the standby's supervisor needs.
+/// Everything the standby's supervisor needs. Cloned when an aborted online
+/// promotion starts the supervisor again (spec P5.2 §3 step 8).
 #[cfg(feature = "ha-tier1")]
+#[derive(Clone)]
 struct StandbyPlan {
     data_dir: PathBuf,
     /// The node's configuration (storage path = `data_dir`): the receiver's
@@ -4409,6 +4578,7 @@ struct StandbyPlan {
 /// Spec P3.1: what a standby's WAL archiver needs once its binding (the
 /// history it follows) is known.
 #[cfg(feature = "ha-tier1")]
+#[derive(Clone)]
 struct StandbyArchivePlan {
     settings: heliosdb_nano::replication::archiver::ArchiveSettings,
     node_id: uuid::Uuid,
@@ -4504,11 +4674,69 @@ struct StandbyRuntime {
     posture: heliosdb_nano::standby_posture::PostureHandle,
     /// The serving database, once the store is attached.
     store: tokio::sync::watch::Receiver<Option<std::sync::Arc<EmbeddedDatabase>>>,
+    /// Spec P5.2 §3: its sender, kept so the online promotion can take the
+    /// store off it (step 4) and an aborted one can attach a new one.
+    store_tx: tokio::sync::watch::Sender<Option<std::sync::Arc<EmbeddedDatabase>>>,
     /// A refusal the receiver cannot resolve by itself.
     refusal: tokio::sync::watch::Receiver<Option<String>>,
-    stop: tokio::sync::watch::Sender<bool>,
-    supervisor: Option<tokio::task::JoinHandle<()>>,
+    refusal_tx: tokio::sync::watch::Sender<Option<String>>,
+    /// The running supervisor, shared with the online promotion, which
+    /// stops it (step 3) and — aborted — starts it again.
+    control: std::sync::Arc<StandbyControl>,
     exit_on_unrecoverable: bool,
+    /// The empty database the listeners serve while there is no store
+    /// (spec P1.3), created once at start so that no listener, the HTTP task
+    /// or the start path ever holds the store itself (spec P5.2 §3 step 5).
+    placeholder: std::sync::Arc<EmbeddedDatabase>,
+    /// A standby following its primary (not an archive-only one): what its
+    /// supervisor is started from, and what its online promotion needs.
+    plan: Option<StandbyPlan>,
+    /// Spec P5.2: the online promotion's host, once installed.
+    promotion: Option<std::sync::Arc<PromotionHost>>,
+}
+
+/// The standby's supervisor: its stop, its task, and (spec P5.2 §3 step 2)
+/// its receiver's command channel.
+#[cfg(feature = "ha-tier1")]
+struct Supervisor {
+    stop: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+    commands: Option<tokio::sync::mpsc::Sender<heliosdb_nano::replication::physical_receiver::ReceiverCommand>>,
+}
+
+/// The supervisor slot the runtime and the online promotion share.
+#[cfg(feature = "ha-tier1")]
+#[derive(Default)]
+struct StandbyControl {
+    supervisor: parking_lot::Mutex<Option<Supervisor>>,
+    /// Spec P5.2 §8.J: the runtime shut down — an aborted promotion's
+    /// restore never starts a supervisor after it. Set under the
+    /// `supervisor` lock, and read under it before a supervisor is put back.
+    closed: std::sync::atomic::AtomicBool,
+}
+
+/// Start the supervisor of a standby following its primary
+/// ([`run_physical_standby`]) with a command channel to its receiver.
+#[cfg(feature = "ha-tier1")]
+fn spawn_standby_supervisor(
+    plan: StandbyPlan,
+    store: tokio::sync::watch::Sender<Option<std::sync::Arc<EmbeddedDatabase>>>,
+    refusal: tokio::sync::watch::Sender<Option<String>>,
+) -> Supervisor {
+    let (stop, shutdown) = tokio::sync::watch::channel(false);
+    let (commands, receiver_commands) = tokio::sync::mpsc::channel(4);
+    let task = tokio::spawn(run_physical_standby(
+        plan,
+        store,
+        refusal,
+        shutdown,
+        Some(receiver_commands),
+    ));
+    Supervisor {
+        stop,
+        task,
+        commands: Some(commands),
+    }
 }
 
 #[cfg(feature = "ha-tier1")]
@@ -4581,17 +4809,28 @@ impl StandbyRuntime {
             tracker,
             archive: standby_archive_plan(ha_config, config, node.node_id),
         };
-        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        // Created before the supervisor: the store, attached later, is the
+        // newest database of the process.
+        let placeholder = standby_placeholder()?;
         let (store_tx, store) = tokio::sync::watch::channel(None);
         let (refusal_tx, refusal) = tokio::sync::watch::channel(None);
-        let supervisor = tokio::spawn(run_physical_standby(plan, store_tx, refusal_tx, shutdown));
+        let control = std::sync::Arc::new(StandbyControl::default());
+        *control.supervisor.lock() = Some(spawn_standby_supervisor(
+            plan.clone(),
+            store_tx.clone(),
+            refusal_tx.clone(),
+        ));
         Ok(Self {
             posture,
             store,
+            store_tx,
             refusal,
-            stop,
-            supervisor: Some(supervisor),
+            refusal_tx,
+            control,
             exit_on_unrecoverable: ha_config.exit_on_unrecoverable,
+            placeholder,
+            plan: Some(plan),
+            promotion: None,
         })
     }
 
@@ -4632,17 +4871,35 @@ impl StandbyRuntime {
             tracker,
             archive: standby_archive_plan(ha_config, config, node.node_id),
         };
+        let placeholder = standby_placeholder()?;
         let (stop, shutdown) = tokio::sync::watch::channel(false);
         let (store_tx, store) = tokio::sync::watch::channel(None);
         let (refusal_tx, refusal) = tokio::sync::watch::channel(None);
-        let supervisor = tokio::spawn(supervise_archive_standby(plan, store_tx, refusal_tx, shutdown));
+        let task = tokio::spawn(supervise_archive_standby(
+            plan,
+            store_tx.clone(),
+            refusal_tx.clone(),
+            shutdown,
+        ));
+        let control = std::sync::Arc::new(StandbyControl::default());
+        *control.supervisor.lock() = Some(Supervisor {
+            stop,
+            task,
+            commands: None,
+        });
         Ok(Self {
             posture,
             store,
+            store_tx,
             refusal,
-            stop,
-            supervisor: Some(supervisor),
+            refusal_tx,
+            control,
             exit_on_unrecoverable: ha_config.exit_on_unrecoverable,
+            placeholder,
+            // Spec P5.2: an archive-only standby is promoted offline only
+            // (`pg_promote` names the command): it has no primary to fence.
+            plan: None,
+            promotion: None,
         })
     }
 
@@ -4702,20 +4959,29 @@ impl StandbyRuntime {
     }
 
     /// The database the listeners open with: the serving store, or — while
-    /// the standby has none — an empty in-memory placeholder whose sessions
-    /// the guard keeps from reading anything (`reject_guarded_standby_statement`).
-    fn listener_database(&self) -> Result<std::sync::Arc<EmbeddedDatabase>> {
+    /// the standby has none — the empty placeholder whose sessions the guard
+    /// keeps from reading anything (`reject_guarded_standby_statement`).
+    fn listener_database(&self) -> std::sync::Arc<EmbeddedDatabase> {
         if let Some(database) = self.store.borrow().clone() {
-            return Ok(database);
+            return database;
         }
         info!(
             "physical standby has no data store yet: its listeners serve an empty placeholder that refuses \
              data reads until the store is attached"
         );
-        Ok(std::sync::Arc::new(EmbeddedDatabase::new_in_memory()?))
+        std::sync::Arc::clone(&self.placeholder)
     }
 
-    /// Hand the store to the listeners once it is attached (at most once).
+    /// The empty placeholder (spec P5.2 §3 step 5: what everything but the
+    /// serving watch is handed instead of the store).
+    fn placeholder(&self) -> std::sync::Arc<EmbeddedDatabase> {
+        std::sync::Arc::clone(&self.placeholder)
+    }
+
+    /// Hand every store attached from now on to the listeners: the first
+    /// one, and (spec P5.2 §3 step 8) the one an aborted promotion attaches
+    /// again. A store taken off (`None`) is not forwarded: the promotion
+    /// publishes the placeholder itself.
     fn publish_store(
         &self,
         serving: tokio::sync::watch::Sender<std::sync::Arc<EmbeddedDatabase>>,
@@ -4725,18 +4991,70 @@ impl StandbyRuntime {
             loop {
                 let attached = store.borrow_and_update().clone();
                 if let Some(database) = attached {
-                    let replaced = !std::sync::Arc::ptr_eq(&serving.borrow(), &database);
-                    serving.send_replace(database);
-                    if replaced {
+                    if !std::sync::Arc::ptr_eq(&serving.borrow(), &database) {
+                        serving.send_replace(database);
                         info!("physical standby store attached: new connections are served from it");
                     }
-                    return;
                 }
                 if store.changed().await.is_err() {
                     return;
                 }
             }
         })
+    }
+
+    /// Spec P5.2: make this standby promotable online (`SELECT
+    /// pg_promote(…)`), when it follows a primary. `parts` are the start
+    /// path's own: the serving watch, the main loop's service requests, how
+    /// this node serves as the primary it would become.
+    fn install_promoter(&mut self, parts: PromoterParts) -> Result<()> {
+        let Some(plan) = self.plan.clone() else {
+            return Ok(());
+        };
+        let settings =
+            heliosdb_nano::replication::promote::online::OnlineSettings::from_config(&parts.config.replication)?;
+        let host = std::sync::Arc::new(PromotionHost {
+            data_dir: plan.data_dir.clone(),
+            config: parts.config.clone(),
+            primary: PrimaryPlan {
+                data_dir: plan.data_dir.clone(),
+                config: parts.config,
+                ha: parts.ha_config,
+                tls_cert: parts.tls_cert,
+                tls_key: parts.tls_key,
+                tls_post_quantum: parts.tls_post_quantum,
+            },
+            posture: self.posture.clone(),
+            plan,
+            placeholder: std::sync::Arc::clone(&self.placeholder),
+            store: self.store_tx.clone(),
+            refusal: self.refusal_tx.clone(),
+            serving: parts.serving,
+            services: parts.services,
+            control: std::sync::Arc::clone(&self.control),
+            cascading: parts.cascading,
+            pg_addr: parts.pg_addr,
+            detached: parking_lot::Mutex::new(None),
+            released: parking_lot::Mutex::new(None),
+            bound: parking_lot::Mutex::new(None),
+        });
+        heliosdb_nano::replication::promote::online::install(
+            std::sync::Arc::clone(&host)
+                as std::sync::Arc<dyn heliosdb_nano::replication::promote::online::StandbyHost>,
+            settings,
+        );
+        info!(
+            "this standby can be promoted online: SELECT pg_promote(true, N) on its PostgreSQL port (fence without \
+             an answer: {}, fence timeout {} s)",
+            if settings.allow_without_fence {
+                "allow"
+            } else {
+                "refuse"
+            },
+            settings.fence_timeout.as_secs()
+        );
+        self.promotion = Some(host);
+        Ok(())
     }
 
     /// Completes only when a refusal arrives and `on_unrecoverable = "exit"`;
@@ -4758,11 +5076,20 @@ impl StandbyRuntime {
     }
 
     /// Stop the supervisor and wait for it: its receiver closes at a command
-    /// boundary (an in-flight fsync is not interrupted).
+    /// boundary (an in-flight fsync is not interrupted). The online promoter
+    /// goes first: the process-global slot must not keep the host — and the
+    /// store it may hold — past the process's clean close.
     async fn shutdown(mut self) {
-        let _ = self.stop.send(true);
-        if let Some(task) = self.supervisor.take() {
-            if tokio::time::timeout(std::time::Duration::from_secs(60), task)
+        heliosdb_nano::replication::promote::online::uninstall();
+        self.promotion = None;
+        let supervisor = {
+            let mut slot = self.control.supervisor.lock();
+            self.control.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            slot.take()
+        };
+        if let Some(supervisor) = supervisor {
+            let _ = supervisor.stop.send(true);
+            if tokio::time::timeout(std::time::Duration::from_secs(60), supervisor.task)
                 .await
                 .is_err()
             {
@@ -4777,7 +5104,839 @@ impl Drop for StandbyRuntime {
     fn drop(&mut self) {
         // An early startup error: ask the supervisor to stop; the process is
         // about to exit with that error.
-        let _ = self.stop.send(true);
+        if let Some(supervisor) = self.control.supervisor.lock().as_ref() {
+            let _ = supervisor.stop.send(true);
+        }
+    }
+}
+
+/// The empty in-memory database a standby's listeners serve while it has no
+/// store, marked so the PostgreSQL wire ends its sessions once the node is
+/// promoted (spec P5.2 §3).
+#[cfg(feature = "ha-tier1")]
+fn standby_placeholder() -> Result<std::sync::Arc<EmbeddedDatabase>> {
+    let placeholder = std::sync::Arc::new(EmbeddedDatabase::new_in_memory()?);
+    heliosdb_nano::standby_posture::mark_placeholder(&placeholder.storage);
+    Ok(placeholder)
+}
+
+/// What the start path hands the online promotion ([`StandbyRuntime::install_promoter`]).
+#[cfg(feature = "ha-tier1")]
+struct PromoterParts {
+    /// The standby's database configuration (storage path = its data dir).
+    config: Config,
+    ha_config: HAConfig,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    tls_post_quantum: bool,
+    serving: tokio::sync::watch::Sender<std::sync::Arc<EmbeddedDatabase>>,
+    services: tokio::sync::mpsc::UnboundedSender<ServiceRequest>,
+    cascading: bool,
+    /// The PostgreSQL listener's address: the promoted primary's replication
+    /// port binds on its IP (spec P2.2).
+    pg_addr: std::net::SocketAddr,
+}
+
+/// Spec P5.2 §3 step 8: how a promoted standby serves as the primary — the
+/// configuration `start --replication-role primary` would run it with,
+/// derived from the standby's own.
+#[cfg(feature = "ha-tier1")]
+#[derive(Clone)]
+struct PrimaryPlan {
+    data_dir: PathBuf,
+    config: Config,
+    ha: HAConfig,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    tls_post_quantum: bool,
+}
+
+#[cfg(feature = "ha-tier1")]
+impl PrimaryPlan {
+    /// The primary's database and HA configuration and its replication-port
+    /// TLS: the standby's with `replication.role = primary`; its physical
+    /// source enabled as a primary start enables it
+    /// ([`auto_enable_physical_source`]: the replication token makes it on,
+    /// the export directory defaults beside the data directory) and
+    /// validated ([`validate_physical_source`]); WAL retention the primary
+    /// defaults of `[replication.physical]`; the same replication port,
+    /// token, TLS (spec P5.2 §8.I: a standby's `[replication] tls_*` are the
+    /// keys it serves with once promoted) and archive settings; the same
+    /// node id. `create`: the reopen creates the default export directory as
+    /// a primary start does; the preflight (spec P5.2 §8.F) only names it and
+    /// validates what exists, so a refused promotion leaves nothing behind.
+    fn derive(
+        &self,
+        create: bool,
+    ) -> Result<(
+        Config,
+        HAConfig,
+        Option<heliosdb_nano::replication::physical_tls::ReplicationServerTls>,
+    )> {
+        let mut config = self.config.clone();
+        config.replication.role = "primary".to_string();
+        config.replication.physical.cascade = false;
+        config.storage.path = Some(self.data_dir.clone());
+        config.storage.memory_only = false;
+        if create {
+            auto_enable_physical_source(&mut config.replication, None, false, &self.data_dir)?;
+            validate_physical_source(
+                &config.replication.physical,
+                config.replication.token_file.as_deref(),
+                "primary",
+                false,
+                &self.data_dir,
+            )?;
+        } else {
+            preflight_physical_source(&mut config.replication, &self.data_dir)?;
+        }
+        let mut ha = self.ha.clone();
+        ha.role = "primary".to_string();
+        ha.physical = config.replication.physical.clone();
+        ha.archive_sources = None;
+        if let Some(node) = heliosdb_nano::replication::ha_state::ha_state().get_config() {
+            ha.node_id = Some(node.node_id.to_string());
+        }
+        let tls = resolve_replication_server_tls(
+            &ha,
+            self.tls_cert.as_ref(),
+            self.tls_key.as_ref(),
+            self.tls_post_quantum,
+            &config.server,
+        )?;
+        Ok((config, ha, tls))
+    }
+}
+
+/// Spec P5.2 §8.F: [`auto_enable_physical_source`] and
+/// [`validate_physical_source`] as a promotion's preflight runs them — the
+/// same decisions, with nothing created: the default export directory
+/// beside the data directory is named (the reopen creates it) and validated
+/// only once it exists; a configured one is validated as at a start.
+#[cfg(feature = "ha-tier1")]
+fn preflight_physical_source(
+    replication: &mut heliosdb_nano::config::ReplicationConfig,
+    data_dir: &std::path::Path,
+) -> Result<()> {
+    if !replication.physical.enabled {
+        if replication.token_file.is_none() {
+            // It would serve no replication port (said at the reopen).
+            return Ok(());
+        }
+        replication.physical.enabled = true;
+    }
+    let default_export = replication.physical.export_dir.is_none();
+    if default_export {
+        replication.physical.export_dir = Some(physical_export_dir_path(data_dir)?);
+    }
+    let exists = replication
+        .physical
+        .export_dir
+        .as_ref()
+        .is_some_and(|dir| std::fs::symlink_metadata(dir).is_ok());
+    if !default_export || exists {
+        return validate_physical_source(
+            &replication.physical,
+            replication.token_file.as_deref(),
+            "primary",
+            false,
+            data_dir,
+        );
+    }
+    replication.physical.validate()?;
+    let token = replication.token_file.as_deref().ok_or_else(|| {
+        Error::config("physical source requires --replication-token-file or [replication] token_file")
+    })?;
+    heliosdb_nano::replication::read_replication_token(token)?;
+    Ok(())
+}
+
+/// Spec P5.2 §3: what the online promotion asks of the start path's main
+/// loop, which owns the replication services (it polls them, and stops them
+/// at shutdown).
+enum ServiceRequest {
+    /// Step 5: stop the cascading source (its sessions refused, its port and
+    /// store released); `done` once it ended.
+    #[cfg(feature = "ha-tier1")]
+    StopCascade { done: tokio::sync::oneshot::Sender<()> },
+    /// Abort: serve downstream standbys again, once the store is attached.
+    #[cfg(feature = "ha-tier1")]
+    RestartCascade,
+    /// Step 8: serve `engine` as the primary — its replication port,
+    /// archiver and gap fill (`prepare_physical_source`), the primary
+    /// posture; `reply` the replication endpoint, or why not.
+    #[cfg(feature = "ha-tier1")]
+    ServePrimary {
+        engine: std::sync::Arc<heliosdb_nano::storage::StorageEngine>,
+        ha: Box<HAConfig>,
+        tls: Option<heliosdb_nano::replication::physical_tls::ReplicationServerTls>,
+        /// Bound at the preflight (spec P5.2 §8.F); `None`: bound now — a
+        /// cascading standby's port, which its cascading source held until
+        /// replication stopped.
+        listener: Option<BoundReplication>,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<Option<String>, String>>,
+    },
+}
+
+/// Spec P5.2 §8.J: what a service request prepared, ready to be served. The
+/// preparation runs as a future the main loop polls alongside the
+/// listeners — never awaited inside a request's arm, which would stall the
+/// PostgreSQL accept loop for as long as a port binds or an archive opens.
+enum Prepared {
+    /// The cascading port bound again after an aborted promotion.
+    #[cfg(feature = "ha-tier1")]
+    Cascade(Result<Option<CascadePlan>>),
+    /// The promoted primary's source, and who waits for its endpoint.
+    #[cfg(feature = "ha-tier1")]
+    Primary {
+        prepared: Result<Option<PreparedPhysicalSource>>,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<Option<String>, String>>,
+    },
+}
+
+/// The preparations the main loop polls ([`Prepared`]).
+type Preparations = futures::stream::FuturesUnordered<std::pin::Pin<Box<dyn std::future::Future<Output = Prepared>>>>;
+
+/// The next preparation to complete; never, while none runs.
+async fn next_prepared(preparing: &mut Preparations) -> Prepared {
+    use futures::StreamExt;
+    match preparing.next().await {
+        Some(prepared) => prepared,
+        None => std::future::pending().await,
+    }
+}
+
+/// Spec P5.2 §8.J: whether this standby's cascading port serves its
+/// downstream standbys now — `/health`'s `cascade` (false once a promotion
+/// stopped it, or when restarting it after an aborted one failed).
+static CASCADE_SERVING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+fn note_cascade_serving(serving: bool) {
+    CASCADE_SERVING.store(serving, std::sync::atomic::Ordering::Release);
+}
+
+fn cascade_serving() -> bool {
+    CASCADE_SERVING.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Which replication service a future of [`ReplicationServices`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+enum ServiceKind {
+    Primary,
+    Cascade,
+}
+
+/// Services asked to stop together, and who is told once all ended.
+#[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+struct Stopping {
+    ids: Vec<u64>,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+/// Spec P5.2 §3: the replication services the main loop polls — a
+/// primary's physical source, a cascading standby's — in a set one can be
+/// added to after start (a promoted standby's source) and removed from (the
+/// cascading source a promotion stops). Each is tracked by its own id
+/// (spec §8.J): a service of a kind started again after another of that
+/// kind was asked to stop is never taken for it. A service that ends
+/// without being asked to is an error of the server, as before.
+#[derive(Default)]
+#[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+struct ReplicationServices {
+    next_id: u64,
+    running: futures::stream::FuturesUnordered<
+        std::pin::Pin<Box<dyn std::future::Future<Output = (u64, ServiceKind, Result<()>)>>>,
+    >,
+    stops: Vec<(u64, ServiceKind, tokio::sync::watch::Sender<bool>)>,
+    /// Asked to stop: their end is expected, `done` is told.
+    stopping: Vec<Stopping>,
+}
+
+#[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+impl ReplicationServices {
+    fn start(
+        &mut self,
+        kind: ServiceKind,
+        service: impl FnOnce(
+            tokio::sync::watch::Receiver<bool>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>>>>,
+    ) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let (stop, shutdown) = tokio::sync::watch::channel(false);
+        let future = service(shutdown);
+        self.running.push(Box::pin(async move { (id, kind, future.await) }));
+        self.stops.push((id, kind, stop));
+        id
+    }
+
+    /// Ask the `kind` services to stop; `done` once they all ended (at once
+    /// when none runs).
+    fn stop(&mut self, kind: ServiceKind, done: Option<tokio::sync::oneshot::Sender<()>>) {
+        let mut ids = Vec::new();
+        self.stops.retain(|(id, running, stop)| {
+            if *running == kind {
+                let _ = stop.send(true);
+                ids.push(*id);
+                false
+            } else {
+                true
+            }
+        });
+        if ids.is_empty() {
+            if let Some(done) = done {
+                let _ = done.send(());
+            }
+        } else {
+            self.stopping.push(Stopping { ids, done });
+        }
+    }
+
+    /// Service `id` ended: `None` when it was asked to, else the server's
+    /// error.
+    fn ended(&mut self, id: u64, kind: ServiceKind, result: Result<()>) -> Option<Result<()>> {
+        self.stops.retain(|(running, _, _)| *running != id);
+        if let Some(index) = self.stopping.iter().position(|group| group.ids.contains(&id)) {
+            if let Err(error) = result {
+                tracing::warn!("the {kind:?} replication service stopped with: {error}");
+            }
+            let finished = self.stopping.get_mut(index).is_some_and(|group| {
+                group.ids.retain(|stopped| *stopped != id);
+                group.ids.is_empty()
+            });
+            if finished {
+                let group = self.stopping.remove(index);
+                if let Some(done) = group.done {
+                    let _ = done.send(());
+                }
+            }
+            return None;
+        }
+        Some(result.and_then(|()| Err(Error::network("physical source stopped unexpectedly"))))
+    }
+
+    /// Stop every service and wait for them; the first error, if any.
+    async fn shutdown(&mut self) -> Result<()> {
+        use futures::StreamExt;
+        for (_, _, stop) in self.stops.drain(..) {
+            let _ = stop.send(true);
+        }
+        let mut outcome = Ok(());
+        while let Some((id, _, result)) = self.running.next().await {
+            if let Some(index) = self.stopping.iter().position(|group| group.ids.contains(&id)) {
+                let finished = self.stopping.get_mut(index).is_some_and(|group| {
+                    group.ids.retain(|stopped| *stopped != id);
+                    group.ids.is_empty()
+                });
+                if finished {
+                    if let Some(done) = self.stopping.remove(index).done {
+                        let _ = done.send(());
+                    }
+                }
+            }
+            if let Err(error) = result {
+                if outcome.is_ok() {
+                    outcome = Err(error);
+                }
+            }
+        }
+        outcome
+    }
+}
+
+/// The next replication service to end; never, while none runs (the set is
+/// polled again after a request may have added one).
+async fn next_replication_service(services: &mut ReplicationServices) -> (u64, ServiceKind, Result<()>) {
+    use futures::StreamExt;
+    match services.running.next().await {
+        Some(ended) => ended,
+        None => std::future::pending().await,
+    }
+}
+
+/// Spec P5.2 §3 step 8: prepare the promoted store `engine` to serve as the
+/// primary — what a primary's start does after its database opened: the HA
+/// node configuration (role primary, read-write), the replication port (the
+/// one the preflight bound, else bound now) with its archiver
+/// (`<archive>/<history>/<epoch>/`) and gap fill, the primary posture
+/// (`/health`, the SQL probes). The main loop adds the source to its
+/// services. `None`: no physical source.
+#[cfg(feature = "ha-tier1")]
+async fn prepare_promoted_primary(
+    engine: std::sync::Arc<heliosdb_nano::storage::StorageEngine>,
+    ha: HAConfig,
+    tls: Option<heliosdb_nano::replication::physical_tls::ReplicationServerTls>,
+    listener: Option<BoundReplication>,
+    pg_addr: std::net::SocketAddr,
+) -> Result<Option<PreparedPhysicalSource>> {
+    let node = configure_ha_node(&ha, &pg_addr.ip().to_string(), pg_addr.port())?;
+    let prepared = prepare_physical_source(&ha, &node, pg_addr, &engine, tls.as_ref(), listener).await?;
+    heliosdb_nano::replication::ha_state::ha_state().set_read_only(false);
+    heliosdb_nano::standby_posture::install_primary(heliosdb_nano::standby_posture::PrimaryStatus {
+        role: "primary",
+        engine: std::sync::Arc::downgrade(&engine),
+        endpoint: prepared.as_ref().map(|source| source.address.to_string()),
+        sync_mode: ha.sync_mode.clone(),
+        tls: prepared.as_ref().is_some_and(|source| source.tls.is_some()),
+    });
+    Ok(prepared)
+}
+
+/// Spec P5.2 §3: the online promotion's host — the parts of a running
+/// standby `replication::promote::online` takes off the listeners (step 2),
+/// stops (step 5), releases (step 6), reopens as the primary (step 8) and,
+/// when the promotion is aborted, restores.
+#[cfg(feature = "ha-tier1")]
+struct PromotionHost {
+    data_dir: PathBuf,
+    /// The standby's database configuration: the conversion's storage options.
+    config: Config,
+    primary: PrimaryPlan,
+    posture: heliosdb_nano::standby_posture::PostureHandle,
+    plan: StandbyPlan,
+    placeholder: std::sync::Arc<EmbeddedDatabase>,
+    store: tokio::sync::watch::Sender<Option<std::sync::Arc<EmbeddedDatabase>>>,
+    refusal: tokio::sync::watch::Sender<Option<String>>,
+    /// What every new PostgreSQL connection is served by (the listeners'
+    /// watch; it lives as long as this sender, spec P5.2 §3 step 8).
+    serving: tokio::sync::watch::Sender<std::sync::Arc<EmbeddedDatabase>>,
+    services: tokio::sync::mpsc::UnboundedSender<ServiceRequest>,
+    control: std::sync::Arc<StandbyControl>,
+    cascading: bool,
+    pg_addr: std::net::SocketAddr,
+    /// The store taken off the listeners (step 2), released at step 6 (or
+    /// put back by an abort).
+    detached: parking_lot::Mutex<Option<std::sync::Arc<EmbeddedDatabase>>>,
+    /// What step 6 proves closed; an aborted promotion waits for it before
+    /// the standby reopens its store.
+    released: parking_lot::Mutex<Option<StoreHandles>>,
+    /// Spec P5.2 §8.F: the replication listener the preflight bound, handed
+    /// to the primary at the reopen (dropped — the port closed — by an
+    /// abort).
+    bound: parking_lot::Mutex<Option<BoundReplication>>,
+}
+
+/// The engine and the RocksDB handle of a store, held weakly: dead once the
+/// store is closed and its LOCK released.
+#[cfg(feature = "ha-tier1")]
+#[derive(Clone)]
+struct StoreHandles {
+    engine: std::sync::Weak<heliosdb_nano::storage::StorageEngine>,
+    handle: std::sync::Weak<rocksdb::DB>,
+}
+
+#[cfg(feature = "ha-tier1")]
+impl StoreHandles {
+    fn of(database: &EmbeddedDatabase) -> Self {
+        Self {
+            engine: std::sync::Arc::downgrade(&database.storage),
+            handle: std::sync::Arc::downgrade(&database.storage.db()),
+        }
+    }
+
+    fn closed(&self) -> bool {
+        self.engine.strong_count() == 0 && self.handle.strong_count() == 0
+    }
+
+    fn holders(&self) -> String {
+        format!(
+            "its engine is held {} time(s) and its RocksDB handle {} time(s)",
+            self.engine.strong_count(),
+            self.handle.strong_count()
+        )
+    }
+}
+
+/// Spec P5.2 §3 step 6: who still holds a store the promotion must close —
+/// a bug class, never an operator error: by step 6 every session of the
+/// store is gone (step 3) and replication is stopped (step 5), so only the
+/// runtime's own handles may be left.
+#[cfg(feature = "ha-tier1")]
+fn release_diagnostics(database_holders: usize, handles: &StoreHandles, budget: std::time::Duration) -> String {
+    let sessions = heliosdb_nano::protocol::postgres::sessions::registry().sessions();
+    format!(
+        "the standby's store is still held {} s after replication stopped: the serving database by \
+         {database_holders} holder(s) besides the promotion, {}; PostgreSQL sessions still registered: {}. This is a \
+         bug to report with this line",
+        budget.as_secs(),
+        handles.holders(),
+        heliosdb_nano::replication::promote::online::describe_sessions(&sessions)
+    )
+}
+
+#[cfg(feature = "ha-tier1")]
+#[async_trait::async_trait]
+impl heliosdb_nano::replication::promote::online::StandbyHost for PromotionHost {
+    async fn preflight(
+        &self,
+    ) -> std::result::Result<
+        heliosdb_nano::replication::promote::online::StandbyFacts,
+        heliosdb_nano::replication::promote::online::Refusal,
+    > {
+        use heliosdb_nano::replication::promote::online::{
+            interrupted_fast_forward, promotion_identity, Refusal, StandbyFacts,
+        };
+        let dir = self.data_dir.display().to_string();
+        let snapshot = self.posture.snapshot();
+        if !snapshot.ready() {
+            return Err(Refusal::new(format!(
+                "this standby is not ready to be promoted ({}): a standby is promoted while it streams from its \
+                 primary (or reconnects within [replication] max_standby_lag); bring it up to date first — stop it \
+                 and run `heliosdb-nano recover --from-primary --data-dir {dir}` — or promote it offline: stop it \
+                 and run `heliosdb-nano promote --force --data-dir {dir}`",
+                snapshot.not_ready_message()
+            )));
+        }
+        let attached = self.store.borrow().clone();
+        let Some(database) = attached else {
+            return Err(Refusal::new(
+                "this standby has no data store attached (it is installing its copy, or restoring it after an \
+                 aborted promotion): promote it once it streams",
+            ));
+        };
+        let engine = std::sync::Arc::clone(&database.storage);
+        let store_engine = engine.instance_id();
+        drop(database);
+        match interrupted_fast_forward(&engine) {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(Refusal::new(format!(
+                    "this standby carries an interrupted fast-forward: stop it and finish it with `heliosdb-nano \
+                     recover --from-primary --data-dir {dir}` first"
+                )))
+            }
+            Err(reason) => {
+                return Err(Refusal::new(format!(
+                    "this standby's node-local state cannot be read ({reason}): it is not promoted"
+                )))
+            }
+        }
+        let epoch = engine.replication_epoch();
+        let history = heliosdb_nano::replication::checkpoint_transfer::physical_stage_history(&self.data_dir).map_err(
+            |error| {
+                Refusal::new(format!(
+                    "the physical standby marker of {dir} cannot be read ({error}): it is not promoted"
+                ))
+            },
+        )?;
+        let (config, ha, tls) = self.primary.derive(false).map_err(|error| {
+            Refusal::new(format!(
+                "this standby could not serve as the primary with its configuration ({error}): fix the \
+                 configuration and restart it, or promote it offline (`heliosdb-nano promote --data-dir {dir}`) and \
+                 start it as the primary"
+            ))
+        })?;
+        let serves_replication = config.replication.physical.enabled;
+        // Spec P5.2 §8.I: a pair that replicated over TLS keeps doing so.
+        if serves_replication && tls.is_none() && (self.plan.transport.tls.is_some() || snapshot.tls) {
+            return Err(Refusal::new(format!(
+                "this standby replicates from its primary over TLS, but once promoted it would serve its replication \
+                 port in PLAINTEXT: configure the keys it serves with — [replication] tls_enabled = true \
+                 (--replication-tls) and tls_cert_path / tls_key_path (--replication-tls-cert / \
+                 --replication-tls-key), or the PostgreSQL pair (--tls-cert / --tls-key) — and restart it; or \
+                 promote it offline (stop it, `heliosdb-nano promote --data-dir {dir}`) and start it as a primary \
+                 with --replication-tls"
+            )));
+        }
+        // Spec P5.2 §8.F: the port it will serve, bound now — a port in use
+        // refuses the promotion with nothing changed. A cascading standby's
+        // port is its cascading source's until replication stops: bound at
+        // the reopen.
+        let bound = if serves_replication && !self.cascading {
+            match bind_primary_replication(&ha, self.pg_addr, tls.is_some()).await {
+                Ok(bound) => Some(bound),
+                Err(error) => {
+                    return Err(Refusal::new(format!(
+                        "the replication port this standby would serve as the primary cannot be bound ({error}): \
+                         free it, or give the standby another [replication] replication_port (--replication-port) \
+                         and restart it; nothing was changed"
+                    )))
+                }
+            }
+        } else {
+            None
+        };
+        let node_id = promotion_identity(&engine).map_err(|reason| {
+            Refusal::new(format!(
+                "the promotion's identity cannot be kept ({reason}): it is not promoted"
+            ))
+        })?;
+        drop(engine);
+        *self.bound.lock() = bound;
+        Ok(StandbyFacts {
+            data_dir: self.data_dir.clone(),
+            config: self.config.clone(),
+            history,
+            epoch,
+            cursor: snapshot.cursor,
+            node_id,
+            primary: Some(self.plan.primary.clone()),
+            store_engine,
+            placeholder_engine: self.placeholder.storage.instance_id(),
+        })
+    }
+
+    fn receiver(
+        &self,
+    ) -> Option<tokio::sync::mpsc::Sender<heliosdb_nano::replication::physical_receiver::ReceiverCommand>> {
+        self.control
+            .supervisor
+            .lock()
+            .as_ref()
+            .and_then(|supervisor| supervisor.commands.clone())
+    }
+
+    fn replication_live(&self) -> bool {
+        use heliosdb_nano::standby_posture::StandbyPosture;
+        matches!(
+            self.posture.snapshot().posture,
+            StandbyPosture::Streaming { .. } | StandbyPosture::CatchingUp { .. }
+        )
+    }
+
+    fn fence_answer_bound(&self) -> std::time::Duration {
+        self.plan
+            .wire
+            .operation_timeout
+            .saturating_add(self.plan.wire.frame_timeout)
+    }
+
+    fn publish_placeholder(&self) {
+        // Off the store watch first: nothing forwards it to the listeners again.
+        if let Some(database) = self.store.send_replace(None) {
+            let mut detached = self.detached.lock();
+            if detached.is_none() {
+                *detached = Some(database);
+            }
+        }
+        // The listeners' watch let go of the store it held.
+        drop(self.serving.send_replace(std::sync::Arc::clone(&self.placeholder)));
+    }
+
+    async fn stop_replication(&self, budget: Option<std::time::Duration>) -> std::result::Result<u64, String> {
+        // The receiver (its in-flight run completes, its cursor fsynced) and
+        // the standby archiver (its open segment sealed through what it was
+        // handed, `archiver.lock` released) stop with the supervisor.
+        let supervisor = self.control.supervisor.lock().take();
+        if let Some(mut supervisor) = supervisor {
+            let _ = supervisor.stop.send(true);
+            match budget {
+                Some(budget) => {
+                    if tokio::time::timeout(budget, &mut supervisor.task).await.is_err() {
+                        // Still stopping: kept, so the restore waits for it.
+                        *self.control.supervisor.lock() = Some(supervisor);
+                        return Err(format!(
+                            "the replication receiver did not stop within {} s",
+                            budget.as_secs()
+                        ));
+                    }
+                }
+                None => {
+                    // The old primary is fenced: nothing to go back to.
+                    let mut waited = 0_u64;
+                    while tokio::time::timeout(std::time::Duration::from_secs(30), &mut supervisor.task)
+                        .await
+                        .is_err()
+                    {
+                        waited = waited.saturating_add(30);
+                        tracing::error!(
+                            "promote: the replication receiver has not stopped after {waited} s; the old primary is \
+                             fenced, so the promotion keeps waiting for it"
+                        );
+                    }
+                }
+            }
+        }
+        if self.cascading {
+            let (done, stopped) = tokio::sync::oneshot::channel();
+            if self.services.send(ServiceRequest::StopCascade { done }).is_ok() {
+                match budget {
+                    Some(budget) => {
+                        if tokio::time::timeout(budget, stopped).await.is_err() {
+                            return Err(format!(
+                                "the cascading replication port did not stop within {} s",
+                                budget.as_secs()
+                            ));
+                        }
+                    }
+                    None => {
+                        let _ = stopped.await;
+                    }
+                }
+            }
+        }
+        Ok(self.posture.snapshot().cursor)
+    }
+
+    async fn release_store(&self, budget: std::time::Duration) -> std::result::Result<(), String> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let detached = self.detached.lock().take();
+        if let Some(database) = detached {
+            let handles = StoreHandles::of(&database);
+            *self.released.lock() = Some(handles.clone());
+            // Only the promotion holds the serving database...
+            while std::sync::Arc::strong_count(&database) > 1 {
+                if tokio::time::Instant::now() >= deadline {
+                    let holders = std::sync::Arc::strong_count(&database) - 1;
+                    // Kept: a fenced promotion asks again.
+                    *self.detached.lock() = Some(database);
+                    return Err(release_diagnostics(holders, &handles, budget));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            // ...and dropping it closes the store: the engine, the writer the
+            // receiver shared, the RocksDB handle and its LOCK.
+            drop(database);
+        }
+        let handles = self.released.lock().clone();
+        let Some(handles) = handles else {
+            return Err("no store was taken off the listeners".to_string());
+        };
+        while !handles.closed() {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(release_diagnostics(0, &handles, budget));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Ok(())
+    }
+
+    async fn reopen_as_primary(&self) -> std::result::Result<u64, String> {
+        // The export directory is created now (spec P5.2 §8.F).
+        let (config, ha, tls) = self.primary.derive(true).map_err(|error| error.to_string())?;
+        let opened = tokio::task::spawn_blocking(move || EmbeddedDatabase::with_config(config))
+            .await
+            .map_err(|error| format!("the primary's open did not complete: {error}"))?
+            .map_err(|error| format!("the converted store cannot be opened as the primary's: {error}"))?;
+        let database = std::sync::Arc::new(opened);
+        if database.storage.is_physical_standby() || database.storage.write_gate().is_fenced() {
+            return Err("the converted store opened as a standby's, or fenced: it is not served".to_string());
+        }
+        let epoch = database.storage.replication_epoch();
+        // The replication port, archiver and gap fill, and the primary
+        // posture: the main loop owns the services.
+        let listener = self.bound.lock().take();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.services
+            .send(ServiceRequest::ServePrimary {
+                engine: std::sync::Arc::clone(&database.storage),
+                ha: Box::new(ha),
+                tls,
+                listener,
+                reply,
+            })
+            .map_err(|_| "the server's main loop is gone".to_string())?;
+        let endpoint = answer
+            .await
+            .map_err(|_| "the server's main loop did not answer".to_string())??;
+        // The ONE sanctioned undo of the standby guard (`ha_state`).
+        heliosdb_nano::replication::ha_state::ha_state().enable_forwarding_after_promotion();
+        drop(self.serving.send_replace(std::sync::Arc::clone(&database)));
+        info!(
+            "promote: new PostgreSQL connections are served by the primary of epoch {epoch} (replication port {})",
+            endpoint.as_deref().unwrap_or("off")
+        );
+        Ok(epoch)
+    }
+
+    async fn restore_standby(
+        &self,
+        restore: heliosdb_nano::replication::promote::online::Restore,
+        budget: std::time::Duration,
+    ) {
+        use heliosdb_nano::protocol::postgres::sessions::{
+            registry, TerminateCause, TerminateScope, TERMINATE_DRAIN_TIMEOUT,
+        };
+        use heliosdb_nano::replication::promote::online::{describe_sessions, Restore};
+        // The replication port the preflight bound closes.
+        drop(self.bound.lock().take());
+        let placeholder_engine = self.placeholder.storage.instance_id();
+        if restore == Restore::Store {
+            // Replication never stopped: the store goes back on the store
+            // watch, which forwards it to the listeners.
+            let detached = self.detached.lock().take();
+            if let Some(database) = detached {
+                self.store.send_replace(Some(database));
+            }
+            *self.released.lock() = None;
+            // The sessions that reached the placeholder meanwhile were told
+            // `in_hot_standby = on` and are served nothing: they reconnect.
+            tokio::spawn(async move {
+                registry()
+                    .terminate_scoped(
+                        TerminateCause::Promotion,
+                        TerminateScope::ServedBy(placeholder_engine),
+                        "terminating connection: this standby's promotion was aborted and its store is served again; \
+                         reconnect",
+                        TERMINATE_DRAIN_TIMEOUT,
+                    )
+                    .await;
+            });
+            info!(
+                "promote: the standby's store is served again; its receiver kept following its primary (the promotion \
+                 was aborted)"
+            );
+            return;
+        }
+        // Replication was stopped: the store off the listeners (if it is
+        // still there) and let go of — the receiver reopens the directory,
+        // which needs its LOCK.
+        self.publish_placeholder();
+        let detached = self.detached.lock().take();
+        let handles = match &detached {
+            Some(database) => Some(StoreHandles::of(database)),
+            None => self.released.lock().clone(),
+        };
+        drop(detached);
+        self.plan.tracker.detach_store();
+        let stopping = self.control.supervisor.lock().take();
+        let plan = self.plan.clone();
+        let store = self.store.clone();
+        let refusal = self.refusal.clone();
+        let control = std::sync::Arc::clone(&self.control);
+        let services = self.services.clone();
+        let cascading = self.cascading;
+        tokio::spawn(async move {
+            // Spec P5.2 §8.J: bounded by the caller's budget.
+            let deadline = tokio::time::Instant::now() + budget;
+            if let Some(mut supervisor) = stopping {
+                let _ = supervisor.stop.send(true);
+                let _ = tokio::time::timeout_at(deadline, &mut supervisor.task).await;
+            }
+            if let Some(handles) = handles {
+                while !handles.closed() && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                if !handles.closed() {
+                    tracing::error!(
+                        "promote: the aborted promotion's store is still open {} s after the abort ({}; PostgreSQL \
+                         sessions: {}): the standby's receiver starts anyway, and its posture says so if it cannot \
+                         open the store",
+                        budget.as_secs(),
+                        handles.holders(),
+                        describe_sessions(&registry().sessions())
+                    );
+                }
+            }
+            {
+                let mut slot = control.supervisor.lock();
+                if control.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    info!("promote: the standby is shutting down; its receiver is not started again");
+                    return;
+                }
+                *slot = Some(spawn_standby_supervisor(plan, store, refusal));
+            }
+            if cascading {
+                let _ = services.send(ServiceRequest::RestartCascade);
+            }
+            info!("promote: the standby reopens its store and follows its primary again (the promotion was aborted)");
+        });
+    }
+
+    fn placeholder(&self) -> std::sync::Arc<EmbeddedDatabase> {
+        std::sync::Arc::clone(&self.placeholder)
     }
 }
 
@@ -4978,15 +6137,18 @@ fn standby_serving_attach(
 /// The supervisor: classify, bootstrap if needed, then follow and serve until
 /// shutdown or a refusal (see the section comment). A refusal — the primary's
 /// typed `Refuse`, or a local one — becomes the posture's `needs_recovery`.
+/// Spec P5.2 §3 step 2: `commands` reach the serving receiver (the online
+/// promotion's fence through its live session).
 #[cfg(feature = "ha-tier1")]
 async fn run_physical_standby(
     plan: StandbyPlan,
     store: tokio::sync::watch::Sender<Option<std::sync::Arc<EmbeddedDatabase>>>,
     refusal: tokio::sync::watch::Sender<Option<String>>,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    commands: Option<tokio::sync::mpsc::Receiver<heliosdb_nano::replication::physical_receiver::ReceiverCommand>>,
 ) {
     use heliosdb_nano::replication::physical_receiver::{
-        run_serving_receiver, ReceiverMode, ReceiverStart, ReceiverStatus,
+        run_serving_receiver, run_serving_receiver_controlled, ReceiverMode, ReceiverStart, ReceiverStatus,
     };
     let history = match classify_standby_directory(&plan.data_dir) {
         StandbyLayout::Refused(reason) => {
@@ -5070,10 +6232,15 @@ async fn run_physical_standby(
     );
     options.archive = feed;
     let attach = standby_serving_attach(plan.config.clone(), std::sync::Arc::clone(&plan.tracker), store.clone());
-    let result = run_serving_receiver(options, attach, shutdown.clone(), progress).await;
+    let result = match commands {
+        Some(commands) => run_serving_receiver_controlled(options, attach, commands, shutdown.clone(), progress).await,
+        None => run_serving_receiver(options, attach, shutdown.clone(), progress).await,
+    };
     let _ = forward.await;
     // The receiver has stopped offering batches: the archiver archives what
-    // it was handed, seals its open segment and stops.
+    // it was handed, seals its open segment and stops (spec P5.2 §3 step 3:
+    // a promotion's last epoch-E segment is sealed here, through the cursor,
+    // and `archiver.lock` is released for the primary archiver).
     if let Some(archive) = archive {
         if let Err(error) = tokio::task::spawn_blocking(move || archive.shutdown()).await {
             tracing::warn!("the WAL archiver did not stop cleanly: {error}");
@@ -7214,9 +8381,10 @@ fn auto_enable_physical_source(
     Ok(())
 }
 
-/// `<data dir>.physical-export`, absolute, created mode 0700 if absent.
+/// `<data dir>.physical-export`, absolute — named only, nothing created
+/// (spec P5.2 §8.F: what an online promotion's preflight checks).
 #[cfg(feature = "ha-tier1")]
-fn default_physical_export_dir(data_dir: &std::path::Path) -> Result<PathBuf> {
+fn physical_export_dir_path(data_dir: &std::path::Path) -> Result<PathBuf> {
     let absolute = if data_dir.is_absolute() {
         data_dir.to_path_buf()
     } else {
@@ -7229,10 +8397,18 @@ fn default_physical_export_dir(data_dir: &std::path::Path) -> Result<PathBuf> {
             "cannot derive a physical export directory from the data directory; set --physical-export-dir",
         ));
     };
-    std::fs::create_dir_all(parent).map_err(|e| Error::io(format!("cannot create {}: {e}", parent.display())))?;
     let mut leaf = name.to_os_string();
     leaf.push(".physical-export");
-    let export = parent.join(leaf);
+    Ok(parent.join(leaf))
+}
+
+/// `<data dir>.physical-export`, absolute, created mode 0700 if absent.
+#[cfg(feature = "ha-tier1")]
+fn default_physical_export_dir(data_dir: &std::path::Path) -> Result<PathBuf> {
+    let export = physical_export_dir_path(data_dir)?;
+    if let Some(parent) = export.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::io(format!("cannot create {}: {e}", parent.display())))?;
+    }
     match std::fs::symlink_metadata(&export) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -7434,6 +8610,50 @@ fn start_primary_archive(
 #[cfg(feature = "ha-tier1")]
 const REFUSING_SESSIONS: usize = 4;
 
+/// A primary's replication listener, bound (and where).
+#[cfg(feature = "ha-tier1")]
+struct BoundReplication {
+    listener: tokio::net::TcpListener,
+    address: std::net::SocketAddr,
+}
+
+/// Spec P2.2: bind a primary's replication port — on `--listen`'s address
+/// when it serves TLS (or plaintext over the network was explicitly
+/// allowed); otherwise on loopback, whatever `--listen` opens. What a
+/// primary's start does, and (spec P5.2 §8.F) an online promotion's
+/// preflight, so a port that cannot be bound refuses the promotion before
+/// anything changed.
+#[cfg(feature = "ha-tier1")]
+async fn bind_primary_replication(
+    ha_config: &HAConfig,
+    pg_addr: std::net::SocketAddr,
+    tls: bool,
+) -> Result<BoundReplication> {
+    use heliosdb_nano::replication::physical_wire::bind_replication;
+    let address = replication_listen_address(
+        pg_addr.ip(),
+        ha_config.replication_port,
+        tls || ha_config.allow_insecure_remote,
+    );
+    if !address.ip().is_loopback() && !tls {
+        tracing::warn!("{}", insecure_replication_banner("primary"));
+    } else if !pg_addr.ip().is_loopback() && address.ip().is_loopback() {
+        info!(
+            "the replication port listens on {address} only: it stays on loopback without TLS, whatever --listen \
+             opens; serve standbys on other hosts with --replication-tls"
+        );
+    }
+    let listener = bind_replication(address, tls, ha_config.allow_insecure_remote)
+        .await
+        .map_err(|e| {
+            Error::network(format!(
+                "Cannot bind the replication listener {address} (NPHYS004): {e}. Use distinct PostgreSQL --port \
+                 and --replication-port endpoints; a standby's --primary-host names this port."
+            ))
+        })?;
+    Ok(BoundReplication { listener, address })
+}
+
 /// Bind a primary's replication port and arm its standby registry: from here
 /// on a sync/semi-sync commit waits for its standbys' acknowledgements.
 /// `None` when the primary serves no replication port (no token, in memory,
@@ -7446,10 +8666,11 @@ async fn prepare_physical_source(
     pg_addr: std::net::SocketAddr,
     storage: &std::sync::Arc<heliosdb_nano::storage::StorageEngine>,
     server_tls: Option<&heliosdb_nano::replication::physical_tls::ReplicationServerTls>,
+    prebound: Option<BoundReplication>,
 ) -> Result<Option<PreparedPhysicalSource>> {
     use heliosdb_nano::replication::ha_state::ha_state;
     use heliosdb_nano::replication::physical_source::{ExportLeases, SourceWorkLimiter, StandbyRegistryObserver};
-    use heliosdb_nano::replication::physical_wire::{bind_replication, SourceContext, SourceIdentity};
+    use heliosdb_nano::replication::physical_wire::{SourceContext, SourceIdentity};
     let config = &ha_config.physical;
     if !config.enabled {
         if !ha_config.sync_mode.eq_ignore_ascii_case("async") {
@@ -7480,33 +8701,15 @@ async fn prepare_physical_source(
     let token = node.auth.clone().ok_or_else(|| {
         Error::config("physical source requires --replication-token-file or [replication] token_file")
     })?;
-    // Spec P2.2: the port binds on --listen's address when it serves TLS (or
-    // plaintext over the network was explicitly allowed); otherwise it stays
-    // on loopback, whatever --listen opens.
     let acceptor = server_tls
         .map(heliosdb_nano::replication::physical_tls::ReplicationServerTls::acceptor)
         .transpose()?;
-    let address = replication_listen_address(
-        pg_addr.ip(),
-        ha_config.replication_port,
-        acceptor.is_some() || ha_config.allow_insecure_remote,
-    );
-    if !address.ip().is_loopback() && acceptor.is_none() {
-        tracing::warn!("{}", insecure_replication_banner("primary"));
-    } else if !pg_addr.ip().is_loopback() && address.ip().is_loopback() {
-        info!(
-            "the replication port listens on {address} only: it stays on loopback without TLS, whatever --listen \
-             opens; serve standbys on other hosts with --replication-tls"
-        );
-    }
-    let listener = bind_replication(address, acceptor.is_some(), ha_config.allow_insecure_remote)
-        .await
-        .map_err(|e| {
-            Error::network(format!(
-                "Cannot bind the replication listener {address} (NPHYS004): {e}. Use distinct PostgreSQL --port \
-                 and --replication-port endpoints; a standby's --primary-host names this port."
-            ))
-        })?;
+    // Spec P5.2 §8.F: an online promotion bound the port at its preflight
+    // (a bind failure refused it with nothing changed).
+    let BoundReplication { listener, address } = match prebound {
+        Some(bound) => bound,
+        None => bind_primary_replication(ha_config, pg_addr, acceptor.is_some()).await?,
+    };
     let db = storage.db();
     let state = ha_state();
     state.set_history(Some(history));

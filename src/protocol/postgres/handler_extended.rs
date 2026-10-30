@@ -263,6 +263,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             return Ok(());
         }
 
+        // Spec P5.2 §2: `SELECT pg_promote(…)` is answered by this session —
+        // DataRow + CommandComplete under the portal's wire plan (Describe
+        // sent the RowDescription Parse derived: one `boolean`), never the
+        // evaluator. The portal completes first: a promotion that started
+        // ends this session after the answer.
+        if let Some(call) = super::handler::parse_pg_promote(&statement.query) {
+            self.prepared_statements
+                .update_portal_state(&portal_name, PortalState::Complete)?;
+            let formats = portal.result_formats.clone();
+            return self.answer_pg_promote(call, Some(&formats)).await;
+        }
+
         // Transaction-control statements need the connection-level state
         // machine from the simple-query path. Letting extended Execute send
         // BEGIN/COMMIT/ROLLBACK straight to the engine leaves the handler's

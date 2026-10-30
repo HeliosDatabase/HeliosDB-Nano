@@ -141,6 +141,14 @@ pub const PRIMARY_FENCED_WRITE_REFUSED: &str = "write refused: this primary was 
 /// that is not ready.
 pub const PRIMARY_FENCED_NOT_READY: &str = "primary is fenced";
 
+/// Spec P5.2 §2: the prefix of the refusal `pg_promote` gets anywhere but
+/// as the PostgreSQL wire session's own statement (`SELECT pg_promote(…)`
+/// alone, literal arguments) — inside another statement, or through the
+/// embedded API: the promotion reopens the store the caller is running
+/// against, which only the server session can let go of. Mapped to `55000
+/// object_not_in_prerequisite_state`.
+pub const PG_PROMOTE_SERVER_ONLY: &str = "pg_promote is answered by the server session";
+
 /// Spec P2.1: the prefix of the error a client receives for a commit its
 /// standbys did not acknowledge within `[replication] sync_timeout_ms` under
 /// `sync_timeout_action = "fail"` (`replication::ha_state::SyncUnconfirmed`).

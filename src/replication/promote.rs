@@ -65,6 +65,13 @@
 //! command that finishes it (spec §11.K). The test hook
 //! [`KILL_PROMOTE_AT_ENV`] (`internal-tests` builds) SIGKILLs the process
 //! after a step, to prove it.
+//!
+//! Spec P5.2: the same conversion ([`convert`], [`identity_files`], under the
+//! same record) promotes a RUNNING standby online ([`online`], `SELECT
+//! pg_promote(wait, wait_seconds)`): it fences through the standby's live
+//! replication session, closes the store, converts it and reopens it as the
+//! primary's in the same process. An online promotion interrupted after its
+//! record is finished by this command, exactly like an offline one.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -94,6 +101,10 @@ use super::physical_wire::{
 };
 pub use crate::storage::replication_records::{interrupted_promotion_refusal, PROMOTION_FILE};
 use crate::Config;
+
+/// Spec P5.2: `SELECT pg_promote(wait, wait_seconds)`, the online promotion
+/// of a RUNNING standby, with this module's conversion.
+pub mod online;
 
 /// The node-local key holding the promotion's identity between step 1 and
 /// the conversion, in [`LOCAL_CF`].
@@ -346,7 +357,7 @@ fn lock_holder(dir: &Path) -> Option<i32> {
 fn running_refusal(dir: &Path, pid: Option<i32>) -> PromoteError {
     refused(format!(
         "the standby is running{} on {}: stop it first (`heliosdb-nano stop`), or promote it online with `SELECT \
-         pg_promote(true, N)` once P5.2 ships",
+         pg_promote(true, N)` on its PostgreSQL port",
         pid.map(|pid| format!(" (process {pid} holds its LOCK)"))
             .unwrap_or_default(),
         dir.display()

@@ -499,8 +499,24 @@ impl HAStateRegistry {
     /// (25006) in every posture. Role/read-only changes must not silently undo
     /// this restriction. (The name predates spec P2.1, which removed the write
     /// forwarding it used to switch off; no write is ever forwarded now.)
+    /// The one sanctioned undo is [`Self::enable_forwarding_after_promotion`].
     pub fn disable_forwarding(&self) {
         self.forwarding_disabled.store(true, Ordering::Release);
+    }
+
+    /// Spec P5.2 §3 step 7: THE one sanctioned undo of
+    /// [`Self::disable_forwarding`] — called once, by the online promotion,
+    /// after this process's store was converted and reopened as the
+    /// primary's and its replication port serves it. From here on its
+    /// PostgreSQL sessions are a primary's. Nothing else may lift the guard:
+    /// a role or read-only change never does. Logged.
+    pub fn enable_forwarding_after_promotion(&self) {
+        if self.forwarding_disabled.swap(false, Ordering::AcqRel) {
+            tracing::warn!(
+                "replication: this process was promoted to primary: the standby guard of its PostgreSQL sessions \
+                 is lifted (the one sanctioned undo of the standby's write guard)"
+            );
+        }
     }
 
     pub fn forwarding_disabled(&self) -> bool {
@@ -1122,6 +1138,11 @@ mod tests {
             registry.set_read_only(false);
             assert!(registry.forwarding_disabled());
         }
+        // Spec P5.2 §3 step 7: the promotion, and only it, lifts the guard.
+        registry.enable_forwarding_after_promotion();
+        assert!(!registry.forwarding_disabled());
+        registry.enable_forwarding_after_promotion();
+        assert!(!registry.forwarding_disabled(), "idempotent");
     }
 
     #[test]

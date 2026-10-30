@@ -473,6 +473,41 @@ logical_wal_retention_entries = 0
 # source = "primary"
 # archive_source = ["/srv/heliosdb/segments"]
 
+# STANDBY: its online promotion, `SELECT pg_promote(wait, wait_seconds)` on its
+# PostgreSQL port (spec P5.2). It ends its sessions, fences its primary
+# through its own replication session and follows it through the fenced
+# primary's last sequence before it converts and reopens its store as the
+# primary's.
+# What it does when the primary cannot be REACHED — no live replication
+# session to it for promote_fence_timeout (it is down; the standby is
+# reconnecting) — before it answered the fence:
+#   "allow" (default) — promote anyway with what this standby holds (Oracle's
+#                       FAILOVER; what HeliosDB Proxy's failover needs, as it
+#                       promotes precisely when the primary is gone). Writes
+#                       the old primary committed later are lost, and if it
+#                       still runs it is NOT fenced: stopping it is the
+#                       operator's job (STONITH), or the first standby of the
+#                       new epoch that reaches it fences it.
+#   "refuse"          — abort with SQLSTATE 55000 and keep following: a
+#                       cluster promoted by SWITCHOVER only (primary
+#                       reachable); an unreachable primary is then promoted past
+#                       offline, with `heliosdb-nano promote --force`.
+# A primary that ANSWERS is never promoted past, however slow: the promotion
+# waits for its fence (at least 75 s once the fence is sent, whatever
+# wait_seconds). A primary that REFUSES the fence always aborts the promotion,
+# and so does a fenced primary lost before this standby holds its final
+# sequence (the abort names `promote --force` and what it would lose).
+# promote_without_fence = "allow"
+# How long the primary must stay unreachable before the setting above
+# applies (and before a fenced primary lost during the catch-up aborts the
+# promotion). 1s to 1h.
+# promote_fence_timeout = "10s"
+# Give a promotable standby its own replication_port: it serves its standbys
+# there once promoted, bound when the promotion starts (a port in use refuses
+# it). Its tls_enabled / tls_cert_path / tls_key_path below are the keys it
+# serves with then; a standby that replicates over TLS (primary_tls) is not
+# promoted to serve plaintext.
+
 # The owner-only 32-byte token file authenticating the replication connection.
 # Put the identical file on the primary and every standby. The token bytes are
 # never read from TOML or the environment — only this path is:

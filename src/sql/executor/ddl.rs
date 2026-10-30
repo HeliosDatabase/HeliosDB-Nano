@@ -1014,17 +1014,18 @@ pub(super) fn handle_switchover(_executor: &Executor, target_node: &str) -> Resu
 
     // Refuse truthfully. The preconditions above pass, but this build has no
     // runtime switchover from SQL, so a success status here would be a lie.
-    // Spec P5.1: the promotion exists offline (`heliosdb-nano promote`, which
-    // fences this primary over its replication port first); the refusal
-    // names it. SQL `SWITCHOVER` stays refused until fencing is proven live
-    // (plan); `pg_promote` arrives with P5.2. The operator contract is in
-    // docs/guides/replication-history-guard.md.
+    // Spec P5.1, P5.2: a promotion is asked of the TARGET, never of this
+    // primary — online (`SELECT pg_promote(true, N)` on the running standby)
+    // or offline (`heliosdb-nano promote` on a stopped one); both fence this
+    // primary over its replication port first. The refusal names both. SQL
+    // `SWITCHOVER` on the primary stays refused (plan). The operator contract
+    // is in docs/guides/replication-history-guard.md.
     Err(Error::switchover(format!(
-        "Switchover refused: runtime switchover from SQL is unsupported in this release and no role was changed \
-         (target {} / {}). Promote the target offline instead: stop it, then run `heliosdb-nano promote \
-         --data-dir <its data directory>` — it applies old-primary fencing to this node first (over its \
-         replication port), tails it through its final sequence and starts the next epoch; `SELECT \
-         pg_promote(true, N)` on a running standby follows in P5.2.",
+        "Switchover refused: runtime switchover from SQL is unsupported on the primary in this release and no \
+         role was changed (target {} / {}). Promote the target instead — online: `SELECT pg_promote(true, N)` \
+         on the running target standby; offline: stop it, then run `heliosdb-nano promote --data-dir <its data \
+         directory>`. Either applies old-primary fencing to this node first (over its replication port), tails \
+         it through its final sequence and starts the next epoch.",
         display_name, target_uuid
     )))
 }
@@ -1066,7 +1067,7 @@ pub(super) fn handle_switchover_check(_executor: &Executor, target_node: &str) -
     let mut warnings = Vec::new();
     let mut blockers = vec![
         "Runtime switchover/promotion is unsupported: use `heliosdb-nano promote` (offline) or `SELECT \
-         pg_promote(true, N)` (P5.2)"
+         pg_promote(true, N)` (online, on the target standby)"
             .to_string(),
     ];
 

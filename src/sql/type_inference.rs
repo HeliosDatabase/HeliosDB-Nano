@@ -179,6 +179,9 @@ impl TypeInference for LogicalExpr {
                     "pg_is_in_recovery" | "pg_catalog.pg_is_in_recovery" | "heliosdb_require_ready" => {
                         Ok(DataType::Boolean)
                     }
+                    // Spec P5.2 §2: PostgreSQL's `boolean`; the extended
+                    // protocol's Describe advertises it, the session answers it.
+                    "pg_promote" | "pg_catalog.pg_promote" => Ok(DataType::Boolean),
                     "pg_current_wal_lsn"
                     | "pg_catalog.pg_current_wal_lsn"
                     | "pg_current_wal_insert_lsn"

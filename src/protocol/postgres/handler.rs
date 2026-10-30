@@ -564,6 +564,30 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     /// 57P01 at its next statement; one opened after is served reads only.
     #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
     admitted_after_fence: bool,
+    /// Spec P5.2 §1: this connection's registration in the process's
+    /// session registry (`super::sessions`), through which a fence or a
+    /// promotion PUSHES its termination. `None` for a handler no listener
+    /// accepted (embedders, tests): only the lazy, next-statement path ends it.
+    /// Declared AFTER `database` and `catalog`, so it drops after them: when
+    /// the registry sees this session gone, the database it held is released
+    /// (spec P5.2 §8.A — a promotion waits for exactly that).
+    session_ticket: Option<super::sessions::SessionTicket>,
+    /// Spec P5.2 §1-§2: the FATAL 57P01 this session owes — a pushed
+    /// termination, or its own close after answering `pg_promote` — sent once
+    /// its current message cycle is over (at the next ReadyForQuery), or at
+    /// the deadline if the cycle does not end by then.
+    terminating: Option<PendingTermination>,
+}
+
+/// Spec P5.2 §1: a termination this session sends once its message cycle is
+/// over (module `super::sessions`).
+#[derive(Debug, Clone)]
+pub(super) struct PendingTermination {
+    message: String,
+    /// Past it the FATAL goes out even mid-cycle: a pipelining client that
+    /// stops before its `Sync` does not keep the session (and the store it
+    /// holds) alive. `[server] close_timeout` from the moment it was owed.
+    deadline: tokio::time::Instant,
 }
 
 /// GH#28: what the listener decided for this connection at accept time.
@@ -604,6 +628,28 @@ impl ConnectionPolicy {
             max_connections,
             auth_deadline,
         }
+    }
+}
+
+/// Spec P5.2 §1: the next termination the registry publishes, `None` once
+/// its watch is closed; never completes without a watch.
+async fn next_termination(
+    watch: &mut Option<tokio::sync::watch::Receiver<super::sessions::Terminate>>,
+) -> Option<super::sessions::Terminate> {
+    match watch {
+        Some(watch) => match watch.changed().await {
+            Ok(()) => Some(watch.borrow_and_update().clone()),
+            Err(_) => None,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Until a termination owed mid-cycle must go out anyway; never without one.
+async fn sleep_until_owed(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -670,6 +716,8 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             idle_guc_overridden: false,
             tls_kx_group: None,
             admitted_after_fence: crate::standby_posture::is_fenced(),
+            session_ticket: None,
+            terminating: None,
         }
     }
 }
@@ -703,6 +751,8 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
             idle_guc_overridden: false,
             tls_kx_group: None,
             admitted_after_fence: crate::standby_posture::is_fenced(),
+            session_ticket: None,
+            terminating: None,
         }
     }
 }
@@ -740,6 +790,25 @@ pub async fn handle_connection_unix_with_timeouts(
     let max_connections = database.storage.config().server.max_connections;
     let mut handler = PgConnectionHandler::new_unix(stream, database, auth_manager)
         .with_connection_policy(ConnectionPolicy::at_accept(timeouts, max_connections));
+    handler.handle().await
+}
+
+/// Spec P5.2 §1: [`handle_connection_unix_with_timeouts`] for a connection
+/// the listener registered (`super::sessions::SessionRegistry::admit`, made
+/// before its database was chosen): a fence or a promotion pushes its
+/// termination to it like to a TCP session.
+#[cfg(unix)]
+pub async fn handle_connection_unix_registered(
+    database: Arc<EmbeddedDatabase>,
+    stream: UnixStream,
+    auth_manager: Arc<AuthManager>,
+    timeouts: ConnectionTimeouts,
+    ticket: super::sessions::SessionTicket,
+) -> Result<()> {
+    let max_connections = database.storage.config().server.max_connections;
+    let mut handler = PgConnectionHandler::new_unix(stream, database, auth_manager)
+        .with_connection_policy(ConnectionPolicy::at_accept(timeouts, max_connections));
+    handler.attach_session_ticket(ticket);
     handler.handle().await
 }
 
@@ -781,6 +850,8 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             idle_guc_overridden: false,
             tls_kx_group: None,
             admitted_after_fence: crate::standby_posture::is_fenced(),
+            session_ticket: None,
+            terminating: None,
         }
     }
 }
@@ -800,6 +871,8 @@ where
             idle_guc_overridden: false,
             tls_kx_group: None,
             admitted_after_fence: crate::standby_posture::is_fenced(),
+            session_ticket: None,
+            terminating: None,
             session_id: database
                 .create_wire_session("pg_wire_test")
                 .expect("wire session creation is infallible"),
@@ -861,6 +934,64 @@ where
     pub(super) fn with_tls_kx_group(mut self, group: Option<String>) -> Self {
         self.tls_kx_group = group;
         self
+    }
+
+    /// Spec P5.2 §1: the registration the listener made when it accepted
+    /// this connection (`super::sessions::SessionRegistry::admit`), through
+    /// which a fence or a promotion pushes its termination. Released with the
+    /// handler.
+    pub(super) fn attach_session_ticket(&mut self, ticket: super::sessions::SessionTicket) {
+        self.session_ticket = Some(ticket);
+    }
+
+    /// Spec P5.2 §1: the termination `terminate` ends this session with,
+    /// noted once — sent when the current message cycle is over (or at the
+    /// `close_timeout` deadline).
+    fn note_termination(&mut self, terminate: &super::sessions::Terminate) {
+        if self.terminating.is_some() {
+            return;
+        }
+        let targeted = self
+            .session_ticket
+            .as_ref()
+            .is_some_and(|ticket| ticket.targeted_by(terminate, self.admitted_after_fence));
+        if targeted {
+            self.owe_termination(terminate.message.clone());
+        }
+    }
+
+    /// This session ends with FATAL 57P01 `message` once its message cycle
+    /// is over (spec P5.2 §1-§2).
+    pub(super) fn owe_termination(&mut self, message: String) {
+        if self.terminating.is_none() {
+            self.terminating = Some(PendingTermination {
+                message,
+                deadline: tokio::time::Instant::now() + self.teardown_write_budget(),
+            });
+        }
+    }
+
+    /// Send the owed FATAL 57P01 (bounded by `close_timeout`, to a peer that
+    /// may have stopped reading). The caller then closes the connection.
+    async fn send_owed_termination(&mut self) {
+        let Some(pending) = self.terminating.clone() else {
+            return;
+        };
+        tracing::info!(session_id = ?self.session_id, "{}", pending.message);
+        let budget = self.teardown_write_budget();
+        let _ = tokio::time::timeout(budget, async {
+            let _ = self
+                .send_error_message(
+                    "FATAL",
+                    crate::network::protocol::sqlstate::ADMIN_SHUTDOWN,
+                    &pending.message,
+                    None,
+                    None,
+                )
+                .await;
+            let _ = self.flush().await;
+        })
+        .await;
     }
 
     /// Handle connection lifecycle
@@ -949,7 +1080,27 @@ where
         //
         // `startup()` ends with a ReadyForQuery, so the first wait is idle.
         let mut at_ready_for_query = true;
+        // Spec P5.2 §1: the registry's terminations, watched while this
+        // session waits for its next message (a termination published while
+        // it was authenticating shows as changed at once). A session that is
+        // part-way through a message cycle finishes it first.
+        let mut terminations = self.session_ticket.as_ref().map(super::sessions::SessionTicket::watch);
+        if let Some(ticket) = &self.session_ticket {
+            ticket.established(self.database.session_backend_pid(self.session_id).ok());
+        }
         loop {
+            if let Some(watch) = terminations.as_mut() {
+                if watch.has_changed().unwrap_or(false) {
+                    let terminate = watch.borrow_and_update().clone();
+                    self.note_termination(&terminate);
+                }
+            }
+            if let Some(pending) = &self.terminating {
+                if at_ready_for_query || tokio::time::Instant::now() >= pending.deadline {
+                    self.send_owed_termination().await;
+                    break;
+                }
+            }
             tracing::trace!("Waiting for next message from client");
             // `Busy` never arms a deadline (`ConnectionTimeouts::armed_timer`).
             let activity = match (at_ready_for_query, self.transaction_status) {
@@ -959,7 +1110,24 @@ where
                 }
                 (true, TransactionStatus::Idle) => SessionActivity::Idle,
             };
-            match self.read_message_deadlined(activity).await {
+            let owed_by = self.terminating.as_ref().map(|pending| pending.deadline);
+            // `read_message_deadlined` is cancel-safe (module documentation
+            // of that function): a dropped read consumed nothing.
+            let outcome = tokio::select! {
+                biased;
+                terminate = next_termination(&mut terminations) => {
+                    match terminate {
+                        Some(terminate) => self.note_termination(&terminate),
+                        // The registry is process-global and never dropped;
+                        // a closed watch only stops the watching.
+                        None => terminations = None,
+                    }
+                    continue;
+                }
+                () = sleep_until_owed(owed_by) => continue,
+                outcome = self.read_message_deadlined(activity) => outcome,
+            };
+            match outcome {
                 Ok(ReadOutcome::Message(msg)) => {
                     tracing::debug!("Received message: {:?}", msg);
                     // Only the six messages that legitimately precede a `Sync`
@@ -1904,6 +2072,19 @@ where
                 }
                 return Ok(false);
             }
+            // Spec P5.2 §3, §8.H: a session served by the empty placeholder
+            // of a standby that was promoted — nothing guards a standby
+            // session any more — is told to reconnect (FATAL 57P01): its next
+            // connection reaches the primary's store, and the placeholder
+            // answers no statement of a primary. While the promotion runs it
+            // is a not-ready standby's session instead (below).
+            if let Some(message) =
+                crate::standby_posture::placeholder_session_termination(self.database.storage.as_ref())
+            {
+                self.owe_termination(message.clone());
+                self.send_owed_termination().await;
+                return Err(Error::network(message));
+            }
             if !crate::replication::ha_state::ha_state().forwarding_disabled() {
                 return Ok(false);
             }
@@ -1923,7 +2104,12 @@ where
             // The per-statement check never touches the store's cursor.
             let (ready, store_attached) = posture.readiness();
             let on_store = self.database.is_physical_standby();
-            if store_attached && !on_store {
+            // Spec P5.2 §8.H: while a promotion runs, the store is off the
+            // listeners and a placeholder session is NOT told to reconnect
+            // (it would reach the placeholder again): it is answered as a
+            // standby that is not ready, and its termination is pushed once
+            // the node serves as the primary.
+            if store_attached && !on_store && !crate::standby_posture::is_promoting() {
                 let message = "terminating connection: this standby's data store is now attached; reconnect";
                 let budget = self.teardown_write_budget();
                 let _ = tokio::time::timeout(budget, async {
@@ -1950,7 +2136,10 @@ where
             }
             let mut snapshot = posture.snapshot();
             snapshot.store_attached &= on_store;
-            let refusal = snapshot.not_ready_message();
+            // Spec P5.2 §3 step 1, §8.H: a standby being promoted says so —
+            // to the sessions of its store and of the placeholder alike.
+            let refusal =
+                crate::standby_posture::promoting_not_ready_message().unwrap_or_else(|| snapshot.not_ready_message());
             self.send_standby_refusal(
                 extended,
                 crate::network::protocol::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
@@ -1996,6 +2185,176 @@ where
         }
     }
 
+    /// Spec P5.2 §2: `SELECT pg_promote(wait, wait_seconds)`, answered by
+    /// this session rather than the evaluator: the promotion REOPENS the
+    /// standby's store, so the session first lets go of it (its database,
+    /// its catalog, its session state) — which only the session can do. One
+    /// row, one `boolean` column (`pg_promote`, or the alias): `t` once the
+    /// node serves as the primary (`wait = true`) or once the promotion was
+    /// started (`wait = false`), `f` when `wait_seconds` ran out while it
+    /// still runs (it goes on). Every refusal before the promotion started
+    /// is SQLSTATE 55000 naming why (22023 for an argument out of range);
+    /// nothing of the session changes then. Once a promotion started, the
+    /// session ends with FATAL 57P01 after this answer: its startup told the
+    /// client `in_hot_standby = on`, which is no longer true. `extended`
+    /// carries the portal's result formats (the extended protocol: no
+    /// RowDescription here, Describe sent it; ReadyForQuery at Sync).
+    pub(super) async fn answer_pg_promote(
+        &mut self,
+        call: std::result::Result<PgPromoteCall, String>,
+        extended: Option<&[i16]>,
+    ) -> Result<()> {
+        if self.transaction_status == TransactionStatus::Failed {
+            return if extended.is_some() {
+                self.send_extended_failed_transaction_error().await
+            } else {
+                self.send_failed_transaction_error().await
+            };
+        }
+        let (column, answer) = match call {
+            Ok(call) => {
+                let column = call.column.clone();
+                (column, self.run_pg_promote(&call).await)
+            }
+            Err(usage) => (
+                "pg_promote".to_string(),
+                Err(PgPromoteRefusal {
+                    code: crate::network::protocol::sqlstate::INVALID_PARAMETER_VALUE,
+                    message: usage,
+                    hint: Some(PG_PROMOTE_USAGE.to_string()),
+                }),
+            ),
+        };
+        match answer {
+            Ok(promoted) => {
+                let schema = Schema::new(vec![crate::Column::new(column, crate::DataType::Boolean)]);
+                let rows = vec![Tuple::new(vec![Value::Boolean(promoted)])];
+                match extended {
+                    None => {
+                        self.send_query_result(&schema, &rows).await?;
+                        self.send_ready_for_query().await
+                    }
+                    Some(formats) => {
+                        let plan = super::codec::wire_plan(&schema, formats);
+                        self.send_data_rows_with_formats(&rows, &plan).await?;
+                        self.send_command_complete("SELECT 1").await?;
+                        self.flush().await
+                    }
+                }
+            }
+            Err(refusal) => {
+                if extended.is_some() {
+                    self.mark_transaction_failed_after_error();
+                    self.suppress_ready_for_query = false;
+                    self.awaiting_sync_after_error = true;
+                    self.send_error_message("ERROR", refusal.code, &refusal.message, None, refusal.hint)
+                        .await?;
+                    self.flush().await
+                } else {
+                    self.send_error("ERROR", refusal.code, &refusal.message, None, refusal.hint)
+                        .await
+                }
+            }
+        }
+    }
+
+    /// The promotion itself (`crate::replication::promote::online`), from
+    /// this session's side: exempt from the termination of its own
+    /// promotion, its hold on the standby's store released, then the answer.
+    #[cfg(feature = "ha-tier1")]
+    async fn run_pg_promote(&mut self, call: &PgPromoteCall) -> std::result::Result<bool, PgPromoteRefusal> {
+        use crate::replication::promote::online;
+        let state = crate::network::protocol::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE;
+        let wait_seconds = u64::try_from(call.wait_seconds)
+            .ok()
+            .filter(|seconds| (1..=online::MAX_WAIT_SECONDS).contains(seconds))
+            .ok_or_else(|| PgPromoteRefusal {
+                code: crate::network::protocol::sqlstate::INVALID_PARAMETER_VALUE,
+                message: format!(
+                    "\"wait_seconds\" must be between 1 and {} (it was {})",
+                    online::MAX_WAIT_SECONDS,
+                    call.wait_seconds
+                ),
+                hint: Some(PG_PROMOTE_USAGE.to_string()),
+            })?;
+        // Answered first, then closed: its own promotion does not end it.
+        if let Some(ticket) = &self.session_ticket {
+            ticket.set_exempt(true);
+        }
+        let request = online::PromoteCall {
+            wait: call.wait,
+            wait_seconds,
+            backend_pid: self.database.session_backend_pid(self.session_id).unwrap_or(0),
+            client: self
+                .session_ticket
+                .as_ref()
+                .and_then(|ticket| ticket.peer().map(str::to_string)),
+        };
+        let started = match online::request(request).await {
+            Ok(started) => started,
+            Err(refusal) => {
+                if let Some(ticket) = &self.session_ticket {
+                    ticket.set_exempt(false);
+                }
+                return Err(PgPromoteRefusal {
+                    code: state,
+                    message: refusal.message,
+                    hint: refusal.hint,
+                });
+            }
+        };
+        self.release_database_for_promotion(started.placeholder());
+        let promoted = started.termination_message();
+        let answer = started.answer().await;
+        // Its startup said `in_hot_standby = on`: it redials, like every
+        // other session (spec P5.2 §2). An aborted promotion closes it too:
+        // it let go of the store and is served by the empty placeholder.
+        let message = match &answer {
+            Ok(_) => promoted,
+            Err(_) => online::ABORTED_CALLER_TERMINATION.to_string(),
+        };
+        self.owe_termination(message);
+        answer.map_err(|reason| PgPromoteRefusal {
+            code: state,
+            message: reason,
+            hint: None,
+        })
+    }
+
+    #[cfg(not(feature = "ha-tier1"))]
+    async fn run_pg_promote(&mut self, _call: &PgPromoteCall) -> std::result::Result<bool, PgPromoteRefusal> {
+        Err(PgPromoteRefusal {
+            code: crate::network::protocol::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            message: "pg_promote promotes a physical standby, and this build has no physical replication (the \
+                      ha-tier1 feature)"
+                .to_string(),
+            hint: None,
+        })
+    }
+
+    /// Spec P5.2 §2: let go of the standby's store before its promotion
+    /// reopens it — the session (and any transaction of it, read-only on a
+    /// standby) is ended on it, and this session is served by `placeholder`,
+    /// the empty database the listeners serve while there is no store, until
+    /// it closes.
+    #[cfg(feature = "ha-tier1")]
+    fn release_database_for_promotion(&mut self, placeholder: Arc<EmbeddedDatabase>) {
+        let _ = self.database.destroy_session(self.session_id);
+        if let Ok(session_id) = placeholder.create_wire_session("pg_wire") {
+            self.session_id = session_id;
+        }
+        self.catalog = PgCatalog::with_database(Arc::clone(&placeholder));
+        let engine = placeholder.storage.instance_id();
+        self.database = placeholder;
+        self.transaction_status = TransactionStatus::Idle;
+        self.implicit_transaction = false;
+        // Spec P5.2 §8.A: the store is let go of (both handles above were
+        // replaced): the promotion stops counting this session as a holder.
+        if let Some(ticket) = &self.session_ticket {
+            ticket.serve(engine);
+        }
+    }
+
     /// Handle exactly one statement. All pre-existing `handle_query`
     /// logic lives here so the per-statement response sequence stays
     /// unchanged from v3.12's behaviour.
@@ -2004,6 +2363,10 @@ where
     pub(super) async fn handle_single_query(&mut self, query: &str) -> Result<()> {
         if self.reject_guarded_standby_statement(query, false).await? {
             return Ok(());
+        }
+        // Spec P5.2 §2: answered by this session, never the evaluator.
+        if let Some(call) = parse_pg_promote(query) {
+            return self.answer_pg_promote(call, None).await;
         }
         tracing::debug!("Executing query: {}", query);
 
@@ -5693,6 +6056,11 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
         Error::Generic(message) if message.starts_with(crate::error::PRIMARY_FENCED_NOT_READY) => {
             sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE // 55000
         }
+        // Spec P5.2 §2: `pg_promote` reached the evaluator (inside another
+        // statement, or through the embedded API).
+        Error::Generic(message) if message.starts_with(crate::error::PG_PROMOTE_SERVER_ONLY) => {
+            sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE // 55000
+        }
         _ => sqlstate::INTERNAL_ERROR, // XX000
     }
 }
@@ -6374,6 +6742,8 @@ mod failed_transaction_state_tests {
                 idle_guc_overridden: false,
                 tls_kx_group: None,
                 admitted_after_fence: crate::standby_posture::is_fenced(),
+                session_ticket: None,
+                terminating: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),
@@ -6470,6 +6840,8 @@ mod show_branches_wire_tests {
                 idle_guc_overridden: false,
                 tls_kx_group: None,
                 admitted_after_fence: crate::standby_posture::is_fenced(),
+                session_ticket: None,
+                terminating: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),
@@ -7105,6 +7477,8 @@ mod md5_auth_wire_tests {
                 idle_guc_overridden: false,
                 tls_kx_group: None,
                 admitted_after_fence: crate::standby_posture::is_fenced(),
+                session_ticket: None,
+                terminating: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")
                     .expect("wire session creation is infallible"),
@@ -7657,6 +8031,232 @@ pub(crate) fn standby_statement_reads_data(sql: &str, is_user_function: impl Fn(
     })
 }
 
+/// Spec P5.2 §2: what a refused `pg_promote` answers (`answer_pg_promote`).
+#[derive(Debug)]
+pub(super) struct PgPromoteRefusal {
+    code: &'static str,
+    message: String,
+    hint: Option<String>,
+}
+
+/// The forms `pg_promote` is answered in (spec P5.2 §2), as its hint says.
+pub(crate) const PG_PROMOTE_USAGE: &str = "SELECT pg_promote(wait boolean DEFAULT true, wait_seconds integer \
+     DEFAULT 60), alone and with literal arguments: SELECT pg_promote(true, 60), pg_promote(false, 60), \
+     pg_promote(true) or pg_promote()";
+
+/// Spec P5.2 §2: a `SELECT pg_promote(wait, wait_seconds)` the server session
+/// answers ([`parse_pg_promote`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PgPromoteCall {
+    pub(crate) wait: bool,
+    /// As written; its range (1..=3600) is checked by the answer.
+    pub(crate) wait_seconds: i64,
+    /// The answer's column: `pg_promote`, or the alias it was given.
+    pub(crate) column: String,
+}
+
+/// Spec P5.2 §2: whether `sql` is a call of `pg_promote` the server session
+/// answers itself — a `SELECT` of nothing but `[pg_catalog.]pg_promote(…)`
+/// (optionally aliased), the forms HeliosDB Proxy sends
+/// (`SELECT pg_promote(true, N)`). `Some(Err(usage))` for such a call whose
+/// arguments are not one or two literals of the right types; `None` for
+/// anything else, which the evaluator refuses (55000) if it calls the
+/// function at all. Text that does not mention the name is never parsed.
+pub(crate) fn parse_pg_promote(sql: &str) -> Option<std::result::Result<PgPromoteCall, String>> {
+    use sqlparser::ast::{
+        Expr, FunctionArg, FunctionArgExpr, FunctionArguments, SelectItem, SetExpr, Statement, UnaryOperator,
+        Value as SqlValue,
+    };
+
+    fn literal_bool(expr: &Expr) -> Option<bool> {
+        match expr {
+            Expr::Value(SqlValue::Boolean(value)) => Some(*value),
+            Expr::Value(SqlValue::SingleQuotedString(text)) => match text.trim().to_ascii_lowercase().as_str() {
+                "t" | "true" | "on" | "yes" | "1" => Some(true),
+                "f" | "false" | "off" | "no" | "0" => Some(false),
+                _ => None,
+            },
+            Expr::Nested(inner) => literal_bool(inner),
+            _ => None,
+        }
+    }
+    fn literal_integer(expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Value(SqlValue::Number(number, _)) => number.to_string().parse().ok(),
+            Expr::UnaryOp {
+                op: UnaryOperator::Minus,
+                expr,
+            } => literal_integer(expr).and_then(i64::checked_neg),
+            Expr::Nested(inner) => literal_integer(inner),
+            _ => None,
+        }
+    }
+
+    const NAME: &[u8] = b"pg_promote";
+    // Every form is far shorter; a longer text is never scanned on the hot
+    // path (and, should it call the function, the evaluator refuses it).
+    const LONGEST: usize = 1024;
+    if sql.len() > LONGEST
+        || !sql
+            .as_bytes()
+            .windows(NAME.len())
+            .any(|window| window.eq_ignore_ascii_case(NAME))
+    {
+        return None;
+    }
+    let statements = crate::sql::Parser::new().parse(pg_skip_leading_comments(sql)).ok()?;
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return None;
+    };
+    if query.with.is_some()
+        || query.order_by.is_some()
+        || query.limit.is_some()
+        || query.offset.is_some()
+        || query.fetch.is_some()
+        || !query.locks.is_empty()
+    {
+        return None;
+    }
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    if !select.from.is_empty()
+        || select.selection.is_some()
+        || select.having.is_some()
+        || select.distinct.is_some()
+        || select.into.is_some()
+        || select.projection.len() != 1
+    {
+        return None;
+    }
+    let (expr, alias) = match select.projection.first()? {
+        SelectItem::UnnamedExpr(expr) => (expr, None),
+        SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+        _ => return None,
+    };
+    let Expr::Function(function) = expr else {
+        return None;
+    };
+    let named = match function.name.0.as_slice() {
+        [name] => name.value.eq_ignore_ascii_case("pg_promote"),
+        [schema, name] => {
+            schema.value.eq_ignore_ascii_case("pg_catalog") && name.value.eq_ignore_ascii_case("pg_promote")
+        }
+        _ => false,
+    };
+    if !named || function.over.is_some() || function.filter.is_some() {
+        return None;
+    }
+    let usage = || {
+        Some(Err(format!(
+            "pg_promote is answered with literal arguments only: {PG_PROMOTE_USAGE}"
+        )))
+    };
+    let args: Vec<&Expr> = match &function.args {
+        FunctionArguments::None => Vec::new(),
+        FunctionArguments::Subquery(_) => return usage(),
+        FunctionArguments::List(list) => {
+            if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+                return usage();
+            }
+            let mut args = Vec::with_capacity(list.args.len());
+            for arg in &list.args {
+                match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => args.push(expr),
+                    _ => return usage(),
+                }
+            }
+            args
+        }
+    };
+    let (wait, wait_seconds) = match args.as_slice() {
+        [] => (Some(true), Some(60)),
+        [wait] => (literal_bool(wait), Some(60)),
+        [wait, seconds] => (literal_bool(wait), literal_integer(seconds)),
+        _ => (None, None),
+    };
+    let (Some(wait), Some(wait_seconds)) = (wait, wait_seconds) else {
+        return usage();
+    };
+    Some(Ok(PgPromoteCall {
+        wait,
+        wait_seconds,
+        column: alias.unwrap_or_else(|| "pg_promote".to_string()),
+    }))
+}
+
+#[cfg(test)]
+mod pg_promote_tests {
+    use super::{parse_pg_promote as parse, PgPromoteCall};
+
+    fn call(wait: bool, wait_seconds: i64) -> PgPromoteCall {
+        PgPromoteCall {
+            wait,
+            wait_seconds,
+            column: "pg_promote".to_string(),
+        }
+    }
+
+    /// Spec P5.2 §2: the forms Proxy (and an operator) sends.
+    #[test]
+    fn the_accepted_forms_are_recognised() {
+        for (sql, want) in [
+            ("SELECT pg_promote(true, 5)", call(true, 5)),
+            ("select PG_PROMOTE(TRUE, 60);", call(true, 60)),
+            ("SELECT pg_promote(false, 60)", call(false, 60)),
+            ("SELECT pg_promote(true)", call(true, 60)),
+            ("SELECT pg_promote()", call(true, 60)),
+            ("SELECT pg_catalog.pg_promote(true, 30)", call(true, 30)),
+            ("/* proxy */ SELECT pg_promote(true, 5)", call(true, 5)),
+            ("SELECT pg_promote(true, 0)", call(true, 0)),
+            ("SELECT pg_promote('t', 10)", call(true, 10)),
+        ] {
+            assert_eq!(parse(sql), Some(Ok(want)), "{sql}");
+        }
+        assert_eq!(
+            parse("SELECT pg_promote(true, 5) AS promoted"),
+            Some(Ok(PgPromoteCall {
+                column: "promoted".to_string(),
+                ..call(true, 5)
+            }))
+        );
+    }
+
+    #[test]
+    fn a_call_with_other_arguments_is_refused_with_the_usage() {
+        for sql in [
+            "SELECT pg_promote($1, $2)",
+            "SELECT pg_promote(true, 'soon')",
+            "SELECT pg_promote(1 = 1, 5)",
+            "SELECT pg_promote(true, 5, 6)",
+        ] {
+            let parsed = parse(sql);
+            assert!(
+                matches!(&parsed, Some(Err(usage)) if usage.contains("literal arguments")),
+                "{sql}: {parsed:?}"
+            );
+        }
+    }
+
+    /// Anything else reaches the evaluator, which refuses the function.
+    #[test]
+    fn other_statements_are_not_taken() {
+        for sql in [
+            "SELECT 1",
+            "SELECT pg_is_in_recovery()",
+            "SELECT pg_promote(true, 5)::text",
+            "SELECT pg_promote(true, 5), 1",
+            "SELECT pg_promote(true, 5) FROM t",
+            "SELECT * FROM t WHERE pg_promote()",
+            "SELECT 'pg_promote(true, 5)'",
+            "SELECT other.pg_promote(true, 5)",
+            "INSERT INTO pg_promote VALUES (1)",
+        ] {
+            assert_eq!(parse(sql), None, "{sql}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod guarded_standby_admission_tests {
     use super::guarded_standby_statement_allowed as allowed;
@@ -7773,6 +8373,31 @@ mod guarded_standby_admission_tests {
         ] {
             assert!(allowed(sql), "precondition, admitted: {sql}");
             assert!(reads(sql, udf), "data read served while not ready: {sql}");
+        }
+    }
+
+    /// Spec P5.2 §2: `pg_promote` is in the always-answered set — the shape
+    /// rule admits it and it is no data read, so the guard lets it reach
+    /// the session's own answer in every posture (a standby that is not
+    /// ready is refused by the promotion itself, naming its posture).
+    #[test]
+    fn pg_promote_is_always_answered_by_the_guard() {
+        use super::standby_statement_reads_data as reads;
+        let no_udf = |_: &str| false;
+        for sql in [
+            "SELECT pg_promote(true, 60)",
+            "SELECT pg_promote(true, 5)",
+            "SELECT pg_promote(false, 60)",
+            "SELECT pg_promote(true)",
+            "SELECT pg_promote()",
+            "SELECT pg_catalog.pg_promote(true, 30)",
+        ] {
+            assert!(allowed(sql), "pg_promote refused by the shape rule: {sql}");
+            assert!(!reads(sql, no_udf), "pg_promote counted as a data read: {sql}");
+            assert!(
+                matches!(super::parse_pg_promote(sql), Some(Ok(_))),
+                "pg_promote not answered by the session: {sql}"
+            );
         }
     }
 }

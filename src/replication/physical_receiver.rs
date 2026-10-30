@@ -38,7 +38,7 @@ use super::physical::{Durability, LocalWriter, PhysicalBatch, PhysicalCursor};
 use super::physical_applier::PhysicalApplier;
 use super::physical_tls::{ReplicationStream, ReplicationTransport};
 use super::physical_wire::{
-    now_millis, BatchSink, Heartbeat, LastGroup, PhysicalClient, PollSummary, ReceiverIdentity, RefuseCode,
+    now_millis, BatchSink, Fenced, Heartbeat, LastGroup, PhysicalClient, PollSummary, ReceiverIdentity, RefuseCode,
     SourceSessionInfo, TransferToken, WireError, WireLimits, MAX_POLL_BYTES,
 };
 use crate::Config;
@@ -215,6 +215,172 @@ impl ReceiverOptions {
 /// receiver with nothing applied.
 pub type ServingAttach =
     Box<dyn FnOnce(&Path, &Arc<LocalWriter>) -> std::result::Result<Arc<PhysicalApplier>, String> + Send>;
+
+/// Spec P5.2 §3 step 2: what the owner of a running serving receiver asks of
+/// it ([`run_serving_receiver_controlled`]). Taken between two polls.
+#[derive(Debug)]
+pub enum ReceiverCommand {
+    /// Fence the source by `epoch` (the store's epoch + 1) through this
+    /// receiver's own session, the online promotion's way. The session is
+    /// first renewed under the promotion's identity `node` (its `Hello`
+    /// names it, with the history, the cursor and the store's epoch — what a
+    /// source requires of a fence, and why a later offline re-run of the same
+    /// promotion is answered the same `Fenced`); its first poll proves the
+    /// tail (P5.1 §11.B); then `Fence` is sent, and the receiver keeps
+    /// following until its DURABLE cursor reaches the fenced source's final
+    /// sequence. Every step is reported on `events`; a closed `events` (its
+    /// owner gave up) abandons a fence not sent yet.
+    ///
+    /// Spec P5.2 §8.E: a LATER `Fence` (the same promotion asking again,
+    /// after its previous `events` closed) is accepted at any time: a fence
+    /// already answered is re-reported from the cached `Fenced` (sending it
+    /// again would be answered the same: the source's fence is idempotent per
+    /// promotion) and the catch-up goes on, reported to the new owner; a
+    /// fence not sent yet is reported to the new owner.
+    Fence {
+        epoch: u64,
+        node: Uuid,
+        events: mpsc::UnboundedSender<FenceEvent>,
+    },
+}
+
+/// How a [`ReceiverCommand::Fence`] goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FenceEvent {
+    /// The receiver took the command and renews its session for it: from
+    /// here on a connection attempt is under way, and only a FAILED one
+    /// says the source cannot be reached (spec P5.2 §8.B).
+    Taken,
+    /// Spec P5.2 §8.B: a connection attempt of the fence's session (its
+    /// renewal, or a reconnect while the fence is under way) failed;
+    /// `answered` when the source ANSWERED it (a refusal: it is reachable,
+    /// so the promotion never treats it as gone), not when it could not be
+    /// reached at all.
+    Attempt { answered: bool, reason: String },
+    /// A session for the fence is established (the renewal under the
+    /// promotion's identity, or a reconnect while the fence is under way).
+    Connected,
+    /// A session under the promotion's identity served its first poll: the
+    /// source serves this standby's cursor (`cursor`, durable).
+    Proven { cursor: u64 },
+    /// The `Fence` frame is about to go out: from here on the source may be
+    /// fenced, whatever happens next. The receiver waits `answer_within` for
+    /// the answer (its operation deadline, and one frame to send it).
+    Sent { answer_within: Duration },
+    /// The source refuses every write from now on; `final_sequence` is the
+    /// last it holds.
+    Fenced(Fenced),
+    /// The durable cursor after a poll that applied groups, while the
+    /// receiver catches up to the final sequence.
+    Advanced { cursor: u64 },
+    /// The durable cursor reached the final sequence: this store holds
+    /// everything the fenced source committed.
+    ReachedFinal { final_sequence: u64, cursor: u64 },
+    /// No fence: why, whether a `Fence` was sent before it failed (then the
+    /// source may be fenced), and whether the source REFUSED the fence
+    /// ([`refuses_the_fence`]: it answers, but will not be fenced by this
+    /// promotion). Any other failure — `SourceNotServing` (a fence left
+    /// incomplete, a source draining), a broken session — is worth asking
+    /// again on a new session (spec P5.2 §8.D).
+    Failed { sent: bool, refused: bool, reason: String },
+}
+
+/// Spec P5.2 §8.D: whether `error` is a source's REFUSAL of a fence — it
+/// will never be fenced by this promotion: `Version` (it cannot be fenced,
+/// or it was fenced by another promotion, or it is at a newer epoch than
+/// asked), `EpochStale` (a newer epoch exists), `SourceStale` (it is a
+/// superseded primary), `HistoryMismatch` (another dataset), `Diverged`
+/// (another numbering of this epoch's writes), or a protocol version the
+/// two nodes do not share. Everything else — `SourceNotServing` above all
+/// (a fence left incomplete, a source draining) — is retried.
+pub fn refuses_the_fence(error: &WireError) -> bool {
+    match error {
+        WireError::Refused(refusal) => matches!(
+            refusal.code,
+            RefuseCode::Version
+                | RefuseCode::EpochStale { .. }
+                | RefuseCode::SourceStale { .. }
+                | RefuseCode::HistoryMismatch
+                | RefuseCode::Diverged { .. }
+        ),
+        WireError::Version { .. } => true,
+        _ => false,
+    }
+}
+
+/// [`refuses_the_fence`] of a receiver error.
+fn receiver_refuses_the_fence(error: &ReceiverError) -> bool {
+    matches!(error, ReceiverError::Wire(wire) if refuses_the_fence(wire))
+}
+
+/// A fence asked of the running session (between the renewed session and
+/// its first poll), then answered (until the final sequence is durable).
+struct FenceRequest {
+    epoch: u64,
+    events: mpsc::UnboundedSender<FenceEvent>,
+}
+
+struct FenceProgress {
+    /// The epoch it was fenced by (a re-sent fence of another epoch is not
+    /// this one).
+    epoch: u64,
+    /// The source's answer, re-reported to a re-sent fence (spec P5.2 §8.E).
+    answer: Fenced,
+    events: mpsc::UnboundedSender<FenceEvent>,
+    reached: bool,
+}
+
+/// Spec P5.2 §8.B: who watches a connection's attempts — the online
+/// promotion whose fence is under way — and whether the connection is the
+/// fence's renewal (a `SourceStale` refusal, retried by every other
+/// connection, then ends it: the fence is refused).
+#[derive(Clone, Copy)]
+struct FenceObserver<'a> {
+    events: &'a mpsc::UnboundedSender<FenceEvent>,
+    renewal: bool,
+}
+
+/// The observer of a reconnect while a fence is asked (not sent yet) or
+/// answered (not caught up yet).
+fn fence_observer<'a>(fence: &'a Option<FenceRequest>, fenced: &'a Option<FenceProgress>) -> Option<FenceObserver<'a>> {
+    fence
+        .as_ref()
+        .map(|request| &request.events)
+        .or_else(|| {
+            fenced
+                .as_ref()
+                .filter(|progress| !progress.reached)
+                .map(|progress| &progress.events)
+        })
+        .map(|events| FenceObserver { events, renewal: false })
+}
+
+/// `internal-tests` builds only: the serving receiver HOLDS at a step of an
+/// online promotion's fence while the file `<dir>/<step>` exists —
+/// `before-fence` (the renewed session's poll was served, the `Fence` not
+/// sent yet: the old primary still takes writes) and `after-fenced` (the
+/// fence was answered, the catch-up not polled yet). The daemon tests'
+/// deterministic points (spec P5.2 §8.K).
+pub const RECEIVER_HOLD_DIR_ENV: &str = "HELIOSDB_NANO_TEST_RECEIVER_HOLD_DIR";
+
+/// Hold at `step` ([`RECEIVER_HOLD_DIR_ENV`]); a no-op in other builds.
+async fn test_hold(step: &str, shutdown: &mut watch::Receiver<bool>) {
+    #[cfg(feature = "internal-tests")]
+    if let Some(dir) = std::env::var_os(RECEIVER_HOLD_DIR_ENV) {
+        let file = std::path::Path::new(&dir).join(step);
+        if file.exists() {
+            tracing::warn!(
+                "{RECEIVER_HOLD_DIR_ENV}: the physical receiver holds at {step} while {} exists",
+                file.display()
+            );
+            while file.exists() && !stopped(shutdown) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tracing::warn!("{RECEIVER_HOLD_DIR_ENV}: the physical receiver goes on past {step}");
+        }
+    }
+    let _ = (step, shutdown);
+}
 
 #[derive(Clone, Debug)]
 pub enum ReceiverStatus {
@@ -994,6 +1160,14 @@ fn session_barrier(info: Option<&SourceSessionInfo>, known_barrier: u64) -> Resu
 /// refusal (the configured source is a superseded primary) is retried like
 /// any retryable one, so the posture stays `reconnecting` with the reason and
 /// a corrected `--primary-host` takes effect; it is logged once per epoch.
+///
+/// Spec P5.2 §3 step 2: `node`, once an online promotion asked this receiver
+/// to fence its source, is the promotion's identity, which every `Hello`
+/// names instead of the configured one. Spec P5.2 §8.B: `observer`, while a
+/// fence is under way, is told every failed attempt — whether the source
+/// answered it or could not be reached — and the established session; the
+/// fence's renewal ends at a `SourceStale` refusal (a refusal of the fence)
+/// instead of retrying it.
 #[allow(clippy::too_many_arguments)]
 async fn connect(
     options: &ReceiverOptions,
@@ -1004,6 +1178,8 @@ async fn connect(
     attempts: &mut u32,
     serving: bool,
     lost: Option<String>,
+    node: Option<Uuid>,
+    observer: Option<FenceObserver<'_>>,
 ) -> Result<PhysicalClient<ReplicationStream>> {
     // A fresh snapshot names the history it was pinned to, if any.
     let snapshot_history = match &options.start {
@@ -1012,6 +1188,7 @@ async fn connect(
     };
     let identity = ReceiverIdentity {
         epoch: epoch.unwrap_or(options.identity.epoch),
+        node_id: node.unwrap_or(options.identity.node_id),
         ..options.identity.clone()
     };
     let mut auth_failures = 0_u32;
@@ -1072,9 +1249,20 @@ async fn connect(
                 if matches!(error, WireError::Tls(_)) {
                     tracing::warn!("the TLS connection to the physical source at {source} failed: {error}");
                 }
+                if let Some(observer) = observer {
+                    if !matches!(error, WireError::Shutdown) {
+                        let _ = observer.events.send(FenceEvent::Attempt {
+                            answered: matches!(error, WireError::Refused(_) | WireError::Version { .. }),
+                            reason: format!("{source}: {error}"),
+                        });
+                    }
+                }
             }
             match result {
                 Ok(client) => {
+                    if let Some(observer) = observer {
+                        let _ = observer.events.send(FenceEvent::Connected);
+                    }
                     let ok = client.hello_ok();
                     tracing::info!(
                         "Standby dataset history verified: {} (primary node {}, epoch {}, replication endpoint {}, {})",
@@ -1101,6 +1289,11 @@ async fn connect(
                     last_error = Some(WireError::Refused(refusal));
                 }
                 Err(WireError::Refused(refusal)) if matches!(refusal.code, RefuseCode::SourceStale { .. }) => {
+                    if observer.is_some_and(|observer| observer.renewal) {
+                        // The fence's renewal: a superseded primary is never
+                        // fenced by this promotion (spec P5.2 §8.D).
+                        return Err(WireError::Refused(refusal).into());
+                    }
                     warn_superseded_source(*source, &refusal);
                     last_error = Some(WireError::Refused(refusal));
                 }
@@ -1142,6 +1335,8 @@ async fn reconnect(
     worker: &Worker,
     reconnects: &mut u32,
     serving: bool,
+    node: Option<Uuid>,
+    observer: Option<FenceObserver<'_>>,
 ) -> Result<PhysicalClient<ReplicationStream>> {
     // Discard poisoned framing before reconnect. FIFO drain is essential: a
     // sink deadline may have expired while its durable apply was still
@@ -1153,29 +1348,61 @@ async fn reconnect(
         // diagnostic from an already failed worker.
         return Err(error.into());
     }
+    resume_session(
+        options,
+        shutdown,
+        progress,
+        worker,
+        reconnects,
+        serving,
+        node,
+        error.to_string(),
+        options.reconnect_delay,
+        observer,
+    )
+    .await
+}
+
+/// A new session after the receiver's DURABLE cursor (its applied groups
+/// synced first), after `delay`: what [`reconnect`] does once it decided to,
+/// and what a fence asked of a running session does to renew it under the
+/// promotion's identity (spec P5.2 §3 step 2; no delay). `lost` is why the
+/// previous session ended, reported while connecting.
+#[allow(clippy::too_many_arguments)]
+async fn resume_session(
+    options: &ReceiverOptions,
+    shutdown: &mut watch::Receiver<bool>,
+    progress: &watch::Sender<ReceiverStatus>,
+    worker: &Worker,
+    reconnects: &mut u32,
+    serving: bool,
+    node: Option<Uuid>,
+    lost: String,
+    delay: Duration,
+    observer: Option<FenceObserver<'_>>,
+) -> Result<PhysicalClient<ReplicationStream>> {
     // The FIFO sync also makes the groups the failed poll applied durable,
     // so the reconnect resumes after a durable cursor.
     worker
         .request(|reply| Command::Sync { reply })
         .await
-        .map_err(|drain| storage(format!("{error}; cannot drain receiver apply: {drain}")))?;
+        .map_err(|drain| storage(format!("{lost}; cannot drain receiver apply: {drain}")))?;
     let position = worker
         .position()
         .await
-        .map_err(|drain| storage(format!("{error}; cannot drain receiver apply: {drain}")))?;
+        .map_err(|drain| storage(format!("{lost}; cannot drain receiver apply: {drain}")))?;
     let epoch = position.epoch;
     let (_, durable) = position.initialized()?;
     if stopped(shutdown) {
         return Err(WireError::Shutdown.into());
     }
     *reconnects = reconnects.saturating_add(1);
-    let lost = error.to_string();
     progress.send_replace(ReceiverStatus::Connecting {
         history: Some(durable.history()),
         after: Some(durable.source_sequence()),
         last_error: Some(lost.clone()),
     });
-    if wait_or_stop(options.reconnect_delay, shutdown).await {
+    if !delay.is_zero() && wait_or_stop(delay, shutdown).await {
         return Err(WireError::Shutdown.into());
     }
     connect(
@@ -1187,6 +1414,8 @@ async fn reconnect(
         reconnects,
         serving,
         Some(lost),
+        node,
+        observer,
     )
     .await
 }
@@ -1230,7 +1459,10 @@ async fn download_snapshot(
     // Bytes this run fetched from the source (resumed bytes are not fetched).
     let mut fetched = 0_u64;
     loop {
-        let mut client = connect(options, shutdown, progress, None, None, reconnects, serving, None).await?;
+        let mut client = connect(
+            options, shutdown, progress, None, None, reconnects, serving, None, None, None,
+        )
+        .await?;
         let preferred = worker
             .request(|reply| Command::Inspect {
                 target: target.to_path_buf(),
@@ -1358,7 +1590,7 @@ pub async fn run_receiver(
     shutdown: watch::Receiver<bool>,
     progress: watch::Sender<ReceiverStatus>,
 ) -> Result<ClosedPhysicalStage> {
-    run_receiver_with(options, None, shutdown, progress).await
+    run_receiver_with(options, None, None, shutdown, progress).await
 }
 
 /// Spec P1.3: follow an installed physical standby AND serve it. `attach`
@@ -1374,17 +1606,43 @@ pub async fn run_serving_receiver(
     shutdown: watch::Receiver<bool>,
     progress: watch::Sender<ReceiverStatus>,
 ) -> Result<ClosedPhysicalStage> {
+    // The serving receiver's state machine is a large future: boxed so the
+    // callers' own futures (the supervisor, the promotion host) stay small.
+    Box::pin(run_serving(options, attach, None, shutdown, progress)).await
+}
+
+/// Spec P5.2 §3 step 2: [`run_serving_receiver`] that also takes its
+/// owner's [`ReceiverCommand`]s from `commands` (the online promotion's
+/// fence through this very session), between two polls.
+pub async fn run_serving_receiver_controlled(
+    options: ReceiverOptions,
+    attach: ServingAttach,
+    commands: mpsc::Receiver<ReceiverCommand>,
+    shutdown: watch::Receiver<bool>,
+    progress: watch::Sender<ReceiverStatus>,
+) -> Result<ClosedPhysicalStage> {
+    Box::pin(run_serving(options, attach, Some(commands), shutdown, progress)).await
+}
+
+async fn run_serving(
+    options: ReceiverOptions,
+    attach: ServingAttach,
+    commands: Option<mpsc::Receiver<ReceiverCommand>>,
+    shutdown: watch::Receiver<bool>,
+    progress: watch::Sender<ReceiverStatus>,
+) -> Result<ClosedPhysicalStage> {
     if options.mode != ReceiverMode::Follow || !matches!(options.start, ReceiverStart::Resume { .. }) {
         return Err(ReceiverError::Invalid(
             "a serving receiver follows an installed physical standby (Resume, Follow)".into(),
         ));
     }
-    run_receiver_with(options, Some(attach), shutdown, progress).await
+    run_receiver_with(options, Some(attach), commands, shutdown, progress).await
 }
 
 async fn run_receiver_with(
     options: ReceiverOptions,
     attach: Option<ServingAttach>,
+    mut commands: Option<mpsc::Receiver<ReceiverCommand>>,
     mut shutdown: watch::Receiver<bool>,
     progress: watch::Sender<ReceiverStatus>,
 ) -> Result<ClosedPhysicalStage> {
@@ -1404,7 +1662,7 @@ async fn run_receiver_with(
         None
     };
     let worker = Worker::spawn(options.config.clone(), attach, archive)?;
-    let outcome = run_inner(&options, &mut shutdown, &progress, &worker, serving).await;
+    let outcome = run_inner(&options, &mut shutdown, &progress, &worker, serving, &mut commands).await;
     match outcome {
         Ok(closed) => {
             progress.send_replace(ReceiverStatus::Stopped {
@@ -1455,7 +1713,20 @@ async fn run_inner(
     progress: &watch::Sender<ReceiverStatus>,
     worker: &Worker,
     serving: bool,
+    commands: &mut Option<mpsc::Receiver<ReceiverCommand>>,
 ) -> Result<ClosedPhysicalStage> {
+    // Spec P5.2 §3 step 2: once an online promotion asked for a fence, the
+    // identity every `Hello` names (the promotion's), the fence asked but not
+    // sent yet (the renewed session's first poll proves the tail first), and
+    // the fence answered (the final sequence to reach, durably).
+    let mut promotion: Option<Uuid> = None;
+    let mut fence: Option<FenceRequest> = None;
+    let mut fenced: Option<FenceProgress> = None;
+    // The last promotion that asked (spec P5.2 §8.E): while it waits, the
+    // promotion's identity stays on every session (a fence that failed is
+    // asked again, and the source answers the same promotion the same way);
+    // once it gave up with nothing fenced, the configured identity is back.
+    let mut owner: Option<mpsc::UnboundedSender<FenceEvent>> = None;
     let mut reconnects: u32 = 0;
     // Numbers this receiver's connections for `ReceiverStatus` (one per
     // successful `connect`).
@@ -1502,6 +1773,8 @@ async fn run_inner(
                 &mut reconnects,
                 serving,
                 None,
+                None,
+                None,
             )
             .await?
         }
@@ -1513,6 +1786,144 @@ async fn run_inner(
     loop {
         if stopped(shutdown) {
             return Err(WireError::Shutdown.into());
+        }
+        // Spec P5.2 §3 step 2: the owner's command, between two polls. A
+        // fence is sent on a session that announces the promotion's
+        // identity, renewed here (no delay), once its first poll was served.
+        // Spec P5.2 §8.E: a later fence is accepted whatever the state.
+        if let Some(ReceiverCommand::Fence { epoch, node, events }) =
+            commands.as_mut().and_then(|commands| commands.try_recv().ok())
+        {
+            if events.is_closed() {
+                // Its owner gave up before it was taken: nothing to do.
+            } else if let Some(done) = fenced.as_mut() {
+                if done.epoch == epoch && promotion == Some(node) {
+                    // Answered already (the source answers the same
+                    // promotion the same `Fenced`): re-reported, and the
+                    // catch-up goes on, reported to the new owner.
+                    let (_, at) = worker.position().await?.initialized()?;
+                    let at = at.source_sequence();
+                    tracing::warn!(
+                        "physical receiver: the online promotion asks again for the fence of its source by epoch \
+                         {epoch}: it was fenced at its sequence {} (this standby holds {at})",
+                        done.answer.final_sequence
+                    );
+                    let _ = events.send(FenceEvent::Connected);
+                    let _ = events.send(FenceEvent::Fenced(done.answer));
+                    if done.reached || at >= done.answer.final_sequence {
+                        done.reached = true;
+                        let _ = events.send(FenceEvent::ReachedFinal {
+                            final_sequence: done.answer.final_sequence,
+                            cursor: at,
+                        });
+                    }
+                    owner = Some(events.clone());
+                    done.events = events;
+                } else {
+                    let _ = events.send(FenceEvent::Failed {
+                        sent: false,
+                        refused: true,
+                        reason: format!(
+                            "this standby already fenced its source by epoch {} for another promotion (asked: \
+                             epoch {epoch}, promotion {node})",
+                            done.epoch
+                        ),
+                    });
+                }
+            } else if let Some(pending) = fence.as_mut().filter(|pending| pending.epoch == epoch) {
+                // Asked, not sent yet: the newest owner is told.
+                owner = Some(events.clone());
+                pending.events = events;
+            } else {
+                owner = Some(events.clone());
+                if promotion != Some(node) {
+                    tracing::warn!(
+                        "physical receiver: an online promotion of this standby (promotion {node}) fences its \
+                         source by epoch {epoch}: renewing the replication session under the promotion's identity"
+                    );
+                    let _ = events.send(FenceEvent::Taken);
+                    promotion = Some(node);
+                    drop(client);
+                    let renewed = resume_session(
+                        options,
+                        shutdown,
+                        progress,
+                        worker,
+                        &mut reconnects,
+                        serving,
+                        promotion,
+                        "the session is renewed under the promotion's identity, to fence the source".to_string(),
+                        Duration::ZERO,
+                        Some(FenceObserver {
+                            events: &events,
+                            renewal: true,
+                        }),
+                    )
+                    .await;
+                    match renewed {
+                        Ok(renewed) => client = renewed,
+                        Err(error) => {
+                            let refused = receiver_refuses_the_fence(&error);
+                            let _ = events.send(FenceEvent::Failed {
+                                sent: false,
+                                refused,
+                                reason: error.to_string(),
+                            });
+                            let stale = matches!(
+                                &error,
+                                ReceiverError::Wire(WireError::Refused(refusal))
+                                    if matches!(refusal.code, RefuseCode::SourceStale { .. })
+                            );
+                            if !stale {
+                                // As any reconnect of this receiver would.
+                                return Err(error);
+                            }
+                            // A superseded source refused the fence; this
+                            // receiver goes on as before (it keeps
+                            // reconnecting under its own identity, so a
+                            // corrected `--primary-host` takes effect).
+                            promotion = None;
+                            client = resume_session(
+                                options,
+                                shutdown,
+                                progress,
+                                worker,
+                                &mut reconnects,
+                                serving,
+                                None,
+                                format!("the fence of the source was refused: {error}"),
+                                options.reconnect_delay,
+                                None,
+                            )
+                            .await?;
+                            session += 1;
+                            observed_barrier = check_session_barrier(&client, observed_barrier)?;
+                            acks = Acknowledgements::new();
+                            continue;
+                        }
+                    }
+                    session += 1;
+                    observed_barrier = check_session_barrier(&client, observed_barrier)?;
+                    acks = Acknowledgements::new();
+                    fence = Some(FenceRequest { epoch, events });
+                    continue;
+                }
+                // Already under the promotion's identity (a fence asked
+                // again after it failed): sent after the next served poll.
+                let _ = events.send(FenceEvent::Connected);
+                fence = Some(FenceRequest { epoch, events });
+            }
+        }
+        // A promotion that gave up with nothing fenced (and did not ask
+        // again above): the configured identity is back for the next session.
+        if fence.is_none() && fenced.is_none() && owner.as_ref().is_some_and(mpsc::UnboundedSender::is_closed) {
+            owner = None;
+            promotion = None;
+        }
+        // Spec P5.2 §8.K (`internal-tests`): the catch-up of a fenced source
+        // held before its next poll.
+        if fenced.as_ref().is_some_and(|progress| !progress.reached) {
+            test_hold("after-fenced", shutdown).await;
         }
         let (path, cursor) = worker.position().await?.initialized()?;
         if let Some(heartbeat) = acks.due(client.heartbeats(), &cursor, options.heartbeat_interval) {
@@ -1528,6 +1939,8 @@ async fn run_inner(
                         worker,
                         &mut reconnects,
                         serving,
+                        promotion,
+                        fence_observer(&fence, &fenced),
                     )
                     .await?;
                     session += 1;
@@ -1571,6 +1984,8 @@ async fn run_inner(
                     worker,
                     &mut reconnects,
                     serving,
+                    promotion,
+                    fence_observer(&fence, &fenced),
                 )
                 .await?;
                 session += 1;
@@ -1599,6 +2014,105 @@ async fn run_inner(
         }
         observed_barrier = summary.durable_barrier;
         reconnects = 0;
+        // Spec P5.2 §3 step 2: the renewed session's poll was served — the
+        // tail is proven (P5.1 §11.B) — so the fence goes out now, inside it.
+        if fence.as_ref().is_some_and(|request| !request.events.is_closed()) {
+            // Spec P5.2 §8.K (`internal-tests`): held before the fence goes
+            // out (the old primary still takes writes).
+            test_hold("before-fence", shutdown).await;
+        }
+        if let Some(request) = fence.take() {
+            if request.events.is_closed() {
+                // Its owner gave up before the fence went out: nothing sent;
+                // the configured identity is back for the next session.
+                promotion = None;
+                owner = None;
+            } else {
+                let _ = request.events.send(FenceEvent::Proven {
+                    cursor: durable.source_sequence(),
+                });
+                let _ = request.events.send(FenceEvent::Sent {
+                    answer_within: options
+                        .wire
+                        .operation_timeout
+                        .saturating_add(options.wire.frame_timeout),
+                });
+                match client.fence(request.epoch).await {
+                    Ok(answer) => {
+                        tracing::warn!(
+                            "physical receiver: the source is fenced by epoch {} at its sequence {}; following it \
+                             through that sequence (this standby holds {})",
+                            answer.epoch,
+                            answer.final_sequence,
+                            durable.source_sequence()
+                        );
+                        let _ = request.events.send(FenceEvent::Fenced(answer));
+                        fenced = Some(FenceProgress {
+                            epoch: request.epoch,
+                            answer,
+                            events: request.events,
+                            reached: false,
+                        });
+                    }
+                    Err(error) => {
+                        let reason = error.to_string();
+                        let refused = refuses_the_fence(&error);
+                        tracing::warn!(
+                            "physical receiver: the fence of the source failed{}: {reason}",
+                            if refused { " (refused)" } else { "" }
+                        );
+                        let _ = request.events.send(FenceEvent::Failed {
+                            sent: true,
+                            refused,
+                            reason: reason.clone(),
+                        });
+                        // A refused or broken fence ends its session. A
+                        // refusal is final: the standby follows on under its
+                        // own identity. Anything else is asked again by the
+                        // promotion (spec P5.2 §8.D), so the promotion's
+                        // identity stays on the new session.
+                        if refused {
+                            promotion = None;
+                        }
+                        drop(client);
+                        client = resume_session(
+                            options,
+                            shutdown,
+                            progress,
+                            worker,
+                            &mut reconnects,
+                            serving,
+                            promotion,
+                            format!("the fence of the source failed: {reason}"),
+                            options.reconnect_delay,
+                            None,
+                        )
+                        .await?;
+                        session += 1;
+                        observed_barrier = check_session_barrier(&client, observed_barrier)?;
+                        acks = Acknowledgements::new();
+                        continue;
+                    }
+                }
+            }
+        }
+        if let Some(catching_up) = fenced.as_mut().filter(|catching_up| !catching_up.reached) {
+            let at = durable.source_sequence();
+            let final_sequence = catching_up.answer.final_sequence;
+            if at >= final_sequence {
+                catching_up.reached = true;
+                tracing::warn!(
+                    "physical receiver: this standby holds everything the fenced source committed (its final \
+                     sequence {final_sequence})"
+                );
+                let _ = catching_up.events.send(FenceEvent::ReachedFinal {
+                    final_sequence,
+                    cursor: at,
+                });
+            } else if summary.batches > 0 {
+                let _ = catching_up.events.send(FenceEvent::Advanced { cursor: at });
+            }
+        }
         let caught_up = summary.through == summary.durable_barrier;
         if !caught_up {
             progress.send_replace(ReceiverStatus::Applying {
@@ -1650,6 +2164,8 @@ async fn run_inner(
                 epoch,
                 &mut reconnects,
                 serving,
+                None,
+                promotion,
                 None,
             )
             .await?;

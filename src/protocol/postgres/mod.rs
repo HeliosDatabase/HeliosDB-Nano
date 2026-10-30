@@ -73,6 +73,9 @@ mod param_infer;
 pub mod password_store;
 pub mod prepared;
 pub mod server;
+// Spec P5.2 §1: every PostgreSQL session of the process, and the push
+// termination (FATAL 57P01) a fence or a promotion ends them with.
+pub mod sessions;
 pub mod ssl;
 pub mod timeouts;
 #[cfg(test)]
