@@ -1610,6 +1610,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                 if self.in_transaction && self.database.session_in_transaction(self.session_id) {
                     let _ = self.database.rollback_transaction_for_session(self.session_id);
                 }
+                // sprinter 6bc4a4040eb7 (B1 fix pass): a reset connection does
+                // not keep the previous client's `USE BRANCH` either — it goes
+                // back to the branch it was opened on (main for MySQL).
+                self.database.reset_session_branch(self.session_id);
                 self.status_flags = StatusFlags::default_flags();
                 self.in_transaction = false;
                 self.send_ok(0, 0).await?;
@@ -1718,6 +1722,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             return match self.database.try_handle_session_guc(self.session_id, trimmed) {
                 Ok(_) => self.send_ok(0, 0).await,
                 Err(e) => self.send_error(1064, "42000", &e.to_string()).await,
+            };
+        }
+
+        // sprinter 6bc4a4040eb7 (B1): `USE BRANCH x` / `USE DATABASE BRANCH x`
+        // and `SET` / `RESET` / `SHOW heliosdb.branch` bind (or report) THIS
+        // connection's branch — the same per-session binding the PostgreSQL wire
+        // uses. Routed ahead of the blanket `SET` and `USE` acknowledgements
+        // below, which would answer OK and apply nothing.
+        if EmbeddedDatabase::is_branch_binding_statement(trimmed) {
+            return match self
+                .database
+                .try_handle_session_branch_statement(self.session_id, trimmed)
+            {
+                Ok(Some((rows, schema))) if !schema.columns.is_empty() => {
+                    let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+                    self.send_result_set(&cols, &rows).await
+                }
+                Ok(_) => self.send_ok(0, 0).await,
+                Err(e) => self.send_error(1049, "42000", &e.to_string()).await,
             };
         }
 

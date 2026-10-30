@@ -532,6 +532,8 @@ impl WebhookHandler {
 pub struct StorageWebhookHandler<'a> {
     config: WebhookConfig,
     branch_manager: &'a crate::storage::BranchManager,
+    /// The engine whose MERGE copies table rows (see `handle_pr_merged`).
+    engine: Option<&'a crate::storage::StorageEngine>,
     link_manager: Option<&'a super::LinkManager>,
 }
 
@@ -541,8 +543,17 @@ impl<'a> StorageWebhookHandler<'a> {
         Self {
             config,
             branch_manager,
+            engine: None,
             link_manager: None,
         }
+    }
+
+    /// Merge PR branches through `engine` — the engine's MERGE, the one `MERGE
+    /// BRANCH` runs, which copies the branch's TABLE rows. Without an engine a
+    /// PR merge is refused (sprinter 6bc4a4040eb7, B1 second fix pass).
+    pub fn with_engine(mut self, engine: &'a crate::storage::StorageEngine) -> Self {
+        self.engine = Some(engine);
+        self
     }
 
     /// Set the link manager for Git-DB branch synchronization
@@ -657,11 +668,23 @@ impl<'a> StorageWebhookHandler<'a> {
 
         // Check if the preview branch exists
         match self.branch_manager.get_branch_by_name(&preview_branch_name) {
-            Ok(branch) => {
-                // Merge the branch - use the current timestamp
-                let snapshot_ts = self.branch_manager.current_timestamp();
-
-                match self.branch_manager.merge_branch(
+            Ok(_) => {
+                // sprinter 6bc4a4040eb7 (B1 second fix pass): merge through the
+                // ENGINE. `BranchManager::merge_branch` reads the manager's
+                // binary key-value overlay keys, which SQL never writes (table
+                // rows live under the engine's `bdata:{id}:{table}:{row}` keys),
+                // so it "merged" 0 rows, after which the preview branch — and
+                // every PR change in it — was dropped regardless. Now: the
+                // engine's merge, and the preview branch is only dropped once
+                // that merge SUCCEEDED; a failed merge keeps the branch and
+                // reports the failure.
+                let Some(engine) = self.engine else {
+                    return Ok(WebhookResult::error(format!(
+                        "PR #{} preview branch was not merged: no storage engine is attached to the webhook handler",
+                        pr_num
+                    )));
+                };
+                match engine.merge_branch(
                     &preview_branch_name,
                     target_branch,
                     crate::storage::MergeStrategy::default(),
@@ -676,15 +699,16 @@ impl<'a> StorageWebhookHandler<'a> {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to merge PR #{} branch (may require manual resolution): {}",
-                            pr_num,
-                            e
-                        );
+                        tracing::warn!("Failed to merge PR #{} branch; keeping it: {}", pr_num, e);
+                        return Ok(WebhookResult::error(format!(
+                            "Failed to merge PR #{} preview branch '{}' into '{}': {}",
+                            pr_num, preview_branch_name, target_branch, e
+                        ))
+                        .with_action("merge_preview_branch"));
                     }
                 }
 
-                // Drop the preview branch after merge
+                // Drop the preview branch after a successful merge
                 if let Err(e) = self.branch_manager.drop_branch(&preview_branch_name, true) {
                     tracing::warn!("Failed to drop PR #{} branch after merge: {}", pr_num, e);
                 }

@@ -266,6 +266,15 @@ impl RestExecutor {
         Self { db }
     }
 
+    /// Run one statement of this request on MAIN, through a request-scoped
+    /// backend — sprinter 6bc4a4040eb7 (B1). These routes are not under
+    /// `/v1/branches/:name/…`, so they run on main; without an explicit scope
+    /// they would run on the handle's own session, which an in-process caller's
+    /// `switch_branch` can move.
+    fn on_main<R>(&self, f: impl FnOnce(&EmbeddedDatabase) -> Result<R>) -> Result<R> {
+        self.db.with_request_branch_scope("main", || f(self.db.as_ref()))
+    }
+
     // ── SELECT ───────────────────────────────────────────────────────────
 
     /// Execute a SELECT query with PostgREST-style parameters.
@@ -321,16 +330,16 @@ impl RestExecutor {
 
         // Execute
         if params.is_empty() {
-            self.db.query_with_columns(&sql)
+            self.on_main(|db| db.query_with_columns(&sql))
         } else {
             // query_with_columns does not accept params, so we fall back to
             // building the column list from query_params and a separate
             // query_with_columns call for column names only.
-            let tuples = self.db.query_params(&sql, &params)?;
+            let tuples = self.on_main(|db| db.query_params(&sql, &params))?;
 
             // Derive column names: run a LIMIT 0 variant to grab names cheaply.
             let col_sql = format!("SELECT {columns} FROM {} LIMIT 0", quote_ident(table));
-            let (_, col_names) = self.db.query_with_columns(&col_sql)?;
+            let (_, col_names) = self.on_main(|db| db.query_with_columns(&col_sql))?;
             Ok((tuples, col_names))
         }
     }
@@ -412,7 +421,7 @@ impl RestExecutor {
     fn detect_owner_column(&self, table: &str) -> Result<Option<String>> {
         validate_identifier(table)?;
         let col_sql = format!("SELECT * FROM {} LIMIT 0", quote_ident(table));
-        let (_, col_names) = self.db.query_with_columns(&col_sql)?;
+        let (_, col_names) = self.on_main(|db| db.query_with_columns(&col_sql))?;
 
         for candidate in &["owner_id", "user_id"] {
             if col_names.iter().any(|c| c == candidate) {
@@ -465,13 +474,13 @@ impl RestExecutor {
                 placeholders.join(", "),
             );
 
-            let affected = self.db.execute_params(&sql, &params)?;
+            let affected = self.on_main(|db| db.execute_params(&sql, &params))?;
             total_affected += affected;
         }
 
         // Fetch the inserted data back for Prefer: return=representation
         let col_sql = format!("SELECT * FROM {} LIMIT 0", quote_ident(table));
-        let (_, col_names) = self.db.query_with_columns(&col_sql)?;
+        let (_, col_names) = self.on_main(|db| db.query_with_columns(&col_sql))?;
 
         Ok((total_affected, Vec::new(), col_names))
     }
@@ -518,7 +527,7 @@ impl RestExecutor {
             sql.push_str(&conditions.join(" AND "));
         }
 
-        self.db.execute_params(&sql, &params)
+        self.on_main(|db| db.execute_params(&sql, &params))
     }
 
     // ── DELETE ───────────────────────────────────────────────────────────
@@ -546,9 +555,9 @@ impl RestExecutor {
         }
 
         if params.is_empty() {
-            self.db.execute(&sql)
+            self.on_main(|db| db.execute(&sql))
         } else {
-            self.db.execute_params(&sql, &params)
+            self.on_main(|db| db.execute_params(&sql, &params))
         }
     }
 }

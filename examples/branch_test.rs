@@ -16,7 +16,7 @@ fn main() {
     db.execute("USE BRANCH dev1").expect("USE dev1");
 
     // Check branch_id resolution
-    let branch = db.storage.get_current_branch();
+    let branch = db.current_branch();
     eprintln!("*** current_branch = {:?}", branch);
     if let Some(bm) = db.storage.branch_manager() {
         match bm.get_branch_by_name("dev1") {

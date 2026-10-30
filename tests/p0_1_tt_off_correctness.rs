@@ -99,10 +99,12 @@ fn tt_off_main_branch_context_does_not_force_versioned_insert() {
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
         .unwrap();
 
-    db.storage.set_current_branch(Some("main".to_string()));
+    // sprinter 6bc4a4040eb7 (B1): the branch is session state; selecting
+    // `main` binds no branch on this handle's session.
+    db.switch_branch("main").unwrap();
     assert_eq!(
-        db.storage.get_current_branch(),
-        None,
+        db.current_branch(),
+        "main",
         "main branch context should normalize to no branch isolation"
     );
 

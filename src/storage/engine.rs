@@ -1965,6 +1965,34 @@ impl OpenMode {
     }
 }
 
+/// sprinter 6bc4a4040eb7 (B1 fix pass): puts a MERGE's source branch back to
+/// its pre-merge metadata when the copy fails after the source was already
+/// marked merged. Disarmed once the copy succeeds.
+struct MergeSourceRestore<'a> {
+    engine: &'a StorageEngine,
+    original: Option<BranchMetadata>,
+}
+
+impl MergeSourceRestore<'_> {
+    fn disarm(&mut self) {
+        self.original = None;
+    }
+}
+
+impl Drop for MergeSourceRestore<'_> {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            if let Err(e) = self.engine.write_branch_metadata(&original) {
+                tracing::warn!(
+                    branch = %original.name,
+                    error = %e,
+                    "MERGE BRANCH failed and its source could not be restored"
+                );
+            }
+        }
+    }
+}
+
 /// Storage engine
 pub struct StorageEngine {
     /// RocksDB instance. Never written directly: every write goes through
@@ -2025,8 +2053,25 @@ pub struct StorageEngine {
     node_id: uuid::Uuid,
     /// Delta tracker for incremental materialized view refresh
     mv_delta_tracker: Arc<super::MvDeltaTracker>,
-    /// Current branch context (for branch-aware queries)
-    current_branch: Arc<parking_lot::Mutex<Option<String>>>,
+    /// sprinter 6bc4a4040eb7 (phase B1): the branch REGISTRY generation —
+    /// bumped by every DROP and MERGE BRANCH, the two transitions that take a
+    /// branch out of `Active`.
+    ///
+    /// This replaces the engine-wide `current_branch` selector, which is GONE:
+    /// the active branch is SESSION state now
+    /// (`SessionScopedState::bind_branch`) and the one reader is
+    /// [`Self::active_branch`]. What stays engine-wide is only this counter, so
+    /// a session bound to a branch that ANOTHER session dropped or merged can
+    /// notice cheaply: its binding records the generation it was validated at
+    /// (`BranchBinding::validated_generation`) and re-checks the registry only
+    /// when the two differ ([`Self::check_active_branch`]). The SAME `Arc` is
+    /// held by the `BranchManager`, whose `drop_branch` / `merge_branch` bump
+    /// it, so a drop through any surface (SQL, REST, MCP) is seen.
+    branch_registry_generation: Arc<AtomicU64>,
+    /// sprinter 6bc4a4040eb7 (B1): the per-branch drains — a statement bound to
+    /// a branch holds its branch shared for its duration; DROP / MERGE close it
+    /// exclusively. Shared with the `BranchManager` (see `super::BranchDrains`).
+    branch_drains: Arc<super::BranchDrains>,
     /// Trigger registry for managing trigger definitions
     trigger_registry: Arc<crate::sql::TriggerRegistry>,
     /// Predicate pushdown manager for storage-level filtering
@@ -2107,8 +2152,10 @@ pub struct StorageEngine {
     /// only while that stamp matches the current generation; any
     /// existence-changing DDL (CREATE/DROP/RENAME TABLE, CREATE/DROP
     /// MATERIALIZED VIEW — including restore and WAL recovery, which funnel
-    /// through the same catalog methods) or branch switch bumps the generation,
-    /// lazily invalidating every entry in O(1). Bounded by distinct table names
+    /// through the same catalog methods) bumps the generation, lazily
+    /// invalidating every entry in O(1). (A branch switch used to bump it too;
+    /// since sprinter 6bc4a4040eb7 B1 the branch is per session and the catalog
+    /// is still global, so a binding changes no table's existence.) Bounded by distinct table names
     /// (one entry per name, overwritten in place on a generation miss).
     existence_cache: Arc<dashmap::DashMap<String, (u64, TableKind)>>,
     /// Monotonic schema generation backing `existence_cache`; bumped by
@@ -2125,9 +2172,10 @@ pub struct StorageEngine {
     /// reader that passes the gate then re-validates after its scan can never
     /// keep a scan that observed a too-new commit. Default-closed: a table
     /// with no entry always takes the snapshot path. Branch-blind by design —
-    /// only main-branch `data:` writes populate it and it is cleared on any
-    /// branch switch / DDL via `bump_schema_generation` (mirrors the row-cache
-    /// clear precedent, since branch reads must not trust main's watermarks).
+    /// only main-branch `data:` writes populate it, it is cleared on DDL via
+    /// `bump_schema_generation`, and a session on a branch never consults it
+    /// (`txn_base_tuples` declines the fast path off main — sprinter
+    /// 6bc4a4040eb7 B1; it used to rely on a global branch switch clearing it).
     write_watermarks: Arc<dashmap::DashMap<String, u64>>,
     /// In-memory table-constraints cache (avoids repeated metadata gets on DML)
     constraints_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::sql::TableConstraints>>>,
@@ -3175,11 +3223,19 @@ impl StorageEngine {
         } else {
             BranchManager::new(Arc::clone(&db), Arc::clone(&gate), Arc::clone(&timestamp))
         };
+        // sprinter 6bc4a4040eb7 (B1): ONE registry generation, shared by the
+        // engine (which reads it per bound statement) and the manager (whose
+        // drop / merge bump it — whichever surface drives them: SQL, the
+        // REST branch routes, which call the manager directly, MCP).
+        let branch_registry_generation = Arc::new(AtomicU64::new(1));
+        let branch_drains = Arc::new(super::BranchDrains::default());
         let branch_manager = match branch_open {
             Ok(mut manager) => {
                 // It writes branch rows against the same `Arc<DB>`, including
                 // copies between keys, so it applies the same rule.
                 manager.set_key_manager(key_manager.clone());
+                manager.set_registry_generation(Arc::clone(&branch_registry_generation));
+                manager.set_branch_drains(Arc::clone(&branch_drains));
                 info!("BranchManager initialized successfully");
                 Arc::new(RwLock::new(Some(Arc::new(manager))))
             }
@@ -3367,7 +3423,8 @@ impl StorageEngine {
             #[cfg(feature = "sync-experimental")]
             node_id,
             mv_delta_tracker,
-            current_branch: Arc::new(parking_lot::Mutex::new(None)),
+            branch_registry_generation,
+            branch_drains,
             trigger_registry,
             predicate_pushdown,
             filter_delta_tracker,
@@ -3660,10 +3717,15 @@ impl StorageEngine {
 
         // Initialize branch manager
         debug!("Initializing BranchManager for in-memory storage");
+        // sprinter 6bc4a4040eb7 (B1): shared with the manager, as on disk.
+        let branch_registry_generation = Arc::new(AtomicU64::new(1));
+        let branch_drains = Arc::new(super::BranchDrains::default());
         let branch_manager = match BranchManager::new(Arc::clone(&db), Arc::clone(&gate), Arc::clone(&timestamp)) {
             Ok(mut manager) => {
                 // Same reason as the on-disk open.
                 manager.set_key_manager(key_manager.clone());
+                manager.set_registry_generation(Arc::clone(&branch_registry_generation));
+                manager.set_branch_drains(Arc::clone(&branch_drains));
                 info!("BranchManager initialized successfully for in-memory storage");
                 Arc::new(RwLock::new(Some(Arc::new(manager))))
             }
@@ -3798,7 +3860,8 @@ impl StorageEngine {
             #[cfg(feature = "sync-experimental")]
             node_id,
             mv_delta_tracker,
-            current_branch: Arc::new(parking_lot::Mutex::new(None)),
+            branch_registry_generation,
+            branch_drains,
             trigger_registry,
             predicate_pushdown,
             filter_delta_tracker,
@@ -3871,19 +3934,18 @@ impl StorageEngine {
     /// Bump the schema generation (W1.3), lazily invalidating every
     /// `existence_cache` entry in O(1). Call AFTER committing any
     /// existence-changing catalog mutation (CREATE/DROP/RENAME TABLE,
-    /// CREATE/DROP MATERIALIZED VIEW) and on branch switch, so a subsequent
-    /// probe recomputes against the post-mutation catalog state.
+    /// CREATE/DROP MATERIALIZED VIEW), so a subsequent probe recomputes
+    /// against the post-mutation catalog state.
     pub fn bump_schema_generation(&self) {
         self.schema_generation.fetch_add(1, Ordering::Release);
         // W2.5: the same existence/visibility changes that invalidate the
         // existence cache also make the per-table committed-write watermarks
-        // untrustworthy — a branch switch changes which branch a table name
-        // resolves to (watermarks are branch-blind), and DDL (DROP/RENAME/
+        // untrustworthy — DDL (DROP/RENAME/
         // TRUNCATE-via-recreate/ALTER) changes the table's identity or content
         // outside the tracked commit-timestamp funnel. Clearing resets every
         // table to default-closed (the safe snapshot path) until the next
         // tracked commit re-establishes a watermark. O(distinct tables), and
-        // only on DDL / branch switch — never on the DML hot path.
+        // only on DDL — never on the DML hot path.
         self.write_watermarks.clear();
     }
 
@@ -5554,8 +5616,7 @@ impl StorageEngine {
         columns: Option<&[usize]>,
         predicates: &[AnalyzedPredicate],
     ) -> Result<Option<Vec<Tuple>>> {
-        let branch_name = self.current_branch.lock().clone();
-        if branch_name.is_some() && branch_name.as_deref() != Some("main") {
+        if self.is_branch_active() {
             return Ok(None);
         }
 
@@ -5694,8 +5755,7 @@ impl StorageEngine {
             return Ok(None);
         }
 
-        let branch_name = self.current_branch.lock().clone();
-        if branch_name.is_some() && branch_name.as_deref() != Some("main") {
+        if self.is_branch_active() {
             return Ok(None);
         }
 
@@ -6308,8 +6368,7 @@ impl StorageEngine {
             return Ok(None);
         }
 
-        let branch_name = self.current_branch.lock().clone();
-        if branch_name.is_some() && branch_name.as_deref() != Some("main") {
+        if self.is_branch_active() {
             return Ok(None);
         }
 
@@ -6427,8 +6486,7 @@ impl StorageEngine {
             return Ok(None);
         }
 
-        let branch_name = self.current_branch.lock().clone();
-        if branch_name.is_some() && branch_name.as_deref() != Some("main") {
+        if self.is_branch_active() {
             return Ok(None);
         }
 
@@ -6577,8 +6635,7 @@ impl StorageEngine {
         if projection.is_empty() {
             return Ok(None);
         }
-        let branch_name = self.current_branch.lock().clone();
-        if branch_name.is_some() && branch_name.as_deref() != Some("main") {
+        if self.is_branch_active() {
             return Ok(None);
         }
 
@@ -8791,11 +8848,15 @@ impl StorageEngine {
     /// Count rows in a table without deserializing tuples (fast COUNT(*) path).
     /// Only counts key prefixes matching `data:{table_name}:` — no deserialization.
     pub fn count_table_rows(&self, table_name: &str) -> Result<usize> {
-        let on_main_branch = self
-            .current_branch
-            .lock()
-            .as_deref()
-            .map_or(true, |name| name == "main");
+        // sprinter 6bc4a4040eb7 (B1 fix pass): on a branch the count is the
+        // number of rows the BRANCH sees — main's rows it inherits, its own
+        // rows, minus its tombstones. Every shortcut below (the PK index, the
+        // presence sidecars, the `data:` key walk) counts MAIN, so a branch
+        // session's `SELECT COUNT(*)` answered main's count. The branch-aware
+        // scan is the only correct source until branch indexes exist.
+        if self.is_branch_active() {
+            return Ok(self.scan_table_branch_aware(table_name)?.len());
+        }
         let has_user_branches = self
             .branch_manager
             .read()
@@ -8818,12 +8879,11 @@ impl StorageEngine {
         // declines these fast paths for any table its transaction has written
         // (`txn_forces_slow_reads_for_table`), so read-your-own-writes still
         // comes from the write-set merge path.
-        if on_main_branch && !has_user_branches && !self.has_uncommitted_writes_for_table(table_name) {
+        if !has_user_branches && !self.has_uncommitted_writes_for_table(table_name) {
             if let Some(count) = self.art_index_manager.pk_index_len(table_name) {
                 // Re-check after the probe: a transaction that armed the census
                 // between the gate above and the read here would otherwise have
-                // its staged rows counted. Costs one more atomic load on a path
-                // that already took the `current_branch` mutex.
+                // its staged rows counted. Costs one more atomic load.
                 if !self.has_uncommitted_writes_for_table(table_name) {
                     tracing::debug!(
                         phase = "count_pk_art_path",
@@ -8841,10 +8901,7 @@ impl StorageEngine {
         // maintained in lockstep with) the `data:{table}:` walk below. No
         // lazy backfill here: this path also serves non-columnar tables,
         // which must never grow presence sidecars.
-        if columnar_presence_enabled()
-            && on_main_branch
-            && ColumnarStore::presence_manifest_complete(&self.db, table_name)
-        {
+        if columnar_presence_enabled() && ColumnarStore::presence_manifest_complete(&self.db, table_name) {
             let count: usize = ColumnarStore::load_presence_map(&self.db, table_name)?
                 .iter()
                 .map(|(_, presence)| presence.live_count as usize)
@@ -8893,7 +8950,7 @@ impl StorageEngine {
         lower: Option<(i64, bool)>,
         upper: Option<(i64, bool)>,
     ) -> Result<Option<usize>> {
-        if self.get_current_branch_id().is_some() {
+        if self.is_branch_active() {
             return Ok(None);
         }
         // Same isolation gate as `count_table_rows`: this counts ART keys, and
@@ -9208,9 +9265,17 @@ impl StorageEngine {
         row_id: u64,
         schema: &crate::Schema,
     ) -> Result<Option<std::sync::Arc<Tuple>>> {
+        // sprinter 6bc4a4040eb7 (B1): the row cache is keyed `(table, row_id)`
+        // with no branch dimension, and used to be kept honest by clearing it on
+        // every (global) branch switch. The branch is per SESSION now, so there
+        // is no switch to clear on: a branch session neither reads nor fills
+        // it, which keeps every entry a MAIN row by construction.
+        let use_row_cache = !self.is_branch_active();
         // Check row cache first
-        if let Some(cached) = self.row_cache.get_arc(table_name, row_id) {
-            return Ok(Some(cached));
+        if use_row_cache {
+            if let Some(cached) = self.row_cache.get_arc(table_name, row_id) {
+                return Ok(Some(cached));
+            }
         }
 
         // Capture before reading storage: live replay publishes its generation
@@ -9268,13 +9333,15 @@ impl StorageEngine {
 
         // Populate the row cache and return the shared handle (no deep copy).
         let tuple = std::sync::Arc::new(tuple);
-        self.row_cache.put_arc_if_generation(
-            table_name,
-            row_id,
-            std::sync::Arc::clone(&tuple),
-            &self.schema_generation,
-            cache_generation,
-        );
+        if use_row_cache {
+            self.row_cache.put_arc_if_generation(
+                table_name,
+                row_id,
+                std::sync::Arc::clone(&tuple),
+                &self.schema_generation,
+                cache_generation,
+            );
+        }
 
         Ok(Some(tuple))
     }
@@ -9329,8 +9396,11 @@ impl StorageEngine {
             }
         };
 
+        // sprinter 6bc4a4040eb7 (B1): a branch session neither reads nor fills
+        // the branch-blind row cache (see `get_row_by_id_arc`).
+        let use_row_cache = !self.is_branch_active();
         // Check row cache before going to storage
-        if let Some(cached) = self.row_cache.get(table_name, row_id) {
+        if let Some(cached) = use_row_cache.then(|| self.row_cache.get(table_name, row_id)).flatten() {
             if let (Some(schema), Some((index, _))) = (schema, pk_column) {
                 if self.pk_probe_is_misdirected(&cached, schema, index, effective_pk, &key) {
                     return self.scan_actual_pk_owner(table_name, schema, index, effective_pk, &key);
@@ -9421,7 +9491,7 @@ impl StorageEngine {
 
         // Populate row cache with resolved tuple for read lookups. Write paths
         // skip this because they immediately invalidate the same row.
-        if populate_cache_on_miss {
+        if populate_cache_on_miss && use_row_cache {
             self.row_cache.put_if_generation(
                 table_name,
                 row_id,
@@ -9465,10 +9535,7 @@ impl StorageEngine {
         if schema.columns.iter().skip(index + 1).any(|column| column.primary_key) {
             return false;
         }
-        self.current_branch
-            .lock()
-            .as_deref()
-            .is_none_or(|branch| branch == "main")
+        !self.is_branch_active()
     }
 
     fn tuple_has_probed_pk(tuple: &Tuple, index: usize, effective_pk: &crate::Value, encoded_key: &[u8]) -> bool {
@@ -10874,6 +10941,9 @@ impl StorageEngine {
             .as_ref()
             .ok_or_else(|| Error::storage("BranchManager not available in read lock"))?;
 
+        // sprinter 6bc4a4040eb7 (B1): the manager bumps the registry
+        // generation, so a session bound to the dropped branch re-validates on
+        // its next statement and fails closed (3D000).
         mgr.drop_branch(name, if_exists)
     }
 
@@ -10962,6 +11032,64 @@ impl StorageEngine {
         let merge_to_main = target_name == "main" || target_id == 1;
         let merge_timestamp = self.next_timestamp();
         let mut merged_keys = 0usize;
+
+        // sprinter 6bc4a4040eb7 (B1 fix pass): take the source out of `Active`
+        // BEFORE copying a single row — after the statements running on it have
+        // finished (the drain), and while new ones are kept out. Marking it at
+        // the END left the whole copy window open: a session bound to the
+        // source kept writing to an overlay that had already been read, and
+        // those writes were silently lost. A failed copy puts the source back
+        // (`MergeSourceRestore`).
+        let _drained = self
+            .branch_drains
+            .close(source_id, source_name, super::BRANCH_DRAIN_TIMEOUT)?;
+        // B1 second fix pass: what was read above may be stale — the close
+        // waited for the source's running statements and possibly for a DROP
+        // or MERGE that closed it first. RE-READ both ends: the source must
+        // still be the branch whose drain was closed (same id) and Active, and
+        // the target likewise; the Merged record (and the restore record) is
+        // built from this fresh read. Then HOLD the target (a statement's
+        // shared hold) for the whole copy, so a DROP / MERGE of the target
+        // waits for the merge instead of dropping the overlay it is writing;
+        // one already closing the target refuses the merge (55006). The source
+        // is closed FIRST and the target hold never waits, so two crossed
+        // merges (b→c, c→b) refuse each other instead of deadlocking.
+        let source_meta = {
+            let manager = manager_lock.read();
+            let mgr = manager
+                .as_ref()
+                .ok_or_else(|| Error::storage("BranchManager not initialized"))?;
+            let source = mgr.get_branch_by_name(source_name)?;
+            let target = mgr.get_branch_by_name(target_name)?;
+            if source.branch_id != source_id || source.state != super::BranchState::Active {
+                return Err(Error::branch_merge(format!(
+                    "Source branch '{}' is not active",
+                    source_name
+                )));
+            }
+            if target.branch_id != target_id || target.state != super::BranchState::Active {
+                return Err(Error::branch_merge(format!(
+                    "Target branch '{}' is not active",
+                    target_name
+                )));
+            }
+            source
+        };
+        let _target_hold = if merge_to_main {
+            super::BranchHold::none()
+        } else {
+            self.branch_drains.enter(target_id, target_name)?
+        };
+        let mut merged_meta = source_meta.clone();
+        merged_meta.state = super::BranchState::Merged {
+            into_branch: target_id,
+            at_timestamp: merge_timestamp,
+        };
+        self.write_branch_metadata(&merged_meta)?;
+        let mut restore_source = MergeSourceRestore {
+            engine: self,
+            original: Some(source_meta),
+        };
 
         // Get all tables from catalog
         let catalog = Catalog::new(self);
@@ -11115,9 +11243,8 @@ impl StorageEngine {
 
         // W2.5 + caches: MERGE writes branch rows straight into the target's
         // `data:`/`bdata:` keyspace outside every tracked commit funnel — no
-        // version, no watermark bump, and (crucially) no branch-context switch,
-        // so `set_current_branch`'s watermark + existence-cache invalidation
-        // never fires. When merging into main, bump the schema generation: it
+        // version, no watermark bump, and no other invalidation of its own.
+        // When merging into main, bump the schema generation: it
         // clears every per-table committed-write watermark (and the existence
         // cache) so an in-transaction reader open across the merge cannot keep
         // fast-reading the merged `data:` values past its snapshot — its next
@@ -11127,29 +11254,9 @@ impl StorageEngine {
             self.bump_schema_generation();
         }
 
-        // Step 4: Update branch metadata to mark as merged
-        {
-            let manager = manager_lock.read();
-            let mgr = manager
-                .as_ref()
-                .ok_or_else(|| Error::storage("BranchManager not initialized"))?;
-
-            // Call merge_branch on manager just to update metadata (no actual data copy needed)
-            // We need to update the source branch state to Merged
-            let mut source = mgr.get_branch_by_name(source_name)?;
-            source.state = super::BranchState::Merged {
-                into_branch: target_id,
-                at_timestamp: merge_timestamp,
-            };
-
-            // Save updated metadata
-            let meta_key = format!("branch:meta:{}", source_name);
-            let meta_value = bincode::serialize(&source)
-                .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-            self.gate
-                .put(&self.db, meta_key.as_bytes(), &meta_value, None)
-                .map_err(|e| Error::storage(format!("Failed to save merged branch metadata: {}", e)))?;
-        }
+        // Step 4 (B1 fix pass): the source was marked merged before the copy;
+        // the copy succeeded, so keep it that way.
+        restore_source.disarm();
 
         tracing::info!(
             "Merge completed: {} -> {}, {} keys merged",
@@ -11164,6 +11271,17 @@ impl StorageEngine {
             conflicts: Vec::new(),
             completed: true,
         })
+    }
+
+    /// Persist `metadata` through the branch manager (cache refresh and
+    /// registry-generation bump included) — sprinter 6bc4a4040eb7 (B1).
+    fn write_branch_metadata(&self, metadata: &BranchMetadata) -> Result<()> {
+        let manager_lock = self.get_or_init_branch_manager()?;
+        let manager = manager_lock.read();
+        let mgr = manager
+            .as_ref()
+            .ok_or_else(|| Error::storage("BranchManager not initialized"))?;
+        mgr.write_branch_metadata(metadata)
     }
 
     /// MERGE BRANCH into main, step 3b (spec P1.1b): bring main's in-memory
@@ -11272,28 +11390,23 @@ impl StorageEngine {
         mgr.get_branch_name(branch_id)
     }
 
-    /// Switch to a different branch
+    /// `USE BRANCH branch_name` for the session whose statement runs on the
+    /// calling thread — sprinter 6bc4a4040eb7 (phase B1).
     ///
-    /// This sets the current branch context for subsequent operations.
-    /// All INSERT, UPDATE, DELETE, and SELECT operations will be isolated
-    /// to this branch until another USE BRANCH or USE main is called.
+    /// Binds THAT session only ([`Self::bind_session_branch`]); every other
+    /// connection keeps its own branch. `main` returns the session to main;
+    /// an unknown, dropped or merged branch is refused (3D000). A caller with
+    /// no session installed has nothing to bind and is refused rather than
+    /// silently moving some shared slot — there is none any more.
     pub fn use_branch(&self, branch_name: &str) -> Result<()> {
-        // Handle "main" branch specially - clear branch context
-        if branch_name == "main" {
-            self.set_current_branch(None);
-            tracing::info!("Switched to main branch (branch isolation disabled)");
-            return Ok(());
-        }
-
-        // Validate that branch exists
-        let _metadata = self.get_branch(branch_name)?;
-
-        // Set the current branch context for subsequent operations
-        // This enables branch isolation for all data operations
-        self.set_current_branch(Some(branch_name.to_string()));
-
-        tracing::info!("Switched to branch '{}' (branch isolation enabled)", branch_name);
-
+        let state = crate::session_scoped_state_tls().ok_or_else(|| {
+            Error::query_execution(
+                "USE BRANCH needs a session to bind the branch to; run it through a connection or an \
+                 EmbeddedDatabase entry point",
+            )
+        })?;
+        self.bind_session_branch(&state, branch_name)?;
+        tracing::info!("Session switched to branch '{}'", branch_name);
         Ok(())
     }
 
@@ -12418,7 +12531,14 @@ impl StorageEngine {
             Arc::clone(&self.timestamp),
         )?;
         manager.set_key_manager(self.key_manager.clone());
+        manager.set_registry_generation(Arc::clone(&self.branch_registry_generation));
+        manager.set_branch_drains(Arc::clone(&self.branch_drains));
         *self.branch_manager.write() = Some(Arc::new(manager));
+        // sprinter 6bc4a4040eb7 (B1): the registry changed underneath this
+        // standby (a primary's DROP or MERGE BRANCH can be among the records
+        // that arrived), so every session bound to a branch here re-validates
+        // its binding on its next statement and fails closed if it is gone.
+        self.branch_registry_generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -14078,11 +14198,8 @@ impl StorageEngine {
         if !columnar_presence_enabled() {
             return None;
         }
-        {
-            let branch = self.current_branch.lock();
-            if branch.as_deref().is_some_and(|name| name != "main") {
-                return None;
-            }
+        if self.is_branch_active() {
+            return None;
         }
         match ColumnarStore::presence_scan_map(&self.db, &self.gate, table_name) {
             Ok(map) => Some(map),
@@ -15697,20 +15814,12 @@ mod tests {
             "dropped view must reclassify to Missing, not serve a stale MatView"
         );
 
-        // A branch switch changes catalog visibility without table DDL and must
-        // also bump the generation (both switch-away and switch-back).
-        let g3 = engine.schema_generation();
-        engine.set_current_branch(Some("feature".to_string()));
-        assert!(
-            engine.schema_generation() > g3,
-            "set_current_branch must bump generation"
-        );
-        let g4 = engine.schema_generation();
-        engine.clear_current_branch();
-        assert!(
-            engine.schema_generation() > g4,
-            "clear_current_branch must bump generation"
-        );
+        // sprinter 6bc4a4040eb7 (B1): there is no engine-wide branch switch to
+        // bump the generation any more. A branch binding is SESSION state, the
+        // catalog is still global (branch-scoped schema is phase B3), and
+        // every cache that used to rely on "a switch clears everything" now
+        // bypasses itself on a branch session instead (row cache, result
+        // cache, the W2.5 watermark read) — so nothing here depends on it.
     }
 
     #[test]
@@ -16532,60 +16641,185 @@ impl StorageEngine {
         Ok(())
     }
 
-    /// Get the current branch context
+    // ---- sprinter 6bc4a4040eb7 (phase B1): the ONE branch accessor ----
+
+    /// The branch the session whose statement runs on the calling thread is
+    /// bound to ON THIS ENGINE, or `None` for main.
     ///
-    /// Returns the name of the currently active branch, or None if on main branch
-    pub fn get_current_branch(&self) -> Option<String> {
-        self.current_branch.lock().as_ref().cloned()
-    }
-
-    /// Set the current branch context
+    /// THE accessor. Every reader of "the current branch" goes through it, or
+    /// through one of its two other spellings — [`Self::is_branch_active`]
+    /// (lock-free yes/no, for the fast-path gates) and
+    /// [`Self::check_active_branch`] (fail-closed, for the funnels that touch
+    /// the overlay): the scans, the write funnels, every fast-path gate of both
+    /// DML executor families, the row/result caches, `CREATE BRANCH` without
+    /// `PARENT`, merge "into current", `SHOW heliosdb.branch`. There is no
+    /// engine-wide selector behind it — the `current_branch` mutex this
+    /// replaces moved every connection whenever one ran `USE BRANCH` — and no
+    /// caller may keep a private copy of the answer across statements.
     ///
-    /// All subsequent queries will execute on this branch instead of main
-    pub fn set_current_branch(&self, branch_name: Option<String>) {
-        *self.current_branch.lock() = branch_name.filter(|name| name != "main");
-        // W1.3: a branch switch changes catalog visibility WITHOUT table DDL;
-        // invalidate the existence cache so a probe never serves wrong-branch
-        // classification (the fast paths also bail on `is_branch_active`, but
-        // this keeps the cache correct across switch-back to main).
-        self.bump_schema_generation();
-        // The row cache is keyed by (table, row_id) with NO branch dimension,
-        // while fills read through `branch_aware_data_key` — so an entry
-        // filled on one branch (e.g. an indexed probe reading `bdata:…`) is
-        // wrong-branch data for every other branch. The branch context is
-        // engine-global and only changes here, so clearing at the switch makes
-        // every fill/hit within a branch epoch self-consistent.
-        self.row_cache.clear();
-    }
-
-    /// Clear the current branch context (revert to main)
-    pub fn clear_current_branch(&self) {
-        *self.current_branch.lock() = None;
-        // W1.3: see `set_current_branch` — invalidate on branch-context change
-        // (generation for the existence cache, row cache for wrong-branch rows).
-        self.bump_schema_generation();
-        self.row_cache.clear();
-    }
-
-    /// Check if a non-main branch is currently active
-    pub fn is_branch_active(&self) -> bool {
-        self.current_branch.lock().as_deref().is_some_and(|name| name != "main")
-    }
-
-    /// Get current branch ID if a non-main branch is active
-    pub fn get_current_branch_id(&self) -> Option<u64> {
-        let branch_name = self.current_branch.lock().clone()?;
-
-        // Handle "main" branch specially
-        if branch_name == "main" {
-            return None;
+    /// The binding lives on the session (`SessionScopedState::bind_branch`)
+    /// and reaches the engine through the per-statement thread-local every
+    /// session and embedded entry point installs, exactly like the tenant
+    /// binding (sprinter d03de7fc3b22) and [`Self::is_bulk_load_mode`], which
+    /// reads the thread-local first. With NO session installed — engine-internal
+    /// work: the MV scheduler, version GC, the physical applier, WAL replay at
+    /// open — the answer is main.
+    pub fn active_branch(&self) -> Option<Arc<crate::session::BranchBinding>> {
+        // B1 fix pass: the binding the running statement was SNAPSHOTTED with
+        // at its gate wins for the rest of that statement, so a concurrent
+        // switch of a shared session (the embedded handle's) cannot split one
+        // statement across two branches.
+        if let Some(snapshot) = crate::statement_branch_tls(self.instance_id) {
+            return snapshot;
         }
+        self.session_branch_binding()
+    }
 
-        let branch_manager = self.branch_manager()?;
-        branch_manager
-            .get_branch_by_name(&branch_name)
-            .ok()
-            .map(|m| m.branch_id)
+    /// The branch the calling thread's SESSION is bound to on this engine,
+    /// ignoring any statement snapshot — what a statement gate snapshots.
+    pub fn session_branch_binding(&self) -> Option<Arc<crate::session::BranchBinding>> {
+        let binding = crate::session_branch_binding_tls()?;
+        (binding.engine_instance == self.instance_id).then_some(binding)
+    }
+
+    /// Take a statement's shared hold on `binding`'s branch (see
+    /// `super::BranchDrains`). Refused immediately (55006) while a DROP or
+    /// MERGE is closing the branch.
+    pub fn enter_branch(&self, binding: &crate::session::BranchBinding) -> Result<super::BranchHold> {
+        self.branch_drains.enter(binding.branch_id, &binding.name)
+    }
+
+    /// The drain of branch `branch_id` right now: statements in flight, a
+    /// close in progress, closers queued — diagnostics, and the hook the
+    /// deterministic DROP / MERGE concurrency tests poll.
+    pub fn branch_drain_state(&self, branch_id: super::BranchId) -> super::BranchDrainState {
+        self.branch_drains.state(branch_id)
+    }
+
+    /// Re-validate `binding` against the registry: `Ok` while its branch is
+    /// still active, 3D000 once it was dropped or merged (or its name now
+    /// names a newer branch). One atomic compare while no DROP / MERGE has run
+    /// since the binding was last validated.
+    pub fn validate_branch_binding(&self, binding: &crate::session::BranchBinding) -> Result<()> {
+        let generation = self.branch_registry_generation();
+        if binding.validated_generation() == generation {
+            return Ok(());
+        }
+        match self.get_branch(&binding.name) {
+            Ok(meta) if meta.branch_id == binding.branch_id && meta.state == super::BranchState::Active => {
+                binding.note_validated(generation);
+                Ok(())
+            }
+            Ok(meta)
+                if meta.branch_id == binding.branch_id && matches!(meta.state, super::BranchState::Merged { .. }) =>
+            {
+                Err(Error::branch_binding_gone(&binding.name, true))
+            }
+            // Dropped, or the name now names a NEWER branch (ids are never
+            // reused, so a different id is a different branch): either way the
+            // branch this session bound is gone.
+            _ => Err(Error::branch_binding_gone(&binding.name, false)),
+        }
+    }
+
+    /// Is the calling session bound to a branch of THIS engine? Two atomic
+    /// loads behind one `RefCell` borrow and no lock — the spelling the
+    /// per-statement and per-row fast-path gates use.
+    ///
+    /// A binding whose branch has since been dropped or merged still answers
+    /// `true` here, on purpose: the fast paths then decline, and the
+    /// branch-aware funnel they fall back to refuses through
+    /// [`Self::check_active_branch`]. A stale binding must fail CLOSED; it
+    /// must never read as "main" (sprinter 6bc4a4040eb7 — the pre-B1
+    /// `get_current_branch_id().is_none()` gates did exactly that for a branch
+    /// that no longer resolved, and sent its writes to main).
+    #[inline]
+    pub fn is_branch_active(&self) -> bool {
+        // The statement snapshot first, for the reason `active_branch` gives.
+        match crate::statement_on_branch_tls(self.instance_id) {
+            Some(on_branch) => on_branch,
+            None => crate::session_on_branch_tls(self.instance_id),
+        }
+    }
+
+    /// [`Self::active_branch`], refusing with SQLSTATE 3D000 when the bound
+    /// branch has been dropped or merged since the binding was validated.
+    ///
+    /// Cheap: unless a DROP or MERGE BRANCH has run since the binding was last
+    /// checked, this is one atomic compare (`branch_registry_generation`). When
+    /// one has, it re-reads THIS binding's branch metadata once and either
+    /// re-stamps the binding or refuses — and keeps refusing on every later
+    /// call: the binding stays until the session changes it (`USE BRANCH`,
+    /// `SET`/`RESET heliosdb.branch`), so nothing the session runs can reach
+    /// main or any other branch in the meantime.
+    pub fn check_active_branch(&self) -> Result<Option<Arc<crate::session::BranchBinding>>> {
+        let Some(binding) = self.active_branch() else {
+            return Ok(None);
+        };
+        self.validate_branch_binding(&binding)?;
+        Ok(Some(binding))
+    }
+
+    /// The branch-registry generation (see the field). Bumped by every DROP
+    /// and MERGE BRANCH.
+    #[inline]
+    pub fn branch_registry_generation(&self) -> u64 {
+        self.branch_registry_generation.load(Ordering::Acquire)
+    }
+
+    /// Resolve `name` to an ACTIVE branch and build the binding a session
+    /// stores — sprinter 6bc4a4040eb7 (phase B1).
+    ///
+    /// THE resolver for every binding (`USE BRANCH`, `SET heliosdb.branch`, the
+    /// PostgreSQL startup forms, REPL `\use`, `switch_branch`, REST and MCP
+    /// request scope) and for `CREATE BRANCH … IF NOT EXISTS`. A `Dropped` or
+    /// `Merged` branch is NOT found: it cannot be bound, and its name is free
+    /// for a new branch (which gets a new id, so none of the old overlay is
+    /// visible through it). `main` is never resolved here — binding main means
+    /// unbinding ([`Self::bind_session_branch`]).
+    ///
+    /// The registry generation is read BEFORE the metadata, so a drop that
+    /// races this resolution leaves the binding stamped with the older
+    /// generation and forces a re-validation on its first use.
+    pub fn resolve_active_branch(&self, name: &str) -> Result<crate::session::BranchBinding> {
+        let generation = self.branch_registry_generation();
+        let meta = match self.get_branch(name) {
+            Ok(meta) if meta.state == super::BranchState::Active && meta.name != "main" => meta,
+            _ => return Err(Error::branch_not_active(name)),
+        };
+        let chain = self.get_branch_chain(meta.branch_id)?;
+        Ok(crate::session::BranchBinding::new(
+            self.instance_id,
+            meta.name,
+            meta.branch_id,
+            chain,
+            generation,
+        ))
+    }
+
+    /// Is `name` an ACTIVE branch? The existence test `CREATE BRANCH … IF NOT
+    /// EXISTS` uses — the same definition the resolver above applies, so a
+    /// dropped branch's name is "free" for both.
+    pub fn active_branch_exists(&self, name: &str) -> bool {
+        name == "main" || matches!(self.get_branch(name), Ok(meta) if meta.state == super::BranchState::Active)
+    }
+
+    /// Bind `state` to the branch `name`; `main` returns it to main.
+    ///
+    /// The ONE writer of a session's branch binding: `USE BRANCH` /
+    /// `USE DATABASE BRANCH` (both executor families and both wires),
+    /// `SET heliosdb.branch`, the PostgreSQL startup forms, REPL `\use` and
+    /// `EmbeddedDatabase::switch_branch`. Unknown, dropped and merged branches
+    /// are refused with SQLSTATE 3D000 and leave the binding unchanged.
+    pub fn bind_session_branch(&self, state: &crate::session::SessionScopedState, name: &str) -> Result<()> {
+        if name == "main" {
+            state.unbind_branch();
+            return Ok(());
+        }
+        let binding = self.resolve_active_branch(name)?;
+        tracing::debug!(branch = %binding.name, branch_id = binding.branch_id, "session bound to branch");
+        state.bind_branch(binding);
+        Ok(())
     }
 
     /// Get the full branch chain from main to current branch (inclusive)
@@ -16620,9 +16854,13 @@ impl StorageEngine {
     /// If a branch is active, returns a key prefixed with the branch ID.
     /// Otherwise, returns the standard data key format.
     pub fn branch_aware_data_key(&self, table_name: &str, row_id: u64) -> Vec<u8> {
-        if let Some(branch_id) = self.get_current_branch_id() {
+        // sprinter 6bc4a4040eb7 (B1): the SESSION's binding, never an
+        // engine-wide selector. A stale binding (its branch dropped) still
+        // yields that branch's overlay key — never main's — so a caller that
+        // skipped `check_active_branch` cannot write through to main.
+        if let Some(binding) = self.active_branch() {
             // Branch-specific key: bdata:{branch_id}:{table}:{row_id}
-            format!("bdata:{}:{}:{}", branch_id, table_name, row_id).into_bytes()
+            format!("bdata:{}:{}:{}", binding.branch_id, table_name, row_id).into_bytes()
         } else {
             Self::build_data_key(table_name, row_id)
         }
@@ -16653,8 +16891,7 @@ impl StorageEngine {
         schema: &crate::Schema,
         prefix_len: usize,
     ) -> Result<Vec<Tuple>> {
-        let branch_name = self.current_branch.lock().clone();
-        if branch_name.is_none() || branch_name.as_deref() == Some("main") {
+        if !self.is_branch_active() {
             return self.scan_table_with_schema_prefix(table_name, schema, prefix_len);
         }
         self.scan_table_branch_aware_with_schema(table_name, schema)
@@ -16669,8 +16906,7 @@ impl StorageEngine {
         schema: &crate::Schema,
         columns: &[usize],
     ) -> Result<Vec<Tuple>> {
-        let branch_name = self.current_branch.lock().clone();
-        if branch_name.is_none() || branch_name.as_deref() == Some("main") {
+        if !self.is_branch_active() {
             return self.scan_table_with_schema_columns(table_name, schema, columns);
         }
         self.scan_table_branch_aware_with_schema(table_name, schema)
@@ -16684,8 +16920,7 @@ impl StorageEngine {
         schema: &crate::Schema,
         columns: &[usize],
     ) -> Result<Vec<Tuple>> {
-        let branch_name = self.current_branch.lock().clone();
-        if branch_name.is_none() || branch_name.as_deref() == Some("main") {
+        if !self.is_branch_active() {
             return self.scan_table_with_schema_columnar_columns(table_name, schema, columns);
         }
         self.scan_table_branch_aware_with_schema(table_name, schema)
@@ -16700,8 +16935,7 @@ impl StorageEngine {
         columns: &[usize],
         predicates: &[AnalyzedPredicate],
     ) -> Result<Vec<Tuple>> {
-        let branch_name = self.current_branch.lock().clone();
-        if branch_name.is_none() || branch_name.as_deref() == Some("main") {
+        if !self.is_branch_active() {
             return self.scan_table_with_schema_columnar_columns_filtered(table_name, schema, columns, predicates);
         }
         self.scan_table_branch_aware_with_schema(table_name, schema)
@@ -16709,32 +16943,20 @@ impl StorageEngine {
 
     /// Branch-aware scan using a pre-fetched schema (avoids duplicate schema lookup).
     pub fn scan_table_branch_aware_with_schema(&self, table_name: &str, schema: &crate::Schema) -> Result<Vec<Tuple>> {
-        // Get current branch name
-        let branch_name = self.current_branch.lock().clone();
-
-        // If branch is "main" or None, use standard scan
-        if branch_name.is_none() || branch_name.as_deref() == Some("main") {
+        // sprinter 6bc4a4040eb7 (B1): the SESSION's binding. Main (no binding)
+        // is the standard scan; a binding whose branch was dropped or merged
+        // since it was validated is refused (3D000) rather than read.
+        let Some(binding) = self.check_active_branch()? else {
             return self.scan_table_with_schema(table_name, schema);
-        }
-
-        // Non-main branch - must resolve to a valid branch ID
-        let branch_id = match self.get_current_branch_id() {
-            Some(id) => id,
-            None => {
-                return Err(Error::query_execution(format!(
-                    "Branch '{}' does not exist. Create it first with: CREATE BRANCH {} FROM main",
-                    branch_name.as_deref().unwrap_or("unknown"),
-                    branch_name.as_deref().unwrap_or("branch_name")
-                )));
-            }
         };
-
-        // Get the full branch chain (from oldest ancestor to current)
-        let branch_chain = self.get_branch_chain(branch_id)?;
+        let branch_id = binding.branch_id;
+        // The chain (oldest ancestor .. this branch) was resolved once, when
+        // the session bound the branch — a branch's ancestry never changes.
+        let branch_chain = &binding.chain;
 
         tracing::debug!(
             "scan_table_branch_aware: branch chain for '{}' (id {}): {:?}",
-            branch_name.as_deref().unwrap_or("unknown"),
+            binding.name,
             branch_id,
             branch_chain
         );
@@ -16787,7 +17009,7 @@ impl StorageEngine {
 
         // Step 2: Walk the branch chain from oldest to newest
         // Each branch's data overrides parent data, and delete markers accumulate
-        for &chain_branch_id in &branch_chain {
+        for &chain_branch_id in branch_chain {
             // Collect delete markers for this branch
             let delete_prefix = format!("bdel:{}:{}:", chain_branch_id, table_name);
             let delete_prefix_bytes = delete_prefix.as_bytes();
@@ -16874,26 +17096,12 @@ impl StorageEngine {
         tuple: Tuple,
         schema: &crate::Schema,
     ) -> Result<u64> {
-        // Get current branch name
-        let branch_name = self.current_branch.lock().clone();
-
-        // If branch is "main" or None, use standard versioned insert
-        if branch_name.is_none() || branch_name.as_deref() == Some("main") {
+        // sprinter 6bc4a4040eb7 (B1): the SESSION's binding — main (none) is
+        // the standard versioned insert; a dropped/merged binding is refused.
+        let Some(binding) = self.check_active_branch()? else {
             return self.insert_tuple_versioned_with_schema(table_name, tuple, schema);
-        }
-
-        // Non-main branch - must resolve to a valid branch ID
-        let branch_id = match self.get_current_branch_id() {
-            Some(id) => id,
-            None => {
-                // Branch name is set but not found in registry - error!
-                return Err(Error::query_execution(format!(
-                    "Branch '{}' does not exist. Create it first with: CREATE BRANCH {} FROM main",
-                    branch_name.as_deref().unwrap_or("unknown"),
-                    branch_name.as_deref().unwrap_or("branch_name")
-                )));
-            }
         };
+        let branch_id = binding.branch_id;
         let catalog = Catalog::new(self);
 
         // R1.1: volatile row id (shared across branches for consistency);
@@ -16984,24 +17192,9 @@ impl StorageEngine {
         table_name: &str,
         mut updates: Vec<(u64, Tuple)>, // (row_id, updated_tuple)
     ) -> Result<u64> {
-        // Get current branch name
-        let branch_name = self.current_branch.lock().clone();
-
-        // Validate branch if non-main
-        let branch_id = if branch_name.is_none() || branch_name.as_deref() == Some("main") {
-            None
-        } else {
-            match self.get_current_branch_id() {
-                Some(id) => Some(id),
-                None => {
-                    return Err(Error::query_execution(format!(
-                        "Branch '{}' does not exist. Create it first with: CREATE BRANCH {} FROM main",
-                        branch_name.as_deref().unwrap_or("unknown"),
-                        branch_name.as_deref().unwrap_or("branch_name")
-                    )));
-                }
-            }
-        };
+        // sprinter 6bc4a4040eb7 (B1): the SESSION's binding (`None` = main);
+        // a dropped/merged binding is refused before anything is written.
+        let branch_id = self.check_active_branch()?.map(|binding| binding.branch_id);
         let catalog = Catalog::new(self);
         let schema = catalog.get_table_schema(table_name)?;
 
@@ -17028,7 +17221,8 @@ impl StorageEngine {
             // re-establishes it. A reader whose snapshot predates this update is
             // still forced onto the snapshot path by the post-scan re-check
             // (absent entry => "changed"). Branch overlays (`bdata:`/`bv:`) are
-            // branch-blind and never enter the map (cleared on switch).
+            // branch-blind and never enter the map (a branch session never
+            // reads it — sprinter 6bc4a4040eb7 B1).
             if branch_id.is_none() {
                 self.invalidate_write_watermark(table_name);
             }
@@ -17172,26 +17366,9 @@ impl StorageEngine {
         let catalog = Catalog::new(self);
         let schema_result = catalog.get_table_schema(table_name);
 
-        // Get current branch name
-        let branch_name = self.current_branch.lock().clone();
-
-        tracing::debug!("delete_tuples_branch_aware: branch_name = {:?}", branch_name);
-
-        // Validate branch and get ID
-        let branch_id = if branch_name.is_none() || branch_name.as_deref() == Some("main") {
-            None
-        } else {
-            match self.get_current_branch_id() {
-                Some(id) => Some(id),
-                None => {
-                    return Err(Error::query_execution(format!(
-                        "Branch '{}' does not exist. Create it first with: CREATE BRANCH {} FROM main",
-                        branch_name.as_deref().unwrap_or("unknown"),
-                        branch_name.as_deref().unwrap_or("branch_name")
-                    )));
-                }
-            }
-        };
+        // sprinter 6bc4a4040eb7 (B1): the SESSION's binding (`None` = main);
+        // a dropped/merged binding is refused before anything is deleted.
+        let branch_id = self.check_active_branch()?.map(|binding| binding.branch_id);
 
         tracing::debug!("delete_tuples_branch_aware: resolved branch_id = {:?}", branch_id);
 

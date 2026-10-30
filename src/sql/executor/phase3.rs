@@ -127,7 +127,11 @@ fn handle_create_branch(
     );
 
     if let Some(storage) = executor.storage() {
-        if if_not_exists && storage.get_branch(branch_name).is_ok() {
+        // sprinter 6bc4a4040eb7 (B1): "exists" means ACTIVE — the same
+        // definition the binding resolver uses. A dropped branch's name is free:
+        // `IF NOT EXISTS` over it creates a fresh branch (new id, none of the
+        // old rows) instead of no-opping onto the dropped branch's overlay.
+        if if_not_exists && storage.active_branch_exists(branch_name) {
             tracing::info!("Branch '{}' already exists (IF NOT EXISTS specified)", branch_name);
             return Ok(empty_phase3_result(executor));
         }
@@ -175,10 +179,13 @@ fn handle_create_branch(
 
         // Resolve parent branch:
         // - If explicitly specified, use that
-        // - Otherwise, use the current active branch (implicit FROM current branch)
+        // - Otherwise, the branch THIS SESSION is on (sprinter 6bc4a4040eb7, B1
+        //   — it was the engine-wide selector, i.e. whichever branch some other
+        //   connection last switched to). A binding whose branch has since gone
+        //   is refused rather than read as main.
         let resolved_parent = match parent {
             Some(p) => Some(p.clone()),
-            None => storage.get_current_branch(),
+            None => storage.check_active_branch()?.map(|binding| binding.name.clone()),
         };
 
         // Create the branch at the resolved snapshot
@@ -217,6 +224,17 @@ fn handle_drop_branch(executor: &Executor, branch_name: &str, if_exists: bool) -
     tracing::info!("Executing DROP BRANCH {} (IF EXISTS: {})", branch_name, if_exists);
 
     if let Some(storage) = executor.storage() {
+        // sprinter 6bc4a4040eb7 (B1): PostgreSQL refuses to drop the database
+        // the session is connected to (55006 `cannot drop the currently open
+        // database`); a branch is refused the same way for the session bound to
+        // it. Other sessions bound to it do not block the drop — they fail
+        // closed on their next statement instead.
+        if storage
+            .active_branch()
+            .is_some_and(|binding| binding.name == branch_name)
+        {
+            return Err(Error::branch_in_use(branch_name));
+        }
         // Drop the branch
         storage.drop_branch(branch_name, if_exists)?;
 
@@ -995,20 +1013,13 @@ fn handle_use_branch(executor: &Executor, branch_name: &str) -> Result<Box<dyn P
     tracing::info!("Executing USE BRANCH {}", branch_name);
 
     if let Some(storage) = executor.storage() {
-        // Validate branch exists
-        let metadata = storage.get_branch_metadata(branch_name)?;
-
-        tracing::info!(
-            "Switched to branch '{}' (ID: {}, created: {})",
-            metadata.name,
-            metadata.branch_id,
-            metadata.created_at
-        );
-
-        // Switch to branch (sets current branch context in storage)
+        // sprinter 6bc4a4040eb7 (B1): bind THIS session (the one whose
+        // statement runs on this thread) to the branch — resolved as ACTIVE, so
+        // an unknown, dropped or merged branch is refused 3D000 — and nobody
+        // else. `main` returns the session to main.
         storage.use_branch(branch_name)?;
 
-        tracing::debug!("Successfully switched to branch '{}'", branch_name);
+        tracing::debug!("Session switched to branch '{}'", branch_name);
     } else {
         return Err(Error::execution("No storage engine available"));
     }

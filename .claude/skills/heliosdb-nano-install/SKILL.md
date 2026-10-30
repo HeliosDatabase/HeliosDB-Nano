@@ -37,7 +37,7 @@ allowed-tools: Bash(cargo *), Bash(heliosdb-nano *), Bash(rustc *), Read
 | `code-graph` | — | tree-sitter (rust/python/ts/go/md/sql), `_hdb_code_*` tables, LSP API | Index source code |
 | `graph-rag` | — | `_hdb_graph_*` schema, seed+expand+rerank API; **implies `code-graph`** | RAG knowledge graph |
 | `code-embed` | — | fastembed-rs (ONNX), local in-process embedder; **implies `code-graph`** | Embed without external HTTP service |
-| `mcp-endpoint` | — | JSON-RPC 2.0 dispatcher, stdio/HTTP/WS, 16-tool catalog | MCP server for AI agents |
+| `mcp-endpoint` | — | JSON-RPC 2.0 dispatcher, stdio/HTTP/WS, 17-tool catalog | MCP server for AI agents |
 | `fips` | — (exclusive with `ring-crypto`) | AWS-LC FIPS #4816 + SHA-256 + PBKDF2 | FIPS 140-3 compliance |
 | `ha-tier2` | — | Branch-based multi-primary, vector-clock conflict resolution; implies `ha-tier1` | Active-active replication |
 | `ha-tier3` | — | Consistent hash ring, cross-shard routing, dynamic resharding | Horizontal sharding |

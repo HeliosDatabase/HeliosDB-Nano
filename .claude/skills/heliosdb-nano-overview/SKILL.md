@@ -27,7 +27,7 @@ Single-binary embedded database (Rust). PostgreSQL- and MySQL-wire compatible. O
 | HNSW vector indexes, similarity search, hybrid search | `heliosdb-nano-vector` |
 | Indexing source code, LSP-style queries, git hook | `heliosdb-nano-code-graph` |
 | RAG ingest (PDF/docs/email/QA), seed+expand+rerank | `heliosdb-nano-graph-rag` |
-| MCP server, 16-tool catalog, stdio/HTTP/WS transports | `heliosdb-nano-mcp` |
+| MCP server, 17-tool catalog, stdio/HTTP/WS transports | `heliosdb-nano-mcp` |
 | Daemon mode, TLS, auth, HA tiers, user management | `heliosdb-nano-server` |
 | Docker, Fly.io, Railway, Render, systemd | `heliosdb-nano-deploy` |
 | Tracing, slow-query log, /health, metrics | `heliosdb-nano-observability` |

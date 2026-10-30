@@ -842,7 +842,7 @@ The cache path exists once cargo has extracted the crate (`cargo install` does t
 | `heliosdb-nano-vector` | HNSW indexes, `<-> <#> <=>` operators, hybrid search |
 | `heliosdb-nano-code-graph` | AST symbol index, LSP queries, git hook (`code-graph` feature) |
 | `heliosdb-nano-graph-rag` | Knowledge graph + RAG ingest pipeline (`graph-rag` feature) |
-| `heliosdb-nano-mcp` | MCP server, 16-tool catalog, stdio/HTTP/WS (`mcp-endpoint` feature) |
+| `heliosdb-nano-mcp` | MCP server, 17-tool catalog, stdio/HTTP/WS (`mcp-endpoint` feature) |
 | `heliosdb-nano-server` | Daemon, TLS, auth, HA tier 1/2/3, user management |
 | `heliosdb-nano-tenant` | Multi-tenant isolation modes, tiered plans, RLS policies |
 | `heliosdb-nano-deploy` | Docker, Fly.io, Railway, Render, systemd template |

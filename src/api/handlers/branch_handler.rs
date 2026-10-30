@@ -11,7 +11,8 @@ use tracing::{error, info, warn};
 
 use crate::api::{
     models::{
-        ApiError, BranchListResponse, BranchResponse, CreateBranchRequest, MergeBranchRequest, MergeBranchResponse,
+        branch::MergeStrategyDto, ApiError, BranchListResponse, BranchResponse, CreateBranchRequest,
+        MergeBranchRequest, MergeBranchResponse,
     },
     server::AppState,
 };
@@ -223,13 +224,16 @@ pub async fn delete_branch(State(state): State<AppState>, Path(name): Path<Strin
 /// # Request Body
 ///
 /// - target: Target branch name to merge into
-/// - strategy: Merge strategy (auto, manual, theirs, ours)
+/// - strategy: Merge strategy — `auto` (default) or `theirs`. The merge is
+///   last-writer-wins with the source branch winning (the engine's MERGE, the
+///   one `MERGE BRANCH` runs) and detects no conflicts, so `manual` and `ours`
+///   are refused with 422 rather than silently ignored.
 ///
 /// # Response
 ///
 /// - 200 OK: Merge completed, returns MergeBranchResponse
-/// - 409 Conflict: Merge conflicts detected (if strategy is manual)
-/// - 422 Unprocessable Entity: Branches are not in valid state for merge
+/// - 422 Unprocessable Entity: Branches are not in valid state for merge, or
+///   the strategy is `manual` / `ours`
 /// - 404 Not Found: Source or target branch not found
 /// - 500 Internal Server Error: Database error
 /// - 501 Not Implemented: Branching not enabled
@@ -241,21 +245,36 @@ pub async fn merge_branch(
     info!("Merging branch '{}' into '{}'", source_name, request.target);
 
     // Access the branch manager from storage
-    let branch_manager = state.db.storage.branch_manager().ok_or_else(|| {
-        ApiError::new(
+    if state.db.storage.branch_manager().is_none() {
+        return Err(ApiError::new(
             axum::http::StatusCode::NOT_IMPLEMENTED,
             "BranchingNotEnabled",
             "Database branching is not enabled for this instance",
-        )
-    })?;
+        ));
+    }
 
-    // Perform the merge
-    let merge_result = branch_manager
-        .merge_branch(&source_name, &request.target, request.strategy.into())
-        .map_err(|e| {
-            error!("Failed to merge '{}' into '{}': {}", source_name, request.target, e);
-            ApiError::from(e)
-        })?;
+    // sprinter 6bc4a4040eb7 (B1 second fix pass): the engine's MERGE — the one
+    // `MERGE BRANCH` runs — which copies the source's TABLE rows into the
+    // target. This route used to call `BranchManager::merge_branch`, which
+    // reads the manager's binary key-value overlay keys; SQL never writes
+    // those, so a merge of a branch written through the REST/SQL routes
+    // copied nothing and still reported success. The engine merge is
+    // last-writer-wins with the source winning and detects no conflicts, so
+    // only the strategies that mean exactly that are accepted: `auto` (the
+    // default, "prefer source") and `theirs` ("always prefer source").
+    // `manual` and `ours` are refused, as `MERGE BRANCH … WITH
+    // (conflict_resolution = …)` is, rather than silently ignored.
+    if matches!(request.strategy, MergeStrategyDto::Manual | MergeStrategyDto::Ours) {
+        return Err(ApiError::unprocessable_entity(format!(
+            "merge strategy {:?} is not implemented: merges are last-writer-wins (the source branch \
+             wins) and conflicts are never detected; use \"auto\" or \"theirs\"",
+            request.strategy
+        )));
+    }
+    let merge_result = state.db.merge_branch_into(&source_name, &request.target).map_err(|e| {
+        error!("Failed to merge '{}' into '{}': {}", source_name, request.target, e);
+        ApiError::from(e)
+    })?;
 
     let message = if merge_result.completed {
         if merge_result.conflicts.is_empty() {

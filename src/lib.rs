@@ -339,7 +339,9 @@ pub use crypto::{
     ZkeRequestContext,
 };
 pub use error::{
-    Error, Result, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE, NOT_NULL_VIOLATION_MARKER,
+    Error, Result, BRANCH_BINDING_GONE_MARKER, BRANCH_BUSY_MARKER, BRANCH_CLOSING_MARKER, BRANCH_IN_USE_MARKER,
+    BRANCH_NOT_ACTIVE_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER, BRANCH_TRANSACTION_UNSUPPORTED_MARKER,
+    COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE, NOT_NULL_VIOLATION_MARKER,
     PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED,
 };
 pub use storage::StorageEngine;
@@ -1000,6 +1002,150 @@ pub(crate) fn session_has_tenant_tls() -> bool {
     SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().is_some_and(|s| s.has_tenant()))
 }
 
+/// sprinter 6bc4a4040eb7 (phase B1): the BRANCH the connection running a
+/// statement on THIS thread is bound to, or `None` for main (and for
+/// engine-internal work with no backend installed).
+///
+/// The only route from the engine to a session's branch. Read through
+/// `StorageEngine::active_branch`, which also checks the binding belongs to
+/// the engine asking; nothing else should call this directly.
+pub(crate) fn session_branch_binding_tls() -> Option<std::sync::Arc<crate::session::BranchBinding>> {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().and_then(|s| s.branch_binding()))
+}
+
+/// Is the connection running a statement on this thread bound to a branch of
+/// the engine `engine_instance`? Two atomic loads behind one `RefCell` borrow
+/// — the per-row fast-path gate (`StorageEngine::is_branch_active`).
+pub(crate) fn session_on_branch_tls(engine_instance: u64) -> bool {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().is_some_and(|s| s.on_branch_of(engine_instance)))
+}
+
+/// sprinter 6bc4a4040eb7 (B1 fix pass): the branch binding the statement
+/// running on a thread was SNAPSHOTTED with at its gate.
+#[derive(Clone)]
+pub(crate) struct StatementBranch {
+    /// The engine whose statement this is; another engine's reads ignore it.
+    engine_instance: u64,
+    /// `None` = the statement runs on main.
+    binding: Option<std::sync::Arc<crate::session::BranchBinding>>,
+}
+
+thread_local! {
+    /// sprinter 6bc4a4040eb7 (B1 fix pass): the branch the statement running on
+    /// THIS thread is bound to, snapshotted ONCE at its gate
+    /// (`EmbeddedDatabase::enter_branch_statement`) and read by
+    /// `StorageEngine::active_branch` / `is_branch_active` for the rest of the
+    /// statement. Reading the session binding live instead let a concurrent
+    /// `switch_branch` of a SHARED session (the embedded handle's — every
+    /// embedded, REPL and session-less caller) split one statement in two: its
+    /// row written to `bdata:` while its index entry went to main.
+    static STATEMENT_BRANCH: std::cell::RefCell<Option<StatementBranch>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The running statement's snapshotted branch on `engine_instance`:
+/// `Some(None)` = main, `Some(Some(b))` = branch `b`, `None` = no statement
+/// snapshot (the caller falls back to the session binding).
+// The two `None`s are different answers ("no snapshot" vs "snapshot: main").
+#[allow(clippy::option_option)]
+pub(crate) fn statement_branch_tls(
+    engine_instance: u64,
+) -> Option<Option<std::sync::Arc<crate::session::BranchBinding>>> {
+    STATEMENT_BRANCH.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|snapshot| snapshot.engine_instance == engine_instance)
+            .map(|snapshot| snapshot.binding.clone())
+    })
+}
+
+/// [`statement_branch_tls`] without the `Arc` clone — the per-row gate.
+pub(crate) fn statement_on_branch_tls(engine_instance: u64) -> Option<bool> {
+    STATEMENT_BRANCH.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|snapshot| snapshot.engine_instance == engine_instance)
+            .map(|snapshot| snapshot.binding.is_some())
+    })
+}
+
+/// The NAME of the running statement's snapshotted branch, on any engine — for
+/// the storage-less evaluator's `current_setting('heliosdb.branch')`.
+pub(crate) fn statement_branch_name_tls() -> Option<String> {
+    STATEMENT_BRANCH.with(|c| {
+        c.borrow().as_ref().map(|snapshot| {
+            snapshot
+                .binding
+                .as_ref()
+                .map_or_else(|| "main".to_string(), |binding| binding.name.clone())
+        })
+    })
+}
+
+/// sprinter 6bc4a4040eb7 (B1 fix pass): one statement's branch scope — the
+/// binding snapshot it runs on (installed on this thread, restored on `Drop`)
+/// and its shared hold on that branch's drain, so a DROP or MERGE of the branch
+/// waits for it. Inert when an outer statement on this thread already owns the
+/// snapshot (a nested engine call), or for a statement let through on a
+/// dropped binding (`ROLLBACK`).
+///
+/// Not `Send`, like every per-statement thread-local guard here: it must never
+/// be held across an `.await`.
+pub(crate) struct BranchStatementScope {
+    /// `Some(previous)` when this scope installed a snapshot and must restore
+    /// `previous` on `Drop`.
+    // Outer `None` = nothing to restore; inner `None` = restore "no snapshot".
+    #[allow(clippy::option_option)]
+    previous: Option<Option<StatementBranch>>,
+    /// Released AFTER the snapshot is restored (fields drop after `drop()`).
+    _hold: crate::storage::BranchHold,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl BranchStatementScope {
+    fn inert() -> Self {
+        Self {
+            previous: None,
+            _hold: crate::storage::BranchHold::none(),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// Install `snapshot` for this statement (replacing any outer one until
+    /// `Drop`), holding `hold`.
+    fn install(snapshot: StatementBranch, hold: crate::storage::BranchHold) -> Self {
+        let previous = STATEMENT_BRANCH.with(|c| c.borrow_mut().replace(snapshot));
+        Self {
+            previous: Some(previous),
+            _hold: hold,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for BranchStatementScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            STATEMENT_BRANCH.with(|c| *c.borrow_mut() = previous);
+        }
+    }
+}
+
+/// sprinter 6bc4a4040eb7 (B1 second fix pass): the end of a REQUEST-scoped
+/// backend ([`EmbeddedDatabase::with_request_branch_scope`]) — drops the temp
+/// tables it created, on every exit including a panic in the request.
+struct RequestBackendTeardown<'a> {
+    storage: &'a storage::StorageEngine,
+    state: std::sync::Arc<crate::session::scoped::SessionScopedState>,
+}
+
+impl Drop for RequestBackendTeardown<'_> {
+    fn drop(&mut self) {
+        if self.state.holds_temp_tables() {
+            sql::temp_tables::drop_backend_temp_tables(self.storage, self.state.backend_pid());
+        }
+    }
+}
+
 /// The declared column types a SERIAL / IDENTITY primary key can be
 /// auto-generated for — the integer family, and nothing else
 /// (sprinter f32ba64c00a7).
@@ -1463,6 +1609,13 @@ pub struct EmbeddedDatabase {
     /// it, and `RaiiArtUndoSlot`'s `Drop` removes it however the handle ends —
     /// including a handle dropped without either, which cannot leak an entry.
     raii_art_undo: std::sync::Arc<dashmap::DashMap<u64, Vec<ArtUndoOp>>>,
+    /// sprinter 6bc4a4040eb7 (B1 second fix pass): RAII [`Transaction`]s open
+    /// on this handle right now (`begin_transaction` up, the handle's `Drop`
+    /// down). They run on the handle's SHARED embedded session, so while any is
+    /// open that session's branch must not change — see
+    /// `shared_session_in_transaction`. Not derivable from `raii_art_undo`,
+    /// whose slots autocommit statements claim too.
+    open_raii_txns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Per-session ART undo logs (R0.1). Session transactions mutate the ART
     /// indexes eagerly just like the global transaction path; their undo
     /// entries must be keyed by session so a session ROLLBACK replays exactly
@@ -2192,68 +2345,30 @@ fn strip_prefix_icase<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-/// RAII guard that swaps the active branch for the duration of a
-/// query when the FR-3 `ON BRANCH '<name>'` directive is present in
-/// an `lsp_*` call. Restores the previous branch on Drop so every
-/// early-return path through the entry point is covered without
-/// closure plumbing.
-#[cfg(feature = "code-graph")]
-struct CodeGraphBranchGuard<'a> {
-    db: Option<&'a EmbeddedDatabase>,
-    previous: Option<String>,
-    target: Option<String>,
-}
-
-#[cfg(feature = "code-graph")]
-impl<'a> CodeGraphBranchGuard<'a> {
-    fn noop() -> Self {
-        Self {
-            db: None,
-            previous: None,
-            target: None,
-        }
-    }
-
-    fn switch_to(db: &'a EmbeddedDatabase, target: String) -> Self {
-        let previous = db.storage.get_current_branch();
-        let current = previous.as_deref().unwrap_or("main");
-        if current == target {
-            // Already on the requested branch; nothing to do.
-            return Self::noop();
-        }
-        // Best-effort switch — if the branch doesn't exist the user
-        // gets the underlying error on the first read/write rather
-        // than a guard-construction failure.
-        let _ = db.switch_branch(&target);
-        Self {
-            db: Some(db),
-            previous,
-            target: Some(target),
-        }
-    }
-}
-
-#[cfg(feature = "code-graph")]
-impl<'a> Drop for CodeGraphBranchGuard<'a> {
-    fn drop(&mut self) {
-        let Some(db) = self.db else { return };
-        let Some(target) = self.target.as_deref() else { return };
-        match self.previous.as_deref() {
-            Some(prev) if prev != target => {
-                let _ = db.switch_branch(prev);
-            }
-            None if target != "main" => {
-                let _ = db.switch_branch("main");
-            }
-            _ => {}
-        }
-    }
-}
-
 enum DbSettingStatement {
     Set { name: String, value: String },
     Show { name: String },
     Reset { name: String },
+}
+
+/// sprinter 6bc4a4040eb7 (phase B1): the GUC spelling of a session's branch —
+/// `SET heliosdb.branch = 'x'`, `SHOW heliosdb.branch`, `RESET heliosdb.branch`,
+/// `current_setting('heliosdb.branch')` and the PostgreSQL startup form
+/// `options=-c heliosdb.branch=x`. One name, one binding: it is the same
+/// session slot `USE BRANCH` writes.
+pub(crate) const BRANCH_GUC: &str = "heliosdb.branch";
+
+/// sprinter 6bc4a4040eb7 (phase B1): a statement that reads or changes the
+/// session's branch binding (see [`EmbeddedDatabase::classify_branch_statement`]).
+enum BranchStatement {
+    /// `USE [DATABASE] BRANCH x`, `SET heliosdb.branch = 'x'` / `TO 'x'`.
+    /// `x == "main"` returns the session to main.
+    Bind(String),
+    /// `RESET heliosdb.branch`, `SET heliosdb.branch TO DEFAULT` — back to the
+    /// branch the connection was opened on (main when none).
+    Reset,
+    /// `SHOW heliosdb.branch`.
+    Show,
 }
 
 /// GH#28 (c2): marker text of the error raised for `SET LOCAL` of a
@@ -2423,13 +2538,18 @@ impl EmbeddedDatabase {
                 // column set.
                 | sql::LogicalPlan::CreateView { .. }
                 | sql::LogicalPlan::DropView { .. }
-                // Branch operations change the session's visible data WITHOUT
-                // any DML-path invalidation: a result cached on branch A must
-                // never be served on branch B (W1.3 branch-switch test). The
-                // REPL's USE BRANCH pre-detect bypasses execute() and calls
-                // invalidate_plan_cache() itself (repl/shell.rs). CreateBranch
-                // is excluded: it snapshots without changing current visibility.
-                | sql::LogicalPlan::UseBranch { .. }
+                // MERGE writes branch rows into the target (main's `data:`
+                // included) outside every DML-path invalidation, so the caches
+                // must not keep serving pre-merge results; DROP is kept with it
+                // as a DDL-rate event. `USE BRANCH` is deliberately NOT here any
+                // more (sprinter 6bc4a4040eb7, B1): the branch is per SESSION, so
+                // there is no global switch to invalidate on — plans carry no
+                // branch decision (every branch gate runs at EXECUTION and reads
+                // the executing session's binding), and the result cache is
+                // bypassed outright by a branch session
+                // (`result_cache_bypassed`). A global flush here would only make
+                // one connection's `USE BRANCH` empty every other connection's
+                // caches. CreateBranch is excluded: it changes no visibility.
                 | sql::LogicalPlan::MergeBranch { .. }
                 | sql::LogicalPlan::DropBranch { .. }
         )
@@ -2956,6 +3076,320 @@ impl EmbeddedDatabase {
         .map(Some)
     }
 
+    // ---- sprinter 6bc4a4040eb7 (phase B1): the per-session branch binding ----
+
+    /// Classify `sql` as a branch-binding statement — `USE [DATABASE] BRANCH x`
+    /// or `SET` / `RESET` / `SHOW heliosdb.branch` — or `None`.
+    ///
+    /// PERF: this runs at every statement entry point. Anything that does not
+    /// start with `U`, `S` or `R` is out after one byte compare; an `UPDATE`
+    /// after one more prefix compare, a `SELECT` after three failed prefix
+    /// compares in `parse_db_setting_statement` — none of them allocates.
+    ///
+    /// `SET LOCAL heliosdb.branch` is refused rather than silently widened to
+    /// the session: a transaction-scoped branch would have to be restored at
+    /// COMMIT/ROLLBACK on every wire, which nothing here does.
+    fn classify_branch_statement(sql: &str) -> Result<Option<BranchStatement>> {
+        let trimmed = sql.trim_start();
+        match trimmed.as_bytes().first().copied() {
+            Some(b'U' | b'u') => {
+                // `starts_with_icase` first: `is_use_branch` upper-cases the
+                // whole text, and every UPDATE starts with `U`.
+                if starts_with_icase(trimmed, "USE ") && sql::Parser::is_use_branch(trimmed) {
+                    return Ok(Some(BranchStatement::Bind(sql::Parser::parse_use_branch_sql(trimmed)?)));
+                }
+                Ok(None)
+            }
+            Some(b'S' | b's' | b'R' | b'r') => {
+                let statement = match Self::parse_db_setting_statement(trimmed) {
+                    Some(statement) => statement,
+                    None => return Ok(None),
+                };
+                match statement {
+                    DbSettingStatement::Set { name, value } if name == BRANCH_GUC => {
+                        if Self::set_statement_is_local(trimmed) {
+                            return Err(Error::query_execution(format!(
+                                "SET LOCAL {BRANCH_GUC} is not supported; use SET {BRANCH_GUC} or USE BRANCH, \
+                                 which bind the branch for the session"
+                            )));
+                        }
+                        if value.eq_ignore_ascii_case("default") {
+                            Ok(Some(BranchStatement::Reset))
+                        } else {
+                            Ok(Some(BranchStatement::Bind(value)))
+                        }
+                    }
+                    DbSettingStatement::Reset { name } if name == BRANCH_GUC => Ok(Some(BranchStatement::Reset)),
+                    DbSettingStatement::Show { name } if name == BRANCH_GUC => Ok(Some(BranchStatement::Show)),
+                    _ => Ok(None),
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// True for `SET` / `RESET` / `SHOW heliosdb.branch` and `USE [DATABASE]
+    /// BRANCH` — the predicate the wire listeners use to route the statement
+    /// at THIS session instead of acking it (PostgreSQL simple-query `SET`,
+    /// MySQL `COM_QUERY` `SET` / `USE`) or erroring it (PostgreSQL extended).
+    pub(crate) fn is_branch_binding_statement(sql: &str) -> bool {
+        matches!(Self::classify_branch_statement(sql), Ok(Some(_)) | Err(_))
+    }
+
+    /// Apply a branch-binding statement to `state`, THE BACKEND THE CALLER
+    /// RESOLVED (the same split `apply_session_guc_setting` makes: the wire
+    /// listeners know their backend by `SessionId`, the funnels by the
+    /// thread-local they installed).
+    fn apply_branch_statement(
+        &self,
+        state: &crate::session::scoped::SessionScopedState,
+        statement: BranchStatement,
+    ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        match statement {
+            BranchStatement::Bind(name) => {
+                self.storage.bind_session_branch(state, &name)?;
+                Ok((Vec::new(), Self::empty_result_schema()))
+            }
+            BranchStatement::Reset => {
+                // PostgreSQL resets a parameter to its SESSION default, which
+                // for one given at startup is the startup value: the branch this
+                // connection was opened on (by id — a dropped home fails closed
+                // on the next statement), main when none.
+                state.reset_branch_to_home();
+                Ok((Vec::new(), Self::empty_result_schema()))
+            }
+            BranchStatement::Show => {
+                let name = state
+                    .branch_binding()
+                    .filter(|binding| binding.engine_instance == self.storage.instance_id())
+                    .map_or_else(|| "main".to_string(), |binding| binding.name.clone());
+                Ok((
+                    vec![Tuple {
+                        values: vec![Value::String(name)],
+                        row_id: None,
+                        branch_id: None,
+                    }],
+                    Self::typed_result_schema(BRANCH_GUC, DataType::Text),
+                ))
+            }
+        }
+    }
+
+    /// The session-id spelling of the branch-binding statements, for the wire
+    /// listeners' protocol-layer `SET` / `RESET` / `SHOW` / `USE` arms, which
+    /// run before any engine entry point installs a thread-local. `None` when
+    /// `sql` is not one of them.
+    pub(crate) fn try_handle_session_branch_statement(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<Option<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
+        let Some(statement) = Self::classify_branch_statement(sql)? else {
+            return Ok(None);
+        };
+        if !matches!(statement, BranchStatement::Show) && self.session_has_open_transaction(session_id) {
+            return Err(Error::branch_switch_in_transaction());
+        }
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        self.apply_branch_statement(&scoped, statement).map(Some)
+    }
+
+    /// THE per-statement branch gate — every SQL entry point calls it right
+    /// after its backend is installed (the `_for_session` entry points after
+    /// `session_statement_context_guard`, the session-less funnels after
+    /// `install_if_absent(&self.embedded_scoped)`), in BOTH executor families.
+    /// `in_txn` is whether the statement runs inside an explicit transaction
+    /// (or a pending implicit block) of ITS caller.
+    ///
+    /// 1. A branch-binding statement is answered here, on the installed
+    ///    backend, before any family-specific parse: the params family has no
+    ///    grammar for `USE BRANCH`, and an in-transaction statement is
+    ///    sqlparser-first. Changing the branch inside a transaction is refused
+    ///    (25001). `Some(rows)` = handled.
+    /// 2. Otherwise the statement's branch is SNAPSHOTTED for its whole
+    ///    duration and its branch's drain is held (see
+    ///    [`Self::enter_branch_statement`]) — the returned scope must live as
+    ///    long as the statement. A session bound to a branch that was dropped
+    ///    or merged since it bound fails CLOSED: the statement is refused
+    ///    (3D000) before it can read or write anything. Only what lets the
+    ///    session recover is let through — `COMMIT` / `ROLLBACK` / `ABORT`
+    ///    (a COMMIT then rolls back and refuses, see `commit_*`) and `SHOW
+    ///    BRANCHES`.
+    /// 3. On a branch, a statement that reads or writes data inside a
+    ///    transaction is refused (0A000) until branch transactions exist
+    ///    (phase B2): in-transaction reads resolve through main's snapshot and
+    ///    write set, so the alternative is answering from main.
+    ///
+    /// PERF: on main (every session that never bound a branch) this is the
+    /// byte gate of `classify_branch_statement`, one atomic load and a
+    /// thread-local snapshot install.
+    fn branch_statement_gate(
+        &self,
+        sql: &str,
+        in_txn: bool,
+    ) -> Result<(Option<(Vec<Tuple>, std::sync::Arc<Schema>)>, BranchStatementScope)> {
+        // `RESET ALL` resets every session parameter to its session default —
+        // `heliosdb.branch` included, which returns the session to the branch
+        // it was opened on. It then carries on down the normal path.
+        if Self::is_reset_all(sql) {
+            if let Some(state) = session_scoped_state_tls() {
+                if Self::branch_differs_from_home(&state) {
+                    if in_txn || self.shared_session_in_transaction(&state) {
+                        return Err(Error::branch_switch_in_transaction());
+                    }
+                    state.reset_branch_to_home();
+                }
+            }
+        }
+        if let Some(statement) = Self::classify_branch_statement(sql)? {
+            let state =
+                session_scoped_state_tls().ok_or_else(|| Error::query_execution("no session to bind the branch to"))?;
+            // B1 second fix pass: `shared_session_in_transaction` — another
+            // thread's transaction on the handle's shared session, or an open
+            // RAII `Transaction`, pins that session's branch as well.
+            if !matches!(statement, BranchStatement::Show) && (in_txn || self.shared_session_in_transaction(&state)) {
+                return Err(Error::branch_switch_in_transaction());
+            }
+            let handled = self.apply_branch_statement(&state, statement)?;
+            return Ok((Some(handled), BranchStatementScope::inert()));
+        }
+        let scope = match self.enter_branch_statement() {
+            Ok(scope) => scope,
+            Err(_) if Self::statement_allowed_on_gone_branch(sql) => BranchStatementScope::inert(),
+            Err(gone) => return Err(gone),
+        };
+        if in_txn && !Self::statement_allowed_in_branch_transaction(sql) {
+            if let Some(binding) = self.storage.active_branch() {
+                return Err(Error::branch_transaction_unsupported(&binding.name));
+            }
+        }
+        Ok((None, scope))
+    }
+
+    /// Snapshot the calling session's branch for the statement about to run on
+    /// this thread and take its drain hold — sprinter 6bc4a4040eb7 (B1 fix
+    /// pass).
+    ///
+    /// The hold is taken BEFORE the binding is re-validated: a DROP / MERGE
+    /// closing the branch right now refuses the hold (55006), and one that
+    /// already finished is seen by the validation that follows (3D000).
+    /// Validating first would let a drop slip in between and the statement
+    /// write to the dropped overlay. Inert when an outer statement on this
+    /// thread already owns this engine's snapshot.
+    pub(crate) fn enter_branch_statement(&self) -> Result<BranchStatementScope> {
+        let engine = self.storage.instance_id();
+        if statement_branch_tls(engine).is_some() {
+            return Ok(BranchStatementScope::inert());
+        }
+        match self.storage.session_branch_binding() {
+            None => Ok(BranchStatementScope::install(
+                StatementBranch {
+                    engine_instance: engine,
+                    binding: None,
+                },
+                crate::storage::BranchHold::none(),
+            )),
+            Some(binding) => {
+                let hold = self.storage.enter_branch(&binding)?;
+                self.storage.validate_branch_binding(&binding)?;
+                Ok(BranchStatementScope::install(
+                    StatementBranch {
+                        engine_instance: engine,
+                        binding: Some(binding),
+                    },
+                    hold,
+                ))
+            }
+        }
+    }
+
+    /// Bind THIS statement (not its session) to `target` for its duration —
+    /// the code-graph `ON BRANCH '<target>'` directive (sprinter 6bc4a4040eb7,
+    /// B1 fix pass). A PRIVATE override of the thread's statement snapshot,
+    /// holding `target`'s drain: no session state is touched, so neither
+    /// another caller of a shared session nor a concurrent `ON BRANCH` on
+    /// another thread ever sees it, and two of them cannot restore each other.
+    /// `target` must be active (3D000 otherwise).
+    ///
+    /// B1 second fix pass: `in_txn` is the caller's transaction state, as for
+    /// [`Self::branch_statement_gate`]. Inside a transaction an override onto
+    /// a branch is refused (0A000) exactly as a session bound to that branch
+    /// would be: the in-transaction read path resolves rows through main's
+    /// snapshot and write set, so `… ON BRANCH 'b'` there answered from main
+    /// (and bypassed the gate's refusal, which ran against the session's own
+    /// branch). Overriding onto main stays allowed.
+    #[cfg(feature = "code-graph")]
+    fn statement_branch_override(&self, target: &str, in_txn: bool) -> Result<BranchStatementScope> {
+        let engine = self.storage.instance_id();
+        let current = self.storage.check_active_branch()?;
+        if in_txn && target != "main" {
+            return Err(Error::branch_transaction_unsupported(target));
+        }
+        if current.as_deref().map_or("main", |binding| binding.name.as_str()) == target {
+            return Ok(BranchStatementScope::inert());
+        }
+        if target == "main" {
+            return Ok(BranchStatementScope::install(
+                StatementBranch {
+                    engine_instance: engine,
+                    binding: None,
+                },
+                crate::storage::BranchHold::none(),
+            ));
+        }
+        let binding = std::sync::Arc::new(self.storage.resolve_active_branch(target)?);
+        let hold = self.storage.enter_branch(&binding)?;
+        self.storage.validate_branch_binding(&binding)?;
+        Ok(BranchStatementScope::install(
+            StatementBranch {
+                engine_instance: engine,
+                binding: Some(binding),
+            },
+            hold,
+        ))
+    }
+
+    /// `RESET ALL` (B1 fix pass: it resets `heliosdb.branch` too).
+    fn is_reset_all(sql: &str) -> bool {
+        let trimmed = sql.trim();
+        let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed).trim_end();
+        trimmed.len() == "RESET ALL".len() && starts_with_icase(trimmed, "RESET ALL")
+    }
+
+    /// Is `state` bound to something other than its home branch (by id)?
+    fn branch_differs_from_home(state: &crate::session::scoped::SessionScopedState) -> bool {
+        let current = state.branch_binding().map(|binding| binding.branch_id);
+        let home = state.home_branch().map(|binding| binding.branch_id);
+        current != home
+    }
+
+    /// What a statement may run inside a transaction on a branch until branch
+    /// transactions exist (phase B2): transaction control, `SET` / `SHOW` /
+    /// `RESET`, `DISCARD`, `DEALLOCATE`. Everything else — every statement
+    /// that can read or write a table — is refused (0A000).
+    fn statement_allowed_in_branch_transaction(sql: &str) -> bool {
+        let trimmed = sql.trim_start();
+        crate::protocol::postgres::handler::classify_transaction_control(trimmed).is_some()
+            || ["SET ", "SHOW ", "RESET ", "DISCARD ", "DEALLOCATE "]
+                .iter()
+                .any(|prefix| starts_with_icase(trimmed, prefix))
+    }
+
+    /// What a session bound to a dropped or merged branch may still run: what
+    /// it needs to get out (`ROLLBACK` / `ABORT`, including `ROLLBACK TO
+    /// SAVEPOINT`; `COMMIT` / `END`, which the commit path turns into a
+    /// rollback and a 3D000 refusal) and to choose where to go (`SHOW
+    /// BRANCHES`). The binding statements themselves never reach this test.
+    fn statement_allowed_on_gone_branch(sql: &str) -> bool {
+        let trimmed = sql.trim_start();
+        starts_with_icase(trimmed, "ROLLBACK")
+            || starts_with_icase(trimmed, "ABORT")
+            || starts_with_icase(trimmed, "COMMIT")
+            || starts_with_icase(trimmed, "END")
+            || sql::Parser::is_show_branches(trimmed)
+    }
+
     /// sprinter a3077a3f68d8: the effective `bulk_load_mode` for statements that
     /// arrive on THIS handle without a session — the embedded API, the REST /
     /// BaaS layer, the MCP tools and the REPL, which all share the handle's own
@@ -3405,7 +3839,10 @@ impl EmbeddedDatabase {
     }
 
     fn fast_prepared_select_spec(&self, sql: &str) -> Option<Result<PreparedFastSelectSpec>> {
-        if self.in_transaction() {
+        // sprinter 6bc4a4040eb7 (B1 fix pass): this direct PK probe reads main's
+        // index and one overlay key, which is not what a branch sees — decline
+        // on a branch session, like every other fast point lookup.
+        if self.in_transaction() || self.storage.is_branch_active() {
             return None;
         }
 
@@ -3466,7 +3903,10 @@ impl EmbeddedDatabase {
         name: &str,
         params: &[Value],
     ) -> Option<Result<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
-        if self.in_transaction() {
+        // sprinter 6bc4a4040eb7 (B1 fix pass): decided at EXECUTE, from the
+        // executing session's branch — a statement PREPAREd on main and
+        // EXECUTEd on a branch must not take main's PK probe.
+        if self.in_transaction() || self.storage.is_branch_active() {
             return None;
         }
         let spec = lock_census::pl_rwlock_read(lock_census::Site::StatementRegistry, &self.prepared_fast_selects)
@@ -4099,7 +4539,7 @@ impl EmbeddedDatabase {
     /// was ever set (the poisoned-pre-existing-entry case) need no migration or
     /// epoch bump for the same reason: the read gate makes them inert.
     fn cache_query_result(&self, sql: &str, results: &[Tuple], cache_epoch: ResultCacheEpoch) {
-        if self.has_effective_tenant_context() {
+        if self.result_cache_bypassed() {
             return;
         }
         // Refuse to publish a result that was computed before an invalidation
@@ -4126,7 +4566,7 @@ impl EmbeddedDatabase {
     /// before this gate existed, by a different tenant's context. See
     /// `cache_query_result` for why this is context-presence and not tenant-keyed.
     fn cached_query_result(&self, sql: &str) -> Option<std::sync::Arc<Vec<Tuple>>> {
-        if self.has_effective_tenant_context() {
+        if self.result_cache_bypassed() {
             return None;
         }
         if let Some(cached) = self.hot_cached_query_result(sql) {
@@ -4151,7 +4591,7 @@ impl EmbeddedDatabase {
     /// "preserve the v3.37 hot-result-cache behavior" block calls this
     /// directly, not through `cached_query_result`.
     fn hot_cached_query_result(&self, sql: &str) -> Option<std::sync::Arc<Vec<Tuple>>> {
-        if self.has_effective_tenant_context() {
+        if self.result_cache_bypassed() {
             return None;
         }
         self.reconcile_result_cache_with_storage();
@@ -4167,6 +4607,26 @@ impl EmbeddedDatabase {
                     && session_login_user_is(entry.login.as_deref()))
                 .then(|| std::sync::Arc::clone(&entry.rows))
             })
+    }
+
+    /// The result cache's admission gate, read AND write — the three funnels
+    /// above (`cache_query_result`, `cached_query_result`,
+    /// `hot_cached_query_result`) all ask it.
+    ///
+    /// * A tenant context (R1.1): rows are RLS-filtered per context.
+    /// * sprinter 6bc4a4040eb7 (phase B1): a session on a BRANCH. The cache is
+    ///   keyed by SQL text (+ login) with no branch dimension, and used to be
+    ///   kept honest by flushing it on every (global) `USE BRANCH`. With the
+    ///   branch per session there is no switch to flush on, so a branch
+    ///   session simply never reads it (main's rows are never served to it)
+    ///   and never writes it (its rows are never served to main or to another
+    ///   branch) — the same self-enforcing shape as the tenant gate: every
+    ///   entry in the cache was written by a main, no-context caller.
+    ///
+    /// Both are one atomic load on the common (main, no tenant) path.
+    #[inline]
+    fn result_cache_bypassed(&self) -> bool {
+        self.has_effective_tenant_context() || self.storage.is_branch_active()
     }
 
     /// Drop cached query results if the storage catalog changed since the last cache
@@ -4234,6 +4694,11 @@ impl EmbeddedDatabase {
             b"PG_BACKEND_PID".as_slice(),
             b"APPLICATION_NAME".as_slice(),
             b"PG_STAT_ACTIVITY".as_slice(),
+            // sprinter 6bc4a4040eb7 (B1): `current_setting('heliosdb.branch')`
+            // is the SESSION's branch. A branch session never touches the cache
+            // (`result_cache_bypassed`), so this is belt-and-braces: no row that
+            // names a branch binding is ever served by SQL text.
+            b"HELIOSDB.BRANCH".as_slice(),
             // Spec P1.3: the standby probes answer from the replication
             // posture and the physical sequence, neither of which moves the
             // storage generation the cache is keyed on — a cached
@@ -4451,6 +4916,10 @@ impl EmbeddedDatabase {
                 Ok(0)
             }
             Some(TxnControl::Commit { chain }) => {
+                // sprinter 6bc4a4040eb7 (B1): a transaction whose branch was
+                // dropped or merged while it was open is rolled back and
+                // refused inside `commit_internal_locked`, against the binding
+                // captured at BEGIN.
                 self.commit_internal()?;
                 // `AND CHAIN` opens the next transaction immediately; without
                 // this the following statements would silently autocommit.
@@ -5212,6 +5681,14 @@ impl EmbeddedDatabase {
             return Err(Error::transaction("Transaction already active"));
         }
         let txn = self.storage.begin_transaction()?;
+        // sprinter 6bc4a4040eb7 (B1 second fix pass): capture the branch this
+        // transaction runs on — the BEGIN statement's snapshot, or (for the
+        // `begin()` API, outside every statement) the handle's own session's
+        // binding. COMMIT re-validates THIS (`commit_internal_locked`).
+        {
+            let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+            txn.capture_branch_binding(self.storage.active_branch());
+        }
         *txn_ref = Some(txn);
         // sprinter 0d6695bf8a86: stamp the OWNER before the flag goes up, so a
         // reader that sees `global_txn_active` can never read a stale token.
@@ -5257,6 +5734,18 @@ impl EmbeddedDatabase {
         if txn_ref.as_ref().is_some_and(storage::Transaction::is_sql_aborted) {
             self.abort_global_slot_locked(&mut txn_ref)?;
             return Err(Error::commit_of_failed_transaction());
+        }
+        // sprinter 6bc4a4040eb7 (B1 fix pass, second pass): the branch this
+        // transaction was opened on (captured at BEGIN — not the session's
+        // live binding, which another caller of the shared embedded session
+        // could have rebound) was dropped or merged while it was open: roll
+        // back and refuse (3D000), never commit into an overlay nobody can
+        // use. Covers the SQL `COMMIT` and the `commit()` API alike.
+        if let Some(binding) = txn_ref.as_ref().and_then(storage::Transaction::captured_branch_binding) {
+            if let Err(gone) = self.storage.validate_branch_binding(&binding) {
+                self.abort_global_slot_locked(&mut txn_ref)?;
+                return Err(gone);
+            }
         }
         // Deferred-FK validation runs BEFORE the durable commit. A failure here
         // ABORTS the transaction — PostgreSQL rolls back a COMMIT that trips a
@@ -5695,7 +6184,7 @@ impl EmbeddedDatabase {
     /// writing the main branch — the HNSW index is process-wide and serves
     /// main-branch kNN, so branch-isolated overlay writes must not mutate it.
     fn vector_dml_gate(&self, table_name: &str) -> bool {
-        self.storage.vector_indexes().table_has_indexes(table_name) && self.storage.get_current_branch().is_none()
+        self.storage.vector_indexes().table_has_indexes(table_name) && !self.storage.is_branch_active()
     }
 
     /// Try to parse HA switchover commands (ha-tier1 feature only)
@@ -6615,7 +7104,7 @@ impl EmbeddedDatabase {
     /// only ever a session or explicit global transaction, because its
     /// autocommit entry passes `None` and CTAS population passes `None`.
     fn insert_select_should_stage(&self) -> bool {
-        !self.has_effective_tenant_context() && self.storage.get_current_branch_id().is_none()
+        !self.has_effective_tenant_context() && !self.storage.is_branch_active()
     }
 
     fn insert_select_txn_batch_rows(&self) -> usize {
@@ -8437,7 +8926,7 @@ impl EmbeddedDatabase {
                 // staging happened, so apply order (and therefore last-write-
                 // wins for ON CONFLICT DO UPDATE of a row inserted earlier in
                 // the same statement) is preserved.
-                let stage_columnar_grouped = self.storage.get_current_branch().is_none()
+                let stage_columnar_grouped = !self.storage.is_branch_active()
                     && schema
                         .columns
                         .iter()
@@ -8450,7 +8939,7 @@ impl EmbeddedDatabase {
                 // unique checks (branch reads bail on `is_branch_active` and
                 // never consult the shared ART). Gate every ART mutation in this
                 // arm on the same main-branch predicate that routes the data key.
-                let on_branch = self.storage.get_current_branch_id().is_some();
+                let on_branch = self.storage.is_branch_active();
 
                 // RLS (ROADMAP_V5 §1.1): resolve + parse the policy ONCE per
                 // statement, never per row (see `RlsWriteGuard`). `None` when no
@@ -9586,7 +10075,7 @@ impl EmbeddedDatabase {
                 // the statement. The `merge_txn_writes` gate below is what makes
                 // the sentence above true again: the point lookup now runs only
                 // when this transaction has staged nothing for the table.
-                let on_branch = self.storage.get_current_branch().is_some();
+                let on_branch = self.storage.is_branch_active();
                 // GH#41 (sprinter 27bf8d819c52): READ-YOUR-OWN-WRITES ON THE
                 // WRITE PATH. Both row sources below read committed state only —
                 // the point lookup probes `data:` and `scan_table_branch_aware`
@@ -10053,7 +10542,7 @@ impl EmbeddedDatabase {
                 // not staged itself; the `merge_txn_writes` gate below restores
                 // that contract by standing the point lookup down whenever it
                 // has.
-                let on_branch = self.storage.get_current_branch().is_some();
+                let on_branch = self.storage.is_branch_active();
                 // GH#41 (sprinter 27bf8d819c52): identical shape and identical
                 // reasoning to the UPDATE arm above — read that comment, which
                 // records why `Transaction::has_writes_for_table` is the gate,
@@ -10226,7 +10715,10 @@ impl EmbeddedDatabase {
                 // Buffer deletions in transaction write set for ACID guarantees
                 // Deletions are only visible after transaction commits
                 // Use branch-aware keys so deletes on branches don't affect main
-                if let Some(branch_id) = self.storage.get_current_branch_id() {
+                // sprinter 6bc4a4040eb7 (B1): the SESSION's branch; a binding
+                // whose branch was dropped is refused, never read as main.
+                if let Some(binding) = self.storage.check_active_branch()? {
+                    let branch_id = binding.branch_id;
                     // Branch delete: write tombstone markers (bdel: keys)
                     for row_id in &row_ids_to_delete {
                         let delete_key = format!("bdel:{}:{}:{}", branch_id, table_name, row_id).into_bytes();
@@ -10588,7 +11080,7 @@ impl EmbeddedDatabase {
                 }
                 // R3.3: rollback-safe columnar truncation — stage Null values
                 // and presence clears through the write set, grouped per batch.
-                if self.storage.get_current_branch().is_none() {
+                if !self.storage.is_branch_active() {
                     self.storage.stage_columnar_deletes_grouped_in_transaction(
                         table_name,
                         &truncated_row_ids,
@@ -10831,6 +11323,7 @@ impl EmbeddedDatabase {
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
             raii_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
+            open_raii_txns: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_notices: std::sync::Arc::new(dashmap::DashMap::new()),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -10964,6 +11457,7 @@ impl EmbeddedDatabase {
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
             raii_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
+            open_raii_txns: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_notices: std::sync::Arc::new(dashmap::DashMap::new()),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -11249,6 +11743,7 @@ impl EmbeddedDatabase {
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             session_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
             raii_art_undo: std::sync::Arc::new(dashmap::DashMap::new()),
+            open_raii_txns: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_txn_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             session_notices: std::sync::Arc::new(dashmap::DashMap::new()),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -11379,6 +11874,28 @@ impl EmbeddedDatabase {
         }
         let start = std::time::Instant::now();
 
+        // sprinter 6bc4a4040eb7 (B1): the batch runs below every funnel, so it
+        // installs the handle's own session itself (a session already installed
+        // on this thread wins) — the branch binding every statement reads.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+
+        // B1 second fix pass: on a branch, with no transaction of the caller
+        // open, the batch AUTOCOMMITS statement by statement through the
+        // ordinary funnel. Its own batch transaction would be a transaction
+        // on a branch, where every data statement is refused (0A000) until
+        // branch transactions exist (phase B2) — so a batch on a branch
+        // always failed. A batch on a branch is therefore NOT atomic until
+        // B2: a failing statement leaves the earlier ones applied. Inside the
+        // caller's own transaction the batch keeps the path below, and its
+        // statements are refused 0A000 like any other there.
+        if !self.global_txn_visible() && self.storage.is_branch_active() {
+            let mut total_rows = 0u64;
+            for sql in statements {
+                total_rows += self.execute(sql)?;
+            }
+            return Ok(total_rows);
+        }
+
         let txn_start = std::time::Instant::now();
         let txn = self.storage.begin_transaction()?;
         // sprinter beefd0d3d069: own slot, not the shared log.
@@ -11396,7 +11913,19 @@ impl EmbeddedDatabase {
             // transaction write set. The no-fast-path variant still allows the
             // transaction-aware INSERT fast path, but prevents direct UPDATE /
             // DELETE storage writes from escaping rollback on a later failure.
-            match self.execute_in_transaction_no_fast_path(sql, &txn) {
+            // The branch gate runs per statement, inside the same rollback arm.
+            // The batch is one transaction: on a branch its statements are
+            // refused like any other in-transaction statement (0A000, B1).
+            let outcome = self
+                .branch_statement_gate(sql, true)
+                .and_then(|(handled, branch_scope)| match handled {
+                    Some(_) => Ok(0),
+                    None => {
+                        let _branch_scope = branch_scope;
+                        self.execute_in_transaction_no_fast_path(sql, &txn)
+                    }
+                });
+            match outcome {
                 Ok(count) => total_rows += count,
                 Err(e) => {
                     // ORDER: replay the ART undo BEFORE dropping `txn` — the
@@ -11688,23 +12217,26 @@ impl EmbeddedDatabase {
         std::borrow::Cow::Borrowed(sql)
     }
 
-    /// Pre-parser rewrite that also returns an RAII branch guard for
-    /// the FR-3 `ON BRANCH '<name>'` directive. The guard switches
-    /// branch on construction and restores it on Drop, so every
-    /// early-return path through the entry point honors the override
-    /// without needing a wrapping closure.
+    /// Pre-parser rewrite that also returns an RAII branch scope for
+    /// the FR-3 `ON BRANCH '<name>'` directive. The scope binds THIS
+    /// STATEMENT — a private override of the thread's statement snapshot,
+    /// never the session state another caller may share — to that branch,
+    /// holds its drain, and restores the previous snapshot on Drop
+    /// (sprinter 6bc4a4040eb7, B1), so every early-return path through the
+    /// entry point honors the override without needing a wrapping closure.
+    /// A directive naming a branch that is not active is refused (3D000).
     ///
     /// Always returns an owned `String` for the rewritten SQL
     /// (whether or not the rewriter changed anything) so the entry
     /// point can keep the borrow stable across early returns.
     #[cfg(feature = "code-graph")]
-    fn rewrite_and_scope(&self, sql: &str) -> (String, CodeGraphBranchGuard<'_>) {
+    fn rewrite_and_scope(&self, sql: &str, in_txn: bool) -> Result<(String, BranchStatementScope)> {
         let rewrite = code_graph::rewrite_lsp_calls_full(sql);
         let guard = match rewrite.branch_override {
-            Some(target) => CodeGraphBranchGuard::switch_to(self, target),
-            None => CodeGraphBranchGuard::noop(),
+            Some(target) => self.statement_branch_override(&target, in_txn)?,
+            None => BranchStatementScope::inert(),
         };
-        (rewrite.sql, guard)
+        Ok((rewrite.sql, guard))
     }
 
     /// Run a `CREATE AST INDEX …` declaration. Registers the index
@@ -12020,6 +12552,13 @@ impl EmbeddedDatabase {
         // is an unconditional install with save-and-restore: a nested body that
         // runs against a DIFFERENT database must win for its own duration only.
         let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate — answers
+        // `USE BRANCH` / `SET|RESET|SHOW heliosdb.branch` on the backend just
+        // installed, and fails a session bound to a dropped branch CLOSED.
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, self.global_txn_visible())?;
+        if handled.is_some() {
+            return Ok(0);
+        }
         // SQLite-compat: PRAGMA without a result-set (assignments / no-op
         // tunables) — `execute()` callers don't expect rows back.
         if let Some((_, _)) = crate::sql::sqlite_compat::parse_pragma(sql) {
@@ -12043,10 +12582,10 @@ impl EmbeddedDatabase {
         }
         // And rewrite any `lsp_*(…)` table-function references.
         // `ON BRANCH '…'` directives, if any, are scoped by a
-        // CodeGraphBranchGuard that switches on construction and
+        // branch scope (a private statement override) that applies on construction and
         // restores on Drop — covers every early-return path below.
         #[cfg(feature = "code-graph")]
-        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
+        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql, self.global_txn_visible())?;
         #[cfg(feature = "code-graph")]
         let sql: &str = &rewritten_owned;
         #[cfg(not(feature = "code-graph"))]
@@ -12272,7 +12811,7 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || self.session_txns_block_fast_inserts()
             || self.has_effective_tenant_context()
-            || self.storage.get_current_branch_id().is_some()
+            || self.storage.is_branch_active()
         {
             return None;
         }
@@ -12368,7 +12907,7 @@ impl EmbeddedDatabase {
         let _wv = write_volume::stmt_scope(write_volume::StmtClass::InsertMulti);
         if self.session_txns_block_fast_inserts()
             || self.has_effective_tenant_context()
-            || self.storage.get_current_branch_id().is_some()
+            || self.storage.is_branch_active()
         {
             return None;
         }
@@ -12589,7 +13128,7 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || self.session_txns_block_fast_inserts()
             || self.has_effective_tenant_context()
-            || self.storage.get_current_branch_id().is_some()
+            || self.storage.is_branch_active()
             || self.trigger_registry.has_triggers_for_table(table_name)
             || self.storage.fast_dml_requires_logical_wal()
         {
@@ -13404,7 +13943,7 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || self.any_session_txns()
             || self.has_effective_tenant_context()
-            || self.storage.get_current_branch_id().is_some()
+            || self.storage.is_branch_active()
         {
             return None;
         }
@@ -13447,7 +13986,7 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || self.any_session_txns()
             || self.has_effective_tenant_context()
-            || self.storage.get_current_branch_id().is_some()
+            || self.storage.is_branch_active()
         {
             return None;
         }
@@ -13565,7 +14104,7 @@ impl EmbeddedDatabase {
         if self.in_transaction()
             || self.any_session_txns()
             || self.has_effective_tenant_context()
-            || self.storage.get_current_branch_id().is_some()
+            || self.storage.is_branch_active()
         {
             return None;
         }
@@ -15698,7 +16237,7 @@ impl EmbeddedDatabase {
         };
 
         // Use fast INSERT (skip WAL fsync + snapshot versioning) when on main branch
-        if self.storage.get_current_branch_id().is_none() {
+        if !self.storage.is_branch_active() {
             Some(
                 self.storage
                     .insert_tuple_fast(&spec.table_name, tuple, &spec.schema)
@@ -15993,7 +16532,7 @@ impl EmbeddedDatabase {
         // R3.3: stage columnar side-data grouped by (column, batch) — one
         // staged read-modify-write per touched batch per statement instead of
         // one per value — including the live-row presence bits.
-        if self.storage.get_current_branch().is_none() {
+        if !self.storage.is_branch_active() {
             let row_refs: Vec<(u64, &Tuple)> = prepared.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
             self.storage
                 .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, schema, txn, true)?;
@@ -16128,7 +16667,7 @@ impl EmbeddedDatabase {
         // Gate on the SAME predicate as `branch_aware_data_key` so ART
         // maintenance happens iff the row lands in the main `data:` keyspace;
         // mirrors the columnar-staging branch gate below.
-        let on_branch = self.storage.get_current_branch_id().is_some();
+        let on_branch = self.storage.is_branch_active();
         let col_values = if on_branch {
             Self::tuple_column_values(schema, &tuple)
         } else {
@@ -16172,7 +16711,7 @@ impl EmbeddedDatabase {
         // R3.3: multi-row callers stage columnar side-data grouped per batch
         // BEFORE this per-row loop (`stage_columnar = false`); single-row
         // callers stage here (grouped staging marks presence too).
-        if stage_columnar && self.storage.get_current_branch().is_none() {
+        if stage_columnar && !self.storage.is_branch_active() {
             if let Err(e) = self.storage.stage_columnar_rows_grouped_in_transaction(
                 table_name,
                 &[(row_id, &tuple)],
@@ -16486,7 +17025,7 @@ impl EmbeddedDatabase {
         }
 
         // Check branch — skip fast path on branches
-        if self.storage.get_current_branch_id().is_some() {
+        if self.storage.is_branch_active() {
             tracing::debug!(target: "helios::fastpath", reason = "lit-update:branch", "fast-update bail");
             return None;
         }
@@ -16715,7 +17254,7 @@ impl EmbeddedDatabase {
         if self.trigger_registry.has_triggers_for_table(table_name) {
             return None;
         }
-        if self.storage.get_current_branch().is_some() {
+        if self.storage.is_branch_active() {
             return None;
         }
 
@@ -16968,7 +17507,12 @@ impl EmbeddedDatabase {
     }
 
     fn fast_select_lookup(&self, sql: &str) -> Option<Result<(std::sync::Arc<FastSelectSpec>, Value)>> {
-        if self.in_transaction() {
+        // sprinter 6bc4a4040eb7 (B1): the probe below reads main's PK index
+        // and a single overlay key, which is not what a branch sees (a row the
+        // branch inherited unchanged has no `bdata:` key, so the probe would
+        // report it absent). Like every other fast path, decline on a branch
+        // session — decided at EXECUTION, from the executing session's binding.
+        if self.in_transaction() || self.storage.is_branch_active() {
             return None;
         }
         // Non-`public` `search_path`: bare names resolve via the planner
@@ -17615,7 +18159,9 @@ impl EmbeddedDatabase {
     }
 
     fn try_fast_select_params(&self, sql: &str, params: &[Value]) -> Option<Result<Vec<Tuple>>> {
-        if self.in_transaction() {
+        // sprinter 6bc4a4040eb7 (B1): decline on a branch session, for the
+        // reason `fast_select_lookup` gives.
+        if self.in_transaction() || self.storage.is_branch_active() {
             return None;
         }
         // This path parses the table name straight from the SQL (bare) and never
@@ -18617,6 +19163,13 @@ impl EmbeddedDatabase {
         // is an unconditional install with save-and-restore: a nested body that
         // runs against a DIFFERENT database must win for its own duration only.
         let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate — answers
+        // `USE BRANCH` / `SET|RESET|SHOW heliosdb.branch` on the backend just
+        // installed, and fails a session bound to a dropped branch CLOSED.
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, self.global_txn_visible())?;
+        if handled.is_some() {
+            return Ok(0);
+        }
         // GH#28 + sprinter a3077a3f68d8: the params family answers
         // `SHOW <setting>`, `SET`/`RESET` of the three connection-lifetime GUCs,
         // and `SET`/`RESET` of every USER-SETTABLE GUC — which now land on the
@@ -18700,6 +19253,14 @@ impl EmbeddedDatabase {
         // exactly once. See `charge_tenant_query`.
         let _qps = self.charge_tenant_query()?;
         if rows.is_empty() {
+            return Ok(0);
+        }
+        // sprinter 6bc4a4040eb7 (B1): the batch fast paths below read the
+        // branch binding, so the handle's session must be installed first; the
+        // per-row fallback (`execute_params`) installs the same one.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, self.global_txn_visible())?;
+        if handled.is_some() {
             return Ok(0);
         }
 
@@ -18806,6 +19367,13 @@ impl EmbeddedDatabase {
         // is an unconditional install with save-and-restore: a nested body that
         // runs against a DIFFERENT database must win for its own duration only.
         let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate — answers
+        // `USE BRANCH` / `SET|RESET|SHOW heliosdb.branch` on the backend just
+        // installed, and fails a session bound to a dropped branch CLOSED.
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, self.global_txn_visible())?;
+        if let Some((rows, _schema)) = handled {
+            return Ok((0, rows));
+        }
         let plan = self.parameterized_plan_cached(sql)?;
 
         let out = self.execute_plan_with_params(&plan, params, None);
@@ -19115,7 +19683,7 @@ impl EmbeddedDatabase {
         // therefore no savepoint stack to consult.
         // sprinter 0d6695bf8a86: `global_txn_visible`, not `in_transaction()`.
         // The Insert arm below only picks up a transaction this caller OWNS.
-        !self.global_txn_visible() && self.storage.get_current_branch_id().is_none()
+        !self.global_txn_visible() && !self.storage.is_branch_active()
     }
 
     /// sprinter e4bb83a1afa0: does this params-family `CALL` need an implicit
@@ -19535,7 +20103,7 @@ impl EmbeddedDatabase {
                                         staged_col_values.insert(col.name.clone(), v.clone());
                                     }
                                 }
-                                if self.storage.get_current_branch().is_none() {
+                                if !self.storage.is_branch_active() {
                                     // R3.3: grouped staging marks presence too
                                     // (single-row INSERT).
                                     self.storage.stage_columnar_rows_grouped_in_transaction(
@@ -19553,7 +20121,7 @@ impl EmbeddedDatabase {
                                 // probes/unique checks never observe the branch row
                                 // (the columnar-staging gate above already skips a
                                 // branch — this ART block sat outside it).
-                                let on_main = self.storage.get_current_branch_id().is_none();
+                                let on_main = !self.storage.is_branch_active();
                                 // sprinter 5a78b8288153: CLAIM before staging —
                                 // the params twin of the text arm's fix, and the
                                 // arm this item's own regression test actually
@@ -20211,7 +20779,7 @@ impl EmbeddedDatabase {
                 };
 
                 let count = if let Some(txn) = active_txn {
-                    let on_branch = self.storage.get_current_branch().is_some();
+                    let on_branch = self.storage.is_branch_active();
                     // R3.3: stage columnar side-data grouped per touched batch
                     // (UPDATE — presence untouched).
                     if !on_branch {
@@ -20316,7 +20884,7 @@ impl EmbeddedDatabase {
                     // on a branch (W2.0 — the row lands in `bdata:` and the
                     // shared ART is branch-blind). No undo log: an autocommit
                     // statement has no ROLLBACK to undo it.
-                    let on_branch = self.storage.get_current_branch().is_some();
+                    let on_branch = self.storage.is_branch_active();
                     let mut art_maintenance: Vec<(
                         u64,
                         std::collections::HashMap<String, Value>,
@@ -20479,7 +21047,7 @@ impl EmbeddedDatabase {
                 // entries for inherited rows, and a RestoreDeleted undo would
                 // re-insert a phantom on rollback; branch reads never use the
                 // shared ART; W2.0).
-                let on_branch = self.storage.get_current_branch_id().is_some();
+                let on_branch = self.storage.is_branch_active();
                 if !on_branch {
                     for (row_id, tuple) in &deleted_tuples {
                         let mut col_values = std::collections::HashMap::new();
@@ -20922,6 +21490,13 @@ impl EmbeddedDatabase {
         // is an unconditional install with save-and-restore: a nested body that
         // runs against a DIFFERENT database must win for its own duration only.
         let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate — answers
+        // `USE BRANCH` / `SET|RESET|SHOW heliosdb.branch` on the backend just
+        // installed, and fails a session bound to a dropped branch CLOSED.
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, self.global_txn_visible())?;
+        if let Some((rows, _schema)) = handled {
+            return Ok(rows);
+        }
         // SQLite-compat: PRAGMA short-circuit. `table_info(t)` returns
         // SQLite-shaped rows; everything else returns an empty result so
         // sqlite3-driven apps can issue PRAGMAs without parser errors.
@@ -20943,7 +21518,7 @@ impl EmbeddedDatabase {
         // `ON BRANCH '…'` directives are scoped via a Drop guard so
         // every early-return path below honors the override.
         #[cfg(feature = "code-graph")]
-        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
+        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql, self.global_txn_visible())?;
         #[cfg(feature = "code-graph")]
         let sql: &str = &rewritten_owned;
         #[cfg(not(feature = "code-graph"))]
@@ -21503,10 +22078,7 @@ impl EmbeddedDatabase {
         //   * Nothing is cached here that could go stale: the normalized path
         //     deliberately does not populate the result cache (see below), and
         //     the plan cache is invalidated on DDL for every path alike.
-        if self.in_transaction()
-            || self.has_effective_tenant_context()
-            || self.storage.get_current_branch_id().is_some()
-        {
+        if self.in_transaction() || self.has_effective_tenant_context() || self.storage.is_branch_active() {
             return None;
         }
 
@@ -21623,6 +22195,13 @@ impl EmbeddedDatabase {
         // is an unconditional install with save-and-restore: a nested body that
         // runs against a DIFFERENT database must win for its own duration only.
         let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate — answers
+        // `USE BRANCH` / `SET|RESET|SHOW heliosdb.branch` on the backend just
+        // installed, and fails a session bound to a dropped branch CLOSED.
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, self.global_txn_visible())?;
+        if let Some(result) = handled {
+            return Ok(result);
+        }
         if let Some(result) = self.try_fast_select_with_schema(sql) {
             return result;
         }
@@ -22297,6 +22876,14 @@ impl EmbeddedDatabase {
         // The commit batch writes `data:`/`v:`/`counter:` straight to RocksDB,
         // so it seals them itself (see `Transaction::key_manager`).
         txn.set_key_manager(self.storage.key_manager_arc());
+        // sprinter 6bc4a4040eb7 (B1 second fix pass): the branch this session
+        // is on at BEGIN — what its COMMIT re-validates.
+        txn.capture_branch_binding(
+            session
+                .scoped
+                .branch_binding()
+                .filter(|binding| binding.engine_instance == self.storage.instance_id()),
+        );
         // Session transactions are built here rather than by
         // `StorageEngine::begin_transaction`, so they enroll in the
         // uncommitted-write census here. Without it, a `COUNT(*)` on ANOTHER
@@ -22406,7 +22993,18 @@ impl EmbeddedDatabase {
     }
 
     pub fn commit_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
-        let result = self.commit_transaction_for_session_inner(session_id);
+        // sprinter 6bc4a4040eb7 (B1 fix pass): a transaction on a branch that
+        // was dropped or merged while it was open rolls back and is refused
+        // (3D000) — never committed into an overlay nobody can see.
+        let result = match self.session_txn_branch_live(session_id) {
+            Ok(()) => self.commit_transaction_for_session_inner(session_id),
+            Err(gone) => {
+                if let Err(rollback) = self.rollback_transaction_for_session_inner(session_id) {
+                    tracing::warn!("rolling back a transaction whose branch is gone failed: {rollback}");
+                }
+                Err(gone)
+            }
+        };
         // sprinter f4f5d450e816: a `SET LOCAL application_name` reverts at the
         // END of the transaction block — on COMMIT and ROLLBACK alike, and
         // whether or not the commit succeeded (a failed COMMIT still ends the
@@ -22645,6 +23243,15 @@ impl EmbeddedDatabase {
         // keys the result cache for everything below, including every early
         // return.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
+        // session's backend (installed just above) — `USE BRANCH` /
+        // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
+        // binding whose branch was dropped fails the statement CLOSED.
+        let branch_in_txn = self.session_has_open_transaction(session_id);
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, branch_in_txn)?;
+        if handled.is_some() {
+            return Ok(0);
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -22813,6 +23420,15 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
+        // session's backend (installed just above) — `USE BRANCH` /
+        // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
+        // binding whose branch was dropped fails the statement CLOSED.
+        let branch_in_txn = self.session_has_open_transaction(session_id);
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, branch_in_txn)?;
+        if let Some((rows, _schema)) = handled {
+            return Ok(rows);
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -23788,6 +24404,15 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
+        // session's backend (installed just above) — `USE BRANCH` /
+        // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
+        // binding whose branch was dropped fails the statement CLOSED.
+        let branch_in_txn = self.session_has_open_transaction(session_id);
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, branch_in_txn)?;
+        if handled.is_some() {
+            return Ok(0);
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -23914,6 +24539,15 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
+        // session's backend (installed just above) — `USE BRANCH` /
+        // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
+        // binding whose branch was dropped fails the statement CLOSED.
+        let branch_in_txn = self.session_has_open_transaction(session_id);
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, branch_in_txn)?;
+        if let Some(result) = handled {
+            return Ok(result);
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -24001,6 +24635,15 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
+        // session's backend (installed just above) — `USE BRANCH` /
+        // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
+        // binding whose branch was dropped fails the statement CLOSED.
+        let branch_in_txn = self.session_has_open_transaction(session_id);
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, branch_in_txn)?;
+        if let Some((rows, _schema)) = handled {
+            return Ok((0, rows));
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -24125,6 +24768,15 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
+        // session's backend (installed just above) — `USE BRANCH` /
+        // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
+        // binding whose branch was dropped fails the statement CLOSED.
+        let branch_in_txn = self.session_has_open_transaction(session_id);
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, branch_in_txn)?;
+        if let Some((rows, _schema)) = handled {
+            return Ok((0, rows));
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -24243,6 +24895,15 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
+        // session's backend (installed just above) — `USE BRANCH` /
+        // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
+        // binding whose branch was dropped fails the statement CLOSED.
+        let branch_in_txn = self.session_has_open_transaction(session_id);
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, branch_in_txn)?;
+        if handled.is_some() {
+            return Ok(0);
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -24357,6 +25018,15 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
+        // session's backend (installed just above) — `USE BRANCH` /
+        // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
+        // binding whose branch was dropped fails the statement CLOSED.
+        let branch_in_txn = self.session_has_open_transaction(session_id);
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, branch_in_txn)?;
+        if let Some((rows, _schema)) = handled {
+            return Ok(rows);
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -24455,6 +25125,15 @@ impl EmbeddedDatabase {
         let _advisory = self.advisory_context_guard(session_id, sql);
         // HDB-009: identity for `current_user` and the result-cache key.
         let _identity_override = self.session_statement_context_guard(session_id)?;
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate, on THIS
+        // session's backend (installed just above) — `USE BRANCH` /
+        // `SET|RESET|SHOW heliosdb.branch` bind this connection only, and a
+        // binding whose branch was dropped fails the statement CLOSED.
+        let branch_in_txn = self.session_has_open_transaction(session_id);
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, branch_in_txn)?;
+        if let Some(result) = handled {
+            return Ok(result);
+        }
         // sprinter f4f5d450e816: `SET` / `SET LOCAL` / `RESET` / `SHOW`
         // application_name lands on THIS session's backend, ahead of the
         // open-transaction fork below — the in-transaction branch is
@@ -24554,7 +25233,7 @@ impl EmbeddedDatabase {
         // `ROLLBACK TO SAVEPOINT` would have to undo it.
         if txn.has_savepoints()
             || self.has_effective_tenant_context()
-            || self.storage.get_current_branch_id().is_some()
+            || self.storage.is_branch_active()
             || !(self.storage.time_travel_enabled()
                 || self.session_txn_count.load(std::sync::atomic::Ordering::Acquire) <= 1)
         {
@@ -24710,11 +25389,18 @@ impl EmbeddedDatabase {
         // is an unconditional install with save-and-restore: a nested body that
         // runs against a DIFFERENT database must win for its own duration only.
         let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate — answers
+        // `USE BRANCH` / `SET|RESET|SHOW heliosdb.branch` on the backend just
+        // installed, and fails a session bound to a dropped branch CLOSED.
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, self.global_txn_visible())?;
+        if let Some((rows, _schema)) = handled {
+            return Ok(rows);
+        }
         // Code-graph pre-parser: see `maybe_rewrite_code_graph`.
         // `ON BRANCH '…'` directives swap the active branch via a
         // Drop guard for the duration of this query.
         #[cfg(feature = "code-graph")]
-        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
+        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql, self.global_txn_visible())?;
         // A code-graph rewrite changes the SQL the plan must come from —
         // a pinned plan for the unrewritten text would be wrong.
         #[cfg(feature = "code-graph")]
@@ -24974,8 +25660,15 @@ impl EmbeddedDatabase {
         // is an unconditional install with save-and-restore: a nested body that
         // runs against a DIFFERENT database must win for its own duration only.
         let _seq_ns = sql::sequences::EngineScope::enter(&self.storage);
+        // sprinter 6bc4a4040eb7 (B1): the per-statement branch gate — answers
+        // `USE BRANCH` / `SET|RESET|SHOW heliosdb.branch` on the backend just
+        // installed, and fails a session bound to a dropped branch CLOSED.
+        let (handled, _branch_scope) = self.branch_statement_gate(sql, self.global_txn_visible())?;
+        if let Some(result) = handled {
+            return Ok(result);
+        }
         #[cfg(feature = "code-graph")]
-        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
+        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql, self.global_txn_visible())?;
         #[cfg(feature = "code-graph")]
         let sql: &str = &rewritten_owned;
         #[cfg(not(feature = "code-graph"))]
@@ -25242,6 +25935,16 @@ impl EmbeddedDatabase {
     pub(crate) fn bulk_insert_tuples(&self, table_name: &str, tuples: Vec<Tuple>) -> Result<Vec<u64>> {
         // Spec P1.4: below every SQL entry point (code-graph indexing calls it).
         self.refuse_write_on_physical_standby("a bulk insert")?;
+        // sprinter 6bc4a4040eb7 (B1): this direct-write path is reached from
+        // OUTSIDE every statement funnel (code-graph indexing), so it installs
+        // the handle's own session itself — otherwise no branch binding is
+        // visible here and a bulk load on a branch would land on main. The
+        // branch decision is then taken ONCE — snapshotted for the whole bulk
+        // load, with the branch's drain held so a DROP waits for it — and a
+        // binding whose branch was dropped is refused before the first row.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        let _branch_scope = self.enter_branch_statement()?;
+        let on_branch = self.storage.check_active_branch()?.is_some();
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
 
@@ -25339,7 +26042,7 @@ impl EmbeddedDatabase {
         // branch reads never consult the shared ART, so skip ART maintenance —
         // adding branch entries here would poison main-branch probes (the vector
         // twin above is already branch-gated via `vector_dml_gate`).
-        if self.storage.get_current_branch_id().is_none() {
+        if !on_branch {
             for (row_id, col_values) in art_updates {
                 if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
                     // sprinter fa2d11f140fe: every row of this bulk path was
@@ -25407,6 +26110,18 @@ impl EmbeddedDatabase {
     #[deprecated(since = "2.1.0", note = "Use `begin()`, `commit()`, and `rollback()` instead")]
     pub fn begin_transaction(&self) -> Result<Transaction<'_>> {
         let tx = self.storage.begin_transaction()?;
+        // sprinter 6bc4a4040eb7 (B1 second fix pass): capture the branch the
+        // handle's session is on — what `Transaction::commit` re-validates —
+        // and count the transaction open, so the session's branch cannot be
+        // switched under it (`shared_session_in_transaction`).
+        {
+            let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+            tx.capture_branch_binding(self.storage.active_branch());
+        }
+        self.open_raii_txns.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let open = RaiiOpenTxn {
+            count: std::sync::Arc::clone(&self.open_raii_txns),
+        };
         // sprinter 8a9b60eeef87: claim this transaction's own ART undo slot
         // BEFORE any statement can run on the handle, so `push_art_undo` routes
         // its eager index ops here instead of into the shared `art_undo_log`
@@ -25420,6 +26135,7 @@ impl EmbeddedDatabase {
                 txn_id,
                 map: std::sync::Arc::clone(&self.raii_art_undo),
             },
+            _open: open,
         })
     }
 
@@ -26083,16 +26799,178 @@ impl EmbeddedDatabase {
         self.execute(&format!("CREATE BRANCH {name}"))
     }
 
-    /// Switch the active branch.
+    /// Switch the active branch OF THIS HANDLE'S SESSION.
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B1): the branch is session state. Called on
+    /// a plain handle this binds the handle's own embedded session (what every
+    /// later `execute()` / `query()` on the handle reads); called from inside a
+    /// `*_for_session` statement it binds that session. It never moves another
+    /// connection. Refused with SQLSTATE 3D000 when `name` is not an active
+    /// branch; `"main"` returns the session to main.
     pub fn switch_branch(&self, name: &str) -> Result<u64> {
-        // Spec P1.4: refused with the other branch operations: the active
-        // branch is engine-wide state every reader of the standby shares.
+        // Spec P1.4: refused with the other branch operations on a physical
+        // standby (a standby's branches are its primary's).
         self.refuse_write_on_physical_standby("switch_branch")?;
-        self.execute(&format!("USE BRANCH {name}"))
+        // B1 fix pass: the branch cannot change under an open transaction of
+        // this handle (25001), exactly as `USE BRANCH` inside one is refused.
+        // Second pass: whichever thread owns the handle's transaction, and a
+        // RAII `Transaction` counts too (`shared_session_in_transaction`).
+        if self.global_txn_visible() {
+            return Err(Error::branch_switch_in_transaction());
+        }
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        let state = session_scoped_state_tls()
+            .ok_or_else(|| Error::query_execution("switch_branch: no session to bind the branch to"))?;
+        if self.shared_session_in_transaction(&state) {
+            return Err(Error::branch_switch_in_transaction());
+        }
+        self.storage.bind_session_branch(&state, name)?;
+        Ok(0)
     }
 
-    /// Merge a branch into the current branch.
-    /// Merge `source` into the branch this handle is currently on (`main` if none).
+    /// The branch THIS HANDLE'S SESSION is on — `"main"` when it is on none.
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B1): what `\show branch` and `SHOW
+    /// heliosdb.branch` report for the embedded handle. Reads the session
+    /// binding through the one engine accessor (`StorageEngine::active_branch`).
+    pub fn current_branch(&self) -> String {
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        self.storage
+            .active_branch()
+            .map_or_else(|| "main".to_string(), |binding| binding.name.clone())
+    }
+
+    /// The branch session `session_id` is bound to — `"main"` when none.
+    pub fn session_branch(&self, session_id: crate::session::SessionId) -> Result<String> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        Ok(scoped
+            .branch_binding()
+            .filter(|binding| binding.engine_instance == self.storage.instance_id())
+            .map_or_else(|| "main".to_string(), |binding| binding.name.clone()))
+    }
+
+    /// Bind session `session_id` to the branch `name` (`"main"` unbinds) — the
+    /// session-id spelling of `USE BRANCH`, for callers that hold a session
+    /// rather than a statement (the PostgreSQL startup packet, the wire
+    /// handlers' `SET heliosdb.branch` arms). Refused 3D000 when `name` is not
+    /// an active branch, leaving the binding unchanged.
+    pub fn bind_session_branch(&self, session_id: crate::session::SessionId, name: &str) -> Result<()> {
+        // B1 fix pass: never under an open transaction of that session (25001).
+        if self.session_has_open_transaction(session_id) {
+            return Err(Error::branch_switch_in_transaction());
+        }
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        self.storage.bind_session_branch(&scoped, name)
+    }
+
+    /// Bind session `session_id` to the branch its connection was OPENED on
+    /// (the PostgreSQL startup forms) and record it as the session's home
+    /// branch — what `RESET heliosdb.branch` and `DISCARD ALL` return to.
+    pub(crate) fn bind_session_startup_branch(&self, session_id: crate::session::SessionId, name: &str) -> Result<()> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        self.storage.bind_session_branch(&scoped, name)?;
+        // The home is the BINDING (by id), so a reset never re-resolves the
+        // name: `DROP b; CREATE b` must not silently move a pooled `<db>@b`
+        // connection onto a different branch that happens to share the name.
+        let home = scoped
+            .branch_binding()
+            .filter(|binding| binding.engine_instance == self.storage.instance_id());
+        scoped.set_home_branch(home);
+        Ok(())
+    }
+
+    /// Return session `session_id` to its home branch (main when it was opened
+    /// on none) — what `DISCARD ALL` and `RESET ALL` do, and what MySQL's
+    /// `COM_RESET_CONNECTION` does. Never refuses: a home branch that has since
+    /// been dropped is bound anyway, unvalidated, so the session fails CLOSED
+    /// (3D000) on its next statement instead of keeping the previous client's
+    /// binding, and the rest of the caller's reset still runs.
+    pub(crate) fn reset_session_branch(&self, session_id: crate::session::SessionId) {
+        if let Ok(session_lock) = self.session_manager.get_session(session_id) {
+            let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+            scoped.reset_branch_to_home();
+        }
+    }
+
+    /// The branch binding the session's open transaction CAPTURED at BEGIN,
+    /// re-validated for its COMMIT — sprinter 6bc4a4040eb7 (B1 fix pass; the
+    /// second pass validates the captured binding instead of the session's
+    /// live one). A transaction does not hold its branch's drain across
+    /// statements (a long-open transaction must not block a DROP), so its
+    /// COMMIT is where a branch dropped or merged under it is caught: the
+    /// caller rolls back and refuses (3D000). `Ok` with no open transaction
+    /// (the commit itself then reports that).
+    fn session_txn_branch_live(&self, session_id: crate::session::SessionId) -> Result<()> {
+        let captured = match self.session_txn_slot(session_id) {
+            Some(slot) => {
+                let guard = slot.read();
+                guard.as_ref().and_then(storage::Transaction::captured_branch_binding)
+            }
+            None => None,
+        };
+        match captured {
+            Some(binding) => self.storage.validate_branch_binding(&binding),
+            None => Ok(()),
+        }
+    }
+
+    /// Is `state` the handle's SHARED embedded session while a transaction is
+    /// open on it — the global slot (whichever thread owns it) or a RAII
+    /// [`Transaction`]? Then its branch must not change (25001): the
+    /// transaction's statements read the binding — sprinter 6bc4a4040eb7 (B1
+    /// second fix pass; the first pass only refused the transaction's owner).
+    fn shared_session_in_transaction(
+        &self,
+        state: &std::sync::Arc<crate::session::scoped::SessionScopedState>,
+    ) -> bool {
+        std::sync::Arc::ptr_eq(state, &self.embedded_scoped)
+            && (self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
+                || self.open_raii_txns.load(std::sync::atomic::Ordering::Acquire) > 0)
+    }
+
+    /// Run `f` with a fresh REQUEST-scoped backend bound to `branch` (`"main"`
+    /// = no binding) installed on this thread — sprinter 6bc4a4040eb7 (B1).
+    ///
+    /// The REST routes under `/v1/branches/:name/…` and every MCP tool call
+    /// use this. Both used to run on the handle's shared state (REST ignored
+    /// `:name` entirely and ran on main; MCP did a global switch-and-restore
+    /// that raced every concurrent call), so two concurrent requests on two
+    /// branches interfered. A request-scoped backend is private to the
+    /// request: a `USE BRANCH` inside it moves nobody else, and it is gone when
+    /// `f` returns. `branch` is resolved as ACTIVE first (3D000 otherwise, which
+    /// REST reports as 404).
+    ///
+    /// `f` runs synchronously on the calling thread — the backend is a
+    /// per-thread install and must not cross an `.await`.
+    pub fn with_request_branch_scope<R>(&self, branch: &str, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        let state = crate::session::scoped::SessionScopedState::new_request_scoped(self.storage.instance_id());
+        // B1 fix pass: the request inherits the handle's own USER-SETTABLE GUCs
+        // (a handle-level `SET statement_timeout` / `bulk_load_mode` used to
+        // apply to every REST request and MCP call, and still does).
+        state.copy_gucs_from(&self.embedded_scoped);
+        self.storage.bind_session_branch(&state, branch)?;
+        // B1 fix pass: the request's backend ends here, so does anything
+        // session-private it created — a `CREATE TEMPORARY TABLE` in a REST
+        // request or MCP call would otherwise outlive it as a permanent
+        // relation (the same teardown `destroy_session` runs for a connection).
+        // B1 second fix pass: in a Drop guard, so the teardown also runs when
+        // `f` panics (a REST handler panic is caught per request and the
+        // server keeps serving). Declared before the install guard below, so
+        // it runs after the backend is uninstalled, as before.
+        let _teardown = RequestBackendTeardown {
+            storage: self.storage.as_ref(),
+            state: std::sync::Arc::clone(&state),
+        };
+        let _scoped = SessionScopedStateGuard::install(std::sync::Arc::clone(&state));
+        f()
+    }
+
+    /// Merge `source` into the branch THIS HANDLE'S SESSION is on (`main` if
+    /// none) — sprinter 6bc4a4040eb7 (B1): "current" is the session's branch,
+    /// never an engine-wide selector.
     ///
     /// The emitted SQL must name the target: `MERGE BRANCH <src>` alone is a parse
     /// error (`MERGE BRANCH requires INTO keyword`), so before this was fixed every
@@ -26101,8 +26979,30 @@ impl EmbeddedDatabase {
     /// branches first, which is what that tool does.
     pub fn merge_branch(&self, source: &str) -> Result<u64> {
         self.refuse_write_on_physical_standby("merge_branch")?;
-        let target = self.storage.get_current_branch().unwrap_or_else(|| "main".to_string());
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
+        let target = self
+            .storage
+            .check_active_branch()?
+            .map_or_else(|| "main".to_string(), |binding| binding.name.clone());
         self.execute(&format!("MERGE BRANCH {source} INTO {target}"))
+    }
+
+    /// Merge branch `source` into branch `target` by NAME, whatever branch the
+    /// calling session is on — the engine's MERGE, the one `MERGE BRANCH`
+    /// runs (last-writer-wins, the source's rows win), with the same cache
+    /// invalidation as the SQL statement. For callers that hold branch names
+    /// rather than SQL text — the REST merge route (sprinter 6bc4a4040eb7, B1
+    /// second fix pass: it used to call `BranchManager::merge_branch`, whose
+    /// key format SQL never writes, and merged 0 rows).
+    pub fn merge_branch_into(&self, source: &str, target: &str) -> Result<storage::MergeResult> {
+        self.refuse_write_on_physical_standby("merge_branch")?;
+        let result = self
+            .storage
+            .merge_branch(source, target, storage::MergeStrategy::default());
+        // As `plan_invalidates_sql_caches` does for `MERGE BRANCH`: the merge
+        // wrote rows outside every DML-path invalidation.
+        self.invalidate_plan_cache();
+        result
     }
 
     /// Drop a branch.
@@ -26211,6 +27111,7 @@ impl EmbeddedDatabase {
             // trigger body re-enters on the SAME transaction, so its eager ART
             // ops must land in that transaction's slot.
             raii_art_undo: self.raii_art_undo.clone(),
+            open_raii_txns: std::sync::Arc::clone(&self.open_raii_txns),
             session_txn_count: self.session_txn_count.clone(),
             session_notices: self.session_notices.clone(),
             fk_validation_mode: self.fk_validation_mode.clone(),
@@ -26719,7 +27620,7 @@ impl EmbeddedDatabase {
             // main entries would make a main point probe return
             // authoritative-empty for an inherited row. Branch reads never use
             // the shared ART, so skip ART maintenance on a branch.
-            if self.storage.get_current_branch_id().is_none() {
+            if !self.storage.is_branch_active() {
                 for (row_id, tuple) in &rows_to_delete {
                     let mut col_values = std::collections::HashMap::new();
                     for (i, col) in schema.columns.iter().enumerate() {
@@ -26802,7 +27703,7 @@ impl EmbeddedDatabase {
             // shared ART's main entries would make a main point probe return
             // authoritative-empty for an inherited row. Branch reads never use
             // the shared ART, so skip ART maintenance on a branch.
-            if self.storage.get_current_branch_id().is_none() {
+            if !self.storage.is_branch_active() {
                 if let Err(e) = self
                     .storage
                     .art_indexes()
@@ -26891,7 +27792,7 @@ impl EmbeddedDatabase {
         // symmetric about it.
         if let Some(txn) = active_txn {
             // R3.3 / W2.0 carve-out, unchanged from the autocommit path below.
-            if self.storage.get_current_branch().is_none() {
+            if !self.storage.is_branch_active() {
                 let row_refs: Vec<(u64, &Tuple)> =
                     rows_to_update.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
                 self.storage
@@ -26915,7 +27816,7 @@ impl EmbeddedDatabase {
         // per touched batch (UPDATE — presence untouched).
         let txn = self.storage.begin_autocommit_transaction()?;
         let _wal_capture = txn.begin_statement_wal_capture();
-        if self.storage.get_current_branch().is_none() {
+        if !self.storage.is_branch_active() {
             let row_refs: Vec<(u64, &Tuple)> = rows_to_update.iter().map(|(row_id, tuple)| (*row_id, tuple)).collect();
             self.storage
                 .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, &schema, &txn, false)?;
@@ -28869,6 +29770,22 @@ pub struct Transaction<'a> {
     /// itself: `commit(self)` and `rollback(self)` move `tx` out of `self`,
     /// which the compiler forbids on a type that implements `Drop`.
     undo_slot: RaiiArtUndoSlot,
+    /// sprinter 6bc4a4040eb7 (B1 second fix pass): counts this transaction in
+    /// `EmbeddedDatabase::open_raii_txns` until the handle ends, however it
+    /// ends (a field with a `Drop`, for the reason given on `undo_slot`).
+    _open: RaiiOpenTxn,
+}
+
+/// Decrements `EmbeddedDatabase::open_raii_txns` when a RAII transaction
+/// handle ends — sprinter 6bc4a4040eb7 (B1 second fix pass).
+struct RaiiOpenTxn {
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for RaiiOpenTxn {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// Removes a RAII transaction's `raii_art_undo` entry however its handle ends.
@@ -28920,6 +29837,21 @@ impl Transaction<'_> {
             self.db.replay_art_undo(undo);
             self.tx.rollback()?;
             return Err(Error::commit_of_failed_transaction());
+        }
+        // sprinter 6bc4a4040eb7 (B1 fix pass): the branch this transaction was
+        // opened on (captured at `begin_transaction` — second pass: not the
+        // session's live binding) was dropped or merged while it was open —
+        // roll back and refuse (3D000), never commit into a branch nobody can
+        // use.
+        let branch_gone = self
+            .tx
+            .captured_branch_binding()
+            .and_then(|binding| self.db.storage.validate_branch_binding(&binding).err());
+        if let Some(gone) = branch_gone {
+            let undo = self.db.take_raii_art_undo(txn_id);
+            self.db.replay_art_undo(undo);
+            self.tx.rollback()?;
+            return Err(gone);
         }
         // R0.2: fresh commit timestamp (see commit_internal).
         // R1.3-p2: commit runs the row-cache fence itself when wired.
@@ -29030,6 +29962,16 @@ impl Transaction<'_> {
         // boundary so a refusal does not abort this transaction
         // (`EmbeddedDatabase::admit_on_physical_standby`).
         let _standby = self.db.admit_on_physical_standby(sql)?;
+        // sprinter 6bc4a4040eb7 (B1): this handle plans and executes the
+        // statement itself, past every funnel, so it installs the database's
+        // own session (`install_if_absent`: a session already installed on this
+        // thread wins) — without it no branch binding is visible here and a
+        // write inside `begin_transaction()` on a branch would land on main.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.db.embedded_scoped);
+        let (handled, _branch_scope) = self.db.branch_statement_gate(sql, true)?;
+        if handled.is_some() {
+            return Ok(0);
+        }
         // Execute within transaction context, skipping fast paths.
         // Fast paths write directly to storage (bypassing the transaction write set),
         // which would make rollback impossible and break isolation guarantees.
@@ -29082,6 +30024,13 @@ impl Transaction<'_> {
         // Spec P1.4: reads only on a physical standby. This path plans the
         // statement itself and does not pass a charge site, so it asks here.
         let _standby = self.db.admit_on_physical_standby(sql)?;
+        // sprinter 6bc4a4040eb7 (B1): see `execute` — the read half needs the
+        // session's branch binding just as much.
+        let _scoped = SessionScopedStateGuard::install_if_absent(&self.db.embedded_scoped);
+        let (handled, _branch_scope) = self.db.branch_statement_gate(sql, true)?;
+        if let Some((rows, _schema)) = handled {
+            return Ok(rows);
+        }
         // HDB-008: parse, plan and execution all sit inside the
         // failed-transaction boundary, so a planning error aborts this
         // transaction exactly as an executor error does — and a query issued
@@ -29961,9 +30910,18 @@ mod tests {
         db.execute("USE BRANCH wal_br").unwrap();
 
         let before = wal_row_op_total(&db, "br");
+        // sprinter 6bc4a4040eb7 (B1 fix pass): until branch transactions exist
+        // (phase B2) a data statement inside an explicit transaction on a branch
+        // is refused (0A000) rather than resolved through main's snapshot — so
+        // the in-transaction write never happens, and neither does a WAL entry.
         db.execute("BEGIN").unwrap();
-        db.execute("INSERT INTO br (id, v) VALUES (2, 20)").unwrap();
-        db.execute("COMMIT").unwrap();
+        let refused = db
+            .execute("INSERT INTO br (id, v) VALUES (2, 20)")
+            .expect_err("a write inside a transaction on a branch must be refused");
+        assert!(refused
+            .to_string()
+            .contains(crate::BRANCH_TRANSACTION_UNSUPPORTED_MARKER));
+        db.execute("ROLLBACK").unwrap();
 
         assert_eq!(
             wal_row_op_total(&db, "br"),

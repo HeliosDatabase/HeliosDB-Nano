@@ -20,6 +20,225 @@ pub type SnapshotId = u64;
 /// Branch identifier (globally unique)
 pub type BranchId = u64;
 
+/// sprinter 6bc4a4040eb7 (B1): how long a DROP or MERGE BRANCH waits for the
+/// statements still running on the branch to finish before it gives up with
+/// SQLSTATE 55006. Bounded so that two sessions dropping each other's branch
+/// cannot wait on each other forever.
+pub const BRANCH_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// sprinter 6bc4a4040eb7 (B1): the per-branch DRAIN.
+///
+/// A statement bound to branch `b` holds a SHARED hold on `b` for its whole
+/// duration ([`BranchDrains::enter`]); DROP and MERGE of `b` take it
+/// EXCLUSIVELY ([`BranchDrains::close`]): they wait for the in-flight
+/// statements to finish, take `b` out of `Active`, and only then let new
+/// statements in — which re-validate their binding and are refused. So once a
+/// DROP returns, nothing bound to the dropped branch writes again. Checking
+/// the binding only at statement entry could not give that: a statement that
+/// had already passed the check kept writing after the drop.
+///
+/// Transactions do NOT hold it across statements (a long-open transaction must
+/// not block a DROP); a transaction's COMMIT re-validates instead.
+///
+/// One instance per engine, shared with the [`BranchManager`] (whose
+/// `drop_branch` / `merge_branch` close it) the same way the registry
+/// generation is.
+#[derive(Default)]
+pub struct BranchDrains {
+    branches: dashmap::DashMap<BranchId, Arc<BranchDrain>>,
+}
+
+#[derive(Default)]
+struct BranchDrain {
+    state: parking_lot::Mutex<DrainState>,
+    changed: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct DrainState {
+    /// Statements running on the branch right now.
+    in_flight: usize,
+    /// A DROP or MERGE is taking the branch out of `Active`.
+    closing: bool,
+    /// Further DROPs / MERGEs waiting for the current close to finish.
+    waiting_closers: usize,
+}
+
+/// A point-in-time view of one branch's drain — for diagnostics and the
+/// deterministic concurrency tests (`StorageEngine::branch_drain_state`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BranchDrainState {
+    /// Statements running on the branch.
+    pub in_flight: usize,
+    /// A DROP or MERGE is closing it.
+    pub closing: bool,
+    /// DROPs / MERGEs queued behind that close.
+    pub waiting_closers: usize,
+}
+
+thread_local! {
+    /// The drains THIS thread holds, as `(drains instance, branch id)`. A
+    /// statement that re-enters the engine on the same thread (a UDF body, a
+    /// trigger, a `_for_session` entry delegating to the session-less funnel)
+    /// is covered by the outer statement's hold and must not take a second one
+    /// — a closer waiting for the first would then wait for itself.
+    static HELD_BRANCHES: std::cell::RefCell<Vec<(usize, BranchId)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl BranchDrains {
+    fn drain(&self, branch_id: BranchId) -> Arc<BranchDrain> {
+        Arc::clone(&self.branches.entry(branch_id).or_default())
+    }
+
+    fn instance_key(self: &Arc<Self>) -> usize {
+        Arc::as_ptr(self) as usize
+    }
+
+    /// Does the calling thread already hold `branch_id`?
+    pub fn held_by_this_thread(self: &Arc<Self>, branch_id: BranchId) -> bool {
+        let key = self.instance_key();
+        HELD_BRANCHES.with(|held| held.borrow().contains(&(key, branch_id)))
+    }
+
+    /// A statement bound to `branch_id` (named `name`) starts: take a shared
+    /// hold for its duration. Free — an inert hold — when this thread already
+    /// holds the branch.
+    ///
+    /// Refused IMMEDIATELY (SQLSTATE 55006) while a DROP or MERGE is closing
+    /// the branch (B1 second fix pass): once that close succeeds the branch is
+    /// no longer active and every waiter would be refused anyway, so waiting
+    /// only pinned the caller's thread for the length of a merge copy.
+    pub fn enter(self: &Arc<Self>, branch_id: BranchId, name: &str) -> Result<BranchHold> {
+        if self.held_by_this_thread(branch_id) {
+            return Ok(BranchHold::none());
+        }
+        let drain = self.drain(branch_id);
+        {
+            let mut state = drain.state.lock();
+            if state.closing {
+                return Err(Error::branch_closing(name));
+            }
+            state.in_flight += 1;
+        }
+        let key = self.instance_key();
+        HELD_BRANCHES.with(|held| held.borrow_mut().push((key, branch_id)));
+        Ok(BranchHold {
+            held: Some((key, branch_id, drain)),
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
+    /// The drain of `branch_id` right now (see [`BranchDrainState`]).
+    pub fn state(&self, branch_id: BranchId) -> BranchDrainState {
+        let Some(drain) = self.branches.get(&branch_id).map(|entry| Arc::clone(entry.value())) else {
+            return BranchDrainState::default();
+        };
+        let state = drain.state.lock();
+        BranchDrainState {
+            in_flight: state.in_flight,
+            closing: state.closing,
+            waiting_closers: state.waiting_closers,
+        }
+    }
+
+    /// A DROP or MERGE of `branch_id` (named `name`, for the refusal) is about
+    /// to take it out of `Active`: wait — at most `timeout` — for the
+    /// statements running on it to finish, and keep new ones out until the
+    /// returned guard drops. Refused with SQLSTATE 55006 when the calling
+    /// thread's own statement runs on the branch, or when the wait times out.
+    pub fn close(
+        self: &Arc<Self>,
+        branch_id: BranchId,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> Result<BranchCloseGuard> {
+        if self.held_by_this_thread(branch_id) {
+            return Err(Error::branch_in_use(name));
+        }
+        let drain = self.drain(branch_id);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = drain.state.lock();
+        if state.closing {
+            // Another DROP / MERGE is closing it: queue behind it. The caller
+            // RE-READS the branch once this returns — the close it waited for
+            // has usually taken the branch out of `Active` already.
+            state.waiting_closers += 1;
+            while state.closing {
+                if drain.changed.wait_until(&mut state, deadline).timed_out() {
+                    state.waiting_closers -= 1;
+                    return Err(Error::branch_busy(name));
+                }
+            }
+            state.waiting_closers -= 1;
+        }
+        state.closing = true;
+        while state.in_flight > 0 {
+            if drain.changed.wait_until(&mut state, deadline).timed_out() {
+                state.closing = false;
+                drain.changed.notify_all();
+                return Err(Error::branch_busy(name));
+            }
+        }
+        drop(state);
+        Ok(BranchCloseGuard { drain })
+    }
+}
+
+/// A statement's shared hold on its branch (see [`BranchDrains`]). Released on
+/// `Drop`. Not `Send` (the `PhantomData`): it is recorded in the taking
+/// thread's `HELD_BRANCHES`, so it must be released on that thread.
+pub struct BranchHold {
+    held: Option<(usize, BranchId, Arc<BranchDrain>)>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl BranchHold {
+    /// A hold on nothing — main, or a statement already covered by its outer
+    /// statement's hold.
+    pub fn none() -> Self {
+        Self {
+            held: None,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for BranchHold {
+    fn drop(&mut self) {
+        let Some((key, branch_id, drain)) = self.held.take() else {
+            return;
+        };
+        {
+            let mut state = drain.state.lock();
+            state.in_flight = state.in_flight.saturating_sub(1);
+            if state.in_flight == 0 {
+                drain.changed.notify_all();
+            }
+        }
+        HELD_BRANCHES.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some(position) = held.iter().rposition(|entry| *entry == (key, branch_id)) {
+                held.remove(position);
+            }
+        });
+    }
+}
+
+/// A DROP's or MERGE's exclusive hold on a branch (see [`BranchDrains::close`]).
+/// Dropping it lets new statements in again; by then the branch is no longer
+/// active, so they are refused.
+pub struct BranchCloseGuard {
+    drain: Arc<BranchDrain>,
+}
+
+impl Drop for BranchCloseGuard {
+    fn drop(&mut self) {
+        let mut state = self.drain.state.lock();
+        state.closing = false;
+        self.drain.changed.notify_all();
+    }
+}
+
 /// Key prefixes for branch metadata
 const BRANCH_META_PREFIX: &[u8] = b"branch:meta:";
 const BRANCH_REGISTRY_KEY: &[u8] = b"branch:registry";
@@ -334,6 +553,18 @@ pub struct BranchManager {
     /// disabled. Set by the engine right after construction; see
     /// [`BranchManager::set_key_manager`].
     key_manager: Option<Arc<crate::crypto::KeyManager>>,
+
+    /// sprinter 6bc4a4040eb7 (phase B1): the branch-registry generation the
+    /// engine's session bindings validate against, bumped by every transition
+    /// that takes a branch out of `Active` (drop, merge). Shared with the
+    /// engine through [`BranchManager::set_registry_generation`]; a manager
+    /// built on its own (unit tests) keeps a private counter.
+    registry_generation: Arc<std::sync::atomic::AtomicU64>,
+
+    /// sprinter 6bc4a4040eb7 (phase B1): the per-branch drains DROP and MERGE
+    /// close before taking a branch out of `Active`. Shared with the engine
+    /// through [`BranchManager::set_branch_drains`].
+    drains: Arc<BranchDrains>,
 }
 
 impl BranchManager {
@@ -380,6 +611,8 @@ impl BranchManager {
             gc_config: BranchGcConfig::default(),
             pending_gc: Arc::new(RwLock::new(pending_gc)),
             key_manager: None,
+            registry_generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            drains: Arc::new(BranchDrains::default()),
         })
     }
 
@@ -392,6 +625,30 @@ impl BranchManager {
     /// unset.
     pub fn set_key_manager(&mut self, key_manager: Option<Arc<crate::crypto::KeyManager>>) {
         self.key_manager = key_manager;
+    }
+
+    /// Share the engine's branch-registry generation (sprinter 6bc4a4040eb7,
+    /// B1). Called before the manager is published, like `set_key_manager`.
+    pub fn set_registry_generation(&mut self, generation: Arc<std::sync::atomic::AtomicU64>) {
+        self.registry_generation = generation;
+    }
+
+    /// Share the engine's per-branch drains (sprinter 6bc4a4040eb7, B1).
+    pub fn set_branch_drains(&mut self, drains: Arc<BranchDrains>) {
+        self.drains = drains;
+    }
+
+    /// The per-branch drains (see [`BranchDrains`]).
+    pub fn branch_drains(&self) -> &Arc<BranchDrains> {
+        &self.drains
+    }
+
+    /// A branch just left `Active` (dropped, or merged by a writer outside
+    /// this manager, e.g. the engine's MERGE): sessions bound to it must
+    /// re-validate on their next statement. Called AFTER the metadata write.
+    pub fn note_branch_left_active(&self) {
+        self.registry_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Create new branch manager with custom GC configuration
@@ -415,6 +672,8 @@ impl BranchManager {
             gc_config,
             pending_gc: Arc::new(RwLock::new(pending_gc)),
             key_manager: None,
+            registry_generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            drains: Arc::new(BranchDrains::default()),
         })
     }
 
@@ -501,24 +760,100 @@ impl BranchManager {
         snapshot_id: SnapshotId,
         options: BranchOptions,
     ) -> Result<BranchId> {
-        // Validate branch name doesn't already exist
-        if self.get_branch_by_name(name).is_ok() {
-            return Err(Error::storage(format!("Branch '{}' already exists", name)));
+        // Resolve parent branch — it must be ACTIVE (B1): a dropped or merged
+        // branch is not a branch anybody can fork from. B1 second fix pass:
+        // and it is HELD (a statement's shared drain hold) until the child is
+        // recorded in its children list, then re-read under that hold. A DROP
+        // or MERGE of the parent closing right now refuses the create (55006);
+        // one that starts after the hold waits for it and then re-reads the
+        // parent's children, so it sees the new child and refuses. Without
+        // the hold a DROP could pass its child check, wait out the statement
+        // creating the child, and then drop the parent of a live branch. Free
+        // when this thread already holds the parent (a session bound to it).
+        let main_id = self.registry.read().main_branch;
+        let (parent_id, _parent_hold) = match parent_name {
+            Some(parent) => {
+                let meta = match self.get_branch_by_name(parent) {
+                    Ok(meta) if meta.state == BranchState::Active => meta,
+                    _ => return Err(Error::branch_not_active(parent)),
+                };
+                if meta.branch_id == main_id {
+                    (Some(main_id), BranchHold::none())
+                } else {
+                    let hold = self.drains.enter(meta.branch_id, parent)?;
+                    match self.get_branch_by_name(parent) {
+                        Ok(fresh) if fresh.branch_id == meta.branch_id && fresh.state == BranchState::Active => {}
+                        _ => return Err(Error::branch_not_active(parent)),
+                    }
+                    (Some(meta.branch_id), hold)
+                }
+            }
+            // Default to main branch
+            None => (Some(main_id), BranchHold::none()),
+        };
+
+        // B1 second fix pass: the registry is locked for the whole create and
+        // changed only AFTER the WriteBatch below succeeded — on a CLONE first
+        // — so a failed write leaves neither a phantom entry nor a consumed id
+        // in memory, and two concurrent creates of one name cannot both pass
+        // the name check.
+        let mut registry = self.registry.write();
+
+        // sprinter 6bc4a4040eb7 (phase B1): only an ACTIVE branch holds its
+        // name. Branch metadata is keyed by NAME, so a dropped (or merged)
+        // branch's record used to sit on the name forever — `CREATE BRANCH x`
+        // after `DROP BRANCH x` failed "already exists" while every other
+        // surface said `x` was gone. The new branch gets a NEW id from the
+        // monotonic registry counter (persisted with the registry, so never
+        // reused across a restart either), and the old overlay keys are under
+        // the old id, so none of the old branch's rows is visible through it.
+        let previous = self.get_branch_by_name(name).ok();
+        let mut next_registry = registry.clone();
+        // Children lists this create rewrites, by parent id.
+        let mut children_updates: HashMap<BranchId, Vec<BranchId>> = HashMap::new();
+        let mut merged_predecessor = None;
+        if let Some(previous) = previous.as_ref() {
+            match previous.state {
+                BranchState::Active => {
+                    return Err(Error::storage(format!("Branch '{}' already exists", name)));
+                }
+                // A merged branch is still REGISTERED (system views list merge
+                // history from the registry). Its name is taken over, so its
+                // registry entry and parent link go; a merged branch that still
+                // has children keeps its name, because the children resolve
+                // their parent through the registry by id.
+                BranchState::Merged { .. } => {
+                    let children = self.get_child_branches(previous.branch_id)?;
+                    if !children.is_empty() {
+                        return Err(Error::storage(format!(
+                            "Cannot reuse the name of merged branch '{}': it still has {} child branch(es)",
+                            name,
+                            children.len()
+                        )));
+                    }
+                    if let Some(old_parent) = previous.parent_id {
+                        let mut siblings = self.get_child_branches(old_parent)?;
+                        siblings.retain(|&id| id != previous.branch_id);
+                        children_updates.insert(old_parent, siblings);
+                    }
+                    next_registry.remove_branch(previous.branch_id);
+                    merged_predecessor = Some(previous.branch_id);
+                }
+                BranchState::Dropped { .. } => {}
+            }
         }
 
-        // Resolve parent branch
-        let parent_id = if let Some(parent) = parent_name {
-            Some(self.get_branch_by_name(parent)?.branch_id)
-        } else {
-            // Default to main branch
-            Some(self.registry.read().main_branch)
-        };
-
         // Allocate branch ID
-        let branch_id = {
-            let mut registry = self.registry.write();
-            registry.next_id()
-        };
+        let branch_id = next_registry.next_id();
+        next_registry.add_branch(branch_id, name.to_string());
+        if let Some(parent_id) = parent_id {
+            let mut children = match children_updates.remove(&parent_id) {
+                Some(children) => children,
+                None => self.get_child_branches(parent_id)?,
+            };
+            children.push(branch_id);
+            children_updates.insert(parent_id, children);
+        }
 
         // Get current timestamp
         let current_ts = self.next_timestamp();
@@ -536,37 +871,51 @@ impl BranchManager {
             stats: BranchStats::default(),
         };
 
-        // Save metadata
+        // sprinter 6bc4a4040eb7 (B1): the metadata (id N, Active), the registry
+        // (which carries `next_branch_id`) and the children lists go in ONE
+        // WriteBatch. Written separately, a crash between the metadata and the
+        // registry left a branch with id N on disk under a registry whose
+        // `next_branch_id` was still N — and the next CREATE BRANCH reused N,
+        // so its overlay keys aliased the crashed branch's.
         let meta_key = encode_branch_meta_key(name);
         let meta_value = bincode::serialize(&metadata)
             .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
+        let registry_value = bincode::serialize(&next_registry)
+            .map_err(|e| Error::storage(format!("Failed to serialize registry: {}", e)))?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(&meta_key, &meta_value);
+        batch.put(BRANCH_REGISTRY_KEY, &registry_value);
+        for (parent, children) in &children_updates {
+            let children_value = bincode::serialize(children)
+                .map_err(|e| Error::storage(format!("Failed to serialize children: {}", e)))?;
+            batch.put(encode_branch_children_key(*parent), &children_value);
+        }
         self.gate
-            .put(&self.db, &meta_key, &meta_value, None)
+            .write(&self.db, batch, None)
             .map_err(|e| Error::storage(format!("Failed to save branch metadata: {}", e)))?;
 
-        // Update registry
-        {
-            let mut registry = self.registry.write();
-            registry.add_branch(branch_id, name.to_string());
+        // The batch is durable: now the in-memory registry and cache follow.
+        *registry = next_registry;
+        drop(registry);
+        let mut cache = self.metadata_cache.write();
+        if let Some(predecessor) = merged_predecessor {
+            cache.remove(&predecessor);
         }
-        self.save_registry()?;
-
-        // Update parent's children list
-        if let Some(parent_id) = parent_id {
-            self.add_child_branch(parent_id, branch_id)?;
-        }
-
-        // Cache metadata
-        self.metadata_cache.write().insert(branch_id, metadata);
+        cache.insert(branch_id, metadata);
 
         Ok(branch_id)
     }
 
     /// Drop a branch
     pub fn drop_branch(&self, name: &str, if_exists: bool) -> Result<()> {
-        // Get branch metadata
+        // Get branch metadata. sprinter 6bc4a4040eb7 (B1): an already-DROPPED
+        // branch is not found (its record only keeps the name until reuse);
+        // a merged branch can still be dropped — `MERGE … WITH
+        // (delete_branch_after)` relies on that.
         let metadata = match self.get_branch_by_name(name) {
-            Ok(meta) => meta,
+            Ok(meta) if !matches!(meta.state, BranchState::Dropped { .. }) => meta,
+            Ok(_) if if_exists => return Ok(()),
+            Ok(_) => return Err(Error::storage(format!("Branch '{}' not found", name))),
             Err(_) if if_exists => return Ok(()),
             Err(e) => return Err(e),
         };
@@ -577,6 +926,39 @@ impl BranchManager {
         }
 
         // Check for child branches
+        let children = self.get_child_branches(metadata.branch_id)?;
+        if !children.is_empty() {
+            return Err(Error::storage(format!(
+                "Cannot drop branch '{}': has {} child branch(es)",
+                name,
+                children.len()
+            )));
+        }
+
+        // sprinter 6bc4a4040eb7 (B1): wait for the statements running on the
+        // branch, and keep new ones out, until it is marked dropped below — so
+        // nothing bound to it writes after this returns.
+        let _drained = self.drains.close(metadata.branch_id, name, BRANCH_DRAIN_TIMEOUT)?;
+
+        // B1 second fix pass: everything read above may be stale by now — the
+        // close waited for running statements and, possibly, for another DROP
+        // or MERGE closing the branch first. RE-READ it: it must still be the
+        // branch whose drain was closed (same id: not a newer branch that
+        // took the name meanwhile) and not already dropped (a merged branch
+        // may still be dropped, as before), and the child check is repeated —
+        // a statement running on the branch while the close waited may have
+        // been a `CREATE BRANCH` forking from it. The Dropped record is built
+        // from this fresh read, never from the pre-wait one (which would
+        // overwrite a concurrent merge's record).
+        let metadata = match self.get_branch_by_name(name) {
+            Ok(fresh)
+                if fresh.branch_id == metadata.branch_id && !matches!(fresh.state, BranchState::Dropped { .. }) =>
+            {
+                fresh
+            }
+            _ if if_exists => return Ok(()),
+            _ => return Err(Error::storage(format!("Branch '{}' not found", name))),
+        };
         let children = self.get_child_branches(metadata.branch_id)?;
         if !children.is_empty() {
             return Err(Error::storage(format!(
@@ -617,6 +999,10 @@ impl BranchManager {
 
         // Remove from cache
         self.metadata_cache.write().remove(&metadata.branch_id);
+
+        // sprinter 6bc4a4040eb7 (B1): the branch is no longer active — every
+        // session bound to it fails closed from its next statement on.
+        self.note_branch_left_active();
 
         // Schedule GC for branch data
         self.schedule_branch_gc(metadata.branch_id, metadata.name.clone())?;
@@ -786,6 +1172,32 @@ impl BranchManager {
         bincode::deserialize(&data).map_err(|e| Error::storage(format!("Failed to deserialize metadata: {}", e)))
     }
 
+    /// Persist `metadata` under its name, refresh the id-keyed cache, and —
+    /// when the branch is no longer `Active` — bump the registry generation so
+    /// sessions bound to it re-validate (sprinter 6bc4a4040eb7, B1). Also used
+    /// to put a branch BACK to its previous state when a merge fails.
+    pub fn write_branch_metadata(&self, metadata: &BranchMetadata) -> Result<()> {
+        let meta_key = encode_branch_meta_key(&metadata.name);
+        let meta_value =
+            bincode::serialize(metadata).map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
+        self.gate
+            .put(&self.db, &meta_key, &meta_value, None)
+            .map_err(|e| Error::storage(format!("Failed to save branch metadata: {}", e)))?;
+        self.metadata_cache.write().insert(metadata.branch_id, metadata.clone());
+        // Bumped on every state write, `Active` included: a session whose
+        // binding was refused while the branch was briefly marked (a failed
+        // merge being rolled back) re-validates and finds it active again.
+        self.note_branch_left_active();
+        Ok(())
+    }
+
+    /// Evict `branch_id` from the id-keyed metadata cache, after a writer
+    /// outside this manager (the engine's MERGE, which marks the source
+    /// `Merged`) rewrote its record.
+    pub fn evict_cached_metadata(&self, branch_id: BranchId) {
+        self.metadata_cache.write().remove(&branch_id);
+    }
+
     /// Get branch metadata by ID
     pub fn get_branch_by_id(&self, branch_id: BranchId) -> Result<BranchMetadata> {
         // Check cache first
@@ -874,30 +1286,10 @@ impl BranchManager {
         registry.branches.get(&branch_id).cloned()
     }
 
-    /// Add a child branch to parent's children list
-    fn add_child_branch(&self, parent_id: BranchId, child_id: BranchId) -> Result<()> {
-        let key = encode_branch_children_key(parent_id);
-
-        let mut children: Vec<BranchId> = match self.db.get(&key) {
-            Ok(Some(data)) => bincode::deserialize(&data)
-                .map_err(|e| Error::storage(format!("Failed to deserialize children: {}", e)))?,
-            Ok(None) => Vec::new(),
-            Err(e) => return Err(Error::storage(format!("Failed to read children: {}", e))),
-        };
-
-        children.push(child_id);
-
-        let value = bincode::serialize(&children)
-            .map_err(|e| Error::storage(format!("Failed to serialize children: {}", e)))?;
-        self.gate
-            .put(&self.db, &key, &value, None)
-            .map_err(|e| Error::storage(format!("Failed to save children: {}", e)))
-    }
-
     /// Remove a child branch from its parent's children list.
     ///
-    /// The mirror of `add_child_branch`, which had none: the list only ever
-    /// grew. A dropped child stayed in its parent's list forever, so
+    /// The mirror of the children-list append in `create_branch`, which had
+    /// none: the list only ever grew. A dropped child stayed in its parent's list forever, so
     /// `drop_branch`'s "has N child branch(es)" guard kept firing and any branch
     /// that had EVER had a child became permanently undroppable — an unbounded
     /// leak with no workaround, since nothing else writes this key.
@@ -985,6 +1377,46 @@ impl BranchManager {
             )));
         }
 
+        // sprinter 6bc4a4040eb7 (B1): take the source out of `Active` BEFORE
+        // copying anything — after the statements running on it have finished
+        // (the drain) — so no session can write to it while, or after, its
+        // rows are merged. A failed apply puts the source back as it was.
+        let _drained = self.drains.close(source.branch_id, source_name, BRANCH_DRAIN_TIMEOUT)?;
+        // B1 second fix pass: re-read both ends after the close (it may have
+        // waited out a DROP of the source, or a statement creating a branch
+        // under its name), hold the TARGET for the merge's duration (a DROP /
+        // MERGE of the target waits for this merge; one already closing it
+        // refuses the merge, 55006), and only then collect the keys — those
+        // collected before the close missed every write the drain waited for.
+        let (closed_source_id, read_target_id) = (source.branch_id, target.branch_id);
+        let (source, target) = (
+            self.get_branch_by_name(source_name)?,
+            self.get_branch_by_name(target_name)?,
+        );
+        if source.branch_id != closed_source_id || target.branch_id != read_target_id {
+            return Err(Error::branch_merge(format!(
+                "branch '{}' or '{}' was replaced while the merge waited; retry",
+                source_name, target_name
+            )));
+        }
+        if source.state != BranchState::Active {
+            return Err(Error::branch_merge(format!(
+                "Source branch '{}' is not active",
+                source_name
+            )));
+        }
+        if target.state != BranchState::Active {
+            return Err(Error::branch_merge(format!(
+                "Target branch '{}' is not active",
+                target_name
+            )));
+        }
+        let _target_hold = if target.branch_id == self.registry.read().main_branch {
+            BranchHold::none()
+        } else {
+            self.drains.enter(target.branch_id, target_name)?
+        };
+
         // Find common ancestor (merge base)
         let merge_base = self.find_merge_base(source.branch_id, target.branch_id)?;
 
@@ -1020,9 +1452,16 @@ impl BranchManager {
             });
         }
 
-        // Perform merge with selected strategy
         let merge_timestamp = self.next_timestamp();
-        let merged_keys = self.apply_merge(
+        let mut updated_source = source.clone();
+        updated_source.state = BranchState::Merged {
+            into_branch: target.branch_id,
+            at_timestamp: merge_timestamp,
+        };
+        self.write_branch_metadata(&updated_source)?;
+
+        // Perform merge with selected strategy
+        let merged_keys = match self.apply_merge(
             source.branch_id,
             target.branch_id,
             merge_base,
@@ -1031,24 +1470,15 @@ impl BranchManager {
             &conflicts,
             strategy,
             merge_timestamp,
-        )?;
-
-        // Update source branch metadata to mark as merged
-        let mut updated_source = source.clone();
-        updated_source.state = BranchState::Merged {
-            into_branch: target.branch_id,
-            at_timestamp: merge_timestamp,
+        ) {
+            Ok(keys) => keys,
+            Err(e) => {
+                if let Err(restore) = self.write_branch_metadata(&source) {
+                    tracing::warn!("MERGE BRANCH failed and the source could not be restored: {restore}");
+                }
+                return Err(e);
+            }
         };
-
-        let meta_key = encode_branch_meta_key(source_name);
-        let meta_value = bincode::serialize(&updated_source)
-            .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-        self.gate
-            .put(&self.db, &meta_key, &meta_value, None)
-            .map_err(|e| Error::storage(format!("Failed to save merged branch metadata: {}", e)))?;
-
-        // Update cache
-        self.metadata_cache.write().insert(source.branch_id, updated_source);
 
         // Update target's merge_base for future merges
         let mut updated_target = target.clone();
@@ -1541,6 +1971,90 @@ pub fn decode_branch_data_key(key: &[u8]) -> Option<(BranchId, String)> {
 mod tests {
     use super::*;
     use crate::storage::StorageEngine;
+
+    /// sprinter 6bc4a4040eb7 (B1 fix pass): the drain. A close waits for the
+    /// statements holding the branch, refuses new ones IMMEDIATELY (55006)
+    /// until it is done (B1 second fix pass), and refuses (instead of waiting
+    /// for itself) when its own thread holds it. A second close queues.
+    #[test]
+    fn a_branch_close_waits_for_holders_and_keeps_new_ones_out() {
+        let drains = Arc::new(BranchDrains::default());
+        let hold = drains.enter(7, "b").unwrap();
+        assert!(drains.held_by_this_thread(7));
+        assert_eq!(drains.state(7).in_flight, 1);
+        // Nested entry on the same thread is free (no self-wait).
+        let nested = drains.enter(7, "b").unwrap();
+        drop(nested);
+        assert!(drains.held_by_this_thread(7), "the outer hold is still held");
+        assert!(
+            drains.close(7, "b", BRANCH_DRAIN_TIMEOUT).is_err(),
+            "own hold: refused, not a self-wait"
+        );
+
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let closer = {
+            let drains = Arc::clone(&drains);
+            std::thread::spawn(move || {
+                let guard = drains.close(7, "b", BRANCH_DRAIN_TIMEOUT).unwrap();
+                closed_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(guard);
+            })
+        };
+        // The closer is waiting for the hold: `closing` is set, nothing closed.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !drains.state(7).closing {
+            assert!(std::time::Instant::now() < deadline, "the close never started");
+            std::thread::yield_now();
+        }
+        assert!(
+            closed_rx.try_recv().is_err(),
+            "the close must wait while a statement holds the branch"
+        );
+        drop(hold);
+        assert!(!drains.held_by_this_thread(7));
+        closed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the close proceeds once the holder is gone");
+        // A new statement arriving while the close is in progress is refused
+        // at once, with the closing marker — not parked behind the close.
+        let late = drains.enter(7, "b").err().expect("refused while closing");
+        assert!(late.to_string().contains(crate::error::BRANCH_CLOSING_MARKER), "{late}");
+        assert!(!drains.held_by_this_thread(7));
+        // A second close queues behind the first (and is counted).
+        let second = {
+            let drains = Arc::clone(&drains);
+            std::thread::spawn(move || drains.close(7, "b", BRANCH_DRAIN_TIMEOUT).map(drop).is_ok())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while drains.state(7).waiting_closers != 1 {
+            assert!(std::time::Instant::now() < deadline, "the second close never queued");
+            std::thread::yield_now();
+        }
+        release_tx.send(()).unwrap();
+        closer.join().unwrap();
+        assert!(second.join().unwrap(), "the queued close runs after the first");
+        assert_eq!(drains.state(7), BranchDrainState::default());
+        drop(drains.enter(7, "b").unwrap());
+
+        // A close that cannot drain in time gives up with 55006's marker.
+        let stuck = drains.enter(9, "s").unwrap();
+        let waiter = {
+            let drains = Arc::clone(&drains);
+            std::thread::spawn(move || drains.close(9, "s", std::time::Duration::from_millis(50)).err())
+        };
+        let refusal = waiter.join().unwrap().expect("timed out");
+        assert!(
+            refusal.to_string().contains(crate::error::BRANCH_BUSY_MARKER),
+            "{refusal}"
+        );
+        drop(stuck);
+        assert!(
+            drains.close(9, "s", BRANCH_DRAIN_TIMEOUT).is_ok(),
+            "a timed-out close leaves the branch open"
+        );
+    }
     use crate::Config;
 
     #[test]

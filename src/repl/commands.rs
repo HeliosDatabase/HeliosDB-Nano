@@ -1424,7 +1424,9 @@ impl MetaCommand {
             }
 
             MetaCommand::ShowBranch => {
-                let branch = db.storage.get_current_branch();
+                // sprinter 6bc4a4040eb7 (B1): THIS REPL session's branch.
+                let current = db.current_branch();
+                let branch = (current != "main").then_some(current);
                 if let Some(branch_name) = branch {
                     // Try to get the branch ID
                     if let Some(branch_manager) = db.storage.branch_manager() {
@@ -1538,23 +1540,22 @@ impl MetaCommand {
             }
 
             MetaCommand::UseBranch(branch_name) => {
-                // "main" is always valid
-                if branch_name != "main" {
-                    // Validate branch exists before switching
-                    if let Some(branch_mgr) = db.storage.branch_manager() {
-                        if branch_mgr.get_branch_by_name(&branch_name).is_err() {
-                            println!("{}: Branch '{}' does not exist.", "Error".red(), branch_name);
-                            println!("{}", "Create it first with: CREATE BRANCH <name> FROM main".dimmed());
-                            println!();
-                            println!("{}", "Existing branches:".bold());
-                            if let Ok(branches) = branch_mgr.list_branches() {
-                                for b in branches {
-                                    println!("  - {}", b.name.cyan());
-                                }
-                            }
-                            return Ok(MetaCommandResult::Continue);
+                // sprinter 6bc4a4040eb7 (B1): bind THIS REPL's session through
+                // the one resolver. An unknown, dropped or merged branch is
+                // refused here — the old check accepted any registered name,
+                // a dropped one included, and the shell then switched the
+                // engine-wide branch.
+                if let Err(e) = db.switch_branch(branch_name) {
+                    println!("{}: {}", "Error".red(), e);
+                    println!("{}", "Create it first with: CREATE BRANCH <name> FROM main".dimmed());
+                    println!();
+                    println!("{}", "Existing branches:".bold());
+                    if let Ok(branches) = db.storage.list_branches() {
+                        for b in branches {
+                            println!("  - {}", b.name.cyan());
                         }
                     }
+                    return Ok(MetaCommandResult::Continue);
                 }
                 println!("Switching to branch: {}", branch_name.cyan());
                 Ok(MetaCommandResult::SwitchBranch(branch_name.clone()))
@@ -4721,7 +4722,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 println!("  State: {}", "Connected".green());
 
                 // Current branch
-                let current_branch = db.storage.get_current_branch().unwrap_or_else(|| "main".to_string());
+                let current_branch = db.current_branch();
                 println!("  Branch: {}", current_branch.cyan());
 
                 // Schema info
@@ -4780,7 +4781,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 }
 
                 println!("\n{}", "Session:".cyan());
-                let branch = db.storage.get_current_branch().unwrap_or_else(|| "main".to_string());
+                let branch = db.current_branch();
                 println!("  Branch: {}", branch.cyan());
 
                 println!("\n{}", "Tips:".dimmed());

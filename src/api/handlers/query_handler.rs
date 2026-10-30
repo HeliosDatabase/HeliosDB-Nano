@@ -61,14 +61,14 @@ pub async fn execute_query(
     // Update state to executing
     state.query_registry.update_state(query_id, QueryState::Executing);
 
-    // Validate branch exists (if branching is enabled)
-    if let Some(branch_manager) = state.db.storage.branch_manager() {
-        // Check if branch exists
-        let _branch = branch_manager.get_branch_by_name(&branch_name).map_err(|e| {
-            warn!("Branch '{}' not found: {}", branch_name, e);
-            state.query_registry.fail_query(query_id);
-            ApiError::from(e)
-        })?;
+    // sprinter 6bc4a4040eb7 (B1): the branch must be ACTIVE — a dropped or
+    // merged branch is a 404 like one that never existed. The request then
+    // RUNS on it (the request-scoped binding below); it used to be validated
+    // here and then executed on main.
+    if !state.db.storage.active_branch_exists(&branch_name) {
+        warn!("Branch '{}' is not an active branch", branch_name);
+        state.query_registry.fail_query(query_id);
+        return Err(ApiError::from(Error::branch_not_active(&branch_name)));
     }
 
     // Start timing
@@ -90,9 +90,21 @@ pub async fn execute_query(
         )));
     }
 
-    // Execute query
-    let tuples = if params.is_empty() {
-        state.db.query(&request.sql, &[]).map_err(|e| {
+    // Execute query — on `:name`, through a backend private to THIS request
+    // (sprinter 6bc4a4040eb7, B1): concurrent requests on different branches
+    // never see each other's binding, and a `USE BRANCH` inside the SQL moves
+    // nobody else. Synchronous, so the per-thread install never crosses an
+    // `.await`.
+    let tuples = state
+        .db
+        .with_request_branch_scope(&branch_name, || {
+            if params.is_empty() {
+                state.db.query(&request.sql, &[])
+            } else {
+                state.db.query_params(&request.sql, &params)
+            }
+        })
+        .map_err(|e| {
             error!("Query execution failed: {}", e);
             // Check if it was cancelled
             if cancel_token.is_cancelled() {
@@ -101,18 +113,7 @@ pub async fn execute_query(
                 state.query_registry.fail_query(query_id);
             }
             ApiError::from(e)
-        })?
-    } else {
-        state.db.query_params(&request.sql, &params).map_err(|e| {
-            error!("Query execution failed: {}", e);
-            if cancel_token.is_cancelled() {
-                state.query_registry.update_state(query_id, QueryState::Cancelled);
-            } else {
-                state.query_registry.fail_query(query_id);
-            }
-            ApiError::from(e)
-        })?
-    };
+        })?;
 
     // Check for cancellation after execution
     if cancel_token.is_cancelled() {
@@ -211,14 +212,14 @@ pub async fn execute_statement(
     // Update state to executing
     state.query_registry.update_state(query_id, QueryState::Executing);
 
-    // Validate branch exists (if branching is enabled)
-    if let Some(branch_manager) = state.db.storage.branch_manager() {
-        // Check if branch exists
-        let _branch = branch_manager.get_branch_by_name(&branch_name).map_err(|e| {
-            warn!("Branch '{}' not found: {}", branch_name, e);
-            state.query_registry.fail_query(query_id);
-            ApiError::from(e)
-        })?;
+    // sprinter 6bc4a4040eb7 (B1): the branch must be ACTIVE — a dropped or
+    // merged branch is a 404 like one that never existed. The request then
+    // RUNS on it (the request-scoped binding below); it used to be validated
+    // here and then executed on main.
+    if !state.db.storage.active_branch_exists(&branch_name) {
+        warn!("Branch '{}' is not an active branch", branch_name);
+        state.query_registry.fail_query(query_id);
+        return Err(ApiError::from(Error::branch_not_active(&branch_name)));
     }
 
     // Start timing
@@ -267,9 +268,18 @@ pub async fn execute_statement(
         )));
     }
 
-    // Execute statement
-    let affected_rows = if params.is_empty() {
-        state.db.execute(&request.sql).map_err(|e| {
+    // Execute statement — on `:name`, through a request-scoped backend
+    // (sprinter 6bc4a4040eb7, B1; see `execute_query`).
+    let affected_rows = state
+        .db
+        .with_request_branch_scope(&branch_name, || {
+            if params.is_empty() {
+                state.db.execute(&request.sql)
+            } else {
+                state.db.execute_params(&request.sql, &params)
+            }
+        })
+        .map_err(|e| {
             error!("Statement execution failed: {}", e);
             if cancel_token.is_cancelled() {
                 state.query_registry.update_state(query_id, QueryState::Cancelled);
@@ -277,18 +287,7 @@ pub async fn execute_statement(
                 state.query_registry.fail_query(query_id);
             }
             ApiError::from(e)
-        })?
-    } else {
-        state.db.execute_params(&request.sql, &params).map_err(|e| {
-            error!("Statement execution failed: {}", e);
-            if cancel_token.is_cancelled() {
-                state.query_registry.update_state(query_id, QueryState::Cancelled);
-            } else {
-                state.query_registry.fail_query(query_id);
-            }
-            ApiError::from(e)
-        })?
-    };
+        })?;
 
     // Check for cancellation after execution
     if cancel_token.is_cancelled() {

@@ -1363,6 +1363,16 @@ impl Evaluator {
                             .unwrap_or_default(),
                     ),
                     "search_path" => Some("\"$user\", public".to_string()),
+                    // sprinter 6bc4a4040eb7 (B1): THIS session's branch — the
+                    // same binding `USE BRANCH`, `SET heliosdb.branch` and the
+                    // PostgreSQL startup forms write, read from the per-statement
+                    // session backend for the reason `application_name` is.
+                    // `main` when the session is on none.
+                    "heliosdb.branch" => Some(crate::statement_branch_name_tls().unwrap_or_else(|| {
+                        crate::session_scoped_state_tls()
+                            .and_then(|state| state.branch_binding())
+                            .map_or_else(|| "main".to_string(), |binding| binding.name.clone())
+                    })),
                     // sprinter a3077a3f68d8: every USER-SETTABLE GUC —
                     // `statement_timeout`, `work_mem`, `bulk_load_mode`, the
                     // planner switches. THIS session's override if it set one,

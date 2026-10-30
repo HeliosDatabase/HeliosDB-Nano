@@ -361,7 +361,10 @@ fn handle_event_with_storage(state: &AppState, event: &WebhookEvent) -> Result<W
 
     // Try to use storage-aware handler if branching is enabled
     if let Some(branch_manager) = state.db.storage.branch_manager() {
-        let storage_handler = StorageWebhookHandler::new(config, branch_manager.as_ref());
+        // B1 second fix pass: PR merges go through the engine's MERGE (see
+        // `StorageWebhookHandler::with_engine`).
+        let storage_handler =
+            StorageWebhookHandler::new(config, branch_manager.as_ref()).with_engine(&state.db.storage);
         storage_handler.handle(event)
     } else {
         // Fall back to basic handler (just logging)

@@ -148,6 +148,12 @@ impl AuthBridge {
     /// Safe to call on every startup; `CREATE TABLE IF NOT EXISTS` is a no-op
     /// when the tables already exist.
     pub fn bootstrap(&self) -> crate::Result<()> {
+        // sprinter 6bc4a4040eb7 (B1): the auth tables live on MAIN, whatever
+        // branch an in-process caller has the handle's own session on.
+        self.db.with_request_branch_scope("main", || self.bootstrap_on_main())
+    }
+
+    fn bootstrap_on_main(&self) -> crate::Result<()> {
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS _auth_users (\
                 id TEXT PRIMARY KEY, \

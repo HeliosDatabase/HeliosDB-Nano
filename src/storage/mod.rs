@@ -88,8 +88,9 @@ pub mod parallel_filter;
 pub mod speculative_filter;
 
 pub use branch::{
-    BranchGcConfig, BranchGcMode, BranchId, BranchManager, BranchMetadata, BranchOptions, BranchRegistry, BranchState,
-    BranchStats, BranchTransaction, GitLinkMetadata, MergeConflict, MergeResult, MergeStrategy, GIT_COMMIT_PREFIX,
+    BranchCloseGuard, BranchDrainState, BranchDrains, BranchGcConfig, BranchGcMode, BranchHold, BranchId,
+    BranchManager, BranchMetadata, BranchOptions, BranchRegistry, BranchState, BranchStats, BranchTransaction,
+    GitLinkMetadata, MergeConflict, MergeResult, MergeStrategy, BRANCH_DRAIN_TIMEOUT, GIT_COMMIT_PREFIX,
     GIT_CONFIG_KEY, GIT_DDL_HISTORY_PREFIX, GIT_LINK_PREFIX, GIT_PR_PREFIX, GIT_SCHEMA_SNAPSHOT_PREFIX,
 };
 pub use catalog::Catalog;

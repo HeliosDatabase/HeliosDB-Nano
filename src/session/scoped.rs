@@ -57,6 +57,15 @@
 //!   the database in `InitPostgres`, once, per backend — so it belongs here,
 //!   next to `application_name` and the GUC overlay, for exactly the reasons
 //!   above. See [`SessionScopedState::bind_tenant`].
+//! * sprinter 6bc4a4040eb7 (phase B1) — the session's ACTIVE BRANCH. It was
+//!   `StorageEngine.current_branch`, ONE `Mutex<Option<String>>` for the whole
+//!   process, so one connection's `USE BRANCH` moved every other connection,
+//!   the REST branch route ran on whatever branch some other caller had last
+//!   selected, and an MCP call's switch-and-restore raced every concurrent
+//!   call. A branch is selected per connection exactly like a database is, so
+//!   it lives here, behind the same lock-plus-mirror shape as the tenant. See
+//!   [`SessionScopedState::bind_branch`] and `StorageEngine::active_branch`,
+//!   the one accessor every reader goes through.
 //!
 //! The one deliberately process-wide structure here is [`live_backends`] — the
 //! registry `pg_stat_activity` scans. Listing every live connection IS that
@@ -77,7 +86,7 @@
 //! let a new engine inherit a dead one's backends).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicI8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicI8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use dashmap::DashMap;
@@ -213,6 +222,91 @@ pub fn snapshot_live_backends(engine_instance: u64) -> Vec<BackendSnapshot> {
     out
 }
 
+/// sprinter 6bc4a4040eb7 (phase B1): the branch a session is bound to.
+///
+/// Built ONCE, when the binding is made (`USE BRANCH`, `SET heliosdb.branch`,
+/// the PostgreSQL startup `database=<db>@<branch>` / `options=-c
+/// heliosdb.branch=…`, a REST branch route, an MCP call that names a branch),
+/// from a branch the registry reported ACTIVE at that moment
+/// (`StorageEngine::resolve_active_branch`). Every reader shares it through an
+/// `Arc`, so the per-row readers (`branch_aware_data_key`, the overlay scans)
+/// cost one refcount and never re-resolve the name — the pre-B1 accessor
+/// resolved `name -> id` through `get_branch_by_name` (a RocksDB read) on
+/// EVERY call.
+///
+/// The ancestor `chain` is immutable for the life of a branch (a branch's
+/// parent is fixed at creation and a branch with children cannot be dropped),
+/// so caching it here is exact, not an approximation. Later phases extend each
+/// level (B4 may add the level's fork anchor) without changing who builds or
+/// reads the binding.
+#[derive(Debug)]
+pub struct BranchBinding {
+    /// `StorageEngine::instance_id()` of the engine whose registry resolved
+    /// the branch. A branch id names a branch of ONE database; a binding made
+    /// against another open database in the same process is not a binding on
+    /// this one (`StorageEngine::active_branch` compares it).
+    pub engine_instance: u64,
+    /// The branch name as the registry stores it.
+    pub name: String,
+    /// The branch id — what the overlay keys (`bdata:{id}:…`, `bdel:{id}:…`,
+    /// `bv:{id}:…`) are written under. Never reused, so a binding to a
+    /// dropped branch can never alias a newer branch that took its name.
+    pub branch_id: u64,
+    /// The overlay chain the branch reads through, OLDEST FIRST and ENDING
+    /// WITH `branch_id` itself — exactly the order the overlay merge applies
+    /// it (each level overrides the one before it). Main's `data:` keyspace is
+    /// read before the chain and is not a level of it.
+    pub chain: Vec<u64>,
+    /// The engine's branch-registry generation this binding was last checked
+    /// against (`StorageEngine::branch_registry_generation`). A DROP or MERGE
+    /// of any branch bumps the generation; the next statement of a bound
+    /// session then re-checks that ITS branch is still active, and refuses
+    /// (3D000) when it is not. Unchanged generation = one atomic compare.
+    pub validated_generation: AtomicU64,
+}
+
+impl BranchBinding {
+    /// A binding to `name` (`branch_id`, reading through `chain`) on the
+    /// engine `engine_instance`, validated at registry generation `generation`.
+    pub fn new(engine_instance: u64, name: String, branch_id: u64, chain: Vec<u64>, generation: u64) -> Self {
+        Self {
+            engine_instance,
+            name,
+            branch_id,
+            chain,
+            validated_generation: AtomicU64::new(generation),
+        }
+    }
+
+    /// The registry generation this binding was last validated at.
+    #[inline]
+    pub fn validated_generation(&self) -> u64 {
+        self.validated_generation.load(Ordering::Acquire)
+    }
+
+    /// Record that the binding was re-validated at `generation`.
+    #[inline]
+    pub fn note_validated(&self, generation: u64) {
+        self.validated_generation.store(generation, Ordering::Release);
+    }
+
+    /// The same binding — same engine, name, id and chain — stamped as never
+    /// validated, so its first use re-checks the registry. What a reset to the
+    /// connection's home branch installs: by ID, so a home branch that was
+    /// dropped (and perhaps re-created under the same name, with a new id)
+    /// fails closed instead of silently binding a different branch.
+    pub fn unvalidated_copy(&self) -> Self {
+        // Generations start at 1, so 0 never matches.
+        Self::new(
+            self.engine_instance,
+            self.name.clone(),
+            self.branch_id,
+            self.chain.clone(),
+            0,
+        )
+    }
+}
+
 /// Session-scoped state shared between the session and the statement currently
 /// running on its behalf. See the module docs for why it is an `Arc` and not a
 /// set of plain `Session` fields.
@@ -311,6 +405,29 @@ pub struct SessionScopedState {
     /// has to cost one relaxed load rather than an `RwLock` read — the same
     /// discipline `guc_overrides_present` follows above.
     tenant_bound: AtomicBool,
+    /// sprinter 6bc4a4040eb7 (phase B1): the branch THIS session is bound to,
+    /// or `None` for main. The ONLY branch selector in the process — the
+    /// engine-wide `StorageEngine.current_branch` it replaces is gone. Written
+    /// by [`Self::bind_branch`] / [`Self::unbind_branch`] /
+    /// [`Self::replace_branch`]; read by `StorageEngine::active_branch`.
+    branch: parking_lot::RwLock<Option<Arc<BranchBinding>>>,
+    /// Lock-free mirror of `branch.is_some()`. `StorageEngine::is_branch_active`
+    /// is read per statement and on per-row fast-path gates, and nearly every
+    /// session is on main, so the common answer has to be one atomic load —
+    /// the discipline `tenant_bound` follows above.
+    on_branch: AtomicBool,
+    /// Lock-free mirror of the bound branch's `engine_instance` (`0` =
+    /// unbound; `0` is [`UNATTACHED_ENGINE`], which names no real engine). Lets
+    /// `is_branch_active` answer "on a branch OF THIS ENGINE" without the lock.
+    branch_engine: AtomicU64,
+    /// The branch this connection was OPENED on — the PostgreSQL startup
+    /// packet's `database=<db>@<branch>` / `options=-c heliosdb.branch=…`,
+    /// `None` for main. It is what `RESET heliosdb.branch`, `RESET ALL` and
+    /// `DISCARD ALL` return to (a GUC set at startup is PostgreSQL's reset
+    /// value), so a pooled connection keyed on `<db>@<branch>` goes back to its
+    /// own branch between clients instead of keeping the previous client's
+    /// `USE BRANCH`. Kept as the BINDING (by id), never by name.
+    home_branch: parking_lot::RwLock<Option<Arc<BranchBinding>>>,
     /// sprinter 1703dba8e82d: has THIS connection created a `CREATE TEMPORARY
     /// TABLE`? Set by the catalog when a `pg_temp_<backend_pid>` key is
     /// registered, and never cleared for the life of the connection.
@@ -383,10 +500,54 @@ impl SessionScopedState {
             gucs_saved: parking_lot::Mutex::new(None),
             tenant: parking_lot::RwLock::new(None),
             tenant_bound: AtomicBool::new(false),
+            branch: parking_lot::RwLock::new(None),
+            on_branch: AtomicBool::new(false),
+            branch_engine: AtomicU64::new(UNATTACHED_ENGINE),
+            home_branch: parking_lot::RwLock::new(None),
             holds_temp_tables: AtomicBool::new(false),
         });
         live_backends().insert(state.backend_pid, Arc::downgrade(&state));
         state
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B1): a backend for ONE request or call
+    /// that has no connection of its own — a REST request under
+    /// `/v1/branches/:name/…`, an MCP tool call.
+    ///
+    /// Same state as [`Self::new_for_engine`], but deliberately NOT listed in
+    /// [`live_backends`]: a REST request is not a connection, and listing it in
+    /// `pg_stat_activity` for the milliseconds it runs would show an operator a
+    /// nameless backend that is gone before they can act on it. Its `Drop`
+    /// still runs the registry removal, which is a no-op for an unlisted pid.
+    pub fn new_request_scoped(engine_instance: u64) -> Arc<Self> {
+        Arc::new(Self {
+            backend_pid: next_backend_pid(),
+            engine_instance,
+            backend_start: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            lastval: AtomicI64::new(LASTVAL_UNDEFINED),
+            application_name: parking_lot::RwLock::new(String::new()),
+            application_name_saved: parking_lot::Mutex::new(None),
+            username: parking_lot::RwLock::new(String::new()),
+            client_addr: parking_lot::RwLock::new(None),
+            client_port: AtomicI32::new(0),
+            seq_currval: parking_lot::RwLock::new(HashMap::new()),
+            seq_currval_present: AtomicBool::new(false),
+            gucs: parking_lot::RwLock::new(HashMap::new()),
+            guc_overrides_present: AtomicBool::new(false),
+            statement_timeout_ms: AtomicI64::new(GUC_TIMEOUT_UNSET),
+            bulk_load_mode: AtomicI8::new(GUC_TRISTATE_UNSET),
+            gucs_saved: parking_lot::Mutex::new(None),
+            tenant: parking_lot::RwLock::new(None),
+            tenant_bound: AtomicBool::new(false),
+            branch: parking_lot::RwLock::new(None),
+            on_branch: AtomicBool::new(false),
+            branch_engine: AtomicU64::new(UNATTACHED_ENGINE),
+            home_branch: parking_lot::RwLock::new(None),
+            holds_temp_tables: AtomicBool::new(false),
+        })
     }
 
     /// `pg_backend_pid()`.
@@ -733,6 +894,103 @@ impl SessionScopedState {
         self.tenant_bound.load(Ordering::Relaxed)
     }
 
+    // ---- sprinter 6bc4a4040eb7 (phase B1): the per-session BRANCH binding ----
+
+    /// Bind this session to `binding`, returning the binding it replaces.
+    ///
+    /// The caller has already resolved the branch as ACTIVE
+    /// (`StorageEngine::resolve_active_branch`); this type stores, it does not
+    /// police — the same split [`Self::bind_tenant`] follows. The mirrors are
+    /// published AFTER the slot, so a reader that sees them set always finds
+    /// the binding behind the lock.
+    pub fn bind_branch(&self, binding: BranchBinding) -> Option<Arc<BranchBinding>> {
+        self.replace_branch(Some(Arc::new(binding)))
+    }
+
+    /// Return this session to main, returning the binding it held.
+    pub fn unbind_branch(&self) -> Option<Arc<BranchBinding>> {
+        self.replace_branch(None)
+    }
+
+    /// Install `binding` (or main, for `None`) and return the previous one —
+    /// the primitive a SCOPED binding is built from: the code-graph `ON BRANCH`
+    /// guard installs its target for the duration of one statement and puts the
+    /// exact previous binding back on `Drop`.
+    ///
+    /// Mirror ordering mirrors [`Self::unbind_tenant`]: on the way to main the
+    /// mirrors are cleared BEFORE the slot (a reader that still sees them set
+    /// takes the lock and finds `None`, the same answer); on the way to a
+    /// branch they are set AFTER it.
+    pub fn replace_branch(&self, binding: Option<Arc<BranchBinding>>) -> Option<Arc<BranchBinding>> {
+        match binding {
+            Some(binding) => {
+                let engine = binding.engine_instance;
+                let previous = self.branch.write().replace(binding);
+                self.branch_engine.store(engine, Ordering::Release);
+                self.on_branch.store(true, Ordering::Release);
+                previous
+            }
+            None => {
+                self.on_branch.store(false, Ordering::Release);
+                self.branch_engine.store(UNATTACHED_ENGINE, Ordering::Release);
+                self.branch.write().take()
+            }
+        }
+    }
+
+    /// This session's branch binding, or `None` for main. One atomic load on
+    /// the (overwhelmingly common) main answer; a read lock and an `Arc`
+    /// refcount otherwise.
+    #[inline]
+    pub fn branch_binding(&self) -> Option<Arc<BranchBinding>> {
+        if !self.on_branch.load(Ordering::Acquire) {
+            return None;
+        }
+        self.branch.read().clone()
+    }
+
+    /// Record the branch this connection was opened on (`None` = main).
+    pub fn set_home_branch(&self, branch: Option<Arc<BranchBinding>>) {
+        *self.home_branch.write() = branch;
+    }
+
+    /// The branch this connection was opened on, `None` for main.
+    pub fn home_branch(&self) -> Option<Arc<BranchBinding>> {
+        self.home_branch.read().clone()
+    }
+
+    /// Return this session to its home branch — main when it was opened on
+    /// none. Never fails: a home branch that has since been dropped is bound
+    /// anyway (unvalidated), so the session fails CLOSED on its next statement
+    /// until it chooses a branch, rather than keeping whatever the previous
+    /// client of a pooled connection had bound.
+    pub fn reset_branch_to_home(&self) {
+        let home = self.home_branch().map(|binding| Arc::new(binding.unvalidated_copy()));
+        self.replace_branch(home);
+    }
+
+    /// Seed this session's USER-SETTABLE GUC overlay from `other`'s — what a
+    /// request-scoped backend (a REST request, an MCP call) inherits from the
+    /// handle it runs on, so a handle-level `SET statement_timeout` or
+    /// `SET bulk_load_mode` still applies to it (sprinter 6bc4a4040eb7, B1).
+    pub fn copy_gucs_from(&self, other: &SessionScopedState) {
+        if !other.guc_overrides_present.load(Ordering::Relaxed) {
+            return;
+        }
+        let overlay = other.gucs.read().clone();
+        for (name, value) in overlay {
+            self.set_guc(&name, value);
+        }
+    }
+
+    /// Is this session bound to a branch of the engine `engine_instance`?
+    /// Two atomic loads, no lock — the spelling the per-statement and per-row
+    /// fast-path gates use.
+    #[inline]
+    pub fn on_branch_of(&self, engine_instance: u64) -> bool {
+        self.on_branch.load(Ordering::Acquire) && self.branch_engine.load(Ordering::Acquire) == engine_instance
+    }
+
     /// One row of `pg_stat_activity`.
     pub fn snapshot(&self) -> BackendSnapshot {
         let port = self.client_port.load(Ordering::Relaxed);
@@ -956,6 +1214,55 @@ mod tests {
         // path that runs twice cannot double-decrement the tenant's connection
         // count.
         assert_eq!(a.unbind_tenant(), None);
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B1): the branch binding is PER SESSION and
+    /// per ENGINE, its mirrors track the slot, and `replace_branch` hands back
+    /// the exact previous binding (what a scoped binding restores). On the
+    /// pre-B1 tree there was nowhere to put one: the only selector was the
+    /// engine-wide `StorageEngine.current_branch`.
+    #[test]
+    fn the_branch_binding_never_crosses_sessions() {
+        let a = SessionScopedState::new_for_engine(7);
+        let b = SessionScopedState::new_for_engine(7);
+        assert!(a.branch_binding().is_none(), "a fresh session is on main");
+        assert!(!a.on_branch_of(7));
+
+        let previous = a.bind_branch(BranchBinding::new(7, "dev".to_string(), 3, vec![3], 1));
+        assert!(previous.is_none(), "a first bind displaces nothing");
+        assert!(a.on_branch_of(7));
+        assert!(!a.on_branch_of(8), "a binding names a branch of ONE engine");
+        assert_eq!(a.branch_binding().map(|bb| bb.branch_id), Some(3));
+        assert!(b.branch_binding().is_none(), "session B saw session A's branch");
+        assert!(!b.on_branch_of(7), "session B saw session A's branch");
+
+        // A scoped replacement returns the exact binding it displaced.
+        let displaced = a.replace_branch(Some(Arc::new(BranchBinding::new(
+            7,
+            "other".to_string(),
+            9,
+            vec![9],
+            1,
+        ))));
+        assert_eq!(displaced.as_ref().map(|bb| bb.name.as_str()), Some("dev"));
+        assert_eq!(a.branch_binding().map(|bb| bb.branch_id), Some(9));
+        a.replace_branch(displaced);
+        assert_eq!(a.branch_binding().map(|bb| bb.branch_id), Some(3));
+
+        assert_eq!(a.unbind_branch().map(|bb| bb.branch_id), Some(3));
+        assert!(a.branch_binding().is_none());
+        assert!(!a.on_branch_of(7));
+        assert!(a.unbind_branch().is_none(), "unbinding main is a no-op");
+    }
+
+    #[test]
+    fn a_request_scoped_backend_is_not_listed() {
+        let s = SessionScopedState::new_request_scoped(7);
+        assert!(
+            !live_backends().contains_key(&s.backend_pid()),
+            "a REST/MCP request backend must not appear in pg_stat_activity"
+        );
+        assert_eq!(s.engine_instance(), 7);
     }
 
     #[test]

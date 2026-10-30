@@ -478,7 +478,13 @@ pub fn code_index_with_embedder(
     // prelude above exists to prevent. Restores the previous marker on Drop, so
     // the caller's own statement scope is untouched after this call returns.
     let _detached = crate::SessionBoundStatementGuard::detach();
-    let manage_txn = !db.in_transaction();
+    // sprinter 6bc4a4040eb7 (B1 fix pass): on a branch the chunks are NOT
+    // wrapped in a transaction — a data statement inside an explicit
+    // transaction on a branch is refused until branch transactions exist
+    // (phase B2), because an in-transaction read resolves through main. Each
+    // statement then autocommits on the branch: slower (one commit per
+    // statement), never wrong.
+    let manage_txn = !db.in_transaction() && db.current_branch() == "main";
 
     // Tier 1.3 correctness guard: `skip_delete_stale` (set when we
     // truncated up front) tells `write_one_parsed` to skip the

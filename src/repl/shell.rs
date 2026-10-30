@@ -20,7 +20,6 @@ pub struct ReplShell {
     config: ReplConfig,
     editor: Editor<ReplHelper, FileHistory>,
     show_timing: bool,
-    current_branch: String,
     show_lsn: bool,
 }
 
@@ -147,7 +146,6 @@ impl ReplShell {
             config,
             editor,
             show_timing,
-            current_branch: "main".to_string(),
             show_lsn: false,
         })
     }
@@ -164,7 +162,10 @@ impl ReplShell {
                 format!(
                     "{} {} ",
                     "heliosdb".green().bold(),
-                    format!("[{}]", &self.current_branch).cyan()
+                    // sprinter 6bc4a4040eb7 (B1): read the REPL session's
+                    // binding every prompt — `SET heliosdb.branch` or a USE
+                    // inside a script moves it too, so the shell keeps no copy.
+                    format!("[{}]", self.db.current_branch()).cyan()
                 ) + ">"
             } else {
                 "       -> ".yellow().to_string()
@@ -195,10 +196,10 @@ impl ReplShell {
                                     self.show_timing = new_state;
                                 }
                                 Ok(MetaCommandResult::SwitchBranch(branch_name)) => {
-                                    self.current_branch = branch_name.clone();
-                                    // Sync branch context to storage layer
-                                    self.db.storage.set_current_branch(Some(branch_name.clone()));
-
+                                    // sprinter 6bc4a4040eb7 (B1): `\use` has already
+                                    // bound THIS REPL's session (`switch_branch`,
+                                    // which refuses a branch that is not active);
+                                    // the prompt reads that binding.
                                     // Branch data isolation is now active
                                     if branch_name != "main" {
                                         println!(
@@ -312,15 +313,15 @@ impl ReplShell {
 
         // Check for USE BRANCH statement
         if crate::sql::Parser::is_use_branch(sql) {
-            match crate::sql::Parser::parse_use_branch_sql(sql) {
+            // sprinter 6bc4a4040eb7 (B1): bind THIS REPL's session through the
+            // one resolver — an unknown, dropped or merged branch is refused
+            // (this pre-detect used to set the engine-wide branch with no
+            // existence check at all). No cache flush: the caches no longer
+            // depend on a branch switch.
+            let bound = crate::sql::Parser::parse_use_branch_sql(sql)
+                .and_then(|branch_name| self.db.switch_branch(&branch_name).map(|_| branch_name));
+            match bound {
                 Ok(branch_name) => {
-                    self.current_branch = branch_name.clone();
-                    // Sync branch context to storage layer
-                    self.db.storage.set_current_branch(Some(branch_name.clone()));
-                    // This pre-detect bypasses execute(), so it must mirror the
-                    // UseBranch cache invalidation itself: results/plans cached
-                    // on the previous branch must not survive the switch.
-                    self.db.invalidate_plan_cache();
                     println!("{}", format!("Switched to branch: {}", branch_name).green());
 
                     // Show isolation status

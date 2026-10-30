@@ -204,6 +204,20 @@ staging or jurisdiction-pinned data. See `docs/guides/ha_cluster_tutorial.md`.
   for deletes (`bdel:`). Drop branches you no longer need.
 - **Long-lived branches diverge.** The longer a branch lives, the more likely an
   undetected merge conflict. Treat branches as short-lived units of work.
+- **No explicit transactions on a branch yet.** Inside `BEGIN … COMMIT` on a branch,
+  every statement that reads or writes data is refused with SQLSTATE `0A000`
+  (transaction control and `SET`/`SHOW` still work). Run branch work in autocommit.
+  For the same reason `COPY … FROM STDIN` and the embedded `execute_batch` on a
+  branch autocommit chunk by chunk / statement by statement: they are **not atomic**
+  on a branch — a failure part-way leaves the earlier rows on the branch.
+- **DROP / MERGE wait for running statements.** A `DROP BRANCH` or `MERGE BRANCH`
+  waits (up to 30 s) for the statements running on that branch, then takes it out
+  of service; a statement that starts on the branch meanwhile is refused at once
+  with SQLSTATE `55006` ("is being dropped or merged; retry"), and a session bound
+  to a branch that is gone gets `3D000` until it `USE`s another branch.
+- **The REST merge route** (`POST /v1/branches/:name/merge`) accepts only
+  `strategy` `auto` (default) or `theirs`; `manual` and `ours` are refused with 422,
+  because the merge is last-writer-wins with the source winning.
 
 ### Fixed in v4.18.0 — do not work around these any more
 - **A branch that ever had a child could not be dropped.** The parent's children list

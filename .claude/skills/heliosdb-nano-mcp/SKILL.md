@@ -1,6 +1,6 @@
 ---
 name: heliosdb-nano-mcp
-description: Run HeliosDB-Nano as an MCP (Model Context Protocol) server so AI agents (Claude Code, Codex CLI, MCP-aware tools) can query, write, branch, time-travel, and search via JSON-RPC 2.0. Covers stdio, HTTP, and WebSocket transports; the 16-tool catalog (10 DB-backed + 6 in-process RAG); and wiring into Claude Code via `claude mcp add`. Use this when the user wants an LLM agent to operate the database directly through tool calls instead of writing SQL.
+description: Run HeliosDB-Nano as an MCP (Model Context Protocol) server so AI agents (Claude Code, Codex CLI, MCP-aware tools) can query, write, branch, time-travel, and search via JSON-RPC 2.0. Covers stdio, HTTP, and WebSocket transports; the 17-tool catalog (11 DB-backed + 6 in-process RAG); and wiring into Claude Code via `claude mcp add`. Use this when the user wants an LLM agent to operate the database directly through tool calls instead of writing SQL.
 allowed-tools: Bash(heliosdb-nano *), Bash(claude *), Read
 ---
 
@@ -26,7 +26,7 @@ heliosdb-nano mcp --help \
 ```
 *(If `mcp` isn't a recognised subcommand on your build, the feature is off — see `Cargo.toml:189-299`.)*
 
-## Tool catalog (16 tools)
+## Tool catalog (17 tools)
 
 ### DB-backed (require an `EmbeddedDatabase` mounted in the server)
 | Tool | Purpose |
@@ -39,6 +39,7 @@ heliosdb-nano mcp --help \
 | `heliosdb_branch_create` | `CREATE DATABASE BRANCH` |
 | `heliosdb_branch_list` | List branches |
 | `heliosdb_branch_merge` ❌ | `MERGE BRANCH` — **merges nothing, reports success**; see the branches skill |
+| `heliosdb_branch_drop` | `DROP BRANCH` (refuses `main`); a session bound to the dropped branch fails closed (3D000) |
 | `heliosdb_search` | Full-text search |
 | `heliosdb_time_travel` | `SELECT … AS OF …` shorthand |
 
@@ -71,7 +72,7 @@ claude mcp add heliosdb -- heliosdb-nano mcp serve --data-dir ./mydata
 claude mcp list
 # Expect: heliosdb (running)
 ```
-Inside any Claude Code session in this project, the 16 tools become available to the model directly.
+Inside any Claude Code session in this project, the 17 tools become available to the model directly.
 
 ### Recipe 3: HTTP transport (for non-stdio agents)
 ```bash

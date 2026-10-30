@@ -239,6 +239,13 @@ pub struct Transaction {
     /// part of a savepoint snapshot: the flag is cleared by a successful
     /// `ROLLBACK TO SAVEPOINT`, not restored by one.
     sql_aborted: AtomicBool,
+    /// sprinter 6bc4a4040eb7 (B1 second fix pass): the branch binding of the
+    /// session that opened this transaction, CAPTURED at `BEGIN` (`None` =
+    /// main). `COMMIT` re-validates this — not the session's live binding,
+    /// which a shared session (the embedded handle's) could have rebound in
+    /// between — and rolls back with 3D000 when the branch was dropped or
+    /// merged while the transaction was open.
+    branch_binding: parking_lot::Mutex<Option<Arc<crate::session::BranchBinding>>>,
     /// Membership in the engine's [`UncommittedWriteCensus`], armed on this
     /// transaction's first staged write and released in `Drop`.
     ///
@@ -763,6 +770,7 @@ impl Transaction {
             gc_pin_id: None,
             key_manager: None,
             sql_aborted: AtomicBool::new(false),
+            branch_binding: parking_lot::Mutex::new(None),
             write_census: None,
             savepoints: RwLock::new(Vec::new()),
         })
@@ -790,6 +798,17 @@ impl Transaction {
     /// HDB-008: is this transaction in the aborted (failed) SQL state?
     pub fn is_sql_aborted(&self) -> bool {
         self.sql_aborted.load(Ordering::Acquire)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B1 second fix pass): record the branch binding
+    /// this transaction was opened on (see the field). Set once, at `BEGIN`.
+    pub fn capture_branch_binding(&self, binding: Option<Arc<crate::session::BranchBinding>>) {
+        *self.branch_binding.lock() = binding;
+    }
+
+    /// The branch binding captured at `BEGIN` (`None` = main).
+    pub fn captured_branch_binding(&self) -> Option<Arc<crate::session::BranchBinding>> {
+        self.branch_binding.lock().clone()
     }
 
     /// This transaction's process-global id — the key the lock manager, the
@@ -1017,6 +1036,7 @@ impl Transaction {
             gc_pin_id: None,
             key_manager: None,
             sql_aborted: AtomicBool::new(false),
+            branch_binding: parking_lot::Mutex::new(None),
             write_census: None,
             savepoints: RwLock::new(Vec::new()),
         })
@@ -1647,7 +1667,8 @@ impl Transaction {
         // their scan and discard a scan that raced a commit). `written_tables`
         // holds only main-branch `data:` tables — branch `bdata:` writes and
         // raw non-`data:` keys never enter it — matching the branch-blind map,
-        // which is cleared on branch switch. Over-raising on a later failed
+        // which a branch session never reads (sprinter 6bc4a4040eb7 B1).
+        // Over-raising on a later failed
         // `db.write` only forces the safe snapshot path.
         if let Some(watermarks) = &self.write_watermarks {
             for table in self.written_tables.iter() {

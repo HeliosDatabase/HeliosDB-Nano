@@ -39,7 +39,7 @@ fn on_branch_routes_lsp_query_to_branch_data() {
 
     // Back to main.
     db.switch_branch("main").unwrap();
-    let on_main = db.storage.get_current_branch().unwrap_or_else(|| "main".into());
+    let on_main = db.current_branch();
 
     // Query for `beta` on main — should resolve zero rows.
     let no_beta = db.query("SELECT * FROM lsp_definition('beta')", &[]).unwrap();
@@ -52,7 +52,7 @@ fn on_branch_routes_lsp_query_to_branch_data() {
     assert!(!with_branch.is_empty(), "ON BRANCH 'preview' should resolve beta");
 
     // Active branch must be restored to main.
-    let after = db.storage.get_current_branch().unwrap_or_else(|| "main".into());
+    let after = db.current_branch();
     assert_eq!(after, on_main, "ON BRANCH must restore the previous branch");
 }
 

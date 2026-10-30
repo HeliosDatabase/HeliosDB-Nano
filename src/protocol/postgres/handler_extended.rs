@@ -24,6 +24,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // See the matching note in `handle_single_query`.
         let query = super::handler::pg_rewrite_empty_projection(&query);
 
+        // sprinter 6bc4a4040eb7 (B1): `USE [DATABASE] BRANCH x` has no
+        // sqlparser grammar, so the syntax check below would refuse it at Parse
+        // and a driver that binds server-side (psycopg3, JDBC, sqlx,
+        // node-postgres) could never switch its own connection's branch. It
+        // takes no parameters and returns no rows; Execute hands it to
+        // `execute_params_for_session`, whose per-statement branch gate binds
+        // THIS session.
+        if super::handler::starts_with_icase(query.trim_start(), "USE ")
+            && crate::EmbeddedDatabase::is_branch_binding_statement(&query)
+        {
+            self.prepared_statements.store_statement(PreparedStatement {
+                name: statement_name.clone(),
+                query: query.clone(),
+                param_types: Vec::new(),
+                result_schema: None,
+                cached_plan: None,
+                cached_plan_epoch: 0,
+                is_catalog: Some(false),
+            })?;
+            self.send_message(BackendMessage::ParseComplete).await?;
+            return Ok(());
+        }
+
         // Parse and validate query syntax
         let parser = crate::sql::Parser::new();
         let statement = parser.parse_one(&query)?;
@@ -335,6 +358,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // the portal's own wire plan, which already sent a RowDescription.
         let is_session_guc_set = crate::EmbeddedDatabase::is_session_guc_statement(trimmed_query)
             && !super::handler::starts_with_icase(trimmed_query, "SHOW");
+        // sprinter 6bc4a4040eb7 (B1): `SET` / `RESET heliosdb.branch` answer
+        // with the simple-query arm's `SET` / `RESET` tag on both protocols.
+        // (`USE BRANCH` binds through the engine's per-statement branch gate
+        // on this path; `SHOW` is answered below.)
+        let is_branch_set = (super::handler::starts_with_icase(trimmed_query, "SET ")
+            || super::handler::starts_with_icase(trimmed_query, "RESET "))
+            && crate::EmbeddedDatabase::is_branch_binding_statement(trimmed_query);
         // HDB-008: `ROLLBACK TO SAVEPOINT` is not a transaction BOUNDARY, so it
         // is normally executed as an ordinary statement — but inside an ABORTED
         // block the `transaction_failed()` guard below refuses it before the
@@ -351,6 +381,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             || is_timeout_guc
             || is_application_name_set
             || is_session_guc_set
+            || is_branch_set
             || is_failed_savepoint_recovery
         {
             let previous_suppress_ready = self.suppress_ready_for_query;
@@ -966,7 +997,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     .map(|ident| ident.value.to_ascii_lowercase())
                     .collect::<Vec<_>>()
                     .join(" ");
-                match Self::session_show_parameter_name(&format!("SHOW {name}")) {
+                // sqlparser splits a dotted name (`heliosdb.branch`) into its
+                // parts, so try the dotted spelling too (sprinter 6bc4a4040eb7).
+                let dotted = variable
+                    .iter()
+                    .map(|ident| ident.value.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                match Self::session_show_parameter_name(&format!("SHOW {name}"))
+                    .or_else(|| Self::session_show_parameter_name(&format!("SHOW {dotted}")))
+                {
                     Some(param) => Ok(Some(crate::Schema::new(vec![crate::Column::new(
                         param,
                         crate::DataType::Text,

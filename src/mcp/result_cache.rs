@@ -138,6 +138,7 @@ pub fn writes(tool_name: &str) -> bool {
             | "heliosdb_insert"
             | "heliosdb_branch_create"
             | "heliosdb_branch_merge"
+            | "heliosdb_branch_drop"
             | "heliosdb_graph_add_edge"
             | "heliosdb_embed_and_store"
             | "heliosdb_bm25_index"

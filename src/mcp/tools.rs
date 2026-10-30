@@ -4,8 +4,10 @@
 //!
 //! * **DB-backed** (`heliosdb_query`, `heliosdb_schema`, `heliosdb_list_tables`,
 //!   `heliosdb_create_table`, `heliosdb_insert`, `heliosdb_branch_create`,
-//!   `heliosdb_branch_list`, `heliosdb_branch_merge`, `heliosdb_search`,
-//!   `heliosdb_time_travel`) — require an `EmbeddedDatabase` reference.
+//!   `heliosdb_branch_list`, `heliosdb_branch_merge`, `heliosdb_branch_drop`,
+//!   `heliosdb_search`, `heliosdb_time_travel`) — require an `EmbeddedDatabase`
+//!   reference. A tool that names a branch runs on it through a CALL-scoped
+//!   binding (sprinter 6bc4a4040eb7), never by switching the database.
 //! * **In-process** (`heliosdb_bm25_index`, `heliosdb_hybrid_search`,
 //!   `heliosdb_graph_add_edge`, `heliosdb_graph_traverse`, `heliosdb_graph_path`,
 //!   `heliosdb_embed_and_store`) — use process-static BM25 / graph state
@@ -203,6 +205,18 @@ fn db_tools() -> Vec<ToolDescriptor> {
             }),
         },
         ToolDescriptor {
+            name: "heliosdb_branch_drop",
+            description: "Drop a branch (its rows, tombstones and history stop being visible; the name can be \
+                          reused). Refuses `main`.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolDescriptor {
             name: "heliosdb_search",
             description: "Vector-similarity search over a table with an embedding column.",
             input_schema: json!({
@@ -381,6 +395,7 @@ fn call_tool_inner(db: Option<&EmbeddedDatabase>, name: &str, args: JsonValue) -
         "heliosdb_branch_create" => require_db(db, "heliosdb_branch_create", |d| do_branch_create(d, args)),
         "heliosdb_branch_list" => require_db(db, "heliosdb_branch_list", |d| do_branch_list(d)),
         "heliosdb_branch_merge" => require_db(db, "heliosdb_branch_merge", |d| do_branch_merge(d, args)),
+        "heliosdb_branch_drop" => require_db(db, "heliosdb_branch_drop", |d| do_branch_drop(d, args)),
         "heliosdb_search" => require_db(db, "heliosdb_search", |d| do_search(d, args)),
         "heliosdb_time_travel" => require_db(db, "heliosdb_time_travel", |d| do_time_travel(d, args)),
 
@@ -410,34 +425,23 @@ where
 
 // ---- Branch scoping helper --------------------------------------------
 
-/// Run `f` with the active branch set to `branch`, restoring the previous
-/// branch afterwards. `branch == "main"` and `branch == current` both
-/// skip the switch.
+/// Run `f` on `branch` through a CALL-scoped binding — sprinter 6bc4a4040eb7
+/// (phase B1).
+///
+/// This used to switch the database's ONE engine-wide branch, run `f`, and
+/// switch back: while the call ran, every other caller of the database — other
+/// MCP calls, embedded callers, REST requests — ran on `branch`, and two
+/// concurrent calls on different branches restored each other's switch. Now
+/// `f` runs with a backend private to this call
+/// (`EmbeddedDatabase::with_request_branch_scope`): nothing else sees the
+/// binding, and a `USE BRANCH` inside the call's SQL moves nobody. `branch`
+/// must be an active branch (or `main`); otherwise the call fails with the
+/// 3D000 refusal rather than running on main.
 fn with_branch<F, R>(db: &EmbeddedDatabase, branch: &str, f: F) -> crate::Result<R>
 where
     F: FnOnce(&EmbeddedDatabase) -> crate::Result<R>,
 {
-    let previous = db.storage.get_current_branch();
-    let current = previous.as_deref().unwrap_or("main");
-    if branch == current {
-        return f(db);
-    }
-    if branch != "main" {
-        db.switch_branch(branch)?;
-    } else {
-        // "main" requested while on a non-main branch: switch off.
-        db.switch_branch("main")?;
-    }
-    let result = f(db);
-    // Restore — best-effort.
-    if let Some(prev) = previous {
-        if prev != branch {
-            let _ = db.switch_branch(&prev);
-        }
-    } else if branch != "main" {
-        let _ = db.switch_branch("main");
-    }
-    result
+    db.with_request_branch_scope(branch, || f(db))
 }
 
 // ---- DB tool input structs --------------------------------------------
@@ -503,6 +507,11 @@ struct BranchMergeInput {
     source: String,
     #[serde(default = "default_branch")]
     target: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchDropInput {
+    name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -713,6 +722,28 @@ fn do_branch_merge(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
             "merged": true,
         })),
         Err(e) => ToolOutcome::err(format!("merge failed: {e}")),
+    }
+}
+
+fn do_branch_drop(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
+    let input: BranchDropInput = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
+    };
+    // sprinter 6bc4a4040eb7 (B1): `main` is the database, not a branch of it.
+    if input.name.trim().eq_ignore_ascii_case("main") {
+        return ToolOutcome::err("branch drop failed: the main branch cannot be dropped");
+    }
+    // A call-scoped backend on main: the drop is never refused as "the active
+    // branch of this session" (the call's session is on main), and a session
+    // bound to the dropped branch elsewhere fails closed on its next statement.
+    let run = |d: &EmbeddedDatabase| d.drop_branch(&input.name);
+    match with_branch(db, "main", run) {
+        Ok(_) => ToolOutcome::ok(json!({
+            "branch": input.name,
+            "dropped": true,
+        })),
+        Err(e) => ToolOutcome::err(format!("branch drop failed: {e}")),
     }
 }
 
@@ -1121,6 +1152,7 @@ mod tests {
             "heliosdb_branch_create",
             "heliosdb_branch_list",
             "heliosdb_branch_merge",
+            "heliosdb_branch_drop",
             "heliosdb_search",
             "heliosdb_time_travel",
             "heliosdb_bm25_index",

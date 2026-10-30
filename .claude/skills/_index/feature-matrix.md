@@ -24,7 +24,7 @@ Authoritative source: `Cargo.toml:189-299`. Re-check with `cargo info heliosdb-n
 | `code-graph` | tree-sitter (Rust/Python/TS/Go/MD/SQL), `_hdb_code_*` tables, LSP API | — | `heliosdb-nano-code-graph` |
 | `graph-rag` | `_hdb_graph_*` schema, seed/expand/rerank | `code-graph` | `heliosdb-nano-graph-rag`, MCP graph tools |
 | `code-embed` | fastembed-rs (ONNX) in-process embedder | `code-graph` | `heliosdb_embed_and_store` MCP tool |
-| `mcp-endpoint` | JSON-RPC 2.0, stdio/HTTP/WS, 16-tool catalog | — | `heliosdb-nano-mcp` |
+| `mcp-endpoint` | JSON-RPC 2.0, stdio/HTTP/WS, 17-tool catalog | — | `heliosdb-nano-mcp` |
 | `compression` | MySQL wire-protocol packet compression (zlib) | — | `heliosdb-nano-connect` (high-bandwidth MySQL) |
 | `server` | Server-mode async runtime knobs | — | (advanced server builds) |
 

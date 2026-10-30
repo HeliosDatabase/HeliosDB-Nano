@@ -682,11 +682,24 @@ fn w2_branch_txn_insert_does_not_poison_shared_secondary_art() {
 
     // Branch INSERT *inside an explicit transaction*: the only path that
     // reached `try_fast_insert_literal_in_transaction`, which pre-fix poisoned
-    // the shared ART.
+    // the shared ART. sprinter 6bc4a4040eb7 (B1 fix pass): until branch
+    // transactions exist (phase B2) such a statement is REFUSED (0A000) — an
+    // in-transaction branch statement resolves rows through main — so nothing
+    // can leak through that path. The row is then written in autocommit so the
+    // rest of this test still checks the shared ART after a branch write.
     db.execute("BEGIN").expect("begin on branch");
+    let refused = db
+        .execute("INSERT INTO t (id, code) VALUES (2, 200)")
+        .expect_err("a branch write inside a transaction must be refused until B2");
+    assert!(
+        refused
+            .to_string()
+            .contains(heliosdb_nano::BRANCH_TRANSACTION_UNSUPPORTED_MARKER),
+        "got: {refused}"
+    );
+    db.execute("ROLLBACK").expect("rollback on branch");
     db.execute("INSERT INTO t (id, code) VALUES (2, 200)")
         .expect("branch insert");
-    db.execute("COMMIT").expect("commit on branch");
 
     // The branch sees its own overlay row (full-scan path — must stay correct).
     assert_eq!(
@@ -746,10 +759,16 @@ fn w2_branch_txn_insert_no_phantom_unique_violation_on_main() {
 
     db.execute("CREATE BRANCH b1 AS OF NOW").expect("create branch");
     db.execute("USE BRANCH b1").expect("switch to branch");
+    // sprinter 6bc4a4040eb7 (B1 fix pass): refused inside a transaction until
+    // B2 (see the test above); written in autocommit instead.
     db.execute("BEGIN").expect("begin on branch");
+    assert!(
+        db.execute("INSERT INTO t (id, code) VALUES (2, 200)").is_err(),
+        "a branch write inside a transaction must be refused until B2"
+    );
+    db.execute("ROLLBACK").expect("rollback on branch");
     db.execute("INSERT INTO t (id, code) VALUES (2, 200)")
         .expect("branch insert");
-    db.execute("COMMIT").expect("commit on branch");
 
     db.execute("USE BRANCH main").expect("switch back to main");
 
@@ -933,9 +952,15 @@ fn w2_branch_delete_does_not_strip_secondary_index_on_main() {
     db.execute("DELETE FROM t WHERE id = 1")
         .expect("branch autocommit delete");
     // In-transaction branch DELETE of a second inherited row (txn DELETE arm).
+    // sprinter 6bc4a4040eb7 (B1 fix pass): refused inside a transaction until
+    // B2; the row is deleted in autocommit instead.
     db.execute("BEGIN").expect("begin on branch");
-    db.execute("DELETE FROM t WHERE id = 2").expect("branch delete in txn");
-    db.execute("COMMIT").expect("commit on branch");
+    assert!(
+        db.execute("DELETE FROM t WHERE id = 2").is_err(),
+        "a branch delete inside a transaction must be refused until B2"
+    );
+    db.execute("ROLLBACK").expect("rollback on branch");
+    db.execute("DELETE FROM t WHERE id = 2").expect("branch delete");
 
     // The branch no longer sees either row (overlay tombstone — full-scan path).
     assert!(

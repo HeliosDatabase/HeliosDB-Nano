@@ -92,7 +92,21 @@ impl ApiError {
 // Convert our domain Error to ApiError
 impl From<Error> for ApiError {
     fn from(err: Error) -> Self {
+        let branch_unavailable = err.is_branch_unavailable();
         match err {
+            // sprinter 6bc4a4040eb7 (B1): a route under `/v1/branches/:name/…`
+            // naming a branch that is not active (never created, dropped,
+            // merged) is a missing resource, not a failed statement.
+            Error::QueryExecution(msg) if branch_unavailable => ApiError::not_found(msg),
+            // B1 second fix pass: the branch is being dropped or merged right
+            // now, or a DROP / MERGE timed out on its running statements —
+            // retryable, PostgreSQL's 55006 object_in_use: 409 Conflict.
+            Error::QueryExecution(msg)
+                if msg.contains(crate::error::BRANCH_CLOSING_MARKER)
+                    || msg.contains(crate::error::BRANCH_BUSY_MARKER) =>
+            {
+                ApiError::conflict(msg)
+            }
             Error::Storage(msg) => {
                 if msg.contains("not found") || msg.contains("does not exist") {
                     ApiError::not_found(msg)

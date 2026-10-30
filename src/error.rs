@@ -157,6 +157,60 @@ pub const PG_PROMOTE_SERVER_ONLY: &str = "pg_promote is answered by the server s
 /// shared const because the commit path emits it and the docs and tests key on it.
 pub const SYNC_REPLICATION_UNCONFIRMED: &str = "synchronous replication not confirmed";
 
+/// sprinter 6bc4a4040eb7 (phase B1): the marker of the refusal a branch
+/// BINDING gets when the name does not resolve to an ACTIVE branch — `USE
+/// BRANCH x`, `SET heliosdb.branch = 'x'`, the PostgreSQL startup forms, a REST
+/// branch route, an MCP call that names a branch. A dropped or merged branch is
+/// not active, so it is refused here too ([`Error::branch_not_active`]).
+///
+/// One shared const because the PostgreSQL wire maps it to `3D000
+/// invalid_catalog_name` (`sqlstate_for_query_execution_message`) — the code
+/// PostgreSQL gives a connection to a database that does not exist — and the
+/// REST layer maps it to 404.
+pub const BRANCH_NOT_ACTIVE_MARKER: &str = "is not an active branch";
+
+/// sprinter 6bc4a4040eb7 (phase B1): the marker of the refusal a session gets
+/// when the branch it is BOUND to has since been dropped or merged by anyone
+/// ([`Error::branch_binding_gone`]). The session fails CLOSED: nothing it runs
+/// reaches main or any other branch until it changes its own binding. Mapped
+/// to `3D000` like [`BRANCH_NOT_ACTIVE_MARKER`].
+pub const BRANCH_BINDING_GONE_MARKER: &str = "USE BRANCH main or another branch";
+
+/// sprinter 6bc4a4040eb7 (phase B1): the marker of the refusal `DROP BRANCH x`
+/// gets on the session that is itself bound to `x` ([`Error::branch_in_use`])
+/// — PostgreSQL's `cannot drop the currently open database`, SQLSTATE `55006
+/// object_in_use`. Another session's binding does not block the drop; that
+/// session fails closed instead.
+pub const BRANCH_IN_USE_MARKER: &str = "is the active branch of this session";
+
+/// sprinter 6bc4a4040eb7 (B1 fix pass): the marker of a DROP / MERGE BRANCH
+/// that waited [`crate::storage::BRANCH_DRAIN_TIMEOUT`] for the statements
+/// running on the branch and gave up ([`Error::branch_busy`]). SQLSTATE 55006,
+/// like dropping the session's own branch.
+pub const BRANCH_BUSY_MARKER: &str = "is in use by running statements";
+
+/// sprinter 6bc4a4040eb7 (B1 second fix pass): the marker of the refusal a
+/// statement gets when it starts on a branch a DROP or MERGE is closing right
+/// now ([`Error::branch_closing`]). Refused immediately rather than queued
+/// behind the close: when the close succeeds the branch is gone anyway.
+/// SQLSTATE 55006, like [`BRANCH_BUSY_MARKER`].
+pub const BRANCH_CLOSING_MARKER: &str = "is being dropped or merged";
+
+/// sprinter 6bc4a4040eb7 (B1 fix pass): the marker of the refusal a statement
+/// that reads or writes data gets inside an explicit transaction (or a
+/// pending implicit block) on a branch ([`Error::branch_transaction_unsupported`]).
+/// An in-transaction read resolves rows through main's snapshot and write set,
+/// so until branch transactions exist (phase B2) the statement is refused
+/// rather than answered from main. SQLSTATE 0A000.
+pub const BRANCH_TRANSACTION_UNSUPPORTED_MARKER: &str = "explicit transactions on a branch are not supported yet";
+
+/// sprinter 6bc4a4040eb7 (B1 fix pass): the marker of `USE BRANCH` /
+/// `SET heliosdb.branch` / `RESET heliosdb.branch` inside an open transaction
+/// ([`Error::branch_switch_in_transaction`]) — PostgreSQL cannot change the
+/// database of a running transaction either. SQLSTATE 25001
+/// active_sql_transaction.
+pub const BRANCH_SWITCH_IN_TRANSACTION_MARKER: &str = "cannot change the branch inside a transaction block";
+
 /// Database error type
 ///
 /// All errors from HeliosDB Lite operations are represented by this enum.
@@ -346,6 +400,74 @@ impl Error {
             "{PHYSICAL_STANDBY_WRITE_REFUSED}: {operation} was refused before reaching the storage engine; \
              run it on the primary"
         ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B1): `name` does not resolve to an ACTIVE
+    /// branch (it never existed, or it was dropped or merged), so it cannot be
+    /// bound. SQLSTATE 3D000 on the PostgreSQL wire. A `QueryExecution`
+    /// variant so every existing mapper (REST, MCP, both wires) keeps working.
+    pub fn branch_not_active(name: &str) -> Self {
+        Error::QueryExecution(format!(
+            "branch \"{name}\" {BRANCH_NOT_ACTIVE_MARKER}; SHOW BRANCHES lists the branches you can use"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B1): the branch this session is bound to
+    /// was dropped (`merged == false`) or merged into another branch since the
+    /// binding was made. SQLSTATE 3D000.
+    pub fn branch_binding_gone(name: &str, merged: bool) -> Self {
+        let how = if merged { "merged" } else { "dropped" };
+        Error::QueryExecution(format!("branch \"{name}\" was {how}; {BRANCH_BINDING_GONE_MARKER}"))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B1): `DROP BRANCH name` on the session
+    /// bound to `name`. SQLSTATE 55006.
+    pub fn branch_in_use(name: &str) -> Self {
+        Error::QueryExecution(format!(
+            "cannot drop branch \"{name}\": it {BRANCH_IN_USE_MARKER}; USE BRANCH main first"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B1 fix pass): DROP / MERGE BRANCH `name` timed
+    /// out waiting for the statements running on it. SQLSTATE 55006.
+    pub fn branch_busy(name: &str) -> Self {
+        Error::QueryExecution(format!(
+            "cannot drop or merge branch \"{name}\": it {BRANCH_BUSY_MARKER}; retry when they finish"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B1 second fix pass): a statement started on a
+    /// branch that a DROP or MERGE is closing. SQLSTATE 55006.
+    pub fn branch_closing(name: &str) -> Self {
+        Error::QueryExecution(format!("branch \"{name}\" {BRANCH_CLOSING_MARKER}; retry"))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B1 fix pass): a data statement inside an
+    /// explicit transaction on a branch. SQLSTATE 0A000.
+    pub fn branch_transaction_unsupported(name: &str) -> Self {
+        Error::QueryExecution(format!(
+            "{BRANCH_TRANSACTION_UNSUPPORTED_MARKER} (branch \"{name}\"): run the statement outside the \
+             transaction, or on main"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B1 fix pass): a branch switch inside an open
+    /// transaction. SQLSTATE 25001.
+    pub fn branch_switch_in_transaction() -> Self {
+        Error::QueryExecution(format!(
+            "{BRANCH_SWITCH_IN_TRANSACTION_MARKER}; COMMIT or ROLLBACK first"
+        ))
+    }
+
+    /// True for [`Error::branch_not_active`] and [`Error::branch_binding_gone`]
+    /// — "this branch cannot be used", what REST answers with 404.
+    pub fn is_branch_unavailable(&self) -> bool {
+        match self {
+            Error::QueryExecution(message) => {
+                message.contains(BRANCH_NOT_ACTIVE_MARKER) || message.contains(BRANCH_BINDING_GONE_MARKER)
+            }
+            _ => false,
+        }
     }
 
     /// True for [`Error::physical_standby_write_refused`].

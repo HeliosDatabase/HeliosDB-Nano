@@ -643,7 +643,10 @@ impl DatabaseRestoreInterface for EmbeddedDatabase {
     /// here, the target is still untouched; said from inside phase B, it would
     /// arrive with every table already created and populated.
     fn begin_restore(&mut self) -> Result<()> {
-        if self.storage.is_branch_active() {
+        // sprinter 6bc4a4040eb7 (B1): the branch is SESSION state; a restore
+        // runs on this handle's own session (`current_branch` installs it), so
+        // ask that session, not whatever happens to be installed on the thread.
+        if self.current_branch() != "main" {
             return Err(Error::query_execution(
                 "restore must run on the main branch: registering the dump's UNIQUE and FOREIGN KEY \
                  constraints mints indexes, and index state lives on main. Run `USE BRANCH main;` \

@@ -22,45 +22,23 @@ use crate::api::{
 };
 use crate::{Tuple, Value};
 
-/// Validate that a branch exists and return branch context info
+/// Validate that `branch_name` is an ACTIVE branch — sprinter 6bc4a4040eb7 (B1).
 ///
-/// For now, this validates the branch exists but notes that full branch switching
-/// for data operations isn't implemented yet. Operations will use main branch data.
+/// This used to accept any registered branch (a dropped one included) and then
+/// warn that "data operations currently use main branch": every data route
+/// under `/v1/branches/:name/…` silently read and wrote MAIN. The operations
+/// below now run on `:name` through a request-scoped binding
+/// (`EmbeddedDatabase::with_request_branch_scope`); this early check only turns
+/// an inactive branch into a 404 before any work is done.
 fn validate_branch(state: &AppState, branch_name: &str) -> Result<(), ApiError> {
-    // "main" branch always exists
-    if branch_name == "main" {
+    if state.db.storage.active_branch_exists(branch_name) {
         return Ok(());
     }
-
-    // Check if branching is enabled and branch exists
-    if let Some(branch_manager) = state.db.storage.branch_manager() {
-        match branch_manager.get_branch_by_name(branch_name) {
-            Ok(_metadata) => {
-                // Branch exists - warn that full switching isn't implemented
-                warn!(
-                    "Branch '{}' exists but data operations currently use main branch. \
-                     Full branch data isolation coming in v2.6.0",
-                    branch_name
-                );
-                Ok(())
-            }
-            Err(_) => Err(ApiError::new(
-                StatusCode::NOT_FOUND,
-                "branch_not_found",
-                format!("Branch '{}' not found", branch_name),
-            )),
-        }
-    } else {
-        // Branching not enabled - only main branch available
-        Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "branch_not_found",
-            format!(
-                "Branch '{}' not found. Branching is not enabled; only 'main' branch is available",
-                branch_name
-            ),
-        ))
-    }
+    Err(ApiError::new(
+        StatusCode::NOT_FOUND,
+        "branch_not_found",
+        format!("Branch '{}' not found (or not active)", branch_name),
+    ))
 }
 
 /// List tables in a branch
@@ -192,11 +170,14 @@ pub async fn query_data(
     let offset = (params.page - 1) * params.limit;
     sql.push_str(&format!(" LIMIT {} OFFSET {}", params.limit + 1, offset)); // Request one extra to check has_more
 
-    // Execute query
-    let results = state.db.query(&sql, &[]).map_err(|e| {
-        error!("Failed to query data: {}", e);
-        ApiError::from(e)
-    })?;
+    // Execute query — on `:name` (request-scoped binding, B1).
+    let results = state
+        .db
+        .with_request_branch_scope(&branch_name, || state.db.query(&sql, &[]))
+        .map_err(|e| {
+            error!("Failed to query data: {}", e);
+            ApiError::from(e)
+        })?;
 
     // Check if there are more results
     let has_more = results.len() > params.limit as usize;
@@ -214,10 +195,13 @@ pub async fn query_data(
             count_sql.push_str(&format!(" WHERE {}", filter));
         }
 
-        let count_result = state.db.query(&count_sql, &[]).map_err(|e| {
-            error!("Failed to count rows: {}", e);
-            ApiError::from(e)
-        })?;
+        let count_result = state
+            .db
+            .with_request_branch_scope(&branch_name, || state.db.query(&count_sql, &[]))
+            .map_err(|e| {
+                error!("Failed to count rows: {}", e);
+                ApiError::from(e)
+            })?;
 
         // Extract count from result
         count_result
@@ -345,11 +329,24 @@ pub async fn insert_data(
             None
         };
 
-        // Insert the tuple
-        state.db.storage.insert_tuple(&table_name, tuple).map_err(|e| {
-            error!("Failed to insert data: {}", e);
-            ApiError::from(e)
-        })?;
+        // Insert the tuple — on `:name` (request-scoped binding, B1): this
+        // storage call reads the session binding the scope installs. B1 second
+        // fix pass: it is a raw storage write, not a statement, so it takes
+        // the branch's statement drain hold itself (`enter_branch_statement`,
+        // what every SQL entry point's gate takes): a DROP / MERGE of the
+        // branch waits for it, one already closing refuses it (55006), and a
+        // branch dropped in between fails it closed (3D000) — instead of the
+        // row landing in an overlay that was just dropped or merged.
+        state
+            .db
+            .with_request_branch_scope(&branch_name, || {
+                let _statement = state.db.enter_branch_statement()?;
+                state.db.storage.insert_tuple(&table_name, tuple)
+            })
+            .map_err(|e| {
+                error!("Failed to insert data: {}", e);
+                ApiError::from(e)
+            })?;
 
         inserted_count += 1;
 
@@ -453,10 +450,13 @@ pub async fn update_data(
         .collect::<Result<Vec<_>, _>>()?;
 
     // Execute update
-    let updated_count = state.db.execute_params(&sql, &params).map_err(|e| {
-        error!("Failed to update data: {}", e);
-        ApiError::from(e)
-    })?;
+    let updated_count = state
+        .db
+        .with_request_branch_scope(&branch_name, || state.db.execute_params(&sql, &params))
+        .map_err(|e| {
+            error!("Failed to update data: {}", e);
+            ApiError::from(e)
+        })?;
 
     let response = UpdateDataResponse {
         updated: updated_count,
@@ -516,10 +516,13 @@ pub async fn delete_data(
     }
 
     // Execute delete
-    let deleted_count = state.db.execute(&sql).map_err(|e| {
-        error!("Failed to delete data: {}", e);
-        ApiError::from(e)
-    })?;
+    let deleted_count = state
+        .db
+        .with_request_branch_scope(&branch_name, || state.db.execute(&sql))
+        .map_err(|e| {
+            error!("Failed to delete data: {}", e);
+            ApiError::from(e)
+        })?;
 
     let response = DeleteDataResponse {
         deleted: deleted_count,

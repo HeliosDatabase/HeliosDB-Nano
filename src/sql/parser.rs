@@ -482,8 +482,22 @@ impl Parser {
 
     /// Check if SQL is a USE BRANCH statement
     pub fn is_use_branch(sql: &str) -> bool {
-        let upper = sql.trim().to_uppercase();
-        upper.starts_with("USE BRANCH") || upper.starts_with("USE DATABASE BRANCH")
+        // sprinter 6bc4a4040eb7 (B1 fix pass): WORDS, not a byte prefix. A
+        // prefix test read MySQL's `USE branchoffice` (a database) as
+        // `USE BRANCH office`, and `USE branches` as a branch statement. The
+        // statement is `USE [DATABASE] BRANCH <name>`; anything else — `USE
+        // branch` with no name included — is an ordinary `USE <db>`.
+        let trimmed = sql.trim();
+        let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed);
+        let mut words = trimmed.split_whitespace();
+        if !words.next().is_some_and(|word| word.eq_ignore_ascii_case("USE")) {
+            return false;
+        }
+        let mut keyword = words.next();
+        if keyword.is_some_and(|word| word.eq_ignore_ascii_case("DATABASE")) {
+            keyword = words.next();
+        }
+        keyword.is_some_and(|word| word.eq_ignore_ascii_case("BRANCH")) && words.next().is_some()
     }
 
     /// Check if SQL is a SHOW BRANCHES statement
@@ -4062,23 +4076,24 @@ impl Parser {
     /// - USE BRANCH `<name>`
     /// - USE DATABASE BRANCH `<name>`
     pub fn parse_use_branch_sql(sql: &str) -> Result<String> {
-        let cleaned = sql.trim().to_string();
-        let upper = cleaned.to_uppercase();
-
-        // Skip USE [DATABASE] BRANCH
-        let name_start = if upper.starts_with("USE DATABASE BRANCH") {
-            "USE DATABASE BRANCH".len()
-        } else {
-            "USE BRANCH".len()
-        };
-
-        let after_use = cleaned[name_start..].trim_start();
-
-        // Extract branch name
-        let name_end = after_use
-            .find(|c: char| c.is_whitespace() || c == ';')
-            .unwrap_or(after_use.len());
-        let branch_name = after_use[..name_end].trim().to_string();
+        // Word-based, like `is_use_branch` (sprinter 6bc4a4040eb7, B1 fix
+        // pass): the old byte-offset slicing assumed exactly one space between
+        // the keywords and could slice into the middle of a character.
+        let trimmed = sql.trim();
+        let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed);
+        let mut words = trimmed.split_whitespace();
+        let _use = words.next();
+        let mut keyword = words.next();
+        if keyword.is_some_and(|word| word.eq_ignore_ascii_case("DATABASE")) {
+            keyword = words.next();
+        }
+        if !keyword.is_some_and(|word| word.eq_ignore_ascii_case("BRANCH")) {
+            return Err(Error::query_execution("USE BRANCH requires a branch name"));
+        }
+        let branch_name = words
+            .next()
+            .map(|word| word.trim_end_matches(';').to_string())
+            .unwrap_or_default();
 
         if branch_name.is_empty() {
             return Err(Error::query_execution("USE BRANCH requires a branch name"));
@@ -4324,6 +4339,34 @@ impl Default for Parser {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// sprinter 6bc4a4040eb7 (B1 fix pass): `USE [DATABASE] BRANCH <name>` is
+    /// recognised by WORDS. MySQL's `USE branchoffice` is a database, not
+    /// `USE BRANCH office`; `USE branches` and a bare `USE branch` are plain
+    /// `USE <db>` statements.
+    #[test]
+    fn use_branch_is_recognised_by_words() {
+        for sql in [
+            "USE BRANCH b",
+            "use branch b;",
+            "USE DATABASE BRANCH b",
+            "USE   BRANCH\tb",
+        ] {
+            assert!(Parser::is_use_branch(sql), "{sql:?}");
+            assert_eq!(Parser::parse_use_branch_sql(sql).unwrap(), "b", "{sql:?}");
+        }
+        let not_branch = [
+            "USE branchoffice",
+            "USE branches",
+            "USE branch",
+            "USE branch;",
+            "USE mydb",
+            "UPDATE t",
+        ];
+        for sql in not_branch {
+            assert!(!Parser::is_use_branch(sql), "{sql:?} must not be a branch statement");
+        }
+    }
 
     #[test]
     fn test_parse_select() {

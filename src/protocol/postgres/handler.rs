@@ -1550,11 +1550,71 @@ where
             // The fallback to the user name is kept (PostgreSQL has it too,
             // see above) because once the peer is authenticated it discloses
             // nothing: the name it is told about is one it just proved it owns.
+            // sprinter 6bc4a4040eb7 (phase B1): a branch can be selected at
+            // startup, two ways, and is bound on THIS session only.
+            //
+            // * `database=<db>@<branch>`. The WHOLE value is resolved first,
+            //   exactly as before (reserved name or tenant name) — if it
+            //   resolves it means what it always meant and selects no branch,
+            //   so a tenant whose own name contains `@` is untouched. Otherwise
+            //   it is split at the FIRST `@`: `<db>` must resolve as before and
+            //   `<branch>` must be an ACTIVE branch. HeliosProxy relays the
+            //   startup packet verbatim and keys its pools and result cache on
+            //   `database`, so a branch named here stays isolated through the
+            //   proxy with no proxy change.
+            // * `options=-c heliosdb.branch=<branch>` — PostgreSQL's standard
+            //   way to set a parameter at startup, validated like `USE BRANCH`.
+            //
+            // Either part failing, or the two forms naming different branches,
+            // is FATAL 3D000 before ReadyForQuery. The `database` form answers
+            // PostgreSQL's own `database "<value>" does not exist` and logs the
+            // reason, the way the tenant path does.
+            let options_branch = params
+                .get("options")
+                .and_then(|options| startup_options_branch(options));
+            let mut startup_branch: Option<String> = None;
             if let Some(requested) = requested_database {
-                if !self.database.database_name_is_valid(&requested) {
-                    return Err(StartupError::UndefinedDatabase(format!(
-                        "database \"{requested}\" does not exist"
-                    )));
+                let requested = if self.database.database_name_is_valid(&requested) {
+                    requested
+                } else {
+                    // EVERY `@` is a candidate split point (B1 fix pass): a
+                    // tenant whose own name contains `@` (`a@b`) must still be
+                    // able to select a branch (`a@b@dev`). A split is accepted
+                    // only when exactly ONE of them resolves — the database part
+                    // as before AND the branch part to an active branch; two
+                    // that both resolve are ambiguous and refused.
+                    let mut resolved = requested.match_indices('@').filter_map(|(at, _)| {
+                        let database = requested.get(..at)?;
+                        let branch = requested.get(at + 1..)?;
+                        (self.database.database_name_is_valid(database)
+                            && self.database.storage.active_branch_exists(branch))
+                        .then_some((database, branch))
+                    });
+                    let first = resolved.next();
+                    let ambiguous = resolved.next().is_some();
+                    let Some((database, branch)) = first.filter(|_| !ambiguous) else {
+                        tracing::debug!(
+                            database = ?requested,
+                            ambiguous,
+                            "refusing connection: the database names no tenant, and not exactly one \
+                             `<db>@<branch>` split resolves"
+                        );
+                        return Err(StartupError::UndefinedDatabase(format!(
+                            "database \"{requested}\" does not exist"
+                        )));
+                    };
+                    startup_branch = Some(branch.to_string());
+                    database.to_string()
+                };
+                if let (Some(from_database), Some(from_options)) =
+                    (startup_branch.as_deref(), options_branch.as_deref())
+                {
+                    if from_database != from_options {
+                        return Err(StartupError::UndefinedDatabase(format!(
+                            "branch \"{from_database}\" (from database) and branch \"{from_options}\" (from \
+                             options heliosdb.branch) disagree; name one branch"
+                        )));
+                    }
                 }
 
                 // sprinter d03de7fc3b22 — THE KEYSTONE, and the whole reason
@@ -1598,6 +1658,21 @@ where
                     tracing::warn!(database = %requested, error = %e, "refusing connection: tenant connection limit");
                     return Err(StartupError::TooManyConnections(format!(
                         "too many connections for database \"{requested}\""
+                    )));
+                }
+            }
+
+            // sprinter 6bc4a4040eb7 (B1): bind the startup branch, if any, on
+            // THIS session. The `database` form was resolved ACTIVE above; the
+            // `options` form is resolved here, by the same resolver `USE BRANCH`
+            // uses. A refusal (including a drop that raced the resolution) is
+            // FATAL 3D000, still before the ParameterStatus burst.
+            if let Some(branch) = startup_branch.or(options_branch) {
+                if let Err(e) = self.database.bind_session_startup_branch(self.session_id, &branch) {
+                    tracing::debug!(branch = ?branch, error = %e, "refusing connection: startup branch is not active");
+                    return Err(StartupError::UndefinedDatabase(format!(
+                        "branch \"{branch}\" {}; SHOW BRANCHES lists the branches you can use",
+                        crate::error::BRANCH_NOT_ACTIVE_MARKER
                     )));
                 }
             }
@@ -2504,6 +2579,23 @@ where
             && !starts_with_icase(trimmed, "SET TRANSACTION")
             && !starts_with_icase(trimmed, "SET SESSION CHARACTERISTICS")
         {
+            // sprinter 6bc4a4040eb7 (B1): `SET heliosdb.branch = 'x'` binds THIS
+            // connection to branch `x` — the same binding `USE BRANCH x` makes.
+            // The generic ack at the bottom of this chain would otherwise
+            // swallow it (acked, applied nowhere).
+            if EmbeddedDatabase::is_branch_binding_statement(trimmed) {
+                if let Err(e) = self
+                    .database
+                    .try_handle_session_branch_statement(self.session_id, trimmed)
+                {
+                    self.send_error("ERROR", sqlstate_for_error(&e), &e.to_string(), None, None)
+                        .await?;
+                    return Ok(());
+                }
+                self.send_command_complete("SET").await?;
+                self.send_ready_for_query().await?;
+                return Ok(());
+            }
             // R1.3-p2: session-scoped synchronous_commit (PG-compatible).
             match EmbeddedDatabase::parse_synchronous_commit_statement(trimmed) {
                 Ok(Some(value)) => {
@@ -2683,6 +2775,20 @@ where
             // Item 9: RESET helios.fast_autocommit -> default (off).
             let _ = self.database.set_session_fast_autocommit(self.session_id, false);
             self.send_parameter_status("helios.fast_autocommit", "off").await?; // item 10 GUC_REPORT
+            self.send_command_complete("RESET").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        } else if starts_with_icase(trimmed, "RESET ") && EmbeddedDatabase::is_branch_binding_statement(trimmed) {
+            // sprinter 6bc4a4040eb7 (B1): `RESET heliosdb.branch` returns THIS
+            // connection to main — never another connection.
+            if let Err(e) = self
+                .database
+                .try_handle_session_branch_statement(self.session_id, trimmed)
+            {
+                self.send_error("ERROR", sqlstate_for_error(&e), &e.to_string(), None, None)
+                    .await?;
+                return Ok(());
+            }
             self.send_command_complete("RESET").await?;
             self.send_ready_for_query().await?;
             return Ok(());
@@ -2951,6 +3057,14 @@ where
                     if crate::advisory_lock::manager().has_locks() {
                         crate::advisory_lock::manager().unlock_all(self.session_id);
                     }
+                    // sprinter 6bc4a4040eb7 (B1): back to the branch this
+                    // connection was opened on (main when none), so the next
+                    // client of a pooled connection never inherits the previous
+                    // client's `USE BRANCH`. Never fails, so the resets below
+                    // always run: a home branch dropped in the meantime is bound
+                    // anyway and the connection fails closed (3D000) until its
+                    // next client chooses a branch.
+                    self.database.reset_session_branch(self.session_id);
                     // Reset session GUCs to their defaults.
                     let _ = self.database.set_session_synchronous_commit(self.session_id, None);
                     let _ = self.database.set_session_fast_autocommit(self.session_id, false);
@@ -3690,8 +3804,21 @@ where
         // transaction is already open — an explicit `BEGIN`, or the implicit
         // block of a multi-statement simple query — the COPY keeps
         // participating in it and that owner decides the outcome.
+        //
+        // sprinter 6bc4a4040eb7 (B1 second fix pass): EXCEPT on a branch. A
+        // data statement inside a transaction on a branch is refused (0A000)
+        // until branch transactions exist (phase B2), so a COPY that opened
+        // its own transaction there failed on its first chunk, every time.
+        // On a branch the chunks therefore AUTOCOMMIT one by one: COPY on a
+        // branch is not atomic until B2 — a failure at chunk k leaves chunks
+        // 1..k-1 on the branch. Inside the session's own transaction on a
+        // branch the chunks are refused 0A000, as any other write there is.
         const BATCH: usize = 500;
-        let copy_owns_txn = !self.database.session_in_transaction(self.session_id);
+        let on_branch = self
+            .database
+            .session_branch(self.session_id)
+            .is_ok_and(|branch| branch != "main");
+        let copy_owns_txn = !on_branch && !self.database.session_in_transaction(self.session_id);
         if copy_owns_txn {
             self.database.begin_transaction_for_session(self.session_id)?;
         }
@@ -4516,6 +4643,9 @@ where
                 // extended path fell through to the params planner.
                 | "application_name"
                 | "role"
+                // sprinter 6bc4a4040eb7 (B1): THIS session's branch, on both
+                // protocols.
+                | "heliosdb.branch"
         ) {
             return Some(name);
         }
@@ -4588,6 +4718,13 @@ where
             // REFUSED (0A000, HC4). Identity switching is not implemented, and
             // reporting a switched role would be a security lie.
             "role" => "none".to_string(),
+            // sprinter 6bc4a4040eb7 (B1): the branch THIS connection is bound
+            // to (`USE BRANCH`, `SET heliosdb.branch`, or the startup packet),
+            // `main` when none — the same binding every statement reads.
+            "heliosdb.branch" => self
+                .database
+                .session_branch(self.session_id)
+                .unwrap_or_else(|_| "main".to_string()),
             // PQ hybrid TLS: the negotiated key-exchange group for THIS
             // connection (e.g. `X25519MLKEM768` vs classical `X25519`), or
             // empty on a plaintext connection.
@@ -5937,6 +6074,94 @@ pub(crate) async fn run_with_retry<T>(
     }
 }
 
+/// sprinter 6bc4a4040eb7 (phase B1): the branch a startup packet's `options`
+/// parameter selects — `-c heliosdb.branch=<b>`, `-cheliosdb.branch=<b>` or
+/// `--heliosdb.branch=<b>` — or `None` when it names none.
+///
+/// The value is split the way libpq / the postmaster split it
+/// (`pg_split_opts`): on unescaped whitespace, with `\` escaping the next
+/// character. Only `heliosdb.branch` is read here; every other option is left
+/// exactly as unapplied as it was before (this server has never honoured
+/// `options`). When the parameter is given more than once the LAST wins, as a
+/// repeated `-c` does in PostgreSQL.
+pub(crate) fn startup_options_branch(options: &str) -> Option<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_token = false;
+    let mut chars = options.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(escaped) = chars.next() {
+                current.push(escaped);
+                in_token = true;
+            }
+        } else if c.is_whitespace() {
+            if in_token {
+                tokens.push(std::mem::take(&mut current));
+                in_token = false;
+            }
+        } else {
+            current.push(c);
+            in_token = true;
+        }
+    }
+    if in_token {
+        tokens.push(current);
+    }
+
+    let mut found = None;
+    let mut iter = tokens.into_iter();
+    while let Some(token) = iter.next() {
+        let setting = if token == "-c" {
+            iter.next()
+        } else if let Some(rest) = token.strip_prefix("--") {
+            Some(rest.to_string())
+        } else {
+            token.strip_prefix("-c").map(str::to_string)
+        };
+        let Some(setting) = setting else {
+            continue;
+        };
+        if let Some((name, value)) = setting.split_once('=') {
+            if name.trim().eq_ignore_ascii_case(crate::BRANCH_GUC) {
+                found = Some(value.trim().trim_matches('\'').to_string());
+            }
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod b1_startup_options_tests {
+    use super::startup_options_branch;
+
+    /// sprinter 6bc4a4040eb7 (B1): the three spellings PostgreSQL accepts in
+    /// `options`, escapes, other options left alone, and last-wins.
+    #[test]
+    fn startup_options_branch_reads_every_spelling() {
+        assert_eq!(startup_options_branch("-c heliosdb.branch=b").as_deref(), Some("b"));
+        assert_eq!(startup_options_branch("-cheliosdb.branch=b").as_deref(), Some("b"));
+        assert_eq!(startup_options_branch("--heliosdb.branch=b").as_deref(), Some("b"));
+        assert_eq!(
+            startup_options_branch("-c search_path=app -c HELIOSDB.BRANCH=dev").as_deref(),
+            Some("dev"),
+            "the name is case-insensitive and other options are skipped"
+        );
+        assert_eq!(
+            startup_options_branch("-c heliosdb.branch=a -c heliosdb.branch=b").as_deref(),
+            Some("b"),
+            "a repeated -c wins last, as in PostgreSQL"
+        );
+        assert_eq!(
+            startup_options_branch(r"-c heliosdb.branch=my\ branch").as_deref(),
+            Some("my branch")
+        );
+        assert_eq!(startup_options_branch("-c statement_timeout=5s"), None);
+        assert_eq!(startup_options_branch(""), None);
+        assert_eq!(startup_options_branch("-c"), None, "a dangling -c names nothing");
+    }
+}
+
 /// Map an [`Error`] to the SQLSTATE the wire reports (D4 phase 1).
 ///
 /// Pattern-matches the engine's existing message shapes (same approach as
@@ -6285,6 +6510,33 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     // tenant, and a tenant id is free text.
     if lower.contains(crate::TENANT_QUOTA_EXCEEDED_MARKER) {
         return sqlstate::CONFIGURATION_LIMIT_EXCEEDED; // 53400
+    }
+    // sprinter 6bc4a4040eb7 (phase B1): a branch that cannot be bound (unknown,
+    // dropped or merged), and a session whose bound branch has since gone, are
+    // PostgreSQL's "that database does not exist" — 3D000 invalid_catalog_name,
+    // the code a connection to a missing database gets. `DROP BRANCH` of the
+    // session's own branch is PostgreSQL's `cannot drop the currently open
+    // database`, 55006 object_in_use. Anchored on the emitters' consts
+    // (`crate::error`) and checked before the wording arms: the messages name
+    // the branch, and a branch name is free text.
+    if message.contains(crate::error::BRANCH_NOT_ACTIVE_MARKER)
+        || message.contains(crate::error::BRANCH_BINDING_GONE_MARKER)
+    {
+        return sqlstate::INVALID_CATALOG_NAME; // 3D000
+    }
+    if message.contains(crate::error::BRANCH_IN_USE_MARKER)
+        || message.contains(crate::error::BRANCH_BUSY_MARKER)
+        || message.contains(crate::error::BRANCH_CLOSING_MARKER)
+    {
+        return sqlstate::OBJECT_IN_USE; // 55006
+    }
+    // B1 fix pass: a data statement in a transaction on a branch (0A000 until
+    // phase B2), and a branch switch inside a transaction (25001).
+    if message.contains(crate::error::BRANCH_TRANSACTION_UNSUPPORTED_MARKER) {
+        return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
+    }
+    if message.contains(crate::error::BRANCH_SWITCH_IN_TRANSACTION_MARKER) {
+        return sqlstate::ACTIVE_SQL_TRANSACTION; // 25001
     }
     // GH#28 (c2): `SET LOCAL idle_session_timeout` /
     // `idle_in_transaction_session_timeout` is refused rather than silently

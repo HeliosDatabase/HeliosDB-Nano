@@ -158,12 +158,12 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `SELECT * FROM heliosdb_archived_wal` / `heliosdb_archive_gaps` / `heliosdb_recovery_window` (archived WAL catalog, gaps, recovery window) | `heliosdb-nano-server` |
 | `SELECT pg_promote(wait boolean DEFAULT true, wait_seconds integer DEFAULT 60)` (spec P5.2; PostgreSQL's): ONLINE promotion of a RUNNING physical standby, on its PostgreSQL port — ends its sessions and waits for their statements (one outlasting `wait_seconds` aborts it, primary unfenced), then fences its primary through its replication session, epoch + 1, same history, reopened in-process as the primary; `t` once it serves (`f` when `wait_seconds` ran out, it goes on; `wait = false` → `t` at once); every session ended FATAL 57P01 (the caller after its answer); 55000 on a primary, on a standby not streaming, during a promotion, a replication port in use, plaintext where the pair replicates over TLS, through the embedded API; every abort says whether the old primary is fenced and names the next command; `[replication] promote_without_fence = "allow"\|"refuse"` (an UNREACHABLE primary only), `promote_fence_timeout` | `heliosdb-nano-server` |
 
-## MCP tools (`mcp-endpoint` feature, 16 tools)
+## MCP tools (`mcp-endpoint` feature, 17 tools)
 
 | Tool | Skill |
 |------|-------|
 | `heliosdb_query`, `_schema`, `_list_tables`, `_create_table`, `_insert` | `heliosdb-nano-mcp` |
-| `heliosdb_branch_{create,list,merge}` | `heliosdb-nano-mcp` (+ `heliosdb-nano-branches`) |
+| `heliosdb_branch_{create,list,merge,drop}` | `heliosdb-nano-mcp` (+ `heliosdb-nano-branches`) |
 | `heliosdb_search`, `_time_travel` | `heliosdb-nano-mcp` |
 | `heliosdb_bm25_index`, `_hybrid_search` | `heliosdb-nano-mcp` (+ `heliosdb-nano-vector`) |
 | `heliosdb_graph_{add_edge,traverse,path}` | `heliosdb-nano-mcp` (+ `heliosdb-nano-graph-rag`) |

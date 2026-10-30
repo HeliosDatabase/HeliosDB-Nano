@@ -446,11 +446,17 @@ pub async fn nl_execute(
         nl_response.sql.clone()
     };
 
-    // Execute query
-    let tuples = state.db.query(&sql, &[]).map_err(|e| {
-        error!("SQL execution failed: {}", e);
-        ApiError::from(e)
-    })?;
+    // Execute query — on the request's `branch` (default main) through a
+    // request-scoped binding (sprinter 6bc4a4040eb7, B1). The field used to be
+    // read and ignored: the generated SQL always ran on whatever branch the
+    // handle was on.
+    let tuples = state
+        .db
+        .with_request_branch_scope(branch, || state.db.query(&sql, &[]))
+        .map_err(|e| {
+            error!("SQL execution failed: {}", e);
+            ApiError::from(e)
+        })?;
 
     let sql_execution_time = sql_start.elapsed().as_millis() as u64;
 

@@ -154,5 +154,5 @@ pq_codebook_bits     = 8      # product-quantization codebook size
 ## See also
 - `heliosdb-nano-schema` — table definitions and index DDL.
 - `heliosdb-nano-graph-rag` — higher-level RAG pipeline that uses vectors as one of its inputs.
-- `heliosdb-nano-mcp` — the 16-tool catalog including `heliosdb_hybrid_search` and `heliosdb_embed_and_store`.
+- `heliosdb-nano-mcp` — the 17-tool catalog including `heliosdb_hybrid_search` and `heliosdb_embed_and_store`.
 - `scripts/demo_hnsw_vector_search.sh` — end-to-end demo.

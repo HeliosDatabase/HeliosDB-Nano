@@ -173,9 +173,11 @@ fn should_apply_columnar_predicates(predicates: &[AnalyzedPredicate]) -> bool {
 /// discards any scan that could have observed a commit newer than the
 /// snapshot (that commit's bump is then visible and exceeds the snapshot).
 /// Default-closed: an absent watermark, an MV target (`actual_table_name !=
-/// table_name`), AS OF, or own writes all fall back to the exact prior
-/// snapshot+merge path. On a non-main branch the map is empty (cleared on
-/// switch), so branch reads always take the snapshot path unchanged.
+/// table_name`), AS OF, own writes, or a session on a BRANCH all fall back to
+/// the exact prior snapshot+merge path. The branch term is explicit since
+/// sprinter 6bc4a4040eb7 (B1): it used to hold implicitly because the
+/// (engine-wide) branch switch cleared the watermark map, and with the branch
+/// per session there is no switch to clear it — the watermarks are main's.
 fn txn_base_tuples(
     storage: &crate::storage::StorageEngine,
     txn: &crate::storage::Transaction,
@@ -187,6 +189,7 @@ fn txn_base_tuples(
     let snapshot = txn.snapshot_id();
     if as_of_absent
         && actual_table_name == table_name
+        && !storage.is_branch_active()
         && !txn.has_writes_for_table(actual_table_name)
         && storage.table_unchanged_since(actual_table_name, snapshot)
     {
