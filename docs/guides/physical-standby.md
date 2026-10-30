@@ -993,6 +993,12 @@ statement, it is refused (SQLSTATE 55000). It is never cached.
   runs out first it answers `f` and the promotion goes on (PostgreSQL's
   semantics): poll `pg_is_in_recovery()` on a new connection.
 - `wait = false` answers `t` at once; the promotion runs in the background.
+- Known limitation (sprinter `ccebc95977f1`, not specific to promotion): a
+  statement that runs inside the engine for a long time holds its server
+  worker thread, and connections that thread had queued — including the one
+  carrying `pg_promote` — wait until the statement ends. On a standby with a
+  very long query running, promote it offline (`promote --data-dir DIR`) or
+  end the query first.
 - Refused with SQLSTATE 55000, nothing changed: on a primary ("this node is
   already the primary (epoch E)"); on a standby that is not `streaming` (or
   `reconnecting` within `max_standby_lag`) — `needs_recovery`, `recovering`,

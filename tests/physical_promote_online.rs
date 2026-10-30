@@ -866,6 +866,11 @@ async fn a_budget_too_short_answers_f_and_a_second_call_is_refused() {
         "{}",
         c.standby.tail(12)
     );
+    // The pause outlasted the budget, so the drain gets no second chance:
+    // the refused caller's session must be gone before the promotion goes
+    // on (the budget was `wait_seconds`, spent while it waited).
+    drop(second);
+    tokio::time::sleep(Duration::from_secs(1)).await;
     // Released: it completes.
     std::fs::remove_file(&pause).unwrap();
     wait_primary(c.pair.pg_s, Duration::from_secs(60), &c.standby).await;
@@ -1172,7 +1177,11 @@ async fn a_long_statement_holds_the_promotion_and_the_primary_stays_unfenced() {
             .map(|(_, answer)| answer)
     });
     // For 3 s: S is promoting, P is unfenced and takes writes.
-    let until = Instant::now() + Duration::from_secs(3);
+    wait_health(c.pair.http_s, Duration::from_secs(10), &c.standby, |block| {
+        block["state"] == "promoting"
+    })
+    .await;
+    let until = Instant::now() + Duration::from_secs(2);
     let mut id = 12;
     while Instant::now() < until {
         let s_block = health(c.pair.http_s).await["replication"].clone();

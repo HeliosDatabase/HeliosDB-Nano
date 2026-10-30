@@ -1159,8 +1159,23 @@ impl Evaluator {
                         "heliosdb_test_hold(): this statement holds while {} exists",
                         file.display()
                     );
-                    while file.exists() && std::time::Instant::now() < deadline {
-                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    let hold = move || {
+                        while file.exists() && std::time::Instant::now() < deadline {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                    };
+                    // The server runs a statement on its worker thread. Held
+                    // there, the thread would also strand every task queued
+                    // on it — new connections are not even accepted (the
+                    // latent stall of sprinter ccebc95977f1, which is not what
+                    // this hook tests). `block_in_place` hands the worker's
+                    // queue to another thread, so only THIS statement stays
+                    // inside the engine, as the promotion's wait requires.
+                    match tokio::runtime::Handle::try_current() {
+                        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                            tokio::task::block_in_place(hold);
+                        }
+                        _ => hold(),
                     }
                     tracing::warn!("heliosdb_test_hold(): released");
                 }

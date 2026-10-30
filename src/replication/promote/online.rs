@@ -101,6 +101,10 @@ use crate::standby_posture::{
 use crate::storage::StorageEngine;
 use crate::{Config, EmbeddedDatabase};
 
+/// How long past `wait_seconds` a waiting caller still hears an abort that
+/// coincides with its budget (the drain polls every [`HOLDER_POLL`]).
+const ANSWER_GRACE: Duration = Duration::from_millis(750);
+
 /// `pg_promote`'s default `wait_seconds` (PostgreSQL's).
 pub const DEFAULT_WAIT_SECONDS: u64 = 60;
 /// The largest `wait_seconds` (spec P5.2 §2).
@@ -264,7 +268,8 @@ impl Started {
         if !self.wait {
             return Ok(true);
         }
-        let deadline = Instant::now() + self.budget;
+        let mut deadline = Instant::now() + self.budget;
+        let mut graced = false;
         loop {
             let state = self.progress.borrow_and_update().clone();
             match state {
@@ -274,6 +279,13 @@ impl Started {
             }
             match tokio::time::timeout_at(deadline, self.progress.changed()).await {
                 Ok(Ok(())) => {}
+                // The promotion's own drain gives up at the same budget: an
+                // abort that lands a poll after it is still the answer, not
+                // an `f` that hides it. One short grace, once.
+                Err(_) if !graced => {
+                    graced = true;
+                    deadline = Instant::now() + ANSWER_GRACE;
+                }
                 // Out of time, or the promotion's task is gone (the process
                 // is exiting after its record): it has not answered.
                 Ok(Err(_)) | Err(_) => return Ok(false),
