@@ -190,7 +190,12 @@ if [ "$TLS" = 1 ]; then
     fi
     PRIMARY_TLS_ARGS=(--replication-tls --replication-tls-cert "$TLS_DIR/server.crt"
         --replication-tls-key "$TLS_DIR/server.key")
-    STANDBY_TLS_ARGS=(--primary-tls --primary-ca "$TLS_DIR/ca.crt")
+    # The standby also holds its own replication keys (same throwaway pair), so an
+    # online promotion (spec P5.2) can serve the promoted primary's port over TLS
+    # instead of being refused for a plaintext downgrade.
+    STANDBY_TLS_ARGS=(--primary-tls --primary-ca "$TLS_DIR/ca.crt"
+        --replication-tls --replication-tls-cert "$TLS_DIR/server.crt"
+        --replication-tls-key "$TLS_DIR/server.key")
 fi
 printf '[replication]\nmax_standby_lag = "%s"\n' "$MAX_LAG" >"$DIR/standby.toml"
 printf '[replication]\nsync_mode = "%s"\nmin_acks = %s\nsync_timeout_ms = %s\nsync_timeout_action = "%s"\n' \
