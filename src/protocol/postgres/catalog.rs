@@ -8,6 +8,17 @@
 use crate::{Column, DataType, EmbeddedDatabase, Result, Schema, Tuple, Value};
 use std::sync::Arc;
 
+/// Does `haystack` contain `needle` (ASCII, lowercase), ignoring ASCII case?
+fn contains_ascii_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// PostgreSQL catalog emulator
 pub struct PgCatalog {
     /// Reference to the database for real catalog queries
@@ -25,6 +36,29 @@ impl PgCatalog {
         Self {
             database: Some(database),
         }
+    }
+
+    /// Could [`Self::handle_query`] answer `query`, or fail on it? A cheap,
+    /// allocation-free over-approximation on the raw text — `false` means
+    /// `handle_query` returns `Ok(None)` — so a wire handler runs the
+    /// interceptor's catalog work off the async worker only when it may do
+    /// any (sprinter ccebc95977f1), and every other statement keeps its one
+    /// execution handoff.
+    ///
+    /// Sound by construction of `handle_query`: its statement-kind gate (F1:
+    /// `(`, `SELECT` or `WITH` first) refuses everything else, and every
+    /// interception after it needs a `pg_` name (the psql meta-command
+    /// signatures, `is_catalog_query`'s markers and the `pg_*` dispatch) or an
+    /// `information_schema.` reference. Keep it that way: a new interception
+    /// that needs neither must widen this check too.
+    pub fn may_intercept(query: &str) -> bool {
+        let text = query.trim_start();
+        let first_word_len = text.bytes().take_while(u8::is_ascii_alphabetic).count();
+        let first_word = text.get(..first_word_len).unwrap_or("");
+        let keyword = first_word.eq_ignore_ascii_case("select") || first_word.eq_ignore_ascii_case("with");
+        let select_like = text.starts_with('(') || keyword;
+        let pg_name = contains_ascii_ignore_case(text, "pg_");
+        select_like && (pg_name || contains_ascii_ignore_case(text, "information_schema"))
     }
 
     /// Handle catalog queries
@@ -2350,6 +2384,51 @@ impl Default for PgCatalog {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// sprinter ccebc95977f1: `may_intercept` over-approximates
+    /// `handle_query` — whenever it says no, the interceptor answers
+    /// `Ok(None)` — and it does say no to ordinary statements, which is what
+    /// keeps them at one handoff.
+    #[test]
+    fn may_intercept_is_a_sound_precheck_of_handle_query() {
+        let catalog = PgCatalog::new();
+        for q in &[
+            "SELECT 1",
+            "select * from orders where note = 'x'",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET note = 'see pg_tables'",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "SELECT * FROM pg_catalog.pg_type",
+            "  with x as (select 1) select * from pg_tables",
+            "(SELECT relname FROM pg_class)",
+            "SELECT * FROM information_schema.routines",
+            "SELECT * FROM information_schema.no_such_view",
+            "SELECT name, setting FROM pg_settings",
+            "SELECT 'pg_tables'",
+        ] {
+            if !PgCatalog::may_intercept(q) {
+                assert!(
+                    matches!(catalog.handle_query(q), Ok(None)),
+                    "may_intercept said no but handle_query would answer {q:?}"
+                );
+            }
+        }
+        for plain in [
+            "SELECT 1",
+            "select * from orders",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET v = 2",
+        ] {
+            assert!(!PgCatalog::may_intercept(plain), "{plain:?}");
+        }
+        for probe in [
+            "SELECT * FROM pg_catalog.pg_type",
+            "select * from PG_TABLES",
+            "(SELECT 1 FROM information_schema.tables)",
+        ] {
+            assert!(PgCatalog::may_intercept(probe), "{probe:?}");
+        }
+    }
 
     /// HDB-011: every `pg_type` shape defers to the planner. The router used
     /// to answer all of these from a 12-row fixed shape whose WHERE handling was

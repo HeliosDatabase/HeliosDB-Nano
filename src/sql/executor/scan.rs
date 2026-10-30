@@ -1014,7 +1014,10 @@ pub(super) fn guarded_range_pairs(
     Some(pairs)
 }
 
-pub(super) fn indexed_equality_lookup(
+/// `pub(crate)` for `EmbeddedDatabase::plan_is_bounded_point_read` (sprinter
+/// ccebc95977f1), which must resolve a point probe exactly as this executor
+/// does to know it stays one probe.
+pub(crate) fn indexed_equality_lookup(
     storage: &crate::storage::StorageEngine,
     table_name: &str,
     schema: &Schema,

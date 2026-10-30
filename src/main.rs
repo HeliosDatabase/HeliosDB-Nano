@@ -2162,6 +2162,12 @@ async fn start_server(
     use std::sync::Arc;
     use std::time::Instant;
 
+    // sprinter ccebc95977f1: from here on every statement runs off the async
+    // worker that serves it, so a long one cannot stall the listeners, the
+    // other sessions or the replication I/O. Set before any listener starts;
+    // `HELIOSDB_NANO_STATEMENT_OFFLOAD=off` keeps the old behaviour.
+    heliosdb_nano::runtime_offload::enable_for_server();
+
     validate_physical_source(
         &ha_config.physical,
         ha_config.token_file.as_deref(),

@@ -104,13 +104,15 @@ pub async fn create_branch(
     // Convert options
     let options = request.options.map(BranchOptions::from).unwrap_or_default();
 
-    // Create the branch
-    let branch_id = branch_manager
-        .create_branch(&request.name, request.parent.as_deref(), snapshot_id, options)
-        .map_err(|e| {
-            error!("Failed to create branch '{}': {}", request.name, e);
-            ApiError::from(e)
-        })?;
+    // Create the branch — off the async worker (sprinter ccebc95977f1,
+    // `runtime_offload`): it copies branch state synchronously.
+    let created = crate::runtime_offload::offload_statement(|| {
+        branch_manager.create_branch(&request.name, request.parent.as_deref(), snapshot_id, options)
+    });
+    let branch_id = created.map_err(|e| {
+        error!("Failed to create branch '{}': {}", request.name, e);
+        ApiError::from(e)
+    })?;
 
     info!("Branch '{}' created with ID: {}", request.name, branch_id);
 
@@ -198,8 +200,10 @@ pub async fn delete_branch(State(state): State<AppState>, Path(name): Path<Strin
         )
     })?;
 
-    // Drop the branch (if_exists = false for strict error handling)
-    branch_manager.drop_branch(&name, false).map_err(|e| {
+    // Drop the branch (if_exists = false for strict error handling), off the
+    // async worker (sprinter ccebc95977f1, `runtime_offload`).
+    let dropped = crate::runtime_offload::offload_statement(|| branch_manager.drop_branch(&name, false));
+    dropped.map_err(|e| {
         error!("Failed to delete branch '{}': {}", name, e);
         ApiError::from(e)
     })?;
@@ -249,13 +253,15 @@ pub async fn merge_branch(
         )
     })?;
 
-    // Perform the merge
-    let merge_result = branch_manager
-        .merge_branch(&source_name, &request.target, request.strategy.into())
-        .map_err(|e| {
-            error!("Failed to merge '{}' into '{}': {}", source_name, request.target, e);
-            ApiError::from(e)
-        })?;
+    // Perform the merge, off the async worker (sprinter ccebc95977f1,
+    // `runtime_offload`): it moves every changed row synchronously.
+    let merged = crate::runtime_offload::offload_statement(|| {
+        branch_manager.merge_branch(&source_name, &request.target, request.strategy.into())
+    });
+    let merge_result = merged.map_err(|e| {
+        error!("Failed to merge '{}' into '{}': {}", source_name, request.target, e);
+        ApiError::from(e)
+    })?;
 
     let message = if merge_result.completed {
         if merge_result.conflicts.is_empty() {

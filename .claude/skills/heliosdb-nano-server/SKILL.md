@@ -117,6 +117,22 @@ sync_timeout_action = "warn"      # warn | fail
 # prune_interval_secs = 60
 ```
 
+## Long statements do not stall the server
+
+Since 4.42.0 a statement that runs for a long time (a big `INSERT … SELECT`, a full
+scan, an aggregate) no longer stops the server from accepting connections, serving other
+sessions, answering `/health` or feeding its physical standbys. The server runs each
+executed statement with `tokio::task::block_in_place`, which hands its async worker to
+another thread for the statement's duration. Primary-key point reads (simple and
+prepared) and result-cache hits stay on the worker; every other executed statement pays
+one handoff, roughly 10 µs.
+
+`HELIOSDB_NANO_STATEMENT_OFFLOAD=off` (also `0`, `false`, `no`, `disabled`) turns the
+handoff off for throughput A/B runs on hosts whose workload has only short statements;
+the server logs a warning, and a long statement then blocks its worker and the I/O it
+was driving, as in 4.41. Embedded users are unaffected: the library never hands off
+unless the embedder calls `heliosdb_nano::runtime_offload::set_statement_offload(true)`.
+
 ## Recipes
 
 ### Recipe 1: Foreground server, trust auth (development)

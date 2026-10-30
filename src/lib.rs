@@ -258,6 +258,7 @@ pub mod protocols; // Protocol integration layer (adapters)
 pub mod query_trace;
 pub mod repl;
 pub mod runtime; // Per-request runtime helpers (bump arena, ...)
+pub mod runtime_offload; // A statement never stalls its server (sprinter ccebc95977f1)
 pub mod search;
 pub mod session; // Multi-user session management
 pub mod sql;
@@ -347,6 +348,10 @@ pub use types::{
     AgentMessage, AgentSession, Column, ColumnStorageMode, DataType, DocumentData, DocumentMetadata, Schema, Tuple,
     Value, VectorStoreInfo,
 };
+
+// sprinter ccebc95977f1: every per-statement entry point below runs its body
+// through this, so a statement leaves the async worker that serves it.
+use crate::runtime_offload::offload_statement;
 
 /// Wait for an operating-system shutdown signal, returning its conventional
 /// name (`"SIGINT"` / `"SIGTERM"`) so the caller can log which one arrived.
@@ -4254,6 +4259,8 @@ impl EmbeddedDatabase {
             // `internal-tests`: a statement held inside the engine (spec
             // P5.2 §8.K) runs every time it is asked.
             b"HELIOSDB_TEST_HOLD".as_slice(),
+            // sprinter ccebc95977f1: the `internal-tests` handoff counter.
+            b"HELIOSDB_TEST_OFFLOADS".as_slice(),
             // Spec P3.1: the archive views answer from the archiver's catalog
             // and pruner, which never move the storage generation either — a
             // cached `heliosdb_recovery_window` row kept reporting an archive
@@ -8103,6 +8110,18 @@ impl EmbeddedDatabase {
     }
 
     fn execute_in_transaction_inner(
+        &self,
+        sql: &str,
+        txn: &storage::Transaction,
+        skip_fast_paths: bool,
+    ) -> Result<u64> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.execute_in_transaction_inner_body(sql, txn, skip_fast_paths))
+    }
+
+    /// The body of [`Self::execute_in_transaction_inner`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn execute_in_transaction_inner_body(
         &self,
         sql: &str,
         txn: &storage::Transaction,
@@ -11987,6 +12006,13 @@ impl EmbeddedDatabase {
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.execute_body(sql))
+    }
+
+    /// The body of [`Self::execute`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn execute_body(&self, sql: &str) -> Result<u64> {
         // Spec P1.4: a physical standby serves reads only; see
         // `admit_on_physical_standby` (the same at every entry point below).
         let _standby = self.admit_on_physical_standby(sql)?;
@@ -12529,15 +12555,18 @@ impl EmbeddedDatabase {
         columns: &[String],
         rows: &[Vec<Option<String>>],
     ) -> Option<Result<u64>> {
-        let _identity_override = match self.session_statement_context_guard(session_id) {
-            Ok(guard) => guard,
-            Err(e) => return Some(Err(e)),
-        };
-        // sprinter 0d6695bf8a86: the one `*_for_session` entry point that does
-        // not charge a tenant query, and therefore the one that does not get the
-        // session marker from `charge_tenant_query_for_session`.
-        let _session_bound = SessionBoundStatementGuard::bind();
-        self.copy_bulk_insert(table_name, columns, rows)
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Option<Result<u64>> {
+            let _identity_override = match self.session_statement_context_guard(session_id) {
+                Ok(guard) => guard,
+                Err(e) => return Some(Err(e)),
+            };
+            // sprinter 0d6695bf8a86: the one `*_for_session` entry point that does
+            // not charge a tenant query, and therefore the one that does not get the
+            // session marker from `charge_tenant_query_for_session`.
+            let _session_bound = SessionBoundStatementGuard::bind();
+            self.copy_bulk_insert(table_name, columns, rows)
+        })
     }
 
     pub(crate) fn copy_bulk_insert(
@@ -18480,6 +18509,161 @@ impl EmbeddedDatabase {
         Ok(plan)
     }
 
+    /// The plan [`Self::parameterized_plan_cached`] would answer from its
+    /// cache, without planning on a miss (sprinter ccebc95977f1).
+    fn cached_parameterized_plan(&self, sql: &str) -> Option<std::sync::Arc<sql::LogicalPlan>> {
+        if self.current_schema_is_set() {
+            return None;
+        }
+        self.plan_cache.get(&format!("\0params\0{sql}"))
+    }
+
+    /// sprinter ccebc95977f1: the BOUNDED reads among `query_with_schema`'s
+    /// general path, answered on the async worker: SQL `EXECUTE name(args)` of
+    /// a prepared primary-key point SELECT (`try_fast_prepared_select_with_schema`),
+    /// and the A2 normalized read (`try_normalized_query_with_schema`) whose
+    /// plan is already cached and is one primary-key probe
+    /// (`plan_is_bounded_point_read`). Each is exactly what the general path
+    /// would run for that statement, under the same gates — no interceptor
+    /// ahead of it there answers a `SELECT` or an `EXECUTE` (`SET`/`SHOW`/
+    /// `RESET`, `PREPARE`/`DEALLOCATE`, the `VACUUM`-family utilities) — so
+    /// answering it here changes no result. `None` sends the statement to the
+    /// general path, off the worker.
+    fn try_bounded_point_read_with_schema(&self, sql: &str) -> Option<Result<(Vec<Tuple>, std::sync::Arc<Schema>)>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        if let Some(rest) = strip_prefix_icase(trimmed, "EXECUTE ") {
+            let (name, params) = Self::split_fast_execute(rest)?;
+            return self.try_fast_prepared_select_with_schema(&name, &params);
+        }
+        if !starts_with_icase(trimmed, "SELECT")
+            || self.current_schema_is_set()
+            || Self::query_is_non_deterministic(sql)
+            || !Self::query_normalization_enabled()
+            || self.in_transaction()
+            || self.has_effective_tenant_context()
+            || self.storage.get_current_branch_id().is_some()
+        {
+            return None;
+        }
+        let (nsql, params) = sql::normalize::normalize_select_literals(sql)?;
+        let plan = self.plan_cache.get(&nsql)?;
+        if !self.plan_is_bounded_point_read(&plan, &params) {
+            return None;
+        }
+        let mut executor = sql::Executor::with_storage(&self.storage)
+            .with_parameters(params)
+            .with_timeout(self.effective_statement_timeout_ms());
+        Some(executor.execute_with_schema(&plan))
+    }
+
+    /// sprinter ccebc95977f1: is executing `plan` with `params` BOUNDED work,
+    /// so that it may run on the async worker instead of off it
+    /// (`runtime_offload`)? Only ONE primary-key probe qualifies: `[Project of
+    /// plain columns over] FilteredScan | Filter(Scan)` of a base table whose
+    /// predicate is exactly `pk = <literal | parameter>` on the table's
+    /// single-column PRIMARY KEY — at most one row, re-checked by a plain
+    /// comparison, and no expression that can call a function.
+    ///
+    /// It mirrors the executor's own route for that shape
+    /// (`scan::try_index_point_lookup_for_scan`, through the same
+    /// `indexed_equality_lookup`) and every case in which that route falls
+    /// back to a scan: an open transaction, a tenant/RLS context, an active
+    /// branch, a view, a value with no index key, a NUMERIC probe, a miss it
+    /// cannot vouch for. Any doubt answers `false` — the statement is
+    /// offloaded, never the other way round. The one residual is a race: an
+    /// index entry another transaction removes between this check and the
+    /// probe turns a miss into that scan fallback, on the worker.
+    fn plan_is_bounded_point_read(&self, plan: &sql::LogicalPlan, params: &[Value]) -> bool {
+        if self.in_transaction() || self.has_effective_tenant_context() || self.storage.is_branch_active() {
+            return false;
+        }
+        let plan = match plan {
+            sql::LogicalPlan::Project {
+                input,
+                exprs,
+                distinct_on: None,
+                ..
+            } if exprs.iter().all(Self::is_plain_output_expr) => input.as_ref(),
+            other => other,
+        };
+        let (table_name, schema, predicate) = match plan {
+            sql::LogicalPlan::FilteredScan {
+                table_name,
+                schema,
+                predicate: Some(predicate),
+                as_of: None,
+                ..
+            } => (table_name, schema, predicate),
+            sql::LogicalPlan::Filter { input, predicate } => match input.as_ref() {
+                sql::LogicalPlan::Scan {
+                    table_name,
+                    schema,
+                    as_of: None,
+                    ..
+                } => (table_name, schema, predicate),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        let sql::LogicalExpr::BinaryExpr {
+            left,
+            op: sql::BinaryOperator::Eq,
+            right,
+        } = predicate
+        else {
+            return false;
+        };
+        let (column, value) = match (left.as_ref(), right.as_ref()) {
+            (sql::LogicalExpr::Column { name, .. }, value) => (name, value),
+            (value, sql::LogicalExpr::Column { name, .. }) => (name, value),
+            _ => return false,
+        };
+        if !Self::is_bound_value(value) {
+            return false;
+        }
+        // The table's single-column PRIMARY KEY, with no RLS on the table.
+        if !matches!(self.fast_select_spec(table_name, column), Some(Ok(_))) {
+            return false;
+        }
+        let kind = self.storage.cached_table_kind(table_name);
+        if !matches!(kind, Ok(storage::TableKind::Table)) {
+            return false;
+        }
+        let lookup = sql::executor::scan::indexed_equality_lookup(&self.storage, table_name, schema, predicate, params);
+        let Some((_index, value)) = lookup else {
+            return false;
+        };
+        let numeric_or_null = matches!(value, Value::Numeric(_) | Value::Null);
+        !numeric_or_null && !self.storage.has_uncommitted_index_removals_for_table(table_name)
+    }
+
+    /// A projected expression that evaluates no function (sprinter
+    /// ccebc95977f1, `plan_is_bounded_point_read`).
+    fn is_plain_output_expr(expr: &sql::LogicalExpr) -> bool {
+        matches!(
+            expr,
+            sql::LogicalExpr::Column { .. }
+                | sql::LogicalExpr::BoundColumn { .. }
+                | sql::LogicalExpr::Literal(_)
+                | sql::LogicalExpr::Wildcard
+                | sql::LogicalExpr::Parameter { .. }
+        )
+    }
+
+    /// The probed side of `pk = <value>`: a non-NULL literal or a parameter,
+    /// possibly cast (sprinter ccebc95977f1, `plan_is_bounded_point_read`).
+    fn is_bound_value(expr: &sql::LogicalExpr) -> bool {
+        match expr {
+            sql::LogicalExpr::Literal(value) => !matches!(value, Value::Null),
+            sql::LogicalExpr::Parameter { .. } => true,
+            sql::LogicalExpr::Cast { expr, .. } => matches!(
+                expr.as_ref(),
+                sql::LogicalExpr::Literal(_) | sql::LogicalExpr::Parameter { .. }
+            ),
+            _ => false,
+        }
+    }
+
     /// Plan-cache invalidation epoch — wire handlers pin `Arc<LogicalPlan>`s
     /// in prepared statements (R5.W2) and use this to detect that DDL
     /// cleared the plan cache since the plan was captured.
@@ -18569,20 +18753,23 @@ impl EmbeddedDatabase {
         params: &[Value],
         plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
     ) -> Result<u64> {
-        // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
-        let _standby = self.admit_on_physical_standby(sql)?;
-        // sprinter d03de7fc3b22: charge this CLIENT statement against the active
-        // tenant's `max_qps`. Every family's entry point charges — there is no
-        // funnel all of them pass through — and the returned guard makes every
-        // nested execution inside this one free, so a statement is counted
-        // exactly once. See `charge_tenant_query`.
-        let _qps = self.charge_tenant_query()?;
-        // HDB-008: the params family resolves the GLOBAL `current_transaction`
-        // slot deep inside `execute_plan_with_params_inner`'s DML arms, so the
-        // failed-transaction boundary is applied here, at the entry point,
-        // where parse and plan errors are still inside it. Free (one atomic
-        // load) whenever no text-`BEGIN` transaction is open.
-        self.run_global_statement(sql, || self.execute_params_inner_unguarded(sql, params, plan_override))
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<u64> {
+            // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
+            let _standby = self.admit_on_physical_standby(sql)?;
+            // sprinter d03de7fc3b22: charge this CLIENT statement against the active
+            // tenant's `max_qps`. Every family's entry point charges — there is no
+            // funnel all of them pass through — and the returned guard makes every
+            // nested execution inside this one free, so a statement is counted
+            // exactly once. See `charge_tenant_query`.
+            let _qps = self.charge_tenant_query()?;
+            // HDB-008: the params family resolves the GLOBAL `current_transaction`
+            // slot deep inside `execute_plan_with_params_inner`'s DML arms, so the
+            // failed-transaction boundary is applied here, at the entry point,
+            // where parse and plan errors are still inside it. Free (one atomic
+            // load) whenever no text-`BEGIN` transaction is open.
+            self.run_global_statement(sql, || self.execute_params_inner_unguarded(sql, params, plan_override))
+        })
     }
 
     /// The body of [`execute_params_inner`](Self::execute_params_inner),
@@ -18676,18 +18863,21 @@ impl EmbeddedDatabase {
     /// transaction when one exists. Other statements fall back to the exact
     /// per-row `execute_params` behavior.
     pub fn execute_many_params(&self, sql: &str, rows: &[Vec<Value>]) -> Result<u64> {
-        // Spec P1.4: reads only on a physical standby, ahead of the HDB-008
-        // boundary below (`admit_on_physical_standby`).
-        let _standby = self.admit_on_physical_standby(sql)?;
-        // HDB-008: the batch fast path (`try_fast_insert_many_params`) stages
-        // straight into the GLOBAL `current_transaction` slot, so this is a
-        // full in-transaction execution site and needs the failed-transaction
-        // boundary like every other one. Without it the reported bug survived
-        // verbatim on a public entry point (and on the Python binding, whose
-        // `execute_many` routes here): a duplicate key inside a batch left the
-        // transaction unmarked and the next `COMMIT` committed the partial
-        // work. One atomic load whenever no text-`BEGIN` transaction is open.
-        self.run_global_statement(sql, || self.execute_many_params_inner(sql, rows))
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<u64> {
+            // Spec P1.4: reads only on a physical standby, ahead of the HDB-008
+            // boundary below (`admit_on_physical_standby`).
+            let _standby = self.admit_on_physical_standby(sql)?;
+            // HDB-008: the batch fast path (`try_fast_insert_many_params`) stages
+            // straight into the GLOBAL `current_transaction` slot, so this is a
+            // full in-transaction execution site and needs the failed-transaction
+            // boundary like every other one. Without it the reported bug survived
+            // verbatim on a public entry point (and on the Python binding, whose
+            // `execute_many` routes here): a duplicate key inside a batch left the
+            // transaction unmarked and the next `COMMIT` committed the partial
+            // work. One atomic load whenever no text-`BEGIN` transaction is open.
+            self.run_global_statement(sql, || self.execute_many_params_inner(sql, rows))
+        })
     }
 
     /// The body of [`execute_many_params`](Self::execute_many_params), inside
@@ -18764,12 +18954,15 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn execute_params_returning(&self, sql: &str, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
-        // Spec P1.4: reads only on a physical standby, ahead of the HDB-008
-        // boundary below (`admit_on_physical_standby`).
-        let _standby = self.admit_on_physical_standby(sql)?;
-        // HDB-008: the params-family `RETURNING` entry point, inside the
-        // failed-transaction boundary (see `execute_params_inner`).
-        self.run_global_statement(sql, || self.execute_params_returning_inner(sql, params))
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<(u64, Vec<Tuple>)> {
+            // Spec P1.4: reads only on a physical standby, ahead of the HDB-008
+            // boundary below (`admit_on_physical_standby`).
+            let _standby = self.admit_on_physical_standby(sql)?;
+            // HDB-008: the params-family `RETURNING` entry point, inside the
+            // failed-transaction boundary (see `execute_params_inner`).
+            self.run_global_statement(sql, || self.execute_params_returning_inner(sql, params))
+        })
     }
 
     /// The body of
@@ -20885,6 +21078,13 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.query_body(sql, _params))
+    }
+
+    /// The body of [`Self::query`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn query_body(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
         // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`):
         // `query` serves DML with RETURNING and `nextval` too.
         let _standby = self.admit_on_physical_standby(sql)?;
@@ -21626,7 +21826,24 @@ impl EmbeddedDatabase {
         if let Some(result) = self.try_fast_select_with_schema(sql) {
             return result;
         }
+        // sprinter ccebc95977f1: a BOUNDED read — one primary-key probe, no user
+        // code — is answered here, on the async worker; everything else below
+        // (the interceptors, planning, the executor) runs off it, in one handoff
+        // (`runtime_offload`). The guards above stay installed: the offloaded
+        // closure runs on this same thread.
+        if let Some(result) = self.try_bounded_point_read_with_schema(sql) {
+            return result;
+        }
+        offload_statement(|| self.query_with_schema_general(sql, cache_epoch))
+    }
 
+    /// The general path of [`Self::query_with_schema`], run off the async
+    /// worker (sprinter ccebc95977f1).
+    fn query_with_schema_general(
+        &self,
+        sql: &str,
+        cache_epoch: ResultCacheEpoch,
+    ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
         if let Some(result) = self.try_handle_db_setting_statement_with_schema(sql)? {
             return Ok(result);
         }
@@ -22118,6 +22335,13 @@ impl EmbeddedDatabase {
     ///
     /// * `session_id` - ID of the session to destroy
     pub fn destroy_session(&self, session_id: crate::session::SessionId) -> Result<()> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.destroy_session_body(session_id))
+    }
+
+    /// The body of [`Self::destroy_session`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn destroy_session_body(&self, session_id: crate::session::SessionId) -> Result<()> {
         // A dropped connection must not leak its open transaction (write-set
         // buffers, row locks) or its eager ART index mutations. Taking the
         // slot's write lock waits out any statement still borrowing the
@@ -22406,27 +22630,30 @@ impl EmbeddedDatabase {
     }
 
     pub fn commit_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
-        let result = self.commit_transaction_for_session_inner(session_id);
-        // sprinter f4f5d450e816: a `SET LOCAL application_name` reverts at the
-        // END of the transaction block — on COMMIT and ROLLBACK alike, and
-        // whether or not the commit succeeded (a failed COMMIT still ends the
-        // block). Hooked on the OUTER wrapper, which is also what the MySQL
-        // listener calls directly rather than through
-        // `handle_transaction_control_for_session`.
-        self.end_session_transaction_scoped_state(session_id);
-        // Spec 03: `pg_advisory_xact_lock` locks end with the transaction, and
-        // the transaction is over on EVERY exit below — a clean commit, a
-        // deferred-FK failure, a serialization failure (all of which abort it).
-        // Released after the inner call so a concurrent waiter cannot observe
-        // the key free while this commit is still writing. Gated on one atomic
-        // load: COMMIT is a hot path (162k wire txns/s on the pg35 rig)
-        // and must not take a process-global mutex when nothing holds a
-        // transaction-scope advisory lock — which is every workload but a
-        // migration.
-        if advisory_lock::manager().has_transaction_locks() {
-            advisory_lock::manager().release_transaction(session_id);
-        }
-        result
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<()> {
+            let result = self.commit_transaction_for_session_inner(session_id);
+            // sprinter f4f5d450e816: a `SET LOCAL application_name` reverts at the
+            // END of the transaction block — on COMMIT and ROLLBACK alike, and
+            // whether or not the commit succeeded (a failed COMMIT still ends the
+            // block). Hooked on the OUTER wrapper, which is also what the MySQL
+            // listener calls directly rather than through
+            // `handle_transaction_control_for_session`.
+            self.end_session_transaction_scoped_state(session_id);
+            // Spec 03: `pg_advisory_xact_lock` locks end with the transaction, and
+            // the transaction is over on EVERY exit below — a clean commit, a
+            // deferred-FK failure, a serialization failure (all of which abort it).
+            // Released after the inner call so a concurrent waiter cannot observe
+            // the key free while this commit is still writing. Gated on one atomic
+            // load: COMMIT is a hot path (162k wire txns/s on the pg35 rig)
+            // and must not take a process-global mutex when nothing holds a
+            // transaction-scope advisory lock — which is every workload but a
+            // migration.
+            if advisory_lock::manager().has_transaction_locks() {
+                advisory_lock::manager().release_transaction(session_id);
+            }
+            result
+        })
     }
 
     fn commit_transaction_for_session_inner(&self, session_id: crate::session::SessionId) -> Result<()> {
@@ -22557,16 +22784,19 @@ impl EmbeddedDatabase {
     ///
     /// Returns an error if the session has no active transaction.
     pub fn rollback_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
-        let result = self.rollback_transaction_for_session_inner(session_id);
-        // sprinter f4f5d450e816: see `commit_transaction_for_session`.
-        self.end_session_transaction_scoped_state(session_id);
-        // Spec 03: `pg_advisory_xact_lock` locks end with the transaction —
-        // ROLLBACK releases them exactly as COMMIT does. Same lock-free gate as
-        // the commit path.
-        if advisory_lock::manager().has_transaction_locks() {
-            advisory_lock::manager().release_transaction(session_id);
-        }
-        result
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<()> {
+            let result = self.rollback_transaction_for_session_inner(session_id);
+            // sprinter f4f5d450e816: see `commit_transaction_for_session`.
+            self.end_session_transaction_scoped_state(session_id);
+            // Spec 03: `pg_advisory_xact_lock` locks end with the transaction —
+            // ROLLBACK releases them exactly as COMMIT does. Same lock-free gate as
+            // the commit path.
+            if advisory_lock::manager().has_transaction_locks() {
+                advisory_lock::manager().release_transaction(session_id);
+            }
+            result
+        })
     }
 
     fn rollback_transaction_for_session_inner(&self, session_id: crate::session::SessionId) -> Result<()> {
@@ -22631,6 +22861,13 @@ impl EmbeddedDatabase {
     ///
     /// Number of rows affected by the statement
     pub fn execute_in_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.execute_in_session_body(session_id, sql))
+    }
+
+    /// The body of [`Self::execute_in_session`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn execute_in_session_body(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
         // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
         let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
@@ -22794,6 +23031,18 @@ impl EmbeddedDatabase {
     ///
     /// Vector of tuples matching the query
     pub fn query_in_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        _params: &[&dyn std::fmt::Display],
+    ) -> Result<Vec<Tuple>> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.query_in_session_body(session_id, sql, _params))
+    }
+
+    /// The body of [`Self::query_in_session`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn query_in_session_body(
         &self,
         session_id: crate::session::SessionId,
         sql: &str,
@@ -23776,6 +24025,13 @@ impl EmbeddedDatabase {
 
     /// Execute a statement on behalf of a wire-protocol session.
     pub fn execute_for_session(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.execute_for_session_body(session_id, sql))
+    }
+
+    /// The body of [`Self::execute_for_session`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn execute_for_session_body(&self, session_id: crate::session::SessionId, sql: &str) -> Result<u64> {
         // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
         let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
@@ -23936,7 +24192,19 @@ impl EmbeddedDatabase {
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_with_schema(sql);
         }
+        // sprinter ccebc95977f1: inside a session transaction a read takes the
+        // general path (planning + the executor), off the async worker in one
+        // handoff (`runtime_offload`); the guards above stay on this thread.
+        offload_statement(|| self.query_with_schema_in_session_txn(session_id, sql))
+    }
 
+    /// The in-transaction half of [`Self::query_with_schema_for_session`], run
+    /// off the async worker (sprinter ccebc95977f1).
+    fn query_with_schema_in_session_txn(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
         // Same funnel as the autocommit delegate above: a utility statement
         // routed through the result-set surface inside a session transaction
         // would otherwise reach the sqlparser-first planner and fail.
@@ -23985,6 +24253,17 @@ impl EmbeddedDatabase {
 
     /// `execute_returning` for a wire session (simple-query DML … RETURNING).
     pub fn execute_returning_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+    ) -> Result<(u64, Vec<Tuple>)> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.execute_returning_for_session_body(session_id, sql))
+    }
+
+    /// The body of [`Self::execute_returning_for_session`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn execute_returning_for_session_body(
         &self,
         session_id: crate::session::SessionId,
         sql: &str,
@@ -24111,6 +24390,18 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(u64, Vec<Tuple>)> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.execute_params_returning_for_session_body(session_id, sql, params))
+    }
+
+    /// The body of [`Self::execute_params_returning_for_session`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn execute_params_returning_for_session_body(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(u64, Vec<Tuple>)> {
         // Spec P1.4: reads only on a physical standby (`admit_on_physical_standby`).
         let _standby = self.admit_on_physical_standby(sql)?;
         // sprinter d03de7fc3b22: charge this CLIENT statement against the active
@@ -24224,6 +24515,19 @@ impl EmbeddedDatabase {
     }
 
     fn execute_params_for_session_inner(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+    ) -> Result<u64> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.execute_params_for_session_inner_body(session_id, sql, params, plan_override))
+    }
+
+    /// The body of [`Self::execute_params_for_session_inner`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn execute_params_for_session_inner_body(
         &self,
         session_id: crate::session::SessionId,
         sql: &str,
@@ -24383,7 +24687,19 @@ impl EmbeddedDatabase {
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_params_inner(sql, params, plan_override);
         }
+        // sprinter ccebc95977f1: see `query_with_schema_for_session`.
+        offload_statement(|| self.query_params_in_session_txn(session_id, sql, params, plan_override))
+    }
 
+    /// The in-transaction half of [`Self::query_params_for_session_inner`],
+    /// run off the async worker (sprinter ccebc95977f1).
+    fn query_params_in_session_txn(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+        plan_override: Option<&std::sync::Arc<sql::LogicalPlan>>,
+    ) -> Result<Vec<Tuple>> {
         let slot = self
             .session_txn_slot(session_id)
             .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
@@ -24438,6 +24754,18 @@ impl EmbeddedDatabase {
     /// [`query_params_with_columns_for_session`](Self::query_params_with_columns_for_session)
     /// returning the result SCHEMA (GH#23).
     pub(crate) fn query_params_with_schema_for_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.query_params_with_schema_for_session_body(session_id, sql, params))
+    }
+
+    /// The body of [`Self::query_params_with_schema_for_session`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn query_params_with_schema_for_session_body(
         &self,
         session_id: crate::session::SessionId,
         sql: &str,
@@ -24748,16 +25076,44 @@ impl EmbeddedDatabase {
         // tree for the RLS rewrite — which the no-context path never performs.
         // R1.2 moved that lazy clone into `rls_filtered_plan`, so it now happens
         // once, inside the shared read choke point, on the RLS branch only.
-        let plan_arc: std::sync::Arc<sql::LogicalPlan> = match plan_override {
-            Some(p) => std::sync::Arc::clone(p),
-            None => self.parameterized_plan_cached(sql)?,
+        //
+        // sprinter ccebc95977f1: a plan already in hand — pinned by the extended
+        // protocol, or in the plan cache — that is ONE primary-key probe
+        // (`plan_is_bounded_point_read`) runs here, on the async worker; planning
+        // and every other plan run off it (`runtime_offload`), in one handoff.
+        let ready_plan = match plan_override {
+            Some(p) => Some(std::sync::Arc::clone(p)),
+            None => self.cached_parameterized_plan(sql),
         };
-        tracing::debug!(
-            phase = "plan",
-            duration_us = plan_start.elapsed().as_micros() as u64,
-            "Parameterized logical plan ready"
-        );
+        match ready_plan {
+            Some(plan_arc) if self.plan_is_bounded_point_read(&plan_arc, params) => {
+                self.query_params_execute(sql, params, plan_arc, start)
+            }
+            ready_plan => offload_statement(|| -> Result<Vec<Tuple>> {
+                let plan_arc = match ready_plan {
+                    Some(plan_arc) => plan_arc,
+                    None => self.parameterized_plan_cached(sql)?,
+                };
+                tracing::debug!(
+                    phase = "plan",
+                    duration_us = plan_start.elapsed().as_micros() as u64,
+                    "Parameterized logical plan ready"
+                );
+                self.query_params_execute(sql, params, plan_arc, start)
+            }),
+        }
+    }
 
+    /// Execute the plan of [`Self::query_params_inner_unguarded`]: on the
+    /// async worker for a bounded point read, off it otherwise (sprinter
+    /// ccebc95977f1).
+    fn query_params_execute(
+        &self,
+        sql: &str,
+        params: &[Value],
+        plan_arc: std::sync::Arc<sql::LogicalPlan>,
+        start: std::time::Instant,
+    ) -> Result<Vec<Tuple>> {
         // R1.2: the RLS rewrite this used to do here moved into
         // `query_plan_with_params` (the shared read choke point), so the plan
         // travels as the cached `Arc` all the way down. This is a pure
@@ -24930,14 +25286,17 @@ impl EmbeddedDatabase {
         sql: &str,
         params: &[Value],
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
-        // Spec P1.4: reads only on a physical standby, ahead of the HDB-008
-        // boundary below (`admit_on_physical_standby`).
-        let _standby = self.admit_on_physical_standby(sql)?;
-        // HDB-008: column-aware params read, inside the failed-transaction
-        // boundary (see `execute_params_inner`). Its tail attaches the global
-        // `current_transaction` to the executor, so it really does run inside
-        // an open text `BEGIN`.
-        self.run_global_statement(sql, || self.query_params_with_schema_inner(sql, params))
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
+            // Spec P1.4: reads only on a physical standby, ahead of the HDB-008
+            // boundary below (`admit_on_physical_standby`).
+            let _standby = self.admit_on_physical_standby(sql)?;
+            // HDB-008: column-aware params read, inside the failed-transaction
+            // boundary (see `execute_params_inner`). Its tail attaches the global
+            // `current_transaction` to the executor, so it really does run inside
+            // an open text `BEGIN`.
+            self.run_global_statement(sql, || self.query_params_with_schema_inner(sql, params))
+        })
     }
 
     /// The body of
@@ -25523,6 +25882,19 @@ impl EmbeddedDatabase {
         metric: &str,
         index_type: &str,
     ) -> Result<VectorStoreInfo> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.create_vector_store_with_options_body(name, dimensions, metric, index_type))
+    }
+
+    /// The body of [`Self::create_vector_store_with_options`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn create_vector_store_with_options_body(
+        &self,
+        name: &str,
+        dimensions: u32,
+        metric: &str,
+        index_type: &str,
+    ) -> Result<VectorStoreInfo> {
         // Spec P1.4: a standard HNSW store is memory-only, so the write gate
         // never sees this; a standby's vector state follows its primary (P1.2).
         self.refuse_write_on_physical_standby("create_vector_store")?;
@@ -25622,10 +25994,13 @@ impl EmbeddedDatabase {
 
     /// Delete a vector store
     pub fn delete_vector_store(&self, name: &str) -> Result<()> {
-        // Spec P1.4: see `create_vector_store_with_options`.
-        self.refuse_write_on_physical_standby("delete_vector_store")?;
-        let vector_mgr = self.storage.vector_indexes();
-        vector_mgr.drop_index(name)
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<()> {
+            // Spec P1.4: see `create_vector_store_with_options`.
+            self.refuse_write_on_physical_standby("delete_vector_store")?;
+            let vector_mgr = self.storage.vector_indexes();
+            vector_mgr.drop_index(name)
+        })
     }
 
     /// Insert vectors into a store
@@ -25636,6 +26011,20 @@ impl EmbeddedDatabase {
     }
 
     pub fn insert_vectors_with_options(
+        &self,
+        store: &str,
+        ids: Option<Vec<String>>,
+        vectors: Vec<Vec<f32>>,
+        metadata: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
+        namespace: Option<String>,
+    ) -> Result<Vec<String>> {
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| self.insert_vectors_with_options_body(store, ids, vectors, metadata, namespace))
+    }
+
+    /// The body of [`Self::insert_vectors_with_options`], which runs it through
+    /// `offload_statement` (sprinter ccebc95977f1).
+    fn insert_vectors_with_options_body(
         &self,
         store: &str,
         ids: Option<Vec<String>>,
@@ -25684,13 +26073,16 @@ impl EmbeddedDatabase {
 
     /// Upsert vectors (insert or update)
     pub fn upsert_vectors(&self, store: &str, vectors: Vec<(String, Vec<f32>)>) -> Result<()> {
-        // Spec P1.4: refused up front — the delete below ignores its error.
-        self.refuse_write_on_physical_standby("upsert_vectors")?;
-        let ids: Vec<String> = vectors.iter().map(|(id, _)| id.clone()).collect();
-        let values: Vec<Vec<f32>> = vectors.into_iter().map(|(_, vector)| vector).collect();
-        let _ = self.delete_vectors(store, ids.clone());
-        self.insert_vectors_with_options(store, Some(ids), values, None, None)?;
-        Ok(())
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<()> {
+            // Spec P1.4: refused up front — the delete below ignores its error.
+            self.refuse_write_on_physical_standby("upsert_vectors")?;
+            let ids: Vec<String> = vectors.iter().map(|(id, _)| id.clone()).collect();
+            let values: Vec<Vec<f32>> = vectors.into_iter().map(|(_, vector)| vector).collect();
+            let _ = self.delete_vectors(store, ids.clone());
+            self.insert_vectors_with_options(store, Some(ids), values, None, None)?;
+            Ok(())
+        })
     }
 
     pub fn upsert_vectors_with_options(
@@ -25701,11 +26093,14 @@ impl EmbeddedDatabase {
         metadata: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
         namespace: Option<String>,
     ) -> Result<()> {
-        // Spec P1.4: refused up front — the delete below ignores its error.
-        self.refuse_write_on_physical_standby("upsert_vectors")?;
-        let _ = self.delete_vectors(store, ids.clone());
-        self.insert_vectors_with_options(store, Some(ids), vectors, metadata, namespace)?;
-        Ok(())
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<()> {
+            // Spec P1.4: refused up front — the delete below ignores its error.
+            self.refuse_write_on_physical_standby("upsert_vectors")?;
+            let _ = self.delete_vectors(store, ids.clone());
+            self.insert_vectors_with_options(store, Some(ids), vectors, metadata, namespace)?;
+            Ok(())
+        })
     }
 
     fn upsert_vectors_legacy(&self, store: &str, vectors: Vec<(String, Vec<f32>)>) -> Result<()> {
@@ -25737,15 +26132,18 @@ impl EmbeddedDatabase {
     ///
     /// Returns (vector_id, distance) pairs sorted by similarity
     pub fn search_vectors(&self, store: &str, query: Vec<f32>, k: usize) -> Result<Vec<(String, f32)>> {
-        let vector_mgr = self.storage.vector_indexes();
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<Vec<(String, f32)>> {
+            let vector_mgr = self.storage.vector_indexes();
 
-        // Verify store exists
-        let _ = vector_mgr.get_metadata(store)?;
+            // Verify store exists
+            let _ = vector_mgr.get_metadata(store)?;
 
-        let results = vector_mgr.search_with_filters(store, &query, k, None, None)?;
+            let results = vector_mgr.search_with_filters(store, &query, k, None, None)?;
 
-        // Convert row_ids to string IDs
-        Ok(results.into_iter().map(|result| (result.id, result.score)).collect())
+            // Convert row_ids to string IDs
+            Ok(results.into_iter().map(|result| (result.id, result.score)).collect())
+        })
     }
 
     pub fn search_vectors_with_options(
@@ -25756,9 +26154,12 @@ impl EmbeddedDatabase {
         filter: Option<&std::collections::HashMap<String, serde_json::Value>>,
         namespace: Option<&str>,
     ) -> Result<Vec<storage::StoredVectorSearchResult>> {
-        let vector_mgr = self.storage.vector_indexes();
-        let _ = vector_mgr.get_metadata(store)?;
-        vector_mgr.search_with_filters(store, &query, k, filter, namespace)
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<Vec<storage::StoredVectorSearchResult>> {
+            let vector_mgr = self.storage.vector_indexes();
+            let _ = vector_mgr.get_metadata(store)?;
+            vector_mgr.search_with_filters(store, &query, k, filter, namespace)
+        })
     }
 
     /// Text search (requires text embedding - stub for now)
@@ -25789,14 +26190,17 @@ impl EmbeddedDatabase {
 
     /// Delete vectors by ID, optionally scoped to namespace. Returns actual deleted count.
     pub fn delete_vectors_in_namespace(&self, store: &str, ids: Vec<String>, namespace: Option<&str>) -> Result<usize> {
-        // Spec P1.4: see `create_vector_store_with_options`.
-        self.refuse_write_on_physical_standby("delete_vectors")?;
-        let vector_mgr = self.storage.vector_indexes();
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<usize> {
+            // Spec P1.4: see `create_vector_store_with_options`.
+            self.refuse_write_on_physical_standby("delete_vectors")?;
+            let vector_mgr = self.storage.vector_indexes();
 
-        // Verify store exists
-        let _ = vector_mgr.get_metadata(store)?;
+            // Verify store exists
+            let _ = vector_mgr.get_metadata(store)?;
 
-        vector_mgr.delete_records_in_namespace(store, &ids, namespace)
+            vector_mgr.delete_records_in_namespace(store, &ids, namespace)
+        })
     }
 
     /// Fetch vectors by API id.
@@ -25815,9 +26219,12 @@ impl EmbeddedDatabase {
         ids: Vec<String>,
         namespace: Option<&str>,
     ) -> Result<Vec<storage::StoredVectorRecord>> {
-        let vector_mgr = self.storage.vector_indexes();
-        let _ = vector_mgr.get_metadata(store)?;
-        vector_mgr.fetch_records_in_namespace(store, &ids, namespace)
+        // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
+        offload_statement(|| -> Result<Vec<storage::StoredVectorRecord>> {
+            let vector_mgr = self.storage.vector_indexes();
+            let _ = vector_mgr.get_metadata(store)?;
+            vector_mgr.fetch_records_in_namespace(store, &ids, namespace)
+        })
     }
 
     // Agent session operations
@@ -29086,8 +29493,13 @@ impl Transaction<'_> {
         // failed-transaction boundary, so a planning error aborts this
         // transaction exactly as an executor error does — and a query issued
         // after an earlier failure is refused with 25P02.
-        self.db
-            .run_statement_in_transaction(&self.tx, sql, || self.query_inner(sql))
+        //
+        // sprinter ccebc95977f1: off the async worker, like every other entry
+        // point (this one reaches no `EmbeddedDatabase` entry point).
+        offload_statement(|| {
+            self.db
+                .run_statement_in_transaction(&self.tx, sql, || self.query_inner(sql))
+        })
     }
 
     /// The body of [`query`](Self::query), inside the HDB-008 boundary.

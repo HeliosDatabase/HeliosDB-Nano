@@ -79,7 +79,9 @@
 //! `tokio::task::block_in_place` whenever it runs on a multi-thread runtime,
 //! which releases the worker to the scheduler for the duration of the wait.
 //! Outside a runtime (embedded callers) and on a current-thread runtime the
-//! wait runs inline.
+//! wait runs inline. On the server the whole statement already runs that way
+//! (`runtime_offload::offload_statement`, sprinter ccebc95977f1), and the
+//! wait's own call is then a nested no-op; it stays for every other caller.
 //!
 //! What the CALLER holds while it waits matters as much. Every wire path is
 //! clear: an autocommit statement reaches `query_with_columns` /
@@ -900,14 +902,10 @@ fn key_from_args(function: &str, database: u64, args: &[Value]) -> Result<Adviso
 /// `block_in_place` tells the multi-thread scheduler to move this worker's
 /// remaining tasks elsewhere first. It is only legal on the multi-thread
 /// flavour, so a current-thread runtime (and the embedded, runtime-less caller)
-/// waits inline.
+/// waits inline. Always on, whatever the per-statement switch says: the one
+/// helper is `runtime_offload::off_worker` (sprinter ccebc95977f1).
 fn run_blocking<T>(f: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if matches!(handle.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
+    crate::runtime_offload::off_worker(f)
 }
 
 /// Evaluate one `pg_advisory_*` call. `function` is the lowercased, unqualified

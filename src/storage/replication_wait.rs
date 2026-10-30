@@ -70,15 +70,11 @@ pub(crate) fn wait(barrier: Option<u64>) {
 /// Run `f`, which may block for the sync timeout, without starving the async
 /// runtime: on a multi-threaded runtime's worker the worker's other tasks —
 /// among them the replication sessions whose acknowledgements `f` waits for —
-/// move to another thread first.
+/// move to another thread first. Always on, whatever the per-statement
+/// switch says (`runtime_offload::off_worker`, sprinter ccebc95977f1).
 #[cfg(feature = "ha-tier1")]
 fn blocking<T>(f: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if matches!(handle.runtime_flavor(), tokio::runtime::RuntimeFlavor::MultiThread) => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
+    crate::runtime_offload::off_worker(f)
 }
 
 #[cfg(feature = "ha-tier1")]

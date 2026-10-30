@@ -1159,27 +1159,32 @@ impl Evaluator {
                         "heliosdb_test_hold(): this statement holds while {} exists",
                         file.display()
                     );
-                    let hold = move || {
-                        while file.exists() && std::time::Instant::now() < deadline {
-                            std::thread::sleep(std::time::Duration::from_millis(20));
-                        }
-                    };
-                    // The server runs a statement on its worker thread. Held
-                    // there, the thread would also strand every task queued
-                    // on it — new connections are not even accepted (the
-                    // latent stall of sprinter ccebc95977f1, which is not what
-                    // this hook tests). `block_in_place` hands the worker's
-                    // queue to another thread, so only THIS statement stays
-                    // inside the engine, as the promotion's wait requires.
-                    match tokio::runtime::Handle::try_current() {
-                        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                            tokio::task::block_in_place(hold);
-                        }
-                        _ => hold(),
+                    // Held INLINE, exactly like any long statement (sprinter
+                    // ccebc95977f1): the statement's entry point already runs
+                    // it off the async worker (`runtime_offload`), so the
+                    // server keeps accepting connections and serving other
+                    // sessions and replication while it holds. This hook used
+                    // to hand the worker over itself (`block_in_place`); that
+                    // would hide a missing entry-point offload from every test
+                    // that holds a statement, so it no longer does — and with
+                    // `HELIOSDB_NANO_STATEMENT_OFFLOAD=off` it stalls the
+                    // server, which is how `tests/statement_off_worker.rs`
+                    // shows that those tests detect the stall.
+                    while file.exists() && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
                     }
                     tracing::warn!("heliosdb_test_hold(): released");
                 }
                 Ok(Value::Boolean(true))
+            }
+            // sprinter ccebc95977f1, `internal-tests` builds only: how many
+            // times work has left the async worker in this process
+            // (`runtime_offload::handoffs`), so a test can tell a bounded read
+            // (no handoff) from a general one (one) on the real server.
+            #[cfg(feature = "internal-tests")]
+            "heliosdb_test_offloads" => {
+                let handoffs = crate::runtime_offload::handoffs();
+                Ok(Value::Int8(i64::try_from(handoffs).unwrap_or(i64::MAX)))
             }
             // sprinter 7903b7111cb4: `currval('s')` — the value THIS SESSION's
             // last `nextval('s')` (or `setval('s', …)`) returned.
