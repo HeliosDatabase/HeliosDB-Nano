@@ -33,6 +33,23 @@ main. "A/B test a new schema." README: "main is never touched."
   ADD COLUMN backfill; this phase (and B4) deliberately changes that — update the test to
   the new rule and say so in its comment.
 
+## State after B1 and B2 (committed: 7c307781, 3de9ac66)
+
+- The session's branch is a per-statement snapshot (`STATEMENT_BRANCH`); a statement on a
+  branch holds that branch's drain; transactions on a branch work.
+- Every row write and read on a branch goes through `src/storage/branch_view.rs`
+  (`BranchView`: `get`, `scan`, `rows_with_key`, `put`/`delete`/`insert_checked`/`truncate`,
+  transaction-aware variants; nearest chain level wins). Uniqueness is main's ART probe plus
+  the overlay. The COMMITTED overlay is cached across statements keyed by each chain level's
+  write generation plus the table width and `schema_generation` — once a branch has its own
+  definition of a table, that cache key must include the BRANCH catalog's generation for that
+  table too (and an isolated table must never consult main's ART for candidates).
+- Refused on a branch with 0A000 today (keep refused in B3 unless this spec says otherwise):
+  CREATE / REFRESH MATERIALIZED VIEW, lock-free ingestion, direct bulk load, the main-only
+  fast write funnels. CREATE/DROP INDEX, ADD PRIMARY KEY, ADD UNIQUE were already refused.
+- `bump_write_generation` must be called for every level a schema change rewrites rows of
+  (ADD COLUMN's materialization).
+
 ## What to build
 
 1. **Branch catalog overlay.** Keys `bmeta:{bid}:table:{t}` holding either a table
