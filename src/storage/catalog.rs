@@ -975,26 +975,38 @@ impl<'a> Catalog<'a> {
             crate::sql::temp_tables::note_temp_table_created(self.storage);
         }
 
-        // Log CreateTable to WAL first (for replication to standbys)
-        // This must happen before the actual table creation so standbys
-        // receive and apply the operation in the correct order.
-        self.storage.log_create_table(table_name, &schema)?;
-
-        // Store schema
+        // Store schema and the zero row counter.
         let key = Self::table_metadata_key(table_name);
         let value =
             bincode::serialize(&schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
-
-        self.storage.put(&key, &value)?;
-
-        // Update in-memory schema cache
-        self.storage.cache_schema(table_name, schema.clone());
-
-        // Initialize row counter to 0
         let counter_key = Self::table_counter_key(table_name);
         let counter_value =
             bincode::serialize(&0u64).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
-        self.storage.put(&counter_key, &counter_value)?;
+
+        // Spec R1 §4 (sprinter e21903322db7): the schema record, the counter
+        // and the logical-WAL `CreateTable` entry are ONE write group. The
+        // entry used to be appended first and on its own — the order a
+        // logical standby needed; a physical standby receives this very write
+        // group — so a write that then failed left an entry for a table that
+        // does not exist, which the primary's open recovery would create after
+        // a crash. Sealed as every writer of these keys seals them (`put`).
+        let key_manager = self.storage.key_manager_arc();
+        let stored_schema = super::tde::seal(key_manager.as_deref(), &value)?;
+        let stored_counter = super::tde::seal(key_manager.as_deref(), &counter_value)?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(&key, stored_schema.as_ref());
+        batch.put(&counter_key, stored_counter.as_ref());
+        let written = self.storage.write_ddl_batch(
+            super::WalOperation::CreateTable {
+                table: table_name.to_string(),
+                schema: value,
+            },
+            batch,
+        )?;
+        super::engine::exit_after_ddl_write("create", table_name);
+
+        // Update in-memory schema cache
+        self.storage.cache_schema(table_name, schema.clone());
 
         // Auto-create ART indexes for PRIMARY KEY and UNIQUE constraints
         // (`art_manager` was resolved by the pre-flight above).
@@ -1093,6 +1105,9 @@ impl<'a> Catalog<'a> {
         // WAL-recovery, which all funnel through this method).
         self.storage.bump_schema_generation();
 
+        // Spec R1 §4: the standbys' acknowledgement last, after every
+        // in-memory step above.
+        written.wait_replicated();
         Ok(())
     }
 
@@ -1140,17 +1155,32 @@ impl<'a> Catalog<'a> {
             }
         }
         self.storage.invalidate_schema_cache(table_name);
-        if let Err(e) = self.storage.delete(&Self::table_metadata_key(table_name)) {
-            tracing::warn!("CREATE TABLE '{}' unwind: failed to delete schema: {}", table_name, e);
+        // Spec R1 §4: the durable half goes in one write group with a
+        // `DropTable` entry, so the `CreateTable` entry the create wrote with
+        // it is not left above the checkpoint for a table that no longer
+        // exists (open recovery would create it after a crash).
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete(Self::table_metadata_key(table_name));
+        batch.delete(Self::table_counter_key(table_name));
+        match self.storage.write_ddl_batch(
+            super::WalOperation::DropTable {
+                table: table_name.to_string(),
+            },
+            batch,
+        ) {
+            Ok(written) => {
+                self.storage.bump_schema_generation();
+                written.wait_replicated();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "CREATE TABLE '{}' unwind: failed to delete the schema and row counter: {}",
+                    table_name,
+                    e
+                );
+                self.storage.bump_schema_generation();
+            }
         }
-        if let Err(e) = self.storage.delete(&Self::table_counter_key(table_name)) {
-            tracing::warn!(
-                "CREATE TABLE '{}' unwind: failed to delete row counter: {}",
-                table_name,
-                e
-            );
-        }
-        self.storage.bump_schema_generation();
     }
 
     /// Is `columns` of `table_name` already enforced by a CONSTRAINT-OWNED
@@ -1884,9 +1914,6 @@ impl<'a> Catalog<'a> {
         // scan refuses the drop here, before anything has changed.
         self.stage_prefix_delete(&format!("data:{}:", table_name), &mut batch)?;
 
-        // Log DropTable to WAL first (for replication to standbys)
-        self.storage.log_drop_table(table_name)?;
-
         // Tear down the physical structures of the indexes whose definitions
         // the batch deletes. Per-index best effort: a structure that refuses
         // to come down must not stop the REMAINING indexes of the same table
@@ -1917,7 +1944,7 @@ impl<'a> Catalog<'a> {
         // Invalidate schema cache
         self.storage.invalidate_schema_cache(table_name);
 
-        {
+        let written = {
             // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) so a
             // re-created table with the same name never reads stale batches, zone
             // stats or live-row presence. No-op prefix seeks for row-only tables.
@@ -1934,10 +1961,24 @@ impl<'a> Catalog<'a> {
                     e
                 );
             }
+            // Spec R1 §4 (sprinter e21903322db7): the drop and its
+            // logical-WAL `DropTable` entry are ONE write group. Appended
+            // first and on its own, the entry outlived a drop that then
+            // failed (open recovery under `apply`/`warn` drops the live table
+            // after a crash); appended after, a crash between the two left the
+            // drop without it while the table's CREATE and inserts above the
+            // checkpoint were replayed — the table came back. A physical
+            // standby receives this very write group.
             self.storage
-                .db_write(batch, None)
-                .map_err(|e| Error::storage(format!("DROP TABLE '{}': batch delete failed: {}", table_name, e)))?;
-        }
+                .write_ddl_batch(
+                    super::WalOperation::DropTable {
+                        table: table_name.to_string(),
+                    },
+                    batch,
+                )
+                .map_err(|e| Error::storage(format!("DROP TABLE '{}': batch delete failed: {}", table_name, e)))?
+        };
+        super::engine::exit_after_ddl_write("drop", table_name);
 
         // W1.3: bump immediately after the delete commits — that is the point
         // where `table_exists` flips false.
@@ -1955,6 +1996,9 @@ impl<'a> Catalog<'a> {
         // lost updates on primary-key lookups). Evict them with the table.
         self.storage.row_cache().invalidate_table(table_name);
 
+        // Spec R1 §4: the standbys' acknowledgement last, after every
+        // in-memory step above.
+        written.wait_replicated();
         Ok(children)
     }
 
@@ -2564,9 +2608,10 @@ impl<'a> Catalog<'a> {
         // CRASH-RECOVERY LEG. "Before any mint" is only true of the mints THIS
         // method makes. `StorageEngine::open` runs `recover_wal_at_open`
         // first, and a post-checkpoint `CreateTable` entry whose
-        // `meta:table:` record never landed (`log_create_table` appends the
-        // entry separately from the schema put, so a crash between the two
-        // leaves exactly that) is replayed through `Catalog::create_table` —
+        // `meta:table:` record never landed (a store written before spec R1
+        // §4, whose `log_create_table` appended the entry separately from the
+        // schema put, can hold exactly that; since R1 the entry is in the
+        // schema's own write group) is replayed through `Catalog::create_table` —
         // which mints its column-flag keys into the still-EMPTY registry,
         // ahead of this pass. So a durable name can already be held when
         // pass 1 reaches it, by a tree that has no record of its own.
@@ -3431,10 +3476,6 @@ impl<'a> Catalog<'a> {
             return Err(Error::query_execution(format!("Table '{}' does not exist", old_name)));
         }
 
-        // Log the rename to the logical WAL before touching data (mirrors
-        // log_drop_table ordering) — no-op during replay or on standbys.
-        self.storage.log_rename_table(old_name, new_name)?;
-
         // Get the schema from old table
         let schema = self.get_table_schema(old_name)?;
 
@@ -3551,9 +3592,22 @@ impl<'a> Catalog<'a> {
         batch.delete(Self::compression_config_key(old_name));
         batch.delete(Self::compression_stats_key(old_name));
 
-        self.storage
-            .db_write(batch, None)
+        // Spec R1 §4 (sprinter e21903322db7): the rename and its logical-WAL
+        // `RenameTable` entry are ONE write group (as `drop_table`'s) — no
+        // entry during replay. A crash between a separate entry and the rename
+        // left either an entry for a rename that never happened or a rename
+        // whose source's CREATE and inserts were replayed (both names).
+        let written = self
+            .storage
+            .write_ddl_batch(
+                super::WalOperation::RenameTable {
+                    old_table: old_name.to_string(),
+                    new_table: new_name.to_string(),
+                },
+                batch,
+            )
             .map_err(|e| Error::storage(format!("Rename batch write failed: {}", e)))?;
+        super::engine::exit_after_ddl_write("rename", old_name);
 
         // Carry the VOLATILE in-memory row-id counter to the new name. The batch
         // above moved the durable `counter:{table}` key, but `next_row_id_volatile`
@@ -3701,6 +3755,9 @@ impl<'a> Catalog<'a> {
         self.storage.row_cache().invalidate_table(old_name);
         self.storage.row_cache().invalidate_table(new_name);
 
+        // Spec R1 §4: the standbys' acknowledgement last, after the row
+        // counter, the ART and index-definition moves and the caches.
+        written.wait_replicated();
         Ok(())
     }
 

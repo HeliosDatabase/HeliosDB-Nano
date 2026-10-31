@@ -1192,6 +1192,10 @@ enum Commands {
     /// interrupted fast-forward, a primary already superseded, or one that
     /// did not answer the fence without --force).
     Promote(PromoteArgs),
+    /// Physical standby tools. `standby verify`: prove a STOPPED physical
+    /// standby's replicated keyspace is byte-identical to its primary's at the
+    /// primary's current cut (spec R1 §1; plan "Verification" §3).
+    Standby(StandbyArgs),
     /// Inspect and maintain a WAL archive (archived segments, spec P3.1)
     /// offline: list, verify, gaps, prune. Reads the files only and takes no
     /// database lock.
@@ -1980,6 +1984,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Resync(args) => run_physical_resync(args).await,
         Commands::Recover(args) => run_recover(args).await,
         Commands::Promote(args) => run_promote(args).await,
+        Commands::Standby(args) => run_standby_command(args).await,
         Commands::Archive(args) => run_archive_command(args),
         Commands::Stop { ref pid_file } => stop_server(pid_file),
         Commands::Status {
@@ -8738,6 +8743,11 @@ async fn prepare_physical_source(
         std::sync::Arc::clone(&archive_slot),
     );
     let epoch = storage.replication_epoch();
+    // Spec R1 §3: the store this port serves knows the standbys it serves
+    // (key rotation of it is refused, naming them).
+    let observer = std::sync::Arc::new(StandbyRegistryObserver::new(&db));
+    let census = observer.census();
+    storage.attach_replication_census(std::sync::Arc::new(move || census.list()));
     let context = std::sync::Arc::new(SourceContext {
         identity: SourceIdentity {
             node_id: node.node_id,
@@ -8748,7 +8758,7 @@ async fn prepare_physical_source(
             physical_endpoint: address.to_string(),
             pg_port: pg_addr.port(),
         },
-        observer: std::sync::Arc::new(StandbyRegistryObserver::new(&db)),
+        observer,
         tls: acceptor.is_some(),
         fence: Some(std::sync::Arc::new(fence)),
     });
@@ -9546,6 +9556,196 @@ struct PromoteArgs {
     start_args: Vec<String>,
 }
 
+/// `heliosdb-nano standby …` (spec R1).
+#[derive(clap::Args, Debug)]
+struct StandbyArgs {
+    #[command(subcommand)]
+    action: StandbyAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum StandbyAction {
+    /// Prove that a STOPPED physical standby is byte-identical to its primary.
+    /// The primary pins a snapshot at its current sequence P; the standby is
+    /// brought to exactly P by the tail a `start` would apply (refused, with
+    /// the recover command, when the primary no longer serves it); then both
+    /// sides digest the replicated keyspace in leaves and compare them —
+    /// nothing is shipped, the primary is never modified, and the standby's
+    /// node-local state is not part of the comparison. Exits 0 when identical
+    /// ("identical at sequence P"), 1 when a leaf differs (each differing key
+    /// range is listed with both digests), 2 when the standby could not be
+    /// verified (a running standby, no standby, an interrupted fast-forward or
+    /// promotion, a primary that does not serve its tail, a transport error).
+    Verify(StandbyVerifyArgs),
+}
+
+/// `heliosdb-nano standby verify` (spec R1 §1).
+#[derive(clap::Args, Debug)]
+struct StandbyVerifyArgs {
+    /// The STOPPED physical standby to verify.
+    #[arg(short, long, value_name = "DIR")]
+    data_dir: PathBuf,
+    /// The primary's replication port (host:port) to verify against; default
+    /// the standby's [replication] primary_host.
+    #[arg(long, value_name = "HOST:PORT")]
+    against: Option<String>,
+    /// The standby's config file: its storage options, its [replication]
+    /// primary_host, token_file and TLS settings.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    /// The leaf size both sides digest the keyspace in (64KiB..=256MiB): the
+    /// granularity a difference is reported at.
+    #[arg(long, value_name = "SIZE", default_value = "4MiB", value_parser = parse_leaf_bytes)]
+    leaf_bytes: u32,
+    /// Print the verdict as one JSON object on stdout (progress goes to
+    /// stderr).
+    #[arg(long)]
+    json: bool,
+    #[command(flatten)]
+    physical: PhysicalTransferArgs,
+    #[command(flatten)]
+    primary_tls: PrimaryTlsArgs,
+    /// Plaintext to a non-loopback primary, token included: isolated
+    /// development only.
+    #[arg(long)]
+    allow_insecure_replication_remote: bool,
+}
+
+/// `heliosdb-nano standby …` (spec R1).
+async fn run_standby_command(args: StandbyArgs) -> Result<()> {
+    match args.action {
+        StandbyAction::Verify(verify) => run_standby_verify(verify).await,
+    }
+}
+
+/// Spec R1 §1: `standby verify` could not compare (exit 2): the reason on
+/// stdout — as `{"result": "not_verified", "reason": …}` with `--json`.
+#[cfg(feature = "ha-tier1")]
+fn standby_not_verified(json: bool, reason: &str) -> ! {
+    if json {
+        println!("{}", serde_json::json!({ "result": "not_verified", "reason": reason }));
+    } else {
+        println!("{reason}");
+    }
+    std::process::exit(2)
+}
+
+/// `heliosdb-nano standby verify` (spec R1 §1): offline; exits 0 when the
+/// standby is byte-identical to its primary at the primary's cut, 1 when a
+/// leaf differs, 2 when it was not verified.
+async fn run_standby_verify(args: StandbyVerifyArgs) -> Result<()> {
+    #[cfg(not(feature = "ha-tier1"))]
+    {
+        let _ = args;
+        return Err(Error::config("standby verify requires the ha-tier1 feature"));
+    }
+    #[cfg(feature = "ha-tier1")]
+    {
+        use heliosdb_nano::replication::standby_verify::{verify_standby, VerifyOptions};
+        let StandbyVerifyArgs {
+            data_dir,
+            against,
+            config: config_path,
+            leaf_bytes,
+            json,
+            physical,
+            primary_tls,
+            allow_insecure_replication_remote,
+        } = args;
+        let mut config = match &config_path {
+            Some(path) => match Config::from_file(path.clone()) {
+                Ok(config) => config,
+                Err(error) => standby_not_verified(json, &format!("standby verify refused: {error}")),
+            },
+            None => Config::default(),
+        };
+        config.storage.path = Some(data_dir.clone());
+        config.storage.memory_only = false;
+        physical.apply(&mut config.replication);
+        primary_tls.apply(&mut config.replication);
+        if allow_insecure_replication_remote {
+            config.replication.allow_insecure_remote = true;
+        }
+        if let Err(error) = config
+            .replication
+            .validate()
+            .and_then(|()| config.replication.physical.validate())
+        {
+            standby_not_verified(json, &format!("standby verify refused: {error}"));
+        }
+        let Some(primary_host) = against.or_else(|| config.replication.primary_host.clone()) else {
+            standby_not_verified(
+                json,
+                "standby verify refused: no primary to verify against: give --against HOST:PORT (the primary's \
+                 replication port) or set [replication] primary_host",
+            )
+        };
+        let sources = match resolve_replication_sources(&primary_host) {
+            Ok(sources) => sources,
+            Err(error) => standby_not_verified(json, &format!("standby verify refused: {error}")),
+        };
+        let tls_settings = ReplicationTlsSettings::from_config(&config.replication);
+        let transport = match replication_transport(
+            &primary_host,
+            &sources,
+            &tls_settings,
+            config.replication.allow_insecure_remote,
+            tls_settings.tls_post_quantum.unwrap_or(true),
+        ) {
+            Ok(transport) => transport,
+            Err(error) => standby_not_verified(json, &format!("standby verify refused: {error}")),
+        };
+        let token = match config.replication.token_file.as_ref() {
+            Some(file) => match heliosdb_nano::replication::read_replication_token(file) {
+                Ok(token) => token,
+                Err(error) => standby_not_verified(json, &format!("standby verify refused: {error}")),
+            },
+            None => standby_not_verified(
+                json,
+                "standby verify refused: it authenticates to the primary's replication port: it needs \
+                 --replication-token-file or [replication] token_file",
+            ),
+        };
+        let wire = physical_wire_limits(&config.replication.physical);
+        let options = VerifyOptions {
+            data_dir,
+            config,
+            primary_host,
+            sources,
+            transport,
+            token,
+            wire,
+            leaf_bytes,
+        };
+        // With --json, stdout carries the verdict alone.
+        let outcome = verify_standby(&options, &mut |line| {
+            if json {
+                eprintln!("{line}");
+            } else {
+                println!("{line}");
+            }
+        })
+        .await;
+        let report = match outcome {
+            Ok(report) => report,
+            Err(error) => standby_not_verified(json, &error.to_string()),
+        };
+        if json {
+            println!("{}", report.to_json());
+        } else {
+            println!("{}", report.summary());
+            for line in report.leaf_lines() {
+                println!("{line}");
+            }
+        }
+        if report.identical() {
+            Ok(())
+        } else {
+            std::process::exit(1)
+        }
+    }
+}
+
 /// Spec P5.1 §4 step 3 and §11.A: why `start` in `role` refuses `data_dir` —
 /// a promotion was interrupted in it (`NANO-PROMOTION.json`: every role), or
 /// it is a fenced primary's (`NANO-FENCED.json`) started as a standby (it is
@@ -10199,9 +10399,17 @@ async fn recover_from_primary_command(
             format_bytes(report.bytes_total)
         ),
         RecoverRoute::FullCopy => println!(
-            "recover: the standby is at sequence {} (a full copy of the primary, {}{}; {seconds:.1} s)",
+            "recover: the standby is at sequence {} ({}{}; {seconds:.1} s)",
             format_count(report.to),
-            format_bytes(report.bytes_total),
+            // Sprinter 6146b39a5beb: an adopted copy moved no byte in this
+            // run; "a full copy of the primary, 0 B" said otherwise.
+            match &report.adopted {
+                Some(copy) => format!(
+                    "adopted the completed copy at {}, nothing copied in this run",
+                    copy.display()
+                ),
+                None => format!("a full copy of the primary, {}", format_bytes(report.bytes_total)),
+            },
             report
                 .replaced
                 .as_ref()

@@ -2207,6 +2207,11 @@ pub struct StorageEngine {
     /// ([`Self::note_replication_epoch`]).
     replication_epoch: AtomicU64,
     replication_previous_epoch: AtomicU64,
+    /// Spec R1 §3: the standbys the replication source serving THIS store
+    /// has attached now ([`Self::attach_replication_census`]); `None` while
+    /// no replication port serves it. What key rotation reads, besides the
+    /// open mode.
+    replication_census: RwLock<Option<ReplicationCensus>>,
     /// RocksDB `LOG` redirect for a READ-ONLY handle (including physical
     /// snapshots): an owned directory OUTSIDE the database, kept alive through
     /// the drop of the engine-owned `StorageEngine`/`DB` handle so the log
@@ -2237,6 +2242,47 @@ pub enum LogicalCatchup {
     StandbyAhead { latest: u64 },
     /// No logical WAL on this engine.
     Unavailable,
+}
+
+/// Spec R1 §3: the standbys a replication source serving a store has
+/// attached now, one description each (`StorageEngine::attach_replication_census`).
+pub type ReplicationCensus = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// A DDL statement's catalog change and its logical-WAL entry, durable
+/// together ([`StorageEngine::write_ddl_batch`], spec R1 §4). The
+/// synchronous-replication wait for the write is its owner's LAST step.
+#[must_use = "a DDL write waits for its standbys once its in-memory finalization is done"]
+pub struct DdlWrite {
+    /// The physical sequence a sync/semi-sync primary's standbys must
+    /// acknowledge (`None` on every other node).
+    barrier: Option<u64>,
+}
+
+impl DdlWrite {
+    /// Wait (bounded by `[replication] sync_timeout_ms`) for the standbys to
+    /// acknowledge the write; a no-op unless this node's commits wait.
+    pub(crate) fn wait_replicated(self) {
+        WriteAheadLog::wait_replicated_sequence(self.barrier);
+    }
+}
+
+/// `internal-tests` builds only: `HELIOSDB_NANO_TEST_EXIT_AFTER_DDL_WRITE=<point>:<table>`
+/// ends this process — no `Drop`, no close-time checkpoint: a crash — right
+/// after the catalog write of that DDL (`create`, `drop`, `rename`; the
+/// table it creates, drops or renames), before its in-memory finalization
+/// and replication wait (spec R1 §4's crash tests). Does nothing in every
+/// other build.
+pub fn exit_after_ddl_write(point: &str, table: &str) {
+    #[cfg(feature = "internal-tests")]
+    {
+        const EXIT_AFTER_DDL_WRITE_ENV: &str = "HELIOSDB_NANO_TEST_EXIT_AFTER_DDL_WRITE";
+        if std::env::var(EXIT_AFTER_DDL_WRITE_ENV).is_ok_and(|at| at.split_once(':') == Some((point, table))) {
+            tracing::warn!("{EXIT_AFTER_DDL_WRITE_ENV}: ending this process after the {point} of {table}");
+            std::process::exit(0);
+        }
+    }
+    #[cfg(not(feature = "internal-tests"))]
+    let _ = (point, table);
 }
 
 impl StorageEngine {
@@ -2554,6 +2600,58 @@ impl StorageEngine {
         matches!(self.open_mode, OpenMode::PhysicalStandby { .. })
     }
 
+    /// Spec R1 §3: attach the census of the replication source that serves
+    /// THIS store — the standbys it has attached now, as the operator reads
+    /// them (node id, address, state). From then on key rotation of this
+    /// store is refused, naming them (or, none attached, because the port
+    /// serves: a standby that is away holds the key too). Attached by the
+    /// code that starts the store's replication port; never detached.
+    pub fn attach_replication_census(&self, census: ReplicationCensus) {
+        *self.replication_census.write() = Some(census);
+    }
+
+    /// Spec R1 §3 (plan `PHYSICAL_STANDBY_REPLICATION.md` §D5): this store's
+    /// standing in physical replication, from its OWN state: its open mode
+    /// (a physical standby's — every other mode of a standby's directory is
+    /// refused at open) and the census of the replication source serving it.
+    fn key_rotation_standing(&self) -> crate::crypto::KeyRotationStanding {
+        use crate::crypto::KeyRotationStanding;
+        if self.is_physical_standby() {
+            return KeyRotationStanding::physical_standby();
+        }
+        match self.replication_census.read().as_ref() {
+            Some(census) => KeyRotationStanding::primary_with_standbys(census()),
+            None => KeyRotationStanding::unreplicated(),
+        }
+    }
+
+    /// Spec R1 §3 (plan §D5): THE key-rotation entry point of a store —
+    /// no SQL, CLI or HTTP surface reaches it in this build. It fails closed
+    /// while a rotation would strand a physical standby, from this store's
+    /// own standing: refused on a physical standby (its key is its primary's:
+    /// it applies the primary's sealed values verbatim), and on a primary
+    /// whose replication port serves — naming the standbys attached, since
+    /// no standby can hold two keys. Past that check it is refused all the
+    /// same: a rotation must re-encrypt every sealed value, the tolerant
+    /// reader tries no previous key, and nothing in this build re-encrypts —
+    /// re-keying is a dump and restore under the new key. Nothing changes
+    /// either way.
+    pub fn rotate_encryption_key(&self, new_key: crate::crypto::EncryptionKey) -> Result<()> {
+        if let Some(reason) = self.key_rotation_standing().refusal() {
+            return Err(Error::encryption(reason));
+        }
+        if self.key_manager.is_none() {
+            return Err(Error::encryption(
+                "encryption key rotation refused: this store is not encrypted ([encryption] enabled = false)",
+            ));
+        }
+        let _ = new_key;
+        Err(Error::encryption(
+            "encryption key rotation is not available in this build: it would have to re-encrypt every sealed \
+             value, which nothing does yet; re-key by dumping the database and restoring it under the new key",
+        ))
+    }
+
     /// Spec P5.1: the replication epoch this store holds (`repl:epoch`; 1
     /// for a store that was never promoted), as read at open and kept
     /// current by a standby's applier. What every replication surface of the
@@ -2618,6 +2716,45 @@ impl StorageEngine {
     /// outside the engine that builds batches against its handle (catalog DDL).
     pub(crate) fn db_write(&self, batch: WriteBatch, opts: Option<&WriteOptions>) -> Result<()> {
         self.gate.write(&self.db, batch, opts)
+    }
+
+    /// Spec R1 §4 (sprinter e21903322db7): write a DDL statement's catalog
+    /// `batch` with its logical-WAL entry `operation` sealed INTO it — ONE
+    /// write, so the entry exists exactly when the change does. Appended on
+    /// its own (first, or after) it could outlive a change that failed, or a
+    /// crash between the two left the change without it while the entries of
+    /// the incarnation it ended (a table's CREATE and inserts above the
+    /// checkpoint) were still there to be replayed. Inside a statement-capture
+    /// frame too: the change is not transactional — it is durable as soon as
+    /// this write is — so its entry cannot wait for the statement's commit.
+    /// During replay, or with no logical WAL, only the batch is written. The
+    /// synchronous-replication wait is NOT made here: the caller makes it
+    /// last ([`DdlWrite::wait_replicated`]), after its in-memory finalization,
+    /// so no standby round trip sits inside the DDL's critical section.
+    pub(crate) fn write_ddl_batch(&self, operation: WalOperation, mut batch: WriteBatch) -> Result<DdlWrite> {
+        let options = self.memory_write_options.as_ref();
+        let wal = if self.is_replaying.load(Ordering::Acquire) {
+            None
+        } else {
+            self.wal.as_ref()
+        };
+        let Some(wal) = wal else {
+            self.db_write(batch, options)?;
+            return Ok(DdlWrite { barrier: None });
+        };
+        let wal = wal.read();
+        let staged = wal.stage(vec![operation], &mut batch)?;
+        if let Err(error) = self.db_write(batch, options) {
+            if let Some(staged) = staged {
+                wal.abandon_staged(staged);
+            }
+            return Err(error);
+        }
+        let barrier = wal.replication_barrier();
+        if let Some(staged) = staged {
+            wal.publish_staged(staged);
+        }
+        Ok(DdlWrite { barrier })
     }
 
     /// Refuse to open a physical standby's directory in any mode but
@@ -3463,6 +3600,7 @@ impl StorageEngine {
             physical_hydration_started: AtomicBool::new(false),
             replication_epoch: AtomicU64::new(super::replication_epoch::epoch_of(epoch_record.as_ref())),
             replication_previous_epoch: AtomicU64::new(super::replication_epoch::previous_of(epoch_record.as_ref())),
+            replication_census: RwLock::new(None),
             _read_only_log_dir: read_only_log_dir,
         };
 
@@ -3901,6 +4039,7 @@ impl StorageEngine {
             // A fresh in-memory store was never promoted.
             replication_epoch: AtomicU64::new(super::replication_epoch::INITIAL_EPOCH),
             replication_previous_epoch: AtomicU64::new(super::replication_epoch::INITIAL_EPOCH),
+            replication_census: RwLock::new(None),
             _read_only_log_dir: None,
         })
     }
@@ -12018,6 +12157,75 @@ impl StorageEngine {
         }
     }
 
+    /// Spec R1 §4 (sprinter e21903322db7): per table, the LSN of the last
+    /// destructive entry (`DropTable`, `Truncate`, `RenameTable`) of open
+    /// recovery's `entries` — every EARLIER entry naming that table is fenced
+    /// off with it (see `replay_wal_after`), whatever the policy does with the
+    /// destructive entry itself. A `RenameTable` fences both names: the
+    /// source's earlier entries are the incarnation it moved away, the
+    /// target's one dropped before the rename. Sound because a destructive
+    /// entry is written in its change's own write group (`write_ddl_batch`,
+    /// a transactional TRUNCATE with its commit): the entry is there exactly
+    /// when the change is, so what it ended is already absent from the store
+    /// and nothing before it on that table has anything to redo.
+    fn destructive_fences(&self, entries: &[super::wal::WalEntry]) -> HashMap<String, u64> {
+        let mut fences: HashMap<String, u64> = HashMap::new();
+        if !self.is_open_recovery.load(Ordering::Acquire) {
+            return fences;
+        }
+        for entry in entries {
+            if !matches!(
+                entry.operation,
+                WalOperation::DropTable { .. } | WalOperation::Truncate { .. } | WalOperation::RenameTable { .. }
+            ) {
+                continue;
+            }
+            for table in Self::wal_operation_tables(&entry.operation) {
+                let fence = fences.entry(table.to_string()).or_insert(entry.lsn);
+                *fence = (*fence).max(entry.lsn);
+            }
+        }
+        fences
+    }
+
+    /// Whether replaying `operation` only adds to the pending row batch
+    /// (`apply_wal_operation_to_batch`): every other arm changes the store at
+    /// once, so the batch is written before it (spec R1 §4).
+    fn replays_into_batch(operation: &WalOperation) -> bool {
+        matches!(
+            operation,
+            WalOperation::Insert { .. }
+                | WalOperation::Update { .. }
+                | WalOperation::Delete { .. }
+                | WalOperation::UpdateCounter { .. }
+                | WalOperation::Begin { .. }
+                | WalOperation::Commit { .. }
+                | WalOperation::Abort { .. }
+        )
+    }
+
+    /// The tables a logical WAL entry names (spec R1 §4's fence).
+    fn wal_operation_tables(operation: &WalOperation) -> Vec<&str> {
+        match operation {
+            WalOperation::Insert { table, .. }
+            | WalOperation::Update { table, .. }
+            | WalOperation::Delete { table, .. }
+            | WalOperation::Truncate { table }
+            | WalOperation::CreateTable { table, .. }
+            | WalOperation::DropTable { table }
+            | WalOperation::AlterColumnStorage { table, .. }
+            | WalOperation::CreateIndex { table, .. }
+            | WalOperation::CreateTrigger { table, .. }
+            | WalOperation::AddConstraint { table, .. }
+            | WalOperation::DropConstraint { table, .. }
+            | WalOperation::AlterTableSchema { table, .. } => vec![table.as_str()],
+            WalOperation::DropTrigger { table, .. } => table.as_deref().into_iter().collect(),
+            WalOperation::UpdateCounter { table_name, .. } => vec![table_name.as_str()],
+            WalOperation::RenameTable { old_table, new_table } => vec![old_table.as_str(), new_table.as_str()],
+            _ => Vec::new(),
+        }
+    }
+
     /// Bounded `data:{table}:` key count for the destructive-replay diagnostic.
     fn count_data_rows(&self, table: &str) -> usize {
         const COUNT_CAP: usize = 100_000;
@@ -12092,6 +12300,20 @@ impl StorageEngine {
                 }
             }
 
+            // Spec R1 §4 (sprinter e21903322db7): the entries BEFORE a
+            // destructive DDL entry that name the same table describe the
+            // incarnation that DDL ended: the rows a DROP removed, the table
+            // a RENAME moved away, the rows a TRUNCATE cleared. Replayed — the
+            // DDL itself skipped (GH#35 Half B, `refuse`), or applied after
+            // them (`warn`/`apply`) — they wrote that incarnation into
+            // whatever bears the name now: a dropped table came back with its
+            // rows, a re-created table of the same name received the dropped
+            // rows. So a destructive entry fences off every earlier entry
+            // naming one of its tables, under every policy; what follows it is
+            // replayed as before.
+            let fences = self.destructive_fences(&entries);
+            let mut fenced_count = 0usize;
+
             // Second pass: Apply operations in batches
             const BATCH_SIZE: usize = 100;
             let mut batch = WriteBatch::default();
@@ -12105,6 +12327,34 @@ impl StorageEngine {
                         skipped_count += 1;
                         continue;
                     }
+                }
+
+                if Self::wal_operation_tables(&entry.operation)
+                    .iter()
+                    .any(|table| fences.get(*table).is_some_and(|fence| entry.lsn < *fence))
+                {
+                    debug!(
+                        "Skipping WAL entry at LSN {}: a later destructive DDL entry names its table",
+                        entry.lsn
+                    );
+                    skipped_count += 1;
+                    fenced_count += 1;
+                    continue;
+                }
+
+                // Spec R1 §4: an arm that changes the store at once (DDL) runs
+                // after the rows batched before it are written, in LSN order:
+                // a CreateTable checks existence and a DropTable deletes the
+                // rows present, so a batched row of an earlier incarnation
+                // written after a replayed drop and re-create landed in the
+                // new table.
+                if !Self::replays_into_batch(&entry.operation) && !batch.is_empty() {
+                    if let Err(e) = self.gate.write(&self.db, std::mem::take(&mut batch), None) {
+                        self.is_replaying.store(false, Ordering::Release);
+                        self.is_open_recovery.store(false, Ordering::Release);
+                        return Err(Error::storage(format!("Batch write failed: {}", e)));
+                    }
+                    batch_count = 0;
                 }
 
                 // Apply the operation to the batch
@@ -12152,6 +12402,13 @@ impl StorageEngine {
                     .map_err(|e| Error::storage(format!("Final batch write failed: {}", e)))?;
             }
 
+            if fenced_count > 0 {
+                warn!(
+                    "WAL replay: {} entries were not replayed because a later destructive DDL entry names \
+                     their table (they belong to the table incarnation it ended)",
+                    fenced_count
+                );
+            }
             info!(
                 "WAL replay complete: {} operations applied, {} skipped, {} errors",
                 replayed_count, skipped_count, error_count
@@ -15071,6 +15328,45 @@ mod tests {
         let engine = StorageEngine::open_in_memory(&config).expect("open encrypted in-memory engine");
         assert!(engine.is_encrypted(), "test engine must have a key manager");
         engine
+    }
+
+    /// Spec R1 §3: key rotation through the store's one entry point, from
+    /// its own standing — refused while a replication port serves the store
+    /// (naming the standbys attached; none attached, because the port
+    /// serves), and otherwise refused because nothing re-encrypts; an
+    /// unencrypted store is refused as such. The key is unchanged throughout.
+    #[test]
+    fn key_rotation_is_refused_from_the_stores_own_standing() {
+        let engine = encrypted_test_engine(
+            "HELIOS_R1_ROTATION_GUARD_KEY",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        let before = *engine.key_manager_arc().unwrap().key();
+        let unattached = engine.rotate_encryption_key([7; 32]).unwrap_err().to_string();
+        assert!(unattached.contains("not available in this build"), "{unattached}");
+
+        engine.attach_replication_census(Arc::new(|| {
+            vec!["node a at 10.0.0.2:41000 (streaming, applied through 7)".to_string()]
+        }));
+        let attached = engine.rotate_encryption_key([7; 32]).unwrap_err().to_string();
+        assert!(attached.contains("serves 1 physical standby(s)"), "{attached}");
+        assert!(
+            attached.contains("node a at 10.0.0.2:41000"),
+            "the standby is named: {attached}"
+        );
+        assert!(
+            attached.contains("recover --from-primary --full --replace"),
+            "{attached}"
+        );
+
+        engine.attach_replication_census(Arc::new(Vec::<String>::new));
+        let serving = engine.rotate_encryption_key([7; 32]).unwrap_err().to_string();
+        assert!(serving.contains("serves its replication port"), "{serving}");
+        assert_eq!(*engine.key_manager_arc().unwrap().key(), before, "nothing changed");
+
+        let plain = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        let error = plain.rotate_encryption_key([7; 32]).unwrap_err().to_string();
+        assert!(error.contains("not encrypted"), "{error}");
     }
 
     fn int_pk_schema() -> Schema {

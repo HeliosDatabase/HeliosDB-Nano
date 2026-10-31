@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `heliosdb-nano standby verify` (spec R1 §1)
+
+Proves that a STOPPED physical standby is byte-identical to its primary: the primary pins
+a snapshot at its current sequence P and sends the SHA-256 of each leaf of its replicated
+keyspace (nothing is shipped, the primary is not modified), the standby is brought to
+exactly P by the tail a `start` would apply, and both sides' leaves are compared. Exit 0
+"identical at sequence P (N leaves, X bytes compared)"; exit 1 lists every differing key
+range with both digests; exit 2 when it could not verify (a running standby — refused by
+its lock —, an interrupted fast-forward or promotion, a primary that no longer serves the
+standby's tail: the message names the `recover --from-primary` command). `--json` prints
+the verdict as one object. The standby's node-local state is not part of the comparison.
+A fast-forward session is now also served to a receiver AT the primary's cut — a new
+capability, `CAP_FAST_FORWARD_AT_CUT`, offered by both sides of this release; an older peer
+is refused or never sent one, and `standby verify` against an older primary says so.
+`recover --from-primary` treats that case as before (a full copy).
+
+### Fixed — `recover --from-primary` no longer adopts a stale completed copy (sprinter 6146b39a5beb)
+
+A completed full copy left beside the data directory (`<DIR>.recover-full`) by an
+earlier run was adopted by history alone, even when the primary's WAL and archive had
+moved past it, installing a standby whose first start could only be refused
+`WalPruned`. The primary is now asked first: a copy it still serves is adopted (also
+under `--full`; "still serves" holds when it is asked — nothing pins the copy's tail), one
+it no longer holds the tail of (`WalPruned`, `Gap`, `GroupTooLarge`, `Diverged`, another
+history, a newer epoch) is removed and copied again ("the completed copy at … is older
+than what the primary retains; copying again"). Any other answer — a busy or shutting-down
+primary, a token or version problem — keeps the copy and fails the run. An adopted copy's
+summary says "adopted the completed copy at …, nothing copied in this run" instead of
+"0 B".
+
+### Fixed — a primary's crash recovery no longer brings back dropped or renamed tables (sprinter e21903322db7)
+
+Open recovery skips a `DROP TABLE`, `TRUNCATE` or rename it finds above the logical WAL
+checkpoint (`storage.wal_replay_destructive_ddl = "refuse"`, the default) but replayed
+every other entry around it. After a crash within the checkpoint interval (default 1000
+entries / 30 s), with rows logged — every explicit transaction, and every statement on an
+HA primary — a table created and dropped in that window came back with its rows, a table
+dropped and re-created under the same name received the old rows (overwriting its own at
+colliding row ids), and a renamed table's rows came back under a re-created source name.
+Under `warn` / `apply` the replay also wrote its batched rows only after the DDL entries
+that followed them. A destructive entry now skips every earlier entry naming its tables,
+under every policy, and the pending rows are written before any DDL entry is replayed.
+`CREATE TABLE`, `DROP TABLE` and the rename write their entry in their own catalog write
+group (it used to be a separate append, first, so a write that then failed left an entry
+the next crash replayed), and a transactional `TRUNCATE` logs with its transaction's
+commit (a `BEGIN; TRUNCATE; ROLLBACK` left an entry that `warn` / `apply` replayed).
+
+### Changed — key rotation is refused while it would strand a physical standby (spec R1 §3)
+
+There is no key-rotation command and nothing re-encrypts a dataset. The one entry point,
+`StorageEngine::rotate_encryption_key` (reached by no SQL, CLI or HTTP surface), computes
+the store's standing from its own open mode and the standbys its replication port serves,
+and refuses on a physical standby (its key is its primary's) and on a primary whose
+replication port serves (naming the standbys attached), naming the procedure: re-key a
+primary that serves no standby, then rebuild each standby from it with the new key;
+otherwise it refuses because no re-encryption exists.
+
 ### Fixed — a long statement no longer stalls the server (sprinter ccebc95977f1)
 
 A statement executed synchronously on the async worker that had just been driving the

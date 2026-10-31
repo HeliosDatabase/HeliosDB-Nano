@@ -11127,8 +11127,19 @@ impl EmbeddedDatabase {
                 // family already logs through `ddl::handle_truncate`; this
                 // inlined text arm did not, so an HA standby never learned of a
                 // psql/embedded TRUNCATE (asymmetric coverage).
-                if let Err(e) = self.storage.log_truncate(table_name) {
-                    tracing::warn!("Failed to log TRUNCATE '{}' to WAL: {}", table_name, e);
+                //
+                // Spec R1 §4 (sprinter e21903322db7): with THIS transaction's
+                // commit, never on its own. The row deletes above are staged in
+                // the write set and roll back with it; an entry appended at once
+                // outlived a `BEGIN; TRUNCATE; ROLLBACK`, and open recovery
+                // under `wal_replay_destructive_ddl = "apply"|"warn"` then
+                // truncated the table the rollback had kept.
+                if !txn.log_on_commit(storage::WalOperation::Truncate {
+                    table: table_name.to_string(),
+                }) {
+                    if let Err(e) = self.storage.log_truncate(table_name) {
+                        tracing::warn!("Failed to log TRUNCATE '{}' to WAL: {}", table_name, e);
+                    }
                 }
                 Ok(0)
             }

@@ -4,7 +4,8 @@
 //! - Loading keys from various sources (environment, file, password)
 //! - Secure in-memory key storage (zeroed on drop)
 //! - Key derivation from passwords
-//! - Key rotation support (planned for phase 2)
+//! - Key rotation support (planned for phase 2; refused while it would strand a
+//!   physical standby, spec R1 §3 — [`KeyRotationStanding`])
 
 use crate::config::KeySource;
 use crate::crypto::{derive_key_from_password, EncryptionKey};
@@ -23,6 +24,99 @@ pub struct KeyRotationMetadata {
     pub current_key_id: String,
     /// Status (pending, completed, failed)
     pub status: String,
+}
+
+/// Spec R1 §3 (plan `PHYSICAL_STANDBY_REPLICATION.md` §D5): where the
+/// dataset a key seals stands in physical replication — what
+/// [`KeyManager::rotate`] must know before it may change the key.
+///
+/// A physical standby applies its primary's write groups verbatim, sealed
+/// values included, so it holds the primary's dataset key; it could follow a
+/// primary that re-keys only by holding both keys while the rewritten values
+/// arrive, and no standby can (there is no such capability on the wire).
+/// Rotating the key therefore strands every standby of the dataset, and a
+/// standby's own key is its primary's, never rotated on its own. Built only
+/// by the store whose key it is (`StorageEngine::rotate_encryption_key`,
+/// from its open mode and the census of the replication source serving it)
+/// — its constructors are the crate's, so no caller can claim a dataset is
+/// unreplicated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyRotationStanding {
+    kind: Standing,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Standing {
+    /// No physical standby holds this key: rotation is not refused here.
+    Unreplicated,
+    /// This dataset IS a physical standby: its key is its primary's.
+    PhysicalStandby,
+    /// A primary with these standbys registered (attached sessions).
+    PrimaryWithStandbys(Vec<String>),
+    /// A primary serving its replication port with no standby attached right
+    /// now: one that is away holds the key all the same.
+    PrimaryServingReplication,
+}
+
+/// What every refusal says to do instead.
+const ROTATION_PROCEDURE: &str = "rotate the key on a primary that serves no physical standby (stop its \
+     standbys; start it with --physical-replication=false), then rebuild each standby from it, configured with the \
+     new key (`heliosdb-nano recover --from-primary --full --replace`)";
+
+impl KeyRotationStanding {
+    pub(crate) fn unreplicated() -> Self {
+        Self {
+            kind: Standing::Unreplicated,
+        }
+    }
+
+    pub(crate) fn physical_standby() -> Self {
+        Self {
+            kind: Standing::PhysicalStandby,
+        }
+    }
+
+    /// A primary and the standbys it has registered, as the operator reads
+    /// them (node id, address, state). An empty list still refuses: the
+    /// primary serves its replication port.
+    pub(crate) fn primary_with_standbys(standbys: Vec<String>) -> Self {
+        if standbys.is_empty() {
+            return Self::primary_serving_replication();
+        }
+        Self {
+            kind: Standing::PrimaryWithStandbys(standbys),
+        }
+    }
+
+    pub(crate) fn primary_serving_replication() -> Self {
+        Self {
+            kind: Standing::PrimaryServingReplication,
+        }
+    }
+
+    /// Why rotating the key now would strand a physical standby, naming what
+    /// to do instead; `None` when it would strand none.
+    pub fn refusal(&self) -> Option<String> {
+        match &self.kind {
+            Standing::Unreplicated => None,
+            Standing::PhysicalStandby => Some(format!(
+                "encryption key rotation refused: this dataset is a physical standby; its key is its primary's (it \
+                 applies the primary's sealed values verbatim), so it is never rotated here: {ROTATION_PROCEDURE}"
+            )),
+            Standing::PrimaryWithStandbys(standbys) => Some(format!(
+                "encryption key rotation refused: this primary serves {} physical standby(s) — {} — which hold its \
+                 current key and apply its sealed values verbatim; a rotated key would strand them (no standby can \
+                 hold two keys): {ROTATION_PROCEDURE}",
+                standbys.len(),
+                standbys.join("; ")
+            )),
+            Standing::PrimaryServingReplication => Some(format!(
+                "encryption key rotation refused: this primary serves its replication port, so physical standbys \
+                 — attached now or away — may hold its current key, and a rotated key would strand them: \
+                 {ROTATION_PROCEDURE}"
+            )),
+        }
+    }
 }
 
 /// Key manager for secure encryption key handling
@@ -172,8 +266,19 @@ impl KeyManager {
     ///
     /// Note: The actual data re-encryption must be handled by the caller
     /// (requires iterating through all data and re-encrypting with new key)
-    pub fn rotate(&mut self, new_key: EncryptionKey) -> Result<()> {
+    ///
+    /// Spec R1 §3 (plan §D5): crate-private — a store's key is rotated only
+    /// through `StorageEngine::rotate_encryption_key`, which computes the
+    /// store's own [`KeyRotationStanding`] (and refuses while nothing
+    /// re-encrypts the sealed values, so nothing calls this yet). It fails
+    /// closed on that standing too, and nothing changes when it refuses.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn rotate(&mut self, new_key: EncryptionKey, standing: &KeyRotationStanding) -> Result<()> {
         use chrono::Utc;
+
+        if let Some(reason) = standing.refusal() {
+            return Err(Error::encryption(reason));
+        }
 
         // Generate key IDs (SHA256 hashes of keys)
         let old_key_id = Self::compute_key_id(&self.key);
@@ -265,6 +370,48 @@ mod tests {
 
         // Verify it's valid hex
         let _parsed = KeyManager::parse_hex_key(&hex).expect("Failed to parse exported hex");
+    }
+
+    /// Spec R1 §3: rotation is refused on a physical standby, on a primary
+    /// with standbys registered (naming them) and on a primary serving its
+    /// replication port; the key is unchanged by a refusal. An unreplicated
+    /// dataset rotates as before.
+    #[test]
+    fn rotation_is_refused_while_it_would_strand_a_physical_standby() {
+        let new_key: EncryptionKey = [7; 32];
+        for (standing, needle) in [
+            (KeyRotationStanding::physical_standby(), "is a physical standby"),
+            (
+                KeyRotationStanding::primary_with_standbys(vec![
+                    "node a at 10.0.0.2:41000 (streaming)".to_string(),
+                    "node b at 10.0.0.3:41000 (bootstrapping)".to_string(),
+                ]),
+                "serves 2 physical standby(s) — node a at 10.0.0.2:41000 (streaming); node b",
+            ),
+            (
+                KeyRotationStanding::primary_with_standbys(Vec::new()),
+                "serves its replication port",
+            ),
+            (
+                KeyRotationStanding::primary_serving_replication(),
+                "serves its replication port",
+            ),
+        ] {
+            let mut km = KeyManager::generate_random();
+            let before = *km.key();
+            let error = km.rotate(new_key, &standing).unwrap_err().to_string();
+            assert!(error.contains(needle), "{error}");
+            assert!(error.contains("recover --from-primary --full --replace"), "{error}");
+            assert_eq!(*km.key(), before, "a refused rotation changes nothing");
+            assert!(km.previous_key().is_none());
+            assert!(km.rotation_metadata().is_none());
+        }
+        let mut km = KeyManager::generate_random();
+        let before = *km.key();
+        assert!(KeyRotationStanding::unreplicated().refusal().is_none());
+        km.rotate(new_key, &KeyRotationStanding::unreplicated()).unwrap();
+        assert_eq!(*km.key(), new_key);
+        assert_eq!(km.previous_key(), Some(&before));
     }
 
     #[test]

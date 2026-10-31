@@ -174,6 +174,12 @@ pub struct Transaction {
     /// statement-capture frame, atomically with this transaction's data. Distinct from
     /// `wal`, which also derives operations from the write set (double-logging hazard).
     statement_wal: Option<Arc<RwLock<WriteAheadLog>>>,
+    /// Spec R1 §4 (sprinter e21903322db7): logical-WAL operations a
+    /// statement of this transaction asked to be logged WITH its commit
+    /// ([`Self::log_on_commit`]) — a transactional TRUNCATE, whose entry an
+    /// immediate append wrote even when the transaction then rolled back.
+    /// Dropped with a rollback; cut back by `ROLLBACK TO SAVEPOINT`.
+    commit_wal_ops: RwLock<Vec<WalOperation>>,
     /// R1.3: fsync the commit WriteBatch (power-loss durable commits).
     sync_commit: bool,
     /// R1.3 phase 2: engine-wide leader/follower group committer. When set
@@ -686,6 +692,8 @@ enum StagedKey {
 pub struct TransactionSavepointSnapshot {
     write_set: Vec<(Key, Option<Vec<u8>>)>,
     insert_log_len: usize,
+    /// How many [`Transaction::log_on_commit`] operations preceded it.
+    commit_wal_ops_len: usize,
 }
 
 /// One entry of a transaction's savepoint stack.
@@ -761,6 +769,7 @@ impl Transaction {
             wal: None,
             logical_wal_sync: false,
             statement_wal: None,
+            commit_wal_ops: RwLock::new(Vec::new()),
             sync_commit: false,
             group_committer: None,
             row_cache: None,
@@ -970,6 +979,21 @@ impl Transaction {
         self.statement_wal = wal;
     }
 
+    /// Spec R1 §4 (sprinter e21903322db7): log `operation` with this
+    /// transaction's COMMIT, in the commit's own write group, after the
+    /// operations its write set yields — never for a transaction that rolls
+    /// back (nor for work a `ROLLBACK TO SAVEPOINT` undoes). Returns `false`
+    /// when this transaction carries no logical WAL at all (neither an
+    /// explicit transaction's nor an autocommit statement's), so the caller
+    /// logs as it did before.
+    pub(crate) fn log_on_commit(&self, operation: WalOperation) -> bool {
+        if self.wal.is_none() && self.statement_wal.is_none() {
+            return false;
+        }
+        self.commit_wal_ops.write().push(operation);
+        true
+    }
+
     /// Open the statement-capture frame for this transaction. Hold the guard for the
     /// statement's whole lifetime including the commit: dropping it discards anything
     /// the commit did not take, which is exactly what a rollback needs.
@@ -1027,6 +1051,7 @@ impl Transaction {
             wal: None,
             logical_wal_sync: false,
             statement_wal: None,
+            commit_wal_ops: RwLock::new(Vec::new()),
             sync_commit: false,
             group_committer: None,
             row_cache: None,
@@ -1648,6 +1673,20 @@ impl Transaction {
                             *sync |= wants_sync;
                         }
                         None => wal_plan = Some((Arc::clone(wal), captured, wants_sync)),
+                    }
+                }
+            }
+        }
+        // Spec R1 §4: the operations a statement asked to be logged with the
+        // commit (`log_on_commit`), after everything above — a TRUNCATE's
+        // entry after the row deletes it staged.
+        let on_commit = std::mem::take(&mut *self.commit_wal_ops.write());
+        if !on_commit.is_empty() {
+            match &mut wal_plan {
+                Some((_, ops, _)) => ops.extend(on_commit),
+                None => {
+                    if let Some(wal) = self.wal.as_ref().or(self.statement_wal.as_ref()) {
+                        wal_plan = Some((Arc::clone(wal), on_commit, self.logical_wal_sync));
                     }
                 }
             }
@@ -2410,6 +2449,7 @@ impl Transaction {
                 .map(|entry| (entry.key().clone(), entry.value().clone()))
                 .collect(),
             insert_log_len: self.insert_log.read().len(),
+            commit_wal_ops_len: self.commit_wal_ops.read().len(),
         }
     }
 
@@ -2440,6 +2480,7 @@ impl Transaction {
         }
 
         self.insert_log.write().truncate(snapshot.insert_log_len);
+        self.commit_wal_ops.write().truncate(snapshot.commit_wal_ops_len);
     }
 
     /// Does THIS transaction have at least one live savepoint?

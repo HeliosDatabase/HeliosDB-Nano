@@ -79,6 +79,7 @@ ships. "P3", "P4" and "P5" are phases of the physical standby plan.
 | Cascaded standby (a standby redo-transport source) | `[replication.physical] cascade = true` on a standby: it serves its own store on its `replication_port` to downstream standbys |
 | Datafile block, block SCN | None: one key-value space with no per-key sequence. `recover --from-primary` compares key-range **leaves** (about 4 MiB of keys and values each) by SHA-256 digest |
 | Block change tracking | None yet: the fast-forward's digest pass reads both datasets once, as RMAN does without a change-tracking file |
+| `DBMS_COMPARISON.COMPARE` (a replica's content against its source) | `heliosdb-nano standby verify --data-dir DIR --against HOST:PORT`: the stopped standby brought to the primary's cut and compared with it leaf by leaf, nothing shipped (see [Verifying a standby](#verifying-a-standby-standby-verify)) |
 | Incarnation, `RESETLOGS` | The dataset **history id** (`NANO-PRIMARY-HISTORY.json`, kept across promotions) plus the **epoch** (`repl:epoch` in the dataset, `pg_control_checkpoint().timeline_id`; 1 until the first promotion, one more per promotion) — see [Promotion and the epoch](#promotion-and-the-epoch) |
 | Protection modes | `[replication] sync_mode`: `async` is Maximum Performance; `semi-sync` with `sync_timeout_action = "warn"` behaves like Maximum Availability. Maximum Protection has no equivalent (`fail` reports an error but never stops the primary) |
 | `NET_TIMEOUT` | `[replication] sync_timeout_ms` |
@@ -926,7 +927,18 @@ copy. With `--replace` the old directory is moved to
 prints its size) and the copy is moved into its place. Without `--replace` the
 command stops after the copy is complete and prints the two `mv` commands
 (exit 3); running it again with `--replace` uses that completed copy instead
-of downloading another. `--no-full-copy` never makes one: when one is needed
+of downloading another — as long as the primary still serves the copy's next
+write group, which the command asks first. That answer holds when it is given:
+nothing pins the copy's tail, so a primary that prunes past it before the
+standby starts sends the standby to recovery again. A completed copy whose tail
+the primary no longer holds (`WalPruned`, `Gap`, `GroupTooLarge`, `Diverged`),
+of another history, or behind a promotion would be a standby nothing can
+continue: the command says so ("the completed copy at … is older than what the
+primary retains; copying again"), removes it and copies again. Any other answer
+— a busy or shutting-down primary, a token or version problem, a superseded
+primary — says nothing about the copy: it is kept and the command fails. When a
+copy was adopted the summary says "adopted the completed copy at …, nothing
+copied in this run". `--no-full-copy` never makes one: when one is needed
 the command prints the estimate and exits 3, leaving everything as it was.
 
 **Sizing.** The stage directory (`--stage-dir`, default
@@ -953,6 +965,71 @@ recovered the same way, with `recover --from-primary` against it.
 | 1 | refused or failed: a running node, a primary's directory, an unreachable or refusing primary, a stage directory without room; a failure part-way keeps the fast-forward's progress — run the command again |
 | 2 | (`--from-archive` only) applied up to an archive gap; also clap's exit code for a usage error |
 | 3 | a full copy is needed but was not applied: `--no-full-copy`, or the data directory is occupied and `--replace` was not given (the completed copy waits beside it) |
+
+## Verifying a standby: `standby verify`
+
+The byte-identity audit of the plan ("Verification" §3): prove that a STOPPED
+standby's replicated keyspace — its whole default column family, the
+primary's bytes — is identical to its primary's at one sequence, or name the
+key ranges where it is not.
+
+```bash
+heliosdb-nano standby verify --data-dir /var/lib/heliosdb/standby \
+  --against 10.0.0.5:5433 --replication-token-file /etc/heliosdb/replication.token
+```
+
+```
+standby verify: the physical standby /var/lib/heliosdb/standby (history 3f2a…, epoch 1) is at sequence 1 827
+standby verify: the primary at 10.0.0.5:5433 pinned its snapshot 9c41… at sequence 1 913: 256 leaves of 4 MiB, 1 017 MiB
+standby verify: applied the primary's write groups 1 828..1 913 (86 groups), as a start would apply them
+standby verify: identical at sequence 1 913 (256 leaves, 1 066 401 792 bytes compared; 9.8 s)
+```
+
+How it proves it:
+
+1. It holds the standby: an installed physical standby that no process runs
+   (a running one is refused, naming the process holding its lock), with no
+   interrupted fast-forward or promotion; its store stays locked until the
+   end, so no `start` can race the comparison.
+2. It asks the primary to resume at the standby's cursor — the standby's last
+   write group verified by content — so a primary that no longer serves it
+   (WAL pruned and not in its archive, a promotion since) is refused at once,
+   with the `recover --from-primary` command to run first.
+3. The primary pins a snapshot (a leased checkpoint export, as for a
+   fast-forward) at its current sequence `P` and sends its **leaf plan**: one
+   SHA-256 per leaf of `--leaf-bytes` (default 4 MiB) of its default column
+   family. Nothing else: no leaf file is built, nothing is shipped, the
+   primary is never modified. An idle primary's `P` is the standby's own
+   cursor; serving a session there is a capability of this release
+   (`CAP_FAST_FORWARD_AT_CUT`), and a primary of an older release is refused
+   plainly ("upgrade the primary").
+4. The standby is brought to exactly `P` by the tail a `start` would apply —
+   the same write groups, applied the same way — and not one group further.
+   It is applied offline, as `recover` and `promote` apply theirs, so a
+   standby that keeps its own WAL archive records those sequences there as a
+   gap at its next start (the command says so): a recovery from that archive
+   cannot cross the gap — recover across it from the primary's archive, which
+   holds the range — and a standby cascaded from this one is served the range
+   from this standby's WAL while that holds it, never from its archive.
+5. The standby digests its own default column family against the same
+   boundaries. Its node-local state (cursor, archive catalog) lives in another
+   column family and is never part of the comparison.
+
+When a leaf differs, every differing leaf is listed (the first 64 in detail)
+with its key range, both digests, the keys each side holds there and the
+standby's first and last key in it; the remedy is a full copy beside the
+directory (`recover --from-primary --full --replace`). `--json` prints the
+verdict as one object on stdout (`result` = `identical`, `different` or
+`not_verified`; keys in hex) and the progress on stderr. `--against` defaults
+to the standby's `[replication] primary_host`; the token and TLS flags are
+`recover`'s. Against a cascading standby the comparison is in the primary's
+numbering, as everything a cascade serves.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | identical at the primary's cut |
+| 1 | a leaf differs: the standby is not a copy of its primary |
+| 2 | not verified: refused (a running standby, no standby, an interrupted fast-forward or promotion, a primary that no longer serves the tail or follows another epoch) or failed (transport, storage); also clap's exit code for a usage error |
 
 ## Promotion and the epoch
 
@@ -1434,10 +1511,16 @@ The test suites are listed in the [HA testing guide](ha_testing.md).
   plaintext on loopback at each end.
 - **Encryption keys.** A standby must be started with the same dataset key as
   its primary: it holds the primary's ciphertext verbatim. There is no key
-  rotation command in this release (the internal `KeyManager::rotate` has no
-  caller and re-encrypts nothing); rotating the key while standbys are attached
-  is not supported until promotion and fencing arrive (P5), which add the
-  control-plane check that every standby holds the new key first.
+  rotation command in this release, and nothing re-encrypts a dataset; the one
+  internal rotation entry point (`StorageEngine::rotate_encryption_key`,
+  reached by no SQL, CLI or HTTP surface) fails closed while a rotation would
+  strand a standby, from the store's own state: it is refused on a physical
+  standby (its key is its primary's), and on a primary whose replication port
+  serves (the refusal names the standbys attached; a standby that is away holds
+  the key too); otherwise it is refused because nothing re-encrypts. No standby can hold
+  two keys, so the procedure is: re-key a primary that serves no standby, then
+  rebuild each standby from it with the new key configured
+  (`recover --from-primary --full --replace`).
 - **Promotion is asked of the standby.** `SELECT pg_promote(true, N)` promotes
   a RUNNING standby, `heliosdb-nano promote` a STOPPED one (see [Promotion and
   the epoch](#promotion-and-the-epoch)); the SQL `SWITCHOVER` statement on the

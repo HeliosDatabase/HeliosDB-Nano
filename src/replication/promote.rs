@@ -328,8 +328,8 @@ fn kill_promote_hook(step: &str) {
 }
 
 /// The process holding RocksDB's `LOCK` of `dir` (a running node), asked with
-/// `F_GETLK`, which takes nothing.
-fn lock_holder(dir: &Path) -> Option<i32> {
+/// `F_GETLK`, which takes nothing. Also `standby verify`'s check (spec R1 §1).
+pub fn lock_holder(dir: &Path) -> Option<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;

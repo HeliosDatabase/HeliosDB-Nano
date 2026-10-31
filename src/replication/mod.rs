@@ -30,6 +30,8 @@
 //! Spec P5.1 makes the replication epoch a stored value ([`epoch`]), fences
 //! a superseded primary on the replication protocol ([`fence`]) and promotes
 //! a stopped standby offline ([`promote`], `heliosdb-nano promote`).
+//! Spec R1 §1 proves a stopped standby is byte-identical to its primary
+//! ([`standby_verify`], `heliosdb-nano standby verify`).
 //!
 //! # Feature Flags
 //!
@@ -95,6 +97,10 @@ pub mod physical_wire;
 pub mod promote;
 #[cfg(feature = "ha-tier1")]
 pub mod recover_primary;
+// Spec R1 §1: `heliosdb-nano standby verify` — a stopped standby's
+// replicated keyspace compared with its primary's at the primary's cut.
+#[cfg(feature = "ha-tier1")]
+pub mod standby_verify;
 // Spec P1.3: the posture lives at the crate root (`crate::standby_posture`),
 // compiled in every build because the SQL layer asks it whether this node is
 // in recovery; re-exported here beside the receiver it is derived from.

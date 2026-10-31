@@ -194,9 +194,17 @@ pub const CAP_TLS: u64 = 1 << 2;
 /// (`OpenRequest::FastForward` and the leaf frames). A receiver does not
 /// start one with a source whose `HelloOk` lacks it.
 pub const CAP_FAST_FORWARD: u64 = 1 << 3;
+/// Spec R1 §1: a fast-forward session may be opened AT the source's cut
+/// (`after == sequence`), not only behind it — what `standby verify` asks of
+/// a caught-up standby's idle primary, for the leaf plan alone. Served and
+/// accepted only when BOTH sides offer it: a source without it refuses a
+/// receiver at its cut (`HistoryMismatch`, as every release did), and a
+/// receiver without it is never sent such a session.
+// Bit 4 is CAP_PROMOTE (SWITCHOVER, R3, branch fix/4420-standby-r3); keep the bits apart.
+pub const CAP_FAST_FORWARD_AT_CUT: u64 = 1 << 5;
 /// What this release offers on every session ([`CAP_TLS`] is added per
 /// session, by its transport).
-pub const CAPABILITIES: u64 = CAP_HEARTBEAT | CAP_FAST_FORWARD;
+pub const CAPABILITIES: u64 = CAP_HEARTBEAT | CAP_FAST_FORWARD | CAP_FAST_FORWARD_AT_CUT;
 
 /// Spec P4.1 §3.1: the bounds of a fast-forward's leaf size (`--leaf-bytes`),
 /// checked by both sides.
@@ -1457,12 +1465,22 @@ impl SourceSessionInfo {
         }
     }
     fn validate(&self, request: OpenRequest, limits: &WireLimits) -> Result<()> {
+        self.validate_with(request, limits, false)
+    }
+
+    /// [`Self::validate`]; `at_cut`: both sides offered
+    /// [`CAP_FAST_FORWARD_AT_CUT`], so a fast-forward cut AT the receiver's
+    /// cursor is valid too.
+    fn validate_with(&self, request: OpenRequest, limits: &WireLimits, at_cut: bool) -> Result<()> {
         match (self, request) {
             (Self::Snapshot(m), OpenRequest::Snapshot | OpenRequest::SnapshotOf { .. }) => {
                 m.validate(&limits.transfer).map_err(|e| invalid(e.to_string()))
             }
             // A receiver at or past the cut has nothing to fast-forward: the
             // source refuses it (`HistoryMismatch`) rather than open this.
+            // Spec R1 §1: one AT the cut is served when both sides offer
+            // `CAP_FAST_FORWARD_AT_CUT` (`standby verify` of a caught-up
+            // standby against an idle primary).
             (
                 Self::FastForward {
                     session_id,
@@ -1480,7 +1498,7 @@ impl SourceSessionInfo {
                 && !snapshot_id.is_nil()
                 && *history == expected
                 && *after == requested
-                && requested < *sequence
+                && (requested < *sequence || (at_cut && requested == *sequence))
                 && *sequence <= MAX_SOURCE_SEQUENCE =>
             {
                 Ok(())
@@ -1544,7 +1562,7 @@ impl SourceSessionInfo {
 
     /// The `FastForwardInfo` answer to `request` (spec P4.1 §3.1), decoded
     /// and checked against it.
-    fn fast_forward_from(payload: &[u8], request: OpenRequest, limits: &WireLimits) -> Result<Self> {
+    fn fast_forward_from(payload: &[u8], request: OpenRequest, limits: &WireLimits, at_cut: bool) -> Result<Self> {
         let OpenRequest::FastForward { history, after, .. } = request else {
             return Err(invalid("a fast-forward answer to another session's open"));
         };
@@ -1558,7 +1576,7 @@ impl SourceSessionInfo {
             after,
             sequence: u64_at(payload, 32)?,
         };
-        info.validate(request, limits)?;
+        info.validate_with(request, limits, at_cut)?;
         Ok(info)
     }
 }
@@ -2729,7 +2747,25 @@ where
         }
     };
     let info = source_session.session_info().clone();
-    info.validate(open, &limits)?;
+    // Spec R1 §1: a fast-forward AT the receiver's cursor only for a receiver
+    // that offered `CAP_FAST_FORWARD_AT_CUT`; any other is refused as every
+    // release refused it, so an older receiver never gets a session its own
+    // checks reject.
+    let at_cut = hello.capabilities & CAP_FAST_FORWARD_AT_CUT != 0;
+    if let SourceSessionInfo::FastForward { after, sequence, .. } = &info {
+        if after == sequence && !at_cut {
+            let refusal = Refusal::new(
+                RefuseCode::HistoryMismatch,
+                format!(
+                    "the receiver at {after} is not behind the cut {sequence}: there is nothing to fast-forward \
+                     (the receiver's release cannot open a session at the cut)"
+                ),
+            );
+            drop(source_session);
+            return Err(refuse(&mut io, refusal, &limits, &mut shutdown).await);
+        }
+    }
+    info.validate_with(open, &limits, at_cut)?;
     let mut known_barrier = info.initial_barrier();
     // What this session has delivered: a heartbeat may not claim more.
     let mut delivered = info.initial_after();
@@ -3076,6 +3112,11 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
     pub fn fast_forward(&self) -> bool {
         self.hello_ok.capabilities & CAP_FAST_FORWARD != 0
     }
+    /// Spec R1 §1: whether a fast-forward session may be cut AT this
+    /// receiver's cursor — both sides offered [`CAP_FAST_FORWARD_AT_CUT`].
+    pub fn fast_forward_at_cut(&self) -> bool {
+        self.hello_ok.capabilities & self.hello.capabilities & CAP_FAST_FORWARD_AT_CUT != 0
+    }
     pub fn manifest(&self) -> Option<&CheckpointManifest> {
         self.info.as_ref().and_then(SourceSessionInfo::manifest)
     }
@@ -3195,7 +3236,8 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
     /// `leaf_bytes`, preferring the export `prefer` (a resumed fast-forward).
     /// A source without [`CAP_FAST_FORWARD`] is refused here, before anything
     /// is sent; a receiver at or past the source's cut is refused by the
-    /// source (`HistoryMismatch`).
+    /// source (`HistoryMismatch`) — spec R1 §1: at the cut is served when both
+    /// sides offer [`CAP_FAST_FORWARD_AT_CUT`].
     pub async fn open_fast_forward(
         &mut self,
         history: Uuid,
@@ -3236,7 +3278,12 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             .await?;
             let limits = self.reply_limits();
             let frame = read_reply(&mut self.io, &[Kind::FastForwardInfo], &limits, &mut self.shutdown).await?;
-            let info = SourceSessionInfo::fast_forward_from(&frame.payload, request, &self.limits)?;
+            let info = SourceSessionInfo::fast_forward_from(
+                &frame.payload,
+                request,
+                &self.limits,
+                self.fast_forward_at_cut(),
+            )?;
             if info.history() != self.hello_ok.history {
                 return Err(invalid("fast-forward history mismatch"));
             }
@@ -4175,7 +4222,7 @@ mod tests {
         let (kind, bytes) = info.response().unwrap();
         assert_eq!(kind, Kind::FastForwardInfo);
         assert!(Kind::FastForwardInfo.valid_size(bytes.len()));
-        let decoded = SourceSessionInfo::fast_forward_from(&bytes, request, &limits()).unwrap();
+        let decoded = SourceSessionInfo::fast_forward_from(&bytes, request, &limits(), false).unwrap();
         assert!(matches!(
             decoded,
             SourceSessionInfo::FastForward { snapshot_id, history: h, after: 10, sequence: 31_897, .. }
@@ -4382,7 +4429,9 @@ mod tests {
 
         // Spec P4.1: a fast-forward answer that cannot be this session's: a
         // cut at or before the receiver, a nil session, the wrong size, an
-        // answer to another kind of open.
+        // answer to another kind of open. Spec R1 §1: a cut AT the receiver
+        // is a valid answer once both sides offered `CAP_FAST_FORWARD_AT_CUT`
+        // (`standby verify` of a caught-up standby), and only then.
         let snapshot = Uuid::new_v4();
         let request = OpenRequest::FastForward {
             history,
@@ -4402,8 +4451,23 @@ mod tests {
             .unwrap()
             .1
         };
+        assert!(
+            matches!(
+                SourceSessionInfo::fast_forward_from(&answer(Uuid::new_v4(), 10), request, &limits(), true),
+                Ok(SourceSessionInfo::FastForward {
+                    after: 10,
+                    sequence: 10,
+                    ..
+                })
+            ),
+            "a cut at the receiver, the capability negotiated"
+        );
+        assert!(
+            SourceSessionInfo::fast_forward_from(&answer(Uuid::new_v4(), 10), request, &limits(), false).is_err(),
+            "a cut at the receiver without the capability"
+        );
+        assert_ne!(CAPABILITIES & CAP_FAST_FORWARD_AT_CUT, 0, "this release offers it");
         for (bytes, why) in [
-            (answer(Uuid::new_v4(), 10), "a cut at the receiver"),
             (answer(Uuid::new_v4(), 9), "a cut behind the receiver"),
             (answer(Uuid::nil(), 11), "a nil session"),
             (
@@ -4413,7 +4477,7 @@ mod tests {
             (answer(Uuid::new_v4(), 11)[..39].to_vec(), "the wrong size"),
         ] {
             assert!(
-                SourceSessionInfo::fast_forward_from(&bytes, request, &limits()).is_err(),
+                SourceSessionInfo::fast_forward_from(&bytes, request, &limits(), true).is_err(),
                 "{why}"
             );
         }
@@ -4424,7 +4488,8 @@ mod tests {
                 after: 10,
                 last: None
             },
-            &limits()
+            &limits(),
+            true
         )
         .is_err());
 

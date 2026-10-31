@@ -233,6 +233,10 @@ pub struct PrimaryRecoverReport {
     pub duration: Duration,
     /// Where an occupied directory went when a full copy replaced it.
     pub replaced: Option<PathBuf>,
+    /// Sprinter 6146b39a5beb: the completed copy a previous run left beside
+    /// the directory, when this run adopted it (the primary still served its
+    /// next write group) instead of copying: nothing was copied in this run.
+    pub adopted: Option<PathBuf>,
 }
 
 fn refused(reason: impl Into<String>) -> RecoverError {
@@ -776,6 +780,7 @@ impl Ladder<'_> {
             leaves_deleted_only: tally.leaves_deleted_only,
             duration: self.started.elapsed(),
             replaced,
+            adopted: None,
         }
     }
 
@@ -801,9 +806,21 @@ impl Ladder<'_> {
         history: Option<Uuid>,
         cursor: Option<u64>,
     ) -> Result<PhysicalClient<ReplicationStream>, WireError> {
+        self.connect_as(self.epoch.load(Ordering::Acquire), history, cursor)
+            .await
+    }
+
+    /// [`Self::connect`], announcing `epoch` (a completed copy's own, which
+    /// may be another than the standby's).
+    async fn connect_as(
+        &self,
+        epoch: u64,
+        history: Option<Uuid>,
+        cursor: Option<u64>,
+    ) -> Result<PhysicalClient<ReplicationStream>, WireError> {
         let mut last = None;
         let identity = ReceiverIdentity {
-            epoch: self.epoch.load(Ordering::Acquire),
+            epoch,
             ..self.identity.clone()
         };
         for source in &self.options.sources {
@@ -952,11 +969,25 @@ impl Ladder<'_> {
                         snapshot_id, sequence, ..
                     },
                 )) => {
+                    // Spec R1 §1: a source serves a fast-forward session to a
+                    // receiver AT its cut too (`standby verify` compares a
+                    // caught-up standby there). The ladder fast-forwards only
+                    // a receiver BEHIND the cut — its record spans `from <
+                    // to` — and keeps the answer it had before for one at it
+                    // (a diverged or unaccounted store whose cursor is the
+                    // primary's sequence): a full copy.
+                    if sequence <= after {
+                        let _ = client.close().await;
+                        return Ok(Opened::Mismatch(format!(
+                            "history mismatch: the receiver at {after} is not behind the primary's cut {sequence}, \
+                             so it cannot be fast-forwarded; only a full copy rebuilds it"
+                        )));
+                    }
                     return Ok(Opened::Session {
                         client,
                         snapshot_id,
                         cut: sequence,
-                    })
+                    });
                 }
                 Ok(_) => {
                     return Err(refused(
@@ -1579,20 +1610,60 @@ impl Ladder<'_> {
             CopyInto::Fresh { .. } => data_dir.clone(),
             CopyInto::Beside => recover_full_path(&data_dir)?,
         };
-        let adopted = match into {
+        let completed = match into {
             CopyInto::Fresh { .. } => None,
             CopyInto::Beside => self.completed_copy(&target, history).await?,
         };
+        // Sprinter 6146b39a5beb: a completed copy is adopted only while the
+        // primary still serves its next write group. One the primary's WAL
+        // and archive have moved past is a standby nothing can continue: it
+        // is removed and the copy is made again.
+        let adopted = match completed {
+            None => None,
+            Some(copy) => match self.copy_served(history, &copy, &target).await? {
+                CopyServed::Served => {
+                    progress(&if self.options.full {
+                        format!(
+                            "recover: --full: {} already holds a completed copy of the primary (history {history}, \
+                             sequence {}), which the primary still serves now (nothing pins it): it is adopted instead \
+                             of copying again",
+                            target.display(),
+                            format_count(copy.sequence)
+                        )
+                    } else {
+                        format!(
+                            "recover: {} already holds a completed copy of the primary (history {history}, sequence \
+                             {}), which the primary still serves now (nothing pins it: a primary that prunes past it \
+                             before the standby starts sends the standby to recovery again): it is used as it is",
+                            target.display(),
+                            format_count(copy.sequence)
+                        )
+                    });
+                    Some(copy.sequence)
+                }
+                CopyServed::Stale(reason) => {
+                    progress(&format!(
+                        "recover: the completed copy at {} (sequence {}) is older than what the primary retains \
+                         ({reason}); copying again",
+                        target.display(),
+                        format_count(copy.sequence)
+                    ));
+                    let stale = target.clone();
+                    blocking(move || {
+                        fs::remove_dir_all(&stale).map_err(|error| {
+                            format!(
+                                "the stale completed copy {} cannot be removed ({error}); move it aside and re-run",
+                                stale.display()
+                            )
+                        })
+                    })
+                    .await?;
+                    None
+                }
+            },
+        };
         let (to, copied) = match adopted {
-            Some(to) => {
-                progress(&format!(
-                    "recover: {} already holds a completed copy of the primary (history {history}, sequence {}): it \
-                     is used as it is",
-                    target.display(),
-                    format_count(to)
-                ));
-                (to, 0)
-            }
+            Some(to) => (to, 0),
             None => {
                 if let CopyInto::Fresh { empty_existing: true } = into {
                     let empty = data_dir.clone();
@@ -1617,6 +1688,7 @@ impl Ladder<'_> {
             bytes_shipped: copied,
             ..Tally::default()
         };
+        let adopted_path = adopted.map(|_| target.clone());
         if let CopyInto::Fresh { .. } = into {
             return Ok(self.report(RecoverRoute::FullCopy, history, from, to, tally, None));
         }
@@ -1685,13 +1757,80 @@ impl Ladder<'_> {
             target.display(),
             data_dir.display()
         ));
-        Ok(self.report(RecoverRoute::FullCopy, history, from, to, tally, Some(replaced)))
+        let mut report = self.report(RecoverRoute::FullCopy, history, from, to, tally, Some(replaced));
+        report.adopted = adopted_path;
+        Ok(report)
     }
 
-    /// The source sequence of a completed copy of `history` at `target`
-    /// (a published physical stage a previous run left), `None` when there
-    /// is no copy there. Anything else at that path is refused, untouched.
-    async fn completed_copy(&self, target: &Path, history: Uuid) -> Result<Option<u64>, RecoverError> {
+    /// Sprinter 6146b39a5beb: whether the primary still serves `copy`'s next
+    /// write group — a resume after its cursor, announcing its own epoch and
+    /// last group, as the standby it becomes would at its first `start`.
+    /// Accepted: the copy can be adopted — as of now; nothing pins its tail.
+    /// Refused for a reason about the copy ([`copy_refusal_is_stale`]): it is
+    /// stale. Any other refusal or failure (after the usual retries) says
+    /// nothing about the copy: the recovery stops and the copy is kept.
+    async fn copy_served(
+        &self,
+        history: Uuid,
+        copy: &CompletedCopy,
+        target: &Path,
+    ) -> Result<CopyServed, RecoverError> {
+        let Some(epoch) = copy.epoch else {
+            return Err(refused(format!(
+                "the completed copy at {} has a replication epoch record that cannot be read: it is kept; move it \
+                 aside and re-run",
+                target.display()
+            )));
+        };
+        let mut attempt = 0;
+        loop {
+            let outcome = async {
+                #[cfg(all(feature = "internal-tests", unix))]
+                if let Some(code) = hooked_copy_probe_refusal() {
+                    return Err(WireError::Refused(super::physical_wire::Refusal::new(
+                        code,
+                        COPY_PROBE_REFUSE_ENV,
+                    )));
+                }
+                let mut client = self.connect_as(epoch, Some(history), Some(copy.sequence)).await?;
+                client.resume(history, copy.sequence, copy.last).await?;
+                Ok::<_, WireError>(client)
+            }
+            .await;
+            let error = match outcome {
+                Ok(client) => {
+                    let _ = client.close().await;
+                    return Ok(CopyServed::Served);
+                }
+                Err(error) => error,
+            };
+            if self.retry_later(&error, &mut attempt).await {
+                continue;
+            }
+            // Only a refusal that says the primary no longer holds what the
+            // copy needs makes it stale; anything else (a busy or shutting
+            // down primary, a token or version problem, a superseded
+            // primary, a transport error) says nothing about the copy, which
+            // may hold hours of transfer: it is kept, and the run stops.
+            return match error {
+                WireError::Refused(refusal) if copy_refusal_is_stale(&refusal.code) => {
+                    Ok(CopyServed::Stale(refusal.to_string()))
+                }
+                other => Err(refused(format!(
+                    "the primary at {} could not say whether it still serves the completed copy at {} ({other}); \
+                     the copy is kept: re-run the command when the primary answers",
+                    self.options.primary_host,
+                    target.display()
+                ))),
+            };
+        }
+    }
+
+    /// The completed copy of `history` at `target` (a published physical
+    /// stage a previous run left) — its cursor's source sequence and last
+    /// group, and its epoch — `None` when there is no copy there. Anything
+    /// else at that path is refused, untouched.
+    async fn completed_copy(&self, target: &Path, history: Uuid) -> Result<Option<CompletedCopy>, RecoverError> {
         let path = target.to_path_buf();
         let config = self.options.config.clone();
         let limits = self.options.wire.transfer;
@@ -1719,8 +1858,16 @@ impl Ladder<'_> {
             }
             let stage = ReopenedPhysicalStage::open(&path, history, limits, &config)
                 .map_err(|error| format!("{} cannot be opened: {error}; move it aside and re-run", path.display()))?;
+            let epoch = read_epoch(stage.writer().db()).ok();
             let closed = stage.close().map_err(|error| error.to_string())?;
-            Ok(Some(closed.cursor.source_sequence()))
+            Ok(Some(CompletedCopy {
+                sequence: closed.cursor.source_sequence(),
+                last: closed
+                    .cursor
+                    .last_group()
+                    .map(|(first_sequence, digest)| LastGroup { first_sequence, digest }),
+                epoch,
+            }))
         })
         .await
     }
@@ -1879,6 +2026,65 @@ impl Ladder<'_> {
     }
 }
 
+/// A completed full copy beside the data directory, as a previous run left
+/// it (sprinter 6146b39a5beb).
+struct CompletedCopy {
+    /// Its cursor's source sequence: where the standby it becomes resumes.
+    sequence: u64,
+    /// Its cursor's last applied group (`None` at its checkpoint cut).
+    last: Option<LastGroup>,
+    /// Its store's epoch; `None` when the record cannot be read.
+    epoch: Option<u64>,
+}
+
+/// Sprinter 6146b39a5beb: whether the primary's refusal of a completed
+/// copy's resume proves the copy stale — the primary no longer holds the
+/// copy's next write group (`WalPruned`, `Gap`, `GroupTooLarge`), the copy's
+/// last group is not the primary's (`Diverged`), the primary serves another
+/// dataset (`HistoryMismatch`), or it was promoted past the copy's epoch
+/// (`EpochStale` with a newer epoch). Nothing else does.
+fn copy_refusal_is_stale(code: &RefuseCode) -> bool {
+    match code {
+        RefuseCode::WalPruned { .. }
+        | RefuseCode::Gap { .. }
+        | RefuseCode::GroupTooLarge { .. }
+        | RefuseCode::Diverged { .. }
+        | RefuseCode::HistoryMismatch => true,
+        RefuseCode::EpochStale { have, want } => have > want,
+        RefuseCode::AuthFailed
+        | RefuseCode::TooManySessions
+        | RefuseCode::SourceNotServing
+        | RefuseCode::Version
+        | RefuseCode::SourceStale { .. } => false,
+    }
+}
+
+/// `internal-tests` builds only: `<RefuseCode name>` (`TooManySessions`,
+/// `SourceNotServing`, `AuthFailed`, `Version`, `WalPruned`) makes every
+/// probe of a completed copy refused with that code, without asking the
+/// primary — the transient refusal a copy must survive.
+#[cfg(all(feature = "internal-tests", unix))]
+pub const COPY_PROBE_REFUSE_ENV: &str = "HELIOSDB_NANO_TEST_COPY_PROBE_REFUSE";
+
+#[cfg(all(feature = "internal-tests", unix))]
+fn hooked_copy_probe_refusal() -> Option<RefuseCode> {
+    Some(match std::env::var(COPY_PROBE_REFUSE_ENV).ok()?.trim() {
+        "TooManySessions" => RefuseCode::TooManySessions,
+        "SourceNotServing" => RefuseCode::SourceNotServing,
+        "AuthFailed" => RefuseCode::AuthFailed,
+        "Version" => RefuseCode::Version,
+        "WalPruned" => RefuseCode::WalPruned { oldest: u64::MAX },
+        _ => return None,
+    })
+}
+
+/// Whether the primary still serves a completed copy's next write group.
+enum CopyServed {
+    Served,
+    /// It does not: the primary's refusal.
+    Stale(String),
+}
+
 /// What the steps of a fast-forward came to.
 enum Steps {
     /// Every differing leaf of `snapshot_id`'s plan replaced, the session
@@ -1980,6 +2186,38 @@ fn directory_bytes(path: &Path) -> u64 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    /// Sprinter 6146b39a5beb: only a refusal that says the primary no longer
+    /// holds what a completed copy needs (or is another dataset, or was
+    /// promoted past it) makes the copy stale; a busy, shutting-down,
+    /// superseded or mis-authenticated primary keeps it.
+    #[test]
+    fn only_a_refusal_about_the_copy_makes_it_stale() {
+        for code in [
+            RefuseCode::WalPruned { oldest: 9 },
+            RefuseCode::Gap {
+                expected: 5,
+                have_from: 7,
+                have_to: 9,
+            },
+            RefuseCode::GroupTooLarge { first: 5, bytes: 1 },
+            RefuseCode::Diverged { at: 4 },
+            RefuseCode::HistoryMismatch,
+            RefuseCode::EpochStale { have: 2, want: 1 },
+        ] {
+            assert!(copy_refusal_is_stale(&code), "{code}");
+        }
+        for code in [
+            RefuseCode::TooManySessions,
+            RefuseCode::SourceNotServing,
+            RefuseCode::AuthFailed,
+            RefuseCode::Version,
+            RefuseCode::SourceStale { have: 1, want: 2 },
+            RefuseCode::EpochStale { have: 1, want: 2 },
+        ] {
+            assert!(!copy_refusal_is_stale(&code), "{code}");
+        }
+    }
 
     #[test]
     fn counts_bytes_and_percentages_read_as_the_progress_lines_print_them() {
