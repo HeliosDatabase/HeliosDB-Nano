@@ -493,3 +493,315 @@ fn open_transaction_at_drop_skips_snapshot_but_not_the_counter_flush() {
     assert_eq!(total, 11, "the new row must not overwrite an old one");
     assert_all_ids_present(&db, "d_ctr_txn", (0..10).chain(std::iter::once(999)));
 }
+
+// ---------------------------------------------------------------------------
+// R4 (Sprinter 746342a0bfbb): the HNSW graph dump lifecycle.
+//
+// Each checkpoint dumps a changed graph under a fresh basename, switches the
+// sidecar + marker to it in one batch and removes the previous dump; an
+// unchanged index keeps its dump; the open sweeps whatever no valid sidecar
+// references; an encrypted store writes no dump at all.
+// ---------------------------------------------------------------------------
+
+/// Sorted names in `{data}/hnsw_snapshots/` (empty when it does not exist).
+fn hnsw_snapshot_entries(data: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(data.join("hnsw_snapshots")) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The fireproof tests' rows: `[v, v + 1, v / 2, 1]` with `v = id / 4`.
+fn seed_line_rows(db: &EmbeddedDatabase, table: &str, ids: std::ops::Range<i32>) {
+    for i in ids {
+        let v = i as f32 * 0.25;
+        db.execute(&format!(
+            "INSERT INTO {table} VALUES ({i}, '[{}, {}, {}, {}]')",
+            v,
+            v + 1.0,
+            v * 0.5,
+            1.0
+        ))
+        .unwrap();
+    }
+}
+
+fn line_vector_literal(id: i32) -> String {
+    let v = id as f32 * 0.25;
+    format!("[{}, {}, {}, {}]", v, v + 1.0, v * 0.5, 1.0)
+}
+
+/// Item 1: reload → change → checkpoint → close → reopen, three times over.
+/// Every checkpoint of the RELOADED graph succeeds, exactly one dump pair is
+/// ever on disk, and every reopen reloads. Red before: hnsw_rs refused to
+/// overwrite a reloaded graph's dump and wrote a `-{rand}` copy, so each
+/// checkpoint counted a dump failure and left a full-size orphan pair.
+#[test]
+fn closing_a_reloaded_hnsw_index_publishes_one_dump_and_counts_no_failure() {
+    let temp = TempDir::new().unwrap();
+    {
+        let db = EmbeddedDatabase::new(temp.path()).unwrap();
+        db.execute("CREATE TABLE d_cycle (id INT PRIMARY KEY, emb VECTOR(4))")
+            .unwrap();
+        seed_line_rows(&db, "d_cycle", 0..200);
+        db.execute("CREATE INDEX idx_d_cycle_emb ON d_cycle USING hnsw (emb)")
+            .unwrap();
+    }
+    assert_eq!(hnsw_snapshot_entries(temp.path()).len(), 2);
+
+    for round in 0..3 {
+        let db = EmbeddedDatabase::new(temp.path()).unwrap();
+        let opened = db.storage.last_index_open_report().unwrap();
+        assert_eq!(opened.vector_reloaded, 1, "round {round}: {opened:?}");
+        assert_eq!(opened.vector_rebuilt, 0, "round {round}: {opened:?}");
+        assert_eq!(
+            opened.vector_dump_files_swept, 0,
+            "round {round}: nothing stray: {opened:?}"
+        );
+
+        // A change, so the reloaded graph itself must be dumped again.
+        seed_line_rows(&db, "d_cycle", 1000 + round..1001 + round);
+        let persisted = db.storage.persist_index_snapshots().unwrap();
+        assert_eq!(persisted.vector_dump_failures, 0, "round {round}: {persisted:?}");
+        assert_eq!(persisted.vector_graphs, 1, "round {round}: {persisted:?}");
+        let entries = hnsw_snapshot_entries(temp.path());
+        assert_eq!(entries.len(), 2, "round {round}: one dump pair, no orphan: {entries:?}");
+    } // clean close: unchanged since the checkpoint, nothing dumped again
+    assert_eq!(hnsw_snapshot_entries(temp.path()).len(), 2);
+
+    let db = EmbeddedDatabase::new(temp.path()).unwrap();
+    let report = db.storage.last_index_open_report().unwrap();
+    assert_eq!(report.vector_reloaded, 1, "{report:?}");
+    let stats = db.storage.vector_indexes().get_index_stats("idx_d_cycle_emb").unwrap();
+    assert_eq!(stats.num_vectors, 203);
+    for id in 1000..1003 {
+        let rows = db
+            .query(
+                &format!(
+                    "SELECT id FROM d_cycle ORDER BY emb <-> '{}' LIMIT 1",
+                    line_vector_literal(id)
+                ),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows[0].values.first(), Some(&Value::Int4(id)));
+    }
+}
+
+/// Per-index dirty flag: an index unchanged since its dump keeps that dump.
+/// Only `d_touch` changes; its first mutation deletes EVERY vector marker,
+/// `d_keep`'s too, and the checkpoint re-arms `d_keep`'s without dumping it,
+/// so both still reload.
+#[test]
+fn an_unchanged_hnsw_index_is_not_dumped_again_and_keeps_reloading() {
+    let temp = TempDir::new().unwrap();
+    {
+        let db = EmbeddedDatabase::new(temp.path()).unwrap();
+        for table in ["d_keep", "d_touch"] {
+            db.execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, emb VECTOR(4))"))
+                .unwrap();
+            seed_line_rows(&db, table, 0..60);
+            db.execute(&format!("CREATE INDEX idx_{table}_emb ON {table} USING hnsw (emb)"))
+                .unwrap();
+        }
+    }
+    let first = hnsw_snapshot_entries(temp.path());
+    assert_eq!(first.len(), 4, "{first:?}");
+    {
+        let db = EmbeddedDatabase::new(temp.path()).unwrap();
+        assert_eq!(db.storage.last_index_open_report().unwrap().vector_reloaded, 2);
+        seed_line_rows(&db, "d_touch", 500..501);
+        let persisted = db.storage.persist_index_snapshots().unwrap();
+        assert_eq!(
+            persisted.vector_graphs, 1,
+            "only the changed index is dumped: {persisted:?}"
+        );
+        assert_eq!(persisted.vector_unchanged, 1, "{persisted:?}");
+        assert_eq!(persisted.vector_dump_failures, 0, "{persisted:?}");
+    }
+    let second = hnsw_snapshot_entries(temp.path());
+    assert_eq!(second.len(), 4, "{second:?}");
+    assert_eq!(
+        first.iter().filter(|name| second.contains(name)).count(),
+        2,
+        "d_keep's dump is the same files, d_touch's was replaced: {first:?} -> {second:?}"
+    );
+
+    let db = EmbeddedDatabase::new(temp.path()).unwrap();
+    let report = db.storage.last_index_open_report().unwrap();
+    assert_eq!(report.vector_reloaded, 2, "{report:?}");
+    assert_eq!(report.vector_rebuilt, 0, "{report:?}");
+    assert_eq!(
+        db.storage
+            .vector_indexes()
+            .get_index_stats("idx_d_touch_emb")
+            .unwrap()
+            .num_vectors,
+        61
+    );
+}
+
+/// Item 1: at open, every dump file no valid sidecar references (an old-style
+/// orphan, another dump's leftovers) and every crashed dump's staging
+/// directory is deleted; the referenced dump and unrelated files stay.
+#[test]
+fn stray_graph_dump_files_are_swept_at_open() {
+    let temp = TempDir::new().unwrap();
+    {
+        let db = EmbeddedDatabase::new(temp.path()).unwrap();
+        db.execute("CREATE TABLE d_stray (id INT PRIMARY KEY, emb VECTOR(4))")
+            .unwrap();
+        seed_line_rows(&db, "d_stray", 0..40);
+        db.execute("CREATE INDEX idx_d_stray_emb ON d_stray USING hnsw (emb)")
+            .unwrap();
+    }
+    let referenced = hnsw_snapshot_entries(temp.path());
+    assert_eq!(referenced.len(), 2, "{referenced:?}");
+    let dir = temp.path().join("hnsw_snapshots");
+    for name in [
+        "0123456789abcdef-0000000000000001.hnsw.graph",
+        "0123456789abcdef-0000000000000001.hnsw.data",
+        "idx_d_stray_emb-4242.hnsw.data",
+    ] {
+        std::fs::write(dir.join(name), b"stale").unwrap();
+    }
+    let staging = dir.join(".hnsw-staging-crashed-1-2-0");
+    std::fs::create_dir(&staging).unwrap();
+    std::fs::write(staging.join("crashed.hnsw.graph"), b"partial").unwrap();
+    std::fs::write(dir.join("notes.txt"), b"not a dump").unwrap();
+
+    let db = EmbeddedDatabase::new(temp.path()).unwrap();
+    let report = db.storage.last_index_open_report().unwrap();
+    assert_eq!(report.vector_reloaded, 1, "{report:?}");
+    assert_eq!(report.vector_dump_files_swept, 4, "{report:?}");
+    let mut expected = referenced;
+    expected.push("notes.txt".to_string());
+    expected.sort();
+    assert_eq!(hnsw_snapshot_entries(temp.path()), expected);
+}
+
+/// Item 4: with at-rest encryption on, no graph dump (plaintext vectors) is
+/// written; the index rebuilds from its sealed rows at open, and a plaintext
+/// dump an unencrypted run left behind is deleted.
+#[cfg(feature = "encryption")]
+#[test]
+fn an_encrypted_store_writes_no_graph_dump_and_rebuilds_from_rows() {
+    const KEY_VAR: &str = "HELIOSDB_TEST_R4_HNSW_DUMP_TDE_KEY";
+    std::env::set_var(
+        KEY_VAR,
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    );
+    let temp = TempDir::new().unwrap();
+    let encrypted = || {
+        let mut config = heliosdb_nano::Config::default();
+        config.storage.memory_only = false;
+        config.storage.path = Some(temp.path().to_path_buf());
+        config.encryption.enabled = true;
+        config.encryption.key_source = heliosdb_nano::KeySource::Environment(KEY_VAR.to_string());
+        config
+    };
+    let is_dump = |name: &String| name.ends_with(".hnsw.graph") || name.ends_with(".hnsw.data");
+    {
+        let db = EmbeddedDatabase::with_config(encrypted()).unwrap();
+        db.execute("CREATE TABLE d_sealed (id INT PRIMARY KEY, emb VECTOR(4))")
+            .unwrap();
+        seed_line_rows(&db, "d_sealed", 0..60);
+        db.execute("CREATE INDEX idx_d_sealed_emb ON d_sealed USING hnsw (emb)")
+            .unwrap();
+        let persisted = db.storage.persist_index_snapshots().unwrap();
+        assert_eq!(persisted.vector_graphs, 0, "{persisted:?}");
+        assert_eq!(persisted.vector_skipped, 1, "{persisted:?}");
+        assert_eq!(persisted.vector_dump_failures, 0, "{persisted:?}");
+    }
+    let entries = hnsw_snapshot_entries(temp.path());
+    assert!(!entries.iter().any(is_dump), "plaintext vectors written: {entries:?}");
+
+    // A plaintext dump from before encryption was enabled.
+    let dir = temp.path().join("hnsw_snapshots");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("idx_d_sealed_emb.hnsw.graph"), b"plaintext graph").unwrap();
+    std::fs::write(dir.join("idx_d_sealed_emb.hnsw.data"), b"plaintext vectors").unwrap();
+    {
+        let db = EmbeddedDatabase::with_config(encrypted()).unwrap();
+        let report = db.storage.last_index_open_report().unwrap();
+        assert_eq!(report.vector_reloaded, 0, "{report:?}");
+        assert_eq!(report.vector_rebuilt, 1, "{report:?}");
+        assert_eq!(report.vector_dump_files_swept, 2, "{report:?}");
+        let v = 30.0_f32 * 0.25;
+        let hits = db
+            .storage
+            .vector_indexes()
+            .search("idx_d_sealed_emb", &vec![v, v + 1.0, v * 0.5, 1.0], 1)
+            .unwrap();
+        assert_eq!(hits.first().map(|hit| hit.1), Some(0.0), "{hits:?}");
+    }
+    let entries = hnsw_snapshot_entries(temp.path());
+    assert!(!entries.iter().any(is_dump), "{entries:?}");
+}
+
+/// Review of R4, item 3: binaries before 4.42 never range-checked `m` /
+/// `ef_construction`, so a stored definition can carry values the index cannot
+/// be built with. At open they are clamped (with a WARN) rather than refused:
+/// the index is rebuilt and live, not degraded — and a physical standby's
+/// strict hydration, which shares the same parameter resolution, does not fail.
+#[test]
+fn a_legacy_out_of_range_m_is_clamped_at_open_not_refused() {
+    use heliosdb_nano::sql::logical_plan::IndexOption;
+    use heliosdb_nano::storage::{Catalog, VectorIndexType};
+
+    let temp = TempDir::new().unwrap();
+    {
+        let db = EmbeddedDatabase::new(temp.path()).unwrap();
+        db.execute("CREATE TABLE d_legacy (id INT PRIMARY KEY, emb VECTOR(4))")
+            .unwrap();
+        seed_line_rows(&db, "d_legacy", 0..60);
+        db.execute("CREATE INDEX idx_d_legacy_emb ON d_legacy USING hnsw (emb)")
+            .unwrap();
+        // What an older binary accepted: WITH (m = 0, ef_construction = 0).
+        let catalog = Catalog::new(&db.storage);
+        let (_, mut definition) = catalog
+            .list_index_definitions()
+            .unwrap()
+            .into_iter()
+            .find(|(name, _)| name == "idx_d_legacy_emb")
+            .unwrap();
+        definition.options.push(IndexOption::HnswM(0));
+        definition.options.push(IndexOption::EfConstruction(0));
+        catalog.save_index_definition("idx_d_legacy_emb", &definition).unwrap();
+        // No dump: the next open must build the index from that definition.
+        db.storage.set_index_snapshots_on_close(false);
+    }
+
+    let db = EmbeddedDatabase::new(temp.path()).unwrap();
+    let report = db.storage.last_index_open_report().unwrap();
+    assert_eq!(report.vector_rebuilt, 1, "{report:?}");
+    assert_eq!(report.vector_degraded, 0, "{report:?}");
+    assert!(db.storage.vector_indexes().degraded_indexes().is_empty());
+    match db
+        .storage
+        .vector_indexes()
+        .get_metadata("idx_d_legacy_emb")
+        .unwrap()
+        .index_type
+    {
+        VectorIndexType::Standard(config) => {
+            assert_eq!(config.max_connections, 2, "m clamped into range");
+            assert_eq!(config.ef_construction, 1, "ef_construction clamped into range");
+        }
+        other => panic!("expected a standard HNSW index, got {other:?}"),
+    }
+    let rows = db
+        .query(
+            &format!(
+                "SELECT id FROM d_legacy ORDER BY emb <-> '{}' LIMIT 1",
+                line_vector_literal(42)
+            ),
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows[0].values.first(), Some(&Value::Int4(42)));
+}

@@ -514,20 +514,24 @@ fn test_knn_planner_matches_bruteforce_top1() -> Result<()> {
     let target = all[1233].1;
     let query = [target[0] + 0.0005, target[1] - 0.0005, target[2] + 0.0005];
 
-    // Exact brute-force nearest by cosine distance.
-    let cos = |a: &[f32; 3], b: &[f32; 3]| {
-        let dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-        let na = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
-        let nb = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt();
-        1.0 - dot / (na * nb)
-    };
-    let mut best_id = all[0].0;
+    // Exact brute-force nearest by cosine distance — computed with the INDEX'S
+    // OWN metric over the vectors as stored (Sprinter 66aeb488f312). The
+    // nearest-neighbour distances here are ~1e-7..1e-6: a pure-f32 cosine
+    // (what this oracle used to compute) and the index's `DistCosine`
+    // (f64 sums) can rank two near-tied rows differently, which failed this
+    // test once. Ties go to the lower id, as in the index's exact scan.
+    use hnsw_rs::prelude::{DistCosine, Distance};
+    let mut best_id = i64::MAX;
     let mut best_d = f32::INFINITY;
-    for (id, v) in &all {
-        let d = cos(v, &query);
-        if d < best_d {
+    for row in db.query("SELECT id, embedding FROM knn_big", &[])? {
+        let (Some(Value::Int4(id)), Some(Value::Vector(v))) = (row.values.first(), row.values.get(1)) else {
+            panic!("unexpected row shape: {row:?}");
+        };
+        let id = i64::from(*id);
+        let d = Distance::<f32>::eval(&DistCosine, &query, v);
+        if d < best_d || (d == best_d && id < best_id) {
             best_d = d;
-            best_id = *id;
+            best_id = id;
         }
     }
 
@@ -694,5 +698,92 @@ fn hnsw_with_options_survive_reopen() -> Result<()> {
         }
         other => panic!("expected standard HNSW metadata after reopen, got {other:?}"),
     }
+    Ok(())
+}
+
+/// Sprinter 746342a0bfbb (review of R4, item 3): `m` / `ef_construction`
+/// outside what an HNSW index can be built with are refused by the planner, by
+/// name, before anything is persisted (`m` above 256 used to make hnsw_rs exit
+/// the process; 256 was dumped as 0).
+#[test]
+fn hnsw_with_out_of_range_construction_params_is_refused() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE hnsw_bad (id INT4 PRIMARY KEY, embedding VECTOR(3))")?;
+    for (with, expected) in [
+        ("m = 0", "HNSW m must be between 2 and 255, got 0"),
+        ("m = 1", "HNSW m must be between 2 and 255, got 1"),
+        ("m = 256", "HNSW m must be between 2 and 255, got 256"),
+        ("m = 300", "HNSW m must be between 2 and 255, got 300"),
+        ("ef_construction = 0", "HNSW ef_construction must be at least 1"),
+    ] {
+        let error = db
+            .execute(&format!(
+                "CREATE INDEX hnsw_bad_idx ON hnsw_bad USING hnsw (embedding vector_l2_ops) WITH ({with})"
+            ))
+            .expect_err(with)
+            .to_string();
+        assert!(error.contains(expected), "WITH ({with}): {error}");
+        assert!(!db.storage.vector_indexes().index_exists("hnsw_bad_idx"));
+    }
+    db.execute("CREATE INDEX hnsw_bad_idx ON hnsw_bad USING hnsw (embedding vector_l2_ops) WITH (m = 255)")?;
+    Ok(())
+}
+
+/// Sprinter 17d901194e59: an inner-product HNSW index over UNNORMALIZED vectors
+/// (dot products far above 1). anndists' `DistDot` asserted `1 - dot >= 0`, so
+/// CREATE INDEX panicked during the backfill; and with the exact scan every
+/// search would have. The index now orders rows as `<#>` does (ascending
+/// negative inner product), identical to the non-index path. 300 rows, so the
+/// planner takes the index path (it scans at 256 or fewer).
+#[test]
+fn inner_product_index_serves_unnormalized_vectors_like_the_scan() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE ip_raw (id INT4 PRIMARY KEY, embedding VECTOR(3))")?;
+    let vector = |id: i32| {
+        [
+            (id % 7 + 1) as f32,
+            (id % 11) as f32 * 0.5 + 1.0,
+            (id % 13) as f32 * 2.0 + 1.0,
+        ]
+    };
+    let values: Vec<String> = (1..=300)
+        .map(|id| format!("({id}, '{}')", vec_lit(&vector(id))))
+        .collect();
+    db.execute(&format!("INSERT INTO ip_raw VALUES {}", values.join(",")))?;
+    let knn = "SELECT id FROM ip_raw ORDER BY embedding <#> '[1.0, 2.0, 3.0]' LIMIT 10";
+    let scan = db.query(knn, &[])?;
+
+    db.execute("CREATE INDEX ip_raw_idx ON ip_raw USING hnsw (embedding vector_ip_ops)")?;
+    let indexed = db.query(knn, &[])?;
+    let ids = |rows: &[heliosdb_nano::Tuple]| -> Vec<Value> {
+        rows.iter().filter_map(|row| row.values.first().cloned()).collect()
+    };
+    assert_eq!(indexed.len(), 10);
+
+    // `<#>` = -(a . b), so ascending = largest dot first; ties to the lower id.
+    let mut expected: Vec<(f32, i32)> = (1..=300)
+        .map(|id| {
+            let v = vector(id);
+            (-(v[0] + 2.0 * v[1] + 3.0 * v[2]), id)
+        })
+        .collect();
+    expected.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let expected: Vec<Value> = expected.iter().take(10).map(|(_, id)| Value::Int4(*id)).collect();
+    assert_eq!(ids(&indexed), expected, "index path (ties ordered by row id)");
+    // The scan's order among tied rows is its own; the top 10 (no tie across
+    // rank 10/11 here) must be the same rows.
+    let sorted = |mut v: Vec<Value>| {
+        v.sort_by_key(|value| match value {
+            Value::Int4(id) => *id,
+            _ => i32::MAX,
+        });
+        v
+    };
+    assert_eq!(sorted(ids(&scan)), sorted(expected), "scan path");
+
+    // Insert after CREATE INDEX: an unnormalized row with the largest dot.
+    db.execute("INSERT INTO ip_raw VALUES (999, '[30.0, 30.0, 30.0]')")?;
+    let top = db.query(knn, &[])?;
+    assert_eq!(top.first().and_then(|r| r.values.first()), Some(&Value::Int4(999)));
     Ok(())
 }

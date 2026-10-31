@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — HNSW graph dumps and exact-match recall (sprinter 746342a0bfbb, 66aeb488f312)
+
+- **HNSW indexes are built with the configured parameters.** The graph library's constructor
+  takes `(M, max_elements, max_layer, ef_construction)`; it was called as
+  `(M, dimension, ef_construction, 100)`, so every graph was built with `ef_construction = 100`
+  and a layer count of `min(16, ef_construction)`, and an `ef_construction` below 16 made every
+  graph dump fail. `WITH (ef_construction = …)` and `[vector] hnsw_ef_construction` now take
+  effect: at the default of 200 an index BUILDS up to about twice as slowly as before. `m`
+  outside 2..=255 and `ef_construction = 0` are refused (`m` above 256 used to exit the process).
+- **A reopened HNSW index is dumped again at close.** A graph reloaded from its dump could not be
+  dumped over it: every clean close after a reload counted a dump failure and left a full-size
+  orphan copy in `hnsw_snapshots/`, one more per restart. Dumps are now written to a staging
+  directory, fsynced and renamed into place under a name derived from a stable index id (two
+  index names that differed only in punctuation used to share one dump), the sidecar and its
+  validity marker are written in one batch, and the previous dump is removed afterwards. An index
+  that has not changed since its dump is not dumped again. At open, dump files no sidecar
+  references are deleted.
+- **Exact-match vector queries find their row.** An HNSW search over at most 8192 vectors and
+  at most 2M vector components (points x dimension; e.g. ~1300 vectors at 1536 dimensions) is
+  now an exact scan, immune to rows the graph left unreachable (the library back-links a point
+  only on its own top layer). Larger indexes build their graph with fuller neighbour lists, a
+  sequential first insert and a shuffled batch order.
+- **Inner-product (`vector_ip_ops`) indexes accept any vectors** (sprinter 17d901194e59). The
+  library's dot-product distance asserted `1 - dot >= 0`, so any pair of vectors with a dot
+  product above 1 panicked the insert or search. The index now orders rows exactly as `<#>`
+  does and reports `<#>`'s value (`-dot`) as the distance — the unfiltered vector search used to
+  report `1 - dot`. Inner-product graph dumps written before this release are rebuilt once.
+- **Encrypted stores no longer write plaintext vectors** to `hnsw_snapshots/`: no graph dump is
+  written, and every HNSW index is rebuilt from its sealed rows at every open — open time grows
+  with index size, and each rebuild is logged with its duration. Dumps left by an unencrypted
+  run are deleted at the first encrypted open; deleting does not erase their bytes from free
+  disk blocks.
+- **`m` / `ef_construction` are range-checked** in `CREATE INDEX … WITH (…)` (2..=255, at least
+  1) and in `[vector] hnsw_m` / `hnsw_ef_construction` at config load. Out-of-range values that
+  an older binary stored are clamped into range at open, with a WARN, rather than refused, so
+  neither a primary's index nor a physical standby's hydration fails over them.
+- Every HNSW index rebuilt at open, or built by a physical standby's hydration, is logged at
+  INFO with its row count and duration.
+- Dropping a trigger's handle clone no longer flushes row counters and checkpoints every index
+  mid-statement; only the last owner of a database does.
+
 ### Fixed — a long statement no longer stalls the server (sprinter ccebc95977f1)
 
 A statement executed synchronously on the async worker that had just been driving the
