@@ -753,8 +753,15 @@ cargo build --release
 cargo build --release --features "code-graph,graph-rag,mcp-endpoint"
 
 # In-process embedder (no external HTTP service for embeddings).
-# Pulls fastembed-rs + ORT — adds ~30 MB to the binary.
+# Pulls fastembed-rs + ORT — adds ~30 MB to the binary. Needs Rust >= 1.92
+# (the pinned ort 2.0.0-rc.15); the model downloads on first use.
 cargo build --release --features "code-graph,code-embed"
+# The ONNX Runtime ort downloads needs glibc >= 2.38 (Ubuntu 24.04, Debian 13,
+# Fedora 39+, RHEL 10). On RHEL/AlmaLinux/Rocky 9, link Microsoft's release
+# build (onnxruntime-linux-x64-1.24.x from github.com/microsoft/onnxruntime)
+# instead, and keep its lib directory on LD_LIBRARY_PATH at run time:
+ORT_LIB_PATH=/opt/onnxruntime-linux-x64-1.24.4/lib ORT_PREFER_DYNAMIC_LINK=1 \
+  cargo build --release --features "code-graph,code-embed"
 
 # FIPS 140-3 compliant crypto (AWS-LC FIPS Cert #4816, SHA-256, PBKDF2).
 # `--no-default-features` is required to swap out ring-crypto.

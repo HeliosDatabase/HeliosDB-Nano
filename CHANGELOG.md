@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — `code-embed` no longer pulls webpki-roots 0.26 (sprinter b93af8c4a65f)
+
+- **fastembed 4.9 → 7.5** for the optional `code-embed` feature. fastembed 4 reached the
+  Hugging Face hub through hf-hub 0.4 → ureq 2 → webpki-roots 0.26.11, whose bundled roots trust
+  the distrusted emSign intermediates (RUSTSEC-2026-0381). 7.5 uses hf-hub 0.5 → ureq 3 →
+  webpki-roots 1.0.10, and the RUSTSEC-2026-0381 ignore is removed from `.cargo/audit.toml`.
+  The default build never compiled either version.
+- Same default model (`BGESmallENV15`, 384 dimensions, `Xenova/bge-small-en-v1.5`), same cache
+  location (`$HF_HOME`, else `$FASTEMBED_CACHE_DIR`, else `./.fastembed_cache`), and the same
+  `CODE_EMBED()` / `FastEmbedder` API.
+- **Model downloads now trust the bundled Mozilla root set, not the OS trust store.** hf-hub 0.5
+  builds its ureq 3 client with ureq's default roots, whichever TLS backend it uses, so a private CA
+  installed only in the OS store (a TLS-inspecting proxy) is no longer accepted. Pre-seed the
+  cache directory, or point `HF_ENDPOINT` at a mirror, in that case. Both the model download and
+  the build-time ONNX Runtime download now use rustls; `code-embed` no longer brings in
+  native-tls/OpenSSL. fastembed 7.5 also sends the `HF_TOKEN` environment variable with model
+  downloads when it is set (4.x sent only the `huggingface-cli login` token file).
+- Building with `--features code-embed` now needs Rust 1.92 or later (fastembed 7.5 needs 1.88,
+  and its pinned `ort` 2.0.0-rc.15 needs 1.92). `ort` rc.15 downloads a newer ONNX Runtime than
+  rc.9 did, so embeddings can differ from 4.x builds in the last float digits.
+  Large `embed_batch` calls run their 256-row inferences one after another instead of in
+  parallel; ONNX Runtime still uses every CPU inside each inference.
+- **`code-embed` and glibc.** The ONNX Runtime that `ort` rc.15 downloads at build time needs
+  glibc 2.38 and GCC 13's libstdc++, so a `code-embed` build no longer links on
+  RHEL/AlmaLinux/Rocky 9 (glibc 2.34) out of the box; every `ort` release since rc.12 ships such a
+  build. On those hosts, build against Microsoft's official ONNX Runtime 1.24 or later (it needs
+  glibc 2.27) with `ORT_LIB_PATH=<onnxruntime>/lib ORT_PREFER_DYNAMIC_LINK=1` and keep that
+  directory on `LD_LIBRARY_PATH`; verified on AlmaLinux 9 with ONNX Runtime 1.24.4 (the local
+  embedder test downloads the model and embeds). The default build and the released binaries do
+  not include `code-embed`.
+
 ### Fixed — HNSW graph dumps and exact-match recall (sprinter 746342a0bfbb, 66aeb488f312)
 
 - **HNSW indexes are built with the configured parameters.** The graph library's constructor
