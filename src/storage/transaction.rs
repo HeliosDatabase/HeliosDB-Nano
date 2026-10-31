@@ -263,6 +263,26 @@ pub struct Transaction {
     /// the whole point. Destroyed with the transaction, which is exactly
     /// PostgreSQL's "savepoints are destroyed at COMMIT and ROLLBACK".
     savepoints: RwLock<Vec<SavepointEntry>>,
+    /// sprinter 6bc4a4040eb7 (phase B2): the branch rows this transaction has
+    /// staged, indexed per (branch level, table) as the branch view stages
+    /// them, so a constraint check reads them without rescanning the write
+    /// set. A successful COMMIT publishes them (`commit_with_timestamp`):
+    /// bumps each table's branch write generation and applies the rows to the
+    /// cached committed overlays — BEFORE the claims below are released.
+    /// ROLLBACK TO SAVEPOINT rewinds it (`rollback_to_savepoint`).
+    branch_staged: parking_lot::Mutex<super::BranchStagedWrites>,
+    /// sprinter 6bc4a4040eb7 (phase B2): the PRIMARY KEY / UNIQUE keys this
+    /// transaction has claimed on a BRANCH (`super::BranchKeyClaim`). A
+    /// branch's rows are in no ART index, so a key a branch transaction has
+    /// staged is invisible to every other transaction until COMMIT; the claim
+    /// is what makes a second writer of the same key on the same branch fail
+    /// 23505 instead of committing a duplicate. Released when the transaction
+    /// is dropped — after the commit batch is applied (so a later writer sees
+    /// the row before it can claim the key) or on rollback. Empty for every
+    /// transaction that never wrote a branch. A ROLLBACK TO SAVEPOINT
+    /// releases the claims taken after the savepoint (main frees the same keys
+    /// through `rollback_art_undo_to`).
+    branch_claims: parking_lot::Mutex<Vec<super::BranchKeyClaim>>,
 }
 
 impl Drop for Transaction {
@@ -339,6 +359,20 @@ impl Drop for Transaction {
 /// map is consulted only once it is non-zero. Callers must always go through
 /// `StorageEngine::has_uncommitted_writes_for_table` /
 /// `has_uncommitted_index_removals_for_table`, which enforce that order.
+///
+/// ## Who is counted
+///
+/// Explicit transactions (`Transaction::set_write_census`) for every staged
+/// write. AUTOCOMMIT statement transactions (`Transaction::set_removal_census`,
+/// sprinter 6bc4a4040eb7) for their index REMOVALS only, for the duration of
+/// the statement: their eager removals are just as visible to a concurrent
+/// probe until the statement commits — a large `DELETE … WHERE` keeps them
+/// for seconds, and the statement can still fail and restore them — while a
+/// plain INSERT, which can never cause a miss, takes no slot (so an insert
+/// workload never turns the COUNT fast paths off). The direct autocommit fast
+/// paths (`delete_tuple_fast` & co.) write row storage BEFORE they touch the
+/// index, so they never leave a committed row without its entry and need no
+/// slot.
 ///
 /// A transaction contributes at most 1 to each counter for a given table,
 /// however many rows it stages, and releases exactly what it took in its
@@ -572,6 +606,11 @@ struct WriteCensusGate {
     tables_written: DashSet<String>,
     /// Tables whose `removals` slot this transaction holds.
     tables_removed: DashSet<String>,
+    /// sprinter 6bc4a4040eb7 (B2 follow-up): an AUTOCOMMIT statement's gate —
+    /// it takes slots only for index REMOVALS (a staged DELETE, a key-moving
+    /// UPDATE, a TRUNCATE), never for a plain staged write. See
+    /// [`Transaction::set_removal_census`].
+    removals_only: bool,
 }
 
 impl WriteCensusGate {
@@ -582,12 +621,21 @@ impl WriteCensusGate {
             unattributed: AtomicBool::new(false),
             tables_written: DashSet::new(),
             tables_removed: DashSet::new(),
+            removals_only: false,
         }
     }
 
-    /// Called on every staged write; does work only for the first one.
+    /// Called on every staged write; does work only for the first one. A
+    /// removals-only gate is counted by its first removal instead.
     #[inline]
     fn note_write(&self) {
+        if self.removals_only {
+            return;
+        }
+        self.arm_counted();
+    }
+
+    fn arm_counted(&self) {
         if self.counted.load(Ordering::Relaxed) {
             return;
         }
@@ -602,8 +650,16 @@ impl WriteCensusGate {
 
     /// This transaction has staged a write for `table` (it may have ADDED index
     /// keys). Called once per table — from the branch that discovers the table
-    /// is new to this transaction — so it is off the per-row path.
+    /// is new to this transaction — so it is off the per-row path. A no-op for
+    /// a removals-only gate.
     fn note_table_write(&self, table: &str) {
+        if self.removals_only {
+            return;
+        }
+        self.arm_table_write(table);
+    }
+
+    fn arm_table_write(&self, table: &str) {
         if self.tables_written.insert(table.to_string()) {
             self.census.enter_table_write(table);
         }
@@ -616,11 +672,14 @@ impl WriteCensusGate {
         if self.tables_removed.contains(table) {
             return;
         }
-        // A removal is also a write for cardinality purposes, and it is armed
-        // FIRST: a reader that saw `removals` armed while `writes` was not would
-        // have a window in which a COUNT still took the index fast path with an
-        // entry already stripped from it.
-        self.note_table_write(table);
+        // Counted first (a removals-only gate is counted by its first removal;
+        // for any other gate the staged write already counted it), then — a
+        // removal is also a write for cardinality purposes — the table's write
+        // slot, BEFORE the removal slot: a reader that saw `removals` armed
+        // while `writes` was not would have a window in which a COUNT still
+        // took the index fast path with an entry already stripped from it.
+        self.arm_counted();
+        self.arm_table_write(table);
         if self.tables_removed.insert(table.to_string()) {
             self.census.enter_table_removal(table);
         }
@@ -628,8 +687,12 @@ impl WriteCensusGate {
 
     /// This transaction staged a key that could not be attributed to a table.
     /// Fail-closed: every table now reports staged writes AND staged removals
-    /// until this transaction ends.
+    /// until this transaction ends. A no-op for a removals-only gate, which
+    /// answers for index removals only (they always name their table).
     fn note_unattributed(&self) {
+        if self.removals_only {
+            return;
+        }
         if self.unattributed.load(Ordering::Relaxed) {
             return;
         }
@@ -686,6 +749,9 @@ enum StagedKey {
 pub struct TransactionSavepointSnapshot {
     write_set: Vec<(Key, Option<Vec<u8>>)>,
     insert_log_len: usize,
+    /// sprinter 6bc4a4040eb7 (B2): how many branch key claims the
+    /// transaction held at the savepoint.
+    branch_claims_len: usize,
 }
 
 /// One entry of a transaction's savepoint stack.
@@ -773,6 +839,8 @@ impl Transaction {
             branch_binding: parking_lot::Mutex::new(None),
             write_census: None,
             savepoints: RwLock::new(Vec::new()),
+            branch_staged: parking_lot::Mutex::new(super::BranchStagedWrites::default()),
+            branch_claims: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -809,6 +877,63 @@ impl Transaction {
     /// The branch binding captured at `BEGIN` (`None` = main).
     pub fn captured_branch_binding(&self) -> Option<Arc<crate::session::BranchBinding>> {
         self.branch_binding.lock().clone()
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B2): keep a branch key claim until this
+    /// transaction ends (see the `branch_claims` field).
+    pub(crate) fn hold_branch_claim(&self, claim: super::BranchKeyClaim) {
+        self.branch_claims.lock().push(claim);
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B2): this transaction's staged branch rows
+    /// (see the `branch_staged` field). Locked briefly by the branch view; it
+    /// may take the cached committed overlay's lock while holding this one,
+    /// never the other way round.
+    pub(crate) fn branch_staged(&self) -> parking_lot::MutexGuard<'_, super::BranchStagedWrites> {
+        self.branch_staged.lock()
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B2): what this transaction has STAGED for
+    /// `key` — `Some(Some(value))` a staged value (plaintext; values are
+    /// sealed only by the commit batch), `Some(None)` a staged delete, `None`
+    /// nothing staged. The write set wins over the insert log, exactly as the
+    /// commit batch applies them. The branch view (`super::BranchView`) reads a
+    /// branch row through this so a transaction sees its own branch writes.
+    // The two `None`s are different answers ("nothing staged" vs "staged delete").
+    #[allow(clippy::option_option)]
+    pub(crate) fn staged(&self, key: &[u8]) -> Option<Option<Vec<u8>>> {
+        if let Some(entry) = self.write_set.get(key) {
+            return Some(entry.value().clone());
+        }
+        let insert_log = self.insert_log.read();
+        insert_log
+            .iter()
+            .rev()
+            .find(|(logged_key, _)| logged_key.as_slice() == key)
+            .map(|(_, value)| Some(value.clone()))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B2): every staged entry whose key starts
+    /// with `prefix`, with the same write-set-wins rule as [`Self::staged`].
+    /// O(staged writes); the branch view calls it only to rebuild one table's
+    /// staged-row index after a ROLLBACK TO SAVEPOINT rewound the write set
+    /// (`branch_staged` is kept current as writes are staged otherwise).
+    pub(crate) fn staged_with_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
+        let mut out: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        for entry in self.write_set.iter() {
+            if entry.key().starts_with(prefix) {
+                seen.insert(entry.key().clone());
+                out.push((entry.key().clone(), entry.value().clone()));
+            }
+        }
+        let insert_log = self.insert_log.read();
+        for (key, value) in insert_log.iter().rev() {
+            if key.starts_with(prefix) && seen.insert(key.clone()) {
+                out.push((key.clone(), Some(value.clone())));
+            }
+        }
+        out
     }
 
     /// This transaction's process-global id — the key the lock manager, the
@@ -848,6 +973,37 @@ impl Transaction {
     /// that table permanently unarmed for this transaction.
     pub fn set_write_census(&mut self, census: Arc<UncommittedWriteCensus>) {
         self.write_census = Some(WriteCensusGate::new(census));
+    }
+
+    /// Enroll an AUTOCOMMIT (statement-scoped) transaction in the census for
+    /// its index REMOVALS only — sprinter 6bc4a4040eb7 (B2 follow-up).
+    ///
+    /// The eager ART maintenance does not wait for COMMIT in a statement
+    /// transaction either: its DELETE / key-moving UPDATE / TRUNCATE takes the
+    /// entries out at statement time and commits at the END of the statement,
+    /// which for a multi-row statement is not an instant (seconds for a large
+    /// `DELETE … WHERE`), and the statement can still fail and roll back after
+    /// the removal (a later row's RESTRICT / UNIQUE / CHECK failure, a statement
+    /// timeout or cancel). In that window a concurrent reader observed a
+    /// committed row as absent: a branch's PRIMARY KEY / UNIQUE / FOREIGN KEY
+    /// probe (`BranchView::rows_with_key` trusts main's index exactly when the
+    /// removal census is clear — a branch could insert a duplicate of a row
+    /// whose DELETE then rolled back) and main's own miss-based fast paths (a
+    /// point lookup reported "no row" for a row that was never deleted).
+    ///
+    /// Removals only, because only a removal can make an index probe MISS a
+    /// committed row. A plain staged write (every INSERT) takes NO slot, so the
+    /// reason autocommit transactions stay out of `set_write_census` — the
+    /// census would be non-zero, and the COUNT fast paths off, for the whole of
+    /// any insert workload — does not apply: a removing statement holds its
+    /// table's slots only for its own duration, which is exactly the window
+    /// in which the index under-reports that table.
+    ///
+    /// Same contract as `set_write_census`: call before anything is staged.
+    pub fn set_removal_census(&mut self, census: Arc<UncommittedWriteCensus>) {
+        let mut gate = WriteCensusGate::new(census);
+        gate.removals_only = true;
+        self.write_census = Some(gate);
     }
 
     /// True once this transaction has staged a write and is therefore counted
@@ -1039,6 +1195,8 @@ impl Transaction {
             branch_binding: parking_lot::Mutex::new(None),
             write_census: None,
             savepoints: RwLock::new(Vec::new()),
+            branch_staged: parking_lot::Mutex::new(super::BranchStagedWrites::default()),
+            branch_claims: parking_lot::Mutex::new(Vec::new()),
         })
     }
 
@@ -1812,6 +1970,22 @@ impl Transaction {
             }
         }
 
+        // sprinter 6bc4a4040eb7 (B2): the branch rows of this commit are
+        // visible now — publish them (bump each written table's branch write
+        // generation and apply the rows to the cached committed overlays)
+        // while this transaction still holds its key claims, which `Drop`
+        // releases only afterwards.
+        //
+        // A failed commit only invalidates (B2 fix pass): an error here can
+        // come after the batch was applied (a failed fsync), and a cached
+        // overlay must never be trusted past a write it did not see.
+        let staged = std::mem::take(&mut *self.branch_staged.lock());
+        if result.is_ok() {
+            staged.publish();
+        } else {
+            staged.invalidate();
+        }
+
         // The write is applied (or definitively failed): new snapshots may
         // proceed past this commit timestamp.
         if inflight {
@@ -2290,6 +2464,17 @@ impl Transaction {
     /// every table (the staged write could affect anything, so every read in
     /// this transaction must stay on the write-set-merging slow path).
     fn note_written_key(&self, key: &[u8], staged: StagedKey) {
+        // sprinter 6bc4a4040eb7 (phase B2): a branch's row image or tombstone.
+        // A branch write NEVER touches the process-wide ART (W2.0 — the shared
+        // indexes describe main only), so it must not arm the census: an open
+        // branch transaction would otherwise demote every main reader's index
+        // fast path. The R2.3 gate below still learns "writes of an unknown
+        // table" (conservative; the transaction's own branch reads go through
+        // the branch view, which merges the write set regardless).
+        if key.starts_with(b"bdata:") || key.starts_with(b"bdel:") {
+            self.has_unattributed_writes.store(true, Ordering::Release);
+            return;
+        }
         // Every staged write funnels through here (`put`, `put_insert_fast`,
         // `delete`, and `update_tuples`/`delete_tuples` via those), so this is
         // the one place the census has to be armed. It is armed BEFORE the
@@ -2410,6 +2595,7 @@ impl Transaction {
                 .map(|entry| (entry.key().clone(), entry.value().clone()))
                 .collect(),
             insert_log_len: self.insert_log.read().len(),
+            branch_claims_len: self.branch_claims.lock().len(),
         }
     }
 
@@ -2440,6 +2626,13 @@ impl Transaction {
         }
 
         self.insert_log.write().truncate(snapshot.insert_log_len);
+
+        // sprinter 6bc4a4040eb7 (B2): the branch rows staged after the
+        // savepoint are gone from the write set, so their index is rebuilt from
+        // it on next use, and the key claims taken after the savepoint are
+        // released — another writer may take those keys now, as on main.
+        self.branch_staged.lock().rewound();
+        self.branch_claims.lock().truncate(snapshot.branch_claims_len);
     }
 
     /// Does THIS transaction have at least one live savepoint?

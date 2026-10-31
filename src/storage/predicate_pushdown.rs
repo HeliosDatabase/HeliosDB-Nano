@@ -531,6 +531,35 @@ impl PredicatePushdownManager {
         schema: &Schema,
         limit: Option<usize>,
     ) -> Vec<Tuple> {
+        self.scan_with_pushdown_inner(table_name, tuples, predicates, schema, limit, true)
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B2): [`Self::scan_with_pushdown`] WITHOUT
+    /// the bloom-filter and zone-map pruning — the predicates are evaluated on
+    /// every tuple. For tuples that are not main's scan: a branch's view. The
+    /// bloom filters and zone maps summarise MAIN's rows (and zone-map blocks
+    /// are positions in main's scan order), so pruning a branch's rows with
+    /// them dropped every row holding a value only the branch has.
+    pub fn filter_without_pruning(
+        &self,
+        table_name: &str,
+        tuples: Vec<Tuple>,
+        predicates: &[AnalyzedPredicate],
+        schema: &Schema,
+        limit: Option<usize>,
+    ) -> Vec<Tuple> {
+        self.scan_with_pushdown_inner(table_name, tuples, predicates, schema, limit, false)
+    }
+
+    fn scan_with_pushdown_inner(
+        &self,
+        table_name: &str,
+        tuples: Vec<Tuple>,
+        predicates: &[AnalyzedPredicate],
+        schema: &Schema,
+        limit: Option<usize>,
+        prune: bool,
+    ) -> Vec<Tuple> {
         let mut stats = self.stats.write();
         stats.total_scans += 1;
         stats.baseline_rows += tuples.len() as u64;
@@ -548,7 +577,7 @@ impl PredicatePushdownManager {
         // Phase 1: Bloom filter pre-filtering (for equality predicates)
         let mut candidate_indices: Vec<usize> = (0..tuples.len()).collect();
 
-        if self.config.capabilities.bloom_filter {
+        if prune && self.config.capabilities.bloom_filter {
             if let Some(tbf) = self.bloom_filters.write().get_mut(table_name) {
                 for pred in predicates.iter().filter(|p| p.can_use_bloom) {
                     if pred.op == PredicateOp::Eq {
@@ -575,7 +604,7 @@ impl PredicatePushdownManager {
         }
 
         // Phase 2: Zone map block skipping (for range predicates)
-        if self.config.capabilities.zone_map && tuples.len() >= self.config.zone_map_min_rows {
+        if prune && self.config.capabilities.zone_map && tuples.len() >= self.config.zone_map_min_rows {
             if let Some(tzm) = self.zone_maps.write().get_mut(table_name) {
                 for pred in predicates.iter().filter(|p| p.can_use_zone_map) {
                     if let Some(range_op) = pred.op.to_range_op() {

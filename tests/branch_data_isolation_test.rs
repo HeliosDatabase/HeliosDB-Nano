@@ -682,26 +682,26 @@ fn w2_branch_txn_insert_does_not_poison_shared_secondary_art() {
 
     // Branch INSERT *inside an explicit transaction*: the only path that
     // reached `try_fast_insert_literal_in_transaction`, which pre-fix poisoned
-    // the shared ART. sprinter 6bc4a4040eb7 (B1 fix pass): until branch
-    // transactions exist (phase B2) such a statement is REFUSED (0A000) — an
-    // in-transaction branch statement resolves rows through main — so nothing
-    // can leak through that path. The row is then written in autocommit so the
-    // rest of this test still checks the shared ART after a branch write.
+    // the shared ART. (sprinter 6bc4a4040eb7: B1 refused it with 0A000; B2
+    // makes branch transactions work, so the test is back in this form.)
     db.execute("BEGIN").expect("begin on branch");
-    let refused = db
-        .execute("INSERT INTO t (id, code) VALUES (2, 200)")
-        .expect_err("a branch write inside a transaction must be refused until B2");
-    assert!(
-        refused
-            .to_string()
-            .contains(heliosdb_nano::BRANCH_TRANSACTION_UNSUPPORTED_MARKER),
-        "got: {refused}"
-    );
-    db.execute("ROLLBACK").expect("rollback on branch");
     db.execute("INSERT INTO t (id, code) VALUES (2, 200)")
-        .expect("branch insert");
+        .expect("branch insert inside a transaction");
+    // Read-your-own-writes inside the branch transaction.
+    assert_eq!(
+        first_col_ints(
+            &db.query("SELECT id FROM t WHERE code = 200", &[])
+                .expect("in-transaction branch probe")
+        ),
+        vec![2],
+        "a branch transaction must see its own staged row"
+    );
+    db.execute("COMMIT").expect("commit on branch");
+    // The autocommit form of the same write (B1's adapted variant), kept.
+    db.execute("INSERT INTO t (id, code) VALUES (3, 300)")
+        .expect("autocommit branch insert");
 
-    // The branch sees its own overlay row (full-scan path — must stay correct).
+    // The branch sees its own overlay rows (full-scan path — must stay correct).
     assert_eq!(
         first_col_ints(
             &db.query("SELECT id FROM t WHERE code = 200", &[])
@@ -710,23 +710,33 @@ fn w2_branch_txn_insert_does_not_poison_shared_secondary_art() {
         vec![2],
         "branch must see its own overlay row"
     );
+    assert_eq!(
+        first_col_ints(
+            &db.query("SELECT id FROM t WHERE code = 300", &[])
+                .expect("branch probe")
+        ),
+        vec![3],
+        "branch must see its own autocommit overlay row"
+    );
 
     db.execute("USE BRANCH main").expect("switch back to main");
 
-    // (a) FLIP: the shared ART must contain NO entry for the branch-only value.
+    // (a) FLIP: the shared ART must contain NO entry for the branch-only values.
     let idx = db
         .storage
         .art_indexes()
         .find_column_index("t", "code")
         .expect("code index exists");
-    let phantom = db
-        .storage
-        .art_indexes()
-        .index_get_all(&idx, &ArtIndexManager::encode_key(&[Value::Int4(200)]));
-    assert!(
-        phantom.is_empty(),
-        "branch INSERT leaked a shared-ART entry visible on main: {phantom:?}"
-    );
+    for code in [200, 300] {
+        let phantom = db
+            .storage
+            .art_indexes()
+            .index_get_all(&idx, &ArtIndexManager::encode_key(&[Value::Int4(code)]));
+        assert!(
+            phantom.is_empty(),
+            "branch INSERT leaked a shared-ART entry for {code} visible on main: {phantom:?}"
+        );
+    }
 
     // (b) Main indexed probes resolve only main data.
     assert!(
@@ -759,16 +769,13 @@ fn w2_branch_txn_insert_no_phantom_unique_violation_on_main() {
 
     db.execute("CREATE BRANCH b1 AS OF NOW").expect("create branch");
     db.execute("USE BRANCH b1").expect("switch to branch");
-    // sprinter 6bc4a4040eb7 (B1 fix pass): refused inside a transaction until
-    // B2 (see the test above); written in autocommit instead.
+    // In an explicit transaction (B2; B1 refused it), and in autocommit.
     db.execute("BEGIN").expect("begin on branch");
-    assert!(
-        db.execute("INSERT INTO t (id, code) VALUES (2, 200)").is_err(),
-        "a branch write inside a transaction must be refused until B2"
-    );
-    db.execute("ROLLBACK").expect("rollback on branch");
     db.execute("INSERT INTO t (id, code) VALUES (2, 200)")
-        .expect("branch insert");
+        .expect("branch insert inside a transaction");
+    db.execute("COMMIT").expect("commit on branch");
+    db.execute("INSERT INTO t (id, code) VALUES (4, 400)")
+        .expect("autocommit branch insert");
 
     db.execute("USE BRANCH main").expect("switch back to main");
 
@@ -783,6 +790,11 @@ fn w2_branch_txn_insert_no_phantom_unique_violation_on_main() {
         first_col_ints(&db.query("SELECT id FROM t WHERE code = 200", &[]).expect("main probe")),
         vec![3],
         "main must resolve code=200 to its own row, not the branch's"
+    );
+    let res = db.execute("INSERT INTO t (id, code) VALUES (5, 400)");
+    assert!(
+        res.is_ok(),
+        "main INSERT of a branch-only (autocommit) unique value must not hit a phantom violation: {res:?}"
     );
 }
 
@@ -952,15 +964,15 @@ fn w2_branch_delete_does_not_strip_secondary_index_on_main() {
     db.execute("DELETE FROM t WHERE id = 1")
         .expect("branch autocommit delete");
     // In-transaction branch DELETE of a second inherited row (txn DELETE arm).
-    // sprinter 6bc4a4040eb7 (B1 fix pass): refused inside a transaction until
-    // B2; the row is deleted in autocommit instead.
+    // (sprinter 6bc4a4040eb7: B1 refused it with 0A000; restored for B2.)
     db.execute("BEGIN").expect("begin on branch");
+    db.execute("DELETE FROM t WHERE id = 2")
+        .expect("branch delete inside a transaction");
     assert!(
-        db.execute("DELETE FROM t WHERE id = 2").is_err(),
-        "a branch delete inside a transaction must be refused until B2"
+        db.query("SELECT id FROM t WHERE id = 2", &[]).unwrap().is_empty(),
+        "the branch transaction must not see the row it deleted"
     );
-    db.execute("ROLLBACK").expect("rollback on branch");
-    db.execute("DELETE FROM t WHERE id = 2").expect("branch delete");
+    db.execute("COMMIT").expect("commit on branch");
 
     // The branch no longer sees either row (overlay tombstone — full-scan path).
     assert!(

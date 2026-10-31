@@ -186,6 +186,28 @@ fn session_one(db: &EmbeddedDatabase) {
         db,
         "CREATE TABLE ks_range_low PARTITION OF ks_range FOR VALUES FROM (0) TO (100)",
     );
+    // COPY's storage call (see the module docs): the batch INSERT entry point
+    // that shares it and its `vmeta:` marker, then the SQL multi-row arm.
+    //
+    // BEFORE the temp table below, on purpose (sprinter 6bc4a4040eb7). Once
+    // this handle has created a temp table, every statement it runs resolves
+    // bare names through its own `pg_temp` namespace, so the SQL-text-keyed
+    // fast paths step aside for it (`current_schema_is_set` →
+    // `caller_holds_temp_tables`, sprinter 1703dba8e82d) and the batch takes
+    // the per-row path, which writes per-row versions and no `vmeta:` marker.
+    // `execute_many_params` honours that gate since B1 installs the handle's
+    // session for it; before that it ran session-less, so it neither saw the
+    // temp namespace (a temp table shadowing `ks_copy` would have been
+    // bypassed) nor the gate, and wrote the marker regardless of order.
+    run(db, "CREATE TABLE ks_copy (id INT PRIMARY KEY, note TEXT)");
+    let rows: Vec<Vec<Value>> = (1..=3)
+        .map(|id| vec![Value::Int4(id), Value::String(format!("row-{id}"))])
+        .collect();
+    db.execute_many_params("INSERT INTO ks_copy (id, note) VALUES ($1, $2)", &rows)
+        .expect("batch INSERT through execute_many_params");
+    run(db, "INSERT INTO ks_copy VALUES (4, 'd'), (5, 'e')");
+    assert_eq!(ints(db, "SELECT id FROM ks_copy ORDER BY id"), vec![1, 2, 3, 4, 5]);
+
     run(db, "CREATE TEMPORARY TABLE ks_temp (id INT)");
     run(db, "INSERT INTO ks_temp VALUES (1)");
 
@@ -198,17 +220,6 @@ fn session_one(db: &EmbeddedDatabase) {
     run(db, "INSERT INTO ks_child VALUES (10, 1, 'first')");
     run(db, "INSERT INTO ks_ident (v) VALUES ('x')");
     run(db, "INSERT INTO ks_range_low (id, label) VALUES (5, 'five')");
-
-    // COPY's storage call (see the module docs): the batch INSERT entry point
-    // that shares it and its `vmeta:` marker, then the SQL multi-row arm.
-    run(db, "CREATE TABLE ks_copy (id INT PRIMARY KEY, note TEXT)");
-    let rows: Vec<Vec<Value>> = (1..=3)
-        .map(|id| vec![Value::Int4(id), Value::String(format!("row-{id}"))])
-        .collect();
-    db.execute_many_params("INSERT INTO ks_copy (id, note) VALUES ($1, $2)", &rows)
-        .expect("batch INSERT through execute_many_params");
-    run(db, "INSERT INTO ks_copy VALUES (4, 'd'), (5, 'e')");
-    assert_eq!(ints(db, "SELECT id FROM ks_copy ORDER BY id"), vec![1, 2, 3, 4, 5]);
 
     // Per-column storage sidecars (`col:`, `dict:`, `cas:`).
     run(

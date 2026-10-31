@@ -869,8 +869,30 @@ pub(super) fn handle_truncate(executor: &Executor, table_name: &str) -> Result<B
         let catalog = storage.catalog();
 
         // Check if table exists
-        if catalog.get_table_schema(table_name).is_err() {
-            return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => schema,
+            Err(_) => return Err(Error::query_execution(format!("Table '{}' does not exist", table_name))),
+        };
+
+        // sprinter 6bc4a4040eb7 (phase B2): on a branch TRUNCATE empties the
+        // table on THE BRANCH only (PostgreSQL semantics): a tombstone for
+        // every row the branch sees, the branch's own images dropped — staged
+        // in the statement's transaction when there is one, so ROLLBACK
+        // restores the rows. Main's rows, ART, columnar side data, pushdown
+        // structures and the logical WAL are untouched. This path used to
+        // delete MAIN's `data:` keys from a branch session (data loss).
+        if let Some(view) = storage.branch_view()? {
+            view.truncate(executor.transaction(), table_name, &schema)?;
+            return Ok(Box::new(
+                ScanOperator::new(
+                    "".to_string(),
+                    Arc::new(crate::Schema { columns: vec![] }),
+                    None,
+                    vec![],
+                    vec![],
+                )
+                .with_timeout(executor.timeout_ctx()),
+            ));
         }
 
         // Item #2: preserve AS-OF history for COPY marker-covered rows before
@@ -916,19 +938,15 @@ pub(super) fn handle_truncate(executor: &Executor, table_name: &str) -> Result<B
 
         // Clear ART index entries for this table so that stale PK/UNIQUE
         // values do not block re-insertion of the same values.
-        // Skip clearing if branches exist or time-travel snapshots are
-        // retained, because branch data and snapshots may still
-        // reference the indexed values.
-        // Check for user-created branches (exclude the auto-created "main" branch).
-        // Branch data uses separate key prefixes and does not share the ART index,
-        // but as a safety measure we skip clearing when user branches exist.
-        let has_user_branches = storage
-            .list_branches()
-            .map(|b| b.iter().any(|br| br.name != "main"))
-            .unwrap_or(false);
-        if !has_user_branches {
-            storage.art_indexes().clear_table_indexes(table_name);
-        }
+        //
+        // sprinter 6bc4a4040eb7 (phase B2): unconditionally. This used to be
+        // skipped "as a safety measure" whenever a user branch existed, which
+        // left main's PK/UNIQUE trees full of the truncated keys — re-inserting
+        // one on main then failed 23505. Nothing on a branch trusts a main
+        // index entry on its own any more: the branch view counts a main
+        // candidate only when main still holds the row
+        // (`BranchView::rows_with_key`).
+        storage.art_indexes().clear_table_indexes(table_name);
 
         // sprinter 29ecb34e3245 (same hazard as the DROP TABLE purge above):
         // the rows these bloom filters / zone maps summarise are gone, and

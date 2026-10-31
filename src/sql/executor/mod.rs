@@ -1401,6 +1401,13 @@ impl<'a> Executor<'a> {
         let Some(storage) = self.storage else {
             return Ok(None);
         };
+        // sprinter 6bc4a4040eb7 (phase B2): the HNSW index is main's — it holds
+        // neither a branch's rows nor its deletes — so a branch session's kNN is
+        // answered by the exact scan + sort over the branch's view instead
+        // (correct, and what the fallback below already does).
+        if storage.is_branch_active() {
+            return Ok(None);
+        }
 
         // Peel an optional non-distinct Project off the top, remembering it so
         // we can re-wrap the indexed scan with it afterwards.

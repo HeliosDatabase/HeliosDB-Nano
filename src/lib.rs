@@ -318,6 +318,7 @@ pub mod standby_posture;
 pub mod ab_testing;
 
 // Internal modules
+mod branch_writes; // sprinter 6bc4a4040eb7 (B2): executor half of writes on a branch
 mod copy_phase_stats;
 mod error;
 mod lock_census;
@@ -341,9 +342,9 @@ pub use crypto::{
 };
 pub use error::{
     Error, Result, BRANCH_BINDING_GONE_MARKER, BRANCH_BUSY_MARKER, BRANCH_CLOSING_MARKER, BRANCH_IN_USE_MARKER,
-    BRANCH_NOT_ACTIVE_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER, BRANCH_TRANSACTION_UNSUPPORTED_MARKER,
-    COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE, NOT_NULL_VIOLATION_MARKER,
-    PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED,
+    BRANCH_NOT_ACTIVE_MARKER, BRANCH_STATEMENT_UNSUPPORTED_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER,
+    BRANCH_WRITE_UNSUPPORTED_MARKER, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE,
+    NOT_NULL_VIOLATION_MARKER, PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED,
 };
 pub use storage::StorageEngine;
 pub use types::{
@@ -1101,6 +1102,11 @@ pub(crate) struct BranchStatementScope {
     // Outer `None` = nothing to restore; inner `None` = restore "no snapshot".
     #[allow(clippy::option_option)]
     previous: Option<Option<StatementBranch>>,
+    /// sprinter 6bc4a4040eb7 (phase B2): the statement's branch-overlay cache
+    /// (`storage::OverlayCacheScope`) — the overlays its constraint checks
+    /// load, once per table per statement. Installed only by a scope that
+    /// binds a BRANCH; dropped (and the outer cache restored) with the scope.
+    _overlays: Option<crate::storage::OverlayCacheScope>,
     /// Released AFTER the snapshot is restored (fields drop after `drop()`).
     _hold: crate::storage::BranchHold,
     _not_send: std::marker::PhantomData<*const ()>,
@@ -1110,6 +1116,7 @@ impl BranchStatementScope {
     fn inert() -> Self {
         Self {
             previous: None,
+            _overlays: None,
             _hold: crate::storage::BranchHold::none(),
             _not_send: std::marker::PhantomData,
         }
@@ -1118,9 +1125,14 @@ impl BranchStatementScope {
     /// Install `snapshot` for this statement (replacing any outer one until
     /// `Drop`), holding `hold`.
     fn install(snapshot: StatementBranch, hold: crate::storage::BranchHold) -> Self {
+        let overlays = snapshot
+            .binding
+            .is_some()
+            .then(crate::storage::OverlayCacheScope::enter);
         let previous = STATEMENT_BRANCH.with(|c| c.borrow_mut().replace(snapshot));
         Self {
             previous: Some(previous),
+            _overlays: overlays,
             _hold: hold,
             _not_send: std::marker::PhantomData,
         }
@@ -3221,10 +3233,12 @@ impl EmbeddedDatabase {
     ///    session recover is let through — `COMMIT` / `ROLLBACK` / `ABORT`
     ///    (a COMMIT then rolls back and refuses, see `commit_*`) and `SHOW
     ///    BRANCHES`.
-    /// 3. On a branch, a statement that reads or writes data inside a
-    ///    transaction is refused (0A000) until branch transactions exist
-    ///    (phase B2): in-transaction reads resolve through main's snapshot and
-    ///    write set, so the alternative is answering from main.
+    /// 3. sprinter 6bc4a4040eb7 (phase B2): a statement inside a transaction
+    ///    on a branch runs — its reads merge the transaction's staged branch
+    ///    writes over the branch view, its writes stage into the transaction
+    ///    as branch overlay keys (`storage::BranchView`). Phase B1 refused
+    ///    every such statement (0A000) because the in-transaction read path
+    ///    resolved rows through main; that interim refusal is gone.
     ///
     /// PERF: on main (every session that never bound a branch) this is the
     /// byte gate of `classify_branch_statement`, one atomic load and a
@@ -3264,11 +3278,8 @@ impl EmbeddedDatabase {
             Err(_) if Self::statement_allowed_on_gone_branch(sql) => BranchStatementScope::inert(),
             Err(gone) => return Err(gone),
         };
-        if in_txn && !Self::statement_allowed_in_branch_transaction(sql) {
-            if let Some(binding) = self.storage.active_branch() {
-                return Err(Error::branch_transaction_unsupported(&binding.name));
-            }
-        }
+        // sprinter 6bc4a4040eb7 (B2): `in_txn` gates nothing past the binding
+        // statements above — transactions on a branch work.
         Ok((None, scope))
     }
 
@@ -3317,22 +3328,25 @@ impl EmbeddedDatabase {
     /// another thread ever sees it, and two of them cannot restore each other.
     /// `target` must be active (3D000 otherwise).
     ///
-    /// B1 second fix pass: `in_txn` is the caller's transaction state, as for
-    /// [`Self::branch_statement_gate`]. Inside a transaction an override onto
-    /// a branch is refused (0A000) exactly as a session bound to that branch
-    /// would be: the in-transaction read path resolves rows through main's
-    /// snapshot and write set, so `… ON BRANCH 'b'` there answered from main
-    /// (and bypassed the gate's refusal, which ran against the session's own
-    /// branch). Overriding onto main stays allowed.
+    /// `in_txn` is the caller's transaction state, as for
+    /// [`Self::branch_statement_gate`]. sprinter 6bc4a4040eb7 (phase B2): a
+    /// transaction belongs to ONE branch — the one it was opened on — so
+    /// inside a transaction `… ON BRANCH 'x'` may name only that branch (then
+    /// the override is inert); any other target is refused 25001, exactly as
+    /// `USE BRANCH x` there is. (B1 refused every override onto a branch
+    /// inside a transaction with 0A000, because the in-transaction read path
+    /// answered from main; that path now reads the branch, but a statement
+    /// of a main transaction reading or staging into another branch would
+    /// still mix two branches in one transaction.)
     #[cfg(feature = "code-graph")]
     fn statement_branch_override(&self, target: &str, in_txn: bool) -> Result<BranchStatementScope> {
         let engine = self.storage.instance_id();
         let current = self.storage.check_active_branch()?;
-        if in_txn && target != "main" {
-            return Err(Error::branch_transaction_unsupported(target));
-        }
         if current.as_deref().map_or("main", |binding| binding.name.as_str()) == target {
             return Ok(BranchStatementScope::inert());
+        }
+        if in_txn {
+            return Err(Error::branch_switch_in_transaction());
         }
         if target == "main" {
             return Ok(BranchStatementScope::install(
@@ -3367,18 +3381,6 @@ impl EmbeddedDatabase {
         let current = state.branch_binding().map(|binding| binding.branch_id);
         let home = state.home_branch().map(|binding| binding.branch_id);
         current != home
-    }
-
-    /// What a statement may run inside a transaction on a branch until branch
-    /// transactions exist (phase B2): transaction control, `SET` / `SHOW` /
-    /// `RESET`, `DISCARD`, `DEALLOCATE`. Everything else — every statement
-    /// that can read or write a table — is refused (0A000).
-    fn statement_allowed_in_branch_transaction(sql: &str) -> bool {
-        let trimmed = sql.trim_start();
-        crate::protocol::postgres::handler::classify_transaction_control(trimmed).is_some()
-            || ["SET ", "SHOW ", "RESET ", "DISCARD ", "DEALLOCATE "]
-                .iter()
-                .any(|prefix| starts_with_icase(trimmed, prefix))
     }
 
     /// What a session bound to a dropped or merged branch may still run: what
@@ -6125,6 +6127,113 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// sprinter 6bc4a4040eb7 (B2 follow-up): TRUNCATE `table_name` on MAIN
+    /// inside `txn` — THE one body both DML executor families run (the text
+    /// family's in-transaction arm; the params family's `Truncate` arm when
+    /// the statement has a session or global transaction). Returns the number
+    /// of rows staged away.
+    ///
+    /// * The rows are the ones the TRANSACTION sees: committed rows merged
+    ///   with its own staged writes. `scan_table` alone (what this used)
+    ///   reads committed rows only, so `BEGIN; INSERT; TRUNCATE` left the
+    ///   transaction's own rows in place — visible to its later SELECTs and
+    ///   committed with it.
+    /// * Every delete is STAGED in `txn`: COMMIT applies them, ROLLBACK (or
+    ///   ROLLBACK TO SAVEPOINT) discards them. The params family used to run
+    ///   `ddl::handle_truncate` here, which deletes `data:` at once, so a
+    ///   ROLLBACK restored nothing.
+    /// * Index entries go through the same eager funnel a DELETE uses. In an
+    ///   `explicit` transaction each row's ART entries are removed with a
+    ///   `RestoreDeleted` undo (which also arms the uncommitted-removal
+    ///   census), so a ROLLBACK restores them; the statement-scoped autocommit
+    ///   transaction keeps the O(1)-memory `clear_table_indexes` (it commits
+    ///   in the same statement). HNSW entries are dropped with their undo ops
+    ///   either way (a TRUNCATE used to leave them behind for deleted rows).
+    /// * The logical-WAL record is appended at statement time, where both
+    ///   families always appended it (GH#36). Whether a rolled-back TRUNCATE's
+    ///   record is replayed belongs to the R1 track (logical-WAL redo), not
+    ///   here.
+    fn truncate_main_in_transaction(
+        &self,
+        txn: &storage::Transaction,
+        table_name: &str,
+        explicit: bool,
+    ) -> Result<u64> {
+        let schema = self.storage.catalog().get_table_schema(table_name)?;
+        let committed = self.storage.scan_table(table_name)?;
+        let rows = txn.merge_with_write_set_to_width(table_name, committed, schema.columns.len())?;
+        let mut truncated_row_ids = Vec::with_capacity(rows.len());
+        for tuple in &rows {
+            if let Some(row_id) = tuple.row_id {
+                txn.delete(format!("data:{}:{}", table_name, row_id).into_bytes())?;
+                self.storage.row_cache().invalidate(table_name, row_id);
+                truncated_row_ids.push(row_id);
+            }
+        }
+        // R3.3: rollback-safe columnar truncation — stage Null values and
+        // presence clears through the write set, grouped per batch.
+        self.storage
+            .stage_columnar_deletes_grouped_in_transaction(table_name, &truncated_row_ids, &schema, txn)?;
+        // sprinter 6bc4a4040eb7 (B2 fix pass): per-row removal with undo in an
+        // explicit transaction. Clearing the trees was never undone: a ROLLBACK
+        // restored the rows but left main's PK/UNIQUE trees empty (a duplicate
+        // of a surviving key was then accepted on main), it stripped OTHER open
+        // transactions' eager entries, and it did not arm the census, so a
+        // concurrent probe (main's or a branch's) trusted the emptied trees.
+        if !explicit {
+            self.storage.art_indexes().clear_table_indexes(table_name);
+        } else if !self.storage.art_indexes().list_table_indexes(table_name).is_empty() {
+            for tuple in &rows {
+                let Some(row_id) = tuple.row_id else {
+                    continue;
+                };
+                let col_values = Self::tuple_column_values(&schema, tuple);
+                if let Err(e) = self.storage.art_indexes().on_delete(table_name, row_id, &col_values) {
+                    tracing::debug!("ART index delete for TRUNCATE of '{}': {}", table_name, e);
+                }
+                self.push_art_undo(
+                    txn,
+                    ArtUndoOp::RestoreDeleted {
+                        table_name: table_name.to_string(),
+                        row_id,
+                        col_values,
+                    },
+                );
+            }
+        }
+        // R5.V1: the truncated rows leave the HNSW vector indexes too, undone
+        // on ROLLBACK — the DELETE arm's maintenance.
+        if self.vector_dml_gate(table_name) {
+            for tuple in &rows {
+                if let Some(row_id) = tuple.row_id {
+                    let vops =
+                        self.storage
+                            .vector_indexes()
+                            .on_row_delete(table_name, row_id, Some(&schema), Some(tuple));
+                    self.push_vector_undo(txn, vops);
+                }
+            }
+        }
+        // sprinter 29ecb34e3245 (same hazard as the DROP TABLE purge in
+        // ddl.rs): the rows these bloom filters / zone maps summarise are gone,
+        // and nothing rebuilds them incrementally, so a surviving structure
+        // would keep pruning against the PRE-truncate contents once rows are
+        // re-inserted. A separate TRUNCATE path from `ddl::handle_truncate`, so
+        // it needs its own purge.
+        self.storage.predicate_pushdown().remove_table(table_name);
+        tracing::debug!(
+            table = table_name,
+            rows = truncated_row_ids.len(),
+            "TRUNCATE staged row deletes in txn"
+        );
+        // GH#36: represent the TRUNCATE in the logical WAL (placement
+        // unchanged — see the doc comment).
+        if let Err(e) = self.storage.log_truncate(table_name) {
+            tracing::warn!("Failed to log TRUNCATE '{}' to WAL: {}", table_name, e);
+        }
+        Ok(truncated_row_ids.len() as u64)
+    }
+
     fn replay_art_undo(&self, undo_entries: Vec<ArtUndoOp>) {
         for op in undo_entries.into_iter().rev() {
             match op {
@@ -6243,7 +6352,8 @@ impl EmbeddedDatabase {
     /// - CREATE TABLE: Catalog operations (already atomic)
     ///
     /// **Limitations (Future Enhancement):**
-    /// - TRUNCATE: Buffers row deletes in write set (rollback-safe), but ART index rebuild on rollback is best-effort
+    /// - TRUNCATE: Buffers row deletes in write set (rollback-safe); inside an explicit transaction the ART
+    ///   entries are removed through the undo log, so a ROLLBACK restores them (B2 fix pass)
     /// 3. Full transaction support for all operations will be added in v2.1
     ///
     /// # Arguments
@@ -7325,7 +7435,17 @@ impl EmbeddedDatabase {
         //
         // A NULL in any constrained column makes the constraint trivially
         // satisfied (PG).
-        for (uc_name, uc_columns, positions) in &gate.unique_checks {
+        // sprinter 6bc4a4040eb7 (B2): main's PK index says nothing about a
+        // branch's rows (a key the branch deleted is free there, a branch row
+        // is not in it), so on a branch the probe is skipped here and the
+        // branch insert (`branch_insert_row` → `BranchView::insert_checked`)
+        // enforces every PRIMARY KEY / UNIQUE rule over the branch's view.
+        let unique_checks: &[(String, Vec<String>, Vec<usize>)] = if self.storage.is_branch_active() {
+            &[]
+        } else {
+            &gate.unique_checks
+        };
+        for (uc_name, uc_columns, positions) in unique_checks {
             let mut uc_values: Vec<Value> = Vec::with_capacity(positions.len());
             let mut any_null = false;
             for idx in positions {
@@ -8661,14 +8781,19 @@ impl EmbeddedDatabase {
         // history (roadmap C15) and stay disabled whenever any session
         // transaction is open.
         let insert_fast_paths_blocked = self.session_txns_block_fast_inserts();
-        let use_fast_paths = !skip_fast_paths && !has_savepoints && !has_session_txns && !schema_active;
-        let use_insert_fast_paths = !skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked && !schema_active;
+        // sprinter 6bc4a4040eb7 (B2): every literal fast path below writes or
+        // validates against MAIN's keyspace and indexes; on a branch the
+        // statement takes the plan arms, which go through the branch view.
+        let on_branch = self.storage.is_branch_active();
+        let use_fast_paths = !skip_fast_paths && !has_savepoints && !has_session_txns && !schema_active && !on_branch;
+        let use_insert_fast_paths =
+            !skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked && !schema_active && !on_branch;
 
         // Explicit transactions can still use transaction-aware INSERT fast
         // paths. These buffer rows in the transaction write set, so
         // COMMIT/ROLLBACK semantics are preserved while avoiding full
         // parser/planner and per-row counter persistence overhead.
-        if skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked && !schema_active {
+        if skip_fast_paths && !has_savepoints && !insert_fast_paths_blocked && !schema_active && !on_branch {
             if let Some(result) = self.try_fast_insert_literal_in_transaction(sql, txn) {
                 return result;
             }
@@ -8959,6 +9084,13 @@ impl EmbeddedDatabase {
                 // never consult the shared ART). Gate every ART mutation in this
                 // arm on the same main-branch predicate that routes the data key.
                 let on_branch = self.storage.is_branch_active();
+                // sprinter 6bc4a4040eb7 (B2): on a branch every PRIMARY KEY /
+                // UNIQUE check, the ON CONFLICT arbiter, the read of the
+                // conflicting row and every write go through the branch view —
+                // the shared ART describes main only (W2.0), so the pre-B2 arm
+                // let duplicates through and a DO UPDATE could not find an
+                // inherited row.
+                let branch_view = self.storage.branch_view()?;
 
                 // RLS (ROADMAP_V5 §1.1): resolve + parse the policy ONCE per
                 // statement, never per row (see `RlsWriteGuard`). `None` when no
@@ -9154,11 +9286,35 @@ impl EmbeddedDatabase {
                                     col_values_map.insert(col.name.clone(), v.clone());
                                 }
                             }
-                            if let Err(e) = self
-                                .storage
-                                .art_indexes()
-                                .check_unique_constraints(table_name, &col_values_map)
-                            {
+                            // B2: the branch view's verdict on a branch (main's
+                            // ART knows none of the branch's rows), main's ART on
+                            // main. Same message shape either way (23505).
+                            //
+                            // sprinter 6bc4a4040eb7 (B2 fix pass): on a branch the
+                            // verdict is an ARBITRATION — each key claimed, then
+                            // its holders read — so a key another open
+                            // transaction on the branch has claimed (its
+                            // uncommitted insert) is a conflict here, where
+                            // `ON CONFLICT` can intercept it, exactly as main's
+                            // eager ART entry of an uncommitted row is. Without
+                            // it `DO NOTHING` raised 23505 from the insert below
+                            // under concurrency.
+                            let mut branch_arbitration = match &branch_view {
+                                Some(view) => Some(view.arbitrate(Some(txn), table_name, &schema, &tuple.values)?),
+                                None => None,
+                            };
+                            let unique_check: std::result::Result<(), String> = match &branch_arbitration {
+                                Some(arbitration) => match arbitration.conflict_message() {
+                                    Some(message) => Err(message),
+                                    None => Ok(()),
+                                },
+                                None => self
+                                    .storage
+                                    .art_indexes()
+                                    .check_unique_constraints(table_name, &col_values_map)
+                                    .map_err(|e| e.to_string()),
+                            };
+                            if let Err(e) = unique_check {
                                 match on_conflict {
                                     Some(sql::logical_plan::OnConflictAction::DoNothing { conflict_target }) => {
                                         // Skip this row silently — but ONLY if
@@ -9167,11 +9323,23 @@ impl EmbeddedDatabase {
                                         // NOTHING` does not swallow a PRIMARY
                                         // KEY collision in PostgreSQL; it
                                         // raises 23505.
-                                        if !self.conflict_matches_target(
-                                            table_name,
-                                            &col_values_map,
-                                            conflict_target.as_deref(),
-                                        ) {
+                                        //
+                                        // On a branch a CLAIMED arbiter key
+                                        // counts (skip): the row another open
+                                        // transaction is inserting conflicts.
+                                        // The skipped row's claims are released
+                                        // with the arbitration.
+                                        let matches_target = match &branch_arbitration {
+                                            Some(arbitration) => {
+                                                arbitration.conflict_on(conflict_target.as_deref()).is_some()
+                                            }
+                                            None => self.conflict_matches_target(
+                                                table_name,
+                                                &col_values_map,
+                                                conflict_target.as_deref(),
+                                            ),
+                                        };
+                                        if !matches_target {
                                             // Same classification the no-ON-CONFLICT
                                             // arm below uses, so the wire still maps
                                             // it to 23505.
@@ -9234,26 +9402,48 @@ impl EmbeddedDatabase {
                                         // original unique violation instead of
                                         // upserting onto a row the statement
                                         // never named.
-                                        let existing_row_id = match self.storage.art_indexes().find_unique_conflict(
-                                            table_name,
-                                            &col_values_map,
-                                            conflict_target.as_deref(),
-                                        ) {
-                                            Some(conflict) => conflict.row_id,
-                                            // Conflict on a NON-target constraint:
-                                            // re-raise the original violation with the
-                                            // same classification the no-ON-CONFLICT
-                                            // arm uses (the wire maps it to 23505).
-                                            None if conflict_target.is_some() => {
-                                                return Err(Error::constraint_violation(err_msg))
-                                            }
-                                            None => {
-                                                return Err(Error::query_execution(format!(
-                                                    "ON CONFLICT DO UPDATE: could not find existing row ({})",
-                                                    err_msg
-                                                )))
-                                            }
-                                        };
+                                        // B2: on a branch the arbiter is the branch
+                                        // view, and it hands back the conflicting
+                                        // row as the BRANCH sees it (an inherited
+                                        // main row, a branch row, or one this
+                                        // transaction staged) — the pre-B2 read of
+                                        // `bdata:` alone failed "existing row not
+                                        // found" for every inherited row.
+                                        let (existing_row_id, branch_existing): (u64, Option<Tuple>) =
+                                            if let Some(arbitration) = branch_arbitration.take() {
+                                                let found = Self::branch_upsert_target(
+                                                    &arbitration,
+                                                    conflict_target.as_deref(),
+                                                    &err_msg,
+                                                );
+                                                // The update below may write the
+                                                // arbitrated keys: the transaction
+                                                // holds them from here on.
+                                                arbitration.keep(Some(txn));
+                                                let (row_id, row) = found?;
+                                                (row_id, Some(row))
+                                            } else {
+                                                match self.storage.art_indexes().find_unique_conflict(
+                                                    table_name,
+                                                    &col_values_map,
+                                                    conflict_target.as_deref(),
+                                                ) {
+                                                    Some(conflict) => (conflict.row_id, None),
+                                                    // Conflict on a NON-target constraint:
+                                                    // re-raise the original violation with the
+                                                    // same classification the no-ON-CONFLICT
+                                                    // arm uses (the wire maps it to 23505).
+                                                    None if conflict_target.is_some() => {
+                                                        return Err(Error::constraint_violation(err_msg))
+                                                    }
+                                                    None => {
+                                                        return Err(Error::query_execution(format!(
+                                                            "ON CONFLICT DO UPDATE: could not find existing row ({})",
+                                                            err_msg
+                                                        )))
+                                                    }
+                                                }
+                                            };
 
                                         // Read existing row through the transaction so that rows
                                         // inserted earlier in the SAME transaction (still in the
@@ -9262,18 +9452,22 @@ impl EmbeddedDatabase {
                                         // before this transaction started.
                                         let existing_key =
                                             self.storage.branch_aware_data_key(table_name, existing_row_id);
-                                        let existing_raw = match txn.get(&existing_key)? {
-                                            Some(raw) => raw,
-                                            None => self.storage.get(&existing_key)?.ok_or_else(|| {
-                                                Error::query_execution(
-                                                    "ON CONFLICT DO UPDATE: existing row not found in storage",
-                                                )
-                                            })?,
+                                        let mut existing_tuple: Tuple = match branch_existing {
+                                            Some(row) => row,
+                                            None => {
+                                                let existing_raw = match txn.get(&existing_key)? {
+                                                    Some(raw) => raw,
+                                                    None => self.storage.get(&existing_key)?.ok_or_else(|| {
+                                                        Error::query_execution(
+                                                            "ON CONFLICT DO UPDATE: existing row not found in storage",
+                                                        )
+                                                    })?,
+                                                };
+                                                bincode::deserialize(&existing_raw).map_err(|err| {
+                                                    Error::storage(format!("Failed to deserialize tuple: {}", err))
+                                                })?
+                                            }
                                         };
-                                        let mut existing_tuple: Tuple =
-                                            bincode::deserialize(&existing_raw).map_err(|err| {
-                                                Error::storage(format!("Failed to deserialize tuple: {}", err))
-                                            })?;
                                         existing_tuple.row_id = Some(existing_row_id);
 
                                         // RLS: the conflicting row is a pre-image the
@@ -9384,7 +9578,15 @@ impl EmbeddedDatabase {
                                         }
                                         let updated_val = bincode::serialize(&existing_tuple)
                                             .map_err(|err| Error::storage(err.to_string()))?;
-                                        txn.put(existing_key.clone(), updated_val.clone())?;
+                                        // B2: the branch's own image (and its own
+                                        // tombstone cleared) on a branch — never
+                                        // main's `data:` key.
+                                        match &branch_view {
+                                            Some(view) => {
+                                                view.put(Some(txn), table_name, existing_row_id, &existing_tuple)?
+                                            }
+                                            None => txn.put(existing_key.clone(), updated_val.clone())?,
+                                        }
 
                                         // Update ART index (main only — a branch
                                         // ON CONFLICT DO UPDATE writes to `bdata:`
@@ -9498,8 +9700,9 @@ impl EmbeddedDatabase {
                                             self.push_vector_undo(txn, vops);
                                         }
 
-                                        // Log to WAL for replication
-                                        if !skip_fast_paths && self.storage.is_wal_enabled() {
+                                        // Log to WAL for replication (main only — a
+                                        // branch write is never replicated, B2).
+                                        if !skip_fast_paths && !on_branch && self.storage.is_wal_enabled() {
                                             if self.storage.fast_dml_requires_logical_wal() {
                                                 self.storage.log_data_insert(
                                                     table_name,
@@ -9530,6 +9733,14 @@ impl EmbeddedDatabase {
                                         return Err(Error::constraint_violation(e.to_string()));
                                     }
                                 }
+                            }
+                            // No conflict: the row goes on to be inserted, so its
+                            // transaction holds the claimed keys from here —
+                            // nobody can take one before `insert_checked` below
+                            // (which re-claims, as the same owner, the PK the
+                            // SERIAL fill may still add).
+                            if let Some(arbitration) = branch_arbitration {
+                                arbitration.keep(Some(txn));
                             }
                         }
 
@@ -9664,31 +9875,35 @@ impl EmbeddedDatabase {
                         // not. All-or-nothing per row: a refusal takes back the
                         // entries this row already took and becomes the
                         // statement's error, so no phantom key is left behind.
-                        if !on_branch {
+                        if let Some(view) = &branch_view {
+                            // sprinter 6bc4a4040eb7 (B2): claim the row's keys,
+                            // check them over the branch's view (PK filled — the
+                            // probe above ran before the SERIAL fill), stage the
+                            // branch's own image. Never replicated.
+                            view.insert_checked(Some(txn), table_name, &schema, row_id, &tuple)?;
+                        } else {
                             self.storage
                                 .art_indexes()
                                 .reserve_insert_tuple(table_name, row_id, &schema, &tuple)
                                 .map_err(|e| Error::constraint_violation(e.to_string()))?;
-                        }
-                        if let Err(e) = txn.put(key.clone(), val.clone()) {
-                            // The row never landed, so the claim is a phantom.
-                            if !on_branch {
+                            if let Err(e) = txn.put(key.clone(), val.clone()) {
+                                // The row never landed, so the claim is a phantom.
                                 let _ = self
                                     .storage
                                     .art_indexes()
                                     .on_delete_tuple(table_name, row_id, &schema, &tuple);
+                                return Err(e);
                             }
-                            return Err(e);
-                        }
 
-                        // Log to WAL for replication (skip in explicit transactions —
-                        // WAL entries should only reflect committed changes).
-                        // R1.1: nosync append by default (P0#2 contract).
-                        if !skip_fast_paths && self.storage.is_wal_enabled() {
-                            if self.storage.fast_dml_requires_logical_wal() {
-                                self.storage.log_data_insert(table_name, &key, &val)?;
-                            } else {
-                                self.storage.log_data_insert_nosync(table_name, &key, &val)?;
+                            // Log to WAL for replication (skip in explicit transactions —
+                            // WAL entries should only reflect committed changes).
+                            // R1.1: nosync append by default (P0#2 contract).
+                            if !skip_fast_paths && self.storage.is_wal_enabled() {
+                                if self.storage.fast_dml_requires_logical_wal() {
+                                    self.storage.log_data_insert(table_name, &key, &val)?;
+                                } else {
+                                    self.storage.log_data_insert_nosync(table_name, &key, &val)?;
+                                }
                             }
                         }
 
@@ -9885,6 +10100,12 @@ impl EmbeddedDatabase {
                 // streaming engine path unchanged; explicit transactions get their
                 // logical WAL at COMMIT via `collect_logical_wal_ops`.
                 let staging = skip_fast_paths && self.insert_select_should_stage();
+                // sprinter 6bc4a4040eb7 (B2): on a branch every row is staged in
+                // THIS statement's transaction through the branch view
+                // (constraints over the branch's rows) — the pre-B2 streaming
+                // path wrote each row straight to the overlay, outside the
+                // transaction, so a later failure or a ROLLBACK left them.
+                let branch_view = self.storage.branch_view()?;
                 let batch_rows = self.insert_select_txn_batch_rows();
                 let mut pending: Vec<Tuple> = Vec::new();
                 let mut pending_returning: Vec<Tuple> = Vec::new();
@@ -9965,11 +10186,23 @@ impl EmbeddedDatabase {
                             }
                         }
                     } else {
-                        // Autocommit / branch / tenant: the streaming engine path,
-                        // unchanged.
-                        let row_id =
-                            self.storage
-                                .insert_tuple_branch_aware_with_schema(table_name, tuple.clone(), &schema)?;
+                        // Autocommit / tenant: the streaming engine path,
+                        // unchanged. Branch: staged through the view (B2).
+                        let (row_id, written): (u64, Option<Tuple>) = match &branch_view {
+                            Some(view) => {
+                                let (row_id, written) =
+                                    self.branch_insert_row(view, Some(txn), table_name, &schema, tuple.clone())?;
+                                (row_id, Some(written))
+                            }
+                            None => (
+                                self.storage.insert_tuple_branch_aware_with_schema(
+                                    table_name,
+                                    tuple.clone(),
+                                    &schema,
+                                )?,
+                                None,
+                            ),
+                        };
 
                         // sprinter 5a78b8288153: NO ART maintenance here.
                         // `insert_tuple_branch_aware_with_schema` above resolves
@@ -9994,7 +10227,7 @@ impl EmbeddedDatabase {
 
                         // Collect tuple for RETURNING clause
                         if has_returning {
-                            let mut returned_tuple = tuple.clone();
+                            let mut returned_tuple = written.unwrap_or_else(|| tuple.clone());
                             returned_tuple.row_id = Some(row_id);
                             if let Some(p) = &returning_projection {
                                 returned_tuples.push(p.project(&returned_tuple)?);
@@ -10154,8 +10387,14 @@ impl EmbeddedDatabase {
                 // family has it too); this gate leaves the branch row source
                 // byte-identical to what it was.
                 let merge_txn_writes = !on_branch && txn.has_writes_for_table(table_name);
-                let tuples = if on_branch {
-                    self.storage.scan_table_branch_aware(table_name)?
+                // sprinter 6bc4a4040eb7 (B2): on a branch the rows are the
+                // branch view's, with THIS transaction's staged branch writes
+                // merged in — read-your-own-writes inside a branch transaction,
+                // which the pre-B2 `scan_table_branch_aware` (committed only)
+                // could not give.
+                let branch_view = self.storage.branch_view()?;
+                let tuples = if let Some(view) = &branch_view {
+                    view.scan(Some(txn), table_name, &schema)?
                 } else if merge_txn_writes {
                     let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
                     txn.merge_with_write_set_to_width(
@@ -10334,6 +10573,7 @@ impl EmbeddedDatabase {
                             &mut seen_column_unique_update_keys,
                             &mut seen_table_unique_update_keys,
                             &index_unique_sets,
+                            Some(txn),
                         )?;
 
                         let row_id = new_tuple.row_id.unwrap_or(0);
@@ -10403,6 +10643,13 @@ impl EmbeddedDatabase {
                 // Updates are only visible after transaction commits
                 // Use branch-aware keys so updates on branches don't pollute main
                 for (row_id, old_tuple, tuple) in &updates {
+                    // sprinter 6bc4a4040eb7 (B2): on a branch, the branch's own
+                    // image (its own tombstone cleared) staged in `txn` — and
+                    // nothing else: no shared ART, no HNSW, no logical WAL.
+                    if let Some(view) = &branch_view {
+                        view.put(Some(txn), table_name, *row_id, tuple)?;
+                        continue;
+                    }
                     let key = self.storage.branch_aware_data_key(table_name, *row_id);
                     let value = bincode::serialize(tuple)
                         .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
@@ -10570,8 +10817,11 @@ impl EmbeddedDatabase {
                 // `DELETE … WHERE pk = …` against a row this transaction had
                 // just inserted reported 0 rows and discarded the delete.
                 let merge_txn_writes = !on_branch && txn.has_writes_for_table(table_name);
-                let tuples = if on_branch {
-                    self.storage.scan_table_branch_aware(table_name)?
+                // sprinter 6bc4a4040eb7 (B2): the branch view, with this
+                // transaction's staged branch writes (see the UPDATE arm).
+                let branch_view = self.storage.branch_view()?;
+                let tuples = if let Some(view) = &branch_view {
+                    view.scan(Some(txn), table_name, &schema_arc)?
                 } else if merge_txn_writes {
                     let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
                     txn.merge_with_write_set_to_width(
@@ -10736,15 +10986,12 @@ impl EmbeddedDatabase {
                 // Use branch-aware keys so deletes on branches don't affect main
                 // sprinter 6bc4a4040eb7 (B1): the SESSION's branch; a binding
                 // whose branch was dropped is refused, never read as main.
-                if let Some(binding) = self.storage.check_active_branch()? {
-                    let branch_id = binding.branch_id;
-                    // Branch delete: write tombstone markers (bdel: keys)
+                // B2: through the branch view — the row's own image cleared
+                // AND its tombstone staged (B1 staged the tombstone only and left
+                // a branch-own image behind it).
+                if let Some(view) = &branch_view {
                     for row_id in &row_ids_to_delete {
-                        let delete_key = format!("bdel:{}:{}:{}", branch_id, table_name, row_id).into_bytes();
-                        txn.put(delete_key, vec![])?;
-
-                        // Invalidate row cache (row deleted on branch)
-                        self.storage.row_cache().invalidate(table_name, *row_id);
+                        view.delete(Some(txn), table_name, *row_id)?;
                     }
                 } else {
                     // Main branch: actual key deletion. R3.3: null the
@@ -11084,52 +11331,31 @@ impl EmbeddedDatabase {
                 // so they can be rolled back if the transaction is aborted
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
-                let rows = self.storage.scan_table(table_name)?;
-                let mut count = 0u64;
-                let mut truncated_row_ids = Vec::with_capacity(rows.len());
-                for tuple in &rows {
-                    if let Some(row_id) = tuple.row_id {
-                        let key = format!("data:{}:{}", table_name, row_id).into_bytes();
-                        txn.delete(key)?;
-                        // Invalidate row cache
-                        self.storage.row_cache().invalidate(table_name, row_id);
-                        truncated_row_ids.push(row_id);
-                        count += 1;
-                    }
+                // sprinter 6bc4a4040eb7 (B2): on a branch TRUNCATE empties the
+                // table ON THE BRANCH only — a staged tombstone for every row the
+                // branch sees, the branch's own images dropped — and leaves main,
+                // main's ART, its columnar side data and the logical WAL alone.
+                // This arm used to stage deletes of MAIN's `data:` keys and clear
+                // main's ART indexes: TRUNCATE on a branch destroyed main's rows.
+                if let Some(view) = self.storage.branch_view()? {
+                    let count = view.truncate(Some(txn), table_name, &schema)?;
+                    tracing::debug!(
+                        table = table_name.as_str(),
+                        branch = view.name(),
+                        rows = count,
+                        "TRUNCATE staged branch tombstones in txn"
+                    );
+                    return Ok(0);
                 }
-                // R3.3: rollback-safe columnar truncation — stage Null values
-                // and presence clears through the write set, grouped per batch.
-                if !self.storage.is_branch_active() {
-                    self.storage.stage_columnar_deletes_grouped_in_transaction(
-                        table_name,
-                        &truncated_row_ids,
-                        &schema,
-                        txn,
-                    )?;
-                }
-                // Clear ART indexes for this table (will be rebuilt if transaction commits)
-                self.storage.art_indexes().clear_table_indexes(table_name);
-                // sprinter 29ecb34e3245 (same hazard as the DROP TABLE purge in
-                // ddl.rs): the rows these bloom filters / zone maps summarise are
-                // gone, and nothing rebuilds them incrementally, so a surviving
-                // structure would keep pruning against the PRE-truncate contents
-                // once rows are re-inserted. This inlined text arm is a separate
-                // TRUNCATE path from `ddl::handle_truncate` and needs its own purge.
-                self.storage.predicate_pushdown().remove_table(table_name);
+                // sprinter 6bc4a4040eb7 (B2 follow-up): main's in-transaction
+                // TRUNCATE is ONE body both executor families run
+                // (`truncate_main_in_transaction`) — the params family's
+                // in-transaction arm used to fall through to
+                // `ddl::handle_truncate`, which deletes at once. Only an explicit
+                // transaction (`skip_fast_paths`) needs the per-row index undo.
+                self.truncate_main_in_transaction(txn, table_name, skip_fast_paths)?;
                 // DDL-like contract (PostgreSQL parity): TRUNCATE reports no
                 // affected-row count, in or out of a transaction.
-                tracing::debug!(
-                    table = table_name.as_str(),
-                    rows = count,
-                    "TRUNCATE staged row deletes in txn"
-                );
-                // GH#36: represent the TRUNCATE in the logical WAL. The params
-                // family already logs through `ddl::handle_truncate`; this
-                // inlined text arm did not, so an HA standby never learned of a
-                // psql/embedded TRUNCATE (asymmetric coverage).
-                if let Err(e) = self.storage.log_truncate(table_name) {
-                    tracing::warn!("Failed to log TRUNCATE '{}' to WAL: {}", table_name, e);
-                }
                 Ok(0)
             }
             sql::LogicalPlan::CreateDatabase { name, if_not_exists } => {
@@ -11898,25 +12124,15 @@ impl EmbeddedDatabase {
         // on this thread wins) — the branch binding every statement reads.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
 
-        // B1 second fix pass: on a branch, with no transaction of the caller
-        // open, the batch AUTOCOMMITS statement by statement through the
-        // ordinary funnel. Its own batch transaction would be a transaction
-        // on a branch, where every data statement is refused (0A000) until
-        // branch transactions exist (phase B2) — so a batch on a branch
-        // always failed. A batch on a branch is therefore NOT atomic until
-        // B2: a failing statement leaves the earlier ones applied. Inside the
-        // caller's own transaction the batch keeps the path below, and its
-        // statements are refused 0A000 like any other there.
-        if !self.global_txn_visible() && self.storage.is_branch_active() {
-            let mut total_rows = 0u64;
-            for sql in statements {
-                total_rows += self.execute(sql)?;
-            }
-            return Ok(total_rows);
-        }
-
+        // sprinter 6bc4a4040eb7 (phase B2): a batch on a branch is ONE
+        // transaction again, exactly as on main — B1 had to autocommit it
+        // statement by statement (not atomic) while a data statement inside a
+        // transaction on a branch was refused. The branch the batch runs on is
+        // captured here and re-validated before COMMIT, like every other
+        // transaction's (`commit_internal_locked`).
         let txn_start = std::time::Instant::now();
         let txn = self.storage.begin_transaction()?;
+        txn.capture_branch_binding(self.storage.session_branch_binding());
         // sprinter beefd0d3d069: own slot, not the shared log.
         let _undo_slot = self.claim_statement_art_undo(&txn);
         let undo_txn_id = _undo_slot.txn_id;
@@ -11932,9 +12148,8 @@ impl EmbeddedDatabase {
             // transaction write set. The no-fast-path variant still allows the
             // transaction-aware INSERT fast path, but prevents direct UPDATE /
             // DELETE storage writes from escaping rollback on a later failure.
-            // The branch gate runs per statement, inside the same rollback arm.
-            // The batch is one transaction: on a branch its statements are
-            // refused like any other in-transaction statement (0A000, B1).
+            // The branch gate runs per statement, inside the same rollback arm;
+            // the batch is one transaction, so `USE BRANCH` inside it is 25001.
             let outcome = self
                 .branch_statement_gate(sql, true)
                 .and_then(|(handled, branch_scope)| match handled {
@@ -11960,6 +12175,17 @@ impl EmbeddedDatabase {
         }
 
         let commit_start = std::time::Instant::now();
+        // sprinter 6bc4a4040eb7 (B2): the branch dropped or merged while the
+        // batch ran — roll back and refuse (3D000), never commit into an
+        // overlay nobody can use.
+        if let Some(binding) = txn.captured_branch_binding() {
+            if let Err(gone) = self.storage.validate_branch_binding(&binding) {
+                self.rollback_art_undo_for(undo_txn_id);
+                let _ = txn.rollback();
+                self.deferred_fk_checks.lock().clear();
+                return Err(gone);
+            }
+        }
         if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
             // Same ordering requirement as the per-statement error path above.
             self.rollback_art_undo_for(undo_txn_id);
@@ -12889,7 +13115,13 @@ impl EmbeddedDatabase {
         // statement for the global slot. With time-travel OFF the process-wide
         // bail is unchanged, so nothing is widened in the configuration where
         // the version gate does not exist.
-        if !self.in_transaction() || self.session_txns_block_fast_inserts() || self.has_effective_tenant_context() {
+        // sprinter 6bc4a4040eb7 (B2): `is_branch_active` — a branch INSERT
+        // takes the plan arm (constraints over the branch's view).
+        if !self.in_transaction()
+            || self.session_txns_block_fast_inserts()
+            || self.has_effective_tenant_context()
+            || self.storage.is_branch_active()
+        {
             return None;
         }
 
@@ -14210,6 +14442,11 @@ impl EmbeddedDatabase {
     }
 
     fn try_execute_fast_update_param_spec(&self, spec: &FastParamUpdateSpec, params: &[Value]) -> Option<Result<u64>> {
+        // sprinter 6bc4a4040eb7 (B2): main-only (every caller already declines
+        // on a branch; this keeps a new caller from writing main).
+        if self.storage.is_branch_active() {
+            return None;
+        }
         let pk_value = match Self::fast_pk_value_from_expr_cow(&spec.pk_expr, &spec.pk_data_type, params) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
@@ -14412,6 +14649,10 @@ impl EmbeddedDatabase {
         params: &[Value],
         finalize_statement: bool,
     ) -> Option<Result<u64>> {
+        // sprinter 6bc4a4040eb7 (B2): main-only, as the UPDATE twin above.
+        if self.storage.is_branch_active() {
+            return None;
+        }
         let pk_value = match Self::fast_pk_value_from_expr_cow(&spec.pk_expr, &spec.pk_data_type, params) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
@@ -14969,6 +15210,8 @@ impl EmbeddedDatabase {
             || self.has_effective_tenant_context()
             // Non-`public` `search_path`: resolve bare names via the planner.
             || self.current_schema_is_set()
+            // sprinter 6bc4a4040eb7 (B2): main-only fast paths.
+            || self.storage.is_branch_active()
         {
             return None;
         }
@@ -15029,13 +15272,24 @@ impl EmbeddedDatabase {
             "Query executed"
         );
 
-        // Commit or rollback based on result
+        // Commit or rollback based on result.
+        //
+        // sprinter 6bc4a4040eb7 (B2 follow-up): this statement's index REMOVALS
+        // hold census slots (`set_removal_census`). Ending the transaction
+        // releases them, while the eager ART entries are put back only by the
+        // undo replay after it — so each ending takes a standalone hold first
+        // and drops it after the replay (the session COMMIT's
+        // `write_census_hold` pattern). A failed commit applied nothing, so it
+        // replays the undo like a rollback (it used to discard it, leaving the
+        // statement's index changes behind).
+        let census_hold = txn.write_census_hold();
         match result {
             Ok(count) => {
                 let commit_start = std::time::Instant::now();
                 if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
                     let _ = txn.rollback();
                     self.rollback_art_undo_for(undo_txn_id);
+                    drop(census_hold);
                     // The queued deferred checks belong to THIS (now rolled back)
                     // statement. Leaving them behind made the NEXT autocommit
                     // statement re-report the same violation at its own commit
@@ -15044,8 +15298,14 @@ impl EmbeddedDatabase {
                     self.deferred_fk_checks.lock().clear();
                     return Err(e);
                 }
-                txn.commit()?;
+                if let Err(e) = txn.commit() {
+                    self.rollback_art_undo_for(undo_txn_id);
+                    drop(census_hold);
+                    self.deferred_fk_checks.lock().clear();
+                    return Err(e);
+                }
                 let _ = self.take_raii_art_undo(undo_txn_id);
+                drop(census_hold);
                 self.deferred_fk_checks.lock().clear();
                 // Increment LSN to track transaction commits
                 self.storage.increment_lsn();
@@ -15060,6 +15320,7 @@ impl EmbeddedDatabase {
             Err(e) => {
                 let _ = txn.rollback(); // Ignore rollback errors
                 self.rollback_art_undo_for(undo_txn_id);
+                drop(census_hold);
                 self.deferred_fk_checks.lock().clear();
                 Err(e)
             }
@@ -16164,6 +16425,12 @@ impl EmbeddedDatabase {
     /// Returns `None` to fall through to the normal path for anything complex.
     #[allow(clippy::indexing_slicing)] // validated indices
     fn try_fast_insert(&self, sql: &str) -> Option<Result<u64>> {
+        // sprinter 6bc4a4040eb7 (B2): never on a branch — this path checks no
+        // constraint against the branch's rows (it enforced nothing at all on a
+        // branch before B2). A branch INSERT takes the plan arm, which does.
+        if self.storage.is_branch_active() {
+            return None;
+        }
         let trimmed = sql.trim();
 
         // Quick prefix check (case-insensitive, avoid allocation)
@@ -16265,20 +16532,13 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
 
-        // Use fast INSERT (skip WAL fsync + snapshot versioning) when on main branch
-        if !self.storage.is_branch_active() {
-            Some(
-                self.storage
-                    .insert_tuple_fast(&spec.table_name, tuple, &spec.schema)
-                    .map(|_| 1),
-            )
-        } else {
-            Some(
-                self.storage
-                    .insert_tuple_branch_aware_with_schema(&spec.table_name, tuple, &spec.schema)
-                    .map(|_| 1),
-            )
-        }
+        // Fast INSERT (skip WAL fsync + snapshot versioning) — main only; a
+        // branch declined at the top.
+        Some(
+            self.storage
+                .insert_tuple_fast(&spec.table_name, tuple, &spec.schema)
+                .map(|_| 1),
+        )
     }
 
     /// Transaction-aware fast path for simple literal INSERT statements.
@@ -16288,6 +16548,11 @@ impl EmbeddedDatabase {
     /// transaction write set.
     #[allow(clippy::indexing_slicing)] // validated indices
     fn try_fast_insert_literal_in_transaction(&self, sql: &str, txn: &storage::Transaction) -> Option<Result<u64>> {
+        // sprinter 6bc4a4040eb7 (B2): a branch INSERT takes the plan arm (the
+        // branch view's constraint checks); this path validates against main.
+        if self.storage.is_branch_active() {
+            return None;
+        }
         let trimmed = sql.trim();
 
         if trimmed.len() < 20 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"INSERT") {
@@ -16544,6 +16809,12 @@ impl EmbeddedDatabase {
         schema: &Schema,
         txn: &storage::Transaction,
     ) -> Result<Vec<u64>> {
+        // sprinter 6bc4a4040eb7 (B2): on a branch the batch is validated and
+        // staged row by row through the branch view — `validate_fast_insert_batch`
+        // below checks MAIN's ART, which knows none of the branch's rows.
+        if let Some(view) = self.storage.branch_view()? {
+            return self.branch_insert_rows(&view, Some(txn), table_name, schema, tuples);
+        }
         if tuples.len() == 1 {
             let tuple = tuples
                 .into_iter()
@@ -16678,6 +16949,13 @@ impl EmbeddedDatabase {
         constraints_prechecked: bool,
         stage_columnar: bool,
     ) -> Result<()> {
+        // sprinter 6bc4a4040eb7 (B2): on a branch, claim + check over the
+        // branch's view and stage the branch's own image — and nothing of
+        // main's (ART, columnar, HNSW). The callers' main-ART pre-checks do not
+        // apply to a branch, so `constraints_prechecked` is not trusted here.
+        if let Some(view) = self.storage.branch_view()? {
+            return view.insert_checked(Some(txn), table_name, schema, row_id, &tuple);
+        }
         // Callers reach this helper only through the fast INSERT paths, which
         // already reject tables with FK/CHECK constraints while building their
         // statement metadata. Avoid reloading constraint metadata on every row
@@ -19785,6 +20063,7 @@ impl EmbeddedDatabase {
         // transaction) — so one gate covers them all and none of them can drift.
         let result = if self.params_insert_needs_implicit_transaction(plan, session_txn)
             || self.params_call_needs_implicit_transaction(plan, session_txn)
+            || self.params_branch_dml_needs_implicit_transaction(plan, session_txn)
         {
             self.execute_plan_with_params_in_implicit_transaction(plan, params, original_sql)
         } else {
@@ -19841,8 +20120,9 @@ impl EmbeddedDatabase {
     /// * A session transaction, or a text `BEGIN` holding the global slot,
     ///   already makes the statement part of a larger unit that rolls back whole;
     ///   the Insert arm picks those up itself.
-    /// * A live BRANCH writes to `bdata:` and keeps the process-wide ART
-    ///   branch-free; that path is left exactly as it was.
+    /// * A live BRANCH is covered by
+    ///   [`Self::params_branch_dml_needs_implicit_transaction`] instead (every
+    ///   DML statement there, not only multi-row INSERT).
     fn params_insert_needs_implicit_transaction(
         &self,
         plan: &sql::LogicalPlan,
@@ -19880,6 +20160,31 @@ impl EmbeddedDatabase {
         !self.global_txn_visible() && !self.storage.is_branch_active()
     }
 
+    /// sprinter 6bc4a4040eb7 (phase B2): on a BRANCH, every params-family DML
+    /// statement (`INSERT` — including `ON CONFLICT` — `INSERT … SELECT`,
+    /// `UPDATE`, `DELETE`) with no transaction in scope runs in an implicit
+    /// statement transaction, as the text family's always does. Its writes are
+    /// then staged through the branch view and committed together: a
+    /// multi-row statement is atomic, an `ON CONFLICT DO UPDATE` and the
+    /// INSERT half of the same statement see each other, and an FK cascade
+    /// joins the DELETE that caused it. Main keeps its narrower rule above.
+    fn params_branch_dml_needs_implicit_transaction(
+        &self,
+        plan: &sql::LogicalPlan,
+        session_txn: Option<&storage::Transaction>,
+    ) -> bool {
+        session_txn.is_none()
+            && matches!(
+                plan,
+                sql::LogicalPlan::Insert { .. }
+                    | sql::LogicalPlan::InsertSelect { .. }
+                    | sql::LogicalPlan::Update { .. }
+                    | sql::LogicalPlan::Delete { .. }
+            )
+            && !self.global_txn_visible()
+            && self.storage.is_branch_active()
+    }
+
     /// sprinter e4bb83a1afa0: does this params-family `CALL` need an implicit
     /// statement transaction of its own?
     ///
@@ -19912,16 +20217,29 @@ impl EmbeddedDatabase {
         // sprinter beefd0d3d069: own slot, not the shared log.
         let _undo_slot = self.claim_statement_art_undo(&txn);
         let undo_txn_id = _undo_slot.txn_id;
-        match self.execute_plan_with_params_inner(plan, params, Some(&txn), original_sql) {
+        let result = self.execute_plan_with_params_inner(plan, params, Some(&txn), original_sql);
+        // sprinter 6bc4a4040eb7 (B2 follow-up): keep this statement's removal
+        // census slots until its index undo has run, however it ends — see
+        // `execute_with_implicit_transaction`. A failed commit replays the undo
+        // like a rollback.
+        let census_hold = txn.write_census_hold();
+        match result {
             Ok(out) => {
                 if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
                     let _ = txn.rollback();
                     self.rollback_art_undo_for(undo_txn_id);
+                    drop(census_hold);
                     self.deferred_fk_checks.lock().clear();
                     return Err(e);
                 }
-                txn.commit()?;
+                if let Err(e) = txn.commit() {
+                    self.rollback_art_undo_for(undo_txn_id);
+                    drop(census_hold);
+                    self.deferred_fk_checks.lock().clear();
+                    return Err(e);
+                }
                 let _ = self.take_raii_art_undo(undo_txn_id);
+                drop(census_hold);
                 self.deferred_fk_checks.lock().clear();
                 self.storage.increment_lsn();
                 Ok(out)
@@ -19929,6 +20247,7 @@ impl EmbeddedDatabase {
             Err(e) => {
                 let _ = txn.rollback();
                 self.rollback_art_undo_for(undo_txn_id);
+                drop(census_hold);
                 self.deferred_fk_checks.lock().clear();
                 Err(e)
             }
@@ -20080,6 +20399,15 @@ impl EmbeddedDatabase {
                         _txn_guard.as_ref().and_then(|guard| guard.as_ref())
                     }
                 };
+                // sprinter 6bc4a4040eb7 (B2): on a branch the PRIMARY KEY /
+                // UNIQUE pre-check, the ON CONFLICT arbiter, the read of the
+                // conflicting row and every write go through the branch view
+                // (with `active_txn`, which a branch statement always has —
+                // `params_branch_dml_needs_implicit_transaction`). The pre-B2 arm
+                // pre-checked MAIN's ART, so a key the branch had deleted was
+                // refused (the code-graph upsert on a branch failed "Duplicate
+                // key … src_pkey") and a key only the branch held went through.
+                let branch_view = self.storage.branch_view()?;
 
                 // BEFORE INSERT FOR EACH ROW row-rewrite parity with the text
                 // family (ROADMAP_V5 HC1). Hoisted OUT of the row loop: it is a
@@ -20225,13 +20553,35 @@ impl EmbeddedDatabase {
                         }
                     }
 
-                    let conflict = self
-                        .storage
-                        .art_indexes()
-                        .check_unique_constraints(table_name, &col_values_map);
+                    // sprinter 6bc4a4040eb7 (B2 fix pass): on a branch, the
+                    // claim-aware arbitration (see the text family's arm) — a
+                    // key another open transaction on the branch claimed is a
+                    // conflict `ON CONFLICT` can intercept.
+                    let mut branch_arbitration = match &branch_view {
+                        Some(view) => Some(view.arbitrate(active_txn, table_name, &schema, &tuple.values)?),
+                        None => None,
+                    };
+                    let conflict: std::result::Result<(), String> = match &branch_arbitration {
+                        Some(arbitration) => match arbitration.conflict_message() {
+                            Some(message) => Err(message),
+                            None => Ok(()),
+                        },
+                        None => self
+                            .storage
+                            .art_indexes()
+                            .check_unique_constraints(table_name, &col_values_map)
+                            .map_err(|e| e.to_string()),
+                    };
 
                     match (conflict, on_conflict) {
                         (Ok(()), _) => {
+                            // No conflict: the row's transaction holds the
+                            // arbitrated keys from here (B2 fix pass) — released
+                            // at once when there is no transaction, so the
+                            // direct insert below claims them afresh.
+                            if let Some(arbitration) = branch_arbitration.take() {
+                                arbitration.keep(active_txn);
+                            }
                             // No conflict — proceed with normal versioned
                             // insert.  `insert_tuple_branch_aware_with_schema`
                             // also runs `check_unique_constraints` (defence
@@ -20337,7 +20687,11 @@ impl EmbeddedDatabase {
                                         .reserve_insert_tuple(table_name, row_id, &schema, &staged)
                                         .map_err(|e| Error::constraint_violation(e.to_string()))?;
                                 }
-                                if let Err(e) = txn.put(key, val) {
+                                if let Some(view) = &branch_view {
+                                    // B2: claim, check over the branch's view
+                                    // (PK filled), stage the branch's own image.
+                                    view.insert_checked(Some(txn), table_name, &schema, row_id, &staged)?;
+                                } else if let Err(e) = txn.put(key, val) {
                                     // The row never landed, so the claim is a phantom.
                                     if on_main {
                                         let _ = self
@@ -20400,7 +20754,16 @@ impl EmbeddedDatabase {
                             // the conflict is on the named constraint. Mirrors
                             // the text family: `ON CONFLICT (v) DO NOTHING`
                             // does not swallow a PRIMARY KEY collision.
-                            if !self.conflict_matches_target(table_name, &col_values_map, conflict_target.as_deref()) {
+                            // On a branch a CLAIMED arbiter key counts (skip).
+                            let matches_target = match &branch_arbitration {
+                                Some(arbitration) => arbitration.conflict_on(conflict_target.as_deref()).is_some(),
+                                None => self.conflict_matches_target(
+                                    table_name,
+                                    &col_values_map,
+                                    conflict_target.as_deref(),
+                                ),
+                            };
+                            if !matches_target {
                                 // Same classification the `(Err(e), None)` arm
                                 // below uses, so the wire still maps it to 23505.
                                 return Err(Error::constraint_violation(e.to_string()));
@@ -20449,33 +20812,63 @@ impl EmbeddedDatabase {
                             // other one re-raises the original 23505 rather
                             // than upserting onto a row the statement never
                             // named.
-                            let existing_row_id = match self.storage.art_indexes().find_unique_conflict(
-                                table_name,
-                                &col_values_map,
-                                conflict_target.as_deref(),
-                            ) {
-                                Some(conflict) => conflict.row_id,
-                                // Conflict on a NON-target constraint: re-raise the
-                                // original violation, classified exactly as the
-                                // `(Err(e), None)` arm classifies it (23505).
-                                None if conflict_target.is_some() => {
-                                    return Err(Error::constraint_violation(e.to_string()))
-                                }
-                                None => {
-                                    return Err(Error::query_execution(format!(
-                                        "ON CONFLICT DO UPDATE: could not find existing row ({})",
-                                        e
-                                    )))
+                            // B2: on a branch the arbiter is the branch view,
+                            // which also hands back the conflicting row as the
+                            // branch sees it (inherited, branch-own, or staged
+                            // by this transaction).
+                            let (existing_row_id, branch_existing): (u64, Option<Tuple>) = if let Some(arbitration) =
+                                branch_arbitration.take()
+                            {
+                                let found = Self::branch_upsert_target(&arbitration, conflict_target.as_deref(), &e);
+                                // The update below may write the arbitrated
+                                // keys: the transaction holds them from here.
+                                arbitration.keep(active_txn);
+                                let (row_id, row) = found?;
+                                (row_id, Some(row))
+                            } else {
+                                match self.storage.art_indexes().find_unique_conflict(
+                                    table_name,
+                                    &col_values_map,
+                                    conflict_target.as_deref(),
+                                ) {
+                                    Some(conflict) => (conflict.row_id, None),
+                                    // Conflict on a NON-target constraint: re-raise the
+                                    // original violation, classified exactly as the
+                                    // `(Err(e), None)` arm classifies it (23505).
+                                    None if conflict_target.is_some() => {
+                                        return Err(Error::constraint_violation(e.to_string()))
+                                    }
+                                    None => {
+                                        return Err(Error::query_execution(format!(
+                                            "ON CONFLICT DO UPDATE: could not find existing row ({})",
+                                            e
+                                        )))
+                                    }
                                 }
                             };
 
-                            // Read the existing tuple from storage.
-                            let existing_key = self.storage.branch_aware_data_key(table_name, existing_row_id);
-                            let existing_raw = self.storage.get(&existing_key)?.ok_or_else(|| {
-                                Error::query_execution("ON CONFLICT DO UPDATE: existing row not found in storage")
-                            })?;
-                            let mut updated_tuple: Tuple = bincode::deserialize(&existing_raw)
-                                .map_err(|err| Error::storage(format!("Failed to deserialize tuple: {}", err)))?;
+                            // Read the existing tuple from storage (main), or take
+                            // the branch view's (branch). `old_tuple_for_art` is
+                            // the pre-image the ART diff / UNIQUE re-check uses.
+                            let (mut updated_tuple, old_tuple_for_art): (Tuple, Tuple) = match branch_existing {
+                                Some(row) => (row.clone(), row),
+                                None => {
+                                    let existing_key = self.storage.branch_aware_data_key(table_name, existing_row_id);
+                                    let existing_raw = self.storage.get(&existing_key)?.ok_or_else(|| {
+                                        Error::query_execution(
+                                            "ON CONFLICT DO UPDATE: existing row not found in storage",
+                                        )
+                                    })?;
+                                    let current: Tuple = bincode::deserialize(&existing_raw).map_err(|err| {
+                                        Error::storage(format!("Failed to deserialize tuple: {}", err))
+                                    })?;
+                                    // Snapshot the old tuple for the ART diff.
+                                    let pre_image: Tuple = bincode::deserialize(&existing_raw).map_err(|err| {
+                                        Error::storage(format!("Failed to deserialize tuple: {}", err))
+                                    })?;
+                                    (current, pre_image)
+                                }
+                            };
                             updated_tuple.row_id = Some(existing_row_id);
 
                             // RLS: the conflicting row is a pre-image governed by the
@@ -20485,10 +20878,6 @@ impl EmbeddedDatabase {
                             if !Self::rls_row_visible(rls_guard_update.as_ref(), &updated_tuple)? {
                                 continue;
                             }
-
-                            // Snapshot the old tuple for the ART diff.
-                            let old_tuple_for_art: Tuple = bincode::deserialize(&existing_raw)
-                                .map_err(|err| Error::storage(format!("Failed to deserialize tuple: {}", err)))?;
 
                             // Apply the ON CONFLICT DO UPDATE assignments.
                             // Evaluator includes both the table schema (so
@@ -20577,13 +20966,23 @@ impl EmbeddedDatabase {
                             // (see `StorageEngine::invalidate_write_watermark`),
                             // dropping in-transaction readers onto the snapshot
                             // path so none fast-reads this un-versioned change.
-                            self.storage.update_tuple_fast(
-                                table_name,
-                                existing_row_id,
-                                updated_tuple.clone(),
-                                &old_tuple_for_art,
-                                &schema,
-                            )?;
+                            //
+                            // B2: on a branch, the branch's own image through the
+                            // view, staged in the statement's transaction — never
+                            // `update_tuple_fast`, which writes MAIN's `data:` key
+                            // and main's ART (it refuses on a branch now).
+                            match &branch_view {
+                                Some(view) => view.put(active_txn, table_name, existing_row_id, &updated_tuple)?,
+                                None => {
+                                    self.storage.update_tuple_fast(
+                                        table_name,
+                                        existing_row_id,
+                                        updated_tuple.clone(),
+                                        &old_tuple_for_art,
+                                        &schema,
+                                    )?;
+                                }
+                            }
 
                             if let Some(p) = &returning_projection {
                                 returned_tuples.push(p.project(&updated_tuple)?);
@@ -20684,6 +21083,11 @@ impl EmbeddedDatabase {
                 let source_rows = executor.execute(source_plan)?;
 
                 let staging = active_txn.is_some() && self.insert_select_should_stage();
+                // sprinter 6bc4a4040eb7 (B2): on a branch each row goes through
+                // the branch view, staged in `active_txn` (the implicit statement
+                // transaction when nothing else is open) — constraints over the
+                // branch's rows, atomic with the statement.
+                let branch_view = self.storage.branch_view()?;
                 let batch_rows = self.insert_select_txn_batch_rows();
                 let mut pending: Vec<Tuple> = Vec::new();
                 let mut pending_returning: Vec<Tuple> = Vec::new();
@@ -20735,6 +21139,14 @@ impl EmbeddedDatabase {
                                 }
                             }
                         }
+                        continue;
+                    }
+                    if let Some(view) = &branch_view {
+                        let (_, written) = self.branch_insert_row(view, active_txn, table_name, &schema, tuple)?;
+                        if let Some(p) = &returning_projection {
+                            returned_tuples.push(p.project(&written)?);
+                        }
+                        count += 1;
                         continue;
                     }
                     if let Some(p) = &returning_projection {
@@ -20833,8 +21245,15 @@ impl EmbeddedDatabase {
                 // 27bf8d819c52) and now routes through this same merge; its arm
                 // carries the full analysis and the `merge_txn_writes` gate that
                 // also makes its PK point-lookup shortcut stand down.
-                let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
-                let tuples = if let Some(txn) = active_txn {
+                // sprinter 6bc4a4040eb7 (B2): on a branch, the branch view with
+                // the transaction's staged branch writes (the merge below keys
+                // on main's `data:` and could never find a branch row).
+                let branch_view = self.storage.branch_view()?;
+                let base_tuples = match &branch_view {
+                    Some(view) => view.scan(active_txn, table_name, &schema)?,
+                    None => self.storage.scan_table_branch_aware(table_name)?,
+                };
+                let tuples = if let (Some(txn), None) = (active_txn, &branch_view) {
                     txn.merge_with_write_set_to_width(
                         table_name,
                         base_tuples,
@@ -20956,6 +21375,7 @@ impl EmbeddedDatabase {
                             &mut seen_column_unique_update_keys,
                             &mut seen_table_unique_update_keys,
                             &index_unique_sets,
+                            active_txn,
                         )?;
 
                         let row_id = tuple.row_id.unwrap_or(0);
@@ -20983,6 +21403,12 @@ impl EmbeddedDatabase {
                             .stage_columnar_rows_grouped_in_transaction(table_name, &row_refs, &schema, txn, false)?;
                     }
                     for (row_id, old_tuple, tuple) in &updates {
+                        // sprinter 6bc4a4040eb7 (B2): the branch's own image
+                        // (tombstone cleared) staged in `txn`, nothing else.
+                        if let Some(view) = &branch_view {
+                            view.put(Some(txn), table_name, *row_id, tuple)?;
+                            continue;
+                        }
                         let key = self.storage.branch_aware_data_key(table_name, *row_id);
                         let value = bincode::serialize(tuple)
                             .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
@@ -21169,8 +21595,14 @@ impl EmbeddedDatabase {
                 // the same correction applies: the simple-query path had no such
                 // behaviour until v4.41.0 (GH#41 / sprinter 27bf8d819c52). See
                 // the params `Update` arm above for the full record.
-                let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
-                let tuples = if let Some(txn) = active_txn {
+                // sprinter 6bc4a4040eb7 (B2): the branch view with the
+                // transaction's staged branch writes on a branch.
+                let branch_view = self.storage.branch_view()?;
+                let base_tuples = match &branch_view {
+                    Some(view) => view.scan(active_txn, table_name, &schema)?,
+                    None => self.storage.scan_table_branch_aware(table_name)?,
+                };
+                let tuples = if let (Some(txn), None) = (active_txn, &branch_view) {
                     txn.merge_with_write_set_to_width(
                         table_name,
                         base_tuples,
@@ -21293,6 +21725,14 @@ impl EmbeddedDatabase {
                         )?;
                     }
                     for row_id in &row_ids_to_delete {
+                        // sprinter 6bc4a4040eb7 (B2): on a branch, the row's own
+                        // image cleared AND its tombstone staged. This arm used
+                        // to stage only a delete of `bdata:`, so an INHERITED row
+                        // (which has no `bdata:`) stayed visible on the branch.
+                        if let Some(view) = &branch_view {
+                            view.delete(Some(txn), table_name, *row_id)?;
+                            continue;
+                        }
                         let key = self.storage.branch_aware_data_key(table_name, *row_id);
                         txn.delete(key.clone())?;
                         self.storage.row_cache().invalidate(table_name, *row_id);
@@ -21574,6 +22014,54 @@ impl EmbeddedDatabase {
                 if_exists,
             } => {
                 self.execute_drop_trigger_plan(name, table_name, *if_exists)?;
+                Ok((0, Vec::new()))
+            }
+            // sprinter 6bc4a4040eb7 (phase B2): TRUNCATE on a BRANCH empties the
+            // table on the branch only and joins the caller's transaction, so a
+            // ROLLBACK restores the rows (the text family's arm does the same).
+            //
+            // B2 follow-up: and on MAIN inside a session or global transaction
+            // it runs the text family's in-transaction body
+            // (`truncate_main_in_transaction`) — staged deletes, ART/HNSW undo.
+            // The catch-all below runs `ddl::handle_truncate` with no
+            // transaction, which deleted main's rows at once: `BEGIN; TRUNCATE;
+            // ROLLBACK` over the extended protocol restored nothing. An
+            // autocommit main TRUNCATE keeps that catch-all route.
+            sql::LogicalPlan::Truncate { table_name }
+                if self.storage.is_branch_active() || session_txn.is_some() || self.global_txn_visible() =>
+            {
+                let schema = self.storage.catalog().get_table_schema(table_name)?;
+                // The global slot only when this caller owns it and does not
+                // already hold its mutex (a trigger body re-entering from
+                // `execute()`), exactly as the InsertSelect arm decides.
+                let can_read_global_txn = self.global_txn_visible() && !GLOBAL_TXN_LOCK_HELD.with(|held| held.get());
+                let mut _txn_guard = None;
+                let active_txn: Option<&storage::Transaction> = match session_txn {
+                    Some(txn) => Some(txn),
+                    None if can_read_global_txn => {
+                        _txn_guard = self.lock_owned_global_txn();
+                        _txn_guard.as_ref().and_then(|guard| guard.as_ref())
+                    }
+                    None => None,
+                };
+                if let Some(view) = self.storage.branch_view()? {
+                    view.truncate(active_txn, table_name, &schema)?;
+                    return Ok((0, Vec::new()));
+                }
+                match active_txn {
+                    Some(txn) => {
+                        self.truncate_main_in_transaction(txn, table_name, true)?;
+                    }
+                    None => {
+                        // The global transaction is this caller's but its mutex
+                        // is already held on this thread (a trigger body
+                        // re-entering from `execute()`): the autocommit route,
+                        // exactly as the catch-all runs it.
+                        let mut executor = sql::Executor::with_storage(&self.storage)
+                            .with_timeout(self.effective_statement_timeout_ms());
+                        executor.execute(plan)?;
+                    }
+                }
                 Ok((0, Vec::new()))
             }
             _ => {
@@ -26304,7 +26792,19 @@ impl EmbeddedDatabase {
         // binding whose branch was dropped is refused before the first row.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
         let _branch_scope = self.enter_branch_statement()?;
-        let on_branch = self.storage.check_active_branch()?.is_some();
+        // sprinter 6bc4a4040eb7 (B2): on a branch each row goes through the
+        // branch view (PRIMARY KEY / UNIQUE over the branch's rows, written at
+        // once like main's rows here). The pre-B2 body checked MAIN's ART and
+        // wrote `bdata:` with `put`, so a key the branch had deleted was refused
+        // and a duplicate of a branch row went through.
+        //
+        // B2 fix pass: the rows' autocommit durability barrier is run ONCE,
+        // after the batch (`view.sync()` below), not once per row.
+        let branch_view = self
+            .storage
+            .branch_view()?
+            .map(storage::BranchView::with_deferred_durability);
+        let on_branch = branch_view.is_some();
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
 
@@ -26366,22 +26866,26 @@ impl EmbeddedDatabase {
                 }
             }
 
-            // PK / UNIQUE check before committing the write.
-            if let Err(e) = self
-                .storage
-                .art_indexes()
-                .check_unique_constraints(table_name, &col_values)
-            {
-                return Err(Error::constraint_violation(e.to_string()));
-            }
+            if let Some(view) = &branch_view {
+                view.insert_checked(None, table_name, &schema, row_id, &tuple)?;
+            } else {
+                // PK / UNIQUE check before committing the write.
+                if let Err(e) = self
+                    .storage
+                    .art_indexes()
+                    .check_unique_constraints(table_name, &col_values)
+                {
+                    return Err(Error::constraint_violation(e.to_string()));
+                }
 
-            // Direct RocksDB write — bypasses txn.write_set so
-            // subsequent SQL statements in the outer txn don't pay
-            // O(N) merge_with_write_set cost.
-            let val =
-                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-            let key = self.storage.branch_aware_data_key(table_name, row_id);
-            self.storage.put(&key, &val)?;
+                // Direct RocksDB write — bypasses txn.write_set so
+                // subsequent SQL statements in the outer txn don't pay
+                // O(N) merge_with_write_set cost.
+                let val = bincode::serialize(&tuple)
+                    .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+                let key = self.storage.branch_aware_data_key(table_name, row_id);
+                self.storage.put(&key, &val)?;
+            }
 
             // R5.V1: maintain HNSW vector indexes. Like the ART update below,
             // this direct-write bulk path is not transactional (no undo).
@@ -26418,6 +26922,11 @@ impl EmbeddedDatabase {
                     storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
                 }
             }
+        }
+        // B2 fix pass: the direct branch writes above deferred their
+        // durability barrier to here — one barrier for the batch.
+        if let Some(view) = &branch_view {
+            view.sync()?;
         }
 
         // Bulk path bypasses the SQL execute pipeline, so the
@@ -27893,9 +28402,16 @@ impl EmbeddedDatabase {
             (Value::Int2(v), DataType::Int8) => Value::Int8(i64::from(*v)),
             (Value::Int4(v), DataType::Int8) => Value::Int8(i64::from(*v)),
             (Value::Int2(v), DataType::Int4) => Value::Int4(i32::from(*v)),
-            (Value::Int8(v), DataType::Int4) => Value::Int4(*v as i32),
-            (Value::Int8(v), DataType::Int2) => Value::Int2(*v as i16),
-            (Value::Int4(v), DataType::Int2) => Value::Int2(*v as i16),
+            // sprinter 6bc4a4040eb7 (B2 fix pass): CHECKED narrowing. These
+            // were `as` casts, which wrap: an int8 value 4294967297 probed an
+            // int4 column as 1, so a child could satisfy its FK against parent
+            // 1 and a parent DELETE cascaded / RESTRICTed on the wrong child.
+            // A value the narrower column cannot hold is left unchanged — it
+            // can then equal (or ART-encode as) nothing stored in that column,
+            // which is the right answer: no such row can exist.
+            (Value::Int8(v), DataType::Int4) => i32::try_from(*v).map_or_else(|_| value.clone(), Value::Int4),
+            (Value::Int8(v), DataType::Int2) => i16::try_from(*v).map_or_else(|_| value.clone(), Value::Int2),
+            (Value::Int4(v), DataType::Int2) => i16::try_from(*v).map_or_else(|_| value.clone(), Value::Int2),
             (Value::Int2(v), DataType::Numeric) => Value::Numeric(format!("{v}")),
             (Value::Int4(v), DataType::Numeric) => Value::Numeric(format!("{v}")),
             (Value::Int8(v), DataType::Numeric) => Value::Numeric(format!("{v}")),
@@ -27978,6 +28494,23 @@ impl EmbeddedDatabase {
     ) -> Result<()> {
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
+        // sprinter 6bc4a4040eb7 (B2 fix pass): the parent's key values in the
+        // CHILD columns' declared types before they are compared with child
+        // rows — the conversion `check_referencing_rows_exist` already applies
+        // (`coerce_fk_probe_values`). Comparing the parent's values as they
+        // came (`Value` equality is type-exact) matched no child of a
+        // cross-type FK (int8 parent, int4 child), so ON DELETE CASCADE / SET
+        // NULL silently left the children behind, on main and on a branch.
+        let parent_values = Self::coerce_fk_probe_values(&schema, fk_columns, parent_values);
+        let parent_values = parent_values.as_slice();
+        // sprinter 6bc4a4040eb7 (phase B2): on a branch, tombstone the children
+        // the BRANCH sees, through the branch view (staged in `active_txn`).
+        // This helper scanned MAIN's children and staged a delete of their
+        // `bdata:` keys — no tombstone, so they stayed visible on the branch,
+        // while children only the branch held were never found.
+        if let Some(view) = self.storage.branch_view()? {
+            return Self::branch_cascade_delete(&view, active_txn, table_name, &schema, fk_columns, parent_values);
+        }
 
         // Find all rows that reference the parent row
         let tuples = self.storage.scan_table(table_name)?;
@@ -28152,6 +28685,16 @@ impl EmbeddedDatabase {
     ) -> Result<()> {
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
+        // B2 fix pass: the parent's values in the child columns' types — see
+        // `cascade_delete_referencing_rows`.
+        let parent_values = Self::coerce_fk_probe_values(&schema, fk_columns, parent_values);
+        let parent_values = parent_values.as_slice();
+        // sprinter 6bc4a4040eb7 (phase B2): on a branch, the branch's own image
+        // of every child the BRANCH sees, FK columns NULLed (see the CASCADE
+        // twin above for what this did before).
+        if let Some(view) = self.storage.branch_view()? {
+            return Self::branch_set_null(&view, active_txn, table_name, &schema, fk_columns, parent_values);
+        }
 
         // Find all rows that reference the parent row
         let tuples = self.storage.scan_table(table_name)?;
@@ -28567,7 +29110,15 @@ impl EmbeddedDatabase {
         seen_column_keys: &mut Vec<(String, Value, Option<u64>)>,
         seen_table_keys: &mut Vec<(Vec<String>, Vec<Value>, Option<u64>)>,
         index_unique_sets: &[Vec<String>],
+        active_txn: Option<&storage::Transaction>,
     ) -> Result<()> {
+        // sprinter 6bc4a4040eb7 (B2): on a branch every "is this key taken by
+        // another row?" probe below is answered over the BRANCH's rows (with
+        // `active_txn`'s staged writes, and the key claimed for it) — main's
+        // ART knows none of them, so the pre-B2 probe let an UPDATE onto a
+        // branch-only key through and refused one onto a key the branch had
+        // freed.
+        let branch_view = self.storage.branch_view()?;
         // The row being updated, so no pass can report it as its own duplicate.
         // `new_tuple` carries the id on the UPDATE arms (it is a clone of the
         // scanned row); `old_tuple` carries it on the ON CONFLICT DO UPDATE leg.
@@ -28601,12 +29152,15 @@ impl EmbeddedDatabase {
                 )));
             }
             let columns = [col.name.clone()];
-            if self.storage.art_indexes().unique_key_taken_by_other_row(
+            if self.unique_key_taken(
+                branch_view.as_ref(),
+                active_txn,
                 table_name,
+                schema,
                 &columns,
                 std::slice::from_ref(new_value),
                 updated_row_id,
-            ) {
+            )? {
                 return Err(Error::constraint_violation(format!(
                     "UNIQUE constraint violated: duplicate value for column '{}'",
                     col.name
@@ -28659,12 +29213,15 @@ impl EmbeddedDatabase {
                         unique.columns.join(", ")
                     )));
                 }
-                if self.storage.art_indexes().unique_key_taken_by_other_row(
+                if self.unique_key_taken(
+                    branch_view.as_ref(),
+                    active_txn,
                     table_name,
+                    schema,
                     &unique.columns,
                     &new_values,
                     updated_row_id,
-                ) {
+                )? {
                     return Err(Error::constraint_violation(format!(
                         "UNIQUE constraint '{}' violated: duplicate value for columns ({})",
                         unique.name,
@@ -28736,12 +29293,15 @@ impl EmbeddedDatabase {
                     columns.join(", ")
                 )));
             }
-            if self.storage.art_indexes().unique_key_taken_by_other_row(
+            if self.unique_key_taken(
+                branch_view.as_ref(),
+                active_txn,
                 table_name,
+                schema,
                 columns,
                 &new_values,
                 updated_row_id,
-            ) {
+            )? {
                 return Err(Error::constraint_violation(format!(
                     "UNIQUE constraint violated: duplicate value for columns ({})",
                     columns.join(", ")
@@ -28751,6 +29311,32 @@ impl EmbeddedDatabase {
         }
 
         Ok(())
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B2): `enforce_unique_on_update`'s probe —
+    /// main's ART on main, the branch view on a branch
+    /// (`BranchView::key_taken_by_other_row`, which also claims the key for
+    /// `txn`).
+    #[allow(clippy::too_many_arguments)]
+    fn unique_key_taken(
+        &self,
+        branch: Option<&storage::BranchView<'_>>,
+        txn: Option<&storage::Transaction>,
+        table_name: &str,
+        schema: &Schema,
+        columns: &[String],
+        values: &[Value],
+        exclude_row_id: Option<u64>,
+    ) -> Result<bool> {
+        match branch {
+            Some(view) => view.key_taken_by_other_row(txn, table_name, schema, columns, values, exclude_row_id),
+            None => Ok(self.storage.art_indexes().unique_key_taken_by_other_row(
+                table_name,
+                columns,
+                values,
+                exclude_row_id,
+            )),
+        }
     }
 
     /// Re-validate the post-update row produced by
@@ -28799,6 +29385,7 @@ impl EmbeddedDatabase {
             &mut seen_column_keys,
             &mut seen_table_keys,
             &index_unique_sets,
+            active_txn,
         )
     }
 
@@ -29171,6 +29758,20 @@ impl EmbeddedDatabase {
         } else {
             values
         };
+
+        // sprinter 6bc4a4040eb7 (phase B2): on a branch the question is "does
+        // a row the BRANCH sees match?" — a FOREIGN KEY's parent must be visible
+        // on the branch, and RESTRICT / CASCADE act on the branch's children.
+        // Main's ART (the fast path below) and main's scan (the slow path) both
+        // answered from main: a parent the branch had deleted still satisfied
+        // a child's FK, a parent only the branch held did not, and RESTRICT
+        // refused a delete because of children only main had.
+        if let Some(view) = self.storage.branch_view()? {
+            let schema = self.storage.catalog().get_table_schema(table_name)?;
+            return Ok(!view
+                .rows_with_key(active_txn, table_name, &schema, column_names, values)?
+                .is_empty());
+        }
 
         // Fast path: ART index lookup. KanttBan / Token-Dashboard Quirk H
         // (DELETE / DROP on 11k-row table hangs >5min) introduced the
@@ -31323,23 +31924,29 @@ mod tests {
         db.execute("USE BRANCH wal_br").unwrap();
 
         let before = wal_row_op_total(&db, "br");
-        // sprinter 6bc4a4040eb7 (B1 fix pass): until branch transactions exist
-        // (phase B2) a data statement inside an explicit transaction on a branch
-        // is refused (0A000) rather than resolved through main's snapshot — so
-        // the in-transaction write never happens, and neither does a WAL entry.
+        // sprinter 6bc4a4040eb7 (B2): restored to its in-transaction form —
+        // the write commits ON THE BRANCH (B1 refused it) and still ships
+        // nothing to a standby.
         db.execute("BEGIN").unwrap();
-        let refused = db
-            .execute("INSERT INTO br (id, v) VALUES (2, 20)")
-            .expect_err("a write inside a transaction on a branch must be refused");
-        assert!(refused
-            .to_string()
-            .contains(crate::BRANCH_TRANSACTION_UNSUPPORTED_MARKER));
-        db.execute("ROLLBACK").unwrap();
+        db.execute("INSERT INTO br (id, v) VALUES (2, 20)").unwrap();
+        db.execute("COMMIT").unwrap();
+        assert_eq!(
+            db.query("SELECT id FROM br", &[]).unwrap().len(),
+            2,
+            "the committed branch write is visible on the branch"
+        );
 
         assert_eq!(
             wal_row_op_total(&db, "br"),
             before,
             "a branch-sandbox write must never be shipped to a standby serving main"
+        );
+        // The autocommit form of the same write ships nothing either.
+        db.execute("INSERT INTO br (id, v) VALUES (3, 30)").unwrap();
+        assert_eq!(
+            wal_row_op_total(&db, "br"),
+            before,
+            "an autocommit branch write must never be shipped to a standby serving main"
         );
 
         db.execute("USE BRANCH main").unwrap();

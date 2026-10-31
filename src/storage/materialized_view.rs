@@ -316,6 +316,10 @@ impl<'a> MaterializedViewCatalog<'a> {
     /// Stores the query results in a regular table format for easy querying.
     /// The table name is prefixed with "__mv_" to distinguish it from user tables.
     pub fn store_view_data(&self, view_name: &str, tuples: Vec<Tuple>, schema: &Schema) -> Result<u64> {
+        // sprinter 6bc4a4040eb7 (B2 fix pass): the view's data table is main's
+        // (dropped, purged and recreated in main's catalog below) — a branch
+        // statement would empty main's view and refill it on the branch.
+        self.storage.refuse_statement_on_branch("REFRESH MATERIALIZED VIEW")?;
         tracing::info!(
             "Storing data for materialized view '{}' ({} rows)",
             view_name,
@@ -377,6 +381,8 @@ impl<'a> MaterializedViewCatalog<'a> {
     /// - Cleanup errors are logged but don't fail the operation
     pub fn store_view_data_concurrent(&self, view_name: &str, tuples: Vec<Tuple>, schema: &Schema) -> Result<u64> {
         use chrono::Utc;
+        // sprinter 6bc4a4040eb7 (B2 fix pass): see `store_view_data`.
+        self.storage.refuse_statement_on_branch("REFRESH MATERIALIZED VIEW")?;
 
         tracing::info!(
             "Storing data for materialized view '{}' CONCURRENTLY ({} rows)",

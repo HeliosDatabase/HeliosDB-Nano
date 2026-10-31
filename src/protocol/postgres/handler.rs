@@ -3837,20 +3837,13 @@ where
         // block of a multi-statement simple query — the COPY keeps
         // participating in it and that owner decides the outcome.
         //
-        // sprinter 6bc4a4040eb7 (B1 second fix pass): EXCEPT on a branch. A
-        // data statement inside a transaction on a branch is refused (0A000)
-        // until branch transactions exist (phase B2), so a COPY that opened
-        // its own transaction there failed on its first chunk, every time.
-        // On a branch the chunks therefore AUTOCOMMIT one by one: COPY on a
-        // branch is not atomic until B2 — a failure at chunk k leaves chunks
-        // 1..k-1 on the branch. Inside the session's own transaction on a
-        // branch the chunks are refused 0A000, as any other write there is.
+        // sprinter 6bc4a4040eb7 (phase B2): on a branch too — B1 had to
+        // autocommit a branch COPY chunk by chunk (not atomic) while a data
+        // statement inside a transaction on a branch was refused; transactions
+        // on a branch work now, so a COPY there is all-or-nothing like on main,
+        // and each chunk's rows are checked over the branch's view.
         const BATCH: usize = 500;
-        let on_branch = self
-            .database
-            .session_branch(self.session_id)
-            .is_ok_and(|branch| branch != "main");
-        let copy_owns_txn = !on_branch && !self.database.session_in_transaction(self.session_id);
+        let copy_owns_txn = !self.database.session_in_transaction(self.session_id);
         if copy_owns_txn {
             self.database.begin_transaction_for_session(self.session_id)?;
         }
@@ -6559,9 +6552,11 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     {
         return sqlstate::OBJECT_IN_USE; // 55006
     }
-    // B1 fix pass: a data statement in a transaction on a branch (0A000 until
-    // phase B2), and a branch switch inside a transaction (25001).
-    if message.contains(crate::error::BRANCH_TRANSACTION_UNSUPPORTED_MARKER) {
+    // sprinter 6bc4a4040eb7 (B2): a main-only write path refused on a branch
+    // (0A000), and a branch switch inside a transaction (25001).
+    if message.contains(crate::error::BRANCH_WRITE_UNSUPPORTED_MARKER)
+        || message.contains(crate::error::BRANCH_STATEMENT_UNSUPPORTED_MARKER)
+    {
         return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
     }
     if message.contains(crate::error::BRANCH_SWITCH_IN_TRANSACTION_MARKER) {

@@ -27,7 +27,7 @@ use heliosdb_nano::session::{IsolationLevel, SessionId};
 use heliosdb_nano::tenant::IsolationMode;
 use heliosdb_nano::{
     EmbeddedDatabase, Tuple, Value, BRANCH_BINDING_GONE_MARKER, BRANCH_CLOSING_MARKER, BRANCH_IN_USE_MARKER,
-    BRANCH_NOT_ACTIVE_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER, BRANCH_TRANSACTION_UNSUPPORTED_MARKER,
+    BRANCH_NOT_ACTIVE_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER,
 };
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
@@ -1022,28 +1022,26 @@ fn sql_prepare_execute_reads_the_branch_at_execute() {
     assert_eq!(execute(&db, 3), None);
 }
 
-/// Until branch transactions exist (phase B2) a statement that reads or writes
-/// data inside an explicit transaction on a branch is refused (0A000) — an
-/// in-transaction read resolves through main — and changing the branch inside
-/// a transaction is refused (25001). Embedded handle and embedded session.
+/// sprinter 6bc4a4040eb7 (phase B2 — B1 refused these with 0A000): an
+/// explicit transaction on a branch reads the branch and its own staged
+/// writes, ROLLBACK discards them, COMMIT lands them on the branch only, and
+/// changing the branch inside it is still refused (25001). Embedded handle
+/// and embedded session.
 #[test]
-fn explicit_transactions_on_a_branch_fail_closed() {
+fn explicit_transactions_on_a_branch_work() {
     let db = seeded();
     db.execute("USE BRANCH b").unwrap();
     db.execute("BEGIN").unwrap();
-    let err = db
-        .query("SELECT v FROM t WHERE id = 1", &[])
-        .expect_err("read in a branch txn");
-    assert!(
-        err.to_string().contains(BRANCH_TRANSACTION_UNSUPPORTED_MARKER),
-        "got: {err}"
+    assert_eq!(
+        handle_v(&db, 1).as_deref(),
+        Some("b1"),
+        "a read in a branch txn reads the branch"
     );
-    let err = db
-        .execute("INSERT INTO t VALUES (30, 'txn')")
-        .expect_err("write in a branch txn");
-    assert!(
-        err.to_string().contains(BRANCH_TRANSACTION_UNSUPPORTED_MARKER),
-        "got: {err}"
+    db.execute("INSERT INTO t VALUES (30, 'txn')").unwrap();
+    assert_eq!(
+        handle_v(&db, 30).as_deref(),
+        Some("txn"),
+        "read-your-own-writes on a branch"
     );
     let err = db.execute("USE BRANCH main").expect_err("switch inside a txn");
     assert!(
@@ -1051,26 +1049,26 @@ fn explicit_transactions_on_a_branch_fail_closed() {
         "got: {err}"
     );
     db.execute("ROLLBACK").unwrap();
-    assert_eq!(handle_v(&db, 30), None, "nothing was written");
-    assert_eq!(handle_v(&db, 1).as_deref(), Some("b1"), "autocommit reads still work");
+    assert_eq!(handle_v(&db, 30), None, "ROLLBACK discarded the branch write");
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO t VALUES (33, 'kept')").unwrap();
+    db.execute("COMMIT").unwrap();
+    assert_eq!(
+        handle_v(&db, 33).as_deref(),
+        Some("kept"),
+        "COMMIT landed it on the branch"
+    );
     db.execute("USE BRANCH main").unwrap();
+    assert_eq!(handle_v(&db, 33), None, "*** a branch COMMIT landed on main ***");
 
     let sid = session(&db, "txn_b");
     db.execute_for_session(sid, "USE BRANCH b").unwrap();
     db.begin_transaction_for_session(sid).unwrap();
-    let err = session_rows(&db, sid, "SELECT v FROM t").expect_err("read in a session branch txn");
-    assert!(
-        err.to_string().contains(BRANCH_TRANSACTION_UNSUPPORTED_MARKER),
-        "got: {err}"
-    );
+    assert_eq!(session_v(&db, sid, 1).as_deref(), Some("b1"));
     let params = [Value::Int4(31), Value::String("p".into())];
-    let err = db
-        .execute_params_for_session(sid, "INSERT INTO t VALUES ($1, $2)", &params)
-        .expect_err("params write in a session branch txn");
-    assert!(
-        err.to_string().contains(BRANCH_TRANSACTION_UNSUPPORTED_MARKER),
-        "got: {err}"
-    );
+    db.execute_params_for_session(sid, "INSERT INTO t VALUES ($1, $2)", &params)
+        .expect("params write in a session branch txn");
+    assert_eq!(session_v(&db, sid, 31).as_deref(), Some("p"));
     let err = db
         .execute_for_session(sid, "SET heliosdb.branch = 'main'")
         .expect_err("switch inside a session txn");
@@ -1079,6 +1077,7 @@ fn explicit_transactions_on_a_branch_fail_closed() {
         "got: {err}"
     );
     db.rollback_transaction_for_session(sid).unwrap();
+    assert_eq!(session_v(&db, sid, 31), None, "the session ROLLBACK discarded it");
     assert_eq!(session_v(&db, sid, 1).as_deref(), Some("b1"));
 
     // A transaction on MAIN is untouched by any of this.
@@ -1089,56 +1088,63 @@ fn explicit_transactions_on_a_branch_fail_closed() {
 }
 
 /// The same over the PostgreSQL wire: a driver-style transaction (`BEGIN`
-/// first, as psycopg / JDBC autocommit-off do) and a multi-statement simple
-/// query, whose implicit block is a transaction too.
+/// first, as psycopg / JDBC autocommit-off do) with the extended protocol, and
+/// a multi-statement simple query, whose implicit block is a transaction too —
+/// atomic on a branch (a failing statement takes the whole block back).
 #[tokio::test]
-async fn explicit_transactions_on_a_branch_fail_closed_on_the_wire() {
+async fn explicit_transactions_on_a_branch_work_on_the_wire() {
     let s = serve(seeded()).await;
     let (mut a, ta) = connect(s.port, "postgres").await;
     a.simple_query("USE BRANCH b").await.unwrap();
 
     {
         let tx = a.transaction().await.unwrap();
-        let refused = tx
-            .query("SELECT v FROM t WHERE id = $1", &[&1i32])
+        let rows = tx.query("SELECT v FROM t WHERE id = $1", &[&1i32]).await.unwrap();
+        assert_eq!(rows.first().map(|r| r.get::<_, String>(0)).as_deref(), Some("b1"));
+        tx.execute("INSERT INTO t VALUES ($1, $2)", &[&42i32, &"wire txn"])
             .await
-            .err()
-            .expect("a read inside a branch transaction must be refused");
-        assert_eq!(sqlstate(&refused), "0A000");
+            .unwrap();
+        let rows = tx.query("SELECT v FROM t WHERE id = $1", &[&42i32]).await.unwrap();
+        assert_eq!(rows.len(), 1, "read-your-own-writes over the extended protocol");
         tx.rollback().await.unwrap();
     }
+    assert_eq!(wire_v(&a, 42).await, None, "the wire ROLLBACK discarded it");
 
     a.simple_query("BEGIN").await.unwrap();
     let refused = a.simple_query("USE BRANCH main").await.err().expect("switch in a txn");
     assert_eq!(sqlstate(&refused), "25001");
     a.simple_query("ROLLBACK").await.unwrap();
 
+    a.simple_query("INSERT INTO t VALUES (40, 'x'); INSERT INTO t VALUES (41, 'y')")
+        .await
+        .expect("an implicit block on a branch");
+    assert_eq!(wire_v(&a, 40).await.as_deref(), Some("x"));
+    assert_eq!(wire_v(&a, 41).await.as_deref(), Some("y"));
     let refused = a
-        .simple_query("INSERT INTO t VALUES (40, 'x'); INSERT INTO t VALUES (41, 'y')")
+        .simple_query("INSERT INTO t VALUES (43, 'z'); INSERT INTO t VALUES (40, 'dup')")
         .await
         .err()
-        .expect("writes in an implicit block on a branch must be refused");
-    assert_eq!(sqlstate(&refused), "0A000");
-    assert_eq!(wire_v(&a, 40).await, None, "nothing from the refused batch landed");
+        .expect("a duplicate key inside an implicit block on a branch");
+    assert_eq!(sqlstate(&refused), "23505");
     assert_eq!(
-        wire_v(&a, 1).await.as_deref(),
-        Some("b1"),
-        "autocommit still reads the branch"
+        wire_v(&a, 43).await,
+        None,
+        "the failed implicit block took its first row back"
     );
 
-    drop(a);
+    let (main, tm) = connect(s.port, "postgres").await;
+    assert_eq!(wire_v(&main, 40).await, None, "*** a branch block landed on main ***");
+
+    drop((a, main));
     ta.abort();
+    tm.abort();
 }
 
 /// A transaction whose branch is merged (or dropped) by another session while
 /// it is open: its COMMIT rolls back and is refused (3D000), on the embedded
-/// session API and on the PostgreSQL wire. Its in-transaction write was already
-/// refused loudly (0A000), so nothing is lost silently.
-///
-/// NOTE (B1 second fix pass): the COMMIT refusal is real, but until phase B2
-/// the transaction can hold no branch write (every data statement in it is
-/// refused 0A000), so there is nothing the refusal could protect yet — the
-/// test is vacuous as a data-loss check. B2 makes it meaningful: keep it.
+/// session API and on the PostgreSQL wire — so its staged branch write (B2:
+/// it now holds one) is reported lost, never committed into an overlay nobody
+/// can use, and never on main.
 #[tokio::test]
 async fn a_commit_across_a_concurrent_merge_or_drop_is_refused() {
     let db = seeded();
@@ -1147,13 +1153,8 @@ async fn a_commit_across_a_concurrent_merge_or_drop_is_refused() {
     let s2 = session(&db, "merger");
     db.execute_for_session(s1, "USE BRANCH b").unwrap();
     db.begin_transaction_for_session(s1).unwrap();
-    let err = db
-        .execute_for_session(s1, "INSERT INTO t VALUES (50, 'in txn')")
-        .expect_err("refused loudly, not lost silently");
-    assert!(
-        err.to_string().contains(BRANCH_TRANSACTION_UNSUPPORTED_MARKER),
-        "got: {err}"
-    );
+    db.execute_for_session(s1, "INSERT INTO t VALUES (50, 'in txn')")
+        .expect("a write inside a branch transaction");
     db.execute_for_session(s2, "MERGE BRANCH b INTO main").unwrap();
     let err = db
         .commit_transaction_for_session(s1)
@@ -1621,10 +1622,10 @@ mod raw_wire {
     }
 }
 
-/// Item 4: `COPY … FROM STDIN` on a branch. The generic fallback opened its own
-/// session transaction, and a data statement in a transaction on a branch is
-/// refused (0A000) — so every COPY on a branch failed. On a branch the chunks
-/// now autocommit (not atomic until B2) and land on the branch only.
+/// Item 4: `COPY … FROM STDIN` on a branch lands on the branch only — and,
+/// since B2, is atomic there as on main: one bad row (a duplicate of an
+/// inherited key) takes the whole COPY back. (B1 had to autocommit it chunk by
+/// chunk while transactions on a branch were refused.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copy_from_stdin_on_a_branch_lands_on_the_branch() {
     let s = serve(seeded()).await;
@@ -1638,14 +1639,36 @@ async fn copy_from_stdin_on_a_branch_lands_on_the_branch() {
     assert_eq!(session_v(&s.db, on_b, 60).as_deref(), Some("copied_a"));
     assert_eq!(session_v(&s.db, on_b, 61).as_deref(), Some("copied_b"));
     assert_eq!(handle_v(&s.db, 60), None, "*** COPY on a branch landed on main ***");
+
+    // Atomic: row 2 is inherited from main, so it is a duplicate. The COPY
+    // handler applies rows in 500-row chunks; the duplicate sits in the THIRD
+    // chunk (after 1,100 good rows), so two whole chunks were applied before
+    // it and must be taken back with it (B2 fix pass: a 2-row COPY could not
+    // tell an atomic COPY from a chunk-by-chunk one).
+    let mut lines: Vec<String> = (1000..2200).map(|id| format!("{id}\tcopied_{id}\n")).collect();
+    lines.insert(1100, "2\tdup\n".to_string());
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let failed = raw_wire::query(&mut wire, "COPY t FROM STDIN", &refs).await;
+    assert!(failed.is_some(), "a COPY with a duplicate key on a branch must fail");
+    for id in [1000, 1499, 1500, 1999] {
+        assert_eq!(
+            session_v(&s.db, on_b, id),
+            None,
+            "*** a failed COPY on a branch left row {id} (an earlier chunk) behind ***"
+        );
+    }
+    assert_eq!(
+        session_v(&s.db, on_b, 2).as_deref(),
+        Some("main2"),
+        "the inherited row is untouched"
+    );
 }
 
-/// Item 4: `execute_batch` on a branch, outside a transaction, autocommits
-/// statement by statement on the branch (its batch transaction was refused
-/// 0A000 on its first statement); inside the caller's transaction it is
-/// refused like any other in-transaction branch write.
+/// Item 4: `execute_batch` on a branch is ONE transaction on the branch again
+/// (B2; B1 autocommitted it statement by statement): it lands on the branch
+/// only, and a failing statement takes the earlier ones back.
 #[test]
-fn execute_batch_on_a_branch_autocommits_on_the_branch() {
+fn execute_batch_on_a_branch_is_atomic_on_the_branch() {
     let db = seeded();
     db.execute("USE BRANCH b").unwrap();
     db.execute_batch(&[
@@ -1656,15 +1679,18 @@ fn execute_batch_on_a_branch_autocommits_on_the_branch() {
     assert_eq!(handle_v(&db, 80).as_deref(), Some("batch_a"));
     assert_eq!(handle_v(&db, 3).as_deref(), Some("batch_b"));
 
-    db.begin().unwrap();
     let refused = db
-        .execute_batch(&["INSERT INTO t VALUES (81, 'in_txn')"])
-        .expect_err("a batch inside a transaction on a branch");
+        .execute_batch(&["INSERT INTO t VALUES (81, 'first')", "INSERT INTO t VALUES (80, 'dup')"])
+        .expect_err("a duplicate key in a batch on a branch");
     assert!(
-        refused.to_string().contains(BRANCH_TRANSACTION_UNSUPPORTED_MARKER),
+        refused.to_string().to_ascii_lowercase().contains("duplicate key"),
         "got: {refused}"
     );
-    db.rollback().unwrap();
+    assert_eq!(
+        handle_v(&db, 81),
+        None,
+        "*** a failed batch on a branch left its first row ***"
+    );
 
     db.execute("USE BRANCH main").unwrap();
     assert_eq!(handle_v(&db, 80), None, "*** a batch on a branch landed on main ***");
@@ -1820,9 +1846,10 @@ fn a_drop_queued_behind_another_drop_finds_the_branch_gone() {
     assert!(refused.to_string().contains("not found"), "got: {refused}");
 }
 
-/// Item 5: a code-graph `… ON BRANCH 'b'` inside a transaction is refused
-/// (0A000) like any branch statement there — the in-transaction read path
-/// would answer it from main.
+/// Item 5: a code-graph `… ON BRANCH 'b'` inside a transaction opened on
+/// another branch is refused — a transaction belongs to one branch, so this is
+/// `USE BRANCH` inside a transaction (25001). (B1 refused it 0A000 because the
+/// in-transaction read path answered from main.)
 #[cfg(feature = "code-graph")]
 #[test]
 fn on_branch_inside_a_transaction_is_refused() {
@@ -1832,7 +1859,7 @@ fn on_branch_inside_a_transaction_is_refused() {
         .query("SELECT * FROM lsp_definition('x') ON BRANCH 'b'", &[])
         .expect_err("ON BRANCH inside a transaction");
     assert!(
-        refused.to_string().contains(BRANCH_TRANSACTION_UNSUPPORTED_MARKER),
+        refused.to_string().contains(BRANCH_SWITCH_IN_TRANSACTION_MARKER),
         "got: {refused}"
     );
     db.rollback().unwrap();

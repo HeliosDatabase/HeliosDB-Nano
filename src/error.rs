@@ -196,13 +196,26 @@ pub const BRANCH_BUSY_MARKER: &str = "is in use by running statements";
 /// SQLSTATE 55006, like [`BRANCH_BUSY_MARKER`].
 pub const BRANCH_CLOSING_MARKER: &str = "is being dropped or merged";
 
-/// sprinter 6bc4a4040eb7 (B1 fix pass): the marker of the refusal a statement
-/// that reads or writes data gets inside an explicit transaction (or a
-/// pending implicit block) on a branch ([`Error::branch_transaction_unsupported`]).
-/// An in-transaction read resolves rows through main's snapshot and write set,
-/// so until branch transactions exist (phase B2) the statement is refused
-/// rather than answered from main. SQLSTATE 0A000.
-pub const BRANCH_TRANSACTION_UNSUPPORTED_MARKER: &str = "explicit transactions on a branch are not supported yet";
+/// sprinter 6bc4a4040eb7 (phase B2): the marker of the refusal a write path
+/// that can only write MAIN's keyspace gets when the running statement is on a
+/// branch ([`Error::branch_write_unsupported`]) — the lock-free ingestion
+/// engine, direct bulk load, the main-only fast DML funnels. Every SQL write
+/// path on a branch goes through the branch view; one that cannot is refused
+/// BEFORE it writes, never let through to main (fail closed). SQLSTATE 0A000.
+///
+/// (Phase B1's interim refusal of every data statement inside a transaction on
+/// a branch — `BRANCH_TRANSACTION_UNSUPPORTED_MARKER` — is gone: B2 makes
+/// transactions on a branch work.)
+pub const BRANCH_WRITE_UNSUPPORTED_MARKER: &str = "is not supported on a branch";
+
+/// sprinter 6bc4a4040eb7 (phase B2 fix pass): the marker of the refusal a
+/// statement gets that cannot yet be scoped to a branch and would otherwise
+/// write main ([`Error::branch_statement_unsupported`]) —
+/// `REFRESH MATERIALIZED VIEW` / `CREATE MATERIALIZED VIEW`, which store a
+/// view's rows through main's catalog (a materialized view is not
+/// branch-scoped until phase B3). Refused before anything is written.
+/// SQLSTATE 0A000.
+pub const BRANCH_STATEMENT_UNSUPPORTED_MARKER: &str = "on a branch is not supported yet";
 
 /// sprinter 6bc4a4040eb7 (B1 fix pass): the marker of `USE BRANCH` /
 /// `SET heliosdb.branch` / `RESET heliosdb.branch` inside an open transaction
@@ -442,12 +455,20 @@ impl Error {
         Error::QueryExecution(format!("branch \"{name}\" {BRANCH_CLOSING_MARKER}; retry"))
     }
 
-    /// sprinter 6bc4a4040eb7 (B1 fix pass): a data statement inside an
-    /// explicit transaction on a branch. SQLSTATE 0A000.
-    pub fn branch_transaction_unsupported(name: &str) -> Self {
+    /// sprinter 6bc4a4040eb7 (phase B2): `path` can only write main's
+    /// keyspace and the statement runs on branch `name`. SQLSTATE 0A000.
+    pub fn branch_write_unsupported(path: &str, name: &str) -> Self {
         Error::QueryExecution(format!(
-            "{BRANCH_TRANSACTION_UNSUPPORTED_MARKER} (branch \"{name}\"): run the statement outside the \
-             transaction, or on main"
+            "{path} {BRANCH_WRITE_UNSUPPORTED_MARKER} (branch \"{name}\"): use INSERT / UPDATE / DELETE / \
+             COPY on the branch, or run it on main"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B2 fix pass): `statement` cannot be scoped
+    /// to branch `name` yet. SQLSTATE 0A000.
+    pub fn branch_statement_unsupported(statement: &str, name: &str) -> Self {
+        Error::QueryExecution(format!(
+            "{statement} {BRANCH_STATEMENT_UNSUPPORTED_MARKER} (branch \"{name}\"): run it on main"
         ))
     }
 

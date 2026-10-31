@@ -186,6 +186,16 @@ fn txn_base_tuples(
     schema: &Schema,
     as_of_absent: bool,
 ) -> Result<Vec<Tuple>> {
+    // sprinter 6bc4a4040eb7 (phase B2): on a branch an in-transaction read is
+    // the branch view with this transaction's staged branch writes merged in
+    // (read-your-own-writes). B1 refused every in-transaction statement on a
+    // branch because this function then read MAIN's snapshot and write set.
+    // `AS OF` keeps the snapshot path below (B4 shapes branch history).
+    if as_of_absent {
+        if let Some(view) = storage.branch_view()? {
+            return view.scan(Some(txn), actual_table_name, schema);
+        }
+    }
     let snapshot = txn.snapshot_id();
     if as_of_absent
         && actual_table_name == table_name
@@ -2471,13 +2481,25 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 let merged_tuples =
                     txn_base_tuples(storage, txn, &actual_table_name, table_name, &schema, as_of.is_none())?;
 
-                storage.predicate_pushdown().scan_with_pushdown(
-                    &actual_table_name,
-                    merged_tuples,
-                    pushed_predicates,
-                    &schema,
-                    None,
-                )
+                // sprinter 6bc4a4040eb7 (B2): a branch's rows are not main's —
+                // filter them without main's bloom / zone-map pruning.
+                if storage.is_branch_active() {
+                    storage.predicate_pushdown().filter_without_pruning(
+                        &actual_table_name,
+                        merged_tuples,
+                        pushed_predicates,
+                        &schema,
+                        None,
+                    )
+                } else {
+                    storage.predicate_pushdown().scan_with_pushdown(
+                        &actual_table_name,
+                        merged_tuples,
+                        pushed_predicates,
+                        &schema,
+                        None,
+                    )
+                }
             } else if let Some(as_of_clause) = as_of {
                 // P0#1: AS OF requires version history (see above).
                 if !storage.time_travel_enabled() {
@@ -2660,6 +2682,16 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 // Apply storage-level filtering through predicate pushdown manager
                 if columnar_predicates_applied || row_predicates_applied {
                     base_tuples
+                } else if storage.is_branch_active() {
+                    // sprinter 6bc4a4040eb7 (B2): the branch view's rows —
+                    // main's bloom filters and zone maps do not describe them.
+                    storage.predicate_pushdown().filter_without_pruning(
+                        &actual_table_name,
+                        base_tuples,
+                        pushed_predicates,
+                        &schema,
+                        None,
+                    )
                 } else {
                     storage.predicate_pushdown().scan_with_pushdown(
                         &actual_table_name,

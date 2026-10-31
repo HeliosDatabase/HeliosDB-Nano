@@ -223,6 +223,21 @@ pub struct ForeignKeyInfo {
     pub index_name: String,
 }
 
+/// sprinter 6bc4a4040eb7 (phase B2): one PRIMARY KEY / UNIQUE rule of a
+/// table, as [`ArtIndexManager::enforced_unique_indexes`] reports it.
+#[derive(Debug, Clone)]
+pub struct EnforcedUniqueIndex {
+    /// Registry key of the index (what `index_get_all` takes).
+    pub index_name: String,
+    /// The name a 23505 prints: the user's constraint name when the index
+    /// key was minted for it, the index name otherwise.
+    pub label: String,
+    /// The indexed columns, in index order.
+    pub columns: Vec<String>,
+    /// PRIMARY KEY rather than UNIQUE.
+    pub is_primary_key: bool,
+}
+
 /// A PK/UNIQUE index that already holds the key a write proposes, and the row
 /// that holds it. Produced by [`ArtIndexManager::find_unique_conflict`].
 #[derive(Debug, Clone)]
@@ -2610,6 +2625,72 @@ impl ArtIndexManager {
             }
         }
         None
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B2): every PRIMARY KEY / UNIQUE rule the
+    /// registry enforces on `table` — PRIMARY KEY first, then the UNIQUE
+    /// indexes in registration order, the order [`Self::check_unique_constraints`]
+    /// probes them — with the label a 23505 must print.
+    ///
+    /// The branch view enforces exactly these rules over a branch's rows
+    /// (a branch's rows are in no ART index; main's indexes still name the
+    /// rules), so a branch and main agree on WHICH constraints exist and on
+    /// how a violation of each reads.
+    pub fn enforced_unique_indexes(&self, table: &str) -> Vec<EnforcedUniqueIndex> {
+        let names = self.unique_index_names(table);
+        if names.is_empty() {
+            return Vec::new();
+        }
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        names
+            .iter()
+            .filter_map(|name| {
+                indexes.get(name).map(|entry| EnforcedUniqueIndex {
+                    index_name: name.clone(),
+                    label: Self::violation_name(entry, name).to_string(),
+                    columns: entry.columns.clone(),
+                    is_primary_key: matches!(entry.index_type, ArtIndexType::PrimaryKey),
+                })
+            })
+            .collect()
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B2): an index of `table` over exactly the
+    /// column SET `columns` (case-insensitive, order-independent), with its
+    /// columns in INDEX order — PRIMARY KEY / UNIQUE preferred, then any
+    /// foreign-key or manual index. `None` when no index covers the set, and
+    /// the caller has to scan.
+    ///
+    /// The branch view's `rows_with_key` takes its main-row candidates from it:
+    /// one probe instead of a scan of main.
+    pub fn index_covering_columns(&self, table: &str, columns: &[String]) -> Option<(String, Vec<String>)> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let mut best: Option<(u8, &String, &IndexEntry)> = None;
+        for (name, entry) in indexes.iter() {
+            if entry.table != table || !Self::column_sets_match(&entry.columns, columns) {
+                continue;
+            }
+            let rank = match entry.index_type {
+                ArtIndexType::PrimaryKey => 0,
+                ArtIndexType::Unique => 1,
+                _ => 2,
+            };
+            // Ties broken by name so the choice is deterministic.
+            let better = match &best {
+                None => true,
+                Some((best_rank, best_name, _)) => rank < *best_rank || (rank == *best_rank && name < *best_name),
+            };
+            if better {
+                best = Some((rank, name, entry));
+            }
+        }
+        best.map(|(_, name, entry)| (name.clone(), entry.columns.clone()))
+    }
+
+    /// [`Self::column_sets_match`] for callers outside the registry (the branch
+    /// view keys its per-statement maps on the same set equality).
+    pub fn same_column_set(a: &[String], b: &[String]) -> bool {
+        Self::column_sets_match(a, b)
     }
 
     /// Do two column sets describe the same unique rule?

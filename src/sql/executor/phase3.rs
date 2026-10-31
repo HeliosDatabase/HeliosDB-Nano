@@ -360,6 +360,11 @@ fn handle_create_materialized_view(
         let storage = executor
             .storage()
             .ok_or_else(|| Error::execution("No storage engine available"))?;
+        // sprinter 6bc4a4040eb7 (B2 fix pass): a materialized view lives in
+        // main's catalog and its rows in main's data table; until phase B3
+        // scopes it to a branch, creating one from a branch is refused before
+        // anything is registered.
+        storage.refuse_statement_on_branch("CREATE MATERIALIZED VIEW")?;
         let mv_catalog = storage.mv_catalog();
 
         // Check if view already exists
@@ -562,6 +567,12 @@ fn handle_refresh_materialized_view(
         let storage = executor
             .storage()
             .ok_or_else(|| Error::execution("No storage engine available"))?;
+        // sprinter 6bc4a4040eb7 (B2 fix pass): REFRESH drops, purges and
+        // recreates the view's MAIN data table and re-inserts through the
+        // session's branch — on a branch it emptied main's view. Refused until
+        // phase B3 scopes materialized views, before anything is read or
+        // written.
+        storage.refuse_statement_on_branch("REFRESH MATERIALIZED VIEW")?;
         let mv_catalog = storage.mv_catalog();
 
         // Get view metadata

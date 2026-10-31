@@ -60,10 +60,11 @@ static PLAINTEXT_PASSTHROUGH_COUNT: AtomicU64 = AtomicU64::new(0);
 /// * `bdata:{branch_id}:{table}:{row_id}` — branch row overlays. A row inserted
 ///   or updated on a non-`main` branch is a full user row image, so it is sealed
 ///   by the same rule as `data:` and by every route that writes it:
-///   `StorageEngine::put` / `put_internal` (branch INSERT via
-///   `insert_tuple_branch_aware_with_schema`, branch UPDATE via
-///   `update_tuples_branch_aware`), the transaction commit batch (through
-///   [`seal_row_value`], which is why this prefix is listed here),
+///   `BranchView`'s direct (no-transaction) writes (sprinter 6bc4a4040eb7, B2:
+///   every branch write goes through the branch view — `insert_tuple_branch_aware_with_schema`,
+///   `update_tuples_branch_aware` and `bulk_insert_tuples` included), the
+///   transaction commit batch (through [`seal_row_value`], which is why this
+///   prefix is listed here),
 ///   `BranchManager::copy_key_to_branch`, and `StorageEngine::merge_branch`'s
 ///   branch-to-branch arm.
 ///

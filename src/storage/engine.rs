@@ -42,6 +42,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+// sprinter 6bc4a4040eb7 (phase B2): the branch view (`storage/branch_view.rs`,
+// an ordinary `storage` module — no `#[path]`, so the write-gate funnel scan
+// sees every write it makes). It reaches the engine through `pub(crate)`
+// primitives: the decode / key helpers and `write_batch_through_gate`.
+use super::branch_view;
+
 // Thread-local buffer for key generation to avoid per-row allocations
 thread_local! {
     static KEY_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
@@ -2368,7 +2374,7 @@ impl StorageEngine {
     /// bulk insert operations. The returned Vec<u8> is a copy of the buffer
     /// contents that can be safely moved.
     #[inline]
-    fn build_data_key(table_name: &str, row_id: u64) -> Vec<u8> {
+    pub(crate) fn build_data_key(table_name: &str, row_id: u64) -> Vec<u8> {
         KEY_BUFFER.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
@@ -2382,7 +2388,7 @@ impl StorageEngine {
     }
 
     #[inline]
-    fn parse_row_id_after_prefix(key: &[u8], prefix_len: usize) -> Option<u64> {
+    pub(crate) fn parse_row_id_after_prefix(key: &[u8], prefix_len: usize) -> Option<u64> {
         let suffix = key.get(prefix_len..)?;
         if suffix.is_empty() {
             return None;
@@ -2606,6 +2612,20 @@ impl StorageEngine {
         let catalog = self.catalog();
         catalog.rebuild_all_indexes_for_physical_snapshot()?;
         catalog.validate_lazy_physical_catalog()
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B2): apply `batch` through the write gate
+    /// with the engine's write options — what a direct (no-transaction) branch
+    /// write commits with, so it takes the same open-mode decision as every
+    /// other engine write (a physical standby refuses it).
+    pub(crate) fn write_batch_through_gate(&self, batch: WriteBatch) -> Result<()> {
+        self.gate.write(&self.db, batch, self.memory_write_options.as_ref())
+    }
+
+    /// The engine's at-rest key manager, borrowed (`None` when encryption is
+    /// off) — for sealing a value outside the engine's own put path.
+    pub(crate) fn key_manager_ref(&self) -> Option<&KeyManager> {
+        self.key_manager.as_deref()
     }
 
     /// The gate every raw write of this engine — and of every component built
@@ -4353,6 +4373,8 @@ impl StorageEngine {
     /// Returns a transaction handle for lock-free operations.
     /// Returns an error if lock-free ingestion is not enabled.
     pub fn lockfree_begin(&self) -> Result<super::lockfree::TransactionHandle> {
+        // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
+        self.refuse_main_only_write_on_branch("lock-free ingestion")?;
         let guard = self.lockfree_engine.read();
         match guard.as_ref() {
             Some(engine) => engine
@@ -4386,6 +4408,8 @@ impl StorageEngine {
         row_id: u64,
         data: &[u8],
     ) -> Result<()> {
+        // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
+        self.refuse_main_only_write_on_branch("lock-free ingestion")?;
         let guard = self.lockfree_engine.read();
         match guard.as_ref() {
             Some(engine) => engine
@@ -4430,6 +4454,8 @@ impl StorageEngine {
     where
         I: IntoIterator<Item = Vec<u8>>,
     {
+        // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
+        self.refuse_main_only_write_on_branch("lock-free ingestion")?;
         let guard = self.lockfree_engine.read();
         match guard.as_ref() {
             Some(engine) => engine
@@ -4502,6 +4528,8 @@ impl StorageEngine {
     where
         I: IntoIterator<Item = (u64, Vec<u8>)>,
     {
+        // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
+        self.refuse_main_only_write_on_branch("direct bulk load")?;
         use std::time::Instant;
 
         let start = Instant::now();
@@ -4891,7 +4919,7 @@ impl StorageEngine {
     /// plaintext-passthrough diagnostic are both keyed on the keyspace, so a
     /// caller that already knows the key must pass it instead of going through
     /// `decode_stored_anon`.
-    fn decrypt_value(&self, storage_key: &[u8], value: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn decrypt_value(&self, storage_key: &[u8], value: &[u8]) -> Result<Vec<u8>> {
         Ok(self.decode_stored_ref(storage_key, value)?.into_owned())
     }
 
@@ -4938,7 +4966,7 @@ impl StorageEngine {
     /// Borrowed decode: returns `Cow::Borrowed(raw)` when the bytes are used
     /// as they are, so the encryption-disabled path allocates nothing.
     #[inline]
-    fn decode_stored_ref<'a>(&self, storage_key: &[u8], raw: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+    pub(crate) fn decode_stored_ref<'a>(&self, storage_key: &[u8], raw: &'a [u8]) -> Result<Cow<'a, [u8]>> {
         super::tde::open_ref(self.key_manager.as_deref(), storage_key, raw)
     }
 
@@ -5055,6 +5083,8 @@ impl StorageEngine {
         // `begin_autocommit_transaction` below: a statement-scoped transaction
         // publishes within its own statement, and counting it would hold the
         // census non-zero (and the count fast paths off) under any write load.
+        // (That one enrolls for its index REMOVALS only —
+        // `Transaction::set_removal_census`, sprinter 6bc4a4040eb7.)
         txn.set_write_census(self.write_census());
         Ok(txn)
     }
@@ -5087,6 +5117,11 @@ impl StorageEngine {
         // Autocommit statements log per statement; buffering those operations until the
         // commit lets them be written atomically with the data (or dropped on rollback).
         txn.set_statement_wal(self.wal.clone());
+        // sprinter 6bc4a4040eb7 (B2 follow-up): the statement's index REMOVALS
+        // are counted for its duration (never its plain writes) — see
+        // `Transaction::set_removal_census` for why, and why this is not the
+        // `set_write_census` enrollment `begin_transaction` makes.
+        txn.set_removal_census(self.write_census());
         Ok(txn)
     }
 
@@ -5520,6 +5555,9 @@ impl StorageEngine {
     /// Returns the number of rows removed. The row-id counter is intentionally left
     /// untouched (a stale counter only advances ids, which is harmless).
     pub fn purge_table_data(&self, table_name: &str) -> Result<u64> {
+        // sprinter 6bc4a4040eb7 (B2 fix pass): deletes MAIN's `data:` keys of
+        // the table — refused on a branch.
+        self.refuse_main_only_write_on_branch("purging a table's rows")?;
         let data_prefix = format!("data:{}:", table_name);
         let prefix_bytes = data_prefix.as_bytes();
 
@@ -8626,13 +8664,13 @@ impl StorageEngine {
     ///
     /// This is ONLY invoked under `snapshot_schema_evolution = "null_pad"`;
     /// under `"strict"` the tuple keeps its stored arity (pre-W3.5 behavior).
-    fn shape_base_tuple_to_width(tuple: &mut Tuple, width: usize) {
+    pub(crate) fn shape_base_tuple_to_width(tuple: &mut Tuple, width: usize) {
         tuple.values.resize(width, crate::Value::Null);
     }
 
     /// W3.5: whether snapshot / branch base-scan decodes NULL-pad rows written
     /// under an older schema (`snapshot_schema_evolution = "null_pad"`).
-    fn null_pad_snapshot_schema(&self) -> bool {
+    pub(crate) fn null_pad_snapshot_schema(&self) -> bool {
         matches!(
             self.config.storage.snapshot_schema_evolution,
             crate::config::SnapshotSchemaEvolution::NullPad
@@ -8648,7 +8686,7 @@ impl StorageEngine {
     /// ([`Self::decode_stored_row`]) resolves a replicated row exactly as a scan
     /// does: the index entries it maintains must hold the values a rebuild by
     /// scan would.
-    fn resolve_column_storage_refs(
+    pub(crate) fn resolve_column_storage_refs(
         &self,
         table_name: &str,
         schema: &crate::Schema,
@@ -9265,6 +9303,14 @@ impl StorageEngine {
         row_id: u64,
         schema: &crate::Schema,
     ) -> Result<Option<std::sync::Arc<Tuple>>> {
+        // sprinter 6bc4a4040eb7 (B2): on a branch the row is the one the
+        // BRANCH sees — the nearest level of its chain, then main — read
+        // through the branch view. Reading `bdata:{branch}:` alone (what the
+        // branch-aware key below did) missed every inherited row and ignored
+        // tombstones.
+        if let Some(view) = self.branch_view()? {
+            return Ok(view.get(None, table_name, row_id, schema)?.map(std::sync::Arc::new));
+        }
         // sprinter 6bc4a4040eb7 (B1): the row cache is keyed `(table, row_id)`
         // with no branch dimension, and used to be kept honest by clearing it on
         // every (global) branch switch. The branch is per SESSION now, so there
@@ -9373,6 +9419,35 @@ impl StorageEngine {
         } else {
             pk_value
         };
+
+        // sprinter 6bc4a4040eb7 (B2): main's PK index knows main's rows only —
+        // on a branch the lookup is the branch view's (`rows_with_key`: main's
+        // candidate kept only when the branch decides nothing for it, plus the
+        // branch's own rows). The pre-B2 lookup took main's row id and read
+        // `bdata:` with it: an inherited row was missing, a branch-only row was
+        // unreachable and a row the branch deleted was found through main.
+        if let Some(view) = self.branch_view()? {
+            let owned_schema;
+            let schema = match schema {
+                Some(schema) => schema,
+                None => {
+                    owned_schema = Catalog::new(self).get_table_schema(table_name)?;
+                    &owned_schema
+                }
+            };
+            let Some(pk) = schema.columns.iter().find(|column| column.primary_key) else {
+                return Ok(None);
+            };
+            let probe = Self::coerce_pk_value(pk_value, &pk.data_type);
+            let rows = view.rows_with_key(
+                None,
+                table_name,
+                schema,
+                std::slice::from_ref(&pk.name),
+                std::slice::from_ref(&probe),
+            )?;
+            return Ok(rows.into_iter().next());
+        }
 
         // Encode the PK value to the ART key format
         let key = super::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(effective_pk));
@@ -11200,6 +11275,18 @@ impl StorageEngine {
                     self.gate
                         .put(&self.db, target_key.as_bytes(), stored.as_ref(), None)
                         .map_err(|e| Error::storage(format!("Failed to merge data: {}", e)))?;
+                    // sprinter 6bc4a4040eb7 (B2): a target BRANCH level holds one
+                    // entry per row (`BranchView::put` clears the tombstone it
+                    // writes over). Without this, merging a child's own image of a
+                    // row its parent had deleted left the parent's tombstone next
+                    // to it, and a tombstone wins within a level: the merged row
+                    // stayed hidden.
+                    if !merge_to_main {
+                        let tombstone = branch_view::branch_tombstone_key(target_id, table_name, row_id);
+                        self.gate
+                            .delete(&self.db, &tombstone, None)
+                            .map_err(|e| Error::storage(format!("Failed to merge data: {}", e)))?;
+                    }
                     // The row cache is keyed (table, row_id) with NO branch
                     // dimension; the merged write changes the row's value, so
                     // evict any cached entry (else an autocommit read serves the
@@ -11237,7 +11324,19 @@ impl StorageEngine {
                     self.gate
                         .put(&self.db, target_key.as_bytes(), b"", None)
                         .map_err(|e| Error::storage(format!("Failed to copy delete marker: {}", e)))?;
+                    // sprinter 6bc4a4040eb7 (B2): one entry per row per level —
+                    // the tombstone replaces the target's own image of the row.
+                    let image = branch_view::branch_row_key(target_id, table_name, *row_id);
+                    self.gate
+                        .delete(&self.db, &image, None)
+                        .map_err(|e| Error::storage(format!("Failed to copy delete marker: {}", e)))?;
                 }
+            }
+            // sprinter 6bc4a4040eb7 (B2): the target level's rows changed
+            // outside every branch transaction — move its write generations so
+            // a statement on the target with a cached overlay reloads it.
+            for table_name in &tables {
+                branch_view::bump_write_generation(self.instance_id, target_id, table_name);
             }
         }
 
@@ -13518,6 +13617,8 @@ impl StorageEngine {
     /// Skips delta tracking (MV/SMFI). Used for SQL fast paths where
     /// parser/planner overhead and per-row counter persistence dominate.
     pub fn insert_tuple_fast(&self, table_name: &str, tuple: Tuple, schema: &crate::Schema) -> Result<u64> {
+        // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
+        self.refuse_main_only_write_on_branch("the fast INSERT path")?;
         // W3.2: single-row autocommit INSERT class scope. Version bytes are
         // recorded in `append_version_snapshot_to_batch`, index-key bytes in
         // `on_insert_tuple`, both of which run inside this scope.
@@ -13767,6 +13868,8 @@ impl StorageEngine {
         prepared: Vec<(u64, Tuple)>,
         schema: &crate::Schema,
     ) -> Result<u64> {
+        // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
+        self.refuse_main_only_write_on_branch("the fast batch INSERT path")?;
         if prepared.is_empty() {
             return Ok(0);
         }
@@ -14430,6 +14533,8 @@ impl StorageEngine {
         schema: &crate::Schema,
         index_update_needed: Option<bool>,
     ) -> Result<u64> {
+        // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
+        self.refuse_main_only_write_on_branch("the fast UPDATE path")?;
         // W3.2: UPDATE class scope. This fast path is version-SKIPPING (no
         // `v:`/`v_idx:` write), so the census records `data:` bytes only — the
         // measured absence of version bytes here is itself a W3.2 finding.
@@ -14521,6 +14626,8 @@ impl StorageEngine {
         schema: &crate::Schema,
         vector_old_tuple: Option<&Tuple>,
     ) -> Result<u64> {
+        // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
+        self.refuse_main_only_write_on_branch("the fast UPDATE path")?;
         // W3.2: UPDATE class scope (version-skipping; `data:` bytes only).
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Update);
         // Item #2: preserve a COPY marker-covered row's insert version before
@@ -14567,6 +14674,8 @@ impl StorageEngine {
         old_tuple: &Tuple,
         schema: &crate::Schema,
     ) -> Result<u64> {
+        // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
+        self.refuse_main_only_write_on_branch("the fast DELETE path")?;
         // W3.2: DELETE class scope. A tombstone carries the `data:` key only.
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Delete);
         // Item #2: preserve a COPY marker-covered row's insert version before
@@ -14612,6 +14721,8 @@ impl StorageEngine {
         pk_key: &[u8],
         pk_value: &crate::Value,
     ) -> Result<u64> {
+        // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
+        self.refuse_main_only_write_on_branch("the fast DELETE path")?;
         // W3.2: DELETE class scope (PK-only tombstone; `data:` key bytes).
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Delete);
         // Item #2: preserve a COPY marker-covered row's insert version before
@@ -16942,141 +17053,23 @@ impl StorageEngine {
     }
 
     /// Branch-aware scan using a pre-fetched schema (avoids duplicate schema lookup).
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B2): on a branch this is the branch view's
+    /// committed scan ([`branch_view::BranchView::scan`]) — main's rows with
+    /// the chain's overlays applied, the NEAREST level deciding each row. The
+    /// pre-B2 merge applied every tombstone of the chain after every image,
+    /// so a child's own row was hidden whenever an ancestor had deleted the
+    /// same row id. A transaction's reads go through
+    /// `BranchView::scan(Some(txn), ..)` instead (sql/executor/scan.rs
+    /// `txn_base_tuples`), which also merges its staged branch writes.
     pub fn scan_table_branch_aware_with_schema(&self, table_name: &str, schema: &crate::Schema) -> Result<Vec<Tuple>> {
         // sprinter 6bc4a4040eb7 (B1): the SESSION's binding. Main (no binding)
         // is the standard scan; a binding whose branch was dropped or merged
         // since it was validated is refused (3D000) rather than read.
-        let Some(binding) = self.check_active_branch()? else {
-            return self.scan_table_with_schema(table_name, schema);
-        };
-        let branch_id = binding.branch_id;
-        // The chain (oldest ancestor .. this branch) was resolved once, when
-        // the session bound the branch — a branch's ancestry never changes.
-        let branch_chain = &binding.chain;
-
-        tracing::debug!(
-            "scan_table_branch_aware: branch chain for '{}' (id {}): {:?}",
-            binding.name,
-            branch_id,
-            branch_chain
-        );
-
-        // Accumulate tuples and delete markers across the chain
-        let mut result_tuples: std::collections::HashMap<u64, Tuple> = std::collections::HashMap::new();
-        let mut deleted_rows: std::collections::HashSet<u64> = std::collections::HashSet::new();
-
-        // W3.5 Stage 1: shape both overlay decodes (main `data:` and branch
-        // `bdata:`) to the current catalog width. A row forked into `bdata:`
-        // before a main ALTER stays at its pre-ALTER arity (the ALTER rewrites
-        // main's `data:`, not `bdata:`), so without this it errors under the
-        // mismatched plan: a pre-ADD fork is narrower (padded to NULL, design §7),
-        // a pre-DROP fork is wider (truncated to the current width, matching the
-        // pre-W3.5 projection — a forked wide row is legitimate, not corruption).
-        // The un-forked main-overlay rows are already at the current width (the
-        // ALTER rewrote them), so the main arm is a no-op — the branch-model case
-        // where an un-forked row shows main's backfill is intentionally unchanged.
-        let null_pad = self.null_pad_snapshot_schema();
-        let target_width = schema.columns.len();
-
-        // Step 1: Start with main branch data
-        let main_prefix = format!("data:{}:", table_name);
-        let main_prefix_bytes = main_prefix.as_bytes();
-
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(
-            main_prefix_bytes,
-            rocksdb::Direction::Forward,
-        ));
-        for item in iter {
-            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
-            if !key.starts_with(main_prefix_bytes) {
-                break;
-            }
-
-            if let Some(row_id) = Self::parse_row_id_after_prefix(&key, main_prefix_bytes.len()) {
-                let value = self.decrypt_value(&key, &raw_value)?;
-
-                let mut tuple: Tuple = bincode::deserialize(&value)
-                    .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-                tuple.row_id = Some(row_id);
-                tuple.branch_id = None; // From main
-                if null_pad {
-                    Self::shape_base_tuple_to_width(&mut tuple, target_width);
-                }
-                result_tuples.insert(row_id, tuple);
-            }
+        match self.branch_view()? {
+            None => self.scan_table_with_schema(table_name, schema),
+            Some(view) => view.scan(None, table_name, schema),
         }
-
-        // Step 2: Walk the branch chain from oldest to newest
-        // Each branch's data overrides parent data, and delete markers accumulate
-        for &chain_branch_id in branch_chain {
-            // Collect delete markers for this branch
-            let delete_prefix = format!("bdel:{}:{}:", chain_branch_id, table_name);
-            let delete_prefix_bytes = delete_prefix.as_bytes();
-
-            let iter = self.db.iterator(rocksdb::IteratorMode::From(
-                delete_prefix_bytes,
-                rocksdb::Direction::Forward,
-            ));
-            for item in iter {
-                let (key, _value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
-                if !key.starts_with(delete_prefix_bytes) {
-                    break;
-                }
-
-                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, delete_prefix_bytes.len()) {
-                    deleted_rows.insert(row_id);
-                }
-            }
-
-            // Collect data for this branch (overrides parent data)
-            let branch_prefix = format!("bdata:{}:{}:", chain_branch_id, table_name);
-            let branch_prefix_bytes = branch_prefix.as_bytes();
-
-            let iter = self.db.iterator(rocksdb::IteratorMode::From(
-                branch_prefix_bytes,
-                rocksdb::Direction::Forward,
-            ));
-            for item in iter {
-                let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
-                if !key.starts_with(branch_prefix_bytes) {
-                    break;
-                }
-
-                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, branch_prefix_bytes.len()) {
-                    let value = self.decrypt_value(&key, &raw_value)?;
-
-                    let mut tuple: Tuple = bincode::deserialize(&value)
-                        .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-                    tuple.row_id = Some(row_id);
-                    tuple.branch_id = Some(chain_branch_id);
-                    if null_pad {
-                        Self::shape_base_tuple_to_width(&mut tuple, target_width);
-                    }
-                    // Override any parent data for this row_id
-                    result_tuples.insert(row_id, tuple);
-                }
-            }
-        }
-
-        // Step 3: Apply delete markers - remove deleted rows from result
-        for row_id in &deleted_rows {
-            result_tuples.remove(row_id);
-        }
-
-        tracing::debug!(
-            "scan_table_branch_aware: returning {} tuples ({} deleted)",
-            result_tuples.len(),
-            deleted_rows.len()
-        );
-
-        // Return sorted by row_id for consistent ordering
-        let mut tuples: Vec<Tuple> = result_tuples.into_values().collect();
-        tuples.sort_by_key(|t| t.row_id.unwrap_or(0));
-
-        Ok(tuples)
     }
 
     /// Insert tuple with branch isolation
@@ -17101,8 +17094,6 @@ impl StorageEngine {
         let Some(binding) = self.check_active_branch()? else {
             return self.insert_tuple_versioned_with_schema(table_name, tuple, schema);
         };
-        let branch_id = binding.branch_id;
-        let catalog = Catalog::new(self);
 
         // R1.1: volatile row id (shared across branches for consistency);
         // flushed after the row write.
@@ -17142,43 +17133,16 @@ impl StorageEngine {
             crate::note_session_lastval(row_id as i64);
         }
 
-        // Serialize tuple directly (RocksDB LZ4 handles compression at block level)
-        let value =
-            bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-
-        // Write to branch-specific key
-        let key = format!("bdata:{}:{}:{}", branch_id, table_name, row_id).into_bytes();
-        self.put(&key, &value)?;
+        // sprinter 6bc4a4040eb7 (phase B2): through the branch view —
+        // PRIMARY KEY / UNIQUE enforced over the rows the BRANCH sees (claim,
+        // check, write; 23505 with main's message), the row written as the
+        // branch's own image. The pre-B2 body checked nothing, so a duplicate
+        // of an inherited or a branch row inserted. A branch write feeds none
+        // of main's derived structures (MV deltas, SMFI, speculative filters,
+        // the logical WAL) and keeps no `bv:` history (nothing reads it).
+        let view = branch_view::BranchView::from_binding(self, &binding);
+        view.insert_checked(None, table_name, schema, row_id, &tuple)?;
         self.flush_row_counter(table_name)?;
-
-        // Get current timestamp for versioning
-        let timestamp = self.next_timestamp();
-
-        // Write versioned copy for branch time-travel (encrypted if TDE enabled)
-        let version_key = format!("bv:{}:{}:{}:{}", branch_id, table_name, row_id, timestamp);
-        self.put_internal(version_key.as_bytes(), &value)?;
-
-        // Register snapshot with WAL LSN
-        if let Some(lsn) = self.wal_lsn() {
-            let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
-        } else {
-            let _ = self.snapshot_manager.register_snapshot(timestamp);
-        }
-
-        // Record delta for incremental MV refresh
-        if let Err(e) = self.mv_delta_tracker.record_insert(table_name, row_id, tuple.clone()) {
-            tracing::warn!("Failed to record insert delta for table '{}': {}", table_name, e);
-        }
-
-        // Record delta for SMFI (Self-Maintaining Filter Index)
-        self.filter_delta_tracker.on_insert(table_name, row_id, &tuple, &schema);
-
-        // Update speculative filters
-        for (i, col) in schema.columns.iter().enumerate() {
-            if let Some(value) = tuple.values.get(i) {
-                self.speculative_filter_manager.on_insert(table_name, &col.name, value);
-            }
-        }
 
         Ok(row_id)
     }
@@ -17194,7 +17158,23 @@ impl StorageEngine {
     ) -> Result<u64> {
         // sprinter 6bc4a4040eb7 (B1): the SESSION's binding (`None` = main);
         // a dropped/merged binding is refused before anything is written.
-        let branch_id = self.check_active_branch()?.map(|binding| binding.branch_id);
+        //
+        // B2 (fix pass): REFUSED on a branch. This funnel writes outside any
+        // transaction and checks nothing, so on a branch it could only enforce
+        // PRIMARY KEY / UNIQUE by trusting a caller — and an UPDATE's key claim
+        // needs a transaction to live in until the row lands. Every SQL UPDATE
+        // on a branch runs in a transaction (the params family's
+        // `params_branch_dml_needs_implicit_transaction`) and writes through
+        // the branch view there, so nothing reaches this today; a future caller
+        // fails closed instead of writing unchecked rows.
+        if let Some(view) = self.branch_view()? {
+            return Err(Error::branch_write_unsupported(
+                "an UPDATE outside a transaction",
+                view.name(),
+            ));
+        }
+        // Main from here on (the branch arm returned above).
+        let branch_id: Option<u64> = None;
         let catalog = Catalog::new(self);
         let schema = catalog.get_table_schema(table_name)?;
 
@@ -17368,12 +17348,24 @@ impl StorageEngine {
 
         // sprinter 6bc4a4040eb7 (B1): the SESSION's binding (`None` = main);
         // a dropped/merged binding is refused before anything is deleted.
-        let branch_id = self.check_active_branch()?.map(|binding| binding.branch_id);
-
-        tracing::debug!("delete_tuples_branch_aware: resolved branch_id = {:?}", branch_id);
-
-        // Check for branch - main branch vs branch-specific delete
-        let Some(branch_id) = branch_id else {
+        //
+        // B2: on a branch every row is hidden through the branch view — its
+        // own image cleared AND its own tombstone written (the pre-B2 arm left
+        // the image behind next to the tombstone), never into main's derived
+        // structures or the dead `bv:` history.
+        if let Some(view) = self.branch_view()? {
+            // B2 fix pass: one durability barrier for the whole delete.
+            let view = view.with_deferred_durability();
+            let mut delete_count = 0u64;
+            for row_id in &row_ids {
+                view.delete(None, table_name, *row_id)?;
+                delete_count += 1;
+            }
+            view.sync()?;
+            return Ok(delete_count);
+        }
+        // Main from here on (the branch arm returned above).
+        {
             // Main branch delete: preserve old value for time-travel before deleting
             let mut delete_count = 0u64;
             // W2.5 note: no watermark bump here. This path removes the row's
@@ -17460,80 +17452,8 @@ impl StorageEngine {
                 let _ = self.snapshot_manager.register_snapshot(timestamp);
             }
 
-            return Ok(delete_count);
-        };
-
-        // Branch delete: mark tuples as deleted and preserve for time-travel
-        // Format: "bdel:{branch_id}:{table}:{row_id}" -> empty value
-        let mut delete_count = 0u64;
-        for row_id in row_ids {
-            let delete_key = format!("bdel:{}:{}:{}", branch_id, table_name, row_id).into_bytes();
-
-            // PRESERVE DELETED VERSION FOR TIME-TRAVEL (for branch)
-            // Read the current value before marking as deleted (decrypt if TDE enabled)
-            let branch_key = format!("bdata:{}:{}:{}", branch_id, table_name, row_id);
-            let mut deleted_tuple_for_delta: Option<Tuple> = None;
-
-            // Try branch-specific key first, then fall back to main branch
-            let old_value = self.get_internal(branch_key.as_bytes()).ok().flatten().or_else(|| {
-                let main_key = format!("data:{}:{}", table_name, row_id);
-                self.get_internal(main_key.as_bytes()).ok().flatten()
-            });
-
-            if let Some(old_value) = old_value {
-                // Deserialize old tuple for delta tracking
-                deleted_tuple_for_delta = bincode::deserialize(&old_value).ok();
-
-                let old_timestamp = timestamp.saturating_sub(1);
-                let version_key = format!("bv:{}:{}:{}:{}", branch_id, table_name, row_id, old_timestamp);
-
-                // Store the deleted value in version history (only if not already there, encrypted if TDE enabled)
-                if self.get_internal(version_key.as_bytes())?.is_none() {
-                    self.put_internal(version_key.as_bytes(), &old_value)?;
-                }
-            }
-
-            // Write delete marker (empty value, but consistent with encryption pattern)
-            let delete_key_str = String::from_utf8_lossy(&delete_key);
-            tracing::debug!(
-                "delete_tuples_branch_aware: writing delete marker key '{}'",
-                delete_key_str
-            );
-            self.put_internal(&delete_key, &[])?;
-            tracing::debug!("delete_tuples_branch_aware: delete marker written successfully");
-
-            // Record delta for incremental MV refresh
-            if let Some(ref deleted_tuple) = deleted_tuple_for_delta {
-                if let Err(e) = self
-                    .mv_delta_tracker
-                    .record_delete(table_name, row_id, deleted_tuple.clone())
-                {
-                    tracing::warn!("Failed to record branch delete delta for table '{}': {}", table_name, e);
-                    // Don't fail the delete if delta recording fails
-                }
-            }
-
-            // Record delta for SMFI (Self-Maintaining Filter Index)
-            if let Ok(ref schema) = schema_result {
-                if let Some(tuple) = deleted_tuple_for_delta.as_ref() {
-                    self.filter_delta_tracker.on_delete(table_name, row_id, tuple, schema);
-                }
-            }
-
-            // Invalidate row cache entry (row deleted on branch)
-            self.row_cache.invalidate(table_name, row_id);
-
-            delete_count += 1;
+            Ok(delete_count)
         }
-
-        // Register snapshot for branch delete
-        if let Some(lsn) = self.wal_lsn() {
-            let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
-        } else {
-            let _ = self.snapshot_manager.register_snapshot(timestamp);
-        }
-
-        Ok(delete_count)
     }
 
     // --- v3.4 Storage Maintenance API ---
