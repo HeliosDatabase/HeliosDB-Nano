@@ -4187,6 +4187,12 @@ impl Parser {
             .ok_or_else(|| Error::query_execution("SWITCHOVER CHECK statement malformed"))?;
 
         let after_check = cleaned[check_pos + 6..].trim_start();
+        // Spec R3b: `SWITCHOVER CHECK TO '<target>'` names the target as
+        // `SWITCHOVER TO` does; the `TO` is optional.
+        let after_check = match after_check.get(..3) {
+            Some(word) if word.eq_ignore_ascii_case("TO ") => after_check.get(3..).unwrap_or_default().trim_start(),
+            _ => after_check,
+        };
 
         // Extract node identifier - may be quoted or unquoted
         let node_id = if after_check.starts_with('\'') || after_check.starts_with('"') {
@@ -4893,6 +4899,19 @@ mod tests {
             let result = Parser::parse_switchover_check_sql("SWITCHOVER CHECK 'target-node'");
             assert!(result.is_ok());
             assert_eq!(result.unwrap(), "target-node");
+        }
+
+        #[test]
+        fn test_parse_switchover_check_to() {
+            // Spec R3b: `SWITCHOVER CHECK TO '<target>'`.
+            assert_eq!(
+                Parser::parse_switchover_check_sql("SWITCHOVER CHECK TO 'target-node'").unwrap(),
+                "target-node"
+            );
+            assert_eq!(
+                Parser::parse_switchover_check_sql("switchover check to node_b").unwrap(),
+                "node_b"
+            );
         }
 
         #[test]

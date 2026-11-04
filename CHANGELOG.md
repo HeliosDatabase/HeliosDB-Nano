@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — rewind a former primary in place; `SWITCHOVER TO` (sprinter 1c8963417a35, bbba90ddfc61)
+
+- **Rewind instead of a full copy** (`recover --from-primary` on a former
+  primary's directory). A fenced or superseded primary of the same dataset
+  history, against the primary promoted over it, is converted in place into a
+  physical stage (one synced write of the node-local family: an unknown cursor,
+  the fast-forward record, a rewind record keeping its epoch, last sequence and
+  fence record; then its primary-only files removed: `NANO-PRIMARY-HISTORY.json`,
+  `NANO-FENCED.json`, RocksDB's `archive/`, `hnsw_snapshots/`, an empty
+  `lockfree_wal/`, temporaries and its own leftover export checkpoints) and
+  fast-forwarded: only the leaves that differ travel. The decision (the leaf
+  plan and the digest pass) is made before anything changes, so a divergence
+  above `--full-copy-threshold` or an entry nobody accounts for (a directory, a
+  symbolic link, a hard link from outside) falls through to the full copy with
+  nothing changed. A user's regular files beside the store (`heliosdb-nano.toml`,
+  `server.key`) are kept where they are: a physical standby's stage now keeps
+  such files too and leaves them out of its census (it used to refuse them). A rewind killed part-way is finished by re-running the
+  command; every `start` refuses the directory until then. Writes the old
+  primary committed after the promotion point (only when it was not fenced) are
+  replaced and said at WARNING. Refused, nothing changed: another history, a
+  source at the directory's own epoch (`--full --replace` rebuilds it), or a
+  lower one. Before: a fenced primary's directory was always rebuilt by a full
+  copy with `--replace`.
+- **`SWITCHOVER TO '<standby>'`** and **`SWITCHOVER CHECK TO '<standby>'`**
+  on the primary's PostgreSQL port (they were refused), for a superuser session
+  (42501 otherwise). CHECK answers every check, one row each, and changes
+  nothing on either node — including whether the directory could be rewound in
+  place (the rewind's census, read-only) and one row per OTHER standby of the
+  primary, which needs `recover --from-primary` against the new primary
+  afterwards. The primary asks the standby over its live replication session
+  to promote online (fencing the primary; never unfenced), waits for it to
+  serve as the primary of the next epoch, then demotes itself in-process:
+  sessions off the store (FATAL 57P01), replication source and archiver
+  stopped, the HTTP surface restarted health-only (every HTTP connection closed
+  with it), the store rewound against the new primary and reopened as its
+  physical standby. The switchover runs on its own task (a cancelled caller
+  abandons nothing); a request the standby took whose answer was lost is never
+  reported "nothing was changed" — the wait for the fence settles it. A
+  failure after the fence leaves the old primary fenced and serving reads (its
+  store reopened fenced when the rewind changed nothing), naming the commands
+  that finish the demotion; never two writable primaries. The embedded API
+  still refuses the statement (the server session answers it).
+- **Replication protocol:** frame kinds `PromoteRequest` (30; 49 bytes,
+  carrying the bound its answer must come within) and `PromoteAnswer` (31,
+  carrying the promotion's identity — a switchover accepts only that
+  promotion's fence) and
+  the Hello capability `CAP_PROMOTE` (`1 << 4`), offered by a standby that can
+  promote online. A request takes the place of a poll's start; a peer that does
+  not offer the capability is never sent one. `NPHYS004` is unchanged (a mixed
+  pair simply cannot switch over).
+- **`<data dir>.role.toml`** (mode 0600): the role a switchover gave a node
+  (and, for a standby, the primary and the TLS it follows over), written
+  beside its data directory and bound to it (history, epoch, store identity).
+  `start` applies it over the configuration file (said at WARN) — only to that
+  directory, and never against the command line: a missing, empty or rebuilt
+  directory, a contradicting `--replication-role` / `--primary-host`, or an
+  unreadable file refuses the start (exit 2), naming it — so a supervisor
+  whose command line passes `--replication-role` must move the role into the
+  configuration file (or drop the flag) once a switchover changed it.
+  `promote`, `pg_promote` and `recover` rewrite one they find, and `recover`
+  follows the TLS it records. The record sits beside the directory the data
+  path resolves to (symbolic links followed). A shutdown signal during a
+  demotion waits for it (at most 300 s; cut short at ERROR, exit non-zero).
+- **Every `recover` a switchover or a fence prints** carries `--replace --then
+  stop` and is followed by the `start` to run: it finishes the job whatever the
+  plan picks (a full copy moves the old directory to `<data dir>.replaced-<UTC>`,
+  never deleted) and leaves no server in the operator's shell.
+
+### Fixed — `recover` and `promote` lost their token and TLS flags when they went on to `start`
+
+`recover --then primary` (the default with `--primary-host`) and `promote --then
+start` built `start`'s command line from the data directory, the role, the
+primary, `--config` and the arguments after `--` only. So `recover --from-primary
+--replication-token-file T` did its work and then refused to follow ("a physical
+standby requires --replication-token-file") unless a configuration file named the
+token, and `promote --then start --replication-token-file T` started a primary
+with no replication port. The replication token file, transfer limits, standby TLS
+flags and `--allow-insecure-replication-remote` are now handed on, unless the
+arguments after `--` set them.
+
 ### Fixed — a long statement no longer stalls the server (sprinter ccebc95977f1)
 
 A statement executed synchronously on the async worker that had just been driving the

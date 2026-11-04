@@ -238,6 +238,54 @@ fn valid_file_name(name: &str) -> bool {
     name.rsplit_once('.')
         .is_some_and(|(number, extension)| digits(number) && matches!(extension, "sst" | "ldb" | "log" | "blob"))
 }
+/// Spec R3a: whether a physical stage's file census accepts `name` as one of
+/// RocksDB's own files — its data and control files, `LOCK` and the `LOG`s —
+/// as opposed to the stage's markers or anything else.
+pub fn is_stage_file_name(name: &str) -> bool {
+    valid_file_name(name) || name == "LOCK" || name == "LOG" || name.starts_with("LOG.old.")
+}
+/// Spec R3a (Sprinter 1c8963417a35): the entries directly under a primary's
+/// data directory that are primary-local state, never a user's: RocksDB's WAL
+/// archive, the HNSW dump cache, the lock-free ingestion engine's log.
+pub const PRIMARY_LOCAL_ENTRY_NAMES: [&str; 3] = [
+    "archive",
+    crate::storage::index_snapshot::HNSW_SNAPSHOT_DIR,
+    "lockfree_wal",
+];
+
+/// Spec R3a (Sprinter 1c8963417a35): whether `name` is a file a data
+/// directory may carry BESIDE its store that neither RocksDB nor HeliosDB
+/// interprets — a user's file the engine tolerates in a data directory (a
+/// `heliosdb-nano.toml`, a `server.key`: engine.rs
+/// `a_writable_open_initializes_a_fresh_directory_with_benign_files`). A
+/// physical stage keeps such a file, when it is a regular file, where it is
+/// and leaves it out of its census: the re-cut manifest, the stage limits and
+/// the open's file check never count it, so a former primary's directory
+/// holding one is rewound in place with it. Foreign is defined from the ONE
+/// predicate the engine's own open uses ([`crate::storage::is_rocksdb_name`]):
+/// not a RocksDB name (`METADB-*` and `archive` included), not a HeliosDB
+/// record (`NANO-*`: a primary's history, a fence, a promotion, a logical
+/// standby's binding, the stage's own marker and manifest and their
+/// temporaries), not a primary-local entry ([`PRIMARY_LOCAL_ENTRY_NAMES`]).
+pub fn is_foreign_file_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 255 || name == "." || name == ".." || name.contains('/') {
+        return false;
+    }
+    if crate::storage::is_rocksdb_name(name) || is_stage_file_name(name) {
+        return false;
+    }
+    if name.trim_start_matches('.').to_ascii_uppercase().starts_with("NANO-") {
+        return false;
+    }
+    !PRIMARY_LOCAL_ENTRY_NAMES.contains(&name)
+}
+
+/// [`is_foreign_file_name`], and the entry at `path` is a regular file (not
+/// a directory, not a symbolic link).
+fn is_foreign_file(name: &str, path: &Path) -> bool {
+    is_foreign_file_name(name) && fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
+}
+
 fn valid_identity(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
 }
@@ -1668,6 +1716,8 @@ fn load_existing_stage(path: &Path, expected_history: Uuid, limits: &TransferLim
 /// manifest (and, for a directory a fast-forward re-cuts, their temporaries:
 /// `recut_temporaries`), `LOCK` and the `LOG` files — each a regular file with
 /// one link — and a `CURRENT` that names a manifest present as such a file.
+/// Spec R3a: a user's regular file the engine tolerates beside a store
+/// ([`is_foreign_file_name`]) is passed over, never followed or counted.
 fn census_stage_files(path: &Path, recut_temporaries: bool) -> Result<()> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
@@ -1676,6 +1726,10 @@ fn census_stage_files(path: &Path, recut_temporaries: bool) -> Result<()> {
             .into_string()
             .map_err(|_| invalid("non-UTF8 stage file"))?;
         let temporary = name == PHYSICAL_MARKER_TEMP_FILE || name == PHYSICAL_MANIFEST_TEMP_FILE;
+        // Spec R3a: a user's regular file beside the store is kept, uncounted.
+        if is_foreign_file(&name, &entry.path()) {
+            continue;
+        }
         if !(valid_file_name(&name)
             || name == PHYSICAL_MARKER_FILE
             || name == PHYSICAL_MANIFEST_FILE
@@ -1755,7 +1809,7 @@ pub fn stage_census_manifest(
             .file_name()
             .into_string()
             .map_err(|_| invalid("non-UTF8 stage file"))?;
-        if outside_census(&name) {
+        if outside_census(&name) || is_foreign_file(&name, &path.join(&name)) {
             continue;
         }
         if !valid_file_name(&name) {
@@ -1819,6 +1873,15 @@ fn outside_census(name: &str) -> bool {
 /// a file that disappears meanwhile (a compaction) is not counted. The files
 /// the fast-forward adds can still take the stage over the limits.
 pub fn check_stage_limits(path: &Path, limits: &TransferLimits) -> Result<()> {
+    check_stage_limits_excluding(path, limits, &[])
+}
+
+/// [`check_stage_limits`], not counting the entries named in `excluded`.
+/// Spec R3a: a former primary's directory, checked before its rewind converts
+/// it, still holds what the conversion removes (its history and fence
+/// records, RocksDB's WAL archive, the HNSW dump cache); none of it is in the
+/// re-cut's census.
+pub fn check_stage_limits_excluding(path: &Path, limits: &TransferLimits, excluded: &[String]) -> Result<()> {
     limits.validate()?;
     let (mut files, mut total, mut largest) = (0_usize, 0_u64, 0_u64);
     for entry in fs::read_dir(path)? {
@@ -1827,7 +1890,7 @@ pub fn check_stage_limits(path: &Path, limits: &TransferLimits) -> Result<()> {
             .file_name()
             .into_string()
             .map_err(|_| invalid("non-UTF8 stage file"))?;
-        if outside_census(&name) {
+        if outside_census(&name) || excluded.contains(&name) || is_foreign_file(&name, &entry.path()) {
             continue;
         }
         let size = match fs::symlink_metadata(entry.path()) {
@@ -2360,6 +2423,78 @@ mod tests {
         let reopened = ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).unwrap();
         assert_eq!(reopened.cursor().snapshot_sequence(), 1);
         reopened.close().unwrap();
+    }
+
+    /// Spec R3a (Sprinter 1c8963417a35): a user's regular file beside the
+    /// store — what the engine tolerates in a data directory — is kept by a
+    /// stage and left out of its census (the open's file check, the re-cut
+    /// manifest); a HeliosDB record, a RocksDB-looking name or a directory is
+    /// not one.
+    #[test]
+    fn a_stage_keeps_a_users_file_beside_its_store_and_counts_nothing_of_it() {
+        for name in ["heliosdb-nano.toml", "server.key", "README", ".env"] {
+            assert!(is_foreign_file_name(name), "{name}");
+        }
+        for name in [
+            "CURRENT",
+            "IDENTITY",
+            "MANIFEST-000005",
+            "METADB-000003",
+            "OPTIONS-000007.dbtmp",
+            "000010.sst",
+            "000011.log",
+            "000013.dbtmp",
+            "LOCK",
+            "LOG",
+            "LOG.old",
+            "LOG.old.1761000000",
+            "archive",
+            "hnsw_snapshots",
+            "lockfree_wal",
+            PHYSICAL_MARKER_FILE,
+            PHYSICAL_MANIFEST_TEMP_FILE,
+            "NANO-FENCED.json",
+            "nano-primary-history.json",
+            ".NANO-PROMOTION.json.tmp",
+            "",
+            "..",
+            "a/b",
+        ] {
+            assert!(!is_foreign_file_name(name), "{name}");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let (_source, history, path, _manifest) = installed_fixture(root.path());
+        fs::write(path.join("heliosdb-nano.toml"), b"[storage]\n").unwrap();
+        fs::write(path.join("server.key"), b"key").unwrap();
+        check_stage_files(&path).unwrap();
+        check_stage_limits(&path, &TransferLimits::default()).unwrap();
+        load_existing_stage(&path, history, &TransferLimits::default()).unwrap();
+        let recut = stage_census_manifest(&path, history, Uuid::new_v4(), 1, &TransferLimits::default()).unwrap();
+        assert!(
+            recut
+                .files
+                .iter()
+                .all(|file| file.name != "heliosdb-nano.toml" && file.name != "server.key"),
+            "a user's file is never part of the stage's manifest"
+        );
+        let reopened = ReopenedPhysicalStage::open(&path, history, TransferLimits::default(), &config()).unwrap();
+        reopened.close().unwrap();
+        assert_eq!(fs::read(path.join("server.key")).unwrap(), b"key", "kept as it was");
+        fs::create_dir(path.join("notes")).unwrap();
+        assert!(check_stage_files(&path).is_err(), "a directory is not kept");
+        fs::remove_dir(path.join("notes")).unwrap();
+        fs::write(path.join("NANO-FENCED.json"), b"{}").unwrap();
+        assert!(check_stage_files(&path).is_err(), "a HeliosDB record is no user's file");
+        fs::remove_file(path.join("NANO-FENCED.json")).unwrap();
+        // Review: a regular file under a RocksDB or primary-local name is
+        // never carried as a user's (a file named `archive` would break WAL
+        // archiving once the stage is promoted).
+        for name in ["archive", "METADB-000004"] {
+            fs::write(path.join(name), b"x").unwrap();
+            assert!(check_stage_files(&path).is_err(), "{name}");
+            fs::remove_file(path.join(name)).unwrap();
+        }
+        check_stage_files(&path).unwrap();
     }
 
     /// Spec P4.1 §3.3.5, §4: a fast-forwarded stage is re-cut at the new

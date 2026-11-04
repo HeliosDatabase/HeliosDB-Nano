@@ -779,3 +779,68 @@ async fn a_cascading_standby_fast_forwards_its_downstream() {
     assert_eq!(settle(pg_b, &want, Duration::from_secs(120)).await, Ok(want));
     drop(standby_a);
 }
+
+/// `recover --from-primary` with its default `--then primary`, on a small
+/// store: the token given to `recover` itself reaches the `start` it goes on
+/// to, and the command ends as a node streaming from the primary, on the port
+/// given after `--`. (Through the review it did its work and then refused to
+/// follow: "a physical standby requires --replication-token-file".)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recover_that_goes_on_to_follow_hands_its_token_to_the_start() {
+    let pair = pair();
+    let dir = pair.dir.path().to_path_buf();
+    let s_data = dir.join("standby");
+    let primary = Daemon::spawn(
+        &dir,
+        "primary",
+        &dir.join("primary"),
+        &pair.token,
+        &pair.primary_args,
+        None,
+    );
+    let writer = connect(pair.pg_p).await;
+    create_table(&writer).await;
+    assert_eq!(insert(&writer, 1..=10, "before").await, 0);
+    let following = Daemon::spawn_cli(
+        &dir,
+        "recover-follows",
+        &[
+            "recover".to_string(),
+            "--data-dir".to_string(),
+            text(&s_data),
+            "--from-primary".to_string(),
+            "--primary-host".to_string(),
+            format!("127.0.0.1:{}", pair.repl_p),
+            "--replication-token-file".to_string(),
+            text(&pair.token),
+            "--".to_string(),
+            "--listen".to_string(),
+            "127.0.0.1".to_string(),
+            "--auth".to_string(),
+            "trust".to_string(),
+            "--port".to_string(),
+            pair.pg_s.to_string(),
+            "--http-port".to_string(),
+            pair.http_s.to_string(),
+            "--replication-startup-timeout-secs".to_string(),
+            "30".to_string(),
+        ],
+    );
+    let ready = wait_http(pair.http_s, "/ready", 200, Duration::from_secs(120), &following).await;
+    assert_eq!(ready["state"], "streaming", "{ready}");
+    assert!(
+        following.log().contains("as `start --replication-role standby` would"),
+        "{}",
+        following.tail(20)
+    );
+    let mut want: Vec<i32> = (1..=10).collect();
+    assert_eq!(
+        settle(pair.pg_s, &want, Duration::from_secs(60)).await,
+        Ok(want.clone())
+    );
+    assert_eq!(insert(&writer, 11..=15, "after").await, 0);
+    want.extend(11..=15);
+    assert_eq!(settle(pair.pg_s, &want, Duration::from_secs(60)).await, Ok(want));
+    drop(following);
+    drop(primary);
+}

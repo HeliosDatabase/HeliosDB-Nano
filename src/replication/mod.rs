@@ -95,6 +95,10 @@ pub mod physical_wire;
 pub mod promote;
 #[cfg(feature = "ha-tier1")]
 pub mod recover_primary;
+// Spec R3b: a node's replication role as a `SWITCHOVER` left it, recorded
+// beside its data directory (`<data dir>.role.toml`).
+#[cfg(feature = "ha-tier1")]
+pub mod role_override;
 // Spec P1.3: the posture lives at the crate root (`crate::standby_posture`),
 // compiled in every build because the SQL layer asks it whether this node is
 // in recovery; re-exported here beside the receiver it is derived from.

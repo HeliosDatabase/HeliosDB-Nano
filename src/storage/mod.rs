@@ -99,10 +99,11 @@ pub use dump::{
     CompressionType as DumpCompressionType, DumpManager, DumpMetadata, DumpMode, DumpOptions, DumpOutputFormat,
     DumpReport, DumpType, RestoreOptions, RestoreReport, RestoreValidation,
 };
-pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
 pub use engine::{
-    DirectBulkLoadResult, LogicalCatchup, StorageEngine, StorageStats, SynchronousCommitOverrideGuard, TableKind,
+    is_rocksdb_name, DirectBulkLoadResult, LogicalCatchup, StorageEngine, StorageStats, SynchronousCommitOverrideGuard,
+    TableKind,
 };
+pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
 pub use gin_index::{GinIndex, GinIndexStats};
 pub use index_snapshot::{IndexOpenReport, IndexSnapshotPersistReport};
 pub use keyspace::{Classified, KeyClass};

@@ -38,8 +38,8 @@ use super::physical::{Durability, LocalWriter, PhysicalBatch, PhysicalCursor};
 use super::physical_applier::PhysicalApplier;
 use super::physical_tls::{ReplicationStream, ReplicationTransport};
 use super::physical_wire::{
-    now_millis, BatchSink, Fenced, Heartbeat, LastGroup, PhysicalClient, PollSummary, ReceiverIdentity, RefuseCode,
-    SourceSessionInfo, TransferToken, WireError, WireLimits, MAX_POLL_BYTES,
+    now_millis, BatchSink, Fenced, Heartbeat, LastGroup, PhysicalClient, PollSummary, PromoteAnswer, PromoteRequest,
+    ReceiverIdentity, RefuseCode, SourceSessionInfo, TransferToken, WireError, WireLimits, CAP_PROMOTE, MAX_POLL_BYTES,
 };
 use crate::Config;
 use async_trait::async_trait;
@@ -1004,9 +1004,26 @@ struct Sink<'a> {
     cursor: &'a PhysicalCursor,
     session: u64,
     tls: bool,
+    /// Spec R3b: a serving standby's sink, which answers a `SWITCHOVER TO`
+    /// request through the process's online promotion.
+    serving: bool,
 }
 #[async_trait]
 impl BatchSink for Sink<'_> {
+    /// Spec R3b (Sprinter bbba90ddfc61): the primary asks this standby to
+    /// promote itself (`SWITCHOVER TO`): the online promotion of this
+    /// process decides — a check runs its preflight only; a request starts
+    /// the promotion, which then fences the primary through this receiver
+    /// (`ReceiverCommand::Fence`). Only a serving standby answers yes.
+    async fn promote_requested(&mut self, request: PromoteRequest) -> PromoteAnswer {
+        if !self.serving {
+            return PromoteAnswer::refused(
+                request.switchover,
+                "this receiver is no serving standby (a copy being installed): it cannot be promoted online",
+            );
+        }
+        crate::replication::promote::online::switchover_requested(request).await
+    }
     async fn begin(&mut self, summary: PollSummary) -> super::physical_wire::Result<()> {
         if summary.batches > 0 {
             self.progress.send_replace(ReceiverStatus::Applying {
@@ -1214,21 +1231,30 @@ async fn connect(
                 last_error: previous_error.clone(),
             });
             let result = if let Some(cursor) = cursor {
-                PhysicalClient::connect_resume_replication(
-                    *source,
-                    &options.transport,
-                    &options.token,
-                    &identity,
-                    options.wire,
-                    shutdown.clone(),
-                    cursor.history(),
-                    cursor.source_sequence(),
-                    // Spec P5.1 §11.F: the source verifies it is the group
-                    // ending at the cursor before it serves the session.
-                    cursor
-                        .last_group()
-                        .map(|(first_sequence, digest)| LastGroup { first_sequence, digest }),
-                )
+                // Spec R3b: a serving standby can be asked to promote itself
+                // (`SWITCHOVER TO` on its primary): its `Hello` says so.
+                let mut hello = identity.hello(Some(cursor.history()), Some(cursor.source_sequence()));
+                if serving {
+                    hello.capabilities |= CAP_PROMOTE;
+                }
+                // Spec P5.1 §11.F: the source verifies it is the group
+                // ending at the cursor before it serves the session.
+                let last = cursor
+                    .last_group()
+                    .map(|(first_sequence, digest)| LastGroup { first_sequence, digest });
+                async {
+                    let mut client = PhysicalClient::connect_replication(
+                        *source,
+                        &options.transport,
+                        &options.token,
+                        hello,
+                        options.wire,
+                        shutdown.clone(),
+                    )
+                    .await?;
+                    client.resume(cursor.history(), cursor.source_sequence(), last).await?;
+                    Ok::<_, WireError>(client)
+                }
                 .await
             } else {
                 let hello = identity.hello(snapshot_history, None);
@@ -1968,6 +1994,7 @@ async fn run_inner(
             cursor: &cursor,
             session,
             tls,
+            serving,
         };
         let outcome = client
             .poll(cursor.source_sequence(), options.poll_byte_limit, &mut sink)
@@ -3058,6 +3085,7 @@ mod tests {
             cursor: &cursor,
             session: 1,
             tls: false,
+            serving: false,
         };
         let summary = client.poll(after, MAX_POLL_BYTES, &mut sink).await.unwrap();
         client.close().await.unwrap();

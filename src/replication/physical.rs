@@ -64,6 +64,28 @@ const FAST_FORWARD_DONE_END: &[u8] = b"ff:done;";
 /// The record's bound: a few fixed fields.
 const MAX_FAST_FORWARD_RECORD_BYTES: usize = 4096;
 const MAX_FAST_FORWARD_LEAVES: usize = 1 << 24;
+/// Spec R3a (Sprinter 1c8963417a35): the record of a REWIND in progress — a
+/// former primary's directory converted in place into a physical stage,
+/// which a fast-forward from the primary promoted over it then finishes — a
+/// key INSIDE [`LOCAL_CF`]. Written by the conversion's one synced write
+/// together with the [`FAST_FORWARD_KEY`] record (so every open but the
+/// fast-forward's refuses the directory exactly as it refuses an interrupted
+/// fast-forward) and a cursor at an unknown position; deleted by the
+/// re-cut's write.
+pub const REWIND_KEY: &[u8] = b"rewind";
+/// Spec R3a: what the re-cut keeps of a finished rewind, for diagnosis — the
+/// [`RewindRecord`] (with the copy of the fence record the former primary
+/// carried), in [`LOCAL_CF`] for the standby's life. Nothing decides on it;
+/// it never refuses an open.
+pub const REWOUND_KEY: &[u8] = b"rewound";
+/// Spec R3a: the local sequence the conversion's cursor names — one no store
+/// can be at after the conversion's own write (three operations), so the
+/// cursor accounts for nothing until the re-cut derives the real one: a
+/// cursor at an UNKNOWN position, from which no tail is ever attempted.
+const UNACCOUNTED_LOCAL_SEQUENCE: u64 = 1;
+/// The rewind record's bound: a few fixed fields, a host name and a copy of
+/// the fence record.
+const MAX_REWIND_RECORD_BYTES: usize = 4096;
 /// Spec P4.1c: the largest raw write group ONE replication `Batch` frame or
 /// ONE archived segment frame can carry. A representability bound, not a
 /// policy: both frames give their length as a `u32`, and the 4096 bytes kept
@@ -1184,6 +1206,15 @@ fn read_cursor(db: &DB) -> Result<PhysicalCursor> {
     // fast-forward breaks by construction — it would otherwise read as a
     // store modified outside physical replication.
     refuse_interrupted_fast_forward(db, local)?;
+    // Spec R3a: a rewind always carries a fast-forward record too (written in
+    // the same write, removed by the same re-cut), so the check above refuses
+    // it first; this one keeps a rewind refused even if the two came apart.
+    if db.get_cf(local, REWIND_KEY)?.is_some() {
+        return Err(invalid(
+            "the store carries the record of an interrupted rewind of a former primary into a standby: run \
+             `heliosdb-nano recover --from-primary` on it to finish it",
+        ));
+    }
     let bytes = db
         .get_cf(local, CURSOR_KEY)?
         .ok_or_else(|| invalid("missing physical receiver cursor"))?;
@@ -1990,22 +2021,31 @@ impl FastForwardWriter {
     /// deletes the record and every leaf mark. The cursor is derived from the
     /// observed sequence, never predicted beyond this write's own operations,
     /// and checked after it.
+    ///
+    /// Spec R3a (Sprinter 1c8963417a35): the re-cut of a REWIND (the store
+    /// carries [`REWIND_KEY`]) also deletes the rewind's record and keeps a
+    /// copy of it under [`REWOUND_KEY`] for diagnosis, in the same write: the
+    /// former primary is a consistent stage at the cut from that write on.
     pub fn recut(&self, sequence: u64, snapshot_id: Uuid) -> Result<PhysicalCursor> {
-        // The cursor put, the record delete and the marks' range deletion.
+        // The cursor put, the record delete and the marks' range deletion;
+        // a rewind's record delete and its diagnostic copy on top.
         const RECUT_OPERATIONS: u64 = 3;
+        const REWIND_OPERATIONS: u64 = 2;
         if snapshot_id.is_nil() {
             return Err(invalid("a re-cut names the primary's snapshot"));
         }
         let mut current = self.cursor.lock();
         let local = local_family(&self.db)?;
+        let rewind = self.db.get_cf(local, REWIND_KEY)?;
+        let operations = RECUT_OPERATIONS + if rewind.is_some() { REWIND_OPERATIONS } else { 0 };
         let latest = self.db.latest_sequence_number();
-        check_local_advance(latest, RECUT_OPERATIONS)?;
+        check_local_advance(latest, operations)?;
         let cursor = PhysicalCursor {
             format: FORMAT,
             history: self.history,
             snapshot_sequence: sequence,
             source_sequence: sequence,
-            local_sequence: latest + RECUT_OPERATIONS,
+            local_sequence: latest + operations,
             last_first_sequence: None,
             last_digest: None,
         };
@@ -2014,7 +2054,11 @@ impl FastForwardWriter {
         batch.put_cf(local, CURSOR_KEY, encode_cursor(&cursor)?);
         batch.delete_cf(local, FAST_FORWARD_KEY);
         batch.delete_range_cf(local, FAST_FORWARD_DONE_PREFIX, FAST_FORWARD_DONE_END);
-        if batch.len() as u64 != RECUT_OPERATIONS {
+        if let Some(record) = rewind {
+            batch.delete_cf(local, REWIND_KEY);
+            batch.put_cf(local, REWOUND_KEY, record);
+        }
+        if batch.len() as u64 != operations {
             return Err(invalid("the re-cut write does not hold the operations it accounts for"));
         }
         self.db.write_opt(batch, &sync_options())?;
@@ -2045,6 +2089,298 @@ impl FastForwardWriter {
         drop(self.db);
         Ok(cursor)
     }
+
+    /// Spec R3a: the record of the rewind this store is under, if it is one
+    /// (a former primary converted in place, [`RewindWriter`]).
+    pub fn rewind_record(&self) -> Result<Option<RewindRecord>> {
+        let local = local_family(&self.db)?;
+        self.db
+            .get_cf(local, REWIND_KEY)?
+            .map(|bytes| RewindRecord::decode(&bytes))
+            .transpose()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rewind of a former primary into a standby (spec R3a, Sprinter 1c8963417a35).
+// ---------------------------------------------------------------------------
+
+/// Spec R3a: the durable record of a rewind in progress, the value of
+/// [`REWIND_KEY`] in [`LOCAL_CF`] — what the former primary was when it was
+/// converted in place (its epoch, its own last sequence, a copy of the fence
+/// record its directory carried, which the conversion removes from the
+/// directory) and what it is rewound to (the primary's epoch, the export the
+/// rewind started from). Written by [`RewindWriter::convert`], deleted by the
+/// re-cut ([`FastForwardWriter::recut`]), which keeps a copy under
+/// [`REWOUND_KEY`] for diagnosis.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RewindRecord {
+    pub format: u32,
+    pub history: Uuid,
+    /// The epoch the former primary's store was at.
+    pub from_epoch: u64,
+    /// The epoch of the primary it is rewound to, when the rewind started.
+    pub to_epoch: u64,
+    /// Unix seconds.
+    pub started_at: u64,
+    /// The former primary's own RocksDB sequence when it was converted: what
+    /// it held (its writes past the promotion point are replaced by the
+    /// rewind).
+    pub primary_sequence: u64,
+    /// The primary's export the rewind started from (the interim stage's
+    /// snapshot; the re-cut names the export it finished from).
+    pub snapshot_id: Uuid,
+    /// The primary as `--primary-host` named it.
+    pub primary: String,
+    /// The former primary's `NANO-FENCED.json`, when it carried one.
+    pub fence: Option<crate::storage::replication_records::FencedRecord>,
+}
+
+impl RewindRecord {
+    fn validate(&self) -> Result<()> {
+        if self.format != FORMAT
+            || self.history.is_nil()
+            || self.snapshot_id.is_nil()
+            || self.from_epoch == 0
+            || self.to_epoch <= self.from_epoch
+            || self.primary.len() > 512
+        {
+            return Err(invalid("invalid rewind record"));
+        }
+        if let Some(fence) = &self.fence {
+            fence.validate().map_err(invalid)?;
+            if fence.history != self.history {
+                return Err(invalid("the rewind record's fence copy names another history"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(|error| invalid(error.to_string()))?;
+        if bytes.len() > MAX_REWIND_RECORD_BYTES {
+            return Err(invalid("oversized rewind record"));
+        }
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > MAX_REWIND_RECORD_BYTES {
+            return Err(invalid("oversized rewind record"));
+        }
+        let record: Self =
+            serde_json::from_slice(bytes).map_err(|error| invalid(format!("malformed rewind record: {error}")))?;
+        record.validate()?;
+        Ok(record)
+    }
+}
+
+/// What a former primary's store holds of a rewind ([`RewindWriter::state`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RewindStoreState {
+    /// No node-local family: a primary's store, never converted.
+    Primary,
+    /// The node-local family exists and holds nothing: a conversion that
+    /// stopped between the family's creation and its write.
+    Created,
+    /// The conversion's write is in: a rewind in progress.
+    Rewinding(RewindRecord),
+}
+
+/// Spec R3a (Sprinter 1c8963417a35): the writer of a rewind's conversion — a
+/// STOPPED former primary's store turned, in place, into a physical stage a
+/// fast-forward from the new primary then finishes (`recover --from-primary`,
+/// `replication::recover_primary`).
+///
+/// The store's default family is the old primary's own, byte for byte the
+/// dataset's history up to the promotion point: only what diverged after it
+/// (the old primary's writes past it, the new primary's own) differs, and the
+/// fast-forward ships only the leaves that differ. Before the first leaf can
+/// be applied the store must be a stage the fast-forward's writer opens: it
+/// needs the node-local family, a cursor, and the fast-forward's record. This
+/// writer creates them in ONE synced write ([`Self::convert`]):
+///
+/// * the cursor at an UNKNOWN position — source `0` and a local sequence the
+///   store is never at ([`UNACCOUNTED_LOCAL_SEQUENCE`]) — so nothing ever
+///   tails from it (a tail from a primary's sequence numbers would apply the
+///   new primary's groups onto other data);
+/// * the [`FastForwardRecord`] of the cut the rewind started from (the
+///   primary's export), so every other open of the directory refuses it
+///   ([`PhysicalError::FastForwardInterrupted`]) until the re-cut, exactly as
+///   it refuses an interrupted fast-forward;
+/// * the [`RewindRecord`].
+///
+/// From that write on the directory is no primary's any more — the engine
+/// refuses a store holding the node-local family in every mode but the
+/// standby's — and only the fast-forward finishes it. It lives here, beside
+/// [`FastForwardWriter`], because it writes raw (`tests/write_gate_funnel.rs`).
+pub struct RewindWriter {
+    db: DB,
+    history: Uuid,
+}
+
+impl RewindWriter {
+    /// Open the STOPPED former primary at `path` exclusively, with the
+    /// primary's own storage options of `config`, every column family it
+    /// holds included. Review item 5: NOT the receiver's (which keep no
+    /// archived WAL, so RocksDB would purge `archive/` at this open): until
+    /// the conversion's write is committed the directory stays the fenced
+    /// primary's, whole — a rewind that stops before it leaves the archived
+    /// WAL where it was. The conversion removes `archive/` itself, after its
+    /// write.
+    pub fn open(path: &Path, config: &Config, history: Uuid) -> Result<Self> {
+        check_history(history)?;
+        let (mut options, families) = StorageEngine::build_db_options(config, path)
+            .map_err(|error| invalid(format!("the store's storage options: {error}")))?;
+        options.create_if_missing(false);
+        let db = DB::open_cf_descriptors(&options, path, families)?;
+        refuse_legacy_cursor(&db)?;
+        Ok(Self { db, history })
+    }
+
+    /// The handle, for the local digest pass. Reads only.
+    pub fn db(&self) -> &DB {
+        &self.db
+    }
+
+    /// The store's RocksDB sequence.
+    pub fn latest_sequence(&self) -> u64 {
+        self.db.latest_sequence_number()
+    }
+
+    /// What the store holds of a rewind. A node-local family that holds
+    /// anything but a rewind's record is refused: it is no conversion of
+    /// this writer's, and nothing here can say what it is.
+    pub fn state(&self) -> Result<RewindStoreState> {
+        let Some(local) = self.db.cf_handle(LOCAL_CF) else {
+            return Ok(RewindStoreState::Primary);
+        };
+        if let Some(bytes) = self.db.get_cf(local, REWIND_KEY)? {
+            let record = RewindRecord::decode(&bytes)?;
+            if record.history != self.history {
+                return Err(PhysicalError::HistoryMismatch);
+            }
+            return Ok(RewindStoreState::Rewinding(record));
+        }
+        let mut read = ReadOptions::default();
+        read.set_total_order_seek(true);
+        if let Some(item) = self.db.iterator_cf_opt(local, read, IteratorMode::Start).next() {
+            let (key, _) = item?;
+            return Err(invalid(format!(
+                "the primary's store holds a node-local family with {:?} in it: it was not left by a rewind, so it is \
+                 not rewound in place",
+                String::from_utf8_lossy(&key)
+            )));
+        }
+        Ok(RewindStoreState::Created)
+    }
+
+    /// The conversion's store step (type documentation): the node-local
+    /// family created when absent, then ONE synced write of the cursor at an
+    /// unknown position, `fast_forward` and `rewind`. Idempotent: a store
+    /// that already holds `rewind` is left as it is; one under another rewind
+    /// is refused.
+    pub fn convert(&mut self, fast_forward: &FastForwardRecord, rewind: &RewindRecord) -> Result<()> {
+        if fast_forward.history != self.history || rewind.history != self.history {
+            return Err(PhysicalError::HistoryMismatch);
+        }
+        if fast_forward.from != 0 {
+            return Err(invalid(
+                "a rewind's fast-forward starts from no source position (sequence 0)",
+            ));
+        }
+        match self.state()? {
+            RewindStoreState::Rewinding(existing) if existing == *rewind => return Ok(()),
+            RewindStoreState::Rewinding(existing) => {
+                return Err(invalid(format!(
+                    "the store is under another rewind already (started at unix {}, toward epoch {})",
+                    existing.started_at, existing.to_epoch
+                )))
+            }
+            RewindStoreState::Primary => self.db.create_cf(LOCAL_CF, &StorageEngine::local_cf_options())?,
+            RewindStoreState::Created => {}
+        }
+        let local = local_family(&self.db)?;
+        let cursor = PhysicalCursor {
+            format: FORMAT,
+            history: self.history,
+            snapshot_sequence: 0,
+            source_sequence: 0,
+            local_sequence: UNACCOUNTED_LOCAL_SEQUENCE,
+            last_first_sequence: None,
+            last_digest: None,
+        };
+        cursor.validate()?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(local, CURSOR_KEY, encode_cursor(&cursor)?);
+        batch.put_cf(local, FAST_FORWARD_KEY, fast_forward.encode()?);
+        batch.put_cf(local, REWIND_KEY, rewind.encode()?);
+        self.db.write_opt(batch, &sync_options())?;
+        if self.db.latest_sequence_number() == UNACCOUNTED_LOCAL_SEQUENCE {
+            return Err(invalid(
+                "the converted store is at the very sequence its unknown cursor names: it would read as accounted",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Fsync the WAL, flush every family (the WAL that carried the
+    /// conversion becomes obsolete and is deleted), and close the store.
+    pub fn close(self) -> Result<()> {
+        self.db.flush_wal(true)?;
+        let default = self
+            .db
+            .cf_handle(rocksdb::DEFAULT_COLUMN_FAMILY_NAME)
+            .ok_or_else(|| invalid("the store was opened without its default column family handle"))?;
+        self.db.flush_cf(default)?;
+        if let Some(local) = self.db.cf_handle(LOCAL_CF) {
+            self.db.flush_cf(local)?;
+        }
+        drop(self.db);
+        Ok(())
+    }
+}
+
+/// Spec R3a: the rewind record of the store at `path`, read without a lock
+/// (every family opened read-only, RocksDB's `LOG` kept out of the
+/// directory) — `None` when the directory holds no store, no node-local
+/// family, or no record. What `recover --from-primary` classifies an
+/// interrupted rewind by, whichever of the directory's files its conversion
+/// had already removed or written.
+pub fn directory_rewind_record(path: &Path) -> Result<Option<RewindRecord>> {
+    match std::fs::symlink_metadata(path.join("CURRENT")) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(invalid(format!("{}: {error}", path.display()))),
+    }
+    // A directory whose column families cannot be listed (no MANIFEST, a
+    // damaged one, a 4.41.x logical standby's) holds no rewind record this
+    // read could see: it is classified, and refused, by whoever opens it.
+    let Ok(families) = DB::list_cf(&Options::default(), path) else {
+        return Ok(None);
+    };
+    if !families.iter().any(|family| family == LOCAL_CF) {
+        return Ok(None);
+    }
+    let log = tempfile::Builder::new()
+        .prefix("nano-rewind-read-")
+        .tempdir()
+        .map_err(|error| invalid(format!("a temporary directory for the read-only open's log: {error}")))?;
+    let mut options = Options::default();
+    options.set_db_log_dir(log.path());
+    let db = DB::open_cf_for_read_only(&options, path, families, false)?;
+    let record = {
+        let local = local_family(&db)?;
+        db.get_cf(local, REWIND_KEY)?
+            .map(|bytes| RewindRecord::decode(&bytes))
+            .transpose()
+    };
+    drop(db);
+    drop(log);
+    record
 }
 
 // ---------------------------------------------------------------------------
@@ -3301,6 +3637,197 @@ mod tests {
             resumed.writer().db().latest_sequence_number(),
             resumed.cursor().local_sequence()
         );
+    }
+
+    // --- spec R3a: the rewind of a former primary (Sprinter 1c8963417a35) ---
+
+    fn fence_copy(history: Uuid) -> crate::storage::replication_records::FencedRecord {
+        crate::storage::replication_records::FencedRecord {
+            format: 1,
+            history,
+            epoch: 1,
+            fenced_by_epoch: 2,
+            fenced_at: 1_761_000_000,
+            by_node: Uuid::new_v4(),
+            final_sequence: 9,
+        }
+    }
+
+    fn rewind_record(history: Uuid) -> RewindRecord {
+        RewindRecord {
+            format: FORMAT,
+            history,
+            from_epoch: 1,
+            to_epoch: 2,
+            started_at: 1_761_000_000,
+            primary_sequence: 42,
+            snapshot_id: Uuid::new_v4(),
+            primary: "127.0.0.1:5440".into(),
+            fence: Some(fence_copy(history)),
+        }
+    }
+
+    /// Spec R3a: a rewind record round-trips (the fence copy included) and
+    /// refuses what cannot be one.
+    #[test]
+    fn a_rewind_record_round_trips_and_refuses_what_cannot_be_one() {
+        let history = Uuid::new_v4();
+        let record = rewind_record(history);
+        assert_eq!(RewindRecord::decode(&record.encode().unwrap()).unwrap(), record);
+        let unfenced = RewindRecord {
+            fence: None,
+            ..record.clone()
+        };
+        assert_eq!(RewindRecord::decode(&unfenced.encode().unwrap()).unwrap(), unfenced);
+        for broken in [
+            RewindRecord {
+                history: Uuid::nil(),
+                ..record.clone()
+            },
+            RewindRecord {
+                snapshot_id: Uuid::nil(),
+                ..record.clone()
+            },
+            RewindRecord {
+                from_epoch: 0,
+                ..record.clone()
+            },
+            RewindRecord {
+                to_epoch: 1,
+                ..record.clone()
+            },
+            RewindRecord {
+                primary: "h".repeat(600),
+                ..record.clone()
+            },
+            RewindRecord {
+                fence: Some(fence_copy(Uuid::new_v4())),
+                ..record.clone()
+            },
+        ] {
+            assert!(broken.encode().is_err(), "{broken:?}");
+        }
+        assert!(RewindRecord::decode(b"{\"format\":1}").is_err());
+        assert!(RewindRecord::decode(&vec![b' '; MAX_REWIND_RECORD_BYTES + 1]).is_err());
+    }
+
+    /// Spec R3a: a primary's store is converted in place by ONE write of the
+    /// node-local family — its default family untouched — into a stage every
+    /// open that adopts a cursor refuses (as an interrupted fast-forward,
+    /// from no position), that the fast-forward's writer opens at an unknown,
+    /// unaccounted position, and whose re-cut removes the rewind's record,
+    /// keeps a copy of it, and leaves a stage an ordinary writer adopts.
+    #[test]
+    fn a_primarys_store_is_converted_in_place_into_a_stage_only_the_fast_forward_finishes() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("primary");
+        {
+            let db = open(&path);
+            for index in 0..20_u32 {
+                db.put(format!("data:t:{index}"), b"row").unwrap();
+            }
+        }
+        let history = Uuid::new_v4();
+        assert_eq!(
+            directory_rewind_record(&path).unwrap(),
+            None,
+            "a primary's store holds none"
+        );
+        let mut writer = RewindWriter::open(&path, &Config::default(), history).unwrap();
+        assert_eq!(writer.state().unwrap(), RewindStoreState::Primary);
+        let before = range_digest(writer.db(), None, b"").unwrap();
+        let rewind = RewindRecord {
+            fence: None,
+            ..rewind_record(history)
+        };
+        let cut = 500;
+        let record = FastForwardRecord::new(history, rewind.snapshot_id, 0, cut, 64 * 1024);
+        let positioned = FastForwardRecord::new(history, rewind.snapshot_id, 3, cut, 64 * 1024);
+        assert!(
+            writer.convert(&positioned, &rewind).is_err(),
+            "a rewind's fast-forward starts from no position"
+        );
+        assert_eq!(writer.state().unwrap(), RewindStoreState::Primary, "nothing written");
+        writer.convert(&record, &rewind).unwrap();
+        assert_eq!(writer.state().unwrap(), RewindStoreState::Rewinding(rewind.clone()));
+        writer.convert(&record, &rewind).unwrap();
+        let another = RewindRecord {
+            started_at: 7,
+            ..rewind.clone()
+        };
+        assert!(writer.convert(&record, &another).is_err(), "another rewind's store");
+        assert_eq!(
+            range_digest(writer.db(), None, b"").unwrap(),
+            before,
+            "the default family is the former primary's, untouched"
+        );
+        assert!(writer.latest_sequence() > UNACCOUNTED_LOCAL_SEQUENCE);
+        writer.close().unwrap();
+        assert_eq!(directory_rewind_record(&path).unwrap(), Some(rewind.clone()));
+
+        // Every open that adopts a cursor refuses it, as an interrupted
+        // fast-forward from no position.
+        match StagedPhysicalReplica::resume(open_receiver(&path), history) {
+            Err(PhysicalError::FastForwardInterrupted { from, to }) => assert_eq!((from, to), (0, cut)),
+            Err(other) => panic!("not the fast-forward refusal: {other}"),
+            Ok(_) => panic!("a rewinding store was resumed"),
+        }
+        // The fast-forward's writer opens it at an unknown position.
+        let writer = FastForwardWriter::open(&path, &Config::default(), history).unwrap();
+        assert_eq!(writer.cursor().source_sequence(), 0);
+        assert!(!writer.accounted(), "the cursor accounts for nothing");
+        assert_eq!(writer.record().unwrap(), Some(record));
+        assert_eq!(writer.rewind_record().unwrap(), Some(rewind.clone()));
+        let cursor = writer.recut(cut, rewind.snapshot_id).unwrap();
+        assert_eq!((cursor.snapshot_sequence(), cursor.source_sequence()), (cut, cut));
+        assert_eq!(writer.db().latest_sequence_number(), cursor.local_sequence());
+        assert!(writer.rewind_record().unwrap().is_none(), "the re-cut removed it");
+        assert!(writer.record().unwrap().is_none());
+        let local = writer.db().cf_handle(LOCAL_CF).unwrap();
+        let kept = writer.db().get_cf(local, REWOUND_KEY).unwrap().unwrap();
+        assert_eq!(
+            RewindRecord::decode(&kept).unwrap(),
+            rewind,
+            "a copy is kept for diagnosis"
+        );
+        assert_eq!(writer.close().unwrap(), cursor);
+        assert_eq!(directory_rewind_record(&path).unwrap(), None);
+        let resumed = StagedPhysicalReplica::resume(open_receiver(&path), history).unwrap();
+        assert_eq!(resumed.cursor(), cursor);
+    }
+
+    /// Spec R3a: a node-local family that holds anything but a rewind's
+    /// record is no conversion of the rewind's writer, and is refused; an
+    /// EMPTY one (a conversion stopped after creating it) is taken up.
+    #[test]
+    fn a_node_local_family_of_another_kind_refuses_a_rewind_and_an_empty_one_is_taken_up() {
+        let root = TempDir::new().unwrap();
+        let history = Uuid::new_v4();
+        let rewind = rewind_record(history);
+        let record = FastForwardRecord::new(history, rewind.snapshot_id, 0, 9, 64 * 1024);
+        for (name, holds_a_key) in [("foreign", true), ("empty", false)] {
+            let path = root.path().join(name);
+            {
+                let mut options = Options::default();
+                options.create_if_missing(true);
+                options.create_missing_column_families(true);
+                let db = DB::open_cf(&options, &path, ["default", LOCAL_CF]).unwrap();
+                db.put(b"data:t:1", b"row").unwrap();
+                if holds_a_key {
+                    db.put_cf(db.cf_handle(LOCAL_CF).unwrap(), CURSOR_KEY, b"{}").unwrap();
+                }
+            }
+            let mut writer = RewindWriter::open(&path, &Config::default(), history).unwrap();
+            if holds_a_key {
+                assert!(writer.state().is_err(), "{name}");
+                assert!(writer.convert(&record, &rewind).is_err(), "{name}");
+            } else {
+                assert_eq!(writer.state().unwrap(), RewindStoreState::Created);
+                writer.convert(&record, &rewind).unwrap();
+                assert_eq!(writer.state().unwrap(), RewindStoreState::Rewinding(rewind.clone()));
+            }
+            writer.close().unwrap();
+        }
     }
 
     // --- spec P4.1c: write groups of any size --------------------------------

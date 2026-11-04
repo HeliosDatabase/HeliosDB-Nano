@@ -107,9 +107,15 @@ fn switchover_refuses_and_changes_nothing() {
 
     let err = refusal.expect_err("SWITCHOVER must be refused, not reported as initiated");
     let message = err.to_string();
+    // Spec R3b: SWITCHOVER is answered by the server's PostgreSQL session on
+    // the primary (`tests/physical_switchover.rs` runs it); the embedded API
+    // refuses it, changing nothing, and names the form that works.
     assert!(
-        message.contains("unsupported") && message.contains("fencing") && message.contains("no role was changed"),
-        "refusal must be an actionable sentence naming unsupported, fencing and no role change, got: {message}"
+        message.contains("answered by the server's PostgreSQL session on the primary")
+            && message.contains("fencing")
+            && message.contains("no role was changed"),
+        "refusal must be an actionable sentence naming the server session, fencing and no role change, got: \
+         {message}"
     );
     // Spec P5.1 §7, P5.2 §5 (8): the refusal points at both forms of the
     // promotion asked of the TARGET — online (`pg_promote` on the running
@@ -176,8 +182,8 @@ fn switchover_refuses_and_changes_nothing() {
     match check_row.get(6) {
         Some(Value::String(blockers)) => {
             assert!(
-                blockers.contains("Runtime switchover/promotion is unsupported"),
-                "blockers must name the unsupported runtime, got: {blockers}"
+                blockers.contains("is answered by the server's PostgreSQL session on the primary"),
+                "blockers must name where SWITCHOVER CHECK is answered, got: {blockers}"
             );
             // Spec P5.1 §7, P5.2: both forms.
             assert!(

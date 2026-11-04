@@ -87,7 +87,7 @@ pub fn interrupted_promotion_refusal(dir: &Path) -> String {
 pub fn fenced_rebuild_hint(dir: &Path) -> String {
     format!(
         "rebuild it as a standby: `heliosdb-nano recover --from-primary --primary-host <the new primary's \
-         replication port> --replace --data-dir {}`",
+         replication port> --replace --data-dir {} --then stop`, then start it as that primary's standby",
         dir.display()
     )
 }
