@@ -57,10 +57,14 @@ downloads the copy again from the beginning.
 ## Startup budget
 
 `[replication] startup_timeout_secs` (default 30, range 1 through 3600) bounds
-how long a standby's listeners wait for it to stream, including DNS. When it runs
-out, the listeners open anyway and the posture decides what they serve: probes
-and status answer, data reads are refused with `55000` until the standby is
-ready. Explicit `--replication-startup-timeout-secs` overrides the file value;
+how long a standby waits for it to stream, including DNS, before it starts
+serving. Until then its PostgreSQL TCP port is bound and connections queue in
+its backlog, unanswered; its PostgreSQL Unix socket and a cascading standby's
+replication port are not open. When the budget runs out they are served anyway
+and the posture decides what they serve: probes and status answer, data reads
+are refused with `55000` until the standby is ready. The HTTP `/health` and
+`/ready` endpoint does not wait: it answers from the start (`/ready` 503 until
+the standby is ready). Explicit `--replication-startup-timeout-secs` overrides the file value;
 the file overrides the default. A daemon standby's parent allows this budget plus
 its usual 5-second startup allowance, and the resolved value is passed to the
 daemon child.

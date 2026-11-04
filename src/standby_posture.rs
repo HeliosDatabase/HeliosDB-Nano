@@ -536,6 +536,23 @@ impl PostureTracker {
         });
     }
 
+    /// The store is about to close (spec P5.2 §3 step 6): from now on no
+    /// snapshot reads it, and once this returns none holds a strong handle to
+    /// it, so a request reading the posture cannot end up running the close
+    /// (sprinter ffe805264aac). The posture keeps what it last read.
+    pub fn release_live_readers(&self) {
+        let last = self.snapshot();
+        self.tx.send_if_modified(|snapshot| {
+            let before = (snapshot.cursor, snapshot.epoch, snapshot.previous_epoch);
+            snapshot.cursor = last.cursor;
+            snapshot.epoch = last.epoch;
+            snapshot.previous_epoch = last.previous_epoch;
+            (snapshot.cursor, snapshot.epoch, snapshot.previous_epoch) != before
+        });
+        *self.live.write() = None;
+        *self.live_epoch.write() = None;
+    }
+
     /// Spec P5.2 §3 step 8: the store was released by an online promotion
     /// that then aborted; the standby reopens it. Not ready (no store) until
     /// it is attached again ([`Self::attach_store`]).
@@ -1620,6 +1637,30 @@ mod tests {
             ),
             "{message}"
         );
+    }
+
+    /// Sprinter ffe805264aac: the store's readers are gone, and the posture
+    /// keeps what they last read.
+    #[test]
+    fn released_live_readers_are_not_called_and_their_values_stay() {
+        let posture = tracker();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        posture.attach_store(
+            4,
+            Arc::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(6)
+            }),
+        );
+        posture.attach_epoch(Arc::new(|| Some((3, 2))));
+        posture.release_live_readers();
+        let read_before = reads.load(std::sync::atomic::Ordering::SeqCst);
+        let snapshot = posture.snapshot();
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), read_before);
+        assert_eq!(snapshot.cursor, 6, "the last live cursor is kept");
+        assert_eq!((snapshot.epoch, snapshot.previous_epoch), (3, 2));
+        assert!(snapshot.store_attached, "the posture itself is not changed");
     }
 
     /// Field finding: a reconnecting standby reported `primary 0/C97` — the

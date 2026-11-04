@@ -18,7 +18,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use heliosdb_nano::EmbeddedDatabase;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpStream;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -35,10 +35,14 @@ const SETTLE: Duration = Duration::from_secs(1);
 /// Rows seeded before the server starts.
 const SEEDED_ROWS: i32 = 10;
 
-/// Reserve a free localhost port by binding and immediately releasing it.
+#[path = "support/ports.rs"]
+mod ports;
+
+/// A loopback port RESERVED for the life of the test process (sprinter
+/// ffe805264aac, `support/ports.rs`): a port bound and released at once could
+/// be taken by a concurrent test before the daemon binds it.
 fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    ports::free_port()
 }
 
 fn count_rows(db: &EmbeddedDatabase, sql: &str) -> i64 {

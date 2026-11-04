@@ -180,8 +180,8 @@ async fn wait_ready_body(
         }
         assert!(
             Instant::now() < deadline,
-            "/ready never answered as wanted; last {seen:?}; log tail: {}",
-            daemon.tail(12)
+            "/ready never answered as wanted; last {seen:?}{}",
+            daemon.diagnose(port)
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

@@ -39,8 +39,20 @@ real PostgreSQL wire and HTTP:
 | `physical_standby_serving` | bootstrap into a new directory; `/ready` 200 and the standby serving exactly the primary's rows; the PostgreSQL-wire contract (`heliosdb_require_ready()`, `pg_is_in_recovery()`, both LSN functions, `pg_control_checkpoint()`, `heliosdb_standby_status`, `in_hot_standby`); writes and `nextval` refused with `25006`; SIGKILL of the primary (the standby stays up, ready within `max_standby_lag`, then `55000`) and of the standby (restart resumes from its cursor, no second copy); a 4.41.x logical standby directory refused; `on_unrecoverable = "exit"` |
 | `physical_standby_sync` | `sync`: an INSERT blocks while the standby is stopped (SIGSTOP) and returns once it runs (SIGCONT); `semi-sync` with `min_acks = 2` and one standby, under `warn` (commits with a WARN) and `fail` (the client gets "synchronous replication not confirmed", the row is durable on the primary); 15 s of heartbeat-only traffic never moves the primary's recorded sequences back; the primary's `/health` lists the standby with advancing positions |
 | `physical_standby_refusals` | `HistoryMismatch`, `WalPruned` (small retention), `AuthFailed` (wrong token), and an `NPHYS001` or `NPHYS002` client answered `Refuse { Version }`; in every case the standby stays up, `/ready` answers 503 with `needs_recovery`, and `heliosdb_require_ready()` refuses with `55000` naming the reason |
-| `ha_integration` | start order (a standby started before its primary waits, then bootstraps); SIGKILL and restart of the primary, stop and restart of the standby, then both; sync and semi-sync commits readable on the standby at once; lag on the primary's `/health` |
+| `ha_integration` | start order (a standby started before its primary waits, then bootstraps); SIGKILL and restart of the primary, stop and restart of the standby, then both; sync and semi-sync commits readable on the standby at once; lag on the primary's `/health`; a SIGTERM between a standby's readiness gate and its main loop shuts it down cleanly (`internal-tests`); an HTTP port that is also the cascading port costs only the HTTP endpoint |
 | `replication_restart_gap` | no silent gap: rows committed while the standby was down arrive after its restart; a standby that joins after the data and DDL exist |
+
+On Linux, ports come from the harness's `free_port()`, which keeps each one
+reserved for the life of the test process: a socket bound with `SO_REUSEADDR`
+that never listens, which the daemon binds over and no other `bind(…:0)` can be
+given (`tests/support/ports.rs`). A port that was bound and released at once
+could be taken by a parallel test before the daemon bound it, leaving the daemon
+without its HTTP endpoint; other platforms still bind and release. A wait on a daemon's HTTP endpoint that runs out
+says how its probes ended (refused, hung, another status, unreadable) and adds
+the daemon's readiness diagnostics: its process and thread states, which
+process holds the port, a `gdb` stack dump when `gdb` is installed, and its
+log; copies of the log and the dump are kept under
+`target/tmp/readiness-diagnostics/`.
 
 Related targets:
 
