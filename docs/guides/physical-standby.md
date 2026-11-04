@@ -83,7 +83,8 @@ ships. "P3", "P4" and "P5" are phases of the physical standby plan.
 | Incarnation, `RESETLOGS` | The dataset **history id** (`NANO-PRIMARY-HISTORY.json`, kept across promotions) plus the **epoch** (`repl:epoch` in the dataset, `pg_control_checkpoint().timeline_id`; 1 until the first promotion, one more per promotion) — see [Promotion and the epoch](#promotion-and-the-epoch) |
 | Protection modes | `[replication] sync_mode`: `async` is Maximum Performance; `semi-sync` with `sync_timeout_action = "warn"` behaves like Maximum Availability. Maximum Protection has no equivalent (`fail` reports an error but never stops the primary) |
 | `NET_TIMEOUT` | `[replication] sync_timeout_ms` |
-| `SWITCHOVER TO` (graceful) | `heliosdb-nano promote --data-dir DIR` on the stopped standby: the old primary is fenced first and nothing it committed is lost (the SQL `SWITCHOVER` statement stays refused) |
+| `SWITCHOVER TO` (graceful, both roles in one command) | `SWITCHOVER TO '<standby>'` on the PRIMARY's PostgreSQL port: the standby is promoted online (it fences the primary first: nothing it committed is lost) and the old primary is demoted in-process into its standby — see [SWITCHOVER](#switchover-both-roles-in-one-command). Offline: `heliosdb-nano promote --data-dir DIR` on the stopped standby, then `recover --from-primary` on the old primary |
+| `REINSTATE DATABASE` (flashback the old primary into a standby) | `heliosdb-nano recover --from-primary --data-dir OLD_PRIMARY --primary-host NEW_PRIMARY`: the old primary's directory is **rewound** in place by fast-forward — only what diverged after the promotion travels (see [Rewinding a former primary](#rewinding-a-former-primary)) |
 | `FAILOVER TO` (old primary lost) | `heliosdb-nano promote --data-dir DIR --force`: promotes even when the old primary cannot be fenced (it is fenced all the same if it answers); writes it committed past the standby are lost |
 | Fast-start failover, observer | None: promotion is the operator's (or the orchestration's) decision |
 | `V$DATAGUARD_STATS`, `V$MANAGED_STANDBY` | `/health`, `/ready`, the `heliosdb_standby_status` view; on a primary, the `standbys` list of `/health` and the `pg_replication_standbys` view |
@@ -762,10 +763,12 @@ heliosdb-nano recover --data-dir /var/lib/heliosdb/standby --from-archive /srv/r
   directories` — and exits **2** (everything before the gap is applied).
 - **`--then primary|stop`.** With `--then primary` (the default when
   `--primary-host` is given) the standby goes on to follow its primary from the
-  new cursor, exactly as `start --replication-role standby` would; arguments
-  after `--` are passed to `start` (its ports, token file, TLS). The primary may
-  still hold a range the segments lacked. `--then stop` (the default otherwise)
-  exits 0.
+  new cursor, exactly as `start --replication-role standby` would, in this
+  process; arguments after `--` are passed to `start` (its ports), and the
+  replication token file, transfer limits and TLS flags given to `recover`
+  itself are handed on unless those arguments set them. The primary may still
+  hold a range the segments lacked. `--then stop` (the default otherwise) exits
+  0: use it under a service manager, which then starts the node.
 
 | Exit code | Meaning |
 |---|---|
@@ -976,6 +979,75 @@ recovered the same way, with `recover --from-primary` against it.
 | 2 | (`--from-archive` only) applied up to an archive gap; also clap's exit code for a usage error |
 | 3 | a full copy is needed but was not applied: `--no-full-copy`, or the data directory is occupied and `--replace` was not given (the completed copy waits beside it) |
 
+### Rewinding a former primary
+
+Oracle's `REINSTATE DATABASE`, PostgreSQL's `pg_rewind`. A primary a standby
+was promoted over — fenced by the promotion, or not (a forced promotion while
+it was cut off) — holds the dataset's history byte for byte up to the
+promotion point; only what diverged after it differs. `recover --from-primary`
+on its STOPPED directory, against the primary promoted over it (the same
+dataset history, a higher epoch), rewinds it in place into that primary's
+standby:
+
+```bash
+heliosdb-nano recover --data-dir /var/lib/heliosdb/old-primary --from-primary \
+  --primary-host 10.0.0.6:5433 --replication-token-file /etc/heliosdb/replication.token \
+  --then stop
+```
+
+```
+recover: /var/lib/heliosdb/old-primary is a fenced primary's directory (NANO-FENCED.json): a standby was promoted over it, at epoch 1; the primary at 10.0.0.6:5433 is at epoch 2: it is REWOUND in place into a standby of that primary — only what differs is shipped
+recover: fast-forward from the primary at 10.0.0.6:5433 (cut 52 114, 4 MiB leaves)
+recover: 256 leaves, 1 017 MiB; 3 differ (0.9%), 9 MiB to ship
+recover: converted /var/lib/heliosdb/old-primary in place into a physical stage of history 6f1c… (from epoch 1, at its own sequence 51 990): the primary-only files are removed; the fence record is kept in the rewind's record
+recover: leaves 0..255 applied (3 of 3, 9 MiB of 9 MiB)
+recover: rewound the former primary (epoch 1 → 2; it was fenced by epoch 2 at its sequence 51 990; …): the primary was promoted after fencing it at its sequence 51 990, so nothing it committed is lost — it is all in the primary
+recover: rewound the former primary into a standby at sequence 52 114 of the primary (epoch 1 → 2, from its own sequence 51 990; 3 of 256 leaves replaced, 9 MiB shipped, 0.9% of 1 017 MiB; 4.1 s)
+```
+
+What it does, in this order:
+
+1. **Decides on the directory as it is.** The fast-forward's plan (the
+   primary's leaves at a fresh cut `T`) and the digest pass over the former
+   primary's store are made before anything changes: a divergence above
+   `--full-copy-threshold`, an entry nobody accounts for (a directory, a
+   symbolic link), a file hard-linked from outside this node's own leftover
+   export checkpoints, or a store that does not open fall through to the full
+   copy with nothing changed — beside the directory, swapped in with
+   `--replace` (exit 3 without it), exactly as for a standby. A user's regular
+   files beside the store (a `heliosdb-nano.toml`, a `server.key` — what the
+   engine tolerates in a data directory) are kept where they are: a standby's
+   stage keeps them too and never counts them (its manifest, its limits, its
+   open's file check).
+2. **Converts it in place**, in one synced write of the node-local family: a
+   cursor at an unknown position (nothing ever tails from it), the
+   fast-forward's record and the rewind's own record (its epoch, its own last
+   sequence, a copy of `NANO-FENCED.json`). From that write on the engine
+   refuses the directory in every mode but the standby's, and every `start`
+   refuses it naming this command. Then the primary-only files go: its
+   history and fence records, RocksDB's archived WAL (`archive/`), the HNSW
+   dump cache (`hnsw_snapshots/`), an empty `lockfree_wal/`, RocksDB's
+   temporaries, and this node's own leftover export checkpoints that
+   hard-link its files (beside it, in `<data dir>.physical-export`); and an
+   interim physical marker is written.
+3. **Fast-forwards** the leaves that differ and **re-cuts** the stage at `T`,
+   as for a standby; the re-cut removes the rewind's record and keeps a copy
+   of it (`rewound`, node-local) for diagnosis.
+
+The logical WAL needs no step of its own: its keys are part of the replicated
+keyspace, so the old primary's own entries after the promotion are leaves that
+differ, replaced by the new primary's. A source of another dataset history is
+refused (a primary's directory is never replaced by another dataset), and so
+is a source at the directory's own epoch (it was not promoted over it) or a
+lower one (the source is the superseded node). `--full` (with `--replace`)
+rebuilds the directory by a full copy instead.
+
+A rewind killed at any point is finished by running the same command again,
+whichever step it stopped at (the store's rewind record classifies the
+directory). The former primary's own WAL archive keeps its epoch's segments,
+including any it archived after the promotion point when it was not fenced;
+they are not part of the new primary's history.
+
 ## Verifying a standby: `standby verify`
 
 The byte-identity audit of the plan ("Verification" §3): prove that a STOPPED
@@ -1055,7 +1127,8 @@ epoch says which incarnation of the history a node is at).
 | Incarnation | Timeline (`timeline_id`) | Epoch: `repl:epoch` in the dataset, `pg_control_checkpoint().timeline_id`, `epoch` of `/health` and `heliosdb_standby_status`, `heliosdb-nano status --data-dir DIR` |
 | `SWITCHOVER TO` | `pg_promote(true, N)` with the old primary reachable | `SELECT pg_promote(true, N)` on the running standby, or `promote --data-dir DIR` on a stopped one (the old primary is fenced first) |
 | `FAILOVER TO` | `pg_promote()` with the old primary lost | `SELECT pg_promote(true, N)` with `[replication] promote_without_fence = "allow"` (the default), or `promote --data-dir DIR --force` (`--no-fence` for a rehearsal on a cloned directory) |
-| Reinstate the old primary | `pg_rewind` | `recover --from-primary --replace` on its directory (a full copy; rewinding in place is a follow-up) |
+| Reinstate the old primary | `pg_rewind` | `recover --from-primary` on its directory: rewound in place by fast-forward (`--full --replace` for a full copy instead) |
+| `SWITCHOVER TO` | `pg_promote(true, N)` on the standby, then `pg_rewind` and a restart of the old primary | `SWITCHOVER TO '<standby>'` on the primary: both, in one command, in-process |
 | — | `pg_promote(wait, seconds)` | `SELECT pg_promote(wait, wait_seconds)` on the running standby's PostgreSQL port |
 
 ### Online: `SELECT pg_promote(wait, wait_seconds)`
@@ -1219,6 +1292,151 @@ failover (Proxy promotes precisely when the primary is gone; stopping a
 partitioned old primary stays the operator's STONITH), or set `"refuse"` when
 only planned switchovers may promote. Proxy routes writes to the node with the
 strictly highest `timeline_id`.
+
+### SWITCHOVER: both roles in one command
+
+Oracle Data Guard's `SWITCHOVER`, run on the PRIMARY's PostgreSQL port, by a
+superuser session (the built-in `postgres` / `helios` roles, or a role created
+`SUPERUSER`; SQLSTATE 42501 otherwise — under `trust` authentication a
+session's role is the name its client sent, so only a password, md5 or
+scram-sha-256 listener makes this a boundary):
+
+```sql
+-- on the primary
+SWITCHOVER CHECK TO '3f2a…';   -- the preflight only: one row per check, nothing changes
+SWITCHOVER TO '3f2a…';         -- the standby becomes the primary, this primary its standby
+```
+
+The target is a standby of this primary, named by its node id or its
+replication address as the primary's `/health` `standbys` list shows them, or
+by its alias. `SWITCHOVER CHECK TO` answers `check`, `ok`, `detail` for EVERY
+check, in this order, whatever failed (a check that could not be made because
+one before it failed is listed, failed, `not checked: …`):
+
+| check | passes when |
+|---|---|
+| `primary` | this node is a primary, not fenced, no switchover under way |
+| `demotable` | a persistent store and a replication port; no MySQL listener and no `--dump-on-shutdown` (a standby serves neither) |
+| `rewind` | this node's directory could be rewound in place once its store is released — the rewind's own census, read-only. Refused: a directory nobody accounts for, a symbolic link, a non-empty `lockfree_wal/`, a store file hard-linked from outside this node's own export checkpoints (a `cp -al` / `rsync --link-dest` backup), a regular file under a RocksDB name (by the engine's own list: `METADB-*`, `archive` …) or a primary-local one. A user's regular files beside the store (a `heliosdb-nano.toml`, a `server.key`) are kept and never block it |
+| `target` | exactly one registered standby has that name |
+| `streaming` | it streams within `[replication] max_standby_lag` |
+| `online promotion` | its session offers it (`CAP_PROMOTE`) |
+| `target preflight` | the standby's own promotion preflight passes — asked over its session in the check form, which changes nothing there (its replication port is bound and closed at once, no promotion identity is kept) |
+| `follow` | this node, demoted, can follow the address the target will serve its replication port on: it resolves, the transport is allowed, and a pair that replicated over TLS keeps doing so (this node needs `--primary-tls` and `--primary-ca` for the new primary's certificate) |
+| `other standby` / `other standbys` | one row per OTHER standby of this primary — it keeps following a node that becomes a standby, so it is rebuilt against the new primary afterwards (`recover --from-primary --primary-host <new> --replace --then stop`, a fast-forward, then a `start` with `--replication-role standby --primary-host <new>`); or one row saying there is none |
+
+`SWITCHOVER TO` runs the same checks (a failure is 55000 naming it, nothing
+changed), then, on a task of its own (a caller that disconnects abandons
+nothing):
+
+1. asks the standby to promote itself over its live replication session (a
+   `PromoteRequest`, carrying the bound its answer must come within); a
+   refusal, or a request that never reached the standby, is 55000 with
+   nothing changed. A request the standby TOOK whose answer is lost (its
+   session ended, or the answer outlasted its bound) is never "nothing
+   changed": the standby may be promoting, and step 2 settles it;
+2. the standby runs its online promotion (as `SELECT pg_promote` would, but
+   never without the fence of this primary): it fences this primary (writes
+   refused, sessions ended with FATAL 57P01, the archive sealed through the
+   final sequence), catches up to that sequence, converts and serves as the
+   primary of the next epoch;
+3. this primary is demoted in-process: its sessions off the store, its
+   replication source and archiver stopped, its HTTP surface restarted
+   health-only (every HTTP connection closed with it — an idle keep-alive
+   client or a WebSocket holds the store otherwise), the store released,
+   rewound against the new primary (see [Rewinding a former primary](#rewinding-a-former-primary):
+   after a clean fence only what the new primary wrote since travels), and
+   reopened as a physical standby following it — `pg_is_in_recovery()` = `t`,
+   `in_hot_standby` = `on`, `/ready` by the standby rule;
+4. answers the caller one row (`new_primary`, `epoch`, `final_sequence`,
+   `this_node`, `other_standbys` — what to run for each, or `none`), then ends
+   its session with FATAL 57P01, like a promotion's.
+
+Each node's new role is recorded BESIDE its data directory,
+`<data dir>.role.toml` (mode 0600): `[replication] role`, for the standby
+`primary_host` and, when the pair replicated over TLS, `primary_tls`,
+`primary_tls_ca_path` and `primary_tls_server_name`; and `[directory]` — the
+dataset history, the epoch and the store's identity (RocksDB's `IDENTITY`) of
+the directory it was written for. `start` applies it over the configuration
+file (said at WARN), so a restart starts each node as what the switchover made
+it, with no `--replication-role` needed — and only to that directory:
+
+- a directory that is missing, empty or holds no store, or one rebuilt,
+  restored or recovered since (another history, epoch or identity), refuses
+  the start (exit 2) naming the file — an old node's role is never given to a
+  new directory;
+- a `--replication-role` or `--primary-host` on the command line that
+  contradicts it refuses the start, naming the file (never silently overridden
+  either way); one that agrees is accepted;
+- `promote`, `SELECT pg_promote` and `recover --from-primary` / `--from-archive`
+  rewrite an override they find (the role and binding they leave the
+  directory in).
+
+The record sits beside the directory the data path RESOLVES to (a
+`--data-dir` given through a symbolic link and given canonically name the same
+record). The configuration file itself is never edited; delete the override to
+go back to it. A second `SWITCHOVER TO` from the new primary swaps the roles
+back (each switchover raises the epoch).
+
+**Supervisors (systemd and the like).** A unit whose `ExecStart` passes
+`--replication-role` (or `--primary-host`) is refused after a switchover that
+changed the node's role (exit 2, naming the record) — never silently started in
+the role the unit says. Give the role in the configuration file instead
+(`[replication] role`, `primary_host`; the record applies over it), or drop
+those two flags from `ExecStart` so the record supplies them: the same unit
+then restarts either node in whatever role the last switchover left it. A
+`--daemon` start resolves the record once and hands its child the role it
+resolved, which agrees with it. `recover` follows over the TLS the record
+names (`primary_tls`, its CA and server name) unless its command line names
+its own.
+
+Failure handling, never two writable primaries:
+
+- before the standby took the request: nothing changed (55000 naming the
+  check, or the standby's refusal);
+- the standby took it but never fenced this primary (its promotion refused or
+  aborted, or never started): this node is still the primary, said so; if the
+  standby fences it later it stays fenced. Until that late fence can no longer
+  come (the promotion's deadline and the fence's own bound) the switchover's
+  slot stays closed — `SWITCHOVER` and `SWITCHOVER CHECK` say until when — so
+  a retry to another standby never takes the first one's late fence for its
+  own. A switchover accepts only ITS promotion's fence: the answer names the
+  promotion's identity, and a fence by any other (even of the same epoch) ends
+  the switchover with this node fenced, naming the primary to recover from;
+- fenced, but the new primary does not come up, or the demotion stops before
+  the directory changed (sessions, services or the store not released in
+  time, or a rewind that stopped before its conversion's one write — its store
+  is reopened, fenced): this node stays the FENCED primary, up, serving reads
+  (its full HTTP surface back); the error (and the log, at ERROR) names, with
+  the token file and the pair's TLS flags,
+  `heliosdb-nano recover --from-primary --data-dir D --primary-host NEW --replace --then stop`,
+  then `heliosdb-nano start --data-dir D --replication-role standby --primary-host NEW`
+  to run through the node's service manager, with its usual ports. The named
+  `recover` finishes the switchover whatever its plan picks: the rewind in
+  place, or — when most of the store differs (a small store, a long divergence)
+  — a full copy, which `--replace` swaps in, moving the old directory aside to
+  `D.replaced-<UTC>` (never deleted). `--then stop` is why it is copied safely:
+  by default `recover` goes on to run the node in its own process, which from
+  an operator's shell would be a server on default ports, outside the service
+  manager;
+- the rewind fails after it converted the directory (anything of the
+  conversion shows — its record, the node-local family it creates first, a
+  removed primary record): the process exits with code 2; every start refuses
+  the directory naming the `recover` that finishes it. A rewind that stops
+  before any of that reopens the store fenced (RocksDB's WAL archive kept: the
+  rewind opens the store with the primary's own options until its conversion
+  is committed);
+- a shutdown signal (SIGTERM) while the node is being demoted waits for the
+  demotion to end, at most 300 s; one that has to cut it short says so at
+  ERROR, naming the `recover` that finishes it, and the process exits non-zero.
+
+Every command these messages print carries what reaches the new primary: the
+replication token file and, for a pair that replicated over TLS,
+`--primary-tls`, `--primary-ca` (and the client certificate and server name
+when configured).
+
+Every wait is bounded (the standby's answer — by the bound the request
+carries — the fence, the new primary serving, each demotion step).
 
 ### Offline: what `heliosdb-nano promote` does
 
@@ -1533,16 +1751,26 @@ The test suites are listed in the [HA testing guide](ha_testing.md).
   (`recover --from-primary --full --replace`).
 - **Promotion is asked of the standby.** `SELECT pg_promote(true, N)` promotes
   a RUNNING standby, `heliosdb-nano promote` a STOPPED one (see [Promotion and
-  the epoch](#promotion-and-the-epoch)); the SQL `SWITCHOVER` statement on the
-  primary stays refused. A standby's data directory is otherwise never opened
+  the epoch](#promotion-and-the-epoch)); `SWITCHOVER TO` on the primary asks
+  it of the standby over the replication session. A standby's data directory is otherwise never opened
   as a primary or standalone database. Writes are never routed through a
   standby: connect to the primary to write. Nano does not decide to fail over
   by itself: a promotion is asked (by an operator, or by HeliosDB Proxy's
   `[auto_promote]`), and fencing an unreachable old primary (STONITH) is the
   operator's job. An archive-only standby is promoted offline only.
-- **A fenced primary is rebuilt, not rewound.** Rejoining a fenced (or dead)
-  old primary as a standby is a full copy of the new primary
-  (`recover --from-primary --replace`); rewinding it in place is a follow-up.
+- **A former primary is rewound, not copied.** `recover --from-primary` on a
+  fenced (or superseded) old primary's directory rewinds it in place by
+  fast-forward against the primary promoted over it; writes it committed
+  after the promotion point — only possible when it was not fenced — are
+  replaced (said as a WARNING). A full copy is taken only when the directory
+  cannot be rewound (`--replace` then swaps it in).
+- **`SWITCHOVER` is answered by the server's PostgreSQL session** on the
+  primary, over the simple query protocol (not the embedded API or a
+  prepared statement), for a superuser session (42501 otherwise; under `trust`
+  authentication the session's role is its client's claim). The primary must
+  have no MySQL listener and no `--dump-on-shutdown` (a standby serves
+  neither). The other standbys of the old primary are not re-pointed: each is
+  rebuilt against the new primary (`recover --from-primary`, a fast-forward).
 - **A standby promoted online serves health only over HTTP** until its next
   start (`/health`, `/ready`, `/version`); the REST/MCP surface is mounted at
   the start of a primary. `pg_terminate_backend(pid)` is not implemented yet.

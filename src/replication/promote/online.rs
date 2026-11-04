@@ -94,7 +94,7 @@ use crate::replication::fence::{ARCHIVE_SEAL_TIMEOUT, DRAIN_TIMEOUT};
 use crate::replication::history::{remove_record_in, write_new_record_in};
 use crate::replication::physical::{LocalBatch, FAST_FORWARD_KEY, LOCAL_CF};
 use crate::replication::physical_receiver::{FenceEvent, ReceiverCommand};
-use crate::replication::physical_wire::Fenced;
+use crate::replication::physical_wire::{Fenced, PromoteAnswer};
 use crate::standby_posture::{
     clear_promoting, format_unix_secs, note_promoting, promotion_termination_message, PromotionStatus,
 };
@@ -185,6 +185,24 @@ pub struct PromoteCall {
     pub wait_seconds: u64,
     pub backend_pid: i32,
     pub client: Option<String>,
+    /// Spec R3b (Sprinter bbba90ddfc61): the promotion was asked by the
+    /// primary this standby follows (`SWITCHOVER TO`), not by a client.
+    pub switchover: Option<SwitchoverOrigin>,
+}
+
+/// Spec R3b: the `SWITCHOVER TO` a promotion was asked by — the primary's
+/// `PromoteRequest`. Such a promotion is the epoch the primary named or none
+/// (`epoch` must be the store's + 1), never goes ahead without the fence of
+/// that primary (a switchover loses nothing: `promote_without_fence` does not
+/// apply), and once it serves as the primary its role is recorded beside its
+/// data directory (`replication::role_override`) so a restart starts it as
+/// the primary its configuration file does not say it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SwitchoverOrigin {
+    pub switchover: Uuid,
+    /// The primary that asked (its node id).
+    pub primary: Uuid,
+    pub epoch: u64,
 }
 
 impl PromoteCall {
@@ -245,6 +263,11 @@ pub struct Started {
     wait: bool,
     budget: Duration,
     to_epoch: u64,
+    /// Spec R3b: where its replication port listens once it serves as the
+    /// primary (the preflight's [`StandbyFacts::replication_endpoint`]).
+    pub replication_endpoint: Option<std::net::SocketAddr>,
+    /// Spec R3b: the promotion's identity, the `by_node` of its fence.
+    pub promotion: Uuid,
 }
 
 impl Started {
@@ -316,6 +339,10 @@ pub struct StandbyFacts {
     /// The placeholder's engine: its sessions are spared at step 2 and
     /// ended after the reopen.
     pub placeholder_engine: u64,
+    /// Spec R3b: the address its replication port listens on once it serves
+    /// as the primary (`None`: it would serve none) — where a primary that
+    /// switches over to it follows it.
+    pub replication_endpoint: Option<std::net::SocketAddr>,
 }
 
 /// How an aborted promotion gives the node back its standby.
@@ -373,6 +400,22 @@ pub trait StandbyHost: Send + Sync + 'static {
     async fn restore_standby(&self, restore: Restore, budget: Duration);
     /// The empty database the listeners serve while there is no store.
     fn placeholder(&self) -> Arc<EmbeddedDatabase>;
+    /// Spec R3b: undo what a preflight that is not followed by a promotion
+    /// holds (the replication listener it bound): a request refused after
+    /// its preflight. Nothing by default.
+    fn release_preflight(&self) {}
+    /// Spec R3b (review item 6c): `SWITCHOVER CHECK`'s remote preflight,
+    /// which changes NOTHING on this standby — the replication port it would
+    /// serve is bound and closed again at once (never kept), and the
+    /// promotion's identity is read but never created. By default the
+    /// preflight, released.
+    async fn check(&self) -> Result<StandbyFacts, Refusal> {
+        let facts = self.preflight().await;
+        if facts.is_ok() {
+            self.release_preflight();
+        }
+        facts
+    }
 }
 
 /// Spec P5.1 §11.C: the promotion's identity — a random UUID, created once
@@ -401,6 +444,21 @@ pub fn promotion_identity(engine: &StorageEngine) -> Result<Uuid, String> {
         .write_local(batch)
         .map_err(|error| format!("the promotion's identity cannot be kept: {error}"))?;
     Ok(node)
+}
+
+/// Spec R3b (review item 6c): the promotion's identity if the standby's
+/// store keeps one — read only, never created (`SWITCHOVER CHECK` changes
+/// nothing on the standby).
+pub fn kept_promotion_identity(engine: &StorageEngine) -> Result<Option<Uuid>, String> {
+    let store = engine.db();
+    let local = store
+        .cf_handle(LOCAL_CF)
+        .ok_or_else(|| "the standby's store has no node-local family".to_string())?;
+    Ok(store
+        .get_cf(local, PROMOTION_NODE_KEY)
+        .map_err(|error| format!("the node-local family cannot be read: {error}"))?
+        .and_then(|bytes| Uuid::from_slice(&bytes).ok())
+        .filter(|node| !node.is_nil()))
 }
 
 /// Spec P5.2 §2: whether the standby's store carries an interrupted
@@ -480,6 +538,107 @@ pub async fn request(call: PromoteCall) -> Result<Started, Refusal> {
     }
 }
 
+/// Spec R3b (Sprinter bbba90ddfc61): the primary this standby follows asks
+/// it to promote itself (`SWITCHOVER TO` on the primary; its `PromoteRequest`
+/// arrived on the replication session). A CHECK runs the promotion's
+/// preflight and undoes it (`SWITCHOVER CHECK`); a request starts the
+/// promotion as `SELECT pg_promote(false, deadline)` would — the answer goes
+/// back at once, the promotion fences the primary that asked through this
+/// standby's receiver — except that it is the epoch the primary named and
+/// never goes ahead unfenced ([`SwitchoverOrigin`]). The answer names where
+/// this node serves its replication port once promoted.
+pub async fn switchover_requested(request: crate::replication::physical_wire::PromoteRequest) -> PromoteAnswer {
+    let Some(promoter) = installed() else {
+        return PromoteAnswer::refused(request.switchover, not_promotable().message);
+    };
+    let call = PromoteCall {
+        wait: false,
+        wait_seconds: u64::from(request.deadline_secs).clamp(1, MAX_WAIT_SECONDS),
+        backend_pid: 0,
+        client: Some(format!(
+            "SWITCHOVER TO this standby, asked by the primary {}",
+            request.requested_by
+        )),
+        switchover: Some(SwitchoverOrigin {
+            switchover: request.switchover,
+            primary: request.requested_by,
+            epoch: request.epoch,
+        }),
+    };
+    if request.check_only {
+        return match promoter.check(&call).await {
+            Ok(facts) => switchover_answer(&request, &facts, "the promotion's preflight passed: it can be promoted"),
+            Err(refusal) => PromoteAnswer::refused(request.switchover, refusal_text(&refusal)),
+        };
+    }
+    match promoter.begin(call).await {
+        Ok(started) => {
+            let endpoint = started.replication_endpoint;
+            let promotion = started.promotion;
+            tracing::warn!(
+                "promote: SWITCHOVER {}: the primary {} asked this standby to promote itself to epoch {}; promoting \
+                 (its replication port: {})",
+                request.switchover,
+                request.requested_by,
+                request.epoch,
+                endpoint.map_or_else(|| "none".to_string(), |address| address.to_string())
+            );
+            PromoteAnswer {
+                switchover: request.switchover,
+                accepted: true,
+                epoch: request.epoch,
+                promotion,
+                replication_port: endpoint.map_or(0, |address| address.port()),
+                endpoint: endpoint.map(|address| address.to_string()).unwrap_or_default(),
+                reason: format!("promoting to epoch {}", request.epoch),
+            }
+        }
+        Err(refusal) => PromoteAnswer::refused(request.switchover, refusal_text(&refusal)),
+    }
+}
+
+/// A refusal as one line (its hint appended).
+fn refusal_text(refusal: &Refusal) -> String {
+    match &refusal.hint {
+        Some(hint) => format!("{} ({hint})", refusal.message),
+        None => refusal.message.clone(),
+    }
+}
+
+/// An accepted answer to `request` from `facts`.
+fn switchover_answer(
+    request: &crate::replication::physical_wire::PromoteRequest,
+    facts: &StandbyFacts,
+    reason: &str,
+) -> PromoteAnswer {
+    PromoteAnswer {
+        switchover: request.switchover,
+        accepted: true,
+        epoch: request.epoch,
+        promotion: facts.node_id,
+        replication_port: facts.replication_endpoint.map_or(0, |address| address.port()),
+        endpoint: facts
+            .replication_endpoint
+            .map(|address| address.to_string())
+            .unwrap_or_default(),
+        reason: reason.to_string(),
+    }
+}
+
+/// Spec R3b: why a switchover's request does not fit this standby — the
+/// epoch it names is not the store's + 1 (the primary and this standby
+/// disagree on the epoch: one of them was promoted or recovered since).
+fn switchover_epoch_refusal(origin: &SwitchoverOrigin, facts: &StandbyFacts) -> Option<Refusal> {
+    let next = facts.epoch.saturating_add(1);
+    (origin.epoch != next).then(|| {
+        Refusal::new(format!(
+            "the switchover asks for epoch {}, but this standby's store is at epoch {} (it would promote to {next}): \
+             the primary and this standby disagree on the epoch; nothing was changed",
+            origin.epoch, facts.epoch
+        ))
+    })
+}
+
 /// The refusal of a node that has no online promoter.
 fn not_promotable() -> Refusal {
     if crate::standby_posture::standby().is_some() {
@@ -494,7 +653,7 @@ fn not_promotable() -> Refusal {
         return Refusal::new(format!(
             "this node is a primary (epoch {}) that was fenced by epoch {}: it is not promoted; a primary of epoch {} \
              exists — rebuild this node as its standby (`heliosdb-nano recover --from-primary --primary-host <it> \
-             --replace --data-dir <this node's data directory>`)",
+             --replace --data-dir <this node's data directory> --then stop`, then start it as that standby)",
             fence.epoch, fence.by_epoch, fence.by_epoch
         ));
     }
@@ -647,6 +806,13 @@ impl Promoter {
         };
         let asked_at = Instant::now();
         let facts = self.host.preflight().await?;
+        // Spec R3b: the primary that asked named the epoch: the store's + 1.
+        if let Some(origin) = call.switchover {
+            if let Some(refusal) = switchover_epoch_refusal(&origin, &facts) {
+                self.host.release_preflight();
+                return Err(refusal);
+            }
+        }
         claim.started = true;
         drop(claim);
         let to_epoch = facts.epoch.saturating_add(1);
@@ -662,9 +828,40 @@ impl Promoter {
             wait: call.wait,
             budget: call.budget(),
             to_epoch,
+            replication_endpoint: facts.replication_endpoint,
+            promotion: facts.node_id,
         };
         tokio::spawn(supervise(Arc::clone(self), facts, call, Arc::new(progress), asked_at));
         Ok(started)
+    }
+
+    /// Spec R3b: `SWITCHOVER CHECK`'s remote half — the promotion's
+    /// preflight (and a switchover's epoch check), then undone: nothing
+    /// changes, whatever it finds. Refused like a promotion while one runs.
+    async fn check(&self, call: &PromoteCall) -> Result<StandbyFacts, Refusal> {
+        {
+            let mut running = self.running.lock();
+            if let Some(since) = *running {
+                return Err(Refusal::new(format!(
+                    "a promotion is in progress since {}",
+                    format_unix_secs(since)
+                )));
+            }
+            *running = Some(unix_secs());
+        }
+        let claim = Claim {
+            running: &self.running,
+            started: false,
+        };
+        let checked = self.host.check().await;
+        drop(claim);
+        let facts = checked?;
+        if let Some(origin) = call.switchover {
+            if let Some(refusal) = switchover_epoch_refusal(&origin, &facts) {
+                return Err(refusal);
+            }
+        }
+        Ok(facts)
     }
 
     /// Abort before the record: the node is a standby again.
@@ -937,7 +1134,7 @@ async fn fence_live(
                         format!(
                             "find the current primary and recover this standby from it (stop it, then \
                              `heliosdb-nano recover --from-primary --primary-host <the current primary> --data-dir \
-                             {}`)",
+                             {} --then stop`, then start it as that primary's standby)",
                             facts.data_dir.display()
                         ),
                     ));
@@ -1263,8 +1460,17 @@ async fn run(
         return promoter.abort(&progress, abort, &facts, budget).await;
     }
     tracing::info!("promote: no PostgreSQL session holds the standby's store any more");
-    // Step 4.
-    let fencing = match fence_live(host.as_ref(), &facts, &promoter.settings, &phase).await {
+    // Step 4. Spec R3b (Sprinter bbba90ddfc61): a promotion the primary
+    // asked for (`SWITCHOVER TO`) never goes ahead without that primary's
+    // fence — it is alive, and a switchover loses nothing.
+    let settings = match call.switchover {
+        Some(_) => OnlineSettings {
+            allow_without_fence: false,
+            ..promoter.settings
+        },
+        None => promoter.settings,
+    };
+    let fencing = match fence_live(host.as_ref(), &facts, &settings, &phase).await {
         Ok(fencing) => fencing,
         Err(abort) => return promoter.abort(&progress, abort, &facts, budget).await,
     };
@@ -1416,6 +1622,33 @@ async fn run(
     tokio::spawn(async move {
         let _ = registry().drain(generation, targets, TERMINATE_DRAIN_TIMEOUT).await;
     });
+    // Spec R3b: a node a switchover promoted records its role beside its data
+    // directory: its configuration file still says standby, and a restart
+    // must start it as the primary it is. Review item 2: the record is bound
+    // to this directory (its history, epoch and store identity), and an
+    // override already there (a demoted former primary's) is rewritten by
+    // ANY promotion, so it never says standby of a node this one replaced.
+    let reason = match call.switchover {
+        Some(origin) => format!(
+            "SWITCHOVER {}: promoted to the primary of epoch {epoch} at the request of the primary {}",
+            origin.switchover, origin.primary
+        ),
+        None => format!("SELECT pg_promote: promoted online to the primary of epoch {epoch}"),
+    };
+    let recorded = crate::replication::role_override::binding_at(&dir, epoch).and_then(|binding| {
+        let record = crate::replication::role_override::RoleOverride::primary(binding, reason);
+        if call.switchover.is_some() {
+            crate::replication::role_override::write_role_override(&dir, &record).map(Some)
+        } else {
+            crate::replication::role_override::rewrite_if_present(&dir, &record)
+        }
+    });
+    if let Err(error) = recorded {
+        tracing::error!(
+            "promote: the role of this node (primary) could not be recorded beside its data directory ({error}): \
+             restart it with --replication-role primary"
+        );
+    }
     clear_promoting();
     uninstall();
     match &fencing {
@@ -1453,6 +1686,7 @@ mod tests {
             primary: Some("10.0.0.1:5433".into()),
             store_engine: 7,
             placeholder_engine: 9,
+            replication_endpoint: None,
         }
     }
 
@@ -1814,6 +2048,8 @@ mod tests {
                     wait,
                     budget,
                     to_epoch: 2,
+                    replication_endpoint: None,
+                    promotion: Uuid::new_v4(),
                 },
             )
         };

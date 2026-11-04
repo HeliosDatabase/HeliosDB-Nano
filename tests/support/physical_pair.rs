@@ -124,6 +124,33 @@ impl Daemon {
         }
     }
 
+    /// `heliosdb-nano <args>` as written (not `start`): a command that goes on
+    /// to serve in its own process, such as `recover --then primary`. Its own
+    /// log (`<name>.log`); killed when dropped, like any daemon.
+    pub fn spawn_cli(dir: &Path, name: &str, args: &[String]) -> Self {
+        let log = dir.join(format!("{name}.log"));
+        let file = std::fs::File::create(&log).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_heliosdb-nano"))
+            .args(args)
+            .env(
+                "RUST_LOG",
+                std::env::var("HELIOSDB_TEST_DAEMON_LOG").unwrap_or_else(|_| "info".to_string()),
+            )
+            .env_remove("HELIOSDB_NANO_READY_FILE")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(file.try_clone().unwrap()))
+            .stderr(Stdio::from(file))
+            .spawn()
+            .unwrap();
+        Self {
+            child: Some(child),
+            log,
+            name: name.to_string(),
+            spawned_at: Instant::now(),
+            first_answer: Mutex::new(None),
+        }
+    }
+
     pub fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }

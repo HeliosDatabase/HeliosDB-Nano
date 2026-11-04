@@ -3018,38 +3018,13 @@ impl StorageEngine {
     /// writes rather than guessing at "database-looking" names, so a fresh
     /// directory holding a user's config or key files is not misread as a
     /// store.
+    ///
+    /// Spec R3a (review): the ONE predicate — [`is_rocksdb_name`] — shared
+    /// with every physical stage census (`checkpoint_transfer`'s foreign
+    /// files are defined from it), so the engine and the stages never
+    /// disagree on what is RocksDB's.
     fn is_rocksdb_remnant_name(name: &str) -> bool {
-        if matches!(name, "IDENTITY" | "LOCK" | "LOG" | "LOG.old" | "archive") {
-            return true;
-        }
-        // The info log rotates to `LOG.old.<timestamp>`; Nano's writable open
-        // uses RocksDB's default (no `db_log_dir`) info-log prefix of `LOG`.
-        if let Some(timestamp) = name.strip_prefix("LOG.old.") {
-            return Self::is_decimal(timestamp);
-        }
-        if let Some(number) = name.strip_prefix("MANIFEST-") {
-            return Self::is_decimal(number);
-        }
-        if let Some(number) = name.strip_prefix("METADB-") {
-            return Self::is_decimal(number);
-        }
-        if let Some(rest) = name.strip_prefix("OPTIONS-") {
-            let number = rest.strip_suffix(".dbtmp").unwrap_or(rest);
-            return Self::is_decimal(number);
-        }
-        match name.rsplit_once('.') {
-            Some((number, extension)) => {
-                Self::is_decimal(number) && matches!(extension, "sst" | "ldb" | "log" | "blob" | "dbtmp")
-            }
-            None => false,
-        }
-    }
-
-    /// `<digits>` in the RocksDB filename grammar: one or more ASCII decimal
-    /// digits, leading zeros allowed (`ConsumeDecimalNumber` in the pinned
-    /// `file/filename.cc`).
-    fn is_decimal(value: &str) -> bool {
-        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        is_rocksdb_name(name)
     }
 
     /// Does `db_path` already hold a store that the writable open must
@@ -15473,6 +15448,52 @@ impl StorageEngine {
             self.flush_row_counter(table_name)?;
         }
         Ok(())
+    }
+}
+
+/// Whether `name` is one of the file or directory names RocksDB itself
+/// writes directly under a database directory. The grammar is taken verbatim
+/// from the pinned `librocksdb-sys` 0.16.0+8.10.0 build of RocksDB 8.10.0
+/// (`rocksdb/file/filename.cc`: `ParseFileName` / `MakeFileName` /
+/// `DescriptorFileName` / `OptionsFileName` / `LockFileName` /
+/// `IdentityFileName` / `OldInfoLogFileName` / `ArchivalDirectory` /
+/// `CurrentFileName`): the exact `CURRENT`, `IDENTITY`, `LOCK`, `LOG`,
+/// `LOG.old`, `LOG.old.<digits>` and `archive` names, the prefixed
+/// `MANIFEST-<digits>`, `METADB-<digits>` and `OPTIONS-<digits>` (plus its
+/// `OPTIONS-<digits>.dbtmp` materialization temp), and the numbered
+/// `<digits>.(sst|ldb|log|blob|dbtmp)` table/WAL/blob/temp files — the
+/// decimal digits as `ConsumeDecimalNumber` takes them, leading zeros allowed.
+/// A NAME test only: it mirrors the exact grammar RocksDB writes rather than
+/// guessing at "database-looking" names, so a user's config or key files are
+/// never read as RocksDB's. Spec R3a (Sprinter 1c8963417a35): THE predicate
+/// the engine's fresh-directory open and every physical stage census share.
+pub fn is_rocksdb_name(name: &str) -> bool {
+    fn is_decimal(value: &str) -> bool {
+        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+    }
+    if matches!(name, "CURRENT" | "IDENTITY" | "LOCK" | "LOG" | "LOG.old" | "archive") {
+        return true;
+    }
+    // The info log rotates to `LOG.old.<timestamp>`; Nano's writable open
+    // uses RocksDB's default (no `db_log_dir`) info-log prefix of `LOG`.
+    if let Some(timestamp) = name.strip_prefix("LOG.old.") {
+        return is_decimal(timestamp);
+    }
+    if let Some(number) = name.strip_prefix("MANIFEST-") {
+        return is_decimal(number);
+    }
+    if let Some(number) = name.strip_prefix("METADB-") {
+        return is_decimal(number);
+    }
+    if let Some(rest) = name.strip_prefix("OPTIONS-") {
+        let number = rest.strip_suffix(".dbtmp").unwrap_or(rest);
+        return is_decimal(number);
+    }
+    match name.rsplit_once('.') {
+        Some((number, extension)) => {
+            is_decimal(number) && matches!(extension, "sst" | "ldb" | "log" | "blob" | "dbtmp")
+        }
+        None => false,
     }
 }
 

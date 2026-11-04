@@ -181,6 +181,31 @@ struct PrimaryTlsArgs {
 }
 
 impl PrimaryTlsArgs {
+    /// These settings as flags of `start` ([`flags_for_start`]).
+    #[cfg(feature = "ha-tier1")]
+    fn start_flags(&self) -> Vec<StartFlag> {
+        let mut flags: Vec<StartFlag> = Vec::new();
+        if let Some(value) = self.primary_tls {
+            flags.push(("--primary-tls", Some(OsString::from(value.to_string()))));
+        }
+        for (flag, path) in [
+            ("--primary-ca", &self.primary_ca),
+            ("--primary-client-cert", &self.primary_client_cert),
+            ("--primary-client-key", &self.primary_client_key),
+        ] {
+            if let Some(path) = path {
+                flags.push((flag, Some(path.clone().into_os_string())));
+            }
+        }
+        if let Some(name) = &self.primary_server_name {
+            flags.push(("--primary-server-name", Some(OsString::from(name))));
+        }
+        if self.primary_tls_insecure_skip_verify {
+            flags.push(("--primary-tls-insecure-skip-verify", None));
+        }
+        flags
+    }
+
     fn apply(self, replication: &mut heliosdb_nano::config::ReplicationConfig) {
         if let Some(value) = self.primary_tls {
             replication.primary_tls = Some(value);
@@ -1793,6 +1818,11 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 heliosdb_nano::config::ReplicationConfig::default()
             };
+            // Spec R3b, review item 2: what the command line itself said, to
+            // hold a role override against (a daemon child is forwarded the
+            // role its parent resolved, which agrees).
+            #[cfg(feature = "ha-tier1")]
+            let (cli_role, cli_primary_host) = (replication_role.clone(), primary_host.clone());
             if let Some(value) = replication_role {
                 replication.role = value;
             }
@@ -1825,6 +1855,58 @@ async fn run(cli: Cli) -> Result<()> {
             // `--physical-replication=false` keeps a primary's physical source off.
             let explicit_physical = physical.physical_replication;
             physical.apply(&mut replication);
+            // Spec R3b (Sprinter bbba90ddfc61): a SWITCHOVER (or a promotion
+            // after one) changed this node's role at runtime and recorded it
+            // beside its data directory (`<data dir>.role.toml`); it applies
+            // over the configuration file, said at WARN. Review item 2: only
+            // to the directory it was written for, and never against the
+            // command line — a missing or rebuilt directory, a contradicting
+            // --replication-role / --primary-host, or one that cannot be read
+            // refuses the start (exit 2), naming the file.
+            #[cfg(feature = "ha-tier1")]
+            if !memory {
+                use heliosdb_nano::replication::role_override::{for_start, role_override_path, StartOverride};
+                match for_start(&resolved_data_dir, cli_role.as_deref(), cli_primary_host.as_deref()) {
+                    StartOverride::None => {}
+                    StartOverride::Refuse(reason) => {
+                        eprintln!("Error: start refused: {reason}");
+                        std::process::exit(2);
+                    }
+                    StartOverride::Apply(record) => {
+                        tracing::warn!(
+                            "this node's replication role is {}{} — recorded beside its data directory ({}: {}); it \
+                             applies over the configuration file (delete that file to go back to it)",
+                            record.replication.role,
+                            record
+                                .replication
+                                .primary_host
+                                .as_deref()
+                                .map(|host| format!(", following {host}"))
+                                .unwrap_or_default(),
+                            role_override_path(&resolved_data_dir)
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_default(),
+                            record.reason
+                        );
+                        replication.role = record.replication.role.clone();
+                        if let Some(host) = record.replication.primary_host {
+                            replication.primary_host = Some(host);
+                        }
+                        // A standby that followed over TLS keeps doing so (a
+                        // restart never drops to plaintext): TLS, its CA and
+                        // server name, unless the command line names its own.
+                        if record.replication.primary_tls == Some(true) {
+                            replication.primary_tls = Some(true);
+                            if replication.primary_tls_ca_path.is_none() {
+                                replication.primary_tls_ca_path = record.replication.primary_tls_ca_path;
+                            }
+                            if replication.primary_tls_server_name.is_none() {
+                                replication.primary_tls_server_name = record.replication.primary_tls_server_name;
+                            }
+                        }
+                    }
+                }
+            }
             replication.role = replication.role.to_ascii_lowercase();
             replication.sync_mode = replication.sync_mode.to_ascii_lowercase();
             replication.validate()?;
@@ -2490,7 +2572,7 @@ async fn start_server(
     // before its readiness gate; `Some(None)` when it was not bound (disabled,
     // or the bind failed and was logged).
     #[cfg_attr(not(feature = "ha-tier1"), allow(unused_mut))]
-    let mut early_http: Option<Option<tokio::task::JoinHandle<()>>> = None;
+    let mut early_http: Option<Option<HttpTask>> = None;
     // Spec R6: the shutdown listener a standby's gate used; the main loop
     // goes on with it.
     #[cfg_attr(not(feature = "ha-tier1"), allow(unused_mut))]
@@ -2510,6 +2592,7 @@ async fn start_server(
             &pg_addr.ip().to_string(),
             pg_addr.port(),
             ha_config.replication_tls.tls_post_quantum.unwrap_or(tls_post_quantum),
+            None,
         )?;
         // Spec R6: `/health` and `/ready` answer while the standby bootstraps
         // or catches up — 503 with its posture — rather than nothing until the
@@ -2535,17 +2618,17 @@ async fn start_server(
                 None
             }
             Some(http_addr) => {
-                start_http_endpoint(
-                    http_addr,
-                    runtime.placeholder(),
-                    &ha_config,
-                    &api_config,
-                    &http_auth_policy,
-                    true,
-                    true,
-                    ha_config.physical.cascade,
-                )
-                .await
+                let plan = HttpPlan {
+                    addr: http_addr,
+                    mcp_token: ha_config.mcp_token.clone(),
+                    allow_remote_mcp: ha_config.allow_remote_mcp,
+                    api: api_config.clone(),
+                    policy: std::sync::Arc::clone(&http_auth_policy),
+                    replicating: true,
+                    cascading: ha_config.physical.cascade,
+                    isolated: false,
+                };
+                start_http_endpoint(&plan, runtime.placeholder(), true).await
             }
             None => {
                 info!("HTTP endpoint disabled (--http-port 0)");
@@ -2595,6 +2678,10 @@ async fn start_server(
     // primary's from (taken before it is moved).
     #[cfg(feature = "ha-tier1")]
     let standby_config = guarded_standby.then(|| db_config.clone());
+    // Spec R3b: what a switchover's demotion (or a promoted standby's
+    // switchover back) reopens the store with (taken before it is moved).
+    #[cfg(feature = "ha-tier1")]
+    let node_config = db_config.clone();
 
     // Open database (in-memory mode avoids disk I/O for all operations)
     let db = if let Some(db) = standby_db {
@@ -2777,10 +2864,26 @@ async fn start_server(
         }
     }
 
+    // Spec R3b (Sprinter bbba90ddfc61): a primary that serves a replication
+    // port can be demoted in-process by `SWITCHOVER TO`, which releases its
+    // store: like a standby's, its listeners serve the store through the
+    // serving watch (never holding it themselves), and an empty placeholder
+    // stands in while there is none.
+    #[cfg(feature = "ha-tier1")]
+    let demotable = !guarded_standby && !memory_mode && ha_role == "primary" && ha_config.physical.enabled;
+    #[cfg(not(feature = "ha-tier1"))]
+    let demotable = false;
+    #[cfg(feature = "ha-tier1")]
+    let primary_placeholder = if demotable { Some(standby_placeholder()?) } else { None };
+    #[cfg(not(feature = "ha-tier1"))]
+    let primary_placeholder: Option<Arc<EmbeddedDatabase>> = None;
+    let server_db = primary_placeholder.as_ref().map_or_else(|| Arc::clone(&db), Arc::clone);
+    let dynamic_serving = guarded_standby || demotable;
+
     // Create PostgreSQL server with appropriate auth configuration
     // Share the single AuthManager built before startup with the wire listener.
     // (Its listener was bound before the database opened, above.)
-    let pg_server = PgServer::with_shared_auth_manager(pg_config, Arc::clone(&db), Arc::clone(&auth_manager))?;
+    let pg_server = PgServer::with_shared_auth_manager(pg_config, server_db, Arc::clone(&auth_manager))?;
 
     // The database every new connection is served by. Fixed, except on a
     // standby: its listeners open on the placeholder until its store is
@@ -2795,12 +2898,58 @@ async fn start_server(
     let initial_serving = Arc::clone(&db);
     let (serving_db_tx, serving_db_rx) = tokio::sync::watch::channel(initial_serving);
     #[cfg(feature = "ha-tier1")]
-    let serving_forward = standby_runtime
+    let mut serving_forward = standby_runtime
         .as_ref()
         .map(|runtime| runtime.publish_store(serving_db_tx.clone()));
     // Spec P5.2 §3: what an online promotion asks of the main loop below
     // (the replication services are polled there).
     let (service_requests_tx, mut service_requests) = tokio::sync::mpsc::unbounded_channel::<ServiceRequest>();
+    // Spec R3b: what a switchover demotes — a primary that serves a
+    // replication port, or a standby that follows one (once promoted online,
+    // it is switched over back the same way).
+    #[cfg(feature = "ha-tier1")]
+    let mut node_switchover: Option<Arc<NodeSwitchover>> = {
+        let placeholder = match (primary_placeholder.as_ref(), standby_runtime.as_ref()) {
+            (Some(placeholder), _) => Some(Arc::clone(placeholder)),
+            (None, Some(runtime)) if ha_config.archive_sources.is_none() => Some(runtime.placeholder()),
+            _ => None,
+        };
+        let blocked = if mysql_enabled || mysql_socket.is_some() {
+            Some(
+                "this node runs MySQL listeners (--mysql / --mysql-socket), which a standby does not serve: switch \
+                 over a primary started without them"
+                    .to_string(),
+            )
+        } else if dump_on_shutdown {
+            Some(
+                "this node dumps on shutdown (--dump-on-shutdown), which a standby does not support: switch over a \
+                 primary started without it"
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        placeholder.map(|placeholder| {
+            Arc::new(NodeSwitchover {
+                data_dir: data_dir.clone(),
+                config: node_config.clone(),
+                ha: ha_config.clone(),
+                tls_post_quantum: ha_config.replication_tls.tls_post_quantum.unwrap_or(tls_post_quantum),
+                placeholder,
+                serving: serving_db_tx.clone(),
+                services: service_requests_tx.clone(),
+                store: parking_lot::Mutex::new(None),
+                blocked,
+                http_holds_store: std::sync::atomic::AtomicBool::new(false),
+            })
+        })
+    };
+    // Spec R3b: what the main loop needs to serve a demoted node as a
+    // standby (and to make it promotable again).
+    #[cfg(feature = "ha-tier1")]
+    let demotion_serving = node_switchover.as_ref().map(|_| serving_db_tx.clone());
+    #[cfg(feature = "ha-tier1")]
+    let demotion_services = node_switchover.as_ref().map(|_| service_requests_tx.clone());
     #[cfg(feature = "ha-tier1")]
     if let (Some(runtime), Some(config)) = (standby_runtime.as_mut(), standby_config) {
         runtime.install_promoter(PromoterParts {
@@ -2813,6 +2962,7 @@ async fn start_server(
             services: service_requests_tx.clone(),
             cascading: cascade_config.is_some(),
             pg_addr,
+            switchover: node_switchover.clone(),
         })?;
     }
     drop(service_requests_tx);
@@ -2852,6 +3002,15 @@ async fn start_server(
     } else {
         None
     };
+    // Spec R3b: a primary serving its replication port can be switched over.
+    #[cfg(feature = "ha-tier1")]
+    if let (true, Some(_), Some(switchover)) = (demotable, physical_source.as_ref(), node_switchover.as_ref()) {
+        switchover.serve_store(Arc::clone(&db), http_addr.is_some());
+        info!(
+            "this primary can be switched over in-process: SWITCHOVER TO '<standby>' on its PostgreSQL port (SWITCHOVER \
+             CHECK TO '<standby>' lists the checks)"
+        );
+    }
     // Spec P3.2 §4: a cascading standby binds its replication port now (a
     // conflict refuses the start) and serves it once its store is attached.
     #[cfg(feature = "ha-tier1")]
@@ -2905,22 +3064,28 @@ async fn start_server(
     // opened (P0-3/P0-4); only the bind happens here. A history-guarded
     // standby binds the same listener but serves only health/version routes —
     // and has bound it already, before its readiness gate (spec R6, above).
-    let http_handle: Option<tokio::task::JoinHandle<()>> = match early_http {
+    // Spec R3b: the plan is kept — a switchover's demotion starts the
+    // listener again, health-only (the REST surface reads the store it
+    // releases).
+    let http_plan = http_addr.map(|addr| HttpPlan {
+        addr,
+        mcp_token: ha_config.mcp_token.clone(),
+        allow_remote_mcp: ha_config.allow_remote_mcp,
+        api: api_config.clone(),
+        policy: std::sync::Arc::clone(&http_auth_policy),
+        replicating: ha_role != "standalone",
+        cascading,
+        isolated: demotable,
+    });
+    let mut http_handle: Option<HttpTask> = match early_http {
         Some(started) => started,
-        None => match http_addr {
-            Some(http_addr) => {
-                start_http_endpoint(
-                    http_addr,
-                    Arc::clone(&db),
-                    &ha_config,
-                    &api_config,
-                    &http_auth_policy,
-                    guarded_standby,
-                    ha_role != "standalone",
-                    cascading,
-                )
-                .await
-            }
+        None => match http_plan.as_ref() {
+            // Spec P5.2 §3 step 5: on a standby `db` is the placeholder — its
+            // HTTP surface is health-only and reads no database — so this
+            // task never holds the store an online promotion closes. Spec
+            // R3b: a primary's task does hold its store; a switchover's
+            // demotion starts it again health-only first.
+            Some(plan) => start_http_endpoint(plan, Arc::clone(&db), guarded_standby).await,
             None => {
                 info!("HTTP endpoint disabled (--http-port 0)");
                 None
@@ -3242,6 +3407,13 @@ async fn start_server(
     // set the online promotion adds to (the promoted standby's source) and
     // removes from (its cascading source); a service that ends unasked ends
     // the server, as before.
+    // Spec R3b: `db` itself is let go of before the serving loop — a
+    // demotable primary's store is held only by what serves it (the serving
+    // watch, the HTTP task, the replication source, the switchover's slot),
+    // each of which a demotion takes off it. A dump on shutdown keeps its own
+    // handle (such a node is not demoted).
+    let dump_db = dump_on_shutdown.then(|| Arc::clone(&db));
+    drop(db);
     let mut services = ReplicationServices::default();
     #[cfg(feature = "ha-tier1")]
     match cascade_plan {
@@ -3262,10 +3434,21 @@ async fn start_server(
     let mut requests_open = true;
     // Spec P5.2 §8.J: what a request prepares, polled with the listeners.
     let mut preparing = Preparations::new();
+    // Review (third pass, item 3): HTTP restarts run one at a time; a request
+    // arriving while one runs waits, and the LATEST waiting one wins.
+    #[cfg(feature = "ha-tier1")]
+    let mut http_restarting = false;
+    #[cfg(feature = "ha-tier1")]
+    #[allow(clippy::type_complexity)]
+    let mut http_queued: Option<(Arc<EmbeddedDatabase>, bool, Option<tokio::sync::oneshot::Sender<()>>)> = None;
+    // Review (third pass, item 6): a shutdown signal during a switchover's
+    // demotion waits for it (bounded) instead of cutting its rewind short.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(unused_mut))]
+    let mut shutdown_after_demotion: Option<tokio::time::Instant> = None;
 
     let server_result: Result<()> = {
         let serve = async {
-            if guarded_standby {
+            if dynamic_serving {
                 pg_server
                     .serve_with_listener_dynamic(pg_listener, serving_db_rx.clone())
                     .await
@@ -3340,6 +3523,22 @@ async fn start_server(
                             let _ = reply.send(Err(error.to_string()));
                         }
                     },
+                    #[cfg(feature = "ha-tier1")]
+                    Prepared::Http { task, done } => {
+                        if let Some(task) = task {
+                            if let Some(stale) = http_handle.replace(task) {
+                                drop(stale);
+                            }
+                        }
+                        if let Some(done) = done {
+                            let _ = done.send(());
+                        }
+                        http_restarting = false;
+                        if let Some((database, health_only, done)) = http_queued.take() {
+                            http_restarting = true;
+                            preparing.push(restart_http(http_handle.take(), http_plan.clone(), database, health_only, done));
+                        }
+                    }
                     #[cfg(not(feature = "ha-tier1"))]
                     never => match never {},
                 },
@@ -3376,14 +3575,129 @@ async fn start_server(
                             }
                         }));
                     }
+                    // Spec R3b: a switchover demotes this primary.
+                    #[cfg(feature = "ha-tier1")]
+                    Some(ServiceRequest::StopPrimary { done }) => {
+                        services.stop(ServiceKind::Primary, Some(done));
+                    }
+                    #[cfg(feature = "ha-tier1")]
+                    Some(ServiceRequest::RestartHttp { database, health_only, done }) => {
+                        // Stopped and started again off the loop (a
+                        // preparation): the PostgreSQL accept loop never
+                        // waits for a listener to close or bind. One at a
+                        // time: a request arriving while one runs waits, and
+                        // replaces any that waits already (the latest wins;
+                        // the replaced one's waiter is answered).
+                        if http_restarting {
+                            if let Some((_, _, Some(replaced))) = http_queued.replace((database, health_only, done)) {
+                                let _ = replaced.send(());
+                            }
+                        } else {
+                            http_restarting = true;
+                            preparing.push(restart_http(http_handle.take(), http_plan.clone(), database, health_only, done));
+                        }
+                    }
+                    #[cfg(feature = "ha-tier1")]
+                    Some(ServiceRequest::ServeStandby { ha, config, reply }) => {
+                        // A node that was a standby before an online
+                        // promotion still holds that runtime (its receiver
+                        // stopped by the promotion, its promoter uninstalled
+                        // by it): it goes first, never awaited here.
+                        drop(standby_runtime.take());
+                        let started = match node_switchover.as_ref() {
+                            Some(node) => StandbyRuntime::start(
+                                &ha,
+                                &data_dir,
+                                &config,
+                                &pg_addr.ip().to_string(),
+                                pg_addr.port(),
+                                node.tls_post_quantum,
+                                Some(Arc::clone(&node.placeholder)),
+                            ),
+                            None => Err(Error::config("this node has no switchover host")),
+                        };
+                        let served = match (started, demotion_serving.as_ref(), demotion_services.as_ref()) {
+                            (Ok(mut runtime), Some(serving), Some(services_tx)) => {
+                                if let Some(forward) = serving_forward.take() {
+                                    forward.abort();
+                                }
+                                serving_forward = Some(runtime.publish_store(serving.clone()));
+                                let promotable = runtime.install_promoter(PromoterParts {
+                                    config: (*config).clone(),
+                                    ha_config: (*ha).clone(),
+                                    tls_cert: tls_cert.clone(),
+                                    tls_key: tls_key.clone(),
+                                    tls_post_quantum: node_switchover
+                                        .as_ref()
+                                        .map_or(tls_post_quantum, |node| node.tls_post_quantum),
+                                    serving: serving.clone(),
+                                    services: services_tx.clone(),
+                                    cascading: false,
+                                    pg_addr,
+                                    switchover: node_switchover.clone(),
+                                });
+                                if let Err(error) = promotable {
+                                    tracing::warn!(
+                                        "the demoted node cannot be promoted online (SELECT pg_promote): {error}"
+                                    );
+                                }
+                                standby_runtime = Some(runtime);
+                                Ok(())
+                            }
+                            (Ok(runtime), _, _) => {
+                                runtime.shutdown().await;
+                                Err("the serving watch is gone".to_string())
+                            }
+                            (Err(error), _, _) => Err(error.to_string()),
+                        };
+                        let _ = reply.send(served);
+                    }
                     #[cfg(not(feature = "ha-tier1"))]
                     Some(request) => match request {},
                 },
                 result = &mut serve => break result,
-                signal = &mut signal => {
+                signal = &mut signal, if shutdown_after_demotion.is_none() => {
                     println!();
                     println!("{}", "Received shutdown signal...".yellow());
+                    #[cfg(feature = "ha-tier1")]
+                    if heliosdb_nano::standby_posture::is_demoting() {
+                        tracing::warn!(
+                            "{signal} received while a switchover demotes this node: the shutdown waits for the \
+                             demotion to end (at most {} s)",
+                            DEMOTION_SHUTDOWN_BOUND.as_secs()
+                        );
+                        shutdown_after_demotion = Some(tokio::time::Instant::now() + DEMOTION_SHUTDOWN_BOUND);
+                        continue;
+                    }
                     tracing::info!("{signal} received — running clean shutdown");
+                    break Ok(());
+                }
+                () = tokio::time::sleep(std::time::Duration::from_millis(200)), if shutdown_after_demotion.is_some() => {
+                    #[cfg(feature = "ha-tier1")]
+                    {
+                        let deadline = shutdown_after_demotion.unwrap_or_else(tokio::time::Instant::now);
+                        if heliosdb_nano::standby_posture::is_demoting() {
+                            if tokio::time::Instant::now() < deadline {
+                                continue;
+                            }
+                            let finish = heliosdb_nano::standby_posture::demotion_command().unwrap_or_else(|| {
+                                "run `heliosdb-nano recover --from-primary --data-dir <this node's data directory> \
+                                 --primary-host <the new primary> --replication-token-file <its token file> --replace \
+                                 --then stop`, then start it as that primary's standby"
+                                    .to_string()
+                            });
+                            tracing::error!(
+                                "shutting down while a switchover's demotion of this node is still under way after \
+                                 {} s: the demotion is cut short and every start refuses the directory until it is \
+                                 finished; to finish it, {finish}",
+                                DEMOTION_SHUTDOWN_BOUND.as_secs()
+                            );
+                            break Err(Error::config(format!(
+                                "the shutdown cut a switchover's demotion short; to finish it, {finish}"
+                            )));
+                        }
+                        tracing::info!("the demotion ended — running clean shutdown");
+                    }
                     break Ok(());
                 }
             }
@@ -3393,10 +3707,10 @@ async fn start_server(
     // A terminal history failure must leave no detached listener serving this
     // receiver. The TCP accept future above is dropped by select; auxiliary
     // accept loops are explicitly aborted on every shutdown/error path.
-    for handle in [http_handle, mysql_handle, mysql_unix_handle, pg_unix_handle]
-        .into_iter()
-        .flatten()
-    {
+    if let Some(task) = http_handle.take() {
+        task.stop().await;
+    }
+    for handle in [mysql_handle, mysql_unix_handle, pg_unix_handle].into_iter().flatten() {
         handle.abort();
         let _ = handle.await;
     }
@@ -3405,6 +3719,12 @@ async fn start_server(
         // No commit may wait for a standby the source no longer serves: a
         // waiting one returns now instead of at its timeout.
         heliosdb_nano::replication::ha_state::ha_state().set_replication_serving(false);
+        // Spec R3b: the process-global switchover slot must not keep the
+        // node's host — and the store it holds — past the clean close.
+        heliosdb_nano::replication::promote::switchover::uninstall();
+        if let Some(node) = node_switchover.take() {
+            node.store.lock().take();
+        }
         let cleanup = services.shutdown().await;
         if let Some(forward) = serving_forward {
             forward.abort();
@@ -3449,7 +3769,11 @@ async fn start_server(
             format: heliosdb_nano::storage::DumpOutputFormat::Binary,
         };
 
-        match dump_manager.dump(&options, db.as_ref()) {
+        let dumped = match dump_db.as_ref() {
+            Some(db) => dump_manager.dump(&options, db.as_ref()),
+            None => Err(Error::storage("no database is held for the shutdown dump")),
+        };
+        match dumped {
             Ok(report) => {
                 println!("{}", "Shutdown dump completed successfully!".green().bold());
                 println!("  Tables: {}", report.tables_dumped);
@@ -4753,6 +5077,9 @@ fn spawn_standby_supervisor(
 #[cfg(feature = "ha-tier1")]
 impl StandbyRuntime {
     /// Install the standby guard and posture, and start the supervisor.
+    /// `placeholder`: the empty database its listeners already serve (spec
+    /// R3b: a switchover's demotion, over listeners that stay open); `None`
+    /// creates one.
     fn start(
         ha_config: &HAConfig,
         data_dir: &std::path::Path,
@@ -4760,6 +5087,7 @@ impl StandbyRuntime {
         listen: &str,
         port: u16,
         post_quantum: bool,
+        placeholder: Option<std::sync::Arc<EmbeddedDatabase>>,
     ) -> Result<Self> {
         use heliosdb_nano::replication::physical_wire::{PeerRole, ReceiverIdentity, WireSyncMode};
         use heliosdb_nano::standby_posture::{install_standby, PostureTracker};
@@ -4822,7 +5150,10 @@ impl StandbyRuntime {
         };
         // Created before the supervisor: the store, attached later, is the
         // newest database of the process.
-        let placeholder = standby_placeholder()?;
+        let placeholder = match placeholder {
+            Some(placeholder) => placeholder,
+            None => standby_placeholder()?,
+        };
         let (store_tx, store) = tokio::sync::watch::channel(None);
         let (refusal_tx, refusal) = tokio::sync::watch::channel(None);
         let control = std::sync::Arc::new(StandbyControl::default());
@@ -5076,6 +5407,7 @@ impl StandbyRuntime {
             detached: parking_lot::Mutex::new(None),
             released: parking_lot::Mutex::new(None),
             bound: parking_lot::Mutex::new(None),
+            switchover: parts.switchover,
         });
         heliosdb_nano::replication::promote::online::install(
             std::sync::Arc::clone(&host)
@@ -5174,6 +5506,9 @@ struct PromoterParts {
     /// The PostgreSQL listener's address: the promoted primary's replication
     /// port binds on its IP (spec P2.2).
     pg_addr: std::net::SocketAddr,
+    /// Spec R3b: what a switchover demotes once this node, promoted, serves
+    /// as the primary.
+    switchover: Option<std::sync::Arc<NodeSwitchover>>,
 }
 
 /// Spec P5.2 §3 step 8: how a promoted standby serves as the primary — the
@@ -5315,6 +5650,29 @@ enum ServiceRequest {
         listener: Option<BoundReplication>,
         reply: tokio::sync::oneshot::Sender<std::result::Result<Option<String>, String>>,
     },
+    /// Spec R3b: a switchover demotes this primary — its replication source
+    /// (and archiver) stop; `done` once it ended.
+    #[cfg(feature = "ha-tier1")]
+    StopPrimary { done: tokio::sync::oneshot::Sender<()> },
+    /// Spec R3b: the HTTP surface stopped (every connection with it) and
+    /// started again from `database` — health-only while a demotion
+    /// releases the store, its full surface again when the demotion stops
+    /// and the store is served once more. `done` once it serves.
+    #[cfg(feature = "ha-tier1")]
+    RestartHttp {
+        database: std::sync::Arc<EmbeddedDatabase>,
+        health_only: bool,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    /// Spec R3b: serve the rewound directory as a physical standby of
+    /// `ha.primary_host` — the standby runtime the start path would have
+    /// built, over the listeners already open.
+    #[cfg(feature = "ha-tier1")]
+    ServeStandby {
+        ha: Box<HAConfig>,
+        config: Box<Config>,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
 }
 
 /// Spec P5.2 §8.J: what a service request prepared, ready to be served. The
@@ -5331,10 +5689,40 @@ enum Prepared {
         prepared: Result<Option<PreparedPhysicalSource>>,
         reply: tokio::sync::oneshot::Sender<std::result::Result<Option<String>, String>>,
     },
+    /// Spec R3b: the HTTP surface started again (`None`: it could not be),
+    /// and who waits for it.
+    #[cfg(feature = "ha-tier1")]
+    Http {
+        task: Option<HttpTask>,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    },
 }
 
 /// The preparations the main loop polls ([`Prepared`]).
 type Preparations = futures::stream::FuturesUnordered<std::pin::Pin<Box<dyn std::future::Future<Output = Prepared>>>>;
+
+/// Spec R3b: the HTTP surface stopped (`previous`, every connection with
+/// it) and started again from `database` — a preparation the main loop
+/// polls ([`Prepared::Http`]).
+#[cfg(feature = "ha-tier1")]
+fn restart_http(
+    previous: Option<HttpTask>,
+    plan: Option<HttpPlan>,
+    database: std::sync::Arc<EmbeddedDatabase>,
+    health_only: bool,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Prepared>>> {
+    Box::pin(async move {
+        if let Some(previous) = previous {
+            previous.stop().await;
+        }
+        let task = match plan {
+            Some(plan) => plan.start_again(database, health_only).await,
+            None => None,
+        };
+        Prepared::Http { task, done }
+    })
+}
 
 /// The next preparation to complete; never, while none runs.
 async fn next_prepared(preparing: &mut Preparations) -> Prepared {
@@ -5564,6 +5952,8 @@ struct PromotionHost {
     /// to the primary at the reopen (dropped — the port closed — by an
     /// abort).
     bound: parking_lot::Mutex<Option<BoundReplication>>,
+    /// Spec R3b: once promoted, this node can be switched over (back).
+    switchover: Option<std::sync::Arc<NodeSwitchover>>,
 }
 
 /// The engine and the RocksDB handle of a store, held weakly: dead once the
@@ -5615,16 +6005,20 @@ fn release_diagnostics(database_holders: usize, handles: &StoreHandles, budget: 
 }
 
 #[cfg(feature = "ha-tier1")]
-#[async_trait::async_trait]
-impl heliosdb_nano::replication::promote::online::StandbyHost for PromotionHost {
-    async fn preflight(
+impl PromotionHost {
+    /// The promotion's preflight (`StandbyHost::preflight`); `check_only`:
+    /// `SWITCHOVER CHECK`'s, which changes nothing (spec R3b, review item
+    /// 6c): the replication port is bound and closed at once, the
+    /// promotion's identity read, never created.
+    async fn promotion_preflight(
         &self,
+        check_only: bool,
     ) -> std::result::Result<
         heliosdb_nano::replication::promote::online::StandbyFacts,
         heliosdb_nano::replication::promote::online::Refusal,
     > {
         use heliosdb_nano::replication::promote::online::{
-            interrupted_fast_forward, promotion_identity, Refusal, StandbyFacts,
+            interrupted_fast_forward, kept_promotion_identity, promotion_identity, Refusal, StandbyFacts,
         };
         let dir = self.data_dir.display().to_string();
         let snapshot = self.posture.snapshot();
@@ -5706,13 +6100,42 @@ impl heliosdb_nano::replication::promote::online::StandbyHost for PromotionHost 
         } else {
             None
         };
-        let node_id = promotion_identity(&engine).map_err(|reason| {
-            Refusal::new(format!(
-                "the promotion's identity cannot be kept ({reason}): it is not promoted"
-            ))
-        })?;
+        // Spec R3b (review item 6c): a check reads the identity, never
+        // creates it (nothing changes on this standby).
+        let node_id = if check_only {
+            kept_promotion_identity(&engine)
+                .map(|kept| kept.unwrap_or_else(uuid::Uuid::nil))
+                .map_err(|reason| {
+                    Refusal::new(format!(
+                        "the promotion's identity cannot be read ({reason}): it is not promoted"
+                    ))
+                })?
+        } else {
+            promotion_identity(&engine).map_err(|reason| {
+                Refusal::new(format!(
+                    "the promotion's identity cannot be kept ({reason}): it is not promoted"
+                ))
+            })?
+        };
         drop(engine);
-        *self.bound.lock() = bound;
+        // Spec R3b: where its replication port listens once promoted — the
+        // address a primary switching over to it follows it at.
+        let replication_endpoint = match &bound {
+            Some(bound) => Some(bound.address),
+            None if serves_replication => Some(replication_listen_address(
+                self.pg_addr.ip(),
+                ha.replication_port,
+                tls.is_some() || ha.allow_insecure_remote,
+            )),
+            None => None,
+        };
+        // A check binds the port only to show it can be: closed again at
+        // once, never kept.
+        if check_only {
+            drop(bound);
+        } else {
+            *self.bound.lock() = bound;
+        }
         Ok(StandbyFacts {
             data_dir: self.data_dir.clone(),
             config: self.config.clone(),
@@ -5723,7 +6146,35 @@ impl heliosdb_nano::replication::promote::online::StandbyHost for PromotionHost 
             primary: Some(self.plan.primary.clone()),
             store_engine,
             placeholder_engine: self.placeholder.storage.instance_id(),
+            replication_endpoint,
         })
+    }
+}
+
+#[cfg(feature = "ha-tier1")]
+#[async_trait::async_trait]
+impl heliosdb_nano::replication::promote::online::StandbyHost for PromotionHost {
+    async fn preflight(
+        &self,
+    ) -> std::result::Result<
+        heliosdb_nano::replication::promote::online::StandbyFacts,
+        heliosdb_nano::replication::promote::online::Refusal,
+    > {
+        self.promotion_preflight(false).await
+    }
+
+    async fn check(
+        &self,
+    ) -> std::result::Result<
+        heliosdb_nano::replication::promote::online::StandbyFacts,
+        heliosdb_nano::replication::promote::online::Refusal,
+    > {
+        self.promotion_preflight(true).await
+    }
+
+    fn release_preflight(&self) {
+        // Spec R3b: the replication port a preflight bound closes again.
+        drop(self.bound.lock().take());
     }
 
     fn receiver(
@@ -5896,6 +6347,11 @@ impl heliosdb_nano::replication::promote::online::StandbyHost for PromotionHost 
         // The ONE sanctioned undo of the standby guard (`ha_state`).
         heliosdb_nano::replication::ha_state::ha_state().enable_forwarding_after_promotion();
         drop(self.serving.send_replace(std::sync::Arc::clone(&database)));
+        // Spec R3b: a primary now, it can be switched over (its HTTP surface
+        // stays the standby's health-only one: it holds no store).
+        if let (Some(switchover), true) = (&self.switchover, endpoint.is_some()) {
+            switchover.serve_store(std::sync::Arc::clone(&database), false);
+        }
         info!(
             "promote: new PostgreSQL connections are served by the primary of epoch {epoch} (replication port {})",
             endpoint.as_deref().unwrap_or("off")
@@ -6001,6 +6457,888 @@ impl heliosdb_nano::replication::promote::online::StandbyHost for PromotionHost 
 
     fn placeholder(&self) -> std::sync::Arc<EmbeddedDatabase> {
         std::sync::Arc::clone(&self.placeholder)
+    }
+}
+
+/// What `start_server`'s HTTP listener is started with — again, health-only,
+/// when a switchover demotes the node (spec R3b: the REST surface of a
+/// primary reads its store, which the demotion releases).
+#[derive(Clone)]
+struct HttpPlan {
+    addr: std::net::SocketAddr,
+    mcp_token: Option<String>,
+    allow_remote_mcp: bool,
+    api: heliosdb_nano::config::ApiConfig,
+    policy: std::sync::Arc<heliosdb_nano::api::HttpAuthPolicy>,
+    /// A replication node: `/health` carries its replication block.
+    replicating: bool,
+    cascading: bool,
+    /// Spec R3b (review item 4): a node whose store a switchover may
+    /// release serves HTTP on a runtime of its own — stopping it drops every
+    /// connection task (an idle keep-alive client, a WebSocket), each of
+    /// which holds the router's database; aborting the accept loop alone
+    /// would leave them holding the store.
+    isolated: bool,
+}
+
+/// The HTTP surface's running listener (`HttpPlan::spawn`).
+struct HttpTask {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    /// Its own runtime ([`HttpPlan::isolated`]).
+    runtime: Option<tokio::runtime::Runtime>,
+}
+
+impl HttpTask {
+    /// Stop it: the accept loop, and — on its own runtime — every
+    /// connection task, before this returns (bounded).
+    async fn stop(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        if let Some(runtime) = self.runtime.take() {
+            let _ =
+                tokio::task::spawn_blocking(move || runtime.shutdown_timeout(std::time::Duration::from_secs(10))).await;
+        }
+    }
+}
+
+impl Drop for HttpTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
+
+impl HttpPlan {
+    /// Bind the plan's address again (the listener a stopped task held may
+    /// take a moment to close) and serve it from `db`.
+    async fn start_again(&self, db: std::sync::Arc<EmbeddedDatabase>, health_only: bool) -> Option<HttpTask> {
+        let mut last = None;
+        for _ in 0..50 {
+            match tokio::net::TcpListener::bind(self.addr).await {
+                Ok(listener) => match self.spawn(listener, db, health_only) {
+                    Ok(task) => {
+                        info!(
+                            "HTTP endpoint at http://{} serves {} again",
+                            self.addr,
+                            if health_only {
+                                "health only (this node is being demoted into a standby)"
+                            } else {
+                                "its full surface"
+                            }
+                        );
+                        return Some(task);
+                    }
+                    Err(error) => {
+                        tracing::error!("the HTTP endpoint {} could not be started again: {error}", self.addr);
+                        return None;
+                    }
+                },
+                Err(error) => last = Some(error),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        tracing::error!(
+            "the HTTP endpoint {} could not be bound again: {}",
+            self.addr,
+            last.map_or_else(String::new, |error| error.to_string())
+        );
+        None
+    }
+
+    /// Serve `listener` from `db` (`health_only`: the standby's surface,
+    /// which reads no database) — on the server's runtime, or on one of its
+    /// own ([`Self::isolated`]).
+    fn spawn(
+        &self,
+        listener: tokio::net::TcpListener,
+        db: std::sync::Arc<EmbeddedDatabase>,
+        health_only: bool,
+    ) -> std::io::Result<HttpTask> {
+        if !self.isolated {
+            return Ok(HttpTask {
+                handle: Some(tokio::spawn(self.serve(listener, db, health_only))),
+                runtime: None,
+            });
+        }
+        let listener = listener.into_std()?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("nano-http")
+            .enable_all()
+            .build()?;
+        let listener = {
+            let _entered = runtime.enter();
+            tokio::net::TcpListener::from_std(listener)
+        };
+        // Review (third pass, item 3): a runtime is never dropped inside an
+        // async context (tokio panics): one that will serve nothing is shut
+        // down in the background.
+        let listener = match listener {
+            Ok(listener) => listener,
+            Err(error) => {
+                runtime.shutdown_background();
+                return Err(error);
+            }
+        };
+        let handle = runtime.spawn(self.serve(listener, db, health_only));
+        Ok(HttpTask {
+            handle: Some(handle),
+            runtime: Some(runtime),
+        })
+    }
+
+    /// The HTTP surface's accept loop.
+    fn serve(
+        &self,
+        listener: tokio::net::TcpListener,
+        db: std::sync::Arc<EmbeddedDatabase>,
+        health_only: bool,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let cascading = self.cascading;
+        // Spec P1.3: a replication node's `/health` carries its replication
+        // block and `/ready` answers its readiness. Spec P2.1: a primary's
+        // `/health` also lists its standbys; spec P3.2 §4: so does a
+        // cascading standby (its downstreams), which also says `cascade:
+        // true`. Spec P5.2, R3b: read at every request — an online promotion
+        // or a switchover changes the node's role in-process.
+        let replication_status: Option<heliosdb_nano::api::ReplicationStatus> = self.replicating.then(|| {
+            let status: heliosdb_nano::api::ReplicationStatus = std::sync::Arc::new(move || {
+                let block = heliosdb_nano::standby_posture::node_block()?;
+                let primary_now = block.role == "primary";
+                // Spec P5.2 §8.J: a cascading port a promotion stopped (or
+                // could not open again) is not reported as serving.
+                let cascading_now = cascading && !primary_now && cascade_serving();
+                Some(heliosdb_nano::api::ReplicationReport {
+                    ready: block.ready,
+                    block: serde_json::to_value(block).ok()?,
+                    standbys: (primary_now || cascading_now).then(primary_standbys_report),
+                    // Spec P3.1: a sibling object, never inside the block.
+                    archive: Some(archive_health_report()),
+                    cascade: cascading_now.then_some(true),
+                })
+            });
+            status
+        });
+        let (mcp_token, allow_remote_mcp, api, policy) = (
+            self.mcp_token.clone(),
+            self.allow_remote_mcp,
+            self.api.clone(),
+            std::sync::Arc::clone(&self.policy),
+        );
+        async move {
+            if let Err(e) = run_http_listener_with_replication(
+                listener,
+                db,
+                mcp_token,
+                allow_remote_mcp,
+                api,
+                policy,
+                health_only,
+                replication_status,
+            )
+            .await
+            {
+                tracing::error!("HTTP server accept loop exited: {e}");
+            }
+        }
+    }
+}
+
+/// Spec R3b (Sprinter bbba90ddfc61): what `SWITCHOVER TO` demotes on this
+/// node — created by `start_server` for a primary that serves a replication
+/// port and for a standby that follows one (an online promotion makes it a
+/// primary, whose switchover back must work too); installed
+/// (`replication::promote::switchover::install`) while the node serves as a
+/// primary, with its store in [`Self::store`].
+#[cfg(feature = "ha-tier1")]
+struct NodeSwitchover {
+    data_dir: PathBuf,
+    /// The node's database configuration as `start` resolved it.
+    config: Config,
+    ha: HAConfig,
+    tls_post_quantum: bool,
+    /// The empty database the listeners serve while there is no store.
+    placeholder: std::sync::Arc<EmbeddedDatabase>,
+    /// What every new PostgreSQL connection is served by.
+    serving: tokio::sync::watch::Sender<std::sync::Arc<EmbeddedDatabase>>,
+    services: tokio::sync::mpsc::UnboundedSender<ServiceRequest>,
+    /// The primary's store while this node serves as one.
+    store: parking_lot::Mutex<Option<std::sync::Arc<EmbeddedDatabase>>>,
+    /// Why this node cannot be demoted in-process, if it cannot.
+    blocked: Option<String>,
+    /// The HTTP task serves the store (a node started as a primary): it is
+    /// started again, health-only, before the store is released — and with
+    /// its full surface when a demotion stops and the store is served again.
+    http_holds_store: std::sync::atomic::AtomicBool,
+}
+
+/// How long a demotion waits for the sessions of the store to go, and for
+/// the services to stop (each).
+#[cfg(feature = "ha-tier1")]
+const DEMOTION_STEP_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a demoted node waits for its standby to stream before it
+/// answers (it answers either way; its posture says what it is doing).
+#[cfg(feature = "ha-tier1")]
+const DEMOTION_STREAM_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+/// Review (third pass, item 6): how long a shutdown signal waits for a
+/// demotion under way to end (its rewind included) before it cuts it short,
+/// at ERROR.
+#[cfg(feature = "ha-tier1")]
+const DEMOTION_SHUTDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[cfg(feature = "ha-tier1")]
+impl NodeSwitchover {
+    /// This node serves `store` as the primary (a start, or an online
+    /// promotion's reopen) and can be switched over from now on.
+    fn serve_store(self: &std::sync::Arc<Self>, store: std::sync::Arc<EmbeddedDatabase>, http_holds_store: bool) {
+        *self.store.lock() = Some(store);
+        self.http_holds_store
+            .store(http_holds_store, std::sync::atomic::Ordering::Release);
+        heliosdb_nano::replication::promote::switchover::install(std::sync::Arc::clone(self)
+            as std::sync::Arc<dyn heliosdb_nano::replication::promote::switchover::DemotionHost>);
+    }
+
+    /// The data directory, resolved (the rewind's stage checks refuse a `..`
+    /// or a symbolic link in the paths they are given).
+    fn resolved_data_dir(&self) -> std::result::Result<PathBuf, String> {
+        heliosdb_nano::replication::recover_primary::canonical_path(&self.data_dir).map_err(|error| {
+            format!(
+                "the data directory {} cannot be resolved: {error}",
+                self.data_dir.display()
+            )
+        })
+    }
+
+    /// The transport this node, demoted, would follow `endpoint` with.
+    fn follow_transport(
+        &self,
+        endpoint: &str,
+        pair_tls: bool,
+    ) -> Result<(
+        Vec<std::net::SocketAddr>,
+        heliosdb_nano::replication::physical_tls::ReplicationTransport,
+    )> {
+        let sources = resolve_replication_sources(endpoint)?;
+        let mut settings = self.ha.replication_tls.clone();
+        // A pair that replicated over TLS keeps doing so (spec P5.2 §8.I's
+        // rule, the demotion's side): the new primary serves TLS.
+        if pair_tls {
+            settings.primary_tls = Some(true);
+        }
+        let transport = replication_transport(
+            endpoint,
+            &sources,
+            &settings,
+            self.ha.allow_insecure_remote,
+            self.tls_post_quantum,
+        )?;
+        if pair_tls && transport.tls.is_none() {
+            return Err(Error::config(
+                "the pair replicated over TLS, but this node, demoted, would follow the new primary in PLAINTEXT",
+            ));
+        }
+        Ok((sources, transport))
+    }
+
+    fn token(&self) -> Result<heliosdb_nano::replication::physical_wire::TransferToken> {
+        let file = self
+            .ha
+            .token_file
+            .as_ref()
+            .ok_or_else(|| Error::config("this node has no replication token (--replication-token-file)"))?;
+        heliosdb_nano::replication::read_replication_token(file)
+    }
+
+    /// Put `store` back on the listeners after a demotion that stopped before
+    /// the directory changed: this node stays the FENCED primary, serving
+    /// reads — over PostgreSQL and, when it served them, over its full HTTP
+    /// surface again (review item 4).
+    fn restore(&self, store: std::sync::Arc<EmbeddedDatabase>, reason: &str) {
+        drop(self.serving.send_replace(std::sync::Arc::clone(&store)));
+        if self.http_holds_store.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = self.services.send(ServiceRequest::RestartHttp {
+                database: std::sync::Arc::clone(&store),
+                health_only: false,
+                done: None,
+            });
+        }
+        *self.store.lock() = Some(store);
+        heliosdb_nano::standby_posture::note_demoting(false);
+        tracing::error!(
+            "switchover: the demotion of this node stopped before its directory changed ({reason}): it stays the \
+             FENCED primary, serving reads"
+        );
+    }
+
+    /// Spec R3b, review item 1: the store reopened, FENCED (its directory
+    /// carries `NANO-FENCED.json`), after an in-process rewind that changed
+    /// nothing of the directory; served again as the fenced primary.
+    async fn reopen_fenced(
+        &self,
+        data_dir: &std::path::Path,
+    ) -> std::result::Result<std::sync::Arc<EmbeddedDatabase>, String> {
+        let mut config = self.config.clone();
+        config.storage.path = Some(data_dir.to_path_buf());
+        config.storage.memory_only = false;
+        let opened = tokio::task::spawn_blocking(move || EmbeddedDatabase::with_config(config))
+            .await
+            .map_err(|error| format!("the store's open did not complete: {error}"))?
+            .map_err(|error| format!("the store cannot be opened again: {error}"))?;
+        let database = std::sync::Arc::new(opened);
+        if database.storage.is_physical_standby() || !database.storage.write_gate().is_fenced() {
+            return Err("the store did not open as the fenced primary's: it is not served".to_string());
+        }
+        heliosdb_nano::standby_posture::install_primary(heliosdb_nano::standby_posture::PrimaryStatus {
+            role: "primary",
+            engine: std::sync::Arc::downgrade(&database.storage),
+            endpoint: None,
+            sync_mode: self.ha.sync_mode.clone(),
+            tls: false,
+        });
+        Ok(database)
+    }
+}
+
+/// Log `message` at ERROR and on stderr, flush, and end the process with
+/// exit code 2 at once (`_exit`): a demotion that failed after its directory
+/// was changed leaves no store to serve, and the directory starts in no role
+/// until `recover --from-primary` finishes it (spec R3b).
+#[cfg(feature = "ha-tier1")]
+fn exit_demotion(message: &str) -> ! {
+    use std::io::Write;
+    tracing::error!("{message}");
+    eprintln!("{message}");
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    #[cfg(unix)]
+    // SAFETY: `_exit(2)` takes no pointer and has no precondition; it ends
+    // the process without running any destructor, which is the point: no
+    // task may touch a store being rewound or not served.
+    unsafe {
+        libc::_exit(2)
+    }
+    #[cfg(not(unix))]
+    std::process::exit(2)
+}
+
+#[cfg(feature = "ha-tier1")]
+#[async_trait::async_trait]
+impl heliosdb_nano::replication::promote::switchover::DemotionHost for NodeSwitchover {
+    async fn preflight(
+        &self,
+    ) -> std::result::Result<heliosdb_nano::replication::promote::switchover::PrimaryFacts, String> {
+        if let Some(reason) = &self.blocked {
+            return Err(reason.clone());
+        }
+        let store = self
+            .store
+            .lock()
+            .clone()
+            .ok_or_else(|| "this node serves no store as the primary".to_string())?;
+        if store.storage.write_gate().is_fenced() {
+            return Err("this primary's store is fenced: it serves reads only".to_string());
+        }
+        let epoch = store.storage.replication_epoch();
+        drop(store);
+        self.token().map_err(|error| error.to_string())?;
+        let history = heliosdb_nano::replication::history::read_primary_history(&self.data_dir)
+            .map_err(|error| format!("this primary's dataset history cannot be read: {error}"))?
+            .ok_or_else(|| "this primary's directory carries no dataset history".to_string())?;
+        let node_id = heliosdb_nano::replication::ha_state::ha_state()
+            .get_config()
+            .map(|node| node.node_id)
+            .ok_or_else(|| "this node has no HA identity".to_string())?;
+        Ok(heliosdb_nano::replication::promote::switchover::PrimaryFacts {
+            data_dir: self.data_dir.clone(),
+            history,
+            epoch,
+            node_id,
+            max_standby_lag: self.ha.max_standby_lag,
+        })
+    }
+
+    async fn rewind_check(&self) -> std::result::Result<String, String> {
+        let data_dir = self.resolved_data_dir()?;
+        let export_dir = self.config.replication.physical.export_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            heliosdb_nano::replication::recover_primary::rewind_census_check(&data_dir, export_dir.as_deref())
+        })
+        .await
+        .map_err(|error| format!("the census did not complete: {error}"))?
+    }
+
+    fn follow_plan(&self, endpoint: &str, pair_tls: bool) -> std::result::Result<String, String> {
+        match self.follow_transport(endpoint, pair_tls) {
+            Ok((_, transport)) => Ok(if transport.tls.is_some() {
+                "over TLS".to_string()
+            } else {
+                "plaintext".to_string()
+            }),
+            Err(error) => Err(format!(
+                "this node, demoted, could not follow {endpoint}: {error}{}",
+                if pair_tls {
+                    " — the pair replicates over TLS: give this node [replication] primary_tls = true and \
+                     primary_tls_ca_path (--primary-tls --primary-ca) for the new primary's certificate"
+                } else {
+                    ""
+                }
+            )),
+        }
+    }
+
+    async fn serves_as_primary(
+        &self,
+        endpoint: &str,
+        history: uuid::Uuid,
+        epoch: u64,
+        pair_tls: bool,
+    ) -> std::result::Result<bool, String> {
+        use heliosdb_nano::replication::physical_wire::{
+            PeerRole, PhysicalClient, ReceiverIdentity, WireLimits, WireSyncMode,
+        };
+        let (sources, transport) = self
+            .follow_transport(endpoint, pair_tls)
+            .map_err(|error| error.to_string())?;
+        let token = self.token().map_err(|error| error.to_string())?;
+        let limits = WireLimits {
+            frame_timeout: std::time::Duration::from_secs(3),
+            operation_timeout: std::time::Duration::from_secs(5),
+            ..physical_wire_limits(&self.ha.physical)
+        };
+        let identity = ReceiverIdentity {
+            node_id: uuid::Uuid::new_v4(),
+            role: PeerRole::Resync,
+            epoch: heliosdb_nano::replication::epoch::INITIAL_EPOCH,
+            pg_port: 0,
+            sync_mode: WireSyncMode::Async,
+        };
+        let (_stop, shutdown) = tokio::sync::watch::channel(false);
+        let mut last = String::from("no address");
+        for source in sources {
+            match PhysicalClient::connect_replication(
+                source,
+                &transport,
+                &token,
+                identity.hello(Some(history), None),
+                limits,
+                shutdown.clone(),
+            )
+            .await
+            {
+                Ok(client) => {
+                    let serves = client.hello_ok().epoch == epoch && client.fenceable();
+                    let _ = client.close().await;
+                    return Ok(serves);
+                }
+                Err(error) => last = error.to_string(),
+            }
+        }
+        Err(last)
+    }
+
+    fn placeholder(&self) -> std::sync::Arc<EmbeddedDatabase> {
+        std::sync::Arc::clone(&self.placeholder)
+    }
+
+    fn answer_bound(&self) -> std::time::Duration {
+        // The target answers within its operation bound (and the bound the
+        // request carries, this one): its promotion's preflight.
+        let limits = physical_wire_limits(&self.ha.physical);
+        limits.operation_timeout.saturating_add(limits.frame_timeout)
+    }
+
+    fn follow_flags(&self, pair_tls: bool) -> String {
+        let mut flags = String::new();
+        if let Some(token) = &self.ha.token_file {
+            flags.push_str(&format!(" --replication-token-file {}", token.display()));
+        }
+        let tls = &self.ha.replication_tls;
+        if pair_tls || tls.primary_tls == Some(true) {
+            flags.push_str(" --primary-tls");
+            for (flag, path) in [
+                ("--primary-ca", &tls.primary_tls_ca_path),
+                ("--primary-client-cert", &tls.primary_tls_client_cert_path),
+                ("--primary-client-key", &tls.primary_tls_client_key_path),
+            ] {
+                if let Some(path) = path {
+                    flags.push_str(&format!(" {flag} {}", path.display()));
+                }
+            }
+            if let Some(name) = &tls.primary_tls_server_name {
+                flags.push_str(&format!(" --primary-server-name {name}"));
+            }
+        }
+        flags
+    }
+
+    fn delivery_bound(&self) -> std::time::Duration {
+        // The target's next poll: a poll in flight is collected within the
+        // source's operation bound, the next one follows within a frame.
+        let limits = physical_wire_limits(&self.ha.physical);
+        limits
+            .operation_timeout
+            .saturating_add(limits.frame_timeout)
+            .saturating_add(std::time::Duration::from_secs(10))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn demote(
+        &self,
+        plan: heliosdb_nano::replication::promote::switchover::DemotionPlan,
+    ) -> std::result::Result<String, heliosdb_nano::replication::promote::switchover::DemotionError> {
+        use heliosdb_nano::protocol::postgres::sessions::{
+            registry, TerminateCause, TerminateScope, TERMINATE_DRAIN_TIMEOUT,
+        };
+        use heliosdb_nano::replication::promote::switchover::DemotionError;
+        use heliosdb_nano::replication::recover_primary::{
+            recover_from_primary, rewind_left_unchanged, DirectoryState, PrimaryRecoverOptions,
+        };
+        let data_dir = self.resolved_data_dir().map_err(DemotionError)?;
+        // Review (third pass, item 7): with the flags that reach the new
+        // primary (its token, the pair's TLS).
+        let flags =
+            <Self as heliosdb_nano::replication::promote::switchover::DemotionHost>::follow_flags(self, plan.pair_tls);
+        // Review (fourth pass, item 1): `--replace`, so the named recover
+        // finishes the switchover whatever its plan picks. Fifth pass:
+        // `--then stop` and the `start` named after it — a copied recover
+        // must not turn the operator's shell into a server on default ports,
+        // outside its service manager.
+        let start_standby = format!(
+            "`heliosdb-nano start --data-dir {dir} --replication-role standby --primary-host {follow}{flags}`",
+            dir = data_dir.display(),
+            follow = plan.follow
+        );
+        let finish = format!(
+            "stop it, run `heliosdb-nano recover --from-primary --data-dir {dir} --primary-host {follow}{flags} \
+             --replace --then stop`, then start it as a standby of the new primary, through its service manager and \
+             with its usual ports: {start_standby} ({note})",
+            dir = data_dir.display(),
+            follow = plan.follow,
+            note = heliosdb_nano::replication::promote::switchover::REPLACE_NOTE
+        );
+        heliosdb_nano::standby_posture::note_demotion_command(finish.clone());
+        let Some(store) = self.store.lock().clone() else {
+            return Err(DemotionError("this node holds no primary store".to_string()));
+        };
+        let store_engine = store.storage.instance_id();
+        let placeholder_engine = self.placeholder.storage.instance_id();
+        // The transport and token the rewind and the standby use: checked
+        // before anything changes.
+        let (sources, transport) = self
+            .follow_transport(&plan.follow, plan.pair_tls)
+            .map_err(|error| DemotionError(format!("the new primary cannot be followed: {error}")))?;
+        let token = self
+            .token()
+            .map_err(|error| DemotionError(format!("the replication token cannot be read: {error}")))?;
+        // 1. The standby guard, the demotion's posture, the placeholder on
+        //    the listeners.
+        info!(
+            "switchover {}: demoting this node into a standby of {} (epoch {} → {})",
+            plan.switchover, plan.follow, plan.from_epoch, plan.to_epoch
+        );
+        heliosdb_nano::standby_posture::note_demoting(true);
+        heliosdb_nano::replication::ha_state::ha_state().disable_forwarding();
+        drop(self.serving.send_replace(std::sync::Arc::clone(&self.placeholder)));
+        // 2. Every session of the store ends (the fence ended those opened
+        //    before it; those opened since were served reads).
+        let (generation, targets) = registry().push_scoped(
+            TerminateCause::Fence,
+            TerminateScope::NotServedBy(placeholder_engine),
+            format!(
+                "terminating connection: this primary is being demoted into a standby of the new primary at {} \
+                 (epoch {}); reconnect",
+                plan.follow, plan.to_epoch
+            ),
+        );
+        let _ = registry().drain(generation, targets, TERMINATE_DRAIN_TIMEOUT).await;
+        let deadline = tokio::time::Instant::now() + DEMOTION_STEP_BOUND;
+        loop {
+            let holders = registry().holders_of(store_engine);
+            if holders.is_empty() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let reason = format!(
+                    "{} PostgreSQL session(s) still use the store after {} s: {}",
+                    holders.len(),
+                    DEMOTION_STEP_BOUND.as_secs(),
+                    heliosdb_nano::replication::promote::online::describe_sessions(&holders)
+                );
+                self.restore(store, &reason);
+                return Err(DemotionError(format!("{reason}; to finish the switchover: {finish}")));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // 3. The replication source (its sessions, its leased exports) and
+        //    the archiver (its open segment sealed) stop. Review item 6b: a
+        //    main loop that is gone (its answer dropped) is a failure, not a
+        //    stop.
+        let (done, stopped) = tokio::sync::oneshot::channel();
+        let stopped = if self.services.send(ServiceRequest::StopPrimary { done }).is_ok() {
+            matches!(tokio::time::timeout(DEMOTION_STEP_BOUND, stopped).await, Ok(Ok(())))
+        } else {
+            false
+        };
+        if !stopped {
+            let reason = "the replication source did not stop (or the server's main loop is gone)";
+            self.restore(store, reason);
+            return Err(DemotionError(format!("{reason}; to finish the switchover: {finish}")));
+        }
+        let state = heliosdb_nano::replication::ha_state::ha_state();
+        state.set_replication_serving(false);
+        state.set_sequence_source(None);
+        // 4. The HTTP surface health-only: it let go of the store (its own
+        //    runtime stopped, every connection task with it: review item 4).
+        if self.http_holds_store.load(std::sync::atomic::Ordering::Acquire) {
+            let (done, restarted) = tokio::sync::oneshot::channel();
+            let restarted = if self
+                .services
+                .send(ServiceRequest::RestartHttp {
+                    database: std::sync::Arc::clone(&self.placeholder),
+                    health_only: true,
+                    done: Some(done),
+                })
+                .is_ok()
+            {
+                matches!(tokio::time::timeout(DEMOTION_STEP_BOUND, restarted).await, Ok(Ok(())))
+            } else {
+                false
+            };
+            if !restarted {
+                let reason = "the HTTP surface did not let go of the store (or the server's main loop is gone)";
+                self.restore(store, reason);
+                return Err(DemotionError(format!("{reason}; to finish the switchover: {finish}")));
+            }
+        }
+        // 5. The store released: only this demotion holds it now.
+        let handles = StoreHandles::of(&store);
+        let slot = self.store.lock().take();
+        drop(slot);
+        let deadline = tokio::time::Instant::now() + DEMOTION_STEP_BOUND;
+        while std::sync::Arc::strong_count(&store) > 1 {
+            if tokio::time::Instant::now() >= deadline {
+                let holders = std::sync::Arc::strong_count(&store) - 1;
+                let reason = release_diagnostics(holders, &handles, DEMOTION_STEP_BOUND);
+                self.restore(store, &reason);
+                return Err(DemotionError(format!("{reason}; to finish the switchover: {finish}")));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        drop(store);
+        let deadline = tokio::time::Instant::now() + DEMOTION_STEP_BOUND;
+        while !handles.closed() {
+            if tokio::time::Instant::now() >= deadline {
+                exit_demotion(&format!(
+                    "switchover {}: this node's store did not close after its last holder let go ({}): this process \
+                     exits. The new primary at {} serves epoch {}; this directory is the FENCED primary's, unchanged \
+                     — {finish}",
+                    plan.switchover,
+                    handles.holders(),
+                    plan.follow,
+                    plan.to_epoch
+                ));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        info!(
+            "switchover {}: the primary's store is closed; rewinding it",
+            plan.switchover
+        );
+        // 6. The rewind (spec R3a) against the new primary: in place, by
+        //    fast-forward — never a full copy in-process (the preflight's
+        //    census refused a directory it could not take).
+        let mut stage = data_dir.as_os_str().to_os_string();
+        stage.push(".recover-stage");
+        let mut config = self.config.clone();
+        config.storage.path = Some(data_dir.clone());
+        config.storage.memory_only = false;
+        let options = PrimaryRecoverOptions {
+            data_dir: data_dir.clone(),
+            layout: DirectoryState::Primary {
+                history: plan.history,
+                fenced: true,
+                epoch: plan.from_epoch,
+            },
+            config: config.clone(),
+            primary_host: plan.follow.clone(),
+            sources: sources.clone(),
+            transport: transport.clone(),
+            token,
+            wire: physical_wire_limits(&self.ha.physical),
+            full: false,
+            no_full_copy: true,
+            full_copy_threshold: 100,
+            leaf_bytes: 4 * 1024 * 1024,
+            replace: false,
+            stage_dir: PathBuf::from(stage),
+        };
+        let report = match recover_from_primary(&options, &mut |line| info!("{line}")).await {
+            Ok(report) => report,
+            Err(error) => {
+                // Review item 1c: what the rewind left decides what works
+                // now. Nothing changed (it stopped before its conversion's
+                // one write — a census, a store that did not open, a plan
+                // above the threshold): the store is reopened, fenced, and
+                // served again. Converted: only the recover finishes it.
+                // Review item 5: "unchanged" means no step of the
+                // conversion shows — not its record, not the node-local
+                // family it creates first, not a removed primary record.
+                if rewind_left_unchanged(&data_dir) {
+                    match self.reopen_fenced(&data_dir).await {
+                        Ok(database) => {
+                            let reason = format!("its rewind stopped before it changed the directory ({error})");
+                            self.restore(database, &reason);
+                            return Err(DemotionError(format!(
+                                "{reason}; this node is the FENCED primary again (reads only); once what stopped the \
+                                 rewind is fixed, {finish} — or rebuild it by a full copy with `heliosdb-nano \
+                                 recover --from-primary --full --replace --data-dir {} --primary-host {}{flags} \
+                                 --then stop`",
+                                data_dir.display(),
+                                plan.follow
+                            )));
+                        }
+                        Err(reopen) => exit_demotion(&format!(
+                            "switchover {}: the rewind of this node into a standby of {} stopped before it changed \
+                             the directory ({error}), and the store could not be served again ({reopen}): this \
+                             process exits; the new primary serves epoch {}. The directory is the FENCED primary's, \
+                             unchanged: once what stopped the rewind is fixed, run `heliosdb-nano recover \
+                             --from-primary --data-dir {} --primary-host {}{flags} --replace --then stop` (add --full \
+                             to rebuild it by a full copy; {note}), then start the node as its standby: {start_standby}",
+                            plan.switchover,
+                            plan.follow,
+                            plan.to_epoch,
+                            data_dir.display(),
+                            plan.follow,
+                            note = heliosdb_nano::replication::promote::switchover::REPLACE_NOTE,
+                        )),
+                    }
+                }
+                exit_demotion(&format!(
+                    "switchover {}: the rewind of this node into a standby of {} failed after it converted the \
+                     directory ({error}): this process exits; the new primary serves epoch {}. Finish it with \
+                     `heliosdb-nano recover --from-primary --data-dir {} --primary-host {}{flags} --replace --then \
+                     stop` (it continues the rewind; {note}), then start the node as its standby: {start_standby}",
+                    plan.switchover,
+                    plan.follow,
+                    plan.to_epoch,
+                    data_dir.display(),
+                    plan.follow,
+                    note = heliosdb_nano::replication::promote::switchover::REPLACE_NOTE,
+                ))
+            }
+        };
+        // 7. Its role beside its directory, bound to it, for the next start
+        //    (review item 2: with the TLS it follows over).
+        let follow_tls = plan.pair_tls.then(|| {
+            (
+                self.ha.replication_tls.primary_tls_ca_path.clone(),
+                self.ha.replication_tls.primary_tls_server_name.clone(),
+            )
+        });
+        let recorded = heliosdb_nano::replication::role_override::current_binding(&data_dir).and_then(|binding| {
+            let binding = binding.ok_or_else(|| format!("{} holds no store", data_dir.display()))?;
+            let role = heliosdb_nano::replication::role_override::RoleOverride::standby(
+                plan.follow.clone(),
+                follow_tls,
+                binding,
+                format!(
+                    "SWITCHOVER {}: this node, the primary of epoch {}, was demoted into a standby of {} (epoch {})",
+                    plan.switchover, plan.from_epoch, plan.follow, plan.to_epoch
+                ),
+            );
+            heliosdb_nano::replication::role_override::write_role_override(&data_dir, &role)
+        });
+        if let Err(error) = recorded {
+            tracing::error!(
+                "switchover {}: this node's role (standby of {}) could not be recorded beside its data directory \
+                 ({error}): restart it with --replication-role standby --primary-host {}",
+                plan.switchover,
+                plan.follow,
+                plan.follow
+            );
+        }
+        // 8. Serve as the standby.
+        let mut ha = self.ha.clone();
+        ha.role = "standby".to_string();
+        ha.primary_host = Some(plan.follow.clone());
+        ha.physical.cascade = false;
+        ha.archive_sources = None;
+        if plan.pair_tls {
+            ha.replication_tls.primary_tls = Some(true);
+        }
+        config.replication.role = "standby".to_string();
+        config.replication.primary_host = Some(plan.follow.clone());
+        config.replication.physical.cascade = false;
+        if plan.pair_tls {
+            config.replication.primary_tls = Some(true);
+        }
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let served = self
+            .services
+            .send(ServiceRequest::ServeStandby {
+                ha: Box::new(ha),
+                config: Box::new(config),
+                reply,
+            })
+            .map_err(|_| "the server's main loop is gone".to_string());
+        let served = match served {
+            Ok(()) => answer
+                .await
+                .unwrap_or_else(|_| Err("the server's main loop did not answer".to_string())),
+            Err(reason) => Err(reason),
+        };
+        if let Err(reason) = served {
+            exit_demotion(&format!(
+                "switchover {}: this node was rewound into a standby of {} but could not be served as one \
+                 ({reason}): this process exits; start it through its service manager with its usual ports: \
+                 {start_standby} (the record beside the directory already holds the role, the primary and its TLS, \
+                 so a unit that names no role needs only its token file)",
+                plan.switchover, plan.follow
+            ));
+        }
+        heliosdb_nano::standby_posture::clear_fence_after_demotion();
+        // 9. Streaming: the answer says so (or what it waits for).
+        let deadline = tokio::time::Instant::now() + DEMOTION_STREAM_BOUND;
+        let streaming = loop {
+            let snapshot = heliosdb_nano::standby_posture::standby().map(|handle| handle.snapshot());
+            if snapshot
+                .as_ref()
+                .is_some_and(heliosdb_nano::standby_posture::StandbySnapshot::ready)
+            {
+                break None;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break Some(snapshot.map_or_else(|| "no posture".to_string(), |snapshot| snapshot.not_ready_message()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        };
+        // The placeholder's sessions redial: the next connection reaches the
+        // standby's store.
+        let (generation, targets) = registry().push_scoped(
+            TerminateCause::Promotion,
+            TerminateScope::ServedBy(placeholder_engine),
+            "terminating connection: this node is now a standby of the new primary; reconnect",
+        );
+        tokio::spawn(async move {
+            let _ = registry().drain(generation, targets, TERMINATE_DRAIN_TIMEOUT).await;
+        });
+        Ok(format!(
+            "rewound by {} ({} of {} leaves replaced, {} bytes shipped); {}",
+            report.route.as_str(),
+            report.leaves_differing,
+            report.leaves_total,
+            report.bytes_shipped,
+            match streaming {
+                None => format!("streaming from {}", plan.follow),
+                Some(reason) => format!("not streaming yet: {reason}"),
+            }
+        ))
     }
 }
 
@@ -6500,24 +7838,19 @@ async fn hold_after_gate() {
 /// Spec R6 (sprinter ffe805264aac): a standby calls it BEFORE its readiness
 /// gate, so its `/ready` answers 503 while it bootstraps; every other node
 /// once its database is open.
-#[allow(clippy::too_many_arguments)]
 async fn start_http_endpoint(
-    http_addr: std::net::SocketAddr,
+    plan: &HttpPlan,
     http_db: std::sync::Arc<EmbeddedDatabase>,
-    ha_config: &HAConfig,
-    api_config: &heliosdb_nano::config::ApiConfig,
-    http_auth_policy: &std::sync::Arc<heliosdb_nano::api::HttpAuthPolicy>,
-    guarded_standby: bool,
-    replication_node: bool,
-    cascading: bool,
-) -> Option<tokio::task::JoinHandle<()>> {
+    health_only: bool,
+) -> Option<HttpTask> {
+    let http_addr = plan.addr;
     match tokio::net::TcpListener::bind(http_addr).await {
         Ok(listener) => {
             info!("HTTP endpoint at http://{http_addr} (/health, /version, /docs, /rest/v1, /auth/v1, /realtime/v1)");
-            if guarded_standby {
-                info!("HTTP endpoint is history-guarded standby health-only: {guarded_standby}");
+            if health_only {
+                info!("HTTP endpoint is history-guarded standby health-only: {health_only}");
             }
-            if http_auth_policy.is_required() {
+            if plan.policy.is_required() {
                 info!(
                     "HTTP API authentication is required on {http_addr} \
                      (HTTP Basic with the wire credential, or the MCP bearer token when configured)"
@@ -6530,58 +7863,16 @@ async fn start_http_endpoint(
                     http_addr
                 );
             }
-            // Spec P5.2 §3 step 5: on a standby `http_db` is the placeholder
-            // — its HTTP surface is health-only and reads no database — so
-            // this task never holds the store an online promotion closes.
-            let mcp_token = ha_config.mcp_token.clone();
-            let allow_remote_mcp = ha_config.allow_remote_mcp;
-            let http_api_config = api_config.clone();
-            let policy = std::sync::Arc::clone(http_auth_policy);
-            // Spec P1.3: a replication node's `/health` carries its
-            // replication block and `/ready` answers its readiness. Spec
-            // P2.1: a primary's `/health` also lists its standbys; spec
-            // P3.2 §4: so does a cascading standby (its downstreams),
-            // which also says `cascade: true`.
-            // Spec P5.2: read at every request — an online promotion
-            // makes a standby (cascading or not) a primary in-process.
-            let replication_status: Option<heliosdb_nano::api::ReplicationStatus> = replication_node.then(|| {
-                let status: heliosdb_nano::api::ReplicationStatus = std::sync::Arc::new(move || {
-                    let block = heliosdb_nano::standby_posture::node_block()?;
-                    let primary_now = block.role == "primary";
-                    // Spec P5.2 §8.J: a cascading port a promotion
-                    // stopped (or could not open again) is not
-                    // reported as serving.
-                    let cascading_now = cascading && !primary_now && cascade_serving();
-                    Some(heliosdb_nano::api::ReplicationReport {
-                        ready: block.ready,
-                        block: serde_json::to_value(block).ok()?,
-                        standbys: (primary_now || cascading_now).then(primary_standbys_report),
-                        // Spec P3.1: a sibling object, never inside the block.
-                        archive: Some(archive_health_report()),
-                        cascade: cascading_now.then_some(true),
-                    })
-                });
-                status
-            });
-            if replication_status.is_some() {
+            if plan.replicating {
                 info!("HTTP readiness at http://{http_addr}/ready (200 when ready, 503 otherwise)");
             }
-            Some(tokio::spawn(async move {
-                if let Err(e) = run_http_listener_with_replication(
-                    listener,
-                    http_db,
-                    mcp_token,
-                    allow_remote_mcp,
-                    http_api_config,
-                    policy,
-                    guarded_standby,
-                    replication_status,
-                )
-                .await
-                {
-                    tracing::error!("HTTP server accept loop exited: {e}");
+            match plan.spawn(listener, http_db, health_only) {
+                Ok(task) => Some(task),
+                Err(error) => {
+                    tracing::error!("the HTTP endpoint {http_addr} could not be started: {error}");
+                    None
                 }
-            }))
+            }
         }
         Err(e) => {
             tracing::error!(
@@ -6599,13 +7890,13 @@ async fn start_http_endpoint(
 
 /// Stop an HTTP endpoint [`start_http_endpoint`] started: its accept loop ends
 /// and its database handle is released. Connections it accepted run on tasks
-/// of their own until they close; on a standby's health-only router they hold
-/// no database.
+/// of their own until they close, or end with its runtime when it has one
+/// ([`HttpPlan::isolated`]); on a standby's health-only router they hold no
+/// database.
 #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
-async fn stop_http_endpoint(handle: Option<tokio::task::JoinHandle<()>>) {
-    if let Some(handle) = handle {
-        handle.abort();
-        let _ = handle.await;
+async fn stop_http_endpoint(task: Option<HttpTask>) {
+    if let Some(task) = task {
+        task.stop().await;
     }
 }
 
@@ -8075,7 +9366,87 @@ struct PhysicalTransferArgs {
     physical_operation_timeout_secs: Option<u64>,
 }
 
+/// A flag handed on to `start` (`--flag`, with its value when it takes one).
+#[cfg(feature = "ha-tier1")]
+type StartFlag = (&'static str, Option<OsString>);
+
+/// What a command that goes on to `start` in-process (`recover --then
+/// primary`, `promote --then start`) was told about reaching its peer: `start`
+/// gets the same token, limits and TLS, as flags — except any the arguments
+/// after `--` already set, which win (a flag given twice is a usage error).
+/// Without this a `recover --replication-token-file T` did its work and then
+/// refused to follow, for want of the token it had just used.
+#[cfg(feature = "ha-tier1")]
+fn flags_for_start(
+    physical: &PhysicalTransferArgs,
+    primary_tls: &PrimaryTlsArgs,
+    allow_insecure_remote: bool,
+    start_args: &[String],
+) -> Vec<OsString> {
+    let mut flags = physical.start_flags();
+    flags.extend(primary_tls.start_flags());
+    if allow_insecure_remote {
+        flags.push(("--allow-insecure-replication-remote", None));
+    }
+    flags
+        .into_iter()
+        .filter(|(flag, _)| {
+            !start_args
+                .iter()
+                .any(|arg| arg == flag || arg.strip_prefix(*flag).is_some_and(|rest| rest.starts_with('=')))
+        })
+        .map(|(flag, value)| {
+            let mut arg = OsString::from(flag);
+            if let Some(value) = value {
+                arg.push("=");
+                arg.push(value);
+            }
+            arg
+        })
+        .collect()
+}
+
 impl PhysicalTransferArgs {
+    /// These settings as flags of `start` ([`flags_for_start`]).
+    #[cfg(feature = "ha-tier1")]
+    fn start_flags(&self) -> Vec<StartFlag> {
+        let mut flags: Vec<StartFlag> = Vec::new();
+        if let Some(file) = &self.replication_token_file {
+            flags.push(("--replication-token-file", Some(file.clone().into_os_string())));
+        }
+        for (flag, value) in [
+            (
+                "--physical-max-files",
+                self.physical_max_files.map(|value| value.to_string()),
+            ),
+            (
+                "--physical-max-file-bytes",
+                self.physical_max_file_bytes.map(|value| value.to_string()),
+            ),
+            (
+                "--physical-max-total-bytes",
+                self.physical_max_total_bytes.map(|value| value.to_string()),
+            ),
+            (
+                "--physical-max-chunk-bytes",
+                self.physical_max_chunk_bytes.map(|value| value.to_string()),
+            ),
+            (
+                "--physical-frame-timeout-secs",
+                self.physical_frame_timeout_secs.map(|value| value.to_string()),
+            ),
+            (
+                "--physical-operation-timeout-secs",
+                self.physical_operation_timeout_secs.map(|value| value.to_string()),
+            ),
+        ] {
+            if let Some(value) = value {
+                flags.push((flag, Some(OsString::from(value))));
+            }
+        }
+        flags
+    }
+
     fn apply(self, replication: &mut heliosdb_nano::config::ReplicationConfig) {
         if let Some(value) = self.replication_token_file {
             replication.token_file = Some(value);
@@ -10005,6 +11376,9 @@ fn fenced_or_promoting_refusal(data_dir: &std::path::Path, role: &str) -> Option
     if let Some(reason) = heliosdb_nano::replication::promote::refuse_promoting_directory(data_dir) {
         return Some(reason);
     }
+    if let Some(reason) = interrupted_rewind_refusal(data_dir) {
+        return Some(reason);
+    }
     if role != "standby" || std::fs::symlink_metadata(data_dir.join(FENCED_FILE)).is_err() {
         return None;
     }
@@ -10016,6 +11390,125 @@ fn fenced_or_promoting_refusal(data_dir: &std::path::Path, role: &str) -> Option
             heliosdb_nano::storage::replication_records::fenced_rebuild_hint(data_dir)
         ),
     })
+}
+
+/// Spec R3a (Sprinter 1c8963417a35): why `start` (any role) refuses a former
+/// primary whose rewind into a standby was interrupted before its interim
+/// marker was written — its store holds the rewind's record, so the engine
+/// refuses it anyway (the node-local family), but this names the command
+/// that finishes it. Once the marker is there, a standby start reports the
+/// interrupted fast-forward itself (`needs_recovery`, naming the same
+/// command), so a standby's directory is not read here at all.
+#[cfg(feature = "ha-tier1")]
+fn interrupted_rewind_refusal(data_dir: &std::path::Path) -> Option<String> {
+    use heliosdb_nano::replication::checkpoint_transfer::PHYSICAL_MARKER_FILE;
+    use heliosdb_nano::replication::fence::FENCED_FILE;
+    use heliosdb_nano::replication::history::{PRIMARY_HISTORY_FILE, STANDBY_BINDING_FILE};
+    let carries = |name: &str| std::fs::symlink_metadata(data_dir.join(name)).is_ok();
+    if carries(PHYSICAL_MARKER_FILE) && !carries(PRIMARY_HISTORY_FILE) && !carries(FENCED_FILE) {
+        return None;
+    }
+    // A 4.41.x logical standby's directory gets its own refusal (the
+    // conversion message, spec P1.3) from the standby's start path; it is no
+    // former primary.
+    if carries(STANDBY_BINDING_FILE) {
+        return None;
+    }
+    // Only a record that READS names the interrupted rewind. A directory
+    // whose store cannot be read here (no RocksDB store, a missing MANIFEST,
+    // a damaged one) is classified by the start path itself, which refuses
+    // it in every role it cannot be opened in: the engine refuses any
+    // non-standby open of a store carrying the node-local family, and a
+    // standby's stage open refuses a store with a pending rewind record.
+    let rewind = match heliosdb_nano::replication::physical::directory_rewind_record(data_dir) {
+        Ok(rewind) => rewind?,
+        Err(error) => {
+            tracing::debug!(
+                "{}: no rewind record could be read ({error}); the start path classifies the directory",
+                data_dir.display()
+            );
+            return None;
+        }
+    };
+    Some(format!(
+        "{} is a former primary (epoch {}) whose rewind into a standby of the primary at {} (epoch {}) was \
+         interrupted: finish it with `heliosdb-nano recover --from-primary --data-dir {} --primary-host {} \
+         --replication-token-file <its token file> --replace --then stop`, then start it as that primary's standby \
+         (--replace matters only if it has to fall back to a full copy: the old directory is then moved aside, never \
+         deleted)",
+        data_dir.display(),
+        rewind.from_epoch,
+        rewind.primary,
+        rewind.to_epoch,
+        data_dir.display(),
+        rewind.primary
+    ))
+}
+
+/// Spec R3b, review item 2: rewrite the role override beside `data_dir` —
+/// only one already there (a switchover's): `promote` and `recover` leave
+/// the directory in another role or binding, and an override must never go
+/// stale behind them. `standby`: the directory is a standby now (of the
+/// given primary, or the one recorded; with the TLS it follows over);
+/// `None`: a primary. A failure is said, never fatal: the start then refuses
+/// the stale file, naming it.
+#[cfg(feature = "ha-tier1")]
+fn rebind_role_override(
+    data_dir: &std::path::Path,
+    standby: Option<(Option<&str>, Option<(Option<PathBuf>, Option<String>)>)>,
+    reason: &str,
+) {
+    use heliosdb_nano::replication::role_override::{
+        current_binding, read_role_override, rewrite_if_present, role_override_path, RoleOverride,
+    };
+    let Ok(path) = role_override_path(data_dir) else {
+        return;
+    };
+    if std::fs::symlink_metadata(&path).is_err() {
+        return;
+    }
+    let recorded = read_role_override(data_dir).ok().flatten();
+    let rewritten = current_binding(data_dir).and_then(|binding| {
+        let binding = binding.ok_or_else(|| format!("{} holds no store", data_dir.display()))?;
+        let record = match standby {
+            None => RoleOverride::primary(binding, reason),
+            Some((host, tls)) => {
+                let host = host
+                    .map(str::to_string)
+                    .or_else(|| {
+                        recorded
+                            .as_ref()
+                            .and_then(|record| record.replication.primary_host.clone())
+                    })
+                    .ok_or_else(|| "no primary to record (give --primary-host)".to_string())?;
+                let tls = tls.or_else(|| {
+                    recorded
+                        .as_ref()
+                        .filter(|record| record.replication.primary_tls == Some(true))
+                        .map(|record| {
+                            (
+                                record.replication.primary_tls_ca_path.clone(),
+                                record.replication.primary_tls_server_name.clone(),
+                            )
+                        })
+                });
+                RoleOverride::standby(host, tls, binding, reason)
+            }
+        };
+        rewrite_if_present(data_dir, &record)
+    });
+    match rewritten {
+        Ok(Some(path)) => println!(
+            "{reason}: the role recorded beside the data directory is rewritten ({})",
+            path.display()
+        ),
+        Ok(None) => {}
+        Err(error) => eprintln!(
+            "WARNING: the role override {} could not be rewritten ({error}): delete it, or `start` refuses the \
+             directory naming it",
+            path.display()
+        ),
+    }
 }
 
 /// `heliosdb-nano promote` (spec P5.1 §4): offline; refuses a running node,
@@ -10070,6 +11563,7 @@ async fn run_promote(args: PromoteArgs) -> Result<()> {
         // Spec P5.1 §11.B: --no-fence never contacts the primary, so it
         // promotes without its final sequence: it implies --force.
         let force = force || no_fence;
+        let start_flags = flags_for_start(&physical, &primary_tls, allow_insecure_replication_remote, &start_args);
         let mut config = match &config_path {
             Some(path) => Config::from_file(path.clone())?,
             None => Config::default(),
@@ -10136,6 +11630,16 @@ async fn run_promote(args: PromoteArgs) -> Result<()> {
             Err(error @ PromoteError::Failed(_)) => return Err(Error::storage(error.to_string())),
         };
         println!("{}", report.summary());
+        // Spec R3b, review item 2: a role override beside the directory (a
+        // switchover's) is rewritten: the directory is a primary's now.
+        rebind_role_override(
+            &canonical,
+            None,
+            &format!(
+                "heliosdb-nano promote: promoted to the primary of epoch {}",
+                report.to_epoch
+            ),
+        );
         if !start {
             return Ok(());
         }
@@ -10157,6 +11661,7 @@ async fn run_promote(args: PromoteArgs) -> Result<()> {
             argv.push("--config".into());
             argv.push(path.into_os_string());
         }
+        argv.extend(start_flags);
         argv.extend(start_args.into_iter().map(OsString::from));
         let cli = Cli::try_parse_from(argv)
             .map_err(|error| Error::config(format!("the start arguments after -- are not valid: {error}")))?;
@@ -10358,6 +11863,7 @@ async fn run_recover(args: RecoverArgs) -> Result<()> {
             allow_insecure_replication_remote,
             start_args,
         } = args;
+        let start_flags = flags_for_start(&physical, &primary_tls, allow_insecure_replication_remote, &start_args);
         let mut config = match &config_path {
             Some(path) => Config::from_file(path.clone())?,
             None => Config::default(),
@@ -10369,6 +11875,27 @@ async fn run_recover(args: RecoverArgs) -> Result<()> {
         if allow_insecure_replication_remote {
             config.replication.allow_insecure_remote = true;
         }
+        // Review (third pass, item 7): a node a switchover demoted records the
+        // TLS it follows over beside its directory; `recover` reaches the
+        // primary the same way (never in plaintext where the pair used TLS),
+        // the command line's CA and server name first.
+        if let Ok(Some(record)) = heliosdb_nano::replication::role_override::read_role_override(&data_dir) {
+            if record.replication.primary_tls == Some(true) {
+                config.replication.primary_tls = Some(true);
+                if config.replication.primary_tls_ca_path.is_none() {
+                    config.replication.primary_tls_ca_path = record.replication.primary_tls_ca_path;
+                }
+                if config.replication.primary_tls_server_name.is_none() {
+                    config.replication.primary_tls_server_name = record.replication.primary_tls_server_name;
+                }
+                println!(
+                    "recover: over TLS, as the role recorded beside the data directory says ({})",
+                    heliosdb_nano::replication::role_override::role_override_path(&data_dir)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                );
+            }
+        }
         refuse_running_node(&data_dir)?;
         // Spec P5.1 §4 step 3: an interrupted promotion is finished by
         // `promote`, never recovered as a standby.
@@ -10376,6 +11903,10 @@ async fn run_recover(args: RecoverArgs) -> Result<()> {
             println!("recover refused: {reason}");
             std::process::exit(2);
         }
+        let override_dir = data_dir.clone();
+        let override_tls = config.replication.primary_tls == Some(true);
+        let override_ca = config.replication.primary_tls_ca_path.clone();
+        let override_server_name = config.replication.primary_tls_server_name.clone();
         let reached = if from_primary {
             let host = primary_host
                 .clone()
@@ -10405,6 +11936,17 @@ async fn run_recover(args: RecoverArgs) -> Result<()> {
             )
             .await?
         };
+        // Spec R3b, review item 2: a role override beside the directory is
+        // rewritten — it is a standby now (of --primary-host when given),
+        // bound to what the recovery left.
+        rebind_role_override(
+            &override_dir,
+            Some((
+                primary_host.as_deref(),
+                override_tls.then_some((override_ca, override_server_name)),
+            )),
+            "heliosdb-nano recover: rebuilt as a standby",
+        );
         if !follow {
             return Ok(());
         }
@@ -10427,6 +11969,7 @@ async fn run_recover(args: RecoverArgs) -> Result<()> {
             argv.push("--config".into());
             argv.push(path.into_os_string());
         }
+        argv.extend(start_flags);
         argv.extend(start_args.into_iter().map(OsString::from));
         let cli = Cli::try_parse_from(argv)
             .map_err(|error| Error::config(format!("the start arguments after -- are not valid: {error}")))?;
@@ -10549,8 +12092,8 @@ async fn recover_from_primary_command(
 ) -> Result<u64> {
     use heliosdb_nano::replication::archive_recovery::RecoverError;
     use heliosdb_nano::replication::recover_primary::{
-        canonical_path, format_bytes, format_count, format_percent, recover_from_primary, DirectoryState,
-        PrimaryRecoverOptions, RecoverRoute,
+        canonical_path, format_bytes, format_count, format_percent, recover_from_primary, rewinding_layout,
+        DirectoryState, PrimaryRecoverOptions, RecoverRoute,
     };
     config.replication.validate()?;
     config.replication.physical.validate()?;
@@ -10558,15 +12101,23 @@ async fn recover_from_primary_command(
     // checks refuse both in the paths they are given.
     let canonical = canonical_path(data_dir).map_err(|error| Error::config(error.to_string()))?;
     let data_dir = canonical.as_path();
-    // Spec P5.1 §6: a fenced primary's directory, or a primary's of the same
-    // dataset that is not fenced, is rebuilt as a standby by a full copy
-    // (with --replace); every other directory as P4.1 classifies it.
-    let layout = match primary_directory_layout(data_dir)? {
+    // Spec R3a (Sprinter 1c8963417a35): a former primary under an
+    // interrupted rewind is classified by its store's record first,
+    // whichever of its files the conversion had already changed. Then, spec
+    // P5.1 §6: a fenced primary's directory, or a primary's of the same
+    // dataset that is not fenced, is rewound in place (or rebuilt by a full
+    // copy with --full / --replace); every other directory as P4.1
+    // classifies it.
+    let rewinding = rewinding_layout(data_dir).map_err(|reason| Error::config(format!("recover refused: {reason}")))?;
+    let layout = match rewinding {
         Some(layout) => layout,
-        None => match classify_standby_directory(data_dir) {
-            StandbyLayout::Physical { history } => DirectoryState::Physical { history },
-            StandbyLayout::Fresh { empty_existing } => DirectoryState::Fresh { empty_existing },
-            StandbyLayout::Refused(reason) => return Err(Error::config(format!("recover refused: {reason}"))),
+        None => match primary_directory_layout(data_dir)? {
+            Some(layout) => layout,
+            None => match classify_standby_directory(data_dir) {
+                StandbyLayout::Physical { history } => DirectoryState::Physical { history },
+                StandbyLayout::Fresh { empty_existing } => DirectoryState::Fresh { empty_existing },
+                StandbyLayout::Refused(reason) => return Err(Error::config(format!("recover refused: {reason}"))),
+            },
         },
     };
     let stage_dir = match flags.stage_dir {
@@ -10639,6 +12190,27 @@ async fn recover_from_primary_command(
              {seconds:.1} s)",
             format_count(report.to),
             format_count(report.from),
+            format_count(report.leaves_differing),
+            format_count(report.leaves_total),
+            format_bytes(report.bytes_shipped),
+            format_percent(report.bytes_shipped, report.bytes_total),
+            format_bytes(report.bytes_total)
+        ),
+        // Spec R3a: the former primary is a standby of the primary now.
+        RecoverRoute::Rewind => println!(
+            "recover: rewound the former primary into a standby at sequence {} of the primary ({}{} of {} leaves \
+             replaced, {} shipped, {} of {}; {seconds:.1} s)",
+            format_count(report.to),
+            report
+                .rewind
+                .as_ref()
+                .map(|rewound| format!(
+                    "epoch {} → {}, from its own sequence {}; ",
+                    rewound.from_epoch,
+                    rewound.to_epoch,
+                    format_count(rewound.primary_sequence)
+                ))
+                .unwrap_or_default(),
             format_count(report.leaves_differing),
             format_count(report.leaves_total),
             format_bytes(report.bytes_shipped),
@@ -10761,6 +12333,95 @@ mod physical_cli_tests {
         };
         assert!(!args.once && !args.resume_existing);
     }
+    /// What `recover` (and `promote`) were told about reaching their peer
+    /// reaches the `start` they go on to: `start` accepts every flag handed
+    /// on, and a flag the arguments after `--` already set is not handed on
+    /// twice (clap refuses a repeated flag).
+    #[cfg(feature = "ha-tier1")]
+    #[test]
+    fn a_recover_hands_its_token_limits_and_tls_to_the_start_it_goes_on_to() {
+        let Commands::Recover(args) = Cli::try_parse_from([
+            "nano",
+            "recover",
+            "--data-dir",
+            "d",
+            "--from-primary",
+            "--primary-host",
+            "10.0.0.6:5433",
+            "--replication-token-file",
+            "/etc/token",
+            "--physical-max-files",
+            "9",
+            "--physical-frame-timeout-secs",
+            "7",
+            "--primary-tls",
+            "--primary-ca",
+            "/etc/ca.pem",
+            "--primary-server-name",
+            "db2",
+            "--primary-client-cert",
+            "/etc/c.pem",
+            "--primary-client-key",
+            "/etc/k.pem",
+            "--allow-insecure-replication-remote",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("wrong command")
+        };
+        let start = |extra: &[&str]| {
+            let extra: Vec<String> = extra.iter().map(ToString::to_string).collect();
+            let mut argv: Vec<OsString> = ["nano", "start", "--replication-role", "standby"]
+                .iter()
+                .map(OsString::from)
+                .collect();
+            argv.extend(flags_for_start(
+                &args.physical,
+                &args.primary_tls,
+                args.allow_insecure_replication_remote,
+                &extra,
+            ));
+            argv.extend(extra.into_iter().map(OsString::from));
+            let Commands::Start {
+                physical,
+                replication_tls,
+                allow_insecure_replication_remote,
+                ..
+            } = Cli::try_parse_from(argv).unwrap().command
+            else {
+                panic!("wrong command")
+            };
+            (physical, replication_tls, allow_insecure_replication_remote)
+        };
+        let (physical, tls, insecure) = start(&["--port", "5555"]);
+        assert_eq!(
+            physical.transfer.replication_token_file,
+            Some(PathBuf::from("/etc/token"))
+        );
+        assert_eq!(physical.transfer.physical_max_files, Some(9));
+        assert_eq!(physical.transfer.physical_frame_timeout_secs, Some(7));
+        assert_eq!(tls.primary.primary_tls, Some(true));
+        assert_eq!(tls.primary.primary_ca, Some(PathBuf::from("/etc/ca.pem")));
+        assert_eq!(tls.primary.primary_server_name.as_deref(), Some("db2"));
+        assert_eq!(tls.primary.primary_client_cert, Some(PathBuf::from("/etc/c.pem")));
+        assert_eq!(tls.primary.primary_client_key, Some(PathBuf::from("/etc/k.pem")));
+        assert!(insecure);
+        // The arguments after `--` win, in either spelling.
+        let (physical, tls, _) = start(&[
+            "--replication-token-file",
+            "/other/token",
+            "--primary-ca=/other/ca.pem",
+            "--primary-tls=false",
+        ]);
+        assert_eq!(
+            physical.transfer.replication_token_file,
+            Some(PathBuf::from("/other/token"))
+        );
+        assert_eq!(tls.primary.primary_ca, Some(PathBuf::from("/other/ca.pem")));
+        assert_eq!(tls.primary.primary_tls, Some(false));
+    }
+
     /// Spec P2.1: one replication port, no compatibility — the separate
     /// physical endpoint flag and the observer role's flag are gone.
     #[test]

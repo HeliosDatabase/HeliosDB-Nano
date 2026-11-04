@@ -338,6 +338,14 @@ pub(crate) fn remove_record_in(dir: &Path, name: &str) -> HistoryResult<()> {
     sync_directory(&directory.path)
 }
 
+/// Spec R3a: whether `file` is one of the temporaries a write of the record
+/// `name` can leave behind (its `.tmp` sibling, or a crashed
+/// [`write_new_record_in`]'s private one) — what [`remove_record_in`]
+/// removes with the record.
+pub(crate) fn is_record_temporary(file: &str, name: &str) -> bool {
+    file.strip_prefix(name).is_some_and(|rest| rest == ".tmp") || is_temporary_of(file, name)
+}
+
 impl OwnedDirectory {
     fn capture(path: PathBuf) -> HistoryResult<Self> {
         reject_symlink_components(&path)?;

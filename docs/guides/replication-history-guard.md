@@ -96,11 +96,19 @@ STOPPED directory (see
 convert the directory the same way, under the same record. A standby's data
 directory is otherwise refused as a primary or standalone database, so
 restarting a standby with `--replication-role primary` does not promote it.
-The SQL `SWITCHOVER TO '<node>'` statement on the primary is still **refused,
-not initiated**: it performs the same checks it always did (the target must
-resolve, this node must be the primary, the target must be a connected
-standby) and returns an error naming both forms on the target; `SWITCHOVER
-CHECK` lists the same as its blocker.
+The SQL `SWITCHOVER TO '<standby>'` statement, run on the PRIMARY's
+PostgreSQL port, swaps the two roles in one command (spec R3b, see
+[SWITCHOVER](physical-standby.md#switchover-both-roles-in-one-command)): the
+standby is asked over its replication session to promote itself online, it
+fences this primary, and this primary is then demoted in-process into its
+standby (rewound by fast-forward, never copied). `SWITCHOVER CHECK TO
+'<standby>'` runs the preflight only and answers one row per check. Every
+refusal before the standby accepted changes nothing (SQLSTATE 55000 naming
+the failed check); once it accepted, the old primary is never writable again
+— if the switchover cannot finish, it stays FENCED and the error names the
+commands that finish it. Through the embedded API (or a prepared statement)
+`SWITCHOVER` is refused: it is answered by the server's PostgreSQL session,
+which lets go of the store the demotion reopens.
 
 A promotion keeps the dataset's **history id** (it is the same dataset) and
 raises its **epoch** by one. The epoch is stored in the dataset itself
@@ -113,13 +121,36 @@ ever to be removed by hand:
 
 | file | written by | meaning | what refuses the directory |
 |---|---|---|---|
-| `NANO-PRIMARY-HISTORY.json` | the first start of a primary; `promote` (inherited history) | this directory is a primary of the history it names | a standby start; `recover --from-primary` rebuilds it only with `--replace`, by a full copy of a primary of the same history |
-| `NANO-FENCED.json` | a primary when a promoted standby fenced it (`{format, history, epoch, fenced_by_epoch, fenced_at, by_node, final_sequence}`) | this primary was superseded: it refused every write from `fenced_at` on and holds everything through `final_sequence` | every open of the directory is FENCED, in every build and through every entry point (`start` as a primary or standalone, `repl`, MCP, the embedded API): reads are served, every write is refused (SQLSTATE 25006), `/ready` 503, `state = fenced`; a `start` as a STANDBY is refused (exit 2: "this directory is a primary that was fenced at … by epoch E+1 …; it is not a standby's and cannot be started as one; rebuild it as a standby: `heliosdb-nano recover --from-primary --primary-host <new> --replace --data-dir D`"); `recover --from-primary --replace` rebuilds it (without `--replace`: exit 3); a record that cannot be read refuses every writable open, naming the file and the rebuild |
+| `NANO-PRIMARY-HISTORY.json` | the first start of a primary; `promote` (inherited history) | this directory is a primary of the history it names | a standby start; `recover --from-primary` against the primary promoted over it (same history, higher epoch) REWINDS it in place into that primary's standby (spec R3a: only the leaves that differ travel; the file is removed by the rewind); `--full --replace` rebuilds it by a full copy instead; a source of another history, or at this directory's own or a lower epoch, is refused |
+| `NANO-FENCED.json` | a primary when a promoted standby fenced it (`{format, history, epoch, fenced_by_epoch, fenced_at, by_node, final_sequence}`) | this primary was superseded: it refused every write from `fenced_at` on and holds everything through `final_sequence` | every open of the directory is FENCED, in every build and through every entry point (`start` as a primary or standalone, `repl`, MCP, the embedded API): reads are served, every write is refused (SQLSTATE 25006), `/ready` 503, `state = fenced`; a `start` as a STANDBY is refused (exit 2: "this directory is a primary that was fenced at … by epoch E+1 …; it is not a standby's and cannot be started as one; rebuild it as a standby: `heliosdb-nano recover --from-primary --primary-host <new> --replace --data-dir D`"); `recover --from-primary` rewinds it in place into the new primary's standby (spec R3a; nothing it committed through `final_sequence` is lost, and a copy of the record is kept in the rewind's own record); `--replace` matters only when the rewind falls back to a full copy; a record that cannot be read refuses every writable open, naming the file and the rebuild |
 | `NANO-PROMOTION.json` | `promote`, before it changes the store | a promotion was interrupted | every open of the directory except `promote`'s own: `start` in every role, `recover`, `resync`, `repl`, the embedded API (exit 2 from the CLI: "promotion interrupted: finish it with `heliosdb-nano promote --data-dir D`"); a re-run of `promote` finishes it (an unreadable record on a store the conversion has not touched yet is discarded with a WARNING and the promotion starts again) |
 
 The three are written whole: a temporary file, fsynced, renamed into place
 without ever replacing an existing record, and the directory fsynced. A crash
 leaves the record complete or absent, never torn.
+
+Spec R3a adds one record INSIDE the store: a former primary under a rewind
+carries, in its node-local family, the rewind's record (its epoch, its own
+last sequence, a copy of its fence record) together with the fast-forward's.
+While it is there every `start` refuses the directory (exit 2, naming `recover
+--from-primary`; once the interim physical marker is written a standby start
+stays up in `needs_recovery` naming the same command, like any interrupted
+fast-forward). A re-run of `recover --from-primary` finishes it, whichever
+step it stopped after; the re-cut removes it and keeps a copy (`rewound`) for
+diagnosis.
+
+Spec R3b adds one file BESIDE the data directory: `<data dir>.role.toml`
+(mode 0600), written by a switchover on both nodes (`[replication] role` and,
+for a standby, `primary_host` and the TLS it follows over) and bound to the
+directory it was written for (`[directory]`: the dataset history, the epoch,
+the store's `IDENTITY`). `start` applies it over the configuration file (said
+at WARN), so a restart starts each node as what the switchover made it; delete
+it to go back to the configuration file's role. It refuses the start (exit 2,
+naming the file) when it does not read, when the directory is missing, empty
+or not the one it was written for (rebuilt, restored, recovered — an old
+node's role never turns a new directory into a writable primary of a new
+history), and when the command line's `--replication-role` or `--primary-host`
+contradicts it. `promote`, `pg_promote` and `recover` rewrite one they find.
 
 The fence is graceful when the old primary is reachable: it is sent on the old
 primary's own replication port, authenticated like every session, only after

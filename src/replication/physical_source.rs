@@ -50,8 +50,8 @@ use super::physical::{
 };
 use super::physical_wire::{
     valid_leaf_bytes, Heartbeat, Hello, LastGroup, LeafDigests, LeafReady, ObservedSession, OpenRequest, PeerRole,
-    PhysicalSource, PollOrigin, Refusal, RefuseCode, Result, SessionObserver, SourceSessionInfo, WireError,
-    WireSyncMode,
+    PhysicalSource, PollOrigin, PromoteAnswer, PromoteRequest, Refusal, RefuseCode, Result, SessionObserver,
+    SourceSessionInfo, WireError, WireSyncMode, CAP_PROMOTE, CAP_TLS,
 };
 use crate::Config;
 use async_trait::async_trait;
@@ -1467,16 +1467,35 @@ impl Drop for CensusEntry {
 }
 
 /// One admitted session, registered while it lives.
-struct RegisteredSession(StandbyHandle, #[allow(dead_code)] CensusEntry);
+struct RegisteredSession {
+    standby: StandbyHandle,
+    /// In the source's session census while it lives (spec R1).
+    _census: CensusEntry,
+    /// Spec R3b: a receiver that offered `CAP_PROMOTE` — a `SWITCHOVER TO`
+    /// of this primary can be delivered on this session.
+    promotable: Option<crate::replication::promote::switchover::PromotableSession>,
+}
 
 impl ObservedSession for RegisteredSession {
     fn heartbeat(&mut self, heartbeat: &Heartbeat) {
-        self.0
+        self.standby
             .record_ack(heartbeat.applied_sequence, heartbeat.durable_sequence);
     }
 
     fn served(&mut self, origin: PollOrigin) {
-        self.0.note_source(origin == PollOrigin::Archive);
+        self.standby.note_source(origin == PollOrigin::Archive);
+    }
+
+    fn promote_request(&mut self) -> Option<PromoteRequest> {
+        self.promotable
+            .as_ref()
+            .and_then(crate::replication::promote::switchover::PromotableSession::take_request)
+    }
+
+    fn promote_answered(&mut self, request: &PromoteRequest, answer: Option<PromoteAnswer>) {
+        if let Some(promotable) = &self.promotable {
+            promotable.answered(request, answer);
+        }
     }
 }
 
@@ -1505,7 +1524,17 @@ impl SessionObserver for StandbyRegistryObserver {
             state.as_str(),
             hello.cursor.map(|cursor| format!(", at {cursor}")).unwrap_or_default()
         ));
-        let handle = ha_state().register_standby(StandbyRegistration {
+        // Spec R3b: a serving standby that follows (and offered it) can be
+        // asked to promote itself by `SWITCHOVER TO`.
+        let promotable =
+            (following && hello.role == PeerRole::Standby && hello.capabilities & CAP_PROMOTE != 0).then(|| {
+                crate::replication::promote::switchover::note_promotable(
+                    hello.node_id,
+                    peer,
+                    hello.capabilities & CAP_TLS != 0,
+                )
+            });
+        let standby = ha_state().register_standby(StandbyRegistration {
             node_id: hello.node_id,
             address,
             history: hello.history,
@@ -1519,7 +1548,11 @@ impl SessionObserver for StandbyRegistryObserver {
             state,
             counts_for_sync: following && hello.role == PeerRole::Standby,
         });
-        Box::new(RegisteredSession(handle, entry))
+        Box::new(RegisteredSession {
+            standby,
+            _census: entry,
+            promotable,
+        })
     }
 }
 

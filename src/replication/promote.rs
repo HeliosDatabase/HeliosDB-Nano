@@ -105,6 +105,9 @@ use crate::Config;
 /// Spec P5.2: `SELECT pg_promote(wait, wait_seconds)`, the online promotion
 /// of a RUNNING standby, with this module's conversion.
 pub mod online;
+/// Spec R3b (Sprinter bbba90ddfc61): `SWITCHOVER TO '<target>'` on the
+/// primary — the target promoted online, this primary demoted in-process.
+pub mod switchover;
 
 /// The node-local key holding the promotion's identity between step 1 and
 /// the conversion, in [`LOCAL_CF`].
