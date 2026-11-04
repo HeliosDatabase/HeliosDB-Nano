@@ -25,15 +25,20 @@
 #![cfg(feature = "ha-tier1")]
 
 use std::{
-    net::TcpListener,
     path::Path,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 use tokio_postgres::NoTls;
 
+#[path = "support/ports.rs"]
+mod ports;
+
+/// A loopback port RESERVED for the life of the test process (sprinter
+/// ffe805264aac, `support/ports.rs`): a port bound and released at once could
+/// be taken by a concurrent test before the daemon binds it.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    ports::free_port()
 }
 
 /// Kills exactly the child it owns when dropped, so a failed assertion cannot

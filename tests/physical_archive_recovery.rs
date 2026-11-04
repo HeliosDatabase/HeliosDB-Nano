@@ -111,8 +111,8 @@ async fn wait_ready_body(
         }
         assert!(
             Instant::now() < deadline,
-            "/ready never answered as wanted; last {seen:?}; log tail: {}",
-            daemon.tail(12)
+            "/ready never answered as wanted; last {seen:?}{}",
+            daemon.diagnose(port)
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -449,6 +449,38 @@ async fn recover_needs_the_dataset_key_of_an_encrypted_dataset() {
         "{}",
         resumed.tail(20)
     );
+}
+
+/// Sprinter ffe805264aac: a directory an archive-only standby cannot follow is
+/// refused before its HTTP endpoint opens, so its first `/ready` says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_only_standby_of_a_fresh_directory_says_why_on_its_first_ready() {
+    let pair = pair();
+    let dir = pair.dir.path().to_path_buf();
+    let feed = dir.join("feed");
+    std::fs::create_dir_all(&feed).unwrap();
+    let args: Vec<String> = vec![
+        "--port".into(),
+        pair.pg_s.to_string(),
+        "--replication-role".into(),
+        "standby".into(),
+        "--source".into(),
+        "archive".into(),
+        "--archive-source".into(),
+        text(&feed),
+        "--http-port".into(),
+        pair.http_s.to_string(),
+    ];
+    let mut follower = Daemon::spawn(&dir, "follower", &dir.join("fresh"), &pair.token, &args, None);
+    let first = wait_http(pair.http_s, "/ready", 503, Duration::from_secs(30), &follower).await;
+    assert_eq!(first["state"], "needs_recovery", "{first}");
+    assert!(
+        first["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("a standby starts from a snapshot of the primary")),
+        "{first}"
+    );
+    assert!(follower.alive(), "a refused standby stays up: {}", follower.tail(12));
 }
 
 /// Spec P3.2 §3, §5: an archive-only standby follows a directory the test

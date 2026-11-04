@@ -402,6 +402,81 @@ pub async fn wait_for_shutdown_signal() -> &'static str {
     "SIGINT"
 }
 
+/// [`wait_for_shutdown_signal`] for a start path that must not miss a signal
+/// while it does something else (sprinter ffe805264aac).
+///
+/// That future installs its handlers at its first poll and, dropped, forgets
+/// them: Tokio's handler stays installed but a signal with no listener is
+/// thrown away. So between a dropped wait and the next one's first poll a
+/// SIGTERM was silently ignored, and before the first one it killed the process
+/// by the default action. [`Self::install`] installs the handlers when it
+/// returns, and a signal that arrives from then on is held until a
+/// [`Self::wait`] asks: a wait can be dropped and another one started later.
+/// A server's own `/ready` can answer long before its main loop runs, so a
+/// supervisor's SIGTERM can land in exactly that gap.
+#[cfg(unix)]
+pub struct ShutdownListener {
+    terminate: Option<tokio::signal::unix::Signal>,
+    interrupt: Option<tokio::signal::unix::Signal>,
+}
+
+#[cfg(unix)]
+impl ShutdownListener {
+    /// Install the SIGTERM and SIGINT handlers now. A handler that cannot be
+    /// installed is logged, and the other signal still shuts the server down.
+    /// Must be called on a Tokio runtime.
+    #[must_use]
+    pub fn install() -> Self {
+        use tokio::signal::unix::{signal, SignalKind};
+        let install = |kind: SignalKind, name: &str| match signal(kind) {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                tracing::warn!("failed to install the {name} handler: {error}");
+                None
+            }
+        };
+        Self {
+            terminate: install(SignalKind::terminate(), "SIGTERM"),
+            interrupt: install(SignalKind::interrupt(), "SIGINT"),
+        }
+    }
+
+    /// The next signal, by name; cancel safe (a wait that is dropped loses no
+    /// signal).
+    pub async fn wait(&mut self) -> &'static str {
+        async fn next(listener: Option<&mut tokio::signal::unix::Signal>) {
+            match listener {
+                Some(listener) => {
+                    listener.recv().await;
+                }
+                None => std::future::pending().await,
+            }
+        }
+        tokio::select! {
+            () = next(self.interrupt.as_mut()) => "SIGINT",
+            () = next(self.terminate.as_mut()) => "SIGTERM",
+        }
+    }
+}
+
+/// Targets without POSIX signals: Ctrl+C, installed by each wait.
+#[cfg(not(unix))]
+pub struct ShutdownListener;
+
+#[cfg(not(unix))]
+impl ShutdownListener {
+    /// Nothing to install ahead of a wait on these targets.
+    #[must_use]
+    pub fn install() -> Self {
+        Self
+    }
+
+    /// The next Ctrl+C.
+    pub async fn wait(&mut self) -> &'static str {
+        wait_for_shutdown_signal().await
+    }
+}
+
 /// Convert logical plan ReferentialAction to constraints module ReferentialAction
 fn convert_logical_referential_action(
     action: &sql::logical_plan::ReferentialAction,

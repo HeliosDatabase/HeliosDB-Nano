@@ -230,8 +230,8 @@ async fn wait_health(
         }
         assert!(
             Instant::now() < deadline,
-            "/health never showed what was wanted; last {body}; log tail: {}",
-            daemon.tail(12)
+            "/health never showed what was wanted; last {body}{}",
+            daemon.diagnose(port)
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

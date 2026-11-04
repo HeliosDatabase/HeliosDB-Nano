@@ -34,7 +34,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -214,10 +214,14 @@ fn spawn_with_failure_limit(
     daemon
 }
 
-/// Reserve a free loopback TCP port.
+#[path = "support/ports.rs"]
+mod ports;
+
+/// A loopback port RESERVED for the life of the test process (sprinter
+/// ffe805264aac, `support/ports.rs`): a port bound and released at once could
+/// be taken by a concurrent test before the daemon binds it.
 fn free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-    listener.local_addr().expect("local addr").port()
+    ports::free_port()
 }
 
 /// Binary + source identity, appended to every failure so a result can be tied to

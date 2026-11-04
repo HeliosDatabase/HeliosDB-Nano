@@ -2481,12 +2481,28 @@ async fn start_server(
     // follows the primary through the physical receiver, and serves the
     // applied store read-only; the listeners open once it streams, or when
     // `replication.startup_timeout_secs` runs out — then in whatever posture
-    // it has, refusing data reads (SQLSTATE 55000) until it is ready.
+    // it has, refusing data reads (SQLSTATE 55000) until it is ready. Its
+    // health-only HTTP endpoint does not wait (spec P1.3, R6): it answers from
+    // the start, `/ready` 503 until the standby is ready.
     #[cfg(feature = "ha-tier1")]
     let mut standby_runtime: Option<StandbyRuntime> = None;
+    // Spec R6 (sprinter ffe805264aac): the HTTP endpoint a standby started
+    // before its readiness gate; `Some(None)` when it was not bound (disabled,
+    // or the bind failed and was logged).
+    #[cfg_attr(not(feature = "ha-tier1"), allow(unused_mut))]
+    let mut early_http: Option<Option<tokio::task::JoinHandle<()>>> = None;
+    // Spec R6: the shutdown listener a standby's gate used; the main loop
+    // goes on with it.
+    #[cfg_attr(not(feature = "ha-tier1"), allow(unused_mut))]
+    let mut shutdown_listener: Option<heliosdb_nano::ShutdownListener> = None;
     #[cfg(feature = "ha-tier1")]
     let standby_db: Option<Arc<EmbeddedDatabase>> = if guarded_standby {
         println!("[2/4] Starting physical standby at {}...", data_dir.display());
+        // Spec R6: installed before anything can answer for this process. Its
+        // `/ready` is live from the early endpoint below, so a supervisor's
+        // SIGTERM can land before the gate polls, or between the gate and the
+        // main loop; it is held until one of them asks.
+        let mut shutdown = heliosdb_nano::ShutdownListener::install();
         let runtime = StandbyRuntime::start(
             &ha_config,
             &data_dir,
@@ -2495,21 +2511,70 @@ async fn start_server(
             pg_addr.port(),
             ha_config.replication_tls.tls_post_quantum.unwrap_or(tls_post_quantum),
         )?;
+        // Spec R6: `/health` and `/ready` answer while the standby bootstraps
+        // or catches up — 503 with its posture — rather than nothing until the
+        // gate below opens, up to `startup_timeout_secs` later. The posture
+        // they report was installed by `StandbyRuntime::start`. The endpoint
+        // is health-only and reads no database: it holds the placeholder,
+        // never the store (spec P5.2 §3 step 5). `cascading`: whether the
+        // standby is configured to cascade — `/health` says `cascade` only
+        // while that port serves (`cascade_serving`).
+        let cascade_tls = replication_server_tls.is_some();
+        early_http = Some(match http_addr {
+            // A cascading standby's replication port is bound after the gate
+            // and a failure there refuses the start, while a failed HTTP bind
+            // never does: the port stays the replication listener's, as when
+            // the HTTP endpoint opened after it.
+            Some(http_addr) if cascade_port_collides(http_addr, &ha_config, pg_addr, cascade_tls) => {
+                tracing::error!(
+                    "Failed to bind HTTP endpoint on {http_addr}: it is this cascading standby's replication port \
+                     (--replication-port {}, NPHYS004), which keeps it. The database listener stays up; pass \
+                     --http-port <free> or --http-port 0 to silence this.",
+                    ha_config.replication_port
+                );
+                None
+            }
+            Some(http_addr) => {
+                start_http_endpoint(
+                    http_addr,
+                    runtime.placeholder(),
+                    &ha_config,
+                    &api_config,
+                    &http_auth_policy,
+                    true,
+                    true,
+                    ha_config.physical.cascade,
+                )
+                .await
+            }
+            None => {
+                info!("HTTP endpoint disabled (--http-port 0)");
+                None
+            }
+        });
         let gate = runtime
-            .open_gate(std::time::Duration::from_secs(ha_config.startup_timeout_secs))
+            .open_gate(
+                std::time::Duration::from_secs(ha_config.startup_timeout_secs),
+                &mut shutdown,
+            )
             .await;
         match gate {
             Ok(GateOutcome::Open) => {}
             Ok(GateOutcome::Shutdown) => {
+                stop_http_endpoint(early_http.take().flatten()).await;
                 runtime.shutdown().await;
                 println!("Server shutdown complete. Goodbye!");
                 return Ok(());
             }
             Err(error) => {
+                stop_http_endpoint(early_http.take().flatten()).await;
                 runtime.shutdown().await;
                 return Err(error);
             }
         }
+        shutdown_listener = Some(shutdown);
+        #[cfg(feature = "internal-tests")]
+        hold_after_gate().await;
         // Spec P5.2 §3 step 5: everything this function holds — the PgServer,
         // the HTTP task, `db` itself — holds the placeholder, never the store;
         // the store reaches the listeners through the serving watch only, so
@@ -2809,6 +2874,11 @@ async fn start_server(
     #[cfg(not(feature = "ha-tier1"))]
     let cascading = false;
 
+    // Spec R6: a node that had no gate installs its shutdown listener here,
+    // before its HTTP endpoint can say it is ready: a SIGTERM from now on is
+    // honoured at the main loop's first poll, not fatal by the default action.
+    let mut shutdown_listener = shutdown_listener.unwrap_or_else(heliosdb_nano::ShutdownListener::install);
+
     // Start HTTP endpoint (health checks, plus MCP routes when compiled in).
     //
     // KanttBan bug #2 (v3.27.0): a `--http-port` collision used to take
@@ -2833,99 +2903,29 @@ async fn start_server(
     //
     // The address and the exposure policy were resolved before the database
     // opened (P0-3/P0-4); only the bind happens here. A history-guarded
-    // standby binds the same listener but serves only health/version routes.
-    let http_handle: Option<tokio::task::JoinHandle<()>> = if let Some(http_addr) = http_addr {
-        match tokio::net::TcpListener::bind(http_addr).await {
-            Ok(listener) => {
-                info!(
-                    "HTTP endpoint at http://{http_addr} (/health, /version, /docs, /rest/v1, /auth/v1, /realtime/v1)"
-                );
-                if guarded_standby {
-                    info!("HTTP endpoint is history-guarded standby health-only: {guarded_standby}");
-                }
-                if http_auth_policy.is_required() {
-                    info!(
-                        "HTTP API authentication is required on {http_addr} \
-                         (HTTP Basic with the wire credential, or the MCP bearer token when configured)"
-                    );
-                } else {
-                    tracing::warn!(
-                        "HTTP API authentication is DISABLED for {} because the wire protocol is in \
-                         trust mode; keep this listener on loopback or pass --allow-insecure-http \
-                         only with compensating controls",
-                        http_addr
-                    );
-                }
-                // Spec P5.2 §3 step 5: on a standby `db` is the placeholder —
-                // its HTTP surface is health-only and reads no database — so
-                // this task never holds the store an online promotion closes.
-                let http_db = Arc::clone(&db);
-                let mcp_token = ha_config.mcp_token.clone();
-                let allow_remote_mcp = ha_config.allow_remote_mcp;
-                let http_api_config = api_config.clone();
-                let policy = std::sync::Arc::clone(&http_auth_policy);
-                // Spec P1.3: a replication node's `/health` carries its
-                // replication block and `/ready` answers its readiness. Spec
-                // P2.1: a primary's `/health` also lists its standbys; spec
-                // P3.2 §4: so does a cascading standby (its downstreams),
-                // which also says `cascade: true`.
-                // Spec P5.2: read at every request — an online promotion
-                // makes a standby (cascading or not) a primary in-process.
-                let replication_status: Option<heliosdb_nano::api::ReplicationStatus> =
-                    (ha_role != "standalone").then(|| {
-                        let status: heliosdb_nano::api::ReplicationStatus = std::sync::Arc::new(move || {
-                            let block = heliosdb_nano::standby_posture::node_block()?;
-                            let primary_now = block.role == "primary";
-                            // Spec P5.2 §8.J: a cascading port a promotion
-                            // stopped (or could not open again) is not
-                            // reported as serving.
-                            let cascading_now = cascading && !primary_now && cascade_serving();
-                            Some(heliosdb_nano::api::ReplicationReport {
-                                ready: block.ready,
-                                block: serde_json::to_value(block).ok()?,
-                                standbys: (primary_now || cascading_now).then(primary_standbys_report),
-                                // Spec P3.1: a sibling object, never inside the block.
-                                archive: Some(archive_health_report()),
-                                cascade: cascading_now.then_some(true),
-                            })
-                        });
-                        status
-                    });
-                if replication_status.is_some() {
-                    info!("HTTP readiness at http://{http_addr}/ready (200 when ready, 503 otherwise)");
-                }
-                Some(tokio::spawn(async move {
-                    if let Err(e) = run_http_listener_with_replication(
-                        listener,
-                        http_db,
-                        mcp_token,
-                        allow_remote_mcp,
-                        http_api_config,
-                        policy,
-                        guarded_standby,
-                        replication_status,
-                    )
-                    .await
-                    {
-                        tracing::error!("HTTP server accept loop exited: {e}");
-                    }
-                }))
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Failed to bind HTTP endpoint on {}: {} (os error {:?}). \
-                     The database listener stays up; pass --http-port <free> or \
-                     --http-port 0 to silence this.",
+    // standby binds the same listener but serves only health/version routes —
+    // and has bound it already, before its readiness gate (spec R6, above).
+    let http_handle: Option<tokio::task::JoinHandle<()>> = match early_http {
+        Some(started) => started,
+        None => match http_addr {
+            Some(http_addr) => {
+                start_http_endpoint(
                     http_addr,
-                    e,
-                    e.raw_os_error(),
-                );
+                    Arc::clone(&db),
+                    &ha_config,
+                    &api_config,
+                    &http_auth_policy,
+                    guarded_standby,
+                    ha_role != "standalone",
+                    cascading,
+                )
+                .await
+            }
+            None => {
+                info!("HTTP endpoint disabled (--http-port 0)");
                 None
             }
-        }
-    } else {
-        info!("HTTP endpoint disabled (--http-port 0)");
-        None
+        },
     };
 
     // Start MySQL listener if enabled.
@@ -3274,7 +3274,7 @@ async fn start_server(
             }
         };
         tokio::pin!(serve);
-        let signal = heliosdb_nano::wait_for_shutdown_signal();
+        let signal = shutdown_listener.wait();
         tokio::pin!(signal);
         loop {
             tokio::select! {
@@ -4826,11 +4826,23 @@ impl StandbyRuntime {
         let (store_tx, store) = tokio::sync::watch::channel(None);
         let (refusal_tx, refusal) = tokio::sync::watch::channel(None);
         let control = std::sync::Arc::new(StandbyControl::default());
-        *control.supervisor.lock() = Some(spawn_standby_supervisor(
-            plan.clone(),
-            store_tx.clone(),
-            refusal_tx.clone(),
-        ));
+        // Spec R6: a directory this standby never adopts (a 4.41.x logical
+        // standby, a primary's, unrelated data) is refused HERE, before the
+        // start path opens its HTTP endpoint (which no longer waits for the
+        // readiness gate), so the endpoint's first `/ready` already says
+        // `needs_recovery`, as it did when it opened after the gate. The
+        // supervisor would refuse it the same way the moment it ran, so none
+        // is started; an aborted promotion's restore (which cannot happen
+        // before the standby was ready) classifies again in its own.
+        if let StandbyLayout::Refused(reason) = classify_standby_directory(data_dir) {
+            plan.refuse(&refusal_tx, reason);
+        } else {
+            *control.supervisor.lock() = Some(spawn_standby_supervisor(
+                plan.clone(),
+                store_tx.clone(),
+                refusal_tx.clone(),
+            ));
+        }
         Ok(Self {
             posture,
             store,
@@ -4886,18 +4898,30 @@ impl StandbyRuntime {
         let (stop, shutdown) = tokio::sync::watch::channel(false);
         let (store_tx, store) = tokio::sync::watch::channel(None);
         let (refusal_tx, refusal) = tokio::sync::watch::channel(None);
-        let task = tokio::spawn(supervise_archive_standby(
-            plan,
-            store_tx.clone(),
-            refusal_tx.clone(),
-            shutdown,
-        ));
         let control = std::sync::Arc::new(StandbyControl::default());
-        *control.supervisor.lock() = Some(Supervisor {
-            stop,
-            task,
-            commands: None,
-        });
+        // Spec R6: as in `start`, the directory is classified before the HTTP
+        // endpoint opens, so its first `/ready` already says why it is refused.
+        match archive_standby_history(data_dir) {
+            Ok(history) => {
+                let task = tokio::spawn(supervise_archive_standby(
+                    plan,
+                    history,
+                    store_tx.clone(),
+                    refusal_tx.clone(),
+                    shutdown,
+                ));
+                *control.supervisor.lock() = Some(Supervisor {
+                    stop,
+                    task,
+                    commands: None,
+                });
+            }
+            Err(reason) => {
+                tracing::error!("physical standby needs recovery: {reason}");
+                plan.tracker.needs_recovery(reason.clone());
+                refusal_tx.send_replace(Some(reason));
+            }
+        }
         Ok(Self {
             posture,
             store,
@@ -4924,10 +4948,14 @@ impl StandbyRuntime {
     /// or a shutdown signal arrives. Only a refusal with `on_unrecoverable =
     /// "exit"` is an error: in every other case the listeners open, and the
     /// posture decides what they serve.
-    async fn open_gate(&self, budget: std::time::Duration) -> Result<GateOutcome> {
+    async fn open_gate(
+        &self,
+        budget: std::time::Duration,
+        shutdown: &mut heliosdb_nano::ShutdownListener,
+    ) -> Result<GateOutcome> {
         use heliosdb_nano::standby_posture::format_lsn;
         let deadline = tokio::time::Instant::now() + budget;
-        let signal = heliosdb_nano::wait_for_shutdown_signal();
+        let signal = shutdown.wait();
         tokio::pin!(signal);
         loop {
             if let Some(reason) = self.refusal.borrow().clone() {
@@ -5495,6 +5523,15 @@ async fn prepare_promoted_primary(
     Ok(prepared)
 }
 
+/// Drop `handle`, which may hold a store's last reference: that is a RocksDB
+/// close (memtable flush, fsyncs), so it runs off the async worker (sprinter
+/// ffe805264aac) and the worker's other tasks — the listeners, `/health`, the
+/// timers — are handed on meanwhile.
+#[cfg(feature = "ha-tier1")]
+fn close_off_worker<T>(handle: T) {
+    heliosdb_nano::runtime_offload::off_worker(move || drop(handle));
+}
+
 /// Spec P5.2 §3: the online promotion's host — the parts of a running
 /// standby `replication::promote::online` takes off the listeners (step 2),
 /// stops (step 5), releases (step 6), reopens as the primary (step 8) and,
@@ -5798,8 +5835,11 @@ impl heliosdb_nano::replication::promote::online::StandbyHost for PromotionHost 
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
             // ...and dropping it closes the store: the engine, the writer the
-            // receiver shared, the RocksDB handle and its LOCK.
-            drop(database);
+            // receiver shared, the RocksDB handle and its LOCK. The posture
+            // lets go first, so that no `/health` holds the last handle and
+            // ends up running the close itself.
+            self.plan.tracker.release_live_readers();
+            close_off_worker(database);
         }
         let handles = self.released.lock().clone();
         let Some(handles) = handles else {
@@ -5823,6 +5863,7 @@ impl heliosdb_nano::replication::promote::online::StandbyHost for PromotionHost 
             .map_err(|error| format!("the converted store cannot be opened as the primary's: {error}"))?;
         let database = std::sync::Arc::new(opened);
         if database.storage.is_physical_standby() || database.storage.write_gate().is_fenced() {
+            close_off_worker(database);
             return Err("the converted store opened as a standby's, or fenced: it is not served".to_string());
         }
         let epoch = database.storage.replication_epoch();
@@ -5830,18 +5871,28 @@ impl heliosdb_nano::replication::promote::online::StandbyHost for PromotionHost 
         // posture: the main loop owns the services.
         let listener = self.bound.lock().take();
         let (reply, answer) = tokio::sync::oneshot::channel();
-        self.services
-            .send(ServiceRequest::ServePrimary {
-                engine: std::sync::Arc::clone(&database.storage),
-                ha: Box::new(ha),
-                tls,
-                listener,
-                reply,
-            })
-            .map_err(|_| "the server's main loop is gone".to_string())?;
-        let endpoint = answer
-            .await
-            .map_err(|_| "the server's main loop did not answer".to_string())??;
+        let request = ServiceRequest::ServePrimary {
+            engine: std::sync::Arc::clone(&database.storage),
+            ha: Box::new(ha),
+            tls,
+            listener,
+            reply,
+        };
+        if self.services.send(request).is_err() {
+            close_off_worker(database);
+            return Err("the server's main loop is gone".to_string());
+        }
+        let endpoint = match answer.await {
+            Ok(Ok(endpoint)) => endpoint,
+            Ok(Err(reason)) => {
+                close_off_worker(database);
+                return Err(reason);
+            }
+            Err(_) => {
+                close_off_worker(database);
+                return Err("the server's main loop did not answer".to_string());
+            }
+        };
         // The ONE sanctioned undo of the standby guard (`ha_state`).
         heliosdb_nano::replication::ha_state::ha_state().enable_forwarding_after_promotion();
         drop(self.serving.send_replace(std::sync::Arc::clone(&database)));
@@ -5900,8 +5951,10 @@ impl heliosdb_nano::replication::promote::online::StandbyHost for PromotionHost 
             Some(database) => Some(StoreHandles::of(database)),
             None => self.released.lock().clone(),
         };
-        drop(detached);
+        // The posture lets go first, as at step 6; this may be the store's
+        // last holder.
         self.plan.tracker.detach_store();
+        close_off_worker(detached);
         let stopping = self.control.supervisor.lock().take();
         let plan = self.plan.clone();
         let store = self.store.clone();
@@ -6121,9 +6174,13 @@ fn standby_serving_attach(
                     .map_err(|error| error.to_string())?,
             );
             let live = std::sync::Arc::downgrade(writer);
+            // The live cursor is read lock free (sprinter ffe805264aac): every
+            // posture snapshot — `/health` and `/ready` on an async worker
+            // among them — reads it, and `cursor()` waits on the writer's
+            // lock, which an apply holds across its fsync.
             tracker.attach_store(
                 writer.cursor().source_sequence(),
-                std::sync::Arc::new(move || live.upgrade().map(|writer| writer.cursor().source_sequence())),
+                std::sync::Arc::new(move || live.upgrade().map(|writer| writer.applied_source_sequence())),
             );
             // Spec P5.1: the posture reports the store's epoch (and the one
             // its record says it was promoted from), which the applier keeps
@@ -6290,6 +6347,21 @@ async fn run_physical_standby(
 const SEGMENTS_NEED_A_SNAPSHOT: &str = "a standby starts from a snapshot of the primary (`start` bootstraps it); \
      segments advance it";
 
+/// The history an archive-only standby of `data_dir` follows, or why it
+/// cannot start: only an installed physical standby can.
+#[cfg(feature = "ha-tier1")]
+fn archive_standby_history(data_dir: &std::path::Path) -> std::result::Result<uuid::Uuid, String> {
+    match classify_standby_directory(data_dir) {
+        StandbyLayout::Physical { history } => Ok(history),
+        StandbyLayout::Fresh { .. } => Err(format!(
+            "{SEGMENTS_NEED_A_SNAPSHOT}: {} is not an installed physical standby yet; start it once following its \
+             primary (--source primary), then switch it to --source archive",
+            data_dir.display()
+        )),
+        StandbyLayout::Refused(reason) => Err(reason),
+    }
+}
+
 /// Everything an archive-only standby's supervisor needs (spec P3.2 §3).
 #[cfg(feature = "ha-tier1")]
 struct ArchiveStandbyPlan {
@@ -6325,6 +6397,7 @@ async fn stop_requested(shutdown: &mut tokio::sync::watch::Receiver<bool>) {
 #[cfg(feature = "ha-tier1")]
 async fn supervise_archive_standby(
     plan: ArchiveStandbyPlan,
+    history: uuid::Uuid,
     store: tokio::sync::watch::Sender<Option<std::sync::Arc<EmbeddedDatabase>>>,
     refusal: tokio::sync::watch::Sender<Option<String>>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -6334,21 +6407,6 @@ async fn supervise_archive_standby(
         tracing::error!("physical standby needs recovery: {reason}");
         plan.tracker.needs_recovery(reason.clone());
         refusal.send_replace(Some(reason));
-    };
-    let history = match classify_standby_directory(&plan.data_dir) {
-        StandbyLayout::Physical { history } => history,
-        StandbyLayout::Fresh { .. } => {
-            refuse(format!(
-                "{SEGMENTS_NEED_A_SNAPSHOT}: {} is not an installed physical standby yet; start it once following its \
-                 primary (--source primary), then switch it to --source archive",
-                plan.data_dir.display()
-            ));
-            return;
-        }
-        StandbyLayout::Refused(reason) => {
-            refuse(reason);
-            return;
-        }
     };
     // Spec P5.1 §11.K: the store's epoch is read only when there is an
     // archive to file segments under it (a cheap read-only point read).
@@ -6409,6 +6467,145 @@ async fn supervise_archive_standby(
         Ok(Err(reason)) if stopping => tracing::debug!("archive-only standby stopped: {reason}"),
         Ok(Err(reason)) => refuse(format!("the archive-only standby stopped: {reason}")),
         Err(error) => refuse(format!("the archive-only standby's worker failed: {error}")),
+    }
+}
+
+/// `internal-tests`: past its readiness gate and before its main loop, the
+/// start path of a standby holds while the file this names exists, so a test
+/// can land a signal in that window (spec R6).
+#[cfg(all(feature = "ha-tier1", feature = "internal-tests"))]
+const HOLD_AFTER_GATE_ENV: &str = "HELIOSDB_NANO_TEST_HOLD_AFTER_GATE_FILE";
+
+/// [`HOLD_AFTER_GATE_ENV`].
+#[cfg(all(feature = "ha-tier1", feature = "internal-tests"))]
+async fn hold_after_gate() {
+    let Some(file) = std::env::var_os(HOLD_AFTER_GATE_ENV) else {
+        return;
+    };
+    tracing::warn!("internal-tests: the start path holds after its readiness gate while {file:?} exists");
+    while std::path::Path::new(&file).exists() {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Bind the HTTP endpoint at `http_addr` (health checks, plus MCP routes when
+/// compiled in) and serve it on a task of its own, `db` its database (a
+/// standby's placeholder: its surface is health-only and reads none);
+/// `None`, logged at ERROR, when the port cannot be bound — the database
+/// listener stays up either way (see the start path). `replication_node`: any
+/// role but standalone, whose `/health` carries the replication block and
+/// whose `/ready` answers its readiness; `cascading`: a standby that serves
+/// downstream standbys (`/health` says so while that port serves).
+///
+/// Spec R6 (sprinter ffe805264aac): a standby calls it BEFORE its readiness
+/// gate, so its `/ready` answers 503 while it bootstraps; every other node
+/// once its database is open.
+#[allow(clippy::too_many_arguments)]
+async fn start_http_endpoint(
+    http_addr: std::net::SocketAddr,
+    http_db: std::sync::Arc<EmbeddedDatabase>,
+    ha_config: &HAConfig,
+    api_config: &heliosdb_nano::config::ApiConfig,
+    http_auth_policy: &std::sync::Arc<heliosdb_nano::api::HttpAuthPolicy>,
+    guarded_standby: bool,
+    replication_node: bool,
+    cascading: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    match tokio::net::TcpListener::bind(http_addr).await {
+        Ok(listener) => {
+            info!("HTTP endpoint at http://{http_addr} (/health, /version, /docs, /rest/v1, /auth/v1, /realtime/v1)");
+            if guarded_standby {
+                info!("HTTP endpoint is history-guarded standby health-only: {guarded_standby}");
+            }
+            if http_auth_policy.is_required() {
+                info!(
+                    "HTTP API authentication is required on {http_addr} \
+                     (HTTP Basic with the wire credential, or the MCP bearer token when configured)"
+                );
+            } else {
+                tracing::warn!(
+                    "HTTP API authentication is DISABLED for {} because the wire protocol is in \
+                     trust mode; keep this listener on loopback or pass --allow-insecure-http \
+                     only with compensating controls",
+                    http_addr
+                );
+            }
+            // Spec P5.2 §3 step 5: on a standby `http_db` is the placeholder
+            // — its HTTP surface is health-only and reads no database — so
+            // this task never holds the store an online promotion closes.
+            let mcp_token = ha_config.mcp_token.clone();
+            let allow_remote_mcp = ha_config.allow_remote_mcp;
+            let http_api_config = api_config.clone();
+            let policy = std::sync::Arc::clone(http_auth_policy);
+            // Spec P1.3: a replication node's `/health` carries its
+            // replication block and `/ready` answers its readiness. Spec
+            // P2.1: a primary's `/health` also lists its standbys; spec
+            // P3.2 §4: so does a cascading standby (its downstreams),
+            // which also says `cascade: true`.
+            // Spec P5.2: read at every request — an online promotion
+            // makes a standby (cascading or not) a primary in-process.
+            let replication_status: Option<heliosdb_nano::api::ReplicationStatus> = replication_node.then(|| {
+                let status: heliosdb_nano::api::ReplicationStatus = std::sync::Arc::new(move || {
+                    let block = heliosdb_nano::standby_posture::node_block()?;
+                    let primary_now = block.role == "primary";
+                    // Spec P5.2 §8.J: a cascading port a promotion
+                    // stopped (or could not open again) is not
+                    // reported as serving.
+                    let cascading_now = cascading && !primary_now && cascade_serving();
+                    Some(heliosdb_nano::api::ReplicationReport {
+                        ready: block.ready,
+                        block: serde_json::to_value(block).ok()?,
+                        standbys: (primary_now || cascading_now).then(primary_standbys_report),
+                        // Spec P3.1: a sibling object, never inside the block.
+                        archive: Some(archive_health_report()),
+                        cascade: cascading_now.then_some(true),
+                    })
+                });
+                status
+            });
+            if replication_status.is_some() {
+                info!("HTTP readiness at http://{http_addr}/ready (200 when ready, 503 otherwise)");
+            }
+            Some(tokio::spawn(async move {
+                if let Err(e) = run_http_listener_with_replication(
+                    listener,
+                    http_db,
+                    mcp_token,
+                    allow_remote_mcp,
+                    http_api_config,
+                    policy,
+                    guarded_standby,
+                    replication_status,
+                )
+                .await
+                {
+                    tracing::error!("HTTP server accept loop exited: {e}");
+                }
+            }))
+        }
+        Err(e) => {
+            tracing::error!(
+                "Failed to bind HTTP endpoint on {}: {} (os error {:?}). \
+                 The database listener stays up; pass --http-port <free> or \
+                 --http-port 0 to silence this.",
+                http_addr,
+                e,
+                e.raw_os_error(),
+            );
+            None
+        }
+    }
+}
+
+/// Stop an HTTP endpoint [`start_http_endpoint`] started: its accept loop ends
+/// and its database handle is released. Connections it accepted run on tasks
+/// of their own until they close; on a standby's health-only router they hold
+/// no database.
+#[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
+async fn stop_http_endpoint(handle: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = handle {
+        handle.abort();
+        let _ = handle.await;
     }
 }
 
@@ -6571,6 +6768,28 @@ async fn run_http_listener_with_replication(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// Spec R6: an HTTP port on a cascading standby's replication address.
+    #[cfg(feature = "ha-tier1")]
+    #[test]
+    fn listeners_collide_on_one_port_of_one_address_or_a_wildcard() {
+        use std::net::SocketAddr;
+        let addr = |text: &str| text.parse::<SocketAddr>().unwrap();
+        for (first, second, collide) in [
+            ("127.0.0.1:5000", "127.0.0.1:5000", true),
+            ("127.0.0.1:5000", "0.0.0.0:5000", true),
+            ("0.0.0.0:5000", "127.0.0.1:5000", true),
+            ("127.0.0.1:5000", "127.0.0.1:5001", false),
+            ("127.0.0.1:5000", "127.0.0.2:5000", false),
+            ("0.0.0.0:5000", "0.0.0.0:5001", false),
+        ] {
+            assert_eq!(
+                super::listen_addresses_collide(addr(first), addr(second)),
+                collide,
+                "{first} and {second}"
+            );
+        }
+    }
+
     #[test]
     fn daemon_readiness_includes_full_standby_window() {
         for seconds in [1, 30, 3600] {
@@ -8851,6 +9070,34 @@ fn archive_fill(
             None
         }
     }
+}
+
+/// Whether `http_addr` is the address a cascading standby's replication port
+/// will bind ([`prepare_cascade_source`]; `tls`: that port serves TLS). A
+/// standby without a token serves no cascading port at all.
+#[cfg(feature = "ha-tier1")]
+fn cascade_port_collides(
+    http_addr: std::net::SocketAddr,
+    ha_config: &HAConfig,
+    pg_addr: std::net::SocketAddr,
+    tls: bool,
+) -> bool {
+    if !ha_config.physical.cascade || ha_config.token_file.is_none() {
+        return false;
+    }
+    let cascade = replication_listen_address(
+        pg_addr.ip(),
+        ha_config.replication_port,
+        tls || ha_config.allow_insecure_remote,
+    );
+    listen_addresses_collide(http_addr, cascade)
+}
+
+/// Whether two listeners claim one port: the same address, or a wildcard.
+#[cfg(feature = "ha-tier1")]
+fn listen_addresses_collide(first: std::net::SocketAddr, second: std::net::SocketAddr) -> bool {
+    first.port() == second.port()
+        && (first.ip() == second.ip() || first.ip().is_unspecified() || second.ip().is_unspecified())
 }
 
 /// Spec P3.2 §4: a cascading standby's replication port, bound at start (a

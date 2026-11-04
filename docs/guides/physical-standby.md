@@ -265,7 +265,12 @@ so those surfaces can never disagree.
 
 - **`GET /ready`** answers 200 if and only if the node is ready (a primary is
   always ready), else 503. The body is the replication block below. `/ready` and
-  `/health` stay public when the HTTP API requires credentials.
+  `/health` stay public when the HTTP API requires credentials. A directory the
+  standby never adopts is refused before the endpoint opens, so its first
+  `/ready` already says `needs_recovery`. A refusal from the primary (a wrong
+  token, another history, a WAL it no longer holds) arrives over the connection,
+  so `/ready` first answers 503 with `connecting` or `catching_up`: poll for the
+  state you expect instead of trusting the first 503.
 - **`GET /health`** is liveness: always 200 while the process runs, with the
   replication block:
 
@@ -301,8 +306,13 @@ so those surfaces can never disagree.
   status stays readable; `"exit"` exits instead, for supervisors that alert on
   exit.
 - **`[replication] startup_timeout_secs`** (1..=3600, default 30;
-  `--replication-startup-timeout-secs` overrides it) is how long a standby's
-  listeners wait for it to stream before they open anyway, not ready. A daemon
+  `--replication-startup-timeout-secs` overrides it) is how long a standby
+  waits for it to stream before it starts serving anyway, not ready. Until then
+  its PostgreSQL TCP port is bound and connections queue in its backlog,
+  unanswered; its PostgreSQL Unix socket and a cascading standby's replication
+  port are not open. Its HTTP endpoint does not wait: `/health` and `/ready`
+  answer from the start (`/ready` 503 while it bootstraps or catches up), so
+  `/ready` can say 200 a moment before PostgreSQL sessions are served. A daemon
   parent allows this budget plus its usual 5-second startup allowance.
 
 ## The PostgreSQL-wire contract (HeliosDB Proxy)

@@ -501,9 +501,9 @@ fn recover_from_primary_validates_its_arguments() {
 fn recover_from_primary_refuses_before_writing_anything() {
     let root = tempfile::tempdir().unwrap();
     let token = text(&token_file(root.path(), "replication.token", 0x42));
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let host = closed.local_addr().unwrap().to_string();
-    drop(closed);
+    // Reserved, and nothing listens on it: refused, and no concurrent test's
+    // daemon can be given this port.
+    let host = format!("127.0.0.1:{}", free_port());
 
     // A primary's directory is never recovered over, whatever the source.
     let primary = root.path().join("primary");

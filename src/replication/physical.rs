@@ -1408,6 +1408,10 @@ pub struct LocalWriter {
     /// fsync that covered it. Only written while `cursor` is locked.
     durable_source: AtomicU64,
     durable_local: AtomicU64,
+    /// The cursor's `source_sequence` as of the last write that completed
+    /// (the applied position, [`Self::applied_source_sequence`]). Only
+    /// written while `cursor` is locked, with the cursor itself.
+    applied_source: AtomicU64,
     poisoned: AtomicBool,
     /// The WAL fsyncs this writer made: synced writes and [`Self::sync`]s
     /// that had something to make durable (spec P4.1e: counted, so a test
@@ -1481,6 +1485,7 @@ impl LocalWriter {
             db: Arc::new(db),
             durable_source: AtomicU64::new(cursor.source_sequence),
             durable_local: AtomicU64::new(cursor.local_sequence),
+            applied_source: AtomicU64::new(cursor.source_sequence),
             cursor: Mutex::new(cursor),
             poisoned: AtomicBool::new(false),
             fsyncs: AtomicU64::new(0),
@@ -1520,6 +1525,17 @@ impl LocalWriter {
     /// `source_sequence` (always, unless a write was [`Durability::Deferred`]).
     pub fn cursor(&self) -> PhysicalCursor {
         self.cursor.lock().clone()
+    }
+
+    /// `cursor().source_sequence`, lock free: the applied position as of the
+    /// last write that completed. While a write (and its fsync) is in flight
+    /// it is the position before that write, where [`Self::cursor`] waits for
+    /// the write — for as long as the fsync takes. What a reader on an async
+    /// worker uses (sprinter ffe805264aac: a standby's `/health`, `/ready`
+    /// and every other posture snapshot read the store's cursor through it),
+    /// so that no request waits on this writer's fsync.
+    pub fn applied_source_sequence(&self) -> u64 {
+        self.applied_source.load(Ordering::Acquire)
     }
 
     /// The source sequence of the durable barrier: the cursor as of the last
@@ -1597,6 +1613,7 @@ impl LocalWriter {
             return Err(error.into());
         }
         *cursor = next;
+        self.applied_source.store(cursor.source_sequence, Ordering::Release);
         if self.db.latest_sequence_number() != cursor.local_sequence {
             self.poison();
             return Err(invalid("receiver was modified outside physical replication"));

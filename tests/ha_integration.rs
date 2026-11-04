@@ -13,7 +13,11 @@
 //! * sync and semi-sync waits — a commit that returns is already on the
 //!   standby, readable there at once;
 //! * lag reporting — a standby that falls behind shows on the primary's
-//!   `/health`, and catches up.
+//!   `/health`, and catches up;
+//! * (sprinter ffe805264aac) a standby's HTTP endpoint answers before its main
+//!   loop runs: a SIGTERM in between is neither lost nor fatal (`internal-tests`,
+//!   red when the gate and the main loop each had a listener of their own), and
+//!   an HTTP port that is also its cascading port costs only the HTTP endpoint.
 //!
 //! ```bash
 //! cargo test --test ha_integration
@@ -259,4 +263,116 @@ async fn lag_shows_on_the_primary_and_the_standby_catches_up() {
         lsn(block["cursor"].as_str().unwrap()) >= target,
         "the standby reports the position it caught up to: {health}"
     );
+}
+
+/// `internal-tests`: past its readiness gate and before its main loop, a
+/// standby's start path holds while the file this names exists (`main.rs`).
+#[cfg(feature = "internal-tests")]
+const HOLD_AFTER_GATE_ENV: &str = "HELIOSDB_NANO_TEST_HOLD_AFTER_GATE_FILE";
+/// The log line that hook writes once it holds.
+#[cfg(feature = "internal-tests")]
+const HOLDING_AFTER_GATE: &str = "holds after its readiness gate";
+
+/// A standby of `data` whose start path will hold past its gate while `hold`
+/// exists.
+#[cfg(feature = "internal-tests")]
+fn spawn_held(p: &Pair, data: &std::path::Path, hold: &std::path::Path) -> Daemon {
+    std::fs::write(hold, b"").unwrap();
+    let options = SpawnOptions {
+        listen: None,
+        env: vec![(HOLD_AFTER_GATE_ENV, hold.display().to_string())],
+    };
+    Daemon::spawn_with(p.dir.path(), "standby", data, &p.token, &p.standby_args, None, &options)
+}
+
+/// SIGTERM while `standby` holds past its gate: it stays up, and once its main
+/// loop runs it shuts down cleanly.
+#[cfg(feature = "internal-tests")]
+async fn sigterm_while_held_is_a_clean_shutdown(standby: &mut Daemon, hold: &std::path::Path) {
+    standby.terminate();
+    // Long enough for the default action, had no handler been installed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(standby.alive(), "killed by the default action: {}", standby.tail(12));
+    std::fs::remove_file(hold).unwrap();
+    let status = standby.wait_exit(Duration::from_secs(60));
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "the signal was lost, or the shutdown failed: {status:?}; {}",
+        standby.tail(20)
+    );
+    assert!(standby.log().contains("SIGTERM received"), "{}", standby.tail(20));
+}
+
+/// `/ready` says 200 before the main loop runs, and a supervisor may act on it
+/// at once.
+#[cfg(feature = "internal-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sigterm_between_the_readiness_gate_and_the_main_loop_is_honoured() {
+    let p = pair();
+    let dir = p.dir.path();
+    let _primary = Daemon::spawn(dir, "primary", &dir.join("primary"), &p.token, &p.primary_args, None);
+    let writer = connect(p.pg_p).await;
+    create_table(&writer).await;
+    let hold = dir.join("hold-after-gate");
+    let mut standby = spawn_held(&p, &dir.join("standby"), &hold);
+    assert!(
+        standby.log_contains_within(HOLDING_AFTER_GATE, Duration::from_secs(90)),
+        "{}",
+        standby.tail(12)
+    );
+    wait_http(p.http_s, "/ready", 200, Duration::from_secs(60), &standby).await;
+    sigterm_while_held_is_a_clean_shutdown(&mut standby, &hold).await;
+}
+
+/// A directory refused at start: its gate returns without ever polling for a
+/// signal, while `/ready` already answers.
+#[cfg(feature = "internal-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sigterm_right_after_a_refused_directory_is_not_fatal() {
+    let p = pair();
+    let dir = p.dir.path();
+    let legacy = dir.join("legacy");
+    std::fs::create_dir(&legacy).unwrap();
+    std::fs::write(legacy.join("NANO-STANDBY-BINDING.json"), b"{}").unwrap();
+    std::fs::write(legacy.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+    let hold = dir.join("hold-after-gate");
+    let mut standby = spawn_held(&p, &legacy, &hold);
+    assert!(
+        standby.log_contains_within(HOLDING_AFTER_GATE, Duration::from_secs(30)),
+        "{}",
+        standby.tail(12)
+    );
+    let refused = wait_http(p.http_s, "/ready", 503, Duration::from_secs(30), &standby).await;
+    assert_eq!(refused["state"], "needs_recovery", "{refused}");
+    sigterm_while_held_is_a_clean_shutdown(&mut standby, &hold).await;
+}
+
+/// A cascading standby whose HTTP port is its replication port: the
+/// replication listener keeps the port and the standby stays up without an
+/// HTTP endpoint (an HTTP bind failure alone is never fatal).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cascading_standbys_http_port_collision_costs_only_its_http_endpoint() {
+    let p = pair();
+    let dir = p.dir.path();
+    let _primary = Daemon::spawn(dir, "primary", &dir.join("primary"), &p.token, &p.primary_args, None);
+    let writer = connect(p.pg_p).await;
+    create_table(&writer).await;
+    assert_eq!(insert(&writer, 1..=1, "row").await, 0);
+    let shared = free_port();
+    let mut args = standby_args(p.pg_s, p.repl_p, shared);
+    args.extend(["--replication-port".to_string(), shared.to_string()]);
+    let cascade = "[replication.physical]\ncascade = true\n";
+    let mut standby = Daemon::spawn(dir, "standby", &dir.join("standby"), &p.token, &args, Some(cascade));
+    assert_eq!(settle(p.pg_s, &[1], Duration::from_secs(90)).await, Ok(vec![1]));
+    assert!(
+        standby.log().contains("Failed to bind HTTP endpoint"),
+        "{}",
+        standby.tail(20)
+    );
+    assert!(
+        standby.log_contains_within("Cascading replication port listening", Duration::from_secs(30)),
+        "{}",
+        standby.tail(20)
+    );
+    assert!(standby.alive(), "{}", standby.tail(20));
 }
