@@ -125,8 +125,8 @@ pub use stats::{DatabaseStats, GlobalStatsCollector, ReplicationRole, StatsSnaps
 pub use time_travel::{GcConfig, Scn, SnapshotManager, SnapshotMetadata, TransactionId};
 pub use transaction::{Transaction, TransactionSavepointSnapshot, UncommittedWriteCensus, UncommittedWriteHold};
 pub use vector_index::{
-    PersistentPolicy, StoredVectorRecord, StoredVectorSearchResult, VectorIndexManager, VectorIndexMetadata,
-    VectorIndexStats, VectorIndexType, VectorIndexUndoOp,
+    PersistentPolicy, StandardDumpState, StandardIndexDump, StoredVectorRecord, StoredVectorSearchResult,
+    VectorIndexManager, VectorIndexMetadata, VectorIndexStats, VectorIndexType, VectorIndexUndoOp,
 };
 pub use version_gc::{VersionGcConfig, VersionGcCycleStats, VersionStorageStats};
 pub use view_catalog::{ViewCatalog, ViewMetadata};

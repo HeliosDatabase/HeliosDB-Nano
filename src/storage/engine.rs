@@ -1993,6 +1993,18 @@ impl Drop for MergeSourceRestore<'_> {
     }
 }
 
+/// Sprinter 746342a0bfbb: what a checkpoint did with one standard HNSW index
+/// (`StorageEngine::persist_vector_graph`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorGraphCheckpoint {
+    /// Dumped under a fresh basename and switched to.
+    Dumped,
+    /// Unchanged since its sidecar's dump: kept, marker re-armed.
+    Unchanged,
+    /// Not dumped by policy (empty graph, or no longer a standard index).
+    Skipped,
+}
+
 /// Storage engine
 pub struct StorageEngine {
     /// RocksDB instance. Never written directly: every write goes through
@@ -10645,17 +10657,21 @@ impl StorageEngine {
     /// Checkpoint: persist ART entries and standard HNSW graphs so the next
     /// open can skip the O(table-size) rebuild.
     ///
-    /// Write order per artifact is snapshot-then-marker through the
+    /// ART: write order per table is snapshot-then-marker through the
     /// encrypting `put` path, so a crash mid-checkpoint leaves at worst a
     /// marker-less snapshot (ignored at open → scan rebuild). Should be
     /// called quiescent (the embedded close path checks for open
     /// transactions); a racing mutation is detected after the marker writes
     /// and re-invalidates them.
     ///
-    /// Note: HNSW graph dumps are plain files under
-    /// `{data_dir}/hnsw_snapshots/` and are not covered by at-rest encryption
-    /// (the vectors themselves; row data stays in RocksDB). ART snapshots go
-    /// through the encrypted keyspace.
+    /// HNSW (Sprinter 746342a0bfbb), per standard index: an index unchanged
+    /// since the dump its sidecar describes keeps that dump and only gets its
+    /// marker back; a changed one is dumped under a fresh basename (fsynced,
+    /// renamed into `{data_dir}/hnsw_snapshots/`), its sidecar and marker are
+    /// written in ONE batch, and only then is the previous dump removed. An
+    /// empty graph is not dumped. With at-rest encryption on, NO graph is
+    /// dumped: hnsw_rs writes plaintext files only, so those indexes rebuild
+    /// from their sealed rows at open (`IndexSnapshotPersistReport::vector_skipped`).
     pub fn persist_index_snapshots(&self) -> Result<super::index_snapshot::IndexSnapshotPersistReport> {
         use super::index_snapshot as snap;
 
@@ -10703,34 +10719,55 @@ impl StorageEngine {
             report.art_tables += 1;
         }
 
-        let vector_metas = self.vector_indexes.list_all_metadata();
-        if vector_metas
-            .iter()
-            .any(|m| matches!(m.index_type, super::VectorIndexType::Standard(_)))
-        {
-            if let Err(e) = std::fs::create_dir_all(&dump_dir) {
-                warn!("could not create HNSW snapshot dir {:?}: {}", dump_dir, e);
-            }
-        }
-        for meta in vector_metas {
-            if !matches!(meta.index_type, super::VectorIndexType::Standard(_)) {
-                continue; // persistent backend is already durable; PQ has its own path
-            }
-            match self.vector_indexes.dump_standard_index(&meta.name, &dump_dir) {
-                Ok(Some(sidecar)) => {
-                    let blob =
-                        bincode::serialize(&sidecar).map_err(|e| Error::storage(format!("sidecar serialize: {e}")))?;
-                    self.put(&snap::vec_snapshot_key(&meta.name), &blob)?;
-                    self.put(&snap::vec_snapshot_marker_key(&meta.name), &marker_bytes)?;
-                    report.vector_graphs += 1;
-                }
-                Ok(None) => {}
+        // Persistent backends are already durable; PQ has its own path.
+        let standard: Vec<String> = self
+            .vector_indexes
+            .list_all_metadata()
+            .into_iter()
+            .filter(|m| matches!(m.index_type, super::VectorIndexType::Standard(_)))
+            .map(|m| m.name)
+            .collect();
+        if self.is_encrypted() {
+            // Sprinter 746342a0bfbb: hnsw_rs only writes plaintext files, and
+            // a graph dump holds every vector; an encrypted store writes none
+            // and rebuilds these indexes from their sealed rows at open.
+            report.vector_skipped += standard.len() as u64;
+        } else if !standard.is_empty() {
+            // Basenames the current sidecars reference, so removing an index's
+            // previous dump never removes one another sidecar still uses (two
+            // names that sanitized alike shared one under the old scheme).
+            // Unknown (a failed listing) keeps every previous dump for the sweep.
+            let listing = self.meta_blobs_with_prefix(snap::VEC_SNAPSHOT_PREFIX);
+            let referenced: Option<Vec<(String, String)>> = match listing {
+                Ok(sidecars) => Some(
+                    sidecars
+                        .into_iter()
+                        .filter_map(|(name, blob)| {
+                            let sidecar = bincode::deserialize::<snap::VectorGraphSidecar>(&blob).ok()?;
+                            Some((name, sidecar.basename))
+                        })
+                        .collect(),
+                ),
                 Err(e) => {
                     warn!(
-                        "HNSW snapshot dump for '{}' failed: {} — it will rebuild on open",
-                        meta.name, e
+                        "HNSW snapshot: cannot list the stored sidecars ({}); previous dumps are kept",
+                        e
                     );
-                    report.vector_dump_failures += 1;
+                    None
+                }
+            };
+            for name in standard {
+                match self.persist_vector_graph(&name, &dump_dir, &marker_bytes, referenced.as_deref()) {
+                    Ok(VectorGraphCheckpoint::Dumped) => report.vector_graphs += 1,
+                    Ok(VectorGraphCheckpoint::Unchanged) => report.vector_unchanged += 1,
+                    Ok(VectorGraphCheckpoint::Skipped) => report.vector_skipped += 1,
+                    Err(e) => {
+                        warn!(
+                            "HNSW snapshot dump for '{}' failed: {} — it will rebuild on open",
+                            name, e
+                        );
+                        report.vector_dump_failures += 1;
+                    }
                 }
             }
         }
@@ -10746,10 +10783,139 @@ impl StorageEngine {
         report.persisted = true;
         report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         info!(
-            "index snapshot checkpoint: {} tables ({} ART entries), {} HNSW graphs, {:.1}ms",
-            report.art_tables, report.art_entries, report.vector_graphs, report.elapsed_ms
+            "index snapshot checkpoint: {} tables ({} ART entries), HNSW {} dumped / {} kept / {} skipped, {:.1}ms",
+            report.art_tables,
+            report.art_entries,
+            report.vector_graphs,
+            report.vector_unchanged,
+            report.vector_skipped,
+            report.elapsed_ms
         );
         Ok(report)
+    }
+
+    /// Sprinter 746342a0bfbb: checkpoint ONE standard HNSW index (see
+    /// [`Self::persist_index_snapshots`]). `referenced` holds `(index name,
+    /// basename)` for every sidecar stored before this checkpoint; `None` when
+    /// that is unknown, and then no previous dump is removed.
+    fn persist_vector_graph(
+        &self,
+        name: &str,
+        dump_dir: &Path,
+        marker_bytes: &[u8],
+        referenced: Option<&[(String, String)]>,
+    ) -> Result<VectorGraphCheckpoint> {
+        use super::index_snapshot as snap;
+        let Some(state) = self.vector_indexes.standard_index_dump_state(name) else {
+            return Ok(VectorGraphCheckpoint::Skipped);
+        };
+        if state == super::StandardDumpState::Empty {
+            return Ok(VectorGraphCheckpoint::Skipped);
+        }
+        let previous = self.read_vector_sidecar(name);
+        if state == super::StandardDumpState::Unchanged {
+            if let Some(previous) = &previous {
+                if self.vector_indexes.standard_index_matches_sidecar(name, previous)
+                    && snap::graph_dump_files_present(dump_dir, &previous.basename)
+                {
+                    // The sidecar and its files already describe the index; the
+                    // marker may have gone with another index's first mutation.
+                    let marker_key = snap::vec_snapshot_marker_key(name);
+                    self.write_sealed_records(&[(marker_key.as_slice(), marker_bytes)])?;
+                    return Ok(VectorGraphCheckpoint::Unchanged);
+                }
+            }
+        }
+
+        let Some(dump) = self.vector_indexes.dump_standard_index(name, dump_dir)? else {
+            return Ok(VectorGraphCheckpoint::Skipped);
+        };
+        let blob = bincode::serialize(&dump.sidecar).map_err(|e| Error::storage(format!("sidecar serialize: {e}")))?;
+        let sidecar_key = snap::vec_snapshot_key(name);
+        let marker_key = snap::vec_snapshot_marker_key(name);
+        // Sidecar and marker in ONE batch: the switch to the new dump.
+        let records = [
+            (sidecar_key.as_slice(), blob.as_slice()),
+            (marker_key.as_slice(), marker_bytes),
+        ];
+        if let Err(e) = self.write_sealed_records(&records) {
+            if let Err(remove) = snap::remove_graph_dump(dump_dir, &dump.sidecar.basename) {
+                warn!(
+                    "HNSW snapshot for '{}': unreferenced dump left behind: {}",
+                    name, remove
+                );
+            }
+            return Err(e);
+        }
+        self.vector_indexes.mark_standard_index_dumped(name, dump.generation);
+
+        if let Some(previous) = previous {
+            let shared = referenced.is_none_or(|referenced| {
+                referenced
+                    .iter()
+                    .any(|(other, basename)| other != name && *basename == previous.basename)
+            });
+            if previous.basename != dump.sidecar.basename && !shared {
+                if let Err(e) = snap::remove_graph_dump(dump_dir, &previous.basename) {
+                    warn!(
+                        "HNSW snapshot for '{}': could not remove the previous dump '{}': {} (swept at the next open)",
+                        name, previous.basename, e
+                    );
+                }
+            }
+        }
+        Ok(VectorGraphCheckpoint::Dumped)
+    }
+
+    /// The decodable sidecar stored for vector index `name`, if any (marker or
+    /// not).
+    fn read_vector_sidecar(&self, name: &str) -> Option<super::index_snapshot::VectorGraphSidecar> {
+        use super::index_snapshot as snap;
+        let blob = self.get(&snap::vec_snapshot_key(name)).ok().flatten()?;
+        let sidecar: snap::VectorGraphSidecar = bincode::deserialize(&blob).ok()?;
+        (sidecar.index_name == name).then_some(sidecar)
+    }
+
+    /// Sprinter 746342a0bfbb: write `records` as ONE gated RocksDB batch, each
+    /// value sealed exactly as [`Self::put`] seals it.
+    fn write_sealed_records(&self, records: &[(&[u8], &[u8])]) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        for &(key, value) in records {
+            let stored = super::tde::seal(self.key_manager.as_deref(), value)?;
+            batch.put(key, stored.as_ref());
+        }
+        self.gate.write(&self.db, batch, self.memory_write_options.as_ref())
+    }
+
+    /// Sprinter 746342a0bfbb: at open, delete every graph dump file in
+    /// `hnsw_snapshots/` that no valid sidecar (`sidecars`, as
+    /// [`Self::load_vector_sidecars`] returned them) references, and every
+    /// staging directory a crashed dump left. On an encrypted store no dump is
+    /// valid: every dump file goes, and so do the sidecars and markers that
+    /// pointed at them. Nothing is touched by a handle that may not write.
+    /// Returns how many entries were removed.
+    pub(crate) fn sweep_hnsw_snapshot_dir(
+        &self,
+        sidecars: &std::collections::HashMap<String, super::index_snapshot::VectorGraphSidecar>,
+    ) -> u64 {
+        use super::index_snapshot as snap;
+        if !self.gate.is_open() || self.is_physical_standby() {
+            return 0;
+        }
+        let encrypted = self.is_encrypted();
+        if encrypted {
+            Self::delete_prefix_raw(&self.db, &self.gate, snap::VEC_SNAPSHOT_MARKER_PREFIX.as_bytes());
+            Self::delete_prefix_raw(&self.db, &self.gate, snap::VEC_SNAPSHOT_PREFIX.as_bytes());
+        }
+        let Some(dir) = self.hnsw_snapshot_dir() else {
+            return 0;
+        };
+        let keep: HashSet<&str> = if encrypted {
+            HashSet::new()
+        } else {
+            sidecars.values().map(|sidecar| sidecar.basename.as_str()).collect()
+        };
+        snap::sweep_graph_dumps(&dir, &keep)
     }
 
     /// Remove the durable snapshot artefacts belonging to ONE vector index: the
@@ -10771,9 +10937,9 @@ impl StorageEngine {
         use super::index_snapshot as snap;
 
         // The dump basename is read back OUT of the sidecar rather than
-        // re-derived: `graph_dump_basename` is lossy (every non-alphanumeric
-        // collapses to `_`), so re-deriving it from the index name could delete
-        // a different index's dump files.
+        // re-derived: it carries a per-checkpoint generation, and sidecars
+        // written before Sprinter 746342a0bfbb used the lossy sanitized index
+        // name, which re-deriving could map onto a different index's files.
         if let Some(dir) = self.hnsw_snapshot_dir() {
             match self.get(&snap::vec_snapshot_key(index_name)) {
                 Ok(Some(blob)) => match bincode::deserialize::<snap::VectorGraphSidecar>(&blob) {
@@ -10861,11 +11027,16 @@ impl StorageEngine {
     }
 
     /// Read every valid HNSW graph sidecar (marker present + versions match).
+    /// None on an encrypted store (Sprinter 746342a0bfbb): a dump there can
+    /// only be a plaintext one an unencrypted run left, and it is never loaded.
     pub(crate) fn load_vector_sidecars(
         &self,
     ) -> std::collections::HashMap<String, super::index_snapshot::VectorGraphSidecar> {
         use super::index_snapshot as snap;
         let mut out = std::collections::HashMap::new();
+        if self.is_encrypted() {
+            return out;
+        }
         for index in self.keys_with_prefix_suffixes(snap::VEC_SNAPSHOT_MARKER_PREFIX) {
             let Ok(Some(marker_bytes)) = self.get(&snap::vec_snapshot_marker_key(&index)) else {
                 continue;

@@ -218,6 +218,8 @@ impl Config {
             // deserialization a default is indistinguishable from an explicit value.
             config.apply_profile_defaults(profile, |key| raw.get("storage").and_then(|s| s.get(key)).is_some());
         }
+        // Sprinter 746342a0bfbb: refused at load, not at the first CREATE INDEX.
+        config.vector.validate()?;
         Ok(config)
     }
 
@@ -335,6 +337,7 @@ impl Config {
         self.locks.validate()?;
         self.dump.validate()?;
         self.resource_quotas.validate()?;
+        self.vector.validate()?;
         Ok(())
     }
 }
@@ -2358,6 +2361,25 @@ pub struct VectorConfig {
     pub pq_bits: usize,
 }
 
+impl VectorConfig {
+    /// Sprinter 746342a0bfbb: the HNSW construction defaults must be values the
+    /// index can be built and dumped with (hnsw_rs exits the process for an M
+    /// above 256 and dumps M as a `u8`).
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::vector::hnsw_index::{MAX_MAX_CONNECTIONS, MIN_MAX_CONNECTIONS};
+        if !(MIN_MAX_CONNECTIONS..=MAX_MAX_CONNECTIONS).contains(&self.hnsw_m) {
+            return Err(crate::Error::config(format!(
+                "vector.hnsw_m must be between {MIN_MAX_CONNECTIONS} and {MAX_MAX_CONNECTIONS}, got {}",
+                self.hnsw_m
+            )));
+        }
+        if self.hnsw_ef_construction < 1 {
+            return Err(crate::Error::config("vector.hnsw_ef_construction must be at least 1"));
+        }
+        Ok(())
+    }
+}
+
 impl Default for VectorConfig {
     fn default() -> Self {
         Self {
@@ -2904,6 +2926,30 @@ mod tests {
             "the primary's redo window only"
         );
         config.validate().unwrap();
+    }
+
+    /// Sprinter 746342a0bfbb: `[vector] hnsw_m` / `hnsw_ef_construction`
+    /// outside what an HNSW index can be built with are refused at load.
+    #[test]
+    fn vector_construction_defaults_are_bounded_at_load() {
+        for bad in [
+            "hnsw_m = 0",
+            "hnsw_m = 1",
+            "hnsw_m = 256",
+            "hnsw_m = 300",
+            "hnsw_ef_construction = 0",
+        ] {
+            let error = Config::from_toml_str(&format!("[vector]\n{bad}\n"))
+                .expect_err(bad)
+                .to_string();
+            assert!(error.contains("vector.hnsw_"), "{bad}: {error}");
+        }
+        for good in ["hnsw_m = 2", "hnsw_m = 255", "hnsw_ef_construction = 1"] {
+            Config::from_toml_str(&format!("[vector]\n{good}\n")).unwrap();
+        }
+        let mut config = Config::default();
+        config.vector.hnsw_m = 400;
+        assert!(config.validate().is_err());
     }
 
     /// Spec P2.1: the synchronous-replication settings are bounded, and the

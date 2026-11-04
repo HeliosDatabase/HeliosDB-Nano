@@ -100,9 +100,27 @@ fn dump_files(data: &Path) -> Vec<std::path::PathBuf> {
     files
 }
 
+/// The dump file whose name ends with `suffix` (`.hnsw.graph` / `.hnsw.data`).
+fn with_suffix<'a>(files: &'a [std::path::PathBuf], suffix: &str) -> &'a std::path::PathBuf {
+    files
+        .iter()
+        .find(|file| file.to_string_lossy().ends_with(suffix))
+        .unwrap_or_else(|| panic!("no {suffix} file in {files:?}"))
+}
+
 /// A graph dump that is valid but not the one the sidecar describes (an
 /// older checkpoint's) is refused; the index is rebuilt from rows and holds
 /// every row.
+///
+/// Sprinter 746342a0bfbb: this used to pass for the wrong reason. The second
+/// close dumps a graph RELOADED from dump A, and hnsw_rs 0.3.3 marks every
+/// reloaded graph as memory-mapped (`load_hnsw`, hnswio.rs:517), so its
+/// `file_dump` refused to overwrite and wrote a `-{rand}` copy instead
+/// (api.rs:73, hnswio.rs:156): the dump counted as failed, no sidecar B was
+/// written, an orphan pair was left behind, and the third open rebuilt only
+/// because no valid sidecar existed at all. Now the second close publishes
+/// dump B under sidecar B and removes dump A, and the third open refuses dump
+/// A's bytes under sidecar B because their digests differ.
 #[test]
 fn a_graph_dump_the_sidecar_does_not_describe_is_rebuilt_from_rows() {
     let data = tempfile::tempdir().unwrap();
@@ -124,10 +142,18 @@ fn a_graph_dump_the_sidecar_does_not_describe_is_rebuilt_from_rows() {
         let db = EmbeddedDatabase::new(data.path()).unwrap();
         assert_eq!(db.storage.last_index_open_report().unwrap().vector_reloaded, 1);
         insert_vectors(&db, 300..400);
-    } // clean close: dump B + sidecar B
-      // Put dump A back under sidecar B.
-    for file in &older {
-        std::fs::copy(saved.path().join(file.file_name().unwrap()), file).unwrap();
+    } // clean close: dump B + sidecar B, dump A removed
+    let newer = dump_files(data.path());
+    assert_eq!(
+        newer.len(),
+        2,
+        "closing a reloaded index leaves exactly its own dump, no orphan copy: {newer:?}"
+    );
+    assert_ne!(newer, older, "the second close published a new dump");
+    // Put dump A's bytes where sidecar B's files are.
+    for suffix in [".hnsw.graph", ".hnsw.data"] {
+        let from = saved.path().join(with_suffix(&older, suffix).file_name().unwrap());
+        std::fs::copy(from, with_suffix(&newer, suffix)).unwrap();
     }
     let db = EmbeddedDatabase::new(data.path()).unwrap();
     let report = db.storage.last_index_open_report().unwrap();
@@ -138,15 +164,18 @@ fn a_graph_dump_the_sidecar_does_not_describe_is_rebuilt_from_rows() {
     assert_eq!(report.vector_rebuilt, 1, "{report:?}");
     let stats = db.storage.vector_indexes().get_index_stats("idx_d_docs_emb").unwrap();
     assert_eq!(stats.num_vectors, 400, "the rebuilt index holds every row");
+    // Sprinter 66aeb488f312: LIMIT 5 again (it had been widened to 50 to ride
+    // out recall misses on the rebuilt graph). Row 380's vector is the query.
     let rows = db
         .query(
-            "SELECT id FROM d_docs ORDER BY emb <-> '[95.0, 96.0, 47.5, 1.0]' LIMIT 50",
+            "SELECT id FROM d_docs ORDER BY emb <-> '[95.0, 96.0, 47.5, 1.0]' LIMIT 5",
             &[],
         )
         .unwrap();
-    assert!(
-        rows.iter().any(|row| row.values.first() == Some(&Value::Int4(380))),
-        "a row only the newer checkpoint had is found"
+    assert_eq!(
+        rows.first().and_then(|row| row.values.first()),
+        Some(&Value::Int4(380)),
+        "a row only the newer checkpoint had is found, first: {rows:?}"
     );
 }
 

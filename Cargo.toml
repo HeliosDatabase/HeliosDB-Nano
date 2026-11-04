@@ -187,7 +187,29 @@ tree-sitter-sequel      = { version = "0.3",  optional = true }
 # Local in-process text embedder (feature = "code-embed").  Adds a
 # CPU ONNX runtime + pre-quantised models; ~150 MB at first run for
 # the model cache, no on-disk impact on the binary itself.
-fastembed = { version = "4", optional = true }
+#
+# 7.x, not 4.x, for a security reason: fastembed 4.9 -> hf-hub 0.4 -> ureq 2
+# -> webpki-roots 0.26.11 (RUSTSEC-2026-0381, trusts distrusted emSign
+# intermediates). 7.x uses hf-hub 0.5 -> ureq 3 -> webpki-roots >= 1.0.10.
+# default-features = false drops fastembed's native-tls defaults (openssl
+# stack, banned in deny.toml) and the image-model stack we never call; the
+# model download (hf-hub) and the build-time ONNX Runtime download (ort-sys)
+# both go through rustls.
+# Platform note: the ONNX Runtime that ort-sys (=2.0.0-rc.15) downloads at
+# build time needs glibc >= 2.38 and GCC 13's libstdc++ (`__isoc23_strtol`,
+# `_M_replace_cold`): it links on Ubuntu 24.04, Debian 13, Fedora 39+, RHEL 10,
+# not on RHEL/AlmaLinux/Rocky 9 (glibc 2.34). Every ort since rc.12 ships such
+# a build, so no fastembed with hf-hub 0.5 avoids it. On an older glibc, link
+# Microsoft's official ONNX Runtime >= 1.24 (glibc >= 2.27) instead:
+#   ORT_LIB_PATH=<onnxruntime-linux-x64-1.24.x>/lib ORT_PREFER_DYNAMIC_LINK=1 \
+#     cargo build --features code-embed
+# and run with that lib directory on LD_LIBRARY_PATH. MSRV: fastembed 7.5 needs
+# Rust 1.88 and ort rc.15 needs 1.92, above this crate's rust-version (the
+# default build is unaffected).
+fastembed = { version = "7.5", optional = true, default-features = false, features = [
+    "hf-hub-rustls-tls",
+    "ort-download-binaries-rustls-tls",
+] }
 
 # Config
 toml = "0.8"

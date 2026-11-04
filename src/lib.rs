@@ -1800,6 +1800,16 @@ impl Drop for EmbeddedDatabase {
         // counter bumped by a still-open transaction costs at most a row-id gap
         // — never a collision. Only the snapshot checkpoint needs that guard.
         //
+        // Sprinter 746342a0bfbb: both writes ARE gated on the last owner, like
+        // every other close-time write below. `clone_for_trigger()` clones drop
+        // mid-statement (once per row of DML on a triggered table), and each
+        // such drop used to flush every row counter and checkpoint every ART
+        // and HNSW index — a full graph dump per triggered row, and markers
+        // written for a statement still in flight. The root handle is not the
+        // last owner either while the UDF bridge's captured clone lives (it
+        // drops with the root's fields, after this body); that clone's drop
+        // runs these writes once, as the last owner.
+        //
         // Spec P1.4: NONE of the four close-time writes below runs for a
         // physical standby's handle, explicitly rather than by leaning on the
         // engine's flags. A physical open already clears the counter-flush and
@@ -1811,7 +1821,8 @@ impl Drop for EmbeddedDatabase {
         // keeps applying), and its owner decides when the store is flushed. A
         // standby's close leaves the directory exactly as it found it.
         let writes_at_close = !self.storage.is_physical_standby();
-        if writes_at_close && self.storage.row_counter_flush_on_close() {
+        let last_owner = std::sync::Arc::strong_count(&self.auto_refresh_worker) == 1;
+        if writes_at_close && last_owner && self.storage.row_counter_flush_on_close() {
             if let Err(e) = self.storage.flush_all_row_counters() {
                 tracing::warn!("row counter flush at close failed: {}", e);
             }
@@ -1826,11 +1837,11 @@ impl Drop for EmbeddedDatabase {
         // requirement documented on the counter flush above.
         let txn_open = self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
             || self.session_txn_count.load(std::sync::atomic::Ordering::Acquire) > 0;
-        if writes_at_close && !txn_open && self.storage.index_snapshots_on_close() {
+        if writes_at_close && last_owner && !txn_open && self.storage.index_snapshots_on_close() {
             if let Err(e) = self.storage.persist_index_snapshots() {
                 tracing::warn!("index snapshot checkpoint at close failed: {}", e);
             }
-        } else if txn_open {
+        } else if last_owner && txn_open {
             tracing::debug!("skipping index snapshot checkpoint: transaction still open at drop");
         }
 
@@ -32501,6 +32512,56 @@ mod tests {
 
         db.commit_transaction_for_session(session).unwrap();
         db.destroy_session(session).unwrap();
+    }
+
+    /// Sprinter 746342a0bfbb (R4 item 2): dropping a `clone_for_trigger()`
+    /// handle must not run the close-time row-counter flush or index-snapshot
+    /// checkpoint. Red before: each such drop dumped every HNSW graph and wrote
+    /// every snapshot marker mid-session. The real close still checkpoints.
+    #[test]
+    fn test_dropping_a_trigger_clone_writes_no_counter_or_index_snapshot() {
+        use crate::storage::index_snapshot as snap;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = EmbeddedDatabase::new(dir.path()).unwrap();
+            db.execute("CREATE TABLE tcs (id INT PRIMARY KEY, emb VECTOR(3))")
+                .unwrap();
+            for i in 0..5 {
+                db.execute(&format!("INSERT INTO tcs VALUES ({i}, '[{i}.5, 1.0, 0.5]')"))
+                    .unwrap();
+            }
+            db.execute("CREATE INDEX tcs_emb ON tcs USING hnsw (emb)").unwrap();
+            let counter_key = b"counter:tcs".to_vec();
+            let counter_before = db.storage.get(&counter_key).unwrap();
+
+            drop(db.clone_for_trigger());
+
+            let dumps = dir.path().join(snap::HNSW_SNAPSHOT_DIR);
+            assert!(
+                !dumps.exists() || std::fs::read_dir(&dumps).unwrap().next().is_none(),
+                "a trigger clone's drop dumped an HNSW graph"
+            );
+            assert_eq!(
+                db.storage.get(&snap::vec_snapshot_marker_key("tcs_emb")).unwrap(),
+                None,
+                "a trigger clone's drop wrote an HNSW snapshot marker"
+            );
+            assert_eq!(
+                db.storage.get(&snap::art_snapshot_marker_key("tcs")).unwrap(),
+                None,
+                "a trigger clone's drop wrote an ART snapshot marker"
+            );
+            assert_eq!(
+                db.storage.get(&counter_key).unwrap(),
+                counter_before,
+                "a trigger clone's drop flushed the row counters"
+            );
+        }
+        let db = EmbeddedDatabase::new(dir.path()).unwrap();
+        let report = db.storage.last_index_open_report().unwrap();
+        assert_eq!(report.vector_reloaded, 1, "the real close checkpointed: {report:?}");
+        assert_eq!(report.tables_from_snapshot, 1, "{report:?}");
     }
 
     // ========================================================================

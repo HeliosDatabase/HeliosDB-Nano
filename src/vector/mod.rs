@@ -14,7 +14,7 @@ pub mod quantized_hnsw;
 pub mod simd;
 
 pub use biased_descent::{apply_bias, BiasOptions, CentralityMap};
-pub use hnsw_index::{HnswConfig, HnswIndex, MultiMetricHnswIndex};
+pub use hnsw_index::{DistNegDot, GraphDump, GraphIndex, GraphMetric, HnswConfig, HnswIndex, MultiMetricHnswIndex};
 pub use in_descent::{search as in_descent_search, Adjacency, InDescentOptions, Positions};
 #[cfg(feature = "vector-persist")]
 pub use persistent::{PersistentVectorIndex, PqHnswConfig, VectorPrecision};

@@ -117,6 +117,31 @@ pub enum VectorIndexUndoOp {
     },
 }
 
+/// Sprinter 746342a0bfbb: what a checkpoint needs to know about a standard
+/// (in-memory HNSW) index before it dumps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandardDumpState {
+    /// The index holds no point. hnsw_rs cannot dump a graph without an entry
+    /// point, and rebuilding it from its rows at open costs nothing.
+    Empty,
+    /// Unchanged since the dump its sidecar describes, or since the reload
+    /// from that dump: the checkpoint keeps the dump.
+    Unchanged,
+    /// Changed since its last dump, or never dumped.
+    Changed,
+}
+
+/// One standard index's graph dump, published under `sidecar.basename`, and
+/// the sidecar describing it ([`VectorIndexManager::dump_standard_index`]).
+#[derive(Debug, Clone)]
+pub struct StandardIndexDump {
+    pub sidecar: super::index_snapshot::VectorGraphSidecar,
+    /// The index's mutation count the dump was taken at: hand it to
+    /// [`VectorIndexManager::mark_standard_index_dumped`] once the sidecar is
+    /// durable.
+    pub generation: u64,
+}
+
 /// How a [`VectorIndexManager`] treats the RocksDB keyspace of its persistent
 /// (`vector-persist`) indexes (spec P1.2).
 ///
@@ -1339,14 +1364,63 @@ impl VectorIndexManager {
 
     // ---- R4.2: standard HNSW graph dump / reload ---------------------------
 
-    /// Dump a standard (non-quantized, non-persistent) HNSW index's graph to
-    /// `dir` and return the sidecar describing it. Returns `Ok(None)` for
-    /// non-Standard backends (quantized/persistent have their own paths).
-    pub fn dump_standard_index(
+    /// Sprinter 746342a0bfbb: the dump state of standard index `name`; `None`
+    /// when it is not a registered standard index.
+    pub fn standard_index_dump_state(&self, name: &str) -> Option<StandardDumpState> {
+        match self.indexes.read().get(name) {
+            Some(IndexStorage::Standard(index)) if index.is_empty() => Some(StandardDumpState::Empty),
+            Some(IndexStorage::Standard(index)) if index.is_unchanged_since_dump() => {
+                Some(StandardDumpState::Unchanged)
+            }
+            Some(IndexStorage::Standard(_)) => Some(StandardDumpState::Changed),
+            _ => None,
+        }
+    }
+
+    /// Record that the dump taken at `generation` now durably describes
+    /// standard index `name` (see [`crate::vector::GraphIndex::mark_dumped`]).
+    pub fn mark_standard_index_dumped(&self, name: &str, generation: u64) {
+        if let Some(IndexStorage::Standard(index)) = self.indexes.read().get(name) {
+            index.mark_dumped(generation);
+        }
+    }
+
+    /// Whether `sidecar` describes standard index `name` as it is registered
+    /// now: same name, table, column and construction parameters. A checkpoint
+    /// keeps an unchanged index's dump only when its sidecar still matches.
+    pub fn standard_index_matches_sidecar(
         &self,
         name: &str,
-        dir: &std::path::Path,
-    ) -> Result<Option<super::index_snapshot::VectorGraphSidecar>> {
+        sidecar: &super::index_snapshot::VectorGraphSidecar,
+    ) -> bool {
+        let metadata = self.metadata.read();
+        let Some(meta) = metadata.get(name) else {
+            return false;
+        };
+        let VectorIndexType::Standard(config) = &meta.index_type else {
+            return false;
+        };
+        sidecar.index_name == name
+            && sidecar.table_name == meta.table_name
+            && sidecar.column_name == meta.column_name
+            && sidecar.dimension == config.dimension
+            && sidecar.metric == metric_name(config.distance_metric)
+            && sidecar.m == config.max_connections
+            && sidecar.ef_construction == config.ef_construction
+    }
+
+    /// Dump a standard (non-quantized, non-persistent) HNSW index's graph into
+    /// `dir` and return it with the sidecar describing it. Returns `Ok(None)`
+    /// for non-Standard backends (quantized/persistent have their own paths).
+    ///
+    /// Sprinter 746342a0bfbb: the dump goes under a FRESH basename derived from
+    /// the index's stable id (`index_snapshot::graph_dump_basename`), never
+    /// over the files the current sidecar references, and is fsynced and
+    /// renamed into place before this returns. Switching the sidecar to it and
+    /// removing the previous dump is the caller's
+    /// (`StorageEngine::persist_index_snapshots`).
+    pub fn dump_standard_index(&self, name: &str, dir: &std::path::Path) -> Result<Option<StandardIndexDump>> {
+        use super::index_snapshot as snap;
         let indexes = self.indexes.read();
         let metadata = self.metadata.read();
         let (Some(index), Some(meta)) = (indexes.get(name), metadata.get(name)) else {
@@ -1359,31 +1433,41 @@ impl VectorIndexManager {
             return Ok(None);
         };
 
-        let basename = graph_dump_basename(name);
-        index.dump_graph(dir, &basename)?;
-        let (id_mapping, reverse_mapping) = index.export_mappings();
+        let basename = fresh_graph_dump_basename(name, dir);
+        let dump = index.dump_graph(dir, &basename)?;
         let digest = |suffix: &str| {
             let path = dir.join(format!("{basename}{suffix}"));
-            super::index_snapshot::dump_file_digest(&path)
+            snap::dump_file_digest(&path)
                 .map_err(|e| Error::storage(format!("HNSW graph dump {} digest: {e}", path.display())))
         };
-        let graph_sha256 = digest(super::index_snapshot::HNSW_GRAPH_SUFFIX)?;
-        let data_sha256 = digest(super::index_snapshot::HNSW_DATA_SUFFIX)?;
+        let (graph_sha256, data_sha256) = match (digest(snap::HNSW_GRAPH_SUFFIX), digest(snap::HNSW_DATA_SUFFIX)) {
+            (Ok(graph), Ok(data)) => (graph, data),
+            (Err(e), _) | (_, Err(e)) => {
+                // Nothing references the new files yet: do not leave them behind.
+                if let Err(remove) = snap::remove_graph_dump(dir, &basename) {
+                    tracing::warn!("HNSW graph dump '{}': could not remove it: {}", basename, remove);
+                }
+                return Err(e);
+            }
+        };
 
-        Ok(Some(super::index_snapshot::VectorGraphSidecar {
-            format_version: super::index_snapshot::INDEX_SNAPSHOT_FORMAT_VERSION,
-            index_name: name.to_string(),
-            table_name: meta.table_name.clone(),
-            column_name: meta.column_name.clone(),
-            dimension: config.dimension,
-            metric: metric_name(config.distance_metric).to_string(),
-            m: config.max_connections,
-            ef_construction: config.ef_construction,
-            basename,
-            id_mapping,
-            reverse_mapping,
-            graph_sha256,
-            data_sha256,
+        Ok(Some(StandardIndexDump {
+            sidecar: snap::VectorGraphSidecar {
+                format_version: snap::INDEX_SNAPSHOT_FORMAT_VERSION,
+                index_name: name.to_string(),
+                table_name: meta.table_name.clone(),
+                column_name: meta.column_name.clone(),
+                dimension: config.dimension,
+                metric: metric_name(config.distance_metric).to_string(),
+                m: config.max_connections,
+                ef_construction: config.ef_construction,
+                basename,
+                id_mapping: dump.id_mapping,
+                reverse_mapping: dump.reverse_mapping,
+                graph_sha256,
+                data_sha256,
+            },
+            generation: dump.generation,
         }))
     }
 
@@ -1504,12 +1588,27 @@ impl VectorIndexManager {
     }
 }
 
-/// Filesystem-safe dump basename for an index name.
-fn graph_dump_basename(index_name: &str) -> String {
-    index_name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect()
+/// Sprinter 746342a0bfbb: a dump basename for `index_name` that no file in
+/// `dir` has: the index's stable id and a nanosecond generation. It replaces
+/// the old basename, the index name with every non-alphanumeric mapped to `_`,
+/// under which `a.b` and `a_b` shared one dump.
+fn fresh_graph_dump_basename(index_name: &str, dir: &std::path::Path) -> String {
+    use super::index_snapshot as snap;
+    let id = stable_index_id(index_name);
+    let mut generation = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    for _ in 0..64 {
+        let basename = snap::graph_dump_basename(id, generation);
+        if !dir.join(format!("{basename}{}", snap::HNSW_GRAPH_SUFFIX)).exists()
+            && !dir.join(format!("{basename}{}", snap::HNSW_DATA_SUFFIX)).exists()
+        {
+            return basename;
+        }
+        generation = generation.wrapping_add(1);
+    }
+    snap::graph_dump_basename(id, generation)
 }
 
 fn metric_name(metric: DistanceMetric) -> &'static str {
@@ -1704,5 +1803,106 @@ mod tests {
 
         let indexes = manager.find_indexes("docs", "embedding");
         assert_eq!(indexes.len(), 2);
+    }
+
+    /// Sprinter 746342a0bfbb item 4: the dump basename was the index name with
+    /// every non-alphanumeric mapped to `_`, so `docs.emb` and `docs_emb` wrote
+    /// the same two files and the first sidecar described the second's graph.
+    /// Each index now gets a basename from its stable id, and both reload.
+    #[test]
+    fn index_names_that_sanitize_alike_get_their_own_graph_dumps() {
+        use crate::storage::index_snapshot as snap;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = VectorIndexManager::new();
+        for (name, offset) in [("docs.emb", 0.0_f32), ("docs_emb", 100.0)] {
+            manager
+                .create_index(
+                    name.to_string(),
+                    "docs".to_string(),
+                    "emb".to_string(),
+                    3,
+                    DistanceMetric::L2,
+                )
+                .unwrap();
+            for i in 0..20_u64 {
+                manager
+                    .insert_vector(name, i + 1, &vec![offset + i as f32, 1.0, 0.5])
+                    .unwrap();
+            }
+        }
+        let a = manager.dump_standard_index("docs.emb", dir.path()).unwrap().unwrap();
+        let b = manager.dump_standard_index("docs_emb", dir.path()).unwrap().unwrap();
+        assert_ne!(a.sidecar.basename, b.sidecar.basename);
+        for (name, dump) in [("docs.emb", &a), ("docs_emb", &b)] {
+            let prefix = format!("{:016x}-", stable_index_id(name));
+            assert!(dump.sidecar.basename.starts_with(&prefix), "{}", dump.sidecar.basename);
+            for (suffix, recorded) in [
+                (snap::HNSW_GRAPH_SUFFIX, dump.sidecar.graph_sha256),
+                (snap::HNSW_DATA_SUFFIX, dump.sidecar.data_sha256),
+            ] {
+                let path = dir.path().join(format!("{}{suffix}", dump.sidecar.basename));
+                assert_eq!(
+                    snap::dump_file_digest(&path).unwrap(),
+                    recorded,
+                    "{name}: its sidecar describes its own file"
+                );
+            }
+        }
+
+        let reopened = VectorIndexManager::new();
+        reopened.reload_standard_index(&a.sidecar, dir.path()).unwrap();
+        reopened.reload_standard_index(&b.sidecar, dir.path()).unwrap();
+        assert_eq!(
+            reopened.search("docs.emb", &vec![5.0, 1.0, 0.5], 1).unwrap(),
+            vec![(6, 0.0)]
+        );
+        assert_eq!(
+            reopened.search("docs_emb", &vec![105.0, 1.0, 0.5], 1).unwrap(),
+            vec![(6, 0.0)]
+        );
+    }
+
+    /// Sprinter 746342a0bfbb: the per-index dump state a checkpoint reads.
+    #[test]
+    fn the_standard_dump_state_follows_dumps_and_mutations() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = VectorIndexManager::new();
+        manager
+            .create_index(
+                "st_idx".to_string(),
+                "st".to_string(),
+                "emb".to_string(),
+                3,
+                DistanceMetric::L2,
+            )
+            .unwrap();
+        assert_eq!(
+            manager.standard_index_dump_state("st_idx"),
+            Some(StandardDumpState::Empty)
+        );
+        assert_eq!(manager.standard_index_dump_state("missing"), None);
+
+        manager.insert_vector("st_idx", 1, &vec![1.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            manager.standard_index_dump_state("st_idx"),
+            Some(StandardDumpState::Changed)
+        );
+        let dump = manager.dump_standard_index("st_idx", dir.path()).unwrap().unwrap();
+        assert!(manager.standard_index_matches_sidecar("st_idx", &dump.sidecar));
+        manager.mark_standard_index_dumped("st_idx", dump.generation);
+        assert_eq!(
+            manager.standard_index_dump_state("st_idx"),
+            Some(StandardDumpState::Unchanged)
+        );
+
+        manager.delete_vector("st_idx", 1).unwrap();
+        assert_eq!(
+            manager.standard_index_dump_state("st_idx"),
+            Some(StandardDumpState::Changed)
+        );
+
+        let mut other = dump.sidecar.clone();
+        other.table_name = "renamed".to_string();
+        assert!(!manager.standard_index_matches_sidecar("st_idx", &other));
     }
 }

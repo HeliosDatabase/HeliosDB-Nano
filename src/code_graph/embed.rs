@@ -116,8 +116,9 @@ struct EmbeddingResponse {
 //
 // Gated on `code-embed`. Wraps `fastembed::TextEmbedding` so the
 // indexer can populate `body_vec` without leaving the process.  The
-// model cache (~150 MB on first run) lives under
-// `$XDG_CACHE_HOME/.fastembed_cache`.
+// model cache (~150 MB on first run) is fastembed's default: `$HF_HOME`
+// if set, else `$FASTEMBED_CACHE_DIR`, else `./.fastembed_cache`
+// relative to the process working directory.
 
 #[cfg(feature = "code-embed")]
 pub use fastembed_impl::FastEmbedder;
@@ -128,9 +129,10 @@ mod fastembed_impl {
     use std::sync::Mutex;
 
     /// Default in-process embedder. Lazily initialises a single
-    /// `fastembed::TextEmbedding` instance behind a Mutex (the
-    /// underlying ORT session is not Sync).  Default model is
-    /// `BGESmallENV15` — 384-dim, English, ~30 MB.
+    /// `fastembed::TextEmbedding` instance behind a Mutex: in fastembed 7.x
+    /// `embed` takes `&mut self` (the ORT session's `run` needs exclusive
+    /// access), so the Mutex is what makes the embedder shareable.  Default
+    /// model is `BGESmallENV15` — 384-dim, English, ~30 MB.
     pub struct FastEmbedder {
         inner: Mutex<fastembed::TextEmbedding>,
     }
@@ -142,7 +144,11 @@ mod fastembed_impl {
         }
 
         pub fn with_model(model: fastembed::EmbeddingModel) -> Result<Self> {
-            let opts = fastembed::InitOptions::new(model);
+            // `TextInitOptions` is the 7.x name; `InitOptions` is deprecated.
+            // Defaults are unchanged from 4.x: cache dir from
+            // `fastembed::get_cache_dir()`, max length 512, download progress
+            // shown, intra-op threads = all CPUs.
+            let opts = fastembed::TextInitOptions::new(model);
             let inner = fastembed::TextEmbedding::try_new(opts)
                 .map_err(|e| Error::query_execution(format!("fastembed init: {e}")))?;
             Ok(Self {
@@ -159,22 +165,24 @@ mod fastembed_impl {
 
     impl Embedder for FastEmbedder {
         fn embed(&self, text: &str) -> Result<Option<Vec<f32>>> {
-            let guard = self
+            let mut guard = self
                 .inner
                 .lock()
                 .map_err(|e| Error::query_execution(format!("fastembed lock: {e}")))?;
-            // The model expects a batch; run with a one-element vec.
+            // The model expects a batch; run with a one-element slice.
             let mut out = guard
-                .embed(vec![text.to_string()], None)
+                .embed([text], None)
                 .map_err(|e| Error::query_execution(format!("fastembed embed: {e}")))?;
             Ok(out.pop())
         }
 
-        /// One ORT inference for the whole slice instead of one per text.
-        /// fastembed fans tokenization over rayon (`par_chunks`) and runs ORT
-        /// with `with_intra_threads(all_cpus)` internally, so a single batched
-        /// call collapses the serial per-symbol embed tail. `Some(256)` bounds
-        /// peak memory (BGESmallENV15 is static-precision → batching is safe).
+        /// One `embed` call per sub-batch instead of one per text. fastembed
+        /// splits the input into `Some(256)`-row ORT inferences (run in order;
+        /// 4.x ran them in parallel over rayon, 7.x runs them sequentially
+        /// because `Session::run` needs `&mut`) and ORT itself uses every CPU
+        /// (`intra_threads` default), so a single batched call collapses the
+        /// serial per-symbol embed tail. `Some(256)` bounds peak memory
+        /// (BGESmallENV15 is static-precision → batching is safe).
         /// Returns one `Some(vec)` per input text, in input order.
         fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Option<Vec<f32>>>> {
             if texts.is_empty() {
@@ -188,15 +196,16 @@ mod fastembed_impl {
             // memory regardless of caller chunking; fastembed still batches the
             // ORT inference internally (Some(256)) within each sub-batch.
             const MAX_BATCH: usize = 2048;
-            let guard = self
+            let mut guard = self
                 .inner
                 .lock()
                 .map_err(|e| Error::query_execution(format!("fastembed lock: {e}")))?;
             let mut result: Vec<Option<Vec<f32>>> = Vec::with_capacity(texts.len());
             for chunk in texts.chunks(MAX_BATCH) {
-                let owned: Vec<String> = chunk.iter().map(|t| t.to_string()).collect();
+                // 7.x takes `impl AsRef<[S]>`, so the borrowed slice goes in
+                // as-is (4.x required an owned `Vec<S>`, hence a String copy).
                 let out = guard
-                    .embed(owned, Some(256))
+                    .embed(chunk, Some(256))
                     .map_err(|e| Error::query_execution(format!("fastembed embed_batch: {e}")))?;
                 // fastembed returns one embedding per input, in order.
                 debug_assert_eq!(out.len(), chunk.len());

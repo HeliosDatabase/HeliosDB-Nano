@@ -63,6 +63,77 @@ and refuses on a physical standby (its key is its primary's) and on a primary wh
 replication port serves (naming the standbys attached), naming the procedure: re-key a
 primary that serves no standby, then rebuild each standby from it with the new key;
 otherwise it refuses because no re-encryption exists.
+### Security — `code-embed` no longer pulls webpki-roots 0.26 (sprinter b93af8c4a65f)
+
+- **fastembed 4.9 → 7.5** for the optional `code-embed` feature. fastembed 4 reached the
+  Hugging Face hub through hf-hub 0.4 → ureq 2 → webpki-roots 0.26.11, whose bundled roots trust
+  the distrusted emSign intermediates (RUSTSEC-2026-0381). 7.5 uses hf-hub 0.5 → ureq 3 →
+  webpki-roots 1.0.10, and the RUSTSEC-2026-0381 ignore is removed from `.cargo/audit.toml`.
+  The default build never compiled either version.
+- Same default model (`BGESmallENV15`, 384 dimensions, `Xenova/bge-small-en-v1.5`), same cache
+  location (`$HF_HOME`, else `$FASTEMBED_CACHE_DIR`, else `./.fastembed_cache`), and the same
+  `CODE_EMBED()` / `FastEmbedder` API.
+- **Model downloads now trust the bundled Mozilla root set, not the OS trust store.** hf-hub 0.5
+  builds its ureq 3 client with ureq's default roots, whichever TLS backend it uses, so a private CA
+  installed only in the OS store (a TLS-inspecting proxy) is no longer accepted. Pre-seed the
+  cache directory, or point `HF_ENDPOINT` at a mirror, in that case. Both the model download and
+  the build-time ONNX Runtime download now use rustls; `code-embed` no longer brings in
+  native-tls/OpenSSL. fastembed 7.5 also sends the `HF_TOKEN` environment variable with model
+  downloads when it is set (4.x sent only the `huggingface-cli login` token file).
+- Building with `--features code-embed` now needs Rust 1.92 or later (fastembed 7.5 needs 1.88,
+  and its pinned `ort` 2.0.0-rc.15 needs 1.92). `ort` rc.15 downloads a newer ONNX Runtime than
+  rc.9 did, so embeddings can differ from 4.x builds in the last float digits.
+  Large `embed_batch` calls run their 256-row inferences one after another instead of in
+  parallel; ONNX Runtime still uses every CPU inside each inference.
+- **`code-embed` and glibc.** The ONNX Runtime that `ort` rc.15 downloads at build time needs
+  glibc 2.38 and GCC 13's libstdc++, so a `code-embed` build no longer links on
+  RHEL/AlmaLinux/Rocky 9 (glibc 2.34) out of the box; every `ort` release since rc.12 ships such a
+  build. On those hosts, build against Microsoft's official ONNX Runtime 1.24 or later (it needs
+  glibc 2.27) with `ORT_LIB_PATH=<onnxruntime>/lib ORT_PREFER_DYNAMIC_LINK=1` and keep that
+  directory on `LD_LIBRARY_PATH`; verified on AlmaLinux 9 with ONNX Runtime 1.24.4 (the local
+  embedder test downloads the model and embeds). The default build and the released binaries do
+  not include `code-embed`.
+
+### Fixed — HNSW graph dumps and exact-match recall (sprinter 746342a0bfbb, 66aeb488f312)
+
+- **HNSW indexes are built with the configured parameters.** The graph library's constructor
+  takes `(M, max_elements, max_layer, ef_construction)`; it was called as
+  `(M, dimension, ef_construction, 100)`, so every graph was built with `ef_construction = 100`
+  and a layer count of `min(16, ef_construction)`, and an `ef_construction` below 16 made every
+  graph dump fail. `WITH (ef_construction = …)` and `[vector] hnsw_ef_construction` now take
+  effect: at the default of 200 an index BUILDS up to about twice as slowly as before. `m`
+  outside 2..=255 and `ef_construction = 0` are refused (`m` above 256 used to exit the process).
+- **A reopened HNSW index is dumped again at close.** A graph reloaded from its dump could not be
+  dumped over it: every clean close after a reload counted a dump failure and left a full-size
+  orphan copy in `hnsw_snapshots/`, one more per restart. Dumps are now written to a staging
+  directory, fsynced and renamed into place under a name derived from a stable index id (two
+  index names that differed only in punctuation used to share one dump), the sidecar and its
+  validity marker are written in one batch, and the previous dump is removed afterwards. An index
+  that has not changed since its dump is not dumped again. At open, dump files no sidecar
+  references are deleted.
+- **Exact-match vector queries find their row.** An HNSW search over at most 8192 vectors and
+  at most 2M vector components (points x dimension; e.g. ~1300 vectors at 1536 dimensions) is
+  now an exact scan, immune to rows the graph left unreachable (the library back-links a point
+  only on its own top layer). Larger indexes build their graph with fuller neighbour lists, a
+  sequential first insert and a shuffled batch order.
+- **Inner-product (`vector_ip_ops`) indexes accept any vectors** (sprinter 17d901194e59). The
+  library's dot-product distance asserted `1 - dot >= 0`, so any pair of vectors with a dot
+  product above 1 panicked the insert or search. The index now orders rows exactly as `<#>`
+  does and reports `<#>`'s value (`-dot`) as the distance — the unfiltered vector search used to
+  report `1 - dot`. Inner-product graph dumps written before this release are rebuilt once.
+- **Encrypted stores no longer write plaintext vectors** to `hnsw_snapshots/`: no graph dump is
+  written, and every HNSW index is rebuilt from its sealed rows at every open — open time grows
+  with index size, and each rebuild is logged with its duration. Dumps left by an unencrypted
+  run are deleted at the first encrypted open; deleting does not erase their bytes from free
+  disk blocks.
+- **`m` / `ef_construction` are range-checked** in `CREATE INDEX … WITH (…)` (2..=255, at least
+  1) and in `[vector] hnsw_m` / `hnsw_ef_construction` at config load. Out-of-range values that
+  an older binary stored are clamped into range at open, with a WARN, rather than refused, so
+  neither a primary's index nor a physical standby's hydration fails over them.
+- Every HNSW index rebuilt at open, or built by a physical standby's hydration, is logged at
+  INFO with its row count and duration.
+- Dropping a trigger's handle clone no longer flushes row counters and checkpoints every index
+  mid-statement; only the last owner of a database does.
 
 ### Fixed — a long statement no longer stalls the server (sprinter ccebc95977f1)
 
