@@ -269,6 +269,63 @@ fn validate_raw_batch(raw: &[u8]) -> Result<u32> {
     walk_raw_batch(raw, |_| ())
 }
 
+/// `internal-tests` builds only — the detector self-check of plan decision 7
+/// (`docs/plans/PHYSICAL_STANDBY_REPLICATION.md` "Decisions" 7 and §D3
+/// "Consistent cut"; spec `docs/plans/specs/R2_ddl_window_cut.md`): the raw
+/// default-family batch `raw` as TWO raw batches, byte for byte — its first
+/// `first_records` sequence-consuming records (with any `LogData` record
+/// among them), then the rest — each with its own count. The 8-byte
+/// sequence of either header is RocksDB's to set at write time, as it is for
+/// every source batch a receiver applies. See
+/// [`LocalWriter::apply_source_split_with`], its only caller.
+#[cfg(feature = "internal-tests")]
+fn split_raw_batch(raw: &[u8], first_records: u64) -> Result<(Vec<u8>, Vec<u8>)> {
+    let records = u64::from(validate_raw_batch(raw)?);
+    if first_records == 0 || first_records >= records {
+        return Err(invalid("a write-group split must leave records on both sides"));
+    }
+    let body = raw.get(12..).ok_or_else(|| invalid("batch header too short"))?;
+    let mut input = body;
+    let mut seen = 0_u64;
+    while seen < first_records {
+        let Some((&tag, rest)) = input.split_first() else {
+            return Err(invalid("batch operation count mismatch"));
+        };
+        input = rest;
+        // The opcodes `walk_raw_batch` accepts, with the same arities.
+        match tag {
+            0 | 7 => {
+                take_slice(&mut input)?;
+                seen += 1;
+            }
+            1 | 15 => {
+                take_slice(&mut input)?;
+                take_slice(&mut input)?;
+                seen += 1;
+            }
+            3 => {
+                take_slice(&mut input)?;
+            }
+            _ => return Err(invalid(format!("unsupported RocksDB write opcode {tag}"))),
+        }
+    }
+    let cut = body.len() - input.len();
+    let header = |count: u64| -> Result<Vec<u8>> {
+        let count = u32::try_from(count).map_err(|_| invalid("batch operation count mismatch"))?;
+        let mut bytes = raw.get(..8).ok_or_else(|| invalid("batch header too short"))?.to_vec();
+        bytes.extend_from_slice(&count.to_le_bytes());
+        Ok(bytes)
+    };
+    let mut head = header(first_records)?;
+    head.extend_from_slice(
+        body.get(..cut)
+            .ok_or_else(|| invalid("batch split outside the batch"))?,
+    );
+    let mut tail = header(records - first_records)?;
+    tail.extend_from_slice(input);
+    Ok((head, tail))
+}
+
 /// The one record walker behind [`validate_raw_batch`] and the physical
 /// applier's `decode_raw_batch`: every check `validate_raw_batch` makes, with
 /// `visit` called for each sequence-consuming record in batch order. A batch
@@ -1650,6 +1707,81 @@ impl LocalWriter {
         let bytes = encode_cursor(&next)?;
         let mut imported = WriteBatch::from_data(&batch.raw);
         imported.put_cf(local_family(&self.db)?, CURSOR_KEY, bytes);
+        self.commit(&mut cursor, next, imported, durability)?;
+        Ok(true)
+    }
+
+    /// `internal-tests` builds only — the detector self-check of plan
+    /// decision 7 (`docs/plans/PHYSICAL_STANDBY_REPLICATION.md` "Decisions"
+    /// 7 and §D3 "Consistent cut"; spec `docs/plans/specs/R2_ddl_window_cut.md`).
+    ///
+    /// Decision 7 rests on one write group being applied as ONE write, so a
+    /// reader of the store only ever sees states the primary passed through.
+    /// This applies `batch` exactly as [`Self::apply_source_with`] does, but
+    /// in TWO writes — its first `first_records` sequence-consuming records,
+    /// then `between()`, then the rest together with the cursor put — so
+    /// that while `between` runs, readers see half of one primary write
+    /// group: a state no primary ever passed through, which the DDL-window
+    /// test's detector must report as a torn read.
+    ///
+    /// The accounting is that of the single write: the records keep their
+    /// local sequence numbers (the first write consumes `first_records`, the
+    /// second the rest plus the cursor put), the cursor adopted is the one
+    /// [`Self::apply_source_with`] adopts, and the invariant
+    /// `latest_sequence_number == cursor.local_sequence` is checked after
+    /// each write. Only the receiver's own RocksDB WAL differs (two records
+    /// for the group); its default column family ends byte-identical. A
+    /// crash between the two writes leaves the store unaccounted (the next
+    /// write poisons): a test hook, never a production path.
+    #[cfg(feature = "internal-tests")]
+    pub(crate) fn apply_source_split_with(
+        &self,
+        batch: &PhysicalBatch,
+        first_records: u64,
+        durability: Durability,
+        between: &mut dyn FnMut(),
+    ) -> Result<bool> {
+        let mut cursor = self.cursor.lock();
+        self.check_accounted(&cursor)?;
+        if batch.history != cursor.history {
+            return Err(PhysicalError::HistoryMismatch);
+        }
+        if batch.last == cursor.source_sequence
+            && Some(batch.first) == cursor.last_first_sequence
+            && Some(batch.digest) == cursor.last_digest
+        {
+            return Ok(false);
+        }
+        if batch.first != cursor.source_sequence + 1 {
+            return Err(PhysicalError::Gap {
+                expected: cursor.source_sequence + 1,
+                observed: batch.first,
+            });
+        }
+        let (head, tail) = split_raw_batch(&batch.raw, first_records)?;
+        let local = local_family(&self.db)?;
+        let mut next = cursor.clone();
+        let local_operations = batch.last - batch.first + 2;
+        check_local_advance(next.local_sequence, local_operations)?;
+        next.local_sequence += local_operations;
+        next.source_sequence = batch.last;
+        next.last_first_sequence = Some(batch.first);
+        next.last_digest = Some(batch.digest);
+        let bytes = encode_cursor(&next)?;
+        if let Err(error) = self
+            .db
+            .write_opt(WriteBatch::from_data(&head), &write_options(Durability::Deferred))
+        {
+            self.poison();
+            return Err(error.into());
+        }
+        if self.db.latest_sequence_number() != cursor.local_sequence + first_records {
+            self.poison();
+            return Err(invalid("receiver was modified outside physical replication"));
+        }
+        between();
+        let mut imported = WriteBatch::from_data(&tail);
+        imported.put_cf(local, CURSOR_KEY, bytes);
         self.commit(&mut cursor, next, imported, durability)?;
         Ok(true)
     }

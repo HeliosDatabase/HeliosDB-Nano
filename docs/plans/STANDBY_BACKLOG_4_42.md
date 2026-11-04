@@ -10,12 +10,12 @@ merge back.
 | Group | Delivers | Sprinter | Spec |
 |---|---|---|---|
 | R1 tooling and guards | `heliosdb-nano standby verify --against <primary>` (plan Verification §3); `recover` no longer adopts a stale leftover full copy; key rotation refused while it would strand a standby; plan doc corrected; residual items re-triaged with tests | 6146b39a5beb, e21903322db7, a3ffb9ef3c2c | `specs/R1_standby_tooling.md` |
-| R2 consistent cut | the DDL-window torn-read test (decision 7); cut markers only if it fails | (decision 7) | `specs/R2_ddl_window_cut.md` |
+| R2 consistent cut | the DDL-window torn-read test (decision 7). It found tears on the standby AND on the primary; a standby reader gate with cut markers was built and rejected after review; the windowed test is R5's acceptance | (decision 7) | `specs/R2_ddl_window_cut.md` |
 | R3 switchover | rewind an old primary into a standby by fast-forward (no full copy); `SWITCHOVER TO` on the primary: the standby promotes online, the old primary demotes in-process and follows it | 1c8963417a35, bbba90ddfc61 | `specs/R3_switchover_rewind.md` |
 | R4 HNSW | dump cache defects (leaked files after reload, per-clone dumps, constructor argument order, fsync/atomicity, encryption) and the recall flake family | 746342a0bfbb, 66aeb488f312 | `specs/R4_hnsw_dump_recall.md` |
-| R5 write grouping | one write group per row at least (ideally per statement) on the primary's insert paths; DROP TABLE / REFRESH MATVIEW scans bounded (pg35 DDL profile) — after B4, it shares the write paths | 925803b35113, c214c2e73938 | `specs/R5_write_grouping.md` (after B4) |
+| R5 statement atomicity | every statement changes the primary's reader-visible state in one write group (row-shape decode funnel, per-table writer lock, layout epochs with bounded retry, explicit DDL batches, missing-value ADD COLUMN, one-group DROP COLUMN up to a cap, INSERT ... SELECT one group); DROP TABLE / REFRESH MATVIEW scans bounded (pg35 DDL profile). On top of B3, in parallel with B4 | 925803b35113, c214c2e73938 | `specs/R5_statement_atomicity.md` |
 | R6 harness | the daemon readiness flake | ffe805264aac | `specs/R6_harness_readiness.md` |
-| R7 dependency | fastembed 4 → 7 so `code-embed` no longer pulls webpki-roots 0.26 (RUSTSEC-2026-0381 ignore removed) | b93af8c4a65f | `specs/R7_fastembed.md` |
+| R7 dependency | fastembed 4 → 7.5 so `code-embed` no longer pulls webpki-roots 0.26 (RUSTSEC-2026-0381 ignore removed) | b93af8c4a65f | `specs/R7_fastembed.md` |
 
 Not in scope, by decision: moving the HNSW graph dump into RocksDB (decided against on
 8f0721af1a70 — standbys never read the dump and rebuild indexes from rows; moving it would

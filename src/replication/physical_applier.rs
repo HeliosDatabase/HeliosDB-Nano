@@ -112,6 +112,26 @@
 //! (functions, triggers, plan caches) are the [`DerivedStateListener`]'s
 //! (`EmbeddedDatabase`, spec P1.4); vector indexes are the [`VectorHook`]'s
 //! (spec P1.2), by default `physical_vector::StandbyVectorHook`.
+//!
+//! # Test hooks (`internal-tests` builds only)
+//!
+//! Plan decision 7 (`docs/plans/PHYSICAL_STANDBY_REPLICATION.md` "Decisions"
+//! 7, §D3 "Consistent cut") is checked by the DDL-window test (spec
+//! `docs/plans/specs/R2_ddl_window_cut.md`, `tests/physical_ddl_window.rs`).
+//! Two environment variables, read once when the applier is created, serve
+//! that test; other builds ignore them:
+//!
+//! * [`APPLY_PACE_ENV`] `=<ms>`: every run is applied one write group at a
+//!   time, each published on its own (decision 7's per-batch publication),
+//!   and the applier sleeps `<ms>` after each — every state between two
+//!   groups of a multi-group statement is held open for readers;
+//! * [`SPLIT_GROUP_ENV`] `=<table prefix>:<ms>`: a write group carrying at
+//!   least two row records of a table whose name starts with the prefix is
+//!   written in two halves (`LocalWriter::apply_source_split_with`), and
+//!   readers are admitted between them for `<ms>` (the schema generation is
+//!   bumped first, so no result or plan cache hides the half) — a state no
+//!   primary passed through, which the test's detector must report: its
+//!   self-check.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
@@ -128,6 +148,17 @@ use crate::storage::{index_family, ArtIndexType, IndexFamily, StorageEngine, Unc
 use crate::{Schema, Tuple, Value};
 
 pub use super::physical::RawOp;
+
+/// `internal-tests` builds only (plan decision 7 self-check, see the module
+/// documentation): publish every write group on its own and sleep this many
+/// milliseconds after each.
+pub const APPLY_PACE_ENV: &str = "HELIOSDB_NANO_TEST_APPLY_PACE_MS";
+
+/// `internal-tests` builds only (plan decision 7 self-check, see the module
+/// documentation): `<table prefix>:<ms>` — write a group with two or more
+/// row records of a matching table in two halves, readers admitted between
+/// them for `<ms>` milliseconds.
+pub const SPLIT_GROUP_ENV: &str = "HELIOSDB_NANO_TEST_SPLIT_GROUP";
 
 /// Most keys one range deletion is enumerated for. A wider range is not
 /// published key by key: its table is re-derived from a scan instead (or,
@@ -305,6 +336,90 @@ struct ApplierState {
     warned_prefixes: HashSet<Vec<u8>>,
 }
 
+/// `internal-tests` builds only: the DDL-window test's hooks (plan decision
+/// 7; see the module documentation), from [`APPLY_PACE_ENV`] and
+/// [`SPLIT_GROUP_ENV`].
+#[cfg(feature = "internal-tests")]
+#[derive(Debug, Clone, Default)]
+struct TestHooks {
+    pace: Option<std::time::Duration>,
+    split: Option<GroupSplit>,
+}
+
+/// [`SPLIT_GROUP_ENV`]: which groups to split, and for how long readers see
+/// the first half.
+#[cfg(feature = "internal-tests")]
+#[derive(Debug, Clone)]
+struct GroupSplit {
+    table_prefix: String,
+    pause: std::time::Duration,
+}
+
+#[cfg(feature = "internal-tests")]
+impl TestHooks {
+    fn from_env() -> Self {
+        let pace = std::env::var(APPLY_PACE_ENV).ok().and_then(|value| {
+            let parsed = value.trim().parse::<u64>().ok().filter(|ms| *ms > 0);
+            if parsed.is_none() {
+                warn!("{APPLY_PACE_ENV}={value:?} is not a positive number of milliseconds; ignored");
+            }
+            parsed.map(std::time::Duration::from_millis)
+        });
+        let split = std::env::var(SPLIT_GROUP_ENV).ok().and_then(|value| {
+            let parsed = value.trim().rsplit_once(':').and_then(|(prefix, ms)| {
+                let ms = ms.trim().parse::<u64>().ok()?;
+                (!prefix.is_empty()).then(|| GroupSplit {
+                    table_prefix: prefix.to_string(),
+                    pause: std::time::Duration::from_millis(ms),
+                })
+            });
+            if parsed.is_none() {
+                warn!("{SPLIT_GROUP_ENV}={value:?} is not `<table prefix>:<milliseconds>`; ignored");
+            }
+            parsed
+        });
+        if pace.is_some() || split.is_some() {
+            warn!(
+                "physical applier test hooks armed (plan decision 7 DDL-window test): pace {:?}, split {:?}",
+                pace, split
+            );
+        }
+        Self { pace, split }
+    }
+}
+
+#[cfg(feature = "internal-tests")]
+impl GroupSplit {
+    /// How many of `batch`'s sequence-consuming records go in the first
+    /// write: those up to and including the middle row record of a matching
+    /// table, when the group carries at least two. `None`: not split.
+    fn split_point(&self, batch: &PhysicalBatch) -> Option<u64> {
+        let ops = decode_raw_batch(batch.data()).ok()?;
+        let rows: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(index, op)| {
+                let key = match op {
+                    RawOp::Put { key, .. } | RawOp::Delete { key } => *key,
+                    RawOp::DeleteRange { .. } => return None,
+                };
+                let classified = classify(key);
+                let matches = classified.class == KeyClass::Data
+                    && classified
+                        .table
+                        .is_some_and(|table| table.starts_with(self.table_prefix.as_str()));
+                matches.then_some(index)
+            })
+            .collect();
+        if rows.len() < 2 {
+            return None;
+        }
+        let middle = *rows.get(rows.len() / 2 - 1)?;
+        let first = u64::try_from(middle + 1).ok()?;
+        (first < u64::try_from(ops.len()).ok()?).then_some(first)
+    }
+}
+
 /// Applies a physical standby's source batches and publishes their effect on
 /// the serving engine's derived state. See the module documentation.
 pub struct PhysicalApplier {
@@ -314,6 +429,8 @@ pub struct PhysicalApplier {
     vector: Arc<dyn VectorHook>,
     stats: Mutex<ApplierStats>,
     state: Mutex<ApplierState>,
+    #[cfg(feature = "internal-tests")]
+    hooks: TestHooks,
 }
 
 impl PhysicalApplier {
@@ -349,6 +466,8 @@ impl PhysicalApplier {
             vector: Arc::new(StandbyVectorHook::new()),
             stats: Mutex::new(ApplierStats::default()),
             state: Mutex::new(ApplierState::default()),
+            #[cfg(feature = "internal-tests")]
+            hooks: TestHooks::from_env(),
         })
     }
 
@@ -435,6 +554,45 @@ impl PhysicalApplier {
     /// publication with the re-derivation path (`rederive_failed_run`), as a
     /// row that does not decode does; the error is returned.
     pub fn apply_run(&self, batches: &[PhysicalBatch], durability: Durability) -> Result<Applied> {
+        // `internal-tests` only (plan decision 7, [`APPLY_PACE_ENV`]): one
+        // publication per write group, each held open for readers.
+        #[cfg(feature = "internal-tests")]
+        if let Some(pace) = self.hooks.pace {
+            return self.apply_paced(batches, durability, pace);
+        }
+        self.apply_run_once(batches, durability)
+    }
+
+    /// `internal-tests` builds only — plan decision 7 (`PHYSICAL_STANDBY_REPLICATION.md`
+    /// "Decisions" 7, §D3 "Consistent cut"), [`APPLY_PACE_ENV`]: apply `batches`
+    /// one write group at a time, each its own run with its own publication
+    /// (the per-batch publication decision 7 describes), sleeping `pace`
+    /// after each with no lock held — so every state between two groups of
+    /// one statement is what readers see for `pace`. The result is the last
+    /// group's position, with the rows and re-derived tables of all of them.
+    #[cfg(feature = "internal-tests")]
+    fn apply_paced(
+        &self,
+        batches: &[PhysicalBatch],
+        durability: Durability,
+        pace: std::time::Duration,
+    ) -> Result<Applied> {
+        if batches.is_empty() {
+            return self.apply_run_once(batches, durability);
+        }
+        let mut total = Applied::default();
+        for batch in batches {
+            let applied = self.apply_run_once(std::slice::from_ref(batch), durability)?;
+            total.source_sequence = applied.source_sequence;
+            total.rows += applied.rows;
+            total.tables_rebuilt.extend(applied.tables_rebuilt);
+            std::thread::sleep(pace);
+        }
+        Ok(total)
+    }
+
+    /// The body of [`Self::apply_run`]: one run, one publication.
+    fn apply_run_once(&self, batches: &[PhysicalBatch], durability: Durability) -> Result<Applied> {
         let _replay = self.engine.replay_guard();
         let mut state = self.state.lock();
 
@@ -497,7 +655,7 @@ impl PhysicalApplier {
         // 3. Apply verbatim: one write per batch, in order.
         let mut written = 0_u64;
         for batch in run {
-            match self.writer.apply_source_with(batch, durability) {
+            match self.write_source(batch, durability) {
                 Ok(true) => written += 1,
                 // An exact retransmission of the batch before it: nothing changed.
                 Ok(false) => {}
@@ -544,6 +702,42 @@ impl PhysicalApplier {
             rows,
             tables_rebuilt,
         })
+    }
+
+    /// Step 3's write of one source batch: [`LocalWriter::apply_source_with`].
+    ///
+    /// `internal-tests` builds only — the detector self-check of plan
+    /// decision 7 (`PHYSICAL_STANDBY_REPLICATION.md` "Decisions" 7, §D3
+    /// "Consistent cut"), [`SPLIT_GROUP_ENV`]: a matching group is written in
+    /// two halves (`LocalWriter::apply_source_split_with`); between them
+    /// the schema generation is bumped (no result, plan or existence cache
+    /// computed before the first half can hide it) and readers run for the
+    /// configured pause against half of one primary write group, under the
+    /// census hold this run already took — so they read row storage. The
+    /// run's publication follows the second half as usual.
+    fn write_source(&self, batch: &PhysicalBatch, durability: Durability) -> std::result::Result<bool, PhysicalError> {
+        #[cfg(feature = "internal-tests")]
+        if let Some(split) = &self.hooks.split {
+            if let Some(first) = split.split_point(batch) {
+                let records = batch.last_sequence() - batch.first_sequence() + 1;
+                warn!(
+                    "{SPLIT_GROUP_ENV}: write group {}..{} applied in two writes ({} + {} records), readers \
+                     admitted between them for {:?} (plan decision 7 self-check)",
+                    batch.first_sequence(),
+                    batch.last_sequence(),
+                    first,
+                    records.saturating_sub(first),
+                    split.pause
+                );
+                let engine = &self.engine;
+                let pause = split.pause;
+                return self.writer.apply_source_split_with(batch, first, durability, &mut || {
+                    engine.bump_schema_generation();
+                    std::thread::sleep(pause);
+                });
+            }
+        }
+        self.writer.apply_source_with(batch, durability)
     }
 
     /// Spec P4.1d: a run whose write failed after some of its batches were
