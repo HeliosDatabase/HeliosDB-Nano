@@ -217,9 +217,16 @@ snapshot_schema_evolution = "null_pad"
 # NOT sealed: RocksDB KEYS (table/column names, row ids and timestamps stay
 # visible); the column sidecars used by non-default `STORAGE` modes
 # (COLUMNAR / DICTIONARY / CONTENT_ADDRESSED), whose payloads live outside the
-# row; HNSW graph snapshot files under <data_dir>/hnsw_snapshots/; backup dumps
-# written by [dump]; and the replication link, which ships rows in the clear
-# (use TLS). See the "Encryption at rest" section of the README.
+# row; backup dumps written by [dump]; and the replication link, which ships
+# rows in the clear (use TLS). See the "Encryption at rest" section of the
+# README.
+#
+# HNSW graph snapshots are NOT WRITTEN with encryption on: every HNSW index is
+# rebuilt from its sealed rows at every open, so open time grows with the size
+# of the indexes (each rebuild is logged with its duration). Dump files an
+# unencrypted run left in <data_dir>/hnsw_snapshots/ are deleted at the first
+# encrypted open; deleting unlinks them, and their bytes may remain in free disk
+# blocks until overwritten.
 #
 # Enabling this on an EXISTING database seals new writes only; data already on
 # disk is read as-is and is never rewritten.

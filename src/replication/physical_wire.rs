@@ -41,6 +41,8 @@
 //! | `HeartbeatAck` | S→R | [`HeartbeatAck`]: the source's sequence and clock |
 //! | `Fence` | R→S | [`Fence`]: a promoting standby fences this source by a higher epoch (spec P5.1) |
 //! | `Fenced` | S→R | [`Fenced`]: the source is fenced, at its final sequence |
+//! | `PromoteRequest` | S→R | [`PromoteRequest`]: `SWITCHOVER TO` asks this standby to promote itself (spec R3b; only to a receiver offering [`CAP_PROMOTE`], in place of a poll's `PollStart`) |
+//! | `PromoteAnswer` | R→S | [`PromoteAnswer`]: accepted or refused, and where it serves once promoted |
 //! | `Close` / `Closed` | R→S / S→R | orderly end |
 //!
 //! Kind 13 (`AuthRejected` of `NPHYS001`) is retired: a wrong token is
@@ -194,9 +196,23 @@ pub const CAP_TLS: u64 = 1 << 2;
 /// (`OpenRequest::FastForward` and the leaf frames). A receiver does not
 /// start one with a source whose `HelloOk` lacks it.
 pub const CAP_FAST_FORWARD: u64 = 1 << 3;
+/// Spec R1 §1: a fast-forward session may be opened AT the source's cut
+/// (`after == sequence`), not only behind it — what `standby verify` asks of
+/// a caught-up standby's idle primary, for the leaf plan alone. Served and
+/// accepted only when BOTH sides offer it: a source without it refuses a
+/// receiver at its cut (`HistoryMismatch`, as every release did), and a
+/// receiver without it is never sent such a session.
+pub const CAP_FAST_FORWARD_AT_CUT: u64 = 1 << 5;
+/// Spec R3b (Sprinter bbba90ddfc61): the RECEIVER can be asked to promote
+/// itself online (`PromoteRequest` / `PromoteAnswer`): a serving standby of
+/// this release, which answers a request through its online promotion (spec
+/// P5.2). Set in its `Hello`; a source never sends a `PromoteRequest` to a
+/// session that lacks it. A protocol capability, not a state: whether the
+/// standby can be promoted NOW is its answer's.
+pub const CAP_PROMOTE: u64 = 1 << 4;
 /// What this release offers on every session ([`CAP_TLS`] is added per
-/// session, by its transport).
-pub const CAPABILITIES: u64 = CAP_HEARTBEAT | CAP_FAST_FORWARD;
+/// session, by its transport; [`CAP_PROMOTE`] by a serving receiver).
+pub const CAPABILITIES: u64 = CAP_HEARTBEAT | CAP_FAST_FORWARD | CAP_FAST_FORWARD_AT_CUT;
 
 /// Spec P4.1 §3.1: the bounds of a fast-forward's leaf size (`--leaf-bytes`),
 /// checked by both sides.
@@ -941,6 +957,226 @@ impl Fenced {
     }
 }
 
+/// Spec R3b (Sprinter bbba90ddfc61), source → receiver: the primary asks the
+/// standby on this session to promote itself online — `SWITCHOVER TO` run on
+/// the primary. Sent only to a receiver whose `Hello` offered
+/// [`CAP_PROMOTE`], in place of the `PollStart` of its next poll; the
+/// receiver answers [`PromoteAnswer`] on the same session, and that poll
+/// delivers nothing (the session goes on). `check_only`: the receiver runs
+/// its promotion's preflight and answers, and nothing is promoted (`SWITCHOVER
+/// CHECK`). An accepted request is followed by the receiver's ordinary online
+/// promotion (spec P5.2): it fences this source through a renewed session
+/// (`Fence { epoch }`), catches up to the final sequence, converts and serves
+/// as the primary of `epoch`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PromoteRequest {
+    /// The switchover asking (a random identity: the answer names it).
+    pub switchover: Uuid,
+    /// The epoch the receiver is asked to promote to: the source's + 1.
+    pub epoch: u64,
+    /// The primary asking (its node id).
+    pub requested_by: Uuid,
+    /// How long the promotion may take (its `wait_seconds`), 1..=3600.
+    pub deadline_secs: u32,
+    /// The seconds the asker waits for the receiver's answer once the request
+    /// is delivered, 1..=[`MAX_PROMOTE_ANSWER_SECS`]: the receiver answers
+    /// within the smaller of this and its own operation bound (its promotion's
+    /// preflight), so the asker's wait is bounded by what the TARGET may take.
+    pub answer_secs: u32,
+    /// Only the receiver's preflight: nothing is promoted.
+    pub check_only: bool,
+}
+
+/// The longest answer bound a [`PromoteRequest`] may carry.
+pub const MAX_PROMOTE_ANSWER_SECS: u32 = 600;
+
+/// `internal-tests` builds only: the seconds a receiver holds its answer to
+/// a (non-check) [`PromoteRequest`] before it writes it — the switchover's
+/// late-answer test (spec R3b, review item 3): the asker's bound runs out
+/// while the target is already promoting.
+pub const PROMOTE_ANSWER_DELAY_ENV: &str = "HELIOSDB_NANO_TEST_PROMOTE_ANSWER_DELAY_SECS";
+
+/// `PromoteRequest`: switchover 16, epoch 8, requested_by 16, deadline 4,
+/// answer bound 4, check_only 1.
+const PROMOTE_REQUEST_BYTES: usize = 49;
+/// `PromoteAnswer` without its two strings: switchover 16, accepted 1, epoch
+/// 8, promotion 16, replication port 2, endpoint length 2, reason length 2.
+const PROMOTE_ANSWER_META: usize = 47;
+
+impl PromoteRequest {
+    fn validate(&self) -> Result<()> {
+        if self.switchover.is_nil()
+            || self.requested_by.is_nil()
+            || self.epoch < 2
+            || !(1..=3600).contains(&self.deadline_secs)
+            || !(1..=MAX_PROMOTE_ANSWER_SECS).contains(&self.answer_secs)
+        {
+            return Err(invalid("invalid promote request"));
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut bytes = Vec::with_capacity(PROMOTE_REQUEST_BYTES);
+        bytes.extend(self.switchover.as_bytes());
+        bytes.extend(self.epoch.to_be_bytes());
+        bytes.extend(self.requested_by.as_bytes());
+        bytes.extend(self.deadline_secs.to_be_bytes());
+        bytes.extend(self.answer_secs.to_be_bytes());
+        bytes.push(u8::from(self.check_only));
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != PROMOTE_REQUEST_BYTES {
+            return Err(invalid("promote request has the wrong size"));
+        }
+        let check_only = match byte_at(bytes, 48)? {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("promote request check flag")),
+        };
+        let request = Self {
+            switchover: uuid_at(bytes, 0)?,
+            epoch: u64_at(bytes, 16)?,
+            requested_by: uuid_at(bytes, 24)?,
+            deadline_secs: u32_at(bytes, 40)?,
+            answer_secs: u32_at(bytes, 44)?,
+            check_only,
+        };
+        request.validate()?;
+        Ok(request)
+    }
+}
+
+/// Spec R3b, receiver → source: the answer to a [`PromoteRequest`] —
+/// accepted (the promotion runs, or for a check, would run) or refused, why,
+/// and the replication port (and, when configured, the advertised endpoint)
+/// it serves once promoted: where the demoted primary follows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromoteAnswer {
+    pub switchover: Uuid,
+    pub accepted: bool,
+    /// The epoch it promotes to (the request's), 0 when refused.
+    pub epoch: u64,
+    /// Review (third pass, item 2): the promotion's identity — the `by_node`
+    /// its fence of the asking primary carries — so the asker accepts only
+    /// THIS promotion's fence. Nil when refused, or for a check whose
+    /// standby keeps no identity yet.
+    pub promotion: Uuid,
+    /// The replication port it serves once promoted; 0 when refused or when
+    /// it would serve none.
+    pub replication_port: u16,
+    /// Its advertised replication endpoint (`host:port`) when it has one,
+    /// else empty: the source then follows the session's peer address at
+    /// `replication_port`.
+    pub endpoint: String,
+    /// Why it refused, or what it does (cut to [`MAX_REASON_BYTES`]).
+    pub reason: String,
+}
+
+/// `text` cut to `limit` bytes at a character boundary.
+fn cut_text(mut text: String, limit: usize) -> String {
+    if text.len() > limit {
+        let mut end = limit;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
+impl PromoteAnswer {
+    /// A refusal of `switchover`, naming why.
+    pub fn refused(switchover: Uuid, reason: impl Into<String>) -> Self {
+        Self {
+            switchover,
+            accepted: false,
+            epoch: 0,
+            promotion: Uuid::nil(),
+            replication_port: 0,
+            endpoint: String::new(),
+            reason: cut_text(reason.into(), MAX_REASON_BYTES),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.switchover.is_nil()
+            || self.endpoint.len() > MAX_ENDPOINT_BYTES
+            || self.reason.len() > MAX_REASON_BYTES
+            || (self.accepted && self.epoch < 2)
+        {
+            return Err(invalid("invalid promote answer"));
+        }
+        Ok(())
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let answer = Self {
+            reason: cut_text(self.reason.clone(), MAX_REASON_BYTES),
+            ..self.clone()
+        };
+        answer.validate()?;
+        let endpoint = u16::try_from(answer.endpoint.len()).map_err(|_| invalid("promote answer endpoint"))?;
+        let reason = u16::try_from(answer.reason.len()).map_err(|_| invalid("promote answer reason"))?;
+        let mut bytes = Vec::with_capacity(PROMOTE_ANSWER_META + answer.endpoint.len() + answer.reason.len());
+        bytes.extend(answer.switchover.as_bytes());
+        bytes.push(u8::from(answer.accepted));
+        bytes.extend(answer.epoch.to_be_bytes());
+        bytes.extend(answer.promotion.as_bytes());
+        bytes.extend(answer.replication_port.to_be_bytes());
+        bytes.extend(endpoint.to_be_bytes());
+        bytes.extend(answer.endpoint.as_bytes());
+        bytes.extend(reason.to_be_bytes());
+        bytes.extend(answer.reason.as_bytes());
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if !(PROMOTE_ANSWER_META..=PROMOTE_ANSWER_META + MAX_ENDPOINT_BYTES + MAX_REASON_BYTES).contains(&bytes.len()) {
+            return Err(invalid("promote answer has the wrong size"));
+        }
+        let accepted = match byte_at(bytes, 16)? {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("promote answer flag")),
+        };
+        let epoch = u64_at(bytes, 17)?;
+        let promotion = uuid_at(bytes, 25)?;
+        let replication_port = u16_at(bytes, 41)?;
+        let endpoint_len = usize::from(u16_at(bytes, 43)?);
+        let endpoint_end = 45_usize
+            .checked_add(endpoint_len)
+            .ok_or_else(|| invalid("promote answer endpoint"))?;
+        let endpoint = bytes
+            .get(45..endpoint_end)
+            .ok_or_else(|| invalid("promote answer truncated"))?;
+        let reason_len = usize::from(u16_at(bytes, endpoint_end)?);
+        let reason_start = endpoint_end + 2;
+        let reason = bytes
+            .get(reason_start..)
+            .filter(|reason| reason.len() == reason_len)
+            .ok_or_else(|| invalid("promote answer reason length"))?;
+        let answer = Self {
+            switchover: uuid_at(bytes, 0)?,
+            accepted,
+            epoch,
+            promotion,
+            replication_port,
+            endpoint: std::str::from_utf8(endpoint)
+                .map_err(|_| invalid("promote answer endpoint is not UTF-8"))?
+                .to_string(),
+            reason: std::str::from_utf8(reason)
+                .map_err(|_| invalid("promote answer reason is not UTF-8"))?
+                .to_string(),
+        };
+        answer.validate()?;
+        Ok(answer)
+    }
+}
+
 /// Whether a source's leaf plan can be served yet (spec P4.1 §3.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeafStatus {
@@ -1457,12 +1693,22 @@ impl SourceSessionInfo {
         }
     }
     fn validate(&self, request: OpenRequest, limits: &WireLimits) -> Result<()> {
+        self.validate_with(request, limits, false)
+    }
+
+    /// [`Self::validate`]; `at_cut`: both sides offered
+    /// [`CAP_FAST_FORWARD_AT_CUT`], so a fast-forward cut AT the receiver's
+    /// cursor is valid too.
+    fn validate_with(&self, request: OpenRequest, limits: &WireLimits, at_cut: bool) -> Result<()> {
         match (self, request) {
             (Self::Snapshot(m), OpenRequest::Snapshot | OpenRequest::SnapshotOf { .. }) => {
                 m.validate(&limits.transfer).map_err(|e| invalid(e.to_string()))
             }
             // A receiver at or past the cut has nothing to fast-forward: the
             // source refuses it (`HistoryMismatch`) rather than open this.
+            // Spec R1 §1: one AT the cut is served when both sides offer
+            // `CAP_FAST_FORWARD_AT_CUT` (`standby verify` of a caught-up
+            // standby against an idle primary).
             (
                 Self::FastForward {
                     session_id,
@@ -1480,7 +1726,7 @@ impl SourceSessionInfo {
                 && !snapshot_id.is_nil()
                 && *history == expected
                 && *after == requested
-                && requested < *sequence
+                && (requested < *sequence || (at_cut && requested == *sequence))
                 && *sequence <= MAX_SOURCE_SEQUENCE =>
             {
                 Ok(())
@@ -1544,7 +1790,7 @@ impl SourceSessionInfo {
 
     /// The `FastForwardInfo` answer to `request` (spec P4.1 §3.1), decoded
     /// and checked against it.
-    fn fast_forward_from(payload: &[u8], request: OpenRequest, limits: &WireLimits) -> Result<Self> {
+    fn fast_forward_from(payload: &[u8], request: OpenRequest, limits: &WireLimits, at_cut: bool) -> Result<Self> {
         let OpenRequest::FastForward { history, after, .. } = request else {
             return Err(invalid("a fast-forward answer to another session's open"));
         };
@@ -1558,7 +1804,7 @@ impl SourceSessionInfo {
             after,
             sequence: u64_at(payload, 32)?,
         };
-        info.validate(request, limits)?;
+        info.validate_with(request, limits, at_cut)?;
         Ok(info)
     }
 }
@@ -1661,6 +1907,18 @@ pub trait BatchSink: Send {
         }
         Ok(())
     }
+    /// Spec R3b (Sprinter bbba90ddfc61): the source asks this receiver to
+    /// promote itself (`SWITCHOVER TO` on the primary) — delivered in place of
+    /// a poll's `PollStart`, to a receiver whose `Hello` offered
+    /// [`CAP_PROMOTE`]. The answer goes back on the same session and the poll
+    /// delivers nothing. By default the request is refused: only a serving
+    /// standby's sink answers it (through its online promotion).
+    async fn promote_requested(&mut self, request: PromoteRequest) -> PromoteAnswer {
+        PromoteAnswer::refused(
+            request.switchover,
+            "this receiver cannot be promoted online (it is no serving physical standby)",
+        )
+    }
 }
 
 /// What a source tells every receiver it admits (`HelloOk`), and checks a
@@ -1697,6 +1955,18 @@ pub trait ObservedSession: Send {
     /// A poll was served from `origin` (spec P3.2 §1). Does nothing by
     /// default.
     fn served(&mut self, _origin: PollOrigin) {}
+
+    /// Spec R3b (Sprinter bbba90ddfc61): a `SWITCHOVER TO` waiting to be
+    /// delivered to this session's receiver, taken (once) when its next poll
+    /// arrives; only asked of a session whose `Hello` offered
+    /// [`CAP_PROMOTE`]. `None` by default.
+    fn promote_request(&mut self) -> Option<PromoteRequest> {
+        None
+    }
+
+    /// Spec R3b: the receiver's answer to the request [`Self::promote_request`]
+    /// handed out — or `None` when the session ended before it answered.
+    fn promote_answered(&mut self, _request: &PromoteRequest, _answer: Option<PromoteAnswer>) {}
 }
 
 /// A source without a registry: a test fixture, or an export nobody waits on.
@@ -1827,6 +2097,9 @@ enum Kind {
     LeafChunk = 27,
     // 28 is not assigned; spec P5.1 numbers the fence acknowledgement 29.
     Fenced = 29,
+    // Spec R3b: `SWITCHOVER TO` asks a standby to promote itself.
+    PromoteRequest = 30,
+    PromoteAnswer = 31,
 }
 impl Kind {
     fn decode(value: u16) -> Result<Self> {
@@ -1858,6 +2131,8 @@ impl Kind {
             26 => Self::LeafChunkRequest,
             27 => Self::LeafChunk,
             29 => Self::Fenced,
+            30 => Self::PromoteRequest,
+            31 => Self::PromoteAnswer,
             _ => return Err(invalid("unknown frame kind")),
         })
     }
@@ -1900,6 +2175,10 @@ impl Kind {
             Self::HeartbeatAck => n == HEARTBEAT_ACK_BYTES,
             Self::Fence => n == FENCE_BYTES,
             Self::Fenced => n == FENCED_BYTES,
+            Self::PromoteRequest => n == PROMOTE_REQUEST_BYTES,
+            Self::PromoteAnswer => {
+                (PROMOTE_ANSWER_META..=PROMOTE_ANSWER_META + MAX_ENDPOINT_BYTES + MAX_REASON_BYTES).contains(&n)
+            }
         }
     }
 }
@@ -2729,7 +3008,25 @@ where
         }
     };
     let info = source_session.session_info().clone();
-    info.validate(open, &limits)?;
+    // Spec R1 §1: a fast-forward AT the receiver's cursor only for a receiver
+    // that offered `CAP_FAST_FORWARD_AT_CUT`; any other is refused as every
+    // release refused it, so an older receiver never gets a session its own
+    // checks reject.
+    let at_cut = hello.capabilities & CAP_FAST_FORWARD_AT_CUT != 0;
+    if let SourceSessionInfo::FastForward { after, sequence, .. } = &info {
+        if after == sequence && !at_cut {
+            let refusal = Refusal::new(
+                RefuseCode::HistoryMismatch,
+                format!(
+                    "the receiver at {after} is not behind the cut {sequence}: there is nothing to fast-forward \
+                     (the receiver's release cannot open a session at the cut)"
+                ),
+            );
+            drop(source_session);
+            return Err(refuse(&mut io, refusal, &limits, &mut shutdown).await);
+        }
+    }
+    info.validate_with(open, &limits, at_cut)?;
     let mut known_barrier = info.initial_barrier();
     // What this session has delivered: a heartbeat may not claim more.
     let mut delivered = info.initial_after();
@@ -2902,6 +3199,46 @@ where
                     || byte_limit > MAX_POLL_BYTES
                 {
                     return Err(invalid("invalid physical continuation request"));
+                }
+                // Spec R3b: a `SWITCHOVER TO` waiting for this receiver is
+                // delivered in place of this poll's `PollStart`; the receiver
+                // answers on this session, and this poll delivers nothing.
+                if hello.capabilities & CAP_PROMOTE != 0 {
+                    if let Some(promote) = observed.promote_request() {
+                        let answered = async {
+                            write_frame(
+                                &mut io,
+                                Kind::PromoteRequest,
+                                &promote.encode()?,
+                                &limits,
+                                &mut shutdown,
+                            )
+                            .await?;
+                            // The receiver runs its promotion's preflight
+                            // before it answers, within the request's answer
+                            // bound (and its own operation bound): that and
+                            // one frame.
+                            let answer_wait = Duration::from_secs(u64::from(promote.answer_secs))
+                                .saturating_add(limits.frame_timeout);
+                            let frame =
+                                read_frame_within(&mut io, &[Kind::PromoteAnswer], &limits, answer_wait, &mut shutdown)
+                                    .await?;
+                            let answer = PromoteAnswer::decode(&frame.payload)?;
+                            if answer.switchover != promote.switchover {
+                                return Err(invalid("the promote answer names another switchover"));
+                            }
+                            Ok::<_, WireError>(answer)
+                        }
+                        .await;
+                        match answered {
+                            Ok(answer) => observed.promote_answered(&promote, Some(answer)),
+                            Err(error) => {
+                                observed.promote_answered(&promote, None);
+                                return Err(error);
+                            }
+                        }
+                        continue;
+                    }
                 }
                 // Collecting the poll — reading, validating and digesting its
                 // write groups, fsyncing the WAL — happens before `PollStart`
@@ -3076,6 +3413,11 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
     pub fn fast_forward(&self) -> bool {
         self.hello_ok.capabilities & CAP_FAST_FORWARD != 0
     }
+    /// Spec R1 §1: whether a fast-forward session may be cut AT this
+    /// receiver's cursor — both sides offered [`CAP_FAST_FORWARD_AT_CUT`].
+    pub fn fast_forward_at_cut(&self) -> bool {
+        self.hello_ok.capabilities & self.hello.capabilities & CAP_FAST_FORWARD_AT_CUT != 0
+    }
     pub fn manifest(&self) -> Option<&CheckpointManifest> {
         self.info.as_ref().and_then(SourceSessionInfo::manifest)
     }
@@ -3195,7 +3537,8 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
     /// `leaf_bytes`, preferring the export `prefer` (a resumed fast-forward).
     /// A source without [`CAP_FAST_FORWARD`] is refused here, before anything
     /// is sent; a receiver at or past the source's cut is refused by the
-    /// source (`HistoryMismatch`).
+    /// source (`HistoryMismatch`) — spec R1 §1: at the cut is served when both
+    /// sides offer [`CAP_FAST_FORWARD_AT_CUT`].
     pub async fn open_fast_forward(
         &mut self,
         history: Uuid,
@@ -3236,7 +3579,12 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             .await?;
             let limits = self.reply_limits();
             let frame = read_reply(&mut self.io, &[Kind::FastForwardInfo], &limits, &mut self.shutdown).await?;
-            let info = SourceSessionInfo::fast_forward_from(&frame.payload, request, &self.limits)?;
+            let info = SourceSessionInfo::fast_forward_from(
+                &frame.payload,
+                request,
+                &self.limits,
+                self.fast_forward_at_cut(),
+            )?;
             if info.history() != self.hello_ok.history {
                 return Err(invalid("fast-forward history mismatch"));
             }
@@ -3568,12 +3916,56 @@ impl<I: AsyncRead + AsyncWrite + Unpin + Send> PhysicalClient<I> {
             let poll_start_wait = self.limits.operation_timeout.saturating_add(self.limits.frame_timeout);
             let frame = read_reply_within(
                 &mut self.io,
-                &[Kind::PollStart],
+                &[Kind::PollStart, Kind::PromoteRequest],
                 &self.limits,
                 poll_start_wait,
                 &mut self.shutdown,
             )
             .await?;
+            // Spec R3b: the source asks this receiver to promote itself; the
+            // sink decides (within the operation bound), the answer goes back
+            // on this session, and this poll delivered nothing.
+            if frame.kind == Kind::PromoteRequest {
+                if self.hello.capabilities & CAP_PROMOTE == 0 {
+                    return Err(invalid(
+                        "a promote request to a receiver that did not offer CAP_PROMOTE",
+                    ));
+                }
+                let promote = PromoteRequest::decode(&frame.payload)?;
+                // Answered within the asker's bound (it waits no longer) and
+                // this receiver's own operation bound, whichever is smaller.
+                let answer_bound = self
+                    .limits
+                    .operation_timeout
+                    .min(Duration::from_secs(u64::from(promote.answer_secs)));
+                let mut answer = bounded(&mut self.shutdown, answer_bound, async {
+                    Ok(sink.promote_requested(promote).await)
+                })
+                .await?;
+                answer.switchover = promote.switchover;
+                #[cfg(feature = "internal-tests")]
+                if !promote.check_only {
+                    if let Some(secs) = std::env::var(PROMOTE_ANSWER_DELAY_ENV)
+                        .ok()
+                        .and_then(|secs| secs.trim().parse::<u64>().ok())
+                    {
+                        tokio::time::sleep(Duration::from_secs(secs)).await;
+                    }
+                }
+                write_frame(
+                    &mut self.io,
+                    Kind::PromoteAnswer,
+                    &answer.encode()?,
+                    &self.limits,
+                    &mut self.shutdown,
+                )
+                .await?;
+                return Ok(PollSummary {
+                    through: after,
+                    durable_barrier: self.known_barrier.max(after),
+                    batches: 0,
+                });
+            }
             let summary = PollSummary::decode(&frame.payload)?;
             summary.validate_since(after, byte_limit, self.known_barrier)?;
             sink.begin(summary).await?;
@@ -4175,7 +4567,7 @@ mod tests {
         let (kind, bytes) = info.response().unwrap();
         assert_eq!(kind, Kind::FastForwardInfo);
         assert!(Kind::FastForwardInfo.valid_size(bytes.len()));
-        let decoded = SourceSessionInfo::fast_forward_from(&bytes, request, &limits()).unwrap();
+        let decoded = SourceSessionInfo::fast_forward_from(&bytes, request, &limits(), false).unwrap();
         assert!(matches!(
             decoded,
             SourceSessionInfo::FastForward { snapshot_id, history: h, after: 10, sequence: 31_897, .. }
@@ -4272,7 +4664,125 @@ mod tests {
         assert!(!Kind::LeafChunk.valid_size(CHUNK_META), "a leaf chunk carries bytes");
         assert!(!Kind::LeafDigests.valid_size(LEAF_DIGESTS_HEADER_BYTES - 1));
         assert!(Kind::decode(28).is_err(), "kind 28 is not assigned");
-        assert!(Kind::decode(30).is_err(), "the next kind is not assigned yet");
+        // Spec R3b: the switchover's two frames.
+        assert_eq!(Kind::decode(30).unwrap(), Kind::PromoteRequest);
+        assert_eq!(Kind::decode(31).unwrap(), Kind::PromoteAnswer);
+        assert!(Kind::decode(32).is_err(), "the next kind is not assigned yet");
+        for request in [
+            PromoteRequest {
+                switchover: Uuid::new_v4(),
+                epoch: 2,
+                requested_by: Uuid::new_v4(),
+                deadline_secs: 60,
+                answer_secs: 1,
+                check_only: false,
+            },
+            PromoteRequest {
+                switchover: Uuid::new_v4(),
+                epoch: u64::MAX,
+                requested_by: Uuid::new_v4(),
+                deadline_secs: 3600,
+                answer_secs: MAX_PROMOTE_ANSWER_SECS,
+                check_only: true,
+            },
+        ] {
+            let bytes = request.encode().unwrap();
+            assert!(Kind::PromoteRequest.valid_size(bytes.len()));
+            assert_eq!(PromoteRequest::decode(&bytes).unwrap(), request);
+        }
+        for answer in [
+            PromoteAnswer {
+                switchover: Uuid::new_v4(),
+                accepted: true,
+                epoch: 3,
+                promotion: Uuid::new_v4(),
+                replication_port: 5433,
+                endpoint: String::new(),
+                reason: "promoting".into(),
+            },
+            PromoteAnswer {
+                switchover: Uuid::new_v4(),
+                accepted: true,
+                epoch: 2,
+                promotion: Uuid::nil(),
+                replication_port: 5433,
+                endpoint: "x".repeat(MAX_ENDPOINT_BYTES),
+                reason: "é".repeat(MAX_REASON_BYTES / 2),
+            },
+            PromoteAnswer::refused(Uuid::new_v4(), "not streaming"),
+        ] {
+            let bytes = answer.encode().unwrap();
+            assert!(Kind::PromoteAnswer.valid_size(bytes.len()));
+            assert_eq!(PromoteAnswer::decode(&bytes).unwrap(), answer);
+        }
+        // A reason past the bound is cut at a character boundary.
+        let long = PromoteAnswer::refused(Uuid::new_v4(), "é".repeat(MAX_REASON_BYTES));
+        assert!(long.reason.len() <= MAX_REASON_BYTES);
+        assert_eq!(PromoteAnswer::decode(&long.encode().unwrap()).unwrap(), long);
+    }
+
+    /// Spec R3b: the switchover frames refuse what cannot be one.
+    #[test]
+    fn malformed_promote_frames_are_refused_by_their_codecs() {
+        let request = PromoteRequest {
+            switchover: Uuid::new_v4(),
+            epoch: 2,
+            requested_by: Uuid::new_v4(),
+            deadline_secs: 60,
+            answer_secs: 30,
+            check_only: false,
+        };
+        for broken in [
+            PromoteRequest {
+                switchover: Uuid::nil(),
+                ..request
+            },
+            PromoteRequest {
+                requested_by: Uuid::nil(),
+                ..request
+            },
+            PromoteRequest { epoch: 1, ..request },
+            PromoteRequest {
+                deadline_secs: 0,
+                ..request
+            },
+            PromoteRequest {
+                deadline_secs: 3601,
+                ..request
+            },
+            PromoteRequest {
+                answer_secs: 0,
+                ..request
+            },
+            PromoteRequest {
+                answer_secs: MAX_PROMOTE_ANSWER_SECS + 1,
+                ..request
+            },
+        ] {
+            assert!(broken.encode().is_err(), "{broken:?}");
+        }
+        let mut bytes = request.encode().unwrap();
+        assert!(PromoteRequest::decode(&bytes[..48]).is_err(), "truncated");
+        bytes[48] = 2;
+        assert!(PromoteRequest::decode(&bytes).is_err(), "a check flag is 0 or 1");
+        let accepted_without_epoch = PromoteAnswer {
+            switchover: Uuid::new_v4(),
+            accepted: true,
+            epoch: 0,
+            promotion: Uuid::new_v4(),
+            replication_port: 1,
+            endpoint: String::new(),
+            reason: String::new(),
+        };
+        assert!(accepted_without_epoch.encode().is_err());
+        let answer = PromoteAnswer::refused(Uuid::new_v4(), "no");
+        let mut bytes = answer.encode().unwrap();
+        bytes.push(b'x');
+        assert!(PromoteAnswer::decode(&bytes).is_err(), "a reason longer than it says");
+        let mut bytes = answer.encode().unwrap();
+        bytes[16] = 7;
+        assert!(PromoteAnswer::decode(&bytes).is_err(), "an accepted flag is 0 or 1");
+        assert!(PromoteAnswer::decode(&[0; PROMOTE_ANSWER_META - 1]).is_err());
     }
 
     #[test]
@@ -4382,7 +4892,9 @@ mod tests {
 
         // Spec P4.1: a fast-forward answer that cannot be this session's: a
         // cut at or before the receiver, a nil session, the wrong size, an
-        // answer to another kind of open.
+        // answer to another kind of open. Spec R1 §1: a cut AT the receiver
+        // is a valid answer once both sides offered `CAP_FAST_FORWARD_AT_CUT`
+        // (`standby verify` of a caught-up standby), and only then.
         let snapshot = Uuid::new_v4();
         let request = OpenRequest::FastForward {
             history,
@@ -4402,8 +4914,23 @@ mod tests {
             .unwrap()
             .1
         };
+        assert!(
+            matches!(
+                SourceSessionInfo::fast_forward_from(&answer(Uuid::new_v4(), 10), request, &limits(), true),
+                Ok(SourceSessionInfo::FastForward {
+                    after: 10,
+                    sequence: 10,
+                    ..
+                })
+            ),
+            "a cut at the receiver, the capability negotiated"
+        );
+        assert!(
+            SourceSessionInfo::fast_forward_from(&answer(Uuid::new_v4(), 10), request, &limits(), false).is_err(),
+            "a cut at the receiver without the capability"
+        );
+        assert_ne!(CAPABILITIES & CAP_FAST_FORWARD_AT_CUT, 0, "this release offers it");
         for (bytes, why) in [
-            (answer(Uuid::new_v4(), 10), "a cut at the receiver"),
             (answer(Uuid::new_v4(), 9), "a cut behind the receiver"),
             (answer(Uuid::nil(), 11), "a nil session"),
             (
@@ -4413,7 +4940,7 @@ mod tests {
             (answer(Uuid::new_v4(), 11)[..39].to_vec(), "the wrong size"),
         ] {
             assert!(
-                SourceSessionInfo::fast_forward_from(&bytes, request, &limits()).is_err(),
+                SourceSessionInfo::fast_forward_from(&bytes, request, &limits(), true).is_err(),
                 "{why}"
             );
         }
@@ -4424,7 +4951,8 @@ mod tests {
                 after: 10,
                 last: None
             },
-            &limits()
+            &limits(),
+            true
         )
         .is_err());
 
@@ -4636,6 +5164,170 @@ mod tests {
         run.await.unwrap().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(source.polls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A source owner holding one `SWITCHOVER TO` request for the next
+    /// session it admits (spec R3b), recording the answers it gets.
+    #[derive(Default)]
+    struct Promoting {
+        request: Mutex<Option<PromoteRequest>>,
+        answers: Arc<Mutex<Vec<Option<PromoteAnswer>>>>,
+    }
+    struct PromotingSession {
+        request: Option<PromoteRequest>,
+        answers: Arc<Mutex<Vec<Option<PromoteAnswer>>>>,
+    }
+    impl ObservedSession for PromotingSession {
+        fn heartbeat(&mut self, _heartbeat: &Heartbeat) {}
+        fn promote_request(&mut self) -> Option<PromoteRequest> {
+            self.request.take()
+        }
+        fn promote_answered(&mut self, _request: &PromoteRequest, answer: Option<PromoteAnswer>) {
+            self.answers.lock().unwrap().push(answer);
+        }
+    }
+    impl SessionObserver for Promoting {
+        fn barrier(&self) -> u64 {
+            42
+        }
+        fn admit(&self, _peer: Option<SocketAddr>, _hello: &Hello) -> Box<dyn ObservedSession> {
+            Box::new(PromotingSession {
+                request: self.request.lock().unwrap().take(),
+                answers: self.answers.clone(),
+            })
+        }
+    }
+    /// A serving standby's sink: it accepts a promote request.
+    #[derive(Default)]
+    struct PromotableSink {
+        inner: Sink,
+        asked: Vec<PromoteRequest>,
+    }
+    #[async_trait]
+    impl BatchSink for PromotableSink {
+        async fn apply(&mut self, batch: PhysicalBatch) -> Result<()> {
+            self.inner.apply(batch).await
+        }
+        async fn promote_requested(&mut self, request: PromoteRequest) -> PromoteAnswer {
+            self.asked.push(request);
+            PromoteAnswer {
+                switchover: request.switchover,
+                accepted: true,
+                epoch: request.epoch,
+                promotion: Uuid::new_v4(),
+                replication_port: 5544,
+                endpoint: String::new(),
+                reason: "promoting".into(),
+            }
+        }
+    }
+
+    /// Spec R3b (Sprinter bbba90ddfc61): a `SWITCHOVER TO` request reaches a
+    /// receiver that offered `CAP_PROMOTE` in place of its next poll's
+    /// `PollStart`; the sink's answer reaches the source owner, that poll
+    /// delivers nothing, and the session goes on (the next poll is served).
+    /// A receiver that did not offer it is never asked.
+    #[tokio::test]
+    async fn a_promote_request_takes_the_place_of_a_poll_and_the_session_goes_on() {
+        for offered in [true, false] {
+            let source = Arc::new(MockSource::new());
+            let request = PromoteRequest {
+                switchover: Uuid::new_v4(),
+                epoch: 2,
+                requested_by: Uuid::new_v4(),
+                deadline_secs: 30,
+                answer_secs: 30,
+                check_only: false,
+            };
+            let promoting = Arc::new(Promoting {
+                request: Mutex::new(Some(request)),
+                ..Promoting::default()
+            });
+            let context = SourceContext {
+                identity: identity(source.manifest.history),
+                observer: promoting.clone(),
+                tls: false,
+                fence: None,
+            };
+            let (_shutdown, rx) = watch::channel(false);
+            let (client_io, server_io) = duplex(4096);
+            let served = source.clone();
+            let server_rx = rx.clone();
+            let run = tokio::spawn(async move {
+                serve_session(
+                    server_io,
+                    &token(),
+                    limits(),
+                    server_rx,
+                    &context,
+                    None,
+                    move |_| async move { Ok(served as Arc<dyn PhysicalSource>) },
+                )
+                .await
+            });
+            let hello = Hello {
+                capabilities: if offered {
+                    CAPABILITIES | CAP_PROMOTE
+                } else {
+                    CAPABILITIES
+                },
+                ..fresh()
+            };
+            let mut client = PhysicalClient::authenticate(client_io, &token(), hello, limits(), rx)
+                .await
+                .unwrap();
+            client.fetch_manifest(Some(source.manifest.history)).await.unwrap();
+            let mut sink = PromotableSink::default();
+            let first = client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap();
+            if offered {
+                assert_eq!(
+                    first.batches, 0,
+                    "the poll the request took the place of delivered nothing"
+                );
+                assert_eq!(first.through, 10);
+                assert_eq!(sink.asked, vec![request]);
+                // The session goes on: the next poll is served. The source
+                // reads the answer (and hands it to its owner) before it
+                // reads that poll's request, so the answer is recorded once
+                // the poll returns — not necessarily when the first did.
+                let next = client.poll(10, MAX_POLL_BYTES, &mut sink).await.unwrap();
+                assert_eq!(next.batches, 1);
+                let answers = promoting.answers.lock().unwrap().clone();
+                assert_eq!(answers.len(), 1);
+                let answer = answers[0].clone().expect("answered");
+                assert!(answer.accepted && answer.switchover == request.switchover && answer.epoch == 2);
+                assert_eq!(answer.replication_port, 5544);
+            } else {
+                assert_eq!(first.batches, 1, "an ordinary poll");
+                assert!(
+                    sink.asked.is_empty(),
+                    "a receiver that did not offer CAP_PROMOTE is never asked"
+                );
+                assert!(promoting.answers.lock().unwrap().is_empty());
+            }
+            assert_eq!(sink.inner.received, vec![(source.manifest.history, 11, 11)]);
+            client.close().await.unwrap();
+            run.await.unwrap().unwrap();
+        }
+    }
+
+    /// Spec R3b: the default sink refuses a promote request, naming why.
+    #[tokio::test]
+    async fn a_sink_that_cannot_be_promoted_refuses_the_request() {
+        let mut sink = Sink::default();
+        let switchover = Uuid::new_v4();
+        let answer = sink
+            .promote_requested(PromoteRequest {
+                switchover,
+                epoch: 2,
+                requested_by: Uuid::new_v4(),
+                deadline_secs: 30,
+                answer_secs: 30,
+                check_only: true,
+            })
+            .await;
+        assert!(!answer.accepted && answer.switchover == switchover);
+        assert!(answer.reason.contains("cannot be promoted online"), "{}", answer.reason);
     }
 
     /// Spec P2.1: the acknowledgement travels on the data session. The

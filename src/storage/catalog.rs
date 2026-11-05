@@ -441,11 +441,21 @@ fn vector_distance_metric(options: &[crate::sql::logical_plan::IndexOption]) -> 
 /// R5.V6: HNSW construction parameters for an index — persisted
 /// `WITH (m = .., ef_construction = ..)` options win, the `[vector]`
 /// config section supplies the defaults.
+///
+/// Sprinter 746342a0bfbb: only the open / hydration paths read STORED
+/// definitions, and binaries before 4.42 never range-checked `m` or
+/// `ef_construction`, so a stored `m = 0`, `1` or `256` (or `ef_construction =
+/// 0`) is clamped into what hnsw_rs can build, with a WARN, instead of being
+/// refused: refusing would degrade the index on a primary and FAIL a physical
+/// standby's strict hydration. New definitions are range-checked by the
+/// planner and the `[vector]` section at config load.
 fn hnsw_construction_params(
+    index_name: &str,
     options: &[crate::sql::logical_plan::IndexOption],
     config: &crate::config::Config,
 ) -> (usize, usize) {
     use crate::sql::logical_plan::IndexOption;
+    use crate::vector::hnsw_index::{MAX_MAX_CONNECTIONS, MIN_MAX_CONNECTIONS};
 
     let mut m = config.vector.hnsw_m;
     let mut ef_construction = config.vector.hnsw_ef_construction;
@@ -456,7 +466,20 @@ fn hnsw_construction_params(
             _ => {}
         }
     }
-    (m, ef_construction)
+    let clamped_m = m.clamp(MIN_MAX_CONNECTIONS, MAX_MAX_CONNECTIONS);
+    let clamped_ef = ef_construction.max(1);
+    if (clamped_m, clamped_ef) != (m, ef_construction) {
+        tracing::warn!(
+            "HNSW index '{}': stored m = {}, ef_construction = {} are outside what the index can be built with; \
+             building it with m = {}, ef_construction = {}",
+            index_name,
+            m,
+            ef_construction,
+            clamped_m,
+            clamped_ef
+        );
+    }
+    (clamped_m, clamped_ef)
 }
 
 /// The vector families a PHYSICAL engine builds (spec P1.2): `hnsw` from rows,
@@ -830,9 +853,10 @@ impl<'a> Catalog<'a> {
         let manager = self.storage.vector_indexes();
         match definition.index_type.as_deref() {
             Some("hnsw") => {
+                let started = std::time::Instant::now();
                 let vectors =
                     self.collect_existing_vectors(schema, &definition.table_name, &definition.column_name, *dimension)?;
-                let (m, ef) = hnsw_construction_params(&definition.options, self.storage.config());
+                let (m, ef) = hnsw_construction_params(name, &definition.options, self.storage.config());
                 manager
                     .create_index_with_params(
                         name.to_string(),
@@ -848,6 +872,17 @@ impl<'a> Catalog<'a> {
                     let _ = manager.drop_index(name);
                     return Err(Error::storage(format!("physical snapshot vector '{name}' populate: {e}")));
                 }
+                // Sprinter 66aeb488f312: a standby builds every HNSW graph from
+                // rows; what that costs is logged per index.
+                tracing::info!(
+                    "physical vector index '{}' built from {} rows in {:.1}ms (dim {}, m {}, ef_construction {})",
+                    name,
+                    vectors.len(),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    dimension,
+                    m,
+                    ef
+                );
                 Ok(PhysicalVectorBuild::Rebuilt)
             }
             #[cfg(feature = "vector-persist")]
@@ -1001,14 +1036,14 @@ impl<'a> Catalog<'a> {
             crate::sql::temp_tables::note_temp_table_created(self.storage);
         }
 
-        // Log CreateTable to WAL first (for replication to standbys)
-        // This must happen before the actual table creation so standbys
-        // receive and apply the operation in the correct order.
-        self.storage.log_create_table(table_name, &schema)?;
-
-        // Store the schema, the row counter (at 0) and the table's incarnation
-        // id in ONE batch (sprinter 6bc4a4040eb7, B3 fix pass): a table never
-        // exists without its id, and sealed as `StorageEngine::put` seals them.
+        // Spec R1 §4 (sprinter e21903322db7): the schema record, the counter, the
+        // table's incarnation id (sprinter 6bc4a4040eb7) and the logical-WAL
+        // `CreateTable` entry are ONE write group. The entry used to be appended
+        // first and on its own — the order a logical standby needed; a physical
+        // standby receives this very write group — so a write that then failed
+        // left an entry for a table that does not exist, which the primary's
+        // open recovery would create after a crash. A table never exists without
+        // its id. Sealed as every writer of these keys seals them (`put`).
         let key = Self::table_metadata_key(table_name);
         let value =
             bincode::serialize(&schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
@@ -1028,7 +1063,14 @@ impl<'a> Catalog<'a> {
             Self::table_incarnation_key(table_name),
             super::tde::seal(key_manager.as_deref(), &incarnation_value)?.as_ref(),
         );
-        self.storage.write_batch_through_gate(batch)?;
+        let written = self.storage.write_ddl_batch(
+            super::WalOperation::CreateTable {
+                table: table_name.to_string(),
+                schema: value,
+            },
+            batch,
+        )?;
+        super::engine::exit_after_ddl_write("create", table_name);
 
         // Update in-memory schema cache
         self.storage.cache_schema(table_name, schema.clone());
@@ -1130,6 +1172,9 @@ impl<'a> Catalog<'a> {
         // WAL-recovery, which all funnel through this method).
         self.storage.bump_schema_generation();
 
+        // Spec R1 §4: the standbys' acknowledgement last, after every
+        // in-memory step above.
+        written.wait_replicated();
         Ok(())
     }
 
@@ -1177,24 +1222,33 @@ impl<'a> Catalog<'a> {
             }
         }
         self.storage.invalidate_schema_cache(table_name);
-        if let Err(e) = self.storage.delete(&Self::table_metadata_key(table_name)) {
-            tracing::warn!("CREATE TABLE '{}' unwind: failed to delete schema: {}", table_name, e);
+        // Spec R1 §4: the durable half goes in one write group with a
+        // `DropTable` entry, so the `CreateTable` entry the create wrote with
+        // it is not left above the checkpoint for a table that no longer
+        // exists (open recovery would create it after a crash).
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete(Self::table_metadata_key(table_name));
+        batch.delete(Self::table_counter_key(table_name));
+        batch.delete(Self::table_incarnation_key(table_name));
+        match self.storage.write_ddl_batch(
+            super::WalOperation::DropTable {
+                table: table_name.to_string(),
+            },
+            batch,
+        ) {
+            Ok(written) => {
+                self.storage.bump_schema_generation();
+                written.wait_replicated();
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "CREATE TABLE '{}' unwind: failed to delete the schema and row counter: {}",
+                    table_name,
+                    e
+                );
+                self.storage.bump_schema_generation();
+            }
         }
-        if let Err(e) = self.storage.delete(&Self::table_counter_key(table_name)) {
-            tracing::warn!(
-                "CREATE TABLE '{}' unwind: failed to delete row counter: {}",
-                table_name,
-                e
-            );
-        }
-        if let Err(e) = self.storage.delete(&Self::table_incarnation_key(table_name)) {
-            tracing::warn!(
-                "CREATE TABLE '{}' unwind: failed to delete the table's incarnation: {}",
-                table_name,
-                e
-            );
-        }
-        self.storage.bump_schema_generation();
     }
 
     /// Is `columns` of `table_name` already enforced by a CONSTRAINT-OWNED
@@ -2034,9 +2088,6 @@ impl<'a> Catalog<'a> {
         // scan refuses the drop here, before anything has changed.
         self.stage_prefix_delete(&format!("data:{}:", table_name), &mut batch)?;
 
-        // Log DropTable to WAL first (for replication to standbys)
-        self.storage.log_drop_table(table_name)?;
-
         // Tear down the physical structures of the indexes whose definitions
         // the batch deletes. Per-index best effort: a structure that refuses
         // to come down must not stop the REMAINING indexes of the same table
@@ -2067,7 +2118,7 @@ impl<'a> Catalog<'a> {
         // Invalidate schema cache
         self.storage.invalidate_schema_cache(table_name);
 
-        {
+        let written = {
             // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) so a
             // re-created table with the same name never reads stale batches, zone
             // stats or live-row presence. No-op prefix seeks for row-only tables.
@@ -2084,10 +2135,24 @@ impl<'a> Catalog<'a> {
                     e
                 );
             }
+            // Spec R1 §4 (sprinter e21903322db7): the drop and its
+            // logical-WAL `DropTable` entry are ONE write group. Appended
+            // first and on its own, the entry outlived a drop that then
+            // failed (open recovery under `apply`/`warn` drops the live table
+            // after a crash); appended after, a crash between the two left the
+            // drop without it while the table's CREATE and inserts above the
+            // checkpoint were replayed — the table came back. A physical
+            // standby receives this very write group.
             self.storage
-                .db_write(batch, None)
-                .map_err(|e| Error::storage(format!("DROP TABLE '{}': batch delete failed: {}", table_name, e)))?;
-        }
+                .write_ddl_batch(
+                    super::WalOperation::DropTable {
+                        table: table_name.to_string(),
+                    },
+                    batch,
+                )
+                .map_err(|e| Error::storage(format!("DROP TABLE '{}': batch delete failed: {}", table_name, e)))?
+        };
+        super::engine::exit_after_ddl_write("drop", table_name);
 
         // W1.3: bump immediately after the delete commits — that is the point
         // where `table_exists` flips false.
@@ -2105,6 +2170,9 @@ impl<'a> Catalog<'a> {
         // lost updates on primary-key lookups). Evict them with the table.
         self.storage.row_cache().invalidate_table(table_name);
 
+        // Spec R1 §4: the standbys' acknowledgement last, after every
+        // in-memory step above.
+        written.wait_replicated();
         Ok(children)
     }
 
@@ -2704,6 +2772,11 @@ impl<'a> Catalog<'a> {
         // markers, so the read phase must come first.
         let art_snapshots = self.storage.load_art_table_snapshots();
         let vector_sidecars = self.storage.load_vector_sidecars();
+        // Sprinter 746342a0bfbb: dump files no valid sidecar references (an
+        // orphan, a crashed dump's staging directory, a previous dump a crash
+        // kept, any dump on an encrypted store) are deleted before the indexes
+        // are built.
+        report.vector_dump_files_swept = self.storage.sweep_hnsw_snapshot_dir(&vector_sidecars);
 
         // Pass 0 — the tables to rebuild, with their schemas, in NAME order.
         //
@@ -2780,9 +2853,10 @@ impl<'a> Catalog<'a> {
         // CRASH-RECOVERY LEG. "Before any mint" is only true of the mints THIS
         // method makes. `StorageEngine::open` runs `recover_wal_at_open`
         // first, and a post-checkpoint `CreateTable` entry whose
-        // `meta:table:` record never landed (`log_create_table` appends the
-        // entry separately from the schema put, so a crash between the two
-        // leaves exactly that) is replayed through `Catalog::create_table` —
+        // `meta:table:` record never landed (a store written before spec R1
+        // §4, whose `log_create_table` appended the entry separately from the
+        // schema put, can hold exactly that; since R1 the entry is in the
+        // schema's own write group) is replayed through `Catalog::create_table` —
         // which mints its column-flag keys into the still-EMPTY registry,
         // ahead of this pass. So a durable name can already be held when
         // pass 1 reaches it, by a tree that has no record of its own.
@@ -3455,9 +3529,16 @@ impl<'a> Catalog<'a> {
             // re-scanning the table and rebuilding the graph from scratch.
             if matches!(definition.index_type.as_deref(), Some("hnsw")) {
                 if let (Some(sidecar), Some(dir)) = (sidecars.get(index_name), dump_dir.as_ref()) {
+                    let reload_started = std::time::Instant::now();
                     match vector_indexes.reload_standard_index(sidecar, dir) {
                         Ok(()) => {
                             report.vector_reloaded += 1;
+                            tracing::info!(
+                                "vector index '{}' reloaded from its graph dump ({} points) in {:.1}ms",
+                                index_name,
+                                sidecar.id_mapping.len(),
+                                reload_started.elapsed().as_secs_f64() * 1000.0
+                            );
                             continue;
                         }
                         Err(e) => {
@@ -3477,7 +3558,8 @@ impl<'a> Catalog<'a> {
             // R5.V6: rebuild with the same construction parameters the index
             // was created with — persisted `WITH (m = .., ef_construction = ..)`
             // options first, the `[vector]` config section as the default.
-            let (m, ef_construction) = hnsw_construction_params(&definition.options, self.storage.config());
+            let rebuild_started = std::time::Instant::now();
+            let (m, ef_construction) = hnsw_construction_params(index_name, &definition.options, self.storage.config());
             if let Err(e) = vector_indexes.create_index_with_params(
                 index_name.clone(),
                 definition.table_name.clone(),
@@ -3517,6 +3599,23 @@ impl<'a> Catalog<'a> {
             }
             vector_indexes.clear_degraded(index_name);
             report.vector_rebuilt += 1;
+            // Sprinter 66aeb488f312: a rebuild costs open time in proportion to
+            // the index (always, on an encrypted store, which writes no graph
+            // dump); say how much, per index.
+            tracing::info!(
+                "vector index '{}' rebuilt from {} rows in {:.1}ms (dim {}, m {}, ef_construction {}){}",
+                index_name,
+                vectors.len(),
+                rebuild_started.elapsed().as_secs_f64() * 1000.0,
+                dimension,
+                m,
+                ef_construction,
+                if self.storage.is_encrypted() {
+                    "; at-rest encryption writes no HNSW graph dump, so this index is rebuilt at every open"
+                } else {
+                    ""
+                }
+            );
         }
         Ok(())
     }
@@ -3650,10 +3749,6 @@ impl<'a> Catalog<'a> {
             return Err(Error::query_execution(format!("Table '{}' does not exist", old_name)));
         }
 
-        // Log the rename to the logical WAL before touching data (mirrors
-        // log_drop_table ordering) — no-op during replay or on standbys.
-        self.storage.log_rename_table(old_name, new_name)?;
-
         // Get the schema from old table
         let schema = self.main_table_schema(old_name)?;
 
@@ -3782,9 +3877,22 @@ impl<'a> Catalog<'a> {
         batch.delete(Self::compression_config_key(old_name));
         batch.delete(Self::compression_stats_key(old_name));
 
-        self.storage
-            .db_write(batch, None)
+        // Spec R1 §4 (sprinter e21903322db7): the rename and its logical-WAL
+        // `RenameTable` entry are ONE write group (as `drop_table`'s) — no
+        // entry during replay. A crash between a separate entry and the rename
+        // left either an entry for a rename that never happened or a rename
+        // whose source's CREATE and inserts were replayed (both names).
+        let written = self
+            .storage
+            .write_ddl_batch(
+                super::WalOperation::RenameTable {
+                    old_table: old_name.to_string(),
+                    new_table: new_name.to_string(),
+                },
+                batch,
+            )
             .map_err(|e| Error::storage(format!("Rename batch write failed: {}", e)))?;
+        super::engine::exit_after_ddl_write("rename", old_name);
 
         // Carry the VOLATILE in-memory row-id counter to the new name. The batch
         // above moved the durable `counter:{table}` key, but `next_row_id_volatile`
@@ -3932,6 +4040,9 @@ impl<'a> Catalog<'a> {
         self.storage.row_cache().invalidate_table(old_name);
         self.storage.row_cache().invalidate_table(new_name);
 
+        // Spec R1 §4: the standbys' acknowledgement last, after the row
+        // counter, the ART and index-definition moves and the caches.
+        written.wait_replicated();
         Ok(())
     }
 
@@ -6715,6 +6826,35 @@ mod tests {
             "Should have no orphaned data rows, found: {:?}",
             orphaned_keys
         );
+    }
+
+    /// Sprinter 746342a0bfbb (review of R4, item 3): stored construction
+    /// parameters an older binary accepted are clamped into what an HNSW index
+    /// can be built with — the parameter resolution both the open-time rebuild
+    /// and a physical standby's strict hydration (`build_physical_vector_index`)
+    /// use, so neither refuses such an index.
+    #[test]
+    fn stored_out_of_range_hnsw_params_are_clamped_not_refused() {
+        use crate::sql::logical_plan::IndexOption;
+        let config = Config::in_memory();
+        let defaults = (config.vector.hnsw_m, config.vector.hnsw_ef_construction);
+        for (options, expected) in [
+            (vec![], defaults),
+            (vec![IndexOption::HnswM(0), IndexOption::EfConstruction(0)], (2, 1)),
+            (vec![IndexOption::HnswM(1)], (2, defaults.1)),
+            (vec![IndexOption::HnswM(256)], (255, defaults.1)),
+            (
+                vec![IndexOption::HnswM(9000), IndexOption::EfConstruction(64)],
+                (255, 64),
+            ),
+            (vec![IndexOption::HnswM(8), IndexOption::EfConstruction(64)], (8, 64)),
+        ] {
+            assert_eq!(
+                hnsw_construction_params("legacy_idx", &options, &config),
+                expected,
+                "{options:?}"
+            );
+        }
     }
 
     #[test]

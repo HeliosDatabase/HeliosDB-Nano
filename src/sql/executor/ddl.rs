@@ -1030,20 +1030,20 @@ pub(super) fn handle_switchover(_executor: &Executor, target_node: &str) -> Resu
         .map(|n| n.display_name())
         .unwrap_or_else(|| target_node.to_string());
 
-    // Refuse truthfully. The preconditions above pass, but this build has no
-    // runtime switchover from SQL, so a success status here would be a lie.
-    // Spec P5.1, P5.2: a promotion is asked of the TARGET, never of this
-    // primary — online (`SELECT pg_promote(true, N)` on the running standby)
-    // or offline (`heliosdb-nano promote` on a stopped one); both fence this
-    // primary over its replication port first. The refusal names both. SQL
-    // `SWITCHOVER` on the primary stays refused (plan). The operator contract
-    // is in docs/guides/replication-history-guard.md.
+    // Spec R3b (Sprinter bbba90ddfc61): `SWITCHOVER TO` is answered by the
+    // server's PostgreSQL session on the primary (`protocol::postgres`'s
+    // handler, `replication::promote::switchover`): it promotes the target
+    // online and demotes this primary in-process, which reopens the store —
+    // what only the server session, which lets go of the store first, can do.
+    // Reached here (the embedded API, a prepared statement), it changes
+    // nothing and names the form that works and the two promotions.
     Err(Error::switchover(format!(
-        "Switchover refused: runtime switchover from SQL is unsupported on the primary in this release and no \
-         role was changed (target {} / {}). Promote the target instead — online: `SELECT pg_promote(true, N)` \
-         on the running target standby; offline: stop it, then run `heliosdb-nano promote --data-dir <its data \
-         directory>`. Either applies old-primary fencing to this node first (over its replication port), tails \
-         it through its final sequence and starts the next epoch.",
+        "SWITCHOVER is answered by the server's PostgreSQL session on the primary (the simple query protocol), not \
+         by the embedded API or a prepared statement; no role was changed (target {} / {}). Run `SWITCHOVER TO \
+         '<standby>'` on the primary's PostgreSQL port: it promotes the target online (fencing this primary first) \
+         and demotes this primary into its standby. To promote a standby yourself — online: `SELECT \
+         pg_promote(true, N)` on the running target standby; offline: stop it, then run `heliosdb-nano promote \
+         --data-dir <its data directory>`.",
         display_name, target_uuid
     )))
 }
@@ -1084,7 +1084,8 @@ pub(super) fn handle_switchover_check(_executor: &Executor, target_node: &str) -
     let primary_lsn = ha_registry.get_lsn();
     let mut warnings = Vec::new();
     let mut blockers = vec![
-        "Runtime switchover/promotion is unsupported: use `heliosdb-nano promote` (offline) or `SELECT \
+        "SWITCHOVER CHECK TO '<standby>' is answered by the server's PostgreSQL session on the primary (one row per \
+         check); through the embedded API nothing is switched over: use `heliosdb-nano promote` (offline) or `SELECT \
          pg_promote(true, N)` (online, on the target standby)"
             .to_string(),
     ];

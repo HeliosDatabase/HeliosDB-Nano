@@ -29,6 +29,8 @@
 //!    the function through its own registry.
 //! 4. Hydration has one owner: a second one is refused, even over a store
 //!    with no index for the rebuild's own fresh-registry check to notice.
+//! 5. Spec R1 §3: key rotation is refused on a physical standby (its key is
+//!    its primary's), through the one rotation entry point.
 //!
 //! # Red before P1.4
 //!
@@ -734,4 +736,33 @@ fn a_standby_leaves_an_unfinished_merge_to_its_primary() {
     standby.primary().execute("MERGE BRANCH r INTO main").unwrap();
     standby.sync();
     assert!(!intent_key(standby.db()), "the primary's completion replicated");
+}
+
+/// Spec R1 §3 (plan `PHYSICAL_STANDBY_REPLICATION.md` §D5): a physical
+/// standby applies its primary's sealed values verbatim, so its key is its
+/// primary's and is never rotated on its own. The store's one rotation entry
+/// point, `StorageEngine::rotate_encryption_key`, refuses on the standby's
+/// engine from its own open mode. Its primary — an embedded store no
+/// replication port serves — is not refused for a standby's sake; once the
+/// census of a replication source is attached to it, it is, naming the
+/// standbys attached.
+#[test]
+fn key_rotation_is_refused_on_a_physical_standby() {
+    let standby = Standby::engine_only(&["CREATE TABLE t (id INT PRIMARY KEY)"]);
+    let error = standby.engine.rotate_encryption_key([9; 32]).unwrap_err().to_string();
+    assert!(error.contains("is a physical standby"), "{error}");
+    assert!(error.contains("recover --from-primary --full --replace"), "{error}");
+
+    let primary = &standby.primary().storage;
+    let unattached = primary.rotate_encryption_key([9; 32]).unwrap_err().to_string();
+    assert!(
+        !unattached.contains("standby"),
+        "no replication port serves it: {unattached}"
+    );
+    primary.attach_replication_census(Arc::new(|| {
+        vec!["node n at 127.0.0.1:41000 (streaming, applied through 7)".to_string()]
+    }));
+    let attached = primary.rotate_encryption_key([9; 32]).unwrap_err().to_string();
+    assert!(attached.contains("serves 1 physical standby(s)"), "{attached}");
+    assert!(attached.contains("node n at 127.0.0.1:41000"), "{attached}");
 }

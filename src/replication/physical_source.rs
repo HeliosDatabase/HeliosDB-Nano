@@ -50,8 +50,8 @@ use super::physical::{
 };
 use super::physical_wire::{
     valid_leaf_bytes, Heartbeat, Hello, LastGroup, LeafDigests, LeafReady, ObservedSession, OpenRequest, PeerRole,
-    PhysicalSource, PollOrigin, Refusal, RefuseCode, Result, SessionObserver, SourceSessionInfo, WireError,
-    WireSyncMode,
+    PhysicalSource, PollOrigin, PromoteAnswer, PromoteRequest, Refusal, RefuseCode, Result, SessionObserver,
+    SourceSessionInfo, WireError, WireSyncMode, CAP_PROMOTE, CAP_TLS,
 };
 use crate::Config;
 use async_trait::async_trait;
@@ -1154,15 +1154,21 @@ async fn open_source_session(
                     };
                     let hold = leased_export(&exports, prefer, &mut released)?;
                     let cut = hold.export.manifest().checkpoint_sequence;
-                    if after >= cut {
+                    // Spec R1 §1: a receiver AT the cut is served — `standby
+                    // verify` compares a caught-up standby with an idle
+                    // primary, whose new export is cut at the standby's very
+                    // cursor, and needs only the plan. (`recover
+                    // --from-primary` fast-forwards a receiver behind the
+                    // cut only, and treats one at it as before.) Only a
+                    // receiver PAST the cut is refused.
+                    if after > cut {
                         return Err(WireError::Refused(Refusal::new(
                             RefuseCode::HistoryMismatch,
                             format!(
-                                "the receiver at {after} is not behind the cut {cut}: {} is not the dataset it \
-                                 followed, there is nothing to fast-forward, or (spec P5.1) the receiver counts in \
-                                 the numbering of a primary this one superseded — a promoted standby numbers its \
-                                 writes in its own sequences, which do not continue its old primary's — so only a \
-                                 full copy rebuilds it",
+                                "the receiver at {after} is past the cut {cut}: {} is not the dataset it followed, \
+                                 or (spec P5.1) the receiver counts in the numbering of a primary this one \
+                                 superseded — a promoted standby numbers its writes in its own sequences, which do \
+                                 not continue its old primary's — so only a full copy rebuilds it",
                                 kind.name()
                             ),
                         )));
@@ -1392,6 +1398,8 @@ impl SourceSession {
 /// downstream standbys; its barrier is its applied source sequence.
 pub struct StandbyRegistryObserver {
     barrier: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// Spec R1 §3: the sessions THIS source has admitted and not ended.
+    census: Arc<SessionCensus>,
 }
 
 impl StandbyRegistryObserver {
@@ -1406,21 +1414,88 @@ impl StandbyRegistryObserver {
     /// A registry whose barrier is read from `barrier` — a cascading
     /// standby's applied source sequence (spec P3.2 §4).
     pub fn with_barrier(barrier: Box<dyn Fn() -> u64 + Send + Sync>) -> Self {
-        Self { barrier }
+        Self {
+            barrier,
+            census: Arc::new(SessionCensus::default()),
+        }
+    }
+
+    /// Spec R1 §3: the standbys this source serves now — what the store it
+    /// serves is told (`StorageEngine::attach_replication_census`), so key
+    /// rotation of that store is refused naming them.
+    pub fn census(&self) -> Arc<SessionCensus> {
+        Arc::clone(&self.census)
+    }
+}
+
+/// Spec R1 §3: the receiver sessions one replication source has admitted and
+/// not ended, one description each (node id, address, state). Owned by the
+/// source, not the process: a second store in the process has its own (or
+/// none).
+#[derive(Default)]
+pub struct SessionCensus {
+    sessions: Mutex<std::collections::BTreeMap<u64, String>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl SessionCensus {
+    /// Every live session's description, in admission order.
+    pub fn list(&self) -> Vec<String> {
+        self.sessions.lock().values().cloned().collect()
+    }
+
+    fn enter(self: &Arc<Self>, description: String) -> CensusEntry {
+        let id = self.next.fetch_add(1, Ordering::AcqRel);
+        self.sessions.lock().insert(id, description);
+        CensusEntry {
+            census: Arc::clone(self),
+            id,
+        }
+    }
+}
+
+/// One session's place in its source's [`SessionCensus`], left with it.
+struct CensusEntry {
+    census: Arc<SessionCensus>,
+    id: u64,
+}
+
+impl Drop for CensusEntry {
+    fn drop(&mut self) {
+        self.census.sessions.lock().remove(&self.id);
     }
 }
 
 /// One admitted session, registered while it lives.
-struct RegisteredSession(StandbyHandle);
+struct RegisteredSession {
+    standby: StandbyHandle,
+    /// In the source's session census while it lives (spec R1).
+    _census: CensusEntry,
+    /// Spec R3b: a receiver that offered `CAP_PROMOTE` — a `SWITCHOVER TO`
+    /// of this primary can be delivered on this session.
+    promotable: Option<crate::replication::promote::switchover::PromotableSession>,
+}
 
 impl ObservedSession for RegisteredSession {
     fn heartbeat(&mut self, heartbeat: &Heartbeat) {
-        self.0
+        self.standby
             .record_ack(heartbeat.applied_sequence, heartbeat.durable_sequence);
     }
 
     fn served(&mut self, origin: PollOrigin) {
-        self.0.note_source(origin == PollOrigin::Archive);
+        self.standby.note_source(origin == PollOrigin::Archive);
+    }
+
+    fn promote_request(&mut self) -> Option<PromoteRequest> {
+        self.promotable
+            .as_ref()
+            .and_then(crate::replication::promote::switchover::PromotableSession::take_request)
+    }
+
+    fn promote_answered(&mut self, request: &PromoteRequest, answer: Option<PromoteAnswer>) {
+        if let Some(promotable) = &self.promotable {
+            promotable.answered(request, answer);
+        }
     }
 }
 
@@ -1437,9 +1512,31 @@ impl SessionObserver for StandbyRegistryObserver {
         // `Resync`) is rebuilding a copy, whatever cursor it announced: it is
         // listed as bootstrapping and never counts.
         let following = hello.cursor.is_some() && hello.role != PeerRole::Resync;
-        Box::new(RegisteredSession(ha_state().register_standby(StandbyRegistration {
+        let address = peer.map_or_else(|| "unknown".to_string(), |peer| peer.to_string());
+        let state = if following {
+            StandbyState::Streaming
+        } else {
+            StandbyState::Bootstrapping
+        };
+        let entry = self.census.enter(format!(
+            "{} at {address} ({}{})",
+            hello.node_id,
+            state.as_str(),
+            hello.cursor.map(|cursor| format!(", at {cursor}")).unwrap_or_default()
+        ));
+        // Spec R3b: a serving standby that follows (and offered it) can be
+        // asked to promote itself by `SWITCHOVER TO`.
+        let promotable =
+            (following && hello.role == PeerRole::Standby && hello.capabilities & CAP_PROMOTE != 0).then(|| {
+                crate::replication::promote::switchover::note_promotable(
+                    hello.node_id,
+                    peer,
+                    hello.capabilities & CAP_TLS != 0,
+                )
+            });
+        let standby = ha_state().register_standby(StandbyRegistration {
             node_id: hello.node_id,
-            address: peer.map_or_else(|| "unknown".to_string(), |peer| peer.to_string()),
+            address,
             history: hello.history,
             pg_port: hello.pg_port,
             sync_mode: match hello.sync_mode {
@@ -1448,13 +1545,14 @@ impl SessionObserver for StandbyRegistryObserver {
                 WireSyncMode::Sync => SyncMode::Sync,
             },
             cursor: hello.cursor,
-            state: if following {
-                StandbyState::Streaming
-            } else {
-                StandbyState::Bootstrapping
-            },
+            state,
             counts_for_sync: following && hello.role == PeerRole::Standby,
-        })))
+        });
+        Box::new(RegisteredSession {
+            standby,
+            _census: entry,
+            promotable,
+        })
     }
 }
 
@@ -1478,6 +1576,29 @@ mod tests {
 
     fn leases() -> ExportLeases {
         ExportLeases::new(Duration::from_secs(3600), 4)
+    }
+
+    /// Spec R1 §3: a source's census lists exactly the sessions it admitted
+    /// and has not ended — what key rotation of the store it serves reads.
+    #[test]
+    fn a_sources_census_lists_its_live_sessions() {
+        let census = Arc::new(SessionCensus::default());
+        let first = census.enter("node a at 10.0.0.2:41000 (streaming, at 7)".to_string());
+        let second = census.enter("node b at 10.0.0.3:41000 (bootstrapping)".to_string());
+        assert_eq!(
+            census.list(),
+            vec![
+                "node a at 10.0.0.2:41000 (streaming, at 7)".to_string(),
+                "node b at 10.0.0.3:41000 (bootstrapping)".to_string()
+            ]
+        );
+        drop(first);
+        assert_eq!(
+            census.list(),
+            vec!["node b at 10.0.0.3:41000 (bootstrapping)".to_string()]
+        );
+        drop(second);
+        assert!(census.list().is_empty());
     }
 
     /// Review P4.1d: a write group larger than one frame can carry reaches
@@ -2128,7 +2249,8 @@ mod tests {
     /// snapshot, answers "planning" until its plan is built on a blocking
     /// thread, then serves leaves whose files, ingested anywhere, hold the
     /// checkpoint's default column family exactly; a reconnect preferring
-    /// the export gets the same cut; a receiver at the cut is refused.
+    /// the export gets the same cut; a receiver past the cut is refused, and
+    /// (spec R1 §1) one AT the cut is served.
     #[tokio::test]
     async fn a_fast_forward_session_plans_its_export_and_builds_its_leaf_files() {
         use super::super::physical::range_digest;
@@ -2142,15 +2264,31 @@ mod tests {
         let cut = db.latest_sequence_number();
         let work = SourceWorkLimiter::new(2).unwrap();
         let leases = leases();
-        let refused = fast_forward_at(&db, history, root.path(), cut, None, &work, &leases).await;
+        let refused = fast_forward_at(&db, history, root.path(), cut + 1, None, &work, &leases).await;
         assert!(
             matches!(&refused, Err(WireError::Refused(refusal)) if refusal.code == RefuseCode::HistoryMismatch),
             "{:?}",
             refused.err()
         );
+        // Spec R1 §1: `standby verify` of a caught-up standby against an idle
+        // primary opens its fast-forward session at the primary's very cut.
+        let at_cut = fast_forward_at(&db, history, root.path(), cut, None, &work, &leases)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                at_cut.session_info(),
+                SourceSessionInfo::FastForward { sequence, after, .. } if *sequence == cut && *after == cut
+            ),
+            "{:?}",
+            at_cut.session_info()
+        );
         let session = fast_forward_at(&db, history, root.path(), 1, None, &work, &leases)
             .await
             .unwrap();
+        // Dropped once the next session holds the same export (it is the
+        // newest lease cut past 1), so that export's planning keeps a holder.
+        drop(at_cut);
         let snapshot_id = session.session_info().fast_forward_snapshot().unwrap();
         assert!(matches!(
             session.session_info(),

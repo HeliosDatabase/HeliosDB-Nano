@@ -616,13 +616,20 @@ definitions, sequences, roles and ACLs) and durable index snapshots. This holds 
 route: autocommit, batch/`COPY`, explicit and session transactions, WAL replay, `RENAME TABLE`
 and `MERGE BRANCH`.
 
+**HNSW graph snapshots are not written at all** on an encrypted store: the graph library can only
+write plaintext files, and a graph dump holds every vector. Each HNSW index is instead rebuilt
+from its sealed rows at **every** open, so open time grows with the size of the vector indexes
+(each rebuild is logged at INFO with its row count and duration). Graph dumps an unencrypted run
+left in `<data_dir>/hnsw_snapshots/` are deleted at the first encrypted open — deleted, not
+erased: their bytes can remain in free disk blocks until overwritten, so a store that held
+vectors before encryption was enabled still needs the underlying disk wiped to be rid of them.
+
 **Not encrypted — read this before relying on it:**
 
 | Not sealed | Why it matters |
 |---|---|
 | **RocksDB keys** | Table names, column names, row ids, timestamps and branch ids are visible on disk. Only *values* are sealed |
 | **Column sidecars for non-default `STORAGE` modes** (`col:`, `colz:`, `colp:`, `dict:`, `cas:`) | For a column declared `STORAGE COLUMNAR`, `DICTIONARY` or `CONTENT_ADDRESSED`, the row holds only a reference and the payload lives in a sidecar in the clear. With `time_travel` on (the default) the sealed version copy still holds the value; with time travel **off** there is no sealed copy anywhere |
-| **HNSW graph snapshots** under `<data_dir>/hnsw_snapshots/` | Plain files outside RocksDB containing raw vectors |
 | **Backup dumps** (`[dump]`, `--dump-on-shutdown`, `--dump-schedule`) | Written unencrypted; protect the dump directory separately |
 | **Data written before enabling encryption** | Existing values are read as-is and never rewritten. Enabling encryption seals *new* writes; it does not retroactively seal an existing database |
 | **The replication link** | A physical standby receives the primary's write groups verbatim: sealed values stay sealed (the standby needs the same key), and RocksDB keys and the replication token travel inside the link. Over TLS (`--replication-tls` / `--primary-tls`, required for a remote standby) the link is encrypted; plaintext stays on loopback unless `--allow-insecure-replication-remote` |
@@ -775,8 +782,15 @@ cargo build --release
 cargo build --release --features "code-graph,graph-rag,mcp-endpoint"
 
 # In-process embedder (no external HTTP service for embeddings).
-# Pulls fastembed-rs + ORT — adds ~30 MB to the binary.
+# Pulls fastembed-rs + ORT — adds ~30 MB to the binary. Needs Rust >= 1.92
+# (the pinned ort 2.0.0-rc.15); the model downloads on first use.
 cargo build --release --features "code-graph,code-embed"
+# The ONNX Runtime ort downloads needs glibc >= 2.38 (Ubuntu 24.04, Debian 13,
+# Fedora 39+, RHEL 10). On RHEL/AlmaLinux/Rocky 9, link Microsoft's release
+# build (onnxruntime-linux-x64-1.24.x from github.com/microsoft/onnxruntime)
+# instead, and keep its lib directory on LD_LIBRARY_PATH at run time:
+ORT_LIB_PATH=/opt/onnxruntime-linux-x64-1.24.4/lib ORT_PREFER_DYNAMIC_LINK=1 \
+  cargo build --release --features "code-graph,code-embed"
 
 # FIPS 140-3 compliant crypto (AWS-LC FIPS Cert #4816, SHA-256, PBKDF2).
 # `--no-default-features` is required to swap out ring-crypto.

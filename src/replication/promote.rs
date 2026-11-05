@@ -105,6 +105,9 @@ use crate::Config;
 /// Spec P5.2: `SELECT pg_promote(wait, wait_seconds)`, the online promotion
 /// of a RUNNING standby, with this module's conversion.
 pub mod online;
+/// Spec R3b (Sprinter bbba90ddfc61): `SWITCHOVER TO '<target>'` on the
+/// primary — the target promoted online, this primary demoted in-process.
+pub mod switchover;
 
 /// The node-local key holding the promotion's identity between step 1 and
 /// the conversion, in [`LOCAL_CF`].
@@ -328,8 +331,8 @@ fn kill_promote_hook(step: &str) {
 }
 
 /// The process holding RocksDB's `LOCK` of `dir` (a running node), asked with
-/// `F_GETLK`, which takes nothing.
-fn lock_holder(dir: &Path) -> Option<i32> {
+/// `F_GETLK`, which takes nothing. Also `standby verify`'s check (spec R1 §1).
+pub fn lock_holder(dir: &Path) -> Option<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;

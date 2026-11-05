@@ -536,6 +536,23 @@ impl PostureTracker {
         });
     }
 
+    /// The store is about to close (spec P5.2 §3 step 6): from now on no
+    /// snapshot reads it, and once this returns none holds a strong handle to
+    /// it, so a request reading the posture cannot end up running the close
+    /// (sprinter ffe805264aac). The posture keeps what it last read.
+    pub fn release_live_readers(&self) {
+        let last = self.snapshot();
+        self.tx.send_if_modified(|snapshot| {
+            let before = (snapshot.cursor, snapshot.epoch, snapshot.previous_epoch);
+            snapshot.cursor = last.cursor;
+            snapshot.epoch = last.epoch;
+            snapshot.previous_epoch = last.previous_epoch;
+            (snapshot.cursor, snapshot.epoch, snapshot.previous_epoch) != before
+        });
+        *self.live.write() = None;
+        *self.live_epoch.write() = None;
+    }
+
     /// Spec P5.2 §3 step 8: the store was released by an online promotion
     /// that then aborted; the standby reopens it. Not ready (no store) until
     /// it is attached again ([`Self::attach_store`]).
@@ -1161,7 +1178,7 @@ pub fn primary_fenced_write_message(by_epoch: u64, at: u64) -> String {
     format!(
         "{} at {} by epoch {by_epoch} (a standby was promoted); it serves reads only — rebuild it as a standby \
          with `heliosdb-nano recover --from-primary --primary-host <the new primary's replication port> \
-         --replace --data-dir <this node's data directory>`",
+         --replace --data-dir <this node's data directory> --then stop`, then start it as that primary's standby",
         crate::error::PRIMARY_FENCED_WRITE_REFUSED,
         format_unix_secs(at)
     )
@@ -1233,6 +1250,59 @@ pub fn is_fenced() -> bool {
 /// The fence this process took, if any.
 pub fn fence_status() -> Option<FenceStatus> {
     FENCE.read().clone()
+}
+
+/// Spec R3b (Sprinter bbba90ddfc61): the ONE sanctioned lowering of this
+/// process's fence — once a `SWITCHOVER` demoted it: the fenced store is
+/// closed (its directory rewound into a physical standby's) and the node
+/// serves as a standby of the primary that fenced it, whose store's own mode
+/// refuses every write. From here the node is a standby, not a superseded
+/// primary: its sessions are a standby's, and once it is promoted again it is
+/// the primary of a newer epoch that no fence of its old store applies to.
+/// Logged at WARN.
+pub fn clear_fence_after_demotion() {
+    let cleared = FENCE.write().take();
+    FENCED.store(false, Ordering::SeqCst);
+    DEMOTING.store(false, Ordering::SeqCst);
+    if let Some(fence) = cleared {
+        tracing::warn!(
+            "replication: the fence of this node's former primary store (epoch {} fenced by epoch {}) is lifted: the \
+             store was demoted into a physical standby's, which refuses every write by its mode",
+            fence.epoch,
+            fence.by_epoch
+        );
+    }
+}
+
+/// Spec R3b: a `SWITCHOVER` is demoting this fenced primary into a standby:
+/// its store is off the listeners, which serve the empty placeholder until
+/// the standby's store is attached. A placeholder session's data reads are
+/// refused (55000) meanwhile — the placeholder holds no data.
+static DEMOTING: AtomicBool = AtomicBool::new(false);
+
+/// Spec R3b: the demotion starts (`true`) or is over (`false`).
+pub fn note_demoting(demoting: bool) {
+    DEMOTING.store(demoting, Ordering::SeqCst);
+}
+
+/// Whether a switchover is demoting this node (one atomic load).
+#[inline]
+pub fn is_demoting() -> bool {
+    DEMOTING.load(Ordering::SeqCst)
+}
+
+/// Review (third pass, item 6): what finishes the demotion under way if the
+/// process is stopped before it ends (`recover` and `start` commands).
+static DEMOTION_COMMAND: parking_lot::RwLock<Option<String>> = parking_lot::RwLock::new(None);
+
+/// The demotion under way is finished, if cut short, by `command`.
+pub fn note_demotion_command(command: String) {
+    *DEMOTION_COMMAND.write() = Some(command);
+}
+
+/// What finishes the demotion under way, if one is.
+pub fn demotion_command() -> Option<String> {
+    is_demoting().then(|| DEMOTION_COMMAND.read().clone()).flatten()
 }
 
 fn engine_sequence(engine: &StorageEngine) -> u64 {
@@ -1620,6 +1690,30 @@ mod tests {
             ),
             "{message}"
         );
+    }
+
+    /// Sprinter ffe805264aac: the store's readers are gone, and the posture
+    /// keeps what they last read.
+    #[test]
+    fn released_live_readers_are_not_called_and_their_values_stay() {
+        let posture = tracker();
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&reads);
+        posture.attach_store(
+            4,
+            Arc::new(move || {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(6)
+            }),
+        );
+        posture.attach_epoch(Arc::new(|| Some((3, 2))));
+        posture.release_live_readers();
+        let read_before = reads.load(std::sync::atomic::Ordering::SeqCst);
+        let snapshot = posture.snapshot();
+        assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), read_before);
+        assert_eq!(snapshot.cursor, 6, "the last live cursor is kept");
+        assert_eq!((snapshot.epoch, snapshot.previous_epoch), (3, 2));
+        assert!(snapshot.store_attached, "the posture itself is not changed");
     }
 
     /// Field finding: a reconnecting standby reported `primary 0/C97` — the

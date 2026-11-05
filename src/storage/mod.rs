@@ -115,10 +115,11 @@ pub use dump::{
     CompressionType as DumpCompressionType, DumpManager, DumpMetadata, DumpMode, DumpOptions, DumpOutputFormat,
     DumpReport, DumpType, RestoreOptions, RestoreReport, RestoreValidation,
 };
-pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
 pub use engine::{
-    DirectBulkLoadResult, LogicalCatchup, StorageEngine, StorageStats, SynchronousCommitOverrideGuard, TableKind,
+    is_rocksdb_name, DirectBulkLoadResult, LogicalCatchup, StorageEngine, StorageStats, SynchronousCommitOverrideGuard,
+    TableKind,
 };
+pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
 pub use gin_index::{GinIndex, GinIndexStats};
 pub use index_snapshot::{IndexOpenReport, IndexSnapshotPersistReport};
 pub use keyspace::{Classified, KeyClass};
@@ -141,8 +142,8 @@ pub use stats::{DatabaseStats, GlobalStatsCollector, ReplicationRole, StatsSnaps
 pub use time_travel::{GcConfig, Scn, SnapshotManager, SnapshotMetadata, TransactionId};
 pub use transaction::{Transaction, TransactionSavepointSnapshot, UncommittedWriteCensus, UncommittedWriteHold};
 pub use vector_index::{
-    PersistentPolicy, StoredVectorRecord, StoredVectorSearchResult, VectorIndexManager, VectorIndexMetadata,
-    VectorIndexStats, VectorIndexType, VectorIndexUndoOp,
+    PersistentPolicy, StandardDumpState, StandardIndexDump, StoredVectorRecord, StoredVectorSearchResult,
+    VectorIndexManager, VectorIndexMetadata, VectorIndexStats, VectorIndexType, VectorIndexUndoOp,
 };
 pub use version_gc::{VersionGcConfig, VersionGcCycleStats, VersionStorageStats};
 pub use view_catalog::{ViewCatalog, ViewMetadata};

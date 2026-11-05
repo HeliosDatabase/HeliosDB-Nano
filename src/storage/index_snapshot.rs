@@ -48,6 +48,30 @@
 //! and no logical-WAL coupling; WAL-tail replay into the index layer can be
 //! layered on later without changing the format.
 //!
+//! # HNSW graph dump files (Sprinter 746342a0bfbb)
+//!
+//! - **Names.** Each checkpoint dumps a graph under a fresh basename,
+//!   `{stable index id:016x}-{generation:016x}` ([`graph_dump_basename`]): never
+//!   the index name, whose filesystem-safe form was lossy (`a.b` and `a_b` both
+//!   became `a_b` and shared one dump). The sidecar records the basename.
+//! - **Atomic switch.** The dump is written into a staging directory, fsynced
+//!   and renamed into [`HNSW_SNAPSHOT_DIR`]; then the sidecar and its marker are
+//!   written in ONE RocksDB batch; then the previous dump's files are removed.
+//!   A crash at any point leaves either the old sidecar with its files or the
+//!   new one with its files.
+//! - **Unchanged indexes are not dumped again.** An index that has not changed
+//!   since the dump its sidecar describes (or since the reload from it) keeps
+//!   that dump; the checkpoint only re-arms its marker, which the first
+//!   mutation of ANY vector index deletes.
+//! - **Sweep at open.** Every dump file no valid sidecar references, and every
+//!   leftover staging directory, is deleted ([`sweep_graph_dumps`]).
+//! - **At-rest encryption.** hnsw_rs reads and writes plaintext files only, so
+//!   an encrypted store writes NO graph dump: its HNSW indexes are rebuilt
+//!   from the sealed rows at every open (open time grows with index size; each
+//!   rebuild is logged with its duration), and dump files an unencrypted run
+//!   left behind (and their sidecars) are deleted at the first encrypted open.
+//!   Deleting unlinks them; it does not erase their bytes from free disk blocks.
+//!
 //! # Versioning / migration
 //!
 //! [`ArtTableSnapshot::key_encoding_version`] records the ART key encoding the
@@ -84,8 +108,75 @@ pub const VEC_SNAPSHOT_MARKER_PREFIX: &str = "vecsnapv:";
 /// Subdirectory of the data dir holding `hnsw_rs` graph dumps.
 pub const HNSW_SNAPSHOT_DIR: &str = "hnsw_snapshots";
 /// The two files of one graph dump: `{basename}{suffix}`.
-pub const HNSW_GRAPH_SUFFIX: &str = ".hnsw.graph";
-pub const HNSW_DATA_SUFFIX: &str = ".hnsw.data";
+pub const HNSW_GRAPH_SUFFIX: &str = crate::vector::hnsw_index::GRAPH_FILE_SUFFIX;
+pub const HNSW_DATA_SUFFIX: &str = crate::vector::hnsw_index::DATA_FILE_SUFFIX;
+
+/// Sprinter 746342a0bfbb: the basename of one checkpoint's dump of the index
+/// whose stable id is `index_id`. `generation` makes it unique per checkpoint,
+/// so a new dump never overwrites the files the current sidecar references.
+pub fn graph_dump_basename(index_id: u64, generation: u64) -> String {
+    format!("{index_id:016x}-{generation:016x}")
+}
+
+/// Whether both files of the dump `basename` are present in `dir`.
+pub fn graph_dump_files_present(dir: &std::path::Path, basename: &str) -> bool {
+    [HNSW_GRAPH_SUFFIX, HNSW_DATA_SUFFIX]
+        .iter()
+        .all(|suffix| dir.join(format!("{basename}{suffix}")).is_file())
+}
+
+/// Remove both files of the dump `basename` from `dir`; a missing file is fine.
+pub fn remove_graph_dump(dir: &std::path::Path, basename: &str) -> std::io::Result<()> {
+    for suffix in [HNSW_GRAPH_SUFFIX, HNSW_DATA_SUFFIX] {
+        match std::fs::remove_file(dir.join(format!("{basename}{suffix}"))) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Sprinter 746342a0bfbb: delete from `dir` every graph dump file whose
+/// basename is not in `keep`, and every leftover dump staging directory.
+/// Anything else in `dir` is left alone. Returns how many entries were
+/// removed; a failure to remove one is warned and the sweep goes on.
+pub fn sweep_graph_dumps(dir: &std::path::Path, keep: &std::collections::HashSet<&str>) -> u64 {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            tracing::warn!("HNSW snapshot sweep: cannot list {}: {}", dir.display(), e);
+            return 0;
+        }
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let (is_dir, is_file) = match entry.file_type() {
+            Ok(file_type) => (file_type.is_dir(), file_type.is_file()),
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let result = if is_dir && name.starts_with(crate::vector::hnsw_index::DUMP_STAGING_PREFIX) {
+            std::fs::remove_dir_all(&path)
+        } else {
+            let basename = name
+                .strip_suffix(HNSW_GRAPH_SUFFIX)
+                .or_else(|| name.strip_suffix(HNSW_DATA_SUFFIX));
+            match basename {
+                Some(basename) if is_file && !keep.contains(basename) => std::fs::remove_file(&path),
+                _ => continue,
+            }
+        };
+        match result {
+            Ok(()) => removed += 1,
+            Err(e) => tracing::warn!("HNSW snapshot sweep: cannot remove {}: {}", path.display(), e),
+        }
+    }
+    removed
+}
 
 /// SHA-256 of one graph dump file (spec P2.2: recorded in the sidecar, so a
 /// dump that is not the one the sidecar describes — another checkpoint's,
@@ -216,6 +307,13 @@ pub struct IndexSnapshotPersistReport {
     pub vector_graphs: u64,
     /// Vector indexes that could not be dumped (left unmarked → rebuilt on open).
     pub vector_dump_failures: u64,
+    /// Sprinter 746342a0bfbb: indexes unchanged since the dump their sidecar
+    /// describes — that dump was kept and only its marker re-armed.
+    pub vector_unchanged: u64,
+    /// Standard indexes deliberately not dumped: an empty graph (hnsw_rs cannot
+    /// dump one; it rebuilds from no rows), or every index of an encrypted
+    /// store (see the module docs).
+    pub vector_skipped: u64,
     pub elapsed_ms: f64,
 }
 
@@ -239,5 +337,73 @@ pub struct IndexOpenReport {
     pub vector_reopened_persistent: u64,
     /// Vector indexes that failed to rebuild/reload and are now degraded.
     pub vector_degraded: u64,
+    /// Sprinter 746342a0bfbb: graph dump files and staging directories in
+    /// `hnsw_snapshots/` that no valid sidecar referenced, deleted at open.
+    pub vector_dump_files_swept: u64,
     pub elapsed_ms: f64,
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The sweep removes unreferenced dump files and staging directories and
+    /// nothing else.
+    #[test]
+    fn the_sweep_removes_only_unreferenced_dumps_and_staging_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "kept.hnsw.graph",
+            "kept.hnsw.data",
+            "stale.hnsw.graph",
+            "stale.hnsw.data",
+            "idx_d_docs_emb-4242.hnsw.data",
+            "notes.txt",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let staging = dir
+            .path()
+            .join(format!("{}kept-1-2-0", crate::vector::hnsw_index::DUMP_STAGING_PREFIX));
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("kept.hnsw.graph"), b"partial").unwrap();
+        // A directory that merely looks like a dump file is not a dump.
+        std::fs::create_dir(dir.path().join("odd.hnsw.graph")).unwrap();
+
+        let keep: std::collections::HashSet<&str> = ["kept"].into_iter().collect();
+        assert_eq!(sweep_graph_dumps(dir.path(), &keep), 4);
+        assert_eq!(
+            names(dir.path()),
+            vec!["kept.hnsw.data", "kept.hnsw.graph", "notes.txt", "odd.hnsw.graph"]
+        );
+        assert_eq!(sweep_graph_dumps(&dir.path().join("absent"), &keep), 0);
+    }
+
+    #[test]
+    fn dump_basenames_are_unique_per_index_and_checkpoint_and_removable() {
+        let a = graph_dump_basename(0xABCD, 1);
+        assert_eq!(a, "000000000000abcd-0000000000000001");
+        assert_ne!(a, graph_dump_basename(0xABCD, 2));
+        assert_ne!(a, graph_dump_basename(0xABCE, 1));
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!graph_dump_files_present(dir.path(), &a));
+        std::fs::write(dir.path().join(format!("{a}{HNSW_GRAPH_SUFFIX}")), b"g").unwrap();
+        assert!(!graph_dump_files_present(dir.path(), &a), "one file is not a dump");
+        std::fs::write(dir.path().join(format!("{a}{HNSW_DATA_SUFFIX}")), b"d").unwrap();
+        assert!(graph_dump_files_present(dir.path(), &a));
+        remove_graph_dump(dir.path(), &a).unwrap();
+        assert!(names(dir.path()).is_empty());
+        remove_graph_dump(dir.path(), &a).expect("removing an absent dump is fine");
+    }
 }

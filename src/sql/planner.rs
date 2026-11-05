@@ -7883,6 +7883,15 @@ impl<'a> Planner<'a> {
                         let m_param = n
                             .parse::<usize>()
                             .map_err(|_| Error::query_execution("Invalid m value"))?;
+                        // Sprinter 746342a0bfbb: refused here, by name, before
+                        // anything is persisted (hnsw_rs exits the process above
+                        // 256 and dumps M as a u8).
+                        use crate::vector::hnsw_index::{MAX_MAX_CONNECTIONS, MIN_MAX_CONNECTIONS};
+                        if !(MIN_MAX_CONNECTIONS..=MAX_MAX_CONNECTIONS).contains(&m_param) {
+                            return Err(Error::query_execution(format!(
+                                "HNSW m must be between {MIN_MAX_CONNECTIONS} and {MAX_MAX_CONNECTIONS}, got {m_param}"
+                            )));
+                        }
                         options.push(IndexOption::HnswM(m_param));
                     } else {
                         return Err(Error::query_execution("m must be a number"));
@@ -7893,6 +7902,9 @@ impl<'a> Planner<'a> {
                         let ef = n
                             .parse::<usize>()
                             .map_err(|_| Error::query_execution("Invalid ef_construction value"))?;
+                        if ef == 0 {
+                            return Err(Error::query_execution("HNSW ef_construction must be at least 1"));
+                        }
                         options.push(IndexOption::EfConstruction(ef));
                     } else {
                         return Err(Error::query_execution("ef_construction must be a number"));

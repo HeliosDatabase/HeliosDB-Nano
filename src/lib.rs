@@ -407,6 +407,81 @@ pub async fn wait_for_shutdown_signal() -> &'static str {
     "SIGINT"
 }
 
+/// [`wait_for_shutdown_signal`] for a start path that must not miss a signal
+/// while it does something else (sprinter ffe805264aac).
+///
+/// That future installs its handlers at its first poll and, dropped, forgets
+/// them: Tokio's handler stays installed but a signal with no listener is
+/// thrown away. So between a dropped wait and the next one's first poll a
+/// SIGTERM was silently ignored, and before the first one it killed the process
+/// by the default action. [`Self::install`] installs the handlers when it
+/// returns, and a signal that arrives from then on is held until a
+/// [`Self::wait`] asks: a wait can be dropped and another one started later.
+/// A server's own `/ready` can answer long before its main loop runs, so a
+/// supervisor's SIGTERM can land in exactly that gap.
+#[cfg(unix)]
+pub struct ShutdownListener {
+    terminate: Option<tokio::signal::unix::Signal>,
+    interrupt: Option<tokio::signal::unix::Signal>,
+}
+
+#[cfg(unix)]
+impl ShutdownListener {
+    /// Install the SIGTERM and SIGINT handlers now. A handler that cannot be
+    /// installed is logged, and the other signal still shuts the server down.
+    /// Must be called on a Tokio runtime.
+    #[must_use]
+    pub fn install() -> Self {
+        use tokio::signal::unix::{signal, SignalKind};
+        let install = |kind: SignalKind, name: &str| match signal(kind) {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                tracing::warn!("failed to install the {name} handler: {error}");
+                None
+            }
+        };
+        Self {
+            terminate: install(SignalKind::terminate(), "SIGTERM"),
+            interrupt: install(SignalKind::interrupt(), "SIGINT"),
+        }
+    }
+
+    /// The next signal, by name; cancel safe (a wait that is dropped loses no
+    /// signal).
+    pub async fn wait(&mut self) -> &'static str {
+        async fn next(listener: Option<&mut tokio::signal::unix::Signal>) {
+            match listener {
+                Some(listener) => {
+                    listener.recv().await;
+                }
+                None => std::future::pending().await,
+            }
+        }
+        tokio::select! {
+            () = next(self.interrupt.as_mut()) => "SIGINT",
+            () = next(self.terminate.as_mut()) => "SIGTERM",
+        }
+    }
+}
+
+/// Targets without POSIX signals: Ctrl+C, installed by each wait.
+#[cfg(not(unix))]
+pub struct ShutdownListener;
+
+#[cfg(not(unix))]
+impl ShutdownListener {
+    /// Nothing to install ahead of a wait on these targets.
+    #[must_use]
+    pub fn install() -> Self {
+        Self
+    }
+
+    /// The next Ctrl+C.
+    pub async fn wait(&mut self) -> &'static str {
+        wait_for_shutdown_signal().await
+    }
+}
+
 /// Convert logical plan ReferentialAction to constraints module ReferentialAction
 fn convert_logical_referential_action(
     action: &sql::logical_plan::ReferentialAction,
@@ -1790,6 +1865,16 @@ impl Drop for EmbeddedDatabase {
         // counter bumped by a still-open transaction costs at most a row-id gap
         // — never a collision. Only the snapshot checkpoint needs that guard.
         //
+        // Sprinter 746342a0bfbb: both writes ARE gated on the last owner, like
+        // every other close-time write below. `clone_for_trigger()` clones drop
+        // mid-statement (once per row of DML on a triggered table), and each
+        // such drop used to flush every row counter and checkpoint every ART
+        // and HNSW index — a full graph dump per triggered row, and markers
+        // written for a statement still in flight. The root handle is not the
+        // last owner either while the UDF bridge's captured clone lives (it
+        // drops with the root's fields, after this body); that clone's drop
+        // runs these writes once, as the last owner.
+        //
         // Spec P1.4: NONE of the four close-time writes below runs for a
         // physical standby's handle, explicitly rather than by leaning on the
         // engine's flags. A physical open already clears the counter-flush and
@@ -1801,7 +1886,8 @@ impl Drop for EmbeddedDatabase {
         // keeps applying), and its owner decides when the store is flushed. A
         // standby's close leaves the directory exactly as it found it.
         let writes_at_close = !self.storage.is_physical_standby();
-        if writes_at_close && self.storage.row_counter_flush_on_close() {
+        let last_owner = std::sync::Arc::strong_count(&self.auto_refresh_worker) == 1;
+        if writes_at_close && last_owner && self.storage.row_counter_flush_on_close() {
             if let Err(e) = self.storage.flush_all_row_counters() {
                 tracing::warn!("row counter flush at close failed: {}", e);
             }
@@ -1816,11 +1902,11 @@ impl Drop for EmbeddedDatabase {
         // requirement documented on the counter flush above.
         let txn_open = self.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
             || self.session_txn_count.load(std::sync::atomic::Ordering::Acquire) > 0;
-        if writes_at_close && !txn_open && self.storage.index_snapshots_on_close() {
+        if writes_at_close && last_owner && !txn_open && self.storage.index_snapshots_on_close() {
             if let Err(e) = self.storage.persist_index_snapshots() {
                 tracing::warn!("index snapshot checkpoint at close failed: {}", e);
             }
-        } else if txn_open {
+        } else if last_owner && txn_open {
             tracing::debug!("skipping index snapshot checkpoint: transaction still open at drop");
         }
 
@@ -6249,10 +6335,8 @@ impl EmbeddedDatabase {
     ///   transaction keeps the O(1)-memory `clear_table_indexes` (it commits
     ///   in the same statement). HNSW entries are dropped with their undo ops
     ///   either way (a TRUNCATE used to leave them behind for deleted rows).
-    /// * The logical-WAL record is appended at statement time, where both
-    ///   families always appended it (GH#36). Whether a rolled-back TRUNCATE's
-    ///   record is replayed belongs to the R1 track (logical-WAL redo), not
-    ///   here.
+    /// * The logical-WAL record goes with the transaction's commit (spec R1 §4),
+    ///   so a rolled-back TRUNCATE leaves none.
     fn truncate_main_in_transaction(
         &self,
         txn: &storage::Transaction,
@@ -6326,10 +6410,20 @@ impl EmbeddedDatabase {
             rows = truncated_row_ids.len(),
             "TRUNCATE staged row deletes in txn"
         );
-        // GH#36: represent the TRUNCATE in the logical WAL (placement
-        // unchanged — see the doc comment).
-        if let Err(e) = self.storage.log_truncate(table_name) {
-            tracing::warn!("Failed to log TRUNCATE '{}' to WAL: {}", table_name, e);
+        // GH#36: represent the TRUNCATE in the logical WAL.
+        //
+        // Spec R1 §4 (sprinter e21903322db7): with THIS transaction's commit,
+        // never on its own. The row deletes above are staged in the write set and
+        // roll back with it; an entry appended at once outlived a `BEGIN;
+        // TRUNCATE; ROLLBACK`, and open recovery under
+        // `wal_replay_destructive_ddl = "apply"|"warn"` then truncated the table
+        // the rollback had kept.
+        if !txn.log_on_commit(storage::WalOperation::Truncate {
+            table: table_name.to_string(),
+        }) {
+            if let Err(e) = self.storage.log_truncate(table_name) {
+                tracing::warn!("Failed to log TRUNCATE '{}' to WAL: {}", table_name, e);
+            }
         }
         Ok(truncated_row_ids.len() as u64)
     }
@@ -33313,6 +33407,56 @@ mod tests {
 
         db.commit_transaction_for_session(session).unwrap();
         db.destroy_session(session).unwrap();
+    }
+
+    /// Sprinter 746342a0bfbb (R4 item 2): dropping a `clone_for_trigger()`
+    /// handle must not run the close-time row-counter flush or index-snapshot
+    /// checkpoint. Red before: each such drop dumped every HNSW graph and wrote
+    /// every snapshot marker mid-session. The real close still checkpoints.
+    #[test]
+    fn test_dropping_a_trigger_clone_writes_no_counter_or_index_snapshot() {
+        use crate::storage::index_snapshot as snap;
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = EmbeddedDatabase::new(dir.path()).unwrap();
+            db.execute("CREATE TABLE tcs (id INT PRIMARY KEY, emb VECTOR(3))")
+                .unwrap();
+            for i in 0..5 {
+                db.execute(&format!("INSERT INTO tcs VALUES ({i}, '[{i}.5, 1.0, 0.5]')"))
+                    .unwrap();
+            }
+            db.execute("CREATE INDEX tcs_emb ON tcs USING hnsw (emb)").unwrap();
+            let counter_key = b"counter:tcs".to_vec();
+            let counter_before = db.storage.get(&counter_key).unwrap();
+
+            drop(db.clone_for_trigger());
+
+            let dumps = dir.path().join(snap::HNSW_SNAPSHOT_DIR);
+            assert!(
+                !dumps.exists() || std::fs::read_dir(&dumps).unwrap().next().is_none(),
+                "a trigger clone's drop dumped an HNSW graph"
+            );
+            assert_eq!(
+                db.storage.get(&snap::vec_snapshot_marker_key("tcs_emb")).unwrap(),
+                None,
+                "a trigger clone's drop wrote an HNSW snapshot marker"
+            );
+            assert_eq!(
+                db.storage.get(&snap::art_snapshot_marker_key("tcs")).unwrap(),
+                None,
+                "a trigger clone's drop wrote an ART snapshot marker"
+            );
+            assert_eq!(
+                db.storage.get(&counter_key).unwrap(),
+                counter_before,
+                "a trigger clone's drop flushed the row counters"
+            );
+        }
+        let db = EmbeddedDatabase::new(dir.path()).unwrap();
+        let report = db.storage.last_index_open_report().unwrap();
+        assert_eq!(report.vector_reloaded, 1, "the real close checkpointed: {report:?}");
+        assert_eq!(report.tables_from_snapshot, 1, "{report:?}");
     }
 
     // ========================================================================

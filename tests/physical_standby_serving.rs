@@ -31,10 +31,15 @@
 #![cfg(all(feature = "ha-tier1", target_os = "linux"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
+// Only its port reservation and its readiness diagnostics (spec R6): this
+// suite keeps its own daemon and pair types.
+#[path = "support/physical_pair.rs"]
+mod physical_pair;
+
 use std::{
     collections::BTreeSet,
     io::{Read, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     time::{Duration, Instant},
@@ -44,8 +49,10 @@ use tokio_postgres::{NoTls, SimpleQueryMessage};
 const LEGACY_REFUSAL: &str = "this directory is a logical standby from 4.41.x; physical standbys are rebuilt once: \
      start with a new, empty data directory (docs/guides/physical-standby.md)";
 
+/// A reserved port (spec R6 §2(c), `support/ports.rs`): no concurrent test can
+/// take it before the daemon binds it.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    physical_pair::free_port()
 }
 
 /// Kills exactly the child it owns when dropped, so a failed assertion cannot
@@ -88,6 +95,17 @@ impl Daemon {
 
     fn log(&self) -> String {
         std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    /// What the shared readiness diagnostics read of this daemon (spec R6 §1).
+    fn watched(&self) -> physical_pair::Watched<'_> {
+        physical_pair::Watched {
+            name: self.log.file_stem().and_then(|stem| stem.to_str()).unwrap_or("daemon"),
+            pid: self.child.as_ref().map(Child::id),
+            log: &self.log,
+            spawned_at: None,
+            first_answer: None,
+        }
     }
 
     fn alive(&mut self) -> bool {
@@ -222,23 +240,11 @@ async fn http(port: u16, path: &'static str) -> Option<(u16, serde_json::Value)>
         .unwrap()
 }
 
-/// Poll `path` until it answers `want`; panics with the last answer otherwise.
+/// Poll `path` until it answers `want`; panics with the last answer otherwise
+/// — the shared helper (spec R6 §2(b)): refused, hung and other-status probes
+/// keep polling, and the panic carries the readiness diagnostics.
 async fn wait_http(port: u16, path: &'static str, want: u16, budget: Duration, daemon: &Daemon) -> serde_json::Value {
-    let deadline = Instant::now() + budget;
-    loop {
-        let seen = http(port, path).await;
-        if let Some((code, body)) = &seen {
-            if *code == want {
-                return body.clone();
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "{path} never answered {want}; last {seen:?}; log tail: {}",
-            daemon.log().lines().rev().take(12).collect::<Vec<_>>().join(" | ")
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    physical_pair::wait_http_watched(port, path, want, budget, &daemon.watched()).await
 }
 
 // ---------------------------------------------------------------------------

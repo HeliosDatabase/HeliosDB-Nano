@@ -47,7 +47,12 @@
 //! `[encryption] rotation_interval_days` is parsed into `Config` but is read by
 //! nothing in this build, and `KeyManager::previous_key` has no callers: there
 //! is no automatic rotation. Re-keying today means dumping and restoring under a
-//! new key.
+//! new key. `StorageEngine::rotate_encryption_key` — the one rotation entry
+//! point, reached by no SQL, CLI or HTTP surface — refuses while a rotation
+//! would strand a physical standby (spec R1 §3, [`KeyRotationStanding`], from
+//! the store's own open mode and attached standbys: a standby applies its
+//! primary's sealed values verbatim and holds one key), and refuses otherwise
+//! because nothing re-encrypts the sealed values.
 //!
 //! The structural fix is a nonce that cannot collide by construction rather than
 //! by probability — an 8-byte per-process random prefix concatenated with a
@@ -71,7 +76,7 @@ mod key_manager;
 pub mod provider;
 mod zero_knowledge;
 
-pub use key_manager::KeyManager;
+pub use key_manager::{KeyManager, KeyRotationStanding};
 pub use provider::{
     derive_key, generate_random_key, hash_content, init_provider, is_fips_build, provider as get_provider,
     provider_name, CryptoKey, CryptoProvider, HashOutput,

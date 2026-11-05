@@ -35,9 +35,32 @@
 //! and the summary says what that did to what it held of the old primary. A
 //! primary that answers `SourceStale` is a superseded one: the command
 //! refuses, naming the fix (point `--primary-host` at the current primary).
-//! A primary's own directory — fenced by a promotion, or not (a dead primary
-//! being rebuilt) — of the same history takes route 3 beside it, swapped in
-//! with `--replace`, never anything in place.
+//!
+//! # Rewinding a former primary (spec R3a, Sprinter 1c8963417a35)
+//!
+//! A primary's own directory — fenced by a promotion, or not (a primary a
+//! forced promotion superseded) — of the SAME history as the primary, at a
+//! LOWER epoch, holds the dataset's history byte for byte up to the
+//! promotion point: only what diverged after it differs. It is rewound in
+//! place (Oracle's `REINSTATE DATABASE`, PostgreSQL's `pg_rewind`): the
+//! fast-forward's plan and the digest pass are made on the directory AS IT
+//! IS, so a rewind that would ship more than `--full-copy-threshold` falls
+//! through to the full copy without having changed anything; otherwise the
+//! directory is converted in place into a physical stage — one synced write
+//! of the node-local family (a cursor at an unknown position, the
+//! fast-forward's record, the rewind's own record with a copy of the fence
+//! record), then the primary-only files removed (its history and fence
+//! records, RocksDB's WAL archive, the HNSW dump cache, its own leftover
+//! export checkpoints), then an interim marker — and the differing leaves
+//! are applied and the stage re-cut exactly as for a standby
+//! ([`physical::RewindWriter`](super::physical::RewindWriter)). The
+//! primary's own writes past the promotion point are replaced (said as a
+//! WARNING when it was not fenced). A different history is refused, and so
+//! is a source at the directory's own epoch or a lower one; `--full` (with
+//! `--replace`) rebuilds it by a full copy beside it instead, and so does a
+//! directory that cannot be rewound (damaged, holding foreign files). An
+//! interrupted rewind is classified by its record ([`DirectoryState::Rewinding`])
+//! and finished by a re-run, whichever of its steps it stopped after.
 //!
 //! # Crash safety of the fast-forward
 //!
@@ -71,18 +94,26 @@ use uuid::Uuid;
 
 use super::archive_recovery::RecoverError;
 use super::checkpoint_transfer::{
-    check_stage_files, check_stage_limits, partial_snapshot, physical_stage_history, recut_stage_with,
-    stage_census_manifest, ReceiverStaging, ReopenedPhysicalStage, StagingStart,
+    check_stage_files, check_stage_limits, check_stage_limits_excluding, is_foreign_file_name, is_stage_file_name,
+    partial_snapshot, physical_stage_history, recut_stage, recut_stage_with, stage_census_manifest, ReceiverStaging,
+    ReopenedPhysicalStage, StagingStart, TransferLimits, PHYSICAL_MANIFEST_FILE, PHYSICAL_MANIFEST_TEMP_FILE,
+    PHYSICAL_MARKER_FILE, PHYSICAL_MARKER_TEMP_FILE,
 };
 use super::epoch::{read_directory_epoch, read_epoch, INITIAL_EPOCH};
 use super::fast_forward::{hash_file, local_leaf_digests, BATCH_LEAVES};
-use super::physical::{FastForwardRecord, FastForwardWriter, PhysicalCursor};
+use super::fence::{read_fenced_record, FENCED_FILE};
+use super::history::{is_record_temporary, remove_record_in, PRIMARY_HISTORY_FILE};
+use super::physical::{
+    directory_rewind_record, FastForwardRecord, FastForwardWriter, PhysicalCursor, RewindRecord, RewindStoreState,
+    RewindWriter,
+};
 use super::physical_receiver::{run_receiver, ReceiverMode, ReceiverOptions, ReceiverStart, ReceiverStatus};
 use super::physical_tls::{ReplicationStream, ReplicationTransport};
 use super::physical_wire::{
     now_millis, valid_leaf_bytes, Heartbeat, LastGroup, LeafEntry, LeafPlan, PeerRole, PhysicalClient,
     ReceiverIdentity, RefuseCode, SourceSessionInfo, TransferToken, WireError, WireLimits, WireSyncMode, LEAF_END,
 };
+use crate::storage::replication_records::FencedRecord;
 use crate::Config;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -90,8 +121,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// --from-primary` SIGKILL its own process at that point of a fast-forward —
 /// `after-delete:<batch>`, `after-ingest:<batch>` (batches numbered from 0),
 /// `before-recut:0`, `after-manifest:0` — the crash points the spec's
-/// crash-safety tests stop at, exactly instead of by timing.
+/// crash-safety tests stop at, exactly instead of by timing. Spec R3a adds
+/// the rewind's conversion: `rewind-after-convert:0` (the node-local
+/// family's write is in, nothing of the directory's files changed yet) and
+/// `rewind-after-files:0` (the primary-only files removed, the interim
+/// marker not yet written).
 pub const KILL_FAST_FORWARD_AT_ENV: &str = "HELIOSDB_NANO_TEST_KILL_FAST_FORWARD_AT";
+/// Spec R3a: the directories a primary keeps inside its data directory that
+/// a standby has none of — RocksDB's archived WAL (kept for the primary's
+/// standbys while physical replication retains it) and the HNSW graph dump
+/// cache (standbys rebuild their indexes from rows) — which a rewind removes.
+const PRIMARY_LOCAL_DIRECTORIES: [&str; 2] = ["archive", crate::storage::index_snapshot::HNSW_SNAPSHOT_DIR];
+/// Spec R3a: the lock-free ingestion engine's log directory. Removed only
+/// when it is empty: entries in it are writes the store may not hold yet.
+const LOCKFREE_WAL_DIRECTORY: &str = "lockfree_wal";
+/// The prefix of an export checkpoint's lease directory
+/// (`checkpoint_transfer::OnlineCheckpointExport`).
+const EXPORT_LEASE_PREFIX: &str = "nano-checkpoint-";
 /// `TooManySessions` / `SourceNotServing` are retried this many times, with
 /// the bootstrap backoff, before the recovery gives up.
 const REFUSAL_RETRIES: u32 = 5;
@@ -120,13 +166,107 @@ pub enum DirectoryState {
     Physical { history: Uuid },
     /// Spec P5.1 §6: a primary's directory of `history` — a fenced one (it
     /// carries `NANO-FENCED.json`: a standby was promoted over it), or one
-    /// that is not fenced (an operator rebuilding a dead primary). Only a
-    /// full copy of the current primary rebuilds it, beside it, swapped in
-    /// with `--replace` (the old directory is kept); without `--replace` the
-    /// command exits 3 naming the file. Rewinding it in place is a
-    /// follow-up. Spec §11.G: `epoch` is the epoch its store holds; a source
-    /// at a LOWER epoch is the superseded one, and the recovery is refused.
+    /// that is not fenced (a primary a forced promotion superseded, or an
+    /// operator rebuilding a dead primary). Spec §11.G: `epoch` is the epoch
+    /// its store holds; a source at a LOWER epoch is the superseded one, and
+    /// the recovery is refused. Spec R3a (Sprinter 1c8963417a35): against a
+    /// primary of the same history at a HIGHER epoch it is rewound in place
+    /// (module documentation); a source at its own epoch is refused; `--full`
+    /// (or a directory that cannot be rewound) rebuilds it by a full copy
+    /// beside it, swapped in with `--replace` (the old directory is kept);
+    /// without `--replace` the command exits 3.
     Primary { history: Uuid, fenced: bool, epoch: u64 },
+    /// Spec R3a: a former primary's directory under an interrupted rewind —
+    /// its store holds the rewind's record
+    /// ([`physical::directory_rewind_record`](super::physical::directory_rewind_record)),
+    /// whichever of the conversion's file steps were done. A re-run finishes
+    /// the conversion and the fast-forward.
+    Rewinding { history: Uuid },
+}
+
+/// Spec R3a: how `recover --from-primary` classifies a directory under an
+/// interrupted rewind, before anything else: `Some` when its store holds the
+/// rewind's record (read-only, without a lock). The caller classifies every
+/// other directory as before.
+pub fn rewinding_layout(data_dir: &Path) -> Result<Option<DirectoryState>, String> {
+    directory_rewind_record(data_dir)
+        .map(|record| {
+            record.map(|record| DirectoryState::Rewinding {
+                history: record.history,
+            })
+        })
+        .map_err(|error| {
+            format!(
+                "the node-local state of {} cannot be read ({error}): it may hold an interrupted rewind, so it is \
+                 not classified",
+                data_dir.display()
+            )
+        })
+}
+
+/// `internal-tests` builds only: `before-convert` makes a rewind stop, with an
+/// error, after it opened the former primary's store and before its
+/// conversion — nothing of the directory changed.
+pub const FAIL_REWIND_ENV: &str = "HELIOSDB_NANO_TEST_FAIL_REWIND_AT";
+
+/// Spec R3b (Sprinter bbba90ddfc61), review item 5: whether a rewind of
+/// `data_dir` that stopped left the directory exactly the fenced primary's it
+/// was — so its store can be reopened, fenced, and served again — or changed
+/// it (then only `recover --from-primary` finishes it). Changed when ANY step
+/// of the conversion shows: the rewind's record, the node-local family (the
+/// conversion creates it first, before its synced write), the stage's marker,
+/// or a primary record already removed. A directory that cannot be read is
+/// changed (fail closed: it is never reopened as a primary on a guess).
+pub fn rewind_left_unchanged(data_dir: &Path) -> bool {
+    if !matches!(rewinding_layout(data_dir), Ok(None)) {
+        return false;
+    }
+    let carries = |name: &str| fs::symlink_metadata(data_dir.join(name)).is_ok();
+    if !carries(FENCED_FILE) || !carries(PRIMARY_HISTORY_FILE) || carries(PHYSICAL_MARKER_FILE) {
+        return false;
+    }
+    match rocksdb::DB::list_cf(&rocksdb::Options::default(), data_dir) {
+        Ok(families) => !families.iter().any(|family| family == super::physical::LOCAL_CF),
+        Err(_) => false,
+    }
+}
+
+/// Spec R3b (Sprinter bbba90ddfc61), review item 1: whether the directory
+/// of the RUNNING primary `data_dir` could be rewound in place once a
+/// switchover releases its store — the census its rewind takes first
+/// ([`rewind_census`]), read-only: nothing changes. `Ok` says what the
+/// conversion would remove and keep; `Err` why it could not take the
+/// directory (an entry nobody accounts for, a symbolic link, a non-empty
+/// lock-free WAL, a store file hard-linked from outside this node's own
+/// export checkpoints — a hard-link backup). `export_dir`: the node's
+/// `[replication.physical] export_dir`, `None` for the default beside the
+/// data directory. A `SWITCHOVER` is refused before its target is asked when
+/// this fails: past the fence the demotion rewinds the directory and never
+/// full-copies it in-process.
+pub fn rewind_census_check(data_dir: &Path, export_dir: Option<&Path>) -> Result<String, String> {
+    let export_dir = match export_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => sibling(data_dir, "physical-export").map_err(|error| error.to_string())?,
+    };
+    let census = rewind_census(data_dir, &export_dir)?;
+    let mut detail = format!(
+        "its directory can be rewound in place once demoted (removed: {})",
+        if census.drop.is_empty() {
+            "nothing but its history and fence records".to_string()
+        } else {
+            census.drop.join(", ")
+        }
+    );
+    if !census.stale_exports.is_empty() {
+        detail.push_str(&format!(
+            "; {} of its own export checkpoint(s) go too",
+            census.stale_exports.len()
+        ));
+    }
+    if !census.kept.is_empty() {
+        detail.push_str(&format!("; kept beside the store: {}", census.kept.join(", ")));
+    }
+    Ok(detail)
 }
 
 /// What [`recover_from_primary`] does.
@@ -195,6 +335,9 @@ pub enum RecoverRoute {
     Tail,
     /// Only the differing leaves were shipped.
     FastForward,
+    /// Spec R3a: a former primary's directory was converted in place and
+    /// fast-forwarded (only the differing leaves were shipped).
+    Rewind,
     /// A full copy of the primary was installed.
     FullCopy,
 }
@@ -204,6 +347,7 @@ impl RecoverRoute {
         match self {
             Self::Tail => "tail",
             Self::FastForward => "fast-forward",
+            Self::Rewind => "rewind",
             Self::FullCopy => "full copy",
         }
     }
@@ -233,6 +377,13 @@ pub struct PrimaryRecoverReport {
     pub duration: Duration,
     /// Where an occupied directory went when a full copy replaced it.
     pub replaced: Option<PathBuf>,
+    /// Sprinter 6146b39a5beb: the completed copy a previous run left beside
+    /// the directory, when this run adopted it (the primary still served its
+    /// next write group) instead of copying: nothing was copied in this run.
+    pub adopted: Option<PathBuf>,
+    /// Spec R3a: what a rewind converted — the former primary's epoch, its
+    /// own last sequence, the fence it carried ([`RecoverRoute::Rewind`]).
+    pub rewind: Option<RewindRecord>,
 }
 
 fn refused(reason: impl Into<String>) -> RecoverError {
@@ -473,7 +624,7 @@ struct Ladder<'a> {
 /// synchronous commits).
 pub async fn recover_from_primary(
     options: &PrimaryRecoverOptions,
-    progress: &mut dyn FnMut(&str),
+    progress: &mut (dyn FnMut(&str) + Send),
 ) -> Result<PrimaryRecoverReport, RecoverError> {
     options.validate()?;
     let (stop, shutdown) = watch::channel(false);
@@ -506,16 +657,19 @@ pub async fn recover_from_primary(
                 .full_copy(CopyInto::Fresh { empty_existing }, 0, None, progress)
                 .await
         }
-        DirectoryState::Physical { history } => ladder.physical(history, progress).await,
+        // The ladder's futures are large: boxed, not inlined into this one.
+        DirectoryState::Physical { history } => Box::pin(ladder.physical(history, None, progress)).await,
+        DirectoryState::Rewinding { history } => Box::pin(ladder.continue_rewind(history, progress)).await,
         DirectoryState::Primary { history, fenced, epoch } => {
-            // Spec P5.1 §6: route 3 only, beside it, with `--replace`. The
-            // primary must serve the same dataset: a primary's directory of
-            // another history is never replaced by this command.
+            // The primary must serve the same dataset: a primary's directory
+            // of another history is never replaced, nor rewound, by this
+            // command (spec P5.1 §6; spec R3a keeps it so — Sprinter
+            // 1c8963417a35: a different history is refused, not copied over).
             let (primary, source_epoch) = ladder.identify_source().await?;
             if primary != history {
                 return Err(refused(format!(
                     "{} is a primary's directory of history {history}; the primary at {} serves {primary}: a \
-                     primary's directory is replaced only by a copy of its own dataset",
+                     primary's directory is rewound or replaced only by its own dataset",
                     ladder.data_dir.display(),
                     options.primary_host
                 )));
@@ -529,26 +683,47 @@ pub async fn recover_from_primary(
                     options.primary_host
                 )));
             }
-            let file = if fenced {
-                super::fence::FENCED_FILE
-            } else {
-                super::history::PRIMARY_HISTORY_FILE
-            };
-            let reason = if fenced {
+            let what = if fenced {
                 format!(
-                    "{} is a fenced primary's directory ({file}): a standby was promoted over it; it is rebuilt as \
-                     a standby of the current primary by a full copy",
+                    "{} is a fenced primary's directory ({FENCED_FILE}): a standby was promoted over it",
                     ladder.data_dir.display()
                 )
             } else {
                 format!(
-                    "{} is a primary's directory of this dataset ({file}, not fenced): it is rebuilt as a standby \
-                     of the primary at {} by a full copy (rewinding it in place is not supported)",
-                    ladder.data_dir.display(),
-                    options.primary_host
+                    "{} is a primary's directory of this dataset ({PRIMARY_HISTORY_FILE}, not fenced)",
+                    ladder.data_dir.display()
                 )
             };
-            ladder.full_copy(CopyInto::Beside, 0, Some(reason), progress).await
+            if options.full {
+                return ladder
+                    .full_copy(
+                        CopyInto::Beside,
+                        0,
+                        Some(format!(
+                            "{what}; --full asks for a full copy: it is rebuilt as a standby of the primary at {} \
+                             beside it",
+                            options.primary_host
+                        )),
+                        progress,
+                    )
+                    .await;
+            }
+            // Spec R3a (1c8963417a35): a primary is rewound only to the
+            // primary promoted over it — a HIGHER epoch. One at its own
+            // epoch was not (a copy of it, its own standby, a second forced
+            // promotion of the same epoch): nothing tells which of the two
+            // holds the dataset, so nothing is rewound.
+            if epoch == source_epoch {
+                return Err(refused(format!(
+                    "{what}, at epoch {epoch}; the primary at {} is at the same epoch {epoch}: it was not promoted \
+                     over this primary (a primary is rewound only to the one promoted over it, at a higher epoch), so \
+                     nothing is rewound. If it IS the primary this node must follow, rebuild this one by a full copy \
+                     beside it: re-run with --full --replace (the old directory is kept as {}.replaced-<UTC>)",
+                    options.primary_host,
+                    ladder.data_dir.display()
+                )));
+            }
+            Box::pin(ladder.rewind(history, fenced, epoch, source_epoch, &what, progress)).await
         }
     }
 }
@@ -558,11 +733,15 @@ impl Ladder<'_> {
         &self.data_dir
     }
 
-    /// Steps 2-5 for an installed physical standby of `history`.
+    /// Steps 2-5 for an installed physical standby of `history` — or (spec
+    /// R3a, `rewind`) a former primary's directory its rewind already
+    /// converted into one: its cursor names no position, so the primary is
+    /// never asked for a tail, and the route is reported as the rewind.
     async fn physical(
         &self,
         history: Uuid,
-        progress: &mut dyn FnMut(&str),
+        rewind: Option<RewindRecord>,
+        progress: &mut (dyn FnMut(&str) + Send),
     ) -> Result<PrimaryRecoverReport, RecoverError> {
         let path = self.data_dir.clone();
         let config = self.options.config.clone();
@@ -612,7 +791,9 @@ impl Ladder<'_> {
                 )));
             }
         };
-        self.epoch.store(store_epoch, Ordering::Release);
+        // Never lowered: a rewind adopted the primary's (higher) epoch
+        // before its converted store's was read (spec R3a).
+        self.epoch.fetch_max(store_epoch, Ordering::AcqRel);
         let record_writer = Arc::clone(&writer);
         let record = run_blocking(move || record_writer.record().map_err(|error| error.to_string())).await;
         if self.options.full {
@@ -643,6 +824,18 @@ impl Ladder<'_> {
                     format_count(record.to)
                 ));
                 Some(record)
+            }
+            // Spec R3a: a rewind's cursor is at an unknown position (the
+            // conversion's write carries the record too; this is the store
+            // whose record a new cut's write replaced and lost): never a
+            // tail, every leaf decided against the primary's.
+            Ok(None) if rewind.is_some() => {
+                progress(&format!(
+                    "recover: {} is a former primary under a rewind: its cursor names no position of the primary, so \
+                     every leaf is decided against the primary's",
+                    self.data_dir().display()
+                ));
+                None
             }
             Ok(None) if !writer.accounted() => {
                 // No record, yet the store's sequence is not the cursor's:
@@ -696,9 +889,23 @@ impl Ladder<'_> {
                 None
             }
         };
-        match self.fast_forward(writer, history, from, record, progress).await? {
-            Routed::Done(report) => {
-                self.promotion_note(store_epoch, from, progress).await;
+        let route = if rewind.is_some() {
+            RecoverRoute::Rewind
+        } else {
+            RecoverRoute::FastForward
+        };
+        match self
+            .fast_forward(writer, history, from, record, route, progress)
+            .await?
+        {
+            Routed::Done(mut report) => {
+                match rewind {
+                    Some(rewound) => {
+                        self.rewind_note(&rewound, progress).await;
+                        report.rewind = Some(rewound);
+                    }
+                    None => self.promotion_note(store_epoch, from, progress).await,
+                }
                 Ok(report)
             }
             Routed::FullCopy(reason) => {
@@ -726,7 +933,7 @@ impl Ladder<'_> {
     /// the old primary was fenced first; when it was not (`promote
     /// --force`), rows it committed after the promotion point are not in the
     /// new primary and are gone from this standby too.
-    async fn promotion_note(&self, epoch_before: u64, from: u64, progress: &mut dyn FnMut(&str)) {
+    async fn promotion_note(&self, epoch_before: u64, from: u64, progress: &mut (dyn FnMut(&str) + Send)) {
         let path = self.data_dir.clone();
         let Ok(Some(record)) = run_blocking(move || read_directory_epoch(&path).map_err(|e| e.to_string())).await
         else {
@@ -776,7 +983,466 @@ impl Ladder<'_> {
             leaves_deleted_only: tally.leaves_deleted_only,
             duration: self.started.elapsed(),
             replaced,
+            adopted: None,
+            rewind: None,
         }
+    }
+
+    /// Spec R3a: after a rewind, say what it did to what the former primary
+    /// held — known from the primary's `repl:epoch` (now this node's): when
+    /// that primary fenced it first, everything it committed through its
+    /// final sequence is in the primary; when it did not (`promote --force`,
+    /// `--no-fence`, `pg_promote` past an unreachable primary), its writes
+    /// after the promotion point were replaced.
+    async fn rewind_note(&self, rewound: &RewindRecord, progress: &mut (dyn FnMut(&str) + Send)) {
+        let path = self.data_dir.clone();
+        let record = run_blocking(move || read_directory_epoch(&path).map_err(|e| e.to_string()))
+            .await
+            .ok()
+            .flatten();
+        let epoch = record.as_ref().map_or(rewound.to_epoch, |record| record.epoch);
+        let fence = match &rewound.fence {
+            Some(fence) => format!(
+                "it was fenced by epoch {} at its sequence {}",
+                fence.fenced_by_epoch, fence.final_sequence
+            ),
+            None => "it was NOT fenced".to_string(),
+        };
+        progress(&match record.and_then(|record| record.old_primary_final_sequence) {
+            Some(final_sequence) => format!(
+                "recover: rewound the former primary (epoch {} → {epoch}; {fence}; it was at its own sequence {}): \
+                     the primary was promoted after fencing it at its sequence {final_sequence}, so nothing it \
+                     committed is lost — it is all in the primary",
+                rewound.from_epoch,
+                format_count(rewound.primary_sequence)
+            ),
+            None => format!(
+                "recover: WARNING: rewound the former primary (epoch {} → {epoch}; {fence}; it was at its own \
+                     sequence {}): the primary was promoted WITHOUT fencing it, so the writes it committed after the \
+                     promotion point are not in the primary, and the rewind replaced them here",
+                rewound.from_epoch,
+                format_count(rewound.primary_sequence)
+            ),
+        });
+    }
+
+    /// Where this node's physical source checkpointed its exports — its
+    /// `[replication.physical] export_dir`, else `<D>.physical-export` (the
+    /// default a primary uses).
+    fn export_dir(&self) -> Result<PathBuf, RecoverError> {
+        match &self.options.config.replication.physical.export_dir {
+            Some(dir) => Ok(dir.clone()),
+            None => sibling(self.data_dir(), "physical-export"),
+        }
+    }
+
+    /// Spec R3a (Sprinter 1c8963417a35): rewind the STOPPED former primary's
+    /// directory in place into a standby of the primary at `source_epoch`
+    /// (module documentation). `what` names the directory for the messages.
+    ///
+    /// 1. The directory's census: what the conversion removes, what it keeps,
+    ///    the fence record to keep a copy of; anything it cannot account for
+    ///    (a foreign file, a hard link from outside its own exports) falls
+    ///    through to the full copy, nothing changed.
+    /// 2. The store opened exclusively as it is (damaged: the full copy).
+    /// 3. The fast-forward session at an unknown position (`after = 0`), the
+    ///    primary's plan, and the digest pass over the UNCONVERTED store: a
+    ///    divergence above `--full-copy-threshold` falls through to the full
+    ///    copy with nothing changed.
+    /// 4. The conversion: the node-local family's one write
+    ///    ([`RewindWriter::convert`]), the store closed, the primary-only
+    ///    files removed, the interim marker written; the stage reopened by
+    ///    the fast-forward's writer.
+    /// 5. The differing leaves applied and the stage re-cut, as for a
+    ///    standby ([`Self::fast_forward`]'s second half).
+    async fn rewind(
+        &self,
+        history: Uuid,
+        fenced: bool,
+        dir_epoch: u64,
+        source_epoch: u64,
+        what: &str,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<PrimaryRecoverReport, RecoverError> {
+        progress(&format!(
+            "recover: {what}, at epoch {dir_epoch}; the primary at {} is at epoch {source_epoch}: it is REWOUND in \
+             place into a standby of that primary — only what differs is shipped",
+            self.options.primary_host
+        ));
+        if !fenced {
+            progress(&format!(
+                "recover: WARNING: {} was not fenced: any writes it committed after the promotion point are not in \
+                 the primary and are replaced by the rewind (copy the directory away first if they matter; --full \
+                 --replace rebuilds it by a full copy and keeps the old directory instead)",
+                self.data_dir().display()
+            ));
+        }
+        // 1. The census.
+        let census = {
+            let (dir, exports) = (self.data_dir.clone(), self.export_dir()?);
+            run_blocking(move || rewind_census(&dir, &exports)).await
+        };
+        let census = match census {
+            Ok(census) => census,
+            Err(reason) => {
+                return self
+                    .full_copy(
+                        CopyInto::Beside,
+                        0,
+                        Some(format!(
+                            "{} cannot be rewound in place: {reason}",
+                            self.data_dir().display()
+                        )),
+                        progress,
+                    )
+                    .await
+            }
+        };
+        if !census.kept.is_empty() {
+            progress(&format!(
+                "recover: kept beside the store, untouched and never counted by the stage: {}",
+                census.kept.join(", ")
+            ));
+        }
+        // 2. The store, as it is.
+        let opened = {
+            let (dir, config) = (self.data_dir.clone(), self.options.config.clone());
+            run_blocking(move || {
+                let writer = RewindWriter::open(&dir, &config, history).map_err(|error| error.to_string())?;
+                let state = writer.state().map_err(|error| error.to_string())?;
+                Ok((writer, state))
+            })
+            .await
+        };
+        let writer = match opened {
+            Ok((writer, RewindStoreState::Rewinding(_))) => {
+                // Converted already (a caller that classified it as a
+                // primary's): finished as an interrupted rewind.
+                let _ = tokio::task::spawn_blocking(move || writer.close()).await;
+                return Box::pin(self.continue_rewind(history, progress)).await;
+            }
+            Ok((writer, _)) => Arc::new(writer),
+            Err(reason) => {
+                return self
+                    .full_copy(
+                        CopyInto::Beside,
+                        0,
+                        Some(format!(
+                            "the store of {} cannot be opened for a rewind ({reason})",
+                            self.data_dir().display()
+                        )),
+                        progress,
+                    )
+                    .await
+            }
+        };
+        // `internal-tests` builds only: a rewind made to stop with its store
+        // opened and nothing converted (the switchover's "rewind changed
+        // nothing: reopen fenced" test).
+        #[cfg(feature = "internal-tests")]
+        if std::env::var(FAIL_REWIND_ENV).is_ok_and(|at| at.trim() == "before-convert") {
+            release_rewind(writer).await;
+            return Err(refused(format!(
+                "internal-tests: the rewind was made to stop before its conversion ({FAIL_REWIND_ENV}=before-convert)"
+            )));
+        }
+        let primary_sequence = writer.latest_sequence();
+        // 3. At the primary's epoch (verified higher than the store's): a
+        // `Hello` at a LOWER epoch than a source's is refused, and one at a
+        // HIGHER epoch fences it — never sent.
+        self.adopt_epoch(source_epoch);
+        match self
+            .rewind_steps(writer, history, dir_epoch, primary_sequence, census, progress)
+            .await?
+        {
+            RewindSteps::Applied {
+                writer,
+                snapshot_id,
+                cut,
+                tally,
+                record,
+            } => {
+                let mut report = self
+                    .finish_fast_forward(
+                        writer,
+                        history,
+                        0,
+                        snapshot_id,
+                        cut,
+                        tally,
+                        RecoverRoute::Rewind,
+                        progress,
+                    )
+                    .await?;
+                self.rewind_note(&record, progress).await;
+                report.rewind = Some(record);
+                Ok(report)
+            }
+            RewindSteps::FullCopy(reason) => {
+                self.full_copy(
+                    CopyInto::Beside,
+                    0,
+                    Some(format!(
+                        "{reason} (nothing of {} was changed: it is still the primary's directory)",
+                        self.data_dir().display()
+                    )),
+                    progress,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Steps 3-5 of [`Self::rewind`] on the opened store, which this owns:
+    /// released on every outcome short of the conversion, which consumes it.
+    async fn rewind_steps(
+        &self,
+        writer: Arc<RewindWriter>,
+        history: Uuid,
+        dir_epoch: u64,
+        primary_sequence: u64,
+        census: RewindCensus,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<RewindSteps, RecoverError> {
+        let leaf_bytes = self.options.leaf_bytes;
+        let (mut client, snapshot_id, cut, planned) = match self.rewind_plan(&writer, history, progress).await {
+            Ok(RewindPlan::Go {
+                client,
+                snapshot_id,
+                cut,
+                planned,
+            }) => (client, snapshot_id, cut, planned),
+            Ok(RewindPlan::FullCopy(reason)) => {
+                release_rewind(writer).await;
+                return Ok(RewindSteps::FullCopy(reason));
+            }
+            Err(error) => {
+                release_rewind(writer).await;
+                return Err(error);
+            }
+        };
+        // The stage's limits, as its re-cut will count it: without what the
+        // conversion removes. Refused here, before anything changed.
+        let limits_path = self.data_dir.clone();
+        let limits = self.options.wire.transfer;
+        let excluded = census.excluded.clone();
+        let fits = self
+            .keep_alive(&mut client, 0, move || {
+                check_stage_limits_excluding(&limits_path, &limits, &excluded).map_err(|error| error.to_string())
+            })
+            .await
+            .and_then(|fits| fits.map_err(RecoverError::Refused));
+        if let Err(error) = fits {
+            let _ = client.close().await;
+            release_rewind(writer).await;
+            return Err(error);
+        }
+        // 4. The conversion: from its first write on, the directory is no
+        // primary's (the engine refuses a store holding the node-local
+        // family in every mode but the standby's) and only this command
+        // finishes it.
+        let record = RewindRecord {
+            format: 1,
+            history,
+            from_epoch: dir_epoch,
+            to_epoch: self.epoch.load(Ordering::Acquire),
+            started_at: unix_secs(),
+            primary_sequence,
+            snapshot_id,
+            primary: self.options.primary_host.clone(),
+            fence: census.fence.clone(),
+        };
+        let fast_forward = FastForwardRecord::new(history, snapshot_id, 0, cut, leaf_bytes);
+        let job = {
+            let (dir, config) = (self.data_dir.clone(), self.options.config.clone());
+            let record = record.clone();
+            move || convert_in_place(writer, &dir, &config, history, &fast_forward, &record, &census, limits)
+        };
+        let converted = self.keep_alive(&mut client, 0, job).await?.map_err(|reason| {
+            failed(
+                0,
+                format!(
+                    "the rewind's conversion of {} stopped ({reason}); re-run the command to finish it (every start \
+                     refuses the directory meanwhile)",
+                    self.data_dir().display()
+                ),
+            )
+        })?;
+        let writer = Arc::new(converted);
+        progress(&format!(
+            "recover: converted {} in place into a physical stage of history {history} (from epoch {dir_epoch}, at \
+             its own sequence {}): the primary-only files are removed{}",
+            self.data_dir().display(),
+            format_count(primary_sequence),
+            if record.fence.is_some() {
+                "; the fence record is kept in the rewind's record"
+            } else {
+                ""
+            }
+        ));
+        // 5. The leaves.
+        if let Err(error) = self
+            .apply_leaves(&mut client, &writer, &planned, cut, 0, progress)
+            .await
+        {
+            release(writer).await;
+            return Err(error);
+        }
+        let _ = client.close().await;
+        Ok(RewindSteps::Applied {
+            writer,
+            snapshot_id,
+            cut,
+            tally: planned.tally,
+            record,
+        })
+    }
+
+    /// Step 3 of [`Self::rewind`]: the fast-forward session at an unknown
+    /// position (`after = 0`), the primary's plan and the digest pass over
+    /// the store AS IT IS — the full copy's reason when the primary cannot
+    /// serve the fast-forward or the divergence is above the threshold.
+    async fn rewind_plan(
+        &self,
+        writer: &Arc<RewindWriter>,
+        history: Uuid,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<RewindPlan, RecoverError> {
+        let (mut client, snapshot_id, cut) = match self.open_fast_forward(history, 0, None).await? {
+            Opened::Session {
+                client,
+                snapshot_id,
+                cut,
+            } => (client, snapshot_id, cut),
+            Opened::Mismatch(reason) => return Ok(RewindPlan::FullCopy(reason)),
+        };
+        progress(&format!(
+            "recover: fast-forward from the primary at {} (cut {}, {} leaves)",
+            self.options.primary_host,
+            format_count(cut),
+            format_bytes(u64::from(self.options.leaf_bytes))
+        ));
+        let scan = Arc::clone(writer);
+        let planned = self
+            .plan_leaves(
+                &mut client,
+                snapshot_id,
+                0,
+                &BTreeSet::new(),
+                move |starts| local_leaf_digests(scan.db(), &starts).map_err(|error| error.to_string()),
+                progress,
+            )
+            .await;
+        let planned = match planned {
+            Ok(planned) => planned,
+            Err(error) => {
+                let _ = client.close().await;
+                return Err(error);
+            }
+        };
+        if let Some(estimate) = self.over_threshold(&planned.tally) {
+            let _ = client.close().await;
+            return self.above_threshold(estimate).map(RewindPlan::FullCopy);
+        }
+        Ok(RewindPlan::Go {
+            client,
+            snapshot_id,
+            cut,
+            planned,
+        })
+    }
+
+    /// Spec R3a: finish an interrupted rewind — the conversion's file steps
+    /// the directory still lacks (the store's write is in: that is what the
+    /// directory was classified by), then the fast-forward, as for a standby
+    /// whose cursor names no position.
+    async fn continue_rewind(
+        &self,
+        history: Uuid,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<PrimaryRecoverReport, RecoverError> {
+        let read = {
+            let dir = self.data_dir.clone();
+            run_blocking(move || directory_rewind_record(&dir).map_err(|error| error.to_string())).await
+        };
+        let record = match read {
+            Ok(Some(record)) if record.history == history => record,
+            Ok(Some(record)) => {
+                return Err(refused(format!(
+                    "{}'s rewind record follows the history {}, not {history}",
+                    self.data_dir().display(),
+                    record.history
+                )))
+            }
+            Ok(None) => {
+                return Err(refused(format!(
+                    "{} carries no rewind record any more: classify it again (re-run the command)",
+                    self.data_dir().display()
+                )))
+            }
+            Err(reason) => {
+                return Err(refused(format!(
+                    "the rewind record of {} cannot be read ({reason}): it is not finished in place; re-run with \
+                     --full --replace to rebuild it by a full copy beside it",
+                    self.data_dir().display()
+                )))
+            }
+        };
+        progress(&format!(
+            "recover: {} carries an interrupted rewind of a former primary (history {history}, epoch {} → {}, started \
+             at unix {}, at its own sequence {}): finishing it",
+            self.data_dir().display(),
+            record.from_epoch,
+            record.to_epoch,
+            record.started_at,
+            format_count(record.primary_sequence)
+        ));
+        // The rewind goes on toward the primary it was started toward, or one
+        // promoted after it — never one at a lower epoch (the store's
+        // `repl:epoch` may still be the former primary's own, which such a
+        // source would accept).
+        let (primary, source_epoch) = self.identify_source().await?;
+        if primary != history {
+            return Err(refused(format!(
+                "{} is under a rewind into a standby of history {history}; the primary at {} serves {primary}",
+                self.data_dir().display(),
+                self.options.primary_host
+            )));
+        }
+        if source_epoch < record.to_epoch {
+            return Err(refused(format!(
+                "{} is under a rewind toward a primary at epoch {}; the primary at {} is at epoch {source_epoch}: \
+                 point --primary-host at the current primary (the one {} named, or one promoted after it)",
+                self.data_dir().display(),
+                record.to_epoch,
+                self.options.primary_host,
+                record.primary
+            )));
+        }
+        let finished = {
+            let (dir, exports, limits) = (self.data_dir.clone(), self.export_dir()?, self.options.wire.transfer);
+            let snapshot_id = record.snapshot_id;
+            run_blocking(move || {
+                let census = rewind_census(&dir, &exports)?;
+                convert_files(&dir, history, snapshot_id, &census, &limits)
+            })
+            .await
+        };
+        if let Err(reason) = finished {
+            return self
+                .full_copy(
+                    CopyInto::Beside,
+                    0,
+                    Some(format!(
+                        "the interrupted rewind of {} cannot be finished in place: {reason}",
+                        self.data_dir().display()
+                    )),
+                    progress,
+                )
+                .await;
+        }
+        self.adopt_epoch(source_epoch);
+        Box::pin(self.physical(history, Some(record), progress)).await
     }
 
     /// Why the primary could not be used, naming it.
@@ -801,9 +1467,21 @@ impl Ladder<'_> {
         history: Option<Uuid>,
         cursor: Option<u64>,
     ) -> Result<PhysicalClient<ReplicationStream>, WireError> {
+        self.connect_as(self.epoch.load(Ordering::Acquire), history, cursor)
+            .await
+    }
+
+    /// [`Self::connect`], announcing `epoch` (a completed copy's own, which
+    /// may be another than the standby's).
+    async fn connect_as(
+        &self,
+        epoch: u64,
+        history: Option<Uuid>,
+        cursor: Option<u64>,
+    ) -> Result<PhysicalClient<ReplicationStream>, WireError> {
         let mut last = None;
         let identity = ReceiverIdentity {
-            epoch: self.epoch.load(Ordering::Acquire),
+            epoch,
             ..self.identity.clone()
         };
         for source in &self.options.sources {
@@ -952,11 +1630,25 @@ impl Ladder<'_> {
                         snapshot_id, sequence, ..
                     },
                 )) => {
+                    // Spec R1 §1: a source serves a fast-forward session to a
+                    // receiver AT its cut too (`standby verify` compares a
+                    // caught-up standby there). The ladder fast-forwards only
+                    // a receiver BEHIND the cut — its record spans `from <
+                    // to` — and keeps the answer it had before for one at it
+                    // (a diverged or unaccounted store whose cursor is the
+                    // primary's sequence): a full copy.
+                    if sequence <= after {
+                        let _ = client.close().await;
+                        return Ok(Opened::Mismatch(format!(
+                            "history mismatch: the receiver at {after} is not behind the primary's cut {sequence}, \
+                             so it cannot be fast-forwarded; only a full copy rebuilds it"
+                        )));
+                    }
                     return Ok(Opened::Session {
                         client,
                         snapshot_id,
                         cut: sequence,
-                    })
+                    });
                 }
                 Ok(_) => {
                     return Err(refused(
@@ -1058,7 +1750,8 @@ impl Ladder<'_> {
         history: Uuid,
         from: u64,
         record: Option<FastForwardRecord>,
-        progress: &mut dyn FnMut(&str),
+        route: RecoverRoute,
+        progress: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Routed, RecoverError> {
         let outcome = self.fast_forward_steps(&writer, history, from, record, progress).await;
         match outcome {
@@ -1066,41 +1759,10 @@ impl Ladder<'_> {
                 snapshot_id,
                 cut,
                 tally,
-            }) => {
-                let closed = match self.recut(writer, history, snapshot_id, cut).await {
-                    Ok(closed) => closed,
-                    Err(reason) => {
-                        return Err(failed(
-                            from,
-                            format!("re-cutting the stage at {cut} failed ({reason}); re-run the command to finish"),
-                        ))
-                    }
-                };
-                if closed.source_sequence() != cut {
-                    return Err(failed(
-                        from,
-                        format!(
-                            "the re-cut cursor is at {}, not the cut {cut}",
-                            closed.source_sequence()
-                        ),
-                    ));
-                }
-                let stage = self.stage_dir.clone();
-                let _ = run_blocking(move || {
-                    finish_stage_dir(&stage);
-                    Ok(())
-                })
-                .await;
-                self.archive_gap_note(from, cut, progress);
-                Ok(Routed::Done(self.report(
-                    RecoverRoute::FastForward,
-                    history,
-                    from,
-                    cut,
-                    tally,
-                    None,
-                )))
-            }
+            }) => Ok(Routed::Done(
+                self.finish_fast_forward(writer, history, from, snapshot_id, cut, tally, route, progress)
+                    .await?,
+            )),
             Ok(Steps::FullCopy(reason)) => {
                 release(writer).await;
                 Ok(Routed::FullCopy(reason))
@@ -1110,6 +1772,48 @@ impl Ladder<'_> {
                 Err(error)
             }
         }
+    }
+
+    /// Every differing leaf applied and the session closed: re-cut the stage
+    /// at `cut` ([`Self::recut`]), remove the stage directory, and report.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_fast_forward(
+        &self,
+        writer: Arc<FastForwardWriter>,
+        history: Uuid,
+        from: u64,
+        snapshot_id: Uuid,
+        cut: u64,
+        tally: Tally,
+        route: RecoverRoute,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<PrimaryRecoverReport, RecoverError> {
+        let closed = match self.recut(writer, history, snapshot_id, cut).await {
+            Ok(closed) => closed,
+            Err(reason) => {
+                return Err(failed(
+                    from,
+                    format!("re-cutting the stage at {cut} failed ({reason}); re-run the command to finish"),
+                ))
+            }
+        };
+        if closed.source_sequence() != cut {
+            return Err(failed(
+                from,
+                format!(
+                    "the re-cut cursor is at {}, not the cut {cut}",
+                    closed.source_sequence()
+                ),
+            ));
+        }
+        let stage = self.stage_dir.clone();
+        let _ = run_blocking(move || {
+            finish_stage_dir(&stage);
+            Ok(())
+        })
+        .await;
+        self.archive_gap_note(from, cut, progress);
+        Ok(self.report(route, history, from, cut, tally, None))
     }
 
     /// The fast-forward's last step (spec P4.1 §3.3.5), once its session is
@@ -1165,7 +1869,7 @@ impl Ladder<'_> {
         history: Uuid,
         from: u64,
         record: Option<FastForwardRecord>,
-        progress: &mut dyn FnMut(&str),
+        progress: &mut (dyn FnMut(&str) + Send),
     ) -> Result<Steps, RecoverError> {
         let leaf_bytes = self.options.leaf_bytes;
         let prefer = record.as_ref().map(|record| record.snapshot_id);
@@ -1222,9 +1926,68 @@ impl Ladder<'_> {
             ),
         };
 
-        // 2. The primary's leaves, and room for one batch of them. This run
-        // applied nothing yet: a primary that cannot send its plan (one still
-        // planning past the client's wait included) is retried later.
+        // 2-3. The primary's leaves, and the standby's digests against them.
+        let scan_writer = Arc::clone(writer);
+        let planned = self
+            .plan_leaves(
+                &mut client,
+                snapshot_id,
+                from,
+                &done,
+                move |starts| local_leaf_digests(scan_writer.db(), &starts).map_err(|error| error.to_string()),
+                progress,
+            )
+            .await?;
+        if let Some(estimate) = self.over_threshold(&planned.tally) {
+            let _ = client.close().await;
+            return self.above_threshold(estimate).map(Steps::FullCopy);
+        }
+
+        // 4. The stage must fit the limits its re-cut manifest is checked
+        // against: refused here, before anything is applied, rather than at
+        // the census after. Then the record of a new cut before any
+        // default-family write, then the batches.
+        let limits_path = self.data_dir.clone();
+        let limits = self.options.wire.transfer;
+        self.keep_alive(&mut client, from, move || {
+            check_stage_limits(&limits_path, &limits).map_err(|error| error.to_string())
+        })
+        .await?
+        .map_err(RecoverError::Refused)?;
+        if let Some(record) = fresh {
+            self.start_record(&mut client, writer, record, from).await?;
+        }
+        self.apply_leaves(&mut client, writer, &planned, cut, from, progress)
+            .await?;
+        // 5. The re-cut follows once the session is closed ([`Self::recut`]).
+        let _ = client.close().await;
+        Ok(Steps::Applied {
+            snapshot_id,
+            cut,
+            tally: planned.tally,
+        })
+    }
+
+    /// Steps 2-3 of spec P4.1 §3.3 on an open fast-forward session: the
+    /// primary's leaf plan, room for one batch of leaves in the stage
+    /// directory, and ONE ordered scan of the local store (`scan`, given the
+    /// plan's leaf starts, on a blocking thread while the session is kept
+    /// alive) against the primary's boundaries. Leaves in `done` (replaced by
+    /// an interrupted run of this cut) are not counted. This run applied
+    /// nothing yet: a primary that cannot send its plan (one still planning
+    /// past the client's wait included) is retried later.
+    async fn plan_leaves<F>(
+        &self,
+        client: &mut PhysicalClient<ReplicationStream>,
+        snapshot_id: Uuid,
+        from: u64,
+        done: &BTreeSet<u32>,
+        scan: F,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<Planned, RecoverError>
+    where
+        F: FnOnce(Vec<Vec<u8>>) -> Result<Vec<[u8; 32]>, String> + Send + 'static,
+    {
         let plan = client.fetch_leaf_digests().await.map_err(|error| {
             failed(
                 from,
@@ -1240,15 +2003,10 @@ impl Ladder<'_> {
                 "the primary's leaf plan names another snapshot than its session",
             ));
         }
-        self.prepare_stage_dir(leaf_bytes).await?;
-
-        // 3. One ordered scan of the standby against the primary's boundaries.
+        self.prepare_stage_dir(self.options.leaf_bytes).await?;
         let starts: Vec<Vec<u8>> = plan.leaves.iter().map(|leaf| leaf.start.clone()).collect();
-        let scan_writer = Arc::clone(writer);
         let local = self
-            .keep_alive(&mut client, from, move || {
-                local_leaf_digests(scan_writer.db(), &starts).map_err(|error| error.to_string())
-            })
+            .keep_alive(client, from, move || scan(starts))
             .await?
             .map_err(|reason| refused(format!("the standby's digest pass failed: {reason}")))?;
         if local.len() != plan.leaves.len() {
@@ -1301,59 +2059,71 @@ impl Ladder<'_> {
             format_percent(tally.bytes_shipped, tally.bytes_total),
             format_bytes(tally.bytes_shipped)
         ));
+        Ok(Planned { plan, differing, tally })
+    }
+
+    /// The estimate of a divergence above `--full-copy-threshold`, `None`
+    /// when a fast-forward is cheaper.
+    fn over_threshold(&self, tally: &Tally) -> Option<String> {
         let threshold = self.options.full_copy_threshold;
-        if u128::from(tally.bytes_shipped) * 100 > u128::from(threshold) * u128::from(tally.bytes_total) {
-            let estimate = format!(
+        (u128::from(tally.bytes_shipped) * 100 > u128::from(threshold) * u128::from(tally.bytes_total)).then(|| {
+            format!(
                 "{} of the primary's {} differ ({})",
                 format_bytes(tally.bytes_shipped),
                 format_bytes(tally.bytes_total),
                 format_percent(tally.bytes_shipped, tally.bytes_total)
-            );
-            let _ = client.close().await;
-            if self.options.no_full_copy {
-                return Err(RecoverError::FullCopyPending(format!(
-                    "a full copy is required: {estimate}, above --full-copy-threshold {threshold}%, and \
-                     --no-full-copy refuses it; re-run without --no-full-copy (or with a higher \
-                     --full-copy-threshold) to recover"
-                )));
-            }
-            return Ok(Steps::FullCopy(format!(
-                "{estimate}, above --full-copy-threshold {threshold}%: a full copy is cheaper"
+            )
+        })
+    }
+
+    /// What a divergence above the threshold leads to: the full copy's
+    /// reason, or (`--no-full-copy`) the refusal that exits 3.
+    fn above_threshold(&self, estimate: String) -> Result<String, RecoverError> {
+        let threshold = self.options.full_copy_threshold;
+        if self.options.no_full_copy {
+            return Err(RecoverError::FullCopyPending(format!(
+                "a full copy is required: {estimate}, above --full-copy-threshold {threshold}%, and \
+                 --no-full-copy refuses it; re-run without --no-full-copy (or with a higher \
+                 --full-copy-threshold) to recover"
             )));
         }
+        Ok(format!(
+            "{estimate}, above --full-copy-threshold {threshold}%: a full copy is cheaper"
+        ))
+    }
 
-        // 4. The stage must fit the limits its re-cut manifest is checked
-        // against: refused here, before anything is applied, rather than at
-        // the census after. Then the record of a new cut before any
-        // default-family write, then the batches.
-        let limits_path = self.data_dir.clone();
-        let limits = self.options.wire.transfer;
-        self.keep_alive(&mut client, from, move || {
-            check_stage_limits(&limits_path, &limits).map_err(|error| error.to_string())
-        })
-        .await?
-        .map_err(RecoverError::Refused)?;
-        if let Some(record) = fresh {
-            self.start_record(&mut client, writer, record, from).await?;
-        }
-        let differing_total = differing.len() as u64;
+    /// Step 4 of spec P4.1 §3.3: the differing leaves, in batches of
+    /// [`BATCH_LEAVES`] — downloaded into the stage directory, their ranges
+    /// emptied in one synced write, the files ingested, the leaves marked —
+    /// on the fast-forward's writer.
+    async fn apply_leaves(
+        &self,
+        client: &mut PhysicalClient<ReplicationStream>,
+        writer: &Arc<FastForwardWriter>,
+        planned: &Planned,
+        cut: u64,
+        from: u64,
+        progress: &mut (dyn FnMut(&str) + Send),
+    ) -> Result<(), RecoverError> {
+        let plan = &planned.plan;
+        let differing_total = planned.differing.len() as u64;
         let mut applied = 0_u64;
         let mut shipped = 0_u64;
-        for (ordinal, batch) in differing.chunks(BATCH_LEAVES).enumerate() {
+        for (ordinal, batch) in planned.differing.chunks(BATCH_LEAVES).enumerate() {
             let mut files = Vec::new();
             let mut ranges = Vec::with_capacity(batch.len());
             for &index in batch {
-                let leaf = leaf_at(&plan, index)?;
-                if let Some(file) = self.download_leaf(&mut client, index, from).await? {
+                let leaf = leaf_at(plan, index)?;
+                if let Some(file) = self.download_leaf(client, index, from).await? {
                     files.push(file);
                 }
-                ranges.push((leaf.start.clone(), leaf_end(&plan, index)));
+                ranges.push((leaf.start.clone(), leaf_end(plan, index)));
                 shipped += leaf.bytes;
             }
             let job_writer = Arc::clone(writer);
             let job_files = files.clone();
             let ordinal = ordinal as u64;
-            self.keep_alive(&mut client, from, move || -> Result<(), String> {
+            self.keep_alive(client, from, move || -> Result<(), String> {
                 job_writer.delete_ranges(&ranges).map_err(|error| error.to_string())?;
                 kill_hook("after-delete", ordinal);
                 job_writer.ingest(&job_files).map_err(|error| error.to_string())?;
@@ -1375,7 +2145,7 @@ impl Ladder<'_> {
             // Each leaf's own mark: the record itself is never rewritten.
             let marks_writer = Arc::clone(writer);
             let marked = batch.to_vec();
-            self.keep_alive(&mut client, from, move || {
+            self.keep_alive(client, from, move || {
                 marks_writer.mark_done(&marked, cut).map_err(|error| error.to_string())
             })
             .await?
@@ -1399,16 +2169,10 @@ impl Ladder<'_> {
                 format_count(applied),
                 format_count(differing_total),
                 format_bytes(shipped),
-                format_bytes(tally.bytes_shipped)
+                format_bytes(planned.tally.bytes_shipped)
             ));
         }
-        // 5. The re-cut follows once the session is closed ([`Self::recut`]).
-        let _ = client.close().await;
-        Ok(Steps::Applied {
-            snapshot_id,
-            cut,
-            tally,
-        })
+        Ok(())
     }
 
     /// Write the record of a new cut (synced, its leaf marks of an earlier
@@ -1463,7 +2227,7 @@ impl Ladder<'_> {
     }
 
     /// Step 6: the standby's own archive now lacks what was skipped.
-    fn archive_gap_note(&self, from: u64, to: u64, progress: &mut dyn FnMut(&str)) {
+    fn archive_gap_note(&self, from: u64, to: u64, progress: &mut (dyn FnMut(&str) + Send)) {
         let archive = match &self.options.config.replication.archive.dir {
             Some(dir) => Ok(dir.clone()),
             None => sibling(self.data_dir(), "archive"),
@@ -1561,7 +2325,7 @@ impl Ladder<'_> {
         into: CopyInto,
         from: u64,
         reason: Option<String>,
-        progress: &mut dyn FnMut(&str),
+        progress: &mut (dyn FnMut(&str) + Send),
     ) -> Result<PrimaryRecoverReport, RecoverError> {
         if let Some(reason) = &reason {
             progress(&format!("recover: a full copy of the primary is needed: {reason}"));
@@ -1579,20 +2343,60 @@ impl Ladder<'_> {
             CopyInto::Fresh { .. } => data_dir.clone(),
             CopyInto::Beside => recover_full_path(&data_dir)?,
         };
-        let adopted = match into {
+        let completed = match into {
             CopyInto::Fresh { .. } => None,
             CopyInto::Beside => self.completed_copy(&target, history).await?,
         };
+        // Sprinter 6146b39a5beb: a completed copy is adopted only while the
+        // primary still serves its next write group. One the primary's WAL
+        // and archive have moved past is a standby nothing can continue: it
+        // is removed and the copy is made again.
+        let adopted = match completed {
+            None => None,
+            Some(copy) => match self.copy_served(history, &copy, &target).await? {
+                CopyServed::Served => {
+                    progress(&if self.options.full {
+                        format!(
+                            "recover: --full: {} already holds a completed copy of the primary (history {history}, \
+                             sequence {}), which the primary still serves now (nothing pins it): it is adopted instead \
+                             of copying again",
+                            target.display(),
+                            format_count(copy.sequence)
+                        )
+                    } else {
+                        format!(
+                            "recover: {} already holds a completed copy of the primary (history {history}, sequence \
+                             {}), which the primary still serves now (nothing pins it: a primary that prunes past it \
+                             before the standby starts sends the standby to recovery again): it is used as it is",
+                            target.display(),
+                            format_count(copy.sequence)
+                        )
+                    });
+                    Some(copy.sequence)
+                }
+                CopyServed::Stale(reason) => {
+                    progress(&format!(
+                        "recover: the completed copy at {} (sequence {}) is older than what the primary retains \
+                         ({reason}); copying again",
+                        target.display(),
+                        format_count(copy.sequence)
+                    ));
+                    let stale = target.clone();
+                    blocking(move || {
+                        fs::remove_dir_all(&stale).map_err(|error| {
+                            format!(
+                                "the stale completed copy {} cannot be removed ({error}); move it aside and re-run",
+                                stale.display()
+                            )
+                        })
+                    })
+                    .await?;
+                    None
+                }
+            },
+        };
         let (to, copied) = match adopted {
-            Some(to) => {
-                progress(&format!(
-                    "recover: {} already holds a completed copy of the primary (history {history}, sequence {}): it \
-                     is used as it is",
-                    target.display(),
-                    format_count(to)
-                ));
-                (to, 0)
-            }
+            Some(to) => (to, 0),
             None => {
                 if let CopyInto::Fresh { empty_existing: true } = into {
                     let empty = data_dir.clone();
@@ -1617,6 +2421,7 @@ impl Ladder<'_> {
             bytes_shipped: copied,
             ..Tally::default()
         };
+        let adopted_path = adopted.map(|_| target.clone());
         if let CopyInto::Fresh { .. } = into {
             return Ok(self.report(RecoverRoute::FullCopy, history, from, to, tally, None));
         }
@@ -1685,13 +2490,80 @@ impl Ladder<'_> {
             target.display(),
             data_dir.display()
         ));
-        Ok(self.report(RecoverRoute::FullCopy, history, from, to, tally, Some(replaced)))
+        let mut report = self.report(RecoverRoute::FullCopy, history, from, to, tally, Some(replaced));
+        report.adopted = adopted_path;
+        Ok(report)
     }
 
-    /// The source sequence of a completed copy of `history` at `target`
-    /// (a published physical stage a previous run left), `None` when there
-    /// is no copy there. Anything else at that path is refused, untouched.
-    async fn completed_copy(&self, target: &Path, history: Uuid) -> Result<Option<u64>, RecoverError> {
+    /// Sprinter 6146b39a5beb: whether the primary still serves `copy`'s next
+    /// write group — a resume after its cursor, announcing its own epoch and
+    /// last group, as the standby it becomes would at its first `start`.
+    /// Accepted: the copy can be adopted — as of now; nothing pins its tail.
+    /// Refused for a reason about the copy ([`copy_refusal_is_stale`]): it is
+    /// stale. Any other refusal or failure (after the usual retries) says
+    /// nothing about the copy: the recovery stops and the copy is kept.
+    async fn copy_served(
+        &self,
+        history: Uuid,
+        copy: &CompletedCopy,
+        target: &Path,
+    ) -> Result<CopyServed, RecoverError> {
+        let Some(epoch) = copy.epoch else {
+            return Err(refused(format!(
+                "the completed copy at {} has a replication epoch record that cannot be read: it is kept; move it \
+                 aside and re-run",
+                target.display()
+            )));
+        };
+        let mut attempt = 0;
+        loop {
+            let outcome = async {
+                #[cfg(all(feature = "internal-tests", unix))]
+                if let Some(code) = hooked_copy_probe_refusal() {
+                    return Err(WireError::Refused(super::physical_wire::Refusal::new(
+                        code,
+                        COPY_PROBE_REFUSE_ENV,
+                    )));
+                }
+                let mut client = self.connect_as(epoch, Some(history), Some(copy.sequence)).await?;
+                client.resume(history, copy.sequence, copy.last).await?;
+                Ok::<_, WireError>(client)
+            }
+            .await;
+            let error = match outcome {
+                Ok(client) => {
+                    let _ = client.close().await;
+                    return Ok(CopyServed::Served);
+                }
+                Err(error) => error,
+            };
+            if self.retry_later(&error, &mut attempt).await {
+                continue;
+            }
+            // Only a refusal that says the primary no longer holds what the
+            // copy needs makes it stale; anything else (a busy or shutting
+            // down primary, a token or version problem, a superseded
+            // primary, a transport error) says nothing about the copy, which
+            // may hold hours of transfer: it is kept, and the run stops.
+            return match error {
+                WireError::Refused(refusal) if copy_refusal_is_stale(&refusal.code) => {
+                    Ok(CopyServed::Stale(refusal.to_string()))
+                }
+                other => Err(refused(format!(
+                    "the primary at {} could not say whether it still serves the completed copy at {} ({other}); \
+                     the copy is kept: re-run the command when the primary answers",
+                    self.options.primary_host,
+                    target.display()
+                ))),
+            };
+        }
+    }
+
+    /// The completed copy of `history` at `target` (a published physical
+    /// stage a previous run left) — its cursor's source sequence and last
+    /// group, and its epoch — `None` when there is no copy there. Anything
+    /// else at that path is refused, untouched.
+    async fn completed_copy(&self, target: &Path, history: Uuid) -> Result<Option<CompletedCopy>, RecoverError> {
         let path = target.to_path_buf();
         let config = self.options.config.clone();
         let limits = self.options.wire.transfer;
@@ -1719,8 +2591,16 @@ impl Ladder<'_> {
             }
             let stage = ReopenedPhysicalStage::open(&path, history, limits, &config)
                 .map_err(|error| format!("{} cannot be opened: {error}; move it aside and re-run", path.display()))?;
+            let epoch = read_epoch(stage.writer().db()).ok();
             let closed = stage.close().map_err(|error| error.to_string())?;
-            Ok(Some(closed.cursor.source_sequence()))
+            Ok(Some(CompletedCopy {
+                sequence: closed.cursor.source_sequence(),
+                last: closed
+                    .cursor
+                    .last_group()
+                    .map(|(first_sequence, digest)| LastGroup { first_sequence, digest }),
+                epoch,
+            }))
         })
         .await
     }
@@ -1734,7 +2614,7 @@ impl Ladder<'_> {
         &self,
         target: &Path,
         history: Uuid,
-        progress: &mut dyn FnMut(&str),
+        progress: &mut (dyn FnMut(&str) + Send),
     ) -> Result<u64, RecoverError> {
         let inspected = target.to_path_buf();
         let prefer = blocking(move || Ok(partial_snapshot(&inspected))).await?;
@@ -1813,7 +2693,7 @@ impl Ladder<'_> {
         target: &Path,
         history: Uuid,
         total: u64,
-        progress: &mut dyn FnMut(&str),
+        progress: &mut (dyn FnMut(&str) + Send),
     ) -> Result<u64, RecoverError> {
         let options = ReceiverOptions {
             config: self.options.config.clone(),
@@ -1877,6 +2757,409 @@ impl Ladder<'_> {
         }
         Ok(closed.cursor.source_sequence())
     }
+}
+
+/// A completed full copy beside the data directory, as a previous run left
+/// it (sprinter 6146b39a5beb).
+struct CompletedCopy {
+    /// Its cursor's source sequence: where the standby it becomes resumes.
+    sequence: u64,
+    /// Its cursor's last applied group (`None` at its checkpoint cut).
+    last: Option<LastGroup>,
+    /// Its store's epoch; `None` when the record cannot be read.
+    epoch: Option<u64>,
+}
+
+/// Sprinter 6146b39a5beb: whether the primary's refusal of a completed
+/// copy's resume proves the copy stale — the primary no longer holds the
+/// copy's next write group (`WalPruned`, `Gap`, `GroupTooLarge`), the copy's
+/// last group is not the primary's (`Diverged`), the primary serves another
+/// dataset (`HistoryMismatch`), or it was promoted past the copy's epoch
+/// (`EpochStale` with a newer epoch). Nothing else does.
+fn copy_refusal_is_stale(code: &RefuseCode) -> bool {
+    match code {
+        RefuseCode::WalPruned { .. }
+        | RefuseCode::Gap { .. }
+        | RefuseCode::GroupTooLarge { .. }
+        | RefuseCode::Diverged { .. }
+        | RefuseCode::HistoryMismatch => true,
+        RefuseCode::EpochStale { have, want } => have > want,
+        RefuseCode::AuthFailed
+        | RefuseCode::TooManySessions
+        | RefuseCode::SourceNotServing
+        | RefuseCode::Version
+        | RefuseCode::SourceStale { .. } => false,
+    }
+}
+
+/// `internal-tests` builds only: `<RefuseCode name>` (`TooManySessions`,
+/// `SourceNotServing`, `AuthFailed`, `Version`, `WalPruned`) makes every
+/// probe of a completed copy refused with that code, without asking the
+/// primary — the transient refusal a copy must survive.
+#[cfg(all(feature = "internal-tests", unix))]
+pub const COPY_PROBE_REFUSE_ENV: &str = "HELIOSDB_NANO_TEST_COPY_PROBE_REFUSE";
+
+#[cfg(all(feature = "internal-tests", unix))]
+fn hooked_copy_probe_refusal() -> Option<RefuseCode> {
+    Some(match std::env::var(COPY_PROBE_REFUSE_ENV).ok()?.trim() {
+        "TooManySessions" => RefuseCode::TooManySessions,
+        "SourceNotServing" => RefuseCode::SourceNotServing,
+        "AuthFailed" => RefuseCode::AuthFailed,
+        "Version" => RefuseCode::Version,
+        "WalPruned" => RefuseCode::WalPruned { oldest: u64::MAX },
+        _ => return None,
+    })
+}
+
+/// Whether the primary still serves a completed copy's next write group.
+enum CopyServed {
+    Served,
+    /// It does not: the primary's refusal.
+    Stale(String),
+}
+
+/// Steps 2-3 of a fast-forward: the primary's plan and the leaves that
+/// differ from the local store, with their tallies.
+struct Planned {
+    plan: LeafPlan,
+    differing: Vec<u32>,
+    tally: Tally,
+}
+
+/// Spec R3a: what step 3 of a rewind came to.
+enum RewindPlan {
+    /// The session is open, the plan made, the divergence below the
+    /// threshold: the conversion may go ahead.
+    Go {
+        client: PhysicalClient<ReplicationStream>,
+        snapshot_id: Uuid,
+        cut: u64,
+        planned: Planned,
+    },
+    /// A full copy instead, for this reason (nothing was changed).
+    FullCopy(String),
+}
+
+/// Spec R3a: what the steps of a rewind came to.
+enum RewindSteps {
+    /// Converted, every differing leaf applied, the session closed; the
+    /// fast-forward's writer is still open, the stage not yet re-cut.
+    Applied {
+        writer: Arc<FastForwardWriter>,
+        snapshot_id: Uuid,
+        cut: u64,
+        tally: Tally,
+        record: RewindRecord,
+    },
+    /// A full copy instead, for this reason (nothing was changed).
+    FullCopy(String),
+}
+
+/// Spec R3a: what a former primary's directory holds, as its rewind sees it
+/// ([`rewind_census`]).
+#[derive(Default)]
+struct RewindCensus {
+    /// Entries of the directory the conversion removes, primary-only state:
+    /// RocksDB's WAL archive, the HNSW dump cache, an empty lock-free WAL
+    /// directory, RocksDB's temporaries. (The history and fence records go
+    /// through their own remover.)
+    drop: Vec<String>,
+    /// This stopped primary's own leftover export checkpoints — outside the
+    /// directory — that hard-link files of its store: a stage holds every
+    /// file of its store alone.
+    stale_exports: Vec<PathBuf>,
+    /// The fence record the directory carries (a copy goes into the
+    /// rewind's record).
+    fence: Option<FencedRecord>,
+    /// Every name the re-cut's census will not count.
+    excluded: Vec<String>,
+    /// A user's regular files beside the store (what the engine tolerates
+    /// in a data directory: `checkpoint_transfer::is_foreign_file_name`),
+    /// kept where they are; a stage never counts them.
+    kept: Vec<String>,
+}
+
+/// Close (drop) a rewind's store on a blocking thread.
+async fn release_rewind(writer: Arc<RewindWriter>) {
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(writer) = Arc::try_unwrap(writer) {
+            let _ = writer.close();
+        }
+    })
+    .await;
+}
+
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// Spec R3a (Sprinter 1c8963417a35): the census of a STOPPED former
+/// primary's directory `dir` before (or, finishing one, during) its rewind:
+/// every entry is the store's own RocksDB file (a regular file, kept), the
+/// physical stage's marker or manifest (rewritten), the history or fence
+/// record with their temporaries (removed: the fence record is copied into
+/// the rewind's record), or primary-only state the conversion removes
+/// ([`RewindCensus::drop`]). Anything else — a foreign file, a symbolic
+/// link, a non-empty lock-free WAL, a file linked from outside this node's
+/// own leftover export checkpoints (found under `export_dir`) — is the
+/// reason this directory is not rewound in place.
+fn rewind_census(dir: &Path, export_dir: &Path) -> Result<RewindCensus, String> {
+    let mut census = RewindCensus::default();
+    // The store's files that have more than one link: (device, inode) →
+    // (links, name).
+    let mut linked: std::collections::HashMap<(u64, u64), (u64, String)> = std::collections::HashMap::new();
+    let entries = fs::read_dir(dir).map_err(|error| format!("{} cannot be listed: {error}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("{} cannot be listed: {error}", dir.display()))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|name| format!("{} holds an entry whose name is not UTF-8 ({name:?})", dir.display()))?;
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            // Gone since the listing (a running primary's compaction, when
+            // the switchover's preflight takes this census): not counted.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{name} cannot be inspected: {error}")),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "{name} is a symbolic link: a standby's stage holds no link out of its directory"
+            ));
+        }
+        if is_stage_file_name(&name) {
+            if !metadata.is_file() {
+                return Err(format!("{name} is not a regular file"));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if metadata.nlink() > 1 {
+                    linked.insert((metadata.dev(), metadata.ino()), (metadata.nlink(), name));
+                }
+            }
+            continue;
+        }
+        if [
+            PHYSICAL_MARKER_FILE,
+            PHYSICAL_MANIFEST_FILE,
+            PHYSICAL_MARKER_TEMP_FILE,
+            PHYSICAL_MANIFEST_TEMP_FILE,
+        ]
+        .contains(&name.as_str())
+        {
+            if !metadata.is_file() {
+                return Err(format!("{name} is not a regular file"));
+            }
+            census.excluded.push(name);
+            continue;
+        }
+        if [FENCED_FILE, PRIMARY_HISTORY_FILE].contains(&name.as_str())
+            || is_record_temporary(&name, FENCED_FILE)
+            || is_record_temporary(&name, PRIMARY_HISTORY_FILE)
+        {
+            census.excluded.push(name);
+            continue;
+        }
+        if metadata.is_dir() && PRIMARY_LOCAL_DIRECTORIES.contains(&name.as_str()) {
+            census.drop.push(name.clone());
+            census.excluded.push(name);
+            continue;
+        }
+        if metadata.is_dir() && name == LOCKFREE_WAL_DIRECTORY {
+            let empty = fs::read_dir(entry.path())
+                .map_err(|error| format!("{name} cannot be listed: {error}"))?
+                .next()
+                .is_none();
+            if !empty {
+                return Err(format!(
+                    "{name} holds the lock-free ingestion engine's log, which may hold writes the store does not: \
+                     start the node once as a primary so it drains, or rebuild it by a full copy (--full --replace)"
+                ));
+            }
+            census.drop.push(name.clone());
+            census.excluded.push(name);
+            continue;
+        }
+        // RocksDB's own temporaries (`<n>.dbtmp`, `OPTIONS-<n>.dbtmp`, by the
+        // engine's grammar): a user's file that merely ends so is kept below.
+        if metadata.is_file()
+            && crate::storage::is_rocksdb_name(&name)
+            && Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension == "dbtmp")
+        {
+            census.drop.push(name.clone());
+            census.excluded.push(name);
+            continue;
+        }
+        // A user's regular file the engine tolerates beside its store (a
+        // `heliosdb-nano.toml`, a `server.key`): kept where it is, out of the
+        // stage's census — a rewind never blocks on it, and never moves it
+        // (a configuration may name its path).
+        if metadata.is_file() && is_foreign_file_name(&name) {
+            census.kept.push(name.clone());
+            census.excluded.push(name);
+            continue;
+        }
+        return Err(format!(
+            "{name} is not the database's: a rewind keeps the store's own RocksDB files and a user's regular files \
+             beside them, and removes only what is primary-local (its history and fence records, RocksDB's WAL \
+             archive, the HNSW dump cache); move {name} out of {} and re-run, or rebuild the node by a full copy \
+             (--full --replace)",
+            dir.display()
+        ));
+    }
+    if fs::symlink_metadata(dir.join(FENCED_FILE)).is_ok() {
+        census.fence =
+            Some(read_fenced_record(dir)?.ok_or_else(|| format!("{FENCED_FILE} vanished while it was read"))?);
+    }
+    if !linked.is_empty() {
+        let mut found: std::collections::HashMap<(u64, u64), u64> = std::collections::HashMap::new();
+        if let Ok(leases) = fs::read_dir(export_dir) {
+            for lease in leases.flatten() {
+                let is_lease = lease
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(EXPORT_LEASE_PREFIX));
+                let is_dir = fs::symlink_metadata(lease.path()).is_ok_and(|metadata| metadata.is_dir());
+                if is_lease && is_dir && count_links(&lease.path(), &linked, &mut found, 0) {
+                    census.stale_exports.push(lease.path());
+                }
+            }
+        }
+        for (key, (links, name)) in &linked {
+            let seen = found.get(key).copied().unwrap_or(0);
+            if seen.saturating_add(1) != *links {
+                return Err(format!(
+                    "{name} has {links} links, and only {seen} of the others are in this node's own leftover export \
+                     checkpoints under {}: something else shares the file, and a standby's stage holds every file \
+                     of its store alone",
+                    export_dir.display()
+                ));
+            }
+        }
+    }
+    Ok(census)
+}
+
+/// Count, under the export checkpoint `dir` (a few levels deep), the links
+/// of the store's linked files; whether it holds any.
+fn count_links(
+    dir: &Path,
+    linked: &std::collections::HashMap<(u64, u64), (u64, String)>,
+    found: &mut std::collections::HashMap<(u64, u64), u64>,
+    depth: usize,
+) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    let mut holds = false;
+    for entry in entries.flatten() {
+        let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if metadata.is_dir() {
+            holds |= count_links(&entry.path(), linked, found, depth + 1);
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let key = (metadata.dev(), metadata.ino());
+            if metadata.is_file() && linked.contains_key(&key) {
+                *found.entry(key).or_default() += 1;
+                holds = true;
+            }
+        }
+    }
+    holds
+}
+
+/// Spec R3a: the rewind's conversion, on a blocking thread (step 4 of
+/// [`Ladder::rewind`]): the node-local family's one write
+/// ([`RewindWriter::convert`]), the store closed, the directory's files made
+/// a stage's ([`convert_files`]), and the stage reopened by the
+/// fast-forward's writer. `writer` must be the store's only handle.
+#[allow(clippy::too_many_arguments)]
+fn convert_in_place(
+    writer: Arc<RewindWriter>,
+    dir: &Path,
+    config: &Config,
+    history: Uuid,
+    fast_forward: &FastForwardRecord,
+    record: &RewindRecord,
+    census: &RewindCensus,
+    limits: TransferLimits,
+) -> Result<FastForwardWriter, String> {
+    let mut writer = Arc::try_unwrap(writer)
+        .map_err(|_| "the former primary's store is still shared; it cannot be converted".to_string())?;
+    writer
+        .convert(fast_forward, record)
+        .map_err(|error| format!("the node-local family cannot be written: {error}"))?;
+    writer
+        .close()
+        .map_err(|error| format!("the converted store cannot be closed: {error}"))?;
+    kill_hook("rewind-after-convert", 0);
+    convert_files(dir, history, record.snapshot_id, census, &limits)?;
+    check_stage_files(dir).map_err(|error| format!("the converted directory is no stage yet: {error}"))?;
+    FastForwardWriter::open(dir, config, history)
+        .map_err(|error| format!("the converted store cannot be reopened as a stage: {error}"))
+}
+
+/// Spec R3a: the conversion's file steps, each idempotent (an interrupted
+/// rewind repeats them): the primary-only entries and this node's own
+/// leftover export checkpoints removed, the fence record then the history
+/// record removed (with their temporaries), the directory fsynced, and —
+/// when the directory has no marker yet — the interim stage: the census of
+/// the CLOSED store as a manifest at the unknown position (sequence 0) of
+/// the export `snapshot_id`, and the marker naming it. The re-cut rewrites
+/// both at the cut.
+fn convert_files(
+    dir: &Path,
+    history: Uuid,
+    snapshot_id: Uuid,
+    census: &RewindCensus,
+    limits: &TransferLimits,
+) -> Result<(), String> {
+    let gone = |result: std::io::Result<()>, what: &Path| match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("{} cannot be removed: {error}", what.display())),
+    };
+    for name in &census.drop {
+        let path = dir.join(name);
+        let is_dir = fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir());
+        gone(
+            if is_dir {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            },
+            &path,
+        )?;
+    }
+    for lease in &census.stale_exports {
+        gone(fs::remove_dir_all(lease), lease)?;
+    }
+    for record in [FENCED_FILE, PRIMARY_HISTORY_FILE] {
+        remove_record_in(dir, record).map_err(|error| format!("{record} cannot be removed: {error}"))?;
+    }
+    fs::File::open(dir)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("{} cannot be fsynced: {error}", dir.display()))?;
+    kill_hook("rewind-after-files", 0);
+    if fs::symlink_metadata(dir.join(PHYSICAL_MARKER_FILE)).is_err() {
+        let manifest = stage_census_manifest(dir, history, snapshot_id, 0, limits)
+            .map_err(|error| format!("the interim stage's manifest: {error}"))?;
+        recut_stage(dir, &manifest).map_err(|error| format!("the interim stage's marker: {error}"))?;
+    }
+    Ok(())
 }
 
 /// What the steps of a fast-forward came to.
@@ -1980,6 +3263,38 @@ fn directory_bytes(path: &Path) -> u64 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    /// Sprinter 6146b39a5beb: only a refusal that says the primary no longer
+    /// holds what a completed copy needs (or is another dataset, or was
+    /// promoted past it) makes the copy stale; a busy, shutting-down,
+    /// superseded or mis-authenticated primary keeps it.
+    #[test]
+    fn only_a_refusal_about_the_copy_makes_it_stale() {
+        for code in [
+            RefuseCode::WalPruned { oldest: 9 },
+            RefuseCode::Gap {
+                expected: 5,
+                have_from: 7,
+                have_to: 9,
+            },
+            RefuseCode::GroupTooLarge { first: 5, bytes: 1 },
+            RefuseCode::Diverged { at: 4 },
+            RefuseCode::HistoryMismatch,
+            RefuseCode::EpochStale { have: 2, want: 1 },
+        ] {
+            assert!(copy_refusal_is_stale(&code), "{code}");
+        }
+        for code in [
+            RefuseCode::TooManySessions,
+            RefuseCode::SourceNotServing,
+            RefuseCode::AuthFailed,
+            RefuseCode::Version,
+            RefuseCode::SourceStale { have: 1, want: 2 },
+            RefuseCode::EpochStale { have: 1, want: 2 },
+        ] {
+            assert!(!copy_refusal_is_stale(&code), "{code}");
+        }
+    }
 
     #[test]
     fn counts_bytes_and_percentages_read_as_the_progress_lines_print_them() {
@@ -2090,6 +3405,110 @@ mod tests {
         assert!(threshold.validate().is_err());
     }
 
+    /// Spec R3a (Sprinter 1c8963417a35): the census of a former primary's
+    /// directory keeps the store's own RocksDB files, lists the primary-only
+    /// state its conversion removes (RocksDB's WAL archive, the HNSW dump
+    /// cache, an empty lock-free WAL directory, RocksDB's temporaries) and
+    /// this node's own leftover export checkpoints that hard-link its files,
+    /// copies the fence record, and refuses anything else by name — a link
+    /// from elsewhere, a non-empty lock-free WAL, a foreign file, a symbolic
+    /// link.
+    #[test]
+    fn a_rewind_census_keeps_the_store_lists_primary_state_and_refuses_the_rest() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("primary");
+        let exports = root.path().join("primary.physical-export");
+        fs::create_dir_all(dir.join("archive")).unwrap();
+        fs::write(dir.join("archive").join("000012.log"), b"wal").unwrap();
+        fs::create_dir_all(dir.join("hnsw_snapshots")).unwrap();
+        for name in [
+            "CURRENT",
+            "IDENTITY",
+            "MANIFEST-000005",
+            "OPTIONS-000007",
+            "000010.sst",
+            "000011.log",
+            "LOCK",
+            "LOG",
+            "LOG.old.1761000000",
+            PRIMARY_HISTORY_FILE,
+            "OPTIONS-000008.dbtmp",
+        ] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        let census = rewind_census(&dir, &exports).unwrap();
+        let mut dropped = census.drop.clone();
+        dropped.sort();
+        assert_eq!(dropped, vec!["OPTIONS-000008.dbtmp", "archive", "hnsw_snapshots"]);
+        assert!(census.fence.is_none());
+        assert!(census.stale_exports.is_empty());
+        assert!(census.excluded.iter().any(|name| name == PRIMARY_HISTORY_FILE));
+
+        // A hard link from this node's own leftover export checkpoint is
+        // listed (the conversion removes the checkpoint); one from anywhere
+        // else refuses the rewind.
+        let lease = exports.join("nano-checkpoint-abc");
+        fs::create_dir_all(lease.join("checkpoint")).unwrap();
+        fs::hard_link(dir.join("000010.sst"), lease.join("checkpoint").join("000010.sst")).unwrap();
+        let census = rewind_census(&dir, &exports).unwrap();
+        assert_eq!(census.stale_exports, vec![lease.clone()]);
+        let elsewhere = root.path().join("elsewhere.sst");
+        fs::hard_link(dir.join("000010.sst"), &elsewhere).unwrap();
+        let refused = rewind_census(&dir, &exports).err().unwrap();
+        assert!(refused.contains("000010.sst has 3 links"), "{refused}");
+        fs::remove_file(&elsewhere).unwrap();
+
+        // The fence record is copied.
+        let fence = FencedRecord {
+            format: 1,
+            history: Uuid::new_v4(),
+            epoch: 1,
+            fenced_by_epoch: 2,
+            fenced_at: 1_761_000_000,
+            by_node: Uuid::new_v4(),
+            final_sequence: 77,
+        };
+        fs::write(dir.join(FENCED_FILE), serde_json::to_vec(&fence).unwrap()).unwrap();
+        assert_eq!(rewind_census(&dir, &exports).unwrap().fence, Some(fence));
+
+        // A non-empty lock-free WAL refuses; an empty one is removed.
+        fs::create_dir_all(dir.join("lockfree_wal")).unwrap();
+        fs::write(dir.join("lockfree_wal").join("1.wal"), b"w").unwrap();
+        let refused = rewind_census(&dir, &exports).err().unwrap();
+        assert!(
+            refused.contains("lockfree_wal holds the lock-free ingestion engine's log"),
+            "{refused}"
+        );
+        fs::remove_file(dir.join("lockfree_wal").join("1.wal")).unwrap();
+        assert!(rewind_census(&dir, &exports)
+            .unwrap()
+            .drop
+            .iter()
+            .any(|name| name == "lockfree_wal"));
+
+        // A user's regular files beside the store are kept (out of the
+        // stage's census); a directory nobody accounts for and a symbolic
+        // link refuse, by name.
+        fs::write(dir.join("heliosdb-nano.toml"), b"[storage]\n").unwrap();
+        fs::write(dir.join("server.key"), b"key").unwrap();
+        let census = rewind_census(&dir, &exports).unwrap();
+        let mut kept = census.kept.clone();
+        kept.sort();
+        assert_eq!(kept, vec!["heliosdb-nano.toml", "server.key"]);
+        assert!(census.excluded.iter().any(|name| name == "server.key"));
+        assert!(!census.drop.iter().any(|name| name == "server.key"), "never removed");
+        fs::create_dir_all(dir.join("backup")).unwrap();
+        let refused = rewind_census(&dir, &exports).err().unwrap();
+        assert!(refused.contains("backup is not the database's"), "{refused}");
+        fs::remove_dir_all(dir.join("backup")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("CURRENT"), dir.join("000099.sst")).unwrap();
+            let refused = rewind_census(&dir, &exports).err().unwrap();
+            assert!(refused.contains("000099.sst is a symbolic link"), "{refused}");
+        }
+    }
+
     /// With nothing listening, the ladder names the primary it could not
     /// reach and changes nothing.
     #[tokio::test]
@@ -2105,7 +3524,7 @@ mod tests {
             ..options(&data, &root.path().join("stage"))
         };
         let mut lines = Vec::new();
-        let error = recover_from_primary(&options, &mut |line| lines.push(line.to_string()))
+        let error = Box::pin(recover_from_primary(&options, &mut |line| lines.push(line.to_string())))
             .await
             .unwrap_err();
         assert!(matches!(error, RecoverError::Refused(_)), "{error}");

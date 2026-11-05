@@ -35,10 +35,12 @@
 #[cfg(all(feature = "ha-tier1", feature = "internal-tests", target_os = "linux"))]
 #[path = "support/physical_pair.rs"]
 mod physical_pair;
+#[path = "support/ports.rs"]
+mod ports;
 
 use heliosdb_nano::runtime_offload::STATEMENT_OFFLOAD_ENV;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -55,8 +57,11 @@ const HOLD_SQL: &str = "SELECT heliosdb_test_hold()";
 #[cfg(feature = "internal-tests")]
 const HOLDING: &str = "this statement holds while";
 
+/// A loopback port RESERVED for the life of the test process (sprinter
+/// ffe805264aac, `support/ports.rs`): a port bound and released at once could
+/// be taken by a concurrent test before the daemon binds it.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    ports::free_port()
 }
 
 /// A standalone daemon on private loopback ports with ONE async worker,

@@ -4,11 +4,13 @@
 [graph]
 # Check the graph of the DEFAULT feature set — i.e. what we actually ship
 # (crates.io default build, release binaries, the Python wheel). all-features
-# was tried and is currently impossible to keep clean: the optional
-# `code-embed` feature (fastembed -> hf-hub) hard-enables native-tls/openssl
-# through third-party feature defaults we don't control. FILED DEBT: swap
-# fastembed's hf-hub client to its rustls variant (or feature-gate an
-# alternative) and flip this back to all-features = true.
+# was tried and could not be kept clean: the optional `code-embed` feature
+# (fastembed 4 -> hf-hub 0.4) hard-enabled native-tls/openssl through
+# third-party feature defaults. fastembed is now 7.x with default-features =
+# false and its rustls variants (`hf-hub-rustls-tls`,
+# `ort-download-binaries-rustls-tls`), so that blocker is gone. REMAINING
+# DEBT: flip this back to all-features = true once
+# `cargo deny --all-features check` is clean.
 all-features = false
 
 [advisories]

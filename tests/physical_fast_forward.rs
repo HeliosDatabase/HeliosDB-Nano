@@ -21,7 +21,10 @@
 //! * (f) a directory of another history takes route 3 the same way;
 //! * (h) an absent data directory gets the primary's snapshot (route 3, as
 //!   `resync` would);
-//! * (i) a cascading standby serves the fast-forward to its downstream.
+//! * (i) a cascading standby serves the fast-forward to its downstream;
+//! * (sprinter 6146b39a5beb) a completed copy beside the directory is adopted
+//!   only while the primary still serves it: a stale one is discarded and
+//!   copied again, and an adopted one is reported as "nothing copied".
 //!
 //! Red on the base of this change (P3.2, `ddfe1708`): `recover` knew only
 //! `--from-archive`, the protocol had no fast-forward session, and a standby
@@ -177,8 +180,8 @@ async fn wait_ready_body(
         }
         assert!(
             Instant::now() < deadline,
-            "/ready never answered as wanted; last {seen:?}; log tail: {}",
-            daemon.tail(12)
+            "/ready never answered as wanted; last {seen:?}{}",
+            daemon.diagnose(port)
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -558,6 +561,11 @@ async fn above_the_threshold_a_full_copy_is_made_and_swapped_in_only_with_replac
     let report = stdout(&output);
     assert!(output.status.success(), "{report}{}", stderr(&output));
     assert!(report.contains("already holds a completed copy"), "{report}");
+    // Sprinter 6146b39a5beb: adopted because the primary still serves it,
+    // and the summary says nothing was copied (it used to say "0 B").
+    assert!(report.contains("which the primary still serves"), "{report}");
+    assert!(report.contains("nothing copied in this run"), "{report}");
+    assert!(!report.contains("a full copy of the primary, 0 B"), "{report}");
     assert!(report.contains("it is kept for the operator"), "{report}");
     assert!(!copy.exists());
     let replaced: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -633,6 +641,120 @@ async fn a_standby_of_another_history_needs_a_full_copy_and_replace() {
     let want: Vec<i32> = (100..=120).collect();
     assert_eq!(settle(pair.pg_s, &want, Duration::from_secs(90)).await, Ok(want));
     assert!(!standby.log().contains("Bootstrapping physical standby"));
+}
+
+/// Sprinter 6146b39a5beb: a completed copy left beside the directory by an
+/// earlier run is adopted only while the primary still serves its next write
+/// group. Here the primary's WAL moved past it (its archive off) before the
+/// re-run, which says so, removes it, copies again, and installs a standby
+/// that follows the primary — where the stale copy was adopted as it was, and
+/// its first `start` could only be refused `WalPruned`. (`internal-tests`:)
+/// a transient refusal of the probe keeps the copy and fails the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_completed_copy_is_discarded_and_copied_again() {
+    let pair = pair();
+    let dir = pair.dir.path().to_path_buf();
+    let standby_dir = dir.join("standby");
+    {
+        // A standby of another dataset: only a full copy beside it helps.
+        let _old = Daemon::spawn(
+            &dir,
+            "primary-old",
+            &dir.join("primary-old"),
+            &pair.token,
+            &pair.primary_args,
+            None,
+        );
+        let writer = connect(pair.pg_p).await;
+        create_table(&writer).await;
+        assert_eq!(insert(&writer, 1..=5, "old").await, 0);
+        let mut standby = Daemon::spawn(&dir, "standby", &standby_dir, &pair.token, &pair.standby_args, None);
+        wait_http(pair.http_s, "/ready", 200, Duration::from_secs(90), &standby).await;
+        standby.stop();
+    }
+    let primary_data = dir.join("primary-new");
+    let config = pruning_primary_config(false);
+    let primary = Daemon::spawn(
+        &dir,
+        "primary-new",
+        &primary_data,
+        &pair.token,
+        &pair.primary_args,
+        Some(config.as_str()),
+    );
+    let writer = connect(pair.pg_p).await;
+    create_table(&writer).await;
+    assert_eq!(insert(&writer, 1..=20, "new").await, 0);
+
+    // Without --replace the copy is completed beside the directory.
+    let output = recover(from_primary(&pair, &standby_dir, &[]), Vec::new());
+    assert_eq!(output.status.code(), Some(3), "{}{}", stdout(&output), stderr(&output));
+    let copy = dir.join("standby.recover-full");
+    let (_, copied_at) = cursor_of(&copy);
+
+    // The primary writes on until its WAL no longer holds the copy's next
+    // write group (nothing archives it).
+    let filler = "w".repeat(400);
+    let mut last = 20;
+    let mut pruned = 0;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while pruned == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "precondition: the primary never archived a WAL file; log tail: {}",
+            primary.tail(12)
+        );
+        assert_eq!(insert(&writer, last + 1..=last + 150, &filler).await, 0);
+        last += 150;
+        pruned += prune_archived_wal(&primary_data);
+    }
+    for _ in 0..3 {
+        assert_eq!(insert(&writer, last + 1..=last + 150, &filler).await, 0);
+        last += 150;
+        prune_archived_wal(&primary_data);
+    }
+
+    // A primary that cannot answer for the copy right now — here refused
+    // `TooManySessions` through every retry (the `internal-tests` hook) —
+    // says nothing about the copy: it is kept, and the command fails.
+    #[cfg(feature = "internal-tests")]
+    {
+        let output = recover(
+            from_primary(&pair, &standby_dir, &["--replace"]),
+            vec![(
+                "HELIOSDB_NANO_TEST_COPY_PROBE_REFUSE".to_string(),
+                "TooManySessions".to_string(),
+            )],
+        );
+        let said = format!("{}{}", stdout(&output), stderr(&output));
+        assert_eq!(output.status.code(), Some(1), "{said}");
+        assert!(said.contains("the copy is kept"), "{said}");
+        assert!(!said.contains("copying again"), "{said}");
+        assert_eq!(cursor_of(&copy).1, copied_at, "the completed copy is kept as it was");
+    }
+
+    let output = recover(from_primary(&pair, &standby_dir, &["--replace"]), Vec::new());
+    let report = stdout(&output);
+    assert!(output.status.success(), "{report}{}", stderr(&output));
+    assert!(
+        report.contains("is older than what the primary retains"),
+        "the stale copy must not be adopted: {report}"
+    );
+    assert!(report.contains("copying again"), "{report}");
+    assert!(!report.contains("nothing copied in this run"), "{report}");
+    let (_, installed_at) = cursor_of(&standby_dir);
+    assert!(
+        installed_at > copied_at,
+        "a new copy, past the stale one: {installed_at} vs {copied_at}"
+    );
+    assert!(!copy.exists(), "the copy was swapped in");
+
+    let standby = Daemon::spawn(&dir, "standby-2", &standby_dir, &pair.token, &pair.standby_args, None);
+    let want: Vec<i32> = (1..=last).collect();
+    assert_eq!(settle(pair.pg_s, &want, Duration::from_secs(120)).await, Ok(want));
+    assert!(!standby.log().contains("Bootstrapping physical standby"));
+    drop(writer);
+    drop(primary);
 }
 
 /// (h) An absent data directory gets the primary's snapshot, as `resync`
@@ -778,4 +900,69 @@ async fn a_cascading_standby_fast_forwards_its_downstream() {
     let want: Vec<i32> = (1..=2_200).collect();
     assert_eq!(settle(pg_b, &want, Duration::from_secs(120)).await, Ok(want));
     drop(standby_a);
+}
+
+/// `recover --from-primary` with its default `--then primary`, on a small
+/// store: the token given to `recover` itself reaches the `start` it goes on
+/// to, and the command ends as a node streaming from the primary, on the port
+/// given after `--`. (Through the review it did its work and then refused to
+/// follow: "a physical standby requires --replication-token-file".)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recover_that_goes_on_to_follow_hands_its_token_to_the_start() {
+    let pair = pair();
+    let dir = pair.dir.path().to_path_buf();
+    let s_data = dir.join("standby");
+    let primary = Daemon::spawn(
+        &dir,
+        "primary",
+        &dir.join("primary"),
+        &pair.token,
+        &pair.primary_args,
+        None,
+    );
+    let writer = connect(pair.pg_p).await;
+    create_table(&writer).await;
+    assert_eq!(insert(&writer, 1..=10, "before").await, 0);
+    let following = Daemon::spawn_cli(
+        &dir,
+        "recover-follows",
+        &[
+            "recover".to_string(),
+            "--data-dir".to_string(),
+            text(&s_data),
+            "--from-primary".to_string(),
+            "--primary-host".to_string(),
+            format!("127.0.0.1:{}", pair.repl_p),
+            "--replication-token-file".to_string(),
+            text(&pair.token),
+            "--".to_string(),
+            "--listen".to_string(),
+            "127.0.0.1".to_string(),
+            "--auth".to_string(),
+            "trust".to_string(),
+            "--port".to_string(),
+            pair.pg_s.to_string(),
+            "--http-port".to_string(),
+            pair.http_s.to_string(),
+            "--replication-startup-timeout-secs".to_string(),
+            "30".to_string(),
+        ],
+    );
+    let ready = wait_http(pair.http_s, "/ready", 200, Duration::from_secs(120), &following).await;
+    assert_eq!(ready["state"], "streaming", "{ready}");
+    assert!(
+        following.log().contains("as `start --replication-role standby` would"),
+        "{}",
+        following.tail(20)
+    );
+    let mut want: Vec<i32> = (1..=10).collect();
+    assert_eq!(
+        settle(pair.pg_s, &want, Duration::from_secs(60)).await,
+        Ok(want.clone())
+    );
+    assert_eq!(insert(&writer, 11..=15, "after").await, 0);
+    want.extend(11..=15);
+    assert_eq!(settle(pair.pg_s, &want, Duration::from_secs(60)).await, Ok(want));
+    drop(following);
+    drop(primary);
 }

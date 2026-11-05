@@ -145,11 +145,11 @@ async fn wait_block(
             }
             assert!(
                 Instant::now() < deadline,
-                "never {what}: {block}; log tail: {}",
-                daemon.tail(12)
+                "never {what}: {block}{}",
+                daemon.diagnose(http_port)
             );
         } else {
-            assert!(Instant::now() < deadline, "no /health: {}", daemon.tail(12));
+            assert!(Instant::now() < deadline, "no /health{}", daemon.diagnose(http_port));
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }

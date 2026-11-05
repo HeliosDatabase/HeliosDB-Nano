@@ -15,7 +15,10 @@
 //! * (3) the fenced P restarted as a primary starts FENCED (spec §11.A:
 //!   reads served, writes 25006, `transaction_read_only` on, `/ready` 503,
 //!   state `fenced`), is refused as a standby (exit 2, the rebuild hint), and
-//!   is rebuilt as a standby of S by `recover --from-primary --replace`;
+//!   is rebuilt as a standby of S by `recover --from-primary --replace` —
+//!   since spec R3a a REWIND in place (a fast-forward of what differs, no
+//!   full copy: nothing is replaced; `tests/physical_rewind.rs` drills the
+//!   diverged case);
 //! * (4) a forced promotion with P killed: refused without `--force` within
 //!   the fence timeout, done with it (`fenced = false`), and P restarted at
 //!   epoch 1 fences itself the moment a receiver of epoch 2 talks to it,
@@ -198,8 +201,8 @@ async fn wait_health(
         }
         assert!(
             Instant::now() < deadline,
-            "/health never showed what was wanted; last {body}; log tail: {}",
-            daemon.tail(12)
+            "/health never showed what was wanted; last {body}{}",
+            daemon.diagnose(port)
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -696,16 +699,47 @@ async fn a_graceful_promotion_fences_the_primary_and_every_node_left_behind_reco
             && log.contains("recover --from-primary"),
         "{log}"
     );
-    let output = cli_async(recover_args(&c.p_data, c.repl_s, &token, &["--replace"]), Vec::new()).await;
+    // Spec R3a (Sprinter 1c8963417a35): it is REWOUND in place — a fast-forward
+    // of what differs, no full copy — even with `--replace`, which keeps its
+    // meaning for the full-copy fallback only. The dataset is a handful of
+    // 64 KiB leaves, so any difference is a large share of it: the threshold
+    // is raised so the rewind, not the size of a test dataset, decides.
+    let output = cli_async(
+        recover_args(
+            &c.p_data,
+            c.repl_s,
+            &token,
+            &["--replace", "--full-copy-threshold", "100"],
+        ),
+        Vec::new(),
+    )
+    .await;
     let out = stdout(&output);
     assert!(output.status.success(), "{out}{}", stderr(&output));
-    assert!(out.contains("full copy") && out.contains("fenced primary"), "{out}");
+    assert!(
+        out.contains("fenced primary")
+            && out.contains("REWOUND in place")
+            && out.contains("fast-forward from the primary"),
+        "{out}"
+    );
+    assert!(!out.contains("a full copy of the primary is needed"), "{out}");
+    assert!(
+        out.contains("nothing it committed is lost"),
+        "a fenced primary loses nothing to its rewind: {out}"
+    );
+    assert!(
+        out.contains("rewound the former primary into a standby at sequence"),
+        "{out}"
+    );
     let replaced = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
         .any(|entry| entry.file_name().to_string_lossy().starts_with("primary.replaced-"));
-    assert!(replaced, "the old directory is kept beside it");
+    assert!(!replaced, "a rewind is in place: no directory is replaced");
     assert!(!c.p_data.join("NANO-FENCED.json").exists());
+    assert!(!c.p_data.join("NANO-PRIMARY-HISTORY.json").exists());
+    assert!(c.p_data.join("NANO-PHYSICAL-REPLICA.json").exists());
+    assert!(families(&c.p_data).iter().any(|family| family == LOCAL_CF));
     let p_args = standby_args(c.pair.pg_p, c.repl_s, c.pair.http_p);
     let p_standby = Daemon::spawn(&dir, "primary-follows-s", &c.p_data, &token, &p_args, Some(ARCHIVE));
     wait_http(c.pair.http_p, "/ready", 200, Duration::from_secs(120), &p_standby).await;

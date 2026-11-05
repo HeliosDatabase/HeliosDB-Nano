@@ -7,6 +7,213 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — `heliosdb-nano standby verify` (spec R1 §1)
+
+Proves that a STOPPED physical standby is byte-identical to its primary: the primary pins
+a snapshot at its current sequence P and sends the SHA-256 of each leaf of its replicated
+keyspace (nothing is shipped, the primary is not modified), the standby is brought to
+exactly P by the tail a `start` would apply, and both sides' leaves are compared. Exit 0
+"identical at sequence P (N leaves, X bytes compared)"; exit 1 lists every differing key
+range with both digests; exit 2 when it could not verify (a running standby — refused by
+its lock —, an interrupted fast-forward or promotion, a primary that no longer serves the
+standby's tail: the message names the `recover --from-primary` command). `--json` prints
+the verdict as one object. The standby's node-local state is not part of the comparison.
+A fast-forward session is now also served to a receiver AT the primary's cut — a new
+capability, `CAP_FAST_FORWARD_AT_CUT`, offered by both sides of this release; an older peer
+is refused or never sent one, and `standby verify` against an older primary says so.
+`recover --from-primary` treats that case as before (a full copy).
+
+### Fixed — `recover --from-primary` no longer adopts a stale completed copy (sprinter 6146b39a5beb)
+
+A completed full copy left beside the data directory (`<DIR>.recover-full`) by an
+earlier run was adopted by history alone, even when the primary's WAL and archive had
+moved past it, installing a standby whose first start could only be refused
+`WalPruned`. The primary is now asked first: a copy it still serves is adopted (also
+under `--full`; "still serves" holds when it is asked — nothing pins the copy's tail), one
+it no longer holds the tail of (`WalPruned`, `Gap`, `GroupTooLarge`, `Diverged`, another
+history, a newer epoch) is removed and copied again ("the completed copy at … is older
+than what the primary retains; copying again"). Any other answer — a busy or shutting-down
+primary, a token or version problem — keeps the copy and fails the run. An adopted copy's
+summary says "adopted the completed copy at …, nothing copied in this run" instead of
+"0 B".
+
+### Fixed — a primary's crash recovery no longer brings back dropped or renamed tables (sprinter e21903322db7)
+
+Open recovery skips a `DROP TABLE`, `TRUNCATE` or rename it finds above the logical WAL
+checkpoint (`storage.wal_replay_destructive_ddl = "refuse"`, the default) but replayed
+every other entry around it. After a crash within the checkpoint interval (default 1000
+entries / 30 s), with rows logged — every explicit transaction, and every statement on an
+HA primary — a table created and dropped in that window came back with its rows, a table
+dropped and re-created under the same name received the old rows (overwriting its own at
+colliding row ids), and a renamed table's rows came back under a re-created source name.
+Under `warn` / `apply` the replay also wrote its batched rows only after the DDL entries
+that followed them. A destructive entry now skips every earlier entry naming its tables,
+under every policy, and the pending rows are written before any DDL entry is replayed.
+`CREATE TABLE`, `DROP TABLE` and the rename write their entry in their own catalog write
+group (it used to be a separate append, first, so a write that then failed left an entry
+the next crash replayed), and a transactional `TRUNCATE` logs with its transaction's
+commit (a `BEGIN; TRUNCATE; ROLLBACK` left an entry that `warn` / `apply` replayed).
+
+### Changed — key rotation is refused while it would strand a physical standby (spec R1 §3)
+
+There is no key-rotation command and nothing re-encrypts a dataset. The one entry point,
+`StorageEngine::rotate_encryption_key` (reached by no SQL, CLI or HTTP surface), computes
+the store's standing from its own open mode and the standbys its replication port serves,
+and refuses on a physical standby (its key is its primary's) and on a primary whose
+replication port serves (naming the standbys attached), naming the procedure: re-key a
+primary that serves no standby, then rebuild each standby from it with the new key;
+otherwise it refuses because no re-encryption exists.
+### Security — `code-embed` no longer pulls webpki-roots 0.26 (sprinter b93af8c4a65f)
+
+- **fastembed 4.9 → 7.5** for the optional `code-embed` feature. fastembed 4 reached the
+  Hugging Face hub through hf-hub 0.4 → ureq 2 → webpki-roots 0.26.11, whose bundled roots trust
+  the distrusted emSign intermediates (RUSTSEC-2026-0381). 7.5 uses hf-hub 0.5 → ureq 3 →
+  webpki-roots 1.0.10, and the RUSTSEC-2026-0381 ignore is removed from `.cargo/audit.toml`.
+  The default build never compiled either version.
+- Same default model (`BGESmallENV15`, 384 dimensions, `Xenova/bge-small-en-v1.5`), same cache
+  location (`$HF_HOME`, else `$FASTEMBED_CACHE_DIR`, else `./.fastembed_cache`), and the same
+  `CODE_EMBED()` / `FastEmbedder` API.
+- **Model downloads now trust the bundled Mozilla root set, not the OS trust store.** hf-hub 0.5
+  builds its ureq 3 client with ureq's default roots, whichever TLS backend it uses, so a private CA
+  installed only in the OS store (a TLS-inspecting proxy) is no longer accepted. Pre-seed the
+  cache directory, or point `HF_ENDPOINT` at a mirror, in that case. Both the model download and
+  the build-time ONNX Runtime download now use rustls; `code-embed` no longer brings in
+  native-tls/OpenSSL. fastembed 7.5 also sends the `HF_TOKEN` environment variable with model
+  downloads when it is set (4.x sent only the `huggingface-cli login` token file).
+- Building with `--features code-embed` now needs Rust 1.92 or later (fastembed 7.5 needs 1.88,
+  and its pinned `ort` 2.0.0-rc.15 needs 1.92). `ort` rc.15 downloads a newer ONNX Runtime than
+  rc.9 did, so embeddings can differ from 4.x builds in the last float digits.
+  Large `embed_batch` calls run their 256-row inferences one after another instead of in
+  parallel; ONNX Runtime still uses every CPU inside each inference.
+- **`code-embed` and glibc.** The ONNX Runtime that `ort` rc.15 downloads at build time needs
+  glibc 2.38 and GCC 13's libstdc++, so a `code-embed` build no longer links on
+  RHEL/AlmaLinux/Rocky 9 (glibc 2.34) out of the box; every `ort` release since rc.12 ships such a
+  build. On those hosts, build against Microsoft's official ONNX Runtime 1.24 or later (it needs
+  glibc 2.27) with `ORT_LIB_PATH=<onnxruntime>/lib ORT_PREFER_DYNAMIC_LINK=1` and keep that
+  directory on `LD_LIBRARY_PATH`; verified on AlmaLinux 9 with ONNX Runtime 1.24.4 (the local
+  embedder test downloads the model and embeds). The default build and the released binaries do
+  not include `code-embed`.
+
+### Fixed — HNSW graph dumps and exact-match recall (sprinter 746342a0bfbb, 66aeb488f312)
+
+- **HNSW indexes are built with the configured parameters.** The graph library's constructor
+  takes `(M, max_elements, max_layer, ef_construction)`; it was called as
+  `(M, dimension, ef_construction, 100)`, so every graph was built with `ef_construction = 100`
+  and a layer count of `min(16, ef_construction)`, and an `ef_construction` below 16 made every
+  graph dump fail. `WITH (ef_construction = …)` and `[vector] hnsw_ef_construction` now take
+  effect: at the default of 200 an index BUILDS up to about twice as slowly as before. `m`
+  outside 2..=255 and `ef_construction = 0` are refused (`m` above 256 used to exit the process).
+- **A reopened HNSW index is dumped again at close.** A graph reloaded from its dump could not be
+  dumped over it: every clean close after a reload counted a dump failure and left a full-size
+  orphan copy in `hnsw_snapshots/`, one more per restart. Dumps are now written to a staging
+  directory, fsynced and renamed into place under a name derived from a stable index id (two
+  index names that differed only in punctuation used to share one dump), the sidecar and its
+  validity marker are written in one batch, and the previous dump is removed afterwards. An index
+  that has not changed since its dump is not dumped again. At open, dump files no sidecar
+  references are deleted.
+- **Exact-match vector queries find their row.** An HNSW search over at most 8192 vectors and
+  at most 2M vector components (points x dimension; e.g. ~1300 vectors at 1536 dimensions) is
+  now an exact scan, immune to rows the graph left unreachable (the library back-links a point
+  only on its own top layer). Larger indexes build their graph with fuller neighbour lists, a
+  sequential first insert and a shuffled batch order.
+- **Inner-product (`vector_ip_ops`) indexes accept any vectors** (sprinter 17d901194e59). The
+  library's dot-product distance asserted `1 - dot >= 0`, so any pair of vectors with a dot
+  product above 1 panicked the insert or search. The index now orders rows exactly as `<#>`
+  does and reports `<#>`'s value (`-dot`) as the distance — the unfiltered vector search used to
+  report `1 - dot`. Inner-product graph dumps written before this release are rebuilt once.
+- **Encrypted stores no longer write plaintext vectors** to `hnsw_snapshots/`: no graph dump is
+  written, and every HNSW index is rebuilt from its sealed rows at every open — open time grows
+  with index size, and each rebuild is logged with its duration. Dumps left by an unencrypted
+  run are deleted at the first encrypted open; deleting does not erase their bytes from free
+  disk blocks.
+- **`m` / `ef_construction` are range-checked** in `CREATE INDEX … WITH (…)` (2..=255, at least
+  1) and in `[vector] hnsw_m` / `hnsw_ef_construction` at config load. Out-of-range values that
+  an older binary stored are clamped into range at open, with a WARN, rather than refused, so
+  neither a primary's index nor a physical standby's hydration fails over them.
+- Every HNSW index rebuilt at open, or built by a physical standby's hydration, is logged at
+  INFO with its row count and duration.
+- Dropping a trigger's handle clone no longer flushes row counters and checkpoints every index
+  mid-statement; only the last owner of a database does.
+### Added — rewind a former primary in place; `SWITCHOVER TO` (sprinter 1c8963417a35, bbba90ddfc61)
+
+- **Rewind instead of a full copy** (`recover --from-primary` on a former
+  primary's directory). A fenced or superseded primary of the same dataset
+  history, against the primary promoted over it, is converted in place into a
+  physical stage (one synced write of the node-local family: an unknown cursor,
+  the fast-forward record, a rewind record keeping its epoch, last sequence and
+  fence record; then its primary-only files removed: `NANO-PRIMARY-HISTORY.json`,
+  `NANO-FENCED.json`, RocksDB's `archive/`, `hnsw_snapshots/`, an empty
+  `lockfree_wal/`, temporaries and its own leftover export checkpoints) and
+  fast-forwarded: only the leaves that differ travel. The decision (the leaf
+  plan and the digest pass) is made before anything changes, so a divergence
+  above `--full-copy-threshold` or an entry nobody accounts for (a directory, a
+  symbolic link, a hard link from outside) falls through to the full copy with
+  nothing changed. A user's regular files beside the store (`heliosdb-nano.toml`,
+  `server.key`) are kept where they are: a physical standby's stage now keeps
+  such files too and leaves them out of its census (it used to refuse them). A rewind killed part-way is finished by re-running the
+  command; every `start` refuses the directory until then. Writes the old
+  primary committed after the promotion point (only when it was not fenced) are
+  replaced and said at WARNING. Refused, nothing changed: another history, a
+  source at the directory's own epoch (`--full --replace` rebuilds it), or a
+  lower one. Before: a fenced primary's directory was always rebuilt by a full
+  copy with `--replace`.
+- **`SWITCHOVER TO '<standby>'`** and **`SWITCHOVER CHECK TO '<standby>'`**
+  on the primary's PostgreSQL port (they were refused), for a superuser session
+  (42501 otherwise). CHECK answers every check, one row each, and changes
+  nothing on either node — including whether the directory could be rewound in
+  place (the rewind's census, read-only) and one row per OTHER standby of the
+  primary, which needs `recover --from-primary` against the new primary
+  afterwards. The primary asks the standby over its live replication session
+  to promote online (fencing the primary; never unfenced), waits for it to
+  serve as the primary of the next epoch, then demotes itself in-process:
+  sessions off the store (FATAL 57P01), replication source and archiver
+  stopped, the HTTP surface restarted health-only (every HTTP connection closed
+  with it), the store rewound against the new primary and reopened as its
+  physical standby. The switchover runs on its own task (a cancelled caller
+  abandons nothing); a request the standby took whose answer was lost is never
+  reported "nothing was changed" — the wait for the fence settles it. A
+  failure after the fence leaves the old primary fenced and serving reads (its
+  store reopened fenced when the rewind changed nothing), naming the commands
+  that finish the demotion; never two writable primaries. The embedded API
+  still refuses the statement (the server session answers it).
+- **Replication protocol:** frame kinds `PromoteRequest` (30; 49 bytes,
+  carrying the bound its answer must come within) and `PromoteAnswer` (31,
+  carrying the promotion's identity — a switchover accepts only that
+  promotion's fence) and
+  the Hello capability `CAP_PROMOTE` (`1 << 4`), offered by a standby that can
+  promote online. A request takes the place of a poll's start; a peer that does
+  not offer the capability is never sent one. `NPHYS004` is unchanged (a mixed
+  pair simply cannot switch over).
+- **`<data dir>.role.toml`** (mode 0600): the role a switchover gave a node
+  (and, for a standby, the primary and the TLS it follows over), written
+  beside its data directory and bound to it (history, epoch, store identity).
+  `start` applies it over the configuration file (said at WARN) — only to that
+  directory, and never against the command line: a missing, empty or rebuilt
+  directory, a contradicting `--replication-role` / `--primary-host`, or an
+  unreadable file refuses the start (exit 2), naming it — so a supervisor
+  whose command line passes `--replication-role` must move the role into the
+  configuration file (or drop the flag) once a switchover changed it.
+  `promote`, `pg_promote` and `recover` rewrite one they find, and `recover`
+  follows the TLS it records. The record sits beside the directory the data
+  path resolves to (symbolic links followed). A shutdown signal during a
+  demotion waits for it (at most 300 s; cut short at ERROR, exit non-zero).
+- **Every `recover` a switchover or a fence prints** carries `--replace --then
+  stop` and is followed by the `start` to run: it finishes the job whatever the
+  plan picks (a full copy moves the old directory to `<data dir>.replaced-<UTC>`,
+  never deleted) and leaves no server in the operator's shell.
+
+### Fixed — `recover` and `promote` lost their token and TLS flags when they went on to `start`
+
+`recover --then primary` (the default with `--primary-host`) and `promote --then
+start` built `start`'s command line from the data directory, the role, the
+primary, `--config` and the arguments after `--` only. So `recover --from-primary
+--replication-token-file T` did its work and then refused to follow ("a physical
+standby requires --replication-token-file") unless a configuration file named the
+token, and `promote --then start --replication-token-file T` started a primary
+with no replication port. The replication token file, transfer limits, standby TLS
+flags and `--allow-insecure-replication-remote` are now handed on, unless the
+arguments after `--` set them.
+
 ### Fixed — a long statement no longer stalls the server (sprinter ccebc95977f1)
 
 A statement executed synchronously on the async worker that had just been driving the

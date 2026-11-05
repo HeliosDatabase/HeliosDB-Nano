@@ -2140,6 +2140,34 @@ where
                     .await;
                     return Err(Error::network(message));
                 }
+                // Spec R3b (Sprinter bbba90ddfc61): a switchover is demoting
+                // this fenced primary; its store is off the listeners, which
+                // serve the empty placeholder until the standby's store is
+                // attached. The placeholder holds no data: a data read is
+                // refused (55000) instead of answered from nothing.
+                if crate::standby_posture::is_demoting()
+                    && crate::standby_posture::is_placeholder(self.database.storage.as_ref())
+                {
+                    let registry = std::sync::Arc::clone(&self.database.function_registry);
+                    if standby_statement_reads_data(query, |name| registry.get_function(name).is_some()) {
+                        self.send_standby_refusal(
+                            extended,
+                            crate::network::protocol::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                            &format!(
+                                "{}: demoting (a SWITCHOVER is turning this primary into a standby of the new \
+                                 primary)",
+                                crate::error::STANDBY_NOT_READY
+                            ),
+                            Some(
+                                "Writes go to the new primary; this node serves reads again once it streams from it \
+                                 (GET /ready reports when)."
+                                    .into(),
+                            ),
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                }
                 if !guarded_standby_statement_allowed(query) {
                     self.send_standby_refusal(
                         extended,
@@ -2342,6 +2370,207 @@ where
         }
     }
 
+    /// Spec R3b (Sprinter bbba90ddfc61): `SWITCHOVER TO '<target>'` and
+    /// `SWITCHOVER CHECK [TO] '<target>'`, answered by this session on the
+    /// PRIMARY (`crate::replication::promote::switchover`): the target is
+    /// promoted online and this primary demoted in-process into its standby,
+    /// which REOPENS the store — so, like `pg_promote`, the session lets go of
+    /// it first, which only the session can do. `CHECK` answers one row per
+    /// check (`check`, `ok`, `detail`) and changes nothing. `TO` answers one
+    /// row (`new_primary`, `epoch`, `final_sequence`, `this_node`) once this
+    /// node is the new primary's standby; every refusal before the target
+    /// accepted is SQLSTATE 55000 naming why, with nothing changed. Once the
+    /// target accepted, the session ends with FATAL 57P01 after its answer
+    /// (its startup described a primary). Review item 5: both forms need a
+    /// superuser session ([`Self::switchover_privilege`]), SQLSTATE 42501
+    /// otherwise.
+    pub(super) async fn answer_switchover(
+        &mut self,
+        statement: std::result::Result<SwitchoverStatement, String>,
+    ) -> Result<()> {
+        use crate::network::protocol::sqlstate;
+        if self.transaction_status == TransactionStatus::Failed {
+            return self.send_failed_transaction_error().await;
+        }
+        match statement {
+            Err(usage) => {
+                self.send_error(
+                    "ERROR",
+                    sqlstate::SYNTAX_ERROR,
+                    &usage,
+                    None,
+                    Some(SWITCHOVER_USAGE.to_string()),
+                )
+                .await
+            }
+            Ok(_) if self.switchover_privilege().is_err() => {
+                let message = self.switchover_privilege().err().unwrap_or_default();
+                self.send_error("ERROR", sqlstate::INSUFFICIENT_PRIVILEGE, &message, None, None)
+                    .await
+            }
+            Ok(SwitchoverStatement::Check(target)) => {
+                let rows = self.run_switchover_check(&target).await;
+                let schema = Schema::new(vec![
+                    crate::Column::new("check", crate::DataType::Text),
+                    crate::Column::new("ok", crate::DataType::Boolean),
+                    crate::Column::new("detail", crate::DataType::Text),
+                ]);
+                self.send_query_result(&schema, &rows).await?;
+                self.send_ready_for_query().await
+            }
+            Ok(SwitchoverStatement::To(target)) => match self.run_switchover(&target).await {
+                Ok(row) => {
+                    let schema = Schema::new(vec![
+                        crate::Column::new("new_primary", crate::DataType::Text),
+                        crate::Column::new("epoch", crate::DataType::Int8),
+                        crate::Column::new("final_sequence", crate::DataType::Int8),
+                        crate::Column::new("this_node", crate::DataType::Text),
+                        crate::Column::new("other_standbys", crate::DataType::Text),
+                    ]);
+                    self.send_query_result(&schema, &[row]).await?;
+                    self.send_ready_for_query().await
+                }
+                Err((code, message, hint)) => self.send_error("ERROR", code, &message, None, hint).await,
+            },
+        }
+    }
+
+    /// Spec R3b (review item 5): whether this session may run `SWITCHOVER`
+    /// (either form) — it swaps this node's role with a standby's and ends
+    /// every session. A superuser session: the built-in `postgres` /
+    /// `helios` roles (the wire's bootstrap users), or a role created with
+    /// `SUPERUSER` (its catalog record, catalog.rs HC4). `Err`: the 42501
+    /// message. Under `trust` authentication a session's name is whatever
+    /// the client sent, so the check refuses only a client that does not
+    /// claim a superuser's name; the message says so.
+    fn switchover_privilege(&self) -> std::result::Result<(), String> {
+        let user = self.username.as_deref().unwrap_or_default();
+        if user == "postgres" || user == "helios" {
+            return Ok(());
+        }
+        let trust = if matches!(self.auth_manager.method(), AuthMethod::Trust) {
+            " (this listener authenticates with trust: a session's role is the name its client sent, so only a \
+             password, md5 or scram-sha-256 listener makes this a boundary)"
+        } else {
+            ""
+        };
+        match self.database.storage.catalog().get_role(user) {
+            Ok(Some(role)) if role.rolsuper => Ok(()),
+            Ok(_) => Err(format!(
+                "permission denied to run SWITCHOVER: role \"{user}\" is not a superuser — SWITCHOVER swaps this \
+                 node's role with a standby's and ends every session; connect as a superuser{trust}"
+            )),
+            Err(error) => Err(format!(
+                "permission denied to run SWITCHOVER: the role \"{user}\" cannot be read ({error}){trust}"
+            )),
+        }
+    }
+
+    /// `SWITCHOVER CHECK`'s rows.
+    #[cfg(feature = "ha-tier1")]
+    async fn run_switchover_check(&mut self, target: &str) -> Vec<Tuple> {
+        crate::replication::promote::switchover::check(target)
+            .await
+            .into_iter()
+            .map(|row| {
+                Tuple::new(vec![
+                    Value::String(row.check.to_string()),
+                    Value::Boolean(row.ok),
+                    Value::String(row.detail),
+                ])
+            })
+            .collect()
+    }
+
+    #[cfg(not(feature = "ha-tier1"))]
+    async fn run_switchover_check(&mut self, _target: &str) -> Vec<Tuple> {
+        vec![Tuple::new(vec![
+            Value::String("primary".to_string()),
+            Value::Boolean(false),
+            Value::String("this build has no physical replication (the ha-tier1 feature)".to_string()),
+        ])]
+    }
+
+    /// The switchover itself, from this session's side: exempt from the
+    /// termination of its own primary's fence, its hold on the store
+    /// released once the target accepted, then the answer.
+    #[cfg(feature = "ha-tier1")]
+    async fn run_switchover(
+        &mut self,
+        target: &str,
+    ) -> std::result::Result<Tuple, (&'static str, String, Option<String>)> {
+        use crate::network::protocol::sqlstate;
+        use crate::replication::promote::switchover;
+        if self.transaction_status != TransactionStatus::Idle || self.implicit_transaction {
+            return Err((
+                sqlstate::ACTIVE_SQL_TRANSACTION,
+                "SWITCHOVER cannot run inside a transaction block".to_string(),
+                None,
+            ));
+        }
+        // Answered first, then closed: its own primary's fence does not end it.
+        if let Some(ticket) = &self.session_ticket {
+            ticket.set_exempt(true);
+        }
+        let caller = format!(
+            "backend {} ({})",
+            self.database.session_backend_pid(self.session_id).unwrap_or(0),
+            self.session_ticket
+                .as_ref()
+                .and_then(|ticket| ticket.peer().map(str::to_string))
+                .unwrap_or_else(|| "local client".to_string())
+        );
+        let running = match switchover::begin(target, caller).await {
+            Ok(running) => running,
+            Err(refusal) => {
+                if let Some(ticket) = &self.session_ticket {
+                    ticket.set_exempt(false);
+                }
+                return Err((
+                    sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                    refusal.message,
+                    refusal.hint,
+                ));
+            }
+        };
+        // The demotion releases the store: this session lets go of it now.
+        self.release_database_for_promotion(running.placeholder());
+        let done = running.termination_message();
+        let answer = running.answer().await;
+        self.owe_termination(match &answer {
+            Ok(_) => done,
+            Err(_) => "terminating connection: the switchover did not complete (its error says what to run); \
+                       reconnect"
+                .to_string(),
+        });
+        match answer {
+            Ok(switched) => Ok(Tuple::new(vec![
+                Value::String(switched.new_primary),
+                Value::Int8(i64::try_from(switched.epoch).unwrap_or(i64::MAX)),
+                Value::Int8(i64::try_from(switched.final_sequence).unwrap_or(i64::MAX)),
+                Value::String(format!("standby ({})", switched.demotion)),
+                Value::String(if switched.other_standbys.is_empty() {
+                    "none".to_string()
+                } else {
+                    switched.other_standbys.join("; ")
+                }),
+            ])),
+            Err(reason) => Err((sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE, reason, None)),
+        }
+    }
+
+    #[cfg(not(feature = "ha-tier1"))]
+    async fn run_switchover(
+        &mut self,
+        _target: &str,
+    ) -> std::result::Result<Tuple, (&'static str, String, Option<String>)> {
+        Err((
+            crate::network::protocol::sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE,
+            "SWITCHOVER needs physical replication, and this build has none (the ha-tier1 feature)".to_string(),
+            None,
+        ))
+    }
+
     /// The promotion itself (`crate::replication::promote::online`), from
     /// this session's side: exempt from the termination of its own
     /// promotion, its hold on the standby's store released, then the answer.
@@ -2373,6 +2602,7 @@ where
                 .session_ticket
                 .as_ref()
                 .and_then(|ticket| ticket.peer().map(str::to_string)),
+            switchover: None,
         };
         let started = match online::request(request).await {
             Ok(started) => started,
@@ -2451,6 +2681,10 @@ where
         // Spec P5.2 §2: answered by this session, never the evaluator.
         if let Some(call) = parse_pg_promote(query) {
             return self.answer_pg_promote(call, None).await;
+        }
+        // Spec R3b: so is a switchover (on the primary).
+        if let Some(statement) = parse_switchover_statement(query) {
+            return self.answer_switchover(statement).await;
         }
         tracing::debug!("Executing query: {}", query);
 
@@ -8378,6 +8612,98 @@ pub(super) struct PgPromoteRefusal {
 pub(crate) const PG_PROMOTE_USAGE: &str = "SELECT pg_promote(wait boolean DEFAULT true, wait_seconds integer \
      DEFAULT 60), alone and with literal arguments: SELECT pg_promote(true, 60), pg_promote(false, 60), \
      pg_promote(true) or pg_promote()";
+
+/// Spec R3b: the forms of `SWITCHOVER` this session answers.
+pub(crate) const SWITCHOVER_USAGE: &str = "SWITCHOVER TO '<standby node id, replication address or alias>' or \
+     SWITCHOVER CHECK TO '<standby>' (CHECK lists the preflight's checks and changes nothing)";
+
+/// Spec R3b (Sprinter bbba90ddfc61): a `SWITCHOVER` statement this session
+/// answers itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SwitchoverStatement {
+    /// `SWITCHOVER TO '<target>'`.
+    To(String),
+    /// `SWITCHOVER CHECK [TO] '<target>'`.
+    Check(String),
+}
+
+/// Spec R3b: whether `sql` is a `SWITCHOVER` (or `HA SWITCHOVER`) statement
+/// — `Some(Err(usage))` for one this session cannot read.
+pub(crate) fn parse_switchover_statement(sql: &str) -> Option<std::result::Result<SwitchoverStatement, String>> {
+    /// `text` past a leading `keyword` (any case) and the whitespace after it.
+    fn keyword<'a>(text: &'a str, word: &str) -> Option<&'a str> {
+        let head = text.get(..word.len())?;
+        let tail = text.get(word.len()..)?;
+        (head.eq_ignore_ascii_case(word) && tail.starts_with(char::is_whitespace)).then(|| tail.trim_start())
+    }
+    let trimmed = sql.trim().trim_end_matches(';').trim_end();
+    let statement = keyword(trimmed, "HA").unwrap_or(trimmed);
+    let rest = match keyword(statement, "SWITCHOVER") {
+        Some(rest) => rest,
+        // `SWITCHOVER` alone, or followed by something but whitespace.
+        None if statement.eq_ignore_ascii_case("SWITCHOVER") => {
+            return Some(Err(format!("SWITCHOVER needs TO and a standby: {SWITCHOVER_USAGE}")))
+        }
+        None => return None,
+    };
+    let (check, rest) = match keyword(rest, "CHECK") {
+        Some(rest) => (true, rest),
+        None => (false, rest),
+    };
+    let rest = match keyword(rest, "TO") {
+        Some(rest) => rest,
+        None if check => rest,
+        None => return Some(Err(format!("SWITCHOVER needs TO and a standby: {SWITCHOVER_USAGE}"))),
+    };
+    let quoted = ['\'', '"']
+        .into_iter()
+        .find_map(|quote| rest.strip_prefix(quote).map(|inner| (quote, inner)));
+    let target = match quoted {
+        Some((quote, inner)) => match inner.split_once(quote) {
+            Some((name, after)) if after.trim().is_empty() => name.to_string(),
+            _ => {
+                return Some(Err(format!(
+                    "the standby's name is not one quoted string: {SWITCHOVER_USAGE}"
+                )))
+            }
+        },
+        None if !rest.is_empty() && !rest.contains(char::is_whitespace) => rest.to_string(),
+        None => return Some(Err(format!("SWITCHOVER needs a standby: {SWITCHOVER_USAGE}"))),
+    };
+    if target.trim().is_empty() {
+        return Some(Err(format!("SWITCHOVER needs a standby: {SWITCHOVER_USAGE}")));
+    }
+    Some(Ok(if check {
+        SwitchoverStatement::Check(target)
+    } else {
+        SwitchoverStatement::To(target)
+    }))
+}
+
+#[cfg(test)]
+mod switchover_statement_tests {
+    use super::{parse_switchover_statement as parse, SwitchoverStatement};
+
+    /// Spec R3b: the forms the session answers, and what it refuses.
+    #[test]
+    fn switchover_statements_are_read_by_the_session() {
+        let to = |target: &str| Some(Ok(SwitchoverStatement::To(target.to_string())));
+        let check = |target: &str| Some(Ok(SwitchoverStatement::Check(target.to_string())));
+        assert_eq!(parse("SWITCHOVER TO 'node-1'"), to("node-1"));
+        assert_eq!(parse("  switchover to \"127.0.0.1:41000\" ; "), to("127.0.0.1:41000"));
+        assert_eq!(parse("HA SWITCHOVER TO standby_b"), to("standby_b"));
+        assert_eq!(parse("SWITCHOVER CHECK TO 'node-1'"), check("node-1"));
+        assert_eq!(parse("SWITCHOVER CHECK 'node-1'"), check("node-1"));
+        assert_eq!(parse("switchover check to node_2;"), check("node_2"));
+        assert!(matches!(parse("SWITCHOVER 'node-1'"), Some(Err(_))));
+        assert!(matches!(parse("SWITCHOVER TO"), Some(Err(_))));
+        assert!(matches!(parse("SWITCHOVER TO 'a' 'b'"), Some(Err(_))));
+        assert!(matches!(parse("SWITCHOVER TO a b"), Some(Err(_))));
+        assert_eq!(parse("SELECT 1"), None);
+        assert_eq!(parse("SWITCHOVERS"), None);
+        assert_eq!(parse("SELECT 'SWITCHOVER TO x'"), None);
+    }
+}
 
 /// Spec P5.2 §2: a `SELECT pg_promote(wait, wait_seconds)` the server session
 /// answers ([`parse_pg_promote`]).

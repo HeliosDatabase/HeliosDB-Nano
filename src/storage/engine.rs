@@ -2055,6 +2055,18 @@ impl MergeStep {
 type BranchReferencingFkCache =
     parking_lot::Mutex<std::collections::HashMap<(u64, String), (u64, Vec<crate::sql::ForeignKeyConstraint>)>>;
 
+/// Sprinter 746342a0bfbb: what a checkpoint did with one standard HNSW index
+/// (`StorageEngine::persist_vector_graph`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VectorGraphCheckpoint {
+    /// Dumped under a fresh basename and switched to.
+    Dumped,
+    /// Unchanged since its sidecar's dump: kept, marker re-armed.
+    Unchanged,
+    /// Not dumped by policy (empty graph, or no longer a standard index).
+    Skipped,
+}
+
 /// Storage engine
 pub struct StorageEngine {
     /// RocksDB instance. Never written directly: every write goes through
@@ -2272,6 +2284,11 @@ pub struct StorageEngine {
     /// ([`Self::note_replication_epoch`]).
     replication_epoch: AtomicU64,
     replication_previous_epoch: AtomicU64,
+    /// Spec R1 §3: the standbys the replication source serving THIS store
+    /// has attached now ([`Self::attach_replication_census`]); `None` while
+    /// no replication port serves it. What key rotation reads, besides the
+    /// open mode.
+    replication_census: RwLock<Option<ReplicationCensus>>,
     /// RocksDB `LOG` redirect for a READ-ONLY handle (including physical
     /// snapshots): an owned directory OUTSIDE the database, kept alive through
     /// the drop of the engine-owned `StorageEngine`/`DB` handle so the log
@@ -2302,6 +2319,47 @@ pub enum LogicalCatchup {
     StandbyAhead { latest: u64 },
     /// No logical WAL on this engine.
     Unavailable,
+}
+
+/// Spec R1 §3: the standbys a replication source serving a store has
+/// attached now, one description each (`StorageEngine::attach_replication_census`).
+pub type ReplicationCensus = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
+/// A DDL statement's catalog change and its logical-WAL entry, durable
+/// together ([`StorageEngine::write_ddl_batch`], spec R1 §4). The
+/// synchronous-replication wait for the write is its owner's LAST step.
+#[must_use = "a DDL write waits for its standbys once its in-memory finalization is done"]
+pub struct DdlWrite {
+    /// The physical sequence a sync/semi-sync primary's standbys must
+    /// acknowledge (`None` on every other node).
+    barrier: Option<u64>,
+}
+
+impl DdlWrite {
+    /// Wait (bounded by `[replication] sync_timeout_ms`) for the standbys to
+    /// acknowledge the write; a no-op unless this node's commits wait.
+    pub(crate) fn wait_replicated(self) {
+        WriteAheadLog::wait_replicated_sequence(self.barrier);
+    }
+}
+
+/// `internal-tests` builds only: `HELIOSDB_NANO_TEST_EXIT_AFTER_DDL_WRITE=<point>:<table>`
+/// ends this process — no `Drop`, no close-time checkpoint: a crash — right
+/// after the catalog write of that DDL (`create`, `drop`, `rename`; the
+/// table it creates, drops or renames), before its in-memory finalization
+/// and replication wait (spec R1 §4's crash tests). Does nothing in every
+/// other build.
+pub fn exit_after_ddl_write(point: &str, table: &str) {
+    #[cfg(feature = "internal-tests")]
+    {
+        const EXIT_AFTER_DDL_WRITE_ENV: &str = "HELIOSDB_NANO_TEST_EXIT_AFTER_DDL_WRITE";
+        if std::env::var(EXIT_AFTER_DDL_WRITE_ENV).is_ok_and(|at| at.split_once(':') == Some((point, table))) {
+            tracing::warn!("{EXIT_AFTER_DDL_WRITE_ENV}: ending this process after the {point} of {table}");
+            std::process::exit(0);
+        }
+    }
+    #[cfg(not(feature = "internal-tests"))]
+    let _ = (point, table);
 }
 
 impl StorageEngine {
@@ -2619,6 +2677,58 @@ impl StorageEngine {
         matches!(self.open_mode, OpenMode::PhysicalStandby { .. })
     }
 
+    /// Spec R1 §3: attach the census of the replication source that serves
+    /// THIS store — the standbys it has attached now, as the operator reads
+    /// them (node id, address, state). From then on key rotation of this
+    /// store is refused, naming them (or, none attached, because the port
+    /// serves: a standby that is away holds the key too). Attached by the
+    /// code that starts the store's replication port; never detached.
+    pub fn attach_replication_census(&self, census: ReplicationCensus) {
+        *self.replication_census.write() = Some(census);
+    }
+
+    /// Spec R1 §3 (plan `PHYSICAL_STANDBY_REPLICATION.md` §D5): this store's
+    /// standing in physical replication, from its OWN state: its open mode
+    /// (a physical standby's — every other mode of a standby's directory is
+    /// refused at open) and the census of the replication source serving it.
+    fn key_rotation_standing(&self) -> crate::crypto::KeyRotationStanding {
+        use crate::crypto::KeyRotationStanding;
+        if self.is_physical_standby() {
+            return KeyRotationStanding::physical_standby();
+        }
+        match self.replication_census.read().as_ref() {
+            Some(census) => KeyRotationStanding::primary_with_standbys(census()),
+            None => KeyRotationStanding::unreplicated(),
+        }
+    }
+
+    /// Spec R1 §3 (plan §D5): THE key-rotation entry point of a store —
+    /// no SQL, CLI or HTTP surface reaches it in this build. It fails closed
+    /// while a rotation would strand a physical standby, from this store's
+    /// own standing: refused on a physical standby (its key is its primary's:
+    /// it applies the primary's sealed values verbatim), and on a primary
+    /// whose replication port serves — naming the standbys attached, since
+    /// no standby can hold two keys. Past that check it is refused all the
+    /// same: a rotation must re-encrypt every sealed value, the tolerant
+    /// reader tries no previous key, and nothing in this build re-encrypts —
+    /// re-keying is a dump and restore under the new key. Nothing changes
+    /// either way.
+    pub fn rotate_encryption_key(&self, new_key: crate::crypto::EncryptionKey) -> Result<()> {
+        if let Some(reason) = self.key_rotation_standing().refusal() {
+            return Err(Error::encryption(reason));
+        }
+        if self.key_manager.is_none() {
+            return Err(Error::encryption(
+                "encryption key rotation refused: this store is not encrypted ([encryption] enabled = false)",
+            ));
+        }
+        let _ = new_key;
+        Err(Error::encryption(
+            "encryption key rotation is not available in this build: it would have to re-encrypt every sealed \
+             value, which nothing does yet; re-key by dumping the database and restoring it under the new key",
+        ))
+    }
+
     /// Spec P5.1: the replication epoch this store holds (`repl:epoch`; 1
     /// for a store that was never promoted), as read at open and kept
     /// current by a standby's applier. What every replication surface of the
@@ -2697,6 +2807,45 @@ impl StorageEngine {
     /// outside the engine that builds batches against its handle (catalog DDL).
     pub(crate) fn db_write(&self, batch: WriteBatch, opts: Option<&WriteOptions>) -> Result<()> {
         self.gate.write(&self.db, batch, opts)
+    }
+
+    /// Spec R1 §4 (sprinter e21903322db7): write a DDL statement's catalog
+    /// `batch` with its logical-WAL entry `operation` sealed INTO it — ONE
+    /// write, so the entry exists exactly when the change does. Appended on
+    /// its own (first, or after) it could outlive a change that failed, or a
+    /// crash between the two left the change without it while the entries of
+    /// the incarnation it ended (a table's CREATE and inserts above the
+    /// checkpoint) were still there to be replayed. Inside a statement-capture
+    /// frame too: the change is not transactional — it is durable as soon as
+    /// this write is — so its entry cannot wait for the statement's commit.
+    /// During replay, or with no logical WAL, only the batch is written. The
+    /// synchronous-replication wait is NOT made here: the caller makes it
+    /// last ([`DdlWrite::wait_replicated`]), after its in-memory finalization,
+    /// so no standby round trip sits inside the DDL's critical section.
+    pub(crate) fn write_ddl_batch(&self, operation: WalOperation, mut batch: WriteBatch) -> Result<DdlWrite> {
+        let options = self.memory_write_options.as_ref();
+        let wal = if self.is_replaying.load(Ordering::Acquire) {
+            None
+        } else {
+            self.wal.as_ref()
+        };
+        let Some(wal) = wal else {
+            self.db_write(batch, options)?;
+            return Ok(DdlWrite { barrier: None });
+        };
+        let wal = wal.read();
+        let staged = wal.stage(vec![operation], &mut batch)?;
+        if let Err(error) = self.db_write(batch, options) {
+            if let Some(staged) = staged {
+                wal.abandon_staged(staged);
+            }
+            return Err(error);
+        }
+        let barrier = wal.replication_barrier();
+        if let Some(staged) = staged {
+            wal.publish_staged(staged);
+        }
+        Ok(DdlWrite { barrier })
     }
 
     /// Refuse to open a physical standby's directory in any mode but
@@ -2948,38 +3097,13 @@ impl StorageEngine {
     /// writes rather than guessing at "database-looking" names, so a fresh
     /// directory holding a user's config or key files is not misread as a
     /// store.
+    ///
+    /// Spec R3a (review): the ONE predicate — [`is_rocksdb_name`] — shared
+    /// with every physical stage census (`checkpoint_transfer`'s foreign
+    /// files are defined from it), so the engine and the stages never
+    /// disagree on what is RocksDB's.
     fn is_rocksdb_remnant_name(name: &str) -> bool {
-        if matches!(name, "IDENTITY" | "LOCK" | "LOG" | "LOG.old" | "archive") {
-            return true;
-        }
-        // The info log rotates to `LOG.old.<timestamp>`; Nano's writable open
-        // uses RocksDB's default (no `db_log_dir`) info-log prefix of `LOG`.
-        if let Some(timestamp) = name.strip_prefix("LOG.old.") {
-            return Self::is_decimal(timestamp);
-        }
-        if let Some(number) = name.strip_prefix("MANIFEST-") {
-            return Self::is_decimal(number);
-        }
-        if let Some(number) = name.strip_prefix("METADB-") {
-            return Self::is_decimal(number);
-        }
-        if let Some(rest) = name.strip_prefix("OPTIONS-") {
-            let number = rest.strip_suffix(".dbtmp").unwrap_or(rest);
-            return Self::is_decimal(number);
-        }
-        match name.rsplit_once('.') {
-            Some((number, extension)) => {
-                Self::is_decimal(number) && matches!(extension, "sst" | "ldb" | "log" | "blob" | "dbtmp")
-            }
-            None => false,
-        }
-    }
-
-    /// `<digits>` in the RocksDB filename grammar: one or more ASCII decimal
-    /// digits, leading zeros allowed (`ConsumeDecimalNumber` in the pinned
-    /// `file/filename.cc`).
-    fn is_decimal(value: &str) -> bool {
-        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+        is_rocksdb_name(name)
     }
 
     /// Does `db_path` already hold a store that the writable open must
@@ -3543,6 +3667,7 @@ impl StorageEngine {
             physical_hydration_started: AtomicBool::new(false),
             replication_epoch: AtomicU64::new(super::replication_epoch::epoch_of(epoch_record.as_ref())),
             replication_previous_epoch: AtomicU64::new(super::replication_epoch::previous_of(epoch_record.as_ref())),
+            replication_census: RwLock::new(None),
             _read_only_log_dir: read_only_log_dir,
         };
 
@@ -3993,6 +4118,7 @@ impl StorageEngine {
             // A fresh in-memory store was never promoted.
             replication_epoch: AtomicU64::new(super::replication_epoch::INITIAL_EPOCH),
             replication_previous_epoch: AtomicU64::new(super::replication_epoch::INITIAL_EPOCH),
+            replication_census: RwLock::new(None),
             _read_only_log_dir: None,
         })
     }
@@ -10715,17 +10841,21 @@ impl StorageEngine {
     /// Checkpoint: persist ART entries and standard HNSW graphs so the next
     /// open can skip the O(table-size) rebuild.
     ///
-    /// Write order per artifact is snapshot-then-marker through the
+    /// ART: write order per table is snapshot-then-marker through the
     /// encrypting `put` path, so a crash mid-checkpoint leaves at worst a
     /// marker-less snapshot (ignored at open → scan rebuild). Should be
     /// called quiescent (the embedded close path checks for open
     /// transactions); a racing mutation is detected after the marker writes
     /// and re-invalidates them.
     ///
-    /// Note: HNSW graph dumps are plain files under
-    /// `{data_dir}/hnsw_snapshots/` and are not covered by at-rest encryption
-    /// (the vectors themselves; row data stays in RocksDB). ART snapshots go
-    /// through the encrypted keyspace.
+    /// HNSW (Sprinter 746342a0bfbb), per standard index: an index unchanged
+    /// since the dump its sidecar describes keeps that dump and only gets its
+    /// marker back; a changed one is dumped under a fresh basename (fsynced,
+    /// renamed into `{data_dir}/hnsw_snapshots/`), its sidecar and marker are
+    /// written in ONE batch, and only then is the previous dump removed. An
+    /// empty graph is not dumped. With at-rest encryption on, NO graph is
+    /// dumped: hnsw_rs writes plaintext files only, so those indexes rebuild
+    /// from their sealed rows at open (`IndexSnapshotPersistReport::vector_skipped`).
     pub fn persist_index_snapshots(&self) -> Result<super::index_snapshot::IndexSnapshotPersistReport> {
         use super::index_snapshot as snap;
 
@@ -10773,34 +10903,55 @@ impl StorageEngine {
             report.art_tables += 1;
         }
 
-        let vector_metas = self.vector_indexes.list_all_metadata();
-        if vector_metas
-            .iter()
-            .any(|m| matches!(m.index_type, super::VectorIndexType::Standard(_)))
-        {
-            if let Err(e) = std::fs::create_dir_all(&dump_dir) {
-                warn!("could not create HNSW snapshot dir {:?}: {}", dump_dir, e);
-            }
-        }
-        for meta in vector_metas {
-            if !matches!(meta.index_type, super::VectorIndexType::Standard(_)) {
-                continue; // persistent backend is already durable; PQ has its own path
-            }
-            match self.vector_indexes.dump_standard_index(&meta.name, &dump_dir) {
-                Ok(Some(sidecar)) => {
-                    let blob =
-                        bincode::serialize(&sidecar).map_err(|e| Error::storage(format!("sidecar serialize: {e}")))?;
-                    self.put(&snap::vec_snapshot_key(&meta.name), &blob)?;
-                    self.put(&snap::vec_snapshot_marker_key(&meta.name), &marker_bytes)?;
-                    report.vector_graphs += 1;
-                }
-                Ok(None) => {}
+        // Persistent backends are already durable; PQ has its own path.
+        let standard: Vec<String> = self
+            .vector_indexes
+            .list_all_metadata()
+            .into_iter()
+            .filter(|m| matches!(m.index_type, super::VectorIndexType::Standard(_)))
+            .map(|m| m.name)
+            .collect();
+        if self.is_encrypted() {
+            // Sprinter 746342a0bfbb: hnsw_rs only writes plaintext files, and
+            // a graph dump holds every vector; an encrypted store writes none
+            // and rebuilds these indexes from their sealed rows at open.
+            report.vector_skipped += standard.len() as u64;
+        } else if !standard.is_empty() {
+            // Basenames the current sidecars reference, so removing an index's
+            // previous dump never removes one another sidecar still uses (two
+            // names that sanitized alike shared one under the old scheme).
+            // Unknown (a failed listing) keeps every previous dump for the sweep.
+            let listing = self.meta_blobs_with_prefix(snap::VEC_SNAPSHOT_PREFIX);
+            let referenced: Option<Vec<(String, String)>> = match listing {
+                Ok(sidecars) => Some(
+                    sidecars
+                        .into_iter()
+                        .filter_map(|(name, blob)| {
+                            let sidecar = bincode::deserialize::<snap::VectorGraphSidecar>(&blob).ok()?;
+                            Some((name, sidecar.basename))
+                        })
+                        .collect(),
+                ),
                 Err(e) => {
                     warn!(
-                        "HNSW snapshot dump for '{}' failed: {} — it will rebuild on open",
-                        meta.name, e
+                        "HNSW snapshot: cannot list the stored sidecars ({}); previous dumps are kept",
+                        e
                     );
-                    report.vector_dump_failures += 1;
+                    None
+                }
+            };
+            for name in standard {
+                match self.persist_vector_graph(&name, &dump_dir, &marker_bytes, referenced.as_deref()) {
+                    Ok(VectorGraphCheckpoint::Dumped) => report.vector_graphs += 1,
+                    Ok(VectorGraphCheckpoint::Unchanged) => report.vector_unchanged += 1,
+                    Ok(VectorGraphCheckpoint::Skipped) => report.vector_skipped += 1,
+                    Err(e) => {
+                        warn!(
+                            "HNSW snapshot dump for '{}' failed: {} — it will rebuild on open",
+                            name, e
+                        );
+                        report.vector_dump_failures += 1;
+                    }
                 }
             }
         }
@@ -10816,10 +10967,139 @@ impl StorageEngine {
         report.persisted = true;
         report.elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         info!(
-            "index snapshot checkpoint: {} tables ({} ART entries), {} HNSW graphs, {:.1}ms",
-            report.art_tables, report.art_entries, report.vector_graphs, report.elapsed_ms
+            "index snapshot checkpoint: {} tables ({} ART entries), HNSW {} dumped / {} kept / {} skipped, {:.1}ms",
+            report.art_tables,
+            report.art_entries,
+            report.vector_graphs,
+            report.vector_unchanged,
+            report.vector_skipped,
+            report.elapsed_ms
         );
         Ok(report)
+    }
+
+    /// Sprinter 746342a0bfbb: checkpoint ONE standard HNSW index (see
+    /// [`Self::persist_index_snapshots`]). `referenced` holds `(index name,
+    /// basename)` for every sidecar stored before this checkpoint; `None` when
+    /// that is unknown, and then no previous dump is removed.
+    fn persist_vector_graph(
+        &self,
+        name: &str,
+        dump_dir: &Path,
+        marker_bytes: &[u8],
+        referenced: Option<&[(String, String)]>,
+    ) -> Result<VectorGraphCheckpoint> {
+        use super::index_snapshot as snap;
+        let Some(state) = self.vector_indexes.standard_index_dump_state(name) else {
+            return Ok(VectorGraphCheckpoint::Skipped);
+        };
+        if state == super::StandardDumpState::Empty {
+            return Ok(VectorGraphCheckpoint::Skipped);
+        }
+        let previous = self.read_vector_sidecar(name);
+        if state == super::StandardDumpState::Unchanged {
+            if let Some(previous) = &previous {
+                if self.vector_indexes.standard_index_matches_sidecar(name, previous)
+                    && snap::graph_dump_files_present(dump_dir, &previous.basename)
+                {
+                    // The sidecar and its files already describe the index; the
+                    // marker may have gone with another index's first mutation.
+                    let marker_key = snap::vec_snapshot_marker_key(name);
+                    self.write_sealed_records(&[(marker_key.as_slice(), marker_bytes)])?;
+                    return Ok(VectorGraphCheckpoint::Unchanged);
+                }
+            }
+        }
+
+        let Some(dump) = self.vector_indexes.dump_standard_index(name, dump_dir)? else {
+            return Ok(VectorGraphCheckpoint::Skipped);
+        };
+        let blob = bincode::serialize(&dump.sidecar).map_err(|e| Error::storage(format!("sidecar serialize: {e}")))?;
+        let sidecar_key = snap::vec_snapshot_key(name);
+        let marker_key = snap::vec_snapshot_marker_key(name);
+        // Sidecar and marker in ONE batch: the switch to the new dump.
+        let records = [
+            (sidecar_key.as_slice(), blob.as_slice()),
+            (marker_key.as_slice(), marker_bytes),
+        ];
+        if let Err(e) = self.write_sealed_records(&records) {
+            if let Err(remove) = snap::remove_graph_dump(dump_dir, &dump.sidecar.basename) {
+                warn!(
+                    "HNSW snapshot for '{}': unreferenced dump left behind: {}",
+                    name, remove
+                );
+            }
+            return Err(e);
+        }
+        self.vector_indexes.mark_standard_index_dumped(name, dump.generation);
+
+        if let Some(previous) = previous {
+            let shared = referenced.is_none_or(|referenced| {
+                referenced
+                    .iter()
+                    .any(|(other, basename)| other != name && *basename == previous.basename)
+            });
+            if previous.basename != dump.sidecar.basename && !shared {
+                if let Err(e) = snap::remove_graph_dump(dump_dir, &previous.basename) {
+                    warn!(
+                        "HNSW snapshot for '{}': could not remove the previous dump '{}': {} (swept at the next open)",
+                        name, previous.basename, e
+                    );
+                }
+            }
+        }
+        Ok(VectorGraphCheckpoint::Dumped)
+    }
+
+    /// The decodable sidecar stored for vector index `name`, if any (marker or
+    /// not).
+    fn read_vector_sidecar(&self, name: &str) -> Option<super::index_snapshot::VectorGraphSidecar> {
+        use super::index_snapshot as snap;
+        let blob = self.get(&snap::vec_snapshot_key(name)).ok().flatten()?;
+        let sidecar: snap::VectorGraphSidecar = bincode::deserialize(&blob).ok()?;
+        (sidecar.index_name == name).then_some(sidecar)
+    }
+
+    /// Sprinter 746342a0bfbb: write `records` as ONE gated RocksDB batch, each
+    /// value sealed exactly as [`Self::put`] seals it.
+    fn write_sealed_records(&self, records: &[(&[u8], &[u8])]) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        for &(key, value) in records {
+            let stored = super::tde::seal(self.key_manager.as_deref(), value)?;
+            batch.put(key, stored.as_ref());
+        }
+        self.gate.write(&self.db, batch, self.memory_write_options.as_ref())
+    }
+
+    /// Sprinter 746342a0bfbb: at open, delete every graph dump file in
+    /// `hnsw_snapshots/` that no valid sidecar (`sidecars`, as
+    /// [`Self::load_vector_sidecars`] returned them) references, and every
+    /// staging directory a crashed dump left. On an encrypted store no dump is
+    /// valid: every dump file goes, and so do the sidecars and markers that
+    /// pointed at them. Nothing is touched by a handle that may not write.
+    /// Returns how many entries were removed.
+    pub(crate) fn sweep_hnsw_snapshot_dir(
+        &self,
+        sidecars: &std::collections::HashMap<String, super::index_snapshot::VectorGraphSidecar>,
+    ) -> u64 {
+        use super::index_snapshot as snap;
+        if !self.gate.is_open() || self.is_physical_standby() {
+            return 0;
+        }
+        let encrypted = self.is_encrypted();
+        if encrypted {
+            Self::delete_prefix_raw(&self.db, &self.gate, snap::VEC_SNAPSHOT_MARKER_PREFIX.as_bytes());
+            Self::delete_prefix_raw(&self.db, &self.gate, snap::VEC_SNAPSHOT_PREFIX.as_bytes());
+        }
+        let Some(dir) = self.hnsw_snapshot_dir() else {
+            return 0;
+        };
+        let keep: HashSet<&str> = if encrypted {
+            HashSet::new()
+        } else {
+            sidecars.values().map(|sidecar| sidecar.basename.as_str()).collect()
+        };
+        snap::sweep_graph_dumps(&dir, &keep)
     }
 
     /// Remove the durable snapshot artefacts belonging to ONE vector index: the
@@ -10841,9 +11121,9 @@ impl StorageEngine {
         use super::index_snapshot as snap;
 
         // The dump basename is read back OUT of the sidecar rather than
-        // re-derived: `graph_dump_basename` is lossy (every non-alphanumeric
-        // collapses to `_`), so re-deriving it from the index name could delete
-        // a different index's dump files.
+        // re-derived: it carries a per-checkpoint generation, and sidecars
+        // written before Sprinter 746342a0bfbb used the lossy sanitized index
+        // name, which re-deriving could map onto a different index's files.
         if let Some(dir) = self.hnsw_snapshot_dir() {
             match self.get(&snap::vec_snapshot_key(index_name)) {
                 Ok(Some(blob)) => match bincode::deserialize::<snap::VectorGraphSidecar>(&blob) {
@@ -10931,11 +11211,16 @@ impl StorageEngine {
     }
 
     /// Read every valid HNSW graph sidecar (marker present + versions match).
+    /// None on an encrypted store (Sprinter 746342a0bfbb): a dump there can
+    /// only be a plaintext one an unencrypted run left, and it is never loaded.
     pub(crate) fn load_vector_sidecars(
         &self,
     ) -> std::collections::HashMap<String, super::index_snapshot::VectorGraphSidecar> {
         use super::index_snapshot as snap;
         let mut out = std::collections::HashMap::new();
+        if self.is_encrypted() {
+            return out;
+        }
         for index in self.keys_with_prefix_suffixes(snap::VEC_SNAPSHOT_MARKER_PREFIX) {
             let Ok(Some(marker_bytes)) = self.get(&snap::vec_snapshot_marker_key(&index)) else {
                 continue;
@@ -13544,6 +13829,75 @@ impl StorageEngine {
         }
     }
 
+    /// Spec R1 §4 (sprinter e21903322db7): per table, the LSN of the last
+    /// destructive entry (`DropTable`, `Truncate`, `RenameTable`) of open
+    /// recovery's `entries` — every EARLIER entry naming that table is fenced
+    /// off with it (see `replay_wal_after`), whatever the policy does with the
+    /// destructive entry itself. A `RenameTable` fences both names: the
+    /// source's earlier entries are the incarnation it moved away, the
+    /// target's one dropped before the rename. Sound because a destructive
+    /// entry is written in its change's own write group (`write_ddl_batch`,
+    /// a transactional TRUNCATE with its commit): the entry is there exactly
+    /// when the change is, so what it ended is already absent from the store
+    /// and nothing before it on that table has anything to redo.
+    fn destructive_fences(&self, entries: &[super::wal::WalEntry]) -> HashMap<String, u64> {
+        let mut fences: HashMap<String, u64> = HashMap::new();
+        if !self.is_open_recovery.load(Ordering::Acquire) {
+            return fences;
+        }
+        for entry in entries {
+            if !matches!(
+                entry.operation,
+                WalOperation::DropTable { .. } | WalOperation::Truncate { .. } | WalOperation::RenameTable { .. }
+            ) {
+                continue;
+            }
+            for table in Self::wal_operation_tables(&entry.operation) {
+                let fence = fences.entry(table.to_string()).or_insert(entry.lsn);
+                *fence = (*fence).max(entry.lsn);
+            }
+        }
+        fences
+    }
+
+    /// Whether replaying `operation` only adds to the pending row batch
+    /// (`apply_wal_operation_to_batch`): every other arm changes the store at
+    /// once, so the batch is written before it (spec R1 §4).
+    fn replays_into_batch(operation: &WalOperation) -> bool {
+        matches!(
+            operation,
+            WalOperation::Insert { .. }
+                | WalOperation::Update { .. }
+                | WalOperation::Delete { .. }
+                | WalOperation::UpdateCounter { .. }
+                | WalOperation::Begin { .. }
+                | WalOperation::Commit { .. }
+                | WalOperation::Abort { .. }
+        )
+    }
+
+    /// The tables a logical WAL entry names (spec R1 §4's fence).
+    fn wal_operation_tables(operation: &WalOperation) -> Vec<&str> {
+        match operation {
+            WalOperation::Insert { table, .. }
+            | WalOperation::Update { table, .. }
+            | WalOperation::Delete { table, .. }
+            | WalOperation::Truncate { table }
+            | WalOperation::CreateTable { table, .. }
+            | WalOperation::DropTable { table }
+            | WalOperation::AlterColumnStorage { table, .. }
+            | WalOperation::CreateIndex { table, .. }
+            | WalOperation::CreateTrigger { table, .. }
+            | WalOperation::AddConstraint { table, .. }
+            | WalOperation::DropConstraint { table, .. }
+            | WalOperation::AlterTableSchema { table, .. } => vec![table.as_str()],
+            WalOperation::DropTrigger { table, .. } => table.as_deref().into_iter().collect(),
+            WalOperation::UpdateCounter { table_name, .. } => vec![table_name.as_str()],
+            WalOperation::RenameTable { old_table, new_table } => vec![old_table.as_str(), new_table.as_str()],
+            _ => Vec::new(),
+        }
+    }
+
     /// Bounded `data:{table}:` key count for the destructive-replay diagnostic.
     fn count_data_rows(&self, table: &str) -> usize {
         const COUNT_CAP: usize = 100_000;
@@ -13618,6 +13972,20 @@ impl StorageEngine {
                 }
             }
 
+            // Spec R1 §4 (sprinter e21903322db7): the entries BEFORE a
+            // destructive DDL entry that name the same table describe the
+            // incarnation that DDL ended: the rows a DROP removed, the table
+            // a RENAME moved away, the rows a TRUNCATE cleared. Replayed — the
+            // DDL itself skipped (GH#35 Half B, `refuse`), or applied after
+            // them (`warn`/`apply`) — they wrote that incarnation into
+            // whatever bears the name now: a dropped table came back with its
+            // rows, a re-created table of the same name received the dropped
+            // rows. So a destructive entry fences off every earlier entry
+            // naming one of its tables, under every policy; what follows it is
+            // replayed as before.
+            let fences = self.destructive_fences(&entries);
+            let mut fenced_count = 0usize;
+
             // Second pass: Apply operations in batches
             const BATCH_SIZE: usize = 100;
             let mut batch = WriteBatch::default();
@@ -13631,6 +13999,34 @@ impl StorageEngine {
                         skipped_count += 1;
                         continue;
                     }
+                }
+
+                if Self::wal_operation_tables(&entry.operation)
+                    .iter()
+                    .any(|table| fences.get(*table).is_some_and(|fence| entry.lsn < *fence))
+                {
+                    debug!(
+                        "Skipping WAL entry at LSN {}: a later destructive DDL entry names its table",
+                        entry.lsn
+                    );
+                    skipped_count += 1;
+                    fenced_count += 1;
+                    continue;
+                }
+
+                // Spec R1 §4: an arm that changes the store at once (DDL) runs
+                // after the rows batched before it are written, in LSN order:
+                // a CreateTable checks existence and a DropTable deletes the
+                // rows present, so a batched row of an earlier incarnation
+                // written after a replayed drop and re-create landed in the
+                // new table.
+                if !Self::replays_into_batch(&entry.operation) && !batch.is_empty() {
+                    if let Err(e) = self.gate.write(&self.db, std::mem::take(&mut batch), None) {
+                        self.is_replaying.store(false, Ordering::Release);
+                        self.is_open_recovery.store(false, Ordering::Release);
+                        return Err(Error::storage(format!("Batch write failed: {}", e)));
+                    }
+                    batch_count = 0;
                 }
 
                 // Apply the operation to the batch
@@ -13678,6 +14074,13 @@ impl StorageEngine {
                     .map_err(|e| Error::storage(format!("Final batch write failed: {}", e)))?;
             }
 
+            if fenced_count > 0 {
+                warn!(
+                    "WAL replay: {} entries were not replayed because a later destructive DDL entry names \
+                     their table (they belong to the table incarnation it ended)",
+                    fenced_count
+                );
+            }
             info!(
                 "WAL replay complete: {} operations applied, {} skipped, {} errors",
                 replayed_count, skipped_count, error_count
@@ -16586,6 +16989,52 @@ impl StorageEngine {
     }
 }
 
+/// Whether `name` is one of the file or directory names RocksDB itself
+/// writes directly under a database directory. The grammar is taken verbatim
+/// from the pinned `librocksdb-sys` 0.16.0+8.10.0 build of RocksDB 8.10.0
+/// (`rocksdb/file/filename.cc`: `ParseFileName` / `MakeFileName` /
+/// `DescriptorFileName` / `OptionsFileName` / `LockFileName` /
+/// `IdentityFileName` / `OldInfoLogFileName` / `ArchivalDirectory` /
+/// `CurrentFileName`): the exact `CURRENT`, `IDENTITY`, `LOCK`, `LOG`,
+/// `LOG.old`, `LOG.old.<digits>` and `archive` names, the prefixed
+/// `MANIFEST-<digits>`, `METADB-<digits>` and `OPTIONS-<digits>` (plus its
+/// `OPTIONS-<digits>.dbtmp` materialization temp), and the numbered
+/// `<digits>.(sst|ldb|log|blob|dbtmp)` table/WAL/blob/temp files — the
+/// decimal digits as `ConsumeDecimalNumber` takes them, leading zeros allowed.
+/// A NAME test only: it mirrors the exact grammar RocksDB writes rather than
+/// guessing at "database-looking" names, so a user's config or key files are
+/// never read as RocksDB's. Spec R3a (Sprinter 1c8963417a35): THE predicate
+/// the engine's fresh-directory open and every physical stage census share.
+pub fn is_rocksdb_name(name: &str) -> bool {
+    fn is_decimal(value: &str) -> bool {
+        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+    }
+    if matches!(name, "CURRENT" | "IDENTITY" | "LOCK" | "LOG" | "LOG.old" | "archive") {
+        return true;
+    }
+    // The info log rotates to `LOG.old.<timestamp>`; Nano's writable open
+    // uses RocksDB's default (no `db_log_dir`) info-log prefix of `LOG`.
+    if let Some(timestamp) = name.strip_prefix("LOG.old.") {
+        return is_decimal(timestamp);
+    }
+    if let Some(number) = name.strip_prefix("MANIFEST-") {
+        return is_decimal(number);
+    }
+    if let Some(number) = name.strip_prefix("METADB-") {
+        return is_decimal(number);
+    }
+    if let Some(rest) = name.strip_prefix("OPTIONS-") {
+        let number = rest.strip_suffix(".dbtmp").unwrap_or(rest);
+        return is_decimal(number);
+    }
+    match name.rsplit_once('.') {
+        Some((number, extension)) => {
+            is_decimal(number) && matches!(extension, "sst" | "ldb" | "log" | "blob" | "dbtmp")
+        }
+        None => false,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -16609,6 +17058,45 @@ mod tests {
         let engine = StorageEngine::open_in_memory(&config).expect("open encrypted in-memory engine");
         assert!(engine.is_encrypted(), "test engine must have a key manager");
         engine
+    }
+
+    /// Spec R1 §3: key rotation through the store's one entry point, from
+    /// its own standing — refused while a replication port serves the store
+    /// (naming the standbys attached; none attached, because the port
+    /// serves), and otherwise refused because nothing re-encrypts; an
+    /// unencrypted store is refused as such. The key is unchanged throughout.
+    #[test]
+    fn key_rotation_is_refused_from_the_stores_own_standing() {
+        let engine = encrypted_test_engine(
+            "HELIOS_R1_ROTATION_GUARD_KEY",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        let before = *engine.key_manager_arc().unwrap().key();
+        let unattached = engine.rotate_encryption_key([7; 32]).unwrap_err().to_string();
+        assert!(unattached.contains("not available in this build"), "{unattached}");
+
+        engine.attach_replication_census(Arc::new(|| {
+            vec!["node a at 10.0.0.2:41000 (streaming, applied through 7)".to_string()]
+        }));
+        let attached = engine.rotate_encryption_key([7; 32]).unwrap_err().to_string();
+        assert!(attached.contains("serves 1 physical standby(s)"), "{attached}");
+        assert!(
+            attached.contains("node a at 10.0.0.2:41000"),
+            "the standby is named: {attached}"
+        );
+        assert!(
+            attached.contains("recover --from-primary --full --replace"),
+            "{attached}"
+        );
+
+        engine.attach_replication_census(Arc::new(Vec::<String>::new));
+        let serving = engine.rotate_encryption_key([7; 32]).unwrap_err().to_string();
+        assert!(serving.contains("serves its replication port"), "{serving}");
+        assert_eq!(*engine.key_manager_arc().unwrap().key(), before, "nothing changed");
+
+        let plain = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        let error = plain.rotate_encryption_key([7; 32]).unwrap_err().to_string();
+        assert!(error.contains("not encrypted"), "{error}");
     }
 
     fn int_pk_schema() -> Schema {
