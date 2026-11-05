@@ -1142,9 +1142,10 @@ async fn explicit_transactions_on_a_branch_work_on_the_wire() {
 
 /// A transaction whose branch is merged (or dropped) by another session while
 /// it is open: its COMMIT rolls back and is refused (3D000), on the embedded
-/// session API and on the PostgreSQL wire — so its staged branch write (B2:
-/// it now holds one) is reported lost, never committed into an overlay nobody
-/// can use, and never on main.
+/// session API and on the PostgreSQL wire — so a staged branch write is reported
+/// lost, never committed into an overlay nobody can use, and never on main.
+/// (B3 second fix pass: a MERGE refuses, 55006, while the transaction HAS staged
+/// writes: they would land after the merge validated its keys. A DROP does not.)
 #[tokio::test]
 async fn a_commit_across_a_concurrent_merge_or_drop_is_refused() {
     let db = seeded();
@@ -1155,6 +1156,15 @@ async fn a_commit_across_a_concurrent_merge_or_drop_is_refused() {
     db.begin_transaction_for_session(s1).unwrap();
     db.execute_for_session(s1, "INSERT INTO t VALUES (50, 'in txn')")
         .expect("a write inside a branch transaction");
+    let refused = db
+        .execute_for_session(s2, "MERGE BRANCH b INTO main")
+        .expect_err("the transaction has staged writes on the source");
+    assert!(
+        refused.to_string().contains(heliosdb_nano::BRANCH_TABLE_BUSY_MARKER),
+        "got: {refused}"
+    );
+    db.rollback_transaction_for_session(s1).unwrap();
+    db.begin_transaction_for_session(s1).unwrap();
     db.execute_for_session(s2, "MERGE BRANCH b INTO main").unwrap();
     let err = db
         .commit_transaction_for_session(s1)
@@ -1975,6 +1985,50 @@ mod held {
     /// The MERGE queues behind the DROP's close, re-reads `d` when it is done,
     /// finds it dropped and refuses — it used to proceed on its stale read and
     /// mark the dropped branch merged.
+    #[test]
+    fn a_merge_into_a_branch_waits_for_the_statements_on_it() {
+        let hold = Hold::arm();
+        let db = Arc::new(seeded());
+        db.execute("CREATE BRANCH donor AS OF NOW").unwrap();
+        db.execute("USE BRANCH donor").unwrap();
+        db.execute("INSERT INTO t VALUES (6000, 'donor')").unwrap();
+        db.execute("USE BRANCH main").unwrap();
+        let (d_id, held) = hold_a_statement_on_d(&db);
+
+        let merge = {
+            let db = Arc::clone(&db);
+            std::thread::spawn(move || db.execute("MERGE BRANCH donor INTO d"))
+        };
+        // Its section is claimed, and it waits for the statement to leave: it
+        // cannot finish while that statement is held, so this is no race.
+        wait_until("the merge to claim d's exclusive section", || {
+            db.storage.branch_drain_state(d_id).exclusive
+        });
+        assert!(!merge.is_finished(), "the merge runs on d alone");
+        hold.release();
+        held.join().unwrap().expect("the held INSERT completes");
+        merge.join().unwrap().expect("the merge then runs");
+    }
+
+    /// A statement that changes nothing takes no exclusive section: it neither
+    /// waits for the statement running on `d`, nor holds anyone else up.
+    #[test]
+    fn a_noop_schema_statement_takes_no_section() {
+        let hold = Hold::arm();
+        let db = Arc::new(seeded());
+        let probe = session(&db, "probe");
+        let (_d_id, held) = hold_a_statement_on_d(&db);
+        db.execute_for_session(probe, "USE BRANCH d").unwrap();
+        db.execute_for_session(probe, "CREATE TABLE IF NOT EXISTS t (other INT)")
+            .expect("a no-op, at once");
+        db.execute_for_session(probe, "DROP TABLE IF EXISTS never_was")
+            .expect("a no-op, at once");
+        db.execute_for_session(probe, "ALTER TABLE t ADD COLUMN IF NOT EXISTS v TEXT")
+            .expect("a no-op, at once");
+        hold.release();
+        held.join().unwrap().expect("the held INSERT completes");
+    }
+
     #[test]
     fn a_merge_arriving_while_a_drop_waits_is_refused() {
         let hold = Hold::arm();

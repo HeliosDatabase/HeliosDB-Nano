@@ -1098,14 +1098,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     ///
     /// `None` until some connection to this database creates a temp table. The
     /// guard is `!Send`; keep it inside the synchronous call it wraps.
-    fn temp_namespace_guard(&self) -> Option<crate::sql::temp_tables::TempNamespaceGuard> {
-        if !self.database.storage.temp_tables_present() {
-            return None;
-        }
-        self.database
-            .session_backend_pid(self.session_id)
-            .ok()
-            .map(crate::sql::temp_tables::TempNamespaceGuard::install)
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B3): also publishes the session's backend
+    /// state when it is on a branch, so `SHOW TABLES` and the catalog
+    /// interceptor list the branch's tables (see the PostgreSQL handler's
+    /// twin).
+    fn temp_namespace_guard(&self) -> crate::ProtocolCatalogGuard {
+        let temp = if self.database.storage.temp_tables_present() {
+            self.database
+                .session_backend_pid(self.session_id)
+                .ok()
+                .map(crate::sql::temp_tables::TempNamespaceGuard::install)
+        } else {
+            None
+        };
+        crate::ProtocolCatalogGuard::new(temp, self.database.session_catalog_probe_scope(self.session_id))
     }
 
     // ------------------------------------------------------------------
@@ -1731,10 +1738,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         // uses. Routed ahead of the blanket `SET` and `USE` acknowledgements
         // below, which would answer OK and apply nothing.
         if EmbeddedDatabase::is_branch_binding_statement(trimmed) {
-            return match self
-                .database
-                .try_handle_session_branch_statement(self.session_id, trimmed)
-            {
+            // Off the async worker: `MERGE BRANCH x ABORT` can wait for the
+            // statements on the branch.
+            let session_id = self.session_id;
+            let answered = crate::runtime_offload::offload_statement(|| {
+                self.database.try_handle_session_branch_statement(session_id, trimmed)
+            });
+            return match answered {
                 Ok(Some((rows, schema))) if !schema.columns.is_empty() => {
                     let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                     self.send_result_set(&cols, &rows).await
@@ -3736,6 +3746,14 @@ fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     // rather than "the server is broken" (1105 / HY000, which is what this
     // reported before).
     if err_msg.contains(crate::error::UNSUPPORTED_STATEMENT_KIND_MARKER) {
+        return (1235, "0A000"); // ER_NOT_SUPPORTED_YET
+    }
+    // sprinter 6bc4a4040eb7 (B2/B3): a statement refused on a branch (a
+    // main-only write path, or a schema statement the branch catalog does not
+    // scope) is 0A000 on the PostgreSQL wire; the same here.
+    if err_msg.contains(crate::error::BRANCH_WRITE_UNSUPPORTED_MARKER)
+        || err_msg.contains(crate::error::BRANCH_STATEMENT_UNSUPPORTED_MARKER)
+    {
         return (1235, "0A000"); // ER_NOT_SUPPORTED_YET
     }
     // sprinter d03de7fc3b22: a spent tenant resource quota. MySQL's own code for

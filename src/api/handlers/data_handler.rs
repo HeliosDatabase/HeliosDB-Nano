@@ -65,29 +65,41 @@ pub async fn list_tables(
     // Validate branch exists
     validate_branch(&state, &branch_name)?;
 
-    let catalog = state.db.storage.catalog();
-    let table_names = catalog.list_tables().map_err(|e| {
-        error!("Failed to list tables: {}", e);
-        ApiError::from(e)
-    })?;
-
-    let tables: Vec<TableInfoResponse> = table_names
-        .iter()
-        .map(|name| {
-            let schema = catalog.get_table_schema(name).ok();
-            // Get row count from table statistics if available
-            let row_count = catalog
-                .get_table_statistics(name)
-                .ok()
-                .flatten()
-                .map(|stats| stats.row_count as u64);
-            TableInfoResponse {
-                name: name.clone(),
-                column_count: schema.as_ref().map(|s| s.columns.len()).unwrap_or(0),
-                row_count,
-            }
+    // sprinter 6bc4a4040eb7 (B3 fix pass): on the branch — its own tables are
+    // listed, the ones it dropped are not, and columns are its definition's.
+    let tables: Vec<TableInfoResponse> = state
+        .db
+        .with_request_branch_scope(&branch_name, || {
+            let catalog = state.db.storage.catalog();
+            let table_names = catalog.list_tables()?;
+            Ok(table_names
+                .iter()
+                .map(|name| {
+                    let schema = catalog.get_table_schema(name).ok();
+                    // Get row count from table statistics if available. They
+                    // describe main's rows, so a branch has none to report
+                    // (sprinter 6bc4a4040eb7, B3 second fix pass).
+                    let row_count = if branch_name == "main" {
+                        catalog
+                            .get_table_statistics(name)
+                            .ok()
+                            .flatten()
+                            .map(|stats| stats.row_count as u64)
+                    } else {
+                        None
+                    };
+                    TableInfoResponse {
+                        name: name.clone(),
+                        column_count: schema.as_ref().map(|s| s.columns.len()).unwrap_or(0),
+                        row_count,
+                    }
+                })
+                .collect())
         })
-        .collect();
+        .map_err(|e| {
+            error!("Failed to list tables: {}", e);
+            ApiError::from(e)
+        })?;
 
     let total = tables.len();
 
@@ -145,11 +157,16 @@ pub async fn query_data(
     }
 
     // Get table schema
-    let catalog = state.db.storage.catalog();
-    let schema = catalog.get_table_schema(&table_name).map_err(|e| {
-        warn!("Table '{}' not found: {}", table_name, e);
-        ApiError::from(e)
-    })?;
+    // On the branch: its catalog decides (sprinter 6bc4a4040eb7, B3 fix pass).
+    let schema = state
+        .db
+        .with_request_branch_scope(&branch_name, || {
+            state.db.storage.catalog().get_table_schema(&table_name)
+        })
+        .map_err(|e| {
+            warn!("Table '{}' not found: {}", table_name, e);
+            ApiError::from(e)
+        })?;
 
     // Build SQL query
     let columns_clause = params.columns.as_ref().map(|c| c.as_str()).unwrap_or("*");
@@ -300,11 +317,16 @@ fn insert_data_rows(
     }
 
     // Get table schema
-    let catalog = state.db.storage.catalog();
-    let schema = catalog.get_table_schema(&table_name).map_err(|e| {
-        warn!("Table '{}' not found: {}", table_name, e);
-        ApiError::from(e)
-    })?;
+    // On the branch: its catalog decides (sprinter 6bc4a4040eb7, B3 fix pass).
+    let schema = state
+        .db
+        .with_request_branch_scope(&branch_name, || {
+            state.db.storage.catalog().get_table_schema(&table_name)
+        })
+        .map_err(|e| {
+            warn!("Table '{}' not found: {}", table_name, e);
+            ApiError::from(e)
+        })?;
 
     let mut inserted_count = 0u64;
     let mut row_ids = Vec::new();
@@ -333,16 +355,6 @@ fn insert_data_rows(
 
         let tuple = Tuple::new(tuple_values);
 
-        // Get next row ID before insertion if needed
-        let row_id = if request.return_ids {
-            Some(catalog.next_row_id(&table_name).map_err(|e| {
-                error!("Failed to get next row ID: {}", e);
-                ApiError::from(e)
-            })?)
-        } else {
-            None
-        };
-
         // Insert the tuple — on `:name` (request-scoped binding, B1): this
         // storage call reads the session binding the scope installs. B1 second
         // fix pass: it is a raw storage write, not a statement, so it takes
@@ -350,8 +362,11 @@ fn insert_data_rows(
         // what every SQL entry point's gate takes): a DROP / MERGE of the
         // branch waits for it, one already closing refuses it (55006), and a
         // branch dropped in between fails it closed (3D000) — instead of the
-        // row landing in an overlay that was just dropped or merged.
-        state
+        // row landing in an overlay that was just dropped or merged. The id it
+        // reports is the one the row got, from the counter the SQL insert uses (B3
+        // third fix pass: this route used to burn a second id of the durable
+        // counter, and report that one).
+        let row_id = state
             .db
             .with_request_branch_scope(&branch_name, || {
                 let _statement = state.db.enter_branch_statement()?;
@@ -364,8 +379,8 @@ fn insert_data_rows(
 
         inserted_count += 1;
 
-        if let Some(id) = row_id {
-            row_ids.push(id);
+        if request.return_ids {
+            row_ids.push(row_id);
         }
     }
 
@@ -417,11 +432,16 @@ pub async fn update_data(
     }
 
     // Get table schema to validate columns
-    let catalog = state.db.storage.catalog();
-    let schema = catalog.get_table_schema(&table_name).map_err(|e| {
-        warn!("Table '{}' not found: {}", table_name, e);
-        ApiError::from(e)
-    })?;
+    // On the branch: its catalog decides (sprinter 6bc4a4040eb7, B3 fix pass).
+    let schema = state
+        .db
+        .with_request_branch_scope(&branch_name, || {
+            state.db.storage.catalog().get_table_schema(&table_name)
+        })
+        .map_err(|e| {
+            warn!("Table '{}' not found: {}", table_name, e);
+            ApiError::from(e)
+        })?;
 
     // Validate that all update columns exist
     for col_name in request.values.keys() {
@@ -514,11 +534,15 @@ pub async fn delete_data(
     validate_branch(&state, &branch_name)?;
 
     // Validate table exists
-    let catalog = state.db.storage.catalog();
-    let _schema = catalog.get_table_schema(&table_name).map_err(|e| {
-        warn!("Table '{}' not found: {}", table_name, e);
-        ApiError::from(e)
-    })?;
+    let _schema = state
+        .db
+        .with_request_branch_scope(&branch_name, || {
+            state.db.storage.catalog().get_table_schema(&table_name)
+        })
+        .map_err(|e| {
+            warn!("Table '{}' not found: {}", table_name, e);
+            ApiError::from(e)
+        })?;
 
     // Build DELETE SQL
     let mut sql = format!("DELETE FROM {}", table_name);
@@ -565,6 +589,146 @@ mod tests {
             oauth_registry: None,
             change_notifier: None,
         }
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): the REST data routes read the
+    /// BRANCH's catalog: a table it created is listed and served, one it dropped
+    /// is not, and a column it added is accepted.
+    #[tokio::test]
+    async fn branch_data_routes_read_the_branchs_catalog() {
+        let state = create_test_state();
+        state.db.execute("CREATE TABLE kept (id INT, v TEXT)").unwrap();
+        state.db.execute("CREATE TABLE gone (id INT)").unwrap();
+        state.db.execute("CREATE BRANCH b AS OF NOW").unwrap();
+        state
+            .db
+            .with_request_branch_scope("b", || {
+                state.db.execute("CREATE TABLE fresh (id INT, v TEXT)")?;
+                state.db.execute("INSERT INTO fresh VALUES (1, 'one')")?;
+                state.db.execute("DROP TABLE gone")?;
+                state.db.execute("ALTER TABLE kept ADD COLUMN extra TEXT")
+            })
+            .unwrap();
+
+        let listed = list_tables(State(state.clone()), Path("b".to_string())).await.unwrap();
+        let names: Vec<&str> = listed.0.tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"fresh"), "{names:?}");
+        assert!(!names.contains(&"gone"), "{names:?}");
+        let kept = listed.0.tables.iter().find(|t| t.name == "kept").unwrap();
+        assert_eq!(kept.column_count, 3, "the branch's definition");
+        let on_main = list_tables(State(state.clone()), Path("main".to_string()))
+            .await
+            .unwrap();
+        let main_names: Vec<&str> = on_main.0.tables.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            main_names.contains(&"gone") && !main_names.contains(&"fresh"),
+            "{main_names:?}"
+        );
+
+        let params = DataQueryParams {
+            filter: None,
+            columns: None,
+            page: 1,
+            limit: 10,
+            as_of: None,
+            order_by: None,
+            include_total: false,
+        };
+        let served = query_data(
+            State(state.clone()),
+            Path(("b".to_string(), "fresh".to_string())),
+            Query(params),
+        )
+        .await
+        .unwrap();
+        assert_eq!(served.0.rows.len(), 1);
+
+        let mut row = std::collections::HashMap::new();
+        row.insert("id".to_string(), serde_json::json!(5));
+        row.insert("v".to_string(), serde_json::json!("five"));
+        row.insert("extra".to_string(), serde_json::json!("added"));
+        let inserted = insert_data(
+            State(state.clone()),
+            Path(("b".to_string(), "kept".to_string())),
+            Json(InsertDataRequest {
+                rows: vec![row],
+                return_ids: true,
+            }),
+        )
+        .await;
+        let (_, Json(inserted)) = inserted.expect("a column the branch added is accepted");
+        // B3 third fix pass: the id of the row it wrote, from the counter the SQL
+        // insert uses. It used to burn another id of the durable counter and report
+        // that one.
+        let row_ids = inserted.row_ids.expect("return_ids");
+        assert_eq!(row_ids.len(), 1);
+        state
+            .db
+            .with_request_branch_scope("b", || {
+                let view = state.db.storage.branch_view()?.expect("on b");
+                let schema = state.db.storage.catalog().get_table_schema("kept")?;
+                let row = view.get(None, "kept", row_ids[0], &schema)?;
+                assert_eq!(
+                    row.map(|row| row.values.first().cloned()),
+                    Some(Some(Value::Int4(5))),
+                    "the reported id is the row's"
+                );
+                Ok::<(), crate::Error>(())
+            })
+            .unwrap();
+
+        // Every data route of a branch reads the branch's catalog.
+        let mut values = std::collections::HashMap::new();
+        values.insert("extra".to_string(), serde_json::json!("changed"));
+        let updated = update_data(
+            State(state.clone()),
+            Path(("b".to_string(), "kept".to_string())),
+            Json(UpdateDataRequest {
+                values,
+                filter: Some("id = 5".to_string()),
+            }),
+        )
+        .await;
+        assert!(updated.is_ok(), "a column the branch added can be updated");
+        let deleted = delete_data(
+            State(state.clone()),
+            Path(("b".to_string(), "fresh".to_string())),
+            Json(DeleteDataRequest {
+                filter: Some("id = 1".to_string()),
+            }),
+        )
+        .await;
+        assert!(deleted.is_ok(), "a table the branch created can be deleted from");
+        let gone = delete_data(
+            State(state.clone()),
+            Path(("b".to_string(), "gone".to_string())),
+            Json(DeleteDataRequest { filter: None }),
+        )
+        .await;
+        assert!(gone.is_err(), "a table the branch dropped is not there");
+
+        // Statistics describe main's rows: a branch reports none.
+        let mut statistics = crate::storage::TableStatistics::new("kept".to_string());
+        statistics.update(99, 99);
+        state
+            .db
+            .storage
+            .catalog()
+            .set_table_statistics("kept", &statistics)
+            .unwrap();
+        let row_count = |listed: &TableListResponse| {
+            listed
+                .tables
+                .iter()
+                .find(|t| t.name == "kept")
+                .and_then(|t| t.row_count)
+        };
+        let on_main = list_tables(State(state.clone()), Path("main".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(row_count(&on_main.0), Some(99));
+        let on_branch = list_tables(State(state.clone()), Path("b".to_string())).await.unwrap();
+        assert_eq!(row_count(&on_branch.0), None);
     }
 
     #[tokio::test]

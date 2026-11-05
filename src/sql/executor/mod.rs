@@ -3510,6 +3510,18 @@ impl<'a> Executor<'a> {
     /// the planner's `LogicalPlan::schema()` stamp and the executor's runtime
     /// schema cannot disagree.
     pub(crate) fn plan_to_operator(&mut self, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
+        // sprinter 6bc4a4040eb7 (phase B3): the executor's layer of the branch
+        // DDL backstop. Both DML executor families answer every schema plan on
+        // a branch in `EmbeddedDatabase::branch_schema_ddl` before it can get
+        // here; one that reaches the executor anyway (another entry point) is
+        // refused (0A000) rather than run against main's catalog. A schema
+        // plan is rare, so the cost is one discriminant match per node, and a
+        // thread-local read only for a schema plan.
+        if let Some(statement) = crate::branch_schema::schema_statement_name(plan) {
+            if let Some(storage) = self.storage {
+                storage.refuse_main_catalog_write_on_branch(statement)?;
+            }
+        }
         let operator = self.plan_to_operator_inner(plan)?;
         match plan {
             LogicalPlan::Project {
@@ -3819,7 +3831,12 @@ impl<'a> Executor<'a> {
                 };
                 if let Some((table_name, schema, projection)) = scan_info {
                     if let Some(storage) = self.storage {
-                        if self.get_cte(table_name).is_none() {
+                        // sprinter 6bc4a4040eb7 (B3 fourth fix pass): this pushdown
+                        // walks main's `data:` keys. On a branch the rows are the
+                        // view's: its own, its deletions and what it inherits, so
+                        // `SELECT … LIMIT n` there takes the generic path below. It
+                        // used to answer with main's rows.
+                        if self.get_cte(table_name).is_none() && !storage.is_branch_active() {
                             // Storage-level OFFSET pushdown: skip the first
                             // `offset` rows without deserialising them, then
                             // fetch the next `limit` fully. Cheaper than the

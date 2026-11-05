@@ -92,6 +92,46 @@
 //! staged writes — not a snapshot of the transaction's start. The overlay
 //! keyspace has no version index to read a snapshot from, and after B4 a
 //! branch no longer depends on its parent's later writes.
+//!
+//! # Tables the branch defines (phase B3)
+//!
+//! Every operation first resolves the table through the branch CATALOG
+//! (`branch_catalog.rs`, nearest level wins) into a [`TableScope`]:
+//!
+//! * no level has an entry — main's rows, then every level's overlay, and
+//!   main's ART rules (the B2 model above);
+//! * level `L` defines it `isolated` (CREATE TABLE / ADD COLUMN on a branch)
+//!   — the overlays of `L` and its descendants ONLY: never main's rows, never
+//!   main's ART for candidates, and the PRIMARY KEY / UNIQUE rules the
+//!   definition carries;
+//! * level `L` dropped it — no rows at all.
+//!
+//! The committed-overlay cache records the first level it read, and every
+//! branch-catalog write bumps the schema generation the cache is validated
+//! by, so a cached overlay never outlives a change of scope.
+//!
+//! # Copies, the key index, and who may be writing (B3 fix pass)
+//!
+//! * `bfrz:{level}:{t}:{row}` marks the level's entry for a row as a COPY (a
+//!   materialized `ADD COLUMN` row; phase B4's frozen pre-image), not a change
+//!   made there. `BranchView::write` clears it, so the level's own write of
+//!   the row makes it a change; MERGE skips what is still marked.
+//! * `bkey:{level}:{hex t}:{hex set}:{hex digest}:{row}` is the level's durable key
+//!   index of an ISOLATED table, one entry per visible own row per key set (the
+//!   definition's PRIMARY KEY / UNIQUE rules and FOREIGN KEY column sets). Main's
+//!   ART does not describe such a table, and reloading an overlay per probe made
+//!   constraint checks O(rows) above the overlay cache's budget: with the index,
+//!   [`BranchView::rows_with_key`] costs O(levels + candidates) and loads no
+//!   overlay. Keys and row images are written in one batch (or staged in one
+//!   transaction), so ROLLBACK discards both. Candidates are always re-verified
+//!   against the row. RocksDB keys are not sealed at rest, so the entry holds a
+//!   salted digest of the key, never its value: the salt is the definition's
+//!   incarnation id, which IS sealed (in the catalog record), and the row's own
+//!   image is what a probe finally compares.
+//! * A registry of open transactions with staged writes, per (level, table)
+//!   (`pending_writers`), which a branch schema statement checks inside its
+//!   exclusive section (`BranchDrains::exclusive`): an open transaction's rows
+//!   would otherwise commit under a definition they were not written for.
 
 use super::StorageEngine;
 use crate::storage::art_index::ArtIndexError;
@@ -124,6 +164,155 @@ fn row_prefix(level: u64, table: &str) -> String {
 
 fn tombstone_prefix(level: u64, table: &str) -> String {
     format!("bdel:{level}:{table}:")
+}
+
+/// `bfrz:{level}:{table}:{row_id}` — level `level`'s entry for the row is a
+/// COPY, not a change made on the level (sprinter 6bc4a4040eb7, B3 fix pass;
+/// shared with phase B4's freeze hook, which uses the same clearing and MERGE
+/// rules).
+pub fn branch_frozen_key(level: u64, table: &str, row_id: u64) -> Vec<u8> {
+    format!("bfrz:{level}:{table}:{row_id}").into_bytes()
+}
+
+/// The copy markers of one table on one level.
+pub fn frozen_prefix(level: u64, table: &str) -> String {
+    format!("bfrz:{level}:{table}:")
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        // Writing to a String cannot fail.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// Every key-index entry of one table on one level. Hex keeps the segments
+/// free of `:`, so a prefix is exact.
+pub fn key_index_table_prefix(level: u64, table: &str) -> String {
+    format!("bkey:{level}:{}:", to_hex(table.as_bytes()))
+}
+
+/// What an entry holds for an encoded key: a salted digest, so no key VALUE ever
+/// reaches a RocksDB key (values are sealed at rest, keys are not), and a long
+/// TEXT key does not make a long RocksDB key. A collision costs one verification.
+fn key_index_digest(set: &KeyIndexSet, encoded: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(set.salt.to_le_bytes());
+    hasher.update(encoded);
+    let digest = hasher.finalize();
+    to_hex(digest.as_slice().get(..16).unwrap_or(digest.as_slice()))
+}
+
+fn key_index_key_prefix(level: u64, table: &str, set: &KeyIndexSet, encoded: &[u8]) -> String {
+    format!(
+        "bkey:{level}:{}:{}:{}:",
+        to_hex(table.as_bytes()),
+        to_hex(set.name.as_bytes()),
+        key_index_digest(set, encoded)
+    )
+}
+
+fn key_index_key(level: u64, table: &str, set: &KeyIndexSet, encoded: &[u8], row_id: u64) -> Vec<u8> {
+    format!("{}{row_id}", key_index_key_prefix(level, table, set, encoded)).into_bytes()
+}
+
+/// sprinter 6bc4a4040eb7 (B3 fix pass): one column set a level's key index of
+/// an isolated table covers.
+#[derive(Debug, Clone)]
+struct KeyIndexSet {
+    /// The rule's index name, or `fk_{i}`.
+    name: String,
+    /// Sorted schema positions: the form key maps and probes encode in.
+    positions: Vec<usize>,
+    /// The definition's incarnation id: random, and sealed in the catalog record.
+    salt: u64,
+}
+
+/// The key sets of a definition: its PRIMARY KEY / UNIQUE rules (what a write
+/// on the table probes, and what a FOREIGN KEY referencing it probes) and its
+/// own FOREIGN KEY column sets (what a parent's DELETE or UPDATE probes).
+fn key_index_sets(definition: &super::branch_catalog::BranchTableDefinition) -> Vec<KeyIndexSet> {
+    let mut sets: Vec<KeyIndexSet> = Vec::new();
+    let mut add = |name: String, columns: &[String]| {
+        let Some(mut positions) = column_positions(&definition.schema, columns) else {
+            return;
+        };
+        positions.sort_unstable();
+        if positions.is_empty() || sets.iter().any(|set| set.positions == positions) {
+            return;
+        }
+        sets.push(KeyIndexSet {
+            name,
+            positions,
+            salt: definition.incarnation,
+        });
+    };
+    for rule in &definition.unique_rules {
+        add(rule.index_name.clone(), &rule.columns);
+    }
+    for (index, foreign_key) in definition.constraints.foreign_keys.iter().enumerate() {
+        add(format!("fk_{index}"), &foreign_key.columns);
+    }
+    sets
+}
+
+/// A row's width after `ALTER TABLE … ADD COLUMN`: pad NULL up to the base
+/// width, then the backfill values of the columns it does not have yet. A row
+/// already that wide is left as it is, so a re-run cannot widen it twice.
+pub fn extend_row_values(values: &mut Vec<Value>, base_width: usize, backfill: &[Value]) {
+    if values.len() < base_width {
+        values.resize(base_width, Value::Null);
+    }
+    let already = values.len().saturating_sub(base_width);
+    values.extend(backfill.iter().skip(already).cloned());
+}
+
+/// How many copies a materialization writes per batch.
+const MATERIALIZE_CHUNK_ROWS: usize = 10_000;
+
+/// How many bytes of copies a materialization writes per batch, whatever the
+/// row count: wide rows must not grow a batch towards the write-group limit.
+const MATERIALIZE_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+
+/// A test's smaller chunk: see `StorageEngine::debug_set_materialize_chunk_rows`.
+static MATERIALIZE_CHUNK_ROWS_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+pub fn set_materialize_chunk_rows(rows: u64) {
+    MATERIALIZE_CHUNK_ROWS_OVERRIDE.store(rows, Ordering::Relaxed);
+}
+
+fn materialize_chunk_rows() -> usize {
+    match MATERIALIZE_CHUNK_ROWS_OVERRIDE.load(Ordering::Relaxed) {
+        0 => MATERIALIZE_CHUNK_ROWS,
+        rows => usize::try_from(rows).unwrap_or(MATERIALIZE_CHUNK_ROWS),
+    }
+}
+
+/// The most one write group can hold and still be shipped to a standby and
+/// archived: a group is never split (`replication::physical::MAX_BATCH_BYTES`,
+/// the same limit in a build without the replication modules, whose store may be
+/// served by one that has them).
+#[cfg(feature = "ha-tier1")]
+const MAX_WRITE_GROUP_BYTES: usize = crate::replication::physical::MAX_BATCH_BYTES;
+#[cfg(not(feature = "ha-tier1"))]
+const MAX_WRITE_GROUP_BYTES: usize = u32::MAX as usize - 4096;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's smaller limit for `final_batch_limit`.
+    pub static FINAL_BATCH_LIMIT_OVERRIDE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+pub fn final_batch_limit() -> usize {
+    #[cfg(test)]
+    if let Some(limit) = FINAL_BATCH_LIMIT_OVERRIDE.with(std::cell::Cell::get) {
+        return limit;
+    }
+    MAX_WRITE_GROUP_BYTES
 }
 
 /// One overlay level's entry for one row.
@@ -261,6 +450,56 @@ pub fn bump_write_generation(engine: u64, level: u64, table: &str) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Open transactions with staged writes
+// ---------------------------------------------------------------------------
+
+/// sprinter 6bc4a4040eb7 (B3 fix pass): how many open transactions have staged
+/// writes of one table on one level.
+static PENDING: LazyLock<DashMap<GenerationKey, usize>> = LazyLock::new(DashMap::new);
+
+/// One open transaction's staged writes of one table on one level.
+#[derive(Debug)]
+struct PendingWriteToken {
+    key: GenerationKey,
+}
+
+impl PendingWriteToken {
+    fn new(key: GenerationKey) -> Self {
+        *PENDING.entry(key.clone()).or_insert(0) += 1;
+        Self { key }
+    }
+}
+
+impl Drop for PendingWriteToken {
+    fn drop(&mut self) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) = PENDING.entry(self.key.clone()) {
+            let remaining = entry.get().saturating_sub(1);
+            if remaining == 0 {
+                entry.remove();
+            } else {
+                *entry.get_mut() = remaining;
+            }
+        }
+    }
+}
+
+/// How many open transactions hold staged writes of `table` on `level`.
+pub fn pending_writers(engine: u64, level: u64, table: &str) -> usize {
+    PENDING
+        .get(&(engine, level, table.to_string()))
+        .map_or(0, |count| *count)
+}
+
+/// The tables open transactions hold staged writes of on `level`.
+pub fn pending_tables_on_level(engine: u64, level: u64) -> Vec<String> {
+    PENDING
+        .iter()
+        .filter(|entry| entry.key().0 == engine && entry.key().1 == level)
+        .map(|entry| entry.key().2.clone())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // A set of rows with lazily built key maps
 // ---------------------------------------------------------------------------
 
@@ -375,7 +614,12 @@ struct CommittedKey {
 struct CommittedOverlay {
     width: usize,
     schema_generation: u64,
-    /// The write generation of each chain level (chain order) it reflects.
+    /// sprinter 6bc4a4040eb7 (phase B3): the first chain position read (`0`:
+    /// every level; the defining level of an isolated table: that level and
+    /// its descendants only).
+    first_level: usize,
+    /// The write generation of each chain level read (chain order, from
+    /// `first_level`) it reflects.
     generations: Vec<u64>,
     set: RowSet,
 }
@@ -543,6 +787,10 @@ pub struct BranchStagedWrites {
     /// rebuilt from the write set on its next use (`fresh` lists the rebuilt).
     stale: bool,
     fresh: HashSet<GenerationKey>,
+    /// One token per entry of `touched`, released when the transaction ends
+    /// (commit, failed commit or rollback). ROLLBACK TO SAVEPOINT keeps them:
+    /// conservative, a schema statement then waits for the transaction's end.
+    tokens: Vec<PendingWriteToken>,
 }
 
 impl BranchStagedWrites {
@@ -645,6 +893,12 @@ impl Drop for OverlayCacheScope {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread loaded a committed overlay from storage.
+    static OVERLAY_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -689,7 +943,7 @@ fn reorder_values(from: &[String], values: &[Value], to: &[String]) -> Option<Ve
 
 /// The values of `rule`'s columns in a full row (schema order), in the rule's
 /// column order; `None` when one is NULL (NULLs never conflict) or missing.
-fn rule_key(schema: &Schema, rule: &EnforcedUniqueIndex, row: &[Value]) -> Option<Vec<Value>> {
+pub fn rule_key(schema: &Schema, rule: &EnforcedUniqueIndex, row: &[Value]) -> Option<Vec<Value>> {
     let mut key = Vec::with_capacity(rule.columns.len());
     for column in &rule.columns {
         let position = schema
@@ -716,6 +970,42 @@ fn padded(tuple: &Tuple, width: usize) -> Tuple {
         tuple.values.resize(width, Value::Null);
     }
     tuple
+}
+
+/// sprinter 6bc4a4040eb7 (phase B3): which rows of a table a view reads, and
+/// which PRIMARY KEY / UNIQUE rules hold — from the branch catalog (see the
+/// module docs).
+#[derive(Debug)]
+pub struct TableScope {
+    /// Main's rows count (false for a table some level defines `isolated`, or
+    /// dropped).
+    include_main: bool,
+    /// The first chain position whose overlay is read (the chain's length for
+    /// a dropped table: none).
+    first_level: usize,
+    /// The rules of the branch's own definition; `None` = main's ART rules.
+    rules: Option<Vec<EnforcedUniqueIndex>>,
+    /// The defining record of an ISOLATED table: what its key index covers.
+    isolated: Option<Arc<super::branch_catalog::BranchTableRecord>>,
+}
+
+impl TableScope {
+    /// The key sets of an isolated table's level key index; empty otherwise.
+    fn key_index_sets(&self) -> Vec<KeyIndexSet> {
+        self.isolated
+            .as_ref()
+            .and_then(|record| record.definition())
+            .map(key_index_sets)
+            .unwrap_or_default()
+    }
+
+    /// The width of an isolated table's rows (its definition's), if it is one.
+    fn isolated_width(&self) -> Option<usize> {
+        self.isolated
+            .as_ref()
+            .and_then(|record| record.definition())
+            .map(|definition| definition.schema.columns.len())
+    }
 }
 
 /// Where main's candidates for a key come from.
@@ -935,6 +1225,68 @@ impl<'a> BranchView<'a> {
         self.engine.instance_id()
     }
 
+    /// sprinter 6bc4a4040eb7 (phase B3): how this view's chain resolves
+    /// `table` in the branch catalog — which rows it reads, and whose
+    /// PRIMARY KEY / UNIQUE rules hold.
+    pub(crate) fn scope(&self, table: &str) -> Result<TableScope> {
+        use super::branch_catalog::BranchTableResolution;
+        Ok(match self.engine.resolve_branch_table(&self.chain, table)? {
+            BranchTableResolution::Inherited => TableScope {
+                include_main: true,
+                first_level: 0,
+                rules: None,
+                isolated: None,
+            },
+            BranchTableResolution::Defined { index, record, .. } => {
+                let rules = record
+                    .definition()
+                    .map(|definition| {
+                        definition
+                            .unique_rules
+                            .iter()
+                            .map(super::branch_catalog::BranchUniqueRule::to_enforced)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let isolated = record.isolated;
+                TableScope {
+                    include_main: !isolated,
+                    first_level: if isolated { index } else { 0 },
+                    rules: Some(rules),
+                    isolated: isolated.then_some(record),
+                }
+            }
+            BranchTableResolution::Dropped { .. } => TableScope {
+                include_main: false,
+                first_level: self.chain.len(),
+                rules: Some(Vec::new()),
+                isolated: None,
+            },
+        })
+    }
+
+    /// The PRIMARY KEY / UNIQUE rules of `table` on this branch: the branch
+    /// definition's when a level defines it, main's ART rules otherwise.
+    pub(crate) fn unique_rules(&self, table: &str) -> Result<Vec<EnforcedUniqueIndex>> {
+        Ok(match self.scope(table)?.rules {
+            Some(rules) => rules,
+            None => self.engine.art_indexes().enforced_unique_indexes(table),
+        })
+    }
+
+    /// Does `txn` hold staged branch writes of `table` on this branch's own
+    /// level? (A branch DDL refuses to change a table the transaction it runs
+    /// in has already written.)
+    pub(crate) fn has_staged_writes(&self, txn: &Transaction, table: &str) -> bool {
+        let key: GenerationKey = (self.engine_id(), self.branch_id, table.to_string());
+        if txn.branch_staged().touched.contains(&key) {
+            return true;
+        }
+        let rows = row_prefix(self.branch_id, table);
+        let tombstones = tombstone_prefix(self.branch_id, table);
+        !txn.staged_with_prefix(rows.as_bytes()).is_empty() || !txn.staged_with_prefix(tombstones.as_bytes()).is_empty()
+    }
+
     // ---- low-level reads ----
 
     fn for_each_with_prefix(&self, prefix: &[u8], mut each: impl FnMut(&[u8], &[u8]) -> Result<()>) -> Result<()> {
@@ -993,7 +1345,12 @@ impl<'a> BranchView<'a> {
         let Some(raw) = raw else {
             return Ok(None);
         };
-        let stored = self.engine.decode_stored_ref(&key, &raw)?;
+        Ok(Some(self.decode_main_row(table, &key, &raw, row_id, schema)?))
+    }
+
+    /// Main's stored row `row_id` of `table`, decoded as main's scan decodes it.
+    fn decode_main_row(&self, table: &str, key: &[u8], raw: &[u8], row_id: u64, schema: &Schema) -> Result<Tuple> {
+        let stored = self.engine.decode_stored_ref(key, raw)?;
         let mut tuple: Tuple =
             bincode::deserialize(&stored).map_err(|e| Error::storage(format!("Failed to deserialize tuple: {e}")))?;
         if self.engine.null_pad_snapshot_schema() {
@@ -1003,7 +1360,7 @@ impl<'a> BranchView<'a> {
         tuple.branch_id = None;
         self.engine
             .resolve_column_storage_refs(table, schema, row_id, &mut tuple)?;
-        Ok(Some(tuple))
+        Ok(tuple)
     }
 
     fn key_present(&self, key: &[u8]) -> Result<bool> {
@@ -1052,11 +1409,20 @@ impl<'a> BranchView<'a> {
         out
     }
 
-    /// Every row some COMMITTED level of the chain decides, nearest level
-    /// winning: `Some` = visible image, `None` = hidden. Read from storage.
-    fn load_committed_rows(&self, table: &str, width: usize) -> Result<HashMap<u64, Option<Tuple>>> {
+    /// Every row some COMMITTED level of the chain — from position
+    /// `first_level` on (phase B3: an isolated table's defining level) —
+    /// decides, nearest level winning: `Some` = visible image, `None` =
+    /// hidden. Read from storage.
+    fn load_committed_rows(
+        &self,
+        table: &str,
+        width: usize,
+        first_level: usize,
+    ) -> Result<HashMap<u64, Option<Tuple>>> {
+        #[cfg(test)]
+        OVERLAY_LOADS.with(|loads| loads.set(loads.get() + 1));
         let mut out: HashMap<u64, Option<Tuple>> = HashMap::new();
-        for &level in &self.chain {
+        for &level in self.chain.iter().skip(first_level) {
             let (rows, tombstones) = self.committed_level(level, table, width)?;
             for (row_id, entry) in Self::resolve_level(rows, tombstones) {
                 out.insert(row_id, entry.into_visible());
@@ -1065,10 +1431,21 @@ impl<'a> BranchView<'a> {
         Ok(out)
     }
 
-    /// The branch's committed overlay of `table` — the cached copy when it is
-    /// still current (every chain level's write generation and the schema
+    /// The branch's committed overlay of `table`, read from chain position
+    /// `first_level` on — the cached copy when it is still current (the same
+    /// first level, every read level's write generation and the schema
     /// generation unchanged), a fresh load otherwise.
-    fn committed_overlay(&self, table: &str, width: usize) -> Result<Arc<parking_lot::Mutex<CommittedOverlay>>> {
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B3): `first_level` is part of the
+    /// validity check, and every branch-catalog write bumps the schema
+    /// generation, so an overlay cached before the branch defined (or
+    /// dropped) the table is never served after.
+    fn committed_overlay(
+        &self,
+        table: &str,
+        width: usize,
+        first_level: usize,
+    ) -> Result<Arc<parking_lot::Mutex<CommittedOverlay>>> {
         let engine = self.engine_id();
         let key = CommittedKey {
             engine,
@@ -1082,6 +1459,7 @@ impl<'a> BranchView<'a> {
         let generations: Vec<u64> = self
             .chain
             .iter()
+            .skip(first_level)
             .map(|level| current_generation(engine, *level, table))
             .collect();
         let schema_generation = self.engine.schema_generation();
@@ -1089,10 +1467,11 @@ impl<'a> BranchView<'a> {
         // every write-generation bump, so nothing could tell a cached copy it
         // is stale: never cache there (reads only; a standby takes no writes).
         if self.engine.is_physical_standby() {
-            let rows = self.load_committed_rows(table, width)?;
+            let rows = self.load_committed_rows(table, width, first_level)?;
             return Ok(Arc::new(parking_lot::Mutex::new(CommittedOverlay {
                 width,
                 schema_generation,
+                first_level,
                 generations,
                 set: RowSet::from_rows(rows),
             })));
@@ -1103,17 +1482,19 @@ impl<'a> BranchView<'a> {
                 let overlay = cached.lock();
                 overlay.width == width
                     && overlay.schema_generation == schema_generation
+                    && overlay.first_level == first_level
                     && overlay.generations == generations
             };
             if current {
                 return Ok(cached);
             }
         }
-        let rows = self.load_committed_rows(table, width)?;
+        let rows = self.load_committed_rows(table, width, first_level)?;
         let count = rows.len();
         let overlay = Arc::new(parking_lot::Mutex::new(CommittedOverlay {
             width,
             schema_generation,
+            first_level,
             generations,
             set: RowSet::from_rows(rows),
         }));
@@ -1228,31 +1609,52 @@ impl<'a> BranchView<'a> {
 
     /// Row `row_id` of `table` as the branch sees it (nearest level wins,
     /// then main), with `txn`'s staged writes.
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B3): within the table's [`TableScope`] —
+    /// an isolated table's levels only, no main; a dropped table has no rows.
     pub fn get(&self, txn: Option<&Transaction>, table: &str, row_id: u64, schema: &Schema) -> Result<Option<Tuple>> {
         let width = schema.columns.len();
+        let scope = self.scope(table)?;
+        let own_index = self.chain.len().saturating_sub(1);
+        if scope.first_level > own_index {
+            return Ok(None);
+        }
         if let Some(entry) = self.own_entry(txn, table, row_id, width)? {
             return Ok(entry.into_visible());
         }
-        for &level in self.ancestors().iter().rev() {
+        let ancestors = self.ancestors().get(scope.first_level..).unwrap_or(&[]);
+        for &level in ancestors.iter().rev() {
             if let Some(entry) = self.committed_entry(level, table, row_id, width)? {
                 return Ok(entry.into_visible());
             }
+        }
+        if !scope.include_main {
+            return Ok(None);
         }
         self.main_row(table, row_id, schema)
     }
 
     /// Every row of `table` the branch sees, ordered by row id, with `txn`'s
     /// staged writes merged in.
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B3): within the table's [`TableScope`].
     pub fn scan(&self, txn: Option<&Transaction>, table: &str, schema: &Schema) -> Result<Vec<Tuple>> {
         let width = schema.columns.len();
+        let scope = self.scope(table)?;
+        if scope.first_level >= self.chain.len() {
+            // Dropped on this branch (or an ancestor): nothing to see.
+            return Ok(Vec::new());
+        }
         let mut rows: HashMap<u64, Tuple> = HashMap::new();
-        for mut tuple in self.engine.scan_table_with_schema(table, schema)? {
-            if let Some(row_id) = tuple.row_id {
-                tuple.branch_id = None;
-                rows.insert(row_id, tuple);
+        if scope.include_main {
+            for mut tuple in self.engine.scan_table_with_schema(table, schema)? {
+                if let Some(row_id) = tuple.row_id {
+                    tuple.branch_id = None;
+                    rows.insert(row_id, tuple);
+                }
             }
         }
-        let committed = self.committed_overlay(table, width)?;
+        let committed = self.committed_overlay(table, width, scope.first_level)?;
         {
             let overlay = committed.lock();
             for (row_id, state) in &overlay.set.rows {
@@ -1413,8 +1815,37 @@ impl<'a> BranchView<'a> {
         let sorted_positions: Vec<usize> = canonical.iter().map(|(position, _)| *position).collect();
         let encoded = ArtIndexManager::encode_key_from_values(canonical.iter().map(|(_, value)| *value));
 
-        let main = self.main_candidates(table, schema, columns, key, &positions, &sorted_positions, &encoded)?;
-        let committed = self.committed_overlay(table, width)?;
+        // sprinter 6bc4a4040eb7 (phase B3): an isolated table never consults
+        // main (neither its rows nor its ART); a dropped one holds nothing.
+        let scope = self.scope(table)?;
+        if scope.first_level >= self.chain.len() {
+            return Ok(Vec::new());
+        }
+        // B3 fix pass: an isolated table's key sets are indexed per level, so
+        // the probe loads no overlay.
+        if let Some(set) = scope
+            .key_index_sets()
+            .into_iter()
+            .find(|set| set.positions == sorted_positions)
+        {
+            return self.rows_with_key_from_index(
+                txn,
+                table,
+                schema,
+                &set,
+                scope.first_level,
+                &positions,
+                &sorted_positions,
+                &encoded,
+                key,
+            );
+        }
+        let main = if scope.include_main {
+            self.main_candidates(table, schema, columns, key, &positions, &sorted_positions, &encoded)?
+        } else {
+            MainCandidates::Rows(Vec::new())
+        };
+        let committed = self.committed_overlay(table, width, scope.first_level)?;
 
         // Lock order: the transaction's staged rows, then the committed copy.
         let collect = |staged: Option<&mut RowSet>| -> (Vec<Tuple>, Vec<u64>, Vec<Tuple>) {
@@ -1481,6 +1912,55 @@ impl<'a> BranchView<'a> {
         Ok(out)
     }
 
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): `Self::rows_with_key` of an
+    /// isolated table from the levels' key index: the candidates of each level
+    /// from `first_level` on, plus the transaction's staged rows with the key,
+    /// each verified through `Self::get` (nearest level wins, staged writes
+    /// included). O(levels + candidates).
+    #[allow(clippy::too_many_arguments)]
+    fn rows_with_key_from_index(
+        &self,
+        txn: Option<&Transaction>,
+        table: &str,
+        schema: &Schema,
+        set: &KeyIndexSet,
+        first_level: usize,
+        positions: &[usize],
+        sorted_positions: &[usize],
+        encoded: &[u8],
+        key: &[Value],
+    ) -> Result<Vec<Tuple>> {
+        let mut candidates: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for &level in self.chain.iter().skip(first_level) {
+            let prefix = key_index_key_prefix(level, table, set, encoded);
+            self.for_each_with_prefix(prefix.as_bytes(), |entry, _| {
+                if let Some(row_id) = StorageEngine::parse_row_id_after_prefix(entry, prefix.len()) {
+                    candidates.insert(row_id);
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(txn) = txn {
+            let staged: Vec<u64> = self.with_staged(txn, table, |staged| {
+                staged
+                    .matching(sorted_positions, encoded)
+                    .into_iter()
+                    .filter_map(|tuple| tuple.row_id)
+                    .collect()
+            })?;
+            candidates.extend(staged);
+        }
+        let mut out = Vec::with_capacity(candidates.len());
+        for row_id in candidates {
+            if let Some(tuple) = self.get(txn, table, row_id, schema)? {
+                if row_matches(&tuple, positions, key) {
+                    out.push(tuple);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The first PRIMARY KEY / UNIQUE rule of `table` (PRIMARY KEY first) that
     /// the full row `values` (schema order) would violate on this branch — a
     /// visible row other than `exclude` holds the same non-NULL key. With
@@ -1495,7 +1975,7 @@ impl<'a> BranchView<'a> {
         exclude: Option<u64>,
         arbiter: Option<&[String]>,
     ) -> Result<Option<BranchUniqueConflict>> {
-        for rule in self.engine.art_indexes().enforced_unique_indexes(table) {
+        for rule in self.unique_rules(table)? {
             if let Some(arbiter) = arbiter {
                 if !ArtIndexManager::same_column_set(&rule.columns, arbiter) {
                     continue;
@@ -1532,7 +2012,7 @@ impl<'a> BranchView<'a> {
         );
         let mut rules = Vec::new();
         let mut claims = Vec::new();
-        for rule in self.engine.art_indexes().enforced_unique_indexes(table) {
+        for rule in self.unique_rules(table)? {
             let Some(key) = rule_key(schema, &rule, values) else {
                 rules.push((rule, None));
                 continue;
@@ -1590,9 +2070,7 @@ impl<'a> BranchView<'a> {
             return Ok(false);
         }
         let Some(rule) = self
-            .engine
-            .art_indexes()
-            .enforced_unique_indexes(table)
+            .unique_rules(table)?
             .into_iter()
             .find(|rule| ArtIndexManager::same_column_set(&rule.columns, columns))
         else {
@@ -1646,7 +2124,7 @@ impl<'a> BranchView<'a> {
         values: &[Value],
     ) -> Result<Vec<BranchKeyClaim>> {
         let mut claims = Vec::new();
-        for rule in self.engine.art_indexes().enforced_unique_indexes(table) {
+        for rule in self.unique_rules(table)? {
             let Some(key) = rule_key(schema, &rule, values) else {
                 continue;
             };
@@ -1688,6 +2166,23 @@ impl<'a> BranchView<'a> {
     ) -> Result<()> {
         let row_key = branch_row_key(self.branch_id, table, row_id);
         let tombstone_key = branch_tombstone_key(self.branch_id, table, row_id);
+        // B3 fix pass: the level's own write of the row makes it a change, not
+        // a copy.
+        let frozen_key = branch_frozen_key(self.branch_id, table, row_id);
+        // B3 fix pass: an isolated table's key index follows the level's own
+        // image. A fresh insert (`clear_tombstone == false`) has no old image.
+        let scope = self.scope(table)?;
+        let key_sets = scope.key_index_sets();
+        let old_image = match scope.isolated_width() {
+            Some(width) if clear_tombstone && !key_sets.is_empty() => {
+                match self.own_entry(txn, table, row_id, width)? {
+                    Some(LevelEntry::Row(tuple)) => Some(tuple),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let (key_deletes, key_puts) = self.key_index_changes(&key_sets, table, row_id, old_image.as_ref(), image);
         match txn {
             Some(txn) => {
                 // The staged rows must be current before this write is noted.
@@ -1704,9 +2199,18 @@ impl<'a> BranchView<'a> {
                         txn.put(tombstone_key, Vec::new())?;
                     }
                 }
+                txn.delete(frozen_key)?;
+                for entry in key_deletes {
+                    txn.delete(entry)?;
+                }
+                for entry in key_puts {
+                    txn.put(entry, Vec::new())?;
+                }
                 let key: GenerationKey = (self.engine_id(), self.branch_id, table.to_string());
                 let mut staged = txn.branch_staged();
-                staged.touched.insert(key.clone());
+                if staged.touched.insert(key.clone()) {
+                    staged.tokens.push(PendingWriteToken::new(key.clone()));
+                }
                 staged.tables.entry(key).or_default().note(row_id, image);
                 Ok(())
             }
@@ -1726,17 +2230,96 @@ impl<'a> BranchView<'a> {
                         batch.put(&tombstone_key, b"");
                     }
                 }
+                batch.delete(&frozen_key);
+                for entry in &key_deletes {
+                    batch.delete(entry);
+                }
+                for entry in &key_puts {
+                    batch.put(entry, b"");
+                }
                 self.engine.write_batch_through_gate(batch)?;
                 self.after_direct_write(table, std::iter::once((row_id, image)))
             }
         }
     }
 
+    /// The key-index entries a write of one row removes and adds at this
+    /// level (`sets` is empty for a table with no key index).
+    fn key_index_changes(
+        &self,
+        sets: &[KeyIndexSet],
+        table: &str,
+        row_id: u64,
+        old: Option<&Tuple>,
+        new: Option<&Tuple>,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let mut deletes = Vec::new();
+        let mut puts = Vec::new();
+        for set in sets {
+            let old_key = old.and_then(|tuple| encode_positions(tuple, &set.positions));
+            let new_key = new.and_then(|tuple| encode_positions(tuple, &set.positions));
+            if old_key == new_key {
+                continue;
+            }
+            if let Some(encoded) = old_key {
+                deletes.push(key_index_key(self.branch_id, table, set, &encoded, row_id));
+            }
+            if let Some(encoded) = new_key {
+                puts.push(key_index_key(self.branch_id, table, set, &encoded, row_id));
+            }
+        }
+        (deletes, puts)
+    }
+
     /// Write `tuple` as the branch's own image of a row id the caller JUST
     /// allocated (`next_row_id_volatile`): no level can hold an entry for it,
     /// so there is no tombstone to clear.
     pub fn insert(&self, txn: Option<&Transaction>, table: &str, row_id: u64, tuple: &Tuple) -> Result<()> {
+        self.refuse_taken_row_id(txn, table, row_id)?;
         self.write(txn, table, row_id, Some(tuple), false)
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): an ISOLATED table's fresh row id must
+    /// not already be held by one of its levels. Its ids come from the table
+    /// name's shared counter, which a main DDL on a same-named table can move
+    /// back (see `StorageEngine::ensure_branch_row_id_floor`, which raises it
+    /// at the first resolution in a process); if one slips through anyway the
+    /// insert is refused — after raising the counter past every id the levels
+    /// hold, so the retry succeeds — rather than overwriting a branch row.
+    /// No lookups for a table no level defines.
+    fn refuse_taken_row_id(&self, txn: Option<&Transaction>, table: &str, row_id: u64) -> Result<()> {
+        let scope = self.scope(table)?;
+        if scope.include_main {
+            // Main's rows and every level share one counter: no collision.
+            return Ok(());
+        }
+        let own_row = branch_row_key(self.branch_id, table, row_id);
+        let own_tombstone = branch_tombstone_key(self.branch_id, table, row_id);
+        let mut taken = txn.is_some_and(|txn| {
+            matches!(txn.staged(&own_row), Some(Some(_))) || matches!(txn.staged(&own_tombstone), Some(Some(_)))
+        });
+        if !taken {
+            for &level in self.chain.iter().skip(scope.first_level) {
+                if self.key_present(&branch_row_key(level, table, row_id))?
+                    || self.key_present(&branch_tombstone_key(level, table, row_id))?
+                {
+                    taken = true;
+                    break;
+                }
+            }
+        }
+        if !taken {
+            return Ok(());
+        }
+        let levels: Vec<u64> = self.chain.iter().skip(scope.first_level).copied().collect();
+        if let Some(max) = self.engine.branch_rows_max_row_id(&levels, table)? {
+            self.engine.raise_row_counter_to(table, max);
+        }
+        Err(Error::query_execution(format!(
+            "row id {row_id} of table '{table}' is already used on branch \"{}\" (the table's row-id counter was \
+             behind the branch's rows and has been advanced): retry the statement",
+            self.name
+        )))
     }
 
     /// Write `tuple` as the branch's own image of row `row_id` and clear the
@@ -1809,12 +2392,233 @@ impl<'a> BranchView<'a> {
                 for row_id in &targets {
                     batch.delete(branch_row_key(self.branch_id, table, *row_id));
                     batch.put(branch_tombstone_key(self.branch_id, table, *row_id), b"");
+                    batch.delete(branch_frozen_key(self.branch_id, table, *row_id));
                 }
+                self.for_each_with_prefix(key_index_table_prefix(self.branch_id, table).as_bytes(), |entry, _| {
+                    batch.delete(entry);
+                    Ok(())
+                })?;
                 self.engine.write_batch_through_gate(batch)?;
                 self.after_direct_write(table, targets.iter().map(|row_id| (*row_id, None)))?;
             }
         }
         Ok(visible.len() as u64)
+    }
+
+    // ---- schema support (B3 fix pass) ----
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): rewrite every row of `table` this
+    /// level sees (committed: the caller holds the branch's exclusive section
+    /// and has refused open transactions' staged writes) under `record`, then
+    /// write `record`. The ONE implementation of a branch `ADD COLUMN` and of a
+    /// schema-changing MERGE into a branch.
+    ///
+    /// A row the level did not already hold becomes a COPY (`bfrz:`, so MERGE
+    /// skips it, and main's own `ADD COLUMN` backfills it there). Whether the
+    /// level changed a row is asked of the level's own keys and markers, never of
+    /// the tuple: a row a commit fast-forwarded into a cached overlay carries
+    /// whatever `branch_id` its writer gave it.
+    ///
+    /// Copies are written in batches of `MATERIALIZE_CHUNK_ROWS`, main's rows
+    /// streamed, so memory is O(overlay + chunk). The rows the level CHANGED (held
+    /// and not marked) go in the LAST batch, with the record: a crash between
+    /// batches then leaves only wider copies under the old definition, which are
+    /// marked, so MERGE ignores them, and a retry rewrites them (a row is cut back
+    /// to `current`'s width before it is extended, and a marked one stays marked
+    /// and chunked). A row the level changed is never wider than its definition,
+    /// since MERGE copies it by position. That batch cannot be split, so it is
+    /// built first, and when it would not fit in one write group nothing at all
+    /// is written (54000). Returns the rows written.
+    pub(crate) fn materialize(
+        &self,
+        table: &str,
+        current: &Schema,
+        record: &super::branch_catalog::BranchTableRecord,
+        backfill: &[Value],
+    ) -> Result<u64> {
+        let level = self.branch_id;
+        let width = current.columns.len();
+        let scope = self.scope(table)?;
+        let own = self.engine.branch_level_row_ids(level, table)?;
+        let frozen = self.engine.branch_frozen_row_ids(level, table)?;
+        let changed_here = |row_id: u64| own.contains(&row_id) && !frozen.contains(&row_id);
+        let key_sets = record.definition().map(key_index_sets).unwrap_or_default();
+        let overlay = self.load_committed_rows(table, width, scope.first_level)?;
+        let stage = |batch: &mut WriteBatch, row_id: u64, values: Vec<Value>, copy: bool| -> Result<()> {
+            let mut values = values;
+            values.truncate(width);
+            extend_row_values(&mut values, width, backfill);
+            let tuple = Tuple::new(values);
+            self.engine
+                .stage_branch_row_image(batch, level, table, row_id, &tuple, copy)?;
+            for set in &key_sets {
+                if let Some(encoded) = encode_positions(&tuple, &set.positions) {
+                    batch.put(key_index_key(level, table, set, &encoded, row_id), b"");
+                }
+            }
+            Ok(())
+        };
+
+        let mut written = 0u64;
+        let mut final_batch = WriteBatch::default();
+        for (row_id, state) in &overlay {
+            if let (true, Some(tuple)) = (changed_here(*row_id), state) {
+                stage(&mut final_batch, *row_id, tuple.values.clone(), false)?;
+                written += 1;
+            }
+        }
+        let needed = final_batch.size_in_bytes() + record.encode()?.len();
+        if needed > final_batch_limit() {
+            return Err(Error::branch_materialize_too_large(
+                table,
+                &self.name,
+                needed,
+                final_batch_limit(),
+            ));
+        }
+
+        let mut copies = WriteBatch::default();
+        let mut in_batch = 0usize;
+        let mut emit_copy = |row_id: u64, values: Vec<Value>| -> Result<()> {
+            stage(&mut copies, row_id, values, true)?;
+            written += 1;
+            in_batch += 1;
+            if in_batch >= materialize_chunk_rows() || copies.size_in_bytes() >= MATERIALIZE_CHUNK_BYTES {
+                self.engine.write_batch_through_gate(std::mem::take(&mut copies))?;
+                self.engine
+                    .merge_failpoint_tick(super::branch_catalog::MergeFailSite::Materialize)?;
+                in_batch = 0;
+            }
+            Ok(())
+        };
+        if scope.include_main {
+            let prefix = format!("data:{table}:");
+            self.for_each_with_prefix(prefix.as_bytes(), |key, raw| {
+                let Some(row_id) = StorageEngine::parse_row_id_after_prefix(key, prefix.len()) else {
+                    return Ok(());
+                };
+                if overlay.contains_key(&row_id) {
+                    return Ok(());
+                }
+                emit_copy(row_id, self.decode_main_row(table, key, raw, row_id, current)?.values)
+            })?;
+        }
+        for (row_id, state) in &overlay {
+            if let (false, Some(tuple)) = (changed_here(*row_id), state) {
+                emit_copy(*row_id, tuple.values.clone())?;
+            }
+        }
+        self.engine.write_batch_through_gate(copies)?;
+        self.engine
+            .put_branch_table_record(level, table, record, final_batch, false)?;
+        Ok(written)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): one row of a MERGE landing on
+    /// this level: `plain` is the row's image (serialized, unsealed), `None` a
+    /// tombstone. ONE batch: the entry, the removal of the level's other entry for
+    /// the row and of its copy marker (a merged change is the level's own change),
+    /// and its key-index entries, so a probe of an isolated table never misses a
+    /// row already on the level. The caller holds the level's exclusive section.
+    pub(crate) fn apply_merged_row(&self, table: &str, row_id: u64, plain: Option<&[u8]>) -> Result<()> {
+        let row_key = branch_row_key(self.branch_id, table, row_id);
+        let tombstone_key = branch_tombstone_key(self.branch_id, table, row_id);
+        let scope = self.scope(table)?;
+        let key_sets = scope.key_index_sets();
+        let (old, new) = match scope.isolated_width() {
+            Some(width) if !key_sets.is_empty() => {
+                let old = match self.own_entry(None, table, row_id, width)? {
+                    Some(LevelEntry::Row(tuple)) => Some(tuple),
+                    _ => None,
+                };
+                let new: Option<Tuple> = plain
+                    .map(|bytes| {
+                        bincode::deserialize(bytes)
+                            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {e}")))
+                    })
+                    .transpose()?;
+                (old, new)
+            }
+            _ => (None, None),
+        };
+        let mut batch = WriteBatch::default();
+        match plain {
+            Some(bytes) => {
+                let sealed = crate::storage::tde::seal_row_value(self.engine.key_manager_ref(), &row_key, bytes)?;
+                batch.put(&row_key, sealed.as_ref());
+                batch.delete(&tombstone_key);
+            }
+            None => {
+                batch.delete(&row_key);
+                batch.put(&tombstone_key, b"");
+            }
+        }
+        batch.delete(branch_frozen_key(self.branch_id, table, row_id));
+        let (key_deletes, key_puts) = self.key_index_changes(&key_sets, table, row_id, old.as_ref(), new.as_ref());
+        for entry in &key_deletes {
+            batch.delete(entry);
+        }
+        for entry in &key_puts {
+            batch.put(entry, b"");
+        }
+        self.engine.write_batch_through_gate(batch)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): does main's index of `columns`
+    /// hold `key` (parallel) for a row that does not hold it committed, other than
+    /// the rows in `ignore`? Main's index is maintained eagerly, so that is an open
+    /// transaction's claim: its INSERT, or its UPDATE moving a row to this key.
+    /// This view's chain plays no part: main's index and rows only.
+    pub(crate) fn main_key_held_by_an_uncommitted_row(
+        &self,
+        table: &str,
+        schema: &Schema,
+        columns: &[String],
+        key: &[Value],
+        ignore: &HashSet<u64>,
+    ) -> Result<bool> {
+        let art = self.engine.art_indexes();
+        let Some((index_name, index_columns)) = art.index_covering_columns(table, columns) else {
+            return Ok(false);
+        };
+        let Some(positions) = column_positions(schema, columns) else {
+            return Ok(false);
+        };
+        let ordered = reorder_values(columns, key, &index_columns)
+            .ok_or_else(|| Error::internal("index columns do not match the probed columns"))?;
+        for row_id in art.index_get_all(&index_name, &ArtIndexManager::encode_key(&ordered)) {
+            if ignore.contains(&row_id) {
+                continue;
+            }
+            match self.main_row(table, row_id, schema)? {
+                Some(tuple) if row_matches(&tuple, &positions, key) => {}
+                _ => return Ok(true),
+            }
+        }
+        Ok(false)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): each image this level itself CHANGED
+    /// (not in `skip`, which holds its copies and its tombstones), decoded to
+    /// `width`. What MERGE's key validation walks: it streams, a merge can be
+    /// large.
+    pub(crate) fn for_each_own_changed_image(
+        &self,
+        table: &str,
+        width: usize,
+        skip: &HashSet<u64>,
+        mut each: impl FnMut(u64, Tuple) -> Result<()>,
+    ) -> Result<()> {
+        let prefix = row_prefix(self.branch_id, table);
+        self.for_each_with_prefix(
+            prefix.as_bytes(),
+            |key, raw| match StorageEngine::parse_row_id_after_prefix(key, prefix.len()) {
+                Some(row_id) if !skip.contains(&row_id) => {
+                    each(row_id, self.decode_committed(key, raw, row_id, self.branch_id, width)?)
+                }
+                _ => Ok(()),
+            },
+        )
     }
 }
 
@@ -1852,6 +2656,247 @@ mod tests {
         rows.iter().map(|t| t.row_id.unwrap()).collect()
     }
 
+    fn isolated_record(schema: &Schema) -> crate::storage::branch_catalog::BranchTableRecord {
+        use crate::storage::branch_catalog::{derive_unique_rules, BranchTableDefinition, BranchTableState};
+        let constraints = crate::sql::TableConstraints::default();
+        record(BranchTableState::Defined(BranchTableDefinition {
+            unique_rules: derive_unique_rules("t", schema, &constraints),
+            schema: schema.clone(),
+            constraints,
+            identity_columns: Vec::new(),
+            incarnation: 1,
+        }))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): constraint probes of an isolated
+    /// table are served by the level's key index, and load no overlay. Nor does
+    /// a write: this holds above the overlay cache's row budget.
+    #[test]
+    fn a_probe_of_an_isolated_table_loads_no_overlay() {
+        let engine = engine();
+        let mut schema = schema();
+        schema.columns[0].primary_key = true;
+        engine
+            .put_branch_table_record(51, "t", &isolated_record(&schema), WriteBatch::default(), false)
+            .unwrap();
+        let view = BranchView::for_chain(&engine, "c", vec![51]).unwrap();
+        let loads = OVERLAY_LOADS.with(std::cell::Cell::get);
+        view.insert_checked(None, "t", &schema, 1, &row(1, "a")).unwrap();
+        view.insert_checked(None, "t", &schema, 2, &row(2, "b")).unwrap();
+        let holders = view
+            .rows_with_key(None, "t", &schema, &["id".to_string()], &[Value::Int4(1)])
+            .unwrap();
+        assert_eq!(ids(&holders), vec![1]);
+        assert!(view.insert_checked(None, "t", &schema, 3, &row(2, "dup")).is_err());
+        view.delete(None, "t", 2).unwrap();
+        view.insert_checked(None, "t", &schema, 4, &row(2, "again")).unwrap();
+        view.put(None, "t", 1, &row(1, "still 1")).unwrap();
+        assert_eq!(
+            OVERLAY_LOADS.with(std::cell::Cell::get),
+            loads,
+            "no constraint check loaded an overlay"
+        );
+        let mut entries = 0;
+        view.for_each_with_prefix(key_index_table_prefix(51, "t").as_bytes(), |_, _| {
+            entries += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(entries, 2, "one PRIMARY KEY entry per visible row");
+    }
+
+    /// The level's own changes cannot be split from the record: when they would
+    /// not fit in one write group, nothing at all is written, not even the copies
+    /// that would have fit.
+    #[test]
+    fn a_final_batch_over_the_limit_is_refused_before_anything_is_written() {
+        let engine = engine();
+        let narrow = schema();
+        put_main(&engine, 1, &row(1, "main1"));
+        put_main(&engine, 2, &row(2, "main2"));
+        let view = BranchView::for_chain(&engine, "c", vec![62]).unwrap();
+        view.put(None, "t", 1, &row(1, "own")).unwrap();
+        let mut wide = narrow.clone();
+        wide.columns.push(crate::Column::new("cur", crate::DataType::Text));
+        let usd = Value::String("USD".to_string());
+        let record = isolated_record(&wide);
+        let refuse = || view.materialize("t", &narrow, &record, std::slice::from_ref(&usd));
+
+        FINAL_BATCH_LIMIT_OVERRIDE.with(|limit| limit.set(Some(1)));
+        let refused = refuse().unwrap_err().to_string();
+        FINAL_BATCH_LIMIT_OVERRIDE.with(|limit| limit.set(None));
+        assert!(
+            refused.contains(crate::error::BRANCH_MATERIALIZE_TOO_LARGE_MARKER) && refused.contains("table t"),
+            "{refused}"
+        );
+        assert!(engine.branch_table_record(62, "t").unwrap().is_none(), "no record");
+        assert_eq!(engine.branch_level_row_ids(62, "t").unwrap().len(), 1, "no copy");
+        assert!(engine.branch_frozen_row_ids(62, "t").unwrap().is_empty(), "no marker");
+        assert_eq!(refuse().unwrap(), 2);
+    }
+
+    /// A materialization stopped between its chunks: only marked COPIES have been
+    /// rewritten, so MERGE ignores what happened. A row the level changed, and the
+    /// record, go together in the last batch. A retry completes it.
+    #[test]
+    fn a_stopped_materialization_leaves_only_marked_copies() {
+        use crate::storage::branch_catalog::MergeFailSite;
+        let engine = engine();
+        let narrow = schema();
+        for id in 1..=(MATERIALIZE_CHUNK_ROWS as i32 + 1) {
+            put_main(&engine, u64::try_from(id).unwrap(), &row(id, "main"));
+        }
+        let view = BranchView::for_chain(&engine, "c", vec![61]).unwrap();
+        view.put(None, "t", 1, &row(1, "own")).unwrap();
+        let mut wide = narrow.clone();
+        wide.columns.push(crate::Column::new("cur", crate::DataType::Text));
+        let usd = Value::String("USD".to_string());
+        let record = isolated_record(&wide);
+
+        engine.debug_fail_merge_at(MergeFailSite::Materialize, 0);
+        assert!(view
+            .materialize("t", &narrow, &record, std::slice::from_ref(&usd))
+            .is_err());
+        assert!(engine.branch_table_record(61, "t").unwrap().is_none(), "no record yet");
+        assert_eq!(
+            engine.branch_changed_row_ids(61, "t").unwrap(),
+            std::iter::once(1).collect::<HashSet<u64>>(),
+            "what MERGE would carry is the level's own change alone"
+        );
+        let stored = engine.get(&branch_row_key(61, "t", 1)).unwrap().unwrap();
+        let own: Tuple = bincode::deserialize(&stored).unwrap();
+        assert_eq!(own.values.len(), 2, "the level's own row is not widened yet");
+
+        // The retry: the copies of the stopped attempt stay marked and chunked, so
+        // the last batch holds the level's own change, not the whole table.
+        let stopped_copies = engine.branch_frozen_row_ids(61, "t").unwrap().len();
+        assert_eq!(stopped_copies, MATERIALIZE_CHUNK_ROWS);
+        let written = view
+            .materialize("t", &narrow, &record, std::slice::from_ref(&usd))
+            .unwrap();
+        assert_eq!(written, MATERIALIZE_CHUNK_ROWS as u64 + 1);
+        assert_eq!(engine.branch_frozen_row_ids(61, "t").unwrap().len(), stopped_copies);
+        let seen = view.scan(None, "t", &wide).unwrap();
+        assert_eq!(seen.len(), MATERIALIZE_CHUNK_ROWS + 1);
+        assert!(seen.iter().all(|row| row.values.len() == 3 && row.values[2] == usd));
+        assert_eq!(
+            engine.branch_changed_row_ids(61, "t").unwrap(),
+            std::iter::once(1).collect::<HashSet<u64>>()
+        );
+    }
+
+    /// RocksDB keys are not sealed at rest: an entry of the key index holds a
+    /// digest of the key, never its value.
+    #[test]
+    fn the_key_index_never_holds_a_key_value() {
+        let engine = engine();
+        let mut schema = schema();
+        schema.columns[1].unique = true;
+        engine
+            .put_branch_table_record(52, "t", &isolated_record(&schema), WriteBatch::default(), false)
+            .unwrap();
+        let view = BranchView::for_chain(&engine, "c", vec![52]).unwrap();
+        let marker = "QZX-KEY-VALUE-5521";
+        view.insert_checked(None, "t", &schema, 1, &row(1, marker)).unwrap();
+        let mut entries = 0;
+        let hex = to_hex(marker.as_bytes());
+        view.for_each_with_prefix(key_index_table_prefix(52, "t").as_bytes(), |key, _| {
+            let key = String::from_utf8_lossy(key).to_string();
+            assert!(!key.contains(marker) && !key.contains(&hex), "{key}");
+            entries += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(entries, 1);
+        assert!(
+            view.insert_checked(None, "t", &schema, 2, &row(2, marker)).is_err(),
+            "the digest still finds the key"
+        );
+    }
+
+    /// A materialization marks the rows the level did not already hold as
+    /// copies, keeps the level's own changes as changes, and the level's own
+    /// write of a copy makes it a change. Rerun, it writes the same rows.
+    #[test]
+    fn materialize_marks_copies_and_an_own_write_clears_the_mark() {
+        let engine = engine();
+        let narrow = schema();
+        put_main(&engine, 1, &row(1, "main1"));
+        put_main(&engine, 2, &row(2, "main2"));
+        put_main(&engine, 3, &row(3, "main3"));
+        let view = BranchView::for_chain(&engine, "c", vec![60]).unwrap();
+        view.put(None, "t", 1, &row(1, "own")).unwrap();
+        view.delete(None, "t", 3).unwrap();
+        let mut wide = narrow.clone();
+        wide.columns.push(crate::Column::new("cur", crate::DataType::Text));
+        let usd = Value::String("USD".to_string());
+        let record = isolated_record(&wide);
+        assert_eq!(
+            view.materialize("t", &narrow, &record, std::slice::from_ref(&usd))
+                .unwrap(),
+            2
+        );
+        let as_set = |ids: &[u64]| ids.iter().copied().collect::<HashSet<u64>>();
+        assert_eq!(engine.branch_frozen_row_ids(60, "t").unwrap(), as_set(&[2]));
+        assert_eq!(engine.branch_changed_row_ids(60, "t").unwrap(), as_set(&[1, 3]));
+        let seen = view.scan(None, "t", &wide).unwrap();
+        assert_eq!(ids(&seen), vec![1, 2]);
+        assert_eq!(
+            seen[0].values,
+            vec![Value::Int4(1), Value::String("own".into()), usd.clone()]
+        );
+        assert_eq!(
+            seen[1].values,
+            vec![Value::Int4(2), Value::String("main2".into()), usd.clone()]
+        );
+
+        view.put(None, "t", 2, &seen[1]).unwrap();
+        assert!(engine.branch_frozen_row_ids(60, "t").unwrap().is_empty());
+        assert_eq!(engine.branch_changed_row_ids(60, "t").unwrap(), as_set(&[1, 2, 3]));
+    }
+
+    #[test]
+    fn extending_a_row_is_idempotent() {
+        let backfill = [Value::Int4(7), Value::Int4(8)];
+        let mut narrow = vec![Value::Int4(1)];
+        extend_row_values(&mut narrow, 2, &backfill);
+        assert_eq!(
+            narrow,
+            vec![Value::Int4(1), Value::Null, Value::Int4(7), Value::Int4(8)]
+        );
+        let again = narrow.clone();
+        extend_row_values(&mut narrow, 2, &backfill);
+        assert_eq!(narrow, again, "a row already that wide is left as it is");
+        let mut half = vec![Value::Int4(1), Value::Int4(2), Value::Int4(70)];
+        extend_row_values(&mut half, 2, &backfill);
+        assert_eq!(
+            half,
+            vec![Value::Int4(1), Value::Int4(2), Value::Int4(70), Value::Int4(8)]
+        );
+    }
+
+    /// The registry a schema statement checks: one entry per open transaction
+    /// that staged writes of the (level, table), until it ends either way.
+    #[test]
+    fn open_transactions_with_staged_writes_are_counted() {
+        let engine = engine();
+        let view = BranchView::for_chain(&engine, "p", vec![70]).unwrap();
+        let id = engine.instance_id();
+        assert_eq!(pending_writers(id, 70, "t"), 0);
+        let first = engine.begin_transaction().unwrap();
+        view.put(Some(&first), "t", 1, &row(1, "a")).unwrap();
+        view.put(Some(&first), "t", 2, &row(2, "b")).unwrap();
+        assert_eq!(pending_writers(id, 70, "t"), 1, "per transaction, not per row");
+        assert_eq!(pending_writers(id, 70, "u"), 0);
+        let second = engine.begin_transaction().unwrap();
+        view.put(Some(&second), "t", 3, &row(3, "c")).unwrap();
+        assert_eq!(pending_writers(id, 70, "t"), 2);
+        first.commit().unwrap();
+        assert_eq!(pending_writers(id, 70, "t"), 1);
+        second.rollback().unwrap();
+        assert_eq!(pending_writers(id, 70, "t"), 0);
+    }
+
     /// The nearest level decides: a child's own image beats its parent's
     /// tombstone of the same row, and a child's tombstone hides the parent's
     /// image (the pre-B2 scan applied every tombstone of the chain last).
@@ -1881,6 +2926,68 @@ mod tests {
             child.get(None, "t", 1, &schema).unwrap().unwrap().values[1],
             Value::String("c1".into())
         );
+    }
+
+    fn record(
+        state: crate::storage::branch_catalog::BranchTableState,
+    ) -> crate::storage::branch_catalog::BranchTableRecord {
+        crate::storage::branch_catalog::BranchTableRecord {
+            state,
+            isolated: true,
+            frozen: false,
+            parent_fingerprint: None,
+            parent_incarnation: None,
+            created: true,
+            added_columns: Vec::new(),
+        }
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): a table a level defines `isolated`
+    /// reads that level and its descendants only — never main's rows or an
+    /// ancestor's — enforces the definition's rules (not main's ART), and a
+    /// table a level dropped has no rows at all.
+    #[test]
+    fn an_isolated_table_reads_its_levels_only() {
+        use crate::storage::branch_catalog::{derive_unique_rules, BranchTableDefinition, BranchTableState};
+        let engine = engine();
+        let mut schema = schema();
+        schema.columns[0].primary_key = true;
+        put_main(&engine, 1, &row(1, "main1"));
+        let parent = BranchView::for_chain(&engine, "p", vec![40]).unwrap();
+        parent.insert(None, "t", 2, &row(2, "p2")).unwrap();
+        let constraints = crate::sql::TableConstraints::default();
+        let defined = record(BranchTableState::Defined(BranchTableDefinition {
+            unique_rules: derive_unique_rules("t", &schema, &constraints),
+            schema: schema.clone(),
+            constraints,
+            identity_columns: Vec::new(),
+            incarnation: 1,
+        }));
+        engine
+            .put_branch_table_record(41, "t", &defined, WriteBatch::default(), false)
+            .unwrap();
+        let child = BranchView::for_chain(&engine, "c", vec![40, 41]).unwrap();
+        assert!(child.scan(None, "t", &schema).unwrap().is_empty(), "nothing inherited");
+        assert!(child.get(None, "t", 1, &schema).unwrap().is_none());
+        assert!(child.get(None, "t", 2, &schema).unwrap().is_none());
+        child.insert_checked(None, "t", &schema, 3, &row(1, "c")).unwrap();
+        assert_eq!(ids(&child.scan(None, "t", &schema).unwrap()), vec![3]);
+        // The definition's PRIMARY KEY holds over the child's own rows only:
+        // main's row 1 does not collide, the child's own does.
+        let err = child
+            .insert_checked(None, "t", &schema, 4, &row(1, "again"))
+            .unwrap_err();
+        assert!(err.to_string().contains("t_pkey"), "{err}");
+        // A fresh row id the level already holds is refused, never overwritten.
+        assert!(child.insert(None, "t", 3, &row(9, "overwrite")).is_err());
+        // The parent still sees main's and its own rows.
+        assert_eq!(ids(&parent.scan(None, "t", &schema).unwrap()), vec![1, 2]);
+
+        engine
+            .put_branch_table_record(41, "t", &record(BranchTableState::Dropped), WriteBatch::default(), true)
+            .unwrap();
+        assert!(child.scan(None, "t", &schema).unwrap().is_empty());
+        assert!(child.get(None, "t", 3, &schema).unwrap().is_none());
     }
 
     /// A tombstone and an image at the SAME level: the tombstone wins (the
@@ -2013,6 +3120,7 @@ mod tests {
             Arc::new(parking_lot::Mutex::new(CommittedOverlay {
                 width: 1,
                 schema_generation: 0,
+                first_level: 0,
                 generations: vec![0],
                 set,
             }))

@@ -46,7 +46,13 @@ use tracing::{debug, error, info, warn};
 // an ordinary `storage` module — no `#[path]`, so the write-gate funnel scan
 // sees every write it makes). It reaches the engine through `pub(crate)`
 // primitives: the decode / key helpers and `write_batch_through_gate`.
+use super::art_manager::{MergedKeysOutcome, MergedRowChange};
+use super::branch_catalog::{
+    incarnations_differ, known_incarnation, AncestorMerge, MergeAction, MergeDdlScope, MergeFailSite, MergeIntent,
+    MergeStep, MERGE_TARGET_MAIN,
+};
 use super::branch_view;
+use super::branch_view::BranchView;
 
 // Thread-local buffer for key generation to avoid per-row allocations
 thread_local! {
@@ -1971,33 +1977,83 @@ impl OpenMode {
     }
 }
 
-/// sprinter 6bc4a4040eb7 (B1 fix pass): puts a MERGE's source branch back to
-/// its pre-merge metadata when the copy fails after the source was already
-/// marked merged. Disarmed once the copy succeeds.
-struct MergeSourceRestore<'a> {
-    engine: &'a StorageEngine,
-    original: Option<BranchMetadata>,
+/// One row of a table a merge lands on main: main's committed image of it, and what
+/// the source made of it (`None`: it deleted it).
+struct LandingRow {
+    row_id: u64,
+    old: Option<Tuple>,
+    new: Option<Tuple>,
 }
 
-impl MergeSourceRestore<'_> {
-    fn disarm(&mut self) {
-        self.original = None;
+/// `(a, b)=(1, 2)`: a key in a merge's refusals.
+fn merge_key_text(schema: &crate::Schema, columns: &[String], row: &Tuple) -> String {
+    let values: Vec<String> = columns
+        .iter()
+        .map(|column| {
+            schema
+                .get_column_index(column)
+                .and_then(|position| row.values.get(position))
+                .map_or_else(|| "?".to_string(), ToString::to_string)
+        })
+        .collect();
+    format!("({})=({})", columns.join(", "), values.join(", "))
+}
+
+/// The two ends of one MERGE BRANCH, as its phases read them.
+#[derive(Clone, Copy)]
+struct MergeEnds<'a> {
+    /// When this statement stops waiting for anything: ONE budget for its close,
+    /// its section and its wait for main's schema statements (B3 third fix pass).
+    deadline: std::time::Instant,
+    source_name: &'a str,
+    target_name: &'a str,
+    source_id: u64,
+    target_id: u64,
+    merge_to_main: bool,
+    source_chain: &'a [u64],
+    /// Empty for main.
+    target_chain: &'a [u64],
+}
+
+/// What a merge changes on its target (`StorageEngine::plan_branch_merge`).
+struct BranchMergePlan {
+    steps: Vec<MergeStep>,
+    /// Every table the merge changes, rows-only ones included.
+    tables: Vec<String>,
+    /// Of those, the ones a branch target resolves to main's catalog.
+    main_tables: Vec<String>,
+}
+
+/// `table`'s definition on a merge's target, against the columns it had at the
+/// fork: for the refusal to say what changed.
+fn describe_definition_change(
+    table: &str,
+    columns_at_fork: &[String],
+    current: &super::branch_catalog::BranchTableDefinition,
+) -> String {
+    let now: Vec<&str> = current.schema.columns.iter().map(|c| c.name.as_str()).collect();
+    if now.iter().copied().eq(columns_at_fork.iter().map(String::as_str)) {
+        format!("{table} (its constraints or unique indexes)")
+    } else {
+        format!(
+            "{table} (columns were ({}), are now ({}))",
+            columns_at_fork.join(", "),
+            now.join(", ")
+        )
     }
 }
 
-impl Drop for MergeSourceRestore<'_> {
-    fn drop(&mut self) {
-        if let Some(original) = self.original.take() {
-            if let Err(e) = self.engine.write_branch_metadata(&original) {
-                tracing::warn!(
-                    branch = %original.name,
-                    error = %e,
-                    "MERGE BRANCH failed and its source could not be restored"
-                );
-            }
-        }
+impl MergeStep {
+    /// Does this step rewrite a branch target's rows or definition?
+    fn rewrites_a_branch(&self) -> bool {
+        matches!(self.action, MergeAction::PutOnBranch { .. })
     }
 }
+
+/// A branch's reverse-FK answers: (branch, referenced table) -> (schema
+/// generation, the foreign keys that point at it).
+type BranchReferencingFkCache =
+    parking_lot::Mutex<std::collections::HashMap<(u64, String), (u64, Vec<crate::sql::ForeignKeyConstraint>)>>;
 
 /// Storage engine
 pub struct StorageEngine {
@@ -2188,6 +2244,9 @@ pub struct StorageEngine {
     /// In-memory reverse-FK cache (referenced table -> constraints that point at it)
     referencing_fk_cache:
         Arc<parking_lot::Mutex<std::collections::HashMap<String, Vec<crate::sql::ForeignKeyConstraint>>>>,
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): the same question per (branch,
+    /// referenced table), stamped with the schema generation it was answered at.
+    branch_referencing_fk_cache: BranchReferencingFkCache,
     /// R4.2: write durable index snapshots at clean shutdown. Disabled by
     /// crash-recovery tests to simulate a process that died without
     /// checkpointing.
@@ -3475,6 +3534,7 @@ impl StorageEngine {
             write_watermarks: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            branch_referencing_fk_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             // Spec P5.1: a fenced primary persists nothing at close either.
             index_snapshots_on_close: Arc::new(AtomicBool::new(!mode.is_physical() && fenced.is_none())),
             row_counter_flush_on_close: Arc::new(AtomicBool::new(!mode.is_physical() && fenced.is_none())),
@@ -3535,6 +3595,17 @@ impl StorageEngine {
         } else if crate::sql::temp_tables::sweep_orphaned_temp_tables(&engine) > 0 {
             // Anything the sweep could NOT drop must still be hidden.
             engine.note_temp_table_present();
+        }
+
+        // sprinter 6bc4a4040eb7 (B3 fix pass): a table created before incarnation
+        // ids existed gets its id here, on a writable open only: a standby's
+        // bytes come from its primary. One batch.
+        if writes {
+            match engine.catalog().backfill_table_incarnations() {
+                Ok(0) => {}
+                Ok(missing) => info!("Backfilled the incarnation id of {} table(s)", missing),
+                Err(e) => warn!("Could not backfill table incarnation ids: {}", e),
+            }
         }
 
         Ok(engine)
@@ -3913,6 +3984,7 @@ impl StorageEngine {
             write_watermarks: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            branch_referencing_fk_cache: parking_lot::Mutex::new(std::collections::HashMap::new()),
             index_snapshots_on_close: Arc::new(AtomicBool::new(true)),
             row_counter_flush_on_close: Arc::new(AtomicBool::new(true)),
             open_mode: OpenMode::Primary,
@@ -4030,6 +4102,17 @@ impl StorageEngine {
     /// stored under the current generation. Used by the indexed-scan fast paths
     /// to avoid two RocksDB metadata point-gets per probe.
     pub fn cached_table_kind(&self, table_name: &str) -> Result<TableKind> {
+        // sprinter 6bc4a4040eb7 (phase B3): the cache is keyed by NAME and
+        // describes main. A table the session's branch defines or dropped is
+        // answered from the branch catalog and never cached; every other name
+        // resolves exactly as on main, so main's cache answers it.
+        if let Some(resolution) = self.session_branch_table(table_name)? {
+            match resolution.exists() {
+                Some(true) => return Ok(TableKind::Table),
+                Some(false) => return Ok(TableKind::Missing),
+                None => {}
+            }
+        }
         let generation = self.schema_generation.load(Ordering::Acquire);
         if let Some(entry) = self.existence_cache.get(table_name) {
             let (entry_generation, kind) = *entry.value();
@@ -4073,6 +4156,7 @@ impl StorageEngine {
     pub fn invalidate_table_constraints_cache(&self, table_name: &str) {
         self.constraints_cache.lock().remove(table_name);
         self.referencing_fk_cache.lock().clear();
+        self.branch_referencing_fk_cache.lock().clear();
     }
 
     /// Get cached reverse-FK constraints for a referenced table.
@@ -4090,6 +4174,46 @@ impl StorageEngine {
     /// Clear all cached reverse-FK lookups.
     pub fn clear_referencing_fk_cache(&self) {
         self.referencing_fk_cache.lock().clear();
+        self.branch_referencing_fk_cache.lock().clear();
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): the cached reverse-FK answer of
+    /// `branch` for `referenced_table`, if it was computed at `generation`. Not
+    /// on a physical standby, whose catalog changes below every bump.
+    pub(crate) fn cached_branch_referencing_fks(
+        &self,
+        branch: u64,
+        referenced_table: &str,
+        generation: u64,
+    ) -> Option<Vec<crate::sql::ForeignKeyConstraint>> {
+        if self.is_physical_standby() {
+            return None;
+        }
+        self.branch_referencing_fk_cache
+            .lock()
+            .get(&(branch, referenced_table.to_string()))
+            .filter(|(stamp, _)| *stamp == generation)
+            .map(|(_, foreign_keys)| foreign_keys.clone())
+    }
+
+    /// Cache a branch's reverse-FK answer, computed at `generation`.
+    pub(crate) fn cache_branch_referencing_fks(
+        &self,
+        branch: u64,
+        referenced_table: &str,
+        generation: u64,
+        foreign_keys: Vec<crate::sql::ForeignKeyConstraint>,
+    ) {
+        if self.is_physical_standby() {
+            return;
+        }
+        let mut cache = self.branch_referencing_fk_cache.lock();
+        // Entries of dropped branches are never asked for again: bounded by
+        // starting over.
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache.insert((branch, referenced_table.to_string()), (generation, foreign_keys));
     }
 
     /// Forget the cached dictionaries of a dropped table, dirty ones included
@@ -8745,8 +8869,8 @@ impl StorageEngine {
     /// [`Self::scan_table_with_schema_opt`], for a physical standby's applier,
     /// which decodes each replicated row change one key at a time and must see
     /// the tuple a rebuild by scan would see — and for MERGE BRANCH, which
-    /// feeds each row it merged into main to the vector indexes the same way
-    /// (`rederive_indexes_after_merge`).
+    /// maintains main's indexes from the row it replaces and the row it lands
+    /// (`land_merged_row_on_main`).
     pub(crate) fn decode_stored_row(
         &self,
         table_name: &str,
@@ -9865,6 +9989,20 @@ impl StorageEngine {
         Ok(migrated)
     }
 
+    /// The value `ALTER TABLE … ADD COLUMN` gives every EXISTING row: a
+    /// literal `DEFAULT`, else NULL (a non-literal default backfills NULL).
+    /// Shared by main's rewrite ([`Self::add_column_to_rows`]) and a branch's
+    /// materialization (sprinter 6bc4a4040eb7, phase B3), so the two cannot
+    /// disagree about what an existing row holds.
+    pub fn add_column_backfill_value(default_expr: &Option<crate::sql::LogicalExpr>) -> crate::Value {
+        match default_expr {
+            // For simple literal defaults, extract the value
+            Some(crate::sql::LogicalExpr::Literal(v)) => v.clone(),
+            // Complex expressions default to NULL
+            Some(_) | None => crate::Value::Null,
+        }
+    }
+
     /// Add a new column to all existing rows in a table
     ///
     /// This method updates all existing rows by appending a new value
@@ -9876,6 +10014,10 @@ impl StorageEngine {
     ///
     /// # Returns
     /// Number of rows updated
+    ///
+    /// The value every existing row gets is [`Self::add_column_backfill_value`]
+    /// — the ONE rule a branch's `ADD COLUMN` materialization applies too
+    /// (sprinter 6bc4a4040eb7, phase B3).
     pub fn add_column_to_rows(
         &self,
         table_name: &str,
@@ -9898,15 +10040,7 @@ impl StorageEngine {
         self.invalidate_write_watermark(table_name);
 
         // Evaluate default expression if provided
-        let default_value = if let Some(expr) = default_expr {
-            // For simple literal defaults, extract the value
-            match expr {
-                crate::sql::LogicalExpr::Literal(v) => v.clone(),
-                _ => crate::Value::Null, // Complex expressions default to NULL
-            }
-        } else {
-            crate::Value::Null
-        };
+        let default_value = Self::add_column_backfill_value(default_expr);
 
         // Collect keys first to avoid iterator invalidation
         let mut keys_to_update = Vec::new();
@@ -11002,7 +11136,25 @@ impl StorageEngine {
         // Use provided snapshot or current timestamp
         let snapshot = snapshot_id.unwrap_or_else(|| self.next_timestamp());
 
-        mgr.create_branch(name, parent_name, snapshot, options)
+        // sprinter 6bc4a4040eb7 (B3 fix pass): the fork record — the incarnation
+        // and definition of every table the parent has right now — is born in the branch's
+        // creation batch. A branch parent is held first, so this waits out a
+        // schema statement running on it (`BranchDrains::exclusive`).
+        let (_parent_hold, parent_chain) = match parent_name {
+            Some(parent) if parent != "main" => match mgr.get_branch_by_name(parent) {
+                Ok(meta) => (
+                    self.branch_drains.enter(meta.branch_id, parent)?,
+                    self.get_branch_chain(meta.branch_id)?,
+                ),
+                // Refused below, with the manager's own error.
+                Err(_) => (super::BranchHold::none(), Vec::new()),
+            },
+            _ => (super::BranchHold::none(), Vec::new()),
+        };
+        let forked = self.fork_entries(&parent_chain)?;
+        mgr.create_branch_with(name, parent_name, snapshot, options, |branch_id, batch| {
+            self.stage_branch_fork_record(branch_id, &forked, batch)
+        })
     }
 
     /// Drop a branch
@@ -11064,6 +11216,18 @@ impl StorageEngine {
     /// For merging into main, data is written with the standard `data:` prefix.
     /// For merging into another branch, data is written with `bdata:` prefix.
     ///
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): a merge either refuses before
+    /// anything changed — the source stays Active and mergeable — or it
+    /// finishes. Everything is validated first (the definitions and the
+    /// incarnations of the target's tables, `plan_branch_merge`; PRIMARY KEY /
+    /// UNIQUE on the target, `validate_merge_keys`); then a durable `MergeIntent`
+    /// is written, synced; then the source is marked merged and the target
+    /// changes. From there on an error leaves the intent in place:
+    /// running the statement again finishes the merge, and so does the next open
+    /// ([`Self::finish_pending_branch_merges`]). Every step is idempotent, the
+    /// target's DDL on the merge's tables is refused (55006) until it is
+    /// finished, and a DROP of either end is too.
+    ///
     /// Returns MergeResult containing merge statistics.
     pub fn merge_branch(
         &self,
@@ -11071,291 +11235,162 @@ impl StorageEngine {
         target_name: &str,
         _strategy: super::MergeStrategy,
     ) -> Result<super::MergeResult> {
-        use std::collections::HashSet;
+        // sprinter 6bc4a4040eb7 (phase B3): a MERGE reads and changes catalogs
+        // by explicit level — the source's own records, the target's chain,
+        // main's catalog — never through the merging session's branch (it may
+        // be bound to any branch). So it runs as MAIN for its duration: the
+        // catalog readers answer from main's catalog, and main's catalog
+        // mutators (the target-side CREATE / DROP / ADD COLUMN of a merge into
+        // main) are not refused as branch writes.
+        let _main_scope = crate::main_statement_scope(self.instance_id);
+        // B3 second fix pass: this merge's own catalog writes are not refused as
+        // DDL on the tables it holds.
+        let _merge_scope = MergeDdlScope::enter(self.instance_id);
+        let deadline = std::time::Instant::now() + super::BRANCH_DRAIN_TIMEOUT;
+        let budget = || deadline.saturating_duration_since(std::time::Instant::now());
 
-        // Get branch metadata
-        let manager_lock = self.get_or_init_branch_manager()?;
-        let source_id;
-        let target_id;
-        {
-            let manager = manager_lock.read();
-            let mgr = manager
-                .as_ref()
-                .ok_or_else(|| Error::storage("BranchManager not initialized"))?;
-
-            let source = mgr.get_branch_by_name(source_name)?;
-            let target = mgr.get_branch_by_name(target_name)?;
-
-            // Validate branches are active
-            if source.state != super::BranchState::Active {
-                return Err(Error::branch_merge(format!(
-                    "Source branch '{}' is not active",
-                    source_name
-                )));
-            }
-            if target.state != super::BranchState::Active {
-                return Err(Error::branch_merge(format!(
-                    "Target branch '{}' is not active",
-                    target_name
-                )));
-            }
-
-            source_id = source.branch_id;
-            target_id = target.branch_id;
-        }
-
+        let (source, target, _) = self.merge_ends(source_name, target_name, None)?;
+        let source_id = source.branch_id;
+        let target_id = target.branch_id;
         let merge_to_main = target_name == "main" || target_id == 1;
-        let merge_timestamp = self.next_timestamp();
-        let mut merged_keys = 0usize;
 
         // sprinter 6bc4a4040eb7 (B1 fix pass): take the source out of `Active`
         // BEFORE copying a single row — after the statements running on it have
         // finished (the drain), and while new ones are kept out. Marking it at
         // the END left the whole copy window open: a session bound to the
         // source kept writing to an overlay that had already been read, and
-        // those writes were silently lost. A failed copy puts the source back
-        // (`MergeSourceRestore`).
-        let _drained = self
-            .branch_drains
-            .close(source_id, source_name, super::BRANCH_DRAIN_TIMEOUT)?;
+        // those writes were silently lost.
+        let _drained = self.branch_drains.close(source_id, source_name, budget())?;
         // B1 second fix pass: what was read above may be stale — the close
         // waited for the source's running statements and possibly for a DROP
         // or MERGE that closed it first. RE-READ both ends: the source must
-        // still be the branch whose drain was closed (same id) and Active, and
-        // the target likewise; the Merged record (and the restore record) is
-        // built from this fresh read. Then HOLD the target (a statement's
-        // shared hold) for the whole copy, so a DROP / MERGE of the target
-        // waits for the merge instead of dropping the overlay it is writing;
-        // one already closing the target refuses the merge (55006). The source
-        // is closed FIRST and the target hold never waits, so two crossed
-        // merges (b→c, c→b) refuse each other instead of deadlocking.
-        let source_meta = {
-            let manager = manager_lock.read();
-            let mgr = manager
-                .as_ref()
-                .ok_or_else(|| Error::storage("BranchManager not initialized"))?;
-            let source = mgr.get_branch_by_name(source_name)?;
-            let target = mgr.get_branch_by_name(target_name)?;
-            if source.branch_id != source_id || source.state != super::BranchState::Active {
-                return Err(Error::branch_merge(format!(
-                    "Source branch '{}' is not active",
-                    source_name
-                )));
-            }
-            if target.branch_id != target_id || target.state != super::BranchState::Active {
-                return Err(Error::branch_merge(format!(
-                    "Target branch '{}' is not active",
-                    target_name
-                )));
-            }
-            source
-        };
-        let _target_hold = if merge_to_main {
-            super::BranchHold::none()
-        } else {
-            self.branch_drains.enter(target_id, target_name)?
-        };
-        let mut merged_meta = source_meta.clone();
-        merged_meta.state = super::BranchState::Merged {
-            into_branch: target_id,
-            at_timestamp: merge_timestamp,
-        };
-        self.write_branch_metadata(&merged_meta)?;
-        let mut restore_source = MergeSourceRestore {
-            engine: self,
-            original: Some(source_meta),
-        };
-
-        // Get all tables from catalog
-        let catalog = Catalog::new(self);
-        let tables = catalog.list_tables()?;
-
-        // Spec P1.1b: merging into main writes main's `data:` keys below every
-        // index funnel, so main's ART and vector indexes must be brought in
-        // line with them here (`rederive_indexes_after_merge`, step 3b) — a
-        // primary used to keep answering PK lookups, UNIQUE probes and
-        // `COUNT(*)` from its pre-merge indexes until it reopened. Until that
-        // is done an index can miss a merged row or under-count its table, the
-        // window the uncommitted-write census guards for eager transaction
-        // writes; hold it for every table the merge may write (from before the
-        // first write until the indexes are re-derived) so the miss-based and
-        // cardinality fast paths decline to the planner, which reads rows.
-        let _index_hold = merge_to_main.then(|| self.write_census().hold_for_replay(tables.clone(), false));
-        // Main rows this merge wrote or deleted, per table.
-        let mut merged_main_rows: std::collections::HashMap<String, std::collections::BTreeSet<u64>> =
-            std::collections::HashMap::new();
-
-        // Track deleted rows per table from source branch
-        let mut deleted_rows_by_table: std::collections::HashMap<String, HashSet<u64>> =
-            std::collections::HashMap::new();
-
-        // Step 1: Collect delete markers from source branch
-        for table_name in &tables {
-            let delete_prefix = format!("bdel:{}:{}:", source_id, table_name);
-            let delete_prefix_bytes = delete_prefix.as_bytes();
-
-            let iter = self.db.iterator(rocksdb::IteratorMode::From(
-                delete_prefix_bytes,
-                rocksdb::Direction::Forward,
-            ));
-            for item in iter {
-                let (key, _value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
-                if !key.starts_with(delete_prefix_bytes) {
-                    break;
-                }
-
-                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, delete_prefix_bytes.len()) {
-                    deleted_rows_by_table
-                        .entry(table_name.clone())
-                        .or_default()
-                        .insert(row_id);
-                }
-            }
-        }
-
-        // W2.5 fence: the Step 2/Step 3 loops below raw-put branch rows into
-        // main's `data:` keyspace, outside every tracked commit funnel and with
-        // no version. Clear the committed-write watermarks BEFORE any of those
-        // writes becomes visible, so the load-bearing invariant "the committer
-        // clears/raises the watermark before its write is visible" (scan.rs
-        // `txn_base_tuples`) holds for the WHOLE copy loop, not just after it: an
-        // in-transaction reader open across the merge either sees the cleared
-        // entry in its pre-check, or passes the pre-check but fails the post-scan
-        // re-check (the entry is gone before it could read an overwritten row) and
-        // falls to the snapshot path, which resolves the pre-merge version. The
-        // existing bump AFTER the loops still closes entries a concurrent commit
-        // re-establishes mid-merge. Gated on `merge_to_main` — only then do the
-        // loops touch `data:` (non-main merges write `bdata:` for the target,
-        // which the branch-switch clear already covers). Also protects a merge
-        // that errors out mid-loop (it returns before the post-loop bump).
-        if merge_to_main {
-            self.bump_schema_generation();
-        }
-
-        // Step 2: Copy data from source branch to target
-        for table_name in &tables {
-            let branch_prefix = format!("bdata:{}:{}:", source_id, table_name);
-            let branch_prefix_bytes = branch_prefix.as_bytes();
-
-            let iter = self.db.iterator(rocksdb::IteratorMode::From(
-                branch_prefix_bytes,
-                rocksdb::Direction::Forward,
-            ));
-            for item in iter {
-                let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
-                if !key.starts_with(branch_prefix_bytes) {
-                    break;
-                }
-
-                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, branch_prefix_bytes.len()) {
-                    // Write to target with appropriate key format
-                    let target_key = if merge_to_main {
-                        format!("data:{}:{}", table_name, row_id)
+        // still be the branch whose drain was closed (same id) and Active (or
+        // merged by the unfinished merge this statement resumes), and the
+        // target likewise.
+        let (source_meta, _, pending) = self.merge_ends(source_name, target_name, Some((source_id, target_id)))?;
+        // B3 second fix pass: a merge of a branch another unfinished merge writes
+        // into, or into a branch that is itself on its way out, could leave that
+        // other merge unfinishable forever.
+        if let Some(other) = self.merge_intent_in_the_way(source_id, target_id)? {
+            return Err(Error::branch_merge_pending(
+                &format!(
+                    "branch {}",
+                    if other.target_id == source_id {
+                        source_name
                     } else {
-                        format!("bdata:{}:{}:{}", target_id, table_name, row_id)
-                    };
-
-                    // The stored form of a value is a property of the key it
-                    // lands under, so a row moving between keys is decoded for
-                    // the key it came FROM and sealed for the key it is going TO
-                    // — never copied across as bytes. `bdata:` and `data:` are
-                    // both sealed keyspaces, so on this path the transform is
-                    // form-preserving; it is written this way because the
-                    // decision belongs to the destination key, and because the
-                    // tolerant open is what lets a source value written by an
-                    // earlier build be promoted correctly. Both directions go
-                    // through the one rule in `tde`, and both are a no-op with
-                    // encryption disabled.
-                    let plain = super::tde::open_ref(self.key_manager.as_deref(), &key, &value)?;
-                    let stored =
-                        super::tde::seal_row_value(self.key_manager.as_deref(), target_key.as_bytes(), plain.as_ref())?;
-
-                    self.gate
-                        .put(&self.db, target_key.as_bytes(), stored.as_ref(), None)
-                        .map_err(|e| Error::storage(format!("Failed to merge data: {}", e)))?;
-                    // sprinter 6bc4a4040eb7 (B2): a target BRANCH level holds one
-                    // entry per row (`BranchView::put` clears the tombstone it
-                    // writes over). Without this, merging a child's own image of a
-                    // row its parent had deleted left the parent's tombstone next
-                    // to it, and a tombstone wins within a level: the merged row
-                    // stayed hidden.
-                    if !merge_to_main {
-                        let tombstone = branch_view::branch_tombstone_key(target_id, table_name, row_id);
-                        self.gate
-                            .delete(&self.db, &tombstone, None)
-                            .map_err(|e| Error::storage(format!("Failed to merge data: {}", e)))?;
+                        target_name
                     }
-                    // The row cache is keyed (table, row_id) with NO branch
-                    // dimension; the merged write changes the row's value, so
-                    // evict any cached entry (else an autocommit read serves the
-                    // pre-merge value).
-                    self.row_cache.invalidate(table_name, row_id);
-                    merged_keys += 1;
-                    if merge_to_main {
-                        merged_main_rows.entry(table_name.clone()).or_default().insert(row_id);
-                    }
+                ),
+                &other.source_name,
+                &other.target_name,
+            ));
+        }
+        // Into a branch, the merge runs on the target ALONE (B3 second fix pass,
+        // every merge rather than only a schema-changing one): a statement on the
+        // target checks its keys through the level's key index, and the rows land
+        // on that level one by one. A DROP / MERGE of the target waits for the
+        // section instead of dropping the overlay it is writing; one already
+        // closing the target refuses the merge (55006). The source is closed FIRST
+        // and the section gives up when the target starts closing, so two crossed
+        // merges (b→c, c→b) refuse each other instead of deadlocking.
+        let _target_section = if merge_to_main {
+            None
+        } else {
+            Some(self.branch_drains.exclusive(target_id, target_name, budget())?)
+        };
+        let source_chain = self.get_branch_chain(source_id)?;
+        let target_chain: Vec<u64> = if merge_to_main {
+            Vec::new()
+        } else {
+            self.get_branch_chain(target_id)?
+        };
+        let ends = MergeEnds {
+            deadline,
+            source_name,
+            target_name,
+            source_id,
+            target_id,
+            merge_to_main,
+            source_chain: &source_chain,
+            target_chain: &target_chain,
+        };
+
+        let mut intent = match pending {
+            Some(intent) => {
+                if intent.target_id != target_id {
+                    return Err(Error::branch_merge_pending(
+                        &format!("branch {source_name}"),
+                        source_name,
+                        &intent.target_name,
+                    ));
                 }
+                self.register_merge_intent_exclusion(&intent)?;
+                let exposed = if merge_to_main {
+                    &intent.tables
+                } else {
+                    &intent.main_tables
+                };
+                self.wait_for_main_ddl(exposed, source_name, target_name, deadline)?;
+                // B3 second fix pass: the window from the first run to this one
+                // was open to main's DML: validate its keys again. An error here
+                // leaves the merge pending, with nothing further changed.
+                self.refuse_live_descendants(&ends, &intent.steps)?;
+                // A table whose rows landed is done with: its rows are main's now,
+                // and main may have changed them since.
+                let left = intent.tables_left();
+                self.refuse_open_writers(&ends, &left)?;
+                self.refuse_merged_tables_too_large(&ends, &left)?;
+                self.validate_merge_keys(&ends, &intent.steps, &left)?;
+                intent
+            }
+            None => match self.write_merge_intent(&ends) {
+                Ok(intent) => intent,
+                Err(e) => {
+                    self.release_merge_exclusion(source_id);
+                    return Err(e);
+                }
+            },
+        };
+
+        self.merge_failpoint_tick(MergeFailSite::AfterIntent)
+            .map_err(|e| Error::branch_merge_interrupted(source_name, target_name, &e))?;
+
+        // Mark the source merged (the resume of a merge that crashed before
+        // this has nothing else to do but the same). Nothing else ran yet, so a
+        // failure here withdraws the intent: the source stays Active.
+        if source_meta.state == super::BranchState::Active {
+            let mut merged_meta = source_meta;
+            merged_meta.state = super::BranchState::Merged {
+                into_branch: target_id,
+                at_timestamp: intent.merge_timestamp,
+            };
+            if let Err(e) = self.write_branch_metadata(&merged_meta) {
+                if let Err(undo) = self.delete_branch_merge_intent(source_id) {
+                    tracing::warn!(
+                        branch = %source_name,
+                        error = %undo,
+                        "MERGE BRANCH could not mark its source merged, nor withdraw its intent"
+                    );
+                }
+                self.release_merge_exclusion(source_id);
+                return Err(e);
             }
         }
 
-        // Step 3: Apply delete markers if merging to main
-        if merge_to_main {
-            for (table_name, row_ids) in &deleted_rows_by_table {
-                for row_id in row_ids {
-                    let target_key = format!("data:{}:{}", table_name, row_id);
-                    self.gate
-                        .delete(&self.db, target_key.as_bytes(), None)
-                        .map_err(|e| Error::storage(format!("Failed to apply delete: {}", e)))?;
-                    self.row_cache.invalidate(table_name, *row_id);
-                    merged_main_rows.entry(table_name.clone()).or_default().insert(*row_id);
-                }
-            }
-            // Step 3b (spec P1.1b): main's indexes follow the rows above.
-            for (table_name, row_ids) in &merged_main_rows {
-                self.rederive_indexes_after_merge(&catalog, table_name, row_ids)?;
-            }
-        } else {
-            // Copy delete markers to target branch
-            for (table_name, row_ids) in &deleted_rows_by_table {
-                for row_id in row_ids {
-                    let target_key = format!("bdel:{}:{}:{}", target_id, table_name, row_id);
-                    self.gate
-                        .put(&self.db, target_key.as_bytes(), b"", None)
-                        .map_err(|e| Error::storage(format!("Failed to copy delete marker: {}", e)))?;
-                    // sprinter 6bc4a4040eb7 (B2): one entry per row per level —
-                    // the tombstone replaces the target's own image of the row.
-                    let image = branch_view::branch_row_key(target_id, table_name, *row_id);
-                    self.gate
-                        .delete(&self.db, &image, None)
-                        .map_err(|e| Error::storage(format!("Failed to copy delete marker: {}", e)))?;
-                }
-            }
-            // sprinter 6bc4a4040eb7 (B2): the target level's rows changed
-            // outside every branch transaction — move its write generations so
-            // a statement on the target with a cached overlay reloads it.
-            for table_name in &tables {
+        let merged = self.run_branch_merge(&mut intent, &ends);
+        // The target level's rows changed below every branch transaction,
+        // whatever the outcome: move its write generations, so a statement on the
+        // target with a cached overlay reloads it (sprinter 6bc4a4040eb7, B2; B3
+        // second fix pass: a stopped merge leaves it readable too).
+        if !merge_to_main {
+            for table_name in &intent.tables {
                 branch_view::bump_write_generation(self.instance_id, target_id, table_name);
             }
         }
-
-        // W2.5 + caches: MERGE writes branch rows straight into the target's
-        // `data:`/`bdata:` keyspace outside every tracked commit funnel — no
-        // version, no watermark bump, and no other invalidation of its own.
-        // When merging into main, bump the schema generation: it
-        // clears every per-table committed-write watermark (and the existence
-        // cache) so an in-transaction reader open across the merge cannot keep
-        // fast-reading the merged `data:` values past its snapshot — its next
-        // read drops to the snapshot path, which resolves the pre-merge version.
-        // The row cache was invalidated per merged / deleted row above.
-        if merge_to_main {
-            self.bump_schema_generation();
-        }
-
-        // Step 4 (B1 fix pass): the source was marked merged before the copy;
-        // the copy succeeded, so keep it that way.
-        restore_source.disarm();
+        let merged_keys = merged.map_err(|e| Error::branch_merge_interrupted(source_name, target_name, &e))?;
+        self.delete_branch_merge_intent(source_id)
+            .map_err(|e| Error::branch_merge_interrupted(source_name, target_name, &e))?;
+        self.release_merge_exclusion(source_id);
 
         tracing::info!(
             "Merge completed: {} -> {}, {} keys merged",
@@ -11365,11 +11400,674 @@ impl StorageEngine {
         );
 
         Ok(super::MergeResult {
-            merge_timestamp,
+            merge_timestamp: intent.merge_timestamp,
             merged_keys,
             conflicts: Vec::new(),
             completed: true,
         })
+    }
+
+    /// The two ends of a MERGE, validated, and the source's unfinished merge if
+    /// it has one (only then may the source be merged already). With
+    /// `expected`, they must still be those ids.
+    fn merge_ends(
+        &self,
+        source_name: &str,
+        target_name: &str,
+        expected: Option<(u64, u64)>,
+    ) -> Result<(BranchMetadata, BranchMetadata, Option<MergeIntent>)> {
+        let (source, target) = {
+            let manager_lock = self.get_or_init_branch_manager()?;
+            let manager = manager_lock.read();
+            let mgr = manager
+                .as_ref()
+                .ok_or_else(|| Error::storage("BranchManager not initialized"))?;
+            (
+                mgr.get_branch_by_name(source_name)?,
+                mgr.get_branch_by_name(target_name)?,
+            )
+        };
+        if source_name == "main" || source.parent_id.is_none() {
+            return Err(Error::branch_merge(format!(
+                "MERGE BRANCH {source_name} INTO {target_name}: main is not a branch that can be merged"
+            )));
+        }
+        if source.branch_id == target.branch_id {
+            return Err(Error::branch_merge(format!(
+                "MERGE BRANCH {source_name} INTO {target_name}: a branch cannot be merged into itself"
+            )));
+        }
+        let pending = self.branch_merge_intent(source.branch_id)?;
+        let source_usable = match source.state {
+            super::BranchState::Active => true,
+            super::BranchState::Merged { .. } => pending.is_some(),
+            super::BranchState::Dropped { .. } => false,
+        };
+        if !source_usable || expected.is_some_and(|(id, _)| id != source.branch_id) {
+            return Err(Error::branch_merge(format!(
+                "Source branch '{}' is not active",
+                source_name
+            )));
+        }
+        if target.state != super::BranchState::Active || expected.is_some_and(|(_, id)| id != target.branch_id) {
+            return Err(Error::branch_merge(format!(
+                "Target branch '{}' is not active",
+                target_name
+            )));
+        }
+        Ok((source, target, pending))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): plan the merge, hold the DDL it
+    /// is exposed to, and wait out what is already past that check; then plan
+    /// again under the exclusion, until the plan asks for nothing that is not
+    /// held. The FINAL table list is what ends up held. On an error the caller
+    /// releases what was registered.
+    fn plan_under_exclusion(&self, ends: &MergeEnds<'_>) -> Result<BranchMergePlan> {
+        let level = if ends.merge_to_main {
+            MERGE_TARGET_MAIN
+        } else {
+            ends.target_id
+        };
+        let mut held_on_level: HashSet<String> = HashSet::new();
+        let mut held_on_main: HashSet<String> = HashSet::new();
+        for attempt in 0..4 {
+            let plan = self.plan_branch_merge(ends)?;
+            let on_level: Vec<String> = plan
+                .tables
+                .iter()
+                .filter(|table| !held_on_level.contains(*table))
+                .cloned()
+                .collect();
+            let on_main: Vec<String> = plan
+                .main_tables
+                .iter()
+                .filter(|table| !held_on_main.contains(*table))
+                .cloned()
+                .collect();
+            if attempt > 0 && on_level.is_empty() && on_main.is_empty() {
+                return Ok(plan);
+            }
+            self.register_merge_exclusion(
+                level,
+                ends.source_id,
+                ends.source_name,
+                ends.target_name,
+                &on_level,
+                true,
+            )?;
+            self.register_merge_exclusion(
+                MERGE_TARGET_MAIN,
+                ends.source_id,
+                ends.source_name,
+                ends.target_name,
+                &on_main,
+                false,
+            )?;
+            held_on_level.extend(on_level);
+            held_on_main.extend(on_main);
+            // Main's schema statements on these tables, already past the exclusion
+            // check, finish first. (A branch target's cannot be running: this merge
+            // holds its exclusive section.)
+            let exposed = if ends.merge_to_main {
+                &plan.tables
+            } else {
+                &plan.main_tables
+            };
+            self.wait_for_main_ddl(exposed, ends.source_name, ends.target_name, ends.deadline)?;
+        }
+        Err(Error::branch_merge_ddl_busy(ends.source_name, ends.target_name))
+    }
+
+    /// Plan and validate the merge — the target's DDL on its tables is refused
+    /// by then — and write its intent. Nothing has changed before this returns.
+    fn write_merge_intent(&self, ends: &MergeEnds<'_>) -> Result<MergeIntent> {
+        let plan = self.plan_under_exclusion(ends)?;
+        self.refuse_merged_tables_too_large(ends, &plan.tables)?;
+        self.validate_merge_keys(ends, &plan.steps, &plan.tables)?;
+        let intent = MergeIntent {
+            source_id: ends.source_id,
+            source_name: ends.source_name.to_string(),
+            target_id: ends.target_id,
+            target_name: ends.target_name.to_string(),
+            merge_to_main: ends.merge_to_main,
+            target_chain: ends.target_chain.to_vec(),
+            merge_timestamp: self.next_timestamp(),
+            steps: plan.steps,
+            tables: plan.tables,
+            main_tables: plan.main_tables,
+            landed: Vec::new(),
+        };
+        self.put_branch_merge_intent(&intent)?;
+        Ok(intent)
+    }
+
+    /// The durable part of a merge: its schema steps, then its rows. Idempotent:
+    /// a rerun after a failure or a crash redoes what did not happen and changes
+    /// nothing else. Returns the row keys copied.
+    fn run_branch_merge(&self, intent: &mut MergeIntent, ends: &MergeEnds<'_>) -> Result<usize> {
+        let MergeEnds {
+            merge_to_main,
+            target_chain,
+            ..
+        } = *ends;
+
+        // Get all tables from catalog — sprinter 6bc4a4040eb7 (phase B3): main's
+        // tables, the tables the merge changes, and (into a branch) the tables
+        // the target's chain defines, whose rows live only in overlays.
+        let catalog = Catalog::new(self);
+        let tables: Vec<String> = {
+            let mut set: std::collections::BTreeSet<String> = catalog.list_main_tables()?.into_iter().collect();
+            set.extend(intent.tables.iter().cloned());
+            if !merge_to_main {
+                set.extend(self.branch_tables_in_chain(target_chain)?.into_keys());
+            }
+            set.into_iter().collect()
+        };
+
+        // Step 0 — sprinter 6bc4a4040eb7 (phase B3): carry the source's schema
+        // changes into the target BEFORE its rows (a created table must exist
+        // to receive them, an added column must be on the target before the
+        // branch's wider rows land). Everything was validated before the intent.
+        for step in &intent.steps {
+            self.merge_failpoint_tick(MergeFailSite::Step)?;
+            match &step.action {
+                MergeAction::PutOnBranch { record, materialize } => {
+                    self.apply_merge_step_to_branch(intent, step, record, materialize.as_deref())?;
+                }
+                _ => self.apply_merge_step_to_main(&catalog, step, ends.source_id)?,
+            }
+        }
+        // Into main, rows go only to tables main now has: a table the source
+        // never defined itself and main does not have (an unmerged ancestor's,
+        // with no source rows — the plan refuses one that has some) is not
+        // written into a `data:` keyspace no catalog entry describes.
+        let main_tables_after: HashSet<String> = if merge_to_main {
+            catalog.list_main_tables()?.into_iter().collect()
+        } else {
+            HashSet::new()
+        };
+        let receiving: Vec<String> = tables
+            .into_iter()
+            .filter(|table_name| !merge_to_main || main_tables_after.contains(table_name.as_str()))
+            .collect();
+
+        // Into main each table's rows land in an ordinary commit, which raises its
+        // watermark and fences the row cache itself; only a branch target's level
+        // is written below that (its generations are moved by the caller).
+        self.copy_merged_rows(ends, intent, &receiving)
+    }
+
+    /// A merge's row phase, on the rows the source itself changed (never its copies).
+    /// Returns the row keys it carried.
+    ///
+    /// Into main, each table lands as one ordinary transaction
+    /// (`land_merged_table_on_main`).
+    ///
+    /// Into a branch, each row goes in one batch with its tombstone, its marker and
+    /// its key-index entries (`BranchView::apply_merged_row`), deletions first,
+    /// because they free keys the rows after them may take. A level has no versions
+    /// and no logical WAL to be consistent with, and the merge runs on it alone, in
+    /// its exclusive section. Idempotent: a rerun lands what is already there again.
+    fn copy_merged_rows(&self, ends: &MergeEnds<'_>, intent: &mut MergeIntent, tables: &[String]) -> Result<usize> {
+        if ends.merge_to_main {
+            let mut merged_keys = 0usize;
+            for table_name in tables {
+                if !intent.landed.contains(table_name) {
+                    merged_keys += self.land_merged_table_on_main(ends, intent, table_name)?;
+                }
+            }
+            return Ok(merged_keys);
+        }
+        let view = BranchView::for_chain(self, ends.target_name, ends.target_chain.to_vec())?;
+        let mut merged_keys = 0usize;
+        for table_name in tables {
+            // B3 fix pass: what the source only COPIED (`bfrz:` — an ADD COLUMN's
+            // materialized rows, B4's frozen pre-images) is not a change: the
+            // target keeps its own row.
+            if self.branch_changed_row_ids(ends.source_id, table_name)?.is_empty() {
+                continue;
+            }
+            let copies = self.branch_frozen_row_ids(ends.source_id, table_name)?;
+            let tombstones = self.branch_tombstone_row_ids(ends.source_id, table_name)?;
+
+            // The source's deletions.
+            for row_id in &tombstones {
+                if copies.contains(row_id) {
+                    continue;
+                }
+                self.merge_failpoint_tick(MergeFailSite::Row)?;
+                view.apply_merged_row(table_name, *row_id, None)?;
+                self.row_cache.invalidate(table_name, *row_id);
+            }
+
+            // The source's images. Within a level a tombstone beats an image (a
+            // pre-B2 delete left both), and a copy is no change.
+            let branch_prefix = format!("bdata:{}:{}:", ends.source_id, table_name);
+            let branch_prefix_bytes = branch_prefix.as_bytes();
+            let iter = self.db.iterator(rocksdb::IteratorMode::From(
+                branch_prefix_bytes,
+                rocksdb::Direction::Forward,
+            ));
+            for item in iter {
+                let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(branch_prefix_bytes) {
+                    break;
+                }
+                let Some(row_id) = Self::parse_row_id_after_prefix(&key, branch_prefix_bytes.len()) else {
+                    continue;
+                };
+                if copies.contains(&row_id) || tombstones.contains(&row_id) {
+                    continue;
+                }
+                self.merge_failpoint_tick(MergeFailSite::Row)?;
+                // The stored form of a value is a property of the key it lands
+                // under, so a row moving between keys is decoded for the key it
+                // came FROM and sealed for the key it is going TO — never copied
+                // across as bytes. Both directions go through the one rule in `tde`,
+                // and both are a no-op with encryption disabled.
+                let plain = super::tde::open_ref(self.key_manager.as_deref(), &key, &value)?;
+                view.apply_merged_row(table_name, row_id, Some(plain.as_ref()))?;
+                // The row cache is keyed (table, row_id) with NO branch dimension:
+                // evict any cached entry.
+                self.row_cache.invalidate(table_name, row_id);
+                merged_keys += 1;
+            }
+        }
+        Ok(merged_keys)
+    }
+
+    /// Main's current row `row_id` of `table`, decoded as a scan decodes it.
+    fn merged_main_row_image(&self, table: &str, schema: &crate::Schema, row_id: u64) -> Result<Option<Tuple>> {
+        match self.get(&Self::build_data_key(table, row_id))? {
+            Some(stored) => Ok(Some(self.decode_stored_row(table, schema, row_id, &stored)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// What the source changed in `table`, against main's committed rows. A
+    /// deletion of a row main does not have is nothing to do. Decoded, so a column's
+    /// stored form on the source plays no part in what lands.
+    fn merged_table_rows(&self, source_id: u64, table: &str, schema: &crate::Schema) -> Result<Vec<LandingRow>> {
+        let copies = self.branch_frozen_row_ids(source_id, table)?;
+        let tombstones = self.branch_tombstone_row_ids(source_id, table)?;
+        let mut rows = Vec::new();
+        for row_id in &tombstones {
+            if copies.contains(row_id) {
+                continue;
+            }
+            if let Some(old) = self.merged_main_row_image(table, schema, *row_id)? {
+                rows.push(LandingRow {
+                    row_id: *row_id,
+                    old: Some(old),
+                    new: None,
+                });
+            }
+        }
+        let prefix = format!("bdata:{source_id}:{table}:");
+        let prefix_bytes = prefix.as_bytes();
+        let iter = self
+            .db
+            .iterator(rocksdb::IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward));
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                continue;
+            };
+            if copies.contains(&row_id) || tombstones.contains(&row_id) {
+                continue;
+            }
+            let plain = super::tde::open_ref(self.key_manager.as_deref(), &key, &value)?;
+            rows.push(LandingRow {
+                row_id,
+                old: self.merged_main_row_image(table, schema, row_id)?,
+                new: Some(self.decode_stored_row(table, schema, row_id, plain.as_ref())?),
+            });
+        }
+        Ok(rows)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fourth fix pass): one table's rows land on main as
+    /// ONE ordinary transaction, committed the way a multi-row UPDATE is. The row
+    /// phase used to be a write path of its own beside main's, and each property it
+    /// lacked was a defect of its own: versions and the version index (AS OF, and any
+    /// snapshot read), the logical WAL (a crash replay reverted a finished merge),
+    /// the replication wait, the conflict registry, the columnar store. The commit
+    /// brings them all, with the row cache, the watermark and the snapshot record, and
+    /// a reader or a crash sees the table's merge wholly or not at all.
+    ///
+    /// The order is what a transactional UPDATE does, with the keys all at once:
+    ///
+    /// 1. The transaction first: its snapshot precedes every row read below, so a
+    ///    commit of one of these rows after them fails this commit.
+    /// 2. The row keys are held in the conflict registry
+    ///    (`WriteConflictRegistry::hold_merge_landing`): from here on, a commit of
+    ///    one of them that read it before the merge fails with a serialization
+    ///    error, whatever its isolation level, instead of putting the old row back.
+    /// 3. Refuse (55006) when a transaction has staged writes of the table, then
+    ///    stage the rows, which counts this one.
+    /// 4. Claim all the keys (`claim_merged_table_keys`), looking again for another
+    ///    writer under each tree's lock.
+    /// 5. Commit. On any failure the claim goes back, nothing has landed for this
+    ///    table, and the intent stays, so a rerun validates again.
+    /// 6. Now that the new images are committed, the keys only the old ones held go,
+    ///    and the vector indexes follow.
+    ///
+    /// Which rows landed is written in the same commit (`MergeIntent::landed`).
+    fn land_merged_table_on_main(&self, ends: &MergeEnds<'_>, intent: &mut MergeIntent, table: &str) -> Result<usize> {
+        let merged = self.branch_changed_row_ids(ends.source_id, table)?;
+        let Some(highest_row_id) = merged.iter().copied().max() else {
+            return Ok(0);
+        };
+        self.merge_failpoint_tick(MergeFailSite::Row)?;
+        let schema = Catalog::new(self).main_table_schema(table)?;
+
+        let mut txn = self.begin_transaction()?;
+        txn.exempt_from_merged_writes();
+        let mut landing = self.conflict_registry.hold_merge_landing(
+            merged
+                .iter()
+                .map(|row_id| Self::build_data_key(table, *row_id))
+                .collect(),
+        );
+        let rows = self.merged_table_rows(ends.source_id, table, &schema)?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        if self.has_uncommitted_writes_for_table(table) {
+            return Err(Error::branch_table_busy(table, ends.target_name));
+        }
+
+        if schema_has_columnar_columns(&schema) {
+            let images = |existing: bool| -> Vec<(u64, &Tuple)> {
+                rows.iter()
+                    .filter(|row| row.old.is_some() == existing)
+                    .filter_map(|row| row.new.as_ref().map(|new| (row.row_id, new)))
+                    .collect()
+            };
+            self.stage_columnar_rows_grouped_in_transaction(table, &images(true), &schema, &txn, false)?;
+            self.stage_columnar_rows_grouped_in_transaction(table, &images(false), &schema, &txn, true)?;
+            let deleted: Vec<u64> = rows
+                .iter()
+                .filter(|row| row.new.is_none())
+                .map(|row| row.row_id)
+                .collect();
+            self.stage_columnar_deletes_grouped_in_transaction(table, &deleted, &schema, &txn)?;
+        }
+        for row in &rows {
+            let key = Self::build_data_key(table, row.row_id);
+            match &row.new {
+                Some(new) => {
+                    let value = bincode::serialize(new)
+                        .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+                    txn.put(key, value)?;
+                }
+                None => txn.delete(key)?,
+            }
+        }
+        // Row ids come with the rows, so the counter has to pass them: main hands
+        // out ids above what landed from now on, also after a crash.
+        self.raise_row_counter_to(table, highest_row_id);
+        txn.stage_row_counter(
+            table,
+            self.row_counter_high_water(table)
+                .unwrap_or(highest_row_id)
+                .max(highest_row_id),
+        )?;
+        let mut progressed = intent.clone();
+        progressed.landed.push(table.to_string());
+        self.stage_branch_merge_intent(&progressed, &txn)?;
+
+        // A key moved between rows leaves a committed row without its entry until
+        // this commits, as a transactional UPDATE that moves a key does. The commit
+        // consumes the transaction, and with it its census slots: this copy of them
+        // stays up until the keys are settled, either way, or a COUNT from the index
+        // would answer in between with old and new keys both in it.
+        txn.note_index_key_removal(table);
+        let census = txn.write_census_hold();
+        let own_writers = if census.is_some() { 2 } else { 1 };
+        let changes: Vec<MergedRowChange<'_>> = rows
+            .iter()
+            .map(|row| MergedRowChange {
+                row_id: row.row_id,
+                old: row.old.as_ref(),
+                new: row.new.as_ref(),
+            })
+            .collect();
+        let other_writer = || self.write_census.table_has_other_staged_writes(table, own_writers);
+        let claim = match self
+            .art_index_manager
+            .claim_merged_table_keys(table, &schema, &changes, &other_writer)
+            .map_err(|e| Error::storage(format!("MERGE BRANCH: claiming the keys of {table}: {e}")))?
+        {
+            MergedKeysOutcome::Claimed(claim) => claim,
+            MergedKeysOutcome::WriterOpen => return Err(Error::branch_table_busy(table, ends.target_name)),
+            MergedKeysOutcome::HeldBy {
+                wanted_by,
+                constraint,
+                columns,
+            } => {
+                let wanted = rows
+                    .iter()
+                    .find(|row| row.row_id == wanted_by)
+                    .and_then(|row| row.new.as_ref());
+                let key_text = wanted.map_or_else(
+                    || format!("({})", columns.join(", ")),
+                    |row| merge_key_text(&schema, &columns, row),
+                );
+                return Err(Error::branch_merge_key_claimed(
+                    ends.source_name,
+                    ends.target_name,
+                    table,
+                    &constraint,
+                    &key_text,
+                ));
+            }
+        };
+        self.merge_failpoint_tick(MergeFailSite::TableClaimed)?;
+
+        let commit_ts = self.next_commit_timestamp(txn.has_tracked_writes());
+        txn.commit_with_timestamp(commit_ts)?;
+        // The statement's own invalidation runs only if it succeeds, and a later
+        // table can stop it: a result cached during the merge must not outlive this
+        // commit (the generation is part of the result cache's epoch).
+        self.bump_schema_generation();
+        landing.landed(commit_ts);
+        *intent = progressed;
+        if let Err(e) = claim.finish() {
+            tracing::error!("MERGE BRANCH: removing the keys {} no longer holds: {}", table, e);
+        }
+        drop(census);
+        if self.vector_indexes.table_has_indexes(table) {
+            for row in &rows {
+                let _ = match &row.new {
+                    Some(new) => self
+                        .vector_indexes
+                        .on_row_update(table, row.row_id, &schema, row.old.as_ref(), new),
+                    None => self
+                        .vector_indexes
+                        .on_row_delete(table, row.row_id, Some(&schema), row.old.as_ref()),
+                };
+            }
+        }
+        let _ = self.increment_lsn();
+        Ok(rows.len())
+    }
+
+    /// The most a merge can stage for one table and still be one write group, which
+    /// is never split and above this limit could be neither served nor archived.
+    /// Refused (54000) before anything changes. What it counts is what the commit
+    /// writes for a row: its `data:` key, its version, its version index, and its
+    /// logical WAL record. A merge holds the changed rows of a table in memory.
+    fn refuse_merged_tables_too_large(&self, ends: &MergeEnds<'_>, tables: &[String]) -> Result<()> {
+        if !ends.merge_to_main {
+            return Ok(());
+        }
+        let limit = branch_view::final_batch_limit();
+        for table in tables {
+            let copies = self.branch_frozen_row_ids(ends.source_id, table)?;
+            let tombstones = self.branch_tombstone_row_ids(ends.source_id, table)?;
+            let row_cost = |key_bytes: usize, value_bytes: usize| {
+                key_bytes
+                    .saturating_mul(4)
+                    .saturating_add(value_bytes.saturating_mul(3))
+                    .saturating_add(64)
+            };
+            let mut bytes = row_cost(table.len() + "data::".len() + 20, 0).saturating_mul(tombstones.len());
+            let prefix = format!("bdata:{}:{table}:", ends.source_id);
+            let prefix_bytes = prefix.as_bytes();
+            let iter = self
+                .db
+                .iterator(rocksdb::IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward));
+            for item in iter {
+                let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                let own = Self::parse_row_id_after_prefix(&key, prefix_bytes.len())
+                    .is_some_and(|row_id| !copies.contains(&row_id) && !tombstones.contains(&row_id));
+                if own {
+                    bytes = bytes.saturating_add(row_cost(key.len(), value.len()));
+                }
+            }
+            if bytes > limit {
+                return Err(Error::branch_merge_table_too_large(
+                    ends.source_name,
+                    ends.target_name,
+                    table,
+                    bytes,
+                    limit,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): finish every MERGE BRANCH an earlier
+    /// run left unfinished — rolled forward, never back. Called when the handle
+    /// opens, after the indexes are rebuilt; the merge's tables are refused to
+    /// DDL from the first moment. A physical standby does nothing: its primary's
+    /// completion replicates. One that cannot be finished is logged and stays
+    /// pending (a later MERGE statement can still finish it): it never fails the
+    /// open. Returns the failures, by source.
+    pub fn finish_pending_branch_merges(&self) -> Vec<(String, Error)> {
+        // The write condition, not the open mode alone (B3 second fix pass): a
+        // fenced primary is opened in a writable mode, and a merge's drop would
+        // tear down in-memory indexes before the gate refused its write.
+        if !self.engine_may_write() || !self.gate.is_open() {
+            return Vec::new();
+        }
+        let intents = match self.branch_merge_intents() {
+            Ok(intents) => intents,
+            Err(e) => {
+                tracing::error!("Unfinished MERGE BRANCH records could not be read: {}", e);
+                return vec![("?".to_string(), e)];
+            }
+        };
+        let mut failures = Vec::new();
+        for intent in &intents {
+            if let Err(e) = self.register_merge_intent_exclusion(intent) {
+                tracing::error!(
+                    "Unfinished MERGE BRANCH {} INTO {} cannot hold its tables: {}",
+                    intent.source_name,
+                    intent.target_name,
+                    e
+                );
+            }
+        }
+        for intent in intents {
+            match self.merge_branch(
+                &intent.source_name,
+                &intent.target_name,
+                super::MergeStrategy::default(),
+            ) {
+                Ok(_) => tracing::info!(
+                    "Finished the interrupted MERGE BRANCH {} INTO {}",
+                    intent.source_name,
+                    intent.target_name
+                ),
+                Err(e) => {
+                    tracing::error!(
+                        "The interrupted MERGE BRANCH {} INTO {} could not be finished: {}; its tables stay \
+                         closed to DDL until MERGE BRANCH is run again",
+                        intent.source_name,
+                        intent.target_name,
+                        e
+                    );
+                    failures.push((intent.source_name, e));
+                }
+            }
+        }
+        failures
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): `MERGE BRANCH source ABORT`,
+    /// the way out of an unfinished merge that can never finish (its target was
+    /// changed by hand, say) and that would otherwise hold its tables and both
+    /// ends for good. The source goes back to `Active`, the intent and the
+    /// exclusion go. What the merge already did to the target is NOT undone: the
+    /// engine keeps no pre-image to undo it with. So this returns (and logs) the
+    /// tables that may be partially changed, for the operator to inspect; merging
+    /// the source again is validated from scratch. Refused when the source has no
+    /// unfinished merge.
+    pub fn abort_branch_merge(&self, source_name: &str) -> Result<Vec<String>> {
+        let _main_scope = crate::main_statement_scope(self.instance_id);
+        let _merge_scope = MergeDdlScope::enter(self.instance_id);
+        let read = || -> Result<(BranchMetadata, Option<MergeIntent>)> {
+            let source = {
+                let manager_lock = self.get_or_init_branch_manager()?;
+                let manager = manager_lock.read();
+                let mgr = manager
+                    .as_ref()
+                    .ok_or_else(|| Error::storage("BranchManager not initialized"))?;
+                mgr.get_branch_by_name(source_name)?
+            };
+            let intent = self.branch_merge_intent(source.branch_id)?;
+            Ok((source, intent))
+        };
+        let no_merge = || {
+            Error::branch_merge(format!(
+                "MERGE BRANCH {source_name} ABORT: branch {source_name} has no unfinished merge"
+            ))
+        };
+        let (source, _) = read()?;
+        let _drained = self
+            .branch_drains
+            .close(source.branch_id, source_name, super::BRANCH_DRAIN_TIMEOUT)?;
+        let (mut source, intent) = read()?;
+        let intent = intent.ok_or_else(no_merge)?;
+        // Active FIRST: a crash between the two leaves an intent on an Active
+        // source, which the next open finishes; the other order would leave a
+        // Merged source with nothing to finish it, and its rows out of reach.
+        source.state = super::BranchState::Active;
+        self.write_branch_metadata(&source)?;
+        self.delete_branch_merge_intent(source.branch_id)?;
+        // Main's indexes follow each row as it lands (B3 third fix pass), so a
+        // stopped merge left them matching its rows and there is nothing to rebuild.
+        // Only what serves those rows by generation has to notice.
+        if intent.merge_to_main {
+            self.bump_schema_generation();
+        } else {
+            for table in &intent.tables {
+                branch_view::bump_write_generation(self.instance_id, intent.target_id, table);
+            }
+        }
+        // Last (B3 third fix pass): DDL on these tables stays out until there is
+        // nothing left to do to them.
+        self.release_merge_exclusion(source.branch_id);
+        tracing::warn!(
+            "MERGE BRANCH {} INTO {} abandoned; branch {} is active again. These tables of {} may be partially \
+             changed: {}",
+            source_name,
+            intent.target_name,
+            source_name,
+            intent.target_name,
+            intent.tables.join(", ")
+        );
+        Ok(intent.tables)
     }
 
     /// Persist `metadata` through the branch manager (cache refresh and
@@ -11383,64 +12081,793 @@ impl StorageEngine {
         mgr.write_branch_metadata(metadata)
     }
 
-    /// MERGE BRANCH into main, step 3b (spec P1.1b): bring main's in-memory
-    /// indexes of `table_name` in line with the rows the merge wrote or deleted
-    /// (`row_ids`), which reached `data:` below every index funnel.
+    /// sprinter 6bc4a4040eb7 (phase B3, B3 fix pass): what a merge changes on its
+    /// target, decided before anything is written. The source's schema changes
+    /// are the records of its OWN catalog level (a frozen copy — phase B4 — is
+    /// not a change, and is skipped; so is a tombstone of a table the parent
+    /// never had, which leaves the branch's "no such table" in place and nothing
+    /// to do on the target). Each must still apply to the target, or the whole
+    /// merge is refused (55000), naming the tables:
     ///
-    /// ART: re-derived from the table's rows as an open derives them —
-    /// `Catalog::index_table_rows`, the row-replay half of
-    /// `Catalog::rebuild_all_indexes` (and of the physical applier's
-    /// re-derivation) — keeping every registration and its name. A merge is
-    /// last-writer-wins, so a merged row can take a UNIQUE value another row
-    /// still holds; the re-derivation indexes the first such row and warns,
-    /// exactly as a reopen of the same rows does, so the primary is left with
-    /// the indexes a restart would compute. The rows are scanned BEFORE the
-    /// trees are cleared: a failed scan leaves the lagging entries (and fails
-    /// the merge), never an empty index answering "absent" for every key. The
-    /// caller's census hold keeps readers off the trees in between.
+    /// * the target's CURRENT definition of the table must be the one the
+    ///   source's parent had when the source first changed it
+    ///   (`parent_fingerprint`) — otherwise the target changed the table after
+    ///   the branch did;
+    /// * its CURRENT incarnation must be the one the parent had then
+    ///   (`parent_incarnation`) and at the fork (`bmeta:{source}:fork`) —
+    ///   otherwise the table was dropped and recreated, even identically, and is
+    ///   not the table the branch changed;
+    /// * a table the branch only changed ROWS of must have, on the target, the
+    ///   definition and the incarnation it had at the fork (B3 second fix pass):
+    ///   rows are copied by position, so a `DROP COLUMN` on main would shift them
+    ///   and an `ADD COLUMN NOT NULL` would leave them short. Fail closed, no row
+    ///   shaping.
     ///
-    /// Vector: each touched row's entry is replaced from its post-merge image
-    /// (`on_row_update` without an old image: delete, then insert) or dropped
-    /// when the row is gone — the R5.V1 maintenance a DML write gets.
-    fn rederive_indexes_after_merge(
-        &self,
-        catalog: &Catalog<'_>,
-        table_name: &str,
-        row_ids: &std::collections::BTreeSet<u64>,
-    ) -> Result<()> {
-        let has_art = !self.art_index_manager.list_table_indexes(table_name).is_empty();
-        let has_vector = self.vector_indexes.table_has_indexes(table_name);
-        if !has_art && !has_vector {
-            return Ok(());
-        }
-        let schema = catalog.get_table_schema(table_name)?;
-        if has_art {
-            let tuples = self.scan_table_with_schema(table_name, &schema)?;
-            self.art_index_manager.clear_table_indexes(table_name);
-            catalog.index_table_rows(table_name, &schema, &tuples);
-        }
-        if has_vector {
-            for row_id in row_ids {
-                let key = format!("data:{}:{}", table_name, row_id).into_bytes();
-                match self.get(&key)? {
-                    Some(stored) => match self.decode_stored_row(table_name, &schema, *row_id, &stored) {
-                        Ok(tuple) => {
-                            let _ = self
-                                .vector_indexes
-                                .on_row_update(table_name, *row_id, &schema, None, &tuple);
+    /// Also refused: rows the source wrote to a table whose definition on the
+    /// source comes from an ANCESTOR between the target and the source (that
+    /// ancestor's schema change is not the source's to carry; merge the ancestor
+    /// first; one already merged into the target's lineage is carried). A
+    /// schema-changing merge into a branch while the target has other live
+    /// descendants (0A000; they read through it, B4's freeze lifts this). And
+    /// open transactions (55006, [`Self::refuse_open_writers`]).
+    fn plan_branch_merge(&self, ends: &MergeEnds<'_>) -> Result<BranchMergePlan> {
+        use super::branch_catalog::{BranchTableResolution, BranchTableState};
+        let MergeEnds {
+            source_name,
+            target_name,
+            source_id,
+            target_id,
+            merge_to_main,
+            source_chain,
+            target_chain,
+            ..
+        } = *ends;
+        let fork = self.branch_fork_record(source_id)?;
+        let fork_of = |table: &str| fork.as_ref().and_then(|fork| fork.get(table));
+        let records = self.branch_table_records_at(source_id)?;
+
+        let mut steps: Vec<MergeStep> = Vec::new();
+        let mut planned: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut moved: Vec<String> = Vec::new();
+        let mut recreated: Vec<String> = Vec::new();
+        let mut gone: Vec<String> = Vec::new();
+        let mut changed_since_fork: Vec<String> = Vec::new();
+        let mut after_fork: Vec<String> = Vec::new();
+        let mut no_fork_record: Vec<String> = Vec::new();
+        for (table, record) in &records {
+            if record.frozen {
+                continue;
+            }
+            if matches!(record.state, BranchTableState::Dropped) && record.parent_fingerprint.is_none() {
+                continue;
+            }
+            let target_definition = self.chain_table_definition(target_chain, table)?;
+            let before = target_definition.as_ref().map(|(_, fingerprint)| *fingerprint);
+            if before != record.parent_fingerprint {
+                moved.push(table.clone());
+                continue;
+            }
+            // The incarnation, where both sides know one (a table with none yet
+            // is unknown, never different). Absent on either side was settled by
+            // the fingerprint.
+            let at_fork = fork_of(table);
+            if incarnations_differ(
+                self.chain_table_incarnation(target_chain, table)?,
+                record.parent_incarnation,
+            ) || at_fork.is_some_and(|forked| incarnations_differ(forked.incarnation, record.parent_incarnation))
+            {
+                recreated.push(table.clone());
+                continue;
+            }
+            // Main changed the table between the fork and the branch's first
+            // change of it, or dropped it: the branch's earlier rows, if any, were
+            // written for the definition at the fork.
+            if let Some(forked) = at_fork {
+                if Some(forked.fingerprint) != record.parent_fingerprint {
+                    match &target_definition {
+                        Some((current, _)) => {
+                            changed_since_fork.push(describe_definition_change(table, &forked.columns, current));
                         }
-                        Err(e) => debug!(
-                            "MERGE BRANCH: merged '{}' row {} does not decode for its vector indexes: {}",
-                            table_name, row_id, e
-                        ),
+                        None => gone.push(table.clone()),
+                    }
+                    continue;
+                }
+            }
+            // B3 third fix pass: fail closed where nothing says what the rows were
+            // written for. See the rows-only loop below.
+            if !self.branch_changed_row_ids(source_id, table)?.is_empty() {
+                if fork.is_none() {
+                    no_fork_record.push(table.clone());
+                    continue;
+                }
+                if at_fork.is_none() && !record.created {
+                    after_fork.push(table.clone());
+                    continue;
+                }
+            }
+            let action = if merge_to_main {
+                match (&record.state, &target_definition) {
+                    (BranchTableState::Dropped, _) => MergeAction::DropOnMain,
+                    (BranchTableState::Defined(definition), _) if record.created => MergeAction::CreateOnMain {
+                        definition: definition.clone(),
                     },
-                    None => {
-                        let _ = self.vector_indexes.on_row_delete(table_name, *row_id, None, None);
+                    (BranchTableState::Defined(_), Some((current, _))) if !record.added_columns.is_empty() => {
+                        MergeAction::AddColumnsOnMain {
+                            base_columns: current.schema.columns.iter().map(|c| c.name.clone()).collect(),
+                            columns: record.added_columns.clone(),
+                        }
+                    }
+                    (BranchTableState::Defined(_), _) => continue,
+                }
+            } else {
+                self.plan_put_on_branch(target_id, table, record)?
+            };
+            planned.insert(table.clone());
+            steps.push(MergeStep {
+                table: table.clone(),
+                before,
+                action,
+            });
+        }
+
+        // The tables whose ROWS the source changed with no schema change of its
+        // own to carry.
+        let mut row_tables: Vec<String> = Vec::new();
+        let candidates: std::collections::BTreeSet<String> = {
+            let mut set: std::collections::BTreeSet<String> =
+                Catalog::new(self).list_main_tables()?.into_iter().collect();
+            set.extend(records.keys().cloned());
+            if let Some(fork) = &fork {
+                set.extend(fork.keys().cloned());
+            }
+            set.extend(self.branch_tables_in_chain(target_chain)?.into_keys());
+            set
+        };
+        for table in candidates {
+            if planned.contains(&table)
+                || moved.contains(&table)
+                || recreated.contains(&table)
+                || gone.contains(&table)
+                || after_fork.contains(&table)
+                || no_fork_record.contains(&table)
+                || changed_since_fork
+                    .iter()
+                    .any(|change| change.starts_with(&format!("{table} (")))
+                || self.branch_changed_row_ids(source_id, &table)?.is_empty()
+            {
+                continue;
+            }
+            // B3 third fix pass: rows are copied by position, so with no record of
+            // the definition they were written for, the merge cannot know where
+            // they would land. Fail closed. A branch with no fork record was created
+            // by an earlier release; a table with no entry was created on the target
+            // after the fork (the branch reads it live until B4 makes it invisible).
+            if fork.is_none() {
+                no_fork_record.push(table);
+                continue;
+            }
+            let Some(forked) = fork_of(&table) else {
+                after_fork.push(table);
+                continue;
+            };
+            match self.chain_table_definition(target_chain, &table)? {
+                None => {
+                    gone.push(table);
+                    continue;
+                }
+                Some((current, fingerprint)) => {
+                    if incarnations_differ(known_incarnation(current.incarnation), forked.incarnation) {
+                        recreated.push(table);
+                        continue;
+                    }
+                    if fingerprint != forked.fingerprint {
+                        changed_since_fork.push(describe_definition_change(&table, &forked.columns, &current));
+                        continue;
                     }
                 }
             }
+            row_tables.push(table);
+        }
+
+        let mut ancestral: Vec<String> = Vec::new();
+        let mut ancestor_lost: Vec<String> = Vec::new();
+        for (table, resolution) in self.branch_tables_in_chain(source_chain)? {
+            let level = match &resolution {
+                BranchTableResolution::Inherited => continue,
+                BranchTableResolution::Defined { level, .. } | BranchTableResolution::Dropped { level, .. } => *level,
+            };
+            if level == source_id
+                || target_chain.contains(&level)
+                || self.branch_changed_row_ids(source_id, &table)?.is_empty()
+            {
+                continue;
+            }
+            match self.ancestor_merge_state(level, target_id, target_chain)? {
+                AncestorMerge::IntoTheTarget => {}
+                AncestorMerge::NotIntoTheTarget => {
+                    ancestral.push(format!("{table} (defined by an ancestor branch, id {level})"));
+                }
+                AncestorMerge::IntoADroppedBranch => ancestor_lost.push(table),
+            }
+        }
+        if !(moved.is_empty()
+            && recreated.is_empty()
+            && gone.is_empty()
+            && changed_since_fork.is_empty()
+            && after_fork.is_empty()
+            && no_fork_record.is_empty()
+            && ancestral.is_empty()
+            && ancestor_lost.is_empty())
+        {
+            let mut why = Vec::new();
+            if !moved.is_empty() {
+                why.push(format!(
+                    "the definition of {} changed on {target_name} after branch {source_name} changed it — run the \
+                     schema change on {target_name} by hand, or recreate the branch from the current {target_name}",
+                    moved.join(", ")
+                ));
+            }
+            if !recreated.is_empty() {
+                why.push(format!(
+                    "{} was dropped and created again on {target_name} since branch {source_name} forked: it is not \
+                     the table the branch changed, even with the same definition — recreate the branch from the \
+                     current {target_name}",
+                    recreated.join(", ")
+                ));
+            }
+            if !gone.is_empty() {
+                why.push(format!(
+                    "{} no longer exists on {target_name} under that name (dropped or renamed since branch \
+                     {source_name} forked), and the branch changed it — recreate the branch from the current \
+                     {target_name}",
+                    gone.join(", ")
+                ));
+            }
+            if !changed_since_fork.is_empty() {
+                why.push(format!(
+                    "the definition on {target_name} changed since branch {source_name} forked, and the branch \
+                     changed rows written for the old one: {} — recreate the branch from the current {target_name}",
+                    changed_since_fork.join("; ")
+                ));
+            }
+            if !after_fork.is_empty() {
+                why.push(format!(
+                    "{} was created on {target_name} after branch {source_name} forked, and the branch changed its \
+                     rows: nothing records the definition they were written for — copy those rows by hand, or \
+                     recreate the branch from the current {target_name}",
+                    after_fork.join(", ")
+                ));
+            }
+            if !no_fork_record.is_empty() {
+                why.push(format!(
+                    "branch {source_name}'s fork point is not recorded (it was created by an earlier release), and \
+                     it changed rows of {}: nothing records the definitions they were written for — recreate the \
+                     branch from the current {target_name}, or copy its rows by hand",
+                    no_fork_record.join(", ")
+                ));
+            }
+            if !ancestral.is_empty() {
+                why.push(format!(
+                    "branch {source_name} wrote rows of {} whose definition it inherits from a branch that is not \
+                     merged into {target_name} — merge that branch first",
+                    ancestral.join(", ")
+                ));
+            }
+            if !ancestor_lost.is_empty() {
+                why.push(format!(
+                    "branch {source_name} wrote rows of {} whose definition it inherits from a branch that was \
+                     merged into a branch that has since been dropped, so it can never reach {target_name} — copy \
+                     those rows by hand, or recreate the branch from the current {target_name}",
+                    ancestor_lost.join(", ")
+                ));
+            }
+            return Err(Error::branch_merge_schema_refused(
+                source_name,
+                target_name,
+                &why.join("; "),
+            ));
+        }
+
+        self.refuse_live_descendants(ends, &steps)?;
+
+        let mut tables: Vec<String> = steps.iter().map(|step| step.table.clone()).collect();
+        tables.extend(row_tables);
+        // A drop on main takes partition children with it: they are this merge's
+        // tables too, to hold off DDL and to report (B3 third fix pass).
+        let dropped_on_main: Vec<String> = steps
+            .iter()
+            .filter(|step| matches!(step.action, MergeAction::DropOnMain | MergeAction::CreateOnMain { .. }))
+            .map(|step| step.table.clone())
+            .collect();
+        tables.extend(Catalog::new(self).with_partition_descendants(dropped_on_main));
+        tables.sort_unstable();
+        tables.dedup();
+        self.refuse_open_writers(ends, &tables)?;
+        // A branch target that inherits a table from main is exposed to main's
+        // DDL on it (B3 second fix pass): a change there would change what this
+        // merge validated, and an identical re-create would pass unseen.
+        let mut main_tables = Vec::new();
+        if !merge_to_main {
+            for table in &tables {
+                if matches!(
+                    self.resolve_branch_table(target_chain, table)?,
+                    BranchTableResolution::Inherited
+                ) {
+                    main_tables.push(table.clone());
+                }
+            }
+        }
+        Ok(BranchMergePlan {
+            steps,
+            tables,
+            main_tables,
+        })
+    }
+
+    /// A schema change of a branch target rewrites what its descendants read
+    /// through: refused (0A000) while it has any but the source, also at a resume.
+    fn refuse_live_descendants(&self, ends: &MergeEnds<'_>, steps: &[MergeStep]) -> Result<()> {
+        if !steps.iter().any(MergeStep::rewrites_a_branch) {
+            return Ok(());
+        }
+        let children = self.live_branch_children(ends.target_id, Some(ends.source_id))?;
+        if children.is_empty() {
+            return Ok(());
+        }
+        Err(Error::branch_schema_has_children(
+            &format!("MERGE BRANCH {} (it changes a table's definition)", ends.source_name),
+            ends.target_name,
+            &children,
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second and third fix passes): refuse (55006) a
+    /// merge while an open transaction has staged writes that would land outside
+    /// it. On the SOURCE, on any table: a COMMIT there is let through while the
+    /// source is still Active, and its rows would land after the keys were
+    /// validated, in a table the merge may not even hold. On the TARGET, on the
+    /// merge's tables: a branch target's staged keys were checked against rows this
+    /// merge is about to change, and a main transaction's are in main's index
+    /// already and may be on a row this merge also writes. An autocommit writer is
+    /// not in that census; the row phase's claims cover it.
+    fn refuse_open_writers(&self, ends: &MergeEnds<'_>, tables: &[String]) -> Result<()> {
+        if let Some(table) = branch_view::pending_tables_on_level(self.instance_id, ends.source_id).first() {
+            return Err(Error::branch_table_busy(table, ends.source_name));
+        }
+        for table in tables {
+            let open = if ends.merge_to_main {
+                self.has_uncommitted_writes_for_table(table)
+            } else {
+                branch_view::pending_writers(self.instance_id, ends.target_id, table) > 0
+            };
+            if open {
+                return Err(Error::branch_table_busy(table, ends.target_name));
+            }
         }
         Ok(())
+    }
+
+    /// The record the target level takes for the source's `record`, computed
+    /// once, at plan time: re-applying a step re-writes the same bytes (a
+    /// recomputation would double `added_columns` on a rerun). The target keeps
+    /// its own `parent_*` when it has an entry (its FIRST change is what its own
+    /// merge compares against). `ADD COLUMN`s also rewrite the target's view
+    /// under the new definition (`materialize`), so the target keeps every row
+    /// it saw, as after its own `ADD COLUMN`.
+    fn plan_put_on_branch(
+        &self,
+        target_id: u64,
+        table: &str,
+        record: &super::branch_catalog::BranchTableRecord,
+    ) -> Result<MergeAction> {
+        use super::branch_catalog::{BranchTableRecord, BranchTableState};
+        let existing = self.branch_table_record(target_id, table)?;
+        let (parent_fingerprint, parent_incarnation) = existing
+            .as_ref()
+            .map_or((record.parent_fingerprint, record.parent_incarnation), |own| {
+                (own.parent_fingerprint, own.parent_incarnation)
+            });
+        let (created, added_columns) = match &record.state {
+            BranchTableState::Dropped => (false, Vec::new()),
+            BranchTableState::Defined(_) if record.created => (true, Vec::new()),
+            BranchTableState::Defined(_) => match existing.as_deref() {
+                Some(own) if own.definition().is_some() => {
+                    let mut added = own.added_columns.clone();
+                    added.extend(record.added_columns.iter().cloned());
+                    (own.created, added)
+                }
+                _ => (false, record.added_columns.clone()),
+            },
+        };
+        let materialize = (record.definition().is_some() && !record.created && !record.added_columns.is_empty())
+            .then(|| record.added_columns.clone());
+        Ok(MergeAction::PutOnBranch {
+            record: BranchTableRecord {
+                state: record.state.clone(),
+                isolated: record.isolated,
+                frozen: false,
+                parent_fingerprint,
+                parent_incarnation,
+                created,
+                added_columns,
+            },
+            materialize,
+        })
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass, amendment B): MERGE must not produce
+    /// a PRIMARY KEY / UNIQUE duplicate on its target. For every row the merge
+    /// will put there, probe the target's rules for the key — ignoring the rows
+    /// the merge itself deletes or replaces by row id — and refuse 23505 naming
+    /// the table, the constraint and the key. Runs before the intent: nothing
+    /// has changed, and the source stays Active and mergeable once the
+    /// conflicting row is gone. A table the source CREATED replaces the target's
+    /// of the name, so only its own rows can collide with each other.
+    ///
+    /// B3 second fix pass: a key on main can also be held by a row that is not
+    /// committed: main's indexes are maintained eagerly, so an open transaction's
+    /// INSERT or key-moving UPDATE is in them already. That is a refusal too
+    /// (55006, retryable), or the merge would duplicate the key when it commits.
+    /// Runs again when a merge resumes.
+    ///
+    /// A statement that claims the key AFTER this check is met by the row phase:
+    /// whichever claims first holds it, and the other is refused, so nothing is
+    /// duplicated. What stays open until R5 is in the spec.
+    fn validate_merge_keys(&self, ends: &MergeEnds<'_>, steps: &[MergeStep], tables: &[String]) -> Result<()> {
+        // Main's committed rows by key, when an open main transaction makes its
+        // index unreliable, are scanned once for the whole validation.
+        let _memo = super::OverlayCacheScope::enter();
+        let source_view = BranchView::for_chain(self, ends.source_name, ends.source_chain.to_vec())?;
+        let target_view = if ends.merge_to_main {
+            BranchView::for_chain(self, "main", vec![ends.target_id])?
+        } else {
+            BranchView::for_chain(self, ends.target_name, ends.target_chain.to_vec())?
+        };
+        for table in tables {
+            let step = steps.iter().find(|step| &step.table == table);
+            let created = match step.map(|step| &step.action) {
+                Some(MergeAction::DropOnMain) => continue,
+                Some(MergeAction::CreateOnMain { .. }) => true,
+                Some(MergeAction::PutOnBranch { record, .. }) => {
+                    if record.definition().is_none() {
+                        continue;
+                    }
+                    record.created
+                }
+                _ => false,
+            };
+            let Some((source_definition, _)) = self.chain_table_definition(ends.source_chain, table)? else {
+                continue;
+            };
+            let (rules, target_schema) = if created {
+                let rules: Vec<crate::storage::EnforcedUniqueIndex> = source_definition
+                    .unique_rules
+                    .iter()
+                    .map(super::branch_catalog::BranchUniqueRule::to_enforced)
+                    .collect();
+                (rules, None)
+            } else {
+                let Some((target_definition, _)) = self.chain_table_definition(ends.target_chain, table)? else {
+                    // Main has no such table: the rows go nowhere (the row phase
+                    // writes no `data:` a catalog entry does not describe).
+                    continue;
+                };
+                (target_view.unique_rules(table)?, Some(target_definition.schema))
+            };
+            if rules.is_empty() {
+                continue;
+            }
+            let merged = self.branch_changed_row_ids(ends.source_id, table)?;
+            let mut skip = self.branch_frozen_row_ids(ends.source_id, table)?;
+            skip.extend(self.branch_tombstone_row_ids(ends.source_id, table)?);
+            let mut seen: std::collections::HashMap<(usize, Vec<u8>), u64> = std::collections::HashMap::new();
+            source_view.for_each_own_changed_image(
+                table,
+                source_definition.schema.columns.len(),
+                &skip,
+                |row_id, tuple| {
+                    for (position, rule) in rules.iter().enumerate() {
+                        let Some(key) = branch_view::rule_key(&source_definition.schema, rule, &tuple.values) else {
+                            continue;
+                        };
+                        let encoded = crate::storage::ArtIndexManager::encode_key(&key);
+                        let twice = seen
+                            .insert((position, encoded), row_id)
+                            .is_some_and(|other| other != row_id);
+                        let held = match &target_schema {
+                            Some(schema) => target_view
+                                .rows_with_key(None, table, schema, &rule.columns, &key)?
+                                .iter()
+                                .any(|holder| holder.row_id.is_some_and(|holder| !merged.contains(&holder))),
+                            None => false,
+                        };
+                        let key_text = merge_key_text(&source_definition.schema, &rule.columns, &tuple);
+                        if twice || held {
+                            return Err(Error::branch_merge_duplicate_key(
+                                ends.source_name,
+                                ends.target_name,
+                                table,
+                                if rule.is_primary_key { "PRIMARY KEY" } else { "UNIQUE" },
+                                &rule.label,
+                                &key_text,
+                            ));
+                        }
+                        if let (true, Some(schema)) = (ends.merge_to_main, &target_schema) {
+                            if target_view.main_key_held_by_an_uncommitted_row(
+                                table,
+                                schema,
+                                &rule.columns,
+                                &key,
+                                &merged,
+                            )? {
+                                return Err(Error::branch_merge_key_claimed(
+                                    ends.source_name,
+                                    ends.target_name,
+                                    table,
+                                    &rule.label,
+                                    &key_text,
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): one schema step of a merge into
+    /// main — EVERY main-side catalog write of a merge is here — through main's
+    /// own catalog funnels (the merge runs under a main scope). Idempotent: what
+    /// main holds now decides whether the step has run, partly run or not run. A
+    /// state no run of the step can produce refuses; the target's DDL is held
+    /// off these tables, so that takes an operator's hand after a crash.
+    fn apply_merge_step_to_main(&self, catalog: &Catalog<'_>, step: &MergeStep, source_id: u64) -> Result<()> {
+        let table = step.table.as_str();
+        let now = self.main_table_definition(table)?;
+        let now_fingerprint = now.as_ref().map(|(_, fingerprint)| *fingerprint);
+        let now_incarnation = catalog.main_table_incarnation(table)?;
+        let unchanged = now_fingerprint == step.before;
+        let changed = || {
+            Error::query_execution(format!(
+                "table {table} changed on main while the merge was unfinished; it cannot be finished"
+            ))
+        };
+        match &step.action {
+            MergeAction::DropOnMain => {
+                if now.is_none() {
+                    return Ok(());
+                }
+                if !unchanged {
+                    return Err(changed());
+                }
+                self.drop_main_table_for_merge(catalog, table)?;
+            }
+            MergeAction::CreateOnMain { definition } => {
+                // The definition's own incarnation on main: this create already
+                // ran, perhaps only partly. Main's old table of the name goes
+                // first. The columns of the definition under another id: a WAL
+                // replay at open re-created it, so this create ran too, and the
+                // table takes the id it would have had.
+                let ran = now_incarnation == Some(definition.incarnation) && now.is_some();
+                if !ran {
+                    let empty = crate::sql::TableConstraints::default();
+                    match &now {
+                        None => self.create_merged_table(catalog, table, definition)?,
+                        Some(_) if unchanged => {
+                            self.drop_main_table_for_merge(catalog, table)?;
+                            self.create_merged_table(catalog, table, definition)?;
+                        }
+                        Some((current, _))
+                            if super::branch_catalog::definition_fingerprint(&current.schema, &empty, &[])?
+                                == super::branch_catalog::definition_fingerprint(&definition.schema, &empty, &[])? =>
+                        {
+                            catalog.set_table_incarnation(table, definition.incarnation)?;
+                        }
+                        Some(_) => return Err(changed()),
+                    }
+                }
+                let constraints = &definition.constraints;
+                if !constraints.foreign_keys.is_empty()
+                    || !constraints.check_constraints.is_empty()
+                    || !constraints.unique_constraints.is_empty()
+                {
+                    catalog.save_table_constraints(table, constraints)?;
+                    catalog.register_unique_constraint_indexes(table, constraints)?;
+                }
+                if !definition.identity_columns.is_empty() {
+                    catalog.register_identity_columns(table, &definition.identity_columns)?;
+                }
+                // sprinter 6bc4a4040eb7 (B3 fourth fix pass): main can write this
+                // table from now on, also while the merge is pending, so its counter
+                // passes the source's row ids before any row lands, durably, on a
+                // rerun too. A row main committed under id 1 would be overwritten by
+                // the source's row 1 when it landed. The open-time re-seeding ran
+                // before the table existed, or before a rerun.
+                if let Some(highest) = self.branch_changed_row_ids(source_id, table)?.into_iter().max() {
+                    self.raise_row_counter_to(table, highest);
+                    self.flush_row_counter(table)?;
+                }
+            }
+            MergeAction::AddColumnsOnMain { base_columns, columns } => {
+                // Main's columns must be the base plus a prefix of the added
+                // ones; the rest is what is left to add.
+                let (mut schema, _) = now
+                    .map(|(definition, fingerprint)| (definition.schema, fingerprint))
+                    .ok_or_else(changed)?;
+                let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
+                let added_already = names.len().checked_sub(base_columns.len()).ok_or_else(changed)?;
+                let expected = base_columns
+                    .iter()
+                    .map(String::as_str)
+                    .chain(columns.iter().take(added_already).map(|c| c.column.name.as_str()));
+                if added_already > columns.len()
+                    || !names.iter().copied().eq(expected)
+                    || (added_already == 0 && !unchanged)
+                {
+                    return Err(changed());
+                }
+                if added_already < columns.len() {
+                    schema
+                        .columns
+                        .extend(columns.iter().skip(added_already).map(|c| c.column.clone()));
+                    catalog.update_table_schema(table, &schema)?;
+                }
+                self.merge_failpoint_tick(MergeFailSite::Step)?;
+                let backfill: Vec<crate::Value> = columns
+                    .iter()
+                    .map(|c| Self::add_column_backfill_value(&c.default))
+                    .collect();
+                self.backfill_added_columns(table, base_columns.len(), &backfill)?;
+            }
+            MergeAction::PutOnBranch { .. } => {
+                return Err(Error::internal("a branch step of a merge reached main's apply"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Main's table goes, as main's own `DROP TABLE` takes it
+    /// (`ddl::drop_table_and_partition_children` + `on_table_dropped`, B3 second
+    /// fix pass): its partition children with it, its pushdown structures, and its
+    /// triggers out of the live registry.
+    fn drop_main_table_for_merge(&self, catalog: &Catalog<'_>, table: &str) -> Result<()> {
+        let children = catalog.drop_table_taking_partition_children(table)?;
+        self.predicate_pushdown().remove_table(table);
+        self.deregister_dropped_table_triggers(table);
+        for child in children {
+            if catalog.main_table_exists(&child)? {
+                self.drop_main_table_for_merge(catalog, &child)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Main's table of a definition a branch created: the definition's columns,
+    /// under the definition's incarnation id.
+    fn create_merged_table(
+        &self,
+        catalog: &Catalog<'_>,
+        table: &str,
+        definition: &super::branch_catalog::BranchTableDefinition,
+    ) -> Result<()> {
+        let mut schema = definition.schema.clone();
+        for column in &mut schema.columns {
+            column.source_table = None;
+            column.source_table_name = None;
+        }
+        catalog.create_table_with_incarnation(table, schema, definition.incarnation)
+    }
+
+    /// One schema step of a merge into a branch: the target level takes the
+    /// plan's record (a drop or a re-creation clears the level's own rows of the
+    /// table; `ADD COLUMN`s rewrite what the level sees under it). The record is
+    /// the last write, so holding those exact bytes means the step ran.
+    fn apply_merge_step_to_branch(
+        &self,
+        intent: &MergeIntent,
+        step: &MergeStep,
+        record: &super::branch_catalog::BranchTableRecord,
+        materialize: Option<&[super::branch_catalog::BranchAddedColumn]>,
+    ) -> Result<()> {
+        let table = step.table.as_str();
+        let stored = self.get(&super::branch_catalog::branch_table_key(intent.target_id, table))?;
+        if stored.is_some_and(|bytes| record.encode().is_ok_and(|wanted| wanted == bytes)) {
+            return Ok(());
+        }
+        if branch_view::pending_writers(self.instance_id, intent.target_id, table) > 0 {
+            return Err(Error::branch_table_busy(table, &intent.target_name));
+        }
+        let now = self.chain_table_definition(&intent.target_chain, table)?;
+        if now.as_ref().map(|(_, fingerprint)| *fingerprint) != step.before {
+            return Err(Error::query_execution(format!(
+                "table {table} changed on branch {} while the merge was unfinished; it cannot be finished",
+                intent.target_name
+            )));
+        }
+        match (materialize, now) {
+            (Some(columns), Some((current, _))) => {
+                let backfill: Vec<crate::Value> = columns
+                    .iter()
+                    .map(|c| Self::add_column_backfill_value(&c.default))
+                    .collect();
+                let view = BranchView::for_chain(self, intent.target_name.as_str(), intent.target_chain.clone())?;
+                view.materialize(table, &current.schema, record, &backfill)?;
+            }
+            _ => {
+                let clear_rows = record.definition().is_none() || record.created;
+                self.put_branch_table_record(
+                    intent.target_id,
+                    table,
+                    record,
+                    rocksdb::WriteBatch::default(),
+                    clear_rows,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): bring every row of main's `table_name`
+    /// to the width `ALTER TABLE … ADD COLUMN` over `base_width` columns gives it
+    /// — MERGE's backfill. Idempotent, unlike [`Self::add_column_to_rows`], which
+    /// appends unconditionally: a row already that wide (a rerun; a row the merge
+    /// itself wrote) is not touched. Keeps its W2.5 / W3.2 fences.
+    fn backfill_added_columns(&self, table_name: &str, base_width: usize, backfill: &[crate::Value]) -> Result<usize> {
+        let prefix = format!("data:{}:", table_name);
+        let width = base_width + backfill.len();
+        self.invalidate_write_watermark(table_name);
+        let needs_version_materialize =
+            self.snapshot_manager.table_has_copy_markers(table_name) || self.snapshot_manager.maybe_elided_rows();
+        let mut keys = Vec::new();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(
+            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            read_opts,
+        );
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            keys.push(key.to_vec());
+        }
+        let mut widened = 0usize;
+        for key in keys {
+            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix.len()) else {
+                continue;
+            };
+            let raw = self
+                .db
+                .get(&key)
+                .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?;
+            let Some(raw) = raw else {
+                continue;
+            };
+            let stored = self.decode_stored_ref(&key, &raw)?;
+            let mut tuple: Tuple = bincode::deserialize(&stored)
+                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            if tuple.values.len() >= width {
+                continue;
+            }
+            branch_view::extend_row_values(&mut tuple.values, base_width, backfill);
+            let new_value =
+                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            let final_value = super::tde::seal_row_value(self.key_manager.as_deref(), &key, &new_value)?;
+            if needs_version_materialize {
+                self.snapshot_manager
+                    .materialize_copy_marker_row_durable(table_name, row_id)?;
+            }
+            self.gate
+                .put(&self.db, &key, final_value.as_ref(), None)
+                .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
+            widened += 1;
+        }
+        self.bump_schema_generation();
+        self.row_cache.invalidate_table(table_name);
+        Ok(widened)
     }
 
     /// Begin a transaction on a specific branch
@@ -16805,6 +18232,12 @@ impl StorageEngine {
     /// deterministic DROP / MERGE concurrency tests poll.
     pub fn branch_drain_state(&self, branch_id: super::BranchId) -> super::BranchDrainState {
         self.branch_drains.state(branch_id)
+    }
+
+    /// The per-branch drains (sprinter 6bc4a4040eb7, B3 fix pass: a branch
+    /// schema statement takes the exclusive section here).
+    pub(crate) fn branch_drains(&self) -> &Arc<super::BranchDrains> {
+        &self.branch_drains
     }
 
     /// Re-validate `binding` against the registry: `Ok` while its branch is

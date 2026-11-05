@@ -56,6 +56,7 @@
 use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use super::Key;
 
@@ -73,6 +74,10 @@ const INFLIGHT_RING_MASK: u64 = (INFLIGHT_RING_SIZE as u64) - 1;
 
 /// Barrier slow-path yield-spins before parking on the condvar.
 const BARRIER_SPINS: u32 = 48;
+
+/// The value of a row in `merged_writes` while its merge is landing it: later
+/// than every snapshot, so any other commit of the row is refused.
+const MERGE_LANDING: u64 = u64::MAX;
 
 /// Ring slot encoding. `0` = empty (reclaimed / never used); low bit set =
 /// pending; low bit clear (nonzero) = applied, awaiting in-order
@@ -161,6 +166,51 @@ pub struct WriteConflictRegistry {
     gc_pins: DashMap<u64, u64>,
     /// Pin id allocator for `gc_pins`.
     next_gc_pin: AtomicU64,
+    /// sprinter 6bc4a4040eb7 (B3 fourth fix pass): the row keys MERGE BRANCH
+    /// landed on main (or is landing: [`MERGE_LANDING`]), with the commit that
+    /// did. Unlike `recent_writes`, EVERY commit checks them, READ COMMITTED and
+    /// autocommit too, from the snapshot its first staged write was read under:
+    /// such a transaction can hold a row image from before the merge, and its
+    /// COMMIT would silently put the pre-merge row back over the merged one, with
+    /// the index saying otherwise. A write it made after the merge read the merged
+    /// row, and passes. See [`Self::hold_merge_landing`].
+    merged_writes: DashMap<Key, u64>,
+    /// Whether `merged_writes` may hold anything: the one load a commit pays per
+    /// key when no merge has run. Changed under `merged_writes_lock`.
+    merged_writes_present: AtomicBool,
+    /// Serializes turning `merged_writes_present` off with a merge starting.
+    merged_writes_lock: Mutex<()>,
+}
+
+/// The row keys of one table a merge is landing. Dropped: they are recorded with
+/// the commit that landed them ([`Self::landed`]), or, when it did not, forgotten.
+pub struct MergeLandingHold {
+    registry: Arc<WriteConflictRegistry>,
+    keys: Vec<Key>,
+    landed_at: Option<u64>,
+}
+
+impl MergeLandingHold {
+    /// The rows are committed, at `commit_ts`.
+    pub fn landed(&mut self, commit_ts: u64) {
+        self.landed_at = Some(commit_ts);
+    }
+}
+
+impl Drop for MergeLandingHold {
+    fn drop(&mut self) {
+        for key in std::mem::take(&mut self.keys) {
+            match self.landed_at {
+                Some(commit_ts) => {
+                    self.registry.merged_writes.insert(key, commit_ts);
+                }
+                None => {
+                    self.registry.merged_writes.remove(&key);
+                }
+            }
+        }
+        self.registry.prune_merged_writes();
+    }
 }
 
 impl Default for WriteConflictRegistry {
@@ -187,6 +237,9 @@ impl WriteConflictRegistry {
             commit_count: AtomicU64::new(0),
             gc_pins: DashMap::new(),
             next_gc_pin: AtomicU64::new(0),
+            merged_writes: DashMap::new(),
+            merged_writes_present: AtomicBool::new(false),
+            merged_writes_lock: Mutex::new(()),
         }
     }
 
@@ -489,6 +542,23 @@ impl WriteConflictRegistry {
         snapshot_ts: u64,
         commit_ts: u64,
     ) -> std::result::Result<(), (Key, u64)> {
+        self.validate_and_record_with_merge_floor(write_set, validate, snapshot_ts, snapshot_ts, commit_ts)
+    }
+
+    /// [`Self::validate_and_record`], with the check every commit makes whatever
+    /// its isolation level: a row a MERGE BRANCH landed after `merge_floor` (the
+    /// snapshot this transaction's first staged write was read under) is a
+    /// conflict. Recorded BEFORE the check, and a merge records its rows BEFORE it
+    /// validates its own commit, under the same per-key shard locks: so of a commit
+    /// and a merge writing one row, at least one sees the other.
+    pub fn validate_and_record_with_merge_floor(
+        &self,
+        write_set: &DashMap<Key, Option<Vec<u8>>>,
+        validate: bool,
+        snapshot_ts: u64,
+        merge_floor: u64,
+        commit_ts: u64,
+    ) -> std::result::Result<(), (Key, u64)> {
         if write_set.is_empty() {
             return Ok(());
         }
@@ -512,6 +582,13 @@ impl WriteConflictRegistry {
                 dashmap::mapref::entry::Entry::Vacant(vacant) => {
                     vacant.insert(commit_ts);
                     recorded.push((key.clone(), None));
+                }
+            }
+            if self.merged_writes_present.load(Ordering::Acquire) {
+                let merged_at = self.merged_writes.get(key).map(|merged| *merged);
+                if let Some(merged_at) = merged_at.filter(|merged_at| *merged_at > merge_floor) {
+                    conflict = Some((key.clone(), merged_at));
+                    break;
                 }
             }
         }
@@ -547,6 +624,40 @@ impl WriteConflictRegistry {
             .min()
             .unwrap_or(u64::MAX);
         self.recent_writes.retain(|_, ts| *ts >= min_active);
+        self.prune_merged_writes();
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fourth fix pass): a merge is about to land these
+    /// row keys. From here until the returned hold drops, any other commit of them
+    /// is refused, and afterwards one that read them before the merge is.
+    pub fn hold_merge_landing(self: &Arc<Self>, keys: Vec<Key>) -> MergeLandingHold {
+        {
+            let _lock = self.merged_writes_lock.lock();
+            self.merged_writes_present.store(true, Ordering::Release);
+            for key in &keys {
+                self.merged_writes.insert(key.clone(), MERGE_LANDING);
+            }
+        }
+        MergeLandingHold {
+            registry: Arc::clone(self),
+            keys,
+            landed_at: None,
+        }
+    }
+
+    /// Forget the merged rows no open transaction can have read before the merge:
+    /// every one of them holds a snapshot pin at or below its merge floor.
+    fn prune_merged_writes(&self) {
+        if !self.merged_writes_present.load(Ordering::Acquire) {
+            return;
+        }
+        let _lock = self.merged_writes_lock.lock();
+        let horizon = self.min_pinned_snapshot().unwrap_or(u64::MAX);
+        self.merged_writes
+            .retain(|_, merged_at| *merged_at == MERGE_LANDING || *merged_at > horizon);
+        if self.merged_writes.is_empty() {
+            self.merged_writes_present.store(false, Ordering::Release);
+        }
     }
 
     /// Test/diagnostic surface.
@@ -613,6 +724,61 @@ impl Drop for GcPinGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A merge's rows conflict for every commit, at any isolation level, from the
+    /// moment they are held, against what it read before them; never against what
+    /// it read after.
+    #[test]
+    fn a_merged_row_conflicts_with_a_commit_that_read_it_before_the_merge() {
+        let reg = Arc::new(WriteConflictRegistry::new());
+        // Not validating: the READ COMMITTED and autocommit shape.
+        assert!(reg
+            .validate_and_record_with_merge_floor(&ws(&["k"]), false, 10, 10, 20)
+            .is_ok());
+        let pin = reg.pin_snapshot(10);
+
+        let mut hold = reg.hold_merge_landing(vec![b"k".to_vec()]);
+        let (key, _) = reg
+            .validate_and_record_with_merge_floor(&ws(&["k"]), false, 30, 30, 31)
+            .expect_err("while it lands");
+        assert_eq!(key, b"k".to_vec());
+        assert!(
+            reg.validate_and_record_with_merge_floor(&ws(&["other"]), false, 30, 30, 32)
+                .is_ok(),
+            "another key"
+        );
+        hold.landed(40);
+        drop(hold);
+
+        let (_, merged_at) = reg
+            .validate_and_record_with_merge_floor(&ws(&["k"]), false, 50, 30, 51)
+            .expect_err("its first write was read before the merge, whatever its snapshot is now");
+        assert_eq!(merged_at, 40);
+        assert!(
+            reg.validate_and_record_with_merge_floor(&ws(&["k"]), false, 50, 40, 52)
+                .is_ok(),
+            "read at or after the merge"
+        );
+        assert!(
+            reg.validate_and_record_with_merge_floor(&ws(&["k"]), false, 50, u64::MAX, 53)
+                .is_ok(),
+            "the merge's own transaction"
+        );
+
+        // The oldest open transaction is past it: nothing can conflict, it goes.
+        reg.unpin_snapshot(pin);
+        reg.prune_merged_writes();
+        assert!(reg.merged_writes.is_empty());
+        assert!(!reg.merged_writes_present.load(Ordering::Acquire));
+        assert!(reg
+            .validate_and_record_with_merge_floor(&ws(&["k"]), false, 5, 5, 60)
+            .is_ok());
+
+        // A merge that did not land leaves no trace.
+        let hold = reg.hold_merge_landing(vec![b"q".to_vec()]);
+        drop(hold);
+        assert!(reg.merged_writes.is_empty());
+    }
 
     fn ws(keys: &[&str]) -> DashMap<Key, Option<Vec<u8>>> {
         let m = DashMap::new();

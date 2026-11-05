@@ -425,20 +425,22 @@ impl AdaptiveRadixTree {
                 let existing_leaf = ArtNode::Leaf(LeafNode::from_values(existing_key, primary, extra));
                 new_node.add_child(child_byte, existing_leaf);
             } else {
-                // Existing key ends at this node - store all values here
+                // Existing key ends at this node - store all values here. That
+                // leaf is gone: its key is a prefix of the new one.
                 new_node.header.values.push(primary);
                 new_node.header.values.extend(extra);
+                self.stats.leaf_count -= 1;
             }
             if new_depth < key.len() {
                 let new_leaf = ArtNode::Leaf(LeafNode::new(key.to_vec(), value));
                 new_node.add_child(key[new_depth], new_leaf);
+                self.stats.leaf_count += 1;
             } else {
-                // New key ends at this node - add value here
+                // New key ends at this node - add value here, in no leaf
                 new_node.header.values.push(value);
             }
 
             self.stats.node4_count += 1;
-            self.stats.leaf_count += 1; // New leaf added
             return Ok(ArtNode::Node4(Box::new(new_node)));
         }
 
@@ -806,7 +808,6 @@ impl AdaptiveRadixTree {
         if removed_value.is_some() {
             self.size -= 1;
             self.stats.key_count = self.size;
-            self.stats.leaf_count -= 1;
         }
 
         Ok(removed_value)
@@ -829,6 +830,11 @@ impl AdaptiveRadixTree {
                         self.size -= count - 1;
                         self.stats.key_count = self.size;
                     }
+                    // Here and not in `remove`: a key that is a prefix of another
+                    // lives in its inner node's values, not in a leaf, so counting
+                    // every removed key as a leaf ran the count below zero (it
+                    // panicked a debug build, and wrapped in release).
+                    self.stats.leaf_count -= 1;
                     Ok((None, first_value))
                 } else {
                     Ok((Some(ArtNode::Leaf(leaf)), None))
@@ -1402,6 +1408,55 @@ impl Iterator for ArtIterator<'_> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn leaves_in(node: &ArtNode) -> u64 {
+        let children: Vec<&ArtNode> = match node {
+            ArtNode::Leaf(_) => return 1,
+            ArtNode::Node4(n) => n.iter_children().map(|(_, child)| child).collect(),
+            ArtNode::Node16(n) => n.iter_children().map(|(_, child)| child).collect(),
+            ArtNode::Node48(n) => n.iter_children().map(|(_, child)| child).collect(),
+            ArtNode::Node256(n) => n.iter_children().map(|(_, child)| child).collect(),
+        };
+        children.into_iter().map(leaves_in).sum()
+    }
+
+    /// `leaf_count` says how many leaf nodes the tree has, so it matches a walk of
+    /// the tree after every step. A key that is a prefix of another (`a1` of `a10`)
+    /// is stored in an inner node's values, in no leaf, in every order of arrival;
+    /// removing one used to subtract a leaf that was never counted, and the count
+    /// went below zero (seen as a panic in a debug build during a key swap).
+    #[test]
+    fn the_leaf_count_is_the_leaves_when_a_key_is_a_prefix_of_another() {
+        for keys in [
+            vec!["a10", "a11", "a1"],
+            vec!["a1", "a10", "a11"],
+            vec!["a10", "a1", "a11"],
+            vec!["abcdefghijklmnop1", "abcdefghijklmnop2", "abc"],
+            vec!["a", "ab", "abc", "abcd"],
+            vec!["abcd", "abc", "ab", "a"],
+        ] {
+            for index_type in [ArtIndexType::Unique, ArtIndexType::Manual] {
+                let mut tree = AdaptiveRadixTree::new("idx", "t", vec!["k".to_string()], index_type);
+                let walked = |tree: &AdaptiveRadixTree| tree.root.as_ref().map_or(0, leaves_in);
+                for (row, key) in keys.iter().enumerate() {
+                    tree.insert(key.as_bytes(), row as u64).unwrap();
+                    assert_eq!(tree.stats().leaf_count, walked(&tree), "{keys:?}: inserted {key}");
+                }
+                // In both directions, by whole key and by row.
+                for (row, key) in keys.iter().enumerate() {
+                    assert_eq!(tree.get(key.as_bytes()), Some(row as u64), "{keys:?}");
+                    if row % 2 == 0 {
+                        assert_eq!(tree.remove(key.as_bytes()).unwrap(), Some(row as u64), "{keys:?}");
+                    } else {
+                        assert!(tree.remove_value(key.as_bytes(), row as u64).unwrap(), "{keys:?}");
+                    }
+                    assert_eq!(tree.stats().leaf_count, walked(&tree), "{keys:?}: removed {key}");
+                    assert_eq!(tree.get(key.as_bytes()), None, "{keys:?}");
+                }
+                assert_eq!(tree.stats().leaf_count, 0, "{keys:?}");
+            }
+        }
+    }
 
     #[test]
     fn test_basic_insert_get() {

@@ -675,3 +675,63 @@ fn a_standby_engine_is_hydrated_once_by_its_sql_layer() {
     assert!(EmbeddedDatabase::with_physical_standby(config, plain).is_err());
     assert_eq!(standby.refusals(), 0);
 }
+
+/// sprinter 6bc4a4040eb7 (B3 second fix pass): a standby receives an unfinished
+/// MERGE's intent as bytes, and does nothing about it: its primary's completion
+/// replicates. It writes nothing trying, and goes on serving reads.
+#[test]
+fn a_standby_leaves_an_unfinished_merge_to_its_primary() {
+    let standby = Standby::new(&[
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+        "INSERT INTO t VALUES (1, 1)",
+        "CREATE TABLE gone (id INT PRIMARY KEY)",
+    ]);
+    standby.run(&[
+        "CREATE BRANCH r AS OF NOW",
+        "USE BRANCH r",
+        "ALTER TABLE t ADD COLUMN x INT DEFAULT 5",
+        "DROP TABLE gone",
+        "USE BRANCH main",
+    ]);
+    standby.primary().storage.debug_fail_merge_after_steps(1);
+    standby
+        .primary()
+        .execute("MERGE BRANCH r INTO main")
+        .expect_err("the injected failure");
+    standby.sync();
+
+    let refusals = standby.refusals();
+    let intent_key = |db: &EmbeddedDatabase| {
+        let raw = db.storage.db();
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let found = raw
+            .iterator_opt(
+                rocksdb::IteratorMode::From(b"branch:merge:", rocksdb::Direction::Forward),
+                read_opts,
+            )
+            .next()
+            .is_some_and(|item| item.unwrap().0.starts_with(b"branch:merge:"));
+        found
+    };
+    assert!(intent_key(standby.db()), "the intent replicated");
+    assert!(standby.db().storage.finish_pending_branch_merges().is_empty());
+    assert_eq!(standby.refusals(), refusals, "the standby tried to write nothing");
+    // B3 third fix pass: abandoning it is its primary's call too. Up front, in the
+    // standard words, with no write attempted.
+    let refused = standby
+        .db()
+        .execute("MERGE BRANCH r ABORT")
+        .expect_err("a standby does not abandon its primary's merge");
+    assert!(
+        refused.is_physical_standby_write_refusal() && refused.to_string().contains(PHYSICAL_STANDBY_WRITE_REFUSED),
+        "{refused}"
+    );
+    assert_eq!(standby.refusals(), refusals, "refused before the engine");
+    assert!(intent_key(standby.db()), "it is still there");
+    assert_eq!(standby.db().query("SELECT id FROM t", &[]).unwrap().len(), 1);
+
+    standby.primary().execute("MERGE BRANCH r INTO main").unwrap();
+    standby.sync();
+    assert!(!intent_key(standby.db()), "the primary's completion replicated");
+}

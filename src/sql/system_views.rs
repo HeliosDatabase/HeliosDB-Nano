@@ -1127,8 +1127,15 @@ impl SystemViewRegistry {
 
     fn execute_pg_indexes(&self, storage: &StorageEngine) -> Result<Vec<Tuple>> {
         let mut results = Vec::new();
+        // sprinter 6bc4a4040eb7 (B3 fix pass): main's indexes describe main's
+        // rows. A table the session's branch defined or dropped has none of them
+        // here; one it defined lists the rules its definition enforces.
+        let catalog = storage.catalog();
 
         for (index_name, table_name, index_type, columns) in storage.art_indexes().list_indexes() {
+            if catalog.branch_overrides(&table_name) {
+                continue;
+            }
             let (unique, using) = match index_type {
                 ArtIndexType::PrimaryKey | ArtIndexType::Unique => ("UNIQUE ", "btree"),
                 ArtIndexType::Manual => ("", "btree"),
@@ -1152,6 +1159,9 @@ impl SystemViewRegistry {
         }
 
         for metadata in storage.vector_indexes().list_all_metadata() {
+            if catalog.branch_overrides(&metadata.table_name) {
+                continue;
+            }
             let opclass = match metadata.distance_metric() {
                 crate::vector::DistanceMetric::Cosine => "vector_cosine_ops",
                 crate::vector::DistanceMetric::L2 => "vector_l2_ops",
@@ -1168,6 +1178,28 @@ impl SystemViewRegistry {
                 )),
             ]);
             results.push(tuple);
+        }
+
+        if let Some(chain) = storage.session_branch_chain() {
+            for (table_name, resolution) in storage.branch_tables_in_chain(&chain)? {
+                let Some(definition) = resolution.definition() else {
+                    continue;
+                };
+                for rule in &definition.unique_rules {
+                    results.push(Tuple::new(vec![
+                        Value::String("public".to_string()),
+                        Value::String(table_name.clone()),
+                        Value::String(rule.index_name.clone()),
+                        Value::Null,
+                        Value::String(format!(
+                            "CREATE UNIQUE INDEX {} ON public.{} USING btree ({})",
+                            rule.index_name,
+                            table_name,
+                            rule.columns.join(", ")
+                        )),
+                    ]));
+                }
+            }
         }
 
         Ok(results)

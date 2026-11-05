@@ -62,6 +62,11 @@ struct DrainState {
     closing: bool,
     /// Further DROPs / MERGEs waiting for the current close to finish.
     waiting_closers: usize,
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): a schema statement runs on the
+    /// branch alone ([`BranchDrains::exclusive`]). New statements wait for it.
+    exclusive: bool,
+    /// Statements waiting for that section to end.
+    waiting_statements: usize,
 }
 
 /// A point-in-time view of one branch's drain — for diagnostics and the
@@ -74,6 +79,10 @@ pub struct BranchDrainState {
     pub closing: bool,
     /// DROPs / MERGEs queued behind that close.
     pub waiting_closers: usize,
+    /// A schema statement or a merge runs on it alone, or is waiting to.
+    pub exclusive: bool,
+    /// Statements waiting for that section to end.
+    pub waiting_statements: usize,
 }
 
 thread_local! {
@@ -108,6 +117,11 @@ impl BranchDrains {
     /// the branch (B1 second fix pass): once that close succeeds the branch is
     /// no longer active and every waiter would be refused anyway, so waiting
     /// only pinned the caller's thread for the length of a merge copy.
+    ///
+    /// WAITS — at most [`BRANCH_DRAIN_TIMEOUT`], then 55006 — while a schema
+    /// statement runs on the branch alone ([`Self::exclusive`], sprinter
+    /// 6bc4a4040eb7, B3 fix pass): it is short, and the statement that waited
+    /// then sees the new definition.
     pub fn enter(self: &Arc<Self>, branch_id: BranchId, name: &str) -> Result<BranchHold> {
         if self.held_by_this_thread(branch_id) {
             return Ok(BranchHold::none());
@@ -115,6 +129,17 @@ impl BranchDrains {
         let drain = self.drain(branch_id);
         {
             let mut state = drain.state.lock();
+            if state.exclusive && !state.closing {
+                let deadline = std::time::Instant::now() + BRANCH_DRAIN_TIMEOUT;
+                state.waiting_statements += 1;
+                while state.exclusive && !state.closing {
+                    if drain.changed.wait_until(&mut state, deadline).timed_out() {
+                        state.waiting_statements -= 1;
+                        return Err(Error::branch_statement_waited(name));
+                    }
+                }
+                state.waiting_statements -= 1;
+            }
             if state.closing {
                 return Err(Error::branch_closing(name));
             }
@@ -138,6 +163,8 @@ impl BranchDrains {
             in_flight: state.in_flight,
             closing: state.closing,
             waiting_closers: state.waiting_closers,
+            exclusive: state.exclusive,
+            waiting_statements: state.waiting_statements,
         }
     }
 
@@ -172,6 +199,9 @@ impl BranchDrains {
             state.waiting_closers -= 1;
         }
         state.closing = true;
+        // A schema statement waiting for its exclusive section gives up now
+        // (B3 fix pass): it holds the branch, so this close would wait for it.
+        drain.changed.notify_all();
         while state.in_flight > 0 {
             if drain.changed.wait_until(&mut state, deadline).timed_out() {
                 state.closing = false;
@@ -181,6 +211,70 @@ impl BranchDrains {
         }
         drop(state);
         Ok(BranchCloseGuard { drain })
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): a schema statement on `branch_id`
+    /// (named `name`, for the refusal) runs on the branch ALONE: wait — at most
+    /// `timeout` — for the OTHER statements running on it to finish, and hold
+    /// new ones back until the guard drops. Otherwise another session's write
+    /// racing the statement is lost (its row re-put from a scan that read
+    /// before it), or lands under the definition it was not validated against.
+    ///
+    /// Refused at once (55006) while a DROP or MERGE is closing the branch, and
+    /// while another schema statement holds the section: two of them must not
+    /// wait for each other's shared hold. The calling thread's own statement
+    /// hold is not "another statement", and its nested statements (a `CREATE
+    /// TABLE AS`'s population) re-enter through `held_by_this_thread`.
+    pub fn exclusive(
+        self: &Arc<Self>,
+        branch_id: BranchId,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> Result<BranchExclusiveGuard> {
+        // The guard's own shared hold when the caller's statement has none:
+        // the nested statements then find the branch held by this thread and
+        // do not wait for this section.
+        let hold = self.enter(branch_id, name)?;
+        let drain = self.drain(branch_id);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = drain.state.lock();
+        if state.closing {
+            return Err(Error::branch_closing(name));
+        }
+        if state.exclusive {
+            return Err(Error::branch_schema_busy(name));
+        }
+        state.exclusive = true;
+        while state.in_flight > 1 {
+            let timed_out = drain.changed.wait_until(&mut state, deadline).timed_out();
+            if state.closing || timed_out {
+                let closing = state.closing;
+                state.exclusive = false;
+                drain.changed.notify_all();
+                return Err(if closing {
+                    Error::branch_closing(name)
+                } else {
+                    Error::branch_schema_busy(name)
+                });
+            }
+        }
+        drop(state);
+        Ok(BranchExclusiveGuard { drain, _hold: hold })
+    }
+}
+
+/// A schema statement's exclusive section on a branch (see
+/// [`BranchDrains::exclusive`]). Dropping it lets the waiting statements in.
+pub struct BranchExclusiveGuard {
+    drain: Arc<BranchDrain>,
+    _hold: BranchHold,
+}
+
+impl Drop for BranchExclusiveGuard {
+    fn drop(&mut self) {
+        let mut state = self.drain.state.lock();
+        state.exclusive = false;
+        self.drain.changed.notify_all();
     }
 }
 
@@ -211,7 +305,9 @@ impl Drop for BranchHold {
         {
             let mut state = drain.state.lock();
             state.in_flight = state.in_flight.saturating_sub(1);
-            if state.in_flight == 0 {
+            // A closer waits for 0, a schema statement's exclusive section for
+            // its own hold alone (B3 fix pass).
+            if state.in_flight <= 1 {
                 drain.changed.notify_all();
             }
         }
@@ -760,6 +856,22 @@ impl BranchManager {
         snapshot_id: SnapshotId,
         options: BranchOptions,
     ) -> Result<BranchId> {
+        self.create_branch_with(name, parent_name, snapshot_id, options, |_, _| Ok(()))
+    }
+
+    /// [`Self::create_branch`], with `extra` adding keys to the creation batch.
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): the fork record of table
+    /// incarnations is born with the branch, in one WriteBatch — a branch never
+    /// exists without it. `extra` runs with the registry locked and must not
+    /// touch this manager.
+    pub fn create_branch_with(
+        &self,
+        name: &str,
+        parent_name: Option<&str>,
+        snapshot_id: SnapshotId,
+        options: BranchOptions,
+        extra: impl FnOnce(BranchId, &mut rocksdb::WriteBatch) -> Result<()>,
+    ) -> Result<BranchId> {
         // Resolve parent branch — it must be ACTIVE (B1): a dropped or merged
         // branch is not a branch anybody can fork from. B1 second fix pass:
         // and it is HELD (a statement's shared drain hold) until the child is
@@ -792,6 +904,13 @@ impl BranchManager {
             None => (Some(main_id), BranchHold::none()),
         };
 
+        // sprinter 6bc4a4040eb7 (B3 third fix pass): not from the target of an
+        // unfinished merge: a child would read through a level part way through
+        // being rewritten, and a resume would then rewrite it under the child.
+        if let Some(parent_id) = parent_id {
+            self.refuse_if_in_unfinished_merge(parent_id, parent_name.unwrap_or("main"))?;
+        }
+
         // B1 second fix pass: the registry is locked for the whole create and
         // changed only AFTER the WriteBatch below succeeded — on a CLONE first
         // — so a failed write leaves neither a phantom entry nor a consumed id
@@ -823,6 +942,8 @@ impl BranchManager {
                 // has children keeps its name, because the children resolve
                 // their parent through the registry by id.
                 BranchState::Merged { .. } => {
+                    // B3 fix pass: an unfinished merge is resumed by this name.
+                    self.refuse_if_in_unfinished_merge(previous.branch_id, name)?;
                     let children = self.get_child_branches(previous.branch_id)?;
                     if !children.is_empty() {
                         return Err(Error::storage(format!(
@@ -890,6 +1011,7 @@ impl BranchManager {
                 .map_err(|e| Error::storage(format!("Failed to serialize children: {}", e)))?;
             batch.put(encode_branch_children_key(*parent), &children_value);
         }
+        extra(branch_id, &mut batch)?;
         self.gate
             .write(&self.db, batch, None)
             .map_err(|e| Error::storage(format!("Failed to save branch metadata: {}", e)))?;
@@ -904,6 +1026,36 @@ impl BranchManager {
         cache.insert(branch_id, metadata);
 
         Ok(branch_id)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): refuse (55006) what would take away
+    /// a branch an unfinished MERGE BRANCH still needs: its source holds the rows
+    /// the resume copies, its target receives them. Here, in the manager, so
+    /// every surface is covered (SQL, the REST routes, the webhooks).
+    fn refuse_if_in_unfinished_merge(&self, branch_id: BranchId, name: &str) -> Result<()> {
+        let prefix = super::branch_catalog::BRANCH_MERGE_INTENT_PREFIX.as_bytes();
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            read_opts,
+        );
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let plain = super::tde::open_ref(self.key_manager.as_deref(), &key, &value)?;
+            let intent = super::branch_catalog::MergeIntent::decode(&plain)?;
+            if intent.source_id == branch_id || intent.target_id == branch_id {
+                return Err(Error::branch_merge_pending(
+                    &format!("branch {name}"),
+                    &intent.source_name,
+                    &intent.target_name,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Drop a branch
@@ -959,6 +1111,7 @@ impl BranchManager {
             _ if if_exists => return Ok(()),
             _ => return Err(Error::storage(format!("Branch '{}' not found", name))),
         };
+        self.refuse_if_in_unfinished_merge(metadata.branch_id, name)?;
         let children = self.get_child_branches(metadata.branch_id)?;
         if !children.is_empty() {
             return Err(Error::storage(format!(
@@ -1971,6 +2124,97 @@ pub fn decode_branch_data_key(key: &[u8]) -> Option<(BranchId, String)> {
 mod tests {
     use super::*;
     use crate::storage::StorageEngine;
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): a schema statement's exclusive
+    /// section waits for the OTHER statements on the branch (times out 55006),
+    /// a second one is refused at once, its own nested statements pass, and a
+    /// new statement waits for it and then proceeds.
+    #[test]
+    fn the_exclusive_section_runs_alone() {
+        let drains = Arc::new(BranchDrains::default());
+        let short = std::time::Duration::from_millis(50);
+
+        // Another thread holds the branch: the section times out, and clears.
+        {
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let other = Arc::clone(&drains);
+            let holder = std::thread::spawn(move || {
+                let _hold = other.enter(9, "b").unwrap();
+                held_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            });
+            held_rx.recv().unwrap();
+            let err = drains
+                .exclusive(9, "b", short)
+                .err()
+                .expect("another statement is running");
+            assert!(err.to_string().contains(crate::error::BRANCH_BUSY_MARKER), "{err}");
+            done_tx.send(()).unwrap();
+            holder.join().unwrap();
+        }
+
+        // Alone: granted, and the caller's nested statements pass.
+        let section = drains.exclusive(9, "b", short).unwrap();
+        drop(drains.enter(9, "b").unwrap());
+        drop(section);
+
+        // Two statements already on the branch both want the section: the
+        // second is refused at once (neither could end waiting for the other's
+        // hold), and the first gets it when the second's statement ends.
+        {
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (asked_tx, asked_rx) = std::sync::mpsc::channel::<()>();
+            let other = Arc::clone(&drains);
+            let second = std::thread::spawn(move || {
+                let _hold = other.enter(9, "b").unwrap();
+                held_tx.send(()).unwrap();
+                asked_rx.recv().unwrap();
+                // The first is waiting by now, and this hold keeps it waiting.
+                while !other.state(9).exclusive {
+                    std::thread::yield_now();
+                }
+                let started = std::time::Instant::now();
+                let refused = other.exclusive(9, "b", std::time::Duration::from_secs(20)).err();
+                (refused.map(|e| e.to_string()), started.elapsed())
+            });
+            held_rx.recv().unwrap();
+            asked_tx.send(()).unwrap();
+            let granted = drains.exclusive(9, "b", std::time::Duration::from_secs(20));
+            assert!(granted.is_ok(), "the first gets the section once the second ended");
+            let (refused, took) = second.join().unwrap();
+            let refused = refused.expect("the second section is refused");
+            assert!(refused.contains(crate::error::BRANCH_BUSY_MARKER), "{refused}");
+            assert!(
+                took < std::time::Duration::from_secs(5),
+                "refused at once, took {took:?}"
+            );
+        }
+
+        // A new statement waits for the section and then proceeds.
+        let section = drains.exclusive(9, "b", short).unwrap();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter = {
+            let drains = Arc::clone(&drains);
+            let entered = Arc::clone(&entered);
+            std::thread::spawn(move || {
+                let hold = drains.enter(9, "b");
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert!(hold.is_ok(), "the statement proceeds once the section ends");
+            })
+        };
+        while drains.state(9).waiting_statements == 0 {
+            std::thread::yield_now();
+        }
+        assert!(
+            !entered.load(std::sync::atomic::Ordering::SeqCst),
+            "the statement waits for the section"
+        );
+        drop(section);
+        waiter.join().unwrap();
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(drains.state(9), BranchDrainState::default());
+    }
 
     /// sprinter 6bc4a4040eb7 (B1 fix pass): the drain. A close waits for the
     /// statements holding the branch, refuses new ones IMMEDIATELY (55006)

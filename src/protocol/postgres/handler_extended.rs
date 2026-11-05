@@ -30,8 +30,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // node-postgres) could never switch its own connection's branch. It
         // takes no parameters and returns no rows; Execute hands it to
         // `execute_params_for_session`, whose per-statement branch gate binds
-        // THIS session.
-        if super::handler::starts_with_icase(query.trim_start(), "USE ")
+        // THIS session. B3 second fix pass: so does `MERGE BRANCH x ABORT`, whose
+        // gate abandons the merge; the tables it names are in the server's log on
+        // this path, and in the rows the simple protocol sends.
+        if (super::handler::starts_with_icase(query.trim_start(), "USE ")
+            || super::handler::starts_with_icase(query.trim_start(), "MERGE "))
             && crate::EmbeddedDatabase::is_branch_binding_statement(&query)
         {
             self.prepared_statements.store_statement(PreparedStatement {
@@ -689,6 +692,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         if self.database.session_schema_active(self.session_id) {
             return None;
         }
+        // sprinter 6bc4a4040eb7 (phase B3): the same for a session on a
+        // branch, whose catalog can define a table differently from main's —
+        // the Execute path re-plans with the session's branch installed.
+        if self.database.session_on_branch(self.session_id) {
+            return None;
+        }
         let current_epoch = self.database.wire_plan_epoch();
         if let Some(plan) = &statement.cached_plan {
             if statement.cached_plan_epoch == current_epoch {
@@ -737,6 +746,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // Under a non-`public` session, the shared (public) plan would derive
         // the wrong table's columns; defer to the private schema path.
         if self.database.session_schema_active(self.session_id) {
+            return None;
+        }
+        // sprinter 6bc4a4040eb7 (phase B3): likewise on a branch — the private
+        // path derives the columns from the session's BRANCH catalog.
+        if self.database.session_on_branch(self.session_id) {
             return None;
         }
         let (plan, epoch) = self.database.wire_parameterized_plan(query).ok()?;
@@ -865,6 +879,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         if param_count == 0 {
             return Vec::new();
         }
+        // sprinter 6bc4a4040eb7 (phase B3): type the parameters from the
+        // session's branch catalog when it is on a branch.
+        let _branch_catalog = self.temp_namespace_guard();
         let current_schema = self.database.session_current_schema(self.session_id).unwrap_or(None);
         let current_search_path = self.database.session_search_path(self.session_id).unwrap_or_default();
         let catalog = self.database.storage.catalog();
@@ -897,6 +914,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     /// - `None` for queries that don't return results (INSERT, UPDATE, DELETE, DDL)
     fn derive_result_schema(&self, statement: &sqlparser::ast::Statement) -> Result<Option<crate::Schema>> {
         use sqlparser::ast::Statement;
+
+        // sprinter 6bc4a4040eb7 (phase B3): describe the relation the session
+        // will execute against — on a branch, its branch catalog's definition
+        // (an ADD COLUMN on the branch widens the RowDescription there only).
+        let _branch_catalog = self.temp_namespace_guard();
 
         // Resolve bare names against THIS session's `search_path` so Describe
         // reports the schema-scoped relation's columns (and doesn't fail on a

@@ -1947,6 +1947,17 @@ impl Touched {
                     self.branch_tables.insert(table.to_string());
                 }
             }
+            // sprinter 6bc4a4040eb7 (phase B3): a branch's own table
+            // definitions. No derived state on a standby: the branch catalog
+            // resolver and the branch view's overlay cache never cache on a
+            // physical standby (`StorageEngine::is_physical_standby`), so a
+            // branch session there reads every record from the applied bytes.
+            KeyClass::BranchMeta => {}
+            // Sprinter 6bc4a4040eb7 (B3 fix pass): a copy marker, a level's key
+            // index and main's table-incarnation id are bytes a read uses
+            // straight from the store; no standby cache derives from them, and
+            // only a writable primary's MERGE BRANCH compares an incarnation.
+            KeyClass::BranchFrozen | KeyClass::BranchKey | KeyClass::MetaTableIncarnation => {}
             KeyClass::VgcWatermark => self.vgc_watermark = true,
             // Spec P5.1: the dataset's epoch; no derived state, only the
             // engine's cache of it (what this standby reports and announces).

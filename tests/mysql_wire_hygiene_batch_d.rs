@@ -32,6 +32,8 @@
 
 use heliosdb_nano::protocol::mysql::MySqlHandler;
 use heliosdb_nano::protocol::postgres::timeouts::ConnectionTimeouts;
+use heliosdb_nano::storage::branch_catalog::MergeFailSite;
+use heliosdb_nano::storage::BranchState;
 use heliosdb_nano::EmbeddedDatabase;
 use std::sync::Arc;
 use std::time::Duration;
@@ -446,4 +448,38 @@ async fn query_last_serial_id_keeps_reporting_plain_tables() {
     let (affected, last_id) = c.ok_insert("INSERT INTO no_pk (v) VALUES (5)").await;
     assert_eq!(affected, 1);
     assert_eq!(last_id, 0, "a table with no primary key has no id to report");
+}
+
+// ===========================================================================
+// sprinter 6bc4a4040eb7 (B3 third fix pass): MERGE BRANCH x ABORT on this wire
+// ===========================================================================
+
+/// `MERGE BRANCH x ABORT` abandons the merge and answers with the tables it may
+/// have left partially changed, as a result set. It takes the path of the other
+/// branch statements, ahead of everything a stray `MERGE` would reach.
+#[tokio::test]
+async fn merge_branch_abort_answers_with_its_tables() {
+    let db = test_db();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    db.execute("CREATE BRANCH r AS OF NOW").unwrap();
+    db.execute("USE BRANCH r").unwrap();
+    db.execute("UPDATE t SET v = 2 WHERE id = 1").unwrap();
+    db.execute("USE BRANCH main").unwrap();
+    db.storage.debug_fail_merge_at(MergeFailSite::Row, 0);
+    db.execute("MERGE BRANCH r INTO main").unwrap_err();
+
+    let mut c = MySqlTestClient::login(Arc::clone(&db)).await;
+    let (columns, rows) = c.query("MERGE BRANCH r ABORT").await;
+    assert_eq!(columns, ["tables_possibly_changed"]);
+    assert_eq!(rows, vec![vec!["t".to_string()]]);
+    assert_eq!(db.storage.get_branch("r").unwrap().state, BranchState::Active);
+
+    let refused = c.send("MERGE BRANCH r ABORT").await;
+    assert_eq!(refused.first().copied(), Some(0xFF), "nothing left to abort");
+    assert!(
+        String::from_utf8_lossy(&refused).contains("no unfinished merge"),
+        "{}",
+        String::from_utf8_lossy(&refused)
+    );
 }

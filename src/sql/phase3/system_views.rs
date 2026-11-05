@@ -3721,6 +3721,11 @@ fn pg_table_oid_by_name(tables: &[String], table_name: &str) -> Option<i32> {
 
 fn sorted_art_indexes(storage: &StorageEngine) -> Vec<(String, String, ArtIndexType, Vec<String>)> {
     let mut indexes = storage.art_indexes().list_indexes();
+    // sprinter 6bc4a4040eb7 (B3 fix pass): main's index of a table the session's
+    // branch defined or dropped does not serve the branch's rows (a definition's
+    // PRIMARY KEY / UNIQUE rows come from its schema, in the callers).
+    let catalog = storage.catalog();
+    indexes.retain(|(_, table, _, _)| !catalog.branch_overrides(table));
     indexes.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
     indexes
 }
@@ -3736,6 +3741,10 @@ fn sorted_art_indexes(storage: &StorageEngine) -> Vec<(String, String, ArtIndexT
 /// different OID to the same index on every call.
 fn sorted_vector_indexes(storage: &StorageEngine) -> Vec<crate::storage::VectorIndexMetadata> {
     let mut indexes = storage.vector_indexes().list_all_metadata();
+    // sprinter 6bc4a4040eb7 (B3 fix pass): main's vector index of a table the
+    // session's branch defined or dropped does not serve the branch's rows.
+    let catalog = storage.catalog();
+    indexes.retain(|metadata| !catalog.branch_overrides(&metadata.table_name));
     indexes.sort_by(|left, right| left.table_name.cmp(&right.table_name).then(left.name.cmp(&right.name)));
     indexes
 }

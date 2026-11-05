@@ -1158,7 +1158,7 @@ fn branch_create_write_and_merge() {
     );
 
     // MERGE writes main's `data:` keys below the primary's index funnels.
-    // Spec P1.1b: it now re-derives main's indexes from them, so the PRIMARY
+    // Spec P1.1b: it now maintains main's indexes for each of them, so the PRIMARY
     // answers like a reopen of its own bytes — before, its live indexes lagged
     // its rows until it reopened, and this case compared the standby with
     // the fresh hydration only.

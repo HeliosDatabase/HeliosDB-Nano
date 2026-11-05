@@ -143,3 +143,43 @@ non-test paths. Report: files touched, the hook's placement and fast path, the m
 record formats, the creation linearization, the delete-event format and every reader
 changed, the reclaim algorithm, the doc changes, and anything in this spec that turned
 out wrong.
+
+## Inherited from B3's fix pass
+
+`docs/plans/specs/B3_branch_schema.md`, section "What B4 inherits", is part of this spec:
+`bfrz:` is already written by a branch `ADD COLUMN` and read by MERGE; the reclaim prefixes
+gain `bkey:{id}:`; reclaim runs after `finish_pending_branch_merges`, skips sources with an
+intent, and re-checks the state (`MERGE BRANCH x ABORT` returns a source to Active); the frozen
+record's `parent_fingerprint` and `parent_incarnation` rules; the live-descendants DDL refusal
+that this phase lifts, walked through merged branches; `bmeta:{id}:fork`, whose
+`ForkEntry { incarnation, fingerprint, columns }` is what MERGE compares a table's target
+definition against.
+
+From B3's third fix pass, which changed what MERGE does and what this phase may rely on:
+
+- **Lift one refusal.** MERGE now refuses 55000 when a branch changed rows of a table with no
+  fork entry ("created on the target after the fork"). Fork-point reads make such a table
+  invisible to the branch, so it cannot have changed rows of it: drop that branch of the check in
+  `plan_branch_merge` (the records loop and the rows-only loop) and its test
+  `merge_of_rows_of_a_table_created_on_the_target_after_the_fork_is_refused`, replacing it with
+  the visibility test above.
+- **Keep the other.** A branch with no fork record at all (created by an earlier release) stays
+  refused for any table it changed rows of: it has no fork point to read from either. Decide here
+  how such a branch reads, and say so in the upgrade notes.
+- **Frozen copies and the row phase.** MERGE into main lands each table as one main transaction
+  (`land_merged_table_on_main`), with its keys claimed in one step per tree, for the rows the branch
+  changed and no others: what is marked `bfrz:` never gets there. A frozen pre-image must stay marked, or
+  it reaches the claim as a change and can stop a merge on a key main moved since the fork, and it would
+  commit over main's row.
+- **Deletes.** That transaction deletes as any main transaction does. `AS OF` on main does not see a row
+  deleted after the timestamp today, merged or not; this phase's delete events change both, through the
+  commit and `scan_table_at_snapshot`, so no merge-specific path is needed.
+- **Materialization's last batch** holds only the rows a level changed, and it is refused 54000 when
+  over `MAX_BATCH_BYTES`; marked copies stay chunked. The freeze hook must not grow that batch, and a
+  frozen copy written in a final batch would count against it.
+- **The statement guard** (`enter_main_statement`, `MAIN_STATEMENT`) counts main's schema statements
+  per table, and a merge waits only on overlap. The freeze hook runs under it, in the statement's
+  thread: never move it off the thread, or the funnels under it refuse a statement a merge waits for.
+- **`CREATE BRANCH` with either end of an unfinished merge as its parent is refused** (55006), so
+  the fork-point snapshot never lands on a level part way through a merge. Keep that order in the
+  creation linearization.

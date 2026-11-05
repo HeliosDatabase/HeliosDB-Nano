@@ -1320,6 +1320,11 @@ impl MetaCommand {
         show_timing: bool,
         config: Option<&super::ReplConfig>,
     ) -> Result<MetaCommandResult> {
+        // sprinter 6bc4a4040eb7 (phase B3): the meta-commands read the catalog
+        // directly (`db.storage.catalog()`), outside every engine funnel — so
+        // publish the REPL handle's session (and its branch) first, and `\d` /
+        // `\dt` describe the branch the REPL is on (`\use`), not main.
+        let _catalog_scope = db.embedded_catalog_scope();
         match self {
             MetaCommand::Quit => Ok(MetaCommandResult::Quit),
 

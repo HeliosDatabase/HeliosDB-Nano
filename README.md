@@ -402,6 +402,35 @@ Branches can also fork from a past point in time:
 > cannot guarantee that — and an agent never can — use fork-test-discard as
 > designed: drop the branch and re-run the validated SQL against `main`.
 >
+> A merge is **refused before anything changes** when it could not apply cleanly: the
+> target changed the definition of a table the branch changed, even only its rows, or
+> dropped and recreated one since the fork, even identically (`55000`); the branch changed
+> rows of a table created on the target after it forked, or it was created by an earlier
+> release and so has no recorded fork point (`55000`: recreate the branch, or copy its rows);
+> a merged row's PRIMARY KEY / UNIQUE key is held by another target row (`23505`); or an open
+> transaction with staged writes on one of the merge's tables, on `main` too, stands in the
+> way (`55006`). The branch stays active and mergeable.
+>
+> On `main`, each table's changes land as one ordinary transaction, with versions and logical WAL:
+> a reader or a crash sees a table's merge wholly or not at all, `AS OF` and replication see it like any
+> commit, and a table whose changed rows would not fit in one atomic write is refused up front (`54000`).
+> The merge holds a table's changed rows in memory. Tables land one after another.
+>
+> If a merge stops part way (a failed write, a crash), run the same statement again; the next
+> writable open also tries (`55006` for what it holds until then). A table that already landed is left
+> alone. If it cannot finish, `MERGE BRANCH x ABORT` abandons it: the branch is active again, and the
+> statement lists the tables that may be partially changed. Nothing undoes what the merge already did to
+> them.
+>
+> A merge does not duplicate a key. A statement on `main` that takes a merged key first stops the
+> merge (`55006`: run it again once that is resolved); one that comes after gets its ordinary `23505`.
+> A transaction that read a row before the merge and commits a change to it after gets a serialization
+> failure (`40001`), at any isolation level.
+>
+> Schema statements on a branch (`CREATE TABLE`, `DROP TABLE`, `ADD COLUMN`) are refused
+> with `0A000` while the branch has live descendants, and with `55006` while another
+> open transaction has staged writes of the table.
+>
 > **An earlier version of this warning said `MERGE BRANCH` "merges nothing and
 > reports success". That was wrong** and is retracted — see `CHANGELOG.md`
 > [4.16.0]. The evidence came from tests driving `BranchTransaction`, an API with

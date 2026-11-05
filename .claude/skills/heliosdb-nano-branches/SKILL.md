@@ -68,6 +68,72 @@ short-lived branch off `main` where nothing else writes to `main`. When you cann
 guarantee that, fork-test-discard and re-run the validated SQL on the target instead.
 Agent runs should always discard, never merge.
 
+### What MERGE refuses, and what it finishes
+
+Two writers of the same row are still last-writer-wins, as above. These are not: each
+is refused **before anything changes**, the source stays `Active`, and it can be merged
+once the cause is gone.
+
+| SQLSTATE | Refused when |
+|---|---|
+| `55000` | The target changed the definition of a table the branch changed (columns, constraints, a new UNIQUE index) |
+| `55000` | The target **dropped and recreated** a table since the fork, even with an identical definition, and the branch changed its schema or only its rows |
+| `55000` | The target changed the definition of, renamed or dropped a table since the fork, and the branch changed its rows: they were written for the old definition and are copied by position. The message names the table and what changed |
+| `55000` | The branch changed rows of a table **created on the target after it forked**: nothing records the definition they were written for. Copy those rows by hand, or recreate the branch |
+| `55000` | The branch was **created by an earlier release**, so its fork point is not recorded, and it changed rows. Recreate it from the current target, or copy its rows. A branch that changed no rows still merges |
+| `55000` | The branch wrote rows of a table whose definition comes from an ancestor branch that is not merged into the target, or that merged into a branch since dropped |
+| `23505` | A row the merge would put on the target has a PRIMARY KEY / UNIQUE key another target row holds. The message names the table, the constraint and the key |
+| `55006` | An open transaction has staged writes on the source branch, or of one of the merge's tables on the target, `main` included: retry after it commits or rolls back |
+| `55006` | A statement on `main` has claimed a key a merged row holds and has not written its row yet: retry |
+| `55006` | Another merge has not finished and holds one of the tables, or a schema statement on one of the merge's tables is still running after the statement's 30 s budget: retry |
+| `54000` | A merge or `ADD COLUMN` on a branch carries more changed rows of a table than one atomic write can hold. Nothing was changed. The message names the table: copy those rows in smaller transactions, or change fewer per branch |
+| `0A000` | A schema change merged into a branch that has other live descendants, through merged branches too |
+
+`MERGE BRANCH main INTO x`, and a branch into itself, are refused outright.
+
+On `main`, each table's changes land as **one ordinary transaction**: versions, logical WAL, replication
+wait, conflict detection and the column store all come from its commit. A reader or a crash sees a table's
+merge wholly or not at all, and `AS OF` sees it like any commit. Tables land one after another, and the merge
+holds a table's changed rows in memory.
+
+A merge carries what the branch itself changed. The rows a branch `ADD COLUMN` copied are
+not changes: a row `main` updated or deleted after the branch's `ADD COLUMN` keeps `main`'s
+change, and `main`'s own column backfill gives it the same default.
+
+**A merge that stopped part way is unfinished, not undone.** After a failed write or a crash the
+error says `run it again to finish it` (SQLSTATE `55006`). Run the same `MERGE BRANCH` again; the
+next writable open also tries. Reads and DML on the target keep working meanwhile. Refused with
+`55006` until it is finished: DDL on its tables on the target (and on main, for tables a branch
+target inherits; `DROP TABLE` of a parent whose partition child it holds is refused whole), `DROP
+BRANCH` of either end, `CREATE BRANCH` over the source's name or with either end as the parent, a
+merge of its target, and a restore. The rerun validates keys again, on the tables that have not landed,
+so a key main wrote meanwhile refuses it (`23505`) until that row is gone. A table that landed is left
+alone: what main changed in it since stays.
+
+A schema statement on main already running when the merge arrives completes: the merge waits for it,
+then plans against the new state (and is refused `55000` if the definition moved). A statement on
+another table holds nothing up.
+
+**It does not always finish.** A step can find a state it refuses. Then abandon it:
+
+```sql
+MERGE BRANCH dev ABORT;   -- returns one row per table that may be partially changed
+```
+
+The source is `Active` again and everything the merge held is released. **What the merge already
+did to the target stays**: nothing keeps a pre-image to undo it with, so inspect the tables it
+names (they also go to the log at WARN). On `main` a table landed whole or not at all, so there is
+nothing to repair. Merging the branch again is validated from scratch and lands every table again: rows
+that landed are the merge's own, so it usually finishes; if the target changed underneath, expect a refusal
+and recreate the branch from the current target. A physical standby refuses `ABORT`: that is its primary's
+call.
+
+A merge does not duplicate a key. A statement on `main` that takes a merged key first stops the merge
+(`55006`, run it again once that is resolved, and it says `23505` while the row holding the key is there);
+one that comes after gets its ordinary `23505`. A transaction that read a row before the merge and commits a
+change to it after gets a serialization failure (`40001`), at any isolation level, READ COMMITTED included:
+retry it.
+
 ### History note — two stale warnings you may encounter
 
 Older copies of this skill, and `README.md` at HEAD, say `MERGE BRANCH` *"merges
@@ -210,6 +276,14 @@ staging or jurisdiction-pinned data. See `docs/guides/ha_cluster_tutorial.md`.
   For the same reason `COPY … FROM STDIN` and the embedded `execute_batch` on a
   branch autocommit chunk by chunk / statement by statement: they are **not atomic**
   on a branch — a failure part-way leaves the earlier rows on the branch.
+- **Schema statements on a branch run alone.** `CREATE TABLE`, `CREATE TABLE … AS`,
+  `DROP TABLE` and `ALTER TABLE … ADD COLUMN` wait for other statements on the branch
+  (up to 30 s, then `55006`), and new statements wait for them. They are refused with
+  `55006` while another open transaction has staged writes of the table: commit or roll
+  it back and retry.
+- **A branch with live descendants refuses schema statements** (`0A000`). A child reads
+  through its parent, so changing a table under it would change what it sees. A merged child
+  stays in its own children's chains, so a live grandchild counts. `DROP` the descendants first.
 - **DROP / MERGE wait for running statements.** A `DROP BRANCH` or `MERGE BRANCH`
   waits (up to 30 s) for the statements running on that branch, then takes it out
   of service; a statement that starts on the branch meanwhile is refused at once

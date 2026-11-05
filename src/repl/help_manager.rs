@@ -212,6 +212,10 @@ impl HelpManager {
         println!("\n{}", "Merging:".yellow());
         Self::print_command("MERGE BRANCH <source> INTO <target>", "Merge branches");
         Self::print_example("MERGE BRANCH dev INTO main");
+        Self::print_command(
+            "MERGE BRANCH <source> ABORT",
+            "Abandon an unfinished merge; lists the tables it may have partially changed",
+        );
 
         println!("\n{}", "Workflow Example:".green().bold());
         println!("  {}", "-- Create experimental branch".dimmed());

@@ -499,6 +499,13 @@ pub struct Catalog<'a> {
     storage: &'a StorageEngine,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread's reverse-FK question on a branch was answered
+    /// from the cache.
+    pub(crate) static BRANCH_FK_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl<'a> Catalog<'a> {
     /// Strictly decode every trigger record, preserving key context on failure.
     pub(crate) fn load_all_triggers_strict(&self) -> Result<Vec<crate::sql::TriggerDefinition>> {
@@ -881,8 +888,27 @@ impl<'a> Catalog<'a> {
 
     /// Create a table with the given schema
     pub fn create_table(&self, table_name: &str, schema: Schema) -> Result<()> {
+        self.create_table_with_incarnation(table_name, schema, super::branch_catalog::fresh_table_incarnation())
+    }
+
+    /// [`Self::create_table`], with the table's incarnation id given — MERGE
+    /// BRANCH carries a table a branch created into main under the id its
+    /// definition has, which is how a resumed merge recognizes a create it
+    /// already ran (sprinter 6bc4a4040eb7, B3 fix pass).
+    pub(crate) fn create_table_with_incarnation(
+        &self,
+        table_name: &str,
+        schema: Schema,
+        incarnation: u64,
+    ) -> Result<()> {
+        // sprinter 6bc4a4040eb7 (phase B3): MAIN's catalog. A branch's CREATE
+        // TABLE writes its own catalog overlay (`branch_schema.rs`) and never
+        // reaches here; anything else that does on a branch is refused (0A000).
+        // B3 second fix pass: and a table an unfinished merge holds is refused
+        // (55006), whatever route got here.
+        let _ddl = self.storage.main_catalog_write(&[table_name], "CREATE TABLE")?;
         // Check if table already exists
-        if self.table_exists(table_name)? {
+        if self.main_table_exists(table_name)? {
             return Err(Error::query_execution(format!("Table '{}' already exists", table_name)));
         }
 
@@ -980,21 +1006,32 @@ impl<'a> Catalog<'a> {
         // receive and apply the operation in the correct order.
         self.storage.log_create_table(table_name, &schema)?;
 
-        // Store schema
+        // Store the schema, the row counter (at 0) and the table's incarnation
+        // id in ONE batch (sprinter 6bc4a4040eb7, B3 fix pass): a table never
+        // exists without its id, and sealed as `StorageEngine::put` seals them.
         let key = Self::table_metadata_key(table_name);
         let value =
             bincode::serialize(&schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
-
-        self.storage.put(&key, &value)?;
-
-        // Update in-memory schema cache
-        self.storage.cache_schema(table_name, schema.clone());
-
-        // Initialize row counter to 0
         let counter_key = Self::table_counter_key(table_name);
         let counter_value =
             bincode::serialize(&0u64).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
-        self.storage.put(&counter_key, &counter_value)?;
+        let incarnation_value = bincode::serialize(&incarnation)
+            .map_err(|e| Error::storage(format!("Failed to serialize a table incarnation: {}", e)))?;
+        let key_manager = self.storage.key_manager_arc();
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(&key, super::tde::seal(key_manager.as_deref(), &value)?.as_ref());
+        batch.put(
+            &counter_key,
+            super::tde::seal(key_manager.as_deref(), &counter_value)?.as_ref(),
+        );
+        batch.put(
+            Self::table_incarnation_key(table_name),
+            super::tde::seal(key_manager.as_deref(), &incarnation_value)?.as_ref(),
+        );
+        self.storage.write_batch_through_gate(batch)?;
+
+        // Update in-memory schema cache
+        self.storage.cache_schema(table_name, schema.clone());
 
         // Auto-create ART indexes for PRIMARY KEY and UNIQUE constraints
         // (`art_manager` was resolved by the pre-flight above).
@@ -1146,6 +1183,13 @@ impl<'a> Catalog<'a> {
         if let Err(e) = self.storage.delete(&Self::table_counter_key(table_name)) {
             tracing::warn!(
                 "CREATE TABLE '{}' unwind: failed to delete row counter: {}",
+                table_name,
+                e
+            );
+        }
+        if let Err(e) = self.storage.delete(&Self::table_incarnation_key(table_name)) {
+            tracing::warn!(
+                "CREATE TABLE '{}' unwind: failed to delete the table's incarnation: {}",
                 table_name,
                 e
             );
@@ -1356,10 +1400,40 @@ impl<'a> Catalog<'a> {
                 push(uc.columns.clone());
             }
         }
-        for cols in self.storage.art_indexes().unique_column_sets(table_name) {
-            push(cols);
+        // sprinter 6bc4a4040eb7 (phase B3): main's ART registry describes
+        // MAIN's tables; a table the session's branch defines (or dropped)
+        // takes its rules from the branch definition instead.
+        match self.branch_unique_rules(table_name) {
+            Some(rules) => {
+                for rule in rules {
+                    push(rule.columns);
+                }
+            }
+            None => {
+                for cols in self.storage.art_indexes().unique_column_sets(table_name) {
+                    push(cols);
+                }
+            }
         }
         sets
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): the PRIMARY KEY / UNIQUE rules of a
+    /// table the running statement's branch defines (empty for one it
+    /// dropped); `None` when main's catalog — and so main's ART registry —
+    /// decides. A resolution error answers `None` (the callers are unique-set
+    /// questions that already fall back on the schema and constraint records).
+    fn branch_unique_rules(&self, table_name: &str) -> Option<Vec<super::branch_catalog::BranchUniqueRule>> {
+        let resolution = self.storage.session_branch_table(table_name).ok()??;
+        match resolution.exists()? {
+            true => Some(
+                resolution
+                    .definition()
+                    .map(|definition| definition.unique_rules.clone())
+                    .unwrap_or_default(),
+            ),
+            false => Some(Vec::new()),
+        }
     }
 
     /// Drop the ART unique index backing each of `removed` (unique constraints
@@ -1573,7 +1647,23 @@ impl<'a> Catalog<'a> {
     }
 
     /// Check if a table exists
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B3): on a branch the branch catalog
+    /// decides first (a table the branch created exists, one it dropped does
+    /// not); main's catalog answers for every table no level of the chain has
+    /// an entry for. On main: one thread-local read, then main's catalog.
     pub fn table_exists(&self, table_name: &str) -> Result<bool> {
+        if let Some(resolution) = self.storage.session_branch_table(table_name)? {
+            if let Some(exists) = resolution.exists() {
+                return Ok(exists);
+            }
+        }
+        self.main_table_exists(table_name)
+    }
+
+    /// Does MAIN's catalog hold `table_name` (`meta:table:`)? Whatever branch
+    /// the running statement is on — for main's own DDL and for MERGE.
+    pub(crate) fn main_table_exists(&self, table_name: &str) -> Result<bool> {
         let key = Self::table_metadata_key(table_name);
         Ok(self.storage.get(&key)?.is_some())
     }
@@ -1583,7 +1673,60 @@ impl<'a> Catalog<'a> {
     /// This method first checks if the table exists as a regular table.
     /// If not found, it checks if it exists as a materialized view and
     /// returns the MV's schema if found.
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B3): on a branch, the branch catalog
+    /// decides first — the NEAREST level of the session's chain with an entry
+    /// for the table (`storage::branch_catalog`): its definition, or "does not
+    /// exist" for a table that level dropped. A branch definition is never
+    /// cached in the name-keyed `schema_cache` (it is not main's); a table no
+    /// level has an entry for resolves exactly as on main, caches included.
     pub fn get_table_schema(&self, table_name: &str) -> Result<Schema> {
+        // The temp-table visibility rule applies whatever branch the session
+        // is on (and a branch refuses CREATE TEMPORARY TABLE, so no level has
+        // an entry for a temp key).
+        self.refuse_invisible_temp_table(table_name)?;
+        if let Some(resolution) = self.storage.session_branch_table(table_name)? {
+            match resolution {
+                super::branch_catalog::BranchTableResolution::Inherited => {}
+                super::branch_catalog::BranchTableResolution::Dropped { .. } => {
+                    return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
+                }
+                super::branch_catalog::BranchTableResolution::Defined { record, .. } => {
+                    let mut schema = record
+                        .definition()
+                        .map(|definition| definition.schema.clone())
+                        .ok_or_else(|| Error::internal("a branch table definition without a definition"))?;
+                    // B31 stamping, as below.
+                    for col in &mut schema.columns {
+                        if col.source_table_name.is_none() {
+                            col.source_table_name = Some(table_name.to_string());
+                        }
+                    }
+                    return Ok(schema);
+                }
+            }
+        }
+        self.main_table_schema(table_name)
+    }
+
+    /// sprinter 1703dba8e82d: the temp-table visibility rule of
+    /// [`Self::get_table_schema`] (see the comment in
+    /// [`Self::main_table_schema`]).
+    fn refuse_invisible_temp_table(&self, table_name: &str) -> Result<()> {
+        if self.storage.temp_tables_present() && crate::sql::temp_tables::is_temp_key(table_name) {
+            let mine = crate::sql::temp_tables::current_temp_namespace();
+            if !crate::sql::temp_tables::key_is_visible(table_name, mine.as_deref()) {
+                return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
+            }
+        }
+        Ok(())
+    }
+
+    /// MAIN's schema of `table_name` (a table, else a materialized view),
+    /// whatever branch the running statement is on — sprinter 6bc4a4040eb7
+    /// (phase B3): what a branch's first `ADD COLUMN` starts from and what
+    /// MERGE compares and changes.
+    pub(crate) fn main_table_schema(&self, table_name: &str) -> Result<Schema> {
         // sprinter 1703dba8e82d: a session-private (`pg_temp_*`) relation
         // resolves ONLY for the backend that owns it.
         //
@@ -1606,12 +1749,7 @@ impl<'a> Catalog<'a> {
         //
         // One relaxed atomic load on every deployment that never creates a temp
         // table, which is the only cost on the default path.
-        if self.storage.temp_tables_present() && crate::sql::temp_tables::is_temp_key(table_name) {
-            let mine = crate::sql::temp_tables::current_temp_namespace();
-            if !crate::sql::temp_tables::key_is_visible(table_name, mine.as_deref()) {
-                return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
-            }
-        }
+        self.refuse_invisible_temp_table(table_name)?;
         // Resolve the raw schema (in-memory cache -> on-disk metadata -> materialized view).
         let mut schema = if let Some(schema) = self.storage.get_cached_schema(table_name) {
             schema
@@ -1662,8 +1800,11 @@ impl<'a> Catalog<'a> {
     /// This is used by ALTER TABLE ALTER COLUMN SET STORAGE to
     /// persist storage mode changes.
     pub fn update_table_schema(&self, table_name: &str, schema: &Schema) -> Result<()> {
+        // sprinter 6bc4a4040eb7 (phase B3): MAIN's catalog only (see
+        // `create_table`); a branch's ADD COLUMN writes its catalog overlay.
+        let _ddl = self.storage.main_catalog_write(&[table_name], "ALTER TABLE")?;
         // Verify table exists
-        if !self.table_exists(table_name)? {
+        if !self.main_table_exists(table_name)? {
             return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
         }
 
@@ -1709,7 +1850,11 @@ impl<'a> Catalog<'a> {
         old: &str,
         new: &str,
     ) -> Result<Vec<String>> {
-        if !self.table_exists(table_name)? {
+        // sprinter 6bc4a4040eb7 (phase B3): MAIN's catalog only.
+        let _ddl = self
+            .storage
+            .main_catalog_write(&[table_name], "ALTER TABLE … RENAME COLUMN")?;
+        if !self.main_table_exists(table_name)? {
             return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
         }
         let value =
@@ -1827,7 +1972,12 @@ impl<'a> Catalog<'a> {
     /// before anything changed; then the logical-WAL `DropTable`, the
     /// in-memory teardown and the one write; then the caches.
     pub fn drop_table_taking_partition_children(&self, table_name: &str) -> Result<Vec<String>> {
-        if !self.table_exists(table_name)? {
+        // sprinter 6bc4a4040eb7 (phase B3): MAIN's catalog only. `DROP TABLE`
+        // on a branch writes a tombstone in the branch's catalog overlay
+        // (`branch_schema.rs`) and never reaches here; this used to drop MAIN's
+        // table and purge main's rows from a branch session (item 1).
+        let _ddl = self.storage.main_catalog_write(&[table_name], "DROP TABLE")?;
+        if !self.main_table_exists(table_name)? {
             return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
         }
 
@@ -1996,6 +2146,9 @@ impl<'a> Catalog<'a> {
     /// warned about, its own key still deleted, and nothing cascaded from it.
     fn stage_table_records_drop(&self, table_name: &str, batch: &mut rocksdb::WriteBatch) -> Result<Vec<String>> {
         batch.delete(Self::table_metadata_key(table_name));
+        // sprinter 6bc4a4040eb7 (B3 fix pass): a later CREATE of the name is
+        // another table, with another id.
+        batch.delete(Self::table_incarnation_key(table_name));
         batch.delete(Self::table_counter_key(table_name));
         batch.delete(Self::compression_config_key(table_name));
         batch.delete(Self::compression_stats_key(table_name));
@@ -2241,7 +2394,68 @@ impl<'a> Catalog<'a> {
     /// interleaving a session-private table would have renumbered every later
     /// table's OID for that one session — a moving OID under any ORM that
     /// caches them.
+    ///
+    /// # On a branch
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B3): main's tables minus the ones the
+    /// session's branch chain dropped, then the tables the chain defines that
+    /// main does not have, in name order, AFTER them — for the OID reason
+    /// above: a branch's own table never renumbers main's. (A table the
+    /// branch dropped does shift the later positions on that branch.)
     pub fn list_tables(&self) -> Result<Vec<String>> {
+        let tables = self.list_main_tables()?;
+        let Some(chain) = self.storage.session_branch_chain() else {
+            return Ok(tables);
+        };
+        let entries = self.storage.branch_tables_in_chain(&chain)?;
+        if entries.is_empty() {
+            return Ok(tables);
+        }
+        let mut out: Vec<String> = tables
+            .into_iter()
+            .filter(|table| entries.get(table).and_then(|entry| entry.exists()) != Some(false))
+            .collect();
+        let present: std::collections::HashSet<String> = out.iter().cloned().collect();
+        for (table, entry) in &entries {
+            if entry.exists() == Some(true) && !present.contains(table) {
+                out.push(table.clone());
+            }
+        }
+        Ok(out)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): does the running statement's branch
+    /// hold its own entry for `table` (a definition, or a drop)? Then main's
+    /// manual and vector indexes of the name, which serve main's rows, are not
+    /// the table's on this branch. `false` on main (one thread-local read).
+    pub(crate) fn branch_overrides(&self, table: &str) -> bool {
+        self.storage
+            .session_branch_table(table)
+            .ok()
+            .flatten()
+            .is_some_and(|resolution| resolution.exists().is_some())
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 third fix pass): `tables` and every partition
+    /// child below them, transitively: what dropping them takes with it. The
+    /// registry is main's. Unreadable registry records are left to the drop.
+    pub(crate) fn with_partition_descendants(&self, tables: Vec<String>) -> Vec<String> {
+        let mut all = tables;
+        let mut next = 0;
+        while let Some(table) = all.get(next).cloned() {
+            next += 1;
+            for child in self.partition_children(&table).unwrap_or_default() {
+                if !all.contains(&child) {
+                    all.push(child);
+                }
+            }
+        }
+        all
+    }
+
+    /// MAIN's tables visible to the caller — [`Self::list_tables`] without the
+    /// branch overlay: what main's own maintenance and MERGE enumerate.
+    pub(crate) fn list_main_tables(&self) -> Result<Vec<String>> {
         let tables = self.list_tables_including_temp()?;
         // Hot path: no temp table has ever existed in this database, so there
         // is nothing to filter and nothing to reorder. One relaxed load.
@@ -2292,6 +2506,8 @@ impl<'a> Catalog<'a> {
 
     /// Persist a user-created index definition in the catalog.
     pub fn save_index_definition(&self, index_name: &str, definition: &PersistedIndexDefinition) -> Result<()> {
+        // sprinter 6bc4a4040eb7 (B3 second fix pass): see `save_table_constraints`.
+        let _ddl = self.storage.enter_main_ddl(&[definition.table_name.as_str()])?;
         let key = Self::index_metadata_key(index_name);
         let value = Self::encode_index_definition(definition)?;
         self.storage.put(&key, &value)
@@ -2817,10 +3033,7 @@ impl<'a> Catalog<'a> {
         Ok(self.index_table_rows(table_name, schema, &tuples))
     }
 
-    /// The feed half of [`Self::backfill_table_indexes`], for a caller that
-    /// scanned the rows itself: `StorageEngine::merge_branch` scans BEFORE it
-    /// clears the trees it re-derives, so a failed scan can never leave a
-    /// registered index empty.
+    /// The feed half of [`Self::backfill_table_indexes`].
     pub(crate) fn index_table_rows(
         &self,
         table_name: &str,
@@ -3375,8 +3588,9 @@ impl<'a> Catalog<'a> {
     /// The internal three-step swap of a CONCURRENT materialized-view refresh is
     /// a different operation and uses [`Self::rename_table_data_swap`].
     pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
-        // Check that new table name is not already in use
-        if self.table_exists(new_name)? {
+        // Check that new table name is not already in use (MAIN's catalog —
+        // `rename_table_inner` refuses a branch session).
+        if self.main_table_exists(new_name)? {
             return Err(Error::query_execution(format!("Table '{}' already exists", new_name)));
         }
         self.rename_table_inner(old_name, new_name, true)
@@ -3406,7 +3620,7 @@ impl<'a> Catalog<'a> {
     /// compression config/stats, ART entries + `meta:index:` definitions,
     /// triggers, the schema caches) still moves: those describe the row set.
     pub(crate) fn rename_table_data_swap(&self, old_name: &str, new_name: &str) -> Result<()> {
-        if self.table_exists(new_name)? {
+        if self.main_table_exists(new_name)? {
             return Err(Error::query_execution(format!("Table '{}' already exists", new_name)));
         }
         self.rename_table_inner(old_name, new_name, false)
@@ -3426,8 +3640,13 @@ impl<'a> Catalog<'a> {
     }
 
     fn rename_table_inner(&self, old_name: &str, new_name: &str, move_side_records: bool) -> Result<()> {
+        // sprinter 6bc4a4040eb7 (phase B3): MAIN's catalog only — a rename on
+        // a branch is refused by the branch DDL layer; this is the backstop.
+        let _ddl = self
+            .storage
+            .main_catalog_write(&[old_name, new_name], "ALTER TABLE … RENAME TO")?;
         // Check that old table exists
-        if !self.table_exists(old_name)? {
+        if !self.main_table_exists(old_name)? {
             return Err(Error::query_execution(format!("Table '{}' does not exist", old_name)));
         }
 
@@ -3436,7 +3655,7 @@ impl<'a> Catalog<'a> {
         self.storage.log_rename_table(old_name, new_name)?;
 
         // Get the schema from old table
-        let schema = self.get_table_schema(old_name)?;
+        let schema = self.main_table_schema(old_name)?;
 
         // Get current row counter
         let old_counter_key = Self::table_counter_key(old_name);
@@ -3489,6 +3708,10 @@ impl<'a> Catalog<'a> {
         let schema_bytes =
             bincode::serialize(&schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
         let new_counter_key = Self::table_counter_key(new_name);
+        // sprinter 6bc4a4040eb7 (B3 fix pass): a renamed table is the same
+        // table — its incarnation id moves with it, in the batch that moves its
+        // schema, whichever rename this is (the MV swap and WAL replay too).
+        let incarnation = self.storage.get(&Self::table_incarnation_key(old_name))?;
 
         // The two values this batch SYNTHESIZES — the schema blob and the row
         // counter — are in-memory plaintext (`schema_bytes` was just serialized
@@ -3515,6 +3738,14 @@ impl<'a> Catalog<'a> {
         let mut batch = rocksdb::WriteBatch::default();
         batch.put(&new_metadata_key, stored_schema.as_ref());
         batch.put(&new_counter_key, stored_counter.as_ref());
+        match &incarnation {
+            Some(value) => batch.put(
+                Self::table_incarnation_key(new_name),
+                super::tde::seal(key_manager.as_deref(), value)?.as_ref(),
+            ),
+            None => batch.delete(Self::table_incarnation_key(new_name)),
+        }
+        batch.delete(Self::table_incarnation_key(old_name));
 
         let old_data_prefix = format!("data:{}:", old_name);
         let old_prefix_bytes = old_data_prefix.as_bytes();
@@ -4368,6 +4599,59 @@ impl<'a> Catalog<'a> {
     }
 
     /// Build metadata key for table schema
+    /// `meta:table_incarnation:{t}`: the incarnation id of main's table `t`
+    /// (`storage::branch_catalog`, sprinter 6bc4a4040eb7, B3 fix pass).
+    fn table_incarnation_key(table_name: &str) -> Vec<u8> {
+        format!("meta:table_incarnation:{}", table_name).into_bytes()
+    }
+
+    /// The incarnation id of main's table `table_name`; `None` when it has none
+    /// (no such table, or one no writable open has backfilled yet).
+    pub(crate) fn main_table_incarnation(&self, table_name: &str) -> Result<Option<u64>> {
+        match self.storage.get(&Self::table_incarnation_key(table_name))? {
+            Some(bytes) => bincode::deserialize(&bytes).map(Some).map_err(|e| {
+                Error::storage(format!(
+                    "the incarnation of table '{}' does not decode: {}",
+                    table_name, e
+                ))
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// Give main's table `table_name` the incarnation id `incarnation`.
+    pub(crate) fn set_table_incarnation(&self, table_name: &str, incarnation: u64) -> Result<()> {
+        let value = bincode::serialize(&incarnation)
+            .map_err(|e| Error::storage(format!("Failed to serialize a table incarnation: {}", e)))?;
+        self.storage.put(&Self::table_incarnation_key(table_name), &value)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): give every table of main created
+    /// before incarnation ids existed one, in one batch. Run by a writable open
+    /// (`StorageEngine::open`'s tail), never on a standby: a standby's bytes
+    /// come from its primary. Returns how many tables had none.
+    pub(crate) fn backfill_table_incarnations(&self) -> Result<usize> {
+        let key_manager = self.storage.key_manager_arc();
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut missing = 0usize;
+        for table in self.list_tables_including_temp()? {
+            if self.storage.get(&Self::table_incarnation_key(&table))?.is_some() {
+                continue;
+            }
+            let value = bincode::serialize(&super::branch_catalog::fresh_table_incarnation())
+                .map_err(|e| Error::storage(format!("Failed to serialize a table incarnation: {}", e)))?;
+            batch.put(
+                Self::table_incarnation_key(&table),
+                super::tde::seal(key_manager.as_deref(), &value)?.as_ref(),
+            );
+            missing += 1;
+        }
+        if missing > 0 {
+            self.storage.write_batch_through_gate(batch)?;
+        }
+        Ok(missing)
+    }
+
     fn table_metadata_key(table_name: &str) -> Vec<u8> {
         format!("meta:table:{}", table_name).into_bytes()
     }
@@ -4572,6 +4856,12 @@ impl<'a> Catalog<'a> {
             }
         }
         // 4. Any live PK/UNIQUE ART index — what `CREATE UNIQUE INDEX` leaves.
+        // sprinter 6bc4a4040eb7 (phase B3): for a table the session's branch
+        // defines, the branch definition's rules instead (main's ART describes
+        // main's tables).
+        if let Some(rules) = self.branch_unique_rules(table) {
+            return Ok(rules.iter().any(|rule| same(&rule.columns)));
+        }
         let art_manager = self.storage.art_indexes();
         Ok(art_manager.unique_column_sets(table).iter().any(|set| same(set)))
     }
@@ -4671,7 +4961,28 @@ impl<'a> Catalog<'a> {
 
     /// List the identity columns recorded for a table. Returns an
     /// empty Vec when the table has none (or when no record exists).
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B3): on a branch, a table a level of the
+    /// chain defines (or dropped) answers from that level's record.
     pub fn list_identity_columns(&self, table_name: &str) -> Result<Vec<String>> {
+        if let Some(resolution) = self.storage.session_branch_table(table_name)? {
+            match resolution.exists() {
+                Some(true) => {
+                    return Ok(resolution
+                        .definition()
+                        .map(|definition| definition.identity_columns.clone())
+                        .unwrap_or_default())
+                }
+                Some(false) => return Ok(Vec::new()),
+                None => {}
+            }
+        }
+        self.main_identity_columns(table_name)
+    }
+
+    /// MAIN's identity record of `table_name`, whatever branch the running
+    /// statement is on.
+    pub(crate) fn main_identity_columns(&self, table_name: &str) -> Result<Vec<String>> {
         let key = Self::identity_key(table_name);
         match self.storage.get(&key)? {
             Some(bytes) => {
@@ -5849,6 +6160,9 @@ impl<'a> Catalog<'a> {
 
     /// Save table constraints to persistent storage
     pub fn save_table_constraints(&self, table_name: &str, constraints: &crate::sql::TableConstraints) -> Result<()> {
+        // sprinter 6bc4a4040eb7 (B3 second fix pass): a table an unfinished merge
+        // holds is refused (55006), whatever route got here.
+        let _ddl = self.storage.enter_main_ddl(&[table_name])?;
         let key = Self::table_constraints_key(table_name);
         let value = bincode::serialize(constraints)
             .map_err(|e| Error::storage(format!("Failed to serialize table constraints: {}", e)))?;
@@ -5867,7 +6181,29 @@ impl<'a> Catalog<'a> {
     }
 
     /// Load table constraints from persistent storage
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B3): on a branch, a table a level of the
+    /// chain defines answers with that definition's constraints (never cached
+    /// under the name — it is not main's), one the chain dropped with none.
     pub fn load_table_constraints(&self, table_name: &str) -> Result<crate::sql::TableConstraints> {
+        if let Some(resolution) = self.storage.session_branch_table(table_name)? {
+            match resolution.exists() {
+                Some(true) => {
+                    return Ok(resolution
+                        .definition()
+                        .map(|definition| definition.constraints.clone())
+                        .unwrap_or_default())
+                }
+                Some(false) => return Ok(crate::sql::TableConstraints::default()),
+                None => {}
+            }
+        }
+        self.main_table_constraints(table_name)
+    }
+
+    /// MAIN's constraint record of `table_name`, whatever branch the running
+    /// statement is on.
+    pub(crate) fn main_table_constraints(&self, table_name: &str) -> Result<crate::sql::TableConstraints> {
         if let Some(constraints) = self.storage.get_cached_table_constraints(table_name) {
             return Ok(constraints);
         }
@@ -5946,7 +6282,71 @@ impl<'a> Catalog<'a> {
     }
 
     /// Get all foreign key constraints referencing a specific table
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B3): on a branch whose chain holds table
+    /// entries, the children are main's tables the chain does not redefine or
+    /// drop, plus the tables the chain defines — computed, never cached (the
+    /// reverse-FK cache is keyed by the referenced name alone and describes
+    /// main).
     pub fn get_referencing_fks(&self, referenced_table: &str) -> Result<Vec<crate::sql::ForeignKeyConstraint>> {
+        if let Some(chain) = self.storage.session_branch_chain() {
+            // sprinter 6bc4a4040eb7 (B3 fix pass): asked once per deleted or
+            // updated row, and answering it decodes every level's records and
+            // every constraint blob: cached per (branch, table), validated by
+            // the schema generation every branch-catalog write bumps (read
+            // BEFORE the answer is computed), and emptied with main's cache.
+            let branch = chain.last().copied().unwrap_or(0);
+            let generation = self.storage.schema_generation();
+            if let Some(cached) = self
+                .storage
+                .cached_branch_referencing_fks(branch, referenced_table, generation)
+            {
+                #[cfg(test)]
+                BRANCH_FK_CACHE_HITS.with(|hits| hits.set(hits.get() + 1));
+                return Ok(cached);
+            }
+            let entries = self.storage.branch_tables_in_chain(&chain)?;
+            let result = if entries.is_empty() {
+                self.main_referencing_fks(referenced_table)?
+            } else {
+                let mut result = Vec::new();
+                for (table_name, value) in self.storage.meta_blobs_with_prefix("table_constraints:")? {
+                    if entries.contains_key(&table_name) {
+                        continue;
+                    }
+                    let constraints: crate::sql::TableConstraints = bincode::deserialize(&value).map_err(|e| {
+                        Error::storage(format!("Failed to deserialize constraints for '{}': {}", table_name, e))
+                    })?;
+                    result.extend(
+                        constraints
+                            .foreign_keys
+                            .into_iter()
+                            .filter(|fk| fk.references_table == referenced_table),
+                    );
+                }
+                for entry in entries.values() {
+                    if let Some(definition) = entry.definition() {
+                        result.extend(
+                            definition
+                                .constraints
+                                .foreign_keys
+                                .iter()
+                                .filter(|fk| fk.references_table == referenced_table)
+                                .cloned(),
+                        );
+                    }
+                }
+                result
+            };
+            self.storage
+                .cache_branch_referencing_fks(branch, referenced_table, generation, result.clone());
+            return Ok(result);
+        }
+        self.main_referencing_fks(referenced_table)
+    }
+
+    /// Main's foreign keys that reference `referenced_table`.
+    fn main_referencing_fks(&self, referenced_table: &str) -> Result<Vec<crate::sql::ForeignKeyConstraint>> {
         if let Some(cached) = self.storage.get_cached_referencing_fks(referenced_table) {
             return Ok(cached);
         }

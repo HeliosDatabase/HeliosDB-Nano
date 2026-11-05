@@ -108,7 +108,12 @@ pub async fn create_branch(
     // Create the branch — off the async worker (sprinter ccebc95977f1,
     // `runtime_offload`): it copies branch state synchronously.
     let created = crate::runtime_offload::offload_statement(|| {
-        branch_manager.create_branch(&request.name, request.parent.as_deref(), snapshot_id, options)
+        // Through the engine (sprinter 6bc4a4040eb7, B3 fix pass): the branch's
+        // fork record of table incarnations is born in its creation batch.
+        state
+            .db
+            .storage
+            .create_branch_at_snapshot(&request.name, request.parent.as_deref(), Some(snapshot_id), options)
     });
     let branch_id = created.map_err(|e| {
         error!("Failed to create branch '{}': {}", request.name, e);

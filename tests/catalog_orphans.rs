@@ -293,7 +293,7 @@ fn rename_column_rewrites_the_index_definitions_a_reopen_registers() {
     run(&db, "INSERT INTO accounts VALUES (5, 'bob', 30)");
 }
 
-/// MERGE BRANCH into main re-derives main's indexes from the rows it wrote,
+/// MERGE BRANCH into main maintains main's indexes for each row it writes,
 /// so the live primary answers exactly like the strict hydration of its own
 /// checkpoint. Red before the fix: the merged row 3 was missing from the
 /// primary's PRIMARY KEY and secondary indexes (its PK lookup missed), and the

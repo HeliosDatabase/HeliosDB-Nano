@@ -28,6 +28,27 @@ struct ReplHelper {
     completer: SqlCompleter,
 }
 
+/// Whether the shell runs `sql` on the query route, for its rows, rather than as
+/// a command, which only shows a row count.
+fn sql_returns_rows(sql: &str) -> bool {
+    let sql_upper = sql.trim().to_uppercase();
+    sql_upper.starts_with("SELECT")
+        || sql_upper.starts_with("WITH")
+        || sql_upper.starts_with("TABLE")
+        || sql_upper.starts_with("VALUES")
+        || sql_upper.starts_with("EXPLAIN")
+        || sql_upper.starts_with("PRAGMA")
+        // SHOW BRANCHES / SHOW DATABASE BRANCHES / SHOW <var> all
+        // produce result rows; without this the executor still
+        // returns the tuples but `db.execute()` discards them and
+        // only the row count surfaces ("Query OK, N row(s) affected").
+        || sql_upper.starts_with("SHOW")
+        // `MERGE BRANCH x ABORT` answers with the tables it may have left
+        // partially changed.
+        || crate::sql::Parser::parse_merge_branch_abort(sql).is_some()
+        || sql_upper.contains(" RETURNING ")
+}
+
 impl Helper for ReplHelper {}
 impl Validator for ReplHelper {}
 impl Highlighter for ReplHelper {}
@@ -265,8 +286,13 @@ impl ReplShell {
                         // Clear buffer
                         multi_line_buffer.clear();
 
-                        // Update table names for completion
-                        if let Ok(tables) = self.db.storage.catalog().list_tables() {
+                        // Update table names for completion — the tables of
+                        // the branch the REPL is on (sprinter 6bc4a4040eb7, B3).
+                        let tables = {
+                            let _catalog_scope = self.db.embedded_catalog_scope();
+                            self.db.storage.catalog().list_tables()
+                        };
+                        if let Ok(tables) = tables {
                             if let Some(helper) = self.editor.helper_mut() {
                                 helper.completer.set_table_names(tables);
                             }
@@ -346,21 +372,8 @@ impl ReplShell {
         // EXPLAIN also returns results, so treat it as a query.
         // PRAGMA table_info(...) returns rows; route it through the query path.
         let sql_upper = sql.trim().to_uppercase();
-        let has_returning = sql_upper.contains(" RETURNING ");
-        let is_query = sql_upper.starts_with("SELECT")
-            || sql_upper.starts_with("WITH")
-            || sql_upper.starts_with("TABLE")
-            || sql_upper.starts_with("VALUES")
-            || sql_upper.starts_with("EXPLAIN")
-            || sql_upper.starts_with("PRAGMA")
-            // SHOW BRANCHES / SHOW DATABASE BRANCHES / SHOW <var> all
-            // produce result rows; without this the executor still
-            // returns the tuples but `db.execute()` discards them and
-            // only the row count surfaces ("Query OK, N row(s) affected").
-            || sql_upper.starts_with("SHOW")
-            || has_returning;
 
-        if is_query {
+        if sql_returns_rows(sql) {
             // PRAGMA short-circuit: sqlparser doesn't recognise PRAGMA, so
             // we synthesise a fixed schema for `table_info(t)` and an empty
             // result schema for connection-tunable PRAGMAs (foreign_keys,
@@ -506,5 +519,23 @@ impl ReplShell {
             "\\q".cyan()
         );
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sql_returns_rows;
+
+    /// sprinter 6bc4a4040eb7 (B3 third fix pass): the REPL shows what an ABORT
+    /// reports (the tables it may have left partially changed), and an ordinary
+    /// merge stays a command.
+    #[test]
+    fn the_shell_runs_a_merge_abort_for_its_rows() {
+        assert!(sql_returns_rows("MERGE BRANCH r ABORT"));
+        assert!(sql_returns_rows("merge database branch r abort;"));
+        assert!(!sql_returns_rows("MERGE BRANCH r INTO main"));
+        assert!(sql_returns_rows("SELECT 1"));
+        assert!(sql_returns_rows("DELETE FROM t RETURNING id"));
+        assert!(!sql_returns_rows("DELETE FROM t"));
     }
 }

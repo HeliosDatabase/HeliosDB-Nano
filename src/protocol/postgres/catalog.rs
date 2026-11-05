@@ -1813,6 +1813,11 @@ impl PgCatalog {
     /// schema (and would list them twice), and PostgreSQL has no index row for
     /// a bare foreign key. Sorted by name so `\d` output is stable.
     fn manual_art_indexes_for(db: &EmbeddedDatabase, table: &str) -> Vec<(String, Vec<String>)> {
+        // sprinter 6bc4a4040eb7 (B3 fix pass): main's index of a table this
+        // branch defined or dropped does not serve the branch's rows.
+        if db.storage.catalog().branch_overrides(table) {
+            return Vec::new();
+        }
         let mut found: Vec<(String, Vec<String>)> = db
             .storage
             .art_indexes()
@@ -1834,6 +1839,9 @@ impl PgCatalog {
     /// that a `CREATE INDEX … USING HNSW` index did not exist: every psql
     /// shape in this file derived its index list from the table schema alone.
     fn vector_indexes_for(db: &EmbeddedDatabase, table: &str) -> Vec<crate::storage::VectorIndexMetadata> {
+        if db.storage.catalog().branch_overrides(table) {
+            return Vec::new();
+        }
         let mut found: Vec<crate::storage::VectorIndexMetadata> = db
             .storage
             .vector_indexes()

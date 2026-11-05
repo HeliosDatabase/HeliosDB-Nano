@@ -214,6 +214,8 @@ pub struct SnapshotManager {
     /// `RwLock<u64>` write lock, one of ~6 SnapshotManager lock acquisitions
     /// per version write and a global serialization point at high concurrency.
     current_scn: Arc<AtomicU64>,
+    /// The newest timestamp registered as a snapshot.
+    newest_snapshot_ts: AtomicU64,
     /// Current transaction ID counter (W2.2(d): lock-free `AtomicU64`, see above).
     current_txn_id: Arc<AtomicU64>,
     /// Snapshot read cache for performance. W2.2(c): each entry carries the
@@ -333,6 +335,7 @@ impl SnapshotManager {
             txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             current_scn: Arc::new(AtomicU64::new(1)),
+            newest_snapshot_ts: AtomicU64::new(0),
             current_txn_id: Arc::new(AtomicU64::new(1)),
             snapshot_cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
             snapshot_cache_gen: Arc::new(dashmap::DashMap::new()),
@@ -369,6 +372,7 @@ impl SnapshotManager {
             txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             current_scn: Arc::new(AtomicU64::new(1)),
+            newest_snapshot_ts: AtomicU64::new(0),
             current_txn_id: Arc::new(AtomicU64::new(1)),
             snapshot_cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
             snapshot_cache_gen: Arc::new(dashmap::DashMap::new()),
@@ -396,6 +400,7 @@ impl SnapshotManager {
             txn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             scn_to_timestamp: Arc::new(RwLock::new(HashMap::new())),
             current_scn: Arc::new(AtomicU64::new(1)),
+            newest_snapshot_ts: AtomicU64::new(0),
             current_txn_id: Arc::new(AtomicU64::new(1)),
             snapshot_cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
             snapshot_cache_gen: Arc::new(dashmap::DashMap::new()),
@@ -572,6 +577,7 @@ impl SnapshotManager {
         let scn = self.next_scn();
 
         let metadata = SnapshotMetadata::new(timestamp, txn_id, scn);
+        self.newest_snapshot_ts.fetch_max(timestamp, Ordering::AcqRel);
 
         // Store in-memory
         self.snapshots.write().insert(timestamp, metadata.clone());
@@ -1762,6 +1768,11 @@ impl SnapshotManager {
         self.snapshots.read().get(&timestamp).cloned()
     }
 
+    /// Has a snapshot newer than `timestamp` been registered?
+    pub fn has_snapshot_after(&self, timestamp: u64) -> bool {
+        self.newest_snapshot_ts.load(Ordering::Acquire) > timestamp
+    }
+
     /// Get current SCN
     pub fn current_scn(&self) -> Scn {
         self.current_scn.load(Ordering::Relaxed)
@@ -1882,6 +1893,7 @@ impl SnapshotManager {
         // Update counters. W2.2(d): fetch_max is the atomic
         // equivalent of the former `if id >= *counter { *counter = id + 1 }`.
         self.current_scn.fetch_max(metadata.scn + 1, Ordering::Relaxed);
+        self.newest_snapshot_ts.fetch_max(metadata.timestamp, Ordering::AcqRel);
         self.current_txn_id
             .fetch_max(metadata.transaction_id + 1, Ordering::Relaxed);
     }

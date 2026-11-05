@@ -609,9 +609,21 @@ impl<'a> StorageWebhookHandler<'a> {
         });
 
         // Create the preview branch
-        let branch_id =
-            self.branch_manager
-                .create_branch(&preview_branch_name, Some(target_branch), snapshot_ts, options)?;
+        // Through the engine when one is attached (sprinter 6bc4a4040eb7, B3 fix
+        // pass): the fork record of table incarnations is born in the creation
+        // batch.
+        let branch_id = match self.engine {
+            Some(engine) => engine.create_branch_at_snapshot(
+                &preview_branch_name,
+                Some(target_branch),
+                Some(snapshot_ts),
+                options,
+            )?,
+            None => {
+                self.branch_manager
+                    .create_branch(&preview_branch_name, Some(target_branch), snapshot_ts, options)?
+            }
+        };
 
         tracing::info!(
             "Preview branch '{}' created with ID {} for PR #{}",

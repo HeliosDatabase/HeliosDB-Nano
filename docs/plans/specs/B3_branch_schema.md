@@ -134,3 +134,436 @@ Do not run cargo, git or any build. Both executor families. No new `unwrap`/`exp
 non-test paths. Report: files touched, the `bmeta` record format, every catalog reader
 routed through the resolver, every DDL entry point and what it now does on a branch, the
 merge algorithm, and anything in this spec that turned out wrong.
+
+## Fix pass (decisions; sprinter 6bc4a4040eb7)
+
+The first B3 tree passed its gate and a review found two high findings and several
+smaller ones; three more reviews of the fixes found more, the last on a live server. This
+section records what the code does now and why, after all four. It overrides the sections
+above where they differ.
+
+### MERGE: copies are not changes
+
+`bfrz:{L}:{t}:{r}` (empty value) says "level L's entry for row r is a copy, not a change
+made on L". A branch `ADD COLUMN` writes it for every row the level did not already hold
+(asked of the level's own keys, never of the tuple's `branch_id`). Any write of the row
+on the level clears it, in the same batch or transaction. MERGE copies only images and
+tombstones without a marker; into a branch target, a merged row's marker is deleted,
+because it is now the target's own change. Without this, MERGE reverted every row main
+changed after the branch's `ADD COLUMN`.
+
+### MERGE: refuse before, finish after
+
+There are two phases and nothing in between.
+
+1. **Validate, changing nothing.** Refusals leave the source Active and mergeable:
+   - definition changed on the target (fingerprint): 55000, for a table the branch changed
+     the schema of, and for one it only changed rows of (below);
+   - table recreated on the target (incarnation, amendment A): 55000;
+   - table gone from the target (dropped or renamed): 55000;
+   - rows of a table created on the target after the fork, or of any table when the branch has
+     no fork record at all (amendment A): 55000, naming what to do instead;
+   - rows of a definition an unmerged ancestor owns: 55000 (an ancestor already merged into
+     the target's lineage is carried, and refuses nothing; one merged into a branch since dropped
+     can never reach the target, and is told so rather than to "merge that branch first");
+   - a PRIMARY KEY / UNIQUE key the target already holds (amendment B): 23505;
+   - a table whose changed rows would not fit in one write group: 54000;
+   - a key an in-flight statement on main claimed and has not written: 55006;
+   - open staged writes on the source, or on any table of the merge on the target, main or
+     branch: 55006;
+   - a schema change into a branch with other live descendants: 0A000;
+   - main as the source, or a branch into itself: refused outright.
+2. **Write the intent, synced, then roll forward.** `branch:merge:{source}` is `BMI1` +
+   version + sealed bincode of `MergeIntent`. The source is marked Merged after it. An
+   error from here on leaves the intent in place and says "run it again to finish it"
+   (55006). Rerunning the MERGE finishes it, and so does the next open
+   (`finish_pending_branch_merges`, after `rebuild_all_indexes` in both constructors,
+   skipped on a physical standby, and a failure never fails the open).
+
+Roll forward, never back: rolling back would need the pre-image of every dropped table and
+of every row an `ADD COLUMN` rewrote in place, which the engine does not keep.
+
+Every step is idempotent, decided by what the target holds now:
+
+| Step | Already ran when | Applies when | Otherwise |
+|---|---|---|---|
+| `DropOnMain` | no such table | definition is `before` | refuses |
+| `CreateOnMain` | main's incarnation is the definition's own, or (a WAL replay re-created it) another id on the definition's columns; re-runs the idempotent constraint writes | no such table, or definition is `before` (drops it first) | refuses |
+| `AddColumnsOnMain` | columns are `base ++ all added` (still re-runs the backfill) | columns are `base ++ a prefix of added` | refuses |
+| `PutOnBranch` | the level holds exactly the step's record bytes (the record is written last) | definition is `before` | refuses |
+
+Three differences from the design:
+
+- There is no `after` fingerprint. A created table keeps its definition's incarnation on main
+  (`create_table_with_incarnation`), which identifies "this create already ran" exactly,
+  including a crash between its schema and its constraint records; a fingerprint could not
+  tell that partial state from a foreign table.
+- A step does not compare the incarnation. The plan did, under the exclusion, and the target's
+  DDL has been held off the table since. A different id at a resume can only be a WAL replay at
+  open minting one for the same table (a DROP + CREATE inside the checkpoint window), which must
+  not leave the merge unfinishable.
+- A resume runs the key validation again, the open-writers refusal, and the live-descendants
+  refusal, on the tables whose rows have not landed: main's DML stays open during a pending merge.
+  An error there leaves the merge pending and changes nothing further.
+
+`backfill_added_columns` is the idempotent sibling of `add_column_to_rows`: it extends only
+rows narrower than the new width, with the same W2.5 / W3.2 fences. All main-side catalog
+writes of a merge are in `apply_merge_step_to_main`; its drop is main's drop (partition
+children cascade, pushdown structures go, the live trigger registry is told).
+
+After a failed row phase, the tables that landed are whole, in main's indexes and in main's history,
+and a branch target's write generations still move: the rerun may be a long way off, and main serves
+meanwhile.
+
+### What an unfinished merge holds
+
+While an intent exists:
+
+- The target's DDL on the merge's tables, rows-only tables included, is refused 55006. A branch
+  target that inherits a table from main is exposed to main's DDL on it, so that is refused too
+  (`MergeIntent.main_tables`, a shared hold: several merges may depend on one main table, but
+  none may write it meanwhile).
+- The refusal is in the catalog funnels (`StorageEngine::main_catalog_write`, with a bypass for
+  the merge's own thread), not only at the plan gate, so `db.query`'s cold path, `DROP SCHEMA …
+  CASCADE`, restore and the protocol adapter are covered. A restore on a store with an intent is
+  refused outright.
+- A schema statement on main is counted, per table it names, for its whole duration, announced
+  BEFORE it reads the exclusions (`main_ddl_statement_guard` -> `enter_main_statement`). A merge
+  registers BEFORE it reads the count, and waits only for statements on ITS tables. So either the
+  statement sees the exclusion, or the merge sees the statement. The plan is re-read after that, and
+  what gets held is the FINAL plan's table list. A statement naming no table skips the count, and a
+  temporary table does not count.
+- **Past that check a statement is never refused again** (third fix pass). It set a thread-local;
+  the catalog funnels under it count but do not refuse, because the merge is waiting for it and a
+  refusal half way tears what it already did: `ALTER COLUMN … SET STORAGE` rewrites its rows before it
+  writes the schema, and `CREATE INDEX` builds its tree before it records the definition. Only a route
+  with no statement guard (a direct catalog call, restore, the protocol adapter) is refused at the
+  funnel. The merge then plans against the new state.
+- **One budget.** A MERGE statement waits at most `BRANCH_DRAIN_TIMEOUT` (30 s) in all: closing its
+  source, its section on a branch target and every wait for main's statements share one deadline.
+- `DROP TABLE` and `DROP SCHEMA … CASCADE` name the partition children they take, transitively, so
+  they are refused up front when a merge holds a child, never half way through. A merged drop or
+  re-create lists them among its tables too: held, and in the report of an ABORT.
+- A new branch with a parent that is either end of an unfinished merge is refused 55006: it would read
+  through a level part way through being rewritten, and a resume would rewrite it under the child.
+- A second merge that needs one of the tables is refused 55006 (`BRANCH_MERGE_BUSY_MARKER`,
+  told to retry, not to "run it again": it has nothing to finish).
+- A merge of a branch another intent writes into, or into a branch with an intent of its own, is
+  refused 55006: it would leave that intent unfinishable. DROP BRANCH of either end, and CREATE
+  BRANCH over the source's name, are refused in `BranchManager`, so every surface is covered.
+
+### The way out: `MERGE BRANCH x ABORT`
+
+A merge is rolled forward whenever it can be, but not every intent CAN finish: a step can find
+a state it refuses, after an operator's hand on the store, or a key conflict nobody will resolve.
+Without an exit that state would hold its tables and both ends forever.
+
+`MERGE [DATABASE] BRANCH x ABORT` puts the source back to Active, deletes the intent, moves what
+serves the rows by generation (main's schema generation, or a branch target's write generations),
+releases the exclusion LAST, and returns one row per table that may be partially changed, partition
+children of a merged drop included; the same list goes to the log at WARN. It rebuilds nothing: on main a
+table's rows landed whole or not at all, with their keys. It undoes nothing: the engine keeps no pre-image
+to undo with. Merging the source again is validated from scratch, and lands every table again, over
+whatever main did since; rows that landed are the merge's own, so it usually finishes, and is refused if
+the target changed underneath. A physical standby refuses it up front with the standard standby refusal:
+abandoning a merge is its primary's call.
+
+Answered by the branch statement gate (`classify_branch_statement`), for the same reason as `USE
+BRANCH`: the gate is in both executor families, the query path and the wire listeners, and the
+params family has no grammar for it. So it works from the embedded API, both PostgreSQL protocols
+(rows on simple, log only on extended), MySQL and the REPL, off the async worker on both wires, since
+it can wait for the statements on the branch. No grammar change to `MERGE BRANCH …
+INTO`. Metadata is written Active before the intent is deleted: a crash between the two leaves an
+intent on an Active source, which the next open finishes, instead of a Merged source with nothing
+to finish it.
+
+### Amendment A: table incarnations
+
+MERGE must refuse `DROP TABLE t` + an identical `CREATE TABLE t` on main (plan D4: the
+target's definition changed since the fork). The fingerprint cannot see that.
+
+- `meta:table_incarnation:{t}`: a **random u64**, not a counter, so no counter key has to
+  stay durable across a crash or a replica. Written in CREATE TABLE's batch (schema, row
+  counter and id are now one batch), deleted in DROP's one-group purge, moved by RENAME in
+  its batch (every rename: relation, MV swap, WAL replay). Classified
+  `KeyClass::MetaTableIncarnation`; it replicates as catalog, and no standby state derives
+  from it.
+- Tables with no key get one at the first writable open, in one batch
+  (`Catalog::backfill_table_incarnations`), never on a standby.
+- **Compared separately from the fingerprint, not an input to it.** A merged CREATE gives
+  the target the definition's id, and an `ADD COLUMN` keeps the base's; keeping the two
+  apart means each answers one question.
+- `BranchTableDefinition.incarnation`: fresh for a branch-created table, the base's for
+  ADD COLUMN, main's for main's. `BranchTableRecord.parent_incarnation`: the parent's at the
+  level's first entry for the table.
+- **One fork record per branch**: `bmeta:{id}:fork` = `BMF1` + version + bincode of
+  `table -> ForkEntry { incarnation, fingerprint, columns }` for every table the parent sees,
+  written in the branch's creation batch (`BranchManager::create_branch_with`). So the check
+  covers a branch that changed only rows, and a first DDL that ran after main recreated the table.
+- **A table with no incarnation is UNKNOWN, never different** (`incarnations_differ`): that
+  only happens after a failed backfill, and the backfill that later succeeds must not turn into
+  a false refusal. A branch's `ADD COLUMN` of such a table mints an id for its own definition,
+  because the id also salts the key index.
+
+The checks: a table with a record needs `target now == record.parent_incarnation`, and
+`F(t) == record.parent_incarnation` when the fork record has `t`. A table with only rows
+needs `target now == F(t)` when the fork record has `t`.
+
+**A rows-only merge across a definition change is refused too** (second review, H2): a table the
+branch changed rows of must have, on the target, the fingerprint it had at the fork, or the merge
+is refused 55000 naming the table and what changed (the columns then and now, or "its constraints
+or unique indexes"). Fail closed, no row shaping: rows are copied by position, so `DROP COLUMN` on
+main used to land `(1,10,21)` under a two-column schema and main then read `b = 10`, and `ADD
+COLUMN … NOT NULL` landed NULL. The same holds for a table with a record: `F(t)` must be the
+definition the branch first changed. A table gone from the target says so, instead of "dropped and
+created again" (it may have been renamed).
+
+**Nothing to compare fails closed** (third fix pass; the same `(1,10,21)` recurs otherwise):
+
+- A table with no fork entry that the branch changed rows of was created on the target after the fork.
+  It is read live until B4 makes it invisible to the branch. MERGE refuses 55000, saying it was created
+  on the target after the branch forked, and to copy the rows by hand or recreate the branch.
+- A branch with no fork record at all was created by an earlier release. MERGE refuses 55000 for any
+  table it changed rows of, saying its fork point is not recorded, and to recreate the branch or copy
+  its rows. A branch that changed no rows has nothing to place, and merges.
+
+Residual, safe direction: a WAL replay that re-runs DROP + CREATE mints a new id, so a MERGE
+across it is refused rather than mis-merged.
+
+### Amendment B: MERGE never duplicates a key
+
+Validated before the intent, with the source Active. For every image the merge will put on
+the target (own images, minus copies and tombstones), each rule's key is probed on the
+target, ignoring holders the merge itself deletes or replaces by row id, plus a check among
+the merged rows. A table the branch created replaces the target's, so only the merged rows
+can collide. Key positions come by column name from the source's definition, so a wider
+source row is read correctly. The refusal is 23505 naming the table, the constraint and the
+key. The row phase's claims are what arbitrates after that.
+
+### A table lands as one main transaction (fourth fix pass)
+
+The row phase used to be a write path of its own beside main's, and each property it lacked was
+a defect of its own: no versions and no version index (`AS OF`, and a transaction begun after the
+merge read the pre-merge row), no logical WAL (a crash replayed older entries over a finished merge),
+no replication wait, no conflict detection (a COMMIT silently put a pre-merge row back), no columnar
+store (`SELECT v` read NULL), no atomicity between a table's keys and its rows. So it is gone. Into
+main, each table's rows land as **one ordinary transaction**
+(`StorageEngine::land_merged_table_on_main`): `begin_transaction`, `txn.put` of `data:{t}:{r}` for
+images, `txn.delete` for deletions, row ids preserved, `next_commit_timestamp` and
+`commit_with_timestamp`, what a main multi-row UPDATE in a transaction runs. From that commit come
+versions and the version index, the copy-marker and elided-version materialization, the logical WAL in
+the same batch, the physical write group, the replication wait, the conflict registry, the row cache
+fence, the watermark and the snapshot record. A reader or a crash sees a table's merge wholly or not at
+all, and a merge's memory is the size of the changed rows of its largest table.
+
+A table is the unit, not the merge: two tables land in two commits, and a merge stopped between them
+has landed the first. A merge into a branch is unchanged: a level has no versions and no logical WAL,
+and the merge runs on it alone, in its exclusive section, with per-row batches.
+
+**Size.** One write group is never split, and above `physical::MAX_BATCH_BYTES` it could be neither
+served nor archived. What a table's merge would stage (key and value of each changed row, three times
+over: `data:`, `v:`, the WAL record) is compared with that limit before the intent and again at a
+resume, and refused 54000 with nothing changed, naming the table and the alternative.
+
+**Columnar.** The rows go through what a transaction's INSERT, UPDATE and DELETE go through:
+`stage_columnar_rows_grouped_in_transaction` (presence marked for a new row, not for an update) and
+`stage_columnar_deletes_grouped_in_transaction`, in the same write set, so the column store commits with
+the rows, on tables the merge created and on existing ones. A dictionary or content-addressed value is
+inline in the row, as a transaction's UPDATE leaves it, and every reader resolves it. No case had to be
+refused.
+
+**Keys.** `ArtIndexManager::claim_merged_table_keys`, before the commit, all of the table's key
+changes in one critical section per tree, under its write lock (one tree lock at a time, rule 3;
+enforcing trees first, since only they can refuse). In each: look for another writer (below); refuse a key
+held by a row that is not giving it up in this merge (55006, the intent stays, nothing of the table
+landed, the trees before it put back); then move the keys that pass between merged rows and enter the
+free ones. A swap, a chain and a key a deletion frees are not special cases, and at no moment is a key
+free for someone else to take. Dense-int statistics count what enters and leaves, not what moves. Keys only
+an old image holds stay with that row until the commit succeeded (`MergedKeysClaim::finish`), so every key
+always has an owner, and when the commit fails, dropping the claim puts everything back and cannot fail
+for lack of a key. Between the commit and `finish` a lookup by such a key finds the row with its new
+image, the window a transaction's UPDATE has on its other side. The transaction's census slots are held
+across all of it, as a transactional UPDATE's are.
+
+**Reruns.** The commit also writes `MergeIntent::landed`, in the same batch. A rerun, and the open-time
+finish, leave a landed table alone: its rows are main's now, and main may have changed them since. Those
+changes are not the merge's to undo, and validation does not hold them against it. ABORT forgets the list:
+merging the source again starts over, last-writer-wins.
+
+**Row counters.** A table the merge created is writable on main from its create step, also while the merge
+is pending, so `CreateOnMain` raises and flushes its counter to the source's largest changed row id before
+any row lands, on a rerun too. Every table's commit stages its counter with its rows.
+
+### Writers on main during a merge
+
+Before the merge:
+
+- **An open transaction with staged writes** of a merge table refuses it (55006), at the plan, at a
+  resume, right before the table's rows are staged, and again under each tree's lock, where it cannot be
+  missed: a transaction counts itself before it changes the tree (both DELETE arms now count before they
+  take a key out), so having looked under the lock it either shows, or it comes after the claim and sees the
+  keys held. So a rollback can no longer find its key taken, and a staged row is never landed under.
+- **An autocommit writer** is in no census. A statement caught between its claim and its row is refused at
+  validation (`main_key_held_by_an_uncommitted_row`, 55006). After that, whoever claims a key first holds it:
+  the row phase refuses a key an INSERT took (55006, intent kept), and an INSERT of a key the merge claimed
+  gets its ordinary 23505. Writers that do not claim through these funnels are under "What stays open".
+
+**A commit over a row the merge landed fails.** `WriteConflictRegistry::hold_merge_landing` records the
+table's row keys before the merge reads them: in flight until the commit, then with its timestamp. Every
+commit checks them, at any isolation level, against the snapshot its first staged write was read under
+(`Transaction::merge_conflict_floor`): READ COMMITTED validates nothing else, and is what a wire client
+gets by default, but such a transaction can hold a row image from before the merge, and its COMMIT would put
+it back with the index saying otherwise. It gets a serialization failure (40001). A statement that begins
+after the merge read the merged row, and passes. The check runs after the commit records its keys, and the
+merge records its keys before it validates its own commit, so of two commits of one row at least one sees the
+other: the merge's own commit also fails on a key committed after its snapshot (55006, retryable). The
+records are pruned once no open transaction's pin is older.
+
+### What stays open
+
+The last review ran these against a live server. The merge itself is right: landing, `landed`, reruns,
+ABORT, recovery, the standby and time travel. What follows is other writers on main racing it.
+
+**Closed:**
+
+- A duplicate key from a writer that claims through the ordinary funnels: a single INSERT, or a transaction
+  that staged before the merge looked.
+- A transaction's COMMIT overwriting a landed row (40001), at any isolation level.
+- A rollback restoring a key the merge took, for a transaction that staged before the merge looked.
+- A table's landing visible in part, or half replayed after a crash.
+
+**Open until the writer lock** (R5's per-table lock, `g/R5_decisions.md` items 1, 13 and 15: the next commit,
+before any release). A merge will hold it exclusively, so these writers wait instead of racing, and the
+`merged_writes` floor goes with them. Until then:
+
+- **The params family's multi-row UPDATE and DELETE** (`update_tuples_branch_aware`,
+  `delete_tuples_branch_aware`), the default path of psycopg, JDBC, sqlx and node-postgres, and of the REST
+  routes. They are outside the registry and the census, and they write rows they read earlier, for the
+  statement's whole duration, not a window of microseconds. Reproduced: `UPDATE d SET g = g + 1 WHERE g >= $1`
+  during a merge of 6000 rows put 686 merged rows back to their pre-merge image, a lookup by either of a row's
+  keys found nothing, and `INSERT` of a key a row still held was accepted, so two rows held it. `DELETE … WHERE
+  g = $1` reported 3000 deleted and 1920 of them came back. The same statements on the text family were correct.
+- **TRUNCATE.** During the row phase it fails at commit with 40001, with its indexes already cleared, because
+  it assumes an autocommit statement always commits. Every row is still there, lookups find nothing and
+  duplicate keys are accepted, until a restart.
+- **A key-moving statement that ends in 40001.** A text-family autocommit `UPDATE d SET code = code || 'x'`
+  started at any point in the last part of a merge reads its rows, moves keys after the claim, and gets 40001.
+  Its undo puts the pre-merge keys back after `finish` removed them. Rows and lookups are right, but `INSERT` of
+  each old key gets a false 23505 until a restart. The window is the statement's read phase, not an instant.
+- **The primary-key fast paths on the very row a merge lands** (`update_tuple_fast*`, `delete_tuple_fast*`).
+  They are outside the registry too: one that read the row before the merge's commit and writes after it puts
+  the pre-merge image back, and if it moved an indexed value the index is stale until a restart.
+- **`ADD COLUMN`'s backfill.** An autocommit UPDATE's read-modify-write can put back a row narrower than the
+  schema, so it reads NULL instead of the default and a PK read can fail. Main's own `ALTER TABLE` does the same
+  (2 runs in 4 in the review's script, 4 in 5 through a merge). **After a crash** the backfill is lost, on main
+  and through a merge, with the same result (`SELECT x … WHERE id = 3` fails with `Column index 2 out of bounds
+  in tuple`), unless the merge was still pending, because then the step reruns. R5's `meta:attmissing:` does away
+  with the rewrite (item 4). `an_add_column_backfill_survives_autocommit_updates` is written and ignored until
+  then.
+- **A false 40001.** A READ COMMITTED transaction that wrote another table before a merge, then reads a merged
+  row and updates it, gets 40001 at COMMIT. A retry clears it. Only a transaction spanning a merge can hit this.
+
+**Open until R5 decision 14: crash replay.** Pre-existing, on main with no branch, after an earlier clean close
+left a checkpoint. An autocommit PK UPDATE or DELETE of a row whose multi-row INSERT is above the checkpoint is
+undone by the replay, and that now includes a PK UPDATE made after a merge, which falls back to the merged image
+(the merged rows themselves survive: their WAL records ride their commit). DROP + CREATE puts the old rows into
+the new table, and CREATE + DROP brings the table back, through a merge as on main. Decision 14 stops the replay
+re-applying entries at open.
+
+Into a branch target none of this exists: the merge runs in the target's exclusive section and refuses open
+staged writes.
+
+### Merge into a branch target
+
+The target ends with the source's definition and its own prior view under it: its view is
+materialized first (copies marked), then the source's own rows land. The merged record is
+computed at plan time and stored in the step, so a rerun writes the same bytes.
+
+### Concurrency
+
+- `BranchDrains::exclusive`: every branch DDL that is not a no-op runs on the branch alone, CTAS
+  through its population (a no-op such as `CREATE TABLE IF NOT EXISTS` takes no section, and the
+  question is asked again once the section is held). Other statements finish first, new ones
+  wait (bounded, then 55006); a second section is refused at once, so two cannot wait on each
+  other's shared hold. EVERY merge into a branch takes the same section, not only a
+  schema-changing one. CREATE BRANCH of a child takes a shared hold of the parent first, so it
+  waits.
+- `PENDING` registry per (level, table) of transactions with staged writes: the DDL refuses
+  55006, and so does a merge, for any table of its source (a COMMIT there lands inside the
+  validation window, since the source is still Active) and the merge's tables of a branch target.
+  ROLLBACK TO SAVEPOINT keeps the entry (conservative).
+- Preflight order, after the no-op checks: own staged writes, live descendants (0A000; walked
+  through merged branches, which stay in their children's chains), other transactions' staged
+  writes (55006), a pending merge into this level (55006).
+
+### Scale
+
+Isolated tables have a durable per-level key index,
+`bkey:{L}:{hex t}:{hex set}:{hex digest}:{row}`, one entry per visible own row per key set
+(PRIMARY KEY / UNIQUE rules and FOREIGN KEY column sets). `rows_with_key` on a covered set
+costs O(levels + candidates), verifies each candidate through `get`, and loads no overlay.
+The entry holds a SHA-256 digest of the encoded key, truncated to 128 bits and salted with
+the definition's incarnation id, because RocksDB keys are not sealed at rest and a key value
+in one would have broken the at-rest promise. The salt is random and sealed in the catalog
+record; the levels that share a definition share it.
+Writes keep it in the same batch or transaction, and a merged row carries its entries in its own
+batch (`apply_merged_row`; there is no rebuild afterwards, which left the target answering "no such
+key" for rows already on it). `BranchView::materialize` streams main's rows and writes the copies
+10,000 per batch (or 256 MiB, whichever comes first); the rows the level CHANGED (held and not marked)
+go in the last batch, with the record. So a crash between batches leaves only marked copies under the
+old definition, which MERGE ignores and a retry rewrites, and a retry does not grow the last batch: the
+copies of a failed attempt stay marked and chunked. A row the level CHANGED is never wider than its
+definition: MERGE copies it by position, and the next main `ADD COLUMN` would have read the stale
+backfill value. The last batch cannot be split, so it is built first, and if it would not fit in one
+write group (`physical::MAX_BATCH_BYTES`, which can be neither served nor archived above that) the
+statement is refused 54000 before anything is written, naming the table and the alternative (merge or
+copy those rows in smaller steps). The branch reverse-FK
+answer is cached per (branch, table), validated by the schema generation. These keys are
+not "row writes" to the census (`note_written_key`), so an open branch transaction does not
+demote main's index fast paths.
+
+### Other
+
+`SELECT … LIMIT n` on a branch reads the branch: the executor's LIMIT pushdown walked main's `data:` keys
+and stands down there now (an overlay's rows were missing, and what the branch deleted was back).
+`CREATE [DATABASE] BRANCH x PARENT p` is the same clause as `FROM p`; it was accepted and ignored. REST data
+routes read the catalog inside the request's branch scope; the insert route reports the
+row id the storage insert returned, from the counter the SQL insert uses (it used to burn another one
+of the durable counter, which ignores the scope); a branch reports no `row_count`, since statistics
+describe main's rows. A schema statement on any query route (`db.query`, the result-set routes, a
+session transaction's, the params read route, the RAII `Transaction` query) applies to the branch like
+any other (it reached the executor's backstop and got a wrong 0A000), and on main it is counted and
+checked, and kept out of the plan cache, whose hit path would skip that. `DROP TABLE` on a branch takes
+partition children with it. The open-time finish asks
+the write gate, so a fenced primary does not tear down indexes trying. Code-graph DDL
+refuses on a branch. `pg_indexes` and `\d` hide main's manual and vector indexes of a table
+the branch overrides. The fingerprint canonicalizes constraint order and includes unique
+column sets. A tombstone of a table the parent never had is not a change. Deferred: stable
+table OIDs (`pg_table_oid` is positional on main too).
+
+### What B4 inherits
+
+- `bfrz:` is shared: same clearing and MERGE rules. The ADD COLUMN copy and B4's frozen
+  pre-image are the same thing to everything that reads the marker.
+- The reclaim prefixes gain `bkey:{id}:`.
+- Reclaim at open runs AFTER `finish_pending_branch_merges` and skips sources with an intent.
+- A frozen `bmeta` record's `parent_fingerprint` is the frozen definition's fingerprint
+  (`None` for a frozen tombstone), and its `parent_incarnation` is that definition's
+  incarnation (`None` for a tombstone).
+- Lift the live-descendants DDL refusal, and the one on a schema-changing MERGE into a branch,
+  once the freeze hook covers the parent's `bmeta:` and `bdata:` writes. The walk goes through
+  merged branches: the hook must too.
+- Lift the "created on the target after the fork" refusal of amendment A: with fork-point reads such
+  a table is not visible to the branch at all, so it cannot have changed rows of it. The refusal for a
+  branch with no fork record stays: such a branch has no fork point to read from either.
+- MERGE into main lands each table as one main transaction, so what it reads and writes is what any main
+  commit does. A deleted row is absent from `AS OF` on main at every point (`scan_table_at_snapshot` starts
+  from the current rows); B4's delete events change that for a merged deletion as for main's own.
+- `ForkEntry` is the fork point's natural home for what B4 needs per table. `bmeta:{id}:fork` is
+  under `bmeta:{id}:`, so it goes with the reclaim.
+- A merged branch stays in its children's chains (M4, M5): reclaim of a Merged branch with live
+  descendants must wait for them, or freeze first.
+- A `MERGE BRANCH x ABORT` puts a source back to Active with its overlay intact: the reclaim of a
+  Merged branch must re-check the state, and skip while an intent exists.
+- R5 will replace `AddColumnsOnMain`'s backfill with `meta:attmissing:`. Keep
+  `backfill_added_columns` small and `apply_merge_step_to_main` the only main-side writer.

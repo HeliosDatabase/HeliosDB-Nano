@@ -224,6 +224,64 @@ pub const BRANCH_STATEMENT_UNSUPPORTED_MARKER: &str = "on a branch is not suppor
 /// active_sql_transaction.
 pub const BRANCH_SWITCH_IN_TRANSACTION_MARKER: &str = "cannot change the branch inside a transaction block";
 
+/// sprinter 6bc4a4040eb7 (phase B3): the marker of a SCHEMA statement refused
+/// on a branch ([`Error::branch_schema_unsupported`]). A branch scopes `CREATE
+/// TABLE`, `DROP TABLE` and `ALTER TABLE … ADD COLUMN` to itself (its catalog
+/// overlay, `storage::branch_catalog`); every other schema statement would
+/// change main's catalog and is refused before it changes anything. The
+/// message also carries [`BRANCH_WRITE_UNSUPPORTED_MARKER`], so every wire
+/// maps it to SQLSTATE 0A000 through the arm that already exists.
+pub const BRANCH_SCHEMA_UNSUPPORTED_MARKER: &str = "rehearse it in a copy of the database";
+
+/// sprinter 6bc4a4040eb7 (phase B3): the marker of a `MERGE BRANCH` refused
+/// because a table whose definition the branch changed was ALSO changed on
+/// the merge target after the branch changed it (or the change belongs to an
+/// unmerged ancestor branch) — [`Error::branch_merge_schema_refused`].
+/// Refused before anything is merged. SQLSTATE 55000
+/// object_not_in_prerequisite_state.
+pub const BRANCH_MERGE_SCHEMA_REFUSED_MARKER: &str = "refused before anything was merged";
+
+/// sprinter 6bc4a4040eb7 (B3 fix pass): the start of the message of a `MERGE
+/// BRANCH` refused because a row it would put on its target holds a PRIMARY KEY
+/// / UNIQUE key another target row holds ([`Error::branch_merge_duplicate_key`]).
+/// Refused before anything is merged. SQLSTATE 23505. Anchored at the START of
+/// the message: the message names the key's values, which are free text.
+pub const BRANCH_MERGE_DUPLICATE_KEY_MARKER: &str = "Duplicate key on MERGE BRANCH";
+
+/// sprinter 6bc4a4040eb7 (B3 fix pass): the marker of everything an UNFINISHED
+/// merge refuses, and of the merge that stopped ([`Error::branch_merge_pending`],
+/// [`Error::branch_merge_interrupted`]): a `MERGE BRANCH` whose durable intent
+/// exists is finished by running it again (or by the next open). SQLSTATE 55006.
+pub const BRANCH_MERGE_PENDING_MARKER: &str = "run it again to finish it";
+
+/// sprinter 6bc4a4040eb7 (B3 second fix pass): the marker of a merge refused
+/// because something else has not finished yet: another merge holds one of its
+/// tables, or a schema statement on main is still running
+/// ([`Error::branch_merge_table_busy`], [`Error::branch_merge_ddl_busy`]). The
+/// merge changed nothing. SQLSTATE 55006.
+pub const BRANCH_MERGE_BUSY_MARKER: &str = "has not finished: retry";
+
+/// sprinter 6bc4a4040eb7 (B3 second fix pass): the marker of a merge refused
+/// because an open transaction on the target has claimed a key a merged row
+/// holds ([`Error::branch_merge_key_claimed`]). Retryable. SQLSTATE 55006.
+pub const BRANCH_MERGE_KEY_CLAIMED_MARKER: &str = "another transaction holds the key";
+
+/// sprinter 6bc4a4040eb7 (B3 third fix pass): the marker of a branch `ADD COLUMN`
+/// refused because the rows the level itself changed would not fit in the one
+/// atomic batch that writes them with the definition
+/// ([`Error::branch_materialize_too_large`]). SQLSTATE 54000.
+pub const BRANCH_MATERIALIZE_TOO_LARGE_MARKER: &str = "too large for one atomic write";
+
+/// sprinter 6bc4a4040eb7 (B3 second fix pass): the marker of a statement that
+/// waited too long for a schema statement on its branch to finish
+/// ([`Error::branch_statement_waited`]). SQLSTATE 55006.
+pub const BRANCH_SCHEMA_RUNNING_MARKER: &str = "is running a schema statement";
+
+/// sprinter 6bc4a4040eb7 (B3 fix pass): the marker of a schema statement on a
+/// branch refused because another open transaction has staged writes of the
+/// table there ([`Error::branch_table_busy`]). SQLSTATE 55006.
+pub const BRANCH_TABLE_BUSY_MARKER: &str = "has uncommitted writes in another transaction";
+
 /// Database error type
 ///
 /// All errors from HeliosDB Lite operations are represented by this enum.
@@ -441,6 +499,23 @@ impl Error {
         ))
     }
 
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): a schema statement on branch `name`
+    /// could not get the branch to itself in time, or another one holds it.
+    /// SQLSTATE 55006.
+    pub fn branch_schema_busy(name: &str) -> Self {
+        Error::QueryExecution(format!(
+            "a schema statement cannot run alone on branch \"{name}\": it {BRANCH_BUSY_MARKER}; retry when they finish"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): a statement on branch `name`
+    /// gave up waiting for a schema statement running on it. SQLSTATE 55006.
+    pub fn branch_statement_waited(name: &str) -> Self {
+        Error::QueryExecution(format!(
+            "branch \"{name}\" {BRANCH_SCHEMA_RUNNING_MARKER} and this statement gave up waiting for it: retry"
+        ))
+    }
+
     /// sprinter 6bc4a4040eb7 (B1 fix pass): DROP / MERGE BRANCH `name` timed
     /// out waiting for the statements running on it. SQLSTATE 55006.
     pub fn branch_busy(name: &str) -> Self {
@@ -469,6 +544,156 @@ impl Error {
     pub fn branch_statement_unsupported(statement: &str, name: &str) -> Self {
         Error::QueryExecution(format!(
             "{statement} {BRANCH_STATEMENT_UNSUPPORTED_MARKER} (branch \"{name}\"): run it on main"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): the schema statement `statement` is
+    /// not scoped to branches, and the running statement is on branch `name`.
+    /// SQLSTATE 0A000 (the message carries [`BRANCH_WRITE_UNSUPPORTED_MARKER`]).
+    pub fn branch_schema_unsupported(statement: &str, name: &str) -> Self {
+        Error::QueryExecution(format!(
+            "{statement} {BRANCH_WRITE_UNSUPPORTED_MARKER} (on branch \"{name}\"): run it on the parent, or \
+             {BRANCH_SCHEMA_UNSUPPORTED_MARKER} (`heliosdb-nano dump` / `restore`)"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): `MERGE BRANCH source INTO target`
+    /// refused, `why` naming the tables. SQLSTATE 55000.
+    pub fn branch_merge_schema_refused(source: &str, target: &str, why: &str) -> Self {
+        Error::QueryExecution(format!(
+            "MERGE BRANCH {source} INTO {target}: {why} — {BRANCH_MERGE_SCHEMA_REFUSED_MARKER}"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): `MERGE BRANCH source INTO target`
+    /// would put a row holding `key` of `constraint` (`kind` is `PRIMARY KEY` or
+    /// `UNIQUE`) on `table` of the target, where another row holds that key.
+    /// Nothing was merged. SQLSTATE 23505.
+    pub fn branch_merge_duplicate_key(
+        source: &str,
+        target: &str,
+        table: &str,
+        kind: &str,
+        constraint: &str,
+        key: &str,
+    ) -> Self {
+        Error::ConstraintViolation(format!(
+            "{BRANCH_MERGE_DUPLICATE_KEY_MARKER} {source} INTO {target}: table {table}, {kind} constraint \
+             \"{constraint}\", key {key} would be held twice — {BRANCH_MERGE_SCHEMA_REFUSED_MARKER}"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): `what` (a table's DDL, or a statement
+    /// on the merge's source) is refused while `MERGE BRANCH source INTO target`
+    /// is unfinished. SQLSTATE 55006.
+    pub fn branch_merge_pending(what: &str, source: &str, target: &str) -> Self {
+        Error::QueryExecution(format!(
+            "{what} is part of an unfinished MERGE BRANCH {source} INTO {target}: {BRANCH_MERGE_PENDING_MARKER}, or \
+             MERGE BRANCH {source} ABORT to abandon it"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): `what` (a whole-database
+    /// operation) is refused while `MERGE BRANCH source INTO target` is
+    /// unfinished. SQLSTATE 55006.
+    pub fn branch_merge_pending_refuses(what: &str, source: &str, target: &str) -> Self {
+        Error::QueryExecution(format!(
+            "{what} is refused while MERGE BRANCH {source} INTO {target} is unfinished: \
+             {BRANCH_MERGE_PENDING_MARKER}, or MERGE BRANCH {source} ABORT to abandon it"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): this merge needs `table`, and
+    /// `MERGE BRANCH source INTO target` is holding it. This merge changed
+    /// nothing. SQLSTATE 55006.
+    pub fn branch_merge_table_busy(table: &str, source: &str, target: &str) -> Self {
+        Error::QueryExecution(format!(
+            "table {table} is held by MERGE BRANCH {source} INTO {target}, which {BRANCH_MERGE_BUSY_MARKER} this \
+             merge when it has (run that one again to finish it, or MERGE BRANCH {source} ABORT to abandon it)"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): `MERGE BRANCH source INTO
+    /// target` waited for schema statements already running on main, and gave
+    /// up. It changed nothing. SQLSTATE 55006.
+    pub fn branch_merge_ddl_busy(source: &str, target: &str) -> Self {
+        Error::QueryExecution(format!(
+            "a schema statement running on main {BRANCH_MERGE_BUSY_MARKER} MERGE BRANCH {source} INTO {target} when \
+             it has"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): an open transaction on the
+    /// target has claimed a key a merged row holds: letting the merge through
+    /// would duplicate the key when that transaction commits. Retryable.
+    /// SQLSTATE 55006.
+    pub fn branch_merge_key_claimed(source: &str, target: &str, table: &str, constraint: &str, key: &str) -> Self {
+        Error::QueryExecution(format!(
+            "MERGE BRANCH {source} INTO {target}: table {table}, constraint \"{constraint}\", key {key}: \
+             {BRANCH_MERGE_KEY_CLAIMED_MARKER} on {target}; retry after it commits or rolls back"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 third fix pass): `table` is held by a merge that
+    /// has not written its intent yet, so there is nothing to run again and
+    /// nothing to abort. SQLSTATE 55006.
+    pub fn branch_merge_in_progress(table: &str, source: &str, target: &str) -> Self {
+        Error::QueryExecution(format!(
+            "table {table} is being merged by MERGE BRANCH {source} INTO {target}, which {BRANCH_MERGE_BUSY_MARKER} \
+             when it has"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 third fix pass): a branch `ADD COLUMN`, or a
+    /// merge that carries one, whose level changed more of `table` than one
+    /// atomic batch can hold. Nothing was written. SQLSTATE 54000.
+    pub fn branch_materialize_too_large(table: &str, branch: &str, bytes: usize, limit: usize) -> Self {
+        Error::QueryExecution(format!(
+            "the rows branch \"{branch}\" changed in table {table} need {bytes} bytes, \
+             {BRANCH_MATERIALIZE_TOO_LARGE_MARKER} (the limit is {limit}): nothing was written; merge those rows \
+             first, or add the column on the parent and recreate the branch"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fourth fix pass): a table's merged rows land in one
+    /// write group, and these would not fit. Nothing was changed. SQLSTATE 54000.
+    pub fn branch_merge_table_too_large(source: &str, target: &str, table: &str, bytes: usize, limit: usize) -> Self {
+        Error::QueryExecution(format!(
+            "MERGE BRANCH {source} INTO {target}: the rows it changed in table {table} need {bytes} bytes, \
+             {BRANCH_MATERIALIZE_TOO_LARGE_MARKER} (the limit is {limit}): nothing was changed; copy those rows to \
+             {target} in smaller transactions, or change fewer of them per branch"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): `MERGE BRANCH source INTO target`
+    /// stopped after its intent was durable. It is resumable, never undone: the
+    /// source stays merged, and running the statement again finishes it (so does
+    /// the next open). SQLSTATE 55006.
+    pub fn branch_merge_interrupted(source: &str, target: &str, cause: &Error) -> Self {
+        Error::QueryExecution(format!(
+            "MERGE BRANCH {source} INTO {target} stopped after it began changing {target} ({cause}): \
+             {BRANCH_MERGE_PENDING_MARKER}, or MERGE BRANCH {source} ABORT to abandon it"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): a schema statement on `table` of
+    /// branch `branch` while another open transaction has staged writes of the
+    /// table there. SQLSTATE 55006.
+    pub fn branch_table_busy(table: &str, branch: &str) -> Self {
+        Error::QueryExecution(format!(
+            "table \"{table}\" {BRANCH_TABLE_BUSY_MARKER} on branch \"{branch}\": retry after it commits or rolls back"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): `statement` on branch `branch`, which
+    /// has live child branches: they read through it, and nothing can yet freeze
+    /// what they see (phase B4). SQLSTATE 0A000 (the message carries
+    /// [`BRANCH_WRITE_UNSUPPORTED_MARKER`]).
+    pub fn branch_schema_has_children(statement: &str, branch: &str, children: &[String]) -> Self {
+        Error::QueryExecution(format!(
+            "{statement} {BRANCH_WRITE_UNSUPPORTED_MARKER} while it has live child branches (on branch \"{branch}\"; \
+             children: {}): DROP or MERGE them first",
+            children.join(", ")
         ))
     }
 

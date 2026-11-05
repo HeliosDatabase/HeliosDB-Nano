@@ -1,0 +1,2109 @@
+//! sprinter 6bc4a4040eb7 (phase B3): the branch CATALOG overlay — a branch's
+//! own definitions of tables, read through the session's branch chain.
+//!
+//! # The model
+//!
+//! The main catalog (`meta:table:{t}`, `table_constraints:{t}`, the ART
+//! registry, …) describes main. A branch level `L` may hold its OWN entry for
+//! table `t` under `bmeta:{L}:table:{t}` ([`branch_table_key`]): either a full
+//! definition of `t` or a tombstone ("`t` does not exist here"). A session on
+//! a branch with chain `main → l1 → … → b` resolves `t` like it resolves a
+//! row: the NEAREST level with an entry decides — a definition is the table's
+//! definition, a tombstone means "no such table" — and with no entry on any
+//! level main's catalog decides ([`BranchTableResolution`]). Every catalog
+//! reader asks this first on a branch (`Catalog::get_table_schema`,
+//! `table_exists`, `list_tables`, `load_table_constraints`,
+//! `get_referencing_fks`, the identity and unique-key questions, and the
+//! existence cache), so the planner, both DML executor families and every
+//! introspection surface see the branch's catalog. On main the question costs
+//! one thread-local read (`StorageEngine::is_branch_active`).
+//!
+//! # Isolated tables
+//!
+//! A definition written by `CREATE TABLE` or `ALTER TABLE … ADD COLUMN` on a
+//! branch is `isolated`: the branch view (`branch_view.rs`) then reads `t`'s
+//! rows from the defining level and its descendants ONLY — never from that
+//! level's ancestors or main — and enforces PRIMARY KEY / UNIQUE with the
+//! rules the definition carries ([`BranchTableDefinition::unique_rules`]),
+//! never main's ART. `ADD COLUMN` therefore materializes every row the branch
+//! sees into its own overlay under the new definition in the same atomic
+//! batch as the definition (`EmbeddedDatabase` branch DDL, `branch_schema.rs`).
+//!
+//! # The record
+//!
+//! `BMT1` + format version `1` + the bincode encoding of
+//! [`BranchTableRecord`], sealed like every catalog blob (`tde::seal`, read
+//! back through `StorageEngine::get`). The record carries what phase B4 and
+//! MERGE need:
+//!
+//! * `frozen` — a frozen copy of the parent's definition written by B4's
+//!   freeze hook, NOT a change made on this level. MERGE skips it. B3 never
+//!   writes one.
+//! * `parent_fingerprint` — the fingerprint ([`definition_fingerprint`]) of
+//!   the definition `t` had on this level's PARENT when this level first wrote
+//!   its own entry (`None`: the parent had no such table). `MERGE BRANCH`
+//!   compares it with the target's CURRENT definition and refuses (55000) when
+//!   they differ — the target changed the table after the branch did.
+//! * `parent_incarnation` — the incarnation id of the table on the parent at
+//!   that same moment. A fingerprint cannot tell "unchanged" from "dropped and
+//!   recreated identically"; the incarnation can. MERGE compares it separately
+//!   from the fingerprint (a merged `CREATE` gives the target a new id, so it
+//!   could not be part of a definition's fingerprint).
+//! * `created` / `added_columns` — how this level's definition relates to the
+//!   parent's: created here (MERGE creates it on the target, replacing the
+//!   target's), or the parent's plus these `ADD COLUMN`s, in order (MERGE
+//!   applies them on the target with main's backfill rule).
+//!
+//! # Table incarnations (sprinter 6bc4a4040eb7, B3 fix pass)
+//!
+//! Every table of main has `meta:table_incarnation:{t}`: a RANDOM u64 minted
+//! by `CREATE TABLE` in the batch that writes its schema, deleted by `DROP` in
+//! its one-group purge, moved by `RENAME` (`Catalog`; WAL replay runs through
+//! the same funnels). Random rather than a counter: no counter key has to stay
+//! durable across a crash or be replicated. Tables older than this get theirs
+//! at the first writable open (`Catalog::backfill_table_incarnations`, never on
+//! a standby). A definition a branch creates mints its own; `ADD COLUMN` keeps
+//! the base's.
+//!
+//! `bmeta:{L}:fork` is one record per branch, written in the branch's creation
+//! batch: the incarnation, the definition fingerprint and the column names of
+//! every table its parent had at the fork. MERGE refuses (55000) a table the
+//! branch changed whose definition or incarnation on the target differs from
+//! it, even when the branch only changed rows: those rows were written for the
+//! definition at the fork, and are copied by position (B3 second fix pass; a
+//! `DROP COLUMN` on main used to shift them silently). A branch with no fork
+//! record (created below the engine, or by an older build), and a table with no
+//! entry in it (created on main after the fork, which B3 reads live), have
+//! nothing to compare; phase B4's fork-point isolation closes both. A table with
+//! no incarnation yet (a backfill that failed) is UNKNOWN, never different.
+//!
+//! # Copies and the key index (B3 fix pass)
+//!
+//! `bfrz:{L}:{t}:{r}` marks level `L`'s entry for row `r` as a COPY — an
+//! `ADD COLUMN`'s materialized row, phase B4's frozen pre-image — not a change
+//! made on `L`: MERGE skips it, and `L`'s own write of the row clears it.
+//! `bkey:{L}:{hex t}:{hex set}:{hex digest}:{r}` is `L`'s durable key index of an
+//! isolated table (`branch_view.rs`).
+//!
+//! # Caches
+//!
+//! Records are cached per (engine, level, table), validated by the engine's
+//! schema generation: every write of a record bumps it (and the level's write
+//! generation for the table, so a cached committed overlay reloads). A
+//! physical standby, whose records arrive below every bump, never caches.
+//!
+//! # Reclaim
+//!
+//! Every key of a level's catalog starts `bmeta:{L}:`; phase B4's reclaim of a
+//! dropped or merged branch deletes that prefix with the rest of the overlay.
+//! Nothing reads a level's records except through a chain that contains it,
+//! and a dropped branch can no longer be bound, so a dropped branch's records
+//! are referenced by nothing.
+
+use super::{Catalog, StorageEngine};
+use crate::sql::logical_plan::ColumnDef;
+use crate::sql::{LogicalExpr, TableConstraints};
+use crate::storage::EnforcedUniqueIndex;
+use crate::{Column, ColumnStorageMode, DataType, Error, Result, Schema};
+use dashmap::DashMap;
+use rocksdb::{Direction, IteratorMode, ReadOptions, WriteBatch};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
+
+// ---------------------------------------------------------------------------
+// Keys
+// ---------------------------------------------------------------------------
+
+/// The prefix of every branch-catalog key (`bmeta:{level}:…`).
+pub const BRANCH_CATALOG_PREFIX: &str = "bmeta:";
+
+/// `bmeta:{level}:table:{table}` — level `level`'s own entry for `table`.
+pub fn branch_table_key(level: u64, table: &str) -> Vec<u8> {
+    format!("bmeta:{level}:table:{table}").into_bytes()
+}
+
+/// `bmeta:{level}:table:` — every table entry of one level.
+pub fn branch_tables_prefix(level: u64) -> String {
+    format!("bmeta:{level}:table:")
+}
+
+/// Every catalog key of one level (`bmeta:{level}:`) — what a reclaim deletes.
+pub fn branch_catalog_level_prefix(level: u64) -> String {
+    format!("bmeta:{level}:")
+}
+
+/// `bmeta:{level}:fork` — the incarnation of every table the level's parent
+/// had when the level forked (see the module docs).
+pub fn branch_fork_key(level: u64) -> Vec<u8> {
+    format!("bmeta:{level}:fork").into_bytes()
+}
+
+/// The prefix of every unfinished MERGE BRANCH's durable intent.
+pub const BRANCH_MERGE_INTENT_PREFIX: &str = "branch:merge:";
+
+/// `branch:merge:{source}` — the durable intent of an unfinished MERGE of the
+/// branch `source` (`MergeIntent`).
+pub fn branch_merge_intent_key(source: u64) -> Vec<u8> {
+    format!("{BRANCH_MERGE_INTENT_PREFIX}{source}").into_bytes()
+}
+
+/// sprinter 6bc4a4040eb7 (B3 fix pass): a fresh table incarnation id — random,
+/// so nothing has to keep a counter durable across a crash or a replica.
+pub fn fresh_table_incarnation() -> u64 {
+    rand::random()
+}
+
+// ---------------------------------------------------------------------------
+// The record
+// ---------------------------------------------------------------------------
+
+const RECORD_MAGIC: &[u8; 4] = b"BMT1";
+const RECORD_FORMAT_VERSION: u8 = 1;
+
+/// One PRIMARY KEY / UNIQUE rule of a branch definition — what the branch
+/// view enforces for a table the branch defines (main's ART describes main's
+/// tables only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchUniqueRule {
+    /// The rule's key in the claim registry (the index name main would use).
+    pub index_name: String,
+    /// The name a 23505 prints.
+    pub label: String,
+    /// The constrained columns, in rule order.
+    pub columns: Vec<String>,
+    /// PRIMARY KEY rather than UNIQUE.
+    pub is_primary_key: bool,
+}
+
+impl BranchUniqueRule {
+    /// The rule in the shape the branch view's checks take.
+    pub fn to_enforced(&self) -> EnforcedUniqueIndex {
+        EnforcedUniqueIndex {
+            index_name: self.index_name.clone(),
+            label: self.label.clone(),
+            columns: self.columns.clone(),
+            is_primary_key: self.is_primary_key,
+        }
+    }
+
+    /// A rule of main's ART registry, kept as it is (same name, same label).
+    pub fn from_enforced(rule: &EnforcedUniqueIndex) -> Self {
+        Self {
+            index_name: rule.index_name.clone(),
+            label: rule.label.clone(),
+            columns: rule.columns.clone(),
+            is_primary_key: rule.is_primary_key,
+        }
+    }
+}
+
+/// A table definition held by a branch level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchTableDefinition {
+    /// The columns, exactly as the main catalog keeps them (`meta:table:`).
+    pub schema: Schema,
+    /// FOREIGN KEY / CHECK / UNIQUE records (`table_constraints:`).
+    pub constraints: TableConstraints,
+    /// The PRIMARY KEY / UNIQUE rules the branch view enforces.
+    pub unique_rules: Vec<BranchUniqueRule>,
+    /// IDENTITY / SERIAL columns (`meta:identity:`), for introspection.
+    pub identity_columns: Vec<String>,
+    /// The table's incarnation id: fresh for a definition created on a branch,
+    /// the base's for one derived by `ADD COLUMN`, main's for main's own (`0`
+    /// for a main table with no id yet).
+    pub incarnation: u64,
+}
+
+/// What a level holds for a table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BranchTableState {
+    /// The level's definition of the table.
+    Defined(BranchTableDefinition),
+    /// The level dropped the table: it does not exist here (or below, unless
+    /// a descendant defines it again).
+    Dropped,
+}
+
+/// One `ADD COLUMN` a level applied over its parent's definition — replayed
+/// by MERGE on the target with main's backfill rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchAddedColumn {
+    /// The column as it was added (the catalog form).
+    pub column: Column,
+    /// Its `DEFAULT`, as planned (the backfill source).
+    pub default: Option<LogicalExpr>,
+    /// The statement's column definition, verbatim.
+    pub definition: ColumnDef,
+}
+
+/// `bmeta:{level}:table:{table}` — see the module docs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchTableRecord {
+    /// A definition, or a tombstone.
+    pub state: BranchTableState,
+    /// Rows are read from the defining level and its descendants only.
+    pub isolated: bool,
+    /// Phase B4: a frozen copy of the parent's definition, not a change made
+    /// on this level. MERGE skips it. B3 never sets it.
+    pub frozen: bool,
+    /// The fingerprint of the definition the PARENT had when this level first
+    /// wrote its own entry for the table; `None` = the parent had no such
+    /// table. MERGE refuses when the target's current definition differs.
+    pub parent_fingerprint: Option<u64>,
+    /// The incarnation of the table on the PARENT at that same moment; `None`
+    /// = the parent had no such table. MERGE refuses when the target's current
+    /// incarnation differs: the table was dropped and recreated.
+    pub parent_incarnation: Option<u64>,
+    /// The definition was created on this level (CREATE TABLE / CTAS), not
+    /// derived from the parent's.
+    pub created: bool,
+    /// The `ADD COLUMN`s this level applied over the parent's definition, in
+    /// order (empty when `created`).
+    pub added_columns: Vec<BranchAddedColumn>,
+}
+
+impl BranchTableRecord {
+    /// The definition, unless this is a tombstone.
+    pub fn definition(&self) -> Option<&BranchTableDefinition> {
+        match &self.state {
+            BranchTableState::Defined(definition) => Some(definition),
+            BranchTableState::Dropped => None,
+        }
+    }
+
+    /// The stored form (unsealed): magic, format version, bincode body.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let body = bincode::serialize(self)
+            .map_err(|e| Error::storage(format!("Failed to serialize a branch table record: {e}")))?;
+        let mut out = Vec::with_capacity(RECORD_MAGIC.len() + 1 + body.len());
+        out.extend_from_slice(RECORD_MAGIC);
+        out.push(RECORD_FORMAT_VERSION);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Decode the stored (unsealed) form of `table`'s record. A record this
+    /// build cannot read is an error, never "no record": guessing would let
+    /// a branch read main's definition of a table it dropped or redefined.
+    pub fn decode(table: &str, bytes: &[u8]) -> Result<Self> {
+        let body = bytes
+            .strip_prefix(RECORD_MAGIC.as_slice())
+            .and_then(<[u8]>::split_first)
+            .filter(|(version, _)| **version == RECORD_FORMAT_VERSION)
+            .map(|(_, body)| body)
+            .ok_or_else(|| {
+                Error::storage(format!(
+                    "the branch catalog record of table '{table}' has an unknown format"
+                ))
+            })?;
+        bincode::deserialize(body).map_err(|e| {
+            Error::storage(format!(
+                "the branch catalog record of table '{table}' does not decode: {e}"
+            ))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fingerprints and rules
+// ---------------------------------------------------------------------------
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// sprinter 6bc4a4040eb7 (phase B3): a stable fingerprint of a table
+/// definition — every column's name, type, nullability, key flags, default
+/// and storage mode, in order, and the constraint records — for MERGE's
+/// "has the target changed this table since the branch did?". The alias
+/// fields a resolver stamps on a schema (`source_table`, `source_table_name`)
+/// are not part of it. Stable across processes (bincode + FNV-1a).
+///
+/// B3 fix pass: the constraint lists are canonicalized (each record serialized,
+/// each list sorted — declaration order is not part of a definition), and the
+/// PRIMARY KEY / UNIQUE rules are part of it as column SETS (lowercased, sorted,
+/// deduplicated; not names, which can be re-minted across a reopen), so a
+/// `CREATE UNIQUE INDEX` on the target since the fork refuses the merge. Column
+/// order IS part of it: rows are positional. The table's incarnation is NOT:
+/// MERGE compares it separately.
+pub fn definition_fingerprint(
+    schema: &Schema,
+    constraints: &TableConstraints,
+    rules: &[BranchUniqueRule],
+) -> Result<u64> {
+    fn canonical_records<T: Serialize>(records: &[T]) -> Result<Vec<Vec<u8>>> {
+        let mut encoded = records
+            .iter()
+            .map(|record| {
+                bincode::serialize(record)
+                    .map_err(|e| Error::storage(format!("Failed to fingerprint a table definition: {e}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        encoded.sort_unstable();
+        Ok(encoded)
+    }
+    #[derive(Serialize)]
+    struct CanonicalColumn<'a> {
+        name: &'a str,
+        data_type: &'a DataType,
+        nullable: bool,
+        primary_key: bool,
+        unique: bool,
+        default_expr: &'a Option<String>,
+        storage_mode: ColumnStorageMode,
+    }
+    let columns: Vec<CanonicalColumn<'_>> = schema
+        .columns
+        .iter()
+        .map(|column| CanonicalColumn {
+            name: &column.name,
+            data_type: &column.data_type,
+            nullable: column.nullable,
+            primary_key: column.primary_key,
+            unique: column.unique,
+            default_expr: &column.default_expr,
+            storage_mode: column.storage_mode,
+        })
+        .collect();
+    let mut rule_sets: Vec<Vec<String>> = rules
+        .iter()
+        .map(|rule| {
+            let mut set: Vec<String> = rule.columns.iter().map(|c| c.to_ascii_lowercase()).collect();
+            set.sort_unstable();
+            set
+        })
+        .collect();
+    rule_sets.sort_unstable();
+    rule_sets.dedup();
+    let bytes = bincode::serialize(&(
+        columns,
+        canonical_records(&constraints.foreign_keys)?,
+        canonical_records(&constraints.check_constraints)?,
+        canonical_records(&constraints.unique_constraints)?,
+        rule_sets,
+    ))
+    .map_err(|e| Error::storage(format!("Failed to fingerprint a table definition: {e}")))?;
+    Ok(fnv1a(&bytes))
+}
+
+/// The PRIMARY KEY / UNIQUE rules main's catalog would register for a table
+/// created with `schema` and `constraints` (`Catalog::create_table`'s column
+/// flags plus `register_unique_constraint_indexes`), with main's names: the
+/// PK is `{t}_pkey`, a column UNIQUE `{t}_{col}_key`, a table-level UNIQUE
+/// `{t}_{cols}_key` labelled with its constraint name. One rule per column
+/// set.
+pub fn derive_unique_rules(table: &str, schema: &Schema, constraints: &TableConstraints) -> Vec<BranchUniqueRule> {
+    fn same_set(a: &[String], b: &[String]) -> bool {
+        let normalize = |cols: &[String]| -> Vec<String> {
+            let mut v: Vec<String> = cols.iter().map(|c| c.to_ascii_lowercase()).collect();
+            v.sort_unstable();
+            v
+        };
+        normalize(a) == normalize(b)
+    }
+    let mut rules: Vec<BranchUniqueRule> = Vec::new();
+    let mut pk: Vec<String> = schema
+        .columns
+        .iter()
+        .filter(|c| c.primary_key)
+        .map(|c| c.name.clone())
+        .collect();
+    if pk.is_empty() {
+        if let Some(declared) = constraints
+            .unique_constraints
+            .iter()
+            .find(|u| u.is_primary_key && !u.columns.is_empty())
+        {
+            pk = declared.columns.clone();
+        }
+    }
+    if !pk.is_empty() {
+        let name = format!("{table}_pkey");
+        rules.push(BranchUniqueRule {
+            index_name: name.clone(),
+            label: name,
+            columns: pk,
+            is_primary_key: true,
+        });
+    }
+    for column in &schema.columns {
+        if !column.unique || column.primary_key {
+            continue;
+        }
+        let columns = vec![column.name.clone()];
+        if rules.iter().any(|rule| same_set(&rule.columns, &columns)) {
+            continue;
+        }
+        let name = format!("{table}_{}_key", column.name);
+        rules.push(BranchUniqueRule {
+            index_name: name.clone(),
+            label: name,
+            columns,
+            is_primary_key: false,
+        });
+    }
+    for unique in &constraints.unique_constraints {
+        if unique.is_primary_key || unique.columns.is_empty() {
+            continue;
+        }
+        if rules.iter().any(|rule| same_set(&rule.columns, &unique.columns)) {
+            continue;
+        }
+        rules.push(BranchUniqueRule {
+            index_name: format!("{table}_{}_key", unique.columns.join("_")),
+            label: unique.name.clone(),
+            columns: unique.columns.clone(),
+            is_primary_key: false,
+        });
+    }
+    rules
+}
+
+// ---------------------------------------------------------------------------
+// The fork record
+// ---------------------------------------------------------------------------
+
+const FORK_MAGIC: &[u8; 4] = b"BMF1";
+const FORK_FORMAT_VERSION: u8 = 1;
+
+/// What a branch's fork record holds for one table of its parent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkEntry {
+    /// The table's incarnation id; `None` while it has none (a backfill that
+    /// failed), which compares as unknown, never as different.
+    pub incarnation: Option<u64>,
+    /// The fingerprint of its definition ([`definition_fingerprint`]).
+    pub fingerprint: u64,
+    /// Its columns, for a refusal to say what changed.
+    pub columns: Vec<String>,
+}
+
+/// Do two incarnation ids say the table is a different one? `None` is unknown.
+pub(crate) fn incarnations_differ(left: Option<u64>, right: Option<u64>) -> bool {
+    matches!((left, right), (Some(left), Some(right)) if left != right)
+}
+
+/// A definition's incarnation as a fact: `0` is "main's table has no id yet".
+pub(crate) fn known_incarnation(incarnation: u64) -> Option<u64> {
+    (incarnation != 0).then_some(incarnation)
+}
+
+/// The stored form (unsealed) of a branch's fork record.
+pub(crate) fn encode_fork_record(entries: &BTreeMap<String, ForkEntry>) -> Result<Vec<u8>> {
+    let body = bincode::serialize(entries)
+        .map_err(|e| Error::storage(format!("Failed to serialize a branch fork record: {e}")))?;
+    let mut out = Vec::with_capacity(FORK_MAGIC.len() + 1 + body.len());
+    out.extend_from_slice(FORK_MAGIC);
+    out.push(FORK_FORMAT_VERSION);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+fn decode_fork_record(bytes: &[u8]) -> Result<BTreeMap<String, ForkEntry>> {
+    let body = bytes
+        .strip_prefix(FORK_MAGIC.as_slice())
+        .and_then(<[u8]>::split_first)
+        .filter(|(version, _)| **version == FORK_FORMAT_VERSION)
+        .map(|(_, body)| body)
+        .ok_or_else(|| Error::storage("a branch fork record has an unknown format"))?;
+    bincode::deserialize(body).map_err(|e| Error::storage(format!("a branch fork record does not decode: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// MERGE BRANCH's durable intent
+// ---------------------------------------------------------------------------
+
+const INTENT_MAGIC: &[u8; 4] = b"BMI1";
+const INTENT_FORMAT_VERSION: u8 = 1;
+
+/// sprinter 6bc4a4040eb7 (B3 fix pass): an unfinished MERGE BRANCH — written,
+/// synced, before the source is marked merged and before the target changes;
+/// deleted when the merge is done. Rolled FORWARD: rerunning the MERGE, or the
+/// next open, finishes it. Rolling back would need the pre-image of every table
+/// the merge dropped and of every row an `ADD COLUMN` rewrote in place, and the
+/// engine keeps neither; the source's rows and the steps below stay on disk
+/// until the merge is finished.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MergeIntent {
+    pub(crate) source_id: u64,
+    pub(crate) source_name: String,
+    pub(crate) target_id: u64,
+    pub(crate) target_name: String,
+    pub(crate) merge_to_main: bool,
+    /// The target's chain; empty for main.
+    pub(crate) target_chain: Vec<u64>,
+    /// When the source became merged.
+    pub(crate) merge_timestamp: u64,
+    /// The schema changes, in table order.
+    pub(crate) steps: Vec<MergeStep>,
+    /// Every table the merge changes on the target, rows-only ones included:
+    /// the target's DDL on them is refused until the merge is finished.
+    pub(crate) tables: Vec<String>,
+    /// Of those, the ones a branch target resolves to main's catalog: main's DDL
+    /// on them would change what the merge validated, so it is refused too.
+    pub(crate) main_tables: Vec<String>,
+    /// Into main: the tables whose rows have landed. Written in the same commit as
+    /// those rows, so a rerun leaves them alone: main may have changed them since,
+    /// and those changes are not the merge's to undo.
+    pub(crate) landed: Vec<String>,
+}
+
+/// One schema change of a merge. Every step is idempotent: applying it checks
+/// what the target holds now against what the plan saw.
+///
+/// The incarnation was compared by the plan, under the merge's exclusion, and
+/// is not compared again here: the target's DDL has been held off the table ever
+/// since, so a different id at a resume can only be a WAL replay at open minting
+/// one for the same table (a DROP + CREATE inside the checkpoint window). That
+/// must not leave the merge unfinishable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MergeStep {
+    pub(crate) table: String,
+    /// The target's definition fingerprint the step applies to.
+    pub(crate) before: Option<u64>,
+    pub(crate) action: MergeAction,
+}
+
+/// What one step does.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) enum MergeAction {
+    /// Into main: the branch dropped the table.
+    DropOnMain,
+    /// Into main: the branch created the table; it replaces main's of the name
+    /// and keeps the definition's incarnation, which is also how a resumed
+    /// merge recognizes a create it already ran.
+    CreateOnMain { definition: BranchTableDefinition },
+    /// Into main: the branch added columns over `base_columns`.
+    AddColumnsOnMain {
+        base_columns: Vec<String>,
+        columns: Vec<BranchAddedColumn>,
+    },
+    /// Into a branch: the target level takes `record`, computed at plan time.
+    /// With `materialize`, the target's view is first rewritten under it.
+    PutOnBranch {
+        record: BranchTableRecord,
+        materialize: Option<Vec<BranchAddedColumn>>,
+    },
+}
+
+impl MergeIntent {
+    /// The merge's tables whose rows are still to land.
+    pub(crate) fn tables_left(&self) -> Vec<String> {
+        self.tables
+            .iter()
+            .filter(|table| !self.landed.contains(table))
+            .cloned()
+            .collect()
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let body =
+            bincode::serialize(self).map_err(|e| Error::storage(format!("Failed to serialize a merge intent: {e}")))?;
+        let mut out = Vec::with_capacity(INTENT_MAGIC.len() + 1 + body.len());
+        out.extend_from_slice(INTENT_MAGIC);
+        out.push(INTENT_FORMAT_VERSION);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    pub(super) fn decode(bytes: &[u8]) -> Result<Self> {
+        let body = bytes
+            .strip_prefix(INTENT_MAGIC.as_slice())
+            .and_then(<[u8]>::split_first)
+            .filter(|(version, _)| **version == INTENT_FORMAT_VERSION)
+            .map(|(_, body)| body)
+            .ok_or_else(|| Error::storage("a MERGE BRANCH intent has an unknown format"))?;
+        bincode::deserialize(body).map_err(|e| Error::storage(format!("a MERGE BRANCH intent does not decode: {e}")))
+    }
+
+    /// The level the merge's exclusion is keyed by.
+    pub(crate) fn exclusion_level(&self) -> u64 {
+        if self.merge_to_main {
+            MERGE_TARGET_MAIN
+        } else {
+            self.target_id
+        }
+    }
+}
+
+/// The exclusion level of main (main's registry id is a branch id like any
+/// other; `0` is never one).
+pub(crate) const MERGE_TARGET_MAIN: u64 = 0;
+
+/// One merge holding a table of a level off DDL.
+#[derive(Debug, Clone)]
+struct MergeHolder {
+    source_id: u64,
+    source: String,
+    target: String,
+    /// The merge changes the table on this level; otherwise it only depends on
+    /// it (a branch target that inherits main's table), and any number of those
+    /// can share it.
+    writes: bool,
+}
+
+/// `(engine instance, level, table)` → the merges holding it.
+static MERGE_EXCLUSIONS: LazyLock<DashMap<RecordKey, Vec<MergeHolder>>> = LazyLock::new(DashMap::new);
+
+/// How many entries [`MERGE_EXCLUSIONS`] holds, over every engine — the one
+/// relaxed load a schema plan on main pays.
+static MERGE_EXCLUSION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Where `merge_branch` can be made to fail or be stopped at, for the
+/// crash-consistency tests.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MergeFailSite {
+    /// The intent is durable, and the source is not marked merged yet.
+    AfterIntent,
+    /// A schema step (and between an `ADD COLUMN`'s schema update and backfill).
+    Step,
+    /// Into main: a table's rows are about to land. Into a branch: one row.
+    Row,
+    /// Into main: a table's keys are claimed, and its rows are not committed yet.
+    TableClaimed,
+    /// One chunk of a materialization written.
+    Materialize,
+    /// A schema statement on main, counted and past its exclusion check.
+    MainDdlStatement,
+}
+
+/// A test's code to run at a [`MergeFailSite`], with no lock held.
+#[doc(hidden)]
+pub type MergeSiteHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Injected failures of `merge_branch`, per engine: fail at the n-th tick of
+/// that site.
+static MERGE_FAILPOINTS: LazyLock<DashMap<u64, (MergeFailSite, usize)>> = LazyLock::new(DashMap::new);
+
+/// Test code to run at each tick of a site, per engine.
+static MERGE_SITE_HOOKS: LazyLock<DashMap<(u64, MergeFailSite), MergeSiteHook>> = LazyLock::new(DashMap::new);
+
+/// Whether any fail point or hook is armed: the one load a merged row pays.
+static MERGE_FAILPOINTS_ARMED: AtomicUsize = AtomicUsize::new(0);
+
+/// Schema statements and catalog writes on main past the exclusion check and
+/// not finished, per (engine, table) (B3 second and third fix passes). A merge
+/// that registers its exclusion waits for the ones on ITS tables: the statement
+/// announces itself BEFORE it reads the exclusions and the merge registers BEFORE
+/// it reads this, so either the statement sees the exclusion or the merge sees the
+/// statement. A statement naming no table, and a temporary table, are not counted.
+static MAIN_DDL_IN_FLIGHT: LazyLock<DashMap<(u64, String), usize>> = LazyLock::new(DashMap::new);
+
+/// A schema statement on main, or one write of main's catalog: counted until it
+/// drops ([`MAIN_DDL_IN_FLIGHT`]). Inert inside a merge's own scope.
+#[must_use]
+pub(crate) struct MainDdlGuard {
+    engine: u64,
+    tables: Vec<String>,
+    /// A statement's guard: it restores [`MAIN_STATEMENT`] to `previous_statement`.
+    restores_statement: bool,
+    previous_statement: Option<u64>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for MainDdlGuard {
+    fn drop(&mut self) {
+        for table in self.tables.drain(..) {
+            if let dashmap::mapref::entry::Entry::Occupied(mut entry) = MAIN_DDL_IN_FLIGHT.entry((self.engine, table)) {
+                let remaining = entry.get().saturating_sub(1);
+                if remaining == 0 {
+                    entry.remove();
+                } else {
+                    *entry.get_mut() = remaining;
+                }
+            }
+        }
+        if self.restores_statement {
+            MAIN_STATEMENT.with(|statement| statement.set(self.previous_statement));
+        }
+    }
+}
+
+thread_local! {
+    /// The engine whose schema statement, past its check, is running on this
+    /// thread (B3 third fix pass): its catalog writes are counted and never
+    /// refused. A merge that registers meanwhile WAITS for that statement, so
+    /// refusing the statement half way would tear what the merge is waiting for:
+    /// `ALTER COLUMN … SET STORAGE` rewrites its rows before its schema, and
+    /// `CREATE INDEX` builds its index before its record. Only a route with no
+    /// statement guard is refused at the funnel.
+    static MAIN_STATEMENT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// The engine whose MERGE BRANCH is running on this thread: its own catalog
+    /// writes are not refused as DDL on its own tables. Statement execution stays
+    /// on its thread, which is what makes a thread-local the right home.
+    static MERGE_SCOPE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// A MERGE BRANCH running on this thread (see [`MERGE_SCOPE`]). Restores what it
+/// found (the open-time finish, and a merge nested under nothing else, find none).
+#[must_use]
+pub(crate) struct MergeDdlScope {
+    previous: Option<u64>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl MergeDdlScope {
+    pub(crate) fn enter(engine: u64) -> Self {
+        Self {
+            previous: MERGE_SCOPE.with(|scope| scope.replace(Some(engine))),
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for MergeDdlScope {
+    fn drop(&mut self) {
+        MERGE_SCOPE.with(|scope| scope.set(self.previous));
+    }
+}
+
+/// The live trigger registry of each open database, for a MERGE's drop.
+static LIVE_TRIGGER_REGISTRIES: LazyLock<DashMap<u64, std::sync::Weak<crate::sql::TriggerRegistry>>> =
+    LazyLock::new(DashMap::new);
+
+/// See `StorageEngine::ancestor_merge_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AncestorMerge {
+    /// Its definitions are on the target: carried.
+    IntoTheTarget,
+    /// Active, or merged somewhere else: it has to be merged first.
+    NotIntoTheTarget,
+    /// Merged into a branch that has since been dropped: it never can be.
+    IntoADroppedBranch,
+}
+
+/// Is any merge excluding DDL on some table of some engine?
+pub(crate) fn merge_exclusions_exist() -> bool {
+    MERGE_EXCLUSION_COUNT.load(Ordering::Relaxed) > 0
+}
+
+// ---------------------------------------------------------------------------
+// Resolution
+// ---------------------------------------------------------------------------
+
+/// How a chain resolves one table name.
+#[derive(Debug, Clone)]
+pub enum BranchTableResolution {
+    /// No level of the chain has an entry: main's catalog decides.
+    Inherited,
+    /// `chain[index]` (= `level`) defines the table.
+    Defined {
+        /// Position of the deciding level in the chain.
+        index: usize,
+        /// The deciding level.
+        level: u64,
+        /// Its record (`state` is `Defined`).
+        record: Arc<BranchTableRecord>,
+    },
+    /// `chain[index]` (= `level`) dropped the table: it does not exist.
+    Dropped {
+        /// Position of the deciding level in the chain.
+        index: usize,
+        /// The deciding level.
+        level: u64,
+        /// Its record (`state` is `Dropped`).
+        record: Arc<BranchTableRecord>,
+    },
+}
+
+impl BranchTableResolution {
+    fn from_record(index: usize, level: u64, record: Arc<BranchTableRecord>) -> Self {
+        if record.definition().is_some() {
+            Self::Defined { index, level, record }
+        } else {
+            Self::Dropped { index, level, record }
+        }
+    }
+
+    /// The branch's definition of the table, when a level defines it.
+    pub fn definition(&self) -> Option<&BranchTableDefinition> {
+        match self {
+            Self::Defined { record, .. } => record.definition(),
+            _ => None,
+        }
+    }
+
+    /// `Some(exists)` when a level decides, `None` when main does.
+    pub fn exists(&self) -> Option<bool> {
+        match self {
+            Self::Inherited => None,
+            Self::Defined { .. } => Some(true),
+            Self::Dropped { .. } => Some(false),
+        }
+    }
+
+    /// The deciding level, unless main decides.
+    pub fn level(&self) -> Option<u64> {
+        match self {
+            Self::Inherited => None,
+            Self::Defined { level, .. } | Self::Dropped { level, .. } => Some(*level),
+        }
+    }
+}
+
+/// `(engine instance, level, table)`.
+type RecordKey = (u64, u64, String);
+
+/// Upper bound on cached (level, table) records; past it the cache is
+/// emptied (every entry is re-read on its next use).
+const RECORD_CACHE_MAX_ENTRIES: usize = 65_536;
+
+/// sprinter 6bc4a4040eb7 (phase B3): each level's record for a table (or its
+/// absence), stamped with the engine's schema generation at the read.
+static RECORDS: LazyLock<DashMap<RecordKey, (u64, Option<Arc<BranchTableRecord>>)>> = LazyLock::new(DashMap::new);
+
+/// `(engine instance, branch, table)` whose isolated table this process has
+/// already raised the shared row-id counter for (see
+/// `StorageEngine::ensure_branch_row_id_floor`).
+static ROW_ID_FLOORS: LazyLock<DashMap<RecordKey, ()>> = LazyLock::new(DashMap::new);
+
+impl StorageEngine {
+    fn branch_keys_with_prefix(&self, prefix: &[u8], mut each: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix, Direction::Forward), read_opts);
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {e}")))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            each(&key)?;
+        }
+        Ok(())
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): level `level`'s OWN record for
+    /// `table` (`None`: the level has no entry for it).
+    pub(crate) fn branch_table_record(&self, level: u64, table: &str) -> Result<Option<Arc<BranchTableRecord>>> {
+        let cacheable = !self.is_physical_standby();
+        // Read the generation BEFORE the record: a write that lands between
+        // the two leaves this entry stamped with the older generation, so the
+        // next use re-reads it.
+        let generation = self.schema_generation();
+        let key: RecordKey = (self.instance_id(), level, table.to_string());
+        if cacheable {
+            if let Some(entry) = RECORDS.get(&key) {
+                if entry.0 == generation {
+                    return Ok(entry.1.clone());
+                }
+            }
+        }
+        let record = match self.get(&branch_table_key(level, table))? {
+            Some(bytes) => Some(Arc::new(BranchTableRecord::decode(table, &bytes)?)),
+            None => None,
+        };
+        if cacheable {
+            if RECORDS.len() >= RECORD_CACHE_MAX_ENTRIES {
+                RECORDS.clear();
+            }
+            RECORDS.insert(key, (generation, record.clone()));
+        }
+        Ok(record)
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): resolve `table` through `chain`
+    /// (oldest first): the NEAREST level with an entry decides.
+    pub(crate) fn resolve_branch_table(&self, chain: &[u64], table: &str) -> Result<BranchTableResolution> {
+        for (index, &level) in chain.iter().enumerate().rev() {
+            if let Some(record) = self.branch_table_record(level, table)? {
+                return Ok(BranchTableResolution::from_record(index, level, record));
+            }
+        }
+        Ok(BranchTableResolution::Inherited)
+    }
+
+    /// The running statement's branch chain (oldest first, ending with the
+    /// branch itself); `None` on main. One thread-local read on main.
+    pub(crate) fn session_branch_chain(&self) -> Option<Vec<u64>> {
+        if !self.is_branch_active() {
+            return None;
+        }
+        let binding = self.active_branch()?;
+        let mut chain = binding.chain.clone();
+        if chain.last() != Some(&binding.branch_id) {
+            chain.push(binding.branch_id);
+        }
+        Some(chain)
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): how the running statement's branch
+    /// resolves `table` — `None` on main (main's catalog decides, and its
+    /// caches apply). The question every catalog reader asks first.
+    pub(crate) fn session_branch_table(&self, table: &str) -> Result<Option<BranchTableResolution>> {
+        let Some(chain) = self.session_branch_chain() else {
+            return Ok(None);
+        };
+        let resolution = self.resolve_branch_table(&chain, table)?;
+        if let BranchTableResolution::Defined { index, record, .. } = &resolution {
+            if record.isolated {
+                if let Some(levels) = chain.get(*index..) {
+                    self.ensure_branch_row_id_floor(levels, table)?;
+                }
+            }
+        }
+        Ok(Some(resolution))
+    }
+
+    /// Every table some level of `chain` holds an entry for, the NEAREST
+    /// level winning.
+    pub(crate) fn branch_tables_in_chain(&self, chain: &[u64]) -> Result<BTreeMap<String, BranchTableResolution>> {
+        let mut out: BTreeMap<String, BranchTableResolution> = BTreeMap::new();
+        for (index, &level) in chain.iter().enumerate() {
+            for (table, bytes) in self.meta_blobs_with_prefix(&branch_tables_prefix(level))? {
+                let record = Arc::new(BranchTableRecord::decode(&table, &bytes)?);
+                out.insert(table, BranchTableResolution::from_record(index, level, record));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Level `level`'s own records, by table.
+    pub(crate) fn branch_table_records_at(&self, level: u64) -> Result<BTreeMap<String, BranchTableRecord>> {
+        let mut out = BTreeMap::new();
+        for (table, bytes) in self.meta_blobs_with_prefix(&branch_tables_prefix(level))? {
+            let record = BranchTableRecord::decode(&table, &bytes)?;
+            out.insert(table, record);
+        }
+        Ok(out)
+    }
+
+    /// Main's definition of `table` (`None`: main has no such table), with
+    /// its fingerprint — read from main's catalog whatever branch the running
+    /// statement is on.
+    pub(crate) fn main_table_definition(&self, table: &str) -> Result<Option<(BranchTableDefinition, u64)>> {
+        let catalog = Catalog::new(self);
+        if !catalog.main_table_exists(table)? {
+            return Ok(None);
+        }
+        let schema = catalog.main_table_schema(table)?;
+        let constraints = catalog.main_table_constraints(table)?;
+        let unique_rules: Vec<BranchUniqueRule> = self
+            .art_indexes()
+            .enforced_unique_indexes(table)
+            .iter()
+            .map(BranchUniqueRule::from_enforced)
+            .collect();
+        let identity_columns = catalog.main_identity_columns(table)?;
+        let fingerprint = definition_fingerprint(&schema, &constraints, &unique_rules)?;
+        Ok(Some((
+            BranchTableDefinition {
+                schema,
+                constraints,
+                unique_rules,
+                identity_columns,
+                incarnation: catalog.main_table_incarnation(table)?.unwrap_or(0),
+            },
+            fingerprint,
+        )))
+    }
+
+    /// The definition of `table` seen through `chain` (an empty chain is
+    /// main), with its fingerprint; `None` when the table does not exist
+    /// there.
+    pub(crate) fn chain_table_definition(
+        &self,
+        chain: &[u64],
+        table: &str,
+    ) -> Result<Option<(BranchTableDefinition, u64)>> {
+        match self.resolve_branch_table(chain, table)? {
+            BranchTableResolution::Inherited => self.main_table_definition(table),
+            BranchTableResolution::Dropped { .. } => Ok(None),
+            BranchTableResolution::Defined { record, .. } => match record.definition() {
+                Some(definition) => {
+                    let fingerprint =
+                        definition_fingerprint(&definition.schema, &definition.constraints, &definition.unique_rules)?;
+                    Ok(Some((definition.clone(), fingerprint)))
+                }
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): the incarnation of `table` seen
+    /// through `chain` (an empty chain is main); `None` when the table does not
+    /// exist there.
+    pub(crate) fn chain_table_incarnation(&self, chain: &[u64], table: &str) -> Result<Option<u64>> {
+        match self.resolve_branch_table(chain, table)? {
+            BranchTableResolution::Inherited => Catalog::new(self).main_table_incarnation(table),
+            BranchTableResolution::Dropped { .. } => Ok(None),
+            BranchTableResolution::Defined { record, .. } => {
+                Ok(record.definition().and_then(|d| known_incarnation(d.incarnation)))
+            }
+        }
+    }
+
+    /// The fork entry of every table `chain` sees (an empty chain is main):
+    /// what a child forked from that level records.
+    pub(crate) fn fork_entries(&self, chain: &[u64]) -> Result<BTreeMap<String, ForkEntry>> {
+        fn entry(definition: &BranchTableDefinition, fingerprint: u64) -> ForkEntry {
+            ForkEntry {
+                incarnation: known_incarnation(definition.incarnation),
+                fingerprint,
+                columns: definition.schema.columns.iter().map(|c| c.name.clone()).collect(),
+            }
+        }
+        let catalog = Catalog::new(self);
+        let entries = self.branch_tables_in_chain(chain)?;
+        let mut out = BTreeMap::new();
+        for table in catalog.list_main_tables()? {
+            if entries.contains_key(&table) {
+                continue;
+            }
+            if let Some((definition, fingerprint)) = self.main_table_definition(&table)? {
+                let forked = entry(&definition, fingerprint);
+                out.insert(table, forked);
+            }
+        }
+        for (table, resolution) in entries {
+            if let Some(definition) = resolution.definition() {
+                let fingerprint =
+                    definition_fingerprint(&definition.schema, &definition.constraints, &definition.unique_rules)?;
+                out.insert(table, entry(definition, fingerprint));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Level `level`'s fork record; `None` for a branch created without one.
+    pub(crate) fn branch_fork_record(&self, level: u64) -> Result<Option<BTreeMap<String, ForkEntry>>> {
+        match self.get(&branch_fork_key(level))? {
+            Some(bytes) => Ok(Some(decode_fork_record(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Stage level `level`'s fork record into its creation batch.
+    pub(crate) fn stage_branch_fork_record(
+        &self,
+        level: u64,
+        entries: &BTreeMap<String, ForkEntry>,
+        batch: &mut WriteBatch,
+    ) -> Result<()> {
+        let value = encode_fork_record(entries)?;
+        let sealed = super::tde::seal(self.key_manager_ref(), &value)?;
+        batch.put(branch_fork_key(level), sealed.as_ref());
+        Ok(())
+    }
+
+    /// The unfinished merge of source `source_id`, if any.
+    pub(crate) fn branch_merge_intent(&self, source_id: u64) -> Result<Option<MergeIntent>> {
+        match self.get(&branch_merge_intent_key(source_id))? {
+            Some(bytes) => Ok(Some(MergeIntent::decode(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every unfinished merge of this store.
+    pub(crate) fn branch_merge_intents(&self) -> Result<Vec<MergeIntent>> {
+        self.meta_blobs_with_prefix(BRANCH_MERGE_INTENT_PREFIX)?
+            .into_iter()
+            .map(|(_, bytes)| MergeIntent::decode(&bytes))
+            .collect()
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): an unfinished merge OTHER than
+    /// `source_id`'s own that a merge of `source_id` into `target_id` would break:
+    /// one that writes into `source_id` (merged away, it could never finish), or
+    /// `target_id`'s own (it is on its way out). Two merges into one target may
+    /// coexist; the exclusion keeps them off each other's tables.
+    pub(crate) fn merge_intent_in_the_way(&self, source_id: u64, target_id: u64) -> Result<Option<MergeIntent>> {
+        Ok(self.branch_merge_intents()?.into_iter().find(|intent| {
+            intent.source_id != source_id && (intent.target_id == source_id || intent.source_id == target_id)
+        }))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): refuse (55006) `what`, a
+    /// whole-database operation, while any merge is unfinished.
+    pub(crate) fn refuse_while_a_merge_is_unfinished(&self, what: &str) -> Result<()> {
+        match self.branch_merge_intents()?.first() {
+            Some(intent) => Err(Error::branch_merge_pending_refuses(
+                what,
+                &intent.source_name,
+                &intent.target_name,
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Write `intent`, synced: nothing of the merge happens before this.
+    pub(crate) fn put_branch_merge_intent(&self, intent: &MergeIntent) -> Result<()> {
+        let value = intent.encode()?;
+        let sealed = super::tde::seal(self.key_manager_ref(), &value)?;
+        let mut batch = WriteBatch::default();
+        batch.put(branch_merge_intent_key(intent.source_id), sealed.as_ref());
+        self.write_batch_through_gate(batch)?;
+        self.durable_autocommit_barrier()
+    }
+
+    /// `intent`, with a table's rows: in `txn`, so the two are one write.
+    pub(crate) fn stage_branch_merge_intent(&self, intent: &MergeIntent, txn: &super::Transaction) -> Result<()> {
+        let value = intent.encode()?;
+        // The commit batch seals row keys only; this is the form the store holds.
+        let sealed = super::tde::seal(self.key_manager_ref(), &value)?;
+        txn.put(branch_merge_intent_key(intent.source_id), sealed.into_owned())
+    }
+
+    /// The merge of `source_id` is done (or never began): its intent goes.
+    pub(crate) fn delete_branch_merge_intent(&self, source_id: u64) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        batch.delete(branch_merge_intent_key(source_id));
+        self.write_batch_through_gate(batch)?;
+        self.durable_autocommit_barrier()
+    }
+
+    /// Hold `level`'s DDL off `tables` for the merge of `source_id`: `writes`
+    /// when the merge changes them on that level, otherwise it only depends on
+    /// them. Refused (55006) when another merge holds one of them, unless both
+    /// only depend on it; the caller then changed nothing.
+    pub(crate) fn register_merge_exclusion(
+        &self,
+        level: u64,
+        source_id: u64,
+        source_name: &str,
+        target_name: &str,
+        tables: &[String],
+        writes: bool,
+    ) -> Result<()> {
+        let engine = self.instance_id();
+        for table in tables {
+            let key: RecordKey = (engine, level, table.clone());
+            let mut holders = MERGE_EXCLUSIONS.entry(key).or_insert_with(|| {
+                MERGE_EXCLUSION_COUNT.fetch_add(1, Ordering::Relaxed);
+                Vec::new()
+            });
+            let conflict = holders
+                .iter()
+                .find(|holder| holder.source_id != source_id && (holder.writes || writes))
+                .cloned();
+            if let Some(holder) = conflict {
+                drop(holders);
+                self.release_merge_exclusion(source_id);
+                return Err(Error::branch_merge_table_busy(table, &holder.source, &holder.target));
+            }
+            if !holders.iter().any(|holder| holder.source_id == source_id) {
+                holders.push(MergeHolder {
+                    source_id,
+                    source: source_name.to_string(),
+                    target: target_name.to_string(),
+                    writes,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Hold the DDL an unfinished merge is exposed to: its target level's, and
+    /// main's on what a branch target inherits.
+    pub(crate) fn register_merge_intent_exclusion(&self, intent: &MergeIntent) -> Result<()> {
+        self.register_merge_exclusion(
+            intent.exclusion_level(),
+            intent.source_id,
+            &intent.source_name,
+            &intent.target_name,
+            &intent.tables,
+            true,
+        )?;
+        self.register_merge_exclusion(
+            MERGE_TARGET_MAIN,
+            intent.source_id,
+            &intent.source_name,
+            &intent.target_name,
+            &intent.main_tables,
+            false,
+        )
+    }
+
+    /// The merge of `source_id` is finished, or never began.
+    pub(crate) fn release_merge_exclusion(&self, source_id: u64) {
+        let engine = self.instance_id();
+        MERGE_EXCLUSIONS.retain(|(owner, _, _), holders| {
+            if *owner == engine {
+                holders.retain(|holder| holder.source_id != source_id);
+            }
+            let keep = !holders.is_empty();
+            if !keep {
+                MERGE_EXCLUSION_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+            keep
+        });
+    }
+
+    /// Refuse (55006) DDL on `table` of `level` while a merge holds it, unless
+    /// this IS that merge, running on this thread. A merge with a durable intent
+    /// has something to finish or abandon; one still validating has neither, and
+    /// is only something to wait for.
+    pub(crate) fn refuse_ddl_on_merging_table(&self, level: u64, table: &str) -> Result<()> {
+        if !merge_exclusions_exist() || self.in_merge_scope() {
+            return Ok(());
+        }
+        let key: RecordKey = (self.instance_id(), level, table.to_string());
+        let holder = MERGE_EXCLUSIONS
+            .get(&key)
+            .and_then(|entry| entry.value().first().cloned());
+        let Some(holder) = holder else {
+            return Ok(());
+        };
+        if self.branch_merge_intent(holder.source_id)?.is_some() {
+            Err(Error::branch_merge_pending(
+                &format!("table {table}"),
+                &holder.source,
+                &holder.target,
+            ))
+        } else {
+            Err(Error::branch_merge_in_progress(table, &holder.source, &holder.target))
+        }
+    }
+
+    fn in_merge_scope(&self) -> bool {
+        MERGE_SCOPE.with(std::cell::Cell::get) == Some(self.instance_id())
+    }
+
+    /// Count this DDL on `tables`: temporary tables are not counted, and a table
+    /// is counted once.
+    fn count_main_ddl(&self, tables: &[&str]) -> MainDdlGuard {
+        let engine = self.instance_id();
+        let mut counted: Vec<String> = Vec::with_capacity(tables.len());
+        for table in tables {
+            if crate::sql::temp_tables::is_temp_key(table) || counted.iter().any(|seen| seen == table) {
+                continue;
+            }
+            *MAIN_DDL_IN_FLIGHT.entry((engine, (*table).to_string())).or_insert(0) += 1;
+            counted.push((*table).to_string());
+        }
+        MainDdlGuard {
+            engine,
+            tables: counted,
+            restores_statement: false,
+            previous_statement: None,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 third fix pass): a schema statement on main
+    /// starts, on `tables`. Counted first, then refused (55006) if a merge holds
+    /// one of them. Past this it is not refused again: see [`MAIN_STATEMENT`]. A
+    /// statement nested in another one (a `CREATE SCHEMA`'s elements) is covered by
+    /// the outer one's check. Inert inside a merge's own scope.
+    pub(crate) fn enter_main_statement(&self, tables: &[&str]) -> Result<MainDdlGuard> {
+        if self.in_merge_scope() {
+            return Ok(self.count_main_ddl(&[]));
+        }
+        let engine = self.instance_id();
+        let previous = MAIN_STATEMENT.with(|statement| statement.replace(Some(engine)));
+        let mut guard = self.count_main_ddl(tables);
+        guard.restores_statement = true;
+        guard.previous_statement = previous;
+        if previous != Some(engine) {
+            for table in tables {
+                self.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, table)?;
+            }
+        }
+        self.merge_failpoint_tick(MergeFailSite::MainDdlStatement)?;
+        Ok(guard)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second and third fix passes): one catalog write
+    /// on main touching `tables`. Always counted. Under a statement guard that is
+    /// all; on a route with none (a direct catalog call, restore, the protocol
+    /// adapter) THIS is the check, and it refuses (55006) if a merge holds one of
+    /// the tables. Inert inside a merge's own scope.
+    pub(crate) fn enter_main_ddl(&self, tables: &[&str]) -> Result<MainDdlGuard> {
+        if self.in_merge_scope() {
+            return Ok(self.count_main_ddl(&[]));
+        }
+        let guard = self.count_main_ddl(tables);
+        if MAIN_STATEMENT.with(std::cell::Cell::get) != Some(self.instance_id()) {
+            for table in tables {
+                self.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, table)?;
+            }
+        }
+        Ok(guard)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second and third fix passes): a merge just
+    /// registered its exclusion of `tables` on main: wait, until `deadline` (one
+    /// budget for the whole statement), for the schema statements on THOSE tables
+    /// already past the check. Refused 55006 when one is still running.
+    pub(crate) fn wait_for_main_ddl(
+        &self,
+        tables: &[String],
+        source: &str,
+        target: &str,
+        deadline: std::time::Instant,
+    ) -> Result<()> {
+        let engine = self.instance_id();
+        while tables
+            .iter()
+            .any(|table| MAIN_DDL_IN_FLIGHT.contains_key(&(engine, table.clone())))
+        {
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::branch_merge_ddl_busy(source, target));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    /// For the tests' handshakes: is a merge holding `table` on main?
+    #[doc(hidden)]
+    pub fn debug_merge_holds_table(&self, table: &str) -> bool {
+        MERGE_EXCLUSIONS.contains_key(&(self.instance_id(), MERGE_TARGET_MAIN, table.to_string()))
+    }
+
+    /// The backstop in MAIN's catalog mutators: refuse (0A000) a branch session
+    /// (`refuse_main_catalog_write_on_branch`), and count the write, refusing
+    /// (55006) a table a merge holds unless a statement guard already checked
+    /// ([`Self::enter_main_ddl`]). The guard lives as long as the write.
+    pub(crate) fn main_catalog_write(&self, tables: &[&str], statement: &str) -> Result<MainDdlGuard> {
+        self.refuse_main_catalog_write_on_branch(statement)?;
+        self.enter_main_ddl(tables)
+    }
+
+    /// The EmbeddedDatabase's live trigger registry, which a MERGE's drop must
+    /// deregister a table from, as main's own DROP TABLE does
+    /// (`EmbeddedDatabase::on_table_dropped`).
+    pub(crate) fn attach_live_trigger_registry(&self, registry: &Arc<crate::sql::TriggerRegistry>) {
+        // An attach happens once per open: the moment to forget closed databases.
+        LIVE_TRIGGER_REGISTRIES.retain(|_, weak| weak.strong_count() > 0);
+        LIVE_TRIGGER_REGISTRIES.insert(self.instance_id(), Arc::downgrade(registry));
+    }
+
+    /// `table` was dropped by a merge: its triggers leave the live registry.
+    pub(crate) fn deregister_dropped_table_triggers(&self, table: &str) {
+        let registry = LIVE_TRIGGER_REGISTRIES
+            .get(&self.instance_id())
+            .and_then(|registry| registry.upgrade());
+        if let Some(registry) = registry {
+            if let Err(e) = registry.drop_table_triggers(table) {
+                tracing::warn!(
+                    "MERGE BRANCH: dropping '{}': failed to deregister triggers: {}",
+                    table,
+                    e
+                );
+            }
+        }
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): fail the MERGE at the n-th tick of
+    /// `site` on this engine (`0`: the first tick), once. For the
+    /// crash-consistency tests.
+    #[doc(hidden)]
+    pub fn debug_fail_merge_at(&self, site: MergeFailSite, after: usize) {
+        if MERGE_FAILPOINTS.insert(self.instance_id(), (site, after)).is_none() {
+            MERGE_FAILPOINTS_ARMED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Run `hook` at every tick of `site` on this engine, with no lock held
+    /// (`None` removes it). For the tests' deterministic handshakes, and for a
+    /// child process to die at a named point.
+    #[doc(hidden)]
+    pub fn debug_on_merge_site(&self, site: MergeFailSite, hook: Option<MergeSiteHook>) {
+        let key = (self.instance_id(), site);
+        let had = match hook {
+            Some(hook) => MERGE_SITE_HOOKS.insert(key, hook).is_some(),
+            None => MERGE_SITE_HOOKS.remove(&key).is_some(),
+        };
+        let has = MERGE_SITE_HOOKS.contains_key(&key);
+        if has && !had {
+            MERGE_FAILPOINTS_ARMED.fetch_add(1, Ordering::Relaxed);
+        } else if had && !has {
+            MERGE_FAILPOINTS_ARMED.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Disarm [`Self::debug_fail_merge_at`].
+    #[doc(hidden)]
+    pub fn debug_clear_merge_failpoint(&self) {
+        if MERGE_FAILPOINTS.remove(&self.instance_id()).is_some() {
+            MERGE_FAILPOINTS_ARMED.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A smaller chunk for materializations in this process (`0`: the default),
+    /// so a test reaches a chunk boundary with a few rows.
+    #[doc(hidden)]
+    pub fn debug_set_materialize_chunk_rows(&self, rows: u64) {
+        super::branch_view::set_materialize_chunk_rows(rows);
+    }
+
+    /// [`Self::debug_fail_merge_at`] the schema steps.
+    #[doc(hidden)]
+    pub fn debug_fail_merge_after_steps(&self, steps: usize) {
+        self.debug_fail_merge_at(MergeFailSite::Step, steps);
+    }
+
+    /// One tick of the fail point above.
+    pub(crate) fn merge_failpoint_tick(&self, site: MergeFailSite) -> Result<()> {
+        if MERGE_FAILPOINTS_ARMED.load(Ordering::Relaxed) == 0 {
+            return Ok(());
+        }
+        let engine = self.instance_id();
+        let hook = MERGE_SITE_HOOKS
+            .get(&(engine, site))
+            .map(|hook| Arc::clone(hook.value()));
+        if let Some(hook) = hook {
+            hook();
+        }
+        let fire = match MERGE_FAILPOINTS.get_mut(&engine) {
+            Some(mut armed) if armed.0 == site => {
+                if armed.1 > 0 {
+                    armed.1 -= 1;
+                    false
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        };
+        if fire {
+            MERGE_FAILPOINTS.remove(&engine);
+            MERGE_FAILPOINTS_ARMED.fetch_sub(1, Ordering::Relaxed);
+            return Err(Error::storage("injected MERGE BRANCH failure"));
+        }
+        Ok(())
+    }
+
+    fn row_ids_with_prefix(&self, prefix: &str) -> Result<HashSet<u64>> {
+        let prefix_len = prefix.len();
+        let mut ids = HashSet::new();
+        self.branch_keys_with_prefix(prefix.as_bytes(), |key| {
+            if let Some(row_id) = Self::parse_row_id_after_prefix(key, prefix_len) {
+                ids.insert(row_id);
+            }
+            Ok(())
+        })?;
+        Ok(ids)
+    }
+
+    /// The row ids level `level` holds an image of.
+    pub(crate) fn branch_level_row_ids(&self, level: u64, table: &str) -> Result<HashSet<u64>> {
+        self.row_ids_with_prefix(&format!("bdata:{level}:{table}:"))
+    }
+
+    /// The row ids level `level` holds a tombstone of.
+    pub(crate) fn branch_tombstone_row_ids(&self, level: u64, table: &str) -> Result<HashSet<u64>> {
+        self.row_ids_with_prefix(&format!("bdel:{level}:{table}:"))
+    }
+
+    /// The row ids whose entry on level `level` is a COPY (`bfrz:`), not a
+    /// change made on the level.
+    pub(crate) fn branch_frozen_row_ids(&self, level: u64, table: &str) -> Result<HashSet<u64>> {
+        self.row_ids_with_prefix(&super::branch_view::frozen_prefix(level, table))
+    }
+
+    /// The rows level `level` itself CHANGED: its images and tombstones, minus
+    /// its copies. What MERGE carries.
+    pub(crate) fn branch_changed_row_ids(&self, level: u64, table: &str) -> Result<HashSet<u64>> {
+        let frozen = self.branch_frozen_row_ids(level, table)?;
+        let mut changed = self.branch_level_row_ids(level, table)?;
+        changed.extend(self.branch_tombstone_row_ids(level, table)?);
+        changed.retain(|row_id| !frozen.contains(row_id));
+        Ok(changed)
+    }
+
+    /// The live branches that read through `level`, but for `except`: its
+    /// descendants, walked THROUGH merged branches (B3 second fix pass): a merged
+    /// child stays in its own children's chains. `except`'s own descendants count.
+    pub(crate) fn live_branch_children(&self, level: u64, except: Option<u64>) -> Result<Vec<String>> {
+        let branches = self.list_branches_for_catalog()?;
+        let mut live = Vec::new();
+        let mut visited: HashSet<u64> = HashSet::new();
+        let mut pending = vec![level];
+        while let Some(cursor) = pending.pop() {
+            for branch in &branches {
+                if branch.parent_id != Some(cursor) || !visited.insert(branch.branch_id) {
+                    continue;
+                }
+                pending.push(branch.branch_id);
+                if branch.state == super::BranchState::Active && Some(branch.branch_id) != except {
+                    live.push(branch.name.clone());
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): where did level `level`, an
+    /// ancestor of a merge's source, go? If it was merged, all the way, into the
+    /// lineage of the merge's target, what it defined is on that target and a
+    /// child of it has nothing left to wait for.
+    pub(crate) fn ancestor_merge_state(
+        &self,
+        level: u64,
+        target_id: u64,
+        target_chain: &[u64],
+    ) -> Result<AncestorMerge> {
+        let branches = self.list_branches_for_catalog()?;
+        let mut cursor = level;
+        for _ in 0..=branches.len() {
+            // Not listed: dropped. An ancestor itself cannot be, while it has a
+            // child; what it was merged INTO can.
+            let Some(branch) = branches.iter().find(|branch| branch.branch_id == cursor) else {
+                return Ok(AncestorMerge::IntoADroppedBranch);
+            };
+            let super::BranchState::Merged { into_branch, .. } = branch.state else {
+                return Ok(AncestorMerge::NotIntoTheTarget);
+            };
+            if into_branch == target_id || target_chain.contains(&into_branch) {
+                return Ok(AncestorMerge::IntoTheTarget);
+            }
+            cursor = into_branch;
+        }
+        Ok(AncestorMerge::NotIntoTheTarget)
+    }
+
+    /// Stage the deletion of every row image and tombstone of `table` that
+    /// level `level` holds itself (`bdata:{level}:{table}:*`,
+    /// `bdel:{level}:{table}:*`), with their copy markers and the level's key
+    /// index of the table, into `batch`. Returns how many row keys.
+    pub(crate) fn stage_branch_rows_delete(&self, level: u64, table: &str, batch: &mut WriteBatch) -> Result<usize> {
+        let mut count = 0usize;
+        self.branch_keys_with_prefix(
+            super::branch_view::key_index_table_prefix(level, table).as_bytes(),
+            |key| {
+                batch.delete(key);
+                Ok(())
+            },
+        )?;
+        for prefix in [
+            format!("bdata:{level}:{table}:"),
+            format!("bdel:{level}:{table}:"),
+            super::branch_view::frozen_prefix(level, table),
+        ] {
+            let prefix_len = prefix.len();
+            self.branch_keys_with_prefix(prefix.as_bytes(), |key| {
+                // Only `{prefix}{row_id}`: a table whose name extends this one
+                // past a ':' (`t:x`) is not this table's row.
+                if Self::parse_row_id_after_prefix(key, prefix_len).is_some() {
+                    batch.delete(key);
+                    count += 1;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(count)
+    }
+
+    /// Stage `tuple` as level `level`'s own image of row `row_id` of `table`
+    /// into `batch` (and drop the level's own tombstone of it — one entry per
+    /// row per level), serialized and sealed exactly as the branch view's own
+    /// direct writes are. For a materialization (`BranchView::materialize`).
+    ///
+    /// sprinter 6bc4a4040eb7 (B3 fix pass): `copy` marks the image as a COPY
+    /// (`bfrz:`), not a change made on the level. `!copy` leaves the row's
+    /// marker as it is: an entry the level already held stays what it was.
+    pub(crate) fn stage_branch_row_image(
+        &self,
+        batch: &mut WriteBatch,
+        level: u64,
+        table: &str,
+        row_id: u64,
+        tuple: &crate::Tuple,
+        copy: bool,
+    ) -> Result<()> {
+        let value = bincode::serialize(tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {e}")))?;
+        let sealed = super::tde::seal(self.key_manager_ref(), &value)?;
+        batch.put(
+            super::branch_view::branch_row_key(level, table, row_id),
+            sealed.as_ref(),
+        );
+        batch.delete(super::branch_view::branch_tombstone_key(level, table, row_id));
+        if copy {
+            batch.put(super::branch_view::branch_frozen_key(level, table, row_id), b"");
+        }
+        Ok(())
+    }
+
+    /// The largest row id any of `levels` holds an image or a tombstone of
+    /// for `table`.
+    pub(crate) fn branch_rows_max_row_id(&self, levels: &[u64], table: &str) -> Result<Option<u64>> {
+        let mut max: Option<u64> = None;
+        for level in levels {
+            for prefix in [format!("bdata:{level}:{table}:"), format!("bdel:{level}:{table}:")] {
+                let prefix_len = prefix.len();
+                self.branch_keys_with_prefix(prefix.as_bytes(), |key| {
+                    if let Some(row_id) = Self::parse_row_id_after_prefix(key, prefix_len) {
+                        max = Some(max.map_or(row_id, |m| m.max(row_id)));
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        Ok(max)
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): the rows of an ISOLATED table carry
+    /// row ids from the table NAME's shared counter (`counter:{t}`), which a
+    /// later main DDL on a same-named table can reset durably (CREATE TABLE
+    /// seeds it at 0, DROP TABLE deletes it) — after a restart the counter
+    /// could then hand out an id the branch already holds. Once per process
+    /// per (branch, table), raise the counter above every row id the isolated
+    /// table's levels hold. The branch view also refuses (never overwrites) a
+    /// fresh id that is already taken (`BranchView::insert`).
+    pub(crate) fn ensure_branch_row_id_floor(&self, levels: &[u64], table: &str) -> Result<()> {
+        let Some(&branch) = levels.last() else {
+            return Ok(());
+        };
+        let key: RecordKey = (self.instance_id(), branch, table.to_string());
+        if ROW_ID_FLOORS.contains_key(&key) {
+            return Ok(());
+        }
+        if let Some(max) = self.branch_rows_max_row_id(levels, table)? {
+            self.raise_row_counter_to(table, max);
+        }
+        if ROW_ID_FLOORS.len() >= RECORD_CACHE_MAX_ENTRIES {
+            ROW_ID_FLOORS.clear();
+        }
+        ROW_ID_FLOORS.insert(key, ());
+        Ok(())
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): write `record` as level `level`'s
+    /// own entry for `table`, in ONE atomic batch with whatever `batch`
+    /// already holds (an `ADD COLUMN`'s materialized rows) and — with
+    /// `clear_own_rows` — the deletion of every row image and tombstone the
+    /// level holds for `table` (a DROP, or a CREATE over a dropped name).
+    /// Through the write gate; then the caches learn of it.
+    pub(crate) fn put_branch_table_record(
+        &self,
+        level: u64,
+        table: &str,
+        record: &BranchTableRecord,
+        mut batch: WriteBatch,
+        clear_own_rows: bool,
+    ) -> Result<()> {
+        if clear_own_rows {
+            self.stage_branch_rows_delete(level, table, &mut batch)?;
+        }
+        let value = record.encode()?;
+        let sealed = super::tde::seal(self.key_manager_ref(), &value)?;
+        batch.put(branch_table_key(level, table), sealed.as_ref());
+        self.write_batch_through_gate(batch)?;
+        self.after_branch_catalog_write(level, table)
+    }
+
+    /// Restore level `level`'s entry for `table` to `previous` (`None`:
+    /// remove it) — the unwind of a branch DDL that failed after its first
+    /// write — in one batch with, when `clear_own_rows`, the deletion of the
+    /// rows the failed statement wrote at the level.
+    pub(crate) fn restore_branch_table_record(
+        &self,
+        level: u64,
+        table: &str,
+        previous: Option<&BranchTableRecord>,
+        clear_own_rows: bool,
+    ) -> Result<()> {
+        let mut batch = WriteBatch::default();
+        if clear_own_rows {
+            self.stage_branch_rows_delete(level, table, &mut batch)?;
+        }
+        match previous {
+            Some(record) => {
+                let value = record.encode()?;
+                let sealed = super::tde::seal(self.key_manager_ref(), &value)?;
+                batch.put(branch_table_key(level, table), sealed.as_ref());
+            }
+            None => batch.delete(branch_table_key(level, table)),
+        }
+        self.write_batch_through_gate(batch)?;
+        self.after_branch_catalog_write(level, table)
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): the backstop in MAIN's catalog
+    /// mutators (`Catalog::create_table`, `update_table_schema`, the column
+    /// rename, `drop_table`, `rename_table`): refuse (0A000) when the running
+    /// statement is on a branch. Every schema statement a branch scopes is
+    /// answered by the branch DDL layer before it reaches them, and every other
+    /// one is refused there; this keeps a path that slipped past both (an
+    /// executor arm, an engine-internal call made while a branch session is
+    /// installed) from changing main's catalog. MERGE runs its main-side DDL
+    /// under a main scope (`crate::main_statement_scope`). One thread-local
+    /// read on main.
+    pub(crate) fn refuse_main_catalog_write_on_branch(&self, statement: &str) -> Result<()> {
+        if !self.is_branch_active() {
+            return Ok(());
+        }
+        let name = self
+            .active_branch()
+            .map_or_else(|| "?".to_string(), |binding| binding.name.clone());
+        Err(Error::branch_schema_unsupported(statement, &name))
+    }
+
+    /// What every branch-catalog write is followed by: the schema generation
+    /// (every cached record, existence answer and committed overlay of every
+    /// branch is stamped with it) and the level's write generation for the
+    /// table move, the level's cached record goes, and the autocommit
+    /// durability barrier runs.
+    fn after_branch_catalog_write(&self, level: u64, table: &str) -> Result<()> {
+        self.bump_schema_generation();
+        super::branch_view::bump_write_generation(self.instance_id(), level, table);
+        RECORDS.remove(&(self.instance_id(), level, table.to_string()));
+        self.durable_autocommit_barrier()
+    }
+}
+
+/// The catalog form of a column `ALTER TABLE … ADD COLUMN` adds — exactly the
+/// `Column` main's `alter_table_add_column` builds (`default_expr` is the
+/// default serialized as JSON).
+pub fn added_column(table: &str, definition: &ColumnDef) -> Column {
+    Column {
+        name: definition.name.clone(),
+        data_type: definition.data_type.clone(),
+        nullable: !definition.not_null,
+        primary_key: definition.primary_key,
+        source_table: None,
+        source_table_name: Some(table.to_string()),
+        default_expr: definition
+            .default
+            .as_ref()
+            .map(|expr| serde_json::to_string(expr).unwrap_or_default()),
+        unique: definition.unique,
+        storage_mode: definition.storage_mode,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::*;
+    use crate::Config;
+
+    fn schema() -> Schema {
+        let mut id = Column::new("id", DataType::Int4);
+        id.primary_key = true;
+        id.nullable = false;
+        let mut code = Column::new("code", DataType::Text);
+        code.unique = true;
+        Schema::new(vec![id, code])
+    }
+
+    fn defined(created: bool) -> BranchTableRecord {
+        let schema = schema();
+        let constraints = TableConstraints::default();
+        BranchTableRecord {
+            state: BranchTableState::Defined(BranchTableDefinition {
+                unique_rules: derive_unique_rules("t", &schema, &constraints),
+                schema,
+                constraints,
+                identity_columns: Vec::new(),
+                incarnation: 11,
+            }),
+            isolated: true,
+            frozen: false,
+            parent_fingerprint: Some(7),
+            parent_incarnation: Some(5),
+            created,
+            added_columns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_record_round_trips_and_an_unknown_format_is_refused() {
+        let record = defined(true);
+        let bytes = record.encode().unwrap();
+        assert!(bytes.starts_with(b"BMT1"));
+        let back = BranchTableRecord::decode("t", &bytes).unwrap();
+        assert!(back.created && back.isolated && !back.frozen);
+        assert_eq!(back.parent_fingerprint, Some(7));
+        assert_eq!(back.parent_incarnation, Some(5));
+        assert_eq!(back.definition().unwrap().incarnation, 11);
+        assert_eq!(back.definition().unwrap().schema.columns.len(), 2);
+        let mut wrong = bytes.clone();
+        wrong[4] = 99;
+        assert!(BranchTableRecord::decode("t", &wrong).is_err());
+        assert!(BranchTableRecord::decode("t", b"junk").is_err());
+    }
+
+    #[test]
+    fn rules_follow_mains_names() {
+        let rules = derive_unique_rules("t", &schema(), &TableConstraints::default());
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].is_primary_key && rules[0].label == "t_pkey");
+        assert_eq!(rules[1].label, "t_code_key");
+        assert_eq!(rules[1].columns, vec!["code".to_string()]);
+    }
+
+    #[test]
+    fn the_fingerprint_ignores_resolver_stamps_and_sees_columns() {
+        let base = schema();
+        let constraints = TableConstraints::default();
+        let mut stamped = base.clone();
+        for column in &mut stamped.columns {
+            column.source_table_name = Some("t".into());
+        }
+        assert_eq!(
+            definition_fingerprint(&base, &constraints, &[]).unwrap(),
+            definition_fingerprint(&stamped, &constraints, &[]).unwrap()
+        );
+        let mut wider = base.clone();
+        wider.columns.push(Column::new("extra", DataType::Int4));
+        assert_ne!(
+            definition_fingerprint(&base, &constraints, &[]).unwrap(),
+            definition_fingerprint(&wider, &constraints, &[]).unwrap()
+        );
+    }
+
+    /// B3 fix pass: a UNIQUE rule is part of a definition, by column SET (not
+    /// its name, not the order rules or constraint records were declared in).
+    #[test]
+    fn the_fingerprint_sees_unique_sets_and_ignores_declaration_order() {
+        use crate::sql::constraints::UniqueConstraint;
+        let base = schema();
+        let none = TableConstraints::default();
+        let rule = |name: &str, columns: &[&str]| BranchUniqueRule {
+            index_name: name.to_string(),
+            label: name.to_string(),
+            columns: columns.iter().map(|c| (*c).to_string()).collect(),
+            is_primary_key: false,
+        };
+        let plain = definition_fingerprint(&base, &none, &[]).unwrap();
+        let with_a = definition_fingerprint(&base, &none, &[rule("x", &["id", "code"])]).unwrap();
+        assert_ne!(
+            plain, with_a,
+            "a unique index on the target must change the fingerprint"
+        );
+        assert_eq!(
+            with_a,
+            definition_fingerprint(&base, &none, &[rule("x_2", &["CODE", "id"])]).unwrap(),
+            "a re-minted name or a column order is not a change"
+        );
+        let unique = |name: &str| UniqueConstraint {
+            name: name.to_string(),
+            table_name: "t".to_string(),
+            columns: vec![name.to_string()],
+            is_primary_key: false,
+        };
+        let forward = TableConstraints {
+            unique_constraints: vec![unique("a"), unique("b")],
+            ..TableConstraints::default()
+        };
+        let reverse = TableConstraints {
+            unique_constraints: vec![unique("b"), unique("a")],
+            ..TableConstraints::default()
+        };
+        assert_eq!(
+            definition_fingerprint(&base, &forward, &[]).unwrap(),
+            definition_fingerprint(&base, &reverse, &[]).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_fork_record_round_trips_and_an_unknown_format_is_refused() {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "t".to_string(),
+            ForkEntry {
+                incarnation: Some(42),
+                fingerprint: 7,
+                columns: vec!["id".to_string()],
+            },
+        );
+        let bytes = encode_fork_record(&entries).unwrap();
+        assert!(bytes.starts_with(b"BMF1"));
+        assert_eq!(decode_fork_record(&bytes).unwrap(), entries);
+        assert!(decode_fork_record(b"junk").is_err());
+    }
+
+    /// A missing incarnation is unknown, never a difference.
+    #[test]
+    fn an_unknown_incarnation_never_differs() {
+        assert!(incarnations_differ(Some(1), Some(2)));
+        assert!(!incarnations_differ(Some(1), Some(1)));
+        assert!(!incarnations_differ(None, Some(2)));
+        assert!(!incarnations_differ(Some(1), None));
+        assert!(!incarnations_differ(None, None));
+        assert_eq!(known_incarnation(0), None);
+        assert_eq!(known_incarnation(9), Some(9));
+    }
+
+    /// The fail point fires at the n-th tick of its site, once.
+    #[test]
+    fn the_merge_failpoint_fires_once_at_its_tick() {
+        let engine = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        engine.merge_failpoint_tick(MergeFailSite::Step).unwrap();
+        engine.debug_fail_merge_after_steps(1);
+        engine.merge_failpoint_tick(MergeFailSite::Row).unwrap();
+        engine.merge_failpoint_tick(MergeFailSite::Step).unwrap();
+        assert!(engine.merge_failpoint_tick(MergeFailSite::Step).is_err());
+        engine.merge_failpoint_tick(MergeFailSite::Step).unwrap();
+    }
+
+    /// An exclusion refuses DDL on its table of its level only, refuses a second
+    /// merge that writes the table, lets two merges that only depend on it share
+    /// it, and is gone once released.
+    #[test]
+    fn a_merge_exclusion_holds_its_tables() {
+        let engine = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        let tables = vec!["t".to_string()];
+        engine
+            .register_merge_exclusion(MERGE_TARGET_MAIN, 7, "b", "main", &tables, true)
+            .unwrap();
+        let refused = engine
+            .refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, "t")
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains(crate::error::BRANCH_MERGE_BUSY_MARKER), "{refused}");
+        engine.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, "u").unwrap();
+        engine.refuse_ddl_on_merging_table(3, "t").unwrap();
+        let busy = engine
+            .register_merge_exclusion(MERGE_TARGET_MAIN, 8, "c", "main", &tables, true)
+            .unwrap_err()
+            .to_string();
+        assert!(busy.contains(crate::error::BRANCH_MERGE_BUSY_MARKER), "{busy}");
+        assert!(!busy.starts_with("table t is part of"), "{busy}");
+        engine
+            .register_merge_exclusion(MERGE_TARGET_MAIN, 7, "b", "main", &tables, true)
+            .unwrap();
+        engine.release_merge_exclusion(7);
+        engine.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, "t").unwrap();
+
+        // Two dependents share it; DDL is refused until the last one is gone.
+        for source in [10, 11] {
+            engine
+                .register_merge_exclusion(MERGE_TARGET_MAIN, source, "d", "b", &tables, false)
+                .unwrap();
+        }
+        assert!(engine
+            .register_merge_exclusion(MERGE_TARGET_MAIN, 12, "e", "main", &tables, true)
+            .is_err());
+        engine.release_merge_exclusion(10);
+        assert!(engine.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, "t").is_err());
+        engine.release_merge_exclusion(11);
+        engine.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, "t").unwrap();
+    }
+
+    /// A merge registers, then waits for what is already past the check, on ITS
+    /// tables only, within the one budget it was given.
+    #[test]
+    fn a_merge_waits_for_a_schema_statement_on_its_tables() {
+        let engine = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        let tables = vec!["t".to_string()];
+        let none_left = std::time::Instant::now;
+        let plenty = || std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let on_t = engine.enter_main_statement(&["t"]).unwrap();
+        engine
+            .register_merge_exclusion(MERGE_TARGET_MAIN, 7, "b", "main", &tables, true)
+            .unwrap();
+        let busy = engine
+            .wait_for_main_ddl(&tables, "b", "main", none_left())
+            .unwrap_err()
+            .to_string();
+        assert!(busy.contains(crate::error::BRANCH_MERGE_BUSY_MARKER), "{busy}");
+        // A statement on another table, or a temporary one, or naming none, is
+        // nothing to wait for.
+        let on_u = engine.enter_main_statement(&["u"]).unwrap();
+        let on_nothing = engine.enter_main_statement(&[]).unwrap();
+        engine
+            .wait_for_main_ddl(&["u2".to_string()], "b", "main", none_left())
+            .unwrap();
+        drop(on_nothing);
+        drop(on_u);
+        // Past its check, the statement's own catalog writes are counted and not
+        // refused; a statement arriving now is, and so is a route with no guard.
+        let write = engine.enter_main_ddl(&["t"]).unwrap();
+        drop(write);
+        drop(on_t);
+        engine.wait_for_main_ddl(&tables, "b", "main", plenty()).unwrap();
+        assert!(
+            engine.enter_main_statement(&["t"]).is_err(),
+            "after the exclusion: refused"
+        );
+        assert!(engine.enter_main_ddl(&["t"]).is_err(), "no statement guard: refused");
+        // The refused statement left nothing to wait for, nor its guard installed.
+        engine.wait_for_main_ddl(&tables, "b", "main", none_left()).unwrap();
+        assert!(engine.enter_main_ddl(&["t"]).is_err());
+        engine.release_merge_exclusion(7);
+
+        // A merge's own catalog writes are not DDL on its own tables.
+        engine
+            .register_merge_exclusion(MERGE_TARGET_MAIN, 8, "c", "main", &tables, true)
+            .unwrap();
+        {
+            let _scope = MergeDdlScope::enter(engine.instance_id());
+            let _inert = engine.enter_main_ddl(&["t"]).unwrap();
+            engine.wait_for_main_ddl(&tables, "c", "main", none_left()).unwrap();
+        }
+        assert!(engine.enter_main_ddl(&["t"]).is_err());
+        engine.release_merge_exclusion(8);
+    }
+
+    /// A merge still validating has nothing to finish or abandon, and says so.
+    #[test]
+    fn ddl_during_a_merges_validation_is_told_to_wait() {
+        let engine = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        engine
+            .register_merge_exclusion(MERGE_TARGET_MAIN, 7, "b", "main", &["t".to_string()], true)
+            .unwrap();
+        let refused = engine
+            .refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, "t")
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains(crate::error::BRANCH_MERGE_BUSY_MARKER), "{refused}");
+        assert!(
+            !refused.contains(crate::error::BRANCH_MERGE_PENDING_MARKER),
+            "{refused}"
+        );
+        assert!(!refused.contains("ABORT"), "{refused}");
+    }
+
+    /// The nearest level decides; a tombstone hides the table; no entry
+    /// leaves it to main; level ids are matched exactly.
+    #[test]
+    fn the_nearest_level_decides() {
+        let engine = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        let tombstone = BranchTableRecord {
+            state: BranchTableState::Dropped,
+            isolated: true,
+            frozen: false,
+            parent_fingerprint: None,
+            parent_incarnation: None,
+            created: false,
+            added_columns: Vec::new(),
+        };
+        engine
+            .put_branch_table_record(2, "t", &defined(true), WriteBatch::default(), false)
+            .unwrap();
+        engine
+            .put_branch_table_record(3, "t", &tombstone, WriteBatch::default(), false)
+            .unwrap();
+        assert!(matches!(
+            engine.resolve_branch_table(&[2], "t").unwrap(),
+            BranchTableResolution::Defined { level: 2, .. }
+        ));
+        assert!(matches!(
+            engine.resolve_branch_table(&[2, 3], "t").unwrap(),
+            BranchTableResolution::Dropped { level: 3, .. }
+        ));
+        assert!(matches!(
+            engine.resolve_branch_table(&[12], "t").unwrap(),
+            BranchTableResolution::Inherited
+        ));
+        assert!(matches!(
+            engine.resolve_branch_table(&[2], "u").unwrap(),
+            BranchTableResolution::Inherited
+        ));
+        // Removing a record is seen at once (the write bumps the generation).
+        engine.restore_branch_table_record(3, "t", None, false).unwrap();
+        assert!(matches!(
+            engine.resolve_branch_table(&[2, 3], "t").unwrap(),
+            BranchTableResolution::Defined { level: 2, .. }
+        ));
+        let listed = engine.branch_tables_in_chain(&[2, 3]).unwrap();
+        assert_eq!(listed.keys().cloned().collect::<Vec<_>>(), vec!["t".to_string()]);
+    }
+}

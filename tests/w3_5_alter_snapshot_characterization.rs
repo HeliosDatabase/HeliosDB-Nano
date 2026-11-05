@@ -30,6 +30,20 @@
 //! rollback, and the wider-than-catalog truncation. The branch-overlay
 //! "un-forked row sees main's backfill" case (design §7, branch-model) is
 //! explicitly out of scope and stays pinned as-is.
+//!
+//! # The branch rule changed (sprinter 6bc4a4040eb7, phase B3)
+//!
+//! A branch now has its own catalog overlay (`storage::branch_catalog`): a
+//! table it changed itself (`ALTER TABLE … ADD COLUMN` on the branch) has the
+//! branch's OWN definition, and its rows were materialized onto the branch
+//! under it — the branch no longer reads main's definition or main's rows of
+//! that table, so a later ADD COLUMN on main is invisible there
+//! (`branch_with_its_own_add_column_is_isolated_from_mains_add_column`, new).
+//! A table the branch has NOT changed itself still reads main's CURRENT
+//! definition and rows, which is why the three branch pins below keep their
+//! answers in B3 — they are re-labelled as that rule, not the old global
+//! catalog. Phase B4 freezes main's definition and rows into live branches
+//! at main's write (copy-on-write), and will flip those three pins.
 
 use heliosdb_nano::session::IsolationLevel;
 use heliosdb_nano::{Config, EmbeddedDatabase, SnapshotSchemaEvolution, Value};
@@ -163,6 +177,10 @@ fn as_of_read_predating_alter_today() {
 /// W3.5 Stage 1 applied to the `bdata:` decode: the forked row reads with
 /// `c IS NULL` (no arity error). The un-forked row (row 2) legitimately shows
 /// main's backfilled 42 — the branch-overlay model, pinned separately below.
+///
+/// sprinter 6bc4a4040eb7 (phase B3): unchanged — forking a ROW is not a change
+/// of the table's definition, so the branch still reads main's current
+/// definition of `t` (the B3 rule; B4 freezes main's pre-image instead).
 #[test]
 fn branch_forked_row_before_alter_today() {
     let db = setup();
@@ -223,6 +241,10 @@ fn branch_forked_row_before_alter_today() {
 /// NOT FLIPPED by the W3.5 tuple-decode fix (3 values match the 3-col catalog —
 /// no arity mismatch); insulating a pre-ALTER branch from a main ALTER would be a
 /// separate per-branch schema pin (design §7, out of scope).
+///
+/// sprinter 6bc4a4040eb7 (phase B3): still the answer, now as the B3 rule — the
+/// branch has no definition of `t` of its own, so it reads main's current one.
+/// Phase B4 (main's DDL freezes the pre-image into live branches) flips it.
 #[test]
 fn branch_before_alter_sees_main_backfill_today() {
     let db = setup();
@@ -241,6 +263,65 @@ fn branch_before_alter_sees_main_backfill_today() {
     assert!(
         rows.iter().all(exposes_backfill),
         "an un-forked branch reads main's live rewritten data:, so it observes c = 42"
+    );
+}
+
+/// sprinter 6bc4a4040eb7 (phase B3) — the NEW rule. A branch that changed the
+/// table's definition itself (`ADD COLUMN x DEFAULT 7` on the branch) owns that
+/// definition and a materialized copy of every row it saw; main's later
+/// `ADD COLUMN c DEFAULT 42` (and main's later rows) do not reach it, and the
+/// branch's column never reaches main. Before B3 the branch's ADD COLUMN
+/// rewrote MAIN's catalog and rows, so main grew `x` and the branch then saw
+/// main's `c` too.
+#[test]
+fn branch_with_its_own_add_column_is_isolated_from_mains_add_column() {
+    let db = setup();
+
+    db.execute("CREATE BRANCH b AS OF NOW").unwrap();
+    db.execute("USE BRANCH b").unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN x INTEGER DEFAULT 7").unwrap();
+    db.execute("USE BRANCH main").unwrap();
+
+    // Main never saw the branch's column…
+    let main_rows = db.query("SELECT * FROM t ORDER BY id", &[]).unwrap();
+    assert!(
+        main_rows.iter().all(|r| r.values.len() == 2),
+        "the branch's ADD COLUMN must not reach main's catalog or rows"
+    );
+    // …and now changes the table itself.
+    db.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 42").unwrap();
+    db.execute("INSERT INTO t (id, v, c) VALUES (3, 300, 42)").unwrap();
+
+    db.execute("USE BRANCH b").unwrap();
+    let rows = db.query("SELECT * FROM t ORDER BY id", &[]).unwrap();
+    assert_eq!(
+        rows.iter().filter_map(row_id).collect::<Vec<_>>(),
+        vec![1, 2],
+        "main's later row does not appear on the branch that owns its definition of t"
+    );
+    for row in &rows {
+        assert_eq!(row.values.len(), 3, "the branch's definition: id, v, x");
+        assert_eq!(
+            row.values.get(2).and_then(as_i64),
+            Some(7),
+            "the branch's backfill, never main's 42"
+        );
+    }
+    assert!(
+        db.query("SELECT c FROM t", &[]).is_err(),
+        "main's column c is not a column of the branch's t"
+    );
+
+    db.execute("USE BRANCH main").unwrap();
+    let main_rows = db.query("SELECT * FROM t ORDER BY id", &[]).unwrap();
+    assert_eq!(main_rows.len(), 3);
+    assert!(
+        main_rows.iter().all(exposes_backfill),
+        "main's own ADD COLUMN backfilled its rows"
+    );
+    assert!(
+        db.query("SELECT x FROM t", &[]).is_err(),
+        "x is the branch's column only"
     );
 }
 

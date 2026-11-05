@@ -54,6 +54,11 @@ pub enum KeyClass {
     Vmeta,
     /// `meta:table:{table}` — table schema.
     MetaTable,
+    /// `meta:table_incarnation:{table}` — a random id minted by every
+    /// `CREATE TABLE` of main's table, moved by RENAME, deleted by DROP:
+    /// what tells "dropped and recreated identically" from "unchanged"
+    /// (sprinter 6bc4a4040eb7, B3 fix pass).
+    MetaTableIncarnation,
     /// `meta:index:{index}` — persisted index definition.
     MetaIndex,
     /// `meta:schema:{schema}` — declared schema marker.
@@ -119,8 +124,9 @@ pub enum KeyClass {
     /// `delta:{table}:{id:020}` — an MV delta record (and the caller-less
     /// `mv_delta:` key of the same subsystem).
     Delta,
-    /// `branch:meta:*`, `branch:children:*`, `branch:registry`,
-    /// `branch:pending_gc` — the branch registry.
+    /// `branch:meta:*`, `branch:children:*`, `branch:merge:*` (an unfinished
+    /// MERGE BRANCH's durable intent), `branch:registry`, `branch:pending_gc` —
+    /// the branch registry.
     Branch,
     /// `bdata:{branch}:{table}:{row_id}` — a row on a branch overlay.
     BranchData,
@@ -128,6 +134,20 @@ pub enum KeyClass {
     BranchDel,
     /// `bv:{branch}:{table}:{row_id}:{ts}` — a branch row version.
     BranchVersion,
+    /// `bmeta:{branch}:table:{table}` — a branch's own definition (or drop)
+    /// of a table: the branch catalog overlay (sprinter 6bc4a4040eb7, phase
+    /// B3; `storage::branch_catalog`), and `bmeta:{branch}:fork` — the
+    /// incarnation of every table its parent had when it forked.
+    BranchMeta,
+    /// `bfrz:{branch}:{table}:{row_id}` — the level's entry for the row is a
+    /// COPY (an `ADD COLUMN`'s materialized row, phase B4's frozen pre-image),
+    /// not a change made on the level: `MERGE BRANCH` skips it.
+    BranchFrozen,
+    /// `bkey:{branch}:{hex table}:{hex rule}:{hex digest}:{row_id}` — a level's
+    /// key index of a table it defines isolated: PRIMARY KEY / UNIQUE / FOREIGN
+    /// KEY probes of a table no ART index describes. A salted digest of the key,
+    /// never its value: RocksDB keys are not sealed at rest.
+    BranchKey,
     /// `git:*` — Git integration state.
     Git,
     /// `__vidx:{index_id}:*` — a persistent HNSW index's own keyspace.
@@ -226,6 +246,8 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
     // --- Catalog ---
     // storage/catalog.rs:3895 `table_metadata_key`
     (b"meta:table:", KeyClass::MetaTable),
+    // storage/catalog.rs `table_incarnation_key` (sprinter 6bc4a4040eb7, B3 fix pass)
+    (b"meta:table_incarnation:", KeyClass::MetaTableIncarnation),
     // storage/catalog.rs:3899 `index_metadata_key`
     (b"meta:index:", KeyClass::MetaIndex),
     // storage/catalog.rs:3914 `schema_metadata_key`
@@ -295,12 +317,21 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
     (b"branch:meta:", KeyClass::Branch),
     // storage/branch.rs:25 `BRANCH_CHILDREN_PREFIX`
     (b"branch:children:", KeyClass::Branch),
+    // storage/branch_catalog.rs `branch_merge_intent_key` (sprinter 6bc4a4040eb7, B3 fix pass)
+    (b"branch:merge:", KeyClass::Branch),
     // storage/branch.rs:26 `BRANCH_DATA_PREFIX`; storage/engine.rs:15711 `branch_aware_data_key`
     (b"bdata:", KeyClass::BranchData),
     // storage/engine.rs:16379 `format!("bdel:{}:{}:{}")`
     (b"bdel:", KeyClass::BranchDel),
     // storage/engine.rs:16036 `format!("bv:{}:{}:{}:{}")`
     (b"bv:", KeyClass::BranchVersion),
+    // storage/branch_catalog.rs `BRANCH_CATALOG_PREFIX` / `branch_table_key`
+    // (sprinter 6bc4a4040eb7, phase B3)
+    (b"bmeta:", KeyClass::BranchMeta),
+    // storage/branch_view.rs `branch_frozen_key` (B3 fix pass; shared with B4)
+    (b"bfrz:", KeyClass::BranchFrozen),
+    // storage/branch_view.rs `branch_key_index_key` (B3 fix pass)
+    (b"bkey:", KeyClass::BranchKey),
     // storage/branch.rs:30 `GIT_LINK_PREFIX`
     (b"git:link:", KeyClass::Git),
     // storage/branch.rs:31 `GIT_COMMIT_PREFIX`
@@ -410,6 +441,7 @@ fn table_of(class: KeyClass, rest: &[u8]) -> Option<&str> {
             | KeyClass::Counter
             | KeyClass::BranchData
             | KeyClass::BranchDel
+            | KeyClass::BranchFrozen
             | KeyClass::BranchVersion
     ) {
         return None;
@@ -453,7 +485,7 @@ fn table_of(class: KeyClass, rest: &[u8]) -> Option<&str> {
         // `{branch_id}:{table}:` prefix. The binary form
         // `branch::encode_branch_data_key` writes (`bdata:{be_u64}:{user_key}`)
         // has a non-decimal branch id and so names no table.
-        KeyClass::BranchData | KeyClass::BranchDel => {
+        KeyClass::BranchData | KeyClass::BranchDel | KeyClass::BranchFrozen => {
             let (branch_id, rest) = rest.split_once(':')?;
             if !is_decimal_u64(branch_id) {
                 return None;
@@ -558,6 +590,12 @@ mod tests {
         (b"bdata:2:users:42", KeyClass::BranchData, Some("users")),
         (b"bdel:2:users:42", KeyClass::BranchDel, Some("users")),
         (b"bv:2:users:42:1700", KeyClass::BranchVersion, Some("users")),
+        (b"bmeta:2:table:users", KeyClass::BranchMeta, None),
+        (b"bmeta:2:fork", KeyClass::BranchMeta, None),
+        (b"bfrz:2:users:42", KeyClass::BranchFrozen, Some("users")),
+        (b"bkey:2:7573657273:75:0102:42", KeyClass::BranchKey, None),
+        (b"branch:merge:2", KeyClass::Branch, None),
+        (b"meta:table_incarnation:users", KeyClass::MetaTableIncarnation, None),
         (b"git:config", KeyClass::Git, None),
         (b"git:link:feature", KeyClass::Git, None),
         (b"git:commit:abc123", KeyClass::Git, None),

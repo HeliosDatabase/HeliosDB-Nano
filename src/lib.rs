@@ -318,6 +318,7 @@ pub mod standby_posture;
 pub mod ab_testing;
 
 // Internal modules
+mod branch_schema; // sprinter 6bc4a4040eb7 (B3): schema DDL on a branch (the one gate)
 mod branch_writes; // sprinter 6bc4a4040eb7 (B2): executor half of writes on a branch
 mod copy_phase_stats;
 mod error;
@@ -342,7 +343,10 @@ pub use crypto::{
 };
 pub use error::{
     Error, Result, BRANCH_BINDING_GONE_MARKER, BRANCH_BUSY_MARKER, BRANCH_CLOSING_MARKER, BRANCH_IN_USE_MARKER,
-    BRANCH_NOT_ACTIVE_MARKER, BRANCH_STATEMENT_UNSUPPORTED_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER,
+    BRANCH_MATERIALIZE_TOO_LARGE_MARKER, BRANCH_MERGE_BUSY_MARKER, BRANCH_MERGE_DUPLICATE_KEY_MARKER,
+    BRANCH_MERGE_KEY_CLAIMED_MARKER, BRANCH_MERGE_PENDING_MARKER, BRANCH_MERGE_SCHEMA_REFUSED_MARKER,
+    BRANCH_NOT_ACTIVE_MARKER, BRANCH_SCHEMA_RUNNING_MARKER, BRANCH_SCHEMA_UNSUPPORTED_MARKER,
+    BRANCH_STATEMENT_UNSUPPORTED_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER, BRANCH_TABLE_BUSY_MARKER,
     BRANCH_WRITE_UNSUPPORTED_MARKER, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE,
     NOT_NULL_VIOLATION_MARKER, PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED,
 };
@@ -864,6 +868,38 @@ impl Drop for SessionScopedStateGuard {
     }
 }
 
+/// sprinter 6bc4a4040eb7 (phase B3): one session's backend state published for
+/// a synchronous catalog probe made outside every engine funnel
+/// ([`EmbeddedDatabase::session_catalog_probe_scope`],
+/// [`EmbeddedDatabase::embedded_catalog_scope`]). Restores what was installed
+/// before on `Drop`. `!Send`, like the guard it wraps.
+pub(crate) struct SessionCatalogProbeScope {
+    _scoped: SessionScopedStateGuard,
+}
+
+/// sprinter 6bc4a4040eb7 (phase B3): what a protocol handler publishes around
+/// a synchronous catalog interception — the connection's temp namespace
+/// (sprinter 1703dba8e82d) and, on a branch, its backend state, so the
+/// interceptor lists and describes the session's own catalog. Either half is
+/// `None` when it has nothing to publish. `!Send`.
+pub(crate) struct ProtocolCatalogGuard {
+    _temp: Option<sql::temp_tables::TempNamespaceGuard>,
+    _branch: Option<SessionCatalogProbeScope>,
+}
+
+impl ProtocolCatalogGuard {
+    /// Hold both halves for one synchronous call.
+    pub(crate) fn new(
+        temp: Option<sql::temp_tables::TempNamespaceGuard>,
+        branch: Option<SessionCatalogProbeScope>,
+    ) -> Self {
+        Self {
+            _temp: temp,
+            _branch: branch,
+        }
+    }
+}
+
 /// Everything one statement of one wire/embedded SESSION needs installed on the
 /// thread that runs it: the SQL identity (HDB-009) and the session's backend
 /// state (sprinter 6dc0cc115db9 / f4f5d450e816).
@@ -1145,6 +1181,23 @@ impl Drop for BranchStatementScope {
             STATEMENT_BRANCH.with(|c| *c.borrow_mut() = previous);
         }
     }
+}
+
+/// sprinter 6bc4a4040eb7 (phase B3): run engine work on MAIN for the
+/// returned scope's lifetime, whatever branch the calling session is on — a
+/// statement snapshot of "main" for the engine `engine_instance`, restored on
+/// `Drop`. For work that reads and changes MAIN's catalog by design: `MERGE
+/// BRANCH` (which addresses every level explicitly and applies the source's
+/// schema changes to main through main's catalog funnels) and the temp-table
+/// reclaim. Takes no drain hold. Not `Send`.
+pub(crate) fn main_statement_scope(engine_instance: u64) -> BranchStatementScope {
+    BranchStatementScope::install(
+        StatementBranch {
+            engine_instance,
+            binding: None,
+        },
+        crate::storage::BranchHold::none(),
+    )
 }
 
 /// sprinter 6bc4a4040eb7 (B1 second fix pass): the end of a REQUEST-scoped
@@ -2386,6 +2439,18 @@ enum BranchStatement {
     Reset,
     /// `SHOW heliosdb.branch`.
     Show,
+    /// `MERGE [DATABASE] BRANCH x ABORT` — sprinter 6bc4a4040eb7 (B3 second fix
+    /// pass): abandon `x`'s unfinished merge. Answered here for the same reason
+    /// the others are: the params family has no grammar for it, and this gate is
+    /// in both families, the query path and the wire listeners. It binds nothing.
+    AbortMerge(String),
+}
+
+impl BranchStatement {
+    /// Does it change the session's branch? (Refused inside a transaction.)
+    fn binds_the_session(&self) -> bool {
+        matches!(self, Self::Bind(_) | Self::Reset)
+    }
 }
 
 /// GH#28 (c2): marker text of the error raised for `SET LOCAL` of a
@@ -2687,6 +2752,15 @@ impl EmbeddedDatabase {
             // table. Narrow by construction: the predicate is per CONNECTION,
             // so only the connections that actually own a temp table pay it.
             || sql::temp_tables::caller_holds_temp_tables()
+            // sprinter 6bc4a4040eb7 (phase B3): a statement on a BRANCH resolves
+            // names through its branch's catalog, which can define a table
+            // differently from main (ADD COLUMN), define one main lacks, or
+            // drop one main has — and a cached plan embeds the schema it was
+            // planned against. So the same argument again: on a branch the
+            // shared SQL-text-keyed plan and spec caches are neither read nor
+            // filled (B1 had already taken the result cache and the literal
+            // fast paths off a branch). Main sessions pay one thread-local read.
+            || self.storage.is_branch_active()
     }
 
     /// Update the embedded session's current schema and the hot-path atomic
@@ -3117,6 +3191,12 @@ impl EmbeddedDatabase {
                 }
                 Ok(None)
             }
+            Some(b'M' | b'm') => {
+                if !starts_with_icase(trimmed, "MERGE ") {
+                    return Ok(None);
+                }
+                Ok(sql::Parser::parse_merge_branch_abort(trimmed).map(BranchStatement::AbortMerge))
+            }
             Some(b'S' | b's' | b'R' | b'r') => {
                 let statement = match Self::parse_db_setting_statement(trimmed) {
                     Some(statement) => statement,
@@ -3189,6 +3269,26 @@ impl EmbeddedDatabase {
                     Self::typed_result_schema(BRANCH_GUC, DataType::Text),
                 ))
             }
+            // One row per table the abandoned merge may have partially changed:
+            // nothing undoes that, so the statement says what to look at.
+            BranchStatement::AbortMerge(name) => {
+                // Up front, in the standard words: its primary's merge replicates.
+                self.refuse_write_on_physical_standby("MERGE BRANCH ... ABORT")?;
+                let tables = self.storage.abort_branch_merge(&name)?;
+                self.invalidate_plan_cache();
+                self.invalidate_result_cache();
+                Ok((
+                    tables
+                        .into_iter()
+                        .map(|table| Tuple {
+                            values: vec![Value::String(table)],
+                            row_id: None,
+                            branch_id: None,
+                        })
+                        .collect(),
+                    Self::typed_result_schema("tables_possibly_changed", DataType::Text),
+                ))
+            }
         }
     }
 
@@ -3204,7 +3304,7 @@ impl EmbeddedDatabase {
         let Some(statement) = Self::classify_branch_statement(sql)? else {
             return Ok(None);
         };
-        if !matches!(statement, BranchStatement::Show) && self.session_has_open_transaction(session_id) {
+        if statement.binds_the_session() && self.session_has_open_transaction(session_id) {
             return Err(Error::branch_switch_in_transaction());
         }
         let session_lock = self.session_manager.get_session(session_id)?;
@@ -3267,7 +3367,7 @@ impl EmbeddedDatabase {
             // B1 second fix pass: `shared_session_in_transaction` — another
             // thread's transaction on the handle's shared session, or an open
             // RAII `Transaction`, pins that session's branch as well.
-            if !matches!(statement, BranchStatement::Show) && (in_txn || self.shared_session_in_transaction(&state)) {
+            if statement.binds_the_session() && (in_txn || self.shared_session_in_transaction(&state)) {
                 return Err(Error::branch_switch_in_transaction());
             }
             let handled = self.apply_branch_statement(&state, statement)?;
@@ -6399,6 +6499,10 @@ impl EmbeddedDatabase {
         spec: &sql::parser::CreateSchemaElementsSpec,
         txn: &storage::Transaction,
     ) -> Result<u64> {
+        // sprinter 6bc4a4040eb7 (phase B3): a pre-plan DDL entry point — a
+        // schema is main's catalog object, so on a branch the whole statement
+        // is refused (0A000) before its first part runs.
+        self.refuse_schema_entry_on_branch("CREATE SCHEMA")?;
         // Did the schema already exist before this statement? Governs whether a
         // failure may tear it down (only if WE created it fresh).
         let schema_preexisted = self.storage.catalog().schema_exists(&spec.schema_name).unwrap_or(false);
@@ -7504,6 +7608,9 @@ impl EmbeddedDatabase {
     /// present-but-inert. That is strictly better than the previous behaviour
     /// (gone entirely) and is called out in CHANGELOG.md.
     fn load_persisted_triggers(&self) {
+        // sprinter 6bc4a4040eb7 (B3 second fix pass): a MERGE's drop deregisters
+        // from THIS registry; the storage layer cannot reach it otherwise.
+        self.storage.attach_live_trigger_registry(&self.trigger_registry);
         match self.storage.load_triggers_into(&self.trigger_registry) {
             Ok(0) => return,
             Ok(n) => tracing::debug!("restored {} persisted trigger definition(s)", n),
@@ -8380,25 +8487,7 @@ impl EmbeddedDatabase {
             return Ok(0);
         }
 
-        let schema_columns: Vec<Column> = columns
-            .iter()
-            .map(|col_def| {
-                // Serialize default expression to JSON for storage
-                let default_expr = Self::serialize_default_expr(&col_def.default);
-
-                Column {
-                    name: col_def.name.clone(),
-                    data_type: col_def.data_type.clone(),
-                    nullable: !col_def.not_null,
-                    primary_key: col_def.primary_key,
-                    source_table: None,
-                    source_table_name: None,
-                    default_expr,
-                    unique: col_def.unique,
-                    storage_mode: col_def.storage_mode,
-                }
-            })
-            .collect();
+        let schema_columns: Vec<Column> = Self::create_table_schema_columns(columns);
 
         let schema = Schema::new(schema_columns);
         let catalog = self.storage.catalog();
@@ -8480,118 +8569,7 @@ impl EmbeddedDatabase {
         let statement_constraints: Option<sql::TableConstraints> = if constraints.is_empty() {
             None
         } else {
-            let mut table_constraints = sql::TableConstraints::new();
-            for constraint in constraints {
-                match constraint {
-                    sql::logical_plan::TableConstraint::ForeignKey {
-                        name: fk_name,
-                        columns: fk_cols,
-                        references_table,
-                        references_columns,
-                        on_delete,
-                        on_update,
-                        deferrable,
-                        initially_deferred,
-                        enforcement,
-                    } => {
-                        // Dedup auto-generated names against the FKs already
-                        // staged on THIS table in this CREATE TABLE: the schema
-                        // no longer participates in the name, so two FKs to
-                        // like-named tables in different schemas would otherwise
-                        // collide (see `generate_unique_name`).
-                        let existing_fk_names: Vec<String> =
-                            table_constraints.foreign_keys.iter().map(|f| f.name.clone()).collect();
-                        // `REFERENCES parent` with no column list binds to
-                        // the parent's PRIMARY KEY (PostgreSQL parity).
-                        // Default it HERE, against the already-resolved
-                        // `references_table` key, so the persisted metadata
-                        // carries the real referenced columns — enforcement
-                        // then probes the parent's PK-column index in the
-                        // right key-space instead of an empty list (which
-                        // degraded to "any parent row exists" and printed a
-                        // malformed `parent()` violation message).
-                        //
-                        // The targets were validated (42P01 / 42703 /
-                        // 42704 / 42830) before `catalog.create_table` ran — see
-                        // `validate_create_table_fk_targets` — so this
-                        // cannot fail here. A SELF-reference resolves
-                        // against the table's OWN key: under a non-
-                        // `public` search_path the planner left the
-                        // parent bare (`emp`, not `s.emp`), which the
-                        // catalog cannot look up (see `fk_targets_self`).
-                        let pk_source = if Self::fk_targets_self(name, references_table) {
-                            name.as_str()
-                        } else {
-                            references_table.as_str()
-                        };
-                        let references_columns =
-                            Self::resolve_fk_referenced_columns(&catalog, pk_source, references_columns)?;
-                        let fk = sql::ForeignKeyConstraint::new(
-                            fk_name.clone().unwrap_or_else(|| {
-                                sql::ForeignKeyConstraint::generate_unique_name(
-                                    name,
-                                    fk_cols,
-                                    references_table,
-                                    &existing_fk_names,
-                                )
-                            }),
-                            name.clone(),
-                            fk_cols.clone(),
-                            references_table.clone(),
-                            references_columns,
-                        );
-                        let fk = if let Some(action) = on_delete {
-                            fk.on_delete(convert_logical_referential_action(action))
-                        } else {
-                            fk
-                        };
-                        let fk = if let Some(action) = on_update {
-                            fk.on_update(convert_logical_referential_action(action))
-                        } else {
-                            fk
-                        };
-                        let fk = if *deferrable {
-                            fk.deferrable(*initially_deferred)
-                        } else {
-                            fk
-                        };
-                        let fk = fk.with_enforcement(*enforcement);
-                        table_constraints.add_foreign_key(fk);
-                    }
-                    sql::logical_plan::TableConstraint::PrimaryKey {
-                        name: pk_name,
-                        columns: pk_cols,
-                    } => {
-                        table_constraints.add_unique(sql::UniqueConstraint::new(
-                            pk_name.clone().unwrap_or_else(|| format!("{}_pkey", name)),
-                            name.clone(),
-                            pk_cols.clone(),
-                            true,
-                        ));
-                    }
-                    sql::logical_plan::TableConstraint::Unique {
-                        name: uq_name,
-                        columns: uq_cols,
-                    } => {
-                        table_constraints.add_unique(sql::UniqueConstraint::new(
-                            uq_name.clone().unwrap_or_else(|| format!("{}_unique", name)),
-                            name.clone(),
-                            uq_cols.clone(),
-                            false,
-                        ));
-                    }
-                    sql::logical_plan::TableConstraint::Check {
-                        name: ck_name,
-                        expression,
-                    } => {
-                        table_constraints.add_check(sql::CheckConstraint::new(
-                            ck_name.clone().unwrap_or_else(|| format!("{}_check", name)),
-                            name.clone(),
-                            serde_json::to_string(expression).unwrap_or_default(),
-                        ));
-                    }
-                }
-            }
+            let table_constraints = Self::create_table_statement_constraints(&catalog, name, constraints)?;
             catalog.save_table_constraints(name, &table_constraints)?;
             // A composite `UNIQUE (a, b)` needs an ART index to be
             // enforced by anything, and `Catalog::create_table` cannot
@@ -8633,7 +8611,156 @@ impl EmbeddedDatabase {
 
         // Also add column-level UNIQUE and PRIMARY KEY constraints
         // These are stored in ColumnDef but need to be in table_constraints for enforcement
+        // (`create_table_column_constraints`, shared with a branch's CREATE TABLE).
         let catalog = self.storage.catalog();
+        if let Some(col_constraints) =
+            Self::create_table_column_constraints(name, columns, constraints, statement_constraints)
+        {
+            catalog.save_table_constraints(name, &col_constraints)?;
+        }
+
+        Ok(1)
+    }
+
+    /// The TABLE-LEVEL constraint set a `CREATE TABLE` declares (FOREIGN KEY,
+    /// PRIMARY KEY, UNIQUE, CHECK records), built exactly as
+    /// [`Self::execute_create_table_plan`] saves it — extracted so a branch's
+    /// `CREATE TABLE` records the identical set in its catalog overlay
+    /// (sprinter 6bc4a4040eb7, phase B3). A list-less `REFERENCES` binds to
+    /// the referenced table's PRIMARY KEY through `catalog`, so the target —
+    /// for a self-reference, the table being created — must already resolve.
+    fn create_table_statement_constraints(
+        catalog: &storage::Catalog<'_>,
+        name: &str,
+        constraints: &[sql::logical_plan::TableConstraint],
+    ) -> Result<sql::TableConstraints> {
+        let mut table_constraints = sql::TableConstraints::new();
+        for constraint in constraints {
+            match constraint {
+                sql::logical_plan::TableConstraint::ForeignKey {
+                    name: fk_name,
+                    columns: fk_cols,
+                    references_table,
+                    references_columns,
+                    on_delete,
+                    on_update,
+                    deferrable,
+                    initially_deferred,
+                    enforcement,
+                } => {
+                    // Dedup auto-generated names against the FKs already
+                    // staged on THIS table in this CREATE TABLE: the schema
+                    // no longer participates in the name, so two FKs to
+                    // like-named tables in different schemas would otherwise
+                    // collide (see `generate_unique_name`).
+                    let existing_fk_names: Vec<String> =
+                        table_constraints.foreign_keys.iter().map(|f| f.name.clone()).collect();
+                    // `REFERENCES parent` with no column list binds to
+                    // the parent's PRIMARY KEY (PostgreSQL parity).
+                    // Default it HERE, against the already-resolved
+                    // `references_table` key, so the persisted metadata
+                    // carries the real referenced columns — enforcement
+                    // then probes the parent's PK-column index in the
+                    // right key-space instead of an empty list (which
+                    // degraded to "any parent row exists" and printed a
+                    // malformed `parent()` violation message).
+                    //
+                    // The targets were validated (42P01 / 42703 /
+                    // 42704 / 42830) before `catalog.create_table` ran — see
+                    // `validate_create_table_fk_targets` — so this
+                    // cannot fail here. A SELF-reference resolves
+                    // against the table's OWN key: under a non-
+                    // `public` search_path the planner left the
+                    // parent bare (`emp`, not `s.emp`), which the
+                    // catalog cannot look up (see `fk_targets_self`).
+                    let pk_source = if Self::fk_targets_self(name, references_table) {
+                        name
+                    } else {
+                        references_table.as_str()
+                    };
+                    let references_columns =
+                        Self::resolve_fk_referenced_columns(&catalog, pk_source, references_columns)?;
+                    let fk = sql::ForeignKeyConstraint::new(
+                        fk_name.clone().unwrap_or_else(|| {
+                            sql::ForeignKeyConstraint::generate_unique_name(
+                                name,
+                                fk_cols,
+                                references_table,
+                                &existing_fk_names,
+                            )
+                        }),
+                        name.to_string(),
+                        fk_cols.clone(),
+                        references_table.clone(),
+                        references_columns,
+                    );
+                    let fk = if let Some(action) = on_delete {
+                        fk.on_delete(convert_logical_referential_action(action))
+                    } else {
+                        fk
+                    };
+                    let fk = if let Some(action) = on_update {
+                        fk.on_update(convert_logical_referential_action(action))
+                    } else {
+                        fk
+                    };
+                    let fk = if *deferrable {
+                        fk.deferrable(*initially_deferred)
+                    } else {
+                        fk
+                    };
+                    let fk = fk.with_enforcement(*enforcement);
+                    table_constraints.add_foreign_key(fk);
+                }
+                sql::logical_plan::TableConstraint::PrimaryKey {
+                    name: pk_name,
+                    columns: pk_cols,
+                } => {
+                    table_constraints.add_unique(sql::UniqueConstraint::new(
+                        pk_name.clone().unwrap_or_else(|| format!("{}_pkey", name)),
+                        name.to_string(),
+                        pk_cols.clone(),
+                        true,
+                    ));
+                }
+                sql::logical_plan::TableConstraint::Unique {
+                    name: uq_name,
+                    columns: uq_cols,
+                } => {
+                    table_constraints.add_unique(sql::UniqueConstraint::new(
+                        uq_name.clone().unwrap_or_else(|| format!("{}_unique", name)),
+                        name.to_string(),
+                        uq_cols.clone(),
+                        false,
+                    ));
+                }
+                sql::logical_plan::TableConstraint::Check {
+                    name: ck_name,
+                    expression,
+                } => {
+                    table_constraints.add_check(sql::CheckConstraint::new(
+                        ck_name.clone().unwrap_or_else(|| format!("{}_check", name)),
+                        name.to_string(),
+                        serde_json::to_string(expression).unwrap_or_default(),
+                    ));
+                }
+            }
+        }
+        Ok(table_constraints)
+    }
+
+    /// The COLUMN-LEVEL PRIMARY KEY / UNIQUE records of a `CREATE TABLE`, merged
+    /// with the table-level set the statement declared (`statement_constraints`)
+    /// — the record [`Self::execute_create_table_plan`] saves last; `None` when
+    /// no column declares a key (the table-level set, if any, is then the
+    /// record). Extracted for a branch's `CREATE TABLE` (sprinter
+    /// 6bc4a4040eb7, phase B3).
+    fn create_table_column_constraints(
+        name: &str,
+        columns: &[sql::logical_plan::ColumnDef],
+        constraints: &[sql::logical_plan::TableConstraint],
+        statement_constraints: Option<sql::TableConstraints>,
+    ) -> Option<sql::TableConstraints> {
         let mut col_constraints = sql::TableConstraints::new();
         let mut has_col_constraints = false;
 
@@ -8641,7 +8768,7 @@ impl EmbeddedDatabase {
             if col_def.primary_key {
                 col_constraints.add_unique(sql::UniqueConstraint::new(
                     format!("{}_{}_pkey", name, col_def.name),
-                    name.clone(),
+                    name.to_string(),
                     vec![col_def.name.clone()],
                     true, // is_primary_key
                 ));
@@ -8674,7 +8801,7 @@ impl EmbeddedDatabase {
                         c,
                         sql::logical_plan::TableConstraint::Unique { columns: uq_cols, .. }
                             if uq_cols.len() == 1
-                                && uq_cols[0].eq_ignore_ascii_case(&col_def.name)
+                                && uq_cols.first().is_some_and(|c| c.eq_ignore_ascii_case(&col_def.name))
                     )
                 });
                 if covered_by_table_level {
@@ -8682,7 +8809,7 @@ impl EmbeddedDatabase {
                 }
                 col_constraints.add_unique(sql::UniqueConstraint::new(
                     format!("{}_{}_unique", name, col_def.name),
-                    name.clone(),
+                    name.to_string(),
                     vec![col_def.name.clone()],
                     false, // is_primary_key
                 ));
@@ -8712,10 +8839,33 @@ impl EmbeddedDatabase {
                     col_constraints.unique_constraints.push(unique);
                 }
             }
-            catalog.save_table_constraints(name, &col_constraints)?;
+            return Some(col_constraints);
         }
+        None
+    }
 
-        Ok(1)
+    /// The catalog columns of a `CREATE TABLE` (shared by main and a branch,
+    /// sprinter 6bc4a4040eb7 phase B3).
+    fn create_table_schema_columns(columns: &[sql::logical_plan::ColumnDef]) -> Vec<Column> {
+        columns
+            .iter()
+            .map(|col_def| {
+                // Serialize default expression to JSON for storage
+                let default_expr = Self::serialize_default_expr(&col_def.default);
+
+                Column {
+                    name: col_def.name.clone(),
+                    data_type: col_def.data_type.clone(),
+                    nullable: !col_def.not_null,
+                    primary_key: col_def.primary_key,
+                    source_table: None,
+                    source_table_name: None,
+                    default_expr,
+                    unique: col_def.unique,
+                    storage_mode: col_def.storage_mode,
+                }
+            })
+            .collect()
     }
 
     fn execute_in_transaction_inner(
@@ -8965,6 +9115,18 @@ impl EmbeddedDatabase {
         // constraints, indexes, triggers, or materialized-view shape.
         if Self::plan_invalidates_sql_caches(&plan) {
             self.invalidate_plan_cache();
+        }
+
+        // sprinter 6bc4a4040eb7 (phase B3): schema DDL on a branch is applied
+        // to the branch's catalog overlay — or refused (0A000) — HERE, before
+        // any arm below can run it against main's catalog. The params family
+        // asks the same gate (`execute_plan_with_params_inner`). On main: one
+        // thread-local read. B3 second fix pass: on main, a schema statement is
+        // counted for its whole duration, and refused on a table an unfinished
+        // merge holds.
+        let _main_ddl = self.main_ddl_statement_guard(&plan)?;
+        if let Some(rows) = self.branch_schema_ddl(&plan, Some(txn), Some(sql))? {
+            return Ok(rows);
         }
 
         // Execute plan based on type
@@ -11049,6 +11211,10 @@ impl EmbeddedDatabase {
                                 col_values.insert(col.name.clone(), v.clone());
                             }
                         }
+                        // sprinter 6bc4a4040eb7 (B3 fourth fix pass): counted BEFORE
+                        // the key goes, so a MERGE BRANCH that looks under the tree's
+                        // lock either sees this writer or sees the key.
+                        txn.note_index_key_removal(table_name);
                         if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
                             tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                         }
@@ -11481,6 +11647,10 @@ impl EmbeddedDatabase {
         if let Err(e) = catalog.rebuild_all_indexes() {
             tracing::warn!("ART rebuild on open failed: {} — falling back to scan paths", e);
         }
+        // sprinter 6bc4a4040eb7 (B3 fix pass): finish every MERGE BRANCH an earlier
+        // run left unfinished, once the indexes it maintains row by row exist.
+        // Failures are logged and stay pending; the open never fails for one.
+        let _ = storage.finish_pending_branch_merges();
 
         // v3.60.0: register THIS database's sequence namespace once, here at
         // DB-open (a `Weak<StorageEngine>` downgrade — does not affect the move
@@ -11880,8 +12050,13 @@ impl EmbeddedDatabase {
         if !memory_only {
             if physical {
                 storage.hydrate_physical()?;
-            } else if let Err(e) = storage::Catalog::new(&storage).rebuild_all_indexes() {
-                tracing::warn!("ART rebuild on open failed: {} — falling back to scan paths", e);
+            } else {
+                if let Err(e) = storage::Catalog::new(&storage).rebuild_all_indexes() {
+                    tracing::warn!("ART rebuild on open failed: {} — falling back to scan paths", e);
+                }
+                // sprinter 6bc4a4040eb7 (B3 fix pass): see `new`. A physical
+                // engine does not get here: its primary's completion replicates.
+                let _ = storage.finish_pending_branch_merges();
             }
         }
 
@@ -12491,6 +12666,9 @@ impl EmbeddedDatabase {
     /// existing source row is indexed.
     #[cfg(feature = "code-graph")]
     fn handle_create_ast_index(&self, ddl: code_graph::AstIndexDdl) -> Result<u64> {
+        // sprinter 6bc4a4040eb7 (B3 fix pass): the registry is process-wide and
+        // the index describes main's tables; a branch cannot scope it.
+        self.refuse_schema_entry_on_branch("CREATE AST INDEX")?;
         let database = self.storage.instance_id();
         let existing = code_graph::storage::get_ast_index(database, &ddl.index_name);
         if existing.is_some() && !ddl.if_not_exists {
@@ -12537,6 +12715,7 @@ impl EmbeddedDatabase {
     /// already populated — a re-run is otherwise free to call.
     #[cfg(feature = "code-graph")]
     fn handle_create_semantic_hash_index(&self, ddl: code_graph::SemanticHashIndexDdl) -> Result<u64> {
+        self.refuse_schema_entry_on_branch("CREATE SEMANTIC HASH INDEX")?;
         // The roll-up table is created on demand inside merkle_refresh,
         // so the DDL itself is little more than a wrapper around
         // build_or_refresh that records the index name in process-
@@ -12558,6 +12737,7 @@ impl EmbeddedDatabase {
     /// named index is not registered.
     #[cfg(feature = "code-graph")]
     fn handle_pause_resume(&self, pr: code_graph::PauseResume) -> Result<u64> {
+        self.refuse_schema_entry_on_branch("hdb_code.pause / hdb_code.resume")?;
         let (name, paused) = match pr {
             code_graph::PauseResume::Pause(n) => (n, true),
             code_graph::PauseResume::Resume(n) => (n, false),
@@ -20284,6 +20464,14 @@ impl EmbeddedDatabase {
         if Self::plan_invalidates_sql_caches(plan) {
             self.invalidate_plan_cache();
         }
+        // sprinter 6bc4a4040eb7 (phase B3): the params family's half of the
+        // branch DDL gate (the text family's is in
+        // `execute_in_transaction_inner_body`) — same function, same answer. So
+        // is the guard on main's schema statements (B3 second fix pass).
+        let _main_ddl = self.main_ddl_statement_guard(plan)?;
+        if let Some(rows) = self.branch_schema_ddl(plan, session_txn, original_sql)? {
+            return Ok((rows, Vec::new()));
+        }
         // Session transactions manage their lifecycle through the session
         // API; routing plan-level transaction control at the global slot
         // from inside a session would corrupt both.
@@ -21682,6 +21870,12 @@ impl EmbeddedDatabase {
                                 col_values.insert(col.name.clone(), v.clone());
                             }
                         }
+                        // sprinter 6bc4a4040eb7 (B3 fourth fix pass): counted BEFORE
+                        // the key goes, so a MERGE BRANCH that looks under the tree's
+                        // lock either sees this writer or sees the key.
+                        if let Some(txn) = active_txn {
+                            txn.note_index_key_removal(table_name);
+                        }
                         if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
                             tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                         }
@@ -22552,6 +22746,13 @@ impl EmbeddedDatabase {
             "Logical plan created"
         );
 
+        // sprinter 6bc4a4040eb7 (B3 second fix pass): a schema statement through
+        // `db.query` is the same statement as through either executor family.
+        let (main_ddl, handled) = self.schema_statement_on_query_path(&plan, None, sql)?;
+        if handled {
+            return Ok(Vec::new());
+        }
+
         // `SELECT … INTO t` (and a CTAS routed here) is a WRITE: run it on the
         // write executor and return no rows. Placed BEFORE the optimize/cache
         // steps below so the plan is never admitted to the plan cache and its
@@ -22591,7 +22792,7 @@ impl EmbeddedDatabase {
         // result-cache insert below) so unique-literal one-shots stop churning
         // the plan/result caches. A genuinely repeated query warms on its
         // second run; a plan-cache hit thereafter takes the branch above.
-        let admit = !schema_active && !is_non_deterministic && self.cache_admits(sql);
+        let admit = !schema_active && !is_non_deterministic && main_ddl.is_none() && self.cache_admits(sql);
         let plan_arc = std::sync::Arc::new(plan);
         if admit {
             self.plan_cache.put(sql.to_string(), plan_arc.clone());
@@ -23017,6 +23218,14 @@ impl EmbeddedDatabase {
             return Ok(result);
         }
 
+        // sprinter 6bc4a4040eb7 (B3 third fix pass): the same schema statement as
+        // through either executor family.
+        let (main_ddl, handled) = self.schema_statement_on_query_path(&plan, None, sql)?;
+        if handled {
+            return Ok((Vec::new(), Self::empty_result_schema()));
+        }
+        let admit = admit && main_ddl.is_none();
+
         // `SELECT … INTO t` (and a CTAS routed here) is a WRITE: run it on the
         // write executor and return no rows/columns. Placed BEFORE the
         // optimize/cache steps below so the plan is never admitted to the plan
@@ -23249,6 +23458,9 @@ impl EmbeddedDatabase {
     pub fn restore_from_dump(&mut self, path: &std::path::Path) -> Result<()> {
         // Spec P1.4: refused before the dump file is even opened.
         self.refuse_write_on_physical_standby("restore_from_dump")?;
+        // sprinter 6bc4a4040eb7 (B3 second fix pass): a restore rewrites tables an
+        // unfinished MERGE BRANCH is part way through changing.
+        self.storage.refuse_while_a_merge_is_unfinished("restore")?;
         let dump_manager = self.dump_manager.clone();
         dump_manager.restore_from_dump(path, self)
     }
@@ -24648,6 +24860,55 @@ impl EmbeddedDatabase {
             && matches!(self.session_current_schema(session_id), Ok(Some(_)))
     }
 
+    /// sprinter 6bc4a4040eb7 (phase B3): is session `session_id` bound to a
+    /// branch of this database? For the protocol-layer callers that hold a
+    /// `SessionId` but run outside every engine funnel (the extended
+    /// protocol's Parse-time plan pinning and Describe derivation): a branch
+    /// can define a table differently from main, so a plan or a RowDescription
+    /// derived against main's catalog must not be pinned for, or sent to, a
+    /// branch session. One session lookup.
+    pub(crate) fn session_on_branch(&self, session_id: crate::session::SessionId) -> bool {
+        self.session_manager
+            .get_session(session_id)
+            .is_ok_and(|session| session.read().scoped.on_branch_of(self.storage.instance_id()))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): publish session `session_id`'s
+    /// backend state (and with it its BRANCH binding) on this thread for one
+    /// synchronous catalog probe made outside every engine funnel — the
+    /// PostgreSQL / MySQL catalog interceptors (`information_schema`,
+    /// `pg_catalog`, `SHOW TABLES`) and the extended protocol's Describe
+    /// derivation — so they read the session's branch catalog, not main's.
+    /// `None` (nothing installed) when the session is on main or a backend
+    /// state is already installed on this thread. `!Send`: never hold it
+    /// across an `.await`.
+    pub(crate) fn session_catalog_probe_scope(
+        &self,
+        session_id: crate::session::SessionId,
+    ) -> Option<SessionCatalogProbeScope> {
+        if SESSION_SCOPED_STATE.with(|c| c.borrow().is_some()) {
+            return None;
+        }
+        let session_lock = self.session_manager.get_session(session_id).ok()?;
+        let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
+        if !scoped.on_branch_of(self.storage.instance_id()) {
+            return None;
+        }
+        Some(SessionCatalogProbeScope {
+            _scoped: SessionScopedStateGuard::install(scoped),
+        })
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B3): publish THIS handle's own session
+    /// state (the embedded / REPL session, and its branch binding) for
+    /// catalog reads made directly through `storage.catalog()` — the REPL's
+    /// `\d` / `\dt` family — so they describe the branch the handle is on.
+    /// `None` when a backend state is already installed on this thread.
+    pub(crate) fn embedded_catalog_scope(&self) -> Option<SessionCatalogProbeScope> {
+        SessionScopedStateGuard::install_if_absent(&self.embedded_scoped)
+            .map(|guard| SessionCatalogProbeScope { _scoped: guard })
+    }
+
     /// Install this session's `search_path` as a thread-local override for the
     /// duration of one statement that routes through the global (non-session)
     /// execute/query paths, so bare names resolve against THIS session (see
@@ -25356,6 +25617,13 @@ impl EmbeddedDatabase {
                 .with_current_schema(self.current_schema())
                 .with_search_path(self.current_search_path());
             let plan = planner.statement_to_plan(statement)?;
+
+            // sprinter 6bc4a4040eb7 (B3 third fix pass): the same schema statement
+            // as through either executor family.
+            let (_main_ddl, handled) = self.schema_statement_on_query_path(&plan, Some(&txn), sql)?;
+            if handled {
+                return Ok((Vec::new(), Self::empty_result_schema()));
+            }
 
             // `SELECT … INTO t` inside an open session transaction is still a
             // WRITE; hand it to the CTAS executor with this session's transaction
@@ -26316,6 +26584,15 @@ impl EmbeddedDatabase {
             return Ok(returned);
         }
 
+        // sprinter 6bc4a4040eb7 (B3 third fix pass): the same schema statement as
+        // through either executor family. Here, past every plan cache, so a hit is
+        // covered too.
+        let (_main_ddl, handled) = self.schema_statement_on_query_path(&plan_arc, None, sql)?;
+        if handled {
+            self.log_slow_query(sql, start.elapsed(), 0);
+            return Ok(Vec::new());
+        }
+
         // 4. Execute plan with parameters and return results
         let exec_start = std::time::Instant::now();
         let results = self.query_plan_with_params(&plan_arc, params, None)?;
@@ -26576,6 +26853,13 @@ impl EmbeddedDatabase {
             };
             let (_count, rows) = self.execute_plan_with_params(&plan, params, None)?;
             return Ok((rows, columns));
+        }
+
+        // sprinter 6bc4a4040eb7 (B3 third fix pass): the same schema statement as
+        // through either executor family.
+        let (_main_ddl, handled) = self.schema_statement_on_query_path(&plan, None, sql)?;
+        if handled {
+            return Ok((Vec::new(), Self::empty_result_schema()));
         }
 
         // Same optimization pipeline as query_with_columns.
@@ -31072,6 +31356,13 @@ impl Transaction<'_> {
             .with_current_schema(self.db.current_schema())
             .with_search_path(self.db.current_search_path());
         let plan = planner.statement_to_plan(statement)?;
+
+        // sprinter 6bc4a4040eb7 (B3 third fix pass): the same schema statement as
+        // through either executor family, in this transaction.
+        let (_main_ddl, handled) = self.db.schema_statement_on_query_path(&plan, Some(&self.tx), sql)?;
+        if handled {
+            return Ok(Vec::new());
+        }
 
         // Execute plan with transaction context.
         // For SELECT queries, we need to see our own writes — handled by the

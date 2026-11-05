@@ -911,14 +911,23 @@ where
     /// connection to this database actually creates a temp table, so the
     /// default path is byte-identical to before. The guard is `!Send` on
     /// purpose; keep it inside the SYNCHRONOUS call it wraps.
-    pub(super) fn temp_namespace_guard(&self) -> Option<crate::sql::temp_tables::TempNamespaceGuard> {
-        if !self.database.storage.temp_tables_present() {
-            return None;
-        }
-        self.database
-            .session_backend_pid(self.session_id)
-            .ok()
-            .map(crate::sql::temp_tables::TempNamespaceGuard::install)
+    ///
+    /// sprinter 6bc4a4040eb7 (phase B3): the same trap for the BRANCH
+    /// catalog — a session on a branch must see its branch's tables and
+    /// columns in `information_schema` / `pg_catalog` / `\d`, so the guard
+    /// also publishes the session's backend state (its branch binding) when it
+    /// is on one (`EmbeddedDatabase::session_catalog_probe_scope`; one session
+    /// lookup).
+    pub(super) fn temp_namespace_guard(&self) -> crate::ProtocolCatalogGuard {
+        let temp = if self.database.storage.temp_tables_present() {
+            self.database
+                .session_backend_pid(self.session_id)
+                .ok()
+                .map(crate::sql::temp_tables::TempNamespaceGuard::install)
+        } else {
+            None
+        };
+        crate::ProtocolCatalogGuard::new(temp, self.database.session_catalog_probe_scope(self.session_id))
     }
 
     /// GH#28: install the listener's connection-lifetime policy. Keeps every
@@ -2559,6 +2568,29 @@ where
                 self.transaction_status = TransactionStatus::InTransaction;
             }
             self.send_command_complete("BEGIN").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        } else if starts_with_icase(trimmed, "MERGE ") && EmbeddedDatabase::is_branch_binding_statement(trimmed) {
+            // sprinter 6bc4a4040eb7 (B3 second fix pass): `MERGE BRANCH x ABORT`
+            // answers with the tables it may have left partially changed.
+            // Off the async worker (sprinter ccebc95977f1): it can wait for the
+            // statements on the branch.
+            let session_id = self.session_id;
+            let database = std::sync::Arc::clone(&self.database);
+            let answered = crate::runtime_offload::offload_statement(|| {
+                database.try_handle_session_branch_statement(session_id, trimmed)
+            });
+            match answered {
+                Ok(Some((rows, schema))) => {
+                    self.send_query_result(&schema, &rows).await?;
+                }
+                Ok(None) => self.send_command_complete("MERGE BRANCH").await?,
+                Err(e) => {
+                    self.send_error("ERROR", sqlstate_for_error(&e), &e.to_string(), None, None)
+                        .await?;
+                    return Ok(());
+                }
+            }
             self.send_ready_for_query().await?;
             return Ok(());
         } else if starts_with_icase(trimmed, "SET TRANSACTION ISOLATION LEVEL ")
@@ -6220,6 +6252,13 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
             // the second FK shape: `ArtIndexError::ForeignKeyViolation` Displays
             // as `Foreign key violation: …` (src/storage/art_index.rs) and
             // several sites wrap it with `constraint_violation(e.to_string())`.
+            // sprinter 6bc4a4040eb7 (B3 fix pass): a MERGE BRANCH refused for a
+            // key it would duplicate. Its message names the key's VALUES, free
+            // text the wording arms below must not read, so it is anchored on
+            // the emitter's const at the START of the message.
+            if message.starts_with(crate::error::BRANCH_MERGE_DUPLICATE_KEY_MARKER) {
+                return sqlstate::UNIQUE_VIOLATION; // 23505
+            }
             // sprinter f32ba64c00a7: checked FIRST, anchored on the emitter's
             // own const (marker-const discipline), so no wording arm below can
             // claim it — `violates not-null constraint` contains neither
@@ -6561,6 +6600,26 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     }
     if message.contains(crate::error::BRANCH_SWITCH_IN_TRANSACTION_MARKER) {
         return sqlstate::ACTIVE_SQL_TRANSACTION; // 25001
+    }
+    // sprinter 6bc4a4040eb7 (B3): a schema statement refused on a branch
+    // carries the B2 marker above (0A000); a MERGE BRANCH whose schema changes
+    // cannot be carried into the target (the target changed the same table
+    // since) is refused before it merges anything — 55000.
+    if message.contains(crate::error::BRANCH_MERGE_SCHEMA_REFUSED_MARKER) {
+        return sqlstate::OBJECT_NOT_IN_PREREQUISITE_STATE; // 55000
+    }
+    // sprinter 6bc4a4040eb7 (B3 fix pass): an unfinished merge (what it refuses,
+    // and the merge that stopped) and a table another transaction has written.
+    if message.contains(crate::error::BRANCH_MERGE_PENDING_MARKER)
+        || message.contains(crate::error::BRANCH_MERGE_BUSY_MARKER)
+        || message.contains(crate::error::BRANCH_MERGE_KEY_CLAIMED_MARKER)
+        || message.contains(crate::error::BRANCH_SCHEMA_RUNNING_MARKER)
+        || message.contains(crate::error::BRANCH_TABLE_BUSY_MARKER)
+    {
+        return sqlstate::OBJECT_IN_USE; // 55006
+    }
+    if message.contains(crate::error::BRANCH_MATERIALIZE_TOO_LARGE_MARKER) {
+        return sqlstate::PROGRAM_LIMIT_EXCEEDED; // 54000
     }
     // GH#28 (c2): `SET LOCAL idle_session_timeout` /
     // `idle_in_transaction_session_timeout` is refused rather than silently

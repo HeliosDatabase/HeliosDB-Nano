@@ -96,6 +96,11 @@ pub struct Transaction {
     snapshot: Snapshot,
     /// Snapshot timestamp (read timestamp for MVCC)
     snapshot_ts: u64,
+    /// sprinter 6bc4a4040eb7 (B3 fourth fix pass): the snapshot this transaction's
+    /// first staged write was read under. `snapshot_ts` moves on with every READ
+    /// COMMITTED statement; what was staged before it does not, so this is what a
+    /// row MERGE BRANCH landed is compared against at commit.
+    merge_conflict_floor: u64,
     /// Unique transaction ID for locking and tracking
     transaction_id: u64,
     /// Snapshot manager for versioned reads
@@ -430,6 +435,17 @@ impl UncommittedWriteCensus {
             .is_some_and(|counts| counts.writes.load(Ordering::Acquire) > 0)
     }
 
+    /// [`Self::table_has_staged_writes`], not counting the `own` writers the caller
+    /// knows about: its own transaction, for one.
+    pub fn table_has_other_staged_writes(&self, table: &str, own: usize) -> bool {
+        if self.unattributed.load(Ordering::Acquire) > 0 {
+            return true;
+        }
+        self.tables
+            .get(table)
+            .is_some_and(|counts| counts.writes.load(Ordering::Acquire) > own)
+    }
+
     /// Has any open transaction REMOVED an index entry for `table`? Gate for
     /// the miss-based fast paths. Call only after `any_uncommitted_writes`.
     pub fn table_has_staged_index_removals(&self, table: &str) -> bool {
@@ -504,10 +520,6 @@ impl UncommittedWriteCensus {
     /// applier takes a hold for the tables it is publishing: every miss-based
     /// and cardinality fast path declines to the planner, which reads row
     /// storage and is already exact. Counted like one transaction.
-    ///
-    /// `StorageEngine::merge_branch` takes the same hold on a primary while it
-    /// writes branch rows into main and re-derives main's indexes from them
-    /// (spec P1.1b): the same window, opened by the same order of operations.
     pub(crate) fn hold_for_replay(self: &Arc<Self>, tables: Vec<String>, every_table: bool) -> UncommittedWriteHold {
         self.hold(CensusMembership {
             counted: true,
@@ -809,6 +821,7 @@ impl Transaction {
             gate,
             snapshot: Snapshot::new(snapshot_id),
             snapshot_ts: snapshot_id,
+            merge_conflict_floor: snapshot_id,
             transaction_id,
             snapshot_manager,
             write_set: Arc::new(DashMap::new()),
@@ -1165,6 +1178,7 @@ impl Transaction {
             gate,
             snapshot: Snapshot::new(snapshot_id),
             snapshot_ts: snapshot_id,
+            merge_conflict_floor: snapshot_id,
             transaction_id,
             snapshot_manager,
             write_set: Arc::new(DashMap::new()),
@@ -1561,9 +1575,13 @@ impl Transaction {
         // never-reused engine row ids and skip the registry by design.
         let inflight = self.has_tracked_writes();
         if let Some(registry) = &self.conflict_registry {
-            if let Err((key, committed_ts)) =
-                registry.validate_and_record(&self.write_set, self.conflict_validation, self.snapshot_ts, commit_ts)
-            {
+            if let Err((key, committed_ts)) = registry.validate_and_record_with_merge_floor(
+                &self.write_set,
+                self.conflict_validation,
+                self.snapshot_ts,
+                self.merge_conflict_floor,
+                commit_ts,
+            ) {
                 if inflight {
                     registry.end_commit(commit_ts);
                 }
@@ -1997,8 +2015,13 @@ impl Transaction {
         // Release all acquired locks
         self.acquired_locks.write().clear();
 
-        // Register the snapshot so it's visible to future queries
-        if result.is_ok() {
+        // Register the snapshot so it's visible to future queries. Not when it wrote
+        // nothing and a newer snapshot exists: it would take the newest SCN for an
+        // older state. A statement that commits inside itself ends that way: MERGE
+        // BRANCH lands its tables in commits of their own, then its implicit
+        // transaction ends at the timestamp it began with, and `AS OF SCN` of the
+        // newest SCN read the rows from before the merge (sprinter 6bc4a4040eb7).
+        if result.is_ok() && (wrote || !self.snapshot_manager.has_snapshot_after(commit_ts)) {
             let _ = self.snapshot_manager.register_snapshot(commit_ts);
         }
 
@@ -2471,7 +2494,12 @@ impl Transaction {
         // fast path. The R2.3 gate below still learns "writes of an unknown
         // table" (conservative; the transaction's own branch reads go through
         // the branch view, which merges the write set regardless).
-        if key.starts_with(b"bdata:") || key.starts_with(b"bdel:") {
+        // B3 fix pass: so is a copy marker's and a key-index entry's write.
+        if key.starts_with(b"bdata:")
+            || key.starts_with(b"bdel:")
+            || key.starts_with(b"bfrz:")
+            || key.starts_with(b"bkey:")
+        {
             self.has_unattributed_writes.store(true, Ordering::Release);
             return;
         }
@@ -2537,13 +2565,14 @@ impl Transaction {
     /// hole. Note this affects the CENSUS only — `has_unattributed_writes`,
     /// which R2.3's read gates gate on, is still set for every one of them.
     fn key_cannot_change_an_index(key: &[u8]) -> bool {
-        const INDEX_IRRELEVANT_PREFIXES: [&[u8]; 6] = [
-            b"col:",     // columnar column batch
-            b"colz:",    // columnar zone stats
-            b"colzm:",   // columnar zone-stats manifest
-            b"colp:",    // columnar presence map
-            b"colpm:",   // columnar presence manifest
-            b"counter:", // per-table row-id high-water mark
+        const INDEX_IRRELEVANT_PREFIXES: [&[u8]; 7] = [
+            b"col:",          // columnar column batch
+            b"colz:",         // columnar zone stats
+            b"colzm:",        // columnar zone-stats manifest
+            b"colp:",         // columnar presence map
+            b"colpm:",        // columnar presence manifest
+            b"counter:",      // per-table row-id high-water mark
+            b"branch:merge:", // MERGE BRANCH's intent, with the table it landed
         ];
         INDEX_IRRELEVANT_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
     }
@@ -2580,6 +2609,16 @@ impl Transaction {
         }
         self.snapshot_ts = new_ts;
         self.snapshot = Snapshot::new(new_ts);
+        // What it staged so far was read under the older snapshot.
+        if self.write_set.is_empty() {
+            self.merge_conflict_floor = new_ts;
+        }
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fourth fix pass): this is the transaction a
+    /// MERGE BRANCH lands a table's rows in: the rows it holds are its own.
+    pub fn exempt_from_merged_writes(&mut self) {
+        self.merge_conflict_floor = u64::MAX;
     }
 
     /// Create a snapshot of the current write set for savepoint support.

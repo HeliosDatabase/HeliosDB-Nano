@@ -206,6 +206,126 @@ pub enum RowState {
     Stored,
 }
 
+/// sprinter 6bc4a4040eb7 (B3 fourth fix pass): what one row does to main's indexes
+/// in a table a MERGE BRANCH lands.
+pub(crate) struct MergedRowChange<'a> {
+    /// The row.
+    pub(crate) row_id: RowId,
+    /// Its committed image on main, if it has one.
+    pub(crate) old: Option<&'a Tuple>,
+    /// What it becomes; `None` when it is deleted.
+    pub(crate) new: Option<&'a Tuple>,
+}
+
+/// What [`ArtIndexManager::claim_merged_table_keys`] found.
+pub(crate) enum MergedKeysOutcome {
+    /// Every key the rows take is theirs now. Hold the claim across the commit.
+    Claimed(MergedKeysClaim),
+    /// An enforcing index holds a key for a row outside the merge.
+    HeldBy {
+        /// The merged row that wanted the key.
+        wanted_by: RowId,
+        /// The constraint, as a 23505 names it.
+        constraint: String,
+        /// Its columns.
+        columns: Vec<String>,
+    },
+    /// Another transaction has staged writes of the table.
+    WriterOpen,
+}
+
+/// One tree's part of a claim.
+struct MergedTreeClaim {
+    tree: SharedArtIndex,
+    enforcing: bool,
+    /// Keys this claim entered, for that row.
+    entered: Vec<(Vec<u8>, RowId, Option<(i64, usize)>)>,
+    /// Keys this claim moved from one merged row to another: `(key, from, to)`.
+    moved: Vec<(Vec<u8>, RowId, RowId)>,
+    /// Keys only an old image holds. They stay with that row until its new image is
+    /// committed, so no key is ever without an owner.
+    freed: Vec<(Vec<u8>, RowId, Option<(i64, usize)>)>,
+}
+
+/// The index side of one table's landing, between the claim and the commit:
+/// [`Self::finish`] once the rows are committed, dropped to put every key back
+/// when they are not (also on an unwind). Putting back cannot fail for lack of a
+/// key: nothing else can have taken a key this claim holds, and no key it moved
+/// away from a row was given to anyone but the row it moved to.
+pub(crate) struct MergedKeysClaim {
+    trees: Vec<MergedTreeClaim>,
+    settled: bool,
+}
+
+impl MergedKeysClaim {
+    /// The rows are committed: the keys only their old images held go.
+    pub(crate) fn finish(mut self) -> ArtResult<()> {
+        self.settled = true;
+        let mut first_error = None;
+        for claim in &self.trees {
+            let mut tree = claim.tree.write().unwrap_or_else(|e| e.into_inner());
+            for (key, row_id, dense) in &claim.freed {
+                let removed = if claim.enforcing {
+                    if tree.get(key) != Some(*row_id) {
+                        continue;
+                    }
+                    tree.remove(key).map(|removed| {
+                        if removed.is_some() {
+                            if let Some((value, _)) = dense {
+                                tree.record_dense_int_delete(*value);
+                            }
+                        }
+                    })
+                } else {
+                    tree.remove_value(key, *row_id).map(|_| ())
+                };
+                if let Err(e) = removed {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for MergedKeysClaim {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        for claim in self.trees.iter().rev() {
+            let mut tree = claim.tree.write().unwrap_or_else(|e| e.into_inner());
+            for (key, from, to) in claim.moved.iter().rev() {
+                if tree.get(key) == Some(*to) {
+                    let back = tree.remove(key).and_then(|_| tree.insert(key, *from));
+                    if let Err(e) = back {
+                        tracing::error!("MERGE BRANCH: giving a key back to row {}: {}", from, e);
+                    }
+                }
+            }
+            for (key, row_id, dense) in claim.entered.iter().rev() {
+                let removed = if claim.enforcing {
+                    if tree.get(key) != Some(*row_id) {
+                        continue;
+                    }
+                    tree.remove(key).map(|removed| {
+                        if removed.is_some() {
+                            if let Some((value, _)) = dense {
+                                tree.record_dense_int_delete(*value);
+                            }
+                        }
+                    })
+                } else {
+                    tree.remove_value(key, *row_id).map(|_| ())
+                };
+                if let Err(e) = removed {
+                    tracing::error!("MERGE BRANCH: taking back a key of row {}: {}", row_id, e);
+                }
+            }
+        }
+    }
+}
+
 /// Metadata about a foreign key constraint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForeignKeyInfo {
@@ -3806,6 +3926,180 @@ impl ArtIndexManager {
                 tree.clear();
             }
         }
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 third fix pass): the key one row holds in one
+    /// index; `None` when it holds none there (a column the row does not have, or
+    /// a NULL under PK/UNIQUE, which is never entered: `key_is_null_distinct`).
+    fn entry_row_key(entry: &IndexEntry, schema: &Schema, tuple: &Tuple) -> Option<Vec<u8>> {
+        let mut values: Vec<&Value> = Vec::with_capacity(entry.columns.len());
+        for column in &entry.columns {
+            values.push(tuple.values.get(schema.get_column_index(column)?)?);
+        }
+        if Self::key_is_null_distinct(entry.index_type, values.iter().copied()) {
+            return None;
+        }
+        Some(Self::encode_key_from_values(values.iter().copied()))
+    }
+
+    /// The value the dense-int statistics count for this row in this index:
+    /// what `insert_row_indexes` and `on_delete_tuple` record.
+    fn entry_dense_int(entry: &IndexEntry, schema: &Schema, tuple: &Tuple) -> Option<(i64, usize)> {
+        if entry.index_type != ArtIndexType::PrimaryKey || entry.columns.len() != 1 {
+            return None;
+        }
+        let column = entry.columns.first()?;
+        Self::int_value_width(tuple.values.get(schema.get_column_index(column)?)?)
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 fourth fix pass): all of a table's key changes for
+    /// a MERGE BRANCH, one tree at a time and all at once in each, under that tree's
+    /// write lock: nothing gets between looking at a key and taking it, and a row
+    /// never sees a key without an owner.
+    ///
+    /// For each tree, in one critical section: refuse if another transaction has
+    /// staged writes of the table (`writer_open`: such a transaction takes a key out
+    /// of the tree eagerly and puts it back when it rolls back, and it is counted
+    /// before it does, so having looked under this lock it either shows here or it
+    /// comes after this claim and sees its keys held); refuse a key held by a row
+    /// that is not giving it up in this merge; then move the keys that pass between
+    /// merged rows (so a swap, a chain or a key freed by a deletion is nothing
+    /// special) and enter the free ones. A refusal in any tree takes back the trees
+    /// before it. Keys only an old image holds stay until [`MergedKeysClaim::finish`].
+    /// A key this row already holds is nothing to do. The dense-int statistics count
+    /// what enters and leaves, not what moves.
+    ///
+    /// Only the enforcing trees can refuse, so they go first; rule 3 holds, one tree
+    /// lock at a time, and the keys are computed outside the locks.
+    pub(crate) fn claim_merged_table_keys(
+        &self,
+        table: &str,
+        schema: &Schema,
+        changes: &[MergedRowChange<'_>],
+        writer_open: &dyn Fn() -> bool,
+    ) -> ArtResult<MergedKeysOutcome> {
+        self.note_mutation();
+        let mut entries: Vec<(String, IndexEntry)> = {
+            let names = {
+                let table_indexes = self.table_indexes.read().unwrap_or_else(|e| e.into_inner());
+                table_indexes.get(table).cloned().unwrap_or_default()
+            };
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            names
+                .into_iter()
+                .filter_map(|name| indexes.get(&name).cloned().map(|entry| (name, entry)))
+                .collect()
+        };
+        entries.sort_by_key(|(_, entry)| !matches!(entry.index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique));
+
+        let mut claim = MergedKeysClaim {
+            trees: Vec::with_capacity(entries.len()),
+            settled: false,
+        };
+        for (name, entry) in &entries {
+            let enforcing = matches!(entry.index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique);
+            // The keys that change, outside the lock.
+            let mut new_keys: Vec<(Vec<u8>, RowId, Option<(i64, usize)>)> = Vec::new();
+            let mut old_keys: Vec<(Vec<u8>, RowId, Option<(i64, usize)>)> = Vec::new();
+            for change in changes {
+                let old = change.old.and_then(|tuple| Self::entry_row_key(entry, schema, tuple));
+                let new = change.new.and_then(|tuple| Self::entry_row_key(entry, schema, tuple));
+                if old == new {
+                    continue;
+                }
+                if let Some(key) = new {
+                    let dense = change.new.and_then(|tuple| Self::entry_dense_int(entry, schema, tuple));
+                    new_keys.push((key, change.row_id, dense));
+                }
+                if let Some(key) = old {
+                    let dense = change.old.and_then(|tuple| Self::entry_dense_int(entry, schema, tuple));
+                    old_keys.push((key, change.row_id, dense));
+                }
+            }
+            let giving_up: HashMap<&[u8], RowId> =
+                old_keys.iter().map(|(key, row, _)| (key.as_slice(), *row)).collect();
+            let taken: HashSet<&[u8]> = new_keys.iter().map(|(key, _, _)| key.as_slice()).collect();
+            let mut part = MergedTreeClaim {
+                tree: Arc::clone(&entry.tree),
+                enforcing,
+                entered: Vec::new(),
+                moved: Vec::new(),
+                freed: Vec::new(),
+            };
+
+            let mut tree = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+            if writer_open() {
+                return Ok(MergedKeysOutcome::WriterOpen);
+            }
+            if !enforcing {
+                for (key, row_id, _) in &new_keys {
+                    if !tree.get_all(key).contains(row_id) && tree.insert(key, *row_id).is_ok() {
+                        part.entered.push((key.clone(), *row_id, None));
+                    }
+                }
+                part.freed = old_keys.iter().map(|(key, row, _)| (key.clone(), *row, None)).collect();
+                drop(tree);
+                claim.trees.push(part);
+                continue;
+            }
+
+            // Look at every key before touching one: a refusal changes nothing here.
+            let mut wanted: HashMap<&[u8], RowId> = HashMap::with_capacity(new_keys.len());
+            for (key, row_id, _) in &new_keys {
+                if let Some(first) = wanted.insert(key.as_slice(), *row_id) {
+                    // Two merged rows want it: validation refuses that first, so
+                    // only a change on the source after it can get here.
+                    tracing::warn!("MERGE BRANCH: rows {} and {} of {} want one key", first, row_id, table);
+                    return Ok(MergedKeysOutcome::HeldBy {
+                        wanted_by: *row_id,
+                        constraint: Self::violation_name(entry, name).to_string(),
+                        columns: entry.columns.clone(),
+                    });
+                }
+                match tree.get(key) {
+                    None => {}
+                    Some(holder) if holder == *row_id => {}
+                    Some(holder) if giving_up.get(key.as_slice()) == Some(&holder) => {}
+                    Some(_) => {
+                        return Ok(MergedKeysOutcome::HeldBy {
+                            wanted_by: *row_id,
+                            constraint: Self::violation_name(entry, name).to_string(),
+                            columns: entry.columns.clone(),
+                        });
+                    }
+                }
+            }
+            let mut failed = None;
+            for (key, row_id, dense) in &new_keys {
+                let done = match tree.get(key) {
+                    Some(holder) if holder == *row_id => continue,
+                    Some(holder) => tree.remove(key).and_then(|_| tree.insert(key, *row_id)).map(|()| {
+                        part.moved.push((key.clone(), holder, *row_id));
+                    }),
+                    None => tree.insert(key, *row_id).map(|()| {
+                        if let Some((value, width)) = dense {
+                            tree.record_dense_int_insert(*width, *value);
+                        }
+                        part.entered.push((key.clone(), *row_id, *dense));
+                    }),
+                };
+                if let Err(e) = done {
+                    failed = Some(e);
+                    break;
+                }
+            }
+            for (key, row_id, dense) in &old_keys {
+                if !taken.contains(key.as_slice()) && tree.get(key) == Some(*row_id) {
+                    part.freed.push((key.clone(), *row_id, *dense));
+                }
+            }
+            drop(tree);
+            claim.trees.push(part);
+            if let Some(e) = failed {
+                return Err(e);
+            }
+        }
+        Ok(MergedKeysOutcome::Claimed(claim))
     }
 
     fn int_value_width(value: &Value) -> Option<(i64, usize)> {

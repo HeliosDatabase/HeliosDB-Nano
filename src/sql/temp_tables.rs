@@ -345,6 +345,11 @@ fn drop_temp_tables_matching<F>(storage: &crate::storage::StorageEngine, mut wan
 where
     F: FnMut(&str) -> bool,
 {
+    // sprinter 6bc4a4040eb7 (phase B3): temp tables live in MAIN's catalog
+    // (a branch refuses CREATE TEMPORARY TABLE), and main's DROP TABLE refuses
+    // a branch session — so reclaim as main even when the backend being torn
+    // down was bound to a branch.
+    let _main = crate::main_statement_scope(storage.instance_id());
     let catalog = storage.catalog();
     let Ok(keys) = catalog.list_tables_including_temp() else {
         // An unreadable catalog is not proof that nothing is there. Report one

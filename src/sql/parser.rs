@@ -480,6 +480,29 @@ impl Parser {
         upper.starts_with("MERGE DATABASE BRANCH") || upper.starts_with("MERGE BRANCH")
     }
 
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass): the branch of `MERGE [DATABASE]
+    /// BRANCH <source> ABORT`, the statement that abandons an unfinished merge;
+    /// `None` for anything else (`MERGE BRANCH a INTO b`, `MERGE INTO t …`).
+    pub fn parse_merge_branch_abort(sql: &str) -> Option<String> {
+        let trimmed = sql.trim().trim_end_matches(';').trim_end();
+        let mut words = trimmed.split_ascii_whitespace();
+        if !words.next()?.eq_ignore_ascii_case("MERGE") {
+            return None;
+        }
+        let mut word = words.next()?;
+        if word.eq_ignore_ascii_case("DATABASE") {
+            word = words.next()?;
+        }
+        if !word.eq_ignore_ascii_case("BRANCH") {
+            return None;
+        }
+        let source = words.next()?;
+        if !words.next()?.eq_ignore_ascii_case("ABORT") || words.next().is_some() {
+            return None;
+        }
+        Some(source.trim_matches('"').to_string())
+    }
+
     /// Check if SQL is a USE BRANCH statement
     pub fn is_use_branch(sql: &str) -> bool {
         // sprinter 6bc4a4040eb7 (B1 fix pass): WORDS, not a byte prefix. A
@@ -3833,6 +3856,7 @@ impl Parser {
     ///
     /// Syntax variations:
     /// - CREATE DATABASE BRANCH `<name>` FROM `<parent>` AS OF NOW
+    /// - CREATE DATABASE BRANCH `<name>` PARENT `<parent>` AS OF NOW
     /// - CREATE BRANCH `<name>` AS OF NOW
     /// - CREATE DATABASE BRANCH IF NOT EXISTS `<name>` FROM `<parent>` AS OF NOW
     /// - CREATE DATABASE BRANCH `<name>` WITH (option = value)
@@ -3891,79 +3915,135 @@ impl Parser {
             return Err(Error::query_execution("CREATE BRANCH requires a branch name"));
         }
 
-        // Find AS OF clause (required)
-        let remaining = after_create[name_end..].trim();
-        let upper_remaining = remaining.to_uppercase();
-
-        // Look for FROM clause (optional parent)
-        let parent = if let Some(from_pos) = upper_remaining.find("FROM ") {
-            let after_from = remaining[from_pos + 5..].trim_start();
-            let from_end = after_from
-                .find(|c: char| c.is_whitespace() || c == ';')
-                .unwrap_or(after_from.len());
-            let from_name = after_from[..from_end].trim().to_string();
-            if from_name.is_empty() || from_name.to_uppercase() == "CURRENT" {
-                None
-            } else {
-                Some(from_name)
-            }
-        } else {
-            None
-        };
-
-        // AS OF is OPTIONAL and defaults to NOW. The documented grammar
-        // (`CREATE DATABASE BRANCH x FROM main;`) and this function's own
-        // docstring both omit it; through v4.29.0 that form was rejected with
-        // "CREATE BRANCH requires AS OF clause". A PRESENT but empty clause is
-        // still an error.
-        let as_of_clause = match upper_remaining.find("AS OF") {
-            None => "NOW".to_string(),
-            Some(as_of_pos) => {
-                let after_as_of = remaining[as_of_pos + 5..].trim_start();
-                // Find end of AS OF clause (WITH, WHERE, GROUP, ORDER, LIMIT, UNION, ;, or end)
-                let as_of_end_keywords = ["WITH", "WHERE", "GROUP", "ORDER", "LIMIT", "UNION", ";"];
-                let as_of_end = as_of_end_keywords
-                    .iter()
-                    .filter_map(|&kw| {
-                        if let Some(pos) = after_as_of.to_uppercase().find(kw) {
-                            if pos == 0
-                                || after_as_of
-                                    .chars()
-                                    .nth(pos.saturating_sub(1))
-                                    .map(|c| c.is_whitespace())
-                                    .unwrap_or(true)
-                            {
-                                return Some(pos);
-                            }
-                        }
-                        None
-                    })
-                    .min()
-                    .unwrap_or(after_as_of.len());
-                let clause = after_as_of[..as_of_end].trim().trim_end_matches(';').to_string();
-                if clause.is_empty() {
-                    return Err(Error::query_execution("CREATE BRANCH requires valid AS OF clause"));
-                }
-                clause
-            }
-        };
-
-        // Find WITH clause (optional)
-        let with_options = if let Some(with_pos) = upper_remaining.find("WITH") {
-            let after_with = remaining[with_pos + 4..].trim_start();
-            // Extract until semicolon or end
-            let with_end = after_with.find(';').unwrap_or(after_with.len());
-            let opts = after_with[..with_end].trim().to_string();
-            if opts.is_empty() {
-                None
-            } else {
-                Some(opts)
-            }
-        } else {
-            None
-        };
+        let (parent, as_of_clause, with_options) = Self::parse_create_branch_clauses(&after_create[name_end..])?;
 
         Ok((branch_name, parent, as_of_clause, with_options, if_not_exists))
+    }
+
+    /// What follows the name in CREATE [DATABASE] BRANCH, word by word, separated by
+    /// any whitespace: `FROM <p>` or `PARENT <p>`, `AS OF <point>`, `WITH <options>`,
+    /// each at most once. Anything else is refused. A search for `"FROM "` with one
+    /// space used to miss `FROM<newline>p`, and a clause nothing recognised was
+    /// ignored, so either way the branch silently forked from the session's branch
+    /// (sprinter 6bc4a4040eb7).
+    ///
+    /// AS OF is OPTIONAL and defaults to NOW. The documented grammar
+    /// (`CREATE DATABASE BRANCH x FROM main;`) omits it; through v4.29.0 that form
+    /// was rejected with "CREATE BRANCH requires AS OF clause". A PRESENT but empty
+    /// clause is still an error, and `parse_as_of_clause` judges what is in it.
+    fn parse_create_branch_clauses(clauses: &str) -> Result<(Option<String>, String, Option<String>)> {
+        fn skip_blanks(mut text: &str) -> &str {
+            loop {
+                text = text.trim_start();
+                if let Some(comment) = text.strip_prefix("--") {
+                    text = comment.find('\n').map_or("", |end| &comment[end..]);
+                } else if let Some(comment) = text.strip_prefix("/*") {
+                    text = comment.find("*/").map_or("", |end| &comment[end + 2..]);
+                } else {
+                    return text;
+                }
+            }
+        }
+        fn next_word(text: &str) -> (&str, &str) {
+            let text = skip_blanks(text);
+            let end = text.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(text.len());
+            text.split_at(end)
+        }
+        /// Where the AS OF point ends: at the next clause keyword outside a literal.
+        fn end_of_as_of(text: &str) -> usize {
+            let mut quote = None;
+            let mut at_word_start = true;
+            for (position, c) in text.char_indices() {
+                match quote {
+                    Some(open) => {
+                        if c == open {
+                            quote = None;
+                        }
+                    }
+                    None if c == '\'' || c == '"' => quote = Some(c),
+                    None if at_word_start => {
+                        let (word, _) = next_word(&text[position..]);
+                        if ["WITH", "FROM", "PARENT"].iter().any(|k| word.eq_ignore_ascii_case(k)) {
+                            return position;
+                        }
+                    }
+                    None => {}
+                }
+                at_word_start = c.is_whitespace();
+            }
+            text.len()
+        }
+        let twice = |clause: &str| Error::query_execution(format!("CREATE BRANCH: more than one {clause} clause"));
+
+        let (mut parent_clause, mut as_of_clause, mut with_options) = (None, None, None);
+        let mut rest = skip_blanks(clauses).trim_end();
+        rest = rest.strip_suffix(';').unwrap_or(rest).trim_end();
+        while !rest.is_empty() {
+            let (word, after) = next_word(rest);
+            let upper = word.to_ascii_uppercase();
+            match upper.as_str() {
+                "FROM" | "PARENT" => {
+                    if parent_clause.is_some() {
+                        return Err(twice("FROM/PARENT"));
+                    }
+                    let (name, after_name) = next_word(after);
+                    if name.is_empty() {
+                        return Err(Error::query_execution(format!(
+                            "CREATE BRANCH: {upper} requires a branch name"
+                        )));
+                    }
+                    parent_clause = Some(name.to_string());
+                    rest = skip_blanks(after_name);
+                }
+                "AS" => {
+                    let (of, after_of) = next_word(after);
+                    if !of.eq_ignore_ascii_case("OF") {
+                        return Err(Error::query_execution(format!(
+                            "CREATE BRANCH: expected AS OF, found AS {of}"
+                        )));
+                    }
+                    if as_of_clause.is_some() {
+                        return Err(twice("AS OF"));
+                    }
+                    let after_of = skip_blanks(after_of);
+                    let end = end_of_as_of(after_of);
+                    let point = after_of[..end].trim();
+                    if point.is_empty() {
+                        return Err(Error::query_execution("CREATE BRANCH requires valid AS OF clause"));
+                    }
+                    as_of_clause = Some(point.to_string());
+                    rest = skip_blanks(&after_of[end..]);
+                }
+                "WITH" => {
+                    if with_options.is_some() {
+                        return Err(twice("WITH"));
+                    }
+                    let options = skip_blanks(after);
+                    // A parenthesised list ends at its parenthesis; what follows is
+                    // still a clause. A bare `a = b` list runs to the end.
+                    let end = if options.starts_with('(') {
+                        Self::find_matching_paren(options)
+                            .map(|close| close + 1)
+                            .ok_or_else(|| Error::query_execution("CREATE BRANCH: unmatched parenthesis in WITH"))?
+                    } else {
+                        options.len()
+                    };
+                    let list = options[..end].trim();
+                    if list.is_empty() {
+                        return Err(Error::query_execution("CREATE BRANCH: WITH requires options"));
+                    }
+                    with_options = Some(list.to_string());
+                    rest = skip_blanks(&options[end..]);
+                }
+                _ => {
+                    return Err(Error::query_execution(format!(
+                        "CREATE BRANCH: unexpected '{word}': expected FROM, PARENT, AS OF or WITH"
+                    )));
+                }
+            }
+        }
+        let parent = parent_clause.filter(|name: &String| !name.eq_ignore_ascii_case("CURRENT"));
+        Ok((parent, as_of_clause.unwrap_or_else(|| "NOW".to_string()), with_options))
     }
 
     /// Parse DROP DATABASE BRANCH statement
@@ -4011,6 +4091,8 @@ impl Parser {
     /// - MERGE DATABASE BRANCH `<source>` INTO `<target>` [WITH options]
     /// - MERGE BRANCH `<source>` INTO `<target>` [WITH options]
     pub fn parse_merge_branch_sql(sql: &str) -> Result<(String, String, Option<String>)> {
+        // `MERGE BRANCH x ABORT` never gets here: the branch statement gate answers
+        // it first (`EmbeddedDatabase::classify_branch_statement`).
         let cleaned = sql.trim().to_string();
         let upper = cleaned.to_uppercase();
 
