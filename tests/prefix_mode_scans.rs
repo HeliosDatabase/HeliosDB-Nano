@@ -245,6 +245,16 @@ const SITES: &[(&str, &str, usize, Scan)] = &[
         1,
         Scan::TotalOrder,
     ),
+    // Spec P5.2: the rewind's look at the node-local family, which holds its
+    // own keys only; "is there any key" needs the first one from the start.
+    ("src/replication/physical.rs", "state", 1, Scan::TotalOrder),
+    // A unit test's whole walk of a private store, to plan its leaves.
+    (
+        "src/replication/standby_verify.rs",
+        "the_comparison_names_exactly_the_leaf_that_differs",
+        1,
+        Scan::TotalOrder,
+    ),
     // The sync change log (`src/sync` is not compiled: `// pub mod sync;`).
     ("src/sync/change_log.rs", "query", 1, Scan::TotalOrder),
     ("src/sync/change_log.rs", "compact", 1, Scan::TotalOrder),
@@ -484,6 +494,11 @@ fn sites(file: &str, src: &str) -> Vec<Site> {
     )
     .unwrap();
     let options_argument = Regex::new(r"\A\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)").unwrap();
+    // rust-rocksdb's own order: `.iterator_cf_opt(cf, read, MODE)`, options first.
+    let options_before = Regex::new(
+        r"\.\s*iterator_cf_opt\s*\(\s*&?\s*[A-Za-z_][A-Za-z0-9_.]*\s*,\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*(?:rocksdb\s*::\s*)?\z",
+    )
+    .unwrap();
     let bodies = functions(&code);
     let mut out = Vec::new();
     for caps in token.captures_iter(&code) {
@@ -494,20 +509,28 @@ fn sites(file: &str, src: &str) -> Vec<Site> {
             .filter(|(_, body)| body.contains(&start))
             .min_by_key(|(_, body)| body.len());
         let window = &code[start.saturating_sub(256)..start];
-        let total_order = opt_call.is_match(window)
-            && options_argument
-                .captures(&code[whole.end()..])
-                .and_then(|options| {
-                    let name = options.get(1)?.as_str();
-                    let (_, body) = function?;
-                    let set = Regex::new(&format!(
-                        r"\b{}\s*\.\s*set_total_order_seek\s*\(\s*true\s*\)",
-                        regex::escape(name)
-                    ))
-                    .ok()?;
-                    Some(set.is_match(&code[body.clone()]))
-                })
-                .unwrap_or(false);
+        let options_name = options_before
+            .captures(window)
+            .and_then(|options| options.get(1))
+            .or_else(|| {
+                opt_call
+                    .is_match(window)
+                    .then(|| options_argument.captures(&code[whole.end()..]))
+                    .flatten()
+                    .and_then(|options| options.get(1))
+            })
+            .map(|name| name.as_str());
+        let total_order = options_name
+            .and_then(|name| {
+                let (_, body) = function?;
+                let set = Regex::new(&format!(
+                    r"\b{}\s*\.\s*set_total_order_seek\s*\(\s*true\s*\)",
+                    regex::escape(name)
+                ))
+                .ok()?;
+                Some(set.is_match(&code[body.clone()]))
+            })
+            .unwrap_or(false);
         out.push(Site {
             file: file.to_string(),
             line: line_of(&code, start),
@@ -658,6 +681,15 @@ mod tests {
         let _ = db.iterator(IteratorMode::Start);
     }
 }
+fn rust_rocksdb_order(db: &DB, cf: &ColumnFamily) {
+    let mut read = ReadOptions::default();
+    read.set_total_order_seek(true);
+    let _ = db.iterator_cf_opt(cf, read, IteratorMode::Start);
+}
+fn rust_rocksdb_order_unset(db: &DB, cf: &ColumnFamily) {
+    let read = ReadOptions::default();
+    let _ = db.iterator_cf_opt(cf, read, IteratorMode::End);
+}
 "##;
     let found: Vec<(usize, Option<String>, String, bool)> = sites("crafted.rs", src)
         .into_iter()
@@ -670,6 +702,13 @@ mod tests {
             (8, Some("prefix_mode".to_string()), "Start".to_string(), false),
             (14, Some("other_options".to_string()), "End".to_string(), false),
             (25, Some("in_test".to_string()), "Start".to_string(), false),
+            (31, Some("rust_rocksdb_order".to_string()), "Start".to_string(), true),
+            (
+                35,
+                Some("rust_rocksdb_order_unset".to_string()),
+                "End".to_string(),
+                false
+            ),
         ]
     );
 }
