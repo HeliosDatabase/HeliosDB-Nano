@@ -49,14 +49,15 @@
 //!   Freezing it for them is phase B4's hook, which lifts this refusal;
 //! * 55006, a table an unfinished MERGE BRANCH into this branch is changing.
 //!
-//! On MAIN, [`EmbeddedDatabase::main_ddl_statement_guard`] counts a schema
-//! statement on the tables it names for its whole duration (a merge registering
-//! its exclusion of one waits for it) and refuses (55006) one on a table an
-//! unfinished merge holds. Past that check the statement is not refused again:
-//! the merge is waiting for it, and a refusal half way would tear what it already
-//! did. The catalog funnels count the same way and refuse only on a route with no
-//! statement guard (`StorageEngine::main_catalog_write`), so a route that does not
-//! come through a planned statement is covered too.
+//! On MAIN, [`EmbeddedDatabase::main_ddl_statement_guard`] takes the tables a schema
+//! statement names exclusively (spec R5.1, `storage::table_locks`) for its whole
+//! duration: writers wait for it, it waits for them, and a merge takes the same locks.
+//! It refuses (55006) one on a table an unfinished merge holds, which is what outlives
+//! a crash, when nobody holds a lock. Past that check the statement is not refused
+//! again: a merge is waiting for its lock, and a refusal half way would tear what it
+//! already did. The catalog funnels take the same locks and refuse only what no
+//! statement guard above them looked at (`StorageEngine::main_catalog_write`), so a
+//! route that does not come through a planned statement is covered too.
 //!
 //! Plans carry schemas, so a branch session neither reads nor fills the
 //! shared SQL-text-keyed plan caches (`EmbeddedDatabase::current_schema_is_set`).
@@ -66,6 +67,7 @@ use crate::storage::branch_catalog::{
     added_column, derive_unique_rules, fresh_table_incarnation, known_incarnation, BranchAddedColumn,
     BranchTableDefinition, BranchTableRecord, BranchTableResolution, BranchTableState, MainDdlGuard,
 };
+use crate::storage::table_locks::{BoundLockOwner, ExclusiveTableLocks, StatementLockScope};
 use crate::storage::{BranchExclusiveGuard, BranchView, StorageEngine, Transaction, BRANCH_DRAIN_TIMEOUT};
 use crate::{sql, EmbeddedDatabase, Error, Result, Schema, Value};
 use rocksdb::WriteBatch;
@@ -176,17 +178,45 @@ pub fn schema_statement_name(plan: &LogicalPlan) -> Option<&'static str> {
     })
 }
 
-/// sprinter 6bc4a4040eb7 (B3 fix pass): the tables a schema plan changes, for
-/// the refusal on a table an unfinished MERGE BRANCH into main is changing.
-/// `DROP INDEX` names an index, resolved here through main's index registry.
-/// Every plan that names no table is not listed: it cannot touch a merge's rows.
+/// sprinter 6bc4a4040eb7 (B3 fix pass, spec R5.1): the tables a schema plan changes:
+/// what it locks exclusively, and what is refused when an unfinished MERGE BRANCH into
+/// main is changing it. `DROP INDEX` names an index, resolved here through main's index
+/// registry. Foreign-key DDL also holds the table on the other end, which it validates
+/// against or whose reverse-FK answer it changes. `CREATE TABLE IF NOT EXISTS` of a
+/// table that exists is a no-op and takes nothing (the funnel takes it if the table
+/// went away meanwhile). Every plan that names no table is not listed: it cannot touch
+/// a merge's rows, and it reads no rows it rewrites.
 fn schema_plan_tables(storage: &StorageEngine, plan: &LogicalPlan) -> Vec<String> {
     match plan {
-        LogicalPlan::CreateTable { name, .. } | LogicalPlan::CreateTableAs { name, .. } => vec![name.clone()],
+        LogicalPlan::CreateTable {
+            name,
+            if_not_exists,
+            constraints,
+            ..
+        } => {
+            if *if_not_exists && storage.catalog().main_table_exists(name).unwrap_or(false) {
+                return Vec::new();
+            }
+            let mut tables = vec![name.clone()];
+            tables.extend(constraints.iter().filter_map(|constraint| match constraint {
+                crate::sql::logical_plan::TableConstraint::ForeignKey { references_table, .. } => {
+                    Some(references_table.clone())
+                }
+                _ => None,
+            }));
+            tables
+        }
+        LogicalPlan::CreateTableAs { name, .. } => vec![name.clone()],
         // A drop takes the table's partition children with it, in writes of its
-        // own (B3 third fix pass): they are refused or counted here, up front,
-        // never half way through the drop.
-        LogicalPlan::DropTable { name, .. } => storage.catalog().with_partition_descendants(vec![name.clone()]),
+        // own (B3 third fix pass): they are refused or held here, up front, never
+        // half way through the drop. And the tables on the other end of its foreign
+        // keys: a parent's DELETE reads what references it.
+        LogicalPlan::DropTable { name, .. } => {
+            let mut tables = storage.catalog().with_partition_descendants(vec![name.clone()]);
+            let neighbours: Vec<String> = tables.iter().flat_map(|table| fk_neighbours(storage, table)).collect();
+            tables.extend(neighbours);
+            tables
+        }
         LogicalPlan::DropMulti { drops } => drops
             .iter()
             .flat_map(|drop| schema_plan_tables(storage, drop))
@@ -200,20 +230,35 @@ fn schema_plan_tables(storage: &StorageEngine, plan: &LogicalPlan) -> Vec<String
         | LogicalPlan::AlterTableRenameColumn { table_name, .. }
         | LogicalPlan::AlterTableAlterColumnNullability { table_name, .. }
         | LogicalPlan::AlterColumnStorage { table_name, .. }
-        | LogicalPlan::AlterTableAddForeignKey { table_name, .. }
         | LogicalPlan::AlterTableAddUnique { table_name, .. }
         | LogicalPlan::AlterTableAddPrimaryKey { table_name, .. }
         | LogicalPlan::AlterTableAddCheck { table_name, .. }
         | LogicalPlan::AlterTableAlterConstraintEnforcement { table_name, .. }
-        | LogicalPlan::AlterTableDropConstraint { table_name, .. }
         | LogicalPlan::CreateIndex { table_name, .. }
         | LogicalPlan::CreateTrigger { table_name, .. }
         | LogicalPlan::AlterTableSetSchema { table_name, .. } => vec![table_name.clone()],
         LogicalPlan::DropTrigger { table_name, .. } => table_name.iter().cloned().collect(),
+        // It validates its rows against the parent's keys, and a parent's DELETE must
+        // not take one away meanwhile.
+        LogicalPlan::AlterTableAddForeignKey {
+            table_name,
+            references_table,
+            ..
+        } => vec![table_name.clone(), references_table.clone()],
+        LogicalPlan::AlterTableDropConstraint { table_name, .. } => {
+            let mut tables = vec![table_name.clone()];
+            tables.extend(fk_neighbours(storage, table_name));
+            tables
+        }
+        // The children's constraint records name the table, and move with it.
         LogicalPlan::AlterTableRename {
             table_name,
             new_table_name,
-        } => vec![table_name.clone(), new_table_name.clone()],
+        } => {
+            let mut tables = vec![table_name.clone(), new_table_name.clone()];
+            tables.extend(fk_neighbours(storage, table_name));
+            tables
+        }
         // CASCADE takes every member with it.
         LogicalPlan::DropSchema { names, .. } => storage.catalog().with_partition_descendants(
             names
@@ -232,6 +277,26 @@ fn schema_plan_tables(storage: &StorageEngine, plan: &LogicalPlan) -> Vec<String
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// The tables on the other end of `table`'s foreign keys, in both directions (spec
+/// R5.1). Asked only by schema statements, and from the catalog's caches.
+fn fk_neighbours(storage: &StorageEngine, table: &str) -> Vec<String> {
+    let catalog = storage.catalog();
+    let mut tables: Vec<String> = catalog
+        .load_table_constraints(table)
+        .map(|constraints| {
+            constraints
+                .foreign_keys
+                .iter()
+                .map(|fk| fk.references_table.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Ok(referencing) = catalog.get_referencing_fks(table) {
+        tables.extend(referencing.into_iter().map(|fk| fk.table_name));
+    }
+    tables
 }
 
 /// Classify `plan` for a statement on a branch.
@@ -331,12 +396,14 @@ impl EmbeddedDatabase {
     ///
     /// `txn` is the transaction the statement runs in (the text family's
     /// implicit or explicit one, the params family's session transaction);
-    /// `original_sql` the statement text (the `PARTITION OF` detection).
+    /// `original_sql` the statement text (the `PARTITION OF` detection); `params`
+    /// the statement's bound parameters (a `CREATE TABLE … AS` source may use them).
     pub(crate) fn branch_schema_ddl(
         &self,
         plan: &LogicalPlan,
         txn: Option<&Transaction>,
         original_sql: Option<&str>,
+        params: &[Value],
     ) -> Result<Option<u64>> {
         if !self.storage.is_branch_active() {
             return Ok(None);
@@ -362,7 +429,9 @@ impl EmbeddedDatabase {
                 if_not_exists,
                 query,
                 with_data,
-            } => self.branch_create_table_as(&view, name, column_names, if_not_exists, query, with_data, txn)?,
+            } => {
+                self.branch_create_table_as(&view, name, column_names, if_not_exists, query, with_data, txn, params)?
+            }
             BranchDdl::DropTables(targets) => self.branch_drop_tables(&view, &targets, txn)?,
             BranchDdl::AddColumns { table, columns } => self.branch_add_columns(&view, table, &columns, txn)?,
         };
@@ -383,26 +452,103 @@ impl EmbeddedDatabase {
         Err(Error::branch_schema_unsupported(statement, &name))
     }
 
-    /// sprinter 6bc4a4040eb7 (B3 second fix pass): a schema statement on main
-    /// starts: counted until the guard drops, and refused (55006) when it touches
-    /// a table an unfinished merge holds. `None` for anything else, and on a
-    /// branch, whose own statements answer to `branch_schema_ddl`. Both executor
-    /// families and the query path hold this for the statement's whole duration.
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass, spec R5.1): a schema statement on
+    /// main starts: it holds its tables exclusively until the guard drops, and is
+    /// refused (55006) when it touches a table an unfinished merge holds. `None` for
+    /// anything else, and on a branch, whose own statements answer to
+    /// `branch_schema_ddl`. Both executor families and the query path hold this for
+    /// the statement's whole duration. A statement in a transaction binds it first
+    /// (`bind_statement_transaction`), so it counts as that transaction's.
     pub(crate) fn main_ddl_statement_guard(&self, plan: &LogicalPlan) -> Result<Option<MainDdlGuard>> {
-        if self.storage.is_branch_active() || schema_statement_name(plan).is_none() {
+        if self.storage.is_branch_active() {
             return Ok(None);
         }
+        let Some(statement) = schema_statement_name(plan) else {
+            return Ok(None);
+        };
         let tables = schema_plan_tables(&self.storage, plan);
         let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
-        self.storage.enter_main_statement(&tables).map(Some)
+        self.storage.enter_main_statement(&tables, statement).map(Some)
+    }
+
+    /// Spec R5.1: may this statement write, or hold locks for a statement inside it?
+    /// One discriminant match, so a read pays nothing else.
+    #[inline]
+    pub(crate) fn plan_may_write(plan: &LogicalPlan) -> bool {
+        matches!(
+            plan,
+            LogicalPlan::Insert { .. }
+                | LogicalPlan::InsertSelect { .. }
+                | LogicalPlan::Update { .. }
+                | LogicalPlan::Delete { .. }
+                | LogicalPlan::Truncate { .. }
+                | LogicalPlan::Call { .. }
+                | LogicalPlan::MergeBranch { .. }
+        ) || schema_statement_name(plan).is_some()
+    }
+
+    /// Spec R5.1: the statement on this thread acts for `txn`, or with none given for
+    /// this caller's own global transaction, so what it locks stays locked until that
+    /// transaction ends. With neither it binds nothing: the statement's own scope is
+    /// the owner. Under `execute()`'s in-transaction branch (`GLOBAL_TXN_LOCK_HELD`)
+    /// the slot cannot be locked, and that branch bound it already.
+    pub(crate) fn bind_statement_transaction(&self, txn: Option<&Transaction>) -> BoundLockOwner {
+        match txn {
+            Some(txn) => txn.bind_table_locks(),
+            None if self.global_txn_visible() && !crate::GLOBAL_TXN_LOCK_HELD.with(std::cell::Cell::get) => {
+                let guard = self.lock_owned_global_txn();
+                guard
+                    .as_ref()
+                    .and_then(|slot| slot.as_ref())
+                    .map_or_else(BoundLockOwner::inert, Transaction::bind_table_locks)
+            }
+            None => BoundLockOwner::inert(),
+        }
+    }
+
+    /// Spec R5.1: the locks a statement takes from its plan, before it reads anything
+    /// it will change: its target table shared, on its branch's level; TRUNCATE's
+    /// exclusive, since it empties the table whole. They stay until the scope's end,
+    /// or the transaction's when one is bound. Schema statements take theirs through
+    /// `main_ddl_statement_guard` and `branch_schema_ddl`, and a merge its own.
+    #[inline]
+    pub(crate) fn statement_table_locks(&self, plan: &LogicalPlan) -> Result<StatementLockScope<'_>> {
+        let scope = self.storage.table_locks().statement_scope();
+        match plan {
+            LogicalPlan::Insert { table_name, .. }
+            | LogicalPlan::InsertSelect { table_name, .. }
+            | LogicalPlan::Update { table_name, .. } => {
+                scope.lock_shared(self.storage.statement_lock_level(), table_name)?;
+            }
+            LogicalPlan::Delete { table_name, .. } => {
+                // Every table its foreign keys make it write, sorted, before it changes
+                // anything: 55P03 has to mean it changed nothing.
+                let level = self.storage.statement_lock_level();
+                let mut tables = self.cascade_lock_tables(table_name)?;
+                if tables.is_empty() {
+                    scope.lock_shared(level, table_name)?;
+                } else {
+                    tables.push(table_name.clone());
+                    tables.sort_unstable();
+                    for table in &tables {
+                        scope.lock_shared(level, table)?;
+                    }
+                }
+            }
+            LogicalPlan::Truncate { table_name } => {
+                scope.lock_exclusive(self.storage.statement_lock_level(), table_name, "TRUNCATE")?;
+            }
+            _ => {}
+        }
+        Ok(scope)
     }
 
     /// sprinter 6bc4a4040eb7 (B3 second and third fix passes): a statement that
     /// arrived on a query route. A schema statement is the same statement there:
     /// on a branch it applies to the branch's catalog (`true`: done, no rows; it
-    /// used to reach the executor's backstop and get a wrong 0A000), on main it is
-    /// counted and checked like both executor families' (`Some` guard, to hold for
-    /// the rest of the statement, whose plan must not go in the plan cache: a hit
+    /// used to reach the executor's backstop and get a wrong 0A000), on main it holds
+    /// its tables and is checked like both executor families' (`Some` guard, to hold
+    /// for the rest of the statement, whose plan must not go in the plan cache: a hit
     /// would skip all this). `(None, false)` for anything else.
     pub(crate) fn schema_statement_on_query_path(
         &self,
@@ -410,12 +556,26 @@ impl EmbeddedDatabase {
         txn: Option<&Transaction>,
         sql: &str,
     ) -> Result<(Option<MainDdlGuard>, bool)> {
+        // Spec R5.1: a TRUNCATE arriving here is `ddl::handle_truncate`'s, which writes
+        // at once. Its guard ends with the statement, and this keeps its plan out of
+        // the plan cache, whose hit would skip the lock.
+        if let LogicalPlan::Truncate { table_name } = plan {
+            let bound = self.bind_statement_transaction(txn);
+            let level = self.storage.statement_lock_level();
+            let locks = self
+                .storage
+                .lock_tables_exclusive(level, &[table_name.as_str()], "TRUNCATE")?;
+            return Ok((Some(MainDdlGuard::holding(locks, bound)), false));
+        }
         if schema_statement_name(plan).is_none() {
             return Ok((None, false));
         }
+        let bound = self.bind_statement_transaction(txn);
         let guard = self.main_ddl_statement_guard(plan)?;
-        let handled = self.branch_schema_ddl(plan, txn, Some(sql))?.is_some();
-        Ok((guard, handled))
+        // No parameters on this route: a `CREATE TABLE … AS` arriving with some is
+        // handed to `execute_plan_with_params`, with them, before it gets here.
+        let handled = self.branch_schema_ddl(plan, txn, Some(sql), &[])?.is_some();
+        Ok((guard.map(|guard| guard.bound_to(bound)), handled))
     }
 
     /// sprinter 6bc4a4040eb7 (B3 fix pass): this schema statement runs on the
@@ -429,14 +589,17 @@ impl EmbeddedDatabase {
     /// The refusals of a schema statement that is not a no-op, inside its
     /// exclusive section: this transaction's own staged writes of `table`, live
     /// children of the branch, another transaction's staged writes of `table`,
-    /// and an unfinished merge into the branch that is changing `table`.
+    /// and an unfinished merge into the branch that is changing `table`. Then the
+    /// table's writer lock on this level (spec R5.1), for the statement: the section
+    /// already keeps other statements out, and what is left to wait for is a
+    /// transaction that holds the table with nothing staged.
     fn branch_ddl_preflight(
         &self,
         view: &BranchView<'_>,
         txn: Option<&Transaction>,
         table: &str,
         statement: &str,
-    ) -> Result<()> {
+    ) -> Result<ExclusiveTableLocks> {
         self.refuse_branch_ddl_after_writes(view, txn, table, statement)?;
         let children = self.storage.live_branch_children(view.branch_id(), None)?;
         if !children.is_empty() {
@@ -445,7 +608,9 @@ impl EmbeddedDatabase {
         if crate::storage::branch_view::pending_writers(self.storage.instance_id(), view.branch_id(), table) > 0 {
             return Err(Error::branch_table_busy(table, view.name()));
         }
-        self.storage.refuse_ddl_on_merging_table(view.branch_id(), table)
+        self.storage.refuse_ddl_on_merging_table(view.branch_id(), table)?;
+        self.storage
+            .lock_tables_exclusive(view.branch_id(), &[table], statement)
     }
 
     /// A branch DDL on `table` is refused when the transaction it runs in has
@@ -564,7 +729,7 @@ impl EmbeddedDatabase {
         if let Some(rows) = exists(&catalog)? {
             return Ok(rows);
         }
-        self.branch_ddl_preflight(view, txn, name, "CREATE TABLE")?;
+        let _table_lock = self.branch_ddl_preflight(view, txn, name, "CREATE TABLE")?;
         let schema = Schema::new(Self::create_table_schema_columns(columns));
         // FOREIGN KEY targets first, as main does (42P01 / 42703 / 42704 /
         // 42830) — through the branch's catalog.
@@ -657,6 +822,7 @@ impl EmbeddedDatabase {
         query: &LogicalPlan,
         with_data: bool,
         txn: Option<&Transaction>,
+        params: &[Value],
     ) -> Result<u64> {
         if sql::temp_tables::is_temp_key(name) {
             return Err(Error::branch_schema_unsupported(
@@ -682,7 +848,7 @@ impl EmbeddedDatabase {
         if let Some(rows) = exists(&catalog)? {
             return Ok(rows);
         }
-        self.branch_ddl_preflight(view, txn, name, "CREATE TABLE … AS")?;
+        let _table_lock = self.branch_ddl_preflight(view, txn, name, "CREATE TABLE … AS")?;
         let schema = Schema::new(sql::Planner::ctas_target_columns(&query.schema(), column_names)?);
         let constraints = sql::TableConstraints::default();
         let level = view.branch_id();
@@ -722,7 +888,7 @@ impl EmbeddedDatabase {
                     source: Box::new(source),
                     returning: None,
                 };
-                self.execute_plan_with_params(&insert, &[], None)
+                self.execute_plan_with_params(&insert, params, None)
                     .map(|(count, _returned)| count)
             });
         match populated {
@@ -796,8 +962,12 @@ impl EmbeddedDatabase {
                 }
             }
         }
-        for name in &dropping {
-            self.branch_ddl_preflight(view, txn, name, "DROP TABLE")?;
+        // Sorted: the locks of a statement that takes several (spec R5.1).
+        let mut preflight_order: Vec<&String> = dropping.iter().collect();
+        preflight_order.sort_unstable();
+        let mut held = Vec::with_capacity(preflight_order.len());
+        for name in preflight_order {
+            held.push(self.branch_ddl_preflight(view, txn, name, "DROP TABLE")?);
         }
         let level = view.branch_id();
         for name in &dropping {
@@ -913,7 +1083,7 @@ impl EmbeddedDatabase {
         if added.is_empty() {
             return Ok(0);
         }
-        self.branch_ddl_preflight(view, txn, table, "ALTER TABLE … ADD COLUMN")?;
+        let _table_lock = self.branch_ddl_preflight(view, txn, table, "ALTER TABLE … ADD COLUMN")?;
 
         let backfill: Vec<Value> = added
             .iter()

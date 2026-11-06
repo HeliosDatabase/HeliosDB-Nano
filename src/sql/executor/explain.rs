@@ -290,13 +290,17 @@ fn execute_for_analyze(executor: &Executor, plan: &LogicalPlan) -> (Option<usize
     let start_time = Instant::now();
 
     if let Some(storage) = executor.storage() {
-        let mut exec = Executor::with_storage(storage);
+        // With the statement's parameters: `EXPLAIN ANALYZE … WHERE id = $1` reported
+        // "Parameter $1 not provided" instead of running.
+        let mut exec = Executor::with_storage(storage).with_parameters(executor.parameters().to_vec());
         if let Some(txn) = executor.transaction() {
             exec = exec.with_transaction(txn);
         }
-        if let Some(timeout) = executor.timeout_ctx() {
-            exec = exec.with_timeout(Some(timeout.elapsed().as_millis() as u64));
-        }
+        // The statement's own deadline. This gave the time elapsed so far as the limit:
+        // every statement has a context here, even with no timeout set, and the first
+        // row's check found a limit of a few milliseconds already passed, so EXPLAIN
+        // ANALYZE reported "Query exceeded timeout limit" in place of its actual rows.
+        exec.timeout_ctx = executor.timeout_ctx();
 
         match exec.execute(plan) {
             Ok(results) => {

@@ -671,7 +671,7 @@ pub enum MergeFailSite {
     TableClaimed,
     /// One chunk of a materialization written.
     Materialize,
-    /// A schema statement on main, counted and past its exclusion check.
+    /// A schema statement on main, holding its tables and past its exclusion check.
     MainDdlStatement,
 }
 
@@ -689,53 +689,41 @@ static MERGE_SITE_HOOKS: LazyLock<DashMap<(u64, MergeFailSite), MergeSiteHook>> 
 /// Whether any fail point or hook is armed: the one load a merged row pays.
 static MERGE_FAILPOINTS_ARMED: AtomicUsize = AtomicUsize::new(0);
 
-/// Schema statements and catalog writes on main past the exclusion check and
-/// not finished, per (engine, table) (B3 second and third fix passes). A merge
-/// that registers its exclusion waits for the ones on ITS tables: the statement
-/// announces itself BEFORE it reads the exclusions and the merge registers BEFORE
-/// it reads this, so either the statement sees the exclusion or the merge sees the
-/// statement. A statement naming no table, and a temporary table, are not counted.
-static MAIN_DDL_IN_FLIGHT: LazyLock<DashMap<(u64, String), usize>> = LazyLock::new(DashMap::new);
-
-/// A schema statement on main, or one write of main's catalog: counted until it
-/// drops ([`MAIN_DDL_IN_FLIGHT`]). Inert inside a merge's own scope.
+/// A schema statement on main, or one write of main's catalog: it holds its tables
+/// exclusively until this drops (spec R5.1, `storage::table_locks`). A merge takes the
+/// same locks, so it waits for a statement already running and a statement waits for
+/// the merge. Inert inside a merge's own scope, whose locks cover it.
 #[must_use]
 pub(crate) struct MainDdlGuard {
-    engine: u64,
-    tables: Vec<String>,
-    /// A statement's guard: it restores [`MAIN_STATEMENT`] to `previous_statement`.
-    restores_statement: bool,
-    previous_statement: Option<u64>,
-    _not_send: std::marker::PhantomData<*const ()>,
+    // In this order: the locks let go while the statement still acts for its transaction.
+    _locks: Option<super::table_locks::ExclusiveTableLocks>,
+    _bound: Option<super::table_locks::BoundLockOwner>,
 }
 
-impl Drop for MainDdlGuard {
-    fn drop(&mut self) {
-        for table in self.tables.drain(..) {
-            if let dashmap::mapref::entry::Entry::Occupied(mut entry) = MAIN_DDL_IN_FLIGHT.entry((self.engine, table)) {
-                let remaining = entry.get().saturating_sub(1);
-                if remaining == 0 {
-                    entry.remove();
-                } else {
-                    *entry.get_mut() = remaining;
-                }
-            }
-        }
-        if self.restores_statement {
-            MAIN_STATEMENT.with(|statement| statement.set(self.previous_statement));
+impl MainDdlGuard {
+    fn inert() -> Self {
+        Self {
+            _locks: None,
+            _bound: None,
         }
     }
-}
 
-thread_local! {
-    /// The engine whose schema statement, past its check, is running on this
-    /// thread (B3 third fix pass): its catalog writes are counted and never
-    /// refused. A merge that registers meanwhile WAITS for that statement, so
-    /// refusing the statement half way would tear what the merge is waiting for:
-    /// `ALTER COLUMN … SET STORAGE` rewrites its rows before its schema, and
-    /// `CREATE INDEX` builds its index before its record. Only a route with no
-    /// statement guard is refused at the funnel.
-    static MAIN_STATEMENT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// Locks taken by a route that binds the statement to its transaction itself.
+    pub(crate) fn holding(
+        locks: super::table_locks::ExclusiveTableLocks,
+        bound: super::table_locks::BoundLockOwner,
+    ) -> Self {
+        Self {
+            _locks: Some(locks),
+            _bound: Some(bound),
+        }
+    }
+
+    /// The statement stays bound to its transaction for this guard's life.
+    pub(crate) fn bound_to(mut self, bound: super::table_locks::BoundLockOwner) -> Self {
+        self._bound = Some(bound);
+        self
+    }
 }
 
 thread_local! {
@@ -1271,90 +1259,66 @@ impl StorageEngine {
         MERGE_SCOPE.with(std::cell::Cell::get) == Some(self.instance_id())
     }
 
-    /// Count this DDL on `tables`: temporary tables are not counted, and a table
-    /// is counted once.
-    fn count_main_ddl(&self, tables: &[&str]) -> MainDdlGuard {
-        let engine = self.instance_id();
-        let mut counted: Vec<String> = Vec::with_capacity(tables.len());
-        for table in tables {
-            if crate::sql::temp_tables::is_temp_key(table) || counted.iter().any(|seen| seen == table) {
-                continue;
-            }
-            *MAIN_DDL_IN_FLIGHT.entry((engine, (*table).to_string())).or_insert(0) += 1;
-            counted.push((*table).to_string());
-        }
-        MainDdlGuard {
-            engine,
-            tables: counted,
-            restores_statement: false,
-            previous_statement: None,
-            _not_send: std::marker::PhantomData,
-        }
-    }
-
-    /// sprinter 6bc4a4040eb7 (B3 third fix pass): a schema statement on main
-    /// starts, on `tables`. Counted first, then refused (55006) if a merge holds
-    /// one of them. Past this it is not refused again: see [`MAIN_STATEMENT`]. A
-    /// statement nested in another one (a `CREATE SCHEMA`'s elements) is covered by
-    /// the outer one's check. Inert inside a merge's own scope.
-    pub(crate) fn enter_main_statement(&self, tables: &[&str]) -> Result<MainDdlGuard> {
+    /// sprinter 6bc4a4040eb7 (B3 third fix pass, spec R5.1): a schema statement on
+    /// main starts, on `tables`. Refused (55006) if a merge holds one of them, or an
+    /// unfinished merge's intent does (the exclusion outlives a crash, when no lock is
+    /// held by anybody); then it takes them exclusively, sorted, bounded by `[session]
+    /// lock_timeout_ms`; and it looks again, for a merge that registered meanwhile and
+    /// did not finish. Past this it is not refused again: a merge that registers now
+    /// waits for this statement's lock, and a refusal half way would tear what it did.
+    /// Inert inside a merge's own scope.
+    pub(crate) fn enter_main_statement(&self, tables: &[&str], statement: &str) -> Result<MainDdlGuard> {
         if self.in_merge_scope() {
-            return Ok(self.count_main_ddl(&[]));
+            return Ok(MainDdlGuard::inert());
         }
-        let engine = self.instance_id();
-        let previous = MAIN_STATEMENT.with(|statement| statement.replace(Some(engine)));
-        let mut guard = self.count_main_ddl(tables);
-        guard.restores_statement = true;
-        guard.previous_statement = previous;
-        if previous != Some(engine) {
-            for table in tables {
-                self.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, table)?;
-            }
+        // A statement nested in another one (a `CREATE TABLE … AS`, on a query route) was
+        // looked at when it took what it holds.
+        let to_check: Vec<&str> = tables
+            .iter()
+            .copied()
+            .filter(|table| {
+                !self
+                    .table_locks()
+                    .current_statement_holds_exclusively(super::table_locks::MAIN_LEVEL, table)
+            })
+            .collect();
+        for table in &to_check {
+            self.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, table)?;
+        }
+        let locks = self.lock_tables_exclusive(super::table_locks::MAIN_LEVEL, tables, statement)?;
+        for table in &to_check {
+            self.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, table)?;
         }
         self.merge_failpoint_tick(MergeFailSite::MainDdlStatement)?;
-        Ok(guard)
+        Ok(MainDdlGuard {
+            _locks: Some(locks),
+            _bound: None,
+        })
     }
 
-    /// sprinter 6bc4a4040eb7 (B3 second and third fix passes): one catalog write
-    /// on main touching `tables`. Always counted. Under a statement guard that is
-    /// all; on a route with none (a direct catalog call, restore, the protocol
-    /// adapter) THIS is the check, and it refuses (55006) if a merge holds one of
-    /// the tables. Inert inside a merge's own scope.
+    /// sprinter 6bc4a4040eb7 (B3 second and third fix passes, spec R5.1): one catalog
+    /// write on main touching `tables`. What the statement above it already holds it
+    /// holds and looked at; a table it takes itself (a direct catalog call, restore,
+    /// the protocol adapter, or a table no statement named) is checked here, and
+    /// refused (55006) if a merge holds it. Inert inside a merge's own scope.
     pub(crate) fn enter_main_ddl(&self, tables: &[&str]) -> Result<MainDdlGuard> {
         if self.in_merge_scope() {
-            return Ok(self.count_main_ddl(&[]));
+            return Ok(MainDdlGuard::inert());
         }
-        let guard = self.count_main_ddl(tables);
-        if MAIN_STATEMENT.with(std::cell::Cell::get) != Some(self.instance_id()) {
-            for table in tables {
+        let mut sorted: Vec<&str> = tables.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let timeout = self.table_locks().timeout();
+        let mut locks = self.table_locks().exclusive_guard();
+        for table in sorted {
+            if locks.take(super::table_locks::MAIN_LEVEL, table, "a catalog write", timeout)? {
                 self.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, table)?;
             }
         }
-        Ok(guard)
-    }
-
-    /// sprinter 6bc4a4040eb7 (B3 second and third fix passes): a merge just
-    /// registered its exclusion of `tables` on main: wait, until `deadline` (one
-    /// budget for the whole statement), for the schema statements on THOSE tables
-    /// already past the check. Refused 55006 when one is still running.
-    pub(crate) fn wait_for_main_ddl(
-        &self,
-        tables: &[String],
-        source: &str,
-        target: &str,
-        deadline: std::time::Instant,
-    ) -> Result<()> {
-        let engine = self.instance_id();
-        while tables
-            .iter()
-            .any(|table| MAIN_DDL_IN_FLIGHT.contains_key(&(engine, table.clone())))
-        {
-            if std::time::Instant::now() >= deadline {
-                return Err(Error::branch_merge_ddl_busy(source, target));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        Ok(())
+        Ok(MainDdlGuard {
+            _locks: Some(locks),
+            _bound: None,
+        })
     }
 
     /// For the tests' handshakes: is a merge holding `table` on main?
@@ -1986,60 +1950,81 @@ mod tests {
         engine.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, "t").unwrap();
     }
 
-    /// A merge registers, then waits for what is already past the check, on ITS
-    /// tables only, within the one budget it was given.
+    /// Spec R5.1: a schema statement holds its tables exclusively. What it holds is
+    /// not looked at again, so a merge registering while it runs waits for it instead
+    /// of tearing it; a statement arriving afterwards, and a route with no statement,
+    /// is refused; and a refused one leaves nothing held.
     #[test]
-    fn a_merge_waits_for_a_schema_statement_on_its_tables() {
+    fn a_schema_statement_holds_its_tables_and_is_refused_by_an_exclusion_it_finds() {
         let engine = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        engine.debug_set_table_lock_timeout(std::time::Duration::from_millis(20));
         let tables = vec!["t".to_string()];
-        let none_left = std::time::Instant::now;
-        let plenty = || std::time::Instant::now() + std::time::Duration::from_secs(30);
 
-        let on_t = engine.enter_main_statement(&["t"]).unwrap();
+        let on_t = engine.enter_main_statement(&["t"], "ALTER TABLE").unwrap();
+        assert!(engine.debug_table_lock_held_exclusively("t"));
         engine
             .register_merge_exclusion(MERGE_TARGET_MAIN, 7, "b", "main", &tables, true)
             .unwrap();
-        let busy = engine
-            .wait_for_main_ddl(&tables, "b", "main", none_left())
-            .unwrap_err()
-            .to_string();
-        assert!(busy.contains(crate::error::BRANCH_MERGE_BUSY_MARKER), "{busy}");
-        // A statement on another table, or a temporary one, or naming none, is
-        // nothing to wait for.
-        let on_u = engine.enter_main_statement(&["u"]).unwrap();
-        let on_nothing = engine.enter_main_statement(&[]).unwrap();
-        engine
-            .wait_for_main_ddl(&["u2".to_string()], "b", "main", none_left())
-            .unwrap();
-        drop(on_nothing);
-        drop(on_u);
-        // Past its check, the statement's own catalog writes are counted and not
-        // refused; a statement arriving now is, and so is a route with no guard.
-        let write = engine.enter_main_ddl(&["t"]).unwrap();
-        drop(write);
-        drop(on_t);
-        engine.wait_for_main_ddl(&tables, "b", "main", plenty()).unwrap();
+        // Past its check, the statement's own catalog writes hold what it holds.
+        drop(engine.enter_main_ddl(&["t"]).unwrap());
         assert!(
-            engine.enter_main_statement(&["t"]).is_err(),
+            engine.debug_table_lock_held_exclusively("t"),
+            "the nested write took nothing of its own"
+        );
+        drop(on_t);
+        assert!(!engine.debug_table_lock_held_exclusively("t"));
+
+        assert!(
+            engine.enter_main_statement(&["t"], "ALTER TABLE").is_err(),
             "after the exclusion: refused"
         );
         assert!(engine.enter_main_ddl(&["t"]).is_err(), "no statement guard: refused");
-        // The refused statement left nothing to wait for, nor its guard installed.
-        engine.wait_for_main_ddl(&tables, "b", "main", none_left()).unwrap();
-        assert!(engine.enter_main_ddl(&["t"]).is_err());
+        assert!(
+            !engine.debug_table_lock_held_exclusively("t"),
+            "a refusal leaves nothing held"
+        );
         engine.release_merge_exclusion(7);
 
-        // A merge's own catalog writes are not DDL on its own tables.
+        // Another table is none of its business.
         engine
             .register_merge_exclusion(MERGE_TARGET_MAIN, 8, "c", "main", &tables, true)
             .unwrap();
+        drop(engine.enter_main_statement(&["u"], "ALTER TABLE").unwrap());
+        // A merge's own catalog writes are not DDL on its own tables, and its own
+        // locks cover them.
         {
             let _scope = MergeDdlScope::enter(engine.instance_id());
             let _inert = engine.enter_main_ddl(&["t"]).unwrap();
-            engine.wait_for_main_ddl(&tables, "c", "main", none_left()).unwrap();
+            assert!(!engine.debug_table_lock_held_exclusively("t"));
         }
         assert!(engine.enter_main_ddl(&["t"]).is_err());
         engine.release_merge_exclusion(8);
+    }
+
+    /// R5 decision 11: a reader's fill, with the generation it read before its durable
+    /// read, cannot outlive a DDL that moved the generation: it read a record that DDL
+    /// may have deleted. The DROP that re-cached a table this way made `RENAME x TO it`
+    /// fail "already exists". A publication goes in whatever the generation is.
+    #[test]
+    fn a_readers_fill_does_not_outlive_a_ddl_that_moved_the_generation() {
+        let engine = StorageEngine::open_in_memory(&Config::in_memory()).unwrap();
+        let before = engine.schema_generation();
+        engine.cache_schema_if_current("t", schema(), before);
+        assert!(engine.get_cached_schema("t").is_some(), "nothing moved it");
+        engine.invalidate_schema_cache("t");
+
+        let before = engine.schema_generation();
+        engine.bump_schema_generation();
+        engine.invalidate_schema_cache("t");
+        engine.cache_schema_if_current("t", schema(), before);
+        assert!(engine.get_cached_schema("t").is_none(), "the DDL came first");
+        engine.cache_table_constraints_if_current("t", crate::sql::TableConstraints::default(), before);
+        assert!(engine.get_cached_table_constraints("t").is_none());
+        engine.cache_referencing_fks_if_current("t", Vec::new(), before);
+        assert!(engine.get_cached_referencing_fks("t").is_none());
+
+        engine.cache_schema("t", schema());
+        assert!(engine.get_cached_schema("t").is_some(), "a DDL's own publication");
     }
 
     /// A merge still validating has nothing to finish or abandon, and says so.

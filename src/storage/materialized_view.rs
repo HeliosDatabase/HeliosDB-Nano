@@ -235,8 +235,9 @@ impl<'a> MaterializedViewCatalog<'a> {
         if catalog.table_exists(&data_table)? {
             catalog.drop_table(&data_table)?;
         }
-        self.storage.invalidate_schema_cache(view_name);
+        // R5 decision 11: write, bump, invalidate.
         self.storage.bump_schema_generation();
+        self.storage.invalidate_schema_cache(view_name);
         Ok(())
     }
 
@@ -268,13 +269,15 @@ impl<'a> MaterializedViewCatalog<'a> {
             catalog.drop_table(&data_table)?;
         }
 
-        // Invalidate schema cache for the view name itself (may have been cached
-        // by catalog.get_table_schema() which falls back to MV lookup)
-        self.storage.invalidate_schema_cache(view_name);
-
         // W1.3: the view no longer exists; bump so the existence cache
         // recomputes this name to `Missing`.
         self.storage.bump_schema_generation();
+
+        // Invalidate schema cache for the view name itself (may have been cached
+        // by catalog.get_table_schema() which falls back to MV lookup). After the
+        // bump (R5 decision 11): a reader's fill either ran already, and is removed
+        // here, or finds the generation moved and is refused.
+        self.storage.invalidate_schema_cache(view_name);
 
         tracing::info!("Successfully dropped materialized view '{}'", view_name);
         Ok(())
@@ -328,6 +331,14 @@ impl<'a> MaterializedViewCatalog<'a> {
 
         let data_table = Self::mv_data_table_name(view_name);
         let catalog = self.storage.catalog();
+        // Spec R5.1: the data table's rows are rewritten whole, by a statement or by
+        // the scheduler's worker, which both come through here: they serialize on this
+        // lock, as does whatever else writes the table.
+        let _table_lock = self.storage.lock_tables_exclusive(
+            super::table_locks::MAIN_LEVEL,
+            &[data_table.as_str()],
+            "REFRESH MATERIALIZED VIEW",
+        )?;
 
         // Create or recreate the data table. Drop catalog metadata if present, then
         // UNCONDITIONALLY purge any data rows: a prior run may have removed the
@@ -397,6 +408,12 @@ impl<'a> MaterializedViewCatalog<'a> {
         let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
         let temp_table = format!("{}__temp_{}", data_table, timestamp);
         let backup_table = format!("{}__old_{}", data_table, timestamp);
+        // Spec R5.1: see `store_view_data`. The swap writes all three.
+        let _table_lock = self.storage.lock_tables_exclusive(
+            super::table_locks::MAIN_LEVEL,
+            &[data_table.as_str(), temp_table.as_str(), backup_table.as_str()],
+            "REFRESH MATERIALIZED VIEW",
+        )?;
 
         tracing::debug!("Using temporary table '{}' for concurrent refresh", temp_table);
 

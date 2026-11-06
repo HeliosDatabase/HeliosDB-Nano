@@ -210,6 +210,7 @@ pub const REGISTERED_PARAMETERS: &[&str] = &[
     "hnsw_m",
     "idle_in_transaction_session_timeout",
     "idle_session_timeout",
+    "lock_timeout",
     "mv_auto_refresh",
     "mv_max_cpu_percent",
     "optimizer",
@@ -284,6 +285,10 @@ impl SessionSettings {
         // Query execution settings
         settings.insert("statement_timeout".to_string(), SettingValue::Duration(0)); // 0 = unlimited
         settings.insert("query_timeout".to_string(), SettingValue::Duration(0)); // 0 = unlimited
+                                                                                 // Spec R5.1: how long a statement waits for a table's writer lock. 0 is the
+                                                                                 // server's `[session] lock_timeout_ms`, NOT PostgreSQL's unbounded wait:
+                                                                                 // `pg_dump` scripts start with `SET lock_timeout = 0`, and a wait stays bounded.
+        settings.insert("lock_timeout".to_string(), SettingValue::Duration(0));
 
         // GH#28: connection-lifetime GUCs (PostgreSQL names and defaults).
         // Registered so the embedded / params executor families answer

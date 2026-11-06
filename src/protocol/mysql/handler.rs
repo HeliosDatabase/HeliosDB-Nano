@@ -3756,6 +3756,12 @@ fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     {
         return (1235, "0A000"); // ER_NOT_SUPPORTED_YET
     }
+    // Spec R5.1: a table's writer lock not obtained in time, 55P03 on the PostgreSQL
+    // wire: MySQL's own for it is ER_LOCK_WAIT_TIMEOUT. Checked early: the message names
+    // the table and the statement holding it, which are free text.
+    if err_msg.contains(crate::error::TABLE_LOCK_TIMEOUT_MARKER) {
+        return (1205, "HY000"); // ER_LOCK_WAIT_TIMEOUT
+    }
     // sprinter d03de7fc3b22: a spent tenant resource quota. MySQL's own code for
     // "this account has exceeded a resource limit" is ER_USER_LIMIT_REACHED;
     // both wires read the ONE marker const the emitters own, so they cannot

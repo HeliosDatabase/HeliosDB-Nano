@@ -128,11 +128,13 @@ that landed are the merge's own, so it usually finishes; if the target changed u
 and recreate the branch from the current target. A physical standby refuses `ABORT`: that is its primary's
 call.
 
-A merge does not duplicate a key. A statement on `main` that takes a merged key first stops the merge
-(`55006`, run it again once that is resolved, and it says `23505` while the row holding the key is there);
-one that comes after gets its ordinary `23505`. A transaction that read a row before the merge and commits a
-change to it after gets a serialization failure (`40001`), at any isolation level, READ COMMITTED included:
-retry it.
+A merge does not duplicate a key, and writers do not race it. It holds each table it changes exclusively,
+as `ALTER TABLE` does: a statement writing such a table waits for it and then runs against what landed (an
+`INSERT` of a merged key gets its ordinary `23505`), and the merge waits for the writers already there,
+including an open transaction. Readers never wait. `[session] lock_timeout_ms` (default 30000) or a session's
+`SET lock_timeout` bounds every wait: after it, `55P03` naming what holds the table, with nothing changed; retry it. A `REPEATABLE READ`
+transaction keeps its snapshot, and if the merge changed a row it writes, its `COMMIT` gets a serialization
+failure (`40001`): retry it.
 
 ### History note — two stale warnings you may encounter
 

@@ -227,20 +227,22 @@ While an intent exists:
   the merge's own thread), not only at the plan gate, so `db.query`'s cold path, `DROP SCHEMA …
   CASCADE`, restore and the protocol adapter are covered. A restore on a store with an intent is
   refused outright.
-- A schema statement on main is counted, per table it names, for its whole duration, announced
-  BEFORE it reads the exclusions (`main_ddl_statement_guard` -> `enter_main_statement`). A merge
-  registers BEFORE it reads the count, and waits only for statements on ITS tables. So either the
-  statement sees the exclusion, or the merge sees the statement. The plan is re-read after that, and
-  what gets held is the FINAL plan's table list. A statement naming no table skips the count, and a
-  temporary table does not count.
-- **Past that check a statement is never refused again** (third fix pass). It set a thread-local;
-  the catalog funnels under it count but do not refuse, because the merge is waiting for it and a
-  refusal half way tears what it already did: `ALTER COLUMN … SET STORAGE` rewrites its rows before it
-  writes the schema, and `CREATE INDEX` builds its tree before it records the definition. Only a route
-  with no statement guard (a direct catalog call, restore, the protocol adapter) is refused at the
+- A schema statement on main holds the tables it names exclusively for its whole duration (spec R5.1,
+  `main_ddl_statement_guard` -> `enter_main_statement`, which replaced a per-table count): it reads the
+  exclusions, takes the locks, and reads them again. A merge registers first and then takes the same
+  locks, so it waits for a statement already past its check, and only for statements on ITS tables.
+  The plan is re-read after that, and what gets held is the FINAL plan's table list. A statement naming
+  no table holds nothing.
+- **Past that check a statement is never refused again** (third fix pass). What it holds, the catalog
+  funnels under it do not look at again, because the merge is waiting for it and a refusal half way tears
+  what it already did: `ALTER COLUMN … SET STORAGE` rewrites its rows before it writes the schema, and
+  `CREATE INDEX` builds its tree before it records the definition. A table it takes itself, on a route
+  with no statement guard (a direct catalog call, restore, the protocol adapter), is refused at the
   funnel. The merge then plans against the new state.
+- Into a branch target, main's statements on the tables it inherits are waited for without taking anything
+  (`wait_for_exclusive_holders`): a branch's merge does not block main's writers.
 - **One budget.** A MERGE statement waits at most `BRANCH_DRAIN_TIMEOUT` (30 s) in all: closing its
-  source, its section on a branch target and every wait for main's statements share one deadline.
+  source, its section on a branch target and every wait for a table's lock share one deadline.
 - `DROP TABLE` and `DROP SCHEMA … CASCADE` name the partition children they take, transitively, so
   they are refused up front when a merge holds a child, never half way through. A merged drop or
   re-create lists them among its tables too: held, and in the report of an ABORT.
@@ -396,82 +398,67 @@ any row lands, on a rerun too. Every table's commit stages its counter with its 
 
 ### Writers on main during a merge
 
-Before the merge:
+Spec R5.1 (`R5_1_writer_lock.md`). A merge holds the per-table writer lock (`storage::table_locks`) exclusively on
+every table of its plan, on the target level, from before its key validation through the last table's landing; a resumed
+merge takes it again and validates again under it. A writer holds it shared from before it reads the rows it will
+change until the end of its statement or transaction. So no writer runs beside a landing: it waits, and then it reads
+what landed. The wait is bounded by `[session] lock_timeout_ms` and the merge's own 30 s budget includes it: past that,
+55P03, naming what holds the table, with nothing changed.
 
-- **An open transaction with staged writes** of a merge table refuses it (55006), at the plan, at a
-  resume, right before the table's rows are staged, and again under each tree's lock, where it cannot be
-  missed: a transaction counts itself before it changes the tree (both DELETE arms now count before they
-  take a key out), so having looked under the lock it either shows, or it comes after the claim and sees the
-  keys held. So a rollback can no longer find its key taken, and a staged row is never landed under.
-- **An autocommit writer** is in no census. A statement caught between its claim and its row is refused at
-  validation (`main_key_held_by_an_uncommitted_row`, 55006). After that, whoever claims a key first holds it:
-  the row phase refuses a key an INSERT took (55006, intent kept), and an INSERT of a key the merge claimed
-  gets its ordinary 23505. Writers that do not claim through these funnels are under "What stays open".
+- **An open transaction with staged writes** of a merge table holds the lock until it ends, so the merge waits for it,
+  whichever level: the target's on those tables, the source's on any table it has staged rows of. A merge inside the
+  very transaction that wrote the table is refused at once (55P03): it cannot end while its own statement waits.
+- **An autocommit writer** finishes first, or waits for the merge and then gets its ordinary answer: an `INSERT` of a key
+  the merge took gets 23505.
+- **A statement that waited reads after what it waited for.** Its transaction's snapshot was taken before the lock, so an
+  autocommit or READ COMMITTED transaction takes a new one when a schema statement or a merge has ended since (the
+  schema generation says so). A transaction that validates keeps its snapshot, and first-committer-wins refuses its
+  COMMIT with a serialization failure (40001): REPEATABLE READ, and the embedded global transaction.
 
-**A commit over a row the merge landed fails.** `WriteConflictRegistry::hold_merge_landing` records the
-table's row keys before the merge reads them: in flight until the commit, then with its timestamp. Every
-commit checks them, at any isolation level, against the snapshot its first staged write was read under
-(`Transaction::merge_conflict_floor`): READ COMMITTED validates nothing else, and is what a wire client
-gets by default, but such a transaction can hold a row image from before the merge, and its COMMIT would put
-it back with the index saying otherwise. It gets a serialization failure (40001). A statement that begins
-after the merge read the merged row, and passes. The check runs after the commit records its keys, and the
-merge records its keys before it validates its own commit, so of two commits of one row at least one sees the
-other: the merge's own commit also fails on a key committed after its snapshot (55006, retryable). The
-records are pruned once no open transaction's pin is older.
+What stays from before the lock, because it is not about writers:
+
+- `claim_merged_table_keys` still moves a table's keys in one critical section per tree, so a swap, a chain and a key
+  freed by a deletion are one step, and a failed commit puts everything back. Its refusal of a key held by a row outside the
+  merge (`HeldBy`) and validation's `main_key_held_by_an_uncommitted_row` can no longer be reached by a SQL writer;
+  they stay as fail-safes, cost nothing, and the tests reach them by taking a key in the tree directly.
+- The exclusion (`MERGE_EXCLUSIONS`), rebuilt from the intent at open: a pending merge must refuse DDL with no lock held
+  by anybody, also after a restart. A pending merge leaves main's DML open, as before.
+- The census slots held across the landing: they keep a `COUNT` off the index while its keys settle. That is about
+  readers, who take no lock.
 
 ### What stays open
 
-The last review ran these against a live server. The merge itself is right: landing, `landed`, reruns,
-ABORT, recovery, the standby and time travel. What follows is other writers on main racing it.
-
 **Closed:**
 
-- A duplicate key from a writer that claims through the ordinary funnels: a single INSERT, or a transaction
-  that staged before the merge looked.
-- A transaction's COMMIT overwriting a landed row (40001), at any isolation level.
-- A rollback restoring a key the merge took, for a transaction that staged before the merge looked.
+- A duplicate key from any writer, on any path.
+- A transaction's COMMIT overwriting a landed row, at any isolation level: it waited, and read the landed row, or it gets
+  40001 from first-committer-wins.
+- A rollback restoring a key the merge took: the merge waits for the transaction.
 - A table's landing visible in part, or half replayed after a crash.
+- **The params family's multi-row UPDATE and DELETE** (`update_tuples_branch_aware`, `delete_tuples_branch_aware`), the
+  default path of psycopg, JDBC, sqlx and node-postgres, and of the REST routes: the statement holds the table's lock from
+  before it reads its rows. The review's numbers (686 rows back to their pre-merge image, 1920 deleted rows back) are now
+  tests (`a_multi_row_update_during_a_merge_keeps_what_landed`, `a_multi_row_delete_during_a_merge_stays_deleted`).
+- **TRUNCATE**: it waits for the merge, and can no longer fail at commit with its indexes cleared, since nothing is left to
+  make an autocommit commit fail.
+- **A key-moving statement that ended in 40001**: there is no 40001, and no undo over a merge's keys.
+- **The primary-key fast paths on the very row a merge lands**: they lock before they read the row.
+- **`ADD COLUMN`'s backfill beside an autocommit UPDATE**, on main and through a merge: they exclude each other.
+  `an_add_column_backfill_survives_autocommit_updates` is no longer ignored.
+- **A false 40001** for a READ COMMITTED transaction spanning a merge: the floor is gone.
 
-**Open until the writer lock** (R5's per-table lock, `g/R5_decisions.md` items 1, 13 and 15: the next commit,
-before any release). A merge will hold it exclusively, so these writers wait instead of racing, and the
-`merged_writes` floor goes with them. Until then:
+**Still open:**
 
-- **The params family's multi-row UPDATE and DELETE** (`update_tuples_branch_aware`,
-  `delete_tuples_branch_aware`), the default path of psycopg, JDBC, sqlx and node-postgres, and of the REST
-  routes. They are outside the registry and the census, and they write rows they read earlier, for the
-  statement's whole duration, not a window of microseconds. Reproduced: `UPDATE d SET g = g + 1 WHERE g >= $1`
-  during a merge of 6000 rows put 686 merged rows back to their pre-merge image, a lookup by either of a row's
-  keys found nothing, and `INSERT` of a key a row still held was accepted, so two rows held it. `DELETE … WHERE
-  g = $1` reported 3000 deleted and 1920 of them came back. The same statements on the text family were correct.
-- **TRUNCATE.** During the row phase it fails at commit with 40001, with its indexes already cleared, because
-  it assumes an autocommit statement always commits. Every row is still there, lookups find nothing and
-  duplicate keys are accepted, until a restart.
-- **A key-moving statement that ends in 40001.** A text-family autocommit `UPDATE d SET code = code || 'x'`
-  started at any point in the last part of a merge reads its rows, moves keys after the claim, and gets 40001.
-  Its undo puts the pre-merge keys back after `finish` removed them. Rows and lookups are right, but `INSERT` of
-  each old key gets a false 23505 until a restart. The window is the statement's read phase, not an instant.
-- **The primary-key fast paths on the very row a merge lands** (`update_tuple_fast*`, `delete_tuple_fast*`).
-  They are outside the registry too: one that read the row before the merge's commit and writes after it puts
-  the pre-merge image back, and if it moved an indexed value the index is stale until a restart.
-- **`ADD COLUMN`'s backfill.** An autocommit UPDATE's read-modify-write can put back a row narrower than the
-  schema, so it reads NULL instead of the default and a PK read can fail. Main's own `ALTER TABLE` does the same
-  (2 runs in 4 in the review's script, 4 in 5 through a merge). **After a crash** the backfill is lost, on main
-  and through a merge, with the same result (`SELECT x … WHERE id = 3` fails with `Column index 2 out of bounds
-  in tuple`), unless the merge was still pending, because then the step reruns. R5's `meta:attmissing:` does away
-  with the rewrite (item 4). `an_add_column_backfill_survives_autocommit_updates` is written and ignored until
-  then.
-- **A false 40001.** A READ COMMITTED transaction that wrote another table before a merge, then reads a merged
-  row and updates it, gets 40001 at COMMIT. A retry clears it. Only a transaction spanning a merge can hit this.
+- **`ADD COLUMN`'s backfill after a crash** is lost, on main and through a merge, with `SELECT x … WHERE id = 3` failing with
+  `Column index 2 out of bounds in tuple`, unless the merge was still pending, because then the step reruns. R5's
+  `meta:attmissing:` does away with the rewrite (decision 4).
+- **Crash replay (R5 decision 14).** Pre-existing, on main with no branch, after an earlier clean close left a checkpoint. An
+  autocommit PK UPDATE or DELETE of a row whose multi-row INSERT is above the checkpoint is undone by the replay, and that
+  now includes a PK UPDATE made after a merge, which falls back to the merged image (the merged rows themselves survive: their
+  WAL records ride their commit). DROP + CREATE puts the old rows into the new table, and CREATE + DROP brings the table
+  back, through a merge as on main. Decision 14 stops the replay re-applying entries at open.
 
-**Open until R5 decision 14: crash replay.** Pre-existing, on main with no branch, after an earlier clean close
-left a checkpoint. An autocommit PK UPDATE or DELETE of a row whose multi-row INSERT is above the checkpoint is
-undone by the replay, and that now includes a PK UPDATE made after a merge, which falls back to the merged image
-(the merged rows themselves survive: their WAL records ride their commit). DROP + CREATE puts the old rows into
-the new table, and CREATE + DROP brings the table back, through a merge as on main. Decision 14 stops the replay
-re-applying entries at open.
-
-Into a branch target none of this exists: the merge runs in the target's exclusive section and refuses open
-staged writes.
+Into a branch target the same lock applies at the target's level, inside the exclusive section the merge already ran in.
 
 ### Merge into a branch target
 
@@ -489,9 +476,10 @@ computed at plan time and stored in the step, so a rerun writes the same bytes.
   schema-changing one. CREATE BRANCH of a child takes a shared hold of the parent first, so it
   waits.
 - `PENDING` registry per (level, table) of transactions with staged writes: the DDL refuses
-  55006, and so does a merge, for any table of its source (a COMMIT there lands inside the
-  validation window, since the source is still Active) and the merge's tables of a branch target.
-  ROLLBACK TO SAVEPOINT keeps the entry (conservative).
+  55006. A merge waits for them on the table's writer lock instead (R5.1), on any table of its
+  source (a COMMIT there would land inside the validation window, since the source is still Active)
+  and on the merge's tables of a branch target; `PENDING` names the source's tables it has to wait
+  for. ROLLBACK TO SAVEPOINT keeps the entry (conservative).
 - Preflight order, after the no-op checks: own staged writes, live descendants (0A000; walked
   through merged branches, which stay in their children's chains), other transactions' staged
   writes (55006), a pending merge into this level (55006).
@@ -532,7 +520,7 @@ row id the storage insert returned, from the counter the SQL insert uses (it use
 of the durable counter, which ignores the scope); a branch reports no `row_count`, since statistics
 describe main's rows. A schema statement on any query route (`db.query`, the result-set routes, a
 session transaction's, the params read route, the RAII `Transaction` query) applies to the branch like
-any other (it reached the executor's backstop and got a wrong 0A000), and on main it is counted and
+any other (it reached the executor's backstop and got a wrong 0A000), and on main it holds its tables and is
 checked, and kept out of the plan cache, whose hit path would skip that. `DROP TABLE` on a branch takes
 partition children with it. The open-time finish asks
 the write gate, so a fenced primary does not tear down indexes trying. Code-graph DDL

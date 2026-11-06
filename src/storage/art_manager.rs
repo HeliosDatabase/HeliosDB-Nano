@@ -230,8 +230,6 @@ pub(crate) enum MergedKeysOutcome {
         /// Its columns.
         columns: Vec<String>,
     },
-    /// Another transaction has staged writes of the table.
-    WriterOpen,
 }
 
 /// One tree's part of a claim.
@@ -3957,15 +3955,14 @@ impl ArtIndexManager {
     /// write lock: nothing gets between looking at a key and taking it, and a row
     /// never sees a key without an owner.
     ///
-    /// For each tree, in one critical section: refuse if another transaction has
-    /// staged writes of the table (`writer_open`: such a transaction takes a key out
-    /// of the tree eagerly and puts it back when it rolls back, and it is counted
-    /// before it does, so having looked under this lock it either shows here or it
-    /// comes after this claim and sees its keys held); refuse a key held by a row
-    /// that is not giving it up in this merge; then move the keys that pass between
-    /// merged rows (so a swap, a chain or a key freed by a deletion is nothing
-    /// special) and enter the free ones. A refusal in any tree takes back the trees
-    /// before it. Keys only an old image holds stay until [`MergedKeysClaim::finish`].
+    /// For each tree, in one critical section: refuse a key held by a row that is not
+    /// giving it up in this merge; then move the keys that pass between merged rows
+    /// (so a swap, a chain or a key freed by a deletion is nothing special) and enter
+    /// the free ones. A refusal in any tree takes back the trees before it. Keys only
+    /// an old image holds stay until [`MergedKeysClaim::finish`]. The merge holds the
+    /// table's writer lock (spec R5.1), so no statement is in the middle of moving a
+    /// key here: what can still refuse is a key held by a row validation did not see,
+    /// which is a fail-safe, and the claim is still what makes a swap one step.
     /// A key this row already holds is nothing to do. The dense-int statistics count
     /// what enters and leaves, not what moves.
     ///
@@ -3976,7 +3973,6 @@ impl ArtIndexManager {
         table: &str,
         schema: &Schema,
         changes: &[MergedRowChange<'_>],
-        writer_open: &dyn Fn() -> bool,
     ) -> ArtResult<MergedKeysOutcome> {
         self.note_mutation();
         let mut entries: Vec<(String, IndexEntry)> = {
@@ -4028,9 +4024,6 @@ impl ArtIndexManager {
             };
 
             let mut tree = entry.tree.write().unwrap_or_else(|e| e.into_inner());
-            if writer_open() {
-                return Ok(MergedKeysOutcome::WriterOpen);
-            }
             if !enforcing {
                 for (key, row_id, _) in &new_keys {
                     if !tree.get_all(key).contains(row_id) && tree.insert(key, *row_id).is_ok() {

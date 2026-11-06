@@ -220,6 +220,8 @@ impl Config {
         }
         // Sprinter 746342a0bfbb: refused at load, not at the first CREATE INDEX.
         config.vector.validate()?;
+        // Spec R5.1: and not at the first contended write, which 0 would fail at once.
+        config.session.validate_lock_timeout()?;
         Ok(config)
     }
 
@@ -2456,6 +2458,15 @@ pub struct SessionConfig {
     /// nesting of functions is needed; lower it to fail faster on runaway
     /// recursion. Must be at least 1 (0 would make every UDF call fail).
     pub udf_max_call_depth: u32,
+    /// How long a statement waits for a table's writer lock, in milliseconds
+    /// (default: 30000), before it fails with SQLSTATE 55P03 naming what holds it.
+    ///
+    /// A statement or transaction that writes a table holds it shared; a schema
+    /// statement, `TRUNCATE` or `MERGE BRANCH` holds it exclusively. So during a long
+    /// `ALTER TABLE` writers wait, and an `ALTER TABLE` waits for the writers already
+    /// there, including a transaction left open. Readers never wait. Must be at least
+    /// 1. This is a server setting; `[locks] timeout_ms` is the row-level wait.
+    pub lock_timeout_ms: u64,
 }
 
 impl Default for SessionConfig {
@@ -2465,6 +2476,7 @@ impl Default for SessionConfig {
             max_sessions_per_user: 10,
             cleanup_interval_secs: 300,
             udf_max_call_depth: 32,
+            lock_timeout_ms: 30_000,
         }
     }
 }
@@ -2486,6 +2498,17 @@ impl SessionConfig {
         if self.udf_max_call_depth < 1 {
             return Err(crate::Error::config(
                 "session.udf_max_call_depth must be at least 1 (0 would refuse every function call)",
+            ));
+        }
+        self.validate_lock_timeout()
+    }
+
+    /// `lock_timeout_ms`, on its own: `Config::from_toml_str` asks this at load, since a
+    /// server started with `--config` does not run [`Self::validate`].
+    pub fn validate_lock_timeout(&self) -> crate::Result<()> {
+        if self.lock_timeout_ms < 1 {
+            return Err(crate::Error::config(
+                "session.lock_timeout_ms must be at least 1 millisecond",
             ));
         }
         Ok(())

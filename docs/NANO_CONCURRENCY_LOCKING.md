@@ -94,3 +94,57 @@ dangling FK; a subsequent `DROP` of the child then misbehaves. Fixes to scope:
 
 Once Option 2 (or the bounded Option 1) removes the 60 s stall, the DROP path
 should fail fast / behave correctly rather than wedging the server.
+
+## The per-table writer lock (R5.1)
+
+Separate from the row-level `LockManager` above, and what writers see during DDL. Spec:
+`docs/plans/specs/R5_1_writer_lock.md`.
+
+- A statement or transaction that writes a table holds it **shared**, from before it reads the rows it will
+  change until the statement ends (autocommit) or the transaction does (`BEGIN`). Writers do not block each other.
+- `ALTER TABLE` (every form), `DROP TABLE`, `RENAME`, `TRUNCATE`, `CREATE INDEX`, `DROP INDEX`, `CREATE`/`DROP TRIGGER`,
+  `REFRESH MATERIALIZED VIEW` of the view's data table, and `MERGE BRANCH` on every table it changes hold it
+  **exclusively**. Foreign-key DDL also holds the table on the other end.
+- **Readers never wait.** `SELECT` takes nothing.
+- **Writers wait.** During a long `ALTER TABLE … ADD COLUMN … DEFAULT` or a merge, a writer of that table waits and
+  then runs against what the statement left, with no error. Other tables, and the same table on another branch, are not
+  affected.
+- **DDL waits for the writers already there**, including a transaction left open, and new writers wait behind it, so a
+  statement cannot starve under a write load. An idle transaction that wrote the table blocks an `ALTER TABLE` until it ends.
+- **`[session] lock_timeout_ms`** (default 30000) bounds every wait, and **`SET lock_timeout`** does for a session (`SET`,
+  `SET LOCAL`, `RESET`, `SHOW`; a bare number is milliseconds, or `'2s'`). After it the statement fails with SQLSTATE
+  **55P03** (MySQL wire: 1205 `ER_LOCK_WAIT_TIMEOUT`, REST: 409) naming what holds the table. It changed nothing; retry it.
+  In a transaction it aborts the transaction like any other failed statement. **`SET lock_timeout = 0` is not PostgreSQL's
+  unbounded wait**: it means the server's `lock_timeout_ms`, so a `pg_dump` script, which starts with it, still ends. A wait
+  here is always bounded.
+- **A wait also ends at `statement_timeout`, and at a cancel** (PostgreSQL's CancelRequest, which psql's Ctrl-C and every
+  driver's cancel send): SQLSTATE **57014**, and the statement does not run when the lock comes free. It looks every 50 ms.
+  Each wait counts its `statement_timeout` from where it starts, so a statement that waits for several tables can overrun
+  it by that. A cancel needs a free connection slot to arrive on; there is no cancel for a REST request or on the MySQL
+  wire. **A client that vanishes during a wait is not noticed**: nothing reads its socket while its statement runs, so the
+  statement waits on and runs when the lock comes free, unless one of these timeouts ends it first. Set a `statement_timeout`
+  or a short `lock_timeout` where that matters.
+- **At most 256 statements wait at once**, across the server. The next is refused with 55P03 at once, saying so. Each waiter
+  pins a thread of the server's blocking pool (512), and when the pool is full nothing answers, the `COMMIT` that would free
+  them included. REST runs at most 384 requests at once for the same reason and queues the rest, holding no thread. With
+  `max_connections` raised, or many long statements, the sum can still reach the pool; keep them below it.
+- **Deadlocks end at the timeout.** Multi-table DDL takes its tables in sorted order, so two of those cannot deadlock.
+  Transactions locking tables in opposite orders behind waiting DDL can, and the timeout ends it.
+- **DDL inside a transaction keeps the table exclusively until the transaction ends**, as in PostgreSQL. The next statement
+  of a migration finds it its own, and writers wait for the whole migration, so keep such transactions short. If the
+  transaction wrote the table first, the DDL upgrades its lock: it waits for the other holders, bounded by the same timeout,
+  ahead of any DDL already queued (which is waiting for this transaction). It is refused with 55P03 at once only where waiting
+  is certain to deadlock: another transaction is already waiting to upgrade the same table. A `MERGE BRANCH` inside a
+  transaction that wrote one of its tables is refused at once too: it lands in commits of its own, and would be waiting
+  for the transaction it runs in.
+- **A DELETE takes every table its foreign keys make it write** (`ON DELETE CASCADE` and `SET NULL`) up front, in sorted
+  order, so its 55P03 means no child has lost a row.
+- **Getting out.** Whoever holds a table is named by kind in the 55P03, not by session: end the transaction that holds it
+  (`pg_stat_activity` lists the sessions), or let `idle_in_transaction_session_timeout` end it, which releases the lock.
+- **No lock is held through a standby's acknowledgement** on `COMMIT` or an autocommit statement: a table is free again when
+  the write is durable here. Two exceptions: a `MERGE BRANCH` landing, and a schema statement inside an explicit transaction,
+  which keeps its table until the transaction ends.
+- A READ COMMITTED or autocommit statement that waited reads what the DDL left. A REPEATABLE READ transaction keeps its
+  snapshot, and if a merge changed a row it wrote, its COMMIT gets 40001.
+
+With no DDL or merge running, a write pays one atomic load and the bookkeeping of its own lock set, and allocates nothing.

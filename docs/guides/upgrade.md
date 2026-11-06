@@ -100,6 +100,12 @@ legacy_acl_noop = false
 [session]
 # Recursion ceiling for user-defined function invocation. Default: 32.
 udf_max_call_depth = 32
+# How long a statement waits for a table's writer lock (milliseconds), before
+# 55P03. Writers wait for DDL, TRUNCATE and MERGE BRANCH on their table, and those
+# wait for the writers already there, including a transaction left open. Readers
+# never wait. SET lock_timeout sets it per session (0 means this value, not an
+# unbounded wait). Added in 4.42.0. Default: 30000.
+lock_timeout_ms = 30000
 ```
 
 > **Roles and grants are stored and introspectable; privileges are NOT

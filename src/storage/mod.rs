@@ -51,6 +51,8 @@ mod stats;
 // the dataset key through the same codec.
 pub(crate) mod tde;
 pub mod time_travel;
+// Spec R5.1: the per-table writer lock.
+pub(crate) mod table_locks;
 mod transaction;
 mod vector_index;
 pub mod version_gc;

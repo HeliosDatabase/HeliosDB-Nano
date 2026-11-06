@@ -221,6 +221,13 @@ impl IncrementalRefresher {
     /// Uses delta-based updates to efficiently refresh the view without full recomputation.
     pub fn refresh_incremental(&self, mv_name: &str) -> Result<RefreshResult> {
         let start = Instant::now();
+        // Spec R5.1: it reads and rewrites the view's data table in place.
+        let data_table = format!("__mv_{mv_name}");
+        let _table_lock = self.storage.lock_tables_exclusive(
+            super::table_locks::MAIN_LEVEL,
+            &[data_table.as_str()],
+            "an incremental REFRESH",
+        )?;
 
         // Get materialized view metadata
         let mv_catalog = self.storage.mv_catalog();

@@ -110,7 +110,9 @@ impl From<Error> for ApiError {
                     || msg.contains(crate::error::BRANCH_MERGE_BUSY_MARKER)
                     || msg.contains(crate::error::BRANCH_MERGE_KEY_CLAIMED_MARKER)
                     || msg.contains(crate::error::BRANCH_SCHEMA_RUNNING_MARKER)
-                    || msg.contains(crate::error::BRANCH_TABLE_BUSY_MARKER) =>
+                    || msg.contains(crate::error::BRANCH_TABLE_BUSY_MARKER)
+                    // Spec R5.1: a table's writer lock not obtained in time.
+                    || msg.contains(crate::error::TABLE_LOCK_TIMEOUT_MARKER) =>
             {
                 ApiError::conflict(msg)
             }

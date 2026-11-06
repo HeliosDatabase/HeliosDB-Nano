@@ -18,7 +18,7 @@ use crate::{Error, Result, Tuple};
 use dashmap::{DashMap, DashSet};
 use parking_lot::RwLock;
 use rocksdb::{WriteOptions, DB};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
@@ -94,13 +94,14 @@ pub struct Transaction {
     gate: Arc<WriteGate>,
     /// Snapshot for reads
     snapshot: Snapshot,
-    /// Snapshot timestamp (read timestamp for MVCC)
-    snapshot_ts: u64,
-    /// sprinter 6bc4a4040eb7 (B3 fourth fix pass): the snapshot this transaction's
-    /// first staged write was read under. `snapshot_ts` moves on with every READ
-    /// COMMITTED statement; what was staged before it does not, so this is what a
-    /// row MERGE BRANCH landed is compared against at commit.
-    merge_conflict_floor: u64,
+    /// Snapshot timestamp (read timestamp for MVCC). Atomic because a statement that
+    /// waited for a table lock moves it with no exclusive hold of the transaction
+    /// ([`Self::refresh_statement_snapshot`]).
+    snapshot_ts: AtomicU64,
+    /// Spec R5.1: the engine's schema generation read before `snapshot_ts` was taken.
+    /// A statement whose locks it finds moved knows a schema statement or a merge
+    /// ended since the snapshot, whose rows the snapshot does not see.
+    snapshot_generation: AtomicU64,
     /// Unique transaction ID for locking and tracking
     transaction_id: u64,
     /// Snapshot manager for versioned reads
@@ -266,6 +267,10 @@ pub struct Transaction {
     /// within the statement that made them and which would otherwise hold the
     /// census non-zero for the whole of any write workload.
     write_census: Option<WriteCensusGate>,
+    /// Spec R5.1: an explicit transaction's table locks, held from its first write
+    /// statement on a table to its end. `None` for an autocommit transaction, which
+    /// ends inside its statement: the statement's scope holds them.
+    table_locks: Option<super::table_locks::TransactionLocks>,
     /// sprinter 37a5968e7698: THIS transaction's savepoint stack — innermost
     /// last. Read [`SavepointEntry`] for why it is here and not on the engine
     /// handle or the session.
@@ -439,17 +444,6 @@ impl UncommittedWriteCensus {
         self.tables
             .get(table)
             .is_some_and(|counts| counts.writes.load(Ordering::Acquire) > 0)
-    }
-
-    /// [`Self::table_has_staged_writes`], not counting the `own` writers the caller
-    /// knows about: its own transaction, for one.
-    pub fn table_has_other_staged_writes(&self, table: &str, own: usize) -> bool {
-        if self.unattributed.load(Ordering::Acquire) > 0 {
-            return true;
-        }
-        self.tables
-            .get(table)
-            .is_some_and(|counts| counts.writes.load(Ordering::Acquire) > own)
     }
 
     /// Has any open transaction REMOVED an index entry for `table`? Gate for
@@ -752,6 +746,16 @@ impl WriteCensusGate {
     }
 }
 
+/// What a transaction has staged under one key ([`Transaction::read_staged`]).
+enum StagedValue {
+    /// Nothing: the committed value is the answer.
+    Nothing,
+    /// This value.
+    Put(Vec<u8>),
+    /// A delete.
+    Deleted,
+}
+
 /// What a staged key does to the table's ART indexes: `Value` can only ADD keys
 /// (an INSERT, or an UPDATE's new row), `Tombstone` REMOVES the row and its
 /// keys. The distinction is what keeps a staged INSERT from slowing down every
@@ -828,8 +832,8 @@ impl Transaction {
             db,
             gate,
             snapshot: Snapshot::new(snapshot_id),
-            snapshot_ts: snapshot_id,
-            merge_conflict_floor: snapshot_id,
+            snapshot_ts: AtomicU64::new(snapshot_id),
+            snapshot_generation: AtomicU64::new(0),
             transaction_id,
             snapshot_manager,
             write_set: Arc::new(DashMap::new()),
@@ -860,6 +864,7 @@ impl Transaction {
             sql_aborted: AtomicBool::new(false),
             branch_binding: parking_lot::Mutex::new(None),
             write_census: None,
+            table_locks: None,
             savepoints: RwLock::new(Vec::new()),
             branch_staged: parking_lot::Mutex::new(super::BranchStagedWrites::default()),
             branch_claims: parking_lot::Mutex::new(Vec::new()),
@@ -1026,6 +1031,31 @@ impl Transaction {
         let mut gate = WriteCensusGate::new(census);
         gate.removals_only = true;
         self.write_census = Some(gate);
+    }
+
+    /// Spec R5.1: this explicit transaction keeps table locks across its statements.
+    pub(crate) fn set_table_locks(&mut self, locks: Arc<super::table_locks::TableLocks>) {
+        self.table_locks = Some(super::table_locks::TransactionLocks::new(locks));
+    }
+
+    /// Spec R5.1: the statement on this thread acts for this transaction until the
+    /// binding drops, so what it locks stays locked until the transaction ends. An
+    /// autocommit transaction binds nothing: its statement's own scope is the owner.
+    pub(crate) fn bind_table_locks(&self) -> super::table_locks::BoundLockOwner {
+        match &self.table_locks {
+            Some(locks) => locks.bind(),
+            None => super::table_locks::BoundLockOwner::inert(),
+        }
+    }
+
+    /// Spec R5.1: a copy of what keeps this transaction's table locks, for work that
+    /// outlives it: a FAILED commit consumes it, and the caller still has to replay
+    /// its eager index undo with nobody else in the table. The sibling of
+    /// [`Self::write_census_hold`].
+    pub(crate) fn table_locks_hold(&self) -> Option<Arc<super::table_locks::TransactionLockHold>> {
+        self.table_locks
+            .as_ref()
+            .and_then(super::table_locks::TransactionLocks::hold_copy)
     }
 
     /// True once this transaction has staged a write and is therefore counted
@@ -1201,8 +1231,8 @@ impl Transaction {
             db,
             gate,
             snapshot: Snapshot::new(snapshot_id),
-            snapshot_ts: snapshot_id,
-            merge_conflict_floor: snapshot_id,
+            snapshot_ts: AtomicU64::new(snapshot_id),
+            snapshot_generation: AtomicU64::new(0),
             transaction_id,
             snapshot_manager,
             write_set: Arc::new(DashMap::new()),
@@ -1233,6 +1263,7 @@ impl Transaction {
             sql_aborted: AtomicBool::new(false),
             branch_binding: parking_lot::Mutex::new(None),
             write_census: None,
+            table_locks: None,
             savepoints: RwLock::new(Vec::new()),
             branch_staged: parking_lot::Mutex::new(super::BranchStagedWrites::default()),
             branch_claims: parking_lot::Mutex::new(Vec::new()),
@@ -1249,6 +1280,32 @@ impl Transaction {
     /// - REPEATABLE READ: Acquires read locks on accessed rows
     /// - SERIALIZABLE: Acquires read locks on accessed rows (prevents phantom reads)
     pub fn get(&self, key: &Key) -> Result<Option<Vec<u8>>> {
+        match self.read_staged(key)? {
+            StagedValue::Put(value) => Ok(Some(value)),
+            StagedValue::Deleted => Ok(None),
+            // Read from database at snapshot using MVCC
+            StagedValue::Nothing => self.read_at_version(key, self.snapshot_ts.load(Ordering::Acquire)),
+        }
+    }
+
+    /// [`Self::get`] for a row the caller will change and write back: what this
+    /// transaction staged, else the row as it is NOW, never as its version history has
+    /// it. That history is for readers, and it is not the row: `ADD COLUMN` and `DROP
+    /// COLUMN` rewrite `data:` in place and every fast UPDATE overwrites it, none with a
+    /// new version. Written back, a version undoes all of those. A transaction that
+    /// validates still gets its serialization failure at COMMIT if the row moved after
+    /// its snapshot.
+    pub(crate) fn get_latest(&self, key: &Key) -> Result<Option<Vec<u8>>> {
+        match self.read_staged(key)? {
+            StagedValue::Put(value) => Ok(Some(value)),
+            StagedValue::Deleted => Ok(None),
+            StagedValue::Nothing => self.read_raw_decoded(key),
+        }
+    }
+
+    /// What this transaction staged under `key`. Takes the read lock the isolation level
+    /// asks for.
+    fn read_staged(&self, key: &Key) -> Result<StagedValue> {
         // Lock-free state check using atomic
         let state_value = self.state.load(Ordering::Acquire);
         let state = TransactionState::from_u8(state_value);
@@ -1275,17 +1332,19 @@ impl Transaction {
 
         // Lock-free write set lookup using DashMap
         if let Some(entry) = self.write_set.get(key) {
-            return Ok(entry.value().clone());
+            return Ok(match entry.value() {
+                Some(value) => StagedValue::Put(value.clone()),
+                None => StagedValue::Deleted,
+            });
         }
 
         for (logged_key, logged_value) in self.insert_log.read().iter().rev() {
             if logged_key == key {
-                return Ok(Some(logged_value.clone()));
+                return Ok(StagedValue::Put(logged_value.clone()));
             }
         }
 
-        // Read from database at snapshot using MVCC
-        self.read_at_version(key, self.snapshot_ts)
+        Ok(StagedValue::Nothing)
     }
 
     /// Read a versioned value at the transaction's snapshot timestamp
@@ -1413,7 +1472,7 @@ impl Transaction {
 
         // R2.3: attribute the staged write to its table for the executor's
         // write-set-empty fast-path gate.
-        self.note_written_key(&key, StagedKey::Value);
+        self.note_written_key(&key, StagedKey::Value)?;
 
         // Lock-free write_set insert using DashMap
         self.write_set.insert(key, Some(value));
@@ -1437,7 +1496,7 @@ impl Transaction {
         }
 
         // R2.3: attribute the staged insert to its table (see `written_tables`).
-        self.note_written_key(&key, StagedKey::Value);
+        self.note_written_key(&key, StagedKey::Value)?;
         self.insert_log.write().push((key, value));
         Ok(())
     }
@@ -1493,7 +1552,7 @@ impl Transaction {
         }
 
         // R2.3: attribute the staged tombstone to its table (see `written_tables`).
-        self.note_written_key(&key, StagedKey::Tombstone);
+        self.note_written_key(&key, StagedKey::Tombstone)?;
 
         // Lock-free write_set insert (tombstone) using DashMap
         self.write_set.insert(key, None);
@@ -1564,8 +1623,17 @@ impl Transaction {
         TransactionState::from_u8(state_value) == TransactionState::Active
     }
 
-    /// Commit the transaction with a specific timestamp
+    /// Commit the transaction with a specific timestamp. Tracks its caller, so that the
+    /// writer-lock detector names whoever committed, not the write in here.
+    #[track_caller]
     pub fn commit_with_timestamp(self, commit_ts: u64) -> Result<()> {
+        // Spec R5.1: this commit's write is made on behalf of the owner holding the
+        // table locks, whichever thread runs it. They are released when the
+        // transaction drops, after the write.
+        let _bound_locks = self
+            .table_locks
+            .as_ref()
+            .map(super::table_locks::TransactionLocks::bind_existing);
         let commit_start = std::time::Instant::now();
         let insert_count = self.insert_log.read().len();
         let row_counter_count = self.row_counter_stages.read().len();
@@ -1600,11 +1668,10 @@ impl Transaction {
         // never-reused engine row ids and skip the registry by design.
         let inflight = self.has_tracked_writes();
         if let Some(registry) = &self.conflict_registry {
-            if let Err((key, committed_ts)) = registry.validate_and_record_with_merge_floor(
+            if let Err((key, committed_ts)) = registry.validate_and_record(
                 &self.write_set,
                 self.conflict_validation,
-                self.snapshot_ts,
-                self.merge_conflict_floor,
+                self.snapshot_ts.load(Ordering::Acquire),
                 commit_ts,
             ) {
                 if inflight {
@@ -1617,7 +1684,7 @@ impl Transaction {
                 self.state.store(TransactionState::Aborted.to_u8(), Ordering::Release);
                 warn!(
                     txn_id = self.transaction_id,
-                    snapshot_ts = self.snapshot_ts,
+                    snapshot_ts = self.snapshot_ts.load(Ordering::Acquire),
                     committed_ts = committed_ts,
                     "Commit aborted: write-write conflict"
                 );
@@ -1625,7 +1692,7 @@ impl Transaction {
                     "serialization failure: write-write conflict on key '{}' (committed at ts {}, transaction snapshot ts {}); retry the transaction",
                     String::from_utf8_lossy(&key),
                     committed_ts,
-                    self.snapshot_ts
+                    self.snapshot_ts.load(Ordering::Acquire)
                 )));
             }
         }
@@ -2103,7 +2170,18 @@ impl Transaction {
         // transaction; an unconfirmed commit under `sync_timeout_action =
         // "fail"` is reported to the client request instead
         // (`storage::replication_wait`).
-        WriteAheadLog::wait_replicated_sequence(replication_barrier);
+        //
+        // Spec R5.1: nor does anybody wait for a standby behind a table lock. This
+        // commit is applied and durable, so its transaction lets go now; an autocommit
+        // TRUNCATE, whose statement scope holds the table, waits when the scope let go.
+        if replication_barrier.is_some() {
+            if let Some(locks) = &self.table_locks {
+                locks.release_for_replication_wait();
+            }
+        }
+        if !super::table_locks::defer_commit_replication_wait(replication_barrier) {
+            WriteAheadLog::wait_replicated_sequence(replication_barrier);
+        }
 
         debug!(
             txn_id = self.transaction_id,
@@ -2395,8 +2473,9 @@ impl Transaction {
     /// Uses atomic state transition for consistency.
     ///
     /// v3.1.0: Enhanced with lock release and dirty tracker integration
+    #[track_caller]
     pub fn commit(self) -> Result<()> {
-        let ts = self.snapshot_ts;
+        let ts = self.snapshot_ts.load(Ordering::Acquire);
         self.commit_with_timestamp(ts)
     }
 
@@ -2455,7 +2534,7 @@ impl Transaction {
 
     /// Get snapshot ID
     pub fn snapshot_id(&self) -> SnapshotId {
-        self.snapshot_ts
+        self.snapshot_ts.load(Ordering::Acquire)
     }
 
     /// Session that owns this transaction, if it was created through the
@@ -2473,14 +2552,15 @@ impl Transaction {
     /// must not cover commits whose writes have not been applied yet, or
     /// its reads would be stale while validating clean.
     pub fn set_conflict_registry(&mut self, registry: Arc<WriteConflictRegistry>, validate: bool) {
-        registry.snapshot_barrier(self.snapshot_ts);
+        let snapshot_ts = self.snapshot_ts.load(Ordering::Acquire);
+        registry.snapshot_barrier(snapshot_ts);
         if validate {
-            registry.register_txn(self.transaction_id, self.snapshot_ts);
+            registry.register_txn(self.transaction_id, snapshot_ts);
         }
         // R4.3: pin this snapshot against MVCC version GC regardless of
         // isolation level — snapshot scans (`scan_table_at_snapshot`) read
         // version history for every transaction kind. Released in Drop.
-        self.gc_pin_id = Some(registry.pin_snapshot(self.snapshot_ts));
+        self.gc_pin_id = Some(registry.pin_snapshot(snapshot_ts));
         self.conflict_registry = Some(registry);
         self.conflict_validation = validate;
     }
@@ -2525,7 +2605,7 @@ impl Transaction {
     /// [`has_writes_for_table`](Self::has_writes_for_table) report `true` for
     /// every table (the staged write could affect anything, so every read in
     /// this transaction must stay on the write-set-merging slow path).
-    fn note_written_key(&self, key: &[u8], staged: StagedKey) {
+    fn note_written_key(&self, key: &[u8], staged: StagedKey) -> Result<()> {
         // sprinter 6bc4a4040eb7 (phase B2): a branch's row image or tombstone.
         // A branch write NEVER touches the process-wide ART (W2.0 — the shared
         // indexes describe main only), so it must not arm the census: an open
@@ -2540,7 +2620,7 @@ impl Transaction {
             || key.starts_with(b"bkey:")
         {
             self.has_unattributed_writes.store(true, Ordering::Release);
-            return;
+            return Ok(());
         }
         // Every staged write funnels through here (`put`, `put_insert_fast`,
         // `delete`, and `update_tuples`/`delete_tuples` via those), so this is
@@ -2553,9 +2633,17 @@ impl Transaction {
         }
         if let Some(rest) = key.strip_prefix(b"data:".as_slice()) {
             if let Ok(text) = std::str::from_utf8(rest) {
-                if let Some(pos) = text.find(':') {
+                // The LAST colon: the row id has none, and a quoted table name may
+                // (`"a:b"` must not lock, or count as, table `a`).
+                if let Some(pos) = text.rfind(':') {
                     let table = &text[..pos];
                     if !self.written_tables.contains(table) {
+                        // Spec R5.1: a transaction driven directly on the storage
+                        // API has no statement that locked the table for it. Every
+                        // SQL path did, and this finds it held.
+                        if let Some(locks) = &self.table_locks {
+                            locks.ensure_shared(super::table_locks::MAIN_LEVEL, table)?;
+                        }
                         // Arming the census rides the branch that discovers the
                         // table is new to this transaction, so the per-row cost
                         // of the census stays at the one relaxed load above.
@@ -2573,7 +2661,7 @@ impl Transaction {
                             gate.note_table_removal(table);
                         }
                     }
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -2587,6 +2675,7 @@ impl Transaction {
             }
         }
         self.has_unattributed_writes.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Staged keys that provably cannot change any ART index, so the census can
@@ -2646,18 +2735,36 @@ impl Transaction {
                 registry.refresh_txn(self.transaction_id, new_ts);
             }
         }
-        self.snapshot_ts = new_ts;
+        self.snapshot_ts.store(new_ts, Ordering::Release);
         self.snapshot = Snapshot::new(new_ts);
-        // What it staged so far was read under the older snapshot.
-        if self.write_set.is_empty() {
-            self.merge_conflict_floor = new_ts;
-        }
     }
 
-    /// sprinter 6bc4a4040eb7 (B3 fourth fix pass): this is the transaction a
-    /// MERGE BRANCH lands a table's rows in: the rows it holds are its own.
-    pub fn exempt_from_merged_writes(&mut self) {
-        self.merge_conflict_floor = u64::MAX;
+    /// Spec R5.1: the schema generation read before this transaction's snapshot.
+    pub(crate) fn snapshot_generation(&self) -> u64 {
+        self.snapshot_generation.load(Ordering::Acquire)
+    }
+
+    /// Spec R5.1: see [`Self::snapshot_generation`]. The caller read it before it took
+    /// the snapshot.
+    pub(crate) fn set_snapshot_generation(&self, generation: u64) {
+        self.snapshot_generation.store(generation, Ordering::Release);
+    }
+
+    /// Spec R5.1: a schema statement or a merge ended after this snapshot was taken,
+    /// and this statement, holding its table locks now, reads nothing but what they
+    /// left. An autocommit or READ COMMITTED transaction takes a new snapshot, as it
+    /// does for every statement: reading the old one it would write back rows from
+    /// before them, with no check at commit to stop it. A transaction that validates
+    /// keeps its snapshot, and its commit gets the serialization failure.
+    pub(crate) fn refresh_statement_snapshot(&self, new_ts: u64, generation: u64) {
+        if self.conflict_validation {
+            return;
+        }
+        if let Some(registry) = &self.conflict_registry {
+            registry.snapshot_barrier(new_ts);
+        }
+        self.snapshot_ts.store(new_ts, Ordering::Release);
+        self.snapshot_generation.store(generation, Ordering::Release);
     }
 
     /// Create a snapshot of the current write set for savepoint support.

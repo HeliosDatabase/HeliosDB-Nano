@@ -866,6 +866,10 @@ fn drop_table_and_partition_children(
 /// Handle TRUNCATE logical plan node
 pub(super) fn handle_truncate(executor: &Executor, table_name: &str) -> Result<Box<dyn PhysicalOperator>> {
     if let Some(storage) = executor.storage() {
+        // Spec R5.1: whatever route got here holds the table exclusively: both DML
+        // families took it at their statement, and this keeps a route that did not
+        // (an executor driven directly, `query_params`) from deleting beside a writer.
+        let _table_lock = storage.lock_tables_exclusive(storage.statement_lock_level(), &[table_name], "TRUNCATE")?;
         let catalog = storage.catalog();
 
         // Check if table exists

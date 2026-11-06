@@ -627,7 +627,8 @@ async fn hdb004_copy_fallback_is_atomic_across_chunks() {
         0,
         "a failed COPY must not also report CommandComplete: {trace}"
     );
-    assert_eq!(error_sqlstate(&frames).as_deref(), Some("XX000"), "trace: {trace}");
+    // The CHECK violation's own SQLSTATE: COPY used to report every failure as XX000.
+    assert_eq!(error_sqlstate(&frames).as_deref(), Some("23514"), "trace: {trace}");
 
     assert_eq!(
         wire_count(&mut stream, "hdb004_copy").await,

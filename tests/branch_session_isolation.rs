@@ -1156,11 +1156,14 @@ async fn a_commit_across_a_concurrent_merge_or_drop_is_refused() {
     db.begin_transaction_for_session(s1).unwrap();
     db.execute_for_session(s1, "INSERT INTO t VALUES (50, 'in txn')")
         .expect("a write inside a branch transaction");
+    // Spec R5.1: it holds the table on the source's level, and the merge waits for it.
+    db.storage
+        .debug_set_table_lock_timeout(std::time::Duration::from_millis(50));
     let refused = db
         .execute_for_session(s2, "MERGE BRANCH b INTO main")
         .expect_err("the transaction has staged writes on the source");
     assert!(
-        refused.to_string().contains(heliosdb_nano::BRANCH_TABLE_BUSY_MARKER),
+        refused.to_string().contains(heliosdb_nano::TABLE_LOCK_TIMEOUT_MARKER),
         "got: {refused}"
     );
     db.rollback_transaction_for_session(s1).unwrap();
