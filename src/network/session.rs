@@ -350,8 +350,18 @@ impl Session {
                 // Count rows before consuming
                 let row_count = rows.len();
 
-                // Send data rows
+                // Send data rows. Spec R5.2: a row its description cannot
+                // describe ends the statement with an error, never a malformed
+                // message (the rows before it stand).
+                let mut refused = None;
                 for row in rows {
+                    if row.values.len() != schema.columns.len() {
+                        refused = Some(crate::storage::row_shape::refuse_mismatched_row(
+                            row.values.len(),
+                            schema.columns.len(),
+                        ));
+                        break;
+                    }
                     let values: Vec<Option<Vec<u8>>> = row
                         .values
                         .iter()
@@ -364,9 +374,15 @@ impl Session {
                 }
 
                 // Send command complete
-                responses.push(BackendMessage::CommandComplete {
-                    tag: format!("SELECT {}", row_count),
-                });
+                match refused {
+                    Some(error) => responses.push(self.create_error_response(
+                        crate::protocol::postgres::handler::sqlstate_for_error(&error),
+                        &error.to_string(),
+                    )),
+                    None => responses.push(BackendMessage::CommandComplete {
+                        tag: format!("SELECT {}", row_count),
+                    }),
+                }
             }
             Ok(QueryResult::Modified { count, operation }) => {
                 // Send command complete
@@ -534,8 +550,18 @@ impl Session {
                 // Count rows before consuming
                 let row_count = rows.len();
 
-                // Send data rows
+                // Send data rows. Spec R5.2: a row its description cannot
+                // describe ends the statement with an error, never a malformed
+                // message (the rows before it stand).
+                let mut refused = None;
                 for row in rows {
+                    if row.values.len() != schema.columns.len() {
+                        refused = Some(crate::storage::row_shape::refuse_mismatched_row(
+                            row.values.len(),
+                            schema.columns.len(),
+                        ));
+                        break;
+                    }
                     let values: Vec<Option<Vec<u8>>> = row
                         .values
                         .iter()
@@ -548,9 +574,15 @@ impl Session {
                 }
 
                 // Send command complete
-                responses.push(BackendMessage::CommandComplete {
-                    tag: format!("SELECT {}", row_count),
-                });
+                match refused {
+                    Some(error) => responses.push(self.create_error_response(
+                        crate::protocol::postgres::handler::sqlstate_for_error(&error),
+                        &error.to_string(),
+                    )),
+                    None => responses.push(BackendMessage::CommandComplete {
+                        tag: format!("SELECT {}", row_count),
+                    }),
+                }
             }
             Ok(QueryResult::Modified { count, operation }) => {
                 responses.push(BackendMessage::CommandComplete {

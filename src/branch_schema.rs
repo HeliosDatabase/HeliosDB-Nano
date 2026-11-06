@@ -14,7 +14,7 @@
 //! * `ALTER TABLE … ADD COLUMN` (one, or a multi-op statement of nothing but
 //!   ADD COLUMNs) computes the new definition exactly as main does,
 //!   materializes every row the branch sees into its own overlay under it
-//!   (main's backfill rule, `StorageEngine::add_column_backfill_value`) and
+//!   (main's rule for an existing row, `storage::row_shape::ColumnFill`) and
 //!   writes the definition, isolated — all in one atomic batch;
 //! * every OTHER schema statement is refused (SQLSTATE 0A000) before it
 //!   changes anything, naming the alternative.
@@ -67,6 +67,7 @@ use crate::storage::branch_catalog::{
     added_column, derive_unique_rules, fresh_table_incarnation, known_incarnation, BranchAddedColumn,
     BranchTableDefinition, BranchTableRecord, BranchTableResolution, BranchTableState, MainDdlGuard,
 };
+use crate::storage::row_shape::ColumnFill;
 use crate::storage::table_locks::{BoundLockOwner, ExclusiveTableLocks, StatementLockScope};
 use crate::storage::{BranchExclusiveGuard, BranchView, StorageEngine, Transaction, BRANCH_DRAIN_TIMEOUT};
 use crate::{sql, EmbeddedDatabase, Error, Result, Schema, Value};
@@ -1078,17 +1079,55 @@ impl EmbeddedDatabase {
             base,
             own,
             schema,
-            added,
+            mut added,
         } = self.plan_branch_add_columns(view, table, adds)?;
         if added.is_empty() {
             return Ok(0);
         }
         let _table_lock = self.branch_ddl_preflight(view, txn, table, "ALTER TABLE … ADD COLUMN")?;
 
-        let backfill: Vec<Value> = added
+        // Spec R5.2: main's rule for what an existing row gets: a stable default
+        // evaluated once (and that one value kept in the record, so a MERGE gives
+        // main's rows what the branch's copies hold), a volatile one per row, and
+        // no NULL in a NOT NULL column. A branch still materializes its copies.
+        let fills = added
             .iter()
-            .map(|column| StorageEngine::add_column_backfill_value(&column.default))
-            .collect();
+            .map(|column| {
+                ColumnFill::for_default(column.default.as_ref(), &column.column.data_type).map(|fill| {
+                    (
+                        fill,
+                        column.column.data_type.clone(),
+                        !column.column.nullable,
+                        column.column.name.clone(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (column, (fill, ..)) in added.iter_mut().zip(&fills) {
+            if let (ColumnFill::Constant(value), true) = (fill, column.default.is_some()) {
+                column.default = Some(sql::LogicalExpr::Literal(value.clone()));
+            }
+        }
+        for (fill, _, not_null, name) in &fills {
+            if *not_null
+                && matches!(fill, ColumnFill::Constant(Value::Null))
+                && !view.scan(None, table, &current)?.is_empty()
+            {
+                return Err(Error::add_column_null_on_existing_rows(table, name));
+            }
+        }
+        let backfill = || -> Result<Vec<Value>> {
+            fills
+                .iter()
+                .map(|(fill, data_type, not_null, name)| -> Result<Value> {
+                    let value = fill.next_value(data_type)?;
+                    if *not_null && matches!(value, Value::Null) {
+                        return Err(Error::add_column_null_on_existing_rows(table, name));
+                    }
+                    Ok(value)
+                })
+                .collect()
+        };
         let parent_fingerprint = self.branch_parent_fingerprint(view, own.as_deref(), table)?;
         let parent_incarnation = self.branch_parent_incarnation(view, own.as_deref(), table)?;
         let (created, added_columns) = match own.as_deref() {
@@ -1118,7 +1157,7 @@ impl EmbeddedDatabase {
             created,
             added_columns,
         };
-        let rewritten = view.materialize(table, &current, &record, &backfill)?;
+        let rewritten = view.materialize_with(table, &current, &record, &backfill)?;
         tracing::info!(
             "Added {} column(s) to table '{}' on branch '{}', materialized {} rows",
             adds.len(),

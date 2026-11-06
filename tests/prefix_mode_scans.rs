@@ -221,7 +221,6 @@ const SITES: &[(&str, &str, usize, Scan)] = &[
     ("src/sql/executor/ddl.rs", "handle_truncate", 1, Scan::TotalOrder),
     // ALTER TABLE's in-place row rewrites, `data:{t}:` only.
     ("src/storage/engine.rs", "migrate_column_storage", 1, Scan::TotalOrder),
-    ("src/storage/engine.rs", "add_column_to_rows", 1, Scan::TotalOrder),
     ("src/storage/engine.rs", "drop_column_from_rows", 1, Scan::TotalOrder),
     // `AS OF` row-id collection, `data:{t}:` only.
     (

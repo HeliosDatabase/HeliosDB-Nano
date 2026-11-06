@@ -1502,6 +1502,81 @@ impl SnapshotManager {
         Ok(())
     }
 
+    /// Spec R5.2: stage the version of a row a schema statement rewrites in
+    /// place, next to the `data:` image in `batch`, at the statement's one
+    /// `timestamp`. `sealed` is that image as sealed for `data:`.
+    ///
+    /// Every snapshot-resolved read goes through the versions, so without this it
+    /// keeps resolving the row's previous version and never sees the rewrite. What
+    /// older snapshots read stays as it was: the version-eliding paths' history is
+    /// materialized first, and a row with no version at all, which reads `data:` at
+    /// every snapshot, gets its previous image as a version older than any snapshot
+    /// (once a row has a version, a snapshot older than all of them does not see it).
+    ///
+    /// The `data:` reads return the image before the rewrite: `batch` has not been
+    /// applied.
+    pub(crate) fn stage_rewritten_row_version(
+        &self,
+        batch: &mut WriteBatch,
+        table_name: &str,
+        row_id: u64,
+        timestamp: u64,
+        sealed: &[u8],
+    ) -> Result<()> {
+        let data_key = format!("data:{}:{}", table_name, row_id);
+        if self.copy_markers.covering_ts(table_name, row_id).is_some() {
+            self.materialize_copy_marker_row(batch, table_name, row_id, timestamp)?;
+        } else if !self.has_any_version_index(table_name, row_id)? {
+            let previous = self
+                .db
+                .get(data_key.as_bytes())
+                .map_err(|e| Error::storage(format!("rewrite version data read failed: {}", e)))?;
+            if let Some(previous) = previous {
+                const OLDER_THAN_ANY_SNAPSHOT: u64 = 0;
+                let version_key = format!("v:{}:{}:{}", table_name, row_id, OLDER_THAN_ANY_SNAPSHOT);
+                batch.put(version_key.as_bytes(), &previous);
+                let index_key = format!(
+                    "v_idx:{}:{}:{:020}",
+                    table_name,
+                    row_id,
+                    u64::MAX - OLDER_THAN_ANY_SNAPSHOT
+                );
+                batch.put(
+                    index_key.as_bytes(),
+                    encode_version_index_value(OLDER_THAN_ANY_SNAPSHOT, false),
+                );
+            }
+        }
+        if self.maybe_elided_rows() {
+            self.materialize_elided_latest_version(batch, table_name, row_id)?;
+        }
+        let version_key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
+        batch.put(version_key.as_bytes(), sealed);
+        let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, u64::MAX - timestamp);
+        batch.put(index_key.as_bytes(), encode_version_index_value(timestamp, false));
+        Ok(())
+    }
+
+    /// Stage the `snapshot:` record of a rewrite's one timestamp in its group, so
+    /// `AS OF` resolves to it once it is durable. Publish it with
+    /// [`Self::publish_rewrite_snapshot`] after the group is written.
+    pub(crate) fn stage_rewrite_snapshot(&self, batch: &mut WriteBatch, timestamp: u64) -> Result<SnapshotMetadata> {
+        let (metadata, _, _) = self.allocate_snapshot_metadata(timestamp, None);
+        if self.persist_metadata {
+            let value = bincode::serialize(&metadata)
+                .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
+            batch.put(format!("snapshot:{}", metadata.timestamp).as_bytes(), value);
+        }
+        Ok(metadata)
+    }
+
+    /// A rewrite's group is durable: its snapshot exists, and what a reader cached
+    /// from before it no longer holds.
+    pub(crate) fn publish_rewrite_snapshot(&self, table_name: &str, metadata: SnapshotMetadata) {
+        self.publish_snapshot_metadata(metadata);
+        self.invalidate_cached_versions(table_name);
+    }
+
     /// Append the `v:` copy, its `v_idx:` event and the optional `snapshot:`
     /// metadata for one version into `batch`.
     ///

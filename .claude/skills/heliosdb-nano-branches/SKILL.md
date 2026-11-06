@@ -98,7 +98,11 @@ holds a table's changed rows in memory.
 
 A merge carries what the branch itself changed. The rows a branch `ADD COLUMN` copied are
 not changes: a row `main` updated or deleted after the branch's `ADD COLUMN` keeps `main`'s
-change, and `main`'s own column backfill gives it the same default.
+change, and `main` reads the same default for it: a merge adds the column to `main` by missing
+value, one atomic write that rewrites no row (a volatile default rewrites main's rows in that
+write, up to `[storage] max_atomic_rewrite_bytes`). What such a column can refuse is asked before
+the merge changes anything: `54000` above the cap, and `23502` for a `NOT NULL` column with no
+value if a row of main would stay without one (a row the branch deleted or changed will not).
 
 **A merge that stopped part way is unfinished, not undone.** After a failed write or a crash the
 error says `run it again to finish it` (SQLSTATE `55006`). Run the same `MERGE BRANCH` again; the

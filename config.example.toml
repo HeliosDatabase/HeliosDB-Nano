@@ -192,17 +192,34 @@ wal_replay_destructive_ddl = "refuse"
 #   "strict"    = decode at the stored arity; projecting the added column errors
 #                 "Column index N out of bounds in tuple" (pre-W3.5 behavior;
 #                 kept as a rollback).
-#   "null_pad"  = Stage 1 (default): shape the row to the current width — pad an
-#                 ADD-COLUMN-narrower row with NULL (a pre-ALTER snapshot projects
-#                 the added column as NULL, never the post-snapshot DEFAULT
-#                 backfill; isolation-preserving), and truncate a DROP-COLUMN-wider
-#                 row (a pre-DROP snapshot / branch fork legitimately resolves a
-#                 wider old version) to the current width, matching the pre-W3.5
-#                 projection.
+#   "null_pad"  = Stage 1 (default): shape the row to the current width — an
+#                 ADD-COLUMN-narrower row reads the column's missing value, or NULL
+#                 when it has none (as PostgreSQL's old tuples do), and a
+#                 DROP-COLUMN-wider row (a pre-DROP snapshot / branch fork
+#                 legitimately resolves a wider old version) is truncated to the
+#                 current width, matching the pre-W3.5 projection.
 #   "versioned" = Stage 2 (RESERVED, not yet implemented): resolve the schema
 #                 as-of the snapshot (pre-ALTER column set; the new column is not
 #                 projected). Setting this value is rejected at config parse.
 snapshot_schema_evolution = "null_pad"
+
+# The most ALTER TABLE ... ADD COLUMN with a VOLATILE default may rewrite in one
+# atomic write, in bytes. A volatile default (random(), nextval(),
+# gen_random_uuid(), a function not declared IMMUTABLE or STABLE, anything the
+# engine cannot tell is stable) gives every row its own value, so every row is
+# rewritten, in one group with the schema change. With time_travel_enabled (the
+# default) the group holds each row two or three times: its image, its version,
+# and a version of its previous image if none was ever written. So a table of a
+# third to a half of this size fits. Above this limit the statement is refused
+# with SQLSTATE 54000, measured before anything is written: add the column without
+# a default, then UPDATE it in batches, or raise the limit. A stable default (a
+# literal, or an expression of stable functions such as now()) is evaluated once
+# and stored beside the schema; it rewrites no row at any table size and does not
+# read this setting. Memory during the rewrite is about this much. Between 1048576
+# (1 MiB) and 2147483648 (2 GiB, below what a physical standby can ship as one
+# group); a value outside that is refused when the file is loaded. Default
+# 268435456 (256 MiB).
+max_atomic_rewrite_bytes = 268435456
 
 # ============================================================================
 # ENCRYPTION CONFIGURATION

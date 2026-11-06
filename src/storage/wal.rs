@@ -159,6 +159,19 @@ pub enum WalOperation {
     AlterSequence { name: String, definition: Vec<u8> },
     /// Drop a sequence (definition + durable state).
     DropSequence { name: String },
+
+    // === Spec R5.2: APPENDED AT THE END, for the bincode-discriminant reason
+    // above. ===========================================================
+    /// `meta:attmissing:{table}:{column}` as this group left it: the column's
+    /// missing value (a bincode `Value`), or `None` for a column that no longer
+    /// has one. Rides the group of the `AlterTableSchema` it belongs to, so a
+    /// replayed DROP + CREATE + ADD COLUMN ends with the value the node wrote. A
+    /// physical standby replicates the key itself.
+    SetColumnMissing {
+        table: String,
+        column: String,
+        value: Option<Vec<u8>>,
+    },
 }
 
 /// WAL entry with metadata

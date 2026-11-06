@@ -50,6 +50,7 @@
 //! | Key class | Publication |
 //! |---|---|
 //! | `Dict` | `forget_cached_dictionaries` — first, so the rows below decode against the new entries |
+//! | `MetaAttMissing` | `clear_missing_values` — before the rows too; a narrow row's absent column reads the value this run wrote (`storage::row_shape`) |
 //! | `MetaTable` | schema/constraints/statistics/row caches of the table; then by schema change: dropped → `drop_table_indexes` + vector hook; created → registered and backfilled (step 5); pure column rename → `rename_column_in_indexes`; columns appended → nothing, or the new UNIQUE flags registered and backfilled; anything else, or a schema more than one batch of the run wrote → the table is re-derived; `pg_temp_*` → `note_temp_table_present` |
 //! | `MetaIndex` delete | `drop_index` (memory only) + vector hook |
 //! | `Data` | new image decoded with the post-run schema (`decode_stored_row`, the scan's decode); `stage_replicated_row(old, new).commit()` per row, a key swapped between rows inside the run resolved by removing every refused row's old keys before adding the new ones; vector hook; row-id counter raised to the row id; `publish_live_replay_visibility`; decode failure → the table is re-derived |
@@ -974,6 +975,10 @@ impl PhysicalApplier {
         if touched.dictionaries {
             // Before any row below is decoded against a dictionary.
             self.engine.forget_cached_dictionaries();
+        }
+        if touched.missing_values {
+            // Likewise: a narrow row below reads the values this run wrote.
+            self.engine.clear_missing_values();
         }
         self.publish_meta_tables(touched, work);
         self.publish_index_deletes(touched, work, state);
@@ -2005,6 +2010,8 @@ struct Touched {
     /// (a dictionary, a CAS payload, a columnar sidecar, a schema, an index
     /// definition, a constraint set).
     fixes_decoding: bool,
+    /// The batch carried a column's missing value (`meta:attmissing:`).
+    missing_values: bool,
 }
 
 impl Touched {
@@ -2051,6 +2058,14 @@ impl Touched {
             }
             KeyClass::Snapshot => {
                 self.snapshots.insert(key.to_vec());
+            }
+            // Spec R5.2: a column's missing value. It rides the schema's own write
+            // group; the publication drops what the serving engine had loaded,
+            // before this run's rows decode, and a pending table may now decode.
+            KeyClass::MetaAttMissing => {
+                self.catalog.insert(key.to_vec(), class);
+                self.fixes_decoding = true;
+                self.missing_values = true;
             }
             KeyClass::MetaTable => {
                 self.catalog.insert(key.to_vec(), class);

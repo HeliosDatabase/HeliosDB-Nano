@@ -12875,3 +12875,717 @@ async fn wire_savepoints_do_not_leak_between_connections() {
         "A's row committed; B's was rolled back and never reachable from A's savepoint"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Spec R5.2: rows narrower than their schema, on the wire
+// ---------------------------------------------------------------------------
+
+/// [`drain`], with its buffer on the heap: `drain`'s 64 KiB array makes every
+/// future that awaits it a large one.
+async fn drain_on_heap(client: &mut DuplexStream) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_millis(50), client.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
+            _ => break,
+        }
+    }
+    out
+}
+
+/// `t` (id, v) and two rows, then a column with a missing value: no row holds it.
+fn narrow_rows_db() -> Arc<EmbeddedDatabase> {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
+        .expect("create");
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").expect("insert");
+    db.execute("ALTER TABLE t ADD COLUMN x INT DEFAULT 5").expect("alter");
+    db.execute("ALTER TABLE t ADD COLUMN y TEXT").expect("alter");
+    db
+}
+
+fn narrow_row(id: &str, v: &str) -> Vec<Option<Vec<u8>>> {
+    vec![
+        Some(id.as_bytes().to_vec()),
+        Some(v.as_bytes().to_vec()),
+        Some(b"5".to_vec()),
+        None,
+    ]
+}
+
+/// The bounded point read used to send a DataRow of fewer fields than its
+/// RowDescription, and the client lost the connection. Simple, extended and COPY.
+#[tokio::test]
+async fn a_row_older_than_a_column_reaches_every_wire_path_whole() {
+    let db = narrow_rows_db();
+
+    for sql in ["SELECT * FROM t WHERE id = 2", "SELECT id, v, x, y FROM t WHERE id = 2"] {
+        let (mut handler, mut client) = test_handler(Arc::clone(&db));
+        let out = wire_query(&mut handler, &mut client, sql).await;
+        assert!(sqlstates(&out).is_empty(), "{sql}: {:?}", sqlstates(&out));
+        assert_eq!(data_rows(&out), vec![narrow_row("2", "b")], "{sql}");
+
+        let (mut handler, mut client) = test_handler(Arc::clone(&db));
+        handler
+            .handle_parse_extended("s1".into(), sql.into(), vec![])
+            .await
+            .expect("parse");
+        handler
+            .handle_bind_extended("p1".into(), "s1".into(), vec![], vec![], vec![])
+            .await
+            .expect("bind");
+        handler.handle_execute_extended("p1".into(), 0).await.expect("execute");
+        assert_eq!(
+            data_rows(&drain_on_heap(&mut client).await),
+            vec![narrow_row("2", "b")],
+            "{sql}"
+        );
+    }
+
+    // The scan, on both protocols.
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    let out = wire_query(&mut handler, &mut client, "SELECT * FROM t ORDER BY id").await;
+    assert_eq!(data_rows(&out), vec![narrow_row("1", "a"), narrow_row("2", "b")]);
+
+    // COPY TO: every field of the line, the missing value and the NULL marker.
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    let out = wire_query(&mut handler, &mut client, "COPY t TO STDOUT").await;
+    assert!(sqlstates(&out).is_empty(), "{:?}", sqlstates(&out));
+    let lines: Vec<String> = parse_messages(&out)
+        .into_iter()
+        .filter(|(ty, _)| *ty == b'd')
+        .map(|(_, payload)| String::from_utf8(payload).expect("text"))
+        .collect();
+    assert_eq!(lines, vec!["1\ta\t5\t\\N\n".to_string(), "2\tb\t5\t\\N\n".to_string()]);
+
+    // RETURNING, over a row read narrow.
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    let out = wire_query(
+        &mut handler,
+        &mut client,
+        "UPDATE t SET v = 'u' WHERE id = 1 RETURNING *",
+    )
+    .await;
+    assert_eq!(data_rows(&out), vec![narrow_row("1", "u")]);
+}
+
+/// A row whose field count differs from the row description is an error to the
+/// client, never a DataRow of another width, on both encoders. The rows before it
+/// stand, the session answers the next statement, and the refusal is counted.
+#[tokio::test]
+#[allow(clippy::expect_used)] // Test code: `expect` documents the failing step.
+async fn a_datarow_never_disagrees_with_its_row_description() {
+    use crate::{Column, DataType, Schema, Tuple, Value};
+    let schema = Schema::new(vec![Column::new("a", DataType::Int4), Column::new("b", DataType::Int4)]);
+    let fits = Tuple::new(vec![Value::Int4(1), Value::Int4(2)]);
+    let narrow = Tuple::new(vec![Value::Int4(3)]);
+    let wide = Tuple::new(vec![Value::Int4(4), Value::Int4(5), Value::Int4(6)]);
+    let before = crate::storage::data_row_arity_refusals();
+
+    for bad in [narrow, wide] {
+        // Text: the direct encoder.
+        let (mut handler, mut client) = test_handler(narrow_rows_db());
+        let plan = super::codec::wire_plan(&schema, &[]);
+        let refused = handler
+            .send_data_rows_direct(&[fits.clone(), bad.clone(), fits.clone()], &plan)
+            .await
+            .expect_err("the mismatched row");
+        assert_eq!(super::handler::sqlstate_for_error(&refused), "0A000", "{refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains(crate::error::ROW_DESCRIPTION_MISMATCH_MARKER),
+            "{refused}"
+        );
+        let sent = data_rows(&drain_on_heap(&mut client).await);
+        assert_eq!(sent.len(), 1, "the row before it, and nothing else");
+        assert_eq!(sent[0].len(), 2);
+
+        // Binary: the per-row conversion path.
+        let binary = super::codec::wire_plan(&schema, &[1]);
+        assert!(!super::codec::all_text(&binary), "vacuity: a binary plan");
+        let refused = handler
+            .send_data_rows_with_formats(std::slice::from_ref(&bad), &binary)
+            .await
+            .expect_err("the mismatched row");
+        assert_eq!(super::handler::sqlstate_for_error(&refused), "0A000", "{refused}");
+        assert!(data_rows(&drain_on_heap(&mut client).await).is_empty());
+
+        // The session goes on.
+        let out = wire_query(&mut handler, &mut client, "SELECT x FROM t WHERE id = 1").await;
+        assert_eq!(data_rows(&out), vec![vec![Some(b"5".to_vec())]]);
+    }
+    assert!(crate::storage::data_row_arity_refusals() >= before + 4);
+}
+
+#[tokio::test]
+async fn add_column_refusals_carry_their_sqlstates() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    wire_setup(
+        &mut handler,
+        &mut client,
+        "CREATE TABLE r (id INT PRIMARY KEY, mid TEXT, v INT)",
+    )
+    .await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO r VALUES (1, 'm', 2)").await;
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE r ADD COLUMN c INT NOT NULL",
+        "23502",
+    )
+    .await;
+
+    // Own staged rows, under a savepoint: 0A000.
+    wire_setup(&mut handler, &mut client, "BEGIN").await;
+    wire_setup(&mut handler, &mut client, "INSERT INTO r VALUES (2, 'n', 3)").await;
+    wire_setup(&mut handler, &mut client, "SAVEPOINT sp").await;
+    assert_wire_sqlstate(&mut handler, &mut client, "ALTER TABLE r DROP COLUMN mid", "0A000").await;
+    let _ = wire_query(&mut handler, &mut client, "ROLLBACK").await;
+
+    // Above the cap: 54000.
+    let mut config = crate::Config::in_memory();
+    config.storage.max_atomic_rewrite_bytes = 1024 * 1024;
+    let db = Arc::new(EmbeddedDatabase::with_config(config).expect("db"));
+    db.execute("CREATE TABLE big (id INT PRIMARY KEY, body TEXT)")
+        .expect("create");
+    let body = "b".repeat(2000);
+    for start in (0..1000).step_by(100) {
+        let rows: Vec<String> = (start..start + 100).map(|id| format!("({id}, '{body}')")).collect();
+        db.execute(&format!("INSERT INTO big VALUES {}", rows.join(", ")))
+            .expect("insert");
+    }
+    let (mut handler, mut client) = test_handler(db);
+    assert_wire_sqlstate(
+        &mut handler,
+        &mut client,
+        "ALTER TABLE big ADD COLUMN u UUID DEFAULT gen_random_uuid()",
+        "54000",
+    )
+    .await;
+}
+
+// ---------------------------------------------------------------------------
+// Decision 2(h): a prepared statement's rows match what it was Described as
+// ---------------------------------------------------------------------------
+
+/// Parse + Describe(Statement), and the row description the client was sent.
+async fn parse_and_describe(
+    handler: &mut PgConnectionHandler<tokio::io::DuplexStream>,
+    client: &mut tokio::io::DuplexStream,
+    name: &str,
+    sql: &str,
+) -> Vec<(String, i32)> {
+    handler
+        .handle_parse_extended(name.into(), sql.into(), vec![])
+        .await
+        .expect("parse");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, name.into())
+        .await
+        .expect("describe");
+    row_description(&drain_on_heap(client).await)
+}
+
+/// Bind + Execute, expecting the 0A000 of a statement whose shape moved, and that
+/// the client was sent nothing.
+#[allow(clippy::expect_used)] // Test code: `expect` documents the failing step.
+async fn assert_refused_before_it_ran(
+    handler: &mut PgConnectionHandler<tokio::io::DuplexStream>,
+    client: &mut tokio::io::DuplexStream,
+    name: &str,
+) {
+    let portal = format!("{name}_p");
+    handler
+        .handle_bind_extended(portal.clone(), name.into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    let refused = handler
+        .handle_execute_extended(portal, 0)
+        .await
+        .expect_err("the shape moved after Describe");
+    assert_eq!(super::handler::sqlstate_for_error(&refused), "0A000", "{refused}");
+    let message = refused.to_string();
+    assert!(
+        message.contains(crate::error::ROW_DESCRIPTION_MISMATCH_MARKER),
+        "{message}"
+    );
+    assert!(message.contains("did not run"), "{message}");
+    assert!(message.contains("Prepare it again"), "{message}");
+    assert!(!message.contains("run the statement again"), "{message}");
+    assert!(
+        data_rows(&drain_on_heap(client).await).is_empty(),
+        "{name}: no row was sent"
+    );
+}
+
+/// The guard used to fire on the rows, so a DML with RETURNING had already
+/// committed when its client was told to run it again. Refused at Execute, nothing
+/// has happened, for every kind of statement that returns rows.
+#[tokio::test]
+async fn a_described_statement_whose_shape_moved_is_refused_before_it_runs() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE g (id INT PRIMARY KEY, v INT)")
+        .expect("create");
+    db.execute("INSERT INTO g VALUES (1, 1), (2, 2)").expect("insert");
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+
+    let statements = [
+        ("sel", "SELECT * FROM g ORDER BY id"),
+        ("upd", "UPDATE g SET v = v + 1 WHERE id = 1 RETURNING *"),
+        ("del", "DELETE FROM g WHERE id = 2 RETURNING *"),
+        ("ins", "INSERT INTO g VALUES (3, 3) RETURNING *"),
+    ];
+    for (name, sql) in statements {
+        let described = parse_and_describe(&mut handler, &mut client, name, sql).await;
+        assert_eq!(described, vec![("id".to_string(), 23), ("v".to_string(), 23)], "{sql}");
+    }
+
+    db.execute("ALTER TABLE g ADD COLUMN x INT DEFAULT 7").expect("alter");
+
+    for (name, _) in statements {
+        assert_refused_before_it_ran(&mut handler, &mut client, name).await;
+    }
+
+    // The UPDATE did not apply, the DELETE deleted nothing, the INSERT added nothing.
+    let out = wire_query(&mut handler, &mut client, "SELECT id, v FROM g ORDER BY id").await;
+    assert_eq!(
+        data_rows(&out),
+        vec![
+            vec![Some(b"1".to_vec()), Some(b"1".to_vec())],
+            vec![Some(b"2".to_vec()), Some(b"2".to_vec())],
+        ]
+    );
+
+    // Prepared again, it runs, once, under the new shape.
+    let described = parse_and_describe(
+        &mut handler,
+        &mut client,
+        "upd",
+        "UPDATE g SET v = v + 1 WHERE id = 1 RETURNING *",
+    )
+    .await;
+    assert_eq!(described.len(), 3);
+    handler
+        .handle_bind_extended("upd_again".into(), "upd".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    handler
+        .handle_execute_extended("upd_again".into(), 0)
+        .await
+        .expect("execute");
+    assert_eq!(
+        data_rows(&drain_on_heap(&mut client).await),
+        vec![vec![Some(b"1".to_vec()), Some(b"2".to_vec()), Some(b"7".to_vec())]]
+    );
+}
+
+/// The guard used to count fields, so a change of the same width sent another
+/// column's bytes under the described name and type.
+#[tokio::test]
+async fn a_shape_change_of_the_same_width_is_refused() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE g (id INT PRIMARY KEY, x INT, c INT)")
+        .expect("create");
+    db.execute("INSERT INTO g VALUES (1, 1, 1)").expect("insert");
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+
+    // Another name, another type.
+    parse_and_describe(&mut handler, &mut client, "named", "SELECT * FROM g").await;
+    db.execute("ALTER TABLE g DROP COLUMN x").expect("drop");
+    db.execute("ALTER TABLE g ADD COLUMN y TEXT DEFAULT 'abc'")
+        .expect("add");
+    assert_refused_before_it_ran(&mut handler, &mut client, "named").await;
+
+    // The same name, another type.
+    parse_and_describe(&mut handler, &mut client, "typed", "SELECT c FROM g").await;
+    db.execute("ALTER TABLE g DROP COLUMN c").expect("drop");
+    db.execute("ALTER TABLE g ADD COLUMN c TEXT DEFAULT 'abc'")
+        .expect("add");
+    assert_refused_before_it_ran(&mut handler, &mut client, "typed").await;
+}
+
+/// A client that received no row description has nothing to contradict, and one
+/// that asks again has adopted the change.
+#[tokio::test]
+async fn only_a_description_the_client_still_holds_is_binding() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE g (id INT PRIMARY KEY, v INT)")
+        .expect("create");
+    db.execute("INSERT INTO g VALUES (1, 1)").expect("insert");
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+
+    // Never Described, a row-returning DML: it runs, under the new shape.
+    handler
+        .handle_parse_extended(
+            "never".into(),
+            "UPDATE g SET v = v + 1 WHERE id = 1 RETURNING *".into(),
+            vec![],
+        )
+        .await
+        .expect("parse");
+    db.execute("ALTER TABLE g ADD COLUMN x INT DEFAULT 7").expect("alter");
+    handler
+        .handle_bind_extended("never_p".into(), "never".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    handler
+        .handle_execute_extended("never_p".into(), 0)
+        .await
+        .expect("execute");
+    assert_eq!(
+        data_rows(&drain_on_heap(&mut client).await),
+        vec![vec![Some(b"1".to_vec()), Some(b"2".to_vec()), Some(b"7".to_vec())]]
+    );
+
+    // Described, changed, Described again (the portal): the new shape stands.
+    let first = parse_and_describe(&mut handler, &mut client, "again", "SELECT * FROM g").await;
+    assert_eq!(first.len(), 3);
+    db.execute("ALTER TABLE g ADD COLUMN y TEXT DEFAULT 'abc'")
+        .expect("alter");
+    handler
+        .handle_bind_extended("again_p".into(), "again".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Portal, "again_p".into())
+        .await
+        .expect("describe");
+    assert_eq!(row_description(&drain_on_heap(&mut client).await).len(), 4);
+    handler
+        .handle_execute_extended("again_p".into(), 0)
+        .await
+        .expect("execute");
+    let rows = data_rows(&drain_on_heap(&mut client).await);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 4);
+
+    // Described again (the statement): the same.
+    db.execute("ALTER TABLE g ADD COLUMN z INT").expect("alter");
+    let third = parse_and_describe(&mut handler, &mut client, "third", "SELECT * FROM g").await;
+    assert_eq!(third.len(), 5);
+    db.execute("ALTER TABLE g ADD COLUMN w INT").expect("alter");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Statement, "third".into())
+        .await
+        .expect("describe");
+    assert_eq!(row_description(&drain_on_heap(&mut client).await).len(), 6);
+    handler
+        .handle_bind_extended("third_p".into(), "third".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    handler
+        .handle_execute_extended("third_p".into(), 0)
+        .await
+        .expect("execute");
+    assert_eq!(data_rows(&drain_on_heap(&mut client).await)[0].len(), 6);
+}
+
+/// A schema change that leaves the shape alone refuses nothing, and one that makes
+/// the statement unplannable reports what is really wrong.
+#[tokio::test]
+#[allow(clippy::expect_used)] // Test code: `expect` documents the failing step.
+async fn a_described_statement_is_refused_only_for_its_own_shape() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE g (id INT PRIMARY KEY, v INT)")
+        .expect("create");
+    db.execute("INSERT INTO g VALUES (1, 1)").expect("insert");
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+
+    parse_and_describe(&mut handler, &mut client, "same", "SELECT id, v FROM g").await;
+    db.execute("CREATE TABLE other (id INT)").expect("create");
+    db.execute("ALTER TABLE g ADD COLUMN x INT DEFAULT 7").expect("alter");
+    handler
+        .handle_bind_extended("same_p".into(), "same".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    handler
+        .handle_execute_extended("same_p".into(), 0)
+        .await
+        .expect("the same two columns, under an unrelated schema change");
+    assert_eq!(
+        data_rows(&drain_on_heap(&mut client).await),
+        vec![vec![Some(b"1".to_vec()), Some(b"1".to_vec())]]
+    );
+
+    parse_and_describe(&mut handler, &mut client, "gone", "SELECT id FROM g").await;
+    db.execute("DROP TABLE g").expect("drop");
+    handler
+        .handle_bind_extended("gone_p".into(), "gone".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    let refused = handler
+        .handle_execute_extended("gone_p".into(), 0)
+        .await
+        .expect_err("the table is gone");
+    assert_ne!(super::handler::sqlstate_for_error(&refused), "0A000", "{refused}");
+}
+
+/// Every field of every ErrorResponse in `bytes`, by its type byte.
+fn error_fields(bytes: &[u8]) -> Vec<std::collections::HashMap<u8, String>> {
+    let mut out = Vec::new();
+    for (ty, payload) in parse_messages(bytes) {
+        if ty != b'E' {
+            continue;
+        }
+        let mut fields = std::collections::HashMap::new();
+        let mut pos = 0;
+        while pos < payload.len() && payload[pos] != 0 {
+            let field = payload[pos];
+            pos += 1;
+            let start = pos;
+            while pos < payload.len() && payload[pos] != 0 {
+                pos += 1;
+            }
+            fields.insert(field, String::from_utf8_lossy(&payload[start..pos]).to_string());
+            pos += 1;
+        }
+        out.push(fields);
+    }
+    out
+}
+
+/// asyncpg and pgjdbc prepare again and retry on this error only when `R` names
+/// PostgreSQL's `RevalidateCachedQuery`; the message was Nano's, with a prefix,
+/// and had no `R`. The wire writers' last resort, after which the statement may
+/// have taken effect, must not invite that retry.
+#[tokio::test]
+async fn the_refusal_carries_what_drivers_prepare_again_on() {
+    use super::messages::FrontendMessage;
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE g (id INT PRIMARY KEY, v INT)")
+        .expect("create");
+    db.execute("INSERT INTO g VALUES (1, 1)").expect("insert");
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    parse_and_describe(&mut handler, &mut client, "upd", "UPDATE g SET v = v + 1 RETURNING *").await;
+    db.execute("ALTER TABLE g ADD COLUMN x INT DEFAULT 7").expect("alter");
+    handler
+        .handle_bind_extended("upd_p".into(), "upd".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    let _ = drain_on_heap(&mut client).await;
+    handler
+        .dispatch_message(FrontendMessage::Execute {
+            portal_name: "upd_p".into(),
+            max_rows: 0,
+        })
+        .await
+        .expect("the error is the client's, not the connection's");
+    let errors = error_fields(&drain_on_heap(&mut client).await);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let error = &errors[0];
+    assert_eq!(error.get(&b'C').map(String::as_str), Some("0A000"), "{error:?}");
+    assert_eq!(
+        error.get(&b'M').map(String::as_str),
+        Some("cached plan must not change result type"),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.get(&b'R').map(String::as_str),
+        Some("RevalidateCachedQuery"),
+        "{error:?}"
+    );
+    assert_eq!(error.get(&b'F').map(String::as_str), Some("plancache.c"), "{error:?}");
+    assert!(
+        error.get(&b'D').is_some_and(|detail| detail.contains("did not run")),
+        "{error:?}"
+    );
+
+    let last_resort = crate::storage::row_shape::refuse_mismatched_row(3, 2).to_string();
+    let fields = super::handler::cached_plan_error_fields(&last_resort).expect("the same error");
+    assert_eq!(fields.message, crate::error::ROW_DESCRIPTION_MISMATCH_MARKER);
+    assert!(fields.source.is_none(), "no retry after a statement that may have run");
+}
+
+/// What binds a portal is its own Describe, else its statement's, as in
+/// PostgreSQL. A re-Describe through another portal used to adopt the new shape
+/// for every portal of the statement.
+#[tokio::test]
+#[allow(clippy::expect_used)] // Test code: `expect` documents the failing step.
+async fn a_portal_is_bound_by_its_own_description() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE g (id INT PRIMARY KEY, v INT)")
+        .expect("create");
+    db.execute("INSERT INTO g VALUES (1, 1)").expect("insert");
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    handler
+        .handle_parse_extended("s".into(), "SELECT * FROM g".into(), vec![])
+        .await
+        .expect("parse");
+    for portal in ["p1", "p2"] {
+        handler
+            .handle_bind_extended(portal.into(), "s".into(), vec![], vec![], vec![])
+            .await
+            .expect("bind");
+    }
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Portal, "p1".into())
+        .await
+        .expect("describe p1");
+    assert_eq!(row_description(&drain_on_heap(&mut client).await).len(), 2);
+
+    db.execute("ALTER TABLE g ADD COLUMN x INT DEFAULT 7").expect("alter");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Portal, "p2".into())
+        .await
+        .expect("describe p2");
+    assert_eq!(row_description(&drain_on_heap(&mut client).await).len(), 3);
+
+    handler
+        .handle_execute_extended("p2".into(), 0)
+        .await
+        .expect("p2 holds 3");
+    assert_eq!(data_rows(&drain_on_heap(&mut client).await)[0].len(), 3);
+    let refused = handler
+        .handle_execute_extended("p1".into(), 0)
+        .await
+        .expect_err("p1 was described with 2");
+    assert_eq!(super::handler::sqlstate_for_error(&refused), "0A000", "{refused}");
+    assert!(data_rows(&drain_on_heap(&mut client).await).is_empty());
+
+    // A portal never Described is bound by its statement's Describe.
+    parse_and_describe(&mut handler, &mut client, "t", "SELECT * FROM g").await;
+    handler
+        .handle_bind_extended("t1".into(), "t".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    handler
+        .handle_bind_extended("t2".into(), "t".into(), vec![], vec![], vec![])
+        .await
+        .expect("bind");
+    db.execute("ALTER TABLE g ADD COLUMN y INT DEFAULT 8").expect("alter");
+    handler
+        .handle_describe_extended(super::messages::DescribeTarget::Portal, "t2".into())
+        .await
+        .expect("describe t2");
+    let _ = drain_on_heap(&mut client).await;
+    handler
+        .handle_execute_extended("t2".into(), 0)
+        .await
+        .expect("t2 holds 4");
+    let _ = drain_on_heap(&mut client).await;
+    assert!(handler.handle_execute_extended("t1".into(), 0).await.is_err());
+}
+
+/// A Bind that fixed one result format per column holds the width it was given:
+/// the new column used to go out in text after two binary ones. One code for
+/// all, or none, still fits any width.
+#[tokio::test]
+#[allow(clippy::expect_used)] // Test code: `expect` documents the failing step.
+async fn result_formats_fixed_per_column_at_bind_hold_their_width() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+    db.execute("CREATE TABLE g (id INT PRIMARY KEY, v INT)")
+        .expect("create");
+    db.execute("INSERT INTO g VALUES (1, 1)").expect("insert");
+    let (mut handler, mut client) = test_handler(Arc::clone(&db));
+    handler
+        .handle_parse_extended("s".into(), "SELECT * FROM g".into(), vec![])
+        .await
+        .expect("parse");
+    for (portal, formats) in [("each", vec![1i16, 1]), ("one", vec![1i16]), ("none", vec![])] {
+        handler
+            .handle_bind_extended(portal.into(), "s".into(), vec![], vec![], formats)
+            .await
+            .expect("bind");
+    }
+    let _ = drain_on_heap(&mut client).await;
+    db.execute("ALTER TABLE g ADD COLUMN x INT DEFAULT 7").expect("alter");
+
+    let refused = handler
+        .handle_execute_extended("each".into(), 0)
+        .await
+        .expect_err("two formats for three columns");
+    assert_eq!(super::handler::sqlstate_for_error(&refused), "0A000", "{refused}");
+    assert!(data_rows(&drain_on_heap(&mut client).await).is_empty());
+    for portal in ["one", "none"] {
+        handler
+            .handle_execute_extended(portal.into(), 0)
+            .await
+            .unwrap_or_else(|e| panic!("{portal}: {e}"));
+        assert_eq!(data_rows(&drain_on_heap(&mut client).await)[0].len(), 3, "{portal}");
+    }
+}
+
+/// Decision 2(h)'s last look. A schema statement landing between the handler's
+/// check at Execute and the statement's table locks used to reach the client as
+/// the wire writers' last-resort 0A000, after the DML had committed. The RETURNING
+/// arm now asks again under the locks, before its first write. Here the schema
+/// statement lands exactly there: after the generation the handler checked under,
+/// before the arm. Every DML kind, autocommit and in a transaction.
+#[test]
+#[allow(clippy::expect_used)] // Test code: `expect` documents the failing step.
+fn a_shape_change_after_the_handlers_check_is_refused_by_the_arm_before_it_writes() {
+    use crate::session::IsolationLevel;
+    use crate::{Column, DataType, Schema, Value};
+    let statements = [
+        "UPDATE g SET v = v + 1 WHERE id = 1 RETURNING *",
+        "DELETE FROM g WHERE id = 1 RETURNING *",
+        "INSERT INTO g (id, v) VALUES (2, 2) RETURNING *",
+    ];
+    for in_transaction in [false, true] {
+        for (step, sql) in statements.iter().enumerate() {
+            let db = EmbeddedDatabase::new_in_memory().expect("db");
+            db.execute("CREATE TABLE g (id INT PRIMARY KEY, v INT)")
+                .expect("create");
+            db.execute("INSERT INTO g VALUES (1, 1)").expect("insert");
+            let described = Schema::new(vec![
+                Column::new("id", DataType::Int4),
+                Column::new("v", DataType::Int4),
+            ]);
+            let session = db.create_session("n2", IsolationLevel::ReadCommitted).expect("session");
+            let checked_under = db.storage.schema_generation();
+            db.execute(&format!("ALTER TABLE g ADD COLUMN x{step} INT DEFAULT 7"))
+                .expect("alter");
+            if in_transaction {
+                db.begin_transaction_for_session(session).expect("begin");
+            }
+            let refused = db
+                .execute_params_returning_for_session_expecting(
+                    session,
+                    sql,
+                    &[],
+                    Some(crate::ExpectedResultShape {
+                        schema: &described,
+                        generation: checked_under,
+                    }),
+                )
+                .expect_err("the shape moved after the handler's check");
+            assert_eq!(
+                super::handler::sqlstate_for_error(&refused),
+                "0A000",
+                "{sql}: {refused}"
+            );
+            assert!(
+                refused
+                    .to_string()
+                    .contains(crate::error::RESULT_TYPE_REFUSED_BEFORE_RUN_MARKER),
+                "{sql}: {refused}"
+            );
+            if in_transaction {
+                db.rollback_transaction_for_session(session).expect("rollback");
+            }
+            let rows = db.query("SELECT id, v FROM g ORDER BY id", &[]).expect("read");
+            assert_eq!(rows.len(), 1, "{sql}: nothing was written");
+            assert_eq!(rows[0].values, vec![Value::Int4(1), Value::Int4(1)], "{sql}");
+
+            // With nothing moved since the check, the same call runs.
+            let now = db.storage.catalog().get_table_schema("g").expect("schema");
+            let (affected, returned) = db
+                .execute_params_returning_for_session_expecting(
+                    session,
+                    sql,
+                    &[],
+                    Some(crate::ExpectedResultShape {
+                        schema: &now,
+                        generation: db.storage.schema_generation(),
+                    }),
+                )
+                .expect("unchanged");
+            assert_eq!(affected, 1, "{sql}");
+            assert_eq!(returned.len(), 1, "{sql}");
+        }
+    }
+}

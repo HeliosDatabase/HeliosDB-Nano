@@ -244,6 +244,45 @@ fn malformed_live_rows_fail_without_mutating_rows_or_indexes() {
     assert_eq!(rows(&target, SELECT), rows(&source, SELECT));
 }
 
+/// Spec R5.2: the row STORED may be older than a column, and is read through the
+/// funnel to take its index entries out. The row APPLIED may not: the log is applied
+/// in order, so an image narrower than the schema is one no schema of this table
+/// wrote at this point of it, and a narrow image would take a key it does not have.
+#[test]
+fn a_stored_row_may_be_older_than_a_column_and_a_replayed_one_may_not() {
+    let source = primary();
+    let target = primary();
+    for db in [&source, &target] {
+        schema(db);
+        db.execute("INSERT INTO replay_bounds VALUES (1, 'old')").unwrap();
+        db.execute("ALTER TABLE replay_bounds ADD COLUMN x INT DEFAULT 5")
+            .unwrap();
+    }
+    let operation = one_row(&capture(
+        &source,
+        "UPDATE replay_bounds SET v = 'new', x = 6 WHERE v = 'old'",
+    ));
+
+    let narrow = change_tuple(&operation, |tuple| {
+        tuple.values.pop();
+    });
+    let raw_before = raw_snapshot(&target);
+    assert!(target.storage.apply_replicated_operation(narrow).is_err());
+    assert_eq!(raw_snapshot(&target), raw_before);
+    assert_eq!(
+        rows(&target, "SELECT id, x FROM replay_bounds WHERE v = 'old'"),
+        vec![vec!["1".to_string(), "5".to_string()]]
+    );
+
+    // The stored row was two values wide: its entry for `old` still came out.
+    target.storage.apply_replicated_operation(operation).unwrap();
+    assert!(rows(&target, "SELECT id FROM replay_bounds WHERE v = 'old'").is_empty());
+    assert_eq!(
+        rows(&target, "SELECT id, x FROM replay_bounds WHERE v = 'new'"),
+        vec![vec!["1".to_string(), "6".to_string()]]
+    );
+}
+
 #[test]
 fn conflicting_replay_restores_pk_and_unique_membership() {
     let source = primary();

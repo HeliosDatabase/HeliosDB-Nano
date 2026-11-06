@@ -1,29 +1,28 @@
 //! W3.5 — snapshot / AS OF / branch reads of rows written under an OLDER schema
 //! than the current catalog (after ALTER ADD COLUMN).
 //!
-//! `ALTER TABLE t ADD COLUMN c DEFAULT 42` rewrites every `data:` row in place
-//! with no snapshot-resolvable version and bumps the schema generation
-//! (`catalog::update_table_schema` -> `bump_schema_generation`), so W2.5
-//! fail-closes an in-transaction reader onto the snapshot path. That path
-//! resolves the pre-ALTER 2-value version and the plan (built from the current
-//! 3-column catalog: `SELECT *` expands `Wildcard` to one explicit column ref
-//! per current column, `planner.rs`) projects column index 2.
+//! Spec R5.2: `ALTER TABLE t ADD COLUMN c DEFAULT 42` rewrites no row. It stores
+//! the column's MISSING VALUE beside the schema and bumps the schema generation,
+//! so W2.5 fail-closes an in-transaction reader onto the snapshot path. That path
+//! resolves the 2-value version and the plan (built from the current 3-column
+//! catalog: `SELECT *` expands `Wildcard` to one explicit column ref per current
+//! column, `planner.rs`) projects column index 2.
 //!
-//! W3.5 **Stage 1** now ships (`docs/plans/PERF_STABILITY_2026_07/W3_5_DESIGN.md`
-//! §3): the base-table scan decode boundaries NULL-pad a row written under an
-//! older (narrower) schema up to the current catalog width, so index 2 reads as
-//! NULL instead of erroring. The pad is localized to the scan boundary, where
-//! the tuple is provably a stored base row of a known table — NEVER the generic
-//! evaluator/aggregate/join arity guards, which stay hard errors for
-//! mis-planned intermediate tuples (design §1.1). A row WIDER than the catalog
-//! after a DROP COLUMN (a resolved old version, or a `bdata:` fork the DROP left
-//! un-rewritten) is legitimate schema evolution, not corruption: it is TRUNCATED
-//! to the current width, matching the pre-W3.5 projection.
+//! The base-table decode boundaries shape a row written under an older (narrower)
+//! schema to the current catalog width, so index 2 reads the column's missing
+//! value, or NULL when it has none, as PostgreSQL's old tuples do: the column
+//! exists, and a row older than it holds its default. (W3.5 Stage 1 padded NULL
+//! there because the default was a rewrite a snapshot could not see.) The shaping
+//! is localized to the scan boundary, where the tuple is provably a stored base
+//! row of a known table — NEVER the generic evaluator/aggregate/join arity guards,
+//! which stay hard errors for mis-planned intermediate tuples (design §1.1). A row
+//! WIDER than the catalog after a DROP COLUMN (a resolved old version, or a
+//! `bdata:` fork the DROP left un-rewritten) is legitimate schema evolution, not
+//! corruption: it is TRUNCATED to the current width, matching the pre-W3.5
+//! projection.
 //!
-//! The behavior is gated by `storage.snapshot_schema_evolution`:
-//! - `"null_pad"` (default): the Stage-1 shaper — a pre-ADD snapshot projects the
-//!   added column as NULL and NEVER the `42` backfill (an isolation break); a
-//!   pre-DROP wider row is truncated to the current width.
+//! For a row VERSION the behavior is gated by `storage.snapshot_schema_evolution`:
+//! - `"null_pad"` (default): the shaper above.
 //! - `"strict"`: the pre-W3.5 arity error, kept as a rollback.
 //!
 //! These tests assert the Stage-1 flip under the default, the `"strict"`
@@ -74,9 +73,7 @@ fn as_i64(v: &Value) -> Option<i64> {
     }
 }
 
-/// A row exposes the ADD COLUMN backfill iff its 3rd value is a non-NULL `42`.
-/// A missing 3rd value (a raw 2-value tuple) or an explicit NULL is absence, not
-/// a leak.
+/// A row reads the ADD COLUMN default iff its 3rd value is a non-NULL `42`.
 fn exposes_backfill(row: &heliosdb_nano::Tuple) -> bool {
     matches!(row.get(2), Some(v) if as_i64(v) == Some(42))
 }
@@ -90,9 +87,8 @@ fn row_id(row: &heliosdb_nano::Tuple) -> Option<i64> {
 /// ADD COLUMN: the re-read routes through the snapshot path (the ALTER cleared
 /// the watermark), which resolves the pre-ALTER 2-value versions.
 ///
-/// W3.5 Stage 1 (default `null_pad`): the snapshot path NULL-pads those rows to
-/// the current 3-column catalog, so the re-read returns `c IS NULL` — never the
-/// `42` backfill and never an arity error.
+/// Spec R5.2: those rows are older than the column, so the re-read returns the
+/// column's missing value, the same `42` a fresh read does — never an arity error.
 #[test]
 fn open_txn_read_after_alter_add_column_today() {
     let db = setup();
@@ -104,28 +100,22 @@ fn open_txn_read_after_alter_add_column_today() {
     let first = db.query_in_session(a, "SELECT * FROM t", &[]).unwrap();
     assert_eq!(first.len(), 2, "in-txn scan must see the two committed rows");
 
-    // Concurrent autocommit ALTER: rewrites data: to 3 values (c = 42) with no
-    // version, and bumps the schema generation (clears A's watermark).
+    // Concurrent autocommit ALTER: no row changes, and the schema generation
+    // moves (clears A's watermark).
     db.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 42").unwrap();
 
     let rows = db
         .query_in_session(a, "SELECT * FROM t", &[])
-        .expect("Stage 1 null_pad: a pre-ALTER snapshot read must succeed, not error on arity");
+        .expect("a pre-ALTER snapshot read must succeed, not error on arity");
     assert_eq!(rows.len(), 2, "the snapshot still resolves both pre-ALTER rows");
     assert!(
-        rows.iter().all(|r| matches!(r.get(2), Some(Value::Null))),
-        "the column added after the snapshot must project as NULL"
-    );
-    assert!(
-        rows.iter().all(|r| !exposes_backfill(r)),
-        "a reader whose snapshot predates the ALTER must never observe the 42 backfill"
+        rows.iter().all(exposes_backfill),
+        "a row version older than the column reads its missing value"
     );
 
     db.commit_transaction_for_session(a).unwrap();
     db.destroy_session(a).unwrap();
 
-    // A fresh autocommit read DOES observe the backfilled column (confirming the
-    // ALTER really rewrote data:, so a leak WOULD have been observable).
     let fresh = db.query("SELECT * FROM t", &[]).unwrap();
     assert!(
         fresh.len() == 2 && fresh.iter().all(exposes_backfill),
@@ -136,8 +126,8 @@ fn open_txn_read_after_alter_add_column_today() {
 /// Autocommit `SELECT * ... AS OF TIMESTAMP '<before the ALTER>'`: the SAME
 /// problem class as the in-txn snapshot read, no session transaction needed. The
 /// AS OF branch resolves to a pre-ALTER snapshot and calls the same
-/// `scan_table_at_snapshot` — so Stage 1's shared base-scan pad flips it
-/// identically (the design's key advantage): `c IS NULL`, never the backfill.
+/// `scan_table_at_snapshot`, so the shared funnel answers identically: the
+/// column's missing value, for a row version older than the column.
 #[test]
 fn as_of_read_predating_alter_today() {
     let db = setup();
@@ -152,15 +142,11 @@ fn as_of_read_predating_alter_today() {
 
     let rows = db
         .query(&format!("SELECT * FROM t AS OF TIMESTAMP '{}'", ts_before_alter), &[])
-        .expect("Stage 1 null_pad: a pre-ALTER AS OF read must succeed");
+        .expect("a pre-ALTER AS OF read must succeed");
     assert_eq!(rows.len(), 2, "AS OF resolves both pre-ALTER rows");
     assert!(
-        rows.iter().all(|r| matches!(r.get(2), Some(Value::Null))),
-        "the column added after the AS OF timestamp must project as NULL"
-    );
-    assert!(
-        rows.iter().all(|r| !exposes_backfill(r)),
-        "an AS OF read predating the ALTER must never observe the 42 backfill"
+        rows.iter().all(exposes_backfill),
+        "a row version older than the column reads its missing value"
     );
 
     // AS OF NOW / the live read sees the backfill (sanity: the ALTER landed).
@@ -174,9 +160,8 @@ fn as_of_read_predating_alter_today() {
 /// A branch that FORKED a row (wrote `bdata:`, 2-value) before a main ALTER: the
 /// branch overlay yields that 2-value row under the current 3-column catalog.
 ///
-/// W3.5 Stage 1 applied to the `bdata:` decode: the forked row reads with
-/// `c IS NULL` (no arity error). The un-forked row (row 2) legitimately shows
-/// main's backfilled 42 — the branch-overlay model, pinned separately below.
+/// Spec R5.2 applied to the `bdata:` decode: the forked row is older than the
+/// column and reads its missing value (no arity error), like the un-forked row 2.
 ///
 /// sprinter 6bc4a4040eb7 (phase B3): unchanged — forking a ROW is not a change
 /// of the table's definition, so the branch still reads main's current
@@ -191,17 +176,16 @@ fn branch_forked_row_before_alter_today() {
     db.execute("UPDATE t SET v = 111 WHERE id = 1").unwrap();
     db.execute("USE BRANCH main").unwrap();
 
-    // Main ALTER rewrites main's data: to 3 values; b's bdata: row 1 is NOT
-    // touched, so it stays 2-value.
+    // Main's ALTER touches no row; b's bdata: row 1 stays 2-value.
     db.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 42").unwrap();
 
     db.execute("USE BRANCH b").unwrap();
     let rows = db
         .query("SELECT * FROM t", &[])
-        .expect("Stage 1 null_pad: the forked 2-value row pads to NULL, no arity error");
+        .expect("the forked 2-value row is shaped, no arity error");
 
-    // The forked row (id = 1, v = 111) keeps the branch's own value and projects
-    // the post-fork column as NULL — never main's backfill.
+    // The forked row (id = 1, v = 111) keeps the branch's own value and reads the
+    // column's missing value.
     let forked = rows
         .iter()
         .find(|r| row_id(r) == Some(1))
@@ -212,29 +196,25 @@ fn branch_forked_row_before_alter_today() {
         "the forked row must carry the branch's own value"
     );
     assert!(
-        matches!(forked.get(2), Some(Value::Null)),
-        "the forked row (written pre-ALTER) must project the added column as NULL"
-    );
-    assert!(
-        !exposes_backfill(forked),
-        "the forked row (written pre-ALTER) must not expose the main ALTER's 42 backfill"
+        exposes_backfill(forked),
+        "the forked row (written pre-ALTER) reads the column's missing value"
     );
 
-    // The un-forked row (id = 2) still reads main's live rewritten data: — the
-    // branch-overlay model (design §7), NOT flipped by Stage 1.
+    // The un-forked row (id = 2) reads main's row and the same missing value — the
+    // branch-overlay model (design §7).
     let unforked = rows
         .iter()
         .find(|r| row_id(r) == Some(2))
         .expect("branch must see un-forked row 2 via the main overlay");
     assert!(
         exposes_backfill(unforked),
-        "an un-forked row reads main's live rewritten data:, so it observes c = 42"
+        "an un-forked row reads main's data: under main's definition, so it observes c = 42"
     );
 }
 
 /// A branch created before a main ALTER, with NO fork of the row: the overlay
-/// reads main's LIVE (rewritten, 3-value) data: for un-forked rows, so the
-/// branch DOES observe the backfilled 42. This is the copy-on-write branch model
+/// reads main's LIVE data: for un-forked rows under main's definition, so the
+/// branch DOES observe the 42. This is the copy-on-write branch model
 /// (a branch is not snapshot-isolated from main DDL for rows it has not forked),
 /// pinned as-is. TODAY: Ok, both rows show c = 42.
 ///
@@ -262,7 +242,7 @@ fn branch_before_alter_sees_main_backfill_today() {
     );
     assert!(
         rows.iter().all(exposes_backfill),
-        "an un-forked branch reads main's live rewritten data:, so it observes c = 42"
+        "an un-forked branch reads main's data: under main's definition, so it observes c = 42"
     );
 }
 

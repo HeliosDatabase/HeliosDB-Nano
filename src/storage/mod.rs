@@ -45,6 +45,9 @@ pub mod replication_records;
 // Spec P2.1: the commit path's wait for standby acknowledgements of the
 // physical sequence, and the slot an unconfirmed commit is reported in.
 pub mod replication_wait;
+// Spec R5.2: the one funnel every full-row decode goes through, and the missing
+// values (`meta:attmissing:`) it answers from.
+pub(crate) mod row_shape;
 pub mod statistics;
 mod stats;
 // Spec P3.1: archived WAL segments of an encrypted dataset are sealed with
@@ -139,6 +142,7 @@ pub use mv_incremental::{
 pub use mv_scheduler::{CpuMonitor, MVScheduler, Priority, RefreshTask, SchedulerConfig, SchedulerStats};
 pub use mv_system_views::{AutoRefreshStatus, CpuUsageInfo, MvSystemViews};
 pub use mvcc::{Snapshot, SnapshotId};
+pub use row_shape::data_row_arity_refusals;
 pub use statistics::{ColumnStatistics, StatisticsAnalyzer, StatisticsCache, TableStatistics};
 pub use stats::{DatabaseStats, GlobalStatsCollector, ReplicationRole, StatsSnapshot};
 pub use time_travel::{GcConfig, Scn, SnapshotManager, SnapshotMetadata, TransactionId};

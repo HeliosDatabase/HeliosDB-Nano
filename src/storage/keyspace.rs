@@ -59,6 +59,9 @@ pub enum KeyClass {
     /// what tells "dropped and recreated identically" from "unchanged"
     /// (sprinter 6bc4a4040eb7, B3 fix pass).
     MetaTableIncarnation,
+    /// `meta:attmissing:{table}:{column}` — what a row older than the column
+    /// reads for it (spec R5.2, `storage::row_shape`).
+    MetaAttMissing,
     /// `meta:index:{index}` — persisted index definition.
     MetaIndex,
     /// `meta:schema:{schema}` — declared schema marker.
@@ -248,6 +251,8 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
     (b"meta:table:", KeyClass::MetaTable),
     // storage/catalog.rs `table_incarnation_key` (sprinter 6bc4a4040eb7, B3 fix pass)
     (b"meta:table_incarnation:", KeyClass::MetaTableIncarnation),
+    // storage/catalog.rs `attmissing_key` (spec R5.2)
+    (b"meta:attmissing:", KeyClass::MetaAttMissing),
     // storage/catalog.rs:3899 `index_metadata_key`
     (b"meta:index:", KeyClass::MetaIndex),
     // storage/catalog.rs:3914 `schema_metadata_key`
@@ -543,6 +548,7 @@ mod tests {
             Some("users"),
         ),
         (b"meta:table:users", KeyClass::MetaTable, None),
+        (b"meta:attmissing:users:bio", KeyClass::MetaAttMissing, None),
         (b"meta:index:users_name_idx", KeyClass::MetaIndex, None),
         (b"meta:schema:app", KeyClass::MetaSchema, None),
         (b"meta:enum_type:mood", KeyClass::MetaEnumType, None),

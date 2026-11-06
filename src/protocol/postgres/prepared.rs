@@ -37,6 +37,31 @@ pub struct PreparedStatement {
     ///   was created outside `handle_parse_extended`); Execute keeps the
     ///   legacy per-Execute scan.
     pub is_catalog: Option<bool>,
+    /// What Execute compares a plan's output with (decision 2(h), spec R5.2).
+    pub result_shape: ResultShapeState,
+}
+
+/// What a prepared statement promised its client about the shape of its rows,
+/// and how fresh `PreparedStatement::result_schema` is (decision 2(h), spec R5.2).
+#[derive(Debug, Clone, Default)]
+pub struct ResultShapeState {
+    /// The row description this client was last sent for the statement, by a
+    /// Describe of the statement or of one of its portals. `None`: nothing was
+    /// sent, so nothing was promised, and a portal gets whatever shape the
+    /// statement has when it runs.
+    pub described: Option<Schema>,
+    /// `(plan-cache epoch, schema generation)` read before `result_schema` was
+    /// derived. Both move on a schema change; while neither has, no parse or plan
+    /// is spent on the question.
+    pub stamp: (u64, u64),
+    /// The session's name resolution `result_schema` was derived under (its
+    /// schema, `search_path` and branch), `None` for the default. Derived again
+    /// when the session's differs.
+    pub scope: Option<String>,
+    /// `result_schema` is the statement text's guess (the planner refused it at
+    /// Parse: `synthesise_schema_from_ast`), every column TEXT, one per select
+    /// item. Described that way it cannot be compared with a plan.
+    pub synthesised: bool,
 }
 
 /// Portal (bound statement ready for execution)
@@ -54,6 +79,18 @@ pub struct Portal {
     pub result_formats: Vec<i16>,
     /// Current execution state
     pub state: PortalState,
+    /// What this portal promised its client about its rows (decision 2(h)).
+    pub shape: PortalShape,
+}
+
+/// What a portal promised: a Describe of the portal binds it, and otherwise its
+/// statement's Describe does, as in PostgreSQL.
+#[derive(Debug, Clone, Default)]
+pub struct PortalShape {
+    /// The row description a Describe of this portal sent.
+    pub described: Option<Schema>,
+    /// The statement's result width when Bind took the result format codes.
+    pub width_at_bind: Option<usize>,
 }
 
 /// Portal execution state
@@ -237,6 +274,54 @@ impl PreparedStatementManager {
         if let Some(stmt) = statements.get_mut(name) {
             stmt.cached_plan = Some(plan);
             stmt.cached_plan_epoch = epoch;
+        }
+        Ok(())
+    }
+
+    /// Change one stored statement's result schema and its freshness.
+    pub fn set_result_schema(
+        &self,
+        name: &str,
+        schema: Schema,
+        stamp: (u64, u64),
+        scope: Option<String>,
+    ) -> Result<()> {
+        use crate::error::LockResultExt;
+        let mut statements = self
+            .statements
+            .write()
+            .map_lock_err("Failed to acquire write lock on statements")?;
+        if let Some(stmt) = statements.get_mut(name) {
+            stmt.result_schema = Some(schema);
+            stmt.result_shape.stamp = stamp;
+            stmt.result_shape.scope = scope;
+            stmt.result_shape.synthesised = false;
+        }
+        Ok(())
+    }
+
+    /// Record the row description a Describe of one portal just sent.
+    pub fn set_portal_described(&self, name: &str, described: Option<Schema>) -> Result<()> {
+        use crate::error::LockResultExt;
+        let mut portals = self
+            .portals
+            .write()
+            .map_lock_err("Failed to acquire write lock on portals")?;
+        if let Some(portal) = portals.get_mut(name) {
+            portal.shape.described = described;
+        }
+        Ok(())
+    }
+
+    /// Record the row description a Describe just sent for one stored statement.
+    pub fn set_described(&self, name: &str, described: Option<Schema>) -> Result<()> {
+        use crate::error::LockResultExt;
+        let mut statements = self
+            .statements
+            .write()
+            .map_lock_err("Failed to acquire write lock on statements")?;
+        if let Some(stmt) = statements.get_mut(name) {
+            stmt.result_shape.described = described;
         }
         Ok(())
     }
@@ -668,6 +753,7 @@ mod tests {
             cached_plan: None,
             cached_plan_epoch: 0,
             is_catalog: None,
+            result_shape: Default::default(),
         };
 
         manager.store_statement(stmt.clone()).unwrap();
@@ -692,6 +778,7 @@ mod tests {
             param_formats: vec![0],
             result_formats: vec![0],
             state: PortalState::Ready,
+            shape: Default::default(),
         };
 
         manager.store_portal(portal.clone()).unwrap();
@@ -770,6 +857,7 @@ mod tests {
                 cached_plan: None,
                 cached_plan_epoch: 0,
                 is_catalog: None,
+                result_shape: Default::default(),
             };
             manager.store_statement(stmt).unwrap();
         }
@@ -783,6 +871,7 @@ mod tests {
             cached_plan: None,
             cached_plan_epoch: 0,
             is_catalog: None,
+            result_shape: Default::default(),
         };
         let result = manager.store_statement(stmt);
         assert!(result.is_ok(), "LRU eviction should allow new statement");

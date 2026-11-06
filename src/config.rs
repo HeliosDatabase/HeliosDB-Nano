@@ -222,6 +222,8 @@ impl Config {
         config.vector.validate()?;
         // Spec R5.1: and not at the first contended write, which 0 would fail at once.
         config.session.validate_lock_timeout()?;
+        // Spec R5.2: and this one at load, not at the first volatile ADD COLUMN.
+        config.storage.validate()?;
         Ok(config)
     }
 
@@ -334,6 +336,7 @@ impl Config {
     /// Validate all configuration sections
     pub fn validate(&self) -> crate::Result<()> {
         self.server.validate_connection_policy()?;
+        self.storage.validate()?;
         self.replication.validate()?;
         self.session.validate()?;
         self.locks.validate()?;
@@ -1080,6 +1083,19 @@ pub struct StorageConfig {
     /// `docs/plans/PERF_STABILITY_2026_07/W3_5_DESIGN.md`.
     #[serde(default = "default_snapshot_schema_evolution")]
     pub snapshot_schema_evolution: SnapshotSchemaEvolution,
+    /// Spec R5.2: the most `ALTER TABLE … ADD COLUMN` with a VOLATILE default
+    /// (`random()`, `nextval()`, `gen_random_uuid()`, a function not declared
+    /// `IMMUTABLE` or `STABLE`) may rewrite in one atomic write group, in bytes.
+    /// Such a default gives every row its own value, so every row is rewritten;
+    /// with time travel on the group holds each row two or three times (its image,
+    /// its version, a version of its previous image if none was ever written).
+    /// Above this the statement is refused (54000), measured before anything
+    /// is written, and the way forward is `ADD COLUMN` without a default and an
+    /// `UPDATE` in batches. A stable default rewrites nothing and does not read
+    /// this. Between 1 MiB and [`MAX_ATOMIC_REWRITE_BYTES`], checked when a file is
+    /// loaded; default 256 MiB.
+    #[serde(default = "default_max_atomic_rewrite_bytes")]
+    pub max_atomic_rewrite_bytes: u64,
     /// R4.3: how long MVCC version history (`v:` / `v_idx:` keys written on
     /// every versioned INSERT/UPDATE/DELETE) is retained before the version
     /// garbage collector may reclaim it.
@@ -1170,6 +1186,16 @@ fn default_snapshot_schema_evolution() -> SnapshotSchemaEvolution {
     SnapshotSchemaEvolution::NullPad
 }
 
+/// The largest `[storage] max_atomic_rewrite_bytes` accepted. One rewrite is one
+/// write group, and a physical standby refuses a group past
+/// `replication::physical::MAX_BATCH_BYTES`, so this stays below that (asserted
+/// there), with room for what shares the group.
+pub const MAX_ATOMIC_REWRITE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+fn default_max_atomic_rewrite_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
 /// W3.5: how a base-table scan shapes a stored row that was written under an
 /// OLDER schema than the current catalog, when a version-resolved (`AS OF` /
 /// open-snapshot) or branch-forked read surfaces the pre-ALTER tuple. The row
@@ -1234,10 +1260,9 @@ pub enum SnapshotSchemaEvolution {
     /// raises "Column index N out of bounds in tuple" (pre-W3.5 behavior).
     /// Retained as a rollback for any consumer keyed on that error.
     Strict,
-    /// Stage 1: shape a base row to the current catalog width. A short row
-    /// (post-`ADD COLUMN`) is padded with `NULL`, so a pre-ALTER snapshot
-    /// projects the added column as NULL — never the post-snapshot DEFAULT
-    /// backfill (isolation-preserving). A row WIDER than the catalog
+    /// Stage 1: shape a row version to the current catalog width. A short one
+    /// (post-`ADD COLUMN`) reads the column's missing value, or `NULL` when it
+    /// has none (spec R5.2), as PostgreSQL's old tuples do. A row WIDER than the catalog
     /// (post-`DROP COLUMN`: a resolved old version or an un-rewritten branch
     /// fork) is TRUNCATED to the current width, matching the pre-W3.5 projection
     /// — it is legitimate schema evolution, not corruption.
@@ -1274,6 +1299,18 @@ fn default_version_gc_max_per_cycle() -> usize {
 }
 
 impl StorageConfig {
+    /// Spec R5.2: the settings of this section that a typo could make harmful.
+    pub fn validate(&self) -> crate::Result<()> {
+        const MIN: u64 = 1024 * 1024;
+        if !(MIN..=MAX_ATOMIC_REWRITE_BYTES).contains(&self.max_atomic_rewrite_bytes) {
+            return Err(crate::Error::config(format!(
+                "storage.max_atomic_rewrite_bytes must be between {MIN} and {MAX_ATOMIC_REWRITE_BYTES}, got {}",
+                self.max_atomic_rewrite_bytes
+            )));
+        }
+        Ok(())
+    }
+
     /// R4.3: parse `version_retention` into seconds. `None` = infinite
     /// retention (version GC disabled). Errors on unparseable values so a
     /// misconfigured retention never silently disables (or enables) GC.
@@ -1450,6 +1487,7 @@ impl Default for StorageConfig {
             // error into isolation-preserving NULL-padded rows. `"strict"`
             // restores the pre-W3.5 error as a rollback.
             snapshot_schema_evolution: SnapshotSchemaEvolution::NullPad,
+            max_atomic_rewrite_bytes: default_max_atomic_rewrite_bytes(),
             version_retention: None,        // infinite retention: version GC disabled (R4.3)
             version_gc_interval_secs: None, // auto: off without retention, 300s with it
             version_gc_max_per_cycle: default_version_gc_max_per_cycle(),

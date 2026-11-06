@@ -45,6 +45,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 cached_plan: None,
                 cached_plan_epoch: 0,
                 is_catalog: Some(false),
+                result_shape: Default::default(),
             })?;
             self.send_message(BackendMessage::ParseComplete).await?;
             return Ok(());
@@ -152,6 +153,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // through `Planner::with_catalog` and read `LogicalPlan::schema()`, so
         // `datatype_to_oid` sees identical types (numeric → 1700, text → 25,
         // int2/4/8 → 21/23/20, …).
+        //
+        // Decision 2(h): the stamp is read first, so a schema change racing this
+        // derivation leaves a stamp that says "look again".
+        let mut result_shape = super::prepared::ResultShapeState {
+            described: None,
+            stamp: self.result_schema_stamp(),
+            scope: self.session_scope(),
+            synthesised: false,
+        };
         let (result_schema, cached_plan, cached_plan_epoch) = if let Some(s) = catalog_schema {
             (Some(s), None, 0)
         } else if let Some((schema, plan, epoch)) = self.shared_query_schema(&statement, &query) {
@@ -185,6 +195,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 Ok(schema) => schema,
                 Err(e) => {
                     tracing::debug!("Schema derivation failed (falling back to AST): {}", e);
+                    result_shape.synthesised = true;
                     Self::synthesise_schema_from_ast(&statement)
                 }
             };
@@ -210,6 +221,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             cached_plan,
             cached_plan_epoch,
             is_catalog,
+            result_shape,
         };
 
         // Store in prepared statement manager
@@ -256,6 +268,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             param_formats,
             result_formats,
             state: PortalState::Ready,
+            shape: super::prepared::PortalShape {
+                described: None,
+                width_at_bind: statement.result_schema.as_ref().map(|schema| schema.columns.len()),
+            },
         };
 
         // Store portal
@@ -431,6 +447,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             self.send_command_complete("SHOW").await?;
             return Ok(());
         }
+
+        // Decision 2(h): before anything runs.
+        let statement = self.revalidate_result_shape(statement, &portal)?;
 
         // Convert parameters from wire format to Value
         let mut param_values = Vec::new();
@@ -617,8 +636,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     // it to a per-statement owner instead, and a wire client's
                     // `INSERT … RETURNING pg_try_advisory_lock(k)` would have
                     // been refused outright.
-                    self.database
-                        .execute_params_returning_for_session(self.session_id, &statement.query, &param_values)
+                    //
+                    // Decision 2(h): what this portal was Described as goes down
+                    // with it, and the RETURNING arm asks again holding the
+                    // statement's table locks, before its first write: a schema
+                    // statement can land between `revalidate_result_shape` and
+                    // them. Built here, inside the call, so the future holds none of it.
+                    let expected = portal
+                        .shape
+                        .described
+                        .as_ref()
+                        .or(statement.result_shape.described.as_ref())
+                        .filter(|_| !statement.result_shape.synthesised)
+                        .map(|schema| crate::ExpectedResultShape {
+                            schema,
+                            generation: statement.result_shape.stamp.1,
+                        });
+                    self.database.execute_params_returning_for_session_expecting(
+                        self.session_id,
+                        &statement.query,
+                        &param_values,
+                        expected,
+                    )
                 })?;
                 self.prepared_statements
                     .update_portal_state(&portal_name, PortalState::Complete)?;
@@ -778,6 +817,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     .prepared_statements
                     .get_statement(&name)?
                     .ok_or_else(|| Error::query_execution(format!("Statement '{}' not found", name)))?;
+                let statement = self.refresh_result_schema(statement)?;
 
                 // Send ParameterDescription
                 if !statement.param_types.is_empty() {
@@ -793,6 +833,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 // Send RowDescription or NoData based on derived schema. No
                 // portal yet, so no result formats: text everywhere (GH#23:
                 // same builder as the simple path and Describe(Portal)).
+                self.prepared_statements
+                    .set_described(&statement.name, statement.result_schema.clone())?;
                 if let Some(schema) = &statement.result_schema {
                     let fields = super::handler::schema_to_field_descriptions(schema);
                     self.send_message(BackendMessage::RowDescription { fields }).await?;
@@ -814,8 +856,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     .ok_or_else(|| {
                         Error::query_execution(format!("Statement '{}' not found", portal.statement_name))
                     })?;
+                let statement = self.refresh_result_schema(statement)?;
 
-                // Send RowDescription or NoData
+                // Send RowDescription or NoData. It binds this portal; the
+                // statement's own description binds the portals not Described.
+                self.prepared_statements
+                    .set_portal_described(&name, statement.result_schema.clone())?;
                 if let Some(schema) = &statement.result_schema {
                     let fields =
                         super::handler::schema_to_field_descriptions_with_formats(schema, &portal.result_formats);
@@ -846,6 +892,155 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
 
         self.send_message(BackendMessage::CloseComplete).await?;
         Ok(())
+    }
+
+    /// What moves when a statement's result shape may have: the plan-cache epoch
+    /// (every schema statement clears the plan cache) and the storage engine's
+    /// schema generation (every catalog funnel). Two atomic loads.
+    fn result_schema_stamp(&self) -> (u64, u64) {
+        (
+            self.database.wire_plan_epoch(),
+            self.database.storage.schema_generation(),
+        )
+    }
+
+    /// The session's name resolution, as far as a result schema depends on it: its
+    /// schema, `search_path` and branch. `None` for the default, with no lookup
+    /// beyond the two flags every Execute already reads.
+    fn session_scope(&self) -> Option<String> {
+        let schema_active = self.database.session_schema_active(self.session_id);
+        let on_branch = self.database.session_on_branch(self.session_id);
+        if !schema_active && !on_branch {
+            return None;
+        }
+        let schema = self.database.session_current_schema(self.session_id).unwrap_or(None);
+        let path = self.database.session_search_path(self.session_id).unwrap_or_default();
+        let branch = if on_branch {
+            self.database.session_branch(self.session_id).ok()
+        } else {
+            None
+        };
+        Some(format!("{schema:?} {path:?} {branch:?}"))
+    }
+
+    /// `statement`'s result schema derived again, by the rule Parse used, when
+    /// something may have moved it: `(schema, stamp, scope)`. `None` when nothing
+    /// can have, which is the common Execute: the statement returns no rows, the
+    /// emulated catalog answers it, or the stamp and the session's scope are the
+    /// ones it was derived under. Also `None` when it can no longer be planned:
+    /// that has no opinion on a shape, and running the statement reports the real
+    /// error.
+    fn fresh_result_schema(
+        &self,
+        statement: &PreparedStatement,
+    ) -> Option<(crate::Schema, (u64, u64), Option<String>)> {
+        if statement.is_catalog != Some(false) || statement.result_schema.is_none() {
+            return None;
+        }
+        let stamp = self.result_schema_stamp();
+        let scope = self.session_scope();
+        if statement.result_shape.stamp == stamp && statement.result_shape.scope == scope {
+            return None;
+        }
+        let parsed = crate::sql::Parser::new().parse_one(&statement.query).ok()?;
+        let fresh = super::handler::run_guarded(|| match self.shared_query_schema(&parsed, &statement.query) {
+            Some((schema, _, _)) => Ok(Some(schema)),
+            None => self.derive_result_schema(&parsed),
+        })
+        .ok()??;
+        Some((fresh, stamp, scope))
+    }
+
+    /// Describe's half of decision 2(h): the row description it is about to send
+    /// is the statement's shape now, so a client that Describes again has adopted
+    /// the change.
+    fn refresh_result_schema(&self, mut statement: PreparedStatement) -> Result<PreparedStatement> {
+        if let Some((fresh, stamp, scope)) = self.fresh_result_schema(&statement) {
+            self.adopt_result_schema(&mut statement, fresh, stamp, scope)?;
+        }
+        Ok(statement)
+    }
+
+    /// Execute's half of decision 2(h), before anything runs. What binds the
+    /// portal is, as in PostgreSQL, the row description a Describe of the portal
+    /// sent, else the one a Describe of its statement sent. If the plan no longer
+    /// returns those names and types the statement is refused (0A000) with nothing
+    /// having happened. That is the point of asking here: a DML with RETURNING
+    /// refused after it ran would have committed already. A portal with neither
+    /// has nothing to contradict, and its rows go out under the statement's shape
+    /// now, unless Bind fixed one result format per column of a width the shape no
+    /// longer has (also 0A000; one format code for all, or none, still fits).
+    ///
+    /// A shape guessed from the statement's text is left as Described: nothing
+    /// says the plan contradicts it, and the wire writers check the rows' width.
+    fn revalidate_result_shape(&self, mut statement: PreparedStatement, portal: &Portal) -> Result<PreparedStatement> {
+        if statement.is_catalog != Some(false) || statement.result_schema.is_none() {
+            return Ok(statement);
+        }
+        let fresh = self.fresh_result_schema(&statement);
+        let binding = portal
+            .shape
+            .described
+            .as_ref()
+            .or(statement.result_shape.described.as_ref());
+        if let Some(described) = binding {
+            if statement.result_shape.synthesised {
+                return Ok(statement);
+            }
+            let now = fresh
+                .as_ref()
+                .map(|(schema, _, _)| schema)
+                .or(statement.result_schema.as_ref());
+            if let Some(now) = now {
+                if !Self::same_result_shape(described, now) {
+                    return Err(Error::cached_plan_result_changed(
+                        &Self::render_result_shape(described),
+                        &Self::render_result_shape(now),
+                    ));
+                }
+            }
+        }
+        if let Some((fresh, stamp, scope)) = fresh {
+            self.adopt_result_schema(&mut statement, fresh, stamp, scope)?;
+        }
+        let formats = portal.result_formats.len();
+        if formats > 1 && portal.shape.width_at_bind == Some(formats) {
+            if let Some(now) = &statement.result_schema {
+                if now.columns.len() != formats {
+                    return Err(Error::cached_plan_result_changed(
+                        &format!("{formats} columns, one result format each, at Bind"),
+                        &Self::render_result_shape(now),
+                    ));
+                }
+            }
+        }
+        Ok(statement)
+    }
+
+    /// `fresh` becomes `statement`'s result schema, here and in the stored statement.
+    fn adopt_result_schema(
+        &self,
+        statement: &mut PreparedStatement,
+        fresh: crate::Schema,
+        stamp: (u64, u64),
+        scope: Option<String>,
+    ) -> Result<()> {
+        self.prepared_statements
+            .set_result_schema(&statement.name, fresh.clone(), stamp, scope.clone())?;
+        statement.result_schema = Some(fresh);
+        statement.result_shape.stamp = stamp;
+        statement.result_shape.scope = scope;
+        statement.result_shape.synthesised = false;
+        Ok(())
+    }
+
+    /// The same column names and types, in the same order.
+    fn same_result_shape(left: &crate::Schema, right: &crate::Schema) -> bool {
+        crate::EmbeddedDatabase::result_shape_matches(left, right)
+    }
+
+    fn render_result_shape(schema: &crate::Schema) -> String {
+        crate::EmbeddedDatabase::render_result_shape(schema)
     }
 
     /// The schema Execute encodes rows under: the one Parse derived and

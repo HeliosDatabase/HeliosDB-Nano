@@ -163,6 +163,10 @@ pub enum BackendMessage {
         detail: Option<String>,
         hint: Option<String>,
         position: Option<i32>,
+        /// `F` and `R`: the PostgreSQL source file and routine that raises the
+        /// same error, where a driver keys its recovery on them (decision 2(h):
+        /// asyncpg and pgjdbc re-prepare on `R = RevalidateCachedQuery`).
+        source: Option<(&'static str, &'static str)>,
     },
 
     /// No data (describe returned no columns)
@@ -663,6 +667,7 @@ impl BackendMessage {
                 detail,
                 hint,
                 position,
+                source,
             } => {
                 buf.put_u8(BackendMessageType::ErrorResponse as u8);
 
@@ -683,6 +688,10 @@ impl BackendMessage {
                 }
                 if let Some(p) = &position_text {
                     len += 1 + p.len() + 1; // P field
+                }
+                if let Some((file, routine)) = source {
+                    len += 1 + file.len() + 1; // F field
+                    len += 1 + routine.len() + 1; // R field
                 }
 
                 buf.put_i32(len as i32);
@@ -710,6 +719,12 @@ impl BackendMessage {
                 if let Some(p) = &position_text {
                     buf.put_u8(b'P');
                     write_cstring(buf, p);
+                }
+                if let Some((file, routine)) = source {
+                    buf.put_u8(b'F');
+                    write_cstring(buf, file);
+                    buf.put_u8(b'R');
+                    write_cstring(buf, routine);
                 }
 
                 buf.put_u8(0); // Terminator
@@ -885,21 +900,24 @@ mod tests {
     /// the position's digits included, whatever their count.
     #[test]
     fn test_error_response_length_counts_every_field() {
-        for position in [None, Some(7), Some(1234), Some(-1), Some(i32::MAX)] {
-            let mut buf = BytesMut::new();
-            BackendMessage::ErrorResponse {
-                severity: "FATAL".to_string(),
-                code: "57P01".to_string(),
-                message: "terminating connection".to_string(),
-                detail: Some("detail".to_string()),
-                hint: Some("hint".to_string()),
-                position,
+        for source in [None, Some(("plancache.c", "RevalidateCachedQuery"))] {
+            for position in [None, Some(7), Some(1234), Some(-1), Some(i32::MAX)] {
+                let mut buf = BytesMut::new();
+                BackendMessage::ErrorResponse {
+                    severity: "FATAL".to_string(),
+                    code: "57P01".to_string(),
+                    message: "terminating connection".to_string(),
+                    detail: Some("detail".to_string()),
+                    hint: Some("hint".to_string()),
+                    position,
+                    source,
+                }
+                .encode(&mut buf);
+                assert_eq!(buf[0], b'E');
+                let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+                assert_eq!(len as usize, buf.len() - 1, "position {position:?} source {source:?}");
+                assert_eq!(buf[buf.len() - 1], 0, "terminated");
             }
-            .encode(&mut buf);
-            assert_eq!(buf[0], b'E');
-            let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
-            assert_eq!(len as usize, buf.len() - 1, "position {position:?}");
-            assert_eq!(buf[buf.len() - 1], 0, "terminated");
         }
     }
 

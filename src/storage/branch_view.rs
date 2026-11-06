@@ -133,6 +133,7 @@
 //!   exclusive section (`BranchDrains::exclusive`): an open transaction's rows
 //!   would otherwise commit under a definition they were not written for.
 
+use super::row_shape::RowShape;
 use super::StorageEngine;
 use crate::storage::art_index::ArtIndexError;
 use crate::storage::{ArtIndexManager, EnforcedUniqueIndex, Transaction};
@@ -962,13 +963,11 @@ fn serialize_tuple(tuple: &Tuple) -> Result<Vec<u8>> {
     bincode::serialize(tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {e}")))
 }
 
-/// A staged (or cached) row, NULL-padded to the table's current width like
-/// `merge_with_write_set_to_width` pads staged rows.
-fn padded(tuple: &Tuple, width: usize) -> Tuple {
+/// A staged (or cached) row, shaped for its reader (spec R5.2) as
+/// `merge_with_write_set_shaped` shapes main's staged rows.
+fn padded(tuple: &Tuple, shape: &RowShape) -> Tuple {
     let mut tuple = tuple.clone();
-    if tuple.values.len() < width {
-        tuple.values.resize(width, Value::Null);
-    }
+    shape.apply(&mut tuple);
     tuple
 }
 
@@ -1306,30 +1305,54 @@ impl<'a> BranchView<'a> {
         Ok(())
     }
 
-    fn decode_committed(&self, key: &[u8], raw: &[u8], row_id: u64, level: u64, width: usize) -> Result<Tuple> {
+    /// The funnel for `table` on this view (spec R5.2): a table some level
+    /// defines isolated was materialized under its definition and owes main's
+    /// missing values nothing (a narrow row there reads NULL); any other reads
+    /// main's definition, and main's missing values with it.
+    fn row_shape(&self, table: &str, width: usize) -> Result<RowShape> {
+        let missing = if self.scope(table)?.include_main {
+            self.engine.missing_values(table)?
+        } else {
+            None
+        };
+        Ok(RowShape::new(width, missing))
+    }
+
+    /// [`Self::row_shape`] for one row: one length comparison when it fits.
+    #[inline]
+    fn shape_row(&self, table: &str, width: usize, tuple: &mut Tuple) -> Result<()> {
+        if tuple.values.len() != width {
+            self.row_shape(table, width)?.apply(tuple);
+        }
+        Ok(())
+    }
+
+    fn decode_committed(
+        &self,
+        table: &str,
+        key: &[u8],
+        raw: &[u8],
+        row_id: u64,
+        level: u64,
+        width: usize,
+    ) -> Result<Tuple> {
         let value = self.engine.decrypt_value(key, raw)?;
         let mut tuple: Tuple =
             bincode::deserialize(&value).map_err(|e| Error::storage(format!("Failed to deserialize tuple: {e}")))?;
         tuple.row_id = Some(row_id);
         tuple.branch_id = Some(level);
-        // W3.5: a row forked before an ADD/DROP COLUMN keeps its arity; shape
-        // it to the current width exactly as the pre-B2 overlay scan did.
-        if self.engine.null_pad_snapshot_schema() {
-            StorageEngine::shape_base_tuple_to_width(&mut tuple, width);
-        }
+        // A row forked before an ADD/DROP COLUMN keeps its arity.
+        self.shape_row(table, width, &mut tuple)?;
         Ok(tuple)
     }
 
-    /// A row value this view's transaction STAGED: plaintext (the commit
-    /// batch seals it), NULL-padded like `merge_with_write_set_to_width`.
-    fn decode_staged(&self, value: &[u8], row_id: u64, width: usize) -> Result<Tuple> {
+    /// A row value this view's transaction STAGED: plaintext (the commit batch
+    /// seals it), at the arity it was staged with.
+    fn decode_staged(&self, value: &[u8], row_id: u64) -> Result<Tuple> {
         let mut tuple: Tuple =
             bincode::deserialize(value).map_err(|e| Error::storage(format!("Failed to deserialize tuple: {e}")))?;
         tuple.row_id = Some(row_id);
         tuple.branch_id = Some(self.branch_id);
-        if tuple.values.len() < width {
-            tuple.values.resize(width, Value::Null);
-        }
         Ok(tuple)
     }
 
@@ -1353,9 +1376,7 @@ impl<'a> BranchView<'a> {
         let stored = self.engine.decode_stored_ref(key, raw)?;
         let mut tuple: Tuple =
             bincode::deserialize(&stored).map_err(|e| Error::storage(format!("Failed to deserialize tuple: {e}")))?;
-        if self.engine.null_pad_snapshot_schema() {
-            StorageEngine::shape_base_tuple_to_width(&mut tuple, schema.columns.len());
-        }
+        self.engine.shape_row(table, schema.columns.len(), &mut tuple)?;
         tuple.row_id = Some(row_id);
         tuple.branch_id = None;
         self.engine
@@ -1379,7 +1400,7 @@ impl<'a> BranchView<'a> {
         let prefix_len = prefix.len();
         self.for_each_with_prefix(prefix.as_bytes(), |key, raw| {
             if let Some(row_id) = StorageEngine::parse_row_id_after_prefix(key, prefix_len) {
-                rows.insert(row_id, self.decode_committed(key, raw, row_id, level, width)?);
+                rows.insert(row_id, self.decode_committed(table, key, raw, row_id, level, width)?);
             }
             Ok(())
         })?;
@@ -1511,7 +1532,7 @@ impl<'a> BranchView<'a> {
         for (key, staged) in txn.staged_with_prefix(prefix.as_bytes()) {
             if let (Some(row_id), Some(value)) = (StorageEngine::parse_row_id_after_prefix(&key, prefix.len()), staged)
             {
-                rows.insert(row_id, Some(self.decode_staged(&value, row_id, 0)?));
+                rows.insert(row_id, Some(self.decode_staged(&value, row_id)?));
             }
         }
         let prefix = tombstone_prefix(self.branch_id, table);
@@ -1554,7 +1575,7 @@ impl<'a> BranchView<'a> {
             .map_err(|e| Error::storage(format!("Get failed: {e}")))?;
         match raw {
             Some(raw) => Ok(Some(LevelEntry::Row(
-                self.decode_committed(&key, &raw, row_id, level, width)?,
+                self.decode_committed(table, &key, &raw, row_id, level, width)?,
             ))),
             None => Ok(None),
         }
@@ -1583,7 +1604,11 @@ impl<'a> BranchView<'a> {
             return Ok(Some(LevelEntry::Tombstone));
         }
         match staged_row {
-            Some(Some(value)) => Ok(Some(LevelEntry::Row(self.decode_staged(&value, row_id, width)?))),
+            Some(Some(value)) => {
+                let mut tuple = self.decode_staged(&value, row_id)?;
+                self.shape_row(table, width, &mut tuple)?;
+                Ok(Some(LevelEntry::Row(tuple)))
+            }
             Some(None) => Ok(None),
             None => {
                 let raw = self
@@ -1593,6 +1618,7 @@ impl<'a> BranchView<'a> {
                     .map_err(|e| Error::storage(format!("Get failed: {e}")))?;
                 match raw {
                     Some(raw) => Ok(Some(LevelEntry::Row(self.decode_committed(
+                        table,
                         &row_key,
                         &raw,
                         row_id,
@@ -1655,12 +1681,13 @@ impl<'a> BranchView<'a> {
             }
         }
         let committed = self.committed_overlay(table, width, scope.first_level)?;
+        let shape = self.row_shape(table, width)?;
         {
             let overlay = committed.lock();
             for (row_id, state) in &overlay.set.rows {
                 match state {
                     Some(tuple) => {
-                        rows.insert(*row_id, padded(tuple, width));
+                        rows.insert(*row_id, padded(tuple, &shape));
                     }
                     None => {
                         rows.remove(row_id);
@@ -1672,7 +1699,7 @@ impl<'a> BranchView<'a> {
             let staged: Vec<(u64, Option<Tuple>)> = self.with_staged(txn, table, |set| {
                 set.rows
                     .iter()
-                    .map(|(row_id, state)| (*row_id, state.as_ref().map(|tuple| padded(tuple, width))))
+                    .map(|(row_id, state)| (*row_id, state.as_ref().map(|tuple| padded(tuple, &shape))))
                     .collect()
             })?;
             for (row_id, state) in staged {
@@ -1846,6 +1873,7 @@ impl<'a> BranchView<'a> {
             MainCandidates::Rows(Vec::new())
         };
         let committed = self.committed_overlay(table, width, scope.first_level)?;
+        let shape = self.row_shape(table, width)?;
 
         // Lock order: the transaction's staged rows, then the committed copy.
         let collect = |staged: Option<&mut RowSet>| -> (Vec<Tuple>, Vec<u64>, Vec<Tuple>) {
@@ -1857,7 +1885,7 @@ impl<'a> BranchView<'a> {
                         staged
                             .matching(&sorted_positions, &encoded)
                             .into_iter()
-                            .map(|tuple| padded(tuple, width)),
+                            .map(|tuple| padded(tuple, &shape)),
                     );
                     Some(&*staged)
                 }
@@ -1869,7 +1897,7 @@ impl<'a> BranchView<'a> {
                 .matching(&sorted_positions, &encoded)
                 .into_iter()
                 .filter(|tuple| tuple.row_id.is_some_and(|row_id| !staged_decides(row_id)))
-                .map(|tuple| padded(tuple, width))
+                .map(|tuple| padded(tuple, &shape))
                 .collect();
             out.extend(committed_matches);
             let decided = |row_id: u64| staged_decides(row_id) || overlay.set.decides(row_id);
@@ -2429,12 +2457,25 @@ impl<'a> BranchView<'a> {
     /// since MERGE copies it by position. That batch cannot be split, so it is
     /// built first, and when it would not fit in one write group nothing at all
     /// is written (54000). Returns the rows written.
+    #[cfg(test)]
     pub(crate) fn materialize(
         &self,
         table: &str,
         current: &Schema,
         record: &super::branch_catalog::BranchTableRecord,
         backfill: &[Value],
+    ) -> Result<u64> {
+        self.materialize_with(table, current, record, &|| Ok(backfill.to_vec()))
+    }
+
+    /// `materialize` with the added columns' values asked for row by row: spec
+    /// R5.2's volatile default gives each row its own. What production calls.
+    pub(crate) fn materialize_with(
+        &self,
+        table: &str,
+        current: &Schema,
+        record: &super::branch_catalog::BranchTableRecord,
+        backfill: &dyn Fn() -> Result<Vec<Value>>,
     ) -> Result<u64> {
         let level = self.branch_id;
         let width = current.columns.len();
@@ -2447,7 +2488,7 @@ impl<'a> BranchView<'a> {
         let stage = |batch: &mut WriteBatch, row_id: u64, values: Vec<Value>, copy: bool| -> Result<()> {
             let mut values = values;
             values.truncate(width);
-            extend_row_values(&mut values, width, backfill);
+            extend_row_values(&mut values, width, &backfill()?);
             let tuple = Tuple::new(values);
             self.engine
                 .stage_branch_row_image(batch, level, table, row_id, &tuple, copy)?;
@@ -2532,9 +2573,11 @@ impl<'a> BranchView<'a> {
                     _ => None,
                 };
                 let new: Option<Tuple> = plain
-                    .map(|bytes| {
-                        bincode::deserialize(bytes)
-                            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {e}")))
+                    .map(|bytes| -> Result<Tuple> {
+                        let mut tuple: Tuple = bincode::deserialize(bytes)
+                            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {e}")))?;
+                        self.shape_row(table, width, &mut tuple)?;
+                        Ok(tuple)
                     })
                     .transpose()?;
                 (old, new)
@@ -2613,9 +2656,10 @@ impl<'a> BranchView<'a> {
         self.for_each_with_prefix(
             prefix.as_bytes(),
             |key, raw| match StorageEngine::parse_row_id_after_prefix(key, prefix.len()) {
-                Some(row_id) if !skip.contains(&row_id) => {
-                    each(row_id, self.decode_committed(key, raw, row_id, self.branch_id, width)?)
-                }
+                Some(row_id) if !skip.contains(&row_id) => each(
+                    row_id,
+                    self.decode_committed(table, key, raw, row_id, self.branch_id, width)?,
+                ),
                 _ => Ok(()),
             },
         )

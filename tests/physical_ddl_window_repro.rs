@@ -3,18 +3,18 @@
 //! embedded primary — no daemons, no standby — so each is a defect of the
 //! engine, not of physical replication or of the test harness.
 //!
-//! Every test here but finding (b) beside a reader, which R5 closed, is
-//! `#[ignore]`d: each asserts the CORRECT behaviour of a defect that is reported,
-//! not fixed in R2. Run them with
+//! Each asserts the CORRECT behaviour of a defect reported in R2. R5.1 closed
+//! finding (b) beside a reader and R5.2 findings (a) and (c), and those tests
+//! run. The sequential (b) test is still `#[ignore]`d: run it with
 //! `cargo test --test physical_ddl_window_repro -- --ignored --nocapture`
 //! (and with `--features internal-tests`: finding (b) appeared only in that
 //! build of the daemon test).
 //!
-//! * (a) the primary's own readers see ALTER TABLE … ADD COLUMN … DEFAULT
-//!   half-applied: the schema is written first, then every row in its own
-//!   write group (`EmbeddedDatabase::alter_table_add_column` →
-//!   `StorageEngine::add_column_to_rows`), and nothing keeps a concurrent
-//!   reader out — rows not yet rewritten read NULL, not the default;
+//! * (a) the primary's own readers saw ALTER TABLE … ADD COLUMN … DEFAULT
+//!   half-applied: the schema was written first, then every row in its own
+//!   write group, and nothing kept a concurrent reader out — rows not yet
+//!   rewritten read NULL, not the default. Now no row is rewritten, and the
+//!   schema and the column's missing value are one group;
 //! * (b) `ALTER TABLE ddl_a RENAME TO ddl_b` failed `Table 'ddl_b' already
 //!   exists` at iteration 6 of the workload in the `internal-tests` build of
 //!   the daemon test (both runs, deterministically), although `DROP TABLE
@@ -22,10 +22,10 @@
 //!   clean. Run here sequentially and with a concurrent reader on the same
 //!   database, in either build;
 //! * (c) a row inserted inside a transaction before an `ADD COLUMN … DEFAULT`
-//!   of the same transaction stays narrow: its primary-key point read fails
+//!   of the same transaction stayed narrow: its primary-key point read failed
 //!   `Column index 3 out of bounds in tuple` on the primary (and over the
-//!   wire the bounded point-read path sends a DataRow the client cannot
-//!   parse: the daemon test's `broken 1`).
+//!   wire the bounded point-read path sent a DataRow the client could not
+//!   parse: the daemon test's `broken 1`). Now every decode shapes the row.
 
 #![cfg(feature = "ha-tier1")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
@@ -191,7 +191,6 @@ fn b_the_ddl_window_workload_runs_ten_iterations_beside_a_reader() {
 /// Finding (c): PostgreSQL gives the row the default; the point read must
 /// answer it like the scan does.
 #[test]
-#[ignore = "R2 finding (c): run with --ignored"]
 fn c_a_row_inserted_in_a_transaction_before_its_add_column_default_reads_by_primary_key() {
     let root = tempfile::tempdir().unwrap();
     let database = EmbeddedDatabase::with_config(primary_config(&root.path().join("primary"))).unwrap();
@@ -222,7 +221,6 @@ fn c_a_row_inserted_in_a_transaction_before_its_add_column_default_reads_by_prim
 /// DEFAULT applied to some rows and not others (the column NULL in some,
 /// the default in the rest).
 #[test]
-#[ignore = "R2 finding (a), a primary-side defect: run with --ignored"]
 fn a_the_primarys_own_reader_never_sees_add_column_default_half_applied() {
     const ROWS: usize = 3_000;
     let root = tempfile::tempdir().unwrap();

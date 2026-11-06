@@ -28,6 +28,7 @@ fn test_prepared_statement_manager() {
         cached_plan: None,
         cached_plan_epoch: 0,
         is_catalog: None,
+        result_shape: Default::default(),
     };
 
     manager.store_statement(stmt.clone()).unwrap();
@@ -57,6 +58,7 @@ fn test_portal_manager() {
         param_formats: vec![0],
         result_formats: vec![0],
         state: PortalState::Ready,
+        shape: Default::default(),
     };
 
     manager.store_portal(portal.clone()).unwrap();
@@ -89,6 +91,7 @@ fn test_capacity_limits() {
             cached_plan: None,
             cached_plan_epoch: 0,
             is_catalog: None,
+            result_shape: Default::default(),
         };
         manager.store_statement(stmt).unwrap();
     }
@@ -102,6 +105,7 @@ fn test_capacity_limits() {
         cached_plan: None,
         cached_plan_epoch: 0,
         is_catalog: None,
+        result_shape: Default::default(),
     };
     manager.store_statement(stmt).unwrap();
     // stmt0 should have been evicted
@@ -117,6 +121,7 @@ fn test_capacity_limits() {
             param_formats: vec![],
             result_formats: vec![],
             state: PortalState::Ready,
+            shape: Default::default(),
         };
         manager.store_portal(portal).unwrap();
     }
@@ -129,6 +134,7 @@ fn test_capacity_limits() {
         param_formats: vec![],
         result_formats: vec![],
         state: PortalState::Ready,
+        shape: Default::default(),
     };
     assert!(manager.store_portal(portal).is_err());
 }
@@ -289,6 +295,7 @@ fn test_clear_all() {
             cached_plan: None,
             cached_plan_epoch: 0,
             is_catalog: None,
+            result_shape: Default::default(),
         };
         manager.store_statement(stmt).unwrap();
 
@@ -299,6 +306,7 @@ fn test_clear_all() {
             param_formats: vec![],
             result_formats: vec![],
             state: PortalState::Ready,
+            shape: Default::default(),
         };
         manager.store_portal(portal).unwrap();
     }
@@ -323,6 +331,7 @@ fn test_portal_state_transitions() {
         param_formats: vec![],
         result_formats: vec![],
         state: PortalState::Ready,
+        shape: Default::default(),
     };
 
     manager.store_portal(portal).unwrap();
@@ -363,6 +372,7 @@ fn test_unnamed_statement_and_portal() {
         cached_plan: None,
         cached_plan_epoch: 0,
         is_catalog: None,
+        result_shape: Default::default(),
     };
 
     manager.store_statement(stmt).unwrap();
@@ -375,6 +385,7 @@ fn test_unnamed_statement_and_portal() {
         param_formats: vec![0],
         result_formats: vec![0],
         state: PortalState::Ready,
+        shape: Default::default(),
     };
 
     manager.store_portal(portal).unwrap();

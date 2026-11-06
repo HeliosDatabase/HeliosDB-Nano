@@ -96,6 +96,7 @@ fn keys_of(db: &EmbeddedDatabase, table: &str, index: &str) -> Vec<String> {
         "trigger_rowmut:",
         "dict:",
         "meta:col_storage:",
+        "meta:attmissing:",
         "meta:acl:table:",
         "col:",
         "colz:",
@@ -154,6 +155,7 @@ fn drop_table_leaves_no_catalog_orphan_and_its_checkpoint_hydrates() {
         // column and by the inserts after it (tests/keyspace_wal_corpus.rs).
         "ALTER TABLE doomed ALTER COLUMN status SET STORAGE DICTIONARY",
         "INSERT INTO doomed (email, qty, pid, status) VALUES ('c@example.com', 3, 1, 'closed')",
+        "ALTER TABLE doomed ADD COLUMN flag INT DEFAULT 7",
         "GRANT SELECT ON doomed TO reader",
         "CREATE FUNCTION doomed_rewrite() RETURNS TRIGGER AS $$ BEGIN NEW.status = 'rewritten'; RETURN NEW; END $$ \
          LANGUAGE plpgsql",
@@ -169,6 +171,7 @@ fn drop_table_leaves_no_catalog_orphan_and_its_checkpoint_hydrates() {
         "meta:identity:doomed",
         "meta:index:doomed_qty_idx",
         "dict:doomed:status",
+        "meta:attmissing:doomed:flag",
         "meta:acl:table:doomed:reader",
         "trigger:doomed:doomed_trigger",
     ] {
