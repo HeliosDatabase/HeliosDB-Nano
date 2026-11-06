@@ -326,6 +326,24 @@ impl Drop for MergedKeysClaim {
     }
 }
 
+/// One row a transaction has staged a change of, as
+/// [`ArtIndexManager::apply_staged_rows_to_index`] takes it: both images full width.
+pub(crate) struct StagedIndexRow {
+    pub(crate) row_id: RowId,
+    /// The committed image: `None` for a row only this transaction has.
+    pub(crate) committed: Option<Tuple>,
+    /// The staged image: `None` for a staged delete.
+    pub(crate) staged: Option<Tuple>,
+}
+
+/// One such row's keys in one index. `None`: the image has no entry there.
+#[derive(Debug, Clone)]
+pub(crate) struct StagedIndexKeys {
+    pub(crate) row_id: RowId,
+    pub(crate) committed: Option<Vec<u8>>,
+    pub(crate) staged: Option<Vec<u8>>,
+}
+
 /// Metadata about a foreign key constraint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForeignKeyInfo {
@@ -1187,6 +1205,117 @@ impl ArtIndexManager {
         }
 
         Ok(inserted)
+    }
+
+    /// Spec R5.2: bring one manual or UNIQUE index, just built from the committed
+    /// rows, up to what a transaction has staged: every committed key a staged
+    /// change replaces comes out first, then every staged key goes in, as if the
+    /// index had existed when the transaction wrote them. A duplicate is an error,
+    /// and the caller drops the index. Returns each row's keys for
+    /// [`Self::restore_committed_rows_in_index`].
+    pub(crate) fn apply_staged_rows_to_index(
+        &self,
+        name: &str,
+        schema: &Schema,
+        rows: &[StagedIndexRow],
+    ) -> ArtResult<Vec<StagedIndexKeys>> {
+        self.note_mutation();
+        let entry = {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            indexes
+                .get(name)
+                .cloned()
+                .ok_or_else(|| ArtIndexError::IndexNotFound(name.to_string()))?
+        };
+        let key_of = |tuple: &Tuple| -> Option<Vec<u8>> {
+            let values = Self::index_value_refs_from_tuple(&entry.columns, schema, tuple)?;
+            if Self::key_is_null_distinct(entry.index_type, values.iter().copied()) {
+                return None;
+            }
+            Some(Self::encode_key_from_values(values.iter().copied()))
+        };
+        let keys: Vec<StagedIndexKeys> = rows
+            .iter()
+            .map(|row| StagedIndexKeys {
+                row_id: row.row_id,
+                committed: row.committed.as_ref().and_then(&key_of),
+                staged: row.staged.as_ref().and_then(&key_of),
+            })
+            .collect();
+        let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+        for row in &keys {
+            if row.committed != row.staged {
+                if let Some(key) = &row.committed {
+                    Self::remove_row_key(&mut index, entry.index_type, key, row.row_id)?;
+                }
+            }
+        }
+        for row in &keys {
+            if row.committed != row.staged {
+                if let Some(key) = &row.staged {
+                    index.insert(key, row.row_id).map_err(|error| match error {
+                        ArtIndexError::DuplicateKey(_) => ArtIndexError::DuplicateKey(format!(
+                            "Duplicate key value violates UNIQUE constraint \"{}\"",
+                            Self::violation_name(&entry, name)
+                        )),
+                        other => other,
+                    })?;
+                }
+            }
+        }
+        Ok(keys)
+    }
+
+    /// The ROLLBACK of [`Self::apply_staged_rows_to_index`]: these rows' entries
+    /// in the index are their committed keys again. Safe after the transaction's
+    /// other undo entries have run over the same index, whichever of them could
+    /// see its columns: a key already gone stays gone, one already back is not
+    /// added twice. An index dropped since has nothing to restore.
+    pub(crate) fn restore_committed_rows_in_index(&self, name: &str, rows: &[StagedIndexKeys]) -> ArtResult<()> {
+        self.note_mutation();
+        let entry = {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            match indexes.get(name) {
+                Some(entry) => entry.clone(),
+                None => return Ok(()),
+            }
+        };
+        let mut index = entry.tree.write().unwrap_or_else(|e| e.into_inner());
+        for row in rows {
+            if row.committed != row.staged {
+                if let Some(key) = &row.staged {
+                    if index.get_all(key).contains(&row.row_id) {
+                        Self::remove_row_key(&mut index, entry.index_type, key, row.row_id)?;
+                    }
+                }
+            }
+        }
+        for row in rows {
+            if let Some(key) = &row.committed {
+                if !index.get_all(key).contains(&row.row_id) {
+                    index.insert(key, row.row_id)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Take `row_id`'s entry for `key` out of one tree.
+    fn remove_row_key(
+        index: &mut AdaptiveRadixTree,
+        index_type: ArtIndexType,
+        key: &[u8],
+        row_id: RowId,
+    ) -> ArtResult<()> {
+        match index_type {
+            ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
+                index.remove(key)?;
+            }
+            ArtIndexType::ForeignKey | ArtIndexType::Manual => {
+                index.remove_value(key, row_id)?;
+            }
+        }
+        Ok(())
     }
 
     /// Backfill a foreign-key index from existing rows. Mirrors

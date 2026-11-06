@@ -272,6 +272,29 @@ pub const BRANCH_MERGE_KEY_CLAIMED_MARKER: &str = "another transaction holds the
 /// ([`Error::branch_materialize_too_large`]). SQLSTATE 54000.
 pub const BRANCH_MATERIALIZE_TOO_LARGE_MARKER: &str = "too large for one atomic write";
 
+/// Spec R5.2, decision 2(h): the marker of a prepared statement whose result
+/// shape moved after it was Described, refused at Execute with nothing run
+/// ([`Error::cached_plan_result_changed`]), and of a result row whose field count
+/// differs from its row description, the last-resort check in every wire writer
+/// (`storage::row_shape::refuse_mismatched_row`). PostgreSQL's words. SQLSTATE
+/// 0A000.
+pub const ROW_DESCRIPTION_MISMATCH_MARKER: &str = "cached plan must not change result type";
+
+/// Decision 2(h): what says a [`ROW_DESCRIPTION_MISMATCH_MARKER`] refusal came before
+/// the statement ran, so a client may prepare it again and retry it: the PG wire
+/// then names PostgreSQL's routine (`R = RevalidateCachedQuery`).
+pub const RESULT_TYPE_REFUSED_BEFORE_RUN_MARKER: &str = "the statement did not run";
+
+/// Spec R5.2: the marker of a schema statement refused because the transaction
+/// it runs in has staged rows of the table it would change
+/// ([`Error::ddl_over_staged_rows`]). SQLSTATE 0A000.
+pub const DDL_OVER_STAGED_ROWS_MARKER: &str = "after writing it in the same transaction is not supported";
+
+/// Spec R5.2: the marker of a volatile `ADD COLUMN` whose rewrite passes
+/// `[storage] max_atomic_rewrite_bytes` ([`Error::atomic_rewrite_too_large`]).
+/// SQLSTATE 54000.
+pub const ATOMIC_REWRITE_TOO_LARGE_MARKER: &str = "exceeds [storage] max_atomic_rewrite_bytes";
+
 /// sprinter 6bc4a4040eb7 (B3 second fix pass): the marker of a statement that
 /// waited too long for a schema statement on its branch to finish
 /// ([`Error::branch_statement_waited`]). SQLSTATE 55006.
@@ -641,6 +664,52 @@ impl Error {
         Error::QueryExecution(format!(
             "table {table} is being merged by MERGE BRANCH {source} INTO {target}, which {BRANCH_MERGE_BUSY_MARKER} \
              when it has"
+        ))
+    }
+
+    /// Spec R5.2: `ADD COLUMN` with no usable value for a NOT NULL column, on a
+    /// table with rows. Nothing was written. SQLSTATE 23502 (the message carries
+    /// [`NOT_NULL_VIOLATION_MARKER`]).
+    pub fn add_column_null_on_existing_rows(table: &str, column: &str) -> Self {
+        Error::ConstraintViolation(format!(
+            "column \"{column}\" of relation \"{table}\" contains null values: adding it with no usable default \
+             {NOT_NULL_VIOLATION_MARKER} on the existing rows"
+        ))
+    }
+
+    /// Spec R5.2: a volatile `ADD COLUMN`, which gives every row its own value and
+    /// so rewrites every row in one write group, measured above the configured
+    /// cap. Nothing was written. SQLSTATE 54000.
+    pub fn atomic_rewrite_too_large(table: &str, bytes: u64, limit: u64) -> Self {
+        Error::QueryExecution(format!(
+            "ALTER TABLE {table} ADD COLUMN with a volatile default rewrites every row in one atomic write, and \
+             at {bytes} bytes it {ATOMIC_REWRITE_TOO_LARGE_MARKER} ({limit}): nothing was written. Add the column \
+             without a default, then UPDATE it in batches, or raise the setting"
+        ))
+    }
+
+    /// Decision 2(h): a statement Described as `described` whose plan now returns
+    /// `now`. Nothing has run: a client that prepares it again and executes it
+    /// applies it once. SQLSTATE 0A000.
+    pub fn cached_plan_result_changed(described: &str, now: &str) -> Self {
+        Error::QueryExecution(format!(
+            "{ROW_DESCRIPTION_MISMATCH_MARKER}: it was described as ({described}) and would now return ({now}); \
+             {RESULT_TYPE_REFUSED_BEFORE_RUN_MARKER}. Prepare it again (or Describe it again) to get the new result type"
+        ))
+    }
+
+    /// Spec R5.2: `statement` on `table`, with rows of it staged by the
+    /// transaction it runs in. Those rows would commit under the old layout, or
+    /// go unseen by what the statement builds. Nothing was written. SQLSTATE
+    /// 0A000. On the PostgreSQL wire and the embedded API the error aborts the
+    /// transaction, so a `COMMIT` after it discards those rows: the message says
+    /// so, and what to do instead.
+    pub fn ddl_over_staged_rows(statement: &str, table: &str) -> Self {
+        Error::QueryExecution(format!(
+            "{statement} of table \"{table}\" {DDL_OVER_STAGED_ROWS_MARKER}. Where this error aborts the \
+             transaction (the PostgreSQL wire, the embedded API), its writes are discarded, a COMMIT included: \
+             commit the rows in a transaction of their own, then run the statement. A restore in one \
+             transaction (psql -1) has to be split there"
         ))
     }
 

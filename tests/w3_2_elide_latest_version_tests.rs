@@ -267,17 +267,18 @@ fn as_of_before_alter_add_column_preserves_elided_pre_image() {
 
     db.execute("ALTER TABLE t ADD COLUMN b INT DEFAULT 99").unwrap();
 
-    // Pre-ALTER AS-OF must project the added column as NULL (W3.5 null_pad on the
-    // materialized 2-value pre-image), NEVER the 99 DEFAULT backfill.
+    // Spec R5.2: no row is rewritten, so the elided pre-image still lies in the
+    // narrow `data:` row; a version older than the column reads its missing value,
+    // as PostgreSQL's old tuples do.
     let rows = db
         .query(&format!("SELECT * FROM t AS OF TIMESTAMP '{}'", ts_before_alter), &[])
         .expect("a pre-ALTER AS OF read must succeed");
     assert_eq!(rows.len(), 1);
     assert_eq!(as_i64(&rows[0].values[1]), 10, "column a resolves to the insert value");
-    assert!(
-        matches!(rows[0].values.get(2), Some(Value::Null)),
-        "the column added after the AS-OF ts must project as NULL, not the DEFAULT backfill, got {:?}",
-        rows[0].values.get(2)
+    assert_eq!(
+        as_i64(&rows[0].values[2]),
+        99,
+        "a row version older than the column reads its missing value"
     );
 
     // The live read observes the backfill (sanity: the ALTER landed).

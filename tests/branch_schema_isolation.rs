@@ -227,6 +227,7 @@ fn main_catalog_state(db: &EmbeddedDatabase) -> (usize, u64) {
             "meta:function:",
             "meta:procedure:",
             "meta:identity:",
+            "meta:attmissing:",
             "meta:schema:",
             "table_constraints:",
             "constraint:",
@@ -1406,10 +1407,11 @@ fn merge_interrupted_then_reopened_is_finished_at_open() {
     }
 }
 
-/// A failure between an ADD COLUMN's schema update and its backfill, twice: every
-/// row ends up exactly one column wider, in storage.
+/// A failure right after an ADD COLUMN's step, twice. Spec R5.2: the schema and the
+/// missing value are one group, so a rerun finds the step done; no row of main is
+/// rewritten. Only the row the branch changed lands wider, in storage, exactly once.
 #[test]
-fn merge_failure_inside_add_column_backfill_is_idempotent() {
+fn merge_failure_after_an_add_column_step_is_idempotent() {
     for family in FAMILIES {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         seed_and_add_currency(&db, family);
@@ -1435,6 +1437,7 @@ fn merge_failure_inside_add_column_backfill_is_idempotent() {
         let mut read_opts = rocksdb::ReadOptions::default();
         read_opts.set_total_order_seek(true);
         let prefix = b"data:orders:";
+        let mut widths = Vec::new();
         for item in raw.iterator_opt(
             rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
             read_opts,
@@ -1444,8 +1447,14 @@ fn merge_failure_inside_add_column_backfill_is_idempotent() {
                 break;
             }
             let tuple: Tuple = bincode::deserialize(&value).unwrap();
-            assert_eq!(tuple.values.len(), 3, "[{family:?}] widened exactly once");
+            widths.push(tuple.values.len());
         }
+        widths.sort_unstable();
+        assert_eq!(
+            widths,
+            vec![2, 2, 3],
+            "[{family:?}] the row the branch changed landed; main's others were not rewritten"
+        );
     }
 }
 
@@ -4681,15 +4690,12 @@ fn a_result_cached_during_a_merge_does_not_outlive_the_table_landing() {
     assert_eq!(hundreds(), 2, "`aa` landed");
 }
 
-/// Scripts w16, w17: an autocommit UPDATE racing the rewrite of an `ADD COLUMN`, in a
-/// merge and in main's own statement. The UPDATE's read-modify-write can put a narrow
-/// row back after the backfill passed it, so it reads `x IS NULL` instead of its
-/// default, and a primary-key read can fail. Pre-existing on main's own ALTER, so not
-/// the merge's to fix: R5's attmissing does away with the rewrite
-/// (`g/R5_decisions.md` item 4), and this test goes in with it.
+/// Scripts w16, w17: an autocommit UPDATE racing an `ADD COLUMN`, in a merge and in
+/// main's own statement. It used to be able to put a narrow row back after the
+/// backfill passed it, so the row read `x IS NULL` and a primary-key read failed.
+/// Spec R5.2: there is no backfill, and a narrow row reads the missing value.
 #[test]
-#[ignore = "R5 (attmissing) closes this; it fails today, as main's own ALTER does"]
-fn an_add_column_backfill_survives_autocommit_updates() {
+fn an_add_column_default_survives_autocommit_updates() {
     const ROWS: i32 = 3000;
     for through_a_merge in [true, false] {
         let db = EmbeddedDatabase::new_in_memory().unwrap();

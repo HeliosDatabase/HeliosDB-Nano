@@ -678,6 +678,84 @@ fn a_standby_engine_is_hydrated_once_by_its_sql_layer() {
     assert_eq!(standby.refusals(), 0);
 }
 
+/// Spec R5.2: a column's missing value replicates in the schema's own group, and
+/// the standby's applier publishes it: a row of the standby older than the column
+/// reads it, whichever key arrives next, on every read path, with no row rewritten.
+#[test]
+fn a_standby_reads_a_columns_missing_value_and_follows_its_life() {
+    let standby = Standby::new(&[
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+        "INSERT INTO t VALUES (1, 10), (2, 20)",
+        "CREATE INDEX t_v ON t (v)",
+    ]);
+    // Read first, so the standby has loaded "this table has no missing values".
+    assert_eq!(
+        standby.db().query("SELECT * FROM t WHERE id = 1", &[]).unwrap().len(),
+        1
+    );
+    let db = standby.db();
+    let read = |sql: &str| values(db.query(sql, &[]).unwrap());
+
+    standby.run(&["ALTER TABLE t ADD COLUMN x INT DEFAULT 5"]);
+    standby.sync();
+    assert_eq!(
+        read("SELECT * FROM t WHERE id = 1"),
+        vec![vec![Value::Int4(1), Value::Int4(10), Value::Int4(5)]],
+        "the primary-key point read"
+    );
+    assert_eq!(
+        read("SELECT id, x FROM t ORDER BY id"),
+        vec![
+            vec![Value::Int4(1), Value::Int4(5)],
+            vec![Value::Int4(2), Value::Int4(5)]
+        ],
+        "the scan"
+    );
+    assert_eq!(
+        read("SELECT x FROM t WHERE v = 20"),
+        vec![vec![Value::Int4(5)]],
+        "the index scan"
+    );
+    assert_eq!(count(&db.query("SELECT count(*) FROM t WHERE x = 5", &[]).unwrap()), 2);
+
+    // A row changed after the column came: index maintenance decodes the narrow
+    // pre-image, the new row is whole.
+    standby.run(&["UPDATE t SET v = 21, x = 6 WHERE id = 2"]);
+    standby.sync();
+    assert_eq!(
+        read("SELECT id, x FROM t WHERE v = 21"),
+        vec![vec![Value::Int4(2), Value::Int4(6)]]
+    );
+    assert!(read("SELECT id FROM t WHERE v = 20").is_empty());
+
+    // RENAME COLUMN carries it; DROP COLUMN and re-adding the name does not
+    // resurrect it; RENAME TABLE carries it; DROP TABLE purges it.
+    standby.run(&["ALTER TABLE t RENAME COLUMN x TO y"]);
+    standby.sync();
+    assert_eq!(read("SELECT y FROM t WHERE id = 1"), vec![vec![Value::Int4(5)]]);
+    standby.run(&["ALTER TABLE t DROP COLUMN y", "ALTER TABLE t ADD COLUMN y INT"]);
+    standby.sync();
+    assert_eq!(read("SELECT y FROM t WHERE id = 1"), vec![vec![Value::Null]]);
+    standby.run(&[
+        "ALTER TABLE t ADD COLUMN z TEXT DEFAULT 'z'",
+        "ALTER TABLE t RENAME TO t2",
+    ]);
+    standby.sync();
+    assert_eq!(
+        read("SELECT z FROM t2 WHERE id = 1"),
+        vec![vec![Value::String("z".into())]]
+    );
+    standby.run(&[
+        "DROP TABLE t2",
+        "CREATE TABLE t2 (id INT PRIMARY KEY)",
+        "INSERT INTO t2 VALUES (1)",
+        "ALTER TABLE t2 ADD COLUMN z TEXT",
+    ]);
+    standby.sync();
+    assert_eq!(read("SELECT z FROM t2 WHERE id = 1"), vec![vec![Value::Null]]);
+    assert_eq!(standby.refusals(), 0);
+}
+
 /// sprinter 6bc4a4040eb7 (B3 second fix pass): a standby receives an unfinished
 /// MERGE's intent as bytes, and does nothing about it: its primary's completion
 /// replicates. It writes nothing trying, and goes on serving reads.

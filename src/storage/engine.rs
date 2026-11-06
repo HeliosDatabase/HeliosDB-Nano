@@ -2219,6 +2219,10 @@ pub struct StorageEngine {
     // all concurrent reads, capping point-read scaling (~48k tps @ c=32). DashMap
     // shards the lock so concurrent schema lookups don't contend.
     schema_cache: Arc<dashmap::DashMap<String, crate::Schema>>,
+    /// Spec R5.2: each table's `meta:attmissing:` values, read once (a table with
+    /// none too), so the row-shape funnel pays no read per row. Lives and dies
+    /// with the schema cache's entry; see `storage::row_shape` for its rule.
+    pub(super) missing_values_cache: Arc<dashmap::DashMap<String, Option<Arc<super::row_shape::MissingValues>>>>,
     /// Generation-stamped catalog-existence cache (W1.3). Maps a table name to
     /// its `TableKind`, letting the indexed-scan fast paths skip two RocksDB
     /// metadata point-gets (`view_exists` + `table_exists`) per probe. Each
@@ -2822,7 +2826,14 @@ impl StorageEngine {
     /// synchronous-replication wait is NOT made here: the caller makes it
     /// last ([`DdlWrite::wait_replicated`]), after its in-memory finalization,
     /// so no standby round trip sits inside the DDL's critical section.
-    pub(crate) fn write_ddl_batch(&self, operation: WalOperation, mut batch: WriteBatch) -> Result<DdlWrite> {
+    pub(crate) fn write_ddl_batch(&self, operation: WalOperation, batch: WriteBatch) -> Result<DdlWrite> {
+        self.write_ddl_batch_ops(vec![operation], batch)
+    }
+
+    /// [`Self::write_ddl_batch`] for a DDL whose logical-WAL history is several
+    /// entries, all riding the one group: spec R5.2's `ADD COLUMN` (the schema
+    /// and each column's missing value).
+    pub(crate) fn write_ddl_batch_ops(&self, operations: Vec<WalOperation>, mut batch: WriteBatch) -> Result<DdlWrite> {
         let options = self.memory_write_options.as_ref();
         let wal = if self.is_replaying.load(Ordering::Acquire) {
             None
@@ -2834,7 +2845,7 @@ impl StorageEngine {
             return Ok(DdlWrite { barrier: None });
         };
         let wal = wal.read();
-        let staged = wal.stage(vec![operation], &mut batch)?;
+        let staged = wal.stage(operations, &mut batch)?;
         if let Err(error) = self.db_write(batch, options) {
             if let Some(staged) = staged {
                 wal.abandon_staged(staged);
@@ -3653,6 +3664,7 @@ impl StorageEngine {
                 std::time::Duration::from_micros(config.storage.group_commit_window_us),
             )),
             schema_cache: Arc::new(dashmap::DashMap::new()),
+            missing_values_cache: Arc::new(dashmap::DashMap::new()),
             existence_cache: Arc::new(dashmap::DashMap::new()),
             schema_generation: Arc::new(AtomicU64::new(0)),
             write_watermarks: Arc::new(dashmap::DashMap::new()),
@@ -4104,6 +4116,7 @@ impl StorageEngine {
                 std::time::Duration::from_micros(config.storage.group_commit_window_us),
             )),
             schema_cache: Arc::new(dashmap::DashMap::new()),
+            missing_values_cache: Arc::new(dashmap::DashMap::new()),
             existence_cache: Arc::new(dashmap::DashMap::new()),
             schema_generation: Arc::new(AtomicU64::new(0)),
             write_watermarks: Arc::new(dashmap::DashMap::new()),
@@ -4141,6 +4154,7 @@ impl StorageEngine {
     /// Invalidate a cached schema (call on DDL changes)
     pub fn invalidate_schema_cache(&self, table_name: &str) {
         self.schema_cache.remove(table_name);
+        self.invalidate_missing_values(table_name);
     }
 
     /// Current schema generation (W1.3). Diagnostic/test surface for the
@@ -4264,6 +4278,7 @@ impl StorageEngine {
     /// Clear all cached schemas (call on bulk DDL operations)
     pub fn clear_schema_cache(&self) {
         self.schema_cache.clear();
+        self.clear_missing_values();
     }
 
     /// Get cached constraints for a table
@@ -5940,6 +5955,10 @@ impl StorageEngine {
             }
         }
 
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -5955,7 +5974,7 @@ impl StorageEngine {
                 break;
             }
 
-            let mut tuple = self.decode_rowstore_columns(&raw_value, &requested, schema.columns.len())?;
+            let mut tuple = self.decode_rowstore_columns(&raw_value, &requested, schema.columns.len(), missing)?;
             if !row_tuple_matches_filters(&tuple, &filter_predicates) {
                 continue;
             }
@@ -5979,6 +5998,10 @@ impl StorageEngine {
             return Ok(None);
         }
 
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -5999,9 +6022,11 @@ impl StorageEngine {
 
             let mut matched = true;
             for filter in filters {
-                let Some(decoded) =
-                    crate::storage::prefix_decode::decode_tuple_numeric_column_value(row_bytes, filter.column_index)
-                else {
+                let Some(decoded) = crate::storage::prefix_decode::decode_tuple_numeric_column_value(
+                    row_bytes,
+                    filter.column_index,
+                    missing,
+                ) else {
                     return Ok(None);
                 };
                 let Some(filter_matches) = decoded_integer_matches_filter(decoded, *filter) else {
@@ -6016,7 +6041,7 @@ impl StorageEngine {
                 continue;
             }
 
-            let mut tuple = self.decode_rowstore_columns(row_bytes, requested, schema.columns.len())?;
+            let mut tuple = self.decode_rowstore_columns(row_bytes, requested, schema.columns.len(), missing)?;
             if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
                 tuple.row_id = Some(row_id);
             }
@@ -6126,6 +6151,10 @@ impl StorageEngine {
             .map(|predicate| requested_pos(predicate.column_index))
             .collect::<Result<Vec<_>>>()?;
 
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -6142,7 +6171,13 @@ impl StorageEngine {
                 break;
             }
 
-            self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
+            self.decode_rowstore_column_values_into(
+                &raw_value,
+                &requested,
+                schema.columns.len(),
+                missing,
+                &mut values,
+            )?;
             if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
                 continue;
             }
@@ -6188,6 +6223,10 @@ impl StorageEngine {
             .map(|&idx| output_pos(idx))
             .collect::<Result<Vec<_>>>()?;
 
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -6207,9 +6246,12 @@ impl StorageEngine {
             let stored = self.decode_stored_ref(&key, raw_value.as_ref())?;
             let row_bytes: &[u8] = &stored;
 
-            let Some(matches) =
-                crate::storage::prefix_decode::tuple_string_column_eq(row_bytes, filter.column_index, filter.value)
-            else {
+            let Some(matches) = crate::storage::prefix_decode::tuple_string_column_eq(
+                row_bytes,
+                filter.column_index,
+                filter.value,
+                missing,
+            ) else {
                 return Ok(None);
             };
             if !matches {
@@ -6220,6 +6262,7 @@ impl StorageEngine {
                 row_bytes,
                 &output_requested,
                 schema.columns.len(),
+                missing,
                 &mut values,
             )
             .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
@@ -6367,6 +6410,10 @@ impl StorageEngine {
             }
         }
 
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -6403,6 +6450,7 @@ impl StorageEngine {
                     &stored,
                     &default_requested,
                     schema.columns.len(),
+                    missing,
                     &mut default_values,
                 )
                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
@@ -6456,6 +6504,10 @@ impl StorageEngine {
             .map(|&idx| output_pos(idx))
             .collect::<Result<Vec<_>>>()?;
 
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -6477,9 +6529,11 @@ impl StorageEngine {
 
             let mut matched = true;
             for filter in filters {
-                let Some(decoded) =
-                    crate::storage::prefix_decode::decode_tuple_numeric_column_value(row_bytes, filter.column_index)
-                else {
+                let Some(decoded) = crate::storage::prefix_decode::decode_tuple_numeric_column_value(
+                    row_bytes,
+                    filter.column_index,
+                    missing,
+                ) else {
                     return Ok(None);
                 };
                 let Some(filter_matches) = decoded_integer_matches_filter(decoded, *filter) else {
@@ -6498,6 +6552,7 @@ impl StorageEngine {
                 row_bytes,
                 &output_requested,
                 schema.columns.len(),
+                missing,
                 &mut values,
             )
             .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
@@ -6562,6 +6617,10 @@ impl StorageEngine {
             .ok_or_else(|| Error::storage(format!("Column index {} out of bounds for {}", sort_column, table_name)))?
             .data_type;
 
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -6578,7 +6637,8 @@ impl StorageEngine {
             }
 
             let stored = self.decode_stored_ref(&key, &raw_value)?;
-            let sort_value = crate::storage::prefix_decode::decode_tuple_numeric_column_value(&stored, sort_column);
+            let sort_value =
+                crate::storage::prefix_decode::decode_tuple_numeric_column_value(&stored, sort_column, missing);
             let Some(crate::storage::prefix_decode::DecodedNumericValue::Int(sort_key)) = sort_value else {
                 return Ok(None);
             };
@@ -6609,8 +6669,12 @@ impl StorageEngine {
         let entries = heap.into_sorted_vec();
         let mut tuples = Vec::with_capacity(entries.len());
         for entry in entries {
-            let output_values =
-                self.decode_rowstore_column_values(&entry.raw_value, &output_decode_columns, schema.columns.len())?;
+            let output_values = self.decode_rowstore_column_values(
+                &entry.raw_value,
+                &output_decode_columns,
+                schema.columns.len(),
+                missing,
+            )?;
             let mut projected_values = Vec::with_capacity(output_sources.len());
             for source in &output_sources {
                 match source {
@@ -6711,6 +6775,10 @@ impl StorageEngine {
             .collect::<Result<Vec<_>>>()?;
         let asc = Arc::new(asc.to_vec());
 
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -6727,7 +6795,13 @@ impl StorageEngine {
                 break;
             }
 
-            self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
+            self.decode_rowstore_column_values_into(
+                &raw_value,
+                &requested,
+                schema.columns.len(),
+                missing,
+                &mut values,
+            )?;
             let replace = if heap.len() < k {
                 true
             } else {
@@ -8126,6 +8200,10 @@ impl StorageEngine {
         let mut small_groups: Vec<(Option<String>, CountSumIntState)> = Vec::new();
         let mut hash_groups: Option<HashMap<Option<String>, CountSumIntState>> = None;
 
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
 
@@ -8149,6 +8227,7 @@ impl StorageEngine {
                                 bytes,
                                 group_column,
                                 sum_column,
+                                missing,
                             )
                         else {
                             // Undecodable row: signal the caller to fall back
@@ -8190,9 +8269,12 @@ impl StorageEngine {
                 }
 
                 let stored = self.decode_stored_ref(&key, &raw_value)?;
-                let Some((group_key, sum_value)) =
-                    crate::storage::prefix_decode::decode_tuple_text_and_int_columns(&stored, group_column, sum_column)
-                else {
+                let Some((group_key, sum_value)) = crate::storage::prefix_decode::decode_tuple_text_and_int_columns(
+                    &stored,
+                    group_column,
+                    sum_column,
+                    missing,
+                ) else {
                     return Ok(None);
                 };
                 update_text_count_sum_group(
@@ -8320,6 +8402,10 @@ impl StorageEngine {
             }
         }
 
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
 
@@ -8342,6 +8428,7 @@ impl StorageEngine {
                         let decoded = crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
                             &stored,
                             &requested,
+                            missing,
                             &mut values,
                         );
                         if decoded.is_none() {
@@ -8380,6 +8467,7 @@ impl StorageEngine {
                 let decoded = crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
                     &stored,
                     &requested,
+                    missing,
                     &mut values,
                 );
                 if decoded.is_none() {
@@ -8413,6 +8501,10 @@ impl StorageEngine {
         sum_position: usize,
         avg_position: usize,
     ) -> Result<Option<Tuple>> {
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
 
@@ -8440,6 +8532,7 @@ impl StorageEngine {
                     let decoded = crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
                         &stored,
                         requested,
+                        missing,
                         &mut values,
                     );
                     if decoded.is_none() {
@@ -8501,6 +8594,7 @@ impl StorageEngine {
                 let decoded = crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
                     &stored,
                     requested,
+                    missing,
                     &mut values,
                 );
                 if decoded.is_none() {
@@ -8633,6 +8727,10 @@ impl StorageEngine {
             .map(|predicate| requested_pos(predicate.column_index))
             .collect::<Result<Vec<_>>>()?;
 
+        // Spec R5.2: what a column past a narrow row's end answers (one map
+        // lookup per scan; `prefix_decode` consults it only past the row's end).
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
 
@@ -8666,6 +8764,7 @@ impl StorageEngine {
                             &raw_value,
                             &requested,
                             schema.columns.len(),
+                            missing,
                             &mut values,
                         )?;
                         if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
@@ -8696,7 +8795,13 @@ impl StorageEngine {
                         break;
                     }
 
-                    self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
+                    self.decode_rowstore_column_values_into(
+                        &raw_value,
+                        &requested,
+                        schema.columns.len(),
+                        missing,
+                        &mut values,
+                    )?;
                     if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
                         continue;
                     }
@@ -8738,6 +8843,7 @@ impl StorageEngine {
                             &raw_value,
                             &requested,
                             schema.columns.len(),
+                            missing,
                             &mut values,
                         )?;
                         if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
@@ -8778,7 +8884,13 @@ impl StorageEngine {
                     break;
                 }
 
-                self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
+                self.decode_rowstore_column_values_into(
+                    &raw_value,
+                    &requested,
+                    schema.columns.len(),
+                    missing,
+                    &mut values,
+                )?;
                 if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
                     continue;
                 }
@@ -8848,9 +8960,15 @@ impl StorageEngine {
         Ok(Some(tuples))
     }
 
-    fn decode_rowstore_columns(&self, raw_value: &[u8], columns: &[usize], total_cols: usize) -> Result<Tuple> {
+    fn decode_rowstore_columns(
+        &self,
+        raw_value: &[u8],
+        columns: &[usize],
+        total_cols: usize,
+        missing: Option<&super::row_shape::MissingValues>,
+    ) -> Result<Tuple> {
         let stored = self.decode_stored_anon(raw_value)?;
-        let tuple = crate::storage::prefix_decode::decode_tuple_columns(&stored, columns, total_cols)
+        let tuple = crate::storage::prefix_decode::decode_tuple_columns(&stored, columns, total_cols, missing)
             .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
         Ok(tuple)
     }
@@ -8860,9 +8978,10 @@ impl StorageEngine {
         raw_value: &[u8],
         columns: &[usize],
         total_cols: usize,
+        missing: Option<&super::row_shape::MissingValues>,
     ) -> Result<Vec<Value>> {
         let stored = self.decode_stored_anon(raw_value)?;
-        let values = crate::storage::prefix_decode::decode_tuple_column_values(&stored, columns, total_cols)
+        let values = crate::storage::prefix_decode::decode_tuple_column_values(&stored, columns, total_cols, missing)
             .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
         Ok(values)
     }
@@ -8872,50 +8991,12 @@ impl StorageEngine {
         raw_value: &[u8],
         columns: &[usize],
         total_cols: usize,
+        missing: Option<&super::row_shape::MissingValues>,
         out: &mut Vec<Value>,
     ) -> Result<()> {
         let stored = self.decode_stored_anon(raw_value)?;
-        crate::storage::prefix_decode::decode_tuple_column_values_into(&stored, columns, total_cols, out)
+        crate::storage::prefix_decode::decode_tuple_column_values_into(&stored, columns, total_cols, missing, out)
             .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))
-    }
-
-    /// W3.5 Stage 1: shape a decoded BASE-TABLE tuple to the current catalog
-    /// width `width` at a scan decode boundary.
-    ///
-    /// A base row can decode to a DIFFERENT arity than the catalog now reports
-    /// when a version-resolved (`AS OF` / open-snapshot) or branch-forked read
-    /// surfaces a tuple written under an older schema. Both directions are
-    /// legitimate schema evolution, and both are shaped to `width` here:
-    ///
-    /// - `A < width` (the table GREW via `ADD COLUMN`): the added columns are
-    ///   padded with `Value::Null`, matching what the projected-decode paths
-    ///   (`prefix_decode`) already do — a pre-ALTER snapshot projects the new
-    ///   column as NULL rather than erroring, and never observes the
-    ///   post-snapshot DEFAULT backfill (isolation-preserving; design §3).
-    /// - `A > width` (the table SHRANK via `DROP COLUMN`): the trailing values
-    ///   are TRUNCATED to `width`. `drop_column_from_rows` rewrites `data:` in
-    ///   place with NO new snapshot-resolvable version, so a pre-DROP snapshot
-    ///   legitimately resolves a wider old version, and a `bdata:` fork made
-    ///   before a main DROP is left un-rewritten (still wide). This is NOT
-    ///   corruption — it is exactly what the pre-W3.5 projection did: the plan,
-    ///   built from the current catalog, only ever references indices `< width`
-    ///   (`Tuple::get(idx)` returns `Some` for `idx < len`), so the extra
-    ///   trailing values were already silently ignored. Truncating here
-    ///   preserves that Ok behavior instead of turning a legitimately-old/forked
-    ///   row into a hard error.
-    ///
-    /// A genuine executor/planner wrong-arity — a plan referencing a column
-    /// index that does not exist even in the current catalog — is caught by the
-    /// generic evaluator/aggregate/join guards on INTERMEDIATE tuples; those stay
-    /// hard errors and this base-scan shaper is never applied to them (§1.1).
-    ///
-    /// `Vec::resize` grows (padding with the fill value) or shrinks (truncating)
-    /// in one call and is a no-op when the arity already matches.
-    ///
-    /// This is ONLY invoked under `snapshot_schema_evolution = "null_pad"`;
-    /// under `"strict"` the tuple keeps its stored arity (pre-W3.5 behavior).
-    pub(crate) fn shape_base_tuple_to_width(tuple: &mut Tuple, width: usize) {
-        tuple.values.resize(width, crate::Value::Null);
     }
 
     /// W3.5: whether snapshot / branch base-scan decodes NULL-pad rows written
@@ -8987,8 +9068,8 @@ impl StorageEngine {
     }
 
     /// Decode one stored row value of `table_name` into the tuple a full-row
-    /// scan ([`Self::scan_table_with_schema`]) yields for it: bincode, the W3.5
-    /// width shaping, the row id, and the per-column storage references.
+    /// scan ([`Self::scan_table_with_schema`]) yields for it: bincode, the row
+    /// shape (spec R5.2), the row id, and the per-column storage references.
     /// `stored` is the value as [`Self::get`] returns it — already decrypted.
     ///
     /// The `RowDecodeHint::Full` arm of the decode closure in
@@ -9006,9 +9087,7 @@ impl StorageEngine {
     ) -> Result<Tuple> {
         let mut tuple: Tuple =
             bincode::deserialize(stored).map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-        if self.null_pad_snapshot_schema() {
-            Self::shape_base_tuple_to_width(&mut tuple, schema.columns.len());
-        }
+        self.shape_row(table_name, schema.columns.len(), &mut tuple)?;
         tuple.row_id = Some(row_id);
         self.resolve_column_storage_refs(table_name, schema, row_id, &mut tuple)?;
         Ok(tuple)
@@ -9024,14 +9103,12 @@ impl StorageEngine {
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
 
-        // W3.5 Stage 1: shape a `Full`-decoded row (its stored arity IS its
-        // write-time column count) to the current catalog width. The Prefix /
-        // Columns hints already NULL-fill to `schema.columns.len()`, so the
-        // shaper is a no-op there — this only makes the `Full` bincode path
-        // consistent with them (design §3). The `Full`-hint predicate is
-        // loop-invariant, so fold it into the flag once here rather than
-        // re-testing it per row in the closure.
-        let pad_full = self.null_pad_snapshot_schema() && matches!(decode_hint, RowDecodeHint::Full);
+        // Spec R5.2: the row shape. A `Full`-decoded row keeps its stored arity
+        // until the funnel shapes it; the Prefix / Columns hints build a
+        // `schema.columns.len()`-wide tuple themselves, answering a requested
+        // column past the row's end from the same missing values.
+        let missing = self.missing_values(table_name)?;
+        let missing = missing.as_deref();
         let target_width = schema.columns.len();
 
         let decode = |key: &[u8], raw_value: &[u8]| -> Result<Tuple> {
@@ -9041,24 +9118,21 @@ impl StorageEngine {
                 let stored = self.decode_stored_ref(key, raw_value)?;
                 let mut tuple: Tuple = match decode_hint {
                     RowDecodeHint::Prefix(k) => {
-                        crate::storage::prefix_decode::decode_tuple_prefix(&stored, k, schema.columns.len())
+                        crate::storage::prefix_decode::decode_tuple_prefix(&stored, k, schema.columns.len(), missing)
                     }
-                    RowDecodeHint::Columns(columns) => {
-                        crate::storage::prefix_decode::decode_tuple_columns(&stored, columns, schema.columns.len())
-                    }
+                    RowDecodeHint::Columns(columns) => crate::storage::prefix_decode::decode_tuple_columns(
+                        &stored,
+                        columns,
+                        schema.columns.len(),
+                        missing,
+                    ),
                     RowDecodeHint::Full => bincode::deserialize(&stored),
                 }
                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
-                // W3.5 Stage 1: shape a row written under an older schema to the
-                // current catalog width — NULL-pad an ADD-COLUMN-narrower row,
-                // truncate a DROP-COLUMN-wider one (see `shape_base_tuple_to_width`).
-                // Only the `Full` bincode path decodes at the stored arity — the
-                // Prefix / Columns hints already build a `schema.columns.len()`-
-                // wide tuple, so `pad_full` scopes the shaper to `Full` (design §3).
-                if pad_full {
-                    Self::shape_base_tuple_to_width(&mut tuple, target_width);
-                }
+                // A no-op length comparison for a row that fits, and for every
+                // tuple of the Prefix / Columns hints.
+                super::row_shape::shape_tuple(&mut tuple, target_width, missing);
 
                 // Extract row_id from key (key format: "data:{table_name}:{row_id}")
                 let mut row_id = 0u64;
@@ -9305,6 +9379,7 @@ impl StorageEngine {
             let stored = self.decode_stored_ref(&key, &raw_value)?;
             let mut tuple: Tuple = bincode::deserialize(&stored)
                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            self.shape_row(table_name, schema.columns.len(), &mut tuple)?;
             if let Some(rid) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
                 tuple.row_id = Some(rid);
             }
@@ -9416,6 +9491,7 @@ impl StorageEngine {
                 let stored = self.decode_stored_ref(&key, &raw_value)?;
                 let mut tuple: Tuple = bincode::deserialize(&stored)
                     .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                self.shape_row(table_name, schema.columns.len(), &mut tuple)?;
                 if let Some(rid) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
                     tuple.row_id = Some(rid);
                 }
@@ -9567,10 +9643,12 @@ impl StorageEngine {
         // is no switch to clear on: a branch session neither reads nor fills
         // it, which keeps every entry a MAIN row by construction.
         let use_row_cache = !self.is_branch_active();
-        // Check row cache first
+        let width = schema.columns.len();
+        // Check row cache first. Spec R5.2: it holds rows as stored; the shape is
+        // this reader's (`storage::row_shape`), one length comparison when it fits.
         if use_row_cache {
             if let Some(cached) = self.row_cache.get_arc(table_name, row_id) {
-                return Ok(Some(cached));
+                return Ok(Some(self.shaped_row_arc(table_name, width, cached)?));
             }
         }
 
@@ -9627,9 +9705,11 @@ impl StorageEngine {
             }
         }
 
-        // Populate the row cache and return the shared handle (no deep copy).
+        // Populate the row cache and return the shared handle (no deep copy). A
+        // row wider than this reader's schema stays out: this reader resolved
+        // the storage references of its own columns only.
         let tuple = std::sync::Arc::new(tuple);
-        if use_row_cache {
+        if use_row_cache && tuple.values.len() <= width {
             self.row_cache.put_arc_if_generation(
                 table_name,
                 row_id,
@@ -9639,7 +9719,7 @@ impl StorageEngine {
             );
         }
 
-        Ok(Some(tuple))
+        Ok(Some(self.shaped_row_arc(table_name, width, tuple)?))
     }
 
     fn get_row_by_pk_inner(
@@ -9725,7 +9805,12 @@ impl StorageEngine {
         // the branch-blind row cache (see `get_row_by_id_arc`).
         let use_row_cache = !self.is_branch_active();
         // Check row cache before going to storage
-        if let Some(cached) = use_row_cache.then(|| self.row_cache.get(table_name, row_id)).flatten() {
+        if let Some(mut cached) = use_row_cache.then(|| self.row_cache.get(table_name, row_id)).flatten() {
+            // Spec R5.2: the cache holds rows as stored; the shape is this
+            // reader's. One length comparison when the row fits.
+            if let Some(schema) = schema {
+                self.shape_row(table_name, schema.columns.len(), &mut cached)?;
+            }
             if let (Some(schema), Some((index, _))) = (schema, pk_column) {
                 if self.pk_probe_is_misdirected(&cached, schema, index, effective_pk, &key) {
                     return self.scan_actual_pk_owner(table_name, schema, index, effective_pk, &key);
@@ -9808,6 +9893,16 @@ impl StorageEngine {
             }
         }
 
+        // Spec R5.2: the row shape. The cache keeps the row as stored (see
+        // `storage::row_shape`): a narrow row's stored image is set aside only on
+        // this path, and a row that fits needs nothing but this comparison.
+        let stored_width = tuple.values.len();
+        let width = schema.map_or(stored_width, |schema| schema.columns.len());
+        let stored_image = (stored_width < width && populate_cache_on_miss && use_row_cache).then(|| tuple.clone());
+        if stored_width != width {
+            self.shape_row(table_name, width, &mut tuple)?;
+        }
+
         if let (Some(schema), Some((index, _))) = (schema, pk_column) {
             if self.pk_probe_is_misdirected(&tuple, schema, index, effective_pk, &key) {
                 return self.scan_actual_pk_owner(table_name, schema, index, effective_pk, &key);
@@ -9815,12 +9910,13 @@ impl StorageEngine {
         }
 
         // Populate row cache with resolved tuple for read lookups. Write paths
-        // skip this because they immediately invalidate the same row.
-        if populate_cache_on_miss && use_row_cache {
+        // skip this because they immediately invalidate the same row. A row wider
+        // than this reader's schema stays out: only its own columns were resolved.
+        if populate_cache_on_miss && use_row_cache && stored_width <= width {
             self.row_cache.put_if_generation(
                 table_name,
                 row_id,
-                tuple.clone(),
+                stored_image.unwrap_or_else(|| tuple.clone()),
                 &self.schema_generation,
                 cache_generation,
             );
@@ -9973,6 +10069,10 @@ impl StorageEngine {
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut migrated = 0;
+        // Spec R5.2: a row older than the column holds no value of it; it is
+        // shaped first, so its missing value lands in the column's new storage
+        // (a columnar read never looks in the row).
+        let width = Catalog::new(self).get_table_schema(table_name)?.columns.len();
 
         // Collect keys first to avoid iterator invalidation during modification
         let mut keys_to_migrate = Vec::new();
@@ -10001,6 +10101,7 @@ impl StorageEngine {
             let mut tuple: Tuple = bincode::deserialize(&stored)
                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
+            self.shape_row(table_name, width, &mut tuple)?;
             if col_idx >= tuple.values.len() {
                 continue;
             }
@@ -10115,142 +10216,6 @@ impl StorageEngine {
         Ok(migrated)
     }
 
-    /// The value `ALTER TABLE … ADD COLUMN` gives every EXISTING row: a
-    /// literal `DEFAULT`, else NULL (a non-literal default backfills NULL).
-    /// Shared by main's rewrite ([`Self::add_column_to_rows`]) and a branch's
-    /// materialization (sprinter 6bc4a4040eb7, phase B3), so the two cannot
-    /// disagree about what an existing row holds.
-    pub fn add_column_backfill_value(default_expr: &Option<crate::sql::LogicalExpr>) -> crate::Value {
-        match default_expr {
-            // For simple literal defaults, extract the value
-            Some(crate::sql::LogicalExpr::Literal(v)) => v.clone(),
-            // Complex expressions default to NULL
-            Some(_) | None => crate::Value::Null,
-        }
-    }
-
-    /// Add a new column to all existing rows in a table
-    ///
-    /// This method updates all existing rows by appending a new value
-    /// (NULL or the default value if provided) for the new column.
-    ///
-    /// # Arguments
-    /// * `table_name` - Name of the table
-    /// * `default_expr` - Optional default value expression
-    ///
-    /// # Returns
-    /// Number of rows updated
-    ///
-    /// The value every existing row gets is [`Self::add_column_backfill_value`]
-    /// — the ONE rule a branch's `ADD COLUMN` materialization applies too
-    /// (sprinter 6bc4a4040eb7, phase B3).
-    pub fn add_column_to_rows(
-        &self,
-        table_name: &str,
-        default_expr: &Option<crate::sql::LogicalExpr>,
-    ) -> Result<usize> {
-        let prefix = format!("data:{}:", table_name);
-        let prefix_bytes = prefix.as_bytes();
-        let mut updated = 0;
-
-        // W2.5: this rewrites every `data:` row in place via a raw `db.put` that
-        // records NO snapshot-resolvable version — the current `data:` image then
-        // diverges from what `read_at_snapshot` resolves for each row (the same
-        // shape as the version-skipping fast-UPDATE funnels). Drop the committed-
-        // write watermark BEFORE the first overwrite so an in-transaction reader
-        // whose fast-read gate was open on this table cannot keep fast-reading the
-        // rewritten rows past its snapshot: its post-scan re-check reads the absent
-        // entry as "changed" and falls to the snapshot path (see
-        // `invalidate_write_watermark`). `update_table_schema` on the caller path
-        // does NOT bump the schema generation, so nothing else fences this write.
-        self.invalidate_write_watermark(table_name);
-
-        // Evaluate default expression if provided
-        let default_value = Self::add_column_backfill_value(default_expr);
-
-        // Collect keys first to avoid iterator invalidation
-        let mut keys_to_update = Vec::new();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if key.starts_with(prefix_bytes) {
-                keys_to_update.push(key.to_vec());
-            } else if key.first() > prefix_bytes.first() {
-                break;
-            }
-        }
-
-        // W3.2: this in-place `data:` rewrite is an uncovered mutation funnel —
-        // like the fast UPDATE/DELETE paths it overwrites `data:` with NO new
-        // version, so it must FIRST materialize any elided (flagged) latest
-        // version (whose only copy lives in `data:`) and any COPY-marker-covered
-        // row before widening the row. Otherwise an AS-OF read predating this
-        // ALTER would resolve a flagged event to the widened post-ALTER `data:`,
-        // and W3.5's `null_pad` would pad the added column from that wrong
-        // pre-image instead of the insert-time value. Gate hoisted out of the row
-        // loop: one relaxed atomic load (+ one marker-map probe) when no
-        // elided/COPY rows can exist, matching `materialize_copy_markers_for_table`.
-        let needs_version_materialize =
-            self.snapshot_manager.table_has_copy_markers(table_name) || self.snapshot_manager.maybe_elided_rows();
-
-        // Update each row by appending the new column value
-        for key in keys_to_update {
-            let raw_value = self
-                .db
-                .get(&key)
-                .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?
-                .ok_or_else(|| Error::storage("Row disappeared during update"))?;
-
-            // Deserialize (decrypt first if needed)
-            let stored = self.decode_stored_ref(&key, &raw_value)?;
-            let mut tuple: Tuple = bincode::deserialize(&stored)
-                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-
-            // Append the new column value
-            tuple.values.push(default_value.clone());
-
-            // Serialize, then seal through the one rule, keyed on the key this
-            // row is landing under.
-            let new_value =
-                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-
-            let final_value = super::tde::seal_row_value(self.key_manager.as_deref(), &key, &new_value)?;
-
-            // W3.2: preserve this row's elided/COPY-marker insert version in its
-            // own durable write BEFORE the overwrite below (the materialize reads
-            // the pre-overwrite `data:` and stages `v:` first, same crash-atomic
-            // ordering as the fast UPDATE/DELETE funnels). No-op unless the row's
-            // newest event is flagged or a COPY marker covers it.
-            if needs_version_materialize {
-                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
-                    self.snapshot_manager
-                        .materialize_copy_marker_row_durable(table_name, row_id)?;
-                }
-            }
-
-            self.gate
-                .put(&self.db, &key, final_value.as_ref(), None)
-                .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
-
-            updated += 1;
-        }
-
-        // W2.5: close any watermark entry a concurrent tracked commit
-        // re-established mid-rewrite (mirrors the merge-to-main choke point in
-        // `merge_branch`); the whole map resets to the default-closed snapshot
-        // path until the next snapshot-correct write re-establishes an entry.
-        self.bump_schema_generation();
-        // Every row was rewritten outside the row-cache funnels, so a cached
-        // pre-ALTER image (one value short) would keep answering PK lookups.
-        // After the bump: a fill that read the old bytes was stamped with the
-        // old generation and is refused, so this sweep cannot be undone.
-        self.row_cache.invalidate_table(table_name);
-
-        Ok(updated)
-    }
-
     /// Drop a column from all existing rows in a table
     ///
     /// This method updates all existing rows by removing the value
@@ -10267,14 +10232,14 @@ impl StorageEngine {
         let prefix_bytes = prefix.as_bytes();
         let mut updated = 0;
 
-        // W2.5: like `add_column_to_rows`, this rewrites every `data:` row in
+        // W2.5: this rewrites every `data:` row in
         // place with NO snapshot-resolvable version. Drop the committed-write
         // watermark BEFORE the first overwrite so an in-transaction reader whose
         // fast-read gate was open on this table falls to the snapshot path (see
         // `invalidate_write_watermark`).
         self.invalidate_write_watermark(table_name);
 
-        // W3.2: like `add_column_to_rows`, this in-place `data:` rewrite is an
+        // W3.2: this in-place `data:` rewrite is an
         // uncovered mutation funnel — materialize any elided (flagged) latest
         // version or COPY-marker-covered row before narrowing `data:`, else an
         // AS-OF read predating the DROP loses the pre-drop (wider) value. Gate
@@ -10343,7 +10308,7 @@ impl StorageEngine {
         // W2.5: close any watermark entry a concurrent tracked commit
         // re-established mid-rewrite (mirrors the merge-to-main choke point).
         self.bump_schema_generation();
-        // As in `add_column_to_rows`: a cached pre-DROP image would keep the
+        // A cached pre-DROP image would keep the
         // dropped value in place, shifting every later column of a PK lookup.
         self.row_cache.invalidate_table(table_name);
 
@@ -11810,6 +11775,11 @@ impl StorageEngine {
         let plan = self.plan_under_exclusion(ends)?;
         self.refuse_merged_tables_too_large(ends, &plan.tables)?;
         self.validate_merge_keys(ends, &plan.steps, &plan.tables)?;
+        for step in &plan.steps {
+            if let MergeAction::AddColumnsOnMain { base_columns, columns } = &step.action {
+                self.preflight_merged_columns(&step.table, ends.source_id, base_columns.len(), columns)?;
+            }
+        }
         let intent = MergeIntent {
             source_id: ends.source_id,
             source_name: ends.source_name.to_string(),
@@ -12395,6 +12365,70 @@ impl StorageEngine {
     /// schema-changing merge into a branch while the target has other live
     /// descendants (0A000; they read through it, B4's freeze lifts this). And
     /// open transactions (55006, [`Self::refuse_open_writers`]).
+    /// Spec R5.2: what a merge's `ADD COLUMN`s would refuse, asked while the merge
+    /// has changed nothing: `base_width` is main's width without them. A NOT NULL
+    /// column with no value is judged against what main will hold: the rows the
+    /// branch deleted will be gone, and the rows it changed land with their values,
+    /// so it is illegal only if main has another row (23502). A volatile default's
+    /// rewrite is run into a scratch batch, as the step will run it (54000, 23502,
+    /// and any error of the expression; its values are thrown away, so a `nextval`
+    /// default consumes them twice).
+    fn preflight_merged_columns(
+        &self,
+        table: &str,
+        source_id: u64,
+        base_width: usize,
+        added: &[super::branch_catalog::BranchAddedColumn],
+    ) -> Result<()> {
+        use super::row_shape::ColumnFill;
+        let fills = added
+            .iter()
+            .map(|c| ColumnFill::for_default(c.default.as_ref(), &c.column.data_type))
+            .collect::<Result<Vec<_>>>()?;
+        self.refuse_merged_not_null_over_kept_rows(table, source_id, added.iter().zip(&fills))?;
+        if fills.iter().any(|fill| matches!(fill, ColumnFill::PerRow(_))) {
+            let plan: Vec<(&str, &crate::DataType, bool, &ColumnFill)> = added
+                .iter()
+                .zip(&fills)
+                .map(|(c, fill)| (c.column.name.as_str(), &c.column.data_type, !c.column.nullable, fill))
+                .collect();
+            let mut scratch = WriteBatch::default();
+            self.stage_added_column_rows(
+                table,
+                base_width,
+                &plan,
+                self.config.storage.max_atomic_rewrite_bytes,
+                &mut scratch,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A NOT NULL column with no value, of a merge: illegal only if main has a row
+    /// the merge will neither delete nor replace (23502).
+    fn refuse_merged_not_null_over_kept_rows<'a>(
+        &self,
+        table: &str,
+        source_id: u64,
+        columns: impl IntoIterator<
+            Item = (
+                &'a super::branch_catalog::BranchAddedColumn,
+                &'a super::row_shape::ColumnFill,
+            ),
+        >,
+    ) -> Result<()> {
+        let unfilled = columns.into_iter().find(|(c, fill)| {
+            !c.column.nullable && matches!(fill, super::row_shape::ColumnFill::Constant(crate::Value::Null))
+        });
+        if let Some((column, _)) = unfilled {
+            let carried = self.branch_changed_row_ids(source_id, table)?;
+            if self.table_has_rows_other_than(table, &carried)? {
+                return Err(Error::add_column_null_on_existing_rows(table, &column.column.name));
+            }
+        }
+        Ok(())
+    }
+
     fn plan_branch_merge(&self, ends: &MergeEnds<'_>) -> Result<BranchMergePlan> {
         use super::branch_catalog::{BranchTableResolution, BranchTableState};
         let MergeEnds {
@@ -12993,18 +13027,33 @@ impl StorageEngine {
                 {
                     return Err(changed());
                 }
+                // Spec R5.2: the schema and the columns' missing values in ONE
+                // group, as main's own `ADD COLUMN`, so main's rows read right at
+                // once and a rerun finds the step done. Only a volatile default
+                // rewrites rows, in that same group. The rows the source changed
+                // land by their own commit, as wide as its definition.
                 if added_already < columns.len() {
-                    schema
-                        .columns
-                        .extend(columns.iter().skip(added_already).map(|c| c.column.clone()));
-                    catalog.update_table_schema(table, &schema)?;
+                    let old_width = schema.columns.len();
+                    let added: Vec<&super::branch_catalog::BranchAddedColumn> =
+                        columns.iter().skip(added_already).collect();
+                    let fills = added
+                        .iter()
+                        .map(|c| super::row_shape::ColumnFill::for_default(c.default.as_ref(), &c.column.data_type))
+                        .collect::<Result<Vec<_>>>()?;
+                    schema.columns.extend(added.iter().map(|c| c.column.clone()));
+                    let plan: Vec<(&str, &crate::DataType, bool, &super::row_shape::ColumnFill)> = added
+                        .iter()
+                        .zip(&fills)
+                        .map(|(c, fill)| (c.column.name.as_str(), &c.column.data_type, !c.column.nullable, fill))
+                        .collect();
+                    // NOT NULL is judged against what main holds once the merge's
+                    // own rows have landed, as the preflight judged it: a row main
+                    // gained since then is refused here, and the merge stops
+                    // pending, not accepted with NULL in the column.
+                    self.refuse_merged_not_null_over_kept_rows(table, source_id, added.iter().copied().zip(&fills))?;
+                    catalog.add_columns(table, &schema, old_width, &plan, false)?;
                 }
                 self.merge_failpoint_tick(MergeFailSite::Step)?;
-                let backfill: Vec<crate::Value> = columns
-                    .iter()
-                    .map(|c| Self::add_column_backfill_value(&c.default))
-                    .collect();
-                self.backfill_added_columns(table, base_columns.len(), &backfill)?;
             }
             MergeAction::PutOnBranch { .. } => {
                 return Err(Error::internal("a branch step of a merge reached main's apply"));
@@ -13073,12 +13122,20 @@ impl StorageEngine {
         }
         match (materialize, now) {
             (Some(columns), Some((current, _))) => {
-                let backfill: Vec<crate::Value> = columns
+                let fills = columns
                     .iter()
-                    .map(|c| Self::add_column_backfill_value(&c.default))
-                    .collect();
+                    .map(|c| {
+                        super::row_shape::ColumnFill::for_default(c.default.as_ref(), &c.column.data_type)
+                            .map(|fill| (fill, &c.column.data_type))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let view = BranchView::for_chain(self, intent.target_name.as_str(), intent.target_chain.clone())?;
-                view.materialize(table, &current.schema, record, &backfill)?;
+                view.materialize_with(table, &current.schema, record, &|| {
+                    fills
+                        .iter()
+                        .map(|(fill, data_type)| fill.next_value(data_type))
+                        .collect()
+                })?;
             }
             _ => {
                 let clear_rows = record.definition().is_none() || record.created;
@@ -13092,67 +13149,6 @@ impl StorageEngine {
             }
         }
         Ok(())
-    }
-
-    /// sprinter 6bc4a4040eb7 (B3 fix pass): bring every row of main's `table_name`
-    /// to the width `ALTER TABLE … ADD COLUMN` over `base_width` columns gives it
-    /// — MERGE's backfill. Idempotent, unlike [`Self::add_column_to_rows`], which
-    /// appends unconditionally: a row already that wide (a rerun; a row the merge
-    /// itself wrote) is not touched. Keeps its W2.5 / W3.2 fences.
-    fn backfill_added_columns(&self, table_name: &str, base_width: usize, backfill: &[crate::Value]) -> Result<usize> {
-        let prefix = format!("data:{}:", table_name);
-        let width = base_width + backfill.len();
-        self.invalidate_write_watermark(table_name);
-        let needs_version_materialize =
-            self.snapshot_manager.table_has_copy_markers(table_name) || self.snapshot_manager.maybe_elided_rows();
-        let mut keys = Vec::new();
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
-            read_opts,
-        );
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix.as_bytes()) {
-                break;
-            }
-            keys.push(key.to_vec());
-        }
-        let mut widened = 0usize;
-        for key in keys {
-            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix.len()) else {
-                continue;
-            };
-            let raw = self
-                .db
-                .get(&key)
-                .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?;
-            let Some(raw) = raw else {
-                continue;
-            };
-            let stored = self.decode_stored_ref(&key, &raw)?;
-            let mut tuple: Tuple = bincode::deserialize(&stored)
-                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-            if tuple.values.len() >= width {
-                continue;
-            }
-            branch_view::extend_row_values(&mut tuple.values, base_width, backfill);
-            let new_value =
-                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-            let final_value = super::tde::seal_row_value(self.key_manager.as_deref(), &key, &new_value)?;
-            if needs_version_materialize {
-                self.snapshot_manager
-                    .materialize_copy_marker_row_durable(table_name, row_id)?;
-            }
-            self.gate
-                .put(&self.db, &key, final_value.as_ref(), None)
-                .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
-            widened += 1;
-        }
-        self.bump_schema_generation();
-        self.row_cache.invalidate_table(table_name);
-        Ok(widened)
     }
 
     /// Begin a transaction on a specific branch
@@ -13890,7 +13886,8 @@ impl StorageEngine {
             | WalOperation::CreateTrigger { table, .. }
             | WalOperation::AddConstraint { table, .. }
             | WalOperation::DropConstraint { table, .. }
-            | WalOperation::AlterTableSchema { table, .. } => vec![table.as_str()],
+            | WalOperation::AlterTableSchema { table, .. }
+            | WalOperation::SetColumnMissing { table, .. } => vec![table.as_str()],
             WalOperation::DropTrigger { table, .. } => table.as_deref().into_iter().collect(),
             WalOperation::UpdateCounter { table_name, .. } => vec![table_name.as_str()],
             WalOperation::RenameTable { old_table, new_table } => vec![old_table.as_str(), new_table.as_str()],
@@ -14276,9 +14273,20 @@ impl StorageEngine {
                 "live replication for table '{table}' requires default row storage; column-storage sidecars are not replicated"
             )));
         }
-        let decode = |bytes: &[u8]| -> Result<Tuple> {
+        let decode = |bytes: &[u8], stored: bool| -> Result<Tuple> {
             let mut tuple: Tuple = bincode::deserialize(bytes)
                 .map_err(|error| Error::storage(format!("invalid live replication tuple: {error}")))?;
+            // Spec R5.2: the row ALREADY STORED may be older than a column, which is
+            // ordinary: it reads the column's missing value. The row being APPLIED
+            // may not. The log is applied in order, so a row logged before the
+            // `ADD COLUMN` is applied under the schema it was written for, and one
+            // logged after it is whole: a transaction's own staged rows are
+            // re-staged by the statement. An image of another width is not one any
+            // schema of this table wrote at this point of the log, and shape alone
+            // could not tell it from a row with a value lost.
+            if stored && tuple.values.len() < schema.columns.len() {
+                self.shape_row(table, schema.columns.len(), &mut tuple)?;
+            }
             if tuple.row_id.is_some_and(|id| id != row_id) || tuple.values.len() != schema.columns.len() {
                 return Err(Error::storage(
                     "live replication tuple does not match its row ID or schema",
@@ -14296,10 +14304,10 @@ impl StorageEngine {
             tuple.row_id = Some(row_id);
             Ok(tuple)
         };
-        let new = bytes.map(|bytes| decode(bytes)).transpose()?;
+        let new = bytes.map(|bytes| decode(bytes, false)).transpose()?;
         // get() decrypts but never consults/populates row caches: index removal
         // must describe the actual stored row, even after a previous delivery.
-        let old = self.get(key)?.map(|bytes| decode(&bytes)).transpose()?;
+        let old = self.get(key)?.map(|bytes| decode(&bytes, true)).transpose()?;
         let counter = if new.is_some() {
             Some(self.live_replay_counter(table, row_id)?)
         } else {
@@ -14915,6 +14923,11 @@ impl StorageEngine {
                 Ok(())
             }
 
+            WalOperation::SetColumnMissing { table, column, value } => {
+                info!("Replayed column missing value: table={}, column={}", table, column);
+                Catalog::new(self).replay_column_missing(&table, &column, value.as_deref())
+            }
+
             WalOperation::CreateView { name, definition } => {
                 info!("Replayed create view: name={}", name);
                 self.view_catalog().restore_view_from_wal(&name, &definition)?;
@@ -15174,6 +15187,7 @@ impl StorageEngine {
             | WalOperation::AddConstraint { .. }
             | WalOperation::DropConstraint { .. }
             | WalOperation::AlterTableSchema { .. }
+            | WalOperation::SetColumnMissing { .. }
             | WalOperation::CreateView { .. }
             | WalOperation::DropView { .. }
             | WalOperation::CreateSequence { .. }
@@ -16686,14 +16700,15 @@ impl StorageEngine {
             }
         }
 
-        // W3.5 Stage 1: the query plan is built against the CURRENT catalog, so
-        // a resolved version written under an older schema is shaped to the
-        // current width — a pre-ADD-COLUMN version (narrower) is NULL-padded, a
-        // pre-DROP-COLUMN version (wider; `drop_column_from_rows` writes no new
-        // version, so a pre-DROP snapshot legitimately resolves the wide version)
-        // is truncated, matching the pre-W3.5 projection. Resolved once; `None`
-        // disables the shaping (strict mode, or an unresolvable schema — never
-        // worse than the pre-W3.5 raw decode).
+        // W3.5 Stage 1 + spec R5.2: the query plan is built against the CURRENT
+        // catalog, so a resolved version written under an older schema is shaped
+        // to the current width — a pre-ADD-COLUMN version (narrower) reads the
+        // column's missing value, or NULL with none, as PostgreSQL's old tuples
+        // do; a pre-DROP-COLUMN version (wider; `drop_column_from_rows` writes no
+        // new version, so a pre-DROP snapshot legitimately resolves the wide
+        // version) is truncated, matching the pre-W3.5 projection. Resolved once;
+        // `None` disables the shaping (strict mode, or an unresolvable schema —
+        // never worse than the pre-W3.5 raw decode).
         let target_width = if self.null_pad_snapshot_schema() {
             self.catalog()
                 .get_table_schema(table_name)
@@ -16719,7 +16734,7 @@ impl StorageEngine {
                 tuple.row_id = Some(row_id);
 
                 if let Some(width) = target_width {
-                    Self::shape_base_tuple_to_width(&mut tuple, width);
+                    self.shape_row(table_name, width, &mut tuple)?;
                 }
 
                 tuples.push(tuple);
@@ -19153,6 +19168,10 @@ impl StorageEngine {
             if let Ok(Some(old_value)) = self.get_internal(&current_key) {
                 // Deserialize old tuple for delta tracking
                 old_tuple_for_delta = bincode::deserialize(&old_value).ok();
+                // Spec R5.2: the pre-image the deltas and the vector hook read.
+                if let Some(old) = old_tuple_for_delta.as_mut() {
+                    self.shape_row(table_name, schema.columns.len(), old)?;
+                }
 
                 // Write old value to version history with the OLD timestamp
                 // The old timestamp is captured before the update
@@ -19312,6 +19331,10 @@ impl StorageEngine {
                 if let Ok(Some(old_value)) = self.get_internal(&key) {
                     // Deserialize old tuple for delta tracking
                     deleted_tuple_for_delta = bincode::deserialize(&old_value).ok();
+                    // Spec R5.2: the pre-image the deltas read.
+                    if let (Some(deleted), Ok(schema)) = (deleted_tuple_for_delta.as_mut(), schema_result.as_ref()) {
+                        self.shape_row(table_name, schema.columns.len(), deleted)?;
+                    }
 
                     // Write deleted value to version history (encrypted if TDE enabled)
                     let old_timestamp = timestamp.saturating_sub(1);

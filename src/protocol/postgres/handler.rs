@@ -3909,6 +3909,20 @@ where
         const DATA_ROW_FLUSH_AT: usize = 64 * 1024;
         self.write_buf.clear();
         for row in rows {
+            // Spec R5.2: a row of another width than its RowDescription ends the
+            // statement with an error, and the client can parse everything it was
+            // sent. The rows before it stand, as with a runtime error mid-query.
+            if row.values.len() != plan.len() {
+                let refused = crate::storage::row_shape::refuse_mismatched_row(row.values.len(), plan.len());
+                if !self.write_buf.is_empty() {
+                    self.stream
+                        .write_all(&self.write_buf)
+                        .await
+                        .map_err(|e| Error::network(format!("Failed to send query rows: {}", e)))?;
+                    self.write_buf.clear();
+                }
+                return Err(refused);
+            }
             self.encode_data_row_direct(row, plan);
             if self.write_buf.len() >= DATA_ROW_FLUSH_AT {
                 self.stream
@@ -4209,6 +4223,13 @@ where
         .await?;
         let total = rows.len();
         for row in &rows {
+            // Spec R5.2: the same rule as a DataRow.
+            if row.values.len() != ncols {
+                return Err(crate::storage::row_shape::refuse_mismatched_row(
+                    row.values.len(),
+                    ncols,
+                ));
+            }
             let mut fields = tuple_to_pg_values(row);
             if any_ts_column {
                 for (index, value) in row.values.iter().enumerate() {
@@ -4583,6 +4604,21 @@ where
         detail: Option<String>,
         hint: Option<String>,
     ) -> Result<()> {
+        self.send_error_message_from(severity, code, message, detail, hint, None)
+            .await
+    }
+
+    /// [`Self::send_error_message`] with the `F` / `R` fields of the PostgreSQL
+    /// routine that raises the same error.
+    async fn send_error_message_from(
+        &mut self,
+        severity: &str,
+        code: &str,
+        message: &str,
+        detail: Option<String>,
+        hint: Option<String>,
+        source: Option<(&'static str, &'static str)>,
+    ) -> Result<()> {
         // HDB-004: the ONE place an ErrorResponse is built, and therefore the
         // one place that can tell the multi-statement simple-query loop that
         // this statement already reported an error — even though it is about to
@@ -4595,6 +4631,7 @@ where
             detail,
             hint,
             position: None,
+            source,
         })
         .await
     }
@@ -4632,15 +4669,22 @@ where
         self.suppress_ready_for_query = false;
         let code = sqlstate_for_error(error);
         let (detail, hint) = detail_hint_for_error(code, error);
+        let message = error.to_string();
+        let (message, detail, source) = match cached_plan_error_fields(&message) {
+            Some(cached_plan) => (cached_plan.message, cached_plan.detail, cached_plan.source),
+            None => (message, detail, None),
+        };
         if wait_for_sync {
             // Extended-query protocol: emit ErrorResponse now and defer
             // ReadyForQuery until the client's Sync, discarding messages in
             // between. Sending ReadyForQuery early closes/wedges drivers.
-            self.send_error_message("ERROR", code, &error.to_string(), detail, hint)
+            self.send_error_message_from("ERROR", code, &message, detail, hint, source)
                 .await?;
             self.flush().await
         } else {
-            self.send_error("ERROR", code, &error.to_string(), detail, hint).await
+            self.send_error_message_from("ERROR", code, &message, detail, hint, source)
+                .await?;
+            self.send_ready_for_query().await
         }
     }
 
@@ -5424,6 +5468,14 @@ pub(super) fn tuple_to_pg_values_with_formats(
     tuple: &Tuple,
     plan: &[super::codec::ColumnCodec],
 ) -> Result<Vec<Option<Vec<u8>>>> {
+    // Spec R5.2: a row of another width than its RowDescription is an error to
+    // the client, never a malformed message.
+    if tuple.values.len() != plan.len() {
+        return Err(crate::storage::row_shape::refuse_mismatched_row(
+            tuple.values.len(),
+            plan.len(),
+        ));
+    }
     tuple
         .values
         .iter()
@@ -6852,8 +6904,17 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     {
         return sqlstate::OBJECT_IN_USE; // 55006
     }
-    if message.contains(crate::error::BRANCH_MATERIALIZE_TOO_LARGE_MARKER) {
+    if message.contains(crate::error::BRANCH_MATERIALIZE_TOO_LARGE_MARKER)
+        || message.contains(crate::error::ATOMIC_REWRITE_TOO_LARGE_MARKER)
+    {
         return sqlstate::PROGRAM_LIMIT_EXCEEDED; // 54000
+    }
+    // Spec R5.2: a row its row description cannot describe, and a schema
+    // statement the transaction's own staged rows cannot follow.
+    if message.contains(crate::error::ROW_DESCRIPTION_MISMATCH_MARKER)
+        || message.contains(crate::error::DDL_OVER_STAGED_ROWS_MARKER)
+    {
+        return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
     }
     // GH#28 (c2): `SET LOCAL idle_session_timeout` /
     // `idle_in_transaction_session_timeout` is refused rather than silently
@@ -7096,6 +7157,39 @@ pub(super) struct SetRoleTarget {
 /// Populated where they help a client act: retry guidance for
 /// serialization failures/deadlocks, and the offending name for undefined
 /// table/column (extracted from the engine's quoted message).
+/// Decision 2(h) on the wire, as PostgreSQL sends it: `M` is exactly `cached plan
+/// must not change result type` and what Nano knows goes to `D`. A refusal made
+/// before the statement ran also names `RevalidateCachedQuery` in `R` (and its
+/// file in `F`), the field asyncpg and pgjdbc key on to prepare again and retry.
+/// `L` is not sent: there is no line of Nano's to give, and no driver reads it.
+/// The wire writers' last-resort refusal carries no `R`: the statement may have
+/// taken effect, and a driver that retried it would apply it twice.
+pub(super) fn cached_plan_error_fields(message: &str) -> Option<WireErrorText> {
+    let marker = crate::error::ROW_DESCRIPTION_MISMATCH_MARKER;
+    let at = message.find(marker)?;
+    let detail = message
+        .get(at + marker.len()..)
+        .unwrap_or_default()
+        .trim_start_matches(':')
+        .trim()
+        .to_string();
+    let source = message
+        .contains(crate::error::RESULT_TYPE_REFUSED_BEFORE_RUN_MARKER)
+        .then_some(("plancache.c", "RevalidateCachedQuery"));
+    Some(WireErrorText {
+        message: marker.to_string(),
+        detail: (!detail.is_empty()).then_some(detail),
+        source,
+    })
+}
+
+/// An ErrorResponse's text fields, where they are not `error.to_string()`.
+pub(super) struct WireErrorText {
+    pub(super) message: String,
+    pub(super) detail: Option<String>,
+    pub(super) source: Option<(&'static str, &'static str)>,
+}
+
 pub(crate) fn detail_hint_for_error(code: &str, error: &Error) -> (Option<String>, Option<String>) {
     use crate::network::protocol::sqlstate;
 

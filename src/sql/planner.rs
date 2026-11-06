@@ -3132,7 +3132,8 @@ impl<'a> Planner<'a> {
             return_type,
             body,
             language,
-            volatility: None,
+            // `IMMUTABLE` / `STABLE` / `VOLATILE`: what `default_volatility` reads.
+            volatility: cf.behavior.map(|behavior| behavior.to_string()),
         })
     }
 

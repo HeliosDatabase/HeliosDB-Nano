@@ -7941,19 +7941,12 @@ impl Evaluator {
         }
     }
 
-    /// RANDOM() - returns random value between 0 and 1
+    /// RANDOM() - a value in [0, 1), a new one on every call
     fn func_random(&self, args: &[Value]) -> Result<Value> {
         if !args.is_empty() {
             return Err(Error::query_execution("RANDOM takes no arguments"));
         }
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        // Simple LCG random number generator
-        let random = ((seed.wrapping_mul(1103515245).wrapping_add(12345)) as f64) / (u64::MAX as f64);
-        Ok(Value::Float8(random.abs()))
+        Ok(Value::Float8(rand::random::<f64>()))
     }
 
     /// EXP(x) - e raised to power x

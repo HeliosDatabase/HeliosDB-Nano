@@ -342,13 +342,14 @@ pub use crypto::{
     ZkeRequestContext,
 };
 pub use error::{
-    Error, Result, BRANCH_BINDING_GONE_MARKER, BRANCH_BUSY_MARKER, BRANCH_CLOSING_MARKER, BRANCH_IN_USE_MARKER,
-    BRANCH_MATERIALIZE_TOO_LARGE_MARKER, BRANCH_MERGE_BUSY_MARKER, BRANCH_MERGE_DUPLICATE_KEY_MARKER,
-    BRANCH_MERGE_KEY_CLAIMED_MARKER, BRANCH_MERGE_PENDING_MARKER, BRANCH_MERGE_SCHEMA_REFUSED_MARKER,
-    BRANCH_NOT_ACTIVE_MARKER, BRANCH_SCHEMA_RUNNING_MARKER, BRANCH_SCHEMA_UNSUPPORTED_MARKER,
-    BRANCH_STATEMENT_UNSUPPORTED_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER, BRANCH_TABLE_BUSY_MARKER,
-    BRANCH_WRITE_UNSUPPORTED_MARKER, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE,
-    NOT_NULL_VIOLATION_MARKER, PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED,
+    Error, Result, ATOMIC_REWRITE_TOO_LARGE_MARKER, BRANCH_BINDING_GONE_MARKER, BRANCH_BUSY_MARKER,
+    BRANCH_CLOSING_MARKER, BRANCH_IN_USE_MARKER, BRANCH_MATERIALIZE_TOO_LARGE_MARKER, BRANCH_MERGE_BUSY_MARKER,
+    BRANCH_MERGE_DUPLICATE_KEY_MARKER, BRANCH_MERGE_KEY_CLAIMED_MARKER, BRANCH_MERGE_PENDING_MARKER,
+    BRANCH_MERGE_SCHEMA_REFUSED_MARKER, BRANCH_NOT_ACTIVE_MARKER, BRANCH_SCHEMA_RUNNING_MARKER,
+    BRANCH_SCHEMA_UNSUPPORTED_MARKER, BRANCH_STATEMENT_UNSUPPORTED_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER,
+    BRANCH_TABLE_BUSY_MARKER, BRANCH_WRITE_UNSUPPORTED_MARKER, COMMIT_OF_FAILED_TRANSACTION_MESSAGE,
+    DDL_OVER_STAGED_ROWS_MARKER, IN_FAILED_TRANSACTION_MESSAGE, NOT_NULL_VIOLATION_MARKER, PG_PROMOTE_SERVER_ONLY,
+    PHYSICAL_STANDBY_WRITE_REFUSED, ROW_DESCRIPTION_MISMATCH_MARKER,
 };
 pub use storage::StorageEngine;
 pub use types::{
@@ -2125,6 +2126,14 @@ enum ArtUndoOp {
     /// same per-transaction (and per-session) log and are replayed by the
     /// same ROLLBACK paths.
     VectorUndo(Vec<storage::VectorIndexUndoOp>),
+    /// Spec R5.2: an index built in the transaction took these staged rows
+    /// (`create_index_over_staged_rows`). At the FRONT of the log, so it replays
+    /// last: whichever earlier entries could see the index's columns have run, and
+    /// this leaves the rows' entries as the committed rows have them.
+    StagedRowsInIndex {
+        index_name: String,
+        rows: Vec<storage::art_manager::StagedIndexKeys>,
+    },
 }
 
 #[derive(Clone)]
@@ -6110,7 +6119,8 @@ impl EmbeddedDatabase {
             // An INSERT only ADDS keys: it can never cause a probe to miss.
             // `note_written_key` has already armed this table's cardinality
             // half from the staged `data:` key.
-            ArtUndoOp::RemoveInserted { .. } | ArtUndoOp::VectorUndo(_) => {}
+            // (`create_index_over_staged_rows` notes its own removals.)
+            ArtUndoOp::RemoveInserted { .. } | ArtUndoOp::VectorUndo(_) | ArtUndoOp::StagedRowsInIndex { .. } => {}
         }
         match txn.session_id() {
             Some(session_id) => {
@@ -6119,6 +6129,20 @@ impl EmbeddedDatabase {
             None => match self.raii_art_undo.get_mut(&txn.transaction_id()) {
                 Some(mut slot) => slot.push(op),
                 None => self.art_undo_log.write().push(op),
+            },
+        }
+    }
+
+    /// [`Self::push_art_undo`], but replayed LAST. Only with no savepoint on the
+    /// stack: a savepoint records a position in this log.
+    fn push_art_undo_first(&self, txn: &storage::Transaction, op: ArtUndoOp) {
+        match txn.session_id() {
+            Some(session_id) => {
+                self.session_art_undo.entry(session_id).or_default().insert(0, op);
+            }
+            None => match self.raii_art_undo.get_mut(&txn.transaction_id()) {
+                Some(mut slot) => slot.insert(0, op),
+                None => self.art_undo_log.write().insert(0, op),
             },
         }
     }
@@ -6345,7 +6369,8 @@ impl EmbeddedDatabase {
     ) -> Result<u64> {
         let schema = self.storage.catalog().get_table_schema(table_name)?;
         let committed = self.storage.scan_table(table_name)?;
-        let rows = txn.merge_with_write_set_to_width(table_name, committed, schema.columns.len())?;
+        let shape = self.storage.row_shape(table_name, schema.columns.len())?;
+        let rows = txn.merge_with_write_set_shaped(table_name, committed, &shape)?;
         let mut truncated_row_ids = Vec::with_capacity(rows.len());
         for tuple in &rows {
             if let Some(row_id) = tuple.row_id {
@@ -6473,6 +6498,15 @@ impl EmbeddedDatabase {
                 ArtUndoOp::VectorUndo(ops) => {
                     for op in ops.iter().rev() {
                         self.storage.vector_indexes().apply_undo(op);
+                    }
+                }
+                ArtUndoOp::StagedRowsInIndex { index_name, rows } => {
+                    if let Err(e) = self
+                        .storage
+                        .art_indexes()
+                        .restore_committed_rows_in_index(&index_name, &rows)
+                    {
+                        tracing::warn!("ART rollback of index '{}' over staged rows: {}", index_name, e);
                     }
                 }
             }
@@ -7544,11 +7578,12 @@ impl EmbeddedDatabase {
                         .get_column_at(idx)
                         .ok_or_else(|| Error::internal("column index out of bounds"))?;
                     if let Some(default_expr) = gate.default_exprs.get(idx).and_then(|d| d.as_ref()) {
-                        let mut value = gate.evaluator.evaluate(default_expr, &gate.empty_tuple)?;
-                        if value.data_type() != col.data_type {
-                            value = gate.evaluator.cast_value(value, &col.data_type)?;
-                        }
-                        values.push(value);
+                        values.push(sql::default_volatility::evaluate_column_default_with(
+                            &gate.evaluator,
+                            &gate.empty_tuple,
+                            default_expr,
+                            &col.data_type,
+                        )?);
                     } else if col.nullable {
                         // Covers SERIAL/IDENTITY primary keys, which the planner
                         // marks nullable precisely so an omitted value becomes the
@@ -8409,7 +8444,19 @@ impl EmbeddedDatabase {
     /// target is validated before the FIRST sub-operation mutates anything,
     /// because DDL is not transactional and a half-applied statement is what
     /// PostgreSQL never produces.
-    fn execute_alter_table_multi(&self, operations: &[sql::LogicalPlan]) -> Result<u64> {
+    ///
+    /// Spec R5.2 extends that to what an `ADD COLUMN` clause can refuse
+    /// ([`Self::prevalidate_added_columns`]). It is validation, not atomicity. Each
+    /// clause is still its own write group, so a crash between two clauses leaves
+    /// the earlier ones, a concurrent reader can see the first column without the
+    /// second, and a refusal that needs an earlier clause's effect still comes
+    /// after it: `ADD c INT DEFAULT 1 CHECK (c > 5)` is 23514 with `c` left behind.
+    /// One group for the whole statement closes all three in a later step.
+    fn execute_alter_table_multi(
+        &self,
+        operations: &[sql::LogicalPlan],
+        txn: Option<&storage::Transaction>,
+    ) -> Result<u64> {
         // GH#27: validate EVERY foreign-key target before the FIRST
         // sub-operation mutates anything. DDL is not transactional
         // here and the sub-plans run in order, so without this pass
@@ -8435,10 +8482,10 @@ impl EmbeddedDatabase {
             // `ADD COLUMN … PRIMARY KEY` of one statement would be refused only
             // AFTER the first had installed a key and the second had added its
             // column; and a UNIQUE over a column the same statement fills with
-            // a LITERAL default is a guaranteed 23505 the moment the table
-            // holds two rows (`add_column_to_rows` writes the identical value
-            // to every row — a non-literal default becomes NULL, and NULLs are
-            // distinct, so only the literal case is provably doomed).
+            // a STABLE default is a guaranteed 23505 the moment the table holds
+            // two rows (every row reads the one missing value, spec R5.2 — a NULL
+            // default and a volatile one are not doomed: NULLs are distinct, and a
+            // volatile default gives each row its own).
             let primary_keys = operations
                 .iter()
                 .filter(|p| matches!(p, sql::LogicalPlan::AlterTableAddPrimaryKey { .. }))
@@ -8463,14 +8510,18 @@ impl EmbeddedDatabase {
                 else {
                     continue;
                 };
-                let literal_default = operations.iter().any(|p| match p {
+                let one_value_default = operations.iter().any(|p| match p {
                     sql::LogicalPlan::AlterTableAddColumn { column_def, .. } => {
                         columns.iter().any(|c| c.eq_ignore_ascii_case(&column_def.name))
-                            && matches!(&column_def.default, Some(sql::LogicalExpr::Literal(_)))
+                            && column_def.default.as_ref().is_some_and(|expr| {
+                                sql::default_volatility::default_is_stable(expr)
+                                    && sql::default_volatility::evaluate_column_default(expr, &column_def.data_type)
+                                        .is_ok_and(|value| !matches!(value, Value::Null))
+                            })
                     }
                     _ => false,
                 });
-                if !literal_default {
+                if !one_value_default {
                     continue;
                 }
                 let schema = catalog.get_table_schema(table_name)?;
@@ -8554,9 +8605,10 @@ impl EmbeddedDatabase {
                 }
             }
         }
+        self.prevalidate_added_columns(operations, txn)?;
         let mut total_rows = 0u64;
         for sub_plan in operations {
-            total_rows += self.execute_alter_table_op(sub_plan)?;
+            total_rows += self.execute_alter_table_op(sub_plan, txn)?;
         }
         Ok(total_rows)
     }
@@ -9222,6 +9274,12 @@ impl EmbeddedDatabase {
         if let Some(rows) = self.branch_schema_ddl(&plan, Some(txn), Some(sql))? {
             return Ok(rows);
         }
+        // Spec R5.2: what a schema statement does over this transaction's own
+        // staged rows. The params family asks the same two.
+        Self::refuse_constraint_over_staged_rows(&plan, Some(txn))?;
+        if let Some(rows) = self.create_index_over_staged_rows(&plan, Some(txn))? {
+            return Ok(rows);
+        }
 
         // Execute plan based on type
         match &plan {
@@ -9724,6 +9782,13 @@ impl EmbeddedDatabase {
                                                 })?
                                             }
                                         };
+                                        // Spec R5.2: a conflicting row older than a
+                                        // column reads its missing value.
+                                        self.storage.shape_row(
+                                            table_name,
+                                            schema.columns.len(),
+                                            &mut existing_tuple,
+                                        )?;
                                         existing_tuple.row_id = Some(existing_row_id);
 
                                         // RLS: the conflicting row is a pre-image the
@@ -9795,12 +9860,14 @@ impl EmbeddedDatabase {
                                             if new_val.data_type() != *target_type && !matches!(new_val, Value::Null) {
                                                 new_val = update_evaluator.cast_value(new_val, target_type)?;
                                             }
-                                            if target_idx < existing_tuple.values.len() {
-                                                #[allow(clippy::indexing_slicing)]
-                                                {
-                                                    existing_tuple.values[target_idx] = new_val;
-                                                }
-                                            }
+                                            // Spec R5.2: the row was shaped above, so an
+                                            // assignment past its end is a bug, never a
+                                            // value to lose quietly.
+                                            *existing_tuple.values.get_mut(target_idx).ok_or_else(|| {
+                                                Error::internal(
+                                                    "ON CONFLICT DO UPDATE: assignment past the end of a row",
+                                                )
+                                            })? = new_val;
                                         }
 
                                         // RLS: the post-assignment row must satisfy the
@@ -10653,10 +10720,11 @@ impl EmbeddedDatabase {
                     view.scan(Some(txn), table_name, &schema)?
                 } else if merge_txn_writes {
                     let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
-                    txn.merge_with_write_set_to_width(
+                    let width = self.storage.catalog().get_table_schema(table_name)?.columns.len();
+                    txn.merge_with_write_set_shaped(
                         table_name,
                         base_tuples,
-                        self.storage.catalog().get_table_schema(table_name)?.columns.len(),
+                        &self.storage.row_shape(table_name, width)?,
                     )?
                 } else if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema) {
                     match self
@@ -11080,10 +11148,11 @@ impl EmbeddedDatabase {
                     view.scan(Some(txn), table_name, &schema_arc)?
                 } else if merge_txn_writes {
                     let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
-                    txn.merge_with_write_set_to_width(
+                    let width = self.storage.catalog().get_table_schema(table_name)?.columns.len();
+                    txn.merge_with_write_set_shaped(
                         table_name,
                         base_tuples,
-                        self.storage.catalog().get_table_schema(table_name)?.columns.len(),
+                        &self.storage.row_shape(table_name, width)?,
                     )?
                 } else if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema_arc) {
                     match self
@@ -11440,6 +11509,7 @@ impl EmbeddedDatabase {
                     // No change needed
                     return Ok(0);
                 }
+                Self::refuse_ddl_over_staged_rows(Some(txn), "ALTER TABLE … SET STORAGE", table_name)?;
 
                 // Migrate existing data online
                 let column = col_ref.clone();
@@ -11485,13 +11555,13 @@ impl EmbeddedDatabase {
                 table_name,
                 column_def,
                 if_not_exists,
-            } => self.alter_table_add_column(table_name, column_def, *if_not_exists),
+            } => self.alter_table_add_column(table_name, column_def, *if_not_exists, Some(txn)),
             sql::LogicalPlan::AlterTableDropColumn {
                 table_name,
                 column_name,
                 if_exists,
                 cascade,
-            } => self.alter_table_drop_column(table_name, column_name, *if_exists, *cascade),
+            } => self.alter_table_drop_column(table_name, column_name, *if_exists, *cascade, Some(txn)),
             sql::LogicalPlan::AlterTableRenameColumn {
                 table_name,
                 old_column_name,
@@ -11507,6 +11577,7 @@ impl EmbeddedDatabase {
                 new_table_name,
             } => {
                 let catalog = self.storage.catalog();
+                Self::refuse_ddl_over_staged_rows(Some(txn), "ALTER TABLE … RENAME TO", table_name)?;
 
                 // Check if new table name already exists
                 if catalog.get_table_schema(new_table_name).is_ok() {
@@ -11575,7 +11646,7 @@ impl EmbeddedDatabase {
                 constraint_name,
                 if_exists,
             } => self.alter_table_drop_constraint(table_name, constraint_name, *if_exists),
-            sql::LogicalPlan::AlterTableMulti { operations } => self.execute_alter_table_multi(operations),
+            sql::LogicalPlan::AlterTableMulti { operations } => self.execute_alter_table_multi(operations, Some(txn)),
             // sprinter 37a5968e7698: the savepoint family, resolved against THIS
             // transaction's own stack (`txn`), which is the transaction the
             // caller is actually inside on every route into this function. The
@@ -12038,6 +12109,9 @@ impl EmbeddedDatabase {
 
     #[allow(clippy::expect_used)]
     fn with_config_open_policy(config: Config, physical_snapshot: bool) -> Result<Self> {
+        // Spec R5.2: what `Config::from_toml_str` refuses at load, refused here
+        // for a configuration built in code.
+        config.storage.validate()?;
         let memory_only = config.storage.memory_only;
         let storage = std::sync::Arc::new(if memory_only {
             storage::StorageEngine::open_in_memory(&config)?
@@ -16130,11 +16204,11 @@ impl EmbeddedDatabase {
     ///   from EVERY flagged column, so at the next restart the table would come
     ///   back with a COMPOSITE primary key nobody declared — a different table
     ///   than the one that was shut down.
-    /// * **Table is not empty** → REFUSED. `add_column_to_rows` fills the new
-    ///   column with the column DEFAULT, i.e. NULL when there is none, so every
-    ///   pre-existing row would violate the key immediately; and a non-NULL
-    ///   default makes every row share one value, which violates it just as
-    ///   surely. PostgreSQL rejects both (`column "c" contains null values` /
+    /// * **Table is not empty** → REFUSED. Every pre-existing row reads the new
+    ///   column's DEFAULT (`Catalog::add_columns`), i.e. NULL when there is none,
+    ///   so each would violate the key immediately; and a non-NULL default makes
+    ///   every row share one value, which violates it just as surely. PostgreSQL
+    ///   rejects both (`column "c" contains null values` /
     ///   duplicate key), and Nano cannot do the one case PostgreSQL accepts —
     ///   `ADD COLUMN id SERIAL PRIMARY KEY` — because SERIAL is filled at
     ///   INSERT time, not by the ALTER.
@@ -16385,13 +16459,424 @@ impl EmbeddedDatabase {
         Ok(())
     }
 
+    /// Spec R5.2: refuse `statement` of `table` while `txn` holds a staged change
+    /// of its rows, an image or a delete: they would commit under the old name or
+    /// the old storage, and a delete would lose its row (DDL is not transactional:
+    /// the statement is durable at once, and they are not).
+    fn refuse_ddl_over_staged_rows(txn: Option<&storage::Transaction>, statement: &str, table: &str) -> Result<()> {
+        if txn.is_some_and(|txn| txn.has_staged_changes(table)) {
+            return Err(Error::ddl_over_staged_rows(statement, table));
+        }
+        Ok(())
+    }
+
+    /// Spec R5.2: run a schema statement of the params family in the transaction
+    /// its rows are staged in: the session's, else, inside an embedded `BEGIN`, the
+    /// global slot this caller owns. Held as the text family holds it across the
+    /// same bodies, with the same marker, so a default's function body that would
+    /// re-enter the slot is refused rather than blocking on it.
+    fn with_params_ddl_txn<T>(
+        &self,
+        session_txn: Option<&storage::Transaction>,
+        body: impl FnOnce(Option<&storage::Transaction>) -> Result<T>,
+    ) -> Result<T> {
+        if session_txn.is_some() || GLOBAL_TXN_LOCK_HELD.with(|held| held.get()) {
+            return body(session_txn);
+        }
+        let global = self.lock_owned_global_txn();
+        let txn = global.as_ref().and_then(|guard| guard.as_ref());
+        let _held = txn.map(|_| GlobalTxnLockMarker::set());
+        body(txn)
+    }
+
+    /// Spec R5.2: a constraint is validated and indexed over the committed rows
+    /// alone, so over a transaction's own staged changes of the table it would be
+    /// accepted unseen: two staged rows under one PRIMARY KEY value, and a key
+    /// lookup that finds neither. Refused (0A000) before any clause of the
+    /// statement has written. A plain `ADD COLUMN` is not: its value reaches the
+    /// staged rows, and there is nothing to violate.
+    fn refuse_constraint_over_staged_rows(plan: &sql::LogicalPlan, txn: Option<&storage::Transaction>) -> Result<()> {
+        use sql::LogicalPlan as P;
+        let (statement, table) = match plan {
+            P::AlterTableMulti { operations } => {
+                for operation in operations {
+                    Self::refuse_constraint_over_staged_rows(operation, txn)?;
+                }
+                return Ok(());
+            }
+            P::AlterTableAddUnique { table_name, .. } => ("ALTER TABLE … ADD … UNIQUE", table_name),
+            P::AlterTableAddPrimaryKey { table_name, .. } => ("ALTER TABLE … ADD … PRIMARY KEY", table_name),
+            P::AlterTableAddCheck { table_name, .. } => ("ALTER TABLE … ADD … CHECK", table_name),
+            P::AlterTableAddForeignKey { table_name, .. } => ("ALTER TABLE … ADD … FOREIGN KEY", table_name),
+            P::AlterTableAddColumn {
+                table_name, column_def, ..
+            } if column_def.primary_key || column_def.unique => ("ALTER TABLE … ADD COLUMN with a key", table_name),
+            _ => return Ok(()),
+        };
+        Self::refuse_ddl_over_staged_rows(txn, statement, table)
+    }
+
+    /// Spec R5.2: `CREATE INDEX` in a transaction with staged changes of the
+    /// table. The executor builds from the committed rows, which leaves out the
+    /// rows only this transaction has and keeps entries for what it changed. So
+    /// the index is brought up to the transaction's view here, each row through
+    /// the funnel, as if the index had existed when it wrote them: UNIQUE sees them
+    /// (23505, and no index), and a ROLLBACK leaves the index over the committed
+    /// rows. `Some` when this answered the statement; `None` for the ordinary path,
+    /// which is also what answers an index that already exists.
+    ///
+    /// Refused (0A000), nothing built: under a savepoint (a `ROLLBACK TO` would
+    /// bring back rows this statement cannot reach; the same rule as a volatile
+    /// `ADD COLUMN`), on a table with column storage (a committed image holds
+    /// references, a staged one values), and an HNSW index over staged changes of
+    /// committed rows (its entries for the transaction's own new rows are its
+    /// whole undo).
+    fn create_index_over_staged_rows(
+        &self,
+        plan: &sql::LogicalPlan,
+        txn: Option<&storage::Transaction>,
+    ) -> Result<Option<u64>> {
+        let sql::LogicalPlan::CreateIndex {
+            name,
+            table_name,
+            column_name,
+            index_type,
+            ..
+        } = plan
+        else {
+            return Ok(None);
+        };
+        let Some(txn) = txn.filter(|txn| txn.has_staged_changes(table_name)) else {
+            return Ok(None);
+        };
+        let family = storage::index_family(index_type.as_deref());
+        let vector = family == Some(storage::IndexFamily::Vector);
+        if !vector && family != Some(storage::IndexFamily::Art) {
+            return Ok(None);
+        }
+        if self.storage.art_indexes().index_exists(name)
+            || self.storage.vector_indexes().index_exists(name)
+            || self.storage.is_branch_active()
+        {
+            return Ok(None);
+        }
+        let schema = self.storage.catalog().get_table_schema(table_name)?;
+        if txn.has_savepoints() {
+            return Err(Error::ddl_over_staged_rows(
+                "CREATE INDEX under a savepoint",
+                table_name,
+            ));
+        }
+        if schema
+            .columns
+            .iter()
+            .any(|c| c.storage_mode != ColumnStorageMode::Default)
+        {
+            return Err(Error::ddl_over_staged_rows(
+                "CREATE INDEX on a table with column storage",
+                table_name,
+            ));
+        }
+
+        let prefix = format!("data:{table_name}:");
+        let image = |row_id: u64, bytes: &[u8]| -> Result<Tuple> {
+            let mut tuple: Tuple =
+                bincode::deserialize(bytes).map_err(|e| Error::storage(format!("Failed to deserialize tuple: {e}")))?;
+            tuple.row_id = Some(row_id);
+            self.storage.shape_row(table_name, schema.columns.len(), &mut tuple)?;
+            Ok(tuple)
+        };
+        let mut rows = Vec::new();
+        for (key, staged) in txn.staged_with_prefix(prefix.as_bytes()) {
+            let Some(row_id) = storage::StorageEngine::parse_row_id_after_prefix(&key, prefix.len()) else {
+                continue;
+            };
+            rows.push(storage::art_manager::StagedIndexRow {
+                row_id,
+                committed: self.storage.get(&key)?.map(|bytes| image(row_id, &bytes)).transpose()?,
+                staged: staged.map(|bytes| image(row_id, &bytes)).transpose()?,
+            });
+        }
+        if vector && rows.iter().any(|row| row.committed.is_some()) {
+            return Err(Error::ddl_over_staged_rows(
+                "CREATE INDEX … USING hnsw over changed rows",
+                table_name,
+            ));
+        }
+
+        let mut executor =
+            sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
+        executor.execute(plan).map_err(|error| match error {
+            Error::ConstraintViolation(message) => Error::ConstraintViolation(format!(
+                "{message}. The committed rows are judged first, alone: this transaction's own changes \
+                 may resolve the duplicate, but a ROLLBACK would bring it back"
+            )),
+            other => other,
+        })?;
+
+        let applied = if vector {
+            self.apply_staged_rows_to_vector_index(name, column_name, &schema, &rows, txn)
+        } else {
+            match self
+                .storage
+                .art_indexes()
+                .apply_staged_rows_to_index(name, &schema, &rows)
+            {
+                Ok(keys) => {
+                    if keys
+                        .iter()
+                        .any(|row| row.committed.is_some() && row.committed != row.staged)
+                    {
+                        txn.note_index_key_removal(table_name);
+                    }
+                    self.push_art_undo_first(
+                        txn,
+                        ArtUndoOp::StagedRowsInIndex {
+                            index_name: name.clone(),
+                            rows: keys,
+                        },
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(Error::constraint_violation(format!(
+                    "could not create unique index \"{name}\": {e}"
+                ))),
+            }
+        };
+        if let Err(error) = applied {
+            // FAIL CLOSED, as the executor's own build does: the statement failed,
+            // so the index is not left behind.
+            let drop_index = sql::LogicalPlan::DropIndex {
+                name: name.clone(),
+                if_exists: true,
+            };
+            let mut executor =
+                sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
+            if let Err(e) = executor.execute(&drop_index) {
+                tracing::warn!("could not drop index '{}' after its build failed: {}", name, e);
+            }
+            return Err(error);
+        }
+        Ok(Some(0))
+    }
+
+    /// The HNSW half of [`Self::create_index_over_staged_rows`]: the vectors of the
+    /// rows only this transaction has.
+    fn apply_staged_rows_to_vector_index(
+        &self,
+        name: &str,
+        column_name: &str,
+        schema: &Schema,
+        rows: &[storage::art_manager::StagedIndexRow],
+        txn: &storage::Transaction,
+    ) -> Result<()> {
+        let Some(column) = schema.get_column_index(column_name) else {
+            return Ok(());
+        };
+        let vectors: Vec<(u64, crate::vector::Vector)> = rows
+            .iter()
+            .filter_map(|row| match row.staged.as_ref()?.values.get(column)? {
+                Value::Vector(vector) => Some((row.row_id, vector.clone())),
+                _ => None,
+            })
+            .collect();
+        if vectors.is_empty() {
+            return Ok(());
+        }
+        self.storage.vector_indexes().insert_vectors_batch(name, &vectors)?;
+        self.push_vector_undo(
+            txn,
+            vectors
+                .iter()
+                .map(|(row_id, _)| storage::VectorIndexUndoOp::RemoveInserted {
+                    index_name: name.to_string(),
+                    row_id: *row_id,
+                })
+                .collect(),
+        );
+        Ok(())
+    }
+
+    /// Spec R5.2: what `fills` (`(column, type, NOT NULL, fill)`) give each of a
+    /// transaction's own staged rows of `table`, by staged key, evaluated now, so a
+    /// refusal (NULL in NOT NULL, an error of a volatile expression) comes before
+    /// the statement writes anything. One evaluation per row: the caller re-stages
+    /// with these values rather than evaluating again.
+    fn own_row_fills(
+        txn: &storage::Transaction,
+        table: &str,
+        fills: &[(&str, &DataType, bool, &storage::row_shape::ColumnFill)],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<Value>>> {
+        let mut values = std::collections::HashMap::new();
+        for key in txn.staged_image_keys(table) {
+            if values.contains_key(&key) {
+                continue;
+            }
+            let mut row = Vec::with_capacity(fills.len());
+            for (column, data_type, not_null, fill) in fills {
+                let value = fill.next_value(data_type)?;
+                if *not_null && matches!(value, Value::Null) {
+                    return Err(Error::add_column_null_on_existing_rows(table, column));
+                }
+                row.push(value);
+            }
+            values.insert(key, row);
+        }
+        Ok(values)
+    }
+
+    /// Spec R5.2: everything an `ADD COLUMN` clause of a multi-clause `ALTER TABLE`
+    /// can refuse, asked in clause order before the first clause writes: a name
+    /// that is taken, by the table or by an earlier clause (42701); a default that
+    /// does not evaluate; NOT NULL with nothing to give the rows that exist
+    /// (23502); and for a volatile default, the staged rows under a savepoint
+    /// (0A000) and the rewrite itself, run into a scratch batch with the images the
+    /// real clause would write, and over the transaction's own staged rows (54000,
+    /// 23502, and any error of the expression).
+    ///
+    /// Those runs evaluate the default for real and throw the values away, so a
+    /// volatile default in a multi-clause statement runs twice per row: a
+    /// `nextval` consumes its values twice, and a function with a side effect has
+    /// it twice. A default that fails only on its second evaluation still fails in
+    /// its clause, after the earlier clauses wrote. A single clause needs none of
+    /// this: it refuses before its own write.
+    ///
+    /// The clauses are still written one group each. What this cannot promise is
+    /// said on `execute_alter_table_multi`.
+    fn prevalidate_added_columns(
+        &self,
+        operations: &[sql::LogicalPlan],
+        txn: Option<&storage::Transaction>,
+    ) -> Result<()> {
+        use sql::LogicalPlan as P;
+        use storage::row_shape::ColumnFill;
+
+        if operations.len() < 2 {
+            return Ok(());
+        }
+        let Some(table) = operations.iter().find_map(|op| match op {
+            P::AlterTableAddColumn { table_name, .. } => Some(table_name.as_str()),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        let schema = self.storage.catalog().get_table_schema(table)?;
+        let old_width = schema.columns.len();
+        let mut names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let own_rows = txn.is_some_and(|txn| txn.has_staged_rows(table));
+        let under_savepoint = own_rows && txn.is_some_and(storage::Transaction::has_savepoints);
+
+        let mut adds: Vec<(&str, &DataType, bool, ColumnFill)> = Vec::new();
+        let mut through_last_volatile = 0usize;
+        for operation in operations {
+            match operation {
+                P::AlterTableAddColumn {
+                    column_def,
+                    if_not_exists,
+                    ..
+                } => {
+                    if names.contains(&column_def.name) {
+                        if *if_not_exists {
+                            continue;
+                        }
+                        return Err(Error::query_execution(format!(
+                            "Column '{}' already exists in table '{}'",
+                            column_def.name, table
+                        )));
+                    }
+                    names.push(column_def.name.clone());
+                    let fill = ColumnFill::for_default(column_def.default.as_ref(), &column_def.data_type)?;
+                    match &fill {
+                        ColumnFill::Constant(Value::Null) => {
+                            if column_def.not_null && (own_rows || self.storage.table_has_rows(table)?) {
+                                return Err(Error::add_column_null_on_existing_rows(table, &column_def.name));
+                            }
+                        }
+                        ColumnFill::PerRow(_) => {
+                            if under_savepoint {
+                                return Err(Error::ddl_over_staged_rows(
+                                    "ALTER TABLE … ADD COLUMN with a volatile default, under a savepoint,",
+                                    table,
+                                ));
+                            }
+                            through_last_volatile = adds.len() + 1;
+                        }
+                        ColumnFill::Constant(_) => {}
+                    }
+                    adds.push((
+                        column_def.name.as_str(),
+                        &column_def.data_type,
+                        column_def.not_null,
+                        fill,
+                    ));
+                }
+                P::AlterTableDropColumn { column_name, .. } => {
+                    if under_savepoint {
+                        return Err(Error::ddl_over_staged_rows(
+                            "ALTER TABLE … DROP COLUMN under a savepoint",
+                            table,
+                        ));
+                    }
+                    names.retain(|name| name != column_name);
+                }
+                P::AlterTableRenameColumn {
+                    old_column_name,
+                    new_column_name,
+                    ..
+                } => {
+                    if let Some(name) = names.iter_mut().find(|name| name.as_str() == old_column_name.as_str()) {
+                        name.clone_from(new_column_name);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if through_last_volatile > 0 {
+            let fills: Vec<(&str, &DataType, bool, &ColumnFill)> = adds
+                .iter()
+                .take(through_last_volatile)
+                .map(|(column, data_type, not_null, fill)| (*column, *data_type, *not_null, fill))
+                .collect();
+            if let Some(txn) = txn.filter(|_| own_rows) {
+                Self::own_row_fills(txn, table, &fills)?;
+            }
+            let mut scratch = rocksdb::WriteBatch::default();
+            self.storage.stage_added_column_rows(
+                table,
+                old_width,
+                &fills,
+                self.storage.config().storage.max_atomic_rewrite_bytes,
+                &mut scratch,
+            )?;
+        }
+        Ok(())
+    }
+
     /// `ALTER TABLE <t> ADD COLUMN …` — ONE body for BOTH executor families.
+    ///
+    /// Spec R5.2, PostgreSQL 11's "missing value". A stable default (a literal, or
+    /// an expression of stable functions) is evaluated once, by the rule an INSERT
+    /// uses, and written with the schema in ONE group (`Catalog::add_columns`): no
+    /// row is rewritten, at any table size, and the row-shape funnel gives every
+    /// row older than the column that value (`storage::row_shape`). A volatile
+    /// default rewrites every row in that same group, up to
+    /// `[storage] max_atomic_rewrite_bytes`. Everything that can refuse does so
+    /// before anything is written; DDL is not transactional, so a statement inside
+    /// an explicit transaction is durable at once, and the transaction's own staged
+    /// rows are re-staged with the column's value, so what they commit (and log) is
+    /// as wide as the table they commit into. An image a `ROLLBACK TO` brings back
+    /// is narrow, and reads through the funnel like any other row older than the
+    /// column; a volatile default has no one value to answer with, so that is
+    /// refused under a savepoint.
     fn alter_table_add_column(
         &self,
         table_name: &str,
         column_def: &sql::logical_plan::ColumnDef,
         if_not_exists: bool,
+        txn: Option<&storage::Transaction>,
     ) -> Result<u64> {
+        use storage::row_shape::ColumnFill;
+
         let catalog = self.storage.catalog();
         let mut schema = catalog.get_table_schema(table_name)?;
 
@@ -16416,20 +16901,63 @@ impl EmbeddedDatabase {
             unique: column_def.unique,
             storage_mode: column_def.storage_mode,
         };
+        let not_null = !new_column.nullable;
 
+        let fill = ColumnFill::for_default(column_def.default.as_ref(), &column_def.data_type)?;
+        let own_rows = txn.filter(|txn| txn.has_staged_rows(table_name));
+        let own_values = match own_rows {
+            Some(txn) => {
+                if not_null && matches!(fill, ColumnFill::Constant(Value::Null)) {
+                    return Err(Error::add_column_null_on_existing_rows(table_name, &column_def.name));
+                }
+                // A ROLLBACK TO would bring back images this statement cannot reach.
+                if matches!(fill, ColumnFill::PerRow(_)) && txn.has_savepoints() {
+                    return Err(Error::ddl_over_staged_rows(
+                        "ALTER TABLE … ADD COLUMN with a volatile default, under a savepoint,",
+                        table_name,
+                    ));
+                }
+                // Before anything is written: a volatile default can refuse on these
+                // rows as on any other (NULL in NOT NULL, an error of the expression).
+                Self::own_row_fills(
+                    txn,
+                    table_name,
+                    &[(column_def.name.as_str(), &column_def.data_type, not_null, &fill)],
+                )?
+            }
+            None => std::collections::HashMap::new(),
+        };
+
+        let old_width = schema.columns.len();
         schema.columns.push(new_column);
-        catalog.update_table_schema(table_name, &schema)?;
+        let rewritten = catalog.add_columns(
+            table_name,
+            &schema,
+            old_width,
+            &[(column_def.name.as_str(), &column_def.data_type, not_null, &fill)],
+            true,
+        )?;
 
-        let rows_updated = self.storage.add_column_to_rows(table_name, &column_def.default)?;
+        if let Some(txn) = own_rows {
+            let shape = self.storage.row_shape(table_name, old_width)?;
+            txn.restage_table_rows(table_name, |key, tuple| {
+                shape.apply(tuple);
+                let values = own_values.get(key).ok_or_else(|| {
+                    Error::internal("ALTER TABLE … ADD COLUMN: a row was staged during the statement")
+                })?;
+                tuple.values.extend(values.iter().cloned());
+                Ok(())
+            })?;
+        }
 
         tracing::info!(
-            "Added column '{}' to table '{}', updated {} rows",
+            "Added column '{}' to table '{}', rewrote {} rows",
             column_def.name,
             table_name,
-            rows_updated
+            rewritten
         );
 
-        Ok(rows_updated as u64)
+        Ok(rewritten)
     }
 
     /// `ALTER TABLE <t> DROP COLUMN …` — ONE body for BOTH executor families.
@@ -16453,6 +16981,7 @@ impl EmbeddedDatabase {
         column_name: &str,
         if_exists: bool,
         cascade: bool,
+        txn: Option<&storage::Transaction>,
     ) -> Result<u64> {
         let catalog = self.storage.catalog();
         let mut schema = catalog.get_table_schema(table_name)?;
@@ -16484,13 +17013,32 @@ impl EmbeddedDatabase {
         // column and no CASCADE was given).
         catalog.validate_drop_column_constraints(table_name, column_name, cascade)?;
 
+        // Spec R5.2 (F5): the rows this transaction staged lose the column too, or
+        // they would commit one value too wide, every later column shifted by one.
+        // A ROLLBACK TO would bring back images this statement cannot reach.
+        let own_rows = txn.filter(|txn| txn.has_staged_rows(table_name));
+        if own_rows.is_some_and(storage::Transaction::has_savepoints) {
+            return Err(Error::ddl_over_staged_rows(
+                "ALTER TABLE … DROP COLUMN under a savepoint",
+                table_name,
+            ));
+        }
+
         let was_columnar = schema
             .get_column_at(idx)
             .is_some_and(|c| c.storage_mode == ColumnStorageMode::Columnar);
         schema.columns.remove(idx);
-        catalog.update_table_schema(table_name, &schema)?;
+        catalog.drop_column_from_schema(table_name, &schema, column_name)?;
 
         let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
+        if let Some(txn) = own_rows {
+            txn.restage_table_rows(table_name, |_, tuple| {
+                if idx < tuple.values.len() {
+                    tuple.values.remove(idx);
+                }
+                Ok(())
+            })?;
+        }
         self.cleanup_columnar_after_drop_column(table_name, column_name, was_columnar, &schema)?;
 
         // Retire every constraint record (and constraint-owned index) that
@@ -16610,19 +17158,19 @@ impl EmbeddedDatabase {
     /// This is used by the `AlterTableMulti` handler to execute each sub-operation
     /// sequentially, and also serves as the shared implementation for ALTER TABLE
     /// execution across different code paths.
-    fn execute_alter_table_op(&self, plan: &sql::LogicalPlan) -> Result<u64> {
+    fn execute_alter_table_op(&self, plan: &sql::LogicalPlan, txn: Option<&storage::Transaction>) -> Result<u64> {
         match plan {
             sql::LogicalPlan::AlterTableAddColumn {
                 table_name,
                 column_def,
                 if_not_exists,
-            } => self.alter_table_add_column(table_name, column_def, *if_not_exists),
+            } => self.alter_table_add_column(table_name, column_def, *if_not_exists, txn),
             sql::LogicalPlan::AlterTableDropColumn {
                 table_name,
                 column_name,
                 if_exists,
                 cascade,
-            } => self.alter_table_drop_column(table_name, column_name, *if_exists, *cascade),
+            } => self.alter_table_drop_column(table_name, column_name, *if_exists, *cascade, txn),
             sql::LogicalPlan::AlterTableRenameColumn {
                 table_name,
                 old_column_name,
@@ -16666,6 +17214,7 @@ impl EmbeddedDatabase {
                 new_table_name,
             } => {
                 let catalog = self.storage.catalog();
+                Self::refuse_ddl_over_staged_rows(txn, "ALTER TABLE … RENAME TO", table_name)?;
 
                 if catalog.get_table_schema(new_table_name).is_ok() {
                     return Err(Error::query_execution(format!(
@@ -20566,6 +21115,25 @@ impl EmbeddedDatabase {
         if let Some(rows) = self.branch_schema_ddl(plan, session_txn, original_sql)? {
             return Ok((rows, Vec::new()));
         }
+        // Spec R5.2: the text family's two questions, same functions.
+        if matches!(
+            plan,
+            sql::LogicalPlan::CreateIndex { .. }
+                | sql::LogicalPlan::AlterTableMulti { .. }
+                | sql::LogicalPlan::AlterTableAddColumn { .. }
+                | sql::LogicalPlan::AlterTableAddUnique { .. }
+                | sql::LogicalPlan::AlterTableAddPrimaryKey { .. }
+                | sql::LogicalPlan::AlterTableAddCheck { .. }
+                | sql::LogicalPlan::AlterTableAddForeignKey { .. }
+        ) {
+            let answered = self.with_params_ddl_txn(session_txn, |txn| {
+                Self::refuse_constraint_over_staged_rows(plan, txn)?;
+                self.create_index_over_staged_rows(plan, txn)
+            })?;
+            if let Some(rows) = answered {
+                return Ok((rows, Vec::new()));
+            }
+        }
         // Session transactions manage their lifecycle through the session
         // API; routing plan-level transaction control at the global slot
         // from inside a session would corrupt both.
@@ -20631,9 +21199,14 @@ impl EmbeddedDatabase {
             | sql::LogicalPlan::AlterTableAddCheck { .. }
             | sql::LogicalPlan::AlterTableDropConstraint { .. }
             | sql::LogicalPlan::AlterTableAddForeignKey { .. }
-            | sql::LogicalPlan::AlterTableRename { .. } => Ok((self.execute_alter_table_op(plan)?, Vec::new())),
+            | sql::LogicalPlan::AlterTableRename { .. } => {
+                let rows = self.with_params_ddl_txn(session_txn, |txn| self.execute_alter_table_op(plan, txn))?;
+                Ok((rows, Vec::new()))
+            }
             sql::LogicalPlan::AlterTableMulti { operations } => {
-                Ok((self.execute_alter_table_multi(operations)?, Vec::new()))
+                let rows =
+                    self.with_params_ddl_txn(session_txn, |txn| self.execute_alter_table_multi(operations, txn))?;
+                Ok((rows, Vec::new()))
             }
             sql::LogicalPlan::Insert {
                 table_name,
@@ -21133,7 +21706,10 @@ impl EmbeddedDatabase {
                             // the branch view's (branch). `old_tuple_for_art` is
                             // the pre-image the ART diff / UNIQUE re-check uses.
                             let (mut updated_tuple, old_tuple_for_art): (Tuple, Tuple) = match branch_existing {
-                                Some(row) => (row.clone(), row),
+                                Some(mut row) => {
+                                    self.storage.shape_row(table_name, schema.columns.len(), &mut row)?;
+                                    (row.clone(), row)
+                                }
                                 None => {
                                     let existing_key = self.storage.branch_aware_data_key(table_name, existing_row_id);
                                     let existing_raw = self.storage.get(&existing_key)?.ok_or_else(|| {
@@ -21141,13 +21717,14 @@ impl EmbeddedDatabase {
                                             "ON CONFLICT DO UPDATE: existing row not found in storage",
                                         )
                                     })?;
-                                    let current: Tuple = bincode::deserialize(&existing_raw).map_err(|err| {
+                                    let mut current: Tuple = bincode::deserialize(&existing_raw).map_err(|err| {
                                         Error::storage(format!("Failed to deserialize tuple: {}", err))
                                     })?;
+                                    // Spec R5.2: a conflicting row older than a
+                                    // column reads its missing value.
+                                    self.storage.shape_row(table_name, schema.columns.len(), &mut current)?;
                                     // Snapshot the old tuple for the ART diff.
-                                    let pre_image: Tuple = bincode::deserialize(&existing_raw).map_err(|err| {
-                                        Error::storage(format!("Failed to deserialize tuple: {}", err))
-                                    })?;
+                                    let pre_image = current.clone();
                                     (current, pre_image)
                                 }
                             };
@@ -21212,12 +21789,10 @@ impl EmbeddedDatabase {
                                 if new_val.data_type() != *target_type && !matches!(new_val, Value::Null) {
                                     new_val = update_eval.cast_value(new_val, target_type)?;
                                 }
-                                if target_idx < updated_tuple.values.len() {
-                                    #[allow(clippy::indexing_slicing)]
-                                    {
-                                        updated_tuple.values[target_idx] = new_val;
-                                    }
-                                }
+                                // Spec R5.2: see the text family's arm.
+                                *updated_tuple.values.get_mut(target_idx).ok_or_else(|| {
+                                    Error::internal("ON CONFLICT DO UPDATE: assignment past the end of a row")
+                                })? = new_val;
                             }
 
                             // RLS WITH CHECK on the post-assignment row — an ERROR on
@@ -21536,10 +22111,11 @@ impl EmbeddedDatabase {
                     None => self.storage.scan_table_branch_aware(table_name)?,
                 };
                 let tuples = if let (Some(txn), None) = (active_txn, &branch_view) {
-                    txn.merge_with_write_set_to_width(
+                    let width = self.storage.catalog().get_table_schema(table_name)?.columns.len();
+                    txn.merge_with_write_set_shaped(
                         table_name,
                         base_tuples,
-                        self.storage.catalog().get_table_schema(table_name)?.columns.len(),
+                        &self.storage.row_shape(table_name, width)?,
                     )?
                 } else {
                     base_tuples
@@ -21885,10 +22461,11 @@ impl EmbeddedDatabase {
                     None => self.storage.scan_table_branch_aware(table_name)?,
                 };
                 let tuples = if let (Some(txn), None) = (active_txn, &branch_view) {
-                    txn.merge_with_write_set_to_width(
+                    let width = self.storage.catalog().get_table_schema(table_name)?.columns.len();
+                    txn.merge_with_write_set_shaped(
                         table_name,
                         base_tuples,
-                        self.storage.catalog().get_table_schema(table_name)?.columns.len(),
+                        &self.storage.row_shape(table_name, width)?,
                     )?
                 } else {
                     base_tuples
@@ -30209,11 +30786,8 @@ impl EmbeddedDatabase {
         let schema = catalog.get_table_schema(table_name)?;
         let base = self.storage.scan_table(table_name)?;
         let tuples = if let Some(txn) = active_txn {
-            txn.merge_with_write_set_to_width(
-                table_name,
-                base,
-                self.storage.catalog().get_table_schema(table_name)?.columns.len(),
-            )?
+            let width = self.storage.catalog().get_table_schema(table_name)?.columns.len();
+            txn.merge_with_write_set_shaped(table_name, base, &self.storage.row_shape(table_name, width)?)?
         } else {
             base
         };
@@ -41818,8 +42392,7 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 2, "Should still have 2 rows");
 
-        // The default may or may not be applied to existing rows depending on
-        // the storage layer's add_column_to_rows implementation. Document actual behavior.
+        // Spec R5.2: every existing row reads the column's missing value.
         let status_0 = rows[0].get(2).unwrap();
         let status_1 = rows[1].get(2).unwrap();
 
@@ -41829,10 +42402,9 @@ mod tests {
             "Both existing rows should get same value for new column with DEFAULT"
         );
 
-        // Accept either NULL (default not backfilled) or the default value
         assert!(
-            *status_0 == Value::Null || *status_0 == Value::String("active".to_string()),
-            "New column should be NULL or 'active', got: {:?}",
+            *status_0 == Value::String("active".to_string()),
+            "New column should read 'active', got: {:?}",
             status_0
         );
     }

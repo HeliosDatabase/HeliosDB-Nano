@@ -12,7 +12,14 @@
 //! uncertain (wildcards, joins, subqueries, unresolved columns). Tuples stay
 //! full-width (tail padded with `Null`), so downstream column indices are unchanged —
 //! the padding columns are, by construction, never read.
+//!
+//! Spec R5.2: a REQUESTED column past the end of a row narrower than its schema
+//! answers the column's missing value ([`MissingValues`], `None` when the table
+//! has none), which is what the full-row funnel (`storage::row_shape`) answers
+//! for it. The value is consulted only once the row has run out, so a row that
+//! holds every requested column pays nothing for it.
 
+use super::row_shape::MissingValues;
 use crate::types::{Tuple, Value};
 use bincode::Options;
 use serde::de::{DeserializeSeed, SeqAccess, Visitor};
@@ -25,28 +32,31 @@ pub(crate) enum DecodedNumericValue {
     Float(f64),
 }
 
-struct PrefixValues {
+struct PrefixValues<'a> {
     prefix_len: usize,
     total_cols: usize,
+    missing: Option<&'a MissingValues>,
 }
 
 struct SelectedValues<'a> {
     columns: &'a [usize],
     total_cols: usize,
+    missing: Option<&'a MissingValues>,
 }
 
-impl<'de> DeserializeSeed<'de> for PrefixValues {
+impl<'de> DeserializeSeed<'de> for PrefixValues<'_> {
     type Value = Vec<Value>;
 
     fn deserialize<D>(self, d: D) -> Result<Self::Value, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        struct V {
+        struct V<'a> {
             prefix_len: usize,
             total_cols: usize,
+            missing: Option<&'a MissingValues>,
         }
-        impl<'de> Visitor<'de> for V {
+        impl<'de> Visitor<'de> for V<'_> {
             type Value = Vec<Value>;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a column-value sequence")
@@ -60,7 +70,17 @@ impl<'de> DeserializeSeed<'de> for PrefixValues {
                 while out.len() < self.prefix_len {
                     match seq.next_element::<Value>()? {
                         Some(v) => out.push(v),
-                        None => break, // row narrower than prefix_len
+                        None => {
+                            // Row narrower than prefix_len: the rest of the prefix
+                            // answers its missing values.
+                            if let Some(missing) = self.missing {
+                                while out.len() < self.prefix_len.min(self.total_cols) {
+                                    let column = out.len();
+                                    out.push(missing.value(column).clone());
+                                }
+                            }
+                            break;
+                        }
                     }
                 }
                 // Pad to full width so downstream positional indexing is unaffected.
@@ -73,6 +93,7 @@ impl<'de> DeserializeSeed<'de> for PrefixValues {
         d.deserialize_seq(V {
             prefix_len: self.prefix_len,
             total_cols: self.total_cols,
+            missing: self.missing,
         })
     }
 }
@@ -87,6 +108,7 @@ impl<'a, 'de> DeserializeSeed<'de> for SelectedValues<'a> {
         struct V<'a> {
             columns: &'a [usize],
             total_cols: usize,
+            missing: Option<&'a MissingValues>,
         }
         impl<'a, 'de> Visitor<'de> for V<'a> {
             type Value = Vec<Value>;
@@ -123,6 +145,15 @@ impl<'a, 'de> DeserializeSeed<'de> for SelectedValues<'a> {
                     }
                 }
 
+                // What is still wanted lies past the row's end.
+                if let Some(missing) = self.missing {
+                    for want in wanted {
+                        if let Some(slot) = out.get_mut(want) {
+                            *slot = missing.value(want).clone();
+                        }
+                    }
+                }
+
                 Ok(out)
             }
         }
@@ -130,6 +161,7 @@ impl<'a, 'de> DeserializeSeed<'de> for SelectedValues<'a> {
         d.deserialize_seq(V {
             columns: self.columns,
             total_cols: self.total_cols,
+            missing: self.missing,
         })
     }
 }
@@ -147,8 +179,20 @@ fn row_blob_opts() -> impl Options {
 /// Decode a row blob into a full-width `Tuple`, materializing only the first
 /// `prefix_len` values (the rest are `Value::Null`). `row_id` is left `None`; the scan
 /// recovers it from the row key.
-pub(crate) fn decode_tuple_prefix(bytes: &[u8], prefix_len: usize, total_cols: usize) -> bincode::Result<Tuple> {
-    let values = row_blob_opts().deserialize_seed(PrefixValues { prefix_len, total_cols }, bytes)?;
+pub(crate) fn decode_tuple_prefix(
+    bytes: &[u8],
+    prefix_len: usize,
+    total_cols: usize,
+    missing: Option<&MissingValues>,
+) -> bincode::Result<Tuple> {
+    let values = row_blob_opts().deserialize_seed(
+        PrefixValues {
+            prefix_len,
+            total_cols,
+            missing,
+        },
+        bytes,
+    )?;
     Ok(Tuple {
         values,
         row_id: None,
@@ -160,12 +204,24 @@ pub(crate) fn decode_tuple_prefix(bytes: &[u8], prefix_len: usize, total_cols: u
 /// unique column indexes in `columns`. Unrequested values before the last requested
 /// column are skipped by the fast bincode cursor when possible, and the tail is
 /// left unread.
-pub(crate) fn decode_tuple_columns(bytes: &[u8], columns: &[usize], total_cols: usize) -> bincode::Result<Tuple> {
-    if let Some(tuple) = try_decode_tuple_columns_fast(bytes, columns, total_cols) {
+pub(crate) fn decode_tuple_columns(
+    bytes: &[u8],
+    columns: &[usize],
+    total_cols: usize,
+    missing: Option<&MissingValues>,
+) -> bincode::Result<Tuple> {
+    if let Some(tuple) = try_decode_tuple_columns_fast(bytes, columns, total_cols, missing) {
         return Ok(tuple);
     }
 
-    let values = row_blob_opts().deserialize_seed(SelectedValues { columns, total_cols }, bytes)?;
+    let values = row_blob_opts().deserialize_seed(
+        SelectedValues {
+            columns,
+            total_cols,
+            missing,
+        },
+        bytes,
+    )?;
     Ok(Tuple {
         values,
         row_id: None,
@@ -180,12 +236,13 @@ pub(crate) fn decode_tuple_column_values(
     bytes: &[u8],
     columns: &[usize],
     total_cols: usize,
+    missing: Option<&MissingValues>,
 ) -> bincode::Result<Vec<Value>> {
-    if let Some(values) = try_decode_tuple_column_values_fast(bytes, columns) {
+    if let Some(values) = try_decode_tuple_column_values_fast(bytes, columns, missing) {
         return Ok(values);
     }
 
-    let tuple = decode_tuple_columns(bytes, columns, total_cols)?;
+    let tuple = decode_tuple_columns(bytes, columns, total_cols, missing)?;
     Ok(columns
         .iter()
         .map(|&idx| tuple.values.get(idx).cloned().unwrap_or(Value::Null))
@@ -202,14 +259,15 @@ pub(crate) fn decode_tuple_column_values_into(
     bytes: &[u8],
     columns: &[usize],
     total_cols: usize,
+    missing: Option<&MissingValues>,
     out: &mut Vec<Value>,
 ) -> bincode::Result<()> {
-    if try_decode_tuple_column_values_fast_into(bytes, columns, out).is_some() {
+    if try_decode_tuple_column_values_fast_into(bytes, columns, missing, out).is_some() {
         return Ok(());
     }
 
     out.clear();
-    let tuple = decode_tuple_columns(bytes, columns, total_cols)?;
+    let tuple = decode_tuple_columns(bytes, columns, total_cols, missing)?;
     out.extend(
         columns
             .iter()
@@ -227,6 +285,7 @@ pub(crate) fn decode_tuple_column_values_into(
 pub(crate) fn decode_tuple_numeric_column_values_into(
     bytes: &[u8],
     columns: &[usize],
+    missing: Option<&MissingValues>,
     out: &mut Vec<DecodedNumericValue>,
 ) -> Option<()> {
     out.clear();
@@ -249,14 +308,28 @@ pub(crate) fn decode_tuple_numeric_column_values_into(
         }
     }
 
-    while wanted.next().is_some() {
-        out.push(DecodedNumericValue::Null);
+    for want in wanted {
+        out.push(missing_numeric(missing, want)?);
     }
     Some(())
 }
 
+/// What a numeric column past the row's end answers; `None` (a missing value of
+/// another shape) sends the caller to its generic decoder.
+#[inline]
+fn missing_numeric(missing: Option<&MissingValues>, column: usize) -> Option<DecodedNumericValue> {
+    match missing {
+        Some(missing) => missing.numeric(column),
+        None => Some(DecodedNumericValue::Null),
+    }
+}
+
 /// Decode one primitive numeric column without materializing a `Vec`.
-pub(crate) fn decode_tuple_numeric_column_value(bytes: &[u8], column: usize) -> Option<DecodedNumericValue> {
+pub(crate) fn decode_tuple_numeric_column_value(
+    bytes: &[u8],
+    column: usize,
+    missing: Option<&MissingValues>,
+) -> Option<DecodedNumericValue> {
     let mut cur = ByteCursor::new(bytes);
     let stored_cols = cur.read_len()?;
 
@@ -271,11 +344,16 @@ pub(crate) fn decode_tuple_numeric_column_value(bytes: &[u8], column: usize) -> 
         }
     }
 
-    Some(DecodedNumericValue::Null)
+    missing_numeric(missing, column)
 }
 
 /// Compare one string column against a literal without materializing `Value`.
-pub(crate) fn tuple_string_column_eq(bytes: &[u8], column: usize, expected: &str) -> Option<bool> {
+pub(crate) fn tuple_string_column_eq(
+    bytes: &[u8],
+    column: usize,
+    expected: &str,
+    missing: Option<&MissingValues>,
+) -> Option<bool> {
     let mut cur = ByteCursor::new(bytes);
     let stored_cols = cur.read_len()?;
 
@@ -298,7 +376,11 @@ pub(crate) fn tuple_string_column_eq(bytes: &[u8], column: usize, expected: &str
         }
     }
 
-    Some(false)
+    match missing.map(|missing| missing.value(column)) {
+        None | Some(Value::Null) => Some(false),
+        Some(Value::String(value)) => Some(value == expected),
+        Some(_) => None,
+    }
 }
 
 /// Decode one text group column and one primitive integer aggregate column.
@@ -306,11 +388,12 @@ pub(crate) fn tuple_string_column_eq(bytes: &[u8], column: usize, expected: &str
 /// This is intentionally narrow: callers use it only as an aggregate fast path
 /// and fall back to the generic decoder if either requested column uses an
 /// unsupported wire shape.
-pub(crate) fn decode_tuple_text_and_int_columns(
-    bytes: &[u8],
+pub(crate) fn decode_tuple_text_and_int_columns<'a>(
+    bytes: &'a [u8],
     text_column: usize,
     int_column: usize,
-) -> Option<(Option<&str>, Option<i64>)> {
+    missing: Option<&'a MissingValues>,
+) -> Option<(Option<&'a str>, Option<i64>)> {
     if text_column == int_column {
         return None;
     }
@@ -318,7 +401,7 @@ pub(crate) fn decode_tuple_text_and_int_columns(
     let mut cur = ByteCursor::new(bytes);
     let stored_cols = cur.read_len()?;
     let max_column = text_column.max(int_column);
-    let mut text_value: Option<Option<&str>> = None;
+    let mut text_value: Option<Option<&'a str>> = None;
     let mut int_value: Option<Option<i64>> = None;
 
     for idx in 0..stored_cols {
@@ -347,7 +430,24 @@ pub(crate) fn decode_tuple_text_and_int_columns(
         }
     }
 
-    Some((text_value.unwrap_or(None), int_value.unwrap_or(None)))
+    // A column the loop never reached lies past the row's end.
+    let text = match text_value {
+        Some(value) => value,
+        None => match missing.map(|missing| missing.value(text_column)) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value.as_str()),
+            Some(_) => return None,
+        },
+    };
+    let int = match int_value {
+        Some(value) => value,
+        None => match missing_numeric(missing, int_column)? {
+            DecodedNumericValue::Null => None,
+            DecodedNumericValue::Int(value) => Some(value),
+            DecodedNumericValue::Float(_) => return None,
+        },
+    };
+    Some((text, int))
 }
 
 struct ByteCursor<'a> {
@@ -408,7 +508,12 @@ impl<'a> ByteCursor<'a> {
     }
 }
 
-fn try_decode_tuple_columns_fast(bytes: &[u8], columns: &[usize], total_cols: usize) -> Option<Tuple> {
+fn try_decode_tuple_columns_fast(
+    bytes: &[u8],
+    columns: &[usize],
+    total_cols: usize,
+    missing: Option<&MissingValues>,
+) -> Option<Tuple> {
     let mut cur = ByteCursor::new(bytes);
     let stored_cols = cur.read_len()?;
     let mut out = vec![Value::Null; total_cols];
@@ -438,6 +543,15 @@ fn try_decode_tuple_columns_fast(bytes: &[u8], columns: &[usize], total_cols: us
         }
     }
 
+    // What is still wanted lies past the row's end.
+    if let Some(missing) = missing {
+        for want in wanted {
+            if let Some(slot) = out.get_mut(want) {
+                *slot = missing.value(want).clone();
+            }
+        }
+    }
+
     Some(Tuple {
         values: out,
         row_id: None,
@@ -445,7 +559,11 @@ fn try_decode_tuple_columns_fast(bytes: &[u8], columns: &[usize], total_cols: us
     })
 }
 
-fn try_decode_tuple_column_values_fast(bytes: &[u8], columns: &[usize]) -> Option<Vec<Value>> {
+fn try_decode_tuple_column_values_fast(
+    bytes: &[u8],
+    columns: &[usize],
+    missing: Option<&MissingValues>,
+) -> Option<Vec<Value>> {
     let mut cur = ByteCursor::new(bytes);
     let stored_cols = cur.read_len()?;
     let mut out = Vec::with_capacity(columns.len());
@@ -466,13 +584,18 @@ fn try_decode_tuple_column_values_fast(bytes: &[u8], columns: &[usize]) -> Optio
         }
     }
 
-    while wanted.next().is_some() {
-        out.push(Value::Null);
+    for want in wanted {
+        out.push(missing.map_or(Value::Null, |missing| missing.value(want).clone()));
     }
     Some(out)
 }
 
-fn try_decode_tuple_column_values_fast_into(bytes: &[u8], columns: &[usize], out: &mut Vec<Value>) -> Option<()> {
+fn try_decode_tuple_column_values_fast_into(
+    bytes: &[u8],
+    columns: &[usize],
+    missing: Option<&MissingValues>,
+    out: &mut Vec<Value>,
+) -> Option<()> {
     out.clear();
     let mut cur = ByteCursor::new(bytes);
     let stored_cols = cur.read_len()?;
@@ -493,8 +616,8 @@ fn try_decode_tuple_column_values_fast_into(bytes: &[u8], columns: &[usize], out
         }
     }
 
-    while wanted.next().is_some() {
-        out.push(Value::Null);
+    for want in wanted {
+        out.push(missing.map_or(Value::Null, |missing| missing.value(want).clone()));
     }
     Some(())
 }
@@ -634,7 +757,7 @@ mod tests {
         assert_eq!(full.values.len(), 6);
 
         // prefix 2: first two real, rest Null, width preserved.
-        let p = decode_tuple_prefix(&bytes, 2, 6).unwrap();
+        let p = decode_tuple_prefix(&bytes, 2, 6, None).unwrap();
         assert_eq!(p.values.len(), 6);
         assert_eq!(p.values[0], Value::Int4(1));
         assert_eq!(p.values[1], Value::String("sess-2".into()));
@@ -642,15 +765,15 @@ mod tests {
         assert_eq!(p.values[5], Value::Null);
 
         // prefix 4: stops before the expensive tail (string + vector).
-        let p4 = decode_tuple_prefix(&bytes, 4, 6).unwrap();
+        let p4 = decode_tuple_prefix(&bytes, 4, 6, None).unwrap();
         assert_eq!(&p4.values[..4], &full.values[..4]);
         assert_eq!(p4.values[4], Value::Null);
         assert_eq!(p4.values[5], Value::Null);
 
         // prefix >= width: identical to a full decode.
-        let pall = decode_tuple_prefix(&bytes, 6, 6).unwrap();
+        let pall = decode_tuple_prefix(&bytes, 6, 6, None).unwrap();
         assert_eq!(pall.values, full.values);
-        let pover = decode_tuple_prefix(&bytes, 10, 6).unwrap();
+        let pover = decode_tuple_prefix(&bytes, 10, 6, None).unwrap();
         assert_eq!(pover.values, full.values);
     }
 
@@ -660,7 +783,7 @@ mod tests {
         let bytes = bincode::serialize(&t).unwrap();
         let full: Tuple = bincode::deserialize(&bytes).unwrap();
 
-        let selected = decode_tuple_columns(&bytes, &[0, 3, 5], 6).unwrap();
+        let selected = decode_tuple_columns(&bytes, &[0, 3, 5], 6, None).unwrap();
         assert_eq!(selected.values.len(), 6);
         assert_eq!(selected.values[0], full.values[0]);
         assert_eq!(selected.values[1], Value::Null);
@@ -676,7 +799,7 @@ mod tests {
         let bytes = bincode::serialize(&t).unwrap();
         let full: Tuple = bincode::deserialize(&bytes).unwrap();
 
-        let selected = decode_tuple_columns(&bytes, &[1, 3], 6).unwrap();
+        let selected = decode_tuple_columns(&bytes, &[1, 3], 6, None).unwrap();
         assert_eq!(selected.values.len(), 6);
         assert_eq!(selected.values[0], Value::Null);
         assert_eq!(selected.values[1], full.values[1]);
@@ -692,7 +815,7 @@ mod tests {
         let bytes = bincode::serialize(&t).unwrap();
         let full: Tuple = bincode::deserialize(&bytes).unwrap();
 
-        let selected = decode_tuple_column_values(&bytes, &[1, 3], 6).unwrap();
+        let selected = decode_tuple_column_values(&bytes, &[1, 3], 6, None).unwrap();
         assert_eq!(selected, vec![full.values[1].clone(), full.values[3].clone()]);
     }
 
@@ -704,10 +827,10 @@ mod tests {
 
         let mut out = Vec::with_capacity(8);
         out.push(Value::String("stale".into()));
-        decode_tuple_column_values_into(&bytes, &[1, 3], 6, &mut out).unwrap();
+        decode_tuple_column_values_into(&bytes, &[1, 3], 6, None, &mut out).unwrap();
         assert_eq!(out, vec![full.values[1].clone(), full.values[3].clone()]);
 
-        decode_tuple_column_values_into(&bytes, &[2], 6, &mut out).unwrap();
+        decode_tuple_column_values_into(&bytes, &[2], 6, None, &mut out).unwrap();
         assert_eq!(out, vec![full.values[2].clone()]);
     }
 
@@ -717,7 +840,7 @@ mod tests {
         let bytes = bincode::serialize(&t).unwrap();
         let mut out = Vec::new();
 
-        decode_tuple_numeric_column_values_into(&bytes, &[0, 1, 2, 3], &mut out).unwrap();
+        decode_tuple_numeric_column_values_into(&bytes, &[0, 1, 2, 3], None, &mut out).unwrap();
         assert_eq!(
             out,
             vec![
@@ -728,15 +851,15 @@ mod tests {
             ]
         );
 
-        decode_tuple_numeric_column_values_into(&bytes, &[2], &mut out).unwrap();
+        decode_tuple_numeric_column_values_into(&bytes, &[2], None, &mut out).unwrap();
         assert_eq!(out, vec![DecodedNumericValue::Int(11)]);
 
         assert_eq!(
-            decode_tuple_numeric_column_value(&bytes, 2).unwrap(),
+            decode_tuple_numeric_column_value(&bytes, 2, None).unwrap(),
             DecodedNumericValue::Int(11)
         );
         assert_eq!(
-            decode_tuple_numeric_column_value(&bytes, 9).unwrap(),
+            decode_tuple_numeric_column_value(&bytes, 9, None).unwrap(),
             DecodedNumericValue::Null
         );
     }
@@ -751,11 +874,11 @@ mod tests {
         ]);
         let bytes = bincode::serialize(&t).unwrap();
 
-        assert_eq!(tuple_string_column_eq(&bytes, 2, "paid"), Some(true));
-        assert_eq!(tuple_string_column_eq(&bytes, 1, "paid"), Some(false));
-        assert_eq!(tuple_string_column_eq(&bytes, 3, "paid"), Some(false));
-        assert_eq!(tuple_string_column_eq(&bytes, 9, "paid"), Some(false));
-        assert_eq!(tuple_string_column_eq(&bytes, 0, "paid"), None);
+        assert_eq!(tuple_string_column_eq(&bytes, 2, "paid", None), Some(true));
+        assert_eq!(tuple_string_column_eq(&bytes, 1, "paid", None), Some(false));
+        assert_eq!(tuple_string_column_eq(&bytes, 3, "paid", None), Some(false));
+        assert_eq!(tuple_string_column_eq(&bytes, 9, "paid", None), Some(false));
+        assert_eq!(tuple_string_column_eq(&bytes, 0, "paid", None), None);
     }
 
     #[test]
@@ -769,15 +892,101 @@ mod tests {
         let bytes = bincode::serialize(&t).unwrap();
 
         assert_eq!(
-            decode_tuple_text_and_int_columns(&bytes, 1, 2),
+            decode_tuple_text_and_int_columns(&bytes, 1, 2, None),
             Some((Some("paid"), Some(42)))
         );
-        assert_eq!(decode_tuple_text_and_int_columns(&bytes, 3, 2), Some((None, Some(42))));
         assert_eq!(
-            decode_tuple_text_and_int_columns(&bytes, 1, 9),
+            decode_tuple_text_and_int_columns(&bytes, 3, 2, None),
+            Some((None, Some(42)))
+        );
+        assert_eq!(
+            decode_tuple_text_and_int_columns(&bytes, 1, 9, None),
             Some((Some("paid"), None))
         );
-        assert_eq!(decode_tuple_text_and_int_columns(&bytes, 0, 2), None);
+        assert_eq!(decode_tuple_text_and_int_columns(&bytes, 0, 2, None), None);
+    }
+
+    /// Spec R5.2: every decoder answers a requested column past the row's end
+    /// from the table's missing values, and reads a column the row holds from the
+    /// row, a stored NULL included.
+    #[test]
+    fn a_column_past_the_rows_end_answers_its_missing_value() {
+        // A row of two columns under a schema of five.
+        let row = Tuple::new(vec![Value::Int4(1), Value::Null]);
+        let bytes = bincode::serialize(&row).unwrap();
+        let missing = MissingValues::from_slots(vec![
+            Value::Int4(100),
+            Value::Int4(200),
+            Value::Int4(7),
+            Value::String("usd".into()),
+            Value::Null,
+        ]);
+        let m = Some(&missing);
+
+        let p = decode_tuple_prefix(&bytes, 4, 5, m).unwrap();
+        assert_eq!(
+            p.values,
+            vec![
+                Value::Int4(1),
+                Value::Null,
+                Value::Int4(7),
+                Value::String("usd".into()),
+                Value::Null
+            ]
+        );
+
+        let selected = decode_tuple_columns(&bytes, &[1, 2, 3], 5, m).unwrap();
+        assert_eq!(
+            selected.values,
+            vec![
+                Value::Null,
+                Value::Null,
+                Value::Int4(7),
+                Value::String("usd".into()),
+                Value::Null
+            ]
+        );
+
+        assert_eq!(
+            decode_tuple_column_values(&bytes, &[0, 2], 5, m).unwrap(),
+            vec![Value::Int4(1), Value::Int4(7)]
+        );
+        let mut out = Vec::new();
+        decode_tuple_column_values_into(&bytes, &[1, 3], 5, m, &mut out).unwrap();
+        assert_eq!(out, vec![Value::Null, Value::String("usd".into())]);
+
+        let mut numeric = Vec::new();
+        decode_tuple_numeric_column_values_into(&bytes, &[0, 2], m, &mut numeric).unwrap();
+        assert_eq!(numeric, vec![DecodedNumericValue::Int(1), DecodedNumericValue::Int(7)]);
+        assert_eq!(
+            decode_tuple_numeric_column_values_into(&bytes, &[3], m, &mut numeric),
+            None,
+            "a missing value of another shape goes to the generic decoder"
+        );
+        assert_eq!(
+            decode_tuple_numeric_column_value(&bytes, 2, m),
+            Some(DecodedNumericValue::Int(7))
+        );
+        assert_eq!(
+            decode_tuple_numeric_column_value(&bytes, 4, m),
+            Some(DecodedNumericValue::Null)
+        );
+        assert_eq!(decode_tuple_numeric_column_value(&bytes, 3, m), None);
+
+        assert_eq!(tuple_string_column_eq(&bytes, 3, "usd", m), Some(true));
+        assert_eq!(tuple_string_column_eq(&bytes, 3, "eur", m), Some(false));
+        assert_eq!(tuple_string_column_eq(&bytes, 4, "usd", m), Some(false));
+        assert_eq!(tuple_string_column_eq(&bytes, 2, "usd", m), None);
+
+        assert_eq!(
+            decode_tuple_text_and_int_columns(&bytes, 3, 2, m),
+            Some((Some("usd"), Some(7)))
+        );
+        assert_eq!(
+            decode_tuple_text_and_int_columns(&bytes, 4, 0, m),
+            Some((None, Some(1)))
+        );
+        assert_eq!(decode_tuple_text_and_int_columns(&bytes, 2, 0, m), None, "not text");
     }
 
     #[test]
@@ -793,12 +1002,12 @@ mod tests {
 
         // Date's serde wire shape is intentionally not hand-skipped by the fast
         // cursor. The fallback path must still preserve correctness for later columns.
-        let selected = decode_tuple_columns(&bytes, &[2], 3).unwrap();
+        let selected = decode_tuple_columns(&bytes, &[2], 3, None).unwrap();
         assert_eq!(selected.values[0], Value::Null);
         assert_eq!(selected.values[1], Value::Null);
         assert_eq!(selected.values[2], full.values[2]);
 
-        let compact = decode_tuple_column_values(&bytes, &[2], 3).unwrap();
+        let compact = decode_tuple_column_values(&bytes, &[2], 3, None).unwrap();
         assert_eq!(compact, vec![full.values[2].clone()]);
     }
 }

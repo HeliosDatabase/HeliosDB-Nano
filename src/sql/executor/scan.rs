@@ -212,7 +212,8 @@ fn txn_base_tuples(
         }
     }
     let base_tuples = storage.scan_table_at_snapshot(actual_table_name, snapshot)?;
-    txn.merge_with_write_set_to_width(actual_table_name, base_tuples, schema.columns.len())
+    let shape = storage.row_shape(actual_table_name, schema.columns.len())?;
+    txn.merge_with_write_set_shaped(actual_table_name, base_tuples, &shape)
 }
 
 pub(crate) fn storage_predicates_are_sql_safe(schema: &Schema, predicates: &[AnalyzedPredicate]) -> bool {
@@ -2187,6 +2188,9 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                         match bincode::deserialize::<crate::Tuple>(&value_bytes) {
                             Ok(mut tuple) => {
                                 tuple.row_id = Some(row_id);
+                                // Spec R5.2: a version older than a column reads
+                                // its missing value, under the version rule.
+                                storage.shape_version_row(&actual_table_name, schema.columns.len(), &mut tuple)?;
                                 tuples.push(tuple);
                             }
                             Err(e) => {
@@ -2550,6 +2554,8 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                         match bincode::deserialize::<crate::Tuple>(&value_bytes) {
                             Ok(mut tuple) => {
                                 tuple.row_id = Some(row_id);
+                                // Spec R5.2: as in `handle_scan`.
+                                storage.shape_version_row(&actual_table_name, schema.columns.len(), &mut tuple)?;
                                 version_tuples.push(tuple);
                             }
                             Err(e) => {

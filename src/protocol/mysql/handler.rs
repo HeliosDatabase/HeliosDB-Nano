@@ -3370,6 +3370,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// Encode and send a full result set (column defs + rows + EOF).
     async fn send_result_set(&mut self, columns: &[String], rows: &[Tuple]) -> Result<()> {
         let ncols = columns.len();
+        // Spec R5.2: before the first byte of the result set.
+        if let Some(refused) = Self::refuse_mismatched_rows(ncols, rows) {
+            return self.send_statement_error(&refused.to_string()).await;
+        }
 
         // 1. Column count
         {
@@ -3407,6 +3411,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         } else {
             self.send_eof().await
         }
+    }
+
+    /// Spec R5.2: the refusal of a row whose field count differs from the column
+    /// definitions it would be sent under, if `rows` holds one: an error to the
+    /// client, never a text row it cannot parse or a binary row reporting a NULL
+    /// that was not there.
+    fn refuse_mismatched_rows(ncols: usize, rows: &[Tuple]) -> Option<crate::Error> {
+        rows.iter()
+            .find(|row| row.values.len() != ncols)
+            .map(|row| crate::storage::row_shape::refuse_mismatched_row(row.values.len(), ncols))
     }
 
     /// Send a single column definition packet.
@@ -3455,6 +3469,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// decoders).
     async fn send_binary_result_set(&mut self, columns: &[String], rows: &[Tuple]) -> Result<()> {
         let ncols = columns.len();
+        // Spec R5.2: before the first byte of the result set.
+        if let Some(refused) = Self::refuse_mismatched_rows(ncols, rows) {
+            return self.send_statement_error(&refused.to_string()).await;
+        }
 
         // 1. Column count
         {
@@ -3753,6 +3771,10 @@ fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     // scope) is 0A000 on the PostgreSQL wire; the same here.
     if err_msg.contains(crate::error::BRANCH_WRITE_UNSUPPORTED_MARKER)
         || err_msg.contains(crate::error::BRANCH_STATEMENT_UNSUPPORTED_MARKER)
+        // Spec R5.2: a row its column definitions cannot describe, and a schema
+        // statement the transaction's own staged rows cannot follow.
+        || err_msg.contains(crate::error::ROW_DESCRIPTION_MISMATCH_MARKER)
+        || err_msg.contains(crate::error::DDL_OVER_STAGED_ROWS_MARKER)
     {
         return (1235, "0A000"); // ER_NOT_SUPPORTED_YET
     }
@@ -4026,6 +4048,26 @@ pub async fn handle_mysql_connection_unix_with_timeouts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec R5.2: a row of another width than its column definitions is refused
+    /// before the first byte of the result set, with the row-description marker
+    /// the error map reads, and counted.
+    #[test]
+    fn a_row_its_columns_cannot_describe_is_refused() {
+        let fits = Tuple::new(vec![Value::Int4(1), Value::Null]);
+        let narrow = Tuple::new(vec![Value::Int4(1)]);
+        type Handler = MySqlHandler<tokio::io::DuplexStream>;
+        assert!(Handler::refuse_mismatched_rows(2, std::slice::from_ref(&fits)).is_none());
+        let before = crate::storage::data_row_arity_refusals();
+        let refused = Handler::refuse_mismatched_rows(2, &[fits, narrow]).expect("refused");
+        assert!(crate::storage::data_row_arity_refusals() > before);
+        let message = refused.to_string();
+        assert!(
+            message.contains(crate::error::ROW_DESCRIPTION_MISMATCH_MARKER),
+            "{message}"
+        );
+        assert_eq!(map_error_code(&message), (1235, "0A000"));
+    }
 
     #[test]
     fn test_capability_flags_default() {

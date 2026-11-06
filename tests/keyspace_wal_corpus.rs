@@ -68,6 +68,8 @@ const REQUIRED_CLASSES: &[KeyClass] = &[
     KeyClass::Vmeta,
     KeyClass::Counter,
     KeyClass::MetaTable,
+    // `ALTER TABLE … ADD COLUMN … DEFAULT` (spec R5.2).
+    KeyClass::MetaAttMissing,
     KeyClass::MetaIndex,
     KeyClass::MetaSchema,
     KeyClass::MetaEnumType,
@@ -331,6 +333,9 @@ fn session_one(db: &EmbeddedDatabase) {
     run(db, "TRUNCATE ks_trunc");
     assert!(ints(db, "SELECT id FROM ks_trunc").is_empty());
     run(db, "ALTER TABLE ks_parent ADD COLUMN extra TEXT");
+    run(db, "CREATE TABLE ks_missing (id INT PRIMARY KEY)");
+    run(db, "INSERT INTO ks_missing VALUES (1)");
+    run(db, "ALTER TABLE ks_missing ADD COLUMN m INT DEFAULT 7");
     run(db, "CREATE TABLE ks_drop (id INT PRIMARY KEY, v TEXT)");
     run(db, "INSERT INTO ks_drop VALUES (1, 'gone')");
     run(db, "CREATE INDEX ks_drop_v_idx ON ks_drop (v)");

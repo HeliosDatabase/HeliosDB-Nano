@@ -2799,32 +2799,112 @@ impl Transaction {
         self.row_counter_stages.write().remove(table_name);
     }
 
-    /// `merge_with_write_set`, with every STAGED row shaped to the table's
-    /// current catalog `width`. `ALTER TABLE … ADD COLUMN` inside a
-    /// transaction rewrites committed rows only; a row this transaction staged
-    /// earlier still carries the old arity and projecting the new column
-    /// raised "Column index N out of bounds in tuple" (GH#61). Short staged
-    /// rows are NULL-padded, exactly as the committed-scan decode does.
-    pub fn merge_with_write_set_to_width(
+    /// `merge_with_write_set`, with every STAGED row through the row-shape
+    /// funnel (spec R5.2). `ALTER TABLE … ADD COLUMN` inside a transaction leaves
+    /// a row this transaction staged earlier at the old arity, and projecting
+    /// the new column raised "Column index N out of bounds in tuple" (GH#61). A
+    /// short staged row reads the column's missing value and a long one is cut,
+    /// exactly as the committed-scan decode does. The transaction has no engine:
+    /// the caller hands it the shape (`StorageEngine::row_shape`).
+    pub fn merge_with_write_set_shaped(
         &self,
         table_name: &str,
         tuples: Vec<Tuple>,
-        width: usize,
+        shape: &super::row_shape::RowShape,
     ) -> Result<Vec<Tuple>> {
-        self.merge_with_write_set_inner(table_name, tuples, Some(width))
+        self.merge_with_write_set_inner(table_name, tuples, Some(shape))
+    }
+
+    /// Does this transaction hold a staged image of a row of `table_name`?
+    /// O(staged writes), for a schema statement of the table.
+    pub(crate) fn has_staged_rows(&self, table_name: &str) -> bool {
+        let prefix = format!("data:{}:", table_name).into_bytes();
+        self.write_set
+            .iter()
+            .any(|entry| entry.key().starts_with(&prefix) && entry.value().is_some())
+            || self.insert_log.read().iter().any(|(key, _)| key.starts_with(&prefix))
+    }
+
+    /// Does this transaction hold any staged change of a row of `table_name`: an
+    /// image or a delete? [`Self::has_staged_rows`] answers for what would commit
+    /// a row; this answers for a schema statement that moves the table away from
+    /// under them or builds something over its committed rows, which a delete
+    /// breaks as surely as an image. O(staged writes).
+    pub(crate) fn has_staged_changes(&self, table_name: &str) -> bool {
+        let prefix = format!("data:{}:", table_name).into_bytes();
+        self.write_set.iter().any(|entry| entry.key().starts_with(&prefix))
+            || self.insert_log.read().iter().any(|(key, _)| key.starts_with(&prefix))
+    }
+
+    /// Spec R5.2: apply `each` to every staged image of a row of `table_name`, in
+    /// the write set and the insert log, for a schema statement that changes the
+    /// layout under them (`ALTER TABLE … DROP COLUMN`, a volatile `ADD COLUMN`).
+    /// Staged values are plaintext (the commit batch seals them). Returns the
+    /// images rewritten; on an error some may have been, and the statement fails.
+    pub(crate) fn restage_table_rows(
+        &self,
+        table_name: &str,
+        mut each: impl FnMut(&[u8], &mut Tuple) -> Result<()>,
+    ) -> Result<usize> {
+        let prefix = format!("data:{}:", table_name).into_bytes();
+        let mut rewrite = |key: &[u8], value: &mut Vec<u8>| -> Result<()> {
+            let mut tuple: Tuple = bincode::deserialize(value.as_slice())
+                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            each(key, &mut tuple)?;
+            *value =
+                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            Ok(())
+        };
+        let mut rewritten = 0usize;
+        for mut entry in self.write_set.iter_mut() {
+            if !entry.key().starts_with(&prefix) {
+                continue;
+            }
+            let (key, value) = entry.pair_mut();
+            if let Some(value) = value {
+                rewrite(key, value)?;
+                rewritten += 1;
+            }
+        }
+        for (key, value) in self.insert_log.write().iter_mut() {
+            if key.starts_with(&prefix) {
+                rewrite(key, value)?;
+                rewritten += 1;
+            }
+        }
+        Ok(rewritten)
+    }
+
+    /// The keys of every staged image of a row of `table_name`, in the write set
+    /// and the insert log, as [`Self::restage_table_rows`] visits them: what a
+    /// schema statement must give a value before it writes anything.
+    pub(crate) fn staged_image_keys(&self, table_name: &str) -> Vec<Vec<u8>> {
+        let prefix = format!("data:{}:", table_name).into_bytes();
+        let mut keys: Vec<Vec<u8>> = self
+            .write_set
+            .iter()
+            .filter(|entry| entry.key().starts_with(&prefix) && entry.value().is_some())
+            .map(|entry| entry.key().clone())
+            .collect();
+        keys.extend(
+            self.insert_log
+                .read()
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(key, _)| key.clone()),
+        );
+        keys
     }
 
     fn merge_with_write_set_inner(
         &self,
         table_name: &str,
         mut tuples: Vec<Tuple>,
-        width: Option<usize>,
+        shape: Option<&super::row_shape::RowShape>,
     ) -> Result<Vec<Tuple>> {
         let pad = |t: &mut Tuple| {
-            if let Some(w) = width {
-                if t.values.len() < w {
-                    t.values.resize(w, crate::Value::Null);
-                }
+            if let Some(shape) = shape {
+                shape.apply(t);
             }
         };
         let prefix = format!("data:{}:", table_name);

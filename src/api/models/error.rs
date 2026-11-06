@@ -116,7 +116,10 @@ impl From<Error> for ApiError {
             }
             // B3 third fix pass: more than one atomic write can hold. Retrying the
             // same request cannot help, and the message says what can.
-            Error::QueryExecution(msg) if msg.contains(crate::error::BRANCH_MATERIALIZE_TOO_LARGE_MARKER) => {
+            Error::QueryExecution(msg)
+                if msg.contains(crate::error::BRANCH_MATERIALIZE_TOO_LARGE_MARKER)
+                    || msg.contains(crate::error::ATOMIC_REWRITE_TOO_LARGE_MARKER) =>
+            {
                 ApiError::bad_request(msg)
             }
             Error::Storage(msg) => {

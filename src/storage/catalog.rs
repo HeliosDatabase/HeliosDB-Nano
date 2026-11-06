@@ -1896,7 +1896,8 @@ impl<'a> Catalog<'a> {
     /// and live-index renames match them. A definition that does not decode is
     /// left alone: nothing in it can be matched. The values are sealed with the
     /// one rule every writer of these keys uses (`tde::seal`, as
-    /// `rename_table_inner` seals its batch).
+    /// `rename_table_inner` seals its batch). The column's missing value (spec
+    /// R5.2) moves in the same group: it belongs to the column, whatever its name.
     pub fn rename_column_in_schema_and_index_definitions(
         &self,
         table_name: &str,
@@ -1931,11 +1932,219 @@ impl<'a> Catalog<'a> {
             );
             rewritten.push(index_name);
         }
-        self.storage
-            .db_write(batch, None)
+        let mut operations = vec![super::WalOperation::AlterTableSchema {
+            table: table_name.to_string(),
+            schema: value,
+        }];
+        let old_missing_key = Self::attmissing_key(table_name, old);
+        let old_missing = self
+            .storage
+            .db
+            .get(&old_missing_key)
+            .map_err(|e| Error::storage(format!("Failed to read a column's missing value: {}", e)))?;
+        if let Some(raw) = old_missing {
+            // Verbatim: the stored form of a value is a property of its key's
+            // family, as the row moves of RENAME TABLE rely on.
+            batch.put(Self::attmissing_key(table_name, new), &raw);
+            batch.delete(&old_missing_key);
+            let plain = self.storage.decode_stored_ref(&old_missing_key, &raw)?.into_owned();
+            operations.push(super::WalOperation::SetColumnMissing {
+                table: table_name.to_string(),
+                column: new.to_string(),
+                value: Some(plain),
+            });
+            operations.push(super::WalOperation::SetColumnMissing {
+                table: table_name.to_string(),
+                column: old.to_string(),
+                value: None,
+            });
+        }
+        let written = self
+            .storage
+            .write_ddl_batch_ops(operations, batch)
             .map_err(|e| Error::storage(format!("Rename column batch write failed: {}", e)))?;
-        self.publish_table_schema(table_name, schema, &value);
+        self.publish_schema_change(table_name, schema);
+        written.wait_replicated();
         Ok(rewritten)
+    }
+
+    /// `meta:attmissing:{table}:{column}` (spec R5.2): what a row older than the
+    /// column reads for it. See `storage::row_shape`.
+    pub(crate) fn attmissing_key(table_name: &str, column: &str) -> Vec<u8> {
+        format!("meta:attmissing:{}:{}", table_name, column).into_bytes()
+    }
+
+    /// The prefix of every missing value of `table_name`.
+    pub(crate) fn attmissing_prefix(table_name: &str) -> String {
+        format!("meta:attmissing:{}:", table_name)
+    }
+
+    /// `table_name`'s schema as main's store holds it, past every cache.
+    pub(crate) fn durable_main_schema(&self, table_name: &str) -> Result<Option<Schema>> {
+        match self.storage.get(&Self::table_metadata_key(table_name))? {
+            Some(data) => bincode::deserialize(&data)
+                .map(Some)
+                .map_err(|e| Error::storage(format!("Failed to deserialize schema: {}", e))),
+            None => Ok(None),
+        }
+    }
+
+    /// `ALTER TABLE … ADD COLUMN`'s change on MAIN, and MERGE BRANCH's when it
+    /// carries one, as ONE write group (spec R5.2): `schema` (the old columns,
+    /// `old_width` of them, then `columns`), each column's missing value and, for
+    /// a volatile default, every row rewritten — through `write_ddl_batch`, with
+    /// its logical-WAL entries in the group. A stable default rewrites no row, at
+    /// any table size; a reader sees the statement before or after, and a crash
+    /// leaves one or the other. Returns the rows rewritten.
+    ///
+    /// Everything that can refuse does so before anything is written: a NOT NULL
+    /// column with no value on a table with rows (23502, unless
+    /// `refuse_not_null_over_rows` is false: a merge has judged that against what
+    /// main will hold, and the rows that would have refused it are on their way
+    /// out), a volatile rewrite above `[storage] max_atomic_rewrite_bytes` (54000),
+    /// a default that does not evaluate. A column whose fill is NULL has no key:
+    /// NULL is what a row older than a column with no key reads.
+    pub(crate) fn add_columns(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        old_width: usize,
+        columns: &[(&str, &crate::DataType, bool, &super::row_shape::ColumnFill)],
+        refuse_not_null_over_rows: bool,
+    ) -> Result<u64> {
+        use super::row_shape::ColumnFill;
+        let _ddl = self.storage.main_catalog_write(&[table_name], "ALTER TABLE")?;
+        if !self.main_table_exists(table_name)? {
+            return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
+        }
+        if refuse_not_null_over_rows {
+            for (column, _, not_null, fill) in columns {
+                if *not_null
+                    && matches!(fill, ColumnFill::Constant(crate::Value::Null))
+                    && self.storage.table_has_rows(table_name)?
+                {
+                    return Err(Error::add_column_null_on_existing_rows(table_name, column));
+                }
+            }
+        }
+
+        let mut batch = rocksdb::WriteBatch::default();
+        let (rewritten, rewrite_snapshot) = if columns
+            .iter()
+            .any(|(_, _, _, fill)| matches!(fill, ColumnFill::PerRow(_)))
+        {
+            let staged = self.storage.stage_added_column_rows(
+                table_name,
+                old_width,
+                columns,
+                self.storage.config().storage.max_atomic_rewrite_bytes,
+                &mut batch,
+            )?;
+            (staged.rows, staged.snapshot)
+        } else {
+            (0, None)
+        };
+
+        let value =
+            bincode::serialize(schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
+        let key_manager = self.storage.key_manager_arc();
+        batch.put(
+            Self::table_metadata_key(table_name),
+            super::tde::seal(key_manager.as_deref(), &value)?.as_ref(),
+        );
+        let mut operations = vec![super::WalOperation::AlterTableSchema {
+            table: table_name.to_string(),
+            schema: value,
+        }];
+        for (column, _, _, fill) in columns {
+            let ColumnFill::Constant(missing) = fill else {
+                continue;
+            };
+            if matches!(missing, crate::Value::Null) {
+                continue;
+            }
+            let bytes = bincode::serialize(missing)
+                .map_err(|e| Error::storage(format!("Failed to serialize a missing value: {}", e)))?;
+            batch.put(
+                Self::attmissing_key(table_name, column),
+                super::tde::seal(key_manager.as_deref(), &bytes)?.as_ref(),
+            );
+            operations.push(super::WalOperation::SetColumnMissing {
+                table: table_name.to_string(),
+                column: (*column).to_string(),
+                value: Some(bytes),
+            });
+        }
+        let written = self
+            .storage
+            .write_ddl_batch_ops(operations, batch)
+            .map_err(|e| Error::storage(format!("ADD COLUMN batch write failed: {}", e)))?;
+        if let Some(snapshot) = rewrite_snapshot {
+            self.storage
+                .snapshot_manager()
+                .publish_rewrite_snapshot(table_name, snapshot);
+        }
+        super::engine::exit_after_ddl_write("add_column", table_name);
+        self.publish_schema_change(table_name, schema);
+        // After the bump: a fill that read the old bytes was stamped with the old
+        // generation and is refused, so this sweep cannot be undone.
+        self.storage.row_cache().invalidate_table(table_name);
+        written.wait_replicated();
+        Ok(rewritten)
+    }
+
+    /// `ALTER TABLE … DROP COLUMN`'s catalog change on main as ONE write group:
+    /// `schema` (without `column`) and the removal of the column's missing value,
+    /// so a later `ADD COLUMN` of the name can never read the old one.
+    pub(crate) fn drop_column_from_schema(&self, table_name: &str, schema: &Schema, column: &str) -> Result<()> {
+        let _ddl = self.storage.main_catalog_write(&[table_name], "ALTER TABLE")?;
+        if !self.main_table_exists(table_name)? {
+            return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
+        }
+        let value =
+            bincode::serialize(schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
+        let key_manager = self.storage.key_manager_arc();
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put(
+            Self::table_metadata_key(table_name),
+            super::tde::seal(key_manager.as_deref(), &value)?.as_ref(),
+        );
+        let mut operations = vec![super::WalOperation::AlterTableSchema {
+            table: table_name.to_string(),
+            schema: value,
+        }];
+        let missing_key = Self::attmissing_key(table_name, column);
+        if self.storage.get(&missing_key)?.is_some() {
+            batch.delete(&missing_key);
+            operations.push(super::WalOperation::SetColumnMissing {
+                table: table_name.to_string(),
+                column: column.to_string(),
+                value: None,
+            });
+        }
+        let written = self
+            .storage
+            .write_ddl_batch_ops(operations, batch)
+            .map_err(|e| Error::storage(format!("DROP COLUMN batch write failed: {}", e)))?;
+        self.publish_schema_change(table_name, schema);
+        written.wait_replicated();
+        Ok(())
+    }
+
+    /// WAL replay: `meta:attmissing:{table}:{column}` as the logged group left it.
+    /// A table the log has already dropped again gets no orphan.
+    pub(crate) fn replay_column_missing(&self, table_name: &str, column: &str, value: Option<&[u8]>) -> Result<()> {
+        if !self.main_table_exists(table_name)? {
+            return Ok(());
+        }
+        let key = Self::attmissing_key(table_name, column);
+        match value {
+            Some(value) => self.storage.put(&key, value)?,
+            None => self.storage.delete(&key)?,
+        }
+        self.storage.bump_schema_generation();
+        self.storage.invalidate_missing_values(table_name);
+        Ok(())
     }
 
     /// Point every column reference of one index definition — the indexed
@@ -1960,11 +2169,10 @@ impl<'a> Catalog<'a> {
         changed
     }
 
-    /// What every schema replacement does once its record is durable, shared
-    /// by [`Self::update_table_schema`] and
-    /// [`Self::rename_column_in_schema_and_index_definitions`]: the logical-WAL
-    /// entry, the schema cache and the schema generation. `value` is the
-    /// serialized `schema` that was stored.
+    /// What a schema replacement written without its logical-WAL entry does once
+    /// its record is durable ([`Self::update_table_schema`]): the entry, then
+    /// [`Self::publish_schema_change`]. `value` is the serialized `schema` that
+    /// was stored.
     fn publish_table_schema(&self, table_name: &str, schema: &Schema, value: &[u8]) {
         // GH#36: represent the schema replacement in the logical WAL. Every
         // column-shape ALTER (ADD/DROP/RENAME COLUMN, ALTER COLUMN … DROP NOT
@@ -1976,7 +2184,17 @@ impl<'a> Catalog<'a> {
         if let Err(e) = self.storage.log_alter_table_schema(table_name, value) {
             tracing::warn!("Failed to log schema change for '{}' to WAL: {}", table_name, e);
         }
+        self.publish_schema_change(table_name, schema);
+    }
 
+    /// What every schema replacement does once its record is durable: the schema
+    /// cache, the schema generation, and (spec R5.2) the table's loaded missing
+    /// values, whose positions follow the schema.
+    fn publish_schema_change(&self, table_name: &str, schema: &Schema) {
+        // Before the new schema is in reach, so a reader holding it loads the
+        // values this write left; again after the bump, for a load that read the
+        // old ones and got its answer in before it (`storage::row_shape`).
+        self.storage.invalidate_missing_values(table_name);
         // Update in-memory schema cache
         self.storage.cache_schema(table_name, schema.clone());
 
@@ -1988,8 +2206,9 @@ impl<'a> Catalog<'a> {
         // clears the watermarks (and the existence cache, harmlessly — the
         // name's kind is unchanged), forcing default-closed snapshot reads
         // until the next tracked commit. Caught by
-        // w2_5_watermark_read_tests::alter_add_column_hidden_from_open_snapshot_reader.
+        // w2_5_watermark_read_tests::alter_add_column_reads_the_missing_value_on_an_open_snapshot.
         self.storage.bump_schema_generation();
+        self.storage.invalidate_missing_values(table_name);
     }
 
     /// Drop a table
@@ -2157,6 +2376,9 @@ impl<'a> Catalog<'a> {
         // W1.3: bump immediately after the delete commits — that is the point
         // where `table_exists` flips false.
         self.storage.bump_schema_generation();
+        // Spec R5.2: after the bump, so a load that read the deleted keys is
+        // refused or removed (see `storage::row_shape`).
+        self.storage.invalidate_missing_values(table_name);
 
         // The constraint set, and with it the reverse-FK cache, which listed
         // this table's foreign keys under every table they reference; a parent
@@ -2200,6 +2422,7 @@ impl<'a> Catalog<'a> {
     /// * `dict:{t}:*` — `DictionaryManager::save_dict`; never deleted before;
     /// * `meta:col_storage:{t}:*` — the `AlterColumnStorage` replay arm of
     ///   `StorageEngine::apply_wal_operation`; never deleted before;
+    /// * `meta:attmissing:{t}:*` — [`Self::add_columns`] (spec R5.2);
     /// * `meta:acl:table:{t}:*` — `grant_privileges` (PostgreSQL drops a
     ///   relation's privileges with it); never deleted before;
     /// * `meta:partparent:{t}`, `meta:partchild:{t}`, and the parent's
@@ -2253,6 +2476,7 @@ impl<'a> Catalog<'a> {
             format!("trigger_rowmut:{}:", table_name),
             format!("dict:{}:", table_name),
             format!("meta:col_storage:{}:", table_name),
+            Self::attmissing_prefix(table_name),
             format!("meta:acl:table:{}:", table_name),
         ] {
             if let Err(e) = self.stage_prefix_delete(&prefix, batch) {
@@ -3841,6 +4065,9 @@ impl<'a> Catalog<'a> {
             None => batch.delete(Self::table_incarnation_key(new_name)),
         }
         batch.delete(Self::table_incarnation_key(old_name));
+        // Spec R5.2: the table's missing values move with its rows, or a row older
+        // than a column would read NULL under the new name. Verbatim, like them.
+        self.stage_missing_values_move(old_name, new_name, &mut batch)?;
 
         let old_data_prefix = format!("data:{}:", old_name);
         let old_prefix_bytes = old_data_prefix.as_bytes();
@@ -3996,6 +4223,8 @@ impl<'a> Catalog<'a> {
         // W1.3: rename changes existence for BOTH names (old → Missing,
         // new → Table); bump so the existence cache recomputes both.
         self.storage.bump_schema_generation();
+        self.storage.invalidate_missing_values(old_name);
+        self.storage.invalidate_missing_values(new_name);
 
         // The per-table SIDE records — `table_constraints:{t}` (every CHECK,
         // FOREIGN KEY and table-level UNIQUE the table owns), the IDENTITY
@@ -4043,6 +4272,26 @@ impl<'a> Catalog<'a> {
         // Spec R1 §4: the standbys' acknowledgement last, after the row
         // counter, the ART and index-definition moves and the caches.
         written.wait_replicated();
+        Ok(())
+    }
+
+    /// Stage the move of `old_name`'s `meta:attmissing:` keys to `new_name`.
+    fn stage_missing_values_move(&self, old_name: &str, new_name: &str, batch: &mut rocksdb::WriteBatch) -> Result<()> {
+        let prefix = Self::attmissing_prefix(old_name);
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            read_opts,
+        );
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            let Some(column) = key.strip_prefix(prefix.as_bytes()) else {
+                break;
+            };
+            batch.put(Self::attmissing_key(new_name, &String::from_utf8_lossy(column)), &value);
+            batch.delete(&key);
+        }
         Ok(())
     }
 

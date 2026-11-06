@@ -95,6 +95,9 @@ const MAX_REWIND_RECORD_BYTES: usize = 4096;
 /// only bound on its size; how many groups travel together is a poll's byte
 /// limit, a coalescing target ([`poll_source`]), and [`MAX_POLL_GROUPS`].
 pub const MAX_BATCH_BYTES: usize = u32::MAX as usize - 4096;
+// Spec R5.2: a rewrite at the largest `[storage] max_atomic_rewrite_bytes` is one
+// group, with room for the schema and log entries that share it.
+const _: () = assert!(crate::config::MAX_ATOMIC_REWRITE_BYTES < MAX_BATCH_BYTES as u64);
 /// The most write groups one poll collects ([`poll_source`],
 /// [`poll_source_cascade`]), whatever its byte limit. A poll costs per group
 /// as much as per byte — each is read from the WAL, validated, copied and

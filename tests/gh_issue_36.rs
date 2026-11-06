@@ -295,6 +295,7 @@ fn describe(ops: &[WalOperation]) -> String {
             WalOperation::RenameTable { old_table, new_table } => {
                 format!("RenameTable({old_table} -> {new_table})")
             }
+            WalOperation::SetColumnMissing { table, column, .. } => format!("SetColumnMissing({table}.{column})"),
             WalOperation::AlterColumnStorage { table, column, .. } => {
                 format!("AlterColumnStorage({table}.{column})")
             }
@@ -349,6 +350,7 @@ fn names_object(op: &WalOperation, object: &str) -> bool {
         | WalOperation::CreateTable { table, .. }
         | WalOperation::DropTable { table }
         | WalOperation::AlterColumnStorage { table, .. }
+        | WalOperation::SetColumnMissing { table, .. }
         | WalOperation::AddConstraint { table, .. }
         | WalOperation::DropConstraint { table, .. } => table == object,
         WalOperation::RenameTable { old_table, new_table } => old_table == object || new_table == object,
@@ -399,6 +401,7 @@ fn is_schema_change(op: &WalOperation) -> bool {
         | WalOperation::DropTable { .. }
         | WalOperation::RenameTable { .. }
         | WalOperation::AlterColumnStorage { .. }
+        | WalOperation::SetColumnMissing { .. }
         | WalOperation::CreateIndex { .. }
         | WalOperation::DropIndex { .. }
         | WalOperation::CreateTrigger { .. }
@@ -672,10 +675,10 @@ fn truncate_emits_a_truncate_entry() {
 
 /// ***UNFIXED*** — current tree emits NO entries at all.
 ///
-/// Doubly invisible: `update_table_schema` logs nothing, and
-/// `add_column_to_rows` (src/storage/engine.rs:8417) rewrites every `data:` row
-/// with a raw `db.put`, also unlogged. A standby keeps the old column list AND
-/// the old row images.
+/// Doubly invisible back then: the schema update logged nothing, and the rows
+/// were rewritten with raw puts, also unlogged. A standby kept the old column list
+/// AND the old row images. (Spec R5.2: no row is rewritten, and a default's missing
+/// value rides the schema's group as `WalOperation::SetColumnMissing`.)
 #[test]
 fn alter_table_add_column_is_represented_in_the_logical_wal() {
     let ops = emitted(&[T], &["ALTER TABLE t ADD COLUMN c INT"], Family::Text);
