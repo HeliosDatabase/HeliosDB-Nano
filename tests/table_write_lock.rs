@@ -1410,23 +1410,31 @@ fn a_statement_timeout_ends_a_wait_and_nothing_commits() {
     assert_eq!(count(&db, "SELECT COUNT(*) FROM d WHERE g = 7"), 0, "nothing ran");
 }
 
-/// A quoted name with a colon is that table and no other: a transaction writing `"a:b"` used
-/// to hold `a` too, by parsing the first colon of the row key.
+/// A quoted name with a colon used to lock another table: a transaction writing `"a:b"` held
+/// `a` too, from the first colon of the row key. Such a name can no longer be created (42602,
+/// spec B4), so only an older store can hold one; the row-key parse reads the last colon for
+/// it. Here: the name is refused, and writing `a` in a transaction still locks `a` alone.
 #[test]
-fn a_write_to_a_name_with_a_colon_locks_that_table_alone() {
-    let _watchdog = watchdog("a_write_to_a_name_with_a_colon_locks_that_table_alone", TEST_AT_MOST);
+fn a_name_with_a_colon_is_refused_and_a_writer_locks_its_own_table() {
+    let _watchdog = watchdog(
+        "a_name_with_a_colon_is_refused_and_a_writer_locks_its_own_table",
+        TEST_AT_MOST,
+    );
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE a (id INT PRIMARY KEY)").unwrap();
-    db.execute(r#"CREATE TABLE "a:b" (id INT PRIMARY KEY)"#).unwrap();
+    db.execute("CREATE TABLE b (id INT PRIMARY KEY)").unwrap();
+    let err = db
+        .execute(r#"CREATE TABLE "a:b" (id INT PRIMARY KEY)"#)
+        .expect_err("a name that cannot be stored");
+    assert!(err.to_string().contains("cannot hold ':'"), "{err}");
     db.storage.debug_set_table_lock_timeout(Duration::from_millis(50));
     let session = db.create_session("writer", IsolationLevel::ReadCommitted).unwrap();
     db.begin_transaction_for_session(session).unwrap();
-    db.execute_for_session(session, r#"INSERT INTO "a:b" VALUES (1)"#)
-        .unwrap();
-    db.execute("ALTER TABLE a ADD COLUMN x INT")
+    db.execute_for_session(session, "INSERT INTO a VALUES (1)").unwrap();
+    db.execute("ALTER TABLE b ADD COLUMN x INT")
         .expect("not the table it wrote");
     let err = db
-        .execute(r#"ALTER TABLE "a:b" ADD COLUMN x INT"#)
+        .execute("ALTER TABLE a ADD COLUMN x INT")
         .expect_err("the table it wrote");
     assert!(is_lock_timeout(&err), "{err}");
     db.commit_transaction_for_session(session).unwrap();

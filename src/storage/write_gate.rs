@@ -31,6 +31,19 @@
 //! `in_flight`, both sequentially consistent — so either the writer sees the
 //! fence and is refused, or the fencer sees the writer and waits for it.
 //! There is no way back: a fenced primary is rebuilt as a standby.
+//!
+//! # The branch fork point (sprinter 6bc4a4040eb7, phase B4)
+//!
+//! Every write of a store passes here, so this is where a parent's write
+//! freezes what its live child branches see (`storage::branch_freeze`). The
+//! cost when no branch exists is the one sequentially consistent load of
+//! `freeze_active` in [`WriteGate::write`], [`WriteGate::put`] and
+//! [`WriteGate::delete`], after the writer announced itself: the creation of a
+//! first branch raises the flag and then waits for what is announced, the same
+//! protocol as the fence, so either the writer sees the flag or the creator
+//! waits for the writer. Past the flag the one function is
+//! `WriteGate::write_frozen`. A standby's gate never has a hook: nothing
+//! installs one on a store that does not accept writes.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -38,6 +51,7 @@ use std::time::{Duration, Instant};
 
 use rocksdb::{WriteBatch, WriteOptions, DB};
 
+use super::branch_freeze::BranchFreeze;
 use crate::{Error, Result};
 
 /// Whether a [`WriteGate`] admits writes.
@@ -70,12 +84,23 @@ pub struct WriteGate {
     fenced: AtomicBool,
     /// The refusal a fenced gate answers; set before `fenced` is raised.
     fence_reason: OnceLock<String>,
-    /// Writes past the gate whose RocksDB call has not returned yet.
+    /// Writes past the gate whose RocksDB call has not returned yet. A write
+    /// that goes through the freeze hook leaves this count once it holds the
+    /// hook's registry ([`Self::write_frozen`]), which then answers for it.
     in_flight: AtomicU64,
     /// Spec R5.1: whether this gate's writes answer to the writer-lock detector
     /// (`storage::table_locks`): set when an `EmbeddedDatabase`'s open is done, so
     /// the open's own writes, and a component driven on a gate of its own, do not.
     row_lock_detector: AtomicBool,
+    /// Sprinter 6bc4a4040eb7 (B4): some level has a live child branch. Shared
+    /// with the hook, which alone changes it.
+    freeze_active: Arc<AtomicBool>,
+    /// The hook of the engine that owns this gate, set once at open, on a store
+    /// that accepts writes.
+    freeze: OnceLock<Arc<BranchFreeze>>,
+    /// How many writes went through the hook. A test surface: this is what
+    /// proves the path of a store with no branch never reaches it.
+    freeze_runs: AtomicU64,
 }
 
 /// A write past the gate, until its RocksDB call returned.
@@ -96,6 +121,9 @@ impl WriteGate {
             fence_reason: OnceLock::new(),
             in_flight: AtomicU64::new(0),
             row_lock_detector: AtomicBool::new(false),
+            freeze_active: Arc::new(AtomicBool::new(false)),
+            freeze: OnceLock::new(),
+            freeze_runs: AtomicU64::new(0),
         })
     }
 
@@ -159,6 +187,18 @@ impl WriteGate {
     /// reports its final sequence as uncertain instead of guessing.
     pub fn wait_for_writes(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
+        if !self.wait_for_announced(deadline) {
+            return false;
+        }
+        // A write that went through the hook left the count when it took the
+        // hook's registry, and holds it until its RocksDB call returned.
+        match self.freeze.get() {
+            Some(freeze) => freeze.wait_for_writers(deadline.saturating_duration_since(Instant::now())),
+            None => true,
+        }
+    }
+
+    fn wait_for_announced(&self, deadline: Instant) -> bool {
         loop {
             if self.in_flight.load(Ordering::SeqCst) == 0 {
                 return true;
@@ -168,6 +208,102 @@ impl WriteGate {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): the flag `BranchFreeze` raises while some
+    /// level has a live child.
+    pub(crate) fn freeze_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.freeze_active)
+    }
+
+    /// Install the engine's hook. Once, at open, before the store takes writes.
+    pub(crate) fn install_freeze(&self, freeze: Arc<BranchFreeze>) {
+        let _ = self.freeze.set(freeze);
+    }
+
+    /// The hook, while some level has a live child. One atomic load otherwise.
+    pub(crate) fn active_freeze(&self) -> Option<&Arc<BranchFreeze>> {
+        if self.freeze_active.load(Ordering::SeqCst) {
+            self.freeze.get()
+        } else {
+            None
+        }
+    }
+
+    /// For the creation of a branch: a write announced before `freeze_active`
+    /// was raised may not have seen it. Wait for those, until `deadline`.
+    ///
+    /// A write that does see the flag and has row keys leaves the count as soon
+    /// as it holds the hook's registry, and one with no row keys cannot change
+    /// what a child sees. So the count is only ever held for an instant under
+    /// load, and a sustained stream of writers cannot starve this.
+    pub(crate) fn wait_for_unhooked_writes(&self, deadline: Instant) -> bool {
+        self.wait_for_announced(deadline)
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): apply copies the hook staged itself, outside a
+    /// write of the gate (`StorageEngine::freeze_row_before_side_write`). A copy
+    /// changes no level's view, so it goes through nothing further.
+    pub(crate) fn write_without_freeze(&self, db: &DB, batch: WriteBatch, opts: Option<&WriteOptions>) -> Result<()> {
+        let slot = self.admit()?;
+        let applied = Self::apply(db, batch, opts);
+        drop(slot);
+        applied
+    }
+
+    /// How many writes went through the freeze hook. For the tests.
+    #[doc(hidden)]
+    pub fn debug_freeze_runs(&self) -> u64 {
+        self.freeze_runs.load(Ordering::Relaxed)
+    }
+
+    fn apply(db: &DB, batch: WriteBatch, opts: Option<&WriteOptions>) -> Result<()> {
+        match opts {
+            Some(opts) => db.write_opt(batch, opts),
+            None => db.write(batch),
+        }
+        .map_err(Error::from)
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): THE write funnel while some level has a live
+    /// child branch; see `storage::branch_freeze`. `slot` is this write's
+    /// announcement.
+    ///
+    /// It runs on the writer's own thread. Past `stage` the batch holds what the
+    /// hook adds to it, and it holds the table locks or row stripes of
+    /// `BranchFreeze`, the innermost locks of a write: nothing is taken under them
+    /// but RocksDB ("Lock order" in `storage::branch_freeze`).
+    fn write_frozen(
+        &self,
+        db: &DB,
+        mut batch: WriteBatch,
+        opts: Option<&WriteOptions>,
+        slot: InFlight<'_>,
+    ) -> Result<()> {
+        self.freeze_runs.fetch_add(1, Ordering::Relaxed);
+        let Some(freeze) = self.freeze.get() else {
+            let applied = Self::apply(db, batch, opts);
+            drop(slot);
+            return applied;
+        };
+        let touches = BranchFreeze::row_touches(&batch);
+        if touches.is_empty() {
+            let applied = Self::apply(db, batch, opts);
+            drop(slot);
+            return applied;
+        }
+        let registry = freeze.registry_for_write();
+        // The registry answers for this write from here: holding it is what a
+        // new branch waits for, and a fence too.
+        drop(slot);
+        let mut flush = |chunk: WriteBatch| Self::apply(db, chunk, opts);
+        let work = freeze.stage(&registry, db, &touches, &mut batch, &mut flush)?;
+        let applied = Self::apply(db, batch, opts);
+        // Bumps what the frozen rows' readers cache, also after a failure: the
+        // write may have reached RocksDB.
+        drop(work);
+        drop(registry);
+        applied
     }
 
     /// The refusal of a fenced gate, counted.
@@ -225,15 +361,20 @@ impl WriteGate {
         if batch.is_empty() && !self.is_open() {
             return Ok(());
         }
-        let _slot = self.admit()?;
+        let slot = self.admit()?;
+        // The writer's own keys, before the freeze hook adds the children's copies: those
+        // are the parent statement's writes under its lock on the parent's table, ordered
+        // against the child's own writers by the hook's locks (`storage::branch_freeze`,
+        // "Lock order"), and no statement of the child's can hold that lock.
         if super::table_locks::detector_active(&self.row_lock_detector) {
             super::table_locks::check_row_batch(&batch, std::panic::Location::caller());
         }
-        match opts {
-            Some(opts) => db.write_opt(batch, opts),
-            None => db.write(batch),
+        if self.freeze_active.load(Ordering::SeqCst) {
+            return self.write_frozen(db, batch, opts, slot);
         }
-        .map_err(Error::from)
+        let applied = Self::apply(db, batch, opts);
+        drop(slot);
+        applied
     }
 
     /// `DB::put` / `DB::put_opt` behind the gate.
@@ -243,29 +384,43 @@ impl WriteGate {
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        let _slot = self.admit()?;
+        let slot = self.admit()?;
         if super::table_locks::detector_active(&self.row_lock_detector) {
             super::table_locks::check_row_key(key.as_ref(), std::panic::Location::caller());
         }
-        match opts {
+        if self.freeze_active.load(Ordering::SeqCst) {
+            let mut batch = WriteBatch::default();
+            batch.put(key, value);
+            return self.write_frozen(db, batch, opts, slot);
+        }
+        let applied = match opts {
             Some(opts) => db.put_opt(key, value, opts),
             None => db.put(key, value),
         }
-        .map_err(Error::from)
+        .map_err(Error::from);
+        drop(slot);
+        applied
     }
 
     /// `DB::delete` / `DB::delete_opt` behind the gate.
     #[track_caller]
     pub fn delete<K: AsRef<[u8]>>(&self, db: &DB, key: K, opts: Option<&WriteOptions>) -> Result<()> {
-        let _slot = self.admit()?;
+        let slot = self.admit()?;
         if super::table_locks::detector_active(&self.row_lock_detector) {
             super::table_locks::check_row_key(key.as_ref(), std::panic::Location::caller());
         }
-        match opts {
+        if self.freeze_active.load(Ordering::SeqCst) {
+            let mut batch = WriteBatch::default();
+            batch.delete(key);
+            return self.write_frozen(db, batch, opts, slot);
+        }
+        let applied = match opts {
             Some(opts) => db.delete_opt(key, opts),
             None => db.delete(key),
         }
-        .map_err(Error::from)
+        .map_err(Error::from);
+        drop(slot);
+        applied
     }
 }
 

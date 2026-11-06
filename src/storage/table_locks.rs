@@ -649,6 +649,18 @@ impl TableLocks {
         })
     }
 
+    /// Does this thread's statement hold any table lock of this engine, in any mode?
+    /// Sprinter 6bc4a4040eb7 (B4): such a statement never waits on the fork fence, which
+    /// is outside these locks (`storage::branch_freeze`, "Lock order").
+    pub(crate) fn current_statement_holds_any(&self) -> bool {
+        CURRENT.with(|current| {
+            current
+                .borrow()
+                .as_ref()
+                .is_some_and(|owner| owner.engine == self.engine && owner.held.lock().iter().next().is_some())
+        })
+    }
+
     /// Shared locks taken late, at a transaction's first staged write of the table.
     /// Every SQL path locks at its statement, so this stays 0 on them.
     pub(crate) fn late_acquisitions(&self) -> u64 {

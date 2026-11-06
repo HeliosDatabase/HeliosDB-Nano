@@ -48,12 +48,10 @@ SELECT current.id,
 
 ### Recipe 3: "Undo a bad UPDATE" — read the past straight into main
 
-No branch, and above all no `MERGE`. An earlier version of this recipe snapshotted
-into a branch and merged it back; `MERGE` reports success and merges **zero rows**
-(see the MERGE warning in `heliosdb-nano-branches`), so the holding table never
-reached `main` and the next step failed on a missing table — during an incident,
-which is the worst possible time to find out. `AS OF` reads history directly, so
-the branch was never buying anything here.
+No branch, and above all no `MERGE`. A branch anchored before the bad `UPDATE` reads
+the old rows, but it only copied them, and `MERGE` carries what a branch changed, never
+what it copied (see `heliosdb-nano-branches`): merging it back leaves `main` as it is.
+`AS OF` reads history directly, so a branch buys nothing here.
 
 ```sql
 -- 1. Copy the affected rows into a holding table, read as they were 5 minutes
@@ -94,8 +92,9 @@ SELECT * FROM pg_vector_index_stats();     -- vector index health
 ## Pitfalls
 - **Snapshot retention is finite**. Configurable in `[storage]` (TOML config). Once a snapshot ages out, `AS OF` for that timestamp returns "snapshot not available".
 - **`AS OF` reads from the version chain (MVCC)**, not from a separate copy. Heavy churn between then and now means more chain walking.
-- **`AS OF` against a branch reads that branch's view at the timestamp** — if the branch was created later, behaviour follows the branch's `AS OF` anchor.
-- **No `AS OF` for writes**. You can read history but you cannot `INSERT/UPDATE/DELETE` "into the past". Use the branch + merge pattern (Recipe 3) instead.
+- **`AS OF` on a session bound to a branch is refused (`0A000`)**, whichever way it is spelled, `COUNT(*)` too: only main has history. To work with main as it was, create a branch anchored there (`heliosdb-nano-branches`), which is refused itself when a `DROP COLUMN`, `RENAME COLUMN`, `SET STORAGE`, `RENAME TO` or materialized view `REFRESH` ran since.
+- **A table's history goes with its name.** `DROP TABLE` and `RENAME TO` delete its versions, so a later table of the name does not read them as its own. So `AS OF` on main is wrong for a time before a rename, also after renaming back: a row written since the rename reads as not created yet at any time before that write (it is missing), and a row not written since reads as it is now. Nothing refuses this yet; a branch anchored there is refused, and a later release refuses the query too. A crash part way through the deletion leaves no table of the name, and the next open finishes it.
+- **No `AS OF` for writes**. You can read history but you cannot `INSERT/UPDATE/DELETE` "into the past". Use Recipe 3 instead.
 - **Time format must be unambiguous**. Prefer ISO-8601 with timezone (`'2026-04-29 09:00:00+00:00'`).
 
 ## See also

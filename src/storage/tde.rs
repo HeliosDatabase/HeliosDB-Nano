@@ -64,26 +64,20 @@ static PLAINTEXT_PASSTHROUGH_COUNT: AtomicU64 = AtomicU64::new(0);
 ///   every branch write goes through the branch view — `insert_tuple_branch_aware_with_schema`,
 ///   `update_tuples_branch_aware` and `bulk_insert_tuples` included), the
 ///   transaction commit batch (through [`seal_row_value`], which is why this
-///   prefix is listed here),
-///   `BranchManager::copy_key_to_branch`, and `StorageEngine::merge_branch`'s
-///   branch-to-branch arm.
+///   prefix is listed here), the fork-point hook's copies of a parent's row
+///   (`branch_freeze`, sprinter 6bc4a4040eb7, B4), and
+///   `StorageEngine::merge_branch`'s branch-to-branch arm.
 ///
 ///   Its readers all decode through this module, so the tolerant open applies to
 ///   the keyspace exactly as it does to `data:`: `Transaction::get`'s
 ///   `read_raw_decoded` fallback (which `BranchTransaction::get` is built on),
-///   `BranchTransaction::get`'s parent-chain arm, `BranchManager::
-///   get_key_at_snapshot` / `get_latest_key_value`, and the engine's
+///   `BranchTransaction::get`'s parent-chain arm, and the engine's
 ///   `get` / `get_internal` / `decrypt_value` — the last of which is what
 ///   `scan_table_branch_aware` and the branch-aware point lookups use.
 ///
-///   The two readers that COMPARE two `bdata:` values — the merge conflict
-///   detector, through `get_key_at_snapshot` and `get_latest_key_value` — must
-///   compare the DECODED form, because a fresh nonce per seal makes two AES-GCM
-///   frames of one plaintext differ and a byte comparison would report a
-///   conflict between two identical rows.
-///
-///   `bdel:` (branch delete markers) is deliberately absent: its values are
-///   empty and every reader tests only for the key's presence.
+///   `bdel:` (branch delete markers) and `bfrz:` (copy markers) are deliberately
+///   absent: their values are empty and every reader tests only for the key's
+///   presence.
 /// * `delta:{table}:{delta_id}` — the materialized-view delta log written by
 ///   `mv_delta::DeltaTracker`. A `Delta`'s operation carries whole `Tuple`s
 ///   (`Insert { tuple }`, `Delete { tuple }`, `Update { old_tuple, new_tuple }`),

@@ -121,7 +121,8 @@ impl MissingValues {
         Self { slots }
     }
 
-    fn from_schema(schema: &Schema, mut by_name: HashMap<String, Value>) -> Self {
+    /// `by_name` by position in `schema`; a column it does not name answers NULL.
+    pub(crate) fn from_schema(schema: &Schema, mut by_name: HashMap<String, Value>) -> Self {
         Self {
             slots: schema
                 .columns
@@ -259,7 +260,7 @@ impl StorageEngine {
     }
 
     /// Every `meta:attmissing:{table}:` key, decoded, by column name.
-    fn stored_missing_values(&self, table: &str) -> Result<HashMap<String, Value>> {
+    pub(crate) fn stored_missing_values(&self, table: &str) -> Result<HashMap<String, Value>> {
         let prefix = Catalog::attmissing_prefix(table);
         let mut by_name = HashMap::new();
         let mut read_opts = ReadOptions::default();
@@ -385,7 +386,9 @@ impl StorageEngine {
     /// the rows as they were. Publish the returned snapshot once `batch` is written
     /// (`SnapshotManager::publish_rewrite_snapshot`).
     ///
-    /// `batch` is measured after each row, versions included. Above `max_bytes`
+    /// `batch` is measured after each row, versions included, and so are the copies
+    /// main's live branches will take of the rows (phase B4: one per row and branch
+    /// that reads the table through main). Above `max_bytes`
     /// the statement is refused (54000), as a NULL in a NOT NULL column is (23502):
     /// nothing has been written, by this function or by anyone it called. Volatile
     /// functions have run, though, so a `nextval` default has consumed its values.
@@ -412,6 +415,12 @@ impl StorageEngine {
         };
         let prefix = format!("data:{table}:");
         let shape = self.row_shape(table, old_width)?;
+        // Sprinter 6bc4a4040eb7 (B4): each live branch that reads the table through
+        // main takes a copy of every row this rewrites, from the same write, at the
+        // size of the image it replaces: counted too, so a dry run refuses what the
+        // write would, and the copies never take the write past the cap.
+        let copying = self.branches_copying_main_rows(table)?;
+        let mut copy_bytes = 0u64;
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(true);
         let iter = self
@@ -450,7 +459,8 @@ impl StorageEngine {
             }
             batch.put(&key, sealed.as_ref());
             rows += 1;
-            let bytes = batch.size_in_bytes() as u64;
+            copy_bytes = copy_bytes.saturating_add(((key.len() + raw.len()) as u64).saturating_mul(copying));
+            let bytes = (batch.size_in_bytes() as u64).saturating_add(copy_bytes);
             if bytes > max_bytes {
                 return Err(Error::atomic_rewrite_too_large(table, bytes, max_bytes));
             }

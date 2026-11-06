@@ -3766,6 +3766,14 @@ fn map_error_code(err_msg: &str) -> (u16, &'static str) {
     if err_msg.contains(crate::error::UNSUPPORTED_STATEMENT_KIND_MARKER) {
         return (1235, "0A000"); // ER_NOT_SUPPORTED_YET
     }
+    // sprinter 6bc4a4040eb7 (B4): a table name a row's key cannot hold, and an anchor
+    // whose rows cannot be read.
+    if err_msg.contains(crate::error::TABLE_NAME_HOLDS_COLON_MARKER) {
+        return (1103, "42000"); // ER_WRONG_TABLE_NAME
+    }
+    if err_msg.contains(crate::error::BRANCH_ANCHOR_UNREADABLE_MARKER) {
+        return (1235, "0A000"); // ER_NOT_SUPPORTED_YET
+    }
     // sprinter 6bc4a4040eb7 (B2/B3): a statement refused on a branch (a
     // main-only write path, or a schema statement the branch catalog does not
     // scope) is 0A000 on the PostgreSQL wire; the same here.

@@ -1007,6 +1007,32 @@ fn a_volatile_rewrite_above_the_cap_is_refused_and_writes_nothing() {
     }
 }
 
+/// Phase B4: each live branch that reads the table through main takes a copy of every
+/// row a volatile rewrite of main changes, from the same write, and the cap counts those
+/// copies too, measured before anything is written. A rewrite that fits alone is
+/// refused with four such branches, and fits again once they are gone.
+#[test]
+fn a_volatile_rewrite_counts_the_copies_mains_live_branches_take() {
+    const CAP: u64 = 1024 * 1024;
+    let db = wide_rows_config_db(CAP, 250);
+    let sql = "ALTER TABLE big ADD COLUMN u UUID DEFAULT gen_random_uuid()";
+    let branches = ["c1", "c2", "c3", "c4"];
+    for branch in branches {
+        db.execute(&format!("CREATE BRANCH {branch} AS OF NOW")).unwrap();
+    }
+    let err = db
+        .execute(sql)
+        .expect_err("the copies take it past the cap")
+        .to_string();
+    assert!(err.contains(heliosdb_nano::ATOMIC_REWRITE_TOO_LARGE_MARKER), "{err}");
+    assert_eq!(stored_widths(&db, "big"), vec![2; 250]);
+    for branch in branches {
+        db.execute(&format!("DROP BRANCH {branch}")).unwrap();
+    }
+    db.execute(sql).expect("alone it fits");
+    assert_eq!(stored_widths(&db, "big"), vec![3; 250]);
+}
+
 #[test]
 fn the_cap_is_validated_by_the_configuration() {
     let mut config = Config::in_memory();

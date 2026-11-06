@@ -53,6 +53,33 @@ fn setup_rows(db: &EmbeddedDatabase, table: &str, rows: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// A row whose delete event is below the horizon: gone at every time a read can
+// ask about, so all of it goes (sprinter 6bc4a4040eb7, B4).
+// ---------------------------------------------------------------------------
+#[test]
+fn vacuum_reclaims_a_deleted_row_with_its_event() {
+    let db = db_with_retention("1s");
+    const ROWS: usize = 6;
+    setup_rows(&db, "d", ROWS);
+    update_rounds(&db, "d", 2);
+    db.execute("BEGIN").unwrap();
+    db.execute("DELETE FROM d WHERE id < 3").unwrap();
+    db.execute("COMMIT").unwrap();
+    sleep_secs(2.0);
+    // A snapshot newer than the delete, for the retention clock to find.
+    db.execute("INSERT INTO d (id, val) VALUES (100, 0)").unwrap();
+    sleep_secs(1.2);
+
+    db.vacuum_versions().unwrap();
+    let after = db.version_storage_stats().unwrap();
+    let live = (ROWS - 3 + 1) as u64;
+    assert_eq!(after.version_keys, live, "one version per row that still exists");
+    assert_eq!(after.version_index_keys, live, "and no event of a row that does not");
+    let rows = db.query("SELECT id FROM d", &[]).unwrap();
+    assert_eq!(rows.len(), live as usize);
+}
+
+// ---------------------------------------------------------------------------
 // 1. Grow → update → GC → verify reclaim (version-key count before/after).
 // ---------------------------------------------------------------------------
 #[test]
@@ -199,11 +226,13 @@ fn active_reader_blocks_gc_past_its_snapshot() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Branch anchors pin history; dropping the branch releases the pin;
-//    branching from an anchor beyond the horizon errors cleanly.
+// 4. A branch pins no history once it exists (sprinter 6bc4a4040eb7, B4: it holds
+//    its parent's old rows in its overlay): GC advances past a long-lived branch's
+//    anchor, the branch keeps what it saw, and branching from an anchor beyond the
+//    horizon errors cleanly.
 // ---------------------------------------------------------------------------
 #[test]
-fn branch_anchor_pins_history_until_dropped() {
+fn version_gc_advances_past_a_branchs_anchor() {
     let db = db_with_retention("1s");
     const ROWS: usize = 10;
     setup_rows(&db, "b", ROWS);
@@ -216,21 +245,20 @@ fn branch_anchor_pins_history_until_dropped() {
     update_rounds(&db, "b", 3); // all younger than the branch anchor
     sleep_secs(2.0);
 
-    // The branch anchor clamps the horizon below every post-anchor
-    // version; the only version per row at-or-below the anchor is the
-    // insert itself (which is kept). Nothing is collectible.
-    let before = db.version_storage_stats().unwrap();
     let collected = db.vacuum_versions().unwrap();
-    assert_eq!(collected, 0, "active branch must pin its anchor history");
-    let mid = db.version_storage_stats().unwrap();
-    assert_eq!(mid.version_keys, before.version_keys);
-
-    // Dropping the branch releases the pin.
-    db.execute("DROP BRANCH pinner").unwrap();
-    let collected = db.vacuum_versions().unwrap();
-    assert!(collected > 0, "dropping the branch must unpin history");
+    assert!(collected > 0, "a live branch pins nothing");
     let after = db.version_storage_stats().unwrap();
     assert_eq!(after.version_keys, ROWS as u64);
+
+    // And it did not need it.
+    db.execute("USE BRANCH pinner").unwrap();
+    let rows = db.query("SELECT val FROM b", &[]).unwrap();
+    assert_eq!(rows.len(), ROWS);
+    assert!(
+        rows.iter().all(|row| as_i64(&row.values[0]) == 0),
+        "the rows as they were"
+    );
+    db.execute("USE BRANCH main").unwrap();
 
     // Branching from a historical anchor beyond the horizon errors cleanly.
     let err = db

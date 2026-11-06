@@ -36,9 +36,10 @@
 //! back through `StorageEngine::get`). The record carries what phase B4 and
 //! MERGE need:
 //!
-//! * `frozen` — a frozen copy of the parent's definition written by B4's
-//!   freeze hook, NOT a change made on this level. MERGE skips it. B3 never
-//!   writes one.
+//! * `frozen` — a copy of the parent's definition (phase B4,
+//!   `branch_freeze.rs`), NOT a change made on this level: what the level keeps
+//!   seeing while the parent moves on. MERGE skips it. A tombstone is a table the
+//!   parent is creating: this level never saw it.
 //! * `parent_fingerprint` — the fingerprint ([`definition_fingerprint`]) of
 //!   the definition `t` had on this level's PARENT when this level first wrote
 //!   its own entry (`None`: the parent had no such table). `MERGE BRANCH`
@@ -72,10 +73,11 @@
 //! it, even when the branch only changed rows: those rows were written for the
 //! definition at the fork, and are copied by position (B3 second fix pass; a
 //! `DROP COLUMN` on main used to shift them silently). A branch with no fork
-//! record (created below the engine, or by an older build), and a table with no
-//! entry in it (created on main after the fork, which B3 reads live), have
-//! nothing to compare; phase B4's fork-point isolation closes both. A table with
-//! no incarnation yet (a backfill that failed) is UNKNOWN, never different.
+//! record was created by an earlier release: MERGE refuses it for any table it
+//! changed rows of. A table with no entry in it was created after the fork, and
+//! the parent's create froze a tombstone into the branch (phase B4), so it cannot
+//! have changed rows of it. A table with no incarnation yet (a backfill that
+//! failed) is UNKNOWN, never different.
 //!
 //! # Copies and the key index (B3 fix pass)
 //!
@@ -94,11 +96,11 @@
 //!
 //! # Reclaim
 //!
-//! Every key of a level's catalog starts `bmeta:{L}:`; phase B4's reclaim of a
-//! dropped or merged branch deletes that prefix with the rest of the overlay.
-//! Nothing reads a level's records except through a chain that contains it,
-//! and a dropped branch can no longer be bound, so a dropped branch's records
-//! are referenced by nothing.
+//! Every key of a level's catalog starts `bmeta:{L}:`; the reclaim of a dropped
+//! or merged branch (phase B4, `BranchManager::reclaim_branch_keys`) deletes that
+//! prefix with the rest of the overlay. Nothing reads a level's records except
+//! through a chain that contains it, and a dropped branch can no longer be bound,
+//! so a dropped branch's records are referenced by nothing.
 
 use super::{Catalog, StorageEngine};
 use crate::sql::logical_plan::ColumnDef;
@@ -132,6 +134,14 @@ pub fn branch_tables_prefix(level: u64) -> String {
 /// Every catalog key of one level (`bmeta:{level}:`) — what a reclaim deletes.
 pub fn branch_catalog_level_prefix(level: u64) -> String {
     format!("bmeta:{level}:")
+}
+
+/// `bmeta:{level}:missing:{table}` (phase B4 with spec R5.2) — the missing values
+/// (`meta:attmissing:`) main had for `table` when level `level` took its frozen
+/// record of it, by column name: what a narrow row there reads, whatever main does
+/// to its own since. Written with the record, in its batch.
+pub fn branch_missing_values_key(level: u64, table: &str) -> Vec<u8> {
+    format!("bmeta:{level}:missing:{table}").into_bytes()
 }
 
 /// `bmeta:{level}:fork` — the incarnation of every table the level's parent
@@ -245,8 +255,8 @@ pub struct BranchTableRecord {
     pub state: BranchTableState,
     /// Rows are read from the defining level and its descendants only.
     pub isolated: bool,
-    /// Phase B4: a frozen copy of the parent's definition, not a change made
-    /// on this level. MERGE skips it. B3 never sets it.
+    /// Phase B4: a copy of the parent's definition, not a change made on this
+    /// level (`branch_freeze.rs`). MERGE skips it.
     pub frozen: bool,
     /// The fingerprint of the definition the PARENT had when this level first
     /// wrote its own entry for the table; `None` = the parent had no such
@@ -673,6 +683,10 @@ pub enum MergeFailSite {
     Materialize,
     /// A schema statement on main, holding its tables and past its exclusion check.
     MainDdlStatement,
+    /// Phase B4: one batch of a level's reclaim deleted.
+    Reclaim,
+    /// Phase B4: one write of a table's version history purge deleted.
+    HistoryPurge,
 }
 
 /// A test's code to run at a [`MergeFailSite`], with no lock held.
@@ -689,15 +703,52 @@ static MERGE_SITE_HOOKS: LazyLock<DashMap<(u64, MergeFailSite), MergeSiteHook>> 
 /// Whether any fail point or hook is armed: the one load a merged row pays.
 static MERGE_FAILPOINTS_ARMED: AtomicUsize = AtomicUsize::new(0);
 
+/// One tick of a fail point of engine `engine` (`StorageEngine::debug_fail_merge_at`,
+/// `debug_on_merge_site`): one load when none is armed anywhere.
+pub(crate) fn engine_failpoint_tick(engine: u64, site: MergeFailSite) -> Result<()> {
+    if MERGE_FAILPOINTS_ARMED.load(Ordering::Relaxed) == 0 {
+        return Ok(());
+    }
+    let hook = MERGE_SITE_HOOKS
+        .get(&(engine, site))
+        .map(|hook| Arc::clone(hook.value()));
+    if let Some(hook) = hook {
+        hook();
+    }
+    let fire = match MERGE_FAILPOINTS.get_mut(&engine) {
+        Some(mut armed) if armed.0 == site => {
+            if armed.1 > 0 {
+                armed.1 -= 1;
+                false
+            } else {
+                true
+            }
+        }
+        _ => false,
+    };
+    if fire {
+        MERGE_FAILPOINTS.remove(&engine);
+        MERGE_FAILPOINTS_ARMED.fetch_sub(1, Ordering::Relaxed);
+        return Err(Error::storage("injected MERGE BRANCH failure"));
+    }
+    Ok(())
+}
+
 /// A schema statement on main, or one write of main's catalog: it holds its tables
 /// exclusively until this drops (spec R5.1, `storage::table_locks`). A merge takes the
 /// same locks, so it waits for a statement already running and a statement waits for
 /// the merge. Inert inside a merge's own scope, whose locks cover it.
+///
+/// Phase B4: it also holds the statement's place in the fork fence, taken BEFORE the
+/// table locks and given back after them (`storage::branch_freeze`, "Lock order").
 #[must_use]
 pub(crate) struct MainDdlGuard {
     // In this order: the locks let go while the statement still acts for its transaction.
     _locks: Option<super::table_locks::ExclusiveTableLocks>,
     _bound: Option<super::table_locks::BoundLockOwner>,
+    /// Phase B4: the fork fence this guard entered, and [`FORK_FENCE_ENTERED`] as it
+    /// was. See [`StorageEngine::enter_fork_fence`].
+    fork_fence: Option<(Arc<super::branch_freeze::BranchFreeze>, Option<u64>)>,
 }
 
 impl MainDdlGuard {
@@ -705,6 +756,7 @@ impl MainDdlGuard {
         Self {
             _locks: None,
             _bound: None,
+            fork_fence: None,
         }
     }
 
@@ -716,6 +768,7 @@ impl MainDdlGuard {
         Self {
             _locks: Some(locks),
             _bound: Some(bound),
+            fork_fence: None,
         }
     }
 
@@ -724,6 +777,25 @@ impl MainDdlGuard {
         self._bound = Some(bound);
         self
     }
+}
+
+impl Drop for MainDdlGuard {
+    fn drop(&mut self) {
+        // The table locks first, then the fence: the reverse of how they were taken.
+        drop(self._locks.take());
+        drop(self._bound.take());
+        if let Some((freeze, previous)) = self.fork_fence.take() {
+            FORK_FENCE_ENTERED.with(|entered| entered.set(previous));
+            freeze.leave_schema_statement();
+        }
+    }
+}
+
+thread_local! {
+    /// The engine whose fork fence a guard on this thread entered (phase B4): what
+    /// runs under that statement is part of it, and must not wait for a fork that is
+    /// waiting for the statement.
+    static FORK_FENCE_ENTERED: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 thread_local! {
@@ -851,6 +923,12 @@ const RECORD_CACHE_MAX_ENTRIES: usize = 65_536;
 /// absence), stamped with the engine's schema generation at the read.
 static RECORDS: LazyLock<DashMap<RecordKey, (u64, Option<Arc<BranchTableRecord>>)>> = LazyLock::new(DashMap::new);
 
+/// Phase B4 with spec R5.2: each level's frozen missing values for a table
+/// ([`branch_missing_values_key`]), under the frozen definition's schema, stamped
+/// like [`RECORDS`].
+static FROZEN_MISSING: LazyLock<DashMap<RecordKey, (u64, Option<Arc<super::row_shape::MissingValues>>)>> =
+    LazyLock::new(DashMap::new);
+
 /// `(engine instance, branch, table)` whose isolated table this process has
 /// already raised the shared row-id counter for (see
 /// `StorageEngine::ensure_branch_row_id_floor`).
@@ -902,6 +980,50 @@ impl StorageEngine {
         Ok(record)
     }
 
+    /// Phase B4 with spec R5.2: the missing values a frozen record of `table` on
+    /// `level` reads its narrow rows with, by position in `schema`, the record's
+    /// definition. `None` when main had none for the table when the record was taken.
+    pub(crate) fn frozen_missing_values(
+        &self,
+        level: u64,
+        table: &str,
+        schema: &Schema,
+    ) -> Result<Option<Arc<super::row_shape::MissingValues>>> {
+        let cacheable = !self.is_physical_standby();
+        let generation = self.schema_generation();
+        let key: RecordKey = (self.instance_id(), level, table.to_string());
+        if cacheable {
+            if let Some(entry) = FROZEN_MISSING.get(&key) {
+                if entry.0 == generation {
+                    return Ok(entry.1.clone());
+                }
+            }
+        }
+        let loaded = match self.get(&branch_missing_values_key(level, table))? {
+            Some(bytes) => {
+                let by_name: Vec<(String, crate::Value)> = bincode::deserialize(&bytes).map_err(|e| {
+                    Error::storage(format!(
+                        "the frozen missing values of '{table}' on branch level {level} do not decode: {e}"
+                    ))
+                })?;
+                (!by_name.is_empty()).then(|| {
+                    Arc::new(super::row_shape::MissingValues::from_schema(
+                        schema,
+                        by_name.into_iter().collect(),
+                    ))
+                })
+            }
+            None => None,
+        };
+        if cacheable {
+            if FROZEN_MISSING.len() >= RECORD_CACHE_MAX_ENTRIES {
+                FROZEN_MISSING.clear();
+            }
+            FROZEN_MISSING.insert(key, (generation, loaded.clone()));
+        }
+        Ok(loaded)
+    }
+
     /// sprinter 6bc4a4040eb7 (phase B3): resolve `table` through `chain`
     /// (oldest first): the NEAREST level with an entry decides.
     pub(crate) fn resolve_branch_table(&self, chain: &[u64], table: &str) -> Result<BranchTableResolution> {
@@ -936,10 +1058,14 @@ impl StorageEngine {
         };
         let resolution = self.resolve_branch_table(&chain, table)?;
         if let BranchTableResolution::Defined { index, record, .. } = &resolution {
+            // Phase B4: a copy of main's definition too: the main table may be gone,
+            // and its counter with it, while the branch still holds its rows.
             if record.isolated {
                 if let Some(levels) = chain.get(*index..) {
                     self.ensure_branch_row_id_floor(levels, table)?;
                 }
+            } else if record.frozen {
+                self.ensure_branch_row_id_floor(&chain, table)?;
             }
         }
         Ok(Some(resolution))
@@ -1259,18 +1385,71 @@ impl StorageEngine {
         MERGE_SCOPE.with(std::cell::Cell::get) == Some(self.instance_id())
     }
 
+    /// Phase B4: a schema statement on main, or a write of main's catalog, on `tables`
+    /// starts. It runs wholly before a fork of main or wholly after it ("Definitions" in
+    /// `storage::branch_freeze`): it waits while a branch of main registers, and a new
+    /// branch waits for it. Before anything looks for children, and BEFORE the table
+    /// locks: a statement waiting here holds none, so a fork waiting for the statements
+    /// in the fence never waits, through one of them, for a lock such a statement holds.
+    /// Once per thread: what nests under a statement is that statement. Refused 55006 if
+    /// the time ran out, which takes a fork waiting for a statement that outlasts its
+    /// budget; and at once, when this thread's statement holds table locks already (a
+    /// transaction's DDL after its writes): it must not wait on the fence while it does.
+    fn enter_fork_fence(&self, tables: &[&str], guard: &mut MainDdlGuard) -> Result<()> {
+        if tables.iter().all(|table| crate::sql::temp_tables::is_temp_key(table)) {
+            return Ok(());
+        }
+        self.take_fork_fence(tables.first().copied().unwrap_or("?"), guard)
+    }
+
+    /// Phase B4: a statement that creates tables it does not name up front (`CREATE
+    /// SCHEMA` with elements): the fork fence for all of what it runs. Nothing else of
+    /// a schema statement: each element is a statement, with its own guard.
+    pub(crate) fn enter_main_statement_of_unnamed_tables(&self) -> Result<MainDdlGuard> {
+        let mut guard = MainDdlGuard::inert();
+        self.take_fork_fence("?", &mut guard)?;
+        Ok(guard)
+    }
+
+    fn take_fork_fence(&self, named: &str, guard: &mut MainDdlGuard) -> Result<()> {
+        let Some(freeze) = self.branch_freeze() else {
+            return Ok(());
+        };
+        let engine = self.instance_id();
+        if FORK_FENCE_ENTERED.with(std::cell::Cell::get) == Some(engine) {
+            return Ok(());
+        }
+        let budget = if self.table_locks().current_statement_holds_any() {
+            std::time::Duration::ZERO
+        } else {
+            super::BRANCH_DRAIN_TIMEOUT
+        };
+        if !freeze.enter_schema_statement(budget) {
+            return Err(Error::branch_schema_waited_for_fork(named));
+        }
+        let previous = FORK_FENCE_ENTERED.with(|entered| entered.replace(Some(engine)));
+        guard.fork_fence = Some((Arc::clone(freeze), previous));
+        Ok(())
+    }
+
     /// sprinter 6bc4a4040eb7 (B3 third fix pass, spec R5.1): a schema statement on
-    /// main starts, on `tables`. Refused (55006) if a merge holds one of them, or an
-    /// unfinished merge's intent does (the exclusion outlives a crash, when no lock is
-    /// held by anybody); then it takes them exclusively, sorted, bounded by `[session]
-    /// lock_timeout_ms`; and it looks again, for a merge that registered meanwhile and
-    /// did not finish. Past this it is not refused again: a merge that registers now
-    /// waits for this statement's lock, and a refusal half way would tear what it did.
-    /// Inert inside a merge's own scope.
+    /// main starts, on `tables`. Phase B4: it enters the fork fence first. Refused
+    /// (55006) if a merge holds one of them, or an unfinished merge's intent does (the
+    /// exclusion outlives a crash, when no lock is held by anybody); then it takes them
+    /// exclusively, sorted, bounded by `[session] lock_timeout_ms`; and it looks again,
+    /// for a merge that registered meanwhile and did not finish. Past this it is not
+    /// refused again: a merge that registers now waits for this statement's lock, and a
+    /// refusal half way would tear what it did. Inert inside a merge's own scope, but for
+    /// the freeze of main's definitions for main's other live branches (phase B4).
     pub(crate) fn enter_main_statement(&self, tables: &[&str], statement: &str) -> Result<MainDdlGuard> {
         if self.in_merge_scope() {
+            // Phase B4: a merge's DDL changes main's definition under main's other
+            // live branches like any other.
+            self.freeze_definitions_for_children(tables)?;
             return Ok(MainDdlGuard::inert());
         }
+        let mut guard = MainDdlGuard::inert();
+        self.enter_fork_fence(tables, &mut guard)?;
         // A statement nested in another one (a `CREATE TABLE … AS`, on a query route) was
         // looked at when it took what it holds.
         let to_check: Vec<&str> = tables
@@ -1285,26 +1464,32 @@ impl StorageEngine {
         for table in &to_check {
             self.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, table)?;
         }
-        let locks = self.lock_tables_exclusive(super::table_locks::MAIN_LEVEL, tables, statement)?;
+        guard._locks = Some(self.lock_tables_exclusive(super::table_locks::MAIN_LEVEL, tables, statement)?);
         for table in &to_check {
             self.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, table)?;
         }
+        // Phase B4, in the fence and under the locks: a child registered by now gets the
+        // definition before the statement's first row; none can register until the
+        // statement is over. A statement can rewrite rows before its first catalog
+        // write, and the funnels below it find the copy already there.
+        self.freeze_definitions_for_children(tables)?;
         self.merge_failpoint_tick(MergeFailSite::MainDdlStatement)?;
-        Ok(MainDdlGuard {
-            _locks: Some(locks),
-            _bound: None,
-        })
+        Ok(guard)
     }
 
     /// sprinter 6bc4a4040eb7 (B3 second and third fix passes, spec R5.1): one catalog
     /// write on main touching `tables`. What the statement above it already holds it
     /// holds and looked at; a table it takes itself (a direct catalog call, restore,
     /// the protocol adapter, or a table no statement named) is checked here, and
-    /// refused (55006) if a merge holds it. Inert inside a merge's own scope.
+    /// refused (55006) if a merge holds it. Inert inside a merge's own scope. Phase B4:
+    /// the fork fence first, as for a statement, then the freeze of main's definitions.
     pub(crate) fn enter_main_ddl(&self, tables: &[&str]) -> Result<MainDdlGuard> {
         if self.in_merge_scope() {
+            self.freeze_definitions_for_children(tables)?;
             return Ok(MainDdlGuard::inert());
         }
+        let mut guard = MainDdlGuard::inert();
+        self.enter_fork_fence(tables, &mut guard)?;
         let mut sorted: Vec<&str> = tables.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -1315,10 +1500,11 @@ impl StorageEngine {
                 self.refuse_ddl_on_merging_table(MERGE_TARGET_MAIN, table)?;
             }
         }
-        Ok(MainDdlGuard {
-            _locks: Some(locks),
-            _bound: None,
-        })
+        guard._locks = Some(locks);
+        // Phase B4: for a route with no statement guard this is the first anyone
+        // hears of it; under one it finds its copies written.
+        self.freeze_definitions_for_children(tables)?;
+        Ok(guard)
     }
 
     /// For the tests' handshakes: is a merge holding `table` on main?
@@ -1412,33 +1598,7 @@ impl StorageEngine {
 
     /// One tick of the fail point above.
     pub(crate) fn merge_failpoint_tick(&self, site: MergeFailSite) -> Result<()> {
-        if MERGE_FAILPOINTS_ARMED.load(Ordering::Relaxed) == 0 {
-            return Ok(());
-        }
-        let engine = self.instance_id();
-        let hook = MERGE_SITE_HOOKS
-            .get(&(engine, site))
-            .map(|hook| Arc::clone(hook.value()));
-        if let Some(hook) = hook {
-            hook();
-        }
-        let fire = match MERGE_FAILPOINTS.get_mut(&engine) {
-            Some(mut armed) if armed.0 == site => {
-                if armed.1 > 0 {
-                    armed.1 -= 1;
-                    false
-                } else {
-                    true
-                }
-            }
-            _ => false,
-        };
-        if fire {
-            MERGE_FAILPOINTS.remove(&engine);
-            MERGE_FAILPOINTS_ARMED.fetch_sub(1, Ordering::Relaxed);
-            return Err(Error::storage("injected MERGE BRANCH failure"));
-        }
-        Ok(())
+        engine_failpoint_tick(self.instance_id(), site)
     }
 
     fn row_ids_with_prefix(&self, prefix: &str) -> Result<HashSet<u64>> {
@@ -1477,28 +1637,6 @@ impl StorageEngine {
         changed.extend(self.branch_tombstone_row_ids(level, table)?);
         changed.retain(|row_id| !frozen.contains(row_id));
         Ok(changed)
-    }
-
-    /// The live branches that read through `level`, but for `except`: its
-    /// descendants, walked THROUGH merged branches (B3 second fix pass): a merged
-    /// child stays in its own children's chains. `except`'s own descendants count.
-    pub(crate) fn live_branch_children(&self, level: u64, except: Option<u64>) -> Result<Vec<String>> {
-        let branches = self.list_branches_for_catalog()?;
-        let mut live = Vec::new();
-        let mut visited: HashSet<u64> = HashSet::new();
-        let mut pending = vec![level];
-        while let Some(cursor) = pending.pop() {
-            for branch in &branches {
-                if branch.parent_id != Some(cursor) || !visited.insert(branch.branch_id) {
-                    continue;
-                }
-                pending.push(branch.branch_id);
-                if branch.state == super::BranchState::Active && Some(branch.branch_id) != except {
-                    live.push(branch.name.clone());
-                }
-            }
-        }
-        Ok(live)
     }
 
     /// sprinter 6bc4a4040eb7 (B3 second fix pass): where did level `level`, an
@@ -1560,6 +1698,13 @@ impl StorageEngine {
             })?;
         }
         Ok(count)
+    }
+
+    /// Phase B4: forget what this process holds for a level whose keys are gone.
+    pub(crate) fn forget_level_records(engine: u64, level: u64) {
+        RECORDS.retain(|(owner, cached_level, _), _| !(*owner == engine && *cached_level == level));
+        FROZEN_MISSING.retain(|(owner, cached_level, _), _| !(*owner == engine && *cached_level == level));
+        ROW_ID_FLOORS.retain(|(owner, cached_level, _), _| !(*owner == engine && *cached_level == level));
     }
 
     /// Stage `tuple` as level `level`'s own image of row `row_id` of `table`
@@ -1650,6 +1795,10 @@ impl StorageEngine {
         mut batch: WriteBatch,
         clear_own_rows: bool,
     ) -> Result<()> {
+        // Phase B4: a parent's copy into this level checks for a record and then
+        // writes one: not between the two.
+        let freeze = self.write_gate().active_freeze();
+        let definition = freeze.map(|freeze| freeze.lock_definition(table));
         if clear_own_rows {
             self.stage_branch_rows_delete(level, table, &mut batch)?;
         }
@@ -1657,6 +1806,7 @@ impl StorageEngine {
         let sealed = super::tde::seal(self.key_manager_ref(), &value)?;
         batch.put(branch_table_key(level, table), sealed.as_ref());
         self.write_batch_through_gate(batch)?;
+        drop(definition);
         self.after_branch_catalog_write(level, table)
     }
 
@@ -1671,6 +1821,8 @@ impl StorageEngine {
         previous: Option<&BranchTableRecord>,
         clear_own_rows: bool,
     ) -> Result<()> {
+        let freeze = self.write_gate().active_freeze();
+        let definition = freeze.map(|freeze| freeze.lock_definition(table));
         let mut batch = WriteBatch::default();
         if clear_own_rows {
             self.stage_branch_rows_delete(level, table, &mut batch)?;
@@ -1684,6 +1836,7 @@ impl StorageEngine {
             None => batch.delete(branch_table_key(level, table)),
         }
         self.write_batch_through_gate(batch)?;
+        drop(definition);
         self.after_branch_catalog_write(level, table)
     }
 
@@ -1712,10 +1865,11 @@ impl StorageEngine {
     /// branch is stamped with it) and the level's write generation for the
     /// table move, the level's cached record goes, and the autocommit
     /// durability barrier runs.
-    fn after_branch_catalog_write(&self, level: u64, table: &str) -> Result<()> {
+    pub(crate) fn after_branch_catalog_write(&self, level: u64, table: &str) -> Result<()> {
         self.bump_schema_generation();
         super::branch_view::bump_write_generation(self.instance_id(), level, table);
         RECORDS.remove(&(self.instance_id(), level, table.to_string()));
+        FROZEN_MISSING.remove(&(self.instance_id(), level, table.to_string()));
         self.durable_autocommit_barrier()
     }
 }

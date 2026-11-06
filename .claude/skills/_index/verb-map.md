@@ -121,8 +121,8 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `in_transaction()` | Check active txn | `heliosdb-nano-transactions` |
 | `create_branch(name)` | New branch | `heliosdb-nano-branches` |
 | `switch_branch(name)` | Activate branch | `heliosdb-nano-branches` |
-| `merge_branch(src)` | ❌ **DOES NOT WORK** — returns completed=true, merged_keys=0, target unchanged | `heliosdb-nano-branches` |
-| `drop_branch(name)` | Delete branch | `heliosdb-nano-branches` |
+| `merge_branch(src)` | Merge `src` into the session's branch: its own changes, last-writer-wins | `heliosdb-nano-branches` |
+| `drop_branch(name)` | Delete branch and its keys | `heliosdb-nano-branches` |
 | `list_branches()` | Enumerate branches | `heliosdb-nano-branches` |
 | `dump_full(path)` | Full backup | `heliosdb-nano-backup` |
 | `restore_from_dump(path)` | Restore | `heliosdb-nano-backup` |
@@ -151,7 +151,7 @@ Source of truth: `src/main.rs`, `src/repl/commands.rs`, `src/lib.rs`, `src/mcp/t
 | `UPDATE … RETURNING` / `DELETE … RETURNING` / `MERGE` | `heliosdb-nano-query` |
 | `SELECT` (windows, CTEs, set ops) / `EXPLAIN [ANALYZE]` | `heliosdb-nano-query` |
 | `BEGIN / COMMIT / ROLLBACK / SAVEPOINT … RELEASE / ROLLBACK TO` | `heliosdb-nano-transactions` |
-| `CREATE DATABASE BRANCH … [PARENT … AS OF …]` / `USE BRANCH` / `MERGE` / `DROP` | `heliosdb-nano-branches` |
+| `CREATE DATABASE BRANCH … [FROM <p>] [AS OF NOW \| TIMESTAMP '…' \| TRANSACTION n \| SCN n]` (a fork: the parent's later writes do not show; a past anchor needs main as the parent, and is refused `0A000` before a `DROP COLUMN`, `RENAME COLUMN`, `SET STORAGE` or `RENAME TO` of a table or a `REFRESH` of a materialized view; views, materialized views and functions are shared by all branches) / `USE BRANCH` / `SET heliosdb.branch` / `MERGE BRANCH x INTO y` / `MERGE BRANCH x ABORT` / `DROP BRANCH` (reclaims its keys) | `heliosdb-nano-branches` |
 | `SELECT … FROM t AS OF TIMESTAMP '…'` | `heliosdb-nano-time-travel` |
 | `CREATE INDEX … USING HNSW` / `<->`, `<#>`, `<=>` operators | `heliosdb-nano-vector` |
 | `PRAGMA <foreign_keys\|table_info\|journal_mode\|synchronous\|busy_timeout>` | `heliosdb-nano-migrate` |

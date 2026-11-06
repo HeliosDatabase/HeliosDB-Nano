@@ -44,20 +44,26 @@
 //!
 //! * 55006, a table another open transaction has staged writes of: those rows
 //!   would commit under a definition they were not written for;
-//! * 0A000, a branch with live descendants, through merged branches too: they
-//!   read through it, so changing a table under them would change what they see.
-//!   Freezing it for them is phase B4's hook, which lifts this refusal;
 //! * 55006, a table an unfinished MERGE BRANCH into this branch is changing.
+//!
+//! A live descendant, through merged branches too, reads through the branch, so it
+//! first becomes self-contained for the table: every row it sees and the definition
+//! go into its own overlay, marked as copies, on its own, in chunks
+//! (`StorageEngine::freeze_table_into_children`, phase B4), under the descendant's
+//! own writer lock on the table. 55006 when it cannot be alone within the budget, or
+//! holds staged writes of the table.
 //!
 //! On MAIN, [`EmbeddedDatabase::main_ddl_statement_guard`] takes the tables a schema
 //! statement names exclusively (spec R5.1, `storage::table_locks`) for its whole
 //! duration: writers wait for it, it waits for them, and a merge takes the same locks.
-//! It refuses (55006) one on a table an unfinished merge holds, which is what outlives
-//! a crash, when nobody holds a lock. Past that check the statement is not refused
-//! again: a merge is waiting for its lock, and a refusal half way would tear what it
-//! already did. The catalog funnels take the same locks and refuse only what no
-//! statement guard above them looked at (`StorageEngine::main_catalog_write`), so a
-//! route that does not come through a planned statement is covered too.
+//! Before them it enters the fork fence (phase B4, `storage::branch_freeze`,
+//! "Definitions"), so a new branch of main is wholly before or after it. It refuses
+//! (55006) one on a table an unfinished merge holds, which is what outlives a crash,
+//! when nobody holds a lock. Past that check the statement is not refused again: a
+//! merge is waiting for its lock, and a refusal half way would tear what it already
+//! did. The catalog funnels take the same locks and refuse only what no statement
+//! guard above them looked at (`StorageEngine::main_catalog_write`), so a route that
+//! does not come through a planned statement is covered too.
 //!
 //! Plans carry schemas, so a branch session neither reads nor fills the
 //! shared SQL-text-keyed plan caches (`EmbeddedDatabase::current_schema_is_set`).
@@ -121,7 +127,8 @@ struct AddColumnsPlan {
 /// ignore no-ops (`CREATE EXTENSION` of an unknown extension, `DROP
 /// EXTENSION`), and `CREATE` / `REFRESH MATERIALIZED VIEW`, which phase B2
 /// already refuses on a branch with its own marker before anything is
-/// written.
+/// written, and whose handlers take the statement guard themselves
+/// (`sql::executor::phase3`).
 pub fn schema_statement_name(plan: &LogicalPlan) -> Option<&'static str> {
     Some(match plan {
         LogicalPlan::CreateTable { .. } => "CREATE TABLE",
@@ -238,6 +245,9 @@ fn schema_plan_tables(storage: &StorageEngine, plan: &LogicalPlan) -> Vec<String
         | LogicalPlan::CreateIndex { table_name, .. }
         | LogicalPlan::CreateTrigger { table_name, .. }
         | LogicalPlan::AlterTableSetSchema { table_name, .. } => vec![table_name.clone()],
+        LogicalPlan::DropMaterializedView { name, .. } => {
+            vec![crate::storage::MaterializedViewCatalog::mv_data_table_name(name)]
+        }
         LogicalPlan::DropTrigger { table_name, .. } => table_name.iter().cloned().collect(),
         // It validates its rows against the parent's keys, and a parent's DELETE must
         // not take one away meanwhile.
@@ -588,12 +598,13 @@ impl EmbeddedDatabase {
     }
 
     /// The refusals of a schema statement that is not a no-op, inside its
-    /// exclusive section: this transaction's own staged writes of `table`, live
-    /// children of the branch, another transaction's staged writes of `table`,
-    /// and an unfinished merge into the branch that is changing `table`. Then the
-    /// table's writer lock on this level (spec R5.1), for the statement: the section
-    /// already keeps other statements out, and what is left to wait for is a
-    /// transaction that holds the table with nothing staged.
+    /// exclusive section: this transaction's own staged writes of `table`,
+    /// another transaction's staged writes of `table`, and an unfinished merge into
+    /// the branch that is changing `table`. Then the table's writer lock on this level
+    /// (spec R5.1), for the statement: the section already keeps other statements out,
+    /// and what is left to wait for is a transaction that holds the table with nothing
+    /// staged. Then, under it, what the branch's live descendants read of `table` is
+    /// made theirs (phase B4): nothing below this changes anything they see.
     fn branch_ddl_preflight(
         &self,
         view: &BranchView<'_>,
@@ -602,16 +613,15 @@ impl EmbeddedDatabase {
         statement: &str,
     ) -> Result<ExclusiveTableLocks> {
         self.refuse_branch_ddl_after_writes(view, txn, table, statement)?;
-        let children = self.storage.live_branch_children(view.branch_id(), None)?;
-        if !children.is_empty() {
-            return Err(Error::branch_schema_has_children(statement, view.name(), &children));
-        }
         if crate::storage::branch_view::pending_writers(self.storage.instance_id(), view.branch_id(), table) > 0 {
             return Err(Error::branch_table_busy(table, view.name()));
         }
         self.storage.refuse_ddl_on_merging_table(view.branch_id(), table)?;
-        self.storage
-            .lock_tables_exclusive(view.branch_id(), &[table], statement)
+        let locks = self
+            .storage
+            .lock_tables_exclusive(view.branch_id(), &[table], statement)?;
+        self.storage.freeze_table_into_children(view.branch_id(), table)?;
+        Ok(locks)
     }
 
     /// A branch DDL on `table` is refused when the transaction it runs in has
@@ -702,6 +712,7 @@ impl EmbeddedDatabase {
                 "branch_create_table called with a non-CREATE-TABLE plan",
             ));
         };
+        crate::storage::Catalog::refuse_unstorable_table_name(name)?;
         if sql::temp_tables::is_temp_key(name) {
             return Err(Error::branch_schema_unsupported("CREATE TEMPORARY TABLE", view.name()));
         }
@@ -825,6 +836,7 @@ impl EmbeddedDatabase {
         txn: Option<&Transaction>,
         params: &[Value],
     ) -> Result<u64> {
+        crate::storage::Catalog::refuse_unstorable_table_name(name)?;
         if sql::temp_tables::is_temp_key(name) {
             return Err(Error::branch_schema_unsupported(
                 "CREATE TEMPORARY TABLE … AS",

@@ -51,6 +51,7 @@ use super::branch_catalog::{
     incarnations_differ, known_incarnation, AncestorMerge, MergeAction, MergeDdlScope, MergeFailSite, MergeIntent,
     MergeStep, MERGE_TARGET_MAIN,
 };
+use super::branch_freeze::{BranchFreeze, MAIN_LEVEL};
 use super::branch_view;
 use super::branch_view::BranchView;
 
@@ -2043,13 +2044,6 @@ fn describe_definition_change(
     }
 }
 
-impl MergeStep {
-    /// Does this step rewrite a branch target's rows or definition?
-    fn rewrites_a_branch(&self) -> bool {
-        matches!(self.action, MergeAction::PutOnBranch { .. })
-    }
-}
-
 /// A branch's reverse-FK answers: (branch, referenced table) -> (schema
 /// generation, the foreign keys that point at it).
 type BranchReferencingFkCache =
@@ -2106,6 +2100,10 @@ pub struct StorageEngine {
     version_gc_worker: Option<super::version_gc::VersionGcWorker>,
     /// Branch manager for database branching
     branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
+    /// Sprinter 6bc4a4040eb7 (B4): the freeze hook of the write gate; `None` on a
+    /// store that does not accept writes (nothing there can change what a branch
+    /// sees: its primary's copies arrive with its primary's writes).
+    branch_freeze: Option<Arc<BranchFreeze>>,
     /// Write-ahead log for durability
     wal: Option<Arc<RwLock<WriteAheadLog>>>,
     /// Database statistics
@@ -2245,7 +2243,7 @@ pub struct StorageEngine {
     /// An in-transaction reader whose snapshot timestamp is >= a table's
     /// watermark (and which has no own staged writes to it) can read the
     /// current `data:` image directly instead of the per-row snapshot/version
-    /// path (`scan_table_at_snapshot`, ~30-150x costlier): no commit touched
+    /// path (`scan_table_at_transaction_snapshot`, ~30-150x costlier): no commit touched
     /// the table after the reader's snapshot, so current data == the snapshot
     /// image row-for-row. Raised to the commit timestamp BEFORE the write
     /// becomes visible (commit path + versioned autocommit inserts), so a
@@ -2801,6 +2799,24 @@ impl StorageEngine {
     #[track_caller]
     pub(crate) fn write_batch_through_gate(&self, batch: WriteBatch) -> Result<()> {
         self.gate.write(&self.db, batch, self.memory_write_options.as_ref())
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): the write gate's freeze hook of this engine, on a
+    /// store that accepts writes.
+    pub(crate) fn branch_freeze(&self) -> Option<&Arc<BranchFreeze>> {
+        self.branch_freeze.as_ref()
+    }
+
+    /// Is the logical WAL being replayed? What it re-applies was admitted when it
+    /// was first run, by whatever rules that release had.
+    pub(crate) fn in_wal_replay(&self) -> bool {
+        self.is_replaying.load(Ordering::Acquire)
+    }
+
+    /// Is this the logical WAL's replay at open? Main's in-memory index registry
+    /// is not built yet, then.
+    pub(crate) fn in_open_recovery(&self) -> bool {
+        self.is_open_recovery.load(Ordering::Acquire)
     }
 
     /// The engine's at-rest key manager, borrowed (`None` when encryption is
@@ -3607,7 +3623,6 @@ impl StorageEngine {
             Arc::clone(&gate),
             Arc::clone(&snapshot_manager),
             Arc::clone(&conflict_registry),
-            Arc::clone(&branch_manager),
             Arc::clone(&timestamp),
             !writes,
         )?;
@@ -3628,6 +3643,15 @@ impl StorageEngine {
             config.storage.statement_timeout_ms.or(config.storage.query_timeout_ms),
             Arc::clone(&schema_generation),
         );
+        let dict_manager = Arc::new(DictionaryManager::new());
+        // Sprinter 6bc4a4040eb7 (B4): before anything can write, WAL replay
+        // included: a replayed row is a write a live branch must not see either.
+        let branch_freeze = if writes {
+            Self::install_branch_freeze(instance_id, &gate, key_manager.as_ref(), &dict_manager, &branch_manager)?
+        } else {
+            None
+        };
+
         let engine = Self {
             instance_id,
             db: Arc::clone(&db),
@@ -3643,6 +3667,7 @@ impl StorageEngine {
             version_gc,
             version_gc_worker,
             branch_manager,
+            branch_freeze,
             wal,
             stats,
             statistics_cache,
@@ -3668,7 +3693,7 @@ impl StorageEngine {
             bulk_load_mode: Arc::new(AtomicBool::new(false)),
             temp_tables_present: Arc::new(AtomicBool::new(false)),
             lockfree_engine: Arc::new(RwLock::new(None)),
-            dict_manager: Arc::new(DictionaryManager::new()),
+            dict_manager,
             art_index_manager: Arc::new(ArtIndexManager::new()),
             row_cache: Arc::new(super::RowCache::new()),
             data_bytes_written: Arc::new(AtomicU64::new(0)),
@@ -4075,7 +4100,6 @@ impl StorageEngine {
             Arc::clone(&gate),
             Arc::clone(&snapshot_manager),
             Arc::clone(&conflict_registry),
-            Arc::clone(&branch_manager),
             Arc::clone(&timestamp),
             false,
         )?;
@@ -4088,6 +4112,10 @@ impl StorageEngine {
             config.storage.statement_timeout_ms.or(config.storage.query_timeout_ms),
             Arc::clone(&schema_generation),
         );
+        let dict_manager = Arc::new(DictionaryManager::new());
+        let branch_freeze =
+            Self::install_branch_freeze(instance_id, &gate, key_manager.as_ref(), &dict_manager, &branch_manager)?;
+
         Ok(Self {
             instance_id,
             db: Arc::clone(&db),
@@ -4103,6 +4131,7 @@ impl StorageEngine {
             version_gc,
             version_gc_worker,
             branch_manager,
+            branch_freeze,
             wal,
             stats,
             statistics_cache,
@@ -4128,7 +4157,7 @@ impl StorageEngine {
             bulk_load_mode: Arc::new(AtomicBool::new(false)),
             temp_tables_present: Arc::new(AtomicBool::new(false)),
             lockfree_engine: Arc::new(RwLock::new(None)),
-            dict_manager: Arc::new(DictionaryManager::new()),
+            dict_manager,
             art_index_manager: Arc::new(ArtIndexManager::new()),
             row_cache: Arc::new(super::RowCache::new()),
             data_bytes_written: Arc::new(AtomicU64::new(0)),
@@ -5685,7 +5714,6 @@ impl StorageEngine {
         gate: Arc<WriteGate>,
         snapshot_manager: Arc<SnapshotManager>,
         conflict_registry: Arc<super::conflict::WriteConflictRegistry>,
-        branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
         timestamp: Arc<RwLock<u64>>,
         read_only: bool,
     ) -> Result<(
@@ -5704,7 +5732,6 @@ impl StorageEngine {
             gate,
             snapshot_manager,
             conflict_registry,
-            branch_manager,
             timestamp,
             gc_config,
         ));
@@ -9302,16 +9329,38 @@ impl StorageEngine {
         schema: &crate::Schema,
         decode_hint: RowDecodeHint<'_>,
     ) -> Result<Vec<Tuple>> {
-        let scan_start = std::time::Instant::now();
-        let prefix = format!("data:{}:", table_name);
-        let prefix_bytes = prefix.as_bytes();
-
         // Spec R5.2: the row shape. A `Full`-decoded row keeps its stored arity
         // until the funnel shapes it; the Prefix / Columns hints build a
         // `schema.columns.len()`-wide tuple themselves, answering a requested
         // column past the row's end from the same missing values.
         let missing = self.missing_values(table_name)?;
-        let missing = missing.as_deref();
+        self.scan_table_with_schema_missing(table_name, schema, decode_hint, missing.as_deref())
+    }
+
+    /// Main's rows of `table_name`, decoded as [`Self::scan_table_with_schema`] decodes
+    /// them, shaped with `missing` instead of main's own missing values. Sprinter
+    /// 6bc4a4040eb7 (B4) with spec R5.2: a branch's frozen record of the table reads
+    /// main's unchanged rows with the values main had when the record was taken, which
+    /// main's `DROP COLUMN` (positions move) or `RENAME TO` (they go) no longer has.
+    pub(crate) fn scan_table_with_schema_shaped_by(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        missing: Option<&super::row_shape::MissingValues>,
+    ) -> Result<Vec<Tuple>> {
+        self.scan_table_with_schema_missing(table_name, schema, RowDecodeHint::Full, missing)
+    }
+
+    fn scan_table_with_schema_missing(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        decode_hint: RowDecodeHint<'_>,
+        missing: Option<&super::row_shape::MissingValues>,
+    ) -> Result<Vec<Tuple>> {
+        let scan_start = std::time::Instant::now();
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
         let target_width = schema.columns.len();
 
         let decode = |key: &[u8], raw_value: &[u8]| -> Result<Tuple> {
@@ -11571,8 +11620,9 @@ impl StorageEngine {
 
     /// Create a branch at a specific snapshot
     ///
-    /// If snapshot_id is None, uses the current timestamp (latest snapshot).
-    /// Otherwise, creates the branch at the specified historical snapshot.
+    /// If snapshot_id is None, the fork point is now. Otherwise the branch sees its
+    /// parent, which must be main, as it was at that snapshot: the difference is
+    /// materialized from version history (sprinter 6bc4a4040eb7, B4).
     pub fn create_branch_at_snapshot(
         &self,
         name: &str,
@@ -11580,40 +11630,158 @@ impl StorageEngine {
         snapshot_id: Option<u64>,
         options: BranchOptions,
     ) -> Result<BranchId> {
-        let manager_lock = self.get_or_init_branch_manager()?;
-        let manager = manager_lock.read();
-        let mgr = manager
-            .as_ref()
-            .ok_or_else(|| Error::storage("BranchManager not available in read lock"))?;
+        let mgr = self
+            .branch_manager()
+            .ok_or_else(|| Error::storage("BranchManager not initialized. Branch operations are unavailable."))?;
+        self.gate.check()?;
+        let parent = parent_name.unwrap_or("main");
+        let deadline = std::time::Instant::now() + super::BRANCH_DRAIN_TIMEOUT;
 
-        // Use provided snapshot or current timestamp
-        let snapshot = snapshot_id.unwrap_or_else(|| self.next_timestamp());
-
-        // sprinter 6bc4a4040eb7 (B3 fix pass): the fork record — the incarnation
-        // and definition of every table the parent has right now — is born in the branch's
-        // creation batch. A branch parent is held first, so this waits out a
-        // schema statement running on it (`BranchDrains::exclusive`).
-        let (_parent_hold, parent_chain) = match parent_name {
-            Some(parent) if parent != "main" => match mgr.get_branch_by_name(parent) {
-                Ok(meta) => (
-                    self.branch_drains.enter(meta.branch_id, parent)?,
-                    self.get_branch_chain(meta.branch_id)?,
-                ),
-                // Refused below, with the manager's own error.
-                Err(_) => (super::BranchHold::none(), Vec::new()),
-            },
-            _ => (super::BranchHold::none(), Vec::new()),
+        // Sprinter 6bc4a4040eb7 (B4): an anchor in the past is materialized from
+        // main's version history; only main has one. Pinned until the branch is
+        // written: from then on it needs no history at all.
+        let _anchor_pin = match snapshot_id {
+            Some(anchor) => {
+                if !self.config.storage.time_travel_enabled {
+                    return Err(Error::query_execution(
+                        "AS OF / time-travel queries require time_travel_enabled = true",
+                    ));
+                }
+                if parent != "main" {
+                    return Err(Error::branch_as_of_needs_main(name, parent));
+                }
+                Some(self.pin_historical_snapshot(anchor)?)
+            }
+            None => None,
         };
-        let forked = self.fork_entries(&parent_chain)?;
-        mgr.create_branch_with(name, parent_name, snapshot, options, |branch_id, batch| {
-            self.stage_branch_fork_record(branch_id, &forked, batch)
+
+        // A branch parent is held first, so this waits out a schema statement
+        // running on it (`BranchDrains::exclusive`), and that statement then
+        // freezes for this child (sprinter 6bc4a4040eb7, B3 fix pass).
+        let parent_meta = match mgr.get_branch_by_name(parent) {
+            Ok(meta) if meta.state == super::BranchState::Active => meta,
+            _ => return Err(Error::branch_not_active(parent)),
+        };
+        let parent_id = parent_meta.branch_id;
+        let parent_is_main = parent_id == MAIN_LEVEL;
+        let _parent_hold = if parent_is_main {
+            super::BranchHold::none()
+        } else {
+            self.branch_drains.enter(parent_id, parent)?
+        };
+        let parent_chain: Vec<u64> = if parent_is_main {
+            Vec::new()
+        } else {
+            self.get_branch_chain(parent_id)?
+                .into_iter()
+                .filter(|level| *level != MAIN_LEVEL)
+                .collect()
+        };
+        mgr.refuse_name_in_use(name)?;
+        mgr.refuse_if_in_unfinished_merge(parent_id, parent)?;
+
+        // The id is durable before anything can be written under it: a crash from
+        // here to the creation batch leaves keys of an id no branch has and none
+        // will be given, which the next open reclaims.
+        let branch_id = mgr.reserve_branch_id()?;
+        let forked = self.fork_branch(
+            &mgr,
+            branch_id,
+            name,
+            parent_name,
+            parent_id,
+            &parent_chain,
+            snapshot_id,
+            options,
+            deadline,
+        );
+        if forked.is_err() {
+            mgr.abandon_reserved_branch(branch_id);
+        }
+        forked
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): the linearization of a branch's creation, on an
+    /// id no branch has yet. See `docs/plans/specs/B4_branch_fork_point.md`.
+    ///
+    /// 1. On main: keep new schema statements out and wait for the running ones, until
+    ///    the child is registered. A statement is wholly before this fork (it finished
+    ///    before the child existed) or wholly after it (it finds the child, and freezes
+    ///    the definition before its first row), so the child's definition and rows come
+    ///    from the same side of it.
+    /// 2. Register: from here on every write of the parent freezes for the child.
+    ///    Taking the registry exclusively waits for the writes that read it before.
+    ///    If no level had a live child, writers were not asking at all: wait for what
+    ///    is announced at the gate.
+    /// 3. A merge that started in between is refused now that the hook can see it:
+    ///    a resume would rewrite the parent under the child (B3).
+    /// 4. The anchor's rows, if there is one.
+    /// 5. The fork point, then the creation batch with the fork record. Nothing named
+    ///    this branch exists before that batch, so no session can read it half filled,
+    ///    and nothing that committed after this returns can show through.
+    #[allow(clippy::too_many_arguments)]
+    fn fork_branch(
+        &self,
+        mgr: &Arc<BranchManager>,
+        branch_id: BranchId,
+        name: &str,
+        parent_name: Option<&str>,
+        parent_id: BranchId,
+        parent_chain: &[u64],
+        anchor: Option<u64>,
+        options: BranchOptions,
+        deadline: std::time::Instant,
+    ) -> Result<BranchId> {
+        let budget = || deadline.saturating_duration_since(std::time::Instant::now());
+        let parent = parent_name.unwrap_or("main");
+        if let Some(freeze) = &self.branch_freeze {
+            let statements = if parent_id == MAIN_LEVEL {
+                Some(
+                    freeze
+                        .hold_schema_statements(budget())
+                        .ok_or_else(|| Error::branch_create_busy(name, parent))?,
+                )
+            } else {
+                // A branch parent is held by the caller, which waits out its schema
+                // statement (`BranchDrains::exclusive`).
+                None
+            };
+            // One creation at a time through its drain: a second one would see the
+            // flag up and not wait for the writers this one is waiting for.
+            let creating = freeze
+                .creation_lock(budget())
+                .ok_or_else(|| Error::branch_create_busy(name, parent))?;
+            let was_active = freeze
+                .register(branch_id, parent_id, budget())
+                .ok_or_else(|| Error::branch_create_busy(name, parent))?;
+            if !was_active && !self.gate.wait_for_unhooked_writes(deadline) {
+                return Err(Error::branch_create_busy(name, parent));
+            }
+            drop(creating);
+            drop(statements);
+        }
+        mgr.refuse_if_in_unfinished_merge(parent_id, parent)?;
+
+        if let Some(anchor) = anchor {
+            self.materialize_branch_anchor(branch_id, name, anchor)?;
+        }
+
+        // What the parent sees now, with what it already froze for this child in
+        // the window: a table changed since is recorded as it was.
+        let mut fork_chain = parent_chain.to_vec();
+        fork_chain.push(branch_id);
+        let forked = self.fork_entries(&fork_chain)?;
+        let snapshot = anchor.unwrap_or_else(|| self.next_timestamp());
+        mgr.create_reserved_branch(branch_id, name, parent_name, snapshot, options, |id, batch| {
+            self.stage_branch_fork_record(id, &forked, batch)
         })
     }
 
     /// Drop a branch
     ///
-    /// Soft-deletes a branch, marking it for garbage collection.
-    /// Cannot drop the main branch or branches with children.
+    /// Takes it out of service, then deletes its keys in bounded batches (a crash
+    /// on the way is finished by the next open). Cannot drop the main branch or
+    /// branches with children.
     pub fn drop_branch(&self, name: &str, if_exists: bool) -> Result<()> {
         let manager_lock = self.get_or_init_branch_manager()?;
         let manager = manager_lock.read();
@@ -11625,6 +11793,16 @@ impl StorageEngine {
         // generation, so a session bound to the dropped branch re-validates on
         // its next statement and fails closed (3D000).
         mgr.drop_branch(name, if_exists)
+    }
+
+    /// Refused (2BP01) when `name` has a child branch, which a drop of it would be.
+    pub(crate) fn refuse_drop_of_branch_with_child(&self, name: &str) -> Result<()> {
+        let manager_lock = self.get_or_init_branch_manager()?;
+        let manager = manager_lock.read();
+        let mgr = manager
+            .as_ref()
+            .ok_or_else(|| Error::storage("BranchManager not available in read lock"))?;
+        mgr.refuse_drop_of_branch_with_child(name)
     }
 
     /// Get branch metadata by name
@@ -11652,7 +11830,7 @@ impl StorageEngine {
     /// List branches for catalog/history views: `Active` and `Merged`.
     ///
     /// Distinct from `list_branches` (Active only), which operational callers
-    /// such as version GC depend on. See `BranchManager::list_branches_for_catalog`.
+    /// depend on. See `BranchManager::list_branches_for_catalog`.
     pub fn list_branches_for_catalog(&self) -> Result<Vec<BranchMetadata>> {
         let manager_lock = self.get_or_init_branch_manager()?;
         let manager = manager_lock.read();
@@ -11689,7 +11867,31 @@ impl StorageEngine {
         &self,
         source_name: &str,
         target_name: &str,
+        strategy: super::MergeStrategy,
+    ) -> Result<super::MergeResult> {
+        self.merge_branch_inner(source_name, target_name, strategy, false)
+    }
+
+    /// [`Self::merge_branch`] for a `MERGE … WITH (delete_branch_after = true)`: refused
+    /// (2BP01) before anything lands if the source has a child branch, since it could
+    /// not be dropped afterwards. Asked under the close of the source: a `CREATE BRANCH`
+    /// from it holds its drain for the whole creation, so the close waited for that
+    /// child or keeps it out, and past that nothing can be forked from a merged branch.
+    pub(crate) fn merge_branch_to_drop_source(
+        &self,
+        source_name: &str,
+        target_name: &str,
+        strategy: super::MergeStrategy,
+    ) -> Result<super::MergeResult> {
+        self.merge_branch_inner(source_name, target_name, strategy, true)
+    }
+
+    fn merge_branch_inner(
+        &self,
+        source_name: &str,
+        target_name: &str,
         _strategy: super::MergeStrategy,
+        source_goes_after: bool,
     ) -> Result<super::MergeResult> {
         // sprinter 6bc4a4040eb7 (phase B3): a MERGE reads and changes catalogs
         // by explicit level — the source's own records, the target's chain,
@@ -11724,6 +11926,9 @@ impl StorageEngine {
         // merged by the unfinished merge this statement resumes), and the
         // target likewise.
         let (source_meta, _, pending) = self.merge_ends(source_name, target_name, Some((source_id, target_id)))?;
+        if source_goes_after {
+            self.refuse_drop_of_branch_with_child(source_name)?;
+        }
         // B3 second fix pass: a merge of a branch another unfinished merge writes
         // into, or into a branch that is itself on its way out, could leave that
         // other merge unfinishable forever.
@@ -11799,7 +12004,6 @@ impl StorageEngine {
                 // B3 second fix pass: the window from the first run to this one
                 // was open to main's DML: validate its keys again. An error here
                 // leaves the merge pending, with nothing further changed.
-                self.refuse_live_descendants(&ends, &intent.steps)?;
                 // A table whose rows landed is done with: its rows are main's now,
                 // and main may have changed them since.
                 let left = intent.tables_left();
@@ -11855,6 +12059,10 @@ impl StorageEngine {
         self.delete_branch_merge_intent(source_id)
             .map_err(|e| Error::branch_merge_interrupted(source_name, target_name, &e))?;
         self.release_merge_exclusion(source_id);
+        // Sprinter 6bc4a4040eb7 (B4): nothing can bind it, and nothing will finish
+        // it: its keys go, unless a live branch still reads through it. The source
+        // was a live child until here: an ABORT could have put it back.
+        self.retire_merged_branch(source_id);
 
         tracing::info!(
             "Merge completed: {} -> {}, {} keys merged",
@@ -12677,9 +12885,10 @@ impl StorageEngine {
     /// Also refused: rows the source wrote to a table whose definition on the
     /// source comes from an ANCESTOR between the target and the source (that
     /// ancestor's schema change is not the source's to carry; merge the ancestor
-    /// first; one already merged into the target's lineage is carried). A
-    /// schema-changing merge into a branch while the target has other live
-    /// descendants (0A000; they read through it, B4's freeze lifts this).
+    /// first; one already merged into the target's lineage is carried). An open
+    /// transaction on the merge's tables is waited for under its table locks (spec
+    /// R5.1, 55P03 after the timeout), and the target's other live descendants keep
+    /// what they see (B4: the step's record write freezes it into them first).
     fn plan_branch_merge(&self, ends: &MergeEnds<'_>) -> Result<BranchMergePlan> {
         use super::branch_catalog::{BranchTableResolution, BranchTableState};
         let MergeEnds {
@@ -12702,7 +12911,6 @@ impl StorageEngine {
         let mut recreated: Vec<String> = Vec::new();
         let mut gone: Vec<String> = Vec::new();
         let mut changed_since_fork: Vec<String> = Vec::new();
-        let mut after_fork: Vec<String> = Vec::new();
         let mut no_fork_record: Vec<String> = Vec::new();
         for (table, record) in &records {
             if record.frozen {
@@ -12745,15 +12953,9 @@ impl StorageEngine {
             }
             // B3 third fix pass: fail closed where nothing says what the rows were
             // written for. See the rows-only loop below.
-            if !self.branch_changed_row_ids(source_id, table)?.is_empty() {
-                if fork.is_none() {
-                    no_fork_record.push(table.clone());
-                    continue;
-                }
-                if at_fork.is_none() && !record.created {
-                    after_fork.push(table.clone());
-                    continue;
-                }
+            if fork.is_none() && !self.branch_changed_row_ids(source_id, table)?.is_empty() {
+                no_fork_record.push(table.clone());
+                continue;
             }
             let action = if merge_to_main {
                 match (&record.state, &target_definition) {
@@ -12798,7 +13000,6 @@ impl StorageEngine {
                 || moved.contains(&table)
                 || recreated.contains(&table)
                 || gone.contains(&table)
-                || after_fork.contains(&table)
                 || no_fork_record.contains(&table)
                 || changed_since_fork
                     .iter()
@@ -12810,29 +13011,31 @@ impl StorageEngine {
             // B3 third fix pass: rows are copied by position, so with no record of
             // the definition they were written for, the merge cannot know where
             // they would land. Fail closed. A branch with no fork record was created
-            // by an earlier release; a table with no entry was created on the target
-            // after the fork (the branch reads it live until B4 makes it invisible).
+            // by an earlier release.
+            //
+            // Sprinter 6bc4a4040eb7 (B4): a table with no entry in a branch's fork
+            // record was created after the fork, and the branch never saw it (the
+            // parent's create froze a tombstone into it), so it cannot have changed
+            // rows of it unless it created the table itself, which is a record.
             if fork.is_none() {
                 no_fork_record.push(table);
                 continue;
             }
-            let Some(forked) = fork_of(&table) else {
-                after_fork.push(table);
-                continue;
-            };
             match self.chain_table_definition(target_chain, &table)? {
                 None => {
                     gone.push(table);
                     continue;
                 }
                 Some((current, fingerprint)) => {
-                    if incarnations_differ(known_incarnation(current.incarnation), forked.incarnation) {
-                        recreated.push(table);
-                        continue;
-                    }
-                    if fingerprint != forked.fingerprint {
-                        changed_since_fork.push(describe_definition_change(&table, &forked.columns, &current));
-                        continue;
+                    if let Some(forked) = fork_of(&table) {
+                        if incarnations_differ(known_incarnation(current.incarnation), forked.incarnation) {
+                            recreated.push(table);
+                            continue;
+                        }
+                        if fingerprint != forked.fingerprint {
+                            changed_since_fork.push(describe_definition_change(&table, &forked.columns, &current));
+                            continue;
+                        }
                     }
                 }
             }
@@ -12842,10 +13045,15 @@ impl StorageEngine {
         let mut ancestral: Vec<String> = Vec::new();
         let mut ancestor_lost: Vec<String> = Vec::new();
         for (table, resolution) in self.branch_tables_in_chain(source_chain)? {
-            let level = match &resolution {
+            let (level, record) = match &resolution {
                 BranchTableResolution::Inherited => continue,
-                BranchTableResolution::Defined { level, .. } | BranchTableResolution::Dropped { level, .. } => *level,
+                BranchTableResolution::Defined { level, record, .. }
+                | BranchTableResolution::Dropped { level, record, .. } => (*level, record),
             };
+            // A copy of a definition is no change an ancestor made.
+            if record.frozen {
+                continue;
+            }
             if level == source_id
                 || target_chain.contains(&level)
                 || self.branch_changed_row_ids(source_id, &table)?.is_empty()
@@ -12864,7 +13072,6 @@ impl StorageEngine {
             && recreated.is_empty()
             && gone.is_empty()
             && changed_since_fork.is_empty()
-            && after_fork.is_empty()
             && no_fork_record.is_empty()
             && ancestral.is_empty()
             && ancestor_lost.is_empty())
@@ -12900,14 +13107,6 @@ impl StorageEngine {
                     changed_since_fork.join("; ")
                 ));
             }
-            if !after_fork.is_empty() {
-                why.push(format!(
-                    "{} was created on {target_name} after branch {source_name} forked, and the branch changed its \
-                     rows: nothing records the definition they were written for — copy those rows by hand, or \
-                     recreate the branch from the current {target_name}",
-                    after_fork.join(", ")
-                ));
-            }
             if !no_fork_record.is_empty() {
                 why.push(format!(
                     "branch {source_name}'s fork point is not recorded (it was created by an earlier release), and \
@@ -12937,8 +13136,6 @@ impl StorageEngine {
                 &why.join("; "),
             ));
         }
-
-        self.refuse_live_descendants(ends, &steps)?;
 
         let mut tables: Vec<String> = steps.iter().map(|step| step.table.clone()).collect();
         tables.extend(row_tables);
@@ -12971,23 +13168,6 @@ impl StorageEngine {
             tables,
             main_tables,
         })
-    }
-
-    /// A schema change of a branch target rewrites what its descendants read
-    /// through: refused (0A000) while it has any but the source, also at a resume.
-    fn refuse_live_descendants(&self, ends: &MergeEnds<'_>, steps: &[MergeStep]) -> Result<()> {
-        if !steps.iter().any(MergeStep::rewrites_a_branch) {
-            return Ok(());
-        }
-        let children = self.live_branch_children(ends.target_id, Some(ends.source_id))?;
-        if children.is_empty() {
-            return Ok(());
-        }
-        Err(Error::branch_schema_has_children(
-            &format!("MERGE BRANCH {} (it changes a table's definition)", ends.source_name),
-            ends.target_name,
-            &children,
-        ))
     }
 
     /// The record the target level takes for the source's `record`, computed
@@ -13334,6 +13514,11 @@ impl StorageEngine {
         if stored.is_some_and(|bytes| record.encode().is_ok_and(|wanted| wanted == bytes)) {
             return Ok(());
         }
+        // Sprinter 6bc4a4040eb7 (B4): the target's other live descendants keep what
+        // they see. The source has its own record of the table, so it is not one. The
+        // merge holds the table's lock on the target (spec R5.1), which is what the
+        // census of open writers here used to stand in for.
+        self.freeze_table_into_children(intent.target_id, table)?;
         let now = self.chain_table_definition(&intent.target_chain, table)?;
         if now.as_ref().map(|(_, fingerprint)| *fingerprint) != step.before {
             return Err(Error::query_execution(format!(
@@ -16339,6 +16524,11 @@ impl StorageEngine {
         }
 
         if schema_has_columnar_columns(schema) {
+            // Sprinter 6bc4a4040eb7 (B4): this overwrites the row's slots before its
+            // `data:` write, and a row's pre-image resolves through them.
+            if !new_row {
+                self.freeze_row_before_side_write(table_name, row_id)?;
+            }
             self.store_columnar_rows_grouped(table_name, &[(row_id, tuple)], schema, new_row)?;
         }
 
@@ -16740,6 +16930,81 @@ impl StorageEngine {
         Ok(1)
     }
 
+    /// Sprinter 6bc4a4040eb7 (B4): the `data:` write of a fast DELETE. With time
+    /// travel on it carries the row's delete event, and the snapshot a later `AS OF`
+    /// resolves to, in one batch.
+    fn delete_row_fast(&self, key: &[u8], table_name: &str, row_id: u64) -> Result<()> {
+        if !self.config.storage.time_travel_enabled {
+            return self.gate.delete(&self.db, key, self.memory_write_options.as_ref());
+        }
+        let timestamp = self.next_timestamp();
+        self.snapshot_manager
+            .delete_data_and_record_event(
+                key,
+                table_name,
+                row_id,
+                timestamp,
+                self.wal_lsn(),
+                self.memory_write_options.as_ref(),
+            )
+            .map(drop)
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): [`Self::delete`] of a main row, with its delete
+    /// event at `timestamp` in the same write. The caller registers the snapshot of
+    /// `timestamp` when its statement is done.
+    pub(crate) fn delete_row_with_event(&self, key: &Key, timestamp: u64) -> Result<()> {
+        let event = self.config.storage.time_travel_enabled.then(|| {
+            let rest = key.strip_prefix(b"data:".as_slice()).unwrap_or_default();
+            std::str::from_utf8(rest)
+                .ok()
+                .and_then(|text| text.rsplit_once(':'))
+                .and_then(|(table, row)| Some((table, row.parse::<u64>().ok()?)))
+                .map(|(table, row)| super::time_travel::version_index_key(table, row, timestamp))
+        });
+        let Some(Some(event_key)) = event else {
+            return self.delete(key);
+        };
+        let mut batch = WriteBatch::default();
+        batch.delete(key);
+        batch.put(event_key.as_bytes(), super::time_travel::encode_delete_event(timestamp));
+        if !self.is_replaying.load(Ordering::Acquire) {
+            if let Some(wal) = &self.wal {
+                let table_name = Self::extract_table_from_key(key);
+                return wal
+                    .read()
+                    .append_with_batch(
+                        WalOperation::Delete {
+                            table: table_name,
+                            key: key.clone(),
+                        },
+                        batch,
+                        self.memory_write_options.as_ref(),
+                    )
+                    .map(drop);
+            }
+        }
+        self.gate
+            .write(&self.db, batch, self.memory_write_options.as_ref())
+            .map_err(|e| Error::storage(format!("Delete failed: {}", e)))
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): main's autocommit TRUNCATE takes `keys`, each with
+    /// its delete event, at one time: `AS OF` before it shows the rows.
+    pub(crate) fn delete_rows_with_events(&self, keys: &[Key]) -> Result<()> {
+        let timestamp = self.next_timestamp();
+        for key in keys {
+            self.delete_row_with_event(key, timestamp)?;
+        }
+        if self.config.storage.time_travel_enabled {
+            let _ = match self.wal_lsn() {
+                Some(lsn) => self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn),
+                None => self.snapshot_manager.register_snapshot(timestamp),
+            };
+        }
+        Ok(())
+    }
+
     /// Fast DELETE: removes a row in-place, updates ART indexes, invalidates row cache.
     /// Callers that need logical replication/replay must append the logical WAL entry first.
     pub fn delete_tuple_fast(
@@ -16758,8 +17023,7 @@ impl StorageEngine {
         self.snapshot_manager
             .materialize_copy_marker_row_durable(table_name, row_id)?;
         let key = Self::build_data_key(table_name, row_id);
-        self.gate
-            .delete(&self.db, &key, self.memory_write_options.as_ref())
+        self.delete_row_fast(&key, table_name, row_id)
             .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
         if crate::write_volume::enabled() {
             crate::write_volume::add_row();
@@ -16805,8 +17069,7 @@ impl StorageEngine {
         self.snapshot_manager
             .materialize_copy_marker_row_durable(table_name, row_id)?;
         let key = Self::build_data_key(table_name, row_id);
-        self.gate
-            .delete(&self.db, &key, self.memory_write_options.as_ref())
+        self.delete_row_fast(&key, table_name, row_id)
             .map_err(|e| Error::storage(format!("Fast PK delete failed: {}", e)))?;
         if crate::write_volume::enabled() {
             crate::write_volume::add_row();
@@ -16892,7 +17155,23 @@ impl StorageEngine {
     ///
     /// Performance: O(n) where n is the number of rows in the table.
     /// Uses snapshot manager's efficient version resolution.
+    ///
+    /// Sprinter 6bc4a4040eb7 (B4): for `AS OF`, the row universe is the current rows
+    /// and every row whose newest event is a delete: a row deleted after the snapshot
+    /// is there. A row deleted before delete events existed has none, and is absent at
+    /// every time, as it always was.
     pub fn scan_table_at_snapshot(&self, table_name: &str, snapshot_ts: u64) -> Result<Vec<Tuple>> {
+        self.scan_snapshot(table_name, snapshot_ts, true)
+    }
+
+    /// A transaction's view of `table_name` at its snapshot: the rows that exist now,
+    /// each as of the snapshot. A row another transaction deleted since is not there,
+    /// which is what a transaction has always read, and what its writes are built on.
+    pub(crate) fn scan_table_at_transaction_snapshot(&self, table_name: &str, snapshot_ts: u64) -> Result<Vec<Tuple>> {
+        self.scan_snapshot(table_name, snapshot_ts, false)
+    }
+
+    fn scan_snapshot(&self, table_name: &str, snapshot_ts: u64, deleted_rows: bool) -> Result<Vec<Tuple>> {
         // P0#1 read-side gate: when versioning is disabled (time_travel_enabled=false),
         // the commit path stops writing v:/v_idx:, so any pre-existing version
         // history is stale (older than the advanced `data:` value). Mirror the
@@ -16929,6 +17208,9 @@ impl StorageEngine {
             if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
                 seen_rows.insert(row_id);
             }
+        }
+        if deleted_rows {
+            seen_rows.extend(self.snapshot_manager.rows_with_delete_event(table_name)?);
         }
 
         // W3.5 Stage 1 + spec R5.2: the query plan is built against the CURRENT
@@ -19542,10 +19824,11 @@ impl StorageEngine {
             // Main branch delete: preserve old value for time-travel before deleting
             let mut delete_count = 0u64;
             // W2.5 note: no watermark bump here. This path removes the row's
-            // `data:` key (`self.delete` below), and `scan_table_at_snapshot`
-            // seeds its row-id universe from the CURRENT `data:` prefix — so a
-            // deleted row is uniformly absent from BOTH the fast (current-data)
-            // and the slow (snapshot) read path. There is no fast/slow
+            // `data:` key (`self.delete_row_with_event` below), and a transaction's
+            // snapshot scan (`scan_table_at_transaction_snapshot`) seeds its row-id
+            // universe from the CURRENT `data:` prefix — so a deleted row is
+            // uniformly absent from BOTH the fast (current-data) and the slow
+            // (snapshot) read path. There is no fast/slow
             // divergence for a delete, so the watermark need not (and, to keep
             // the fast path available, should not) advance on it. Contrast the
             // UPDATE/INSERT funnels, which leave the row present in `data:` with
@@ -19579,8 +19862,9 @@ impl StorageEngine {
                     }
                 }
 
-                // Now delete the current value
-                self.delete(&key)?;
+                // Now delete the current value, and say when (sprinter 6bc4a4040eb7,
+                // B4). The snapshot is registered below.
+                self.delete_row_with_event(&key, timestamp)?;
 
                 // Record delta for incremental MV refresh
                 if let Some(ref deleted_tuple) = deleted_tuple_for_delta {

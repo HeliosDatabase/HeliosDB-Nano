@@ -227,8 +227,7 @@ Branches are copy-on-write forks of the database — the primitive for letting a
 agent execute arbitrary SQL against real data with zero write-risk to `main`.
 The recommended lifecycle is fork-test-discard:
 
-`AS OF` is REQUIRED on CREATE — `AS OF NOW` forks current state. Omitting it
-errors with `CREATE BRANCH requires AS OF clause` (src/sql/parser.rs:3490).
+`AS OF` is optional: none, or `AS OF NOW`, forks the parent's current state.
 
 ```sql
 CREATE DATABASE BRANCH agent_run_42 FROM main AS OF NOW;  -- copy-on-write fork
@@ -240,17 +239,45 @@ DROP DATABASE BRANCH agent_run_42;               -- discard; main never touched
 
 Anchor the fork in the past instead: `CREATE DATABASE BRANCH b FROM main AS
 OF TIMESTAMP '2026-08-24 09:00:00'` (needs time-travel ON — the agent profile
-guarantees it; it is OFF under `fast` and `fast_ingest`). Library API: `create_branch` / `switch_branch` / `drop_branch`
-/ `list_branches`. REPL: `\branches`, `\use <branch>`, `\show branch`.
+guarantees it; it is OFF under `fast` and `fast_ingest`, and `main` must be the parent: a branch keeps no
+history). Library API: `create_branch` / `switch_branch` / `drop_branch` / `list_branches`. REPL: `\branches`,
+`\use <branch>`, `\show branch`.
+
+A branch is a FORK: what its parent does after the fork point (rows, `ADD COLUMN`, `DROP TABLE`, a new table)
+does not show on it. The branch is per session: `USE BRANCH`, `SET heliosdb.branch`, startup `dbname=<db>@<branch>`
+or `options=-c heliosdb.branch=<branch>` (not through HeliosProxy's `hba` and tenant rules yet). On a branch:
+PRIMARY KEY / UNIQUE / FOREIGN KEY hold over the rows it sees; `TRUNCATE` empties it on that branch only;
+`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE … ADD COLUMN` apply to it alone and every other schema statement is
+refused `0A000`; sequences are shared; `SELECT … AS OF` is refused (only main has history). `DROP BRANCH` deletes
+its keys; a branch with a child, a merged one too, is refused `2BP01` until that child is dropped. REST
+`/v1/branches/:name/…` and MCP branch tools are scoped; `heliosdb_branch_drop` exists.
+
+NOT forked, shared by all branches: views, materialized views, functions, procedures, sequences. What main does
+to one shows on every branch at once: after `CREATE OR REPLACE FUNCTION dbl …` on main, `SELECT dbl(21)` on a
+branch forked before it returns the new answer, and after `DROP VIEW v` on main, `SELECT * FROM v` on the branch
+fails `42P01`. A branch session cannot change them: `CREATE` / `REPLACE` / `DROP` / `REFRESH` there is `0A000`.
+
+A past anchor is refused `0A000`, naming the table or view, when `DROP COLUMN`, `RENAME COLUMN`, `SET STORAGE`,
+`RENAME TO` or `REFRESH MATERIALIZED VIEW` ran on one after it. That refuses the whole branch, whichever table you
+care about. A later anchor is refused too if a row's last version at it is from before that statement and the row
+changed since. For such a statement run before 4.42.0 no record exists and it is not refused: the rows read by
+position, wrongly. `ADD COLUMN` and a table dropped or created since are fine, and `AS OF NOW` always works.
+
+Cost per row written, per live child of the level written: one or two point reads, on every write of the row,
+plus a read and two keys the first time. So keep few branches live: 100 live branches of main made a primary-key
+`UPDATE` about 16 times slower. With none, one atomic load per write. Separately, `DELETE` with time travel on now
+writes a delete event per row, branch or no branch, so `AS OF` can return it.
 
 > MERGE — moves rows, but has NO conflict detection. `MERGE BRANCH x INTO main`
 > does merge, and always did (pinned by tests/branch_merge_surface_tests.rs).
 > It is LAST-WRITER-WINS: if main and the branch changed the same row, one value
 > silently wins with no warning. `WITH (conflict_resolution = …)` errors as not
 > implemented; `WITH (delete_branch_after = true)` works.
-> Merge only when the target has not been written since the fork. An agent cannot
-> guarantee that, so for agent runs always fork-test-discard and re-run validated
-> SQL on the target instead of merging.
+> It carries the branch's own changes and schema changes, never what the branch only
+> copied, so a row the target changed after the fork stays the target's unless the
+> branch changed that same row. It is refused when the target's definition of a table
+> moved. An agent cannot verify a merge, so for agent runs always fork-test-discard and
+> re-run validated SQL on the target instead of merging.
 > Earlier versions of this warning said MERGE "merges nothing and reports success"
 > — retracted in CHANGELOG [4.16.0]; that evidence came from BranchTransaction
 > tests with no production callers.
@@ -341,7 +368,7 @@ automatically after `git clone`; install globally with
   levels and the two PostgreSQL-parity gaps (SERIALIZABLE = snapshot isolation,
   DDL is not transactional).
 - heliosdb-nano-branches — fork-test-discard agent sandboxes: `CREATE
-  DATABASE BRANCH … FROM main AS OF NOW` (AS OF required), `USE BRANCH`,
+  DATABASE BRANCH … FROM main` (AS OF optional), `USE BRANCH`,
   `SHOW BRANCHES`, `DROP DATABASE BRANCH`; merge works but is last-writer-wins
   — see the MERGE note above.
 - heliosdb-nano-time-travel — `SELECT … AS OF TIMESTAMP '…'`, snapshot

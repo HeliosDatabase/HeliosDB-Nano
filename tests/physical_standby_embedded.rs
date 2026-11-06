@@ -469,7 +469,11 @@ fn every_write_entry_point_is_refused_before_it_reaches_the_engine() {
         db.refresh_materialized_view("item_names").map(drop),
     );
     refused("create_branch", db.create_branch("dev").map(drop));
-    refused("switch_branch", db.switch_branch("dev").map(drop));
+    // sprinter 6bc4a4040eb7 (B4 fix pass): binding a session writes nothing, as `USE
+    // BRANCH` and a startup packet's `db@branch`: no refusal, and no write attempted.
+    assert!(!db
+        .switch_branch("dev")
+        .is_err_and(|error| error.is_physical_standby_write_refusal()));
     refused("merge_branch", db.merge_branch("dev").map(drop));
     refused("drop_branch", db.drop_branch("dev").map(drop));
     refused("vacuum_versions", db.vacuum_versions().map(drop));
@@ -754,6 +758,37 @@ fn a_standby_reads_a_columns_missing_value_and_follows_its_life() {
     standby.sync();
     assert_eq!(read("SELECT z FROM t2 WHERE id = 1"), vec![vec![Value::Null]]);
     assert_eq!(standby.refusals(), 0);
+}
+
+/// sprinter 6bc4a4040eb7 (B4 fix pass): `USE BRANCH` on a standby binds the session
+/// like the startup packet's `db@branch`, and writes nothing. What the branch reads is
+/// what its primary replicated; a write on it is still refused.
+#[test]
+fn a_standby_session_binds_a_branch_with_use_branch() {
+    let standby = Standby::new(&[
+        "CREATE TABLE t (id INT PRIMARY KEY, v INT)",
+        "INSERT INTO t VALUES (1, 1)",
+    ]);
+    standby.run(&[
+        "CREATE BRANCH r AS OF NOW",
+        "USE BRANCH r",
+        "UPDATE t SET v = 2 WHERE id = 1",
+        "USE BRANCH main",
+    ]);
+    standby.sync();
+    let refusals = standby.refusals();
+    let db = standby.db();
+    let value = |db: &EmbeddedDatabase| db.query("SELECT v FROM t", &[]).unwrap()[0].values[0].clone();
+    assert_eq!(value(db), heliosdb_nano::Value::Int4(1));
+    db.execute("USE BRANCH r").expect("binding a session writes nothing");
+    assert_eq!(value(db), heliosdb_nano::Value::Int4(2));
+    let refused = db
+        .execute("UPDATE t SET v = 3 WHERE id = 1")
+        .expect_err("a standby takes no write");
+    assert!(refused.is_physical_standby_write_refusal(), "{refused}");
+    db.execute("USE BRANCH main").unwrap();
+    assert_eq!(value(db), heliosdb_nano::Value::Int4(1));
+    assert_eq!(standby.refusals(), refusals, "nothing tried to write");
 }
 
 /// sprinter 6bc4a4040eb7 (B3 second fix pass): a standby receives an unfinished

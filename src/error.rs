@@ -217,6 +217,21 @@ pub const BRANCH_WRITE_UNSUPPORTED_MARKER: &str = "is not supported on a branch"
 /// SQLSTATE 0A000.
 pub const BRANCH_STATEMENT_UNSUPPORTED_MARKER: &str = "on a branch is not supported yet";
 
+/// sprinter 6bc4a4040eb7 (phase B4): the marker of a `DROP BRANCH`, or a `MERGE …
+/// WITH (delete_branch_after = true)`, of a branch with a child branch
+/// ([`Error::branch_has_child`]). SQLSTATE 2BP01.
+pub const BRANCH_HAS_CHILD_MARKER: &str = "it has child branches";
+
+/// sprinter 6bc4a4040eb7 (phase B4): the marker of a `CREATE TABLE`, `RENAME TO` or
+/// `CREATE SCHEMA` whose name holds a `:` ([`Error::table_name_holds_colon`],
+/// [`Error::schema_name_holds_colon`]). SQLSTATE 42602.
+pub const TABLE_NAME_HOLDS_COLON_MARKER: &str = "name cannot hold ':'";
+
+/// sprinter 6bc4a4040eb7 (phase B4): the marker of a `CREATE BRANCH … AS OF` a time
+/// whose rows cannot be read under the table's definition now
+/// ([`Error::branch_anchor_before_shape_change`]). SQLSTATE 0A000.
+pub const BRANCH_ANCHOR_UNREADABLE_MARKER: &str = "its rows as they were then cannot be read";
+
 /// sprinter 6bc4a4040eb7 (B1 fix pass): the marker of `USE BRANCH` /
 /// `SET heliosdb.branch` / `RESET heliosdb.branch` inside an open transaction
 /// ([`Error::branch_switch_in_transaction`]) — PostgreSQL cannot change the
@@ -792,15 +807,73 @@ impl Error {
         ))
     }
 
-    /// sprinter 6bc4a4040eb7 (B3 fix pass): `statement` on branch `branch`, which
-    /// has live child branches: they read through it, and nothing can yet freeze
-    /// what they see (phase B4). SQLSTATE 0A000 (the message carries
-    /// [`BRANCH_WRITE_UNSUPPORTED_MARKER`]).
-    pub fn branch_schema_has_children(statement: &str, branch: &str, children: &[String]) -> Self {
+    /// sprinter 6bc4a4040eb7 (B4): `CREATE BRANCH name FROM parent AS OF …` of a branch:
+    /// a level keeps no history to materialize an anchor from. SQLSTATE 0A000 (the message
+    /// carries [`BRANCH_WRITE_UNSUPPORTED_MARKER`]).
+    pub fn branch_as_of_needs_main(name: &str, parent: &str) -> Self {
         Error::QueryExecution(format!(
-            "{statement} {BRANCH_WRITE_UNSUPPORTED_MARKER} while it has live child branches (on branch \"{branch}\"; \
-             children: {}): DROP or MERGE them first",
-            children.join(", ")
+            "CREATE BRANCH {name} AS OF a past time {BRANCH_WRITE_UNSUPPORTED_MARKER}: branch \"{parent}\" keeps no \
+             history, only main does; fork it AS OF NOW, or fork main AS OF that time"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (B4): a new branch waited out its 30 s budget for writes or
+    /// schema statements already running on its parent. SQLSTATE 55006.
+    pub fn branch_create_busy(name: &str, parent: &str) -> Self {
+        Error::QueryExecution(format!(
+            "cannot create branch \"{name}\": branch \"{parent}\" {BRANCH_BUSY_MARKER}; retry when they finish"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B4): a schema statement on main waited for a
+    /// `CREATE BRANCH` of main, which waits for the statements before it, and the time
+    /// ran out. Nothing changed. SQLSTATE 55006.
+    pub fn branch_schema_waited_for_fork(table: &str) -> Self {
+        Error::QueryExecution(format!(
+            "a schema statement on table \"{table}\" cannot start while a branch of main is being created: \
+             main {BRANCH_BUSY_MARKER}; retry when they finish"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B4): `CREATE BRANCH name … AS OF` a time before
+    /// `what_happened`, a change of a table of main that a row version written before
+    /// it cannot be read under. SQLSTATE 0A000.
+    pub fn branch_anchor_before_shape_change(name: &str, what_happened: &str) -> Self {
+        Error::QueryExecution(format!(
+            "cannot create branch {name} AS OF that time: {what_happened} since, and \
+             {BRANCH_ANCHOR_UNREADABLE_MARKER}. Branch from a later time, after its rows last changed, or AS OF NOW"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B4): `name` has child branch `child`, merged or not,
+    /// so it cannot be dropped. SQLSTATE 2BP01.
+    pub fn branch_has_child(name: &str, child: &str, count: usize, child_is_merged: bool) -> Self {
+        let advice = if child_is_merged {
+            format!("branch \"{child}\" is merged and only its record is left: DROP BRANCH {child} first")
+        } else {
+            format!("branch \"{child}\" reads through it: MERGE or DROP BRANCH {child} first")
+        };
+        Error::QueryExecution(format!(
+            "Cannot drop branch '{name}': {BRANCH_HAS_CHILD_MARKER} ({count}): {advice}"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B4): the name of a table holds a `:`, which the
+    /// keys of its rows use to end the name, so its rows would mix with another
+    /// table's. SQLSTATE 42602.
+    pub fn table_name_holds_colon(name: &str) -> Self {
+        let name = name.trim_matches('"');
+        Error::QueryExecution(format!(
+            "invalid table name \"{name}\": a table {TABLE_NAME_HOLDS_COLON_MARKER}"
+        ))
+    }
+
+    /// sprinter 6bc4a4040eb7 (phase B4): the name of a schema holds a `:`, so no table
+    /// could be created in it (`schema.table` is its tables' name). SQLSTATE 42602.
+    pub fn schema_name_holds_colon(name: &str) -> Self {
+        let name = name.trim_matches('"');
+        Error::QueryExecution(format!(
+            "invalid schema name \"{name}\": a schema {TABLE_NAME_HOLDS_COLON_MARKER}"
         ))
     }
 

@@ -16,19 +16,19 @@
 //! is localized to the scan boundary, where the tuple is provably a stored base
 //! row of a known table — NEVER the generic evaluator/aggregate/join arity guards,
 //! which stay hard errors for mis-planned intermediate tuples (design §1.1). A row
-//! WIDER than the catalog after a DROP COLUMN (a resolved old version, or a
-//! `bdata:` fork the DROP left un-rewritten) is legitimate schema evolution, not
-//! corruption: it is TRUNCATED to the current width, matching the pre-W3.5
-//! projection.
+//! WIDER than the catalog after a DROP COLUMN (a resolved old version) is
+//! legitimate schema evolution, not corruption: it is TRUNCATED to the current
+//! width, matching the pre-W3.5 projection. A branch does not see main's new
+//! column at all: since phase B4 it keeps the definition it forked with
+//! (sprinter 6bc4a4040eb7), and its narrow rows read the missing values main had
+//! when it took that definition.
 //!
 //! For a row VERSION the behavior is gated by `storage.snapshot_schema_evolution`:
 //! - `"null_pad"` (default): the shaper above.
 //! - `"strict"`: the pre-W3.5 arity error, kept as a rollback.
 //!
 //! These tests assert the Stage-1 flip under the default, the `"strict"`
-//! rollback, and the wider-than-catalog truncation. The branch-overlay
-//! "un-forked row sees main's backfill" case (design §7, branch-model) is
-//! explicitly out of scope and stays pinned as-is.
+//! rollback, and the wider-than-catalog truncation.
 //!
 //! # The branch rule changed (sprinter 6bc4a4040eb7, phase B3)
 //!
@@ -38,11 +38,11 @@
 //! under it — the branch no longer reads main's definition or main's rows of
 //! that table, so a later ADD COLUMN on main is invisible there
 //! (`branch_with_its_own_add_column_is_isolated_from_mains_add_column`, new).
-//! A table the branch has NOT changed itself still reads main's CURRENT
-//! definition and rows, which is why the three branch pins below keep their
-//! answers in B3 — they are re-labelled as that rule, not the old global
-//! catalog. Phase B4 freezes main's definition and rows into live branches
-//! at main's write (copy-on-write), and will flip those three pins.
+//!
+//! Phase B4 (same sprinter): a table the branch has NOT changed is frozen into it
+//! as main changes it: main's definition before its first catalog write, and each
+//! row before main rewrites it. A branch is a fork, so the pins below that said it
+//! saw main's backfill now say it does not.
 
 use heliosdb_nano::session::IsolationLevel;
 use heliosdb_nano::{Config, EmbeddedDatabase, SnapshotSchemaEvolution, Value};
@@ -157,17 +157,17 @@ fn as_of_read_predating_alter_today() {
     );
 }
 
-/// A branch that FORKED a row (wrote `bdata:`, 2-value) before a main ALTER: the
-/// branch overlay yields that 2-value row under the current 3-column catalog.
+/// A branch that FORKED a row (wrote `bdata:`, 2-value) before a main ALTER.
 ///
-/// Spec R5.2 applied to the `bdata:` decode: the forked row is older than the
-/// column and reads its missing value (no arity error), like the un-forked row 2.
-///
-/// sprinter 6bc4a4040eb7 (phase B3): unchanged — forking a ROW is not a change
-/// of the table's definition, so the branch still reads main's current
-/// definition of `t` (the B3 rule; B4 freezes main's pre-image instead).
+/// sprinter 6bc4a4040eb7 (phase B4): the branch keeps the definition it forked with,
+/// because main's statement froze it into the branch before it changed anything. So
+/// the branch reads two columns, its own value and the row as it was: no backfill.
+/// Main's ALTER rewrites no row (spec R5.2), and the branch's definition has no third
+/// column to shape a row to. (Through B3 it read main's definition: the forked row
+/// padded with NULL, and the un-forked one showed main's 42; between R5.2 and B4 both
+/// read the missing value.)
 #[test]
-fn branch_forked_row_before_alter_today() {
+fn branch_forked_row_before_alter_keeps_its_definition() {
     let db = setup();
 
     db.execute("CREATE BRANCH b AS OF NOW").unwrap();
@@ -180,12 +180,13 @@ fn branch_forked_row_before_alter_today() {
     db.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 42").unwrap();
 
     db.execute("USE BRANCH b").unwrap();
-    let rows = db
-        .query("SELECT * FROM t", &[])
-        .expect("the forked 2-value row is shaped, no arity error");
+    let rows = db.query("SELECT * FROM t", &[]).unwrap();
+    assert!(
+        rows.iter().all(|r| r.values.len() == 2),
+        "the branch keeps the definition it forked with"
+    );
+    assert!(db.query("SELECT c FROM t", &[]).is_err(), "main's column is main's");
 
-    // The forked row (id = 1, v = 111) keeps the branch's own value and reads the
-    // column's missing value.
     let forked = rows
         .iter()
         .find(|r| row_id(r) == Some(1))
@@ -196,37 +197,24 @@ fn branch_forked_row_before_alter_today() {
         "the forked row must carry the branch's own value"
     );
     assert!(
-        exposes_backfill(forked),
-        "the forked row (written pre-ALTER) reads the column's missing value"
+        rows.iter().any(|r| row_id(r) == Some(2)),
+        "the row it did not fork, as it was"
     );
-
-    // The un-forked row (id = 2) reads main's row and the same missing value — the
-    // branch-overlay model (design §7).
-    let unforked = rows
-        .iter()
-        .find(|r| row_id(r) == Some(2))
-        .expect("branch must see un-forked row 2 via the main overlay");
     assert!(
-        exposes_backfill(unforked),
-        "an un-forked row reads main's data: under main's definition, so it observes c = 42"
+        !rows.iter().any(exposes_backfill),
+        "nothing on the branch exposes the main ALTER's 42 backfill"
     );
 }
 
-/// A branch created before a main ALTER, with NO fork of the row: the overlay
-/// reads main's LIVE data: for un-forked rows under main's definition, so the
-/// branch DOES observe the 42. This is the copy-on-write branch model
-/// (a branch is not snapshot-isolated from main DDL for rows it has not forked),
-/// pinned as-is. TODAY: Ok, both rows show c = 42.
+/// A branch created before a main ALTER, with NO fork of the row.
 ///
-/// NOT FLIPPED by the W3.5 tuple-decode fix (3 values match the 3-col catalog —
-/// no arity mismatch); insulating a pre-ALTER branch from a main ALTER would be a
-/// separate per-branch schema pin (design §7, out of scope).
-///
-/// sprinter 6bc4a4040eb7 (phase B3): still the answer, now as the B3 rule — the
-/// branch has no definition of `t` of its own, so it reads main's current one.
-/// Phase B4 (main's DDL freezes the pre-image into live branches) flips it.
+/// sprinter 6bc4a4040eb7 (phase B4): the fork rule. Until B3 this pinned that the branch
+/// read main's LIVE rewritten rows and so saw the backfilled 42 ("a branch is not
+/// snapshot-isolated from main DDL for rows it has not forked"); with spec R5.2 alone it
+/// read main's missing value. Main's ALTER now freezes the definition into the branch
+/// first (and, for a volatile default, each row it rewrites), so it sees neither.
 #[test]
-fn branch_before_alter_sees_main_backfill_today() {
+fn branch_before_alter_does_not_see_main_backfill() {
     let db = setup();
 
     db.execute("CREATE BRANCH b AS OF NOW").unwrap();
@@ -235,15 +223,14 @@ fn branch_before_alter_sees_main_backfill_today() {
 
     db.execute("USE BRANCH b").unwrap();
     let rows = db.query("SELECT * FROM t", &[]).unwrap();
-    assert_eq!(
-        rows.len(),
-        2,
-        "branch must see both un-forked rows via the main overlay"
-    );
+    assert_eq!(rows.len(), 2, "branch must see both rows");
     assert!(
-        rows.iter().all(exposes_backfill),
-        "an un-forked branch reads main's data: under main's definition, so it observes c = 42"
+        rows.iter().all(|r| r.values.len() == 2),
+        "the branch keeps the definition it forked with"
     );
+    db.execute("USE BRANCH main").unwrap();
+    let main_rows = db.query("SELECT * FROM t", &[]).unwrap();
+    assert!(main_rows.iter().all(exposes_backfill), "main has its column");
 }
 
 /// sprinter 6bc4a4040eb7 (phase B3) — the NEW rule. A branch that changed the
@@ -333,20 +320,13 @@ fn strict_mode_restores_arity_error() {
     );
 }
 
-/// A stored row WIDER than the current catalog after a DROP COLUMN is a
-/// legitimately-old/forked row, NOT corruption: `drop_column_from_rows` rewrites
-/// `data:` in place with no new version and leaves a branch's `bdata:` fork
-/// untouched, so a wider row survives. It is TRUNCATED to the current width —
-/// exactly the pre-W3.5 projection (the plan, built from the current catalog,
-/// only references the surviving columns and silently ignored trailing values),
-/// never a hard error (design §3). A branch forks a row under the 3-column schema
-/// (`bdata:` = 3-value); main then DROPs a column, narrowing the (global) catalog
-/// to 2 columns and rewriting main's `data:` — but NOT `bdata:`. Reading the
-/// branch decodes the 3-value `bdata:` row under the 2-column catalog: A(3) >
-/// W(2) → truncate to 2. (Mirror of `branch_forked_row_before_alter` with DROP
-/// instead of ADD, so the retained forked row is wider, not narrower.)
+/// A branch forked before main's `DROP COLUMN`.
+///
+/// sprinter 6bc4a4040eb7 (phase B4): the branch keeps the definition it forked with, so
+/// both rows keep the column main dropped. (Through B3 it read main's definition: its
+/// forked row was truncated, and the other read main's rewritten row.)
 #[test]
-fn wider_than_catalog_row_truncates() {
+fn a_branch_keeps_a_column_main_drops() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, c INTEGER)")
         .unwrap();
@@ -355,49 +335,80 @@ fn wider_than_catalog_row_truncates() {
 
     db.execute("CREATE BRANCH b AS OF NOW").unwrap();
     db.execute("USE BRANCH b").unwrap();
-    // Fork row 1 under the 3-column schema (bdata:{b}:t:1 = (1, 111, 9)).
     db.execute("UPDATE t SET v = 111 WHERE id = 1").unwrap();
     db.execute("USE BRANCH main").unwrap();
 
-    // Main DROP narrows the global catalog to 2 columns and rewrites main's
-    // data:, but leaves b's bdata: row 1 at its 3-value arity.
     db.execute("ALTER TABLE t DROP COLUMN c").unwrap();
 
     db.execute("USE BRANCH b").unwrap();
-    let rows = db
-        .query("SELECT * FROM t", &[])
-        .expect("a bdata: row wider than the current catalog is truncated, not a hard error");
+    let rows = db.query("SELECT * FROM t", &[]).unwrap();
     assert_eq!(rows.len(), 2, "the branch still sees both rows");
+    for (id, v) in [(1, 111), (2, 200)] {
+        let row = rows
+            .iter()
+            .find(|r| row_id(r) == Some(id))
+            .unwrap_or_else(|| panic!("row {id}"));
+        assert_eq!(row.values.len(), 3, "the definition it forked with");
+        assert_eq!(row.values.get(1).and_then(as_i64), Some(v));
+        assert_eq!(row.values.get(2).and_then(as_i64), Some(9));
+    }
 
-    // The forked row (id = 1) keeps the branch's own value and is truncated to
-    // the current 2-column width — the dropped column's stored 9 is NOT exposed.
-    let forked = rows
-        .iter()
-        .find(|r| row_id(r) == Some(1))
-        .expect("branch must still see forked row 1");
-    assert_eq!(
-        forked.values.get(1).and_then(as_i64),
-        Some(111),
-        "the forked row must carry the branch's own value"
-    );
-    assert_eq!(
-        forked.values.len(),
-        2,
-        "the wider forked row must be truncated to the current 2-column width"
-    );
-    assert!(
-        forked.get(2).is_none(),
-        "the dropped column must not be exposed after truncation"
-    );
+    db.execute("USE BRANCH main").unwrap();
+    let main_rows = db.query("SELECT * FROM t", &[]).unwrap();
+    assert!(main_rows.iter().all(|r| r.values.len() == 2), "main's own DROP COLUMN");
+}
 
-    // The un-forked row (id = 2) reads main's rewritten 2-value data: directly.
-    let unforked = rows
-        .iter()
-        .find(|r| row_id(r) == Some(2))
-        .expect("branch must see un-forked row 2 via the main overlay");
-    assert_eq!(
-        unforked.values.get(1).and_then(as_i64),
-        Some(200),
-        "the un-forked row reads main's post-DROP value"
-    );
+/// A version wider than the current catalog (written before a `DROP COLUMN`, which
+/// writes no version) is truncated to the current width on `AS OF`, not a hard error,
+/// and the dropped column's stored value is not exposed.
+#[test]
+fn wider_than_catalog_version_truncates() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, c INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t (id, v, c) VALUES (1, 100, 9)").unwrap();
+    let before = db.storage.snapshot_manager().current_scn().saturating_sub(1);
+
+    db.execute("ALTER TABLE t DROP COLUMN c").unwrap();
+
+    let rows = db
+        .query(&format!("SELECT * FROM t AS OF SCN {before}"), &[])
+        .expect("a version wider than the current catalog is truncated, not a hard error");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values.len(), 2, "truncated to the current 2-column width");
+    assert_eq!(rows[0].values.get(1).and_then(as_i64), Some(100));
+}
+
+/// Phase B4 with spec R5.2: a branch forked after main's `ADD COLUMN … DEFAULT` reads
+/// those columns' missing values for the rows older than them. When main changes the
+/// table again, the branch keeps the definition it saw and the missing values main had
+/// then, not main's own: main's `DROP COLUMN` removes one of them and moves the rest by
+/// a position, a `RENAME TO` takes them to another name, a `DROP TABLE` purges them.
+#[test]
+fn a_branch_keeps_the_missing_values_main_had_when_it_changed_the_table() {
+    for statement in [
+        "ALTER TABLE t DROP COLUMN c",
+        "ALTER TABLE t RENAME TO t_renamed",
+        "DROP TABLE t",
+    ] {
+        let db = setup();
+        db.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 42").unwrap();
+        db.execute("ALTER TABLE t ADD COLUMN d INTEGER DEFAULT 7").unwrap();
+        db.execute("CREATE BRANCH b AS OF NOW").unwrap();
+        db.execute(statement).unwrap();
+
+        db.execute("USE BRANCH b").unwrap();
+        let rows = db.query("SELECT * FROM t ORDER BY id", &[]).unwrap();
+        assert_eq!(
+            rows.iter().filter_map(row_id).collect::<Vec<_>>(),
+            vec![1, 2],
+            "{statement}"
+        );
+        for row in &rows {
+            assert_eq!(row.values.len(), 4, "{statement}: the definition it forked with");
+            assert_eq!(row.values.get(2).and_then(as_i64), Some(42), "{statement}: {row:?}");
+            assert_eq!(row.values.get(3).and_then(as_i64), Some(7), "{statement}: {row:?}");
+        }
+        db.execute("USE BRANCH main").unwrap();
+    }
 }

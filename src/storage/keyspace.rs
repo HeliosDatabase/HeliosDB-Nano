@@ -62,6 +62,15 @@ pub enum KeyClass {
     /// `meta:attmissing:{table}:{column}` — what a row older than the column
     /// reads for it (spec R5.2, `storage::row_shape`).
     MetaAttMissing,
+    /// `meta:table_shape:{table}` — when main's table last changed in a way a row
+    /// version written before it cannot be read under (`DROP COLUMN`, `RENAME
+    /// COLUMN`, `RENAME TO`, `SET STORAGE`), in the DDL's own write: what refuses a
+    /// branch anchored before it (sprinter 6bc4a4040eb7, B4 fix pass).
+    MetaTableShape,
+    /// `meta:history_purge:{table}` — the version history under the name is to be
+    /// deleted, and no table has the name: written in a `DROP` or `RENAME` batch,
+    /// deleted when the history is (sprinter 6bc4a4040eb7, B4 fix pass).
+    MetaHistoryPurge,
     /// `meta:index:{index}` — persisted index definition.
     MetaIndex,
     /// `meta:schema:{schema}` — declared schema marker.
@@ -139,8 +148,10 @@ pub enum KeyClass {
     BranchVersion,
     /// `bmeta:{branch}:table:{table}` — a branch's own definition (or drop)
     /// of a table: the branch catalog overlay (sprinter 6bc4a4040eb7, phase
-    /// B3; `storage::branch_catalog`), and `bmeta:{branch}:fork` — the
-    /// incarnation of every table its parent had when it forked.
+    /// B3; `storage::branch_catalog`), `bmeta:{branch}:fork` — the
+    /// incarnation of every table its parent had when it forked, and
+    /// `bmeta:{branch}:missing:{table}` — the missing values (spec R5.2) a
+    /// frozen record of the table reads its narrow rows with (phase B4).
     BranchMeta,
     /// `bfrz:{branch}:{table}:{row_id}` — the level's entry for the row is a
     /// COPY (an `ADD COLUMN`'s materialized row, phase B4's frozen pre-image),
@@ -253,6 +264,10 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
     (b"meta:table_incarnation:", KeyClass::MetaTableIncarnation),
     // storage/catalog.rs `attmissing_key` (spec R5.2)
     (b"meta:attmissing:", KeyClass::MetaAttMissing),
+    // storage/catalog.rs `table_shape_key` (sprinter 6bc4a4040eb7, B4 fix pass)
+    (b"meta:table_shape:", KeyClass::MetaTableShape),
+    // storage/catalog.rs `history_purge_key` (sprinter 6bc4a4040eb7, B4 fix pass)
+    (b"meta:history_purge:", KeyClass::MetaHistoryPurge),
     // storage/catalog.rs:3899 `index_metadata_key`
     (b"meta:index:", KeyClass::MetaIndex),
     // storage/catalog.rs:3914 `schema_metadata_key`
@@ -388,7 +403,7 @@ pub const FIXED_KEYS: &[(&[u8], KeyClass)] = &[
     (b"meta:tde:keycheck", KeyClass::MetaTdeKeyCheck),
     // storage/branch.rs:24 `BRANCH_REGISTRY_KEY`
     (b"branch:registry", KeyClass::Branch),
-    // storage/branch.rs:475 `save_pending_gc` `PENDING_GC_KEY`
+    // storage/branch.rs `LEGACY_PENDING_GC_KEY`: written through 4.41, deleted at open
     (b"branch:pending_gc", KeyClass::Branch),
     // storage/branch.rs:29 `GIT_CONFIG_KEY`
     (b"git:config", KeyClass::Git),
@@ -598,10 +613,13 @@ mod tests {
         (b"bv:2:users:42:1700", KeyClass::BranchVersion, Some("users")),
         (b"bmeta:2:table:users", KeyClass::BranchMeta, None),
         (b"bmeta:2:fork", KeyClass::BranchMeta, None),
+        (b"bmeta:2:missing:users", KeyClass::BranchMeta, None),
         (b"bfrz:2:users:42", KeyClass::BranchFrozen, Some("users")),
         (b"bkey:2:7573657273:75:0102:42", KeyClass::BranchKey, None),
         (b"branch:merge:2", KeyClass::Branch, None),
         (b"meta:table_incarnation:users", KeyClass::MetaTableIncarnation, None),
+        (b"meta:table_shape:users", KeyClass::MetaTableShape, None),
+        (b"meta:history_purge:users", KeyClass::MetaHistoryPurge, None),
         (b"git:config", KeyClass::Git, None),
         (b"git:link:feature", KeyClass::Git, None),
         (b"git:commit:abc123", KeyClass::Git, None),
