@@ -2137,22 +2137,23 @@ mod tests {
     #[test]
     fn the_inline_set_spills_and_comes_back() {
         let mut held = HeldSet::new();
-        let keys: Vec<TableKey> = (0..7u64).map(|level| TableKey::new(level, b"t")).collect();
+        let keys: [TableKey; 7] = std::array::from_fn(|level| TableKey::new(level as u64, b"t"));
+        let [k0, k1, k2, k3, k4, k5, k6] = keys;
         for key in &keys {
             held.push(Held::shared(*key));
         }
         assert_eq!(held.iter().count(), 7);
-        held.remove(keys[1]);
-        held.remove(keys[6]);
-        assert_eq!(held.find(keys[1]), None);
-        assert_eq!(held.find(keys[6]), None);
-        for key in [keys[0], keys[2], keys[3], keys[4], keys[5]] {
+        held.remove(k1);
+        held.remove(k6);
+        assert_eq!(held.find(k1), None);
+        assert_eq!(held.find(k6), None);
+        for key in [k0, k2, k3, k4, k5] {
             assert_eq!(held.find(key), Some(LockMode::Shared));
         }
-        held.upgrade(keys[4]);
+        held.upgrade(k4);
         assert_eq!(held.exclusive, 1);
-        held.end_exclusive(keys[4]);
-        assert_eq!(held.find(keys[4]), Some(LockMode::Shared), "it was shared before");
+        held.end_exclusive(k4);
+        assert_eq!(held.find(k4), Some(LockMode::Shared), "it was shared before");
         assert_eq!(held.exclusive, 0);
         held.clear();
         assert_eq!(held.iter().count(), 0);
