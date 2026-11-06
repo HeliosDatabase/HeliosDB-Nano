@@ -1238,6 +1238,7 @@ impl<'a> Catalog<'a> {
         ) {
             Ok(written) => {
                 self.storage.bump_schema_generation();
+                self.storage.invalidate_schema_cache(table_name);
                 written.wait_replicated();
             }
             Err(e) => {
@@ -1808,13 +1809,18 @@ impl<'a> Catalog<'a> {
         let mut schema = if let Some(schema) = self.storage.get_cached_schema(table_name) {
             schema
         } else {
+            // R5 decision 11: the generation BEFORE the durable read. A DDL that moves
+            // it after this read refuses the fills below, so what they read cannot
+            // outlive that DDL's invalidation.
+            let generation = self.storage.schema_generation();
             let key = Self::table_metadata_key(table_name);
             match self.storage.get(&key)? {
                 Some(data) => {
                     let schema: Schema = bincode::deserialize(&data)
                         .map_err(|e| Error::storage(format!("Failed to deserialize schema: {}", e)))?;
                     // Cache for future lookups
-                    self.storage.cache_schema(table_name, schema.clone());
+                    self.storage
+                        .cache_schema_if_current(table_name, schema.clone(), generation);
                     schema
                 }
                 None => {
@@ -1823,7 +1829,8 @@ impl<'a> Catalog<'a> {
                     if mv_catalog.view_exists(table_name)? {
                         let mv_metadata = mv_catalog.get_view(table_name)?;
                         // Cache MV schema too
-                        self.storage.cache_schema(table_name, mv_metadata.schema.clone());
+                        self.storage
+                            .cache_schema_if_current(table_name, mv_metadata.schema.clone(), generation);
                         mv_metadata.schema
                     } else {
                         return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
@@ -1977,9 +1984,6 @@ impl<'a> Catalog<'a> {
             tracing::warn!("Failed to log schema change for '{}' to WAL: {}", table_name, e);
         }
 
-        // Update in-memory schema cache
-        self.storage.cache_schema(table_name, schema.clone());
-
         // W2.5 (via the W1.3 primitive): every ALTER variant funnels through
         // here, and a schema-shape change makes the per-table committed-write
         // watermarks untrustworthy — an open-snapshot reader taking the
@@ -1990,6 +1994,11 @@ impl<'a> Catalog<'a> {
         // until the next tracked commit. Caught by
         // w2_5_watermark_read_tests::alter_add_column_hidden_from_open_snapshot_reader.
         self.storage.bump_schema_generation();
+
+        // Update in-memory schema cache, after the bump (R5 decision 11): a reader's
+        // fill from the old record either ran before this and is replaced, or finds
+        // the generation moved and is refused.
+        self.storage.cache_schema(table_name, schema.clone());
     }
 
     /// Drop a table
@@ -2157,6 +2166,13 @@ impl<'a> Catalog<'a> {
         // W1.3: bump immediately after the delete commits — that is the point
         // where `table_exists` flips false.
         self.storage.bump_schema_generation();
+
+        // R5 decision 11 (R2 finding (b)): the cached schema goes after the write as
+        // well as before it. A reader that missed in between read the record still
+        // there; its fill either ran already, and is removed here, or sees the
+        // generation moved, and is refused. It used to stay: the table read as
+        // existing, and `RENAME x TO it` failed "already exists".
+        self.storage.invalidate_schema_cache(table_name);
 
         // The constraint set, and with it the reverse-FK cache, which listed
         // this table's foreign keys under every table they reference; a parent
@@ -3990,12 +4006,14 @@ impl<'a> Catalog<'a> {
         // physically happened, the statement reported failure, and the process
         // went on serving the OLD name from `schema_cache` — a table readable
         // under a name whose keys no longer exist.
+        //
+        // W1.3: rename changes existence for BOTH names (old → Missing,
+        // new → Table); bump so the existence cache recomputes both. Before the cache
+        // moves (R5 decision 11): a reader's fill of the old name's record either ran
+        // already and is removed here, or finds the generation moved and is refused.
+        self.storage.bump_schema_generation();
         self.storage.invalidate_schema_cache(old_name);
         self.storage.cache_schema(new_name, schema);
-
-        // W1.3: rename changes existence for BOTH names (old → Missing,
-        // new → Table); bump so the existence cache recomputes both.
-        self.storage.bump_schema_generation();
 
         // The per-table SIDE records — `table_constraints:{t}` (every CHECK,
         // FOREIGN KEY and table-level UNIQUE the table owns), the IDENTITY
@@ -6286,6 +6304,9 @@ impl<'a> Catalog<'a> {
         if let Err(e) = self.storage.log_add_constraint(table_name, &value) {
             tracing::warn!("Failed to log table constraints for '{}' to WAL: {}", table_name, e);
         }
+        // R5 decision 11: write, bump, publish: a reader's fill from the old record
+        // is either replaced here or refused.
+        self.storage.bump_schema_generation();
         self.storage.cache_table_constraints(table_name, constraints.clone());
         self.storage.clear_referencing_fk_cache();
         Ok(())
@@ -6319,13 +6340,16 @@ impl<'a> Catalog<'a> {
             return Ok(constraints);
         }
 
+        // R5 decision 11: the generation before the durable read.
+        let generation = self.storage.schema_generation();
         let key = Self::table_constraints_key(table_name);
         let constraints = match self.storage.get(&key)? {
             Some(data) => bincode::deserialize(&data)
                 .map_err(|e| Error::storage(format!("Failed to deserialize table constraints: {}", e)))?,
             None => crate::sql::TableConstraints::default(),
         };
-        self.storage.cache_table_constraints(table_name, constraints.clone());
+        self.storage
+            .cache_table_constraints_if_current(table_name, constraints.clone(), generation);
         Ok(constraints)
     }
 
@@ -6462,6 +6486,8 @@ impl<'a> Catalog<'a> {
             return Ok(cached);
         }
 
+        // R5 decision 11: the generation before the durable read.
+        let generation = self.storage.schema_generation();
         let mut result = Vec::new();
 
         // Read through `meta_blobs_with_prefix`, which fetches each value with
@@ -6486,7 +6512,8 @@ impl<'a> Catalog<'a> {
             }
         }
 
-        self.storage.cache_referencing_fks(referenced_table, result.clone());
+        self.storage
+            .cache_referencing_fks_if_current(referenced_table, result.clone(), generation);
         Ok(result)
     }
 
@@ -6494,6 +6521,8 @@ impl<'a> Catalog<'a> {
     pub fn delete_table_constraints(&self, table_name: &str) -> Result<()> {
         let key = Self::table_constraints_key(table_name);
         self.storage.delete(&key)?;
+        // R5 decision 11: write, bump, invalidate.
+        self.storage.bump_schema_generation();
         self.storage.invalidate_table_constraints_cache(table_name);
         Ok(())
     }

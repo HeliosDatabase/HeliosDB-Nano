@@ -183,6 +183,25 @@ pub fn live_backends() -> &'static DashMap<i32, Weak<SessionScopedState>> {
     BACKENDS.get_or_init(DashMap::new)
 }
 
+/// [`SessionScopedState::cancel_secret`] before the connection armed it.
+const CANCEL_NOT_ARMED: i64 = i64::MIN;
+
+/// Spec R5.1: a PostgreSQL `CancelRequest`. `true` if `secret` is the key of a live
+/// backend, which is told; any other pair does nothing, and says nothing to the peer.
+pub fn request_cancel(backend_pid: i32, secret: i32) -> bool {
+    let Some(state) = live_backends()
+        .get(&backend_pid)
+        .and_then(|entry| entry.value().upgrade())
+    else {
+        return false;
+    };
+    if state.cancel_secret.load(Ordering::Acquire) != i64::from(secret) {
+        return false;
+    }
+    state.cancel_requested.store(true, Ordering::Release);
+    true
+}
+
 /// A snapshot of one live backend, in `pg_stat_activity` column order.
 #[derive(Debug, Clone)]
 pub struct BackendSnapshot {
@@ -373,6 +392,12 @@ pub struct SessionScopedState {
     /// and one connection's `SET bulk_load_mode = on` flipped the storage
     /// engine's flag for the whole process.
     gucs: parking_lot::RwLock<HashMap<String, SettingValue>>,
+    /// Spec R5.1: a cancel request arrived for this connection. Looked at by a wait for
+    /// a table lock; cleared by the connection's handler with each message it reads.
+    cancel_requested: Arc<AtomicBool>,
+    /// The key the connection gave its client (`BackendKeyData`), or
+    /// [`CANCEL_NOT_ARMED`]. Wider than the key, so nothing matches an unarmed backend.
+    cancel_secret: AtomicI64,
     /// Lock-free mirror of `!gucs.is_empty()`. The long-tail GUC readers gate on
     /// this so an unmodified session never pays the map lock.
     guc_overrides_present: AtomicBool,
@@ -505,6 +530,8 @@ impl SessionScopedState {
             branch_engine: AtomicU64::new(UNATTACHED_ENGINE),
             home_branch: parking_lot::RwLock::new(None),
             holds_temp_tables: AtomicBool::new(false),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            cancel_secret: AtomicI64::new(CANCEL_NOT_ARMED),
         });
         live_backends().insert(state.backend_pid, Arc::downgrade(&state));
         state
@@ -547,12 +574,34 @@ impl SessionScopedState {
             branch_engine: AtomicU64::new(UNATTACHED_ENGINE),
             home_branch: parking_lot::RwLock::new(None),
             holds_temp_tables: AtomicBool::new(false),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            cancel_secret: AtomicI64::new(CANCEL_NOT_ARMED),
         })
     }
 
     /// `pg_backend_pid()`.
     pub fn backend_pid(&self) -> i32 {
         self.backend_pid
+    }
+
+    /// Spec R5.1: this connection told its client the key of a cancel request, and the
+    /// flag is what its handler clears when a new message arrives: a cancel that finds
+    /// no statement running does nothing, as in PostgreSQL.
+    pub(crate) fn arm_cancel(&self, secret: i32) -> Arc<AtomicBool> {
+        self.cancel_secret.store(i64::from(secret), Ordering::Release);
+        Arc::clone(&self.cancel_requested)
+    }
+
+    /// Spec R5.1: has a cancel request arrived for the statement running? Taken: it
+    /// ends that statement and no other.
+    pub(crate) fn take_cancel_request(&self) -> bool {
+        self.cancel_requested.swap(false, Ordering::AcqRel)
+    }
+
+    /// Spec R5.1: this session's `lock_timeout` in milliseconds, or `None` when it has
+    /// not set one. Read when a wait for a table lock begins, not on any hot path.
+    pub(crate) fn lock_timeout_ms(&self) -> Option<u64> {
+        self.guc("lock_timeout").and_then(|value| value.as_duration_ms())
     }
 
     /// sprinter 1703dba8e82d: record that this connection has created a

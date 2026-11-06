@@ -2003,7 +2003,7 @@ fn merge_key_text(schema: &crate::Schema, columns: &[String], row: &Tuple) -> St
 #[derive(Clone, Copy)]
 struct MergeEnds<'a> {
     /// When this statement stops waiting for anything: ONE budget for its close,
-    /// its section and its wait for main's schema statements (B3 third fix pass).
+    /// its section and its wait for its tables' locks (B3 third fix pass, spec R5.1).
     deadline: std::time::Instant,
     source_name: &'a str,
     target_name: &'a str,
@@ -2097,6 +2097,8 @@ pub struct StorageEngine {
     /// [`UncommittedWriteCensus`](super::UncommittedWriteCensus) and
     /// [`Self::count_table_rows`].
     write_census: Arc<super::UncommittedWriteCensus>,
+    /// Spec R5.1: the per-table writer lock (`storage::table_locks`).
+    table_locks: Arc<super::table_locks::TableLocks>,
     /// R4.3: MVCC version garbage collector (watermark + collector state).
     version_gc: Arc<super::version_gc::VersionGc>,
     /// R4.3: background version-GC thread; joined on engine drop. None
@@ -2337,9 +2339,13 @@ pub struct DdlWrite {
 
 impl DdlWrite {
     /// Wait (bounded by `[replication] sync_timeout_ms`) for the standbys to
-    /// acknowledge the write; a no-op unless this node's commits wait.
+    /// acknowledge the write; a no-op unless this node's commits wait. Spec R5.1:
+    /// while this thread holds a statement's exclusive table locks the wait moves to
+    /// when they are released, so a writer never waits for a standby.
     pub(crate) fn wait_replicated(self) {
-        WriteAheadLog::wait_replicated_sequence(self.barrier);
+        if !super::table_locks::defer_replication_wait(self.barrier) {
+            WriteAheadLog::wait_replicated_sequence(self.barrier);
+        }
     }
 }
 
@@ -2786,7 +2792,9 @@ impl StorageEngine {
     /// sprinter 6bc4a4040eb7 (phase B2): apply `batch` through the write gate
     /// with the engine's write options — what a direct (no-transaction) branch
     /// write commits with, so it takes the same open-mode decision as every
-    /// other engine write (a physical standby refuses it).
+    /// other engine write (a physical standby refuses it). Tracks its caller, so that
+    /// the writer-lock detector names whoever wrote the batch rather than this line.
+    #[track_caller]
     pub(crate) fn write_batch_through_gate(&self, batch: WriteBatch) -> Result<()> {
         self.gate.write(&self.db, batch, self.memory_write_options.as_ref())
     }
@@ -3601,8 +3609,16 @@ impl StorageEngine {
             vector_indexes.set_persistent_policy(super::vector_index::PersistentPolicy::ReplicaMemoryOnly);
         }
 
+        let instance_id = NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        let schema_generation = Arc::new(AtomicU64::new(0));
+        let table_locks = super::table_locks::TableLocks::new(
+            instance_id,
+            config.session.lock_timeout_ms,
+            config.storage.statement_timeout_ms.or(config.storage.query_timeout_ms),
+            Arc::clone(&schema_generation),
+        );
         let engine = Self {
-            instance_id: NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            instance_id,
             db: Arc::clone(&db),
             gate,
             config: config.clone(),
@@ -3612,6 +3628,7 @@ impl StorageEngine {
             snapshot_manager,
             conflict_registry,
             write_census: Arc::new(super::UncommittedWriteCensus::new()),
+            table_locks,
             version_gc,
             version_gc_worker,
             branch_manager,
@@ -3654,7 +3671,7 @@ impl StorageEngine {
             )),
             schema_cache: Arc::new(dashmap::DashMap::new()),
             existence_cache: Arc::new(dashmap::DashMap::new()),
-            schema_generation: Arc::new(AtomicU64::new(0)),
+            schema_generation,
             write_watermarks: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -4051,8 +4068,16 @@ impl StorageEngine {
             false,
         )?;
 
+        let instance_id = NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        let schema_generation = Arc::new(AtomicU64::new(0));
+        let table_locks = super::table_locks::TableLocks::new(
+            instance_id,
+            config.session.lock_timeout_ms,
+            config.storage.statement_timeout_ms.or(config.storage.query_timeout_ms),
+            Arc::clone(&schema_generation),
+        );
         Ok(Self {
-            instance_id: NEXT_STORAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
+            instance_id,
             db: Arc::clone(&db),
             gate,
             config: config.clone(),
@@ -4062,6 +4087,7 @@ impl StorageEngine {
             snapshot_manager,
             conflict_registry,
             write_census: Arc::new(super::UncommittedWriteCensus::new()),
+            table_locks,
             version_gc,
             version_gc_worker,
             branch_manager,
@@ -4105,7 +4131,7 @@ impl StorageEngine {
             )),
             schema_cache: Arc::new(dashmap::DashMap::new()),
             existence_cache: Arc::new(dashmap::DashMap::new()),
-            schema_generation: Arc::new(AtomicU64::new(0)),
+            schema_generation,
             write_watermarks: Arc::new(dashmap::DashMap::new()),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -4133,9 +4159,34 @@ impl StorageEngine {
         self.schema_cache.get(table_name).map(|e| e.value().clone())
     }
 
-    /// Cache a schema for a table
+    /// Publish a schema a catalog write just made durable. The order every DDL keeps
+    /// (R5 decision 11): durable write, [`Self::bump_schema_generation`], then this or
+    /// [`Self::invalidate_schema_cache`], so a reader's fill racing it is either
+    /// replaced here or refused by [`Self::cache_schema_if_current`].
     pub fn cache_schema(&self, table_name: &str, schema: crate::Schema) {
         self.schema_cache.insert(table_name.to_string(), schema);
+    }
+
+    /// A reader's fill of the schema cache from what it read durably, with the
+    /// [`Self::schema_generation`] it read BEFORE that read. Refused when a DDL moved
+    /// the generation since: what it read may be gone, and the entry would outlive the
+    /// DDL's own invalidation (R5 decision 11: a reader re-cached a table a DROP had
+    /// just deleted, and `RENAME x TO it` then failed "already exists"). Checked and
+    /// inserted under the entry's shard lock, so a DDL's invalidation, which comes
+    /// after its bump, either removes this insert or comes first and this is refused.
+    pub(crate) fn cache_schema_if_current(&self, table_name: &str, schema: crate::Schema, generation: u64) {
+        match self.schema_cache.entry(table_name.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occupied) => {
+                if self.schema_generation.load(Ordering::Acquire) == generation {
+                    occupied.insert(schema);
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                if self.schema_generation.load(Ordering::Acquire) == generation {
+                    vacant.insert(schema);
+                }
+            }
+        }
     }
 
     /// Invalidate a cached schema (call on DDL changes)
@@ -4271,11 +4322,25 @@ impl StorageEngine {
         self.constraints_cache.lock().get(table_name).cloned()
     }
 
-    /// Cache constraints for a table
+    /// Publish constraints a catalog write just made durable (see [`Self::cache_schema`]).
     pub fn cache_table_constraints(&self, table_name: &str, constraints: crate::sql::TableConstraints) {
         self.constraints_cache
             .lock()
             .insert(table_name.to_string(), constraints);
+    }
+
+    /// A reader's fill of the constraints cache, with the [`Self::schema_generation`]
+    /// it read before its durable read: see [`Self::cache_schema_if_current`].
+    pub(crate) fn cache_table_constraints_if_current(
+        &self,
+        table_name: &str,
+        constraints: crate::sql::TableConstraints,
+        generation: u64,
+    ) {
+        let mut cache = self.constraints_cache.lock();
+        if self.schema_generation.load(Ordering::Acquire) == generation {
+            cache.insert(table_name.to_string(), constraints);
+        }
     }
 
     /// Invalidate cached constraints (call on constraint DDL changes)
@@ -4290,11 +4355,18 @@ impl StorageEngine {
         self.referencing_fk_cache.lock().get(referenced_table).cloned()
     }
 
-    /// Cache reverse-FK constraints for a referenced table.
-    pub fn cache_referencing_fks(&self, referenced_table: &str, constraints: Vec<crate::sql::ForeignKeyConstraint>) {
-        self.referencing_fk_cache
-            .lock()
-            .insert(referenced_table.to_string(), constraints);
+    /// A reader's fill of the reverse-FK cache, with the [`Self::schema_generation`]
+    /// it read before its durable read: see [`Self::cache_schema_if_current`].
+    pub(crate) fn cache_referencing_fks_if_current(
+        &self,
+        referenced_table: &str,
+        constraints: Vec<crate::sql::ForeignKeyConstraint>,
+        generation: u64,
+    ) {
+        let mut cache = self.referencing_fk_cache.lock();
+        if self.schema_generation.load(Ordering::Acquire) == generation {
+            cache.insert(referenced_table.to_string(), constraints);
+        }
     }
 
     /// Clear all cached reverse-FK lookups.
@@ -4528,7 +4600,17 @@ impl StorageEngine {
         let db = Arc::clone(&self.db);
         let gate = Arc::clone(&self.gate);
         let key_manager = self.key_manager.clone();
+        let table_locks = Arc::clone(&self.table_locks);
         engine.set_apply_callback(move |table, row_id, data| {
+            // Spec R5.1: this worker writes rows with no statement above it, so each
+            // applied row takes the lock it needs. There is no caller to return an
+            // error to: a timeout abandons the write and logs at ERROR, like a failed
+            // `put` below.
+            let locks = table_locks.statement_scope();
+            if let Err(e) = locks.lock_shared(super::table_locks::MAIN_LEVEL, table) {
+                tracing::error!("Lock-free apply callback gave up on {}:{} - {}", table, row_id, e);
+                return;
+            }
             // Build key
             let key = format!("data:{}:{}", table, row_id);
             let key_bytes = key.as_bytes();
@@ -4780,6 +4862,8 @@ impl StorageEngine {
     {
         // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
         self.refuse_main_only_write_on_branch("direct bulk load")?;
+        // Spec R5.1: an API with no statement above it is its own.
+        let _locks = self.lock_table_for_write(table)?;
         use std::time::Instant;
 
         let start = Instant::now();
@@ -5251,6 +5335,111 @@ impl StorageEngine {
     /// Handle on the engine's uncommitted-write census, for transactions this
     /// engine does not construct itself (the per-session transactions in
     /// `lib.rs` are built with `Transaction::new_with_session`).
+    pub(crate) fn table_locks(&self) -> &Arc<super::table_locks::TableLocks> {
+        &self.table_locks
+    }
+
+    /// The level a statement's table locks are on: its branch, or main.
+    #[inline]
+    pub(crate) fn statement_lock_level(&self) -> u64 {
+        if !self.is_branch_active() {
+            return super::table_locks::MAIN_LEVEL;
+        }
+        self.active_branch()
+            .map_or(super::table_locks::MAIN_LEVEL, |binding| binding.branch_id)
+    }
+
+    /// Spec R5.1: open (or join) this thread's statement scope and take `table`
+    /// shared on the statement's level. The caller holds the scope for as long as it
+    /// reads and writes: a write funnel that has no statement above it is its own.
+    #[inline]
+    pub(crate) fn lock_table_for_write(&self, table: &str) -> Result<super::table_locks::StatementLockScope<'_>> {
+        let scope = self.table_locks.statement_scope();
+        scope.lock_shared(self.statement_lock_level(), table)?;
+        Ok(scope)
+    }
+
+    /// [`Self::lock_table_for_write`] for a fast path, which runs on main only.
+    #[inline]
+    pub(crate) fn lock_main_table_for_write(&self, table: &str) -> Result<super::table_locks::StatementLockScope<'_>> {
+        let scope = self.table_locks.statement_scope();
+        scope.lock_shared(super::table_locks::MAIN_LEVEL, table)?;
+        Ok(scope)
+    }
+
+    /// Spec R5.1: this statement holds its table locks. Its transaction's snapshot was
+    /// taken before that, and if a schema statement or a merge ended since, the rows
+    /// it left are not in it (see [`Transaction::refresh_statement_snapshot`]). One
+    /// atomic load when none did.
+    #[inline]
+    pub(crate) fn refresh_snapshot_after_locks(&self, txn: &Transaction) {
+        let generation = self.schema_generation();
+        if txn.snapshot_generation() != generation {
+            txn.refresh_statement_snapshot(self.next_timestamp(), generation);
+        }
+    }
+
+    /// Spec R5.1: take `tables` exclusively, sorted, on `level`, bounded by `[session]
+    /// lock_timeout_ms`, for the guard's life. `what` names the holder in the error
+    /// another statement gets.
+    pub(crate) fn lock_tables_exclusive(
+        &self,
+        level: u64,
+        tables: &[&str],
+        what: &str,
+    ) -> Result<super::table_locks::ExclusiveTableLocks> {
+        self.table_locks
+            .exclusive(level, tables, what, self.table_locks.timeout())
+    }
+
+    /// For the tests: `[session] lock_timeout_ms` on a running engine.
+    #[doc(hidden)]
+    pub fn debug_set_table_lock_timeout(&self, timeout: std::time::Duration) {
+        self.table_locks.set_timeout(timeout);
+    }
+
+    /// For the tests: how many statements may wait for a table lock at once.
+    #[doc(hidden)]
+    pub fn debug_set_table_lock_max_waiters(&self, max_waiters: usize) {
+        self.table_locks.set_max_waiters(max_waiters);
+    }
+
+    /// For the tests' handshakes: on main's `table`, the exclusive requests waiting,
+    /// and the shared requests waiting behind them or the holder.
+    #[doc(hidden)]
+    pub fn debug_table_lock_waiters(&self, table: &str) -> (usize, usize) {
+        self.table_locks.waiters(super::table_locks::MAIN_LEVEL, table)
+    }
+
+    /// For the tests' handshakes: does anything hold main's `table` exclusively?
+    #[doc(hidden)]
+    pub fn debug_table_lock_held_exclusively(&self, table: &str) -> bool {
+        self.table_locks
+            .has_exclusive_holder(super::table_locks::MAIN_LEVEL, table)
+    }
+
+    /// How many shared locks a transaction took at its first staged write instead of
+    /// at its statement. Every SQL path locks at its statement, so this stays 0 there.
+    #[doc(hidden)]
+    pub fn debug_table_lock_late_acquisitions(&self) -> u64 {
+        self.table_locks.late_acquisitions()
+    }
+
+    /// Row writes the detector found with no lock on them.
+    #[doc(hidden)]
+    pub fn debug_unlocked_row_writes() -> u64 {
+        super::table_locks::unlocked_row_writes()
+    }
+
+    /// For the tests: `plant` writes rows below every statement, rows no statement
+    /// could write (two with one key, say), with nothing running beside it, so there is
+    /// nothing for it to race. The detector's allow-list.
+    #[doc(hidden)]
+    pub fn debug_plant_rows<R>(&self, plant: impl FnOnce() -> R) -> R {
+        let _allowed = super::table_locks::allow_unlocked_row_writes("a test planting rows");
+        plant()
+    }
+
     pub fn write_census(&self) -> Arc<super::UncommittedWriteCensus> {
         Arc::clone(&self.write_census)
     }
@@ -5297,6 +5486,8 @@ impl StorageEngine {
 
     /// Begin a transaction
     pub fn begin_transaction(&self) -> Result<Transaction> {
+        // Spec R5.1: the generation first, then the snapshot.
+        let generation = self.schema_generation();
         let snapshot_id = self.next_timestamp();
         let mut txn = Transaction::new(
             Arc::clone(&self.db),
@@ -5304,6 +5495,7 @@ impl StorageEngine {
             snapshot_id,
             Arc::clone(&self.snapshot_manager),
         )?;
+        txn.set_snapshot_generation(generation);
         // The commit batch writes `data:`/`v:`/`counter:` straight to RocksDB,
         // bypassing `StorageEngine::put`, so it must carry the key manager and
         // seal them itself.
@@ -5336,6 +5528,10 @@ impl StorageEngine {
         // (That one enrolls for its index REMOVALS only —
         // `Transaction::set_removal_census`, sprinter 6bc4a4040eb7.)
         txn.set_write_census(self.write_census());
+        // Spec R5.1: an explicit transaction keeps its table locks across statements.
+        // NEVER on `begin_autocommit_transaction`: that one ends inside its
+        // statement, whose scope holds them.
+        txn.set_table_locks(Arc::clone(&self.table_locks));
         Ok(txn)
     }
 
@@ -5347,6 +5543,8 @@ impl StorageEngine {
     /// surfacing retryable serialization errors on plain autocommit DML
     /// would break every driver's expectations.
     pub fn begin_autocommit_transaction(&self) -> Result<Transaction> {
+        // Spec R5.1: the generation first, then the snapshot.
+        let generation = self.schema_generation();
         let snapshot_id = self.next_timestamp();
         let mut txn = Transaction::new(
             Arc::clone(&self.db),
@@ -5354,6 +5552,7 @@ impl StorageEngine {
             snapshot_id,
             Arc::clone(&self.snapshot_manager),
         )?;
+        txn.set_snapshot_generation(generation);
         // See `begin_transaction`: the commit batch seals its own row values.
         txn.set_key_manager(self.key_manager.clone());
         txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
@@ -5701,6 +5900,10 @@ impl StorageEngine {
     /// ([`Self::claim_index_entries`]) before anything is written — enforcement
     /// never depends on `storage.time_travel_enabled`.
     pub fn insert_tuple(&self, table_name: &str, tuple: Tuple) -> Result<u64> {
+        // Spec R5.1: the write funnel of whatever has no statement of its own (REST
+        // inserts, restore, the audit log, an MV's rows, the sync applier): a pure
+        // insert reads nothing it will rewrite, so the lock can start here.
+        let _locks = self.lock_table_for_write(table_name)?;
         // Check if a non-main branch is active - use branch-aware insertion
         if self.is_branch_active() {
             return self.insert_tuple_branch_aware(table_name, tuple);
@@ -11503,7 +11706,10 @@ impl StorageEngine {
     ///
     /// sprinter 6bc4a4040eb7 (B3 fix pass): a merge either refuses before
     /// anything changed — the source stays Active and mergeable — or it
-    /// finishes. Everything is validated first (the definitions and the
+    /// finishes. It holds every table of its plan exclusively on the target level
+    /// from before its validation (spec R5.1: writers wait, and an open transaction
+    /// is waited for, bounded by `[session] lock_timeout_ms` and its 30 s budget,
+    /// then 55P03). Everything is validated first (the definitions and the
     /// incarnations of the target's tables, `plan_branch_merge`; PRIMARY KEY /
     /// UNIQUE on the target, `validate_merge_keys`); then a durable `MergeIntent`
     /// is written, synced; then the source is marked merged and the target
@@ -11583,6 +11789,13 @@ impl StorageEngine {
         } else {
             Some(self.branch_drains.exclusive(target_id, target_name, budget())?)
         };
+        // Spec R5.1: the merge holds every table of its plan exclusively, on the target
+        // level, from before its key validation through the last table's landing: a
+        // writer waits instead of racing it. Declared after the sections above, so it
+        // lets go first; its release moves the schema generation and then runs the
+        // replication wait its catalog writes deferred.
+        let merge_owner = self.table_locks.separate_owner();
+        let mut merge_locks = self.table_locks.exclusive_guard();
         let source_chain = self.get_branch_chain(source_id)?;
         let target_chain: Vec<u64> = if merge_to_main {
             Vec::new()
@@ -11610,12 +11823,14 @@ impl StorageEngine {
                     ));
                 }
                 self.register_merge_intent_exclusion(&intent)?;
-                let exposed = if merge_to_main {
-                    &intent.tables
-                } else {
-                    &intent.main_tables
-                };
-                self.wait_for_main_ddl(exposed, source_name, target_name, deadline)?;
+                // Spec R5.1: taken again, and everything validated again under it.
+                self.lock_merge_tables(
+                    &ends,
+                    &merge_owner,
+                    &mut merge_locks,
+                    &intent.tables,
+                    &intent.main_tables,
+                )?;
                 // B3 second fix pass: the window from the first run to this one
                 // was open to main's DML: validate its keys again. An error here
                 // leaves the merge pending, with nothing further changed.
@@ -11623,12 +11838,11 @@ impl StorageEngine {
                 // A table whose rows landed is done with: its rows are main's now,
                 // and main may have changed them since.
                 let left = intent.tables_left();
-                self.refuse_open_writers(&ends, &left)?;
                 self.refuse_merged_tables_too_large(&ends, &left)?;
                 self.validate_merge_keys(&ends, &intent.steps, &left)?;
                 intent
             }
-            None => match self.write_merge_intent(&ends) {
+            None => match self.write_merge_intent(&ends, &merge_owner, &mut merge_locks) {
                 Ok(intent) => intent,
                 Err(e) => {
                     self.release_merge_exclusion(source_id);
@@ -11743,12 +11957,72 @@ impl StorageEngine {
         Ok((source, target, pending))
     }
 
-    /// sprinter 6bc4a4040eb7 (B3 second fix pass): plan the merge, hold the DDL it
-    /// is exposed to, and wait out what is already past that check; then plan
-    /// again under the exclusion, until the plan asks for nothing that is not
-    /// held. The FINAL table list is what ends up held. On an error the caller
-    /// releases what was registered.
-    fn plan_under_exclusion(&self, ends: &MergeEnds<'_>) -> Result<BranchMergePlan> {
+    /// Spec R5.1: this merge's locks on `tables` (sorted, at the target level) and what
+    /// it waits for besides them, within its one budget:
+    ///
+    /// * the transactions still open on the SOURCE with staged rows. Its running
+    ///   statements were drained and a new one is refused, so all that is left of them
+    ///   is a COMMIT or a ROLLBACK; each holds the table on the source's level until
+    ///   then, and rows committed after the validation would land nowhere;
+    /// * into a branch, main's schema statements already past their exclusion check on
+    ///   the tables the target inherits (`main_tables`). This takes no lock on main:
+    ///   a branch never blocks main's writers.
+    ///
+    /// A statement in a transaction that wrote one of these tables is refused at once:
+    /// the merge lands in commits of its own, so that transaction would write over it,
+    /// and it cannot end while its own statement waits.
+    fn lock_merge_tables(
+        &self,
+        ends: &MergeEnds<'_>,
+        owner: &super::table_locks::SeparateLockOwner,
+        locks: &mut super::table_locks::ExclusiveTableLocks,
+        tables: &[String],
+        main_tables: &[String],
+    ) -> Result<()> {
+        let what = format!("MERGE BRANCH {} INTO {}", ends.source_name, ends.target_name);
+        let wait = || {
+            ends.deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(self.table_locks.timeout())
+        };
+        let level = if ends.merge_to_main {
+            super::table_locks::MAIN_LEVEL
+        } else {
+            ends.target_id
+        };
+        let mut sorted: Vec<&str> = tables.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        for table in sorted {
+            if owner.outer_holds(level, table) {
+                return Err(Error::table_lock_upgrade_refused(
+                    table,
+                    "the transaction this MERGE BRANCH runs in has written it",
+                ));
+            }
+            locks.take(level, table, &what, wait())?;
+        }
+        for table in branch_view::pending_tables_on_level(self.instance_id, ends.source_id) {
+            locks.take(ends.source_id, &table, &what, wait())?;
+        }
+        if !ends.merge_to_main {
+            self.table_locks
+                .wait_for_exclusive_holders(super::table_locks::MAIN_LEVEL, main_tables, wait())?;
+        }
+        Ok(())
+    }
+
+    /// sprinter 6bc4a4040eb7 (B3 second fix pass, spec R5.1): plan the merge, hold the
+    /// DDL it is exposed to, and take its tables' locks, which waits out what is
+    /// already running on them; then plan again under the locks, until the plan asks
+    /// for nothing that is not held. The FINAL table list is what ends up held. On an
+    /// error the caller releases what was registered.
+    fn plan_under_exclusion(
+        &self,
+        ends: &MergeEnds<'_>,
+        owner: &super::table_locks::SeparateLockOwner,
+        locks: &mut super::table_locks::ExclusiveTableLocks,
+    ) -> Result<BranchMergePlan> {
         let level = if ends.merge_to_main {
             MERGE_TARGET_MAIN
         } else {
@@ -11789,25 +12063,23 @@ impl StorageEngine {
                 &on_main,
                 false,
             )?;
+            self.lock_merge_tables(ends, owner, locks, &on_level, &on_main)?;
             held_on_level.extend(on_level);
             held_on_main.extend(on_main);
-            // Main's schema statements on these tables, already past the exclusion
-            // check, finish first. (A branch target's cannot be running: this merge
-            // holds its exclusive section.)
-            let exposed = if ends.merge_to_main {
-                &plan.tables
-            } else {
-                &plan.main_tables
-            };
-            self.wait_for_main_ddl(exposed, ends.source_name, ends.target_name, ends.deadline)?;
         }
         Err(Error::branch_merge_ddl_busy(ends.source_name, ends.target_name))
     }
 
-    /// Plan and validate the merge — the target's DDL on its tables is refused
-    /// by then — and write its intent. Nothing has changed before this returns.
-    fn write_merge_intent(&self, ends: &MergeEnds<'_>) -> Result<MergeIntent> {
-        let plan = self.plan_under_exclusion(ends)?;
+    /// Plan and validate the merge — its tables are held exclusively by then, and the
+    /// target's DDL on them is refused — and write its intent. Nothing has changed
+    /// before this returns.
+    fn write_merge_intent(
+        &self,
+        ends: &MergeEnds<'_>,
+        owner: &super::table_locks::SeparateLockOwner,
+        locks: &mut super::table_locks::ExclusiveTableLocks,
+    ) -> Result<MergeIntent> {
+        let plan = self.plan_under_exclusion(ends, owner, locks)?;
         self.refuse_merged_tables_too_large(ends, &plan.tables)?;
         self.validate_merge_keys(ends, &plan.steps, &plan.tables)?;
         let intent = MergeIntent {
@@ -12024,21 +12296,15 @@ impl StorageEngine {
     /// brings them all, with the row cache, the watermark and the snapshot record, and
     /// a reader or a crash sees the table's merge wholly or not at all.
     ///
-    /// The order is what a transactional UPDATE does, with the keys all at once:
+    /// Spec R5.1: the merge holds the table exclusively from before its key validation
+    /// on, so nothing else stages, moves a key or commits in it meanwhile. The order is
+    /// what a transactional UPDATE does, with the keys all at once:
     ///
-    /// 1. The transaction first: its snapshot precedes every row read below, so a
-    ///    commit of one of these rows after them fails this commit.
-    /// 2. The row keys are held in the conflict registry
-    ///    (`WriteConflictRegistry::hold_merge_landing`): from here on, a commit of
-    ///    one of them that read it before the merge fails with a serialization
-    ///    error, whatever its isolation level, instead of putting the old row back.
-    /// 3. Refuse (55006) when a transaction has staged writes of the table, then
-    ///    stage the rows, which counts this one.
-    /// 4. Claim all the keys (`claim_merged_table_keys`), looking again for another
-    ///    writer under each tree's lock.
-    /// 5. Commit. On any failure the claim goes back, nothing has landed for this
+    /// 1. The transaction first, then the rows read and staged.
+    /// 2. Claim all the keys (`claim_merged_table_keys`).
+    /// 3. Commit. On any failure the claim goes back, nothing has landed for this
     ///    table, and the intent stays, so a rerun validates again.
-    /// 6. Now that the new images are committed, the keys only the old ones held go,
+    /// 4. Now that the new images are committed, the keys only the old ones held go,
     ///    and the vector indexes follow.
     ///
     /// Which rows landed is written in the same commit (`MergeIntent::landed`).
@@ -12050,20 +12316,10 @@ impl StorageEngine {
         self.merge_failpoint_tick(MergeFailSite::Row)?;
         let schema = Catalog::new(self).main_table_schema(table)?;
 
-        let mut txn = self.begin_transaction()?;
-        txn.exempt_from_merged_writes();
-        let mut landing = self.conflict_registry.hold_merge_landing(
-            merged
-                .iter()
-                .map(|row_id| Self::build_data_key(table, *row_id))
-                .collect(),
-        );
+        let txn = self.begin_transaction()?;
         let rows = self.merged_table_rows(ends.source_id, table, &schema)?;
         if rows.is_empty() {
             return Ok(0);
-        }
-        if self.has_uncommitted_writes_for_table(table) {
-            return Err(Error::branch_table_busy(table, ends.target_name));
         }
 
         if schema_has_columnar_columns(&schema) {
@@ -12113,7 +12369,6 @@ impl StorageEngine {
         // would answer in between with old and new keys both in it.
         txn.note_index_key_removal(table);
         let census = txn.write_census_hold();
-        let own_writers = if census.is_some() { 2 } else { 1 };
         let changes: Vec<MergedRowChange<'_>> = rows
             .iter()
             .map(|row| MergedRowChange {
@@ -12122,14 +12377,12 @@ impl StorageEngine {
                 new: row.new.as_ref(),
             })
             .collect();
-        let other_writer = || self.write_census.table_has_other_staged_writes(table, own_writers);
         let claim = match self
             .art_index_manager
-            .claim_merged_table_keys(table, &schema, &changes, &other_writer)
+            .claim_merged_table_keys(table, &schema, &changes)
             .map_err(|e| Error::storage(format!("MERGE BRANCH: claiming the keys of {table}: {e}")))?
         {
             MergedKeysOutcome::Claimed(claim) => claim,
-            MergedKeysOutcome::WriterOpen => return Err(Error::branch_table_busy(table, ends.target_name)),
             MergedKeysOutcome::HeldBy {
                 wanted_by,
                 constraint,
@@ -12160,7 +12413,6 @@ impl StorageEngine {
         // table can stop it: a result cached during the merge must not outlive this
         // commit (the generation is part of the result cache's epoch).
         self.bump_schema_generation();
-        landing.landed(commit_ts);
         *intent = progressed;
         if let Err(e) = claim.finish() {
             tracing::error!("MERGE BRANCH: removing the keys {} no longer holds: {}", table, e);
@@ -12393,8 +12645,7 @@ impl StorageEngine {
     /// ancestor's schema change is not the source's to carry; merge the ancestor
     /// first; one already merged into the target's lineage is carried). A
     /// schema-changing merge into a branch while the target has other live
-    /// descendants (0A000; they read through it, B4's freeze lifts this). And
-    /// open transactions (55006, [`Self::refuse_open_writers`]).
+    /// descendants (0A000; they read through it, B4's freeze lifts this).
     fn plan_branch_merge(&self, ends: &MergeEnds<'_>) -> Result<BranchMergePlan> {
         use super::branch_catalog::{BranchTableResolution, BranchTableState};
         let MergeEnds {
@@ -12667,7 +12918,6 @@ impl StorageEngine {
         tables.extend(Catalog::new(self).with_partition_descendants(dropped_on_main));
         tables.sort_unstable();
         tables.dedup();
-        self.refuse_open_writers(ends, &tables)?;
         // A branch target that inherits a table from main is exposed to main's
         // DDL on it (B3 second fix pass): a change there would change what this
         // merge validated, and an identical re-create would pass unseen.
@@ -12704,32 +12954,6 @@ impl StorageEngine {
             ends.target_name,
             &children,
         ))
-    }
-
-    /// sprinter 6bc4a4040eb7 (B3 second and third fix passes): refuse (55006) a
-    /// merge while an open transaction has staged writes that would land outside
-    /// it. On the SOURCE, on any table: a COMMIT there is let through while the
-    /// source is still Active, and its rows would land after the keys were
-    /// validated, in a table the merge may not even hold. On the TARGET, on the
-    /// merge's tables: a branch target's staged keys were checked against rows this
-    /// merge is about to change, and a main transaction's are in main's index
-    /// already and may be on a row this merge also writes. An autocommit writer is
-    /// not in that census; the row phase's claims cover it.
-    fn refuse_open_writers(&self, ends: &MergeEnds<'_>, tables: &[String]) -> Result<()> {
-        if let Some(table) = branch_view::pending_tables_on_level(self.instance_id, ends.source_id).first() {
-            return Err(Error::branch_table_busy(table, ends.source_name));
-        }
-        for table in tables {
-            let open = if ends.merge_to_main {
-                self.has_uncommitted_writes_for_table(table)
-            } else {
-                branch_view::pending_writers(self.instance_id, ends.target_id, table) > 0
-            };
-            if open {
-                return Err(Error::branch_table_busy(table, ends.target_name));
-            }
-        }
-        Ok(())
     }
 
     /// The record the target level takes for the source's `record`, computed
@@ -13060,9 +13284,6 @@ impl StorageEngine {
         let stored = self.get(&super::branch_catalog::branch_table_key(intent.target_id, table))?;
         if stored.is_some_and(|bytes| record.encode().is_ok_and(|wanted| wanted == bytes)) {
             return Ok(());
-        }
-        if branch_view::pending_writers(self.instance_id, intent.target_id, table) > 0 {
-            return Err(Error::branch_table_busy(table, &intent.target_name));
         }
         let now = self.chain_table_definition(&intent.target_chain, table)?;
         if now.as_ref().map(|(_, fingerprint)| *fingerprint) != step.before {
@@ -13917,6 +14138,9 @@ impl StorageEngine {
     }
 
     pub fn replay_wal_after(&self, after_lsn: u64) -> Result<usize> {
+        // Spec R5.1, the detector's allow-list: replay runs at open, before any
+        // statement, and on a logical replica's resync, whose primary writes for it.
+        let _allowed = super::table_locks::allow_unlocked_row_writes("WAL replay");
         if let Some(wal) = &self.wal {
             // Set replay flag to skip WAL logging during recovery
             self.is_replaying.store(true, Ordering::Release);
@@ -14258,6 +14482,9 @@ impl StorageEngine {
         bytes: Option<&Vec<u8>>,
         cursor: Option<u64>,
     ) -> Result<()> {
+        // Spec R5.1, the detector's allow-list: a logical replica's applier. Its
+        // primary writes for it, and a replica takes no client writes of its own.
+        let _allowed = super::table_locks::allow_unlocked_row_writes("the logical applier");
         let prefix = format!("data:{table}:");
         let row_id = key
             .strip_prefix(prefix.as_bytes())
@@ -14484,6 +14711,8 @@ impl StorageEngine {
 
     /// Apply a single WAL operation to restore database state
     fn apply_wal_operation(&self, operation: WalOperation) -> Result<()> {
+        // Spec R5.1: see `replay_wal_after`.
+        let _allowed = super::table_locks::allow_unlocked_row_writes("WAL replay");
         // GH#35 (Half B): fail closed on destructive DDL during open recovery.
         if self.destructive_replay_is_refused(&operation) {
             return Ok(());
@@ -15272,6 +15501,8 @@ impl StorageEngine {
     /// This creates a versioned copy of the tuple for time-travel queries
     /// while also writing the current version for fast non-time-travel access.
     pub fn insert_tuple_versioned(&self, table_name: &str, tuple: Tuple) -> Result<u64> {
+        // Spec R5.1: as `insert_tuple`.
+        let _locks = self.lock_table_for_write(table_name)?;
         let catalog = Catalog::new(self);
         let schema = catalog.get_table_schema(table_name)?;
         self.insert_tuple_versioned_with_schema(table_name, tuple, &schema)
@@ -18998,6 +19229,8 @@ impl StorageEngine {
     /// When a branch is active, writes to branch-specific storage.
     /// Data written to a branch is isolated from the main branch.
     pub fn insert_tuple_branch_aware(&self, table_name: &str, tuple: Tuple) -> Result<u64> {
+        // Spec R5.1: as `insert_tuple`.
+        let _locks = self.lock_table_for_write(table_name)?;
         let catalog = Catalog::new(self);
         let schema = catalog.get_table_schema(table_name)?;
         self.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)

@@ -3,8 +3,9 @@
 //! embedded primary — no daemons, no standby — so each is a defect of the
 //! engine, not of physical replication or of the test harness.
 //!
-//! Every test here is `#[ignore]`d: each asserts the CORRECT behaviour of a
-//! defect that is reported, not fixed in R2. Run them with
+//! Every test here but finding (b) beside a reader, which R5 closed, is
+//! `#[ignore]`d: each asserts the CORRECT behaviour of a defect that is reported,
+//! not fixed in R2. Run them with
 //! `cargo test --test physical_ddl_window_repro -- --ignored --nocapture`
 //! (and with `--features internal-tests`: finding (b) appeared only in that
 //! build of the daemon test).
@@ -135,10 +136,33 @@ fn b_the_ddl_window_workload_runs_ten_iterations() {
 }
 
 /// Finding (b) with what the daemon test also had: a reader on the primary
-/// asking about every table while the workload runs.
+/// asking about every table while the workload runs. Closed (R5 decision 11): a
+/// reader that filled the schema cache in the middle of a DROP TABLE re-cached the
+/// table, and `RENAME x TO it` failed "already exists". Fills are guarded by the
+/// generation now, and a DDL publishes after its write.
 #[test]
-#[ignore = "R2 finding (b): run with --ignored"]
 fn b_the_ddl_window_workload_runs_ten_iterations_beside_a_reader() {
+    /// Stops the reader on every way out of the test, a failed iteration included.
+    struct StopReader(Arc<AtomicBool>);
+    impl Drop for StopReader {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    // A statement that never returns: no flag stops that. Past this the process ends,
+    // with a message libtest cannot capture, rather than hold the build lock.
+    let (_disarm, disarmed) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let limit = std::time::Duration::from_secs(900);
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = disarmed.recv_timeout(limit) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "\nwatchdog: b_the_ddl_window_workload_runs_ten_iterations_beside_a_reader still running after 900 s"
+            );
+            std::process::abort();
+        }
+    });
     let root = tempfile::tempdir().unwrap();
     let database = Arc::new(EmbeddedDatabase::with_config(primary_config(&root.path().join("primary"))).unwrap());
     let stop = Arc::new(AtomicBool::new(false));
@@ -157,8 +181,9 @@ fn b_the_ddl_window_workload_runs_ten_iterations_beside_a_reader() {
             }
         })
     };
+    let stop_reader = StopReader(stop);
     drive(&database, 10);
-    stop.store(true, Ordering::Release);
+    drop(stop_reader);
     reader.join().unwrap();
     assert!(reads.load(Ordering::Relaxed) > 0, "the reader asked nothing");
 }

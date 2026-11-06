@@ -169,6 +169,9 @@ impl SslConfig {
 /// PostgreSQL SSLRequest message code
 pub const SSL_REQUEST_CODE: i32 = 80877103;
 
+/// PostgreSQL CancelRequest message code: length 16, this, the backend's pid, its key.
+pub const CANCEL_REQUEST_CODE: i32 = 80877102;
+
 /// SSL negotiation handler
 pub struct SslNegotiator {
     config: SslConfig,

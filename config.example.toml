@@ -1005,6 +1005,16 @@ cleanup_interval_secs = 300
 # Default: 32
 udf_max_call_depth = 32
 
+# How long a statement waits for a table's writer lock, in milliseconds, before it
+# fails with SQLSTATE 55P03 naming what holds it. A statement or transaction that
+# writes a table holds it shared; a schema statement (ALTER, DROP, RENAME, CREATE or
+# DROP INDEX, ...), TRUNCATE and MERGE BRANCH hold it exclusively. So during a long
+# ALTER TABLE writers wait, and an ALTER TABLE waits for the writers already there,
+# including a transaction left open. Readers never wait. Must be at least 1.
+# A session can set its own with SET lock_timeout; 0 there means this value, not an
+# unbounded wait. Default: 30000
+lock_timeout_ms = 30000
+
 # ============================================================================
 # LOCK CONFIGURATION (v3.1.0 - Multi-User ACID)
 # ============================================================================

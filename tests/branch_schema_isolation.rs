@@ -37,6 +37,7 @@ use heliosdb_nano::{
     EmbeddedDatabase, Error, Tuple, Value, BRANCH_MERGE_BUSY_MARKER, BRANCH_MERGE_DUPLICATE_KEY_MARKER,
     BRANCH_MERGE_KEY_CLAIMED_MARKER, BRANCH_MERGE_PENDING_MARKER, BRANCH_MERGE_SCHEMA_REFUSED_MARKER,
     BRANCH_SCHEMA_UNSUPPORTED_MARKER, BRANCH_TABLE_BUSY_MARKER, BRANCH_WRITE_UNSUPPORTED_MARKER,
+    TABLE_LOCK_TIMEOUT_MARKER,
 };
 use tokio_postgres::{Client, NoTls};
 
@@ -2145,24 +2146,39 @@ fn seed_a_key_on_a_branch(db: &EmbeddedDatabase, family: Family) {
     db.execute("USE BRANCH main").unwrap();
 }
 
-/// H1, B6: an open main transaction has staged writes of a table the merge changes:
-/// its keys are in main's index but not in its rows, and it may hold a row the
-/// merge also writes. Refused (55006) whatever the keys are, as on a branch target.
+/// R5.1: what an open writer of its table holds a merge up with: it waits, for
+/// `[session] lock_timeout_ms`, and says what it waited for. Small here, since nothing
+/// ends the writer while the test waits.
+fn short_lock_timeout(db: &EmbeddedDatabase) {
+    db.storage.debug_set_table_lock_timeout(Duration::from_millis(50));
+}
+
+fn assert_lock_timeout(message: &str, holder: &str) {
+    assert!(
+        message.contains(TABLE_LOCK_TIMEOUT_MARKER) && message.contains(holder),
+        "{message}"
+    );
+}
+
+/// H1, B6, R5.1: an open main transaction has staged writes of a table the merge
+/// changes: its keys are in main's index but not in its rows, and it may hold a row the
+/// merge also writes. It holds the table's lock until it ends, so the merge waits for
+/// it, whatever the keys are, as on a branch target, and gives up (55P03) with nothing
+/// changed.
 #[test]
-fn a_merge_is_refused_while_a_main_transaction_has_staged_writes_on_its_table() {
+fn a_merge_waits_for_a_main_transaction_with_staged_writes_on_its_table() {
     for family in FAMILIES {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         seed_a_key_on_a_branch(&db, family);
+        short_lock_timeout(&db);
         let writer = session(&db, "writer");
         db.begin_transaction_for_session(writer).unwrap();
         db.execute_for_session(writer, "INSERT INTO d VALUES (3, 'x')").unwrap();
 
         let err = db.execute("MERGE BRANCH r INTO main").expect_err("an open writer");
         let message = err.to_string();
-        assert!(
-            message.contains(BRANCH_TABLE_BUSY_MARKER) && message.contains("\"d\""),
-            "[{family:?}] {message}"
-        );
+        assert_lock_timeout(&message, "an open transaction holds it");
+        assert!(message.contains(" d:"), "[{family:?}] {message}");
         assert!(branch_is_active(&db, "r"), "[{family:?}] nothing changed");
         assert_eq!(count_keys(&db, "branch:merge:"), 0, "[{family:?}] no intent");
 
@@ -2180,10 +2196,12 @@ fn a_merge_is_refused_while_a_main_transaction_has_staged_writes_on_its_table() 
 
 /// B6: the review's false pass. An open transaction moves row 1 to the key the
 /// merge's new row takes, and the merge also rewrites row 1: both were "the rows it
-/// replaces" to validation, and the COMMIT then duplicated the key.
+/// replaces" to validation, and the COMMIT then duplicated the key. R5.1: the merge
+/// waits for that transaction.
 #[test]
-fn a_merge_is_refused_when_an_open_transaction_moved_a_row_it_also_writes() {
+fn a_merge_waits_for_an_open_transaction_that_moved_a_row_it_also_writes() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
+    short_lock_timeout(&db);
     db.execute("CREATE TABLE d (id INT PRIMARY KEY, code TEXT UNIQUE)")
         .unwrap();
     db.execute("INSERT INTO d VALUES (1, 'a')").unwrap();
@@ -2199,7 +2217,7 @@ fn a_merge_is_refused_when_an_open_transaction_moved_a_row_it_also_writes() {
         .execute("MERGE BRANCH r INTO main")
         .expect_err("an open writer")
         .to_string();
-    assert!(err.contains(BRANCH_TABLE_BUSY_MARKER), "{err}");
+    assert_lock_timeout(&err, "an open transaction holds it");
     db.rollback_transaction_for_session(writer).unwrap();
     db.execute("MERGE BRANCH r INTO main").unwrap();
     assert_eq!(
@@ -2212,6 +2230,7 @@ fn a_merge_is_refused_when_an_open_transaction_moved_a_row_it_also_writes() {
 #[test]
 fn a_merge_goes_through_once_the_claiming_transaction_rolled_back() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
+    short_lock_timeout(&db);
     seed_a_key_on_a_branch(&db, Family::Text);
     let writer = session(&db, "writer");
     db.begin_transaction_for_session(writer).unwrap();
@@ -2735,8 +2754,9 @@ fn a_schema_statement_through_query_applies_to_the_branch() {
 
 /// M3: staged writes on the source would land after the keys were validated.
 #[test]
-fn a_merge_is_refused_while_a_transaction_has_staged_writes_on_the_source() {
+fn a_merge_waits_for_a_transaction_with_staged_writes_on_the_source() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
+    short_lock_timeout(&db);
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
     db.execute("CREATE BRANCH r AS OF NOW").unwrap();
     let writer = session(&db, "writer");
@@ -2745,18 +2765,19 @@ fn a_merge_is_refused_while_a_transaction_has_staged_writes_on_the_source() {
     db.execute_for_session(writer, "INSERT INTO t VALUES (1, 1)").unwrap();
 
     let err = db.execute("MERGE BRANCH r INTO main").unwrap_err().to_string();
-    assert!(err.contains(BRANCH_TABLE_BUSY_MARKER), "{err}");
+    assert_lock_timeout(&err, "an open transaction holds it");
     assert!(branch_is_active(&db, "r"));
     db.commit_transaction_for_session(writer).unwrap();
     db.execute("MERGE BRANCH r INTO main").unwrap();
     assert_eq!(ids(&rows(&db, Family::Text, "SELECT id FROM t", &[])), vec![1]);
 }
 
-/// Into a branch, an open transaction on the TARGET refuses the merge too: its
+/// Into a branch, an open transaction on the TARGET holds the merge up too: its
 /// staged keys were checked against rows the merge is about to change.
 #[test]
-fn a_merge_is_refused_while_a_transaction_has_staged_writes_on_the_target() {
+fn a_merge_waits_for_a_transaction_with_staged_writes_on_the_target() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
+    short_lock_timeout(&db);
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
     branch(&db, "b");
     db.execute("CREATE BRANCH c AS OF NOW").unwrap();
@@ -2768,7 +2789,7 @@ fn a_merge_is_refused_while_a_transaction_has_staged_writes_on_the_target() {
     db.begin_transaction_for_session(writer).unwrap();
     db.execute_for_session(writer, "INSERT INTO t VALUES (6, 6)").unwrap();
     let err = db.execute("MERGE BRANCH c INTO b").unwrap_err().to_string();
-    assert!(err.contains(BRANCH_TABLE_BUSY_MARKER), "{err}");
+    assert_lock_timeout(&err, "an open transaction holds it");
     db.commit_transaction_for_session(writer).unwrap();
     db.execute("MERGE BRANCH c INTO b").unwrap();
 }
@@ -2939,8 +2960,12 @@ fn two_merged_rows_with_one_key_are_refused() {
     db.execute("USE BRANCH main").unwrap();
     let level = db.storage.get_branch("r").unwrap().branch_id;
     let view = heliosdb_nano::storage::BranchView::for_chain(&db.storage, "r", vec![level]).unwrap();
-    view.put(None, "made", 1, &Tuple::new(vec![i(7), i(1)])).unwrap();
-    view.put(None, "made", 2, &Tuple::new(vec![i(7), i(2)])).unwrap();
+    // Rows no statement could write, which is the point: below every statement, so
+    // with no writer lock, and nothing runs beside them.
+    db.storage.debug_plant_rows(|| {
+        view.put(None, "made", 1, &Tuple::new(vec![i(7), i(1)])).unwrap();
+        view.put(None, "made", 2, &Tuple::new(vec![i(7), i(2)])).unwrap();
+    });
 
     let err = db.execute("MERGE BRANCH r INTO main").expect_err("one key twice");
     assert!(is_unique_violation(&err), "{err}");
@@ -3054,6 +3079,38 @@ fn during_a_merge<T>(
     outcome
 }
 
+/// R5.1. Runs `merge` on a thread of its own and stops it at the first tick of `site`,
+/// holding its tables. `writer` starts on a thread of its own and is seen to wait for
+/// `table`; `during` runs while it does; then the merge goes on, and the writer after
+/// it. No sleep, no race: the writer cannot finish while the merge is stopped.
+fn a_writer_waiting_for_a_merge<T: Send>(
+    db: &EmbeddedDatabase,
+    merge: &str,
+    site: MergeFailSite,
+    table: &str,
+    writer: impl FnOnce() -> T + Send,
+    during: impl FnOnce(),
+) -> (heliosdb_nano::Result<u64>, T) {
+    let (reached_rx, go_tx) = stop_at_site(db, site, 0);
+    let outcome = std::thread::scope(|scope| {
+        let merging = scope.spawn(|| db.execute(merge));
+        while reached_rx.recv_timeout(Duration::from_millis(2)).is_err() {
+            assert!(!merging.is_finished(), "the merge ended before {site:?}");
+        }
+        let writing = scope.spawn(writer);
+        wait_for("the writer to wait for the table", || {
+            db.storage.debug_table_lock_waiters(table).1 > 0
+        });
+        assert!(!writing.is_finished(), "the writer waits for the merge");
+        during();
+        drop(go_tx);
+        let merged = merging.join().unwrap();
+        (merged, writing.join().unwrap())
+    });
+    db.storage.debug_on_merge_site(site, None);
+    outcome
+}
+
 /// `statement` runs and stops past its guard, where it is counted and checked;
 /// `during` runs while it is stopped there, then it goes on.
 fn during_a_schema_statement<T>(
@@ -3135,24 +3192,31 @@ fn some_pairs(expected: &[(i64, &str)]) -> Vec<(i64, Option<String>)> {
         .collect()
 }
 
-/// A transaction that opens while a merge is landing a table, after the merge looked
-/// for writers, and moves and adds keys of OTHER rows: nothing the merge does disturbs
-/// its entries, whether it then commits or rolls back. The re-derivation this replaces
-/// dropped them, put dead ones back, and left the dense-int statistics behind the rows,
-/// so this `COUNT` answered wrong with no race at all.
+/// R5.1. A transaction that opens while a merge is landing a table and moves and adds
+/// keys of OTHER rows waits for the merge, and then nothing the merge did disturbs its
+/// entries, whether it commits or rolls back. Before the lock it ran beside the merge,
+/// and the re-derivation of the keys dropped its entries, put dead ones back, and left
+/// the dense-int statistics behind the rows.
 #[test]
-fn a_transaction_during_a_merge_keeps_its_index_work() {
+fn a_transaction_during_a_merge_waits_and_keeps_its_index_work() {
     for commit in [true, false] {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         seed_two_keys_on_a_branch(&db, Family::Text);
         let writer = session(&db, "writer");
-        let (merged, ()) = during_a_merge(&db, "MERGE BRANCH r INTO main", MergeFailSite::TableClaimed, 0, || {
-            db.begin_transaction_for_session(writer).unwrap();
-            db.execute_for_session(writer, "UPDATE d SET code = 'b' WHERE id = 1")
-                .unwrap();
-            db.execute_for_session(writer, "INSERT INTO d VALUES (4, 'q')").unwrap();
-        });
+        let (merged, wrote) = a_writer_waiting_for_a_merge(
+            &db,
+            "MERGE BRANCH r INTO main",
+            MergeFailSite::TableClaimed,
+            "d",
+            || {
+                db.begin_transaction_for_session(writer)?;
+                db.execute_for_session(writer, "UPDATE d SET code = 'b' WHERE id = 1")?;
+                db.execute_for_session(writer, "INSERT INTO d VALUES (4, 'q')")
+            },
+            || {},
+        );
         merged.unwrap();
+        wrote.unwrap();
         assert_eq!(count_keys(&db, "branch:merge:"), 0, "commit: {commit}");
 
         for merged_key in ["x", "y"] {
@@ -3201,64 +3265,40 @@ fn a_transaction_during_a_merge_keeps_its_index_work() {
     }
 }
 
-/// An autocommit INSERT is in no census, so nothing refuses the merge up front.
-/// Whoever claims the key first holds it: here the INSERT, and the row phase
-/// stops (55006). The intent stays, the rerun validates, the committed holder is
-/// a 23505 until it is gone, and no key is ever held twice.
+/// R5.1. An autocommit INSERT of a key a merge is about to land used to get in first and
+/// stop the merge half way. It waits now, whichever family, and then it gets its ordinary
+/// answer: the merge lands, the key is held, 23505. No key is ever held twice.
 #[test]
-fn an_autocommit_insert_of_a_key_yet_to_land_stops_the_merge() {
+fn an_autocommit_insert_during_a_merge_waits_and_gets_its_ordinary_answer() {
     for family in FAMILIES {
-        let db = EmbeddedDatabase::new_in_memory().unwrap();
-        seed_two_keys_on_a_branch(&db, family);
-        let (merged, inserted) = during_a_merge(&db, "MERGE BRANCH r INTO main", MergeFailSite::Row, 0, || {
-            exec(&db, family, "INSERT INTO d VALUES ($1, $2)", &[i(9), s("y")])
-        });
-        inserted.expect("first come");
-        let err = merged.expect_err("the key is held").to_string();
-        assert!(
-            err.contains(BRANCH_MERGE_KEY_CLAIMED_MARKER) && err.contains(BRANCH_MERGE_PENDING_MARKER),
-            "[{family:?}] {err}"
-        );
-        assert_eq!(count_keys(&db, "branch:merge:"), 1, "[{family:?}] still pending");
-
-        let err = db.execute("MERGE BRANCH r INTO main").expect_err("committed now");
-        assert!(is_unique_violation(&err), "[{family:?}] {err}");
-        assert_eq!(count_keys(&db, "branch:merge:"), 1, "[{family:?}] still pending");
-
-        ok(&db, family, "DELETE FROM d WHERE id = $1", &[i(9)]);
-        db.execute("MERGE BRANCH r INTO main").unwrap();
-        assert_eq!(
-            pairs(&db, family, "SELECT id, code FROM d ORDER BY id"),
-            some_pairs(&[(1, "a"), (2, "x"), (3, "y")]),
-            "[{family:?}]"
-        );
-        assert_eq!(dense_count(&db), 3, "[{family:?}]");
-    }
-}
-
-/// And the other way round: a key the merge has claimed is held, so the statement
-/// that comes later gets its ordinary 23505 while the merge is still running. A reader
-/// meanwhile sees none of the table's rows: it lands whole, or not at all.
-#[test]
-fn an_autocommit_insert_of_a_claimed_key_is_refused() {
-    for family in FAMILIES {
-        let db = EmbeddedDatabase::new_in_memory().unwrap();
-        seed_two_keys_on_a_branch(&db, family);
-        let (merged, refused) = during_a_merge(&db, "MERGE BRANCH r INTO main", MergeFailSite::TableClaimed, 0, || {
-            assert_eq!(
-                pairs(&db, family, "SELECT id, code FROM d WHERE id > 1"),
-                Vec::new(),
-                "[{family:?}] not committed yet"
+        for site in [MergeFailSite::Row, MergeFailSite::TableClaimed] {
+            let db = EmbeddedDatabase::new_in_memory().unwrap();
+            seed_two_keys_on_a_branch(&db, family);
+            let (merged, inserted) = a_writer_waiting_for_a_merge(
+                &db,
+                "MERGE BRANCH r INTO main",
+                site,
+                "d",
+                || exec(&db, family, "INSERT INTO d VALUES ($1, $2)", &[i(9), s("y")]),
+                || {
+                    // A reader never waits, and sees none of the table's rows: it
+                    // lands whole, or not at all.
+                    assert_eq!(
+                        pairs(&db, family, "SELECT id, code FROM d WHERE id > 1"),
+                        Vec::new(),
+                        "[{family:?}] not committed yet"
+                    );
+                },
             );
-            exec(&db, family, "INSERT INTO d VALUES ($1, $2)", &[i(9), s("x")])
-        });
-        assert_unique_violation(refused, family, "a key the merge claimed");
-        merged.unwrap();
-        assert_eq!(
-            pairs(&db, family, "SELECT id, code FROM d ORDER BY id"),
-            some_pairs(&[(1, "a"), (2, "x"), (3, "y")]),
-            "[{family:?}]"
-        );
+            merged.unwrap();
+            assert_unique_violation(inserted, family, "a key the merge landed");
+            assert_eq!(
+                pairs(&db, family, "SELECT id, code FROM d ORDER BY id"),
+                some_pairs(&[(1, "a"), (2, "x"), (3, "y")]),
+                "[{family:?}]"
+            );
+            assert_eq!(dense_count(&db), 3, "[{family:?}]");
+        }
     }
 }
 
@@ -3861,69 +3901,34 @@ fn last_scn(db: &EmbeddedDatabase) -> u64 {
     db.storage.snapshot_manager().current_scn().saturating_sub(1)
 }
 
-/// Review item 1 (script w3), the first half: a transaction that staged the row
-/// before the merge looked. The merge is refused (55006), nothing has landed, the
-/// transaction commits, and running the merge again lands the row over it, with the
-/// indexes right. It used to land under the transaction and lose the UNIQUE key.
+/// Review item 1 (script w3), R5.1: a transaction that writes a row while the merge
+/// lands it waits, so its row image comes after the merge's. At READ COMMITTED, the
+/// default of every wire client, its statement reads the merged row. It used to read
+/// the row first and put the pre-merge image back over the merged one, with the index
+/// saying otherwise.
 #[test]
-fn a_merge_is_refused_when_a_transaction_staged_a_row_on_its_way() {
+fn a_transaction_writing_a_row_a_merge_lands_waits_and_reads_the_merged_row() {
     for family in FAMILIES {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         seed_a_row_both_write(&db, family);
         let writer = session(&db, "writer");
-        let (merged, ()) = during_a_merge(&db, "MERGE BRANCH r INTO main", MergeFailSite::Row, 0, || {
-            db.begin_transaction_for_session(writer).unwrap();
-            db.execute_for_session(writer, "UPDATE d SET v = 1 WHERE id = 1")
-                .unwrap();
-        });
-        let err = merged.expect_err("an open writer").to_string();
-        assert!(
-            err.contains(BRANCH_TABLE_BUSY_MARKER) && err.contains(BRANCH_MERGE_PENDING_MARKER),
-            "[{family:?}] {err}"
+        let (merged, wrote) = a_writer_waiting_for_a_merge(
+            &db,
+            "MERGE BRANCH r INTO main",
+            MergeFailSite::TableClaimed,
+            "d",
+            || {
+                db.begin_transaction_for_session(writer)?;
+                db.execute_for_session(writer, "UPDATE d SET v = v + 1 WHERE id = 1")
+            },
+            || {},
         );
-        assert_eq!(count_keys(&db, "branch:merge:"), 1, "[{family:?}] the intent stays");
-        assert_eq!(
-            triples(&db),
-            vec![(1, Some("a".to_string()), 0)],
-            "[{family:?}] nothing landed"
-        );
-
+        merged.unwrap();
+        wrote.unwrap();
         db.commit_transaction_for_session(writer).unwrap();
-        assert_eq!(triples(&db), vec![(1, Some("a".to_string()), 1)], "[{family:?}]");
-
-        db.execute("MERGE BRANCH r INTO main").unwrap();
-        assert_eq!(triples(&db), vec![(1, Some("z".to_string()), 100)], "[{family:?}]");
+        assert_eq!(triples(&db), vec![(1, Some("z".to_string()), 101)], "[{family:?}]");
         assert_eq!(holders_of(&db, "z"), (vec![1], vec![1]), "[{family:?}]");
         assert_eq!(holders_of(&db, "a"), (vec![], vec![]), "[{family:?}]");
-    }
-}
-
-/// Review item 1, the second half: a transaction that staged the row after the merge
-/// looked, so nothing refuses the merge. Its image is from before the merge, and its
-/// COMMIT would put it back over the merged row. The registry refuses that with a
-/// serialization failure, at READ COMMITTED too (the default of every wire client,
-/// which validates nothing else), and the row, the keys and the index stay the merge's.
-#[test]
-fn a_commit_over_a_row_a_merge_landed_is_a_serialization_failure() {
-    for isolation in [IsolationLevel::ReadCommitted, IsolationLevel::RepeatableRead] {
-        let db = EmbeddedDatabase::new_in_memory().unwrap();
-        seed_a_row_both_write(&db, Family::Text);
-        let writer = db.create_session("writer", isolation).unwrap();
-        let (merged, ()) = during_a_merge(&db, "MERGE BRANCH r INTO main", MergeFailSite::TableClaimed, 0, || {
-            db.begin_transaction_for_session(writer).unwrap();
-            db.execute_for_session(writer, "UPDATE d SET v = 1 WHERE id = 1")
-                .unwrap();
-        });
-        merged.expect("no writer when it looked");
-
-        let err = db
-            .commit_transaction_for_session(writer)
-            .expect_err("its row image is from before the merge")
-            .to_string();
-        assert!(err.contains("serialization failure"), "{isolation:?}: {err}");
-        assert_eq!(triples(&db), vec![(1, Some("z".to_string()), 100)], "{isolation:?}");
-        assert_eq!(holders_of(&db, "z"), (vec![1], vec![1]), "{isolation:?}");
-        assert_eq!(holders_of(&db, "a"), (vec![], vec![]), "{isolation:?}");
         assert_unique_violation(
             db.execute("INSERT INTO d VALUES (6, 'z', 0)"),
             Family::Text,
@@ -3931,25 +3936,51 @@ fn a_commit_over_a_row_a_merge_landed_is_a_serialization_failure() {
         );
         db.execute("INSERT INTO d VALUES (5, 'a', 0)")
             .expect("the key the merge freed");
-        assert_eq!(holders_of(&db, "a"), (vec![5], vec![5]), "{isolation:?}");
-
-        // A statement that begins after the merge read the merged row, and passes.
-        let later = session(&db, "later");
-        db.begin_transaction_for_session(later).unwrap();
-        db.execute_for_session(later, "UPDATE d SET v = 2 WHERE id = 1")
-            .unwrap();
-        db.commit_transaction_for_session(later).unwrap();
-        assert_eq!(
-            triples(&db).first().cloned(),
-            Some((1, Some("z".to_string()), 2)),
-            "{isolation:?}"
-        );
     }
 }
 
-/// The same refusal as a client sees it: SQLSTATE 40001, so its retry loop retries.
+/// The same, at REPEATABLE READ: its snapshot is from before the merge, so the row it
+/// read is too, and first-committer-wins refuses its COMMIT (40001). The merged row, its
+/// keys and the index stay the merge's, and a later transaction passes.
+#[test]
+fn a_repeatable_read_commit_over_a_row_a_merge_landed_is_a_serialization_failure() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    seed_a_row_both_write(&db, Family::Text);
+    let writer = db.create_session("writer", IsolationLevel::RepeatableRead).unwrap();
+    let (merged, wrote) = a_writer_waiting_for_a_merge(
+        &db,
+        "MERGE BRANCH r INTO main",
+        MergeFailSite::TableClaimed,
+        "d",
+        || {
+            db.begin_transaction_for_session(writer)?;
+            db.execute_for_session(writer, "UPDATE d SET v = 1 WHERE id = 1")
+        },
+        || {},
+    );
+    merged.unwrap();
+    wrote.unwrap();
+    let err = db
+        .commit_transaction_for_session(writer)
+        .expect_err("its row image is from before the merge")
+        .to_string();
+    assert!(err.contains("serialization failure"), "{err}");
+    assert_eq!(triples(&db), vec![(1, Some("z".to_string()), 100)]);
+    assert_eq!(holders_of(&db, "z"), (vec![1], vec![1]));
+    assert_eq!(holders_of(&db, "a"), (vec![], vec![]));
+
+    let later = session(&db, "later");
+    db.begin_transaction_for_session(later).unwrap();
+    db.execute_for_session(later, "UPDATE d SET v = 2 WHERE id = 1")
+        .unwrap();
+    db.commit_transaction_for_session(later).unwrap();
+    assert_eq!(triples(&db), vec![(1, Some("z".to_string()), 2)]);
+}
+
+/// On the wire: the writer's statement does not answer until the merge is done, and a
+/// plain READ COMMITTED client never sees an error for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_commit_over_a_row_a_merge_landed_is_40001_on_the_wire() {
+async fn a_writer_on_the_wire_waits_for_a_merge_with_no_error() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     seed_a_row_both_write(&db, Family::Text);
     let s = serve(db).await;
@@ -3965,7 +3996,21 @@ async fn a_commit_over_a_row_a_merge_landed_is_40001_on_the_wire() {
         .unwrap()
         .expect("the merge reaches its commit");
     client.simple_query("BEGIN").await.unwrap();
-    client.simple_query("UPDATE d SET v = 1 WHERE id = 1").await.unwrap();
+    let updating = tokio::spawn(async move {
+        let answer = client
+            .simple_query("UPDATE d SET v = v + 1 WHERE id = 1")
+            .await
+            .map(|_| ());
+        (client, answer)
+    });
+    let waiting = Arc::clone(&s.db);
+    tokio::task::spawn_blocking(move || {
+        wait_for("the UPDATE to wait for the table", || {
+            waiting.storage.debug_table_lock_waiters("d").1 > 0
+        });
+    })
+    .await
+    .unwrap();
     drop(go);
     tokio::task::spawn_blocking(move || merging.join().unwrap())
         .await
@@ -3973,31 +4018,40 @@ async fn a_commit_over_a_row_a_merge_landed_is_40001_on_the_wire() {
         .expect("the merge lands");
     s.db.storage.debug_on_merge_site(MergeFailSite::TableClaimed, None);
 
-    let err = client.simple_query("COMMIT").await.err().expect("a stale row image");
-    assert_eq!(sqlstate(&err), "40001", "{err:?}");
+    let (client, answer) = updating.await.unwrap();
+    answer.expect("it waited, then it ran");
+    client
+        .simple_query("COMMIT")
+        .await
+        .expect("no stale row image to refuse");
+    let row = client
+        .query_one("SELECT code, v FROM d WHERE id = 1", &[])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "z");
+    assert_eq!(row.get::<_, i32>(1), 101);
     let by_old = client.query("SELECT id FROM d WHERE code = 'a'", &[]).await.unwrap();
     assert!(by_old.is_empty());
     drop(client);
     task.abort();
 }
 
-/// Review item 2 (script w10). An autocommit INSERT takes a key the merge wants; a
-/// transaction then deletes that row, which takes the key out of the tree eagerly,
-/// and it rolls back. The merge saw the open writer and took nothing: it used to
-/// claim the key in between, and the rollback left two rows holding it.
+/// Review item 2 (script w10), R5.1. An open transaction deletes a row holding a key the
+/// merge wants, which takes the key out of the tree eagerly. The merge waits for it, and
+/// gives up with nothing landed; the rollback then finds its key where it left it. The
+/// merge used to claim the key in between, and the rollback left two rows holding it.
 #[test]
 fn a_rollback_around_a_merge_never_duplicates_a_key() {
     for family in FAMILIES {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         seed_two_keys_on_a_branch(&db, family);
+        short_lock_timeout(&db);
         let writer = session(&db, "writer");
-        let (merged, ()) = during_a_merge(&db, "MERGE BRANCH r INTO main", MergeFailSite::Row, 0, || {
-            db.execute("INSERT INTO d VALUES (8, 'y')").unwrap();
-            db.begin_transaction_for_session(writer).unwrap();
-            db.execute_for_session(writer, "DELETE FROM d WHERE id = 8").unwrap();
-        });
-        let err = merged.expect_err("an open writer").to_string();
-        assert!(err.contains(BRANCH_TABLE_BUSY_MARKER), "[{family:?}] {err}");
+        db.execute("INSERT INTO d VALUES (8, 'y')").unwrap();
+        db.begin_transaction_for_session(writer).unwrap();
+        db.execute_for_session(writer, "DELETE FROM d WHERE id = 8").unwrap();
+        let err = db.execute("MERGE BRANCH r INTO main").expect_err("an open writer");
+        assert_lock_timeout(&err.to_string(), "an open transaction holds it");
 
         db.rollback_transaction_for_session(writer).unwrap();
         assert_eq!(holders_of(&db, "y"), (vec![8], vec![8]), "[{family:?}]");
@@ -4018,11 +4072,13 @@ fn a_rollback_around_a_merge_never_duplicates_a_key() {
 /// Review item 3 (script w9). Rows swapping keys land as one: at no moment, before
 /// their keys are claimed or between the claim and the commit, is a key free for an
 /// INSERT to take. It used to release them all first, an INSERT got in, and the
-/// put-back failed: two rows with one key.
+/// put-back failed: two rows with one key. R5.1: the INSERT waits for the merge, and
+/// after that the key has its new owner.
 #[test]
 fn a_key_being_swapped_always_has_an_owner() {
     for site in [MergeFailSite::Row, MergeFailSite::TableClaimed] {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
+        short_lock_timeout(&db);
         db.execute("CREATE TABLE d (id INT PRIMARY KEY, code TEXT UNIQUE)")
             .unwrap();
         db.execute("INSERT INTO d VALUES (1, 'a'), (2, 'b')").unwrap();
@@ -4038,9 +4094,17 @@ fn a_key_being_swapped_always_has_an_owner() {
                 db.execute("INSERT INTO d VALUES (9, 'b')"),
             )
         });
-        assert_unique_violation(refusals.0, Family::Text, "a");
-        assert_unique_violation(refusals.1, Family::Text, "b");
+        assert_lock_timeout(
+            &refusals.0.unwrap_err().to_string(),
+            "MERGE BRANCH r INTO main holds it",
+        );
+        assert_lock_timeout(
+            &refusals.1.unwrap_err().to_string(),
+            "MERGE BRANCH r INTO main holds it",
+        );
         merged.expect("nothing stood in its way");
+        assert_unique_violation(db.execute("INSERT INTO d VALUES (9, 'a')"), Family::Text, "a");
+        assert_unique_violation(db.execute("INSERT INTO d VALUES (9, 'b')"), Family::Text, "b");
         assert_eq!(
             pairs(&db, Family::Text, "SELECT id, code FROM d ORDER BY id"),
             some_pairs(&[(1, "b"), (2, "a")]),
@@ -4082,7 +4146,9 @@ fn a_commit_that_does_not_happen_puts_every_key_back() {
     assert_eq!(dense_count(&db), 3);
 }
 
-/// A foreign holder stops the table with nothing of it landed: the keys the claim had
+/// R5.1: nothing SQL does can reach a table's keys while its merge holds it, so the
+/// claim's refusal is a fail-safe, and this test takes the key in the tree itself. A
+/// foreign holder stops the table with nothing of it landed: the keys the claim had
 /// already moved or entered go back, in every tree, and a reader never sees a row of
 /// it. Whole or not at all.
 #[test]
@@ -4098,17 +4164,29 @@ fn a_refused_table_lands_nothing_and_its_keys_go_back() {
 
     // Taken after validation, so only the claim can see it; the tree of `other` is
     // the one that refuses, whichever order the trees go in.
-    let (merged, inserted) = during_a_merge(&db, "MERGE BRANCH r INTO main", MergeFailSite::Row, 0, || {
-        db.execute("INSERT INTO d VALUES (8, 'zz', 's')")
+    let schema = db.storage.catalog().get_table_schema("d").unwrap();
+    let holder = Tuple::new(vec![
+        Value::Int4(8),
+        Value::String("zz".to_string()),
+        Value::String("s".to_string()),
+    ]);
+    let (merged, ()) = during_a_merge(&db, "MERGE BRANCH r INTO main", MergeFailSite::Row, 0, || {
+        db.storage
+            .art_indexes()
+            .reserve_insert_tuple("d", 8, &schema, &holder)
+            .unwrap();
     });
-    inserted.expect("first come");
     let err = merged.expect_err("held").to_string();
     assert!(err.contains(BRANCH_MERGE_KEY_CLAIMED_MARKER), "{err}");
 
     assert_eq!(
         ids(&rows(&db, Family::Text, "SELECT id FROM d ORDER BY id", &[])),
-        vec![1, 2, 8]
+        vec![1, 2]
     );
+    db.storage
+        .art_indexes()
+        .on_delete_tuple("d", 8, &schema, &holder)
+        .unwrap();
     // Row 1 still holds what it holds, and the keys it wanted are free again.
     assert_eq!(holders_of(&db, "a"), (vec![1], vec![1]));
     assert_eq!(holders_of(&db, "c"), (vec![], vec![]));
@@ -4124,7 +4202,7 @@ fn a_refused_table_lands_nothing_and_its_keys_go_back() {
     );
     db.execute("INSERT INTO d VALUES (20, 'c', 'r')")
         .expect("what the merge wanted is free");
-    assert_eq!(dense_count(&db), 4);
+    assert_eq!(dense_count(&db), 3);
 }
 
 /// Review item 4 (scripts w4a, w4b). A merge creates `t`, and stops in `a` before any
@@ -4145,12 +4223,12 @@ fn a_row_main_commits_to_a_created_table_survives_the_pending_merge() {
         db.execute("INSERT INTO t VALUES (100, 'b1'), (200, 'b2')").unwrap();
         db.execute("UPDATE a SET code = 'z2' WHERE id = 2").unwrap();
         db.execute("USE BRANCH main").unwrap();
-        let (merged, inserted) = during_a_merge(&db, "MERGE BRANCH r INTO main", MergeFailSite::Row, 0, || {
-            db.execute("INSERT INTO a VALUES (900, 'z2')")
-        });
-        inserted.unwrap();
-        let err = merged.expect_err("the key is held").to_string();
-        if err.contains(BRANCH_MERGE_KEY_CLAIMED_MARKER) {
+        // The merge stops before `a` lands, with `t` created. A pending merge leaves
+        // main's DML open, so a row takes the key it wants: it cannot finish at the
+        // next open.
+        db.storage.debug_fail_merge_at(MergeFailSite::Row, 0);
+        db.execute("MERGE BRANCH r INTO main").unwrap_err();
+        if db.execute("INSERT INTO a VALUES (900, 'z2')").is_ok() {
             std::process::abort();
         }
         std::process::exit(0);
@@ -4665,9 +4743,15 @@ fn a_result_cached_during_a_merge_does_not_outlive_the_table_landing() {
             .first())
     };
 
+    let zz_schema = db.storage.catalog().get_table_schema("zz").unwrap();
+    let holder = Tuple::new(vec![Value::Int4(1000), Value::String("want".to_string())]);
     let (merged, ()) = during_a_merge(&db, "MERGE BRANCH r INTO main", MergeFailSite::Row, 0, || {
-        // `aa` goes first and lands; this stops the merge at `zz`.
-        db.execute("INSERT INTO zz VALUES (1000, 'want')").unwrap();
+        // `aa` goes first and lands; this stops the merge at `zz`, as nothing SQL does
+        // can while the merge holds it (R5.1).
+        db.storage
+            .art_indexes()
+            .reserve_insert_tuple("zz", 1000, &zz_schema, &holder)
+            .unwrap();
         // The second sighting admits a result to the cache, the third reads it.
         for _ in 0..3 {
             assert_eq!(sum(), Some(0.0));
@@ -4682,15 +4766,35 @@ fn a_result_cached_during_a_merge_does_not_outlive_the_table_landing() {
 }
 
 /// Scripts w16, w17: an autocommit UPDATE racing the rewrite of an `ADD COLUMN`, in a
-/// merge and in main's own statement. The UPDATE's read-modify-write can put a narrow
-/// row back after the backfill passed it, so it reads `x IS NULL` instead of its
-/// default, and a primary-key read can fail. Pre-existing on main's own ALTER, so not
-/// the merge's to fix: R5's attmissing does away with the rewrite
-/// (`g/R5_decisions.md` item 4), and this test goes in with it.
+/// merge and in main's own statement. The UPDATE's read-modify-write could put a narrow
+/// row back after the backfill passed it, so it read `x IS NULL` instead of its
+/// default, and a primary-key read could fail. R5.1: the UPDATEs wait for the rewrite,
+/// which waits for them: every row keeps both.
 #[test]
-#[ignore = "R5 (attmissing) closes this; it fails today, as main's own ALTER does"]
 fn an_add_column_backfill_survives_autocommit_updates() {
+    /// Stops the writers on every way out of the scope joining them, an unwinding
+    /// statement included: nothing else would, and the scope would wait for ever.
+    struct StopWriters<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for StopWriters<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
     const ROWS: i32 = 3000;
+    const WRITERS_RUN_AT_MOST: Duration = Duration::from_secs(300);
+    // A statement that never returns: no flag stops that. Past this the process ends,
+    // with a message libtest cannot capture, rather than hold the build lock.
+    let (_disarm, disarmed) = mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if let Err(mpsc::RecvTimeoutError::Timeout) = disarmed.recv_timeout(Duration::from_secs(900)) {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "\nwatchdog: an_add_column_backfill_survives_autocommit_updates still running after 900 s"
+            );
+            std::process::abort();
+        }
+    });
     for through_a_merge in [true, false] {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
@@ -4708,18 +4812,29 @@ fn an_add_column_backfill_survives_autocommit_updates() {
             "ALTER TABLE t ADD COLUMN x INT DEFAULT 5"
         };
         let done = std::sync::atomic::AtomicBool::new(false);
+        let out_of_time = std::sync::atomic::AtomicBool::new(false);
+        let deadline = std::time::Instant::now() + WRITERS_RUN_AT_MOST;
         std::thread::scope(|scope| {
+            let _stop = StopWriters(&done);
             for row in [1, 500, 1000, 1500, 2000, 2500, 2999] {
-                let (db, done) = (&db, &done);
+                let (db, done, out_of_time) = (&db, &done, &out_of_time);
                 scope.spawn(move || {
                     while !done.load(Ordering::Acquire) {
+                        if std::time::Instant::now() >= deadline {
+                            out_of_time.store(true, Ordering::Release);
+                            return;
+                        }
                         let _ = db.execute(&format!("UPDATE t SET v = v + 1 WHERE id = {row}"));
                     }
                 });
             }
             db.execute(statement).unwrap();
-            done.store(true, Ordering::Release);
         });
+        assert!(
+            !out_of_time.load(Ordering::Acquire),
+            "`{statement}` had not finished after {} s beside the writers",
+            WRITERS_RUN_AT_MOST.as_secs()
+        );
         assert_eq!(
             int(rows(&db, Family::Text, "SELECT COUNT(*) FROM t WHERE x = 5", &[])[0]
                 .values

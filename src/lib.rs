@@ -348,7 +348,7 @@ pub use error::{
     BRANCH_NOT_ACTIVE_MARKER, BRANCH_SCHEMA_RUNNING_MARKER, BRANCH_SCHEMA_UNSUPPORTED_MARKER,
     BRANCH_STATEMENT_UNSUPPORTED_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER, BRANCH_TABLE_BUSY_MARKER,
     BRANCH_WRITE_UNSUPPORTED_MARKER, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE,
-    NOT_NULL_VIOLATION_MARKER, PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED,
+    NOT_NULL_VIOLATION_MARKER, PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED, TABLE_LOCK_TIMEOUT_MARKER,
 };
 pub use storage::StorageEngine;
 pub use types::{
@@ -833,6 +833,46 @@ impl Drop for GlobalTxnLockMarker {
     }
 }
 
+/// Spec R5.1: a fast path's shared lock on main's table, for as long as the returned
+/// scope lives, taken before it fetches its spec or reads a row. An error (55P03 after
+/// `[session] lock_timeout_ms`) is the statement's answer.
+macro_rules! lock_main_table_or_return {
+    ($db:expr, $table:expr) => {
+        match $db.storage.lock_main_table_for_write($table) {
+            Ok(locks) => locks,
+            Err(e) => return Some(Err(e)),
+        }
+    };
+}
+
+/// Spec R5.1: the same, for a fast path that has its spec in hand already, because the
+/// spec is what names the table. `$generation` is the schema generation read before
+/// the spec was: if a schema statement let go of a lock since, the spec may describe
+/// the table as it was, and the statement declines to the general path, which reads
+/// the schema under the lock.
+macro_rules! lock_main_table_at_generation_or_return {
+    ($db:expr, $table:expr, $generation:expr) => {{
+        let locks = lock_main_table_or_return!($db, $table);
+        if $db.storage.schema_generation() != $generation {
+            return None;
+        }
+        locks
+    }};
+}
+
+/// Spec R5.1: a schema statement clears the SQL caches before it runs, and a statement
+/// on another session can fill them from the old schema while it does. This clears
+/// them again when the statement is done, before it lets go of its table locks.
+struct PlanCachesClearedOnDrop<'a>(Option<&'a EmbeddedDatabase>);
+
+impl Drop for PlanCachesClearedOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(db) = self.0 {
+            db.invalidate_plan_cache();
+        }
+    }
+}
+
 /// RAII installer for the per-statement thread-local `search_path` override a
 /// wire session threads into planning. Clears both thread-locals on `Drop`.
 struct SessionSchemaOverrideGuard;
@@ -1020,6 +1060,18 @@ pub(crate) fn session_bulk_load_mode_tls() -> Option<bool> {
 /// for the same reason as above — this runs for every executor built.
 pub(crate) fn session_statement_timeout_tls() -> Option<u64> {
     SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().and_then(|s| s.statement_timeout_ms()))
+}
+
+/// Spec R5.1: this session's `SET lock_timeout`, if any: read when a wait for a table's
+/// writer lock begins.
+pub(crate) fn session_lock_timeout_tls() -> Option<u64> {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().and_then(|s| s.lock_timeout_ms()))
+}
+
+/// Spec R5.1: has this session's client asked to cancel the statement running on this
+/// thread? Taken. Looked at by a wait for a table's writer lock.
+pub(crate) fn session_take_cancel_request() -> bool {
+    SESSION_SCOPED_STATE.with(|c| c.borrow().as_ref().is_some_and(|s| s.take_cancel_request()))
 }
 
 /// Record the value a sequence just produced as THIS connection's `lastval()`
@@ -3083,10 +3135,11 @@ impl EmbeddedDatabase {
             | DbSettingStatement::Reset { name }
             | DbSettingStatement::Show { name } => name.as_str(),
         };
-        let name = if raw == "helios.bulk_load_mode" {
-            "bulk_load_mode"
-        } else {
-            raw
+        let name = match raw {
+            "helios.bulk_load_mode" => "bulk_load_mode",
+            // The config file's spelling, which it would be a trap to accept and ignore.
+            "lock_timeout_ms" => "lock_timeout",
+            other => other,
         };
         // `sql::is_user_settable` is registered-AND-not-server-level, so an
         // unknown name keeps falling through to whatever answered it before this
@@ -3160,7 +3213,7 @@ impl EmbeddedDatabase {
                 // is not a duration fails closed with PostgreSQL's 22023 wording,
                 // exactly as GH#28 made the idle timeouts fail.
                 let parsed = match name {
-                    "statement_timeout" | "query_timeout" => sql::SettingValue::Duration(
+                    "statement_timeout" | "query_timeout" | "lock_timeout" => sql::SettingValue::Duration(
                         crate::protocol::postgres::timeouts::parse_guc_duration_ms(value, 1).map_err(|bad| {
                             Error::query_execution(format!("invalid value for parameter \"{}\": \"{}\"", name, bad))
                         })?,
@@ -3614,10 +3667,10 @@ impl EmbeddedDatabase {
 
     /// The registry name a `SHOW` target maps to, when it is a user-settable GUC.
     fn show_guc_name(name: &str) -> Option<&'static str> {
-        let name = if name == "helios.bulk_load_mode" {
-            "bulk_load_mode"
-        } else {
-            name
+        let name = match name {
+            "helios.bulk_load_mode" => "bulk_load_mode",
+            "lock_timeout_ms" => "lock_timeout",
+            other => other,
         };
         sql::REGISTERED_PARAMETERS
             .iter()
@@ -7743,6 +7796,10 @@ impl EmbeddedDatabase {
     /// at every construction site.
     fn install_trigger_runtime(self) -> Result<Self> {
         self.load_persisted_triggers();
+        // Spec R5.1: the last step of every writable open. The writes of the open
+        // itself (recovery, index rebuilds, a pending merge's finish) ran before any
+        // statement could, so the writer-lock detector starts here.
+        self.storage.write_gate().arm_row_lock_detector();
         Ok(self)
     }
 
@@ -8256,6 +8313,7 @@ impl EmbeddedDatabase {
     /// Returns the number of rows the population inserted — 0 for
     /// `WITH NO DATA` and for an `IF NOT EXISTS` that found the table already
     /// there. The `Ok(1)`-for-DDL convention stays with plain `CreateTable`.
+    #[allow(clippy::too_many_arguments)]
     fn execute_create_table_as(
         &self,
         name: &str,
@@ -8264,6 +8322,7 @@ impl EmbeddedDatabase {
         query: &sql::LogicalPlan,
         with_data: bool,
         session_txn: Option<&storage::Transaction>,
+        params: &[Value],
     ) -> Result<u64> {
         let catalog = self.storage.catalog();
 
@@ -8315,8 +8374,9 @@ impl EmbeddedDatabase {
                 // below remains correct. DDL is non-transactional on this
                 // engine (recorded in the ACID audit); staging rows into a
                 // session txn while the CREATE is not staged would let them
-                // commit later against a table the compensating drop removed.
-                self.execute_plan_with_params(&insert, &[], None)
+                // commit later against a table the compensating drop removed. The
+                // statement's parameters go with it: the source may use them.
+                self.execute_plan_with_params(&insert, params, None)
                     .map(|(count, _returned)| count)
             });
 
@@ -9218,8 +9278,24 @@ impl EmbeddedDatabase {
         // thread-local read. B3 second fix pass: on main, a schema statement is
         // counted for its whole duration, and refused on a table an unfinished
         // merge holds.
+        //
+        // Spec R5.1: the statement's table locks, from before it reads anything it
+        // will change: its target shared, DDL exclusive. Under an explicit transaction
+        // they stay until it ends; otherwise until the statement's scope does, which
+        // `execute_with_implicit_transaction` opened around the commit.
+        let plan_may_write = Self::plan_may_write(&plan);
+        let _bound_locks = plan_may_write.then(|| txn.bind_table_locks());
+        let _statement_locks = if plan_may_write {
+            Some(self.statement_table_locks(&plan)?)
+        } else {
+            None
+        };
         let _main_ddl = self.main_ddl_statement_guard(&plan)?;
-        if let Some(rows) = self.branch_schema_ddl(&plan, Some(txn), Some(sql))? {
+        let _plan_caches = PlanCachesClearedOnDrop(Self::plan_invalidates_sql_caches(&plan).then_some(self));
+        if plan_may_write {
+            self.storage.refresh_snapshot_after_locks(txn);
+        }
+        if let Some(rows) = self.branch_schema_ddl(&plan, Some(txn), Some(sql), &[])? {
             return Ok(rows);
         }
 
@@ -9235,7 +9311,7 @@ impl EmbeddedDatabase {
                 if_not_exists,
                 query,
                 with_data,
-            } => self.execute_create_table_as(name, column_names, *if_not_exists, query, *with_data, Some(txn)),
+            } => self.execute_create_table_as(name, column_names, *if_not_exists, query, *with_data, Some(txn), &[]),
             sql::LogicalPlan::Insert {
                 table_name,
                 columns,
@@ -9570,6 +9646,14 @@ impl EmbeddedDatabase {
                                     .check_unique_constraints(table_name, &col_values_map)
                                     .map_err(|e| e.to_string()),
                             };
+                            let unique_check = self.upsert_conflict_settled(
+                                table_name,
+                                &col_values_map,
+                                on_conflict,
+                                branch_view.is_some(),
+                                txn,
+                                unique_check,
+                            )?;
                             if let Err(e) = unique_check {
                                 match on_conflict {
                                     Some(sql::logical_plan::OnConflictAction::DoNothing { conflict_target }) => {
@@ -9706,12 +9790,20 @@ impl EmbeddedDatabase {
                                         // write set, not yet flushed to storage) are visible.
                                         // Falls back to direct storage read for rows committed
                                         // before this transaction started.
+                                        //
+                                        // The row as it is, not its last version: this is written
+                                        // back. `txn.get` resolved a committed row through the
+                                        // version history, so an upsert after an `ADD COLUMN` wrote
+                                        // the pre-ALTER image over the backfill, and one after a
+                                        // fast UPDATE undid it (`get_latest`). What `data:` holds
+                                        // may be storage references, which a version made from the
+                                        // staged row was not, so they are resolved here.
                                         let existing_key =
                                             self.storage.branch_aware_data_key(table_name, existing_row_id);
                                         let mut existing_tuple: Tuple = match branch_existing {
                                             Some(row) => row,
                                             None => {
-                                                let existing_raw = match txn.get(&existing_key)? {
+                                                let existing_raw = match txn.get_latest(&existing_key)? {
                                                     Some(raw) => raw,
                                                     None => self.storage.get(&existing_key)?.ok_or_else(|| {
                                                         Error::query_execution(
@@ -9719,9 +9811,17 @@ impl EmbeddedDatabase {
                                                         )
                                                     })?,
                                                 };
-                                                bincode::deserialize(&existing_raw).map_err(|err| {
-                                                    Error::storage(format!("Failed to deserialize tuple: {}", err))
-                                                })?
+                                                let mut row: Tuple =
+                                                    bincode::deserialize(&existing_raw).map_err(|err| {
+                                                        Error::storage(format!("Failed to deserialize tuple: {}", err))
+                                                    })?;
+                                                self.storage.resolve_column_storage_refs(
+                                                    table_name,
+                                                    &schema,
+                                                    existing_row_id,
+                                                    &mut row,
+                                                )?;
+                                                row
                                             }
                                         };
                                         existing_tuple.row_id = Some(existing_row_id);
@@ -11508,8 +11608,11 @@ impl EmbeddedDatabase {
             } => {
                 let catalog = self.storage.catalog();
 
-                // Check if new table name already exists
-                if catalog.get_table_schema(new_table_name).is_ok() {
+                // Check if new table name already exists, durably (R5 decision 11):
+                // this statement holds both names, and a cache is not the store.
+                if catalog.main_table_exists(new_table_name)?
+                    || self.storage.mv_catalog().view_exists(new_table_name)?
+                {
                     return Err(Error::query_execution(format!(
                         "Table '{}' already exists",
                         new_table_name
@@ -13318,6 +13421,14 @@ impl EmbeddedDatabase {
     /// direct storage path used by literal INSERTs. This keeps PG-wire
     /// extended-protocol inserts from falling back to the slower
     /// versioned/logical-plan path on every row.
+    /// Spec R5.1: the table a parameterized INSERT fast path writes.
+    fn plan_insert_table(plan: &sql::LogicalPlan) -> Option<&str> {
+        match plan {
+            sql::LogicalPlan::Insert { table_name, .. } => Some(table_name.as_str()),
+            _ => None,
+        }
+    }
+
     fn try_autocommit_fast_insert_params(
         &self,
         sql: &str,
@@ -13342,6 +13453,8 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        // Spec R5.1: before the spec, so it is read with no schema statement running.
+        let _locks = lock_main_table_or_return!(self, Self::plan_insert_table(plan)?);
         let spec = match self.fast_param_insert_spec(sql, plan)? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
@@ -13399,6 +13512,7 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        let generation = self.storage.schema_generation();
         let spec = match self.fast_param_insert_spec(sql, plan)? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
@@ -13419,6 +13533,9 @@ impl EmbeddedDatabase {
         if txn.has_savepoints() {
             return None;
         }
+        // Spec R5.1: until this transaction ends.
+        let _bound_locks = txn.bind_table_locks();
+        let _locks = lock_main_table_at_generation_or_return!(self, &spec.table_name, generation);
         Some(self.insert_validated_tuple_in_transaction(&spec.table_name, tuple, &spec.schema, txn))
     }
 
@@ -13444,6 +13561,7 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        let generation = self.storage.schema_generation();
         let spec = match self.fast_param_insert_spec(sql, plan)? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
@@ -13470,9 +13588,14 @@ impl EmbeddedDatabase {
             if txn.has_savepoints() {
                 return None;
             }
+            // Spec R5.1: until this transaction ends.
+            let _bound_locks = txn.bind_table_locks();
+            let _locks = lock_main_table_at_generation_or_return!(self, &spec.table_name, generation);
             return Some(self.insert_validated_tuples_in_transaction(&spec.table_name, tuples, &spec.schema, txn));
         }
         drop(txn_guard);
+        // Spec R5.1: through the batch's write or commit, every branch below.
+        let _locks = lock_main_table_at_generation_or_return!(self, &spec.table_name, generation);
 
         if !self.storage.fast_dml_requires_logical_wal() && Self::fast_insert_batch_can_use_direct_write(&spec.schema) {
             let prepared = match self.prepare_fast_insert_batch(&spec.table_name, tuples, &spec.schema) {
@@ -13670,6 +13793,9 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        // Spec R5.1: COPY FROM's lock, through its one batch. COPY reaches this from the
+        // wire handler with no statement above it, off the async worker.
+        let _locks = lock_main_table_or_return!(self, table_name);
         let explicit_columns: Option<Vec<&str>> =
             (!columns.is_empty()).then(|| columns.iter().map(String::as_str).collect());
         // `fast_literal_insert_spec` resolves the schema + column indices and
@@ -14209,6 +14335,7 @@ impl EmbeddedDatabase {
             }
         }
 
+        let generation = self.storage.schema_generation();
         let spec = match self.build_fast_param_insert_spec(plan)? {
             Ok(spec) => std::sync::Arc::new(spec),
             Err(e) => return Some(Err(e)),
@@ -14216,6 +14343,14 @@ impl EmbeddedDatabase {
         if !schema_active {
             self.fast_param_insert_cache
                 .put(cache_key, std::sync::Arc::clone(&spec));
+            // Spec R5.1: the batch and global-slot INSERTs fill this before they hold the
+            // table. They decline to use what they built if a schema statement moved on
+            // meanwhile, but its last clear may have run before this insert, and the entry
+            // would then serve every later INSERT of this text the old schema: a row
+            // narrower than the table, with the backfill long done.
+            if self.storage.schema_generation() != generation {
+                self.fast_param_insert_cache.clear();
+            }
         }
         Some(Ok(spec))
     }
@@ -14533,6 +14668,8 @@ impl EmbeddedDatabase {
                 selection,
                 returning,
             } => {
+                // Spec R5.1: through the whole batch.
+                let _locks = lock_main_table_or_return!(self, table_name);
                 let spec = match self.fast_param_update_spec(sql, table_name, assignments, selection, returning)? {
                     Ok(spec) => spec,
                     Err(e) => return Some(Err(e)),
@@ -14574,6 +14711,8 @@ impl EmbeddedDatabase {
                 selection,
                 returning,
             } => {
+                // Spec R5.1: through the whole batch.
+                let _locks = lock_main_table_or_return!(self, table_name);
                 let spec = match self.fast_param_delete_spec(sql, table_name, selection, returning)? {
                     Ok(spec) => spec,
                     Err(e) => return Some(Err(e)),
@@ -14644,6 +14783,8 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        // Spec R5.1: the spec is what names the table here.
+        let generation = self.storage.schema_generation();
         let trimmed = sql.trim_start();
         let prefix = trimmed.as_bytes().get(..6)?;
         if prefix.eq_ignore_ascii_case(b"UPDATE") {
@@ -14657,6 +14798,7 @@ impl EmbeddedDatabase {
             } else {
                 self.fast_param_update_cache.get(sql)?
             };
+            let _locks = lock_main_table_at_generation_or_return!(self, &spec.table_name, generation);
             if self.tenant_manager.should_apply_rls(&spec.table_name, "UPDATE")
                 || self.trigger_registry.has_triggers_for_table(&spec.table_name)
             {
@@ -14679,6 +14821,7 @@ impl EmbeddedDatabase {
             } else {
                 self.fast_param_delete_cache.get(&cache_key)?
             };
+            let _locks = lock_main_table_at_generation_or_return!(self, &spec.table_name, generation);
             if self.tenant_manager.should_apply_rls(&spec.table_name, "DELETE")
                 || self.trigger_registry.has_triggers_for_table(&spec.table_name)
             {
@@ -14708,6 +14851,8 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        // Spec R5.1: before the spec and before the row it reads.
+        let _locks = lock_main_table_or_return!(self, table_name);
         let spec = match self.fast_param_update_spec(sql, table_name, assignments, selection, returning)? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
@@ -14906,6 +15051,8 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        // Spec R5.1: before the spec and before the row it reads.
+        let _locks = lock_main_table_or_return!(self, table_name);
         let spec = match self.fast_param_delete_spec(sql, table_name, selection, returning)? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
@@ -15522,6 +15669,9 @@ impl EmbeddedDatabase {
         // COMMIT stays `other` (W3_2_DESIGN §2.3 note 1). Inert when the census
         // is disabled.
         let _wv = write_volume::checkpoint();
+        // Spec R5.1: what this statement locks stays locked through its commit and its
+        // index undo, so this scope is declared before everything they use.
+        let _statement_locks = self.storage.table_locks().statement_scope();
         // Begin implicit transaction
         let txn_start = std::time::Instant::now();
         let txn = self.storage.begin_autocommit_transaction()?;
@@ -15598,6 +15748,21 @@ impl EmbeddedDatabase {
                 self.deferred_fk_checks.lock().clear();
                 Err(e)
             }
+        }
+    }
+
+    /// R5 decision 11: admit a plan built from the catalog as it was at `generation`,
+    /// read before the planning, unless a schema statement moved it since: a reader
+    /// that planned before a DROP and admitted after it would keep serving the dropped
+    /// table. Looked at again after the insert, for a statement that cleared the cache
+    /// in between.
+    fn plan_cache_put_if_current(&self, key: String, plan: std::sync::Arc<sql::LogicalPlan>, generation: u64) {
+        if self.storage.schema_generation() != generation {
+            return;
+        }
+        self.plan_cache.put(key, plan);
+        if self.storage.schema_generation() != generation {
+            self.plan_cache.clear();
         }
     }
 
@@ -16667,7 +16832,11 @@ impl EmbeddedDatabase {
             } => {
                 let catalog = self.storage.catalog();
 
-                if catalog.get_table_schema(new_table_name).is_ok() {
+                // Durably (R5 decision 11): this statement holds both names, and a
+                // cache is not the store.
+                if catalog.main_table_exists(new_table_name)?
+                    || self.storage.mv_catalog().view_exists(new_table_name)?
+                {
                     return Err(Error::query_execution(format!(
                         "Table '{}' already exists",
                         new_table_name
@@ -16792,6 +16961,8 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        // Spec R5.1: before the spec, so it is read with no schema statement running.
+        let _locks = lock_main_table_or_return!(self, table_name);
         let spec = match self.fast_literal_insert_spec(table_name, columns.as_deref(), None)? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
@@ -16886,6 +17057,10 @@ impl EmbeddedDatabase {
         if self.trigger_registry.has_triggers_for_table(table_name) {
             return None;
         }
+
+        // Spec R5.1: until this transaction ends.
+        let _bound_locks = txn.bind_table_locks();
+        let _locks = lock_main_table_or_return!(self, table_name);
 
         if let Some(values_str) = single_values {
             let spec = match self.fast_literal_insert_spec(table_name, explicit_columns.as_deref(), None)? {
@@ -17611,6 +17786,8 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        // Spec R5.1: before the spec and before the row it reads.
+        let _locks = lock_main_table_or_return!(self, table_name);
         let spec = match self.fast_literal_update_spec(table_name, set_col, pk_col)? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
@@ -17839,6 +18016,13 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        // Spec R5.1: before the spec and before the row it reads, into the scope both
+        // callers opened, which outlives the write.
+        let in_callers_scope = self.storage.table_locks().statement_scope();
+        if let Err(e) = in_callers_scope.lock_shared(storage::table_locks::MAIN_LEVEL, table_name) {
+            return Some(Err(e));
+        }
+        drop(in_callers_scope);
         let fk_mode = *self.fk_validation_mode.read();
         let fk_source = *self.fk_validation_source.read();
         let spec = match self.fast_literal_delete_spec(table_name, pk_col, fk_mode, fk_source)? {
@@ -17902,6 +18086,7 @@ impl EmbeddedDatabase {
     /// Fast path for simple DELETE: `DELETE FROM table WHERE pk_col = literal`.
     /// Returns None to fall through to the normal path for complex DELETE statements.
     fn try_fast_delete(&self, sql: &str, txn: &storage::Transaction) -> Option<Result<u64>> {
+        let _locks = self.storage.table_locks().statement_scope();
         let target = match self.prepare_fast_delete(sql, true)? {
             Ok(Some(target)) => target,
             Ok(None) => return Some(Ok(0)),
@@ -17969,6 +18154,7 @@ impl EmbeddedDatabase {
     }
 
     fn try_fast_delete_autocommit(&self, sql: &str) -> Option<Result<u64>> {
+        let _locks = self.storage.table_locks().statement_scope();
         let target = match self.prepare_fast_delete(sql, false)? {
             Ok(Some(target)) => target,
             Ok(None) => return Some(Ok(0)),
@@ -19586,6 +19772,7 @@ impl EmbeddedDatabase {
             return Ok(plan);
         }
 
+        let plan_generation = self.storage.schema_generation();
         let (statement, _) = self.parse_cached(sql)?;
         let catalog = self.storage.catalog();
         let planner = sql::Planner::with_catalog(&catalog)
@@ -19602,7 +19789,7 @@ impl EmbeddedDatabase {
         // would publish one connection's private target to every other
         // connection that sends the same statement text.
         if !schema_active && !self.current_schema_is_set() {
-            self.plan_cache.put(cache_key, std::sync::Arc::clone(&plan));
+            self.plan_cache_put_if_current(cache_key, std::sync::Arc::clone(&plan), plan_generation);
         }
         Ok(plan)
     }
@@ -20486,6 +20673,8 @@ impl EmbeddedDatabase {
         params: &[Value],
         original_sql: Option<&str>,
     ) -> Result<(u64, Vec<Tuple>)> {
+        // Spec R5.1: as `execute_with_implicit_transaction`.
+        let _statement_locks = self.storage.table_locks().statement_scope();
         let txn = self.storage.begin_autocommit_transaction()?;
         let _wal_capture = txn.begin_statement_wal_capture();
         // sprinter beefd0d3d069: own slot, not the shared log.
@@ -20562,8 +20751,24 @@ impl EmbeddedDatabase {
         // branch DDL gate (the text family's is in
         // `execute_in_transaction_inner_body`) — same function, same answer. So
         // is the guard on main's schema statements (B3 second fix pass).
+        //
+        // Spec R5.1: the statement's table locks, as the text family takes them: the
+        // transaction's (the session's, or this caller's global one) when there is
+        // one, otherwise the statement's own, which end when this function returns,
+        // or with the implicit transaction around it.
+        let plan_may_write = Self::plan_may_write(plan);
+        let _bound_locks = plan_may_write.then(|| self.bind_statement_transaction(session_txn));
+        let _statement_locks = if plan_may_write {
+            Some(self.statement_table_locks(plan)?)
+        } else {
+            None
+        };
         let _main_ddl = self.main_ddl_statement_guard(plan)?;
-        if let Some(rows) = self.branch_schema_ddl(plan, session_txn, original_sql)? {
+        let _plan_caches = PlanCachesClearedOnDrop(Self::plan_invalidates_sql_caches(plan).then_some(self));
+        if let Some(txn) = session_txn.filter(|_| plan_may_write) {
+            self.storage.refresh_snapshot_after_locks(txn);
+        }
+        if let Some(rows) = self.branch_schema_ddl(plan, session_txn, original_sql, params)? {
             return Ok((rows, Vec::new()));
         }
         // Session transactions manage their lifecycle through the session
@@ -21141,13 +21346,21 @@ impl EmbeddedDatabase {
                                             "ON CONFLICT DO UPDATE: existing row not found in storage",
                                         )
                                     })?;
-                                    let current: Tuple = bincode::deserialize(&existing_raw).map_err(|err| {
+                                    let mut current: Tuple = bincode::deserialize(&existing_raw).map_err(|err| {
                                         Error::storage(format!("Failed to deserialize tuple: {}", err))
                                     })?;
+                                    // What `data:` holds may be storage references, and
+                                    // this row is written back through the storage
+                                    // transform: a COLUMNAR column's reference became
+                                    // the literal '<columnar>', for good.
+                                    self.storage.resolve_column_storage_refs(
+                                        table_name,
+                                        &schema,
+                                        existing_row_id,
+                                        &mut current,
+                                    )?;
                                     // Snapshot the old tuple for the ART diff.
-                                    let pre_image: Tuple = bincode::deserialize(&existing_raw).map_err(|err| {
-                                        Error::storage(format!("Failed to deserialize tuple: {}", err))
-                                    })?;
+                                    let pre_image = current.clone();
                                     (current, pre_image)
                                 }
                             };
@@ -21356,9 +21569,12 @@ impl EmbeddedDatabase {
                 };
 
                 // Source SELECT built AFTER the transaction is resolved so it
-                // can see rows staged earlier in the same transaction (#100).
-                let mut executor =
-                    sql::Executor::with_storage(&self.storage).with_timeout(self.effective_statement_timeout_ms());
+                // can see rows staged earlier in the same transaction (#100). With
+                // the statement's parameters: without them every `$n` in the source
+                // failed "Parameter $n not provided", on every driver that binds.
+                let mut executor = sql::Executor::with_storage(&self.storage)
+                    .with_timeout(self.effective_statement_timeout_ms())
+                    .with_parameters(params.to_vec());
                 if let Some(t) = active_txn {
                     executor = executor.with_transaction(t);
                 }
@@ -21464,8 +21680,15 @@ impl EmbeddedDatabase {
                 query,
                 with_data,
             } => {
-                let count =
-                    self.execute_create_table_as(name, column_names, *if_not_exists, query, *with_data, session_txn)?;
+                let count = self.execute_create_table_as(
+                    name,
+                    column_names,
+                    *if_not_exists,
+                    query,
+                    *with_data,
+                    session_txn,
+                    params,
+                )?;
                 Ok((count, Vec::new()))
             }
             sql::LogicalPlan::Update {
@@ -22818,6 +23041,7 @@ impl EmbeddedDatabase {
 
         // Cache miss: parse, plan, optimize, cache, execute
         // 1. Parse SQL (with cache)
+        let plan_generation = self.storage.schema_generation();
         let parse_start = std::time::Instant::now();
         let (statement, _parse_cached) = self.parse_cached(sql)?;
         tracing::debug!(
@@ -22889,7 +23113,7 @@ impl EmbeddedDatabase {
         let admit = !schema_active && !is_non_deterministic && main_ddl.is_none() && self.cache_admits(sql);
         let plan_arc = std::sync::Arc::new(plan);
         if admit {
-            self.plan_cache.put(sql.to_string(), plan_arc.clone());
+            self.plan_cache_put_if_current(sql.to_string(), plan_arc.clone(), plan_generation);
         }
 
         // 5. Apply RLS policies + 6. Execute.
@@ -23074,6 +23298,7 @@ impl EmbeddedDatabase {
         let plan_arc = if let Some(cached) = self.plan_cache.get(&nsql) {
             cached
         } else {
+            let plan_generation = self.storage.schema_generation();
             let (statement, _) = match self.parse_cached(&nsql) {
                 Ok(v) => v,
                 Err(e) => return Some(Err(e)),
@@ -23093,7 +23318,7 @@ impl EmbeddedDatabase {
             };
             let plan_arc = std::sync::Arc::new(plan);
             if self.cache_admits(&nsql) {
-                self.plan_cache.put(nsql.clone(), plan_arc.clone());
+                self.plan_cache_put_if_current(nsql.clone(), plan_arc.clone(), plan_generation);
             }
             plan_arc
         };
@@ -23265,6 +23490,7 @@ impl EmbeddedDatabase {
         // aren't recognised by sqlparser; mirror the pre-detect that
         // `execute_in_transaction_inner` already does so the query path
         // produces rows instead of "Statement not yet supported".
+        let plan_generation = self.storage.schema_generation();
         let cached_plan = if schema_active { None } else { self.plan_cache.get(sql) };
         let plan = if sql::Parser::is_show_branches(sql) {
             sql::LogicalPlan::ShowBranches
@@ -23336,7 +23562,7 @@ impl EmbeddedDatabase {
         // refcount bump) rather than deep-cloning the whole LogicalPlan.
         let plan_arc = std::sync::Arc::new(plan);
         if admit && !is_show_branches {
-            self.plan_cache.put(sql.to_string(), std::sync::Arc::clone(&plan_arc));
+            self.plan_cache_put_if_current(sql.to_string(), std::sync::Arc::clone(&plan_arc), plan_generation);
         }
 
         let mut executor =
@@ -23881,7 +24107,9 @@ impl EmbeddedDatabase {
         // exactly as it was (no half-started transaction).
         self.enforce_serializable_policy(session_id, session.isolation_level)?;
 
-        // Create a real storage transaction with a FRESH snapshot
+        // Create a real storage transaction with a FRESH snapshot (spec R5.1: the
+        // schema generation first, then the snapshot).
+        let snapshot_generation = self.storage.schema_generation();
         let mut txn = storage::Transaction::new_with_session(
             self.storage.db.clone(),
             std::sync::Arc::clone(self.storage.write_gate()),
@@ -23892,6 +24120,7 @@ impl EmbeddedDatabase {
             self.lock_manager.clone(),
             self.dirty_tracker.clone(),
         )?;
+        txn.set_snapshot_generation(snapshot_generation);
         // The commit batch writes `data:`/`v:`/`counter:` straight to RocksDB,
         // so it seals them itself (see `Transaction::key_manager`).
         txn.set_key_manager(self.storage.key_manager_arc());
@@ -23910,6 +24139,8 @@ impl EmbeddedDatabase {
         // staged rows are in it (sprinter ca2bd77d03d8). The census is armed
         // only if this transaction actually writes.
         txn.set_write_census(self.storage.write_census());
+        // Spec R5.1: and it keeps its table locks across its statements.
+        txn.set_table_locks(std::sync::Arc::clone(self.storage.table_locks()));
         // P0#1: session transactions must honor time_travel_enabled too
         // (new_with_session defaults versioning on).
         txn.set_versioning_enabled(self.storage.time_travel_enabled());
@@ -24132,6 +24363,8 @@ impl EmbeddedDatabase {
             // dropped at the end of this block (after the undo on the failure
             // path, after the commit is applied on the success path).
             let _commit_hold = txn.write_census_hold();
+            // Spec R5.1: and the table locks, for the same window.
+            let _commit_locks = txn.table_locks_hold();
             if let Err(e) = txn.commit_with_timestamp(commit_ts) {
                 // Failed commit (e.g. R0.2 serialization failure) behaves
                 // like ROLLBACK: undo eager ART mutations, clear the
@@ -24322,7 +24555,9 @@ impl EmbeddedDatabase {
             // Hold the slot's write lock only briefly for the mutable refresh.
             if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
                 if let Some(txn) = slot.write().as_mut() {
+                    let generation = self.storage.schema_generation();
                     txn.refresh_snapshot(self.storage.current_timestamp());
+                    txn.set_snapshot_generation(generation);
                 }
             }
 
@@ -24338,6 +24573,12 @@ impl EmbeddedDatabase {
             // statement's failure aborts the session transaction.
             self.run_statement_in_transaction(&txn, sql, || self.execute_in_transaction_no_fast_path(sql, &txn))
         } else {
+            // Spec R5.1: as `execute_with_implicit_transaction`. This transaction has no
+            // owner of its own, so what the statement locks stays locked through its
+            // commit and its index undo only if this scope is declared before them.
+            let _statement_locks = self.storage.table_locks().statement_scope();
+            // The generation first, then the snapshot.
+            let snapshot_generation = self.storage.schema_generation();
             // Implicit transaction — skip fast paths since session-based execution
             // requires MVCC versioning for proper isolation across sessions
             let mut txn = storage::Transaction::new_with_session(
@@ -24350,6 +24591,7 @@ impl EmbeddedDatabase {
                 self.lock_manager.clone(),
                 self.dirty_tracker.clone(),
             )?;
+            txn.set_snapshot_generation(snapshot_generation);
             // The commit batch writes `data:`/`v:`/`counter:` straight to
             // RocksDB, so it seals them itself (see `Transaction::key_manager`).
             txn.set_key_manager(self.storage.key_manager_arc());
@@ -24503,7 +24745,9 @@ impl EmbeddedDatabase {
             // Hold the slot's write lock only briefly for the mutable refresh.
             if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
                 if let Some(txn) = slot.write().as_mut() {
+                    let generation = self.storage.schema_generation();
                     txn.refresh_snapshot(self.storage.current_timestamp());
+                    txn.set_snapshot_generation(generation);
                 }
             }
 
@@ -24934,6 +25178,18 @@ impl EmbeddedDatabase {
         let session_lock = self.session_manager.get_session(session_id)?;
         let pid = session_lock.read().scoped.backend_pid();
         Ok(pid)
+    }
+
+    /// Spec R5.1: arm this session for cancel requests with the key its client was
+    /// told. What comes back is what its handler clears with each message it reads.
+    pub(crate) fn arm_session_cancel(
+        &self,
+        session_id: crate::session::SessionId,
+        secret: i32,
+    ) -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+        let session_lock = self.session_manager.get_session(session_id)?;
+        let flag = session_lock.read().scoped.arm_cancel(secret);
+        Ok(flag)
     }
 
     /// Read this session's login role/username (default `None`).
@@ -25390,7 +25646,9 @@ impl EmbeddedDatabase {
         if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
             if let Some(slot) = self.session_txn_slot(session_id) {
                 if let Some(txn) = slot.write().as_mut() {
+                    let generation = self.storage.schema_generation();
                     txn.refresh_snapshot(self.storage.current_timestamp());
+                    txn.set_snapshot_generation(generation);
                 }
             }
         }
@@ -26419,6 +26677,10 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        // Spec R5.1: until this transaction ends, and before the spec.
+        let table = Self::plan_insert_table(plan)?;
+        let _bound_locks = txn.bind_table_locks();
+        let _locks = lock_main_table_or_return!(self, table);
         let spec = match self.fast_param_insert_spec(sql, plan)? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
@@ -27170,6 +27432,8 @@ impl EmbeddedDatabase {
         // binding whose branch was dropped is refused before the first row.
         let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
         let _branch_scope = self.enter_branch_statement()?;
+        // Spec R5.1: below every statement funnel, so this is its own lock.
+        let _locks = self.storage.lock_table_for_write(table_name)?;
         // sprinter 6bc4a4040eb7 (B2): on a branch each row goes through the
         // branch view (PRIMARY KEY / UNIQUE over the branch's rows, written at
         // once like main's rows here). The pre-B2 body checked MAIN's ART and
@@ -28870,6 +29134,9 @@ impl EmbeddedDatabase {
         active_txn: Option<&storage::Transaction>,
         in_explicit_txn: bool,
     ) -> Result<()> {
+        // Spec R5.1: a cascade writes the child, reached here, before it reads it. In
+        // the statement's scope, or the transaction's when one is bound.
+        let _locks = self.storage.lock_table_for_write(table_name)?;
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
         // sprinter 6bc4a4040eb7 (B2 fix pass): the parent's key values in the
@@ -29061,6 +29328,8 @@ impl EmbeddedDatabase {
         active_txn: Option<&storage::Transaction>,
         in_explicit_txn: bool,
     ) -> Result<()> {
+        // Spec R5.1: as `cascade_delete_referencing_rows`.
+        let _locks = self.storage.lock_table_for_write(table_name)?;
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
         // B2 fix pass: the parent's values in the child columns' types — see
@@ -29378,6 +29647,88 @@ impl EmbeddedDatabase {
             }
         }
         Ok(())
+    }
+
+    /// Spec R5.1: an `ON CONFLICT DO UPDATE` is about to update the row the index names,
+    /// and that row may have gone: a statement deleting it takes the row out before its
+    /// index entry, and another's uncommitted insert has its entry before its row. Then
+    /// there is nothing to update yet. Look again, a few times over a few milliseconds:
+    /// the key is free, and this row is an insert, or the row has landed, and it is an
+    /// update. Past that the DO UPDATE reports the row missing, as it would have.
+    /// Returns the verdict to go on; one probe of the store, and only on a conflict.
+    fn upsert_conflict_settled(
+        &self,
+        table_name: &str,
+        col_values: &std::collections::HashMap<String, Value>,
+        on_conflict: &Option<sql::logical_plan::OnConflictAction>,
+        on_branch: bool,
+        txn: &storage::Transaction,
+        mut verdict: std::result::Result<(), String>,
+    ) -> Result<std::result::Result<(), String>> {
+        const LOOKS: u32 = 20;
+        const BETWEEN_LOOKS: std::time::Duration = std::time::Duration::from_millis(1);
+        let Some(sql::logical_plan::OnConflictAction::DoUpdate { conflict_target, .. }) = on_conflict else {
+            return Ok(verdict);
+        };
+        if on_branch {
+            return Ok(verdict);
+        }
+        for _ in 0..LOOKS {
+            if verdict.is_ok() {
+                break;
+            }
+            let Some(conflict) =
+                self.storage
+                    .art_indexes()
+                    .find_unique_conflict(table_name, col_values, conflict_target.as_deref())
+            else {
+                break;
+            };
+            let key = self.storage.branch_aware_data_key(table_name, conflict.row_id);
+            if txn.get_latest(&key)?.is_some() || self.storage.get(&key)?.is_some() {
+                break;
+            }
+            std::thread::sleep(BETWEEN_LOOKS);
+            verdict = self
+                .storage
+                .art_indexes()
+                .check_unique_constraints(table_name, col_values)
+                .map_err(|e| e.to_string());
+        }
+        Ok(verdict)
+    }
+
+    /// Spec R5.1: the tables a DELETE on `table_name` writes through its foreign keys'
+    /// ON DELETE CASCADE and SET NULL, as far as they reach, without `table_name` itself.
+    ///
+    /// The params family commits each child's cascade on its own, so a child found held
+    /// half way would fail the statement after an earlier child's rows had gone: a 55P03
+    /// that has to mean "it changed nothing", so the statement takes them all before it
+    /// begins. A cascade one level deep is all the engine runs today; going on down the
+    /// chain costs nothing unless a table has such a chain, and only over-locks then.
+    pub(crate) fn cascade_lock_tables(&self, table_name: &str) -> Result<Vec<String>> {
+        if *self.fk_validation_mode.read() == FkValidationMode::Off
+            || *self.fk_validation_source.read() == FkValidationSource::Proxy
+        {
+            return Ok(Vec::new());
+        }
+        let catalog = self.storage.catalog();
+        let mut found: Vec<String> = Vec::new();
+        let mut to_look_at = vec![table_name.to_string()];
+        while let Some(parent) = to_look_at.pop() {
+            for fk in catalog.get_referencing_fks(&parent)? {
+                let writes_child = fk.enforcement == sql::ConstraintEnforcement::Immediate
+                    && matches!(
+                        fk.on_delete,
+                        sql::constraints::ReferentialAction::Cascade | sql::constraints::ReferentialAction::SetNull
+                    );
+                if writes_child && fk.table_name != table_name && !found.contains(&fk.table_name) {
+                    found.push(fk.table_name.clone());
+                    to_look_at.push(fk.table_name);
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Is the unique conflict a row provokes on the constraint the
@@ -31248,6 +31599,8 @@ impl Transaction<'_> {
             self.tx.written_data_keys()
         };
         let commit_ts = self.db.storage.next_commit_timestamp(self.tx.has_tracked_writes());
+        // Spec R5.1: nobody else in the table until the undo below has run.
+        let _commit_locks = self.tx.table_locks_hold();
         if let Err(e) = self.tx.commit_with_timestamp(commit_ts) {
             // A failed commit behaves like ROLLBACK — the transaction is
             // consumed either way, and its eager ART mutations are still in the
@@ -43960,11 +44313,14 @@ mod tests {
         let first = db.query_in_session(a, "SELECT * FROM fw", &[]).unwrap();
         assert_eq!(first[0].values[1], Value::Int4(100));
 
-        // Simulate the autocommit fast-UPDATE storage write while A is open.
+        // Simulate the autocommit fast-UPDATE storage write while A is open, with the
+        // table lock its statement takes (spec R5.1).
         let new_tuple = Tuple::new(vec![Value::Int4(1), Value::Int4(999)]);
+        let locks = db.storage.lock_main_table_for_write("fw").unwrap();
         db.storage
             .update_tuple_fast_no_index("fw", row_id, new_tuple, &schema, None)
             .unwrap();
+        drop(locks);
 
         // Snapshot isolation: A must still resolve the pre-update value.
         let second = db.query_in_session(a, "SELECT * FROM fw", &[]).unwrap();

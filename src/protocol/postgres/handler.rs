@@ -572,6 +572,10 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     /// the registry sees this session gone, the database it held is released
     /// (spec P5.2 §8.A — a promotion waits for exactly that).
     session_ticket: Option<super::sessions::SessionTicket>,
+    /// Spec R5.1: a cancel request arrived for this connection (`None` until the client
+    /// has been told its key). Cleared with each message read: a cancel that finds no
+    /// statement running does nothing.
+    cancel_requested: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Spec P5.2 §1-§2: the FATAL 57P01 this session owes — a pushed
     /// termination, or its own close after answering `pg_promote` — sent once
     /// its current message cycle is over (at the next ReadyForQuery), or at
@@ -717,6 +721,7 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             tls_kx_group: None,
             admitted_after_fence: crate::standby_posture::is_fenced(),
             session_ticket: None,
+            cancel_requested: None,
             terminating: None,
         }
     }
@@ -752,6 +757,7 @@ impl PgConnectionHandler<BufWriter<UnixStream>> {
             tls_kx_group: None,
             admitted_after_fence: crate::standby_posture::is_fenced(),
             session_ticket: None,
+            cancel_requested: None,
             terminating: None,
         }
     }
@@ -851,6 +857,7 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             tls_kx_group: None,
             admitted_after_fence: crate::standby_posture::is_fenced(),
             session_ticket: None,
+            cancel_requested: None,
             terminating: None,
         }
     }
@@ -872,6 +879,7 @@ where
             tls_kx_group: None,
             admitted_after_fence: crate::standby_posture::is_fenced(),
             session_ticket: None,
+            cancel_requested: None,
             terminating: None,
             session_id: database
                 .create_wire_session("pg_wire_test")
@@ -1139,6 +1147,9 @@ where
             match outcome {
                 Ok(ReadOutcome::Message(msg)) => {
                     tracing::debug!("Received message: {:?}", msg);
+                    if let Some(cancel) = &self.cancel_requested {
+                        cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
                     // Only the six messages that legitimately precede a `Sync`
                     // leave the session mid-pipeline. Everything else — `Query`,
                     // `Sync`, `Terminate`, and any message that has no business
@@ -1383,6 +1394,23 @@ where
                 .await
                 .map_err(|e| Error::network(format!("Failed to read startup message: {}", e)))?;
             self.buffer.extend_from_slice(&remaining_buf);
+        }
+
+        // Spec R5.1: a CancelRequest that came through TLS (the clear one is served in
+        // `PgServer::negotiate`). Nothing more is asked of this connection.
+        if len == 16 && self.buffer.len() >= 16 {
+            let word = |at: usize| {
+                i32::from_be_bytes([
+                    self.buffer[at],
+                    self.buffer[at + 1],
+                    self.buffer[at + 2],
+                    self.buffer[at + 3],
+                ])
+            };
+            if word(4) == super::ssl::CANCEL_REQUEST_CODE {
+                crate::session::scoped::request_cancel(word(8), word(12));
+                return Err(Error::network("a cancel request: nothing more to do").into());
+            }
         }
 
         // Parse startup message
@@ -1747,14 +1775,16 @@ where
             // identical for every connection in this process, which makes the
             // key useless for identifying a backend (and would contradict
             // `pg_backend_pid()` / `pg_stat_activity.pid` now that those are
-            // per-connection). Nothing in this server routes CancelRequest by
-            // it, so there is no compatibility cost to reporting the truth.
+            // per-connection). Spec R5.1: and `request_cancel` finds the backend by
+            // it: a CancelRequest reaches a statement waiting for a table lock.
+            let secret_key: i32 = rand::random();
+            self.cancel_requested = self.database.arm_session_cancel(self.session_id, secret_key).ok();
             self.send_message(BackendMessage::BackendKeyData {
                 process_id: self
                     .database
                     .session_backend_pid(self.session_id)
                     .unwrap_or_else(|_| std::process::id() as i32),
-                secret_key: rand::random(),
+                secret_key,
             })
             .await?;
 
@@ -4042,7 +4072,10 @@ where
                 self.send_ready_for_query().await
             }
             Err(e) => {
-                self.send_error("ERROR", "XX000", &format!("COPY insert failed: {e}"), None, None)
+                // Spec R5.1: the same SQLSTATE as anywhere else: a client retrying on 55P03
+                // or 40001 has to recognise it here too.
+                let code = sqlstate_for_error(&e);
+                self.send_error("ERROR", code, &format!("COPY insert failed: {e}"), None, None)
                     .await
             }
         }
@@ -6789,6 +6822,12 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     if message.contains(crate::error::PRIMARY_FENCED_WRITE_REFUSED) {
         return sqlstate::READ_ONLY_SQL_TRANSACTION; // 25006
     }
+    // Spec R5.1: a table's writer lock not obtained in time. PostgreSQL's own class for
+    // `lock_timeout`. Anchored on the emitters' const and checked early: the message
+    // names the table and the statement holding it, which are free text.
+    if message.contains(crate::error::TABLE_LOCK_TIMEOUT_MARKER) {
+        return sqlstate::LOCK_NOT_AVAILABLE; // 55P03
+    }
     // sprinter d03de7fc3b22: a tenant that has spent its `max_qps` budget (or its
     // `max_storage_bytes`) is OUT OF A RESOURCE, not broken. PostgreSQL has no
     // exact per-tenant equivalent; 53400 `configuration_limit_exceeded` is the
@@ -7312,6 +7351,7 @@ mod failed_transaction_state_tests {
                 tls_kx_group: None,
                 admitted_after_fence: crate::standby_posture::is_fenced(),
                 session_ticket: None,
+                cancel_requested: None,
                 terminating: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")
@@ -7410,6 +7450,7 @@ mod show_branches_wire_tests {
                 tls_kx_group: None,
                 admitted_after_fence: crate::standby_posture::is_fenced(),
                 session_ticket: None,
+                cancel_requested: None,
                 terminating: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")
@@ -8047,6 +8088,7 @@ mod md5_auth_wire_tests {
                 tls_kx_group: None,
                 admitted_after_fence: crate::standby_posture::is_fenced(),
                 session_ticket: None,
+                cancel_requested: None,
                 terminating: None,
                 session_id: db
                     .create_wire_session("pg_wire_test")

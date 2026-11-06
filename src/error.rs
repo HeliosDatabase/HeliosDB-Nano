@@ -282,6 +282,12 @@ pub const BRANCH_SCHEMA_RUNNING_MARKER: &str = "is running a schema statement";
 /// table there ([`Error::branch_table_busy`]). SQLSTATE 55006.
 pub const BRANCH_TABLE_BUSY_MARKER: &str = "has uncommitted writes in another transaction";
 
+/// Spec R5.1: the marker of a statement that could not get a table's writer lock
+/// within `[session] lock_timeout_ms` ([`Error::table_lock_timeout`]), or that could
+/// not upgrade to it ([`Error::table_lock_upgrade_refused`]). Nothing it would have
+/// changed in the table has changed; retry. SQLSTATE 55P03.
+pub const TABLE_LOCK_TIMEOUT_MARKER: &str = "could not obtain lock on table";
+
 /// Database error type
 ///
 /// All errors from HeliosDB Lite operations are represented by this enum.
@@ -662,6 +668,38 @@ impl Error {
             "MERGE BRANCH {source} INTO {target}: the rows it changed in table {table} need {bytes} bytes, \
              {BRANCH_MATERIALIZE_TOO_LARGE_MARKER} (the limit is {limit}): nothing was changed; copy those rows to \
              {target} in smaller transactions, or change fewer of them per branch"
+        ))
+    }
+
+    /// Spec R5.1: this statement waited `waited` for `table`'s writer lock and gave
+    /// up. `holder` says what it is behind ("an open transaction holds it", "ALTER
+    /// TABLE … ADD COLUMN holds it"). SQLSTATE 55P03.
+    pub fn table_lock_timeout(table: &str, holder: &str, waited: std::time::Duration) -> Self {
+        Error::QueryExecution(format!(
+            "{TABLE_LOCK_TIMEOUT_MARKER} {table}: {holder} (waited {} ms; SET lock_timeout or [session] \
+             lock_timeout_ms bounds this): retry when it has finished",
+            waited.as_millis()
+        ))
+    }
+
+    /// Spec R5.1: this owner holds `table` shared and wants it exclusively, in a case
+    /// where waiting is certain to deadlock, and `holder` says why: another owner is
+    /// already waiting to upgrade it, or the merge landing beside this transaction would
+    /// be waiting for the transaction it runs in. Refused at once. SQLSTATE 55P03.
+    pub fn table_lock_upgrade_refused(table: &str, holder: &str) -> Self {
+        Error::QueryExecution(format!(
+            "{TABLE_LOCK_TIMEOUT_MARKER} {table}: {holder}, and this transaction already holds the table shared: \
+             COMMIT or ROLLBACK, then retry"
+        ))
+    }
+
+    /// Spec R5.1: this statement would have to wait for `table`, and `waiters` are
+    /// waiting already, each pinning a thread the server needs for the statements that
+    /// would free them. Refused at once. SQLSTATE 55P03.
+    pub fn table_lock_too_many_waiters(table: &str, waiters: usize) -> Self {
+        Error::QueryExecution(format!(
+            "{TABLE_LOCK_TIMEOUT_MARKER} {table}: {waiters} statements are already waiting for table locks, the most \
+             this server lets wait: retry when they have finished"
         ))
     }
 

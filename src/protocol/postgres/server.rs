@@ -366,7 +366,7 @@ impl PgServer {
     ) -> Result<()> {
         let auth_deadline = policy.auth_deadline;
         let negotiate = Self::negotiate(stream, database, auth_manager, ssl_negotiator, policy);
-        let mut handler = match auth_deadline {
+        let negotiated = match auth_deadline {
             Some(at) => match tokio::time::timeout_at(at, negotiate).await {
                 Ok(negotiated) => negotiated?,
                 Err(_elapsed) => {
@@ -377,20 +377,25 @@ impl PgServer {
             },
             None => negotiate.await?,
         };
+        // A cancel request: done, and the connection ends with no answer.
+        let Some(mut handler) = negotiated else {
+            return Ok(());
+        };
         handler.attach_session_ticket(ticket);
         handler.handle().await
     }
 
     /// Pre-startup negotiation: read the 8-byte request header, answer /
     /// perform SSL, and build the handler for the resulting stream (plain or
-    /// TLS). All three outcomes yield the same handler type.
+    /// TLS). All three outcomes yield the same handler type. `None`: it was a cancel
+    /// request, which is served here and asks for nothing more.
     async fn negotiate(
         mut stream: TcpStream,
         database: Arc<EmbeddedDatabase>,
         auth_manager: Arc<AuthManager>,
         ssl_negotiator: Option<Arc<SslNegotiator>>,
         policy: ConnectionPolicy,
-    ) -> Result<PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>>> {
+    ) -> Result<Option<PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>>>> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Read message length
@@ -408,6 +413,21 @@ impl PgServer {
             .map_err(|e| Error::network(format!("Failed to read request code: {}", e)))?;
 
         let code = i32::from_be_bytes(code_buf);
+        // Spec R5.1: PostgreSQL's cancel, ahead of everything a real connection is asked:
+        // a client sends it in the clear on a connection of its own, and is told nothing.
+        // What it reaches is a wait for a table lock (`storage::table_locks`).
+        if code == super::ssl::CANCEL_REQUEST_CODE {
+            let mut key = [0u8; 8];
+            stream
+                .read_exact(&mut key)
+                .await
+                .map_err(|e| Error::network(format!("Failed to read cancel request: {}", e)))?;
+            let (pid, secret) = key.split_at(4);
+            if let (Ok(pid), Ok(secret)) = (<[u8; 4]>::try_from(pid), <[u8; 4]>::try_from(secret)) {
+                crate::session::scoped::request_cancel(i32::from_be_bytes(pid), i32::from_be_bytes(secret));
+            }
+            return Ok(None);
+        }
         let is_ssl_request = code == super::ssl::SSL_REQUEST_CODE;
 
         // Handle SSL negotiation based on configuration
@@ -446,7 +466,7 @@ impl PgServer {
                             auth_manager,
                             None, // TLS stream starts fresh
                         );
-                        return Ok(handler.with_connection_policy(policy).with_tls_kx_group(kx_group));
+                        return Ok(Some(handler.with_connection_policy(policy).with_tls_kx_group(kx_group)));
                     }
                 } else if negotiator.is_required() {
                     return Err(Error::network("SSL is required but was rejected"));
@@ -471,7 +491,7 @@ impl PgServer {
             // So initial_data should be None for the handler.
             let secure_conn = SecureConnection::Plain(stream);
             let handler = PgConnectionHandler::new_with_stream(secure_conn, database, auth_manager, None);
-            return Ok(handler.with_connection_policy(policy));
+            return Ok(Some(handler.with_connection_policy(policy)));
         }
 
         // Plain connection with potentially consumed startup header
@@ -481,7 +501,7 @@ impl PgServer {
 
         let secure_conn = SecureConnection::Plain(stream);
         let handler = PgConnectionHandler::new_with_stream(secure_conn, database, auth_manager, Some(&initial_data));
-        Ok(handler.with_connection_policy(policy))
+        Ok(Some(handler.with_connection_policy(policy)))
     }
 
     /// Get server configuration

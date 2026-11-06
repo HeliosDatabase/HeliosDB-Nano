@@ -422,10 +422,14 @@ Branches can also fork from a past point in time:
 > statement lists the tables that may be partially changed. Nothing undoes what the merge already did to
 > them.
 >
-> A merge does not duplicate a key. A statement on `main` that takes a merged key first stops the
-> merge (`55006`: run it again once that is resolved); one that comes after gets its ordinary `23505`.
-> A transaction that read a row before the merge and commits a change to it after gets a serialization
-> failure (`40001`), at any isolation level.
+> A merge does not duplicate a key, and writers do not race it. It holds each table it changes
+> exclusively, as `ALTER TABLE` does: a statement writing such a table waits for it and then runs against
+> what landed (an `INSERT` of a merged key gets its ordinary `23505`), and the merge waits for the writers
+> already there, including an open transaction. Readers never wait. `[session] lock_timeout_ms` (default
+> 30000) or a session's `SET lock_timeout` bounds every wait: after it, `55P03` naming what holds the table,
+> with nothing changed. A
+> `REPEATABLE READ` transaction keeps its snapshot, and if the merge changed a row it writes, its `COMMIT`
+> gets a serialization failure (`40001`).
 >
 > Schema statements on a branch (`CREATE TABLE`, `DROP TABLE`, `ADD COLUMN`) are refused
 > with `0A000` while the branch has live descendants, and with `55006` while another

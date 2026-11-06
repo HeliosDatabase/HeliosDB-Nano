@@ -72,6 +72,10 @@ pub struct WriteGate {
     fence_reason: OnceLock<String>,
     /// Writes past the gate whose RocksDB call has not returned yet.
     in_flight: AtomicU64,
+    /// Spec R5.1: whether this gate's writes answer to the writer-lock detector
+    /// (`storage::table_locks`): set when an `EmbeddedDatabase`'s open is done, so
+    /// the open's own writes, and a component driven on a gate of its own, do not.
+    row_lock_detector: AtomicBool,
 }
 
 /// A write past the gate, until its RocksDB call returned.
@@ -91,6 +95,7 @@ impl WriteGate {
             fenced: AtomicBool::new(false),
             fence_reason: OnceLock::new(),
             in_flight: AtomicU64::new(0),
+            row_lock_detector: AtomicBool::new(false),
         })
     }
 
@@ -203,17 +208,27 @@ impl WriteGate {
         Ok(slot)
     }
 
+    /// Spec R5.1: this database's statements are running from now on, so a row write
+    /// with no lock on its table is a missed path.
+    pub(crate) fn arm_row_lock_detector(&self) {
+        self.row_lock_detector.store(true, Ordering::Relaxed);
+    }
+
     /// `DB::write` / `DB::write_opt` behind the gate.
     ///
     /// A batch with no operations changes nothing, so on a closed gate it is a
     /// no-op rather than a refusal: a read-only transaction's COMMIT applies an
     /// empty batch, and that is not an attempt to write. On an open gate it is
     /// handed to RocksDB unchanged, exactly as before the gate existed.
+    #[track_caller]
     pub fn write(&self, db: &DB, batch: WriteBatch, opts: Option<&WriteOptions>) -> Result<()> {
         if batch.is_empty() && !self.is_open() {
             return Ok(());
         }
         let _slot = self.admit()?;
+        if super::table_locks::detector_active(&self.row_lock_detector) {
+            super::table_locks::check_row_batch(&batch, std::panic::Location::caller());
+        }
         match opts {
             Some(opts) => db.write_opt(batch, opts),
             None => db.write(batch),
@@ -222,12 +237,16 @@ impl WriteGate {
     }
 
     /// `DB::put` / `DB::put_opt` behind the gate.
+    #[track_caller]
     pub fn put<K, V>(&self, db: &DB, key: K, value: V, opts: Option<&WriteOptions>) -> Result<()>
     where
         K: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
         let _slot = self.admit()?;
+        if super::table_locks::detector_active(&self.row_lock_detector) {
+            super::table_locks::check_row_key(key.as_ref(), std::panic::Location::caller());
+        }
         match opts {
             Some(opts) => db.put_opt(key, value, opts),
             None => db.put(key, value),
@@ -236,8 +255,12 @@ impl WriteGate {
     }
 
     /// `DB::delete` / `DB::delete_opt` behind the gate.
+    #[track_caller]
     pub fn delete<K: AsRef<[u8]>>(&self, db: &DB, key: K, opts: Option<&WriteOptions>) -> Result<()> {
         let _slot = self.admit()?;
+        if super::table_locks::detector_active(&self.row_lock_detector) {
+            super::table_locks::check_row_key(key.as_ref(), std::panic::Location::caller());
+        }
         match opts {
             Some(opts) => db.delete_opt(key, opts),
             None => db.delete(key),

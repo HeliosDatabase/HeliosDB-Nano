@@ -305,8 +305,14 @@ impl ApiServer {
             .layer(CompressionLayer::new())
             .layer(cors);
 
+        // Spec R5.1: past the auth below, so a request that will be refused holds nothing.
+        let in_flight = Arc::new(tokio::sync::Semaphore::new(MAX_REST_STATEMENTS_IN_FLIGHT));
+
         // Build protected v1 routes (require authentication)
-        let v1_router = routes::v1_routes();
+        let admitted = Arc::clone(&in_flight);
+        let v1_router = routes::v1_routes().layer(axum::middleware::from_fn(move |req, next| {
+            admit_statement(Arc::clone(&admitted), req, next)
+        }));
 
         // Apply authentication middleware if configured
         let v1_router = if let Some(auth) = &self.auth_middleware {
@@ -366,7 +372,9 @@ impl ApiServer {
         };
 
         // Build PostgREST-compatible REST routes
-        let rest_router = routes::rest::routes();
+        let rest_router = routes::rest::routes().layer(axum::middleware::from_fn(move |req, next| {
+            admit_statement(Arc::clone(&in_flight), req, next)
+        }));
 
         // Build auth routes (public - no auth middleware required)
         use super::handlers::{auth_handler, oauth_handler};
@@ -498,6 +506,23 @@ impl ApiServer {
 }
 
 /// Health check endpoint
+/// The most REST requests that run at once; the rest queue here, holding no thread.
+///
+/// Spec R5.1: a statement pins a thread of Tokio's blocking pool for its whole length (512
+/// threads by default), and when the pool is full a worker's core cannot be handed over: the
+/// whole server stops answering, a COMMIT that would free them included. A PostgreSQL
+/// connection is bounded by `max_connections` (100 by default), and REST by nothing else. So:
+/// [`crate::storage::table_locks::MAX_LOCK_WAITERS`] waiting, which refuses the next with 409,
+/// plus 128 running, and with 100 connections on top the pool still has room.
+const MAX_REST_STATEMENTS_IN_FLIGHT: usize = 384;
+
+/// See [`MAX_REST_STATEMENTS_IN_FLIGHT`].
+async fn admit_statement(in_flight: Arc<tokio::sync::Semaphore>, req: Request, next: Next) -> axum::response::Response {
+    // Fails only on a closed semaphore, and nothing closes this one.
+    let _permit = in_flight.acquire_owned().await.ok();
+    next.run(req).await
+}
+
 async fn health_check() -> axum::Json<serde_json::Value> {
     // `{"status":"ok"}`, NOT the plain string "OK".
     //

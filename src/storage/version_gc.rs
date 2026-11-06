@@ -362,6 +362,11 @@ impl VersionGc {
     /// `horizon` (plus its `v_idx:` twin). Bounded by
     /// `max_versions_per_cycle` deletions / a scan budget.
     fn collect_below(&self, horizon: u64) -> Result<VersionGcCycleStats> {
+        // Spec R5.1, the detector's allow-list: this deletes history below every
+        // pinned snapshot, never a row and never a version a reader or a DDL's rewrite
+        // can still need, so a schema statement beside it has nothing to lose. Taking
+        // the lock would make GC wait for DDL, and DDL for GC, for no reason.
+        let _allowed = super::table_locks::allow_unlocked_row_writes("version GC");
         let mut stats = VersionGcCycleStats::default();
         let max_deletes = self.config.max_versions_per_cycle.max(1);
         let scan_budget = max_deletes.saturating_mul(SCAN_BOUND_FACTOR).max(65_536);
