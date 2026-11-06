@@ -5,6 +5,7 @@
 
 #![allow(unused_variables)]
 
+use super::branch_freeze::BranchFreeze;
 use super::write_gate::WriteGate;
 use super::{Key, Transaction};
 use crate::{Error, Result};
@@ -12,7 +13,7 @@ use parking_lot::RwLock;
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Snapshot identifier (timestamp-based versioning)
 pub type SnapshotId = u64;
@@ -592,36 +593,6 @@ impl Default for BranchRegistry {
     }
 }
 
-/// Branch garbage collection configuration
-#[derive(Debug, Clone)]
-pub struct BranchGcConfig {
-    /// Minimum retention period (seconds) before GC can delete branch data
-    pub min_retention_seconds: u64,
-    /// Whether to enable automatic GC on branch drop
-    pub auto_gc_enabled: bool,
-    /// GC mode: Immediate or Deferred
-    pub gc_mode: BranchGcMode,
-}
-
-impl Default for BranchGcConfig {
-    fn default() -> Self {
-        Self {
-            min_retention_seconds: 300, // 5 minutes
-            auto_gc_enabled: true,
-            gc_mode: BranchGcMode::Deferred,
-        }
-    }
-}
-
-/// Branch garbage collection mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BranchGcMode {
-    /// Immediate deletion (fast but may block)
-    Immediate,
-    /// Deferred deletion (non-blocking, GC runs later)
-    Deferred,
-}
-
 /// Branch manager - coordinates all branch operations
 pub struct BranchManager {
     /// Storage engine reference. Written only through `gate`.
@@ -639,12 +610,6 @@ pub struct BranchManager {
     /// Current timestamp generator
     timestamp: Arc<RwLock<u64>>,
 
-    /// GC configuration
-    gc_config: BranchGcConfig,
-
-    /// Pending GC queue (branch_id -> drop_timestamp)
-    pending_gc: Arc<RwLock<HashMap<BranchId, u64>>>,
-
     /// The storage boundary's key manager, or `None` when encryption is
     /// disabled. Set by the engine right after construction; see
     /// [`BranchManager::set_key_manager`].
@@ -661,12 +626,43 @@ pub struct BranchManager {
     /// close before taking a branch out of `Active`. Shared with the engine
     /// through [`BranchManager::set_branch_drains`].
     drains: Arc<BranchDrains>,
+
+    /// Sprinter 6bc4a4040eb7 (phase B4): the write gate's freeze hook, which is told
+    /// of every level that comes and goes. Set once, at a writable open.
+    freeze: OnceLock<Arc<BranchFreeze>>,
+
+    /// See [`Self::debug_catalog_listings`].
+    catalog_listings: std::sync::atomic::AtomicU64,
 }
 
+/// One batch of a level's reclaim, in keys.
+const RECLAIM_CHUNK_KEYS: usize = 10_000;
+
+/// Every family a level's keys live in. The id follows in decimal, then `:`, so
+/// `bdata:1:` never matches `bdata:12:`.
+const LEVEL_FAMILIES: [&str; 6] = ["bdata:", "bdel:", "bfrz:", "bv:", "bmeta:", "bkey:"];
+
+/// Written by the deferred binary-format GC this phase replaced, which never ran. An
+/// open deletes it; nothing reads it.
+const LEGACY_PENDING_GC_KEY: &[u8] = b"branch:pending_gc";
+
 impl BranchManager {
-    /// Create new branch manager with default GC configuration
+    /// Create new branch manager
     pub fn new(db: Arc<DB>, gate: Arc<WriteGate>, timestamp: Arc<RwLock<u64>>) -> Result<Self> {
-        Self::with_gc_config(db, gate, timestamp, BranchGcConfig::default())
+        let registry = Self::load_or_create_registry(&db, &gate)?;
+
+        Ok(Self {
+            db,
+            gate,
+            registry: Arc::new(RwLock::new(registry)),
+            metadata_cache: Arc::new(RwLock::new(HashMap::new())),
+            timestamp,
+            key_manager: None,
+            registry_generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            drains: Arc::new(BranchDrains::default()),
+            freeze: OnceLock::new(),
+            catalog_listings: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     /// Load a complete existing branch registry without creating metadata.
@@ -697,18 +693,17 @@ impl BranchManager {
             }
             metadata_cache.insert(*id, metadata);
         }
-        let pending_gc = Self::load_pending_gc(&db)?;
         Ok(Self {
             db,
             gate,
             registry: Arc::new(RwLock::new(registry)),
             metadata_cache: Arc::new(RwLock::new(metadata_cache)),
             timestamp,
-            gc_config: BranchGcConfig::default(),
-            pending_gc: Arc::new(RwLock::new(pending_gc)),
             key_manager: None,
             registry_generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
             drains: Arc::new(BranchDrains::default()),
+            freeze: OnceLock::new(),
+            catalog_listings: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -739,38 +734,34 @@ impl BranchManager {
         &self.drains
     }
 
+    /// Sprinter 6bc4a4040eb7 (B4): tell this manager of the engine's freeze hook.
+    pub(crate) fn install_freeze(&self, freeze: Arc<BranchFreeze>) {
+        let _ = self.freeze.set(freeze);
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): every level the freeze hook must know at open, as
+    /// `(id, parent, live)`: Active, or merged with an unfinished merge, which an
+    /// `ABORT` puts back, are live; a merged one stays in its descendants' chains.
+    pub(crate) fn levels_for_freeze(&self) -> Result<Vec<(BranchId, BranchId, bool)>> {
+        let main_id = self.registry.read().main_branch;
+        let unfinished = self.unfinished_merge_sources()?;
+        Ok(self
+            .list_branches_for_catalog()?
+            .into_iter()
+            .filter(|branch| branch.branch_id != main_id)
+            .map(|branch| {
+                let live = branch.state == BranchState::Active || unfinished.contains(&branch.branch_id);
+                (branch.branch_id, branch.parent_id.unwrap_or(main_id), live)
+            })
+            .collect())
+    }
+
     /// A branch just left `Active` (dropped, or merged by a writer outside
     /// this manager, e.g. the engine's MERGE): sessions bound to it must
     /// re-validate on their next statement. Called AFTER the metadata write.
     pub fn note_branch_left_active(&self) {
         self.registry_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
-
-    /// Create new branch manager with custom GC configuration
-    pub fn with_gc_config(
-        db: Arc<DB>,
-        gate: Arc<WriteGate>,
-        timestamp: Arc<RwLock<u64>>,
-        gc_config: BranchGcConfig,
-    ) -> Result<Self> {
-        let registry = Self::load_or_create_registry(&db, &gate)?;
-
-        // Load pending GC queue from storage
-        let pending_gc = Self::load_pending_gc(&db)?;
-
-        Ok(Self {
-            db,
-            gate,
-            registry: Arc::new(RwLock::new(registry)),
-            metadata_cache: Arc::new(RwLock::new(HashMap::new())),
-            timestamp,
-            gc_config,
-            pending_gc: Arc::new(RwLock::new(pending_gc)),
-            key_manager: None,
-            registry_generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            drains: Arc::new(BranchDrains::default()),
-        })
     }
 
     /// Load registry from storage or create new one (through `gate`)
@@ -824,30 +815,6 @@ impl BranchManager {
             .map_err(|e| Error::storage(format!("Failed to save registry: {}", e)))
     }
 
-    /// Load pending GC queue from storage
-    fn load_pending_gc(db: &DB) -> Result<HashMap<BranchId, u64>> {
-        const PENDING_GC_KEY: &[u8] = b"branch:pending_gc";
-
-        match db.get(PENDING_GC_KEY) {
-            Ok(Some(data)) => bincode::deserialize(&data)
-                .map_err(|e| Error::storage(format!("Failed to deserialize pending GC queue: {}", e))),
-            Ok(None) => Ok(HashMap::new()),
-            Err(e) => Err(Error::storage(format!("Failed to load pending GC queue: {}", e))),
-        }
-    }
-
-    /// Save pending GC queue to storage
-    fn save_pending_gc(&self) -> Result<()> {
-        const PENDING_GC_KEY: &[u8] = b"branch:pending_gc";
-
-        let pending = self.pending_gc.read();
-        let value = bincode::serialize(&*pending)
-            .map_err(|e| Error::storage(format!("Failed to serialize pending GC queue: {}", e)))?;
-        self.gate
-            .put(&self.db, PENDING_GC_KEY, &value, None)
-            .map_err(|e| Error::storage(format!("Failed to save pending GC queue: {}", e)))
-    }
-
     /// Create a new branch
     pub fn create_branch(
         &self,
@@ -859,6 +826,62 @@ impl BranchManager {
         self.create_branch_with(name, parent_name, snapshot_id, options, |_, _| Ok(()))
     }
 
+    /// Sprinter 6bc4a4040eb7 (B4): an id for a branch being created, durable before
+    /// anything can be written under it: the keys of a branch that never came to be
+    /// must not alias the next one's. A crash leaves them to the next open
+    /// ([`Self::reclaim_dead_levels`]).
+    pub(crate) fn reserve_branch_id(&self) -> Result<BranchId> {
+        let mut registry = self.registry.write();
+        let mut next = registry.clone();
+        let id = next.next_id();
+        let value =
+            bincode::serialize(&next).map_err(|e| Error::storage(format!("Failed to serialize registry: {}", e)))?;
+        self.gate
+            .put(&self.db, BRANCH_REGISTRY_KEY, &value, None)
+            .map_err(|e| Error::storage(format!("Failed to save registry: {}", e)))?;
+        *registry = next;
+        Ok(id)
+    }
+
+    /// Refuse a name an Active branch holds, before an id is spent on it. The create
+    /// asks again, under the registry's lock.
+    pub(crate) fn refuse_name_in_use(&self, name: &str) -> Result<()> {
+        match self.get_branch_by_name(name) {
+            Ok(previous) if previous.state == BranchState::Active => {
+                Err(Error::storage(format!("Branch '{}' already exists", name)))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Self::create_branch_with`], for the id [`Self::reserve_branch_id`] gave.
+    pub(crate) fn create_reserved_branch(
+        &self,
+        id: BranchId,
+        name: &str,
+        parent_name: Option<&str>,
+        snapshot_id: SnapshotId,
+        options: BranchOptions,
+        extra: impl FnOnce(BranchId, &mut rocksdb::WriteBatch) -> Result<()>,
+    ) -> Result<BranchId> {
+        self.create_branch_inner(Some(id), name, parent_name, snapshot_id, options, extra)
+    }
+
+    /// A branch being created will not be: the hook forgets it, and whatever it froze
+    /// into it goes. What cannot go now goes at the next open.
+    pub(crate) fn abandon_reserved_branch(&self, id: BranchId) {
+        if let Some(freeze) = self.freeze.get() {
+            freeze.remove(id);
+        }
+        if let Err(e) = self.reclaim_branch_keys(id) {
+            tracing::warn!(
+                "The keys of an abandoned branch (id {}) stay until the next open: {}",
+                id,
+                e
+            );
+        }
+    }
+
     /// [`Self::create_branch`], with `extra` adding keys to the creation batch.
     /// sprinter 6bc4a4040eb7 (B3 fix pass): the fork record of table
     /// incarnations is born with the branch, in one WriteBatch — a branch never
@@ -866,6 +889,18 @@ impl BranchManager {
     /// touch this manager.
     pub fn create_branch_with(
         &self,
+        name: &str,
+        parent_name: Option<&str>,
+        snapshot_id: SnapshotId,
+        options: BranchOptions,
+        extra: impl FnOnce(BranchId, &mut rocksdb::WriteBatch) -> Result<()>,
+    ) -> Result<BranchId> {
+        self.create_branch_inner(None, name, parent_name, snapshot_id, options, extra)
+    }
+
+    fn create_branch_inner(
+        &self,
+        reserved: Option<BranchId>,
         name: &str,
         parent_name: Option<&str>,
         snapshot_id: SnapshotId,
@@ -964,8 +999,11 @@ impl BranchManager {
             }
         }
 
-        // Allocate branch ID
-        let branch_id = next_registry.next_id();
+        // Allocate branch ID, unless the engine reserved it already.
+        let branch_id = match reserved {
+            Some(id) => id,
+            None => next_registry.next_id(),
+        };
         next_registry.add_branch(branch_id, name.to_string());
         if let Some(parent_id) = parent_id {
             let mut children = match children_updates.remove(&parent_id) {
@@ -1024,6 +1062,12 @@ impl BranchManager {
             cache.remove(&predecessor);
         }
         cache.insert(branch_id, metadata);
+        drop(cache);
+        // Sprinter 6bc4a4040eb7 (B4): a create with no engine in front of it (a
+        // webhook with none attached); the engine's registered it first.
+        if let (Some(freeze), Some(parent)) = (self.freeze.get(), parent_id) {
+            freeze.note_published(branch_id, parent);
+        }
 
         Ok(branch_id)
     }
@@ -1032,7 +1076,7 @@ impl BranchManager {
     /// a branch an unfinished MERGE BRANCH still needs: its source holds the rows
     /// the resume copies, its target receives them. Here, in the manager, so
     /// every surface is covered (SQL, the REST routes, the webhooks).
-    fn refuse_if_in_unfinished_merge(&self, branch_id: BranchId, name: &str) -> Result<()> {
+    pub(crate) fn refuse_if_in_unfinished_merge(&self, branch_id: BranchId, name: &str) -> Result<()> {
         let prefix = super::branch_catalog::BRANCH_MERGE_INTENT_PREFIX.as_bytes();
         let mut read_opts = rocksdb::ReadOptions::default();
         read_opts.set_total_order_seek(true);
@@ -1058,6 +1102,27 @@ impl BranchManager {
         Ok(())
     }
 
+    /// The sources of the unfinished merges of this store.
+    fn unfinished_merge_sources(&self) -> Result<HashSet<BranchId>> {
+        let prefix = super::branch_catalog::BRANCH_MERGE_INTENT_PREFIX.as_bytes();
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            read_opts,
+        );
+        let mut sources = HashSet::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let plain = super::tde::open_ref(self.key_manager.as_deref(), &key, &value)?;
+            sources.insert(super::branch_catalog::MergeIntent::decode(&plain)?.source_id);
+        }
+        Ok(sources)
+    }
+
     /// Drop a branch
     pub fn drop_branch(&self, name: &str, if_exists: bool) -> Result<()> {
         // Get branch metadata. sprinter 6bc4a4040eb7 (B1): an already-DROPPED
@@ -1078,19 +1143,12 @@ impl BranchManager {
         }
 
         // Check for child branches
-        let children = self.get_child_branches(metadata.branch_id)?;
-        if !children.is_empty() {
-            return Err(Error::storage(format!(
-                "Cannot drop branch '{}': has {} child branch(es)",
-                name,
-                children.len()
-            )));
-        }
+        self.refuse_if_it_has_a_child(metadata.branch_id, name)?;
 
         // sprinter 6bc4a4040eb7 (B1): wait for the statements running on the
         // branch, and keep new ones out, until it is marked dropped below — so
         // nothing bound to it writes after this returns.
-        let _drained = self.drains.close(metadata.branch_id, name, BRANCH_DRAIN_TIMEOUT)?;
+        let drained = self.drains.close(metadata.branch_id, name, BRANCH_DRAIN_TIMEOUT)?;
 
         // B1 second fix pass: everything read above may be stale by now — the
         // close waited for running statements and, possibly, for another DROP
@@ -1112,14 +1170,7 @@ impl BranchManager {
             _ => return Err(Error::storage(format!("Branch '{}' not found", name))),
         };
         self.refuse_if_in_unfinished_merge(metadata.branch_id, name)?;
-        let children = self.get_child_branches(metadata.branch_id)?;
-        if !children.is_empty() {
-            return Err(Error::storage(format!(
-                "Cannot drop branch '{}': has {} child branch(es)",
-                name,
-                children.len()
-            )));
-        }
+        self.refuse_if_it_has_a_child(metadata.branch_id, name)?;
 
         // Mark as dropped (soft delete)
         let mut updated_meta = metadata.clone();
@@ -1156,161 +1207,250 @@ impl BranchManager {
         // sprinter 6bc4a4040eb7 (B1): the branch is no longer active — every
         // session bound to it fails closed from its next statement on.
         self.note_branch_left_active();
+        drop(drained);
 
-        // Schedule GC for branch data
-        self.schedule_branch_gc(metadata.branch_id, metadata.name.clone())?;
+        // Sprinter 6bc4a4040eb7 (B4): its keys go, now that it is out of service. No
+        // write freezes into it once the hook has forgotten it, and that waits for the
+        // ones that still might. The drop is done whatever happens here: what a crash
+        // or an error leaves is finished by the next open.
+        if let Some(freeze) = self.freeze.get() {
+            freeze.remove(metadata.branch_id);
+        }
+        if let Err(e) = self.reclaim_branch_keys(metadata.branch_id) {
+            tracing::warn!(
+                "The keys of dropped branch '{}' (id {}) stay until the next open: {}",
+                name,
+                metadata.branch_id,
+                e
+            );
+        }
+        // It may have been the last live branch reading through a merged parent.
+        self.reclaim_merged_chain(metadata.parent_id);
 
         Ok(())
     }
 
-    /// Schedule garbage collection for a deleted branch
-    ///
-    /// Depending on the GC mode:
-    /// - Immediate: Deletes branch data right away (may block)
-    /// - Deferred: Adds to GC queue for later cleanup (non-blocking)
-    fn schedule_branch_gc(&self, branch_id: BranchId, branch_name: String) -> Result<()> {
-        if !self.gc_config.auto_gc_enabled {
-            tracing::debug!("Branch GC disabled, skipping cleanup for branch {}", branch_name);
+    /// Sprinter 6bc4a4040eb7 (B4): delete every key of level `id`, in batches of
+    /// [`RECLAIM_CHUNK_KEYS`]. Idempotent: run again, it deletes what is left. The
+    /// caller knows nothing reads or writes the level any more. A prefix match on the
+    /// decimal id and its `:`. Returns the keys deleted.
+    pub(crate) fn reclaim_branch_keys(&self, id: BranchId) -> Result<u64> {
+        let mut deleted = 0u64;
+        for family in LEVEL_FAMILIES {
+            deleted += self.delete_prefix_in_batches(format!("{family}{id}:").as_bytes())?;
+        }
+        if let Some(freeze) = self.freeze.get() {
+            super::branch_view::forget_level(freeze.engine_id(), id);
+            super::StorageEngine::forget_level_records(freeze.engine_id(), id);
+        }
+        Ok(deleted)
+    }
+
+    fn delete_prefix_in_batches(&self, prefix: &[u8]) -> Result<u64> {
+        let mut deleted = 0u64;
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): each batch starts after the last key of
+        // the one before, and stops at the prefix's end: starting over at the prefix
+        // stepped through every key already deleted, once per batch.
+        let mut from = prefix.to_vec();
+        loop {
+            // A fresh iterator per batch: it pins no more than one batch's worth.
+            let iter = self.db.iterator_opt(
+                rocksdb::IteratorMode::From(&from, rocksdb::Direction::Forward),
+                super::time_travel::bounded_read_options(prefix),
+            );
+            let mut batch = rocksdb::WriteBatch::default();
+            let mut keys = 0usize;
+            for item in iter {
+                let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix) {
+                    break;
+                }
+                batch.delete(&key);
+                keys += 1;
+                if keys >= RECLAIM_CHUNK_KEYS {
+                    from = key.to_vec();
+                    from.push(0);
+                    break;
+                }
+            }
+            if keys == 0 {
+                return Ok(deleted);
+            }
+            self.gate
+                .write(&self.db, batch, None)
+                .map_err(|e| Error::storage(format!("Failed to delete branch keys: {}", e)))?;
+            deleted += keys as u64;
+            if let Some(freeze) = self.freeze.get() {
+                super::branch_catalog::engine_failpoint_tick(
+                    freeze.engine_id(),
+                    super::branch_catalog::MergeFailSite::Reclaim,
+                )?;
+            }
+        }
+    }
+
+    /// The levels a live branch still reads through: every ancestor of a branch that
+    /// is Active or the source of an unfinished merge. Asked of the metadata: a merged
+    /// level stays in its descendants' chains. Linear in the branches listed.
+    fn levels_with_live_descendants(branches: &[BranchMetadata], unfinished: &HashSet<BranchId>) -> HashSet<BranchId> {
+        let parents: HashMap<BranchId, Option<BranchId>> = branches
+            .iter()
+            .map(|branch| (branch.branch_id, branch.parent_id))
+            .collect();
+        let mut read_through: HashSet<BranchId> = HashSet::new();
+        for branch in branches {
+            if branch.state != BranchState::Active && !unfinished.contains(&branch.branch_id) {
+                continue;
+            }
+            let mut cursor = branch.parent_id;
+            // An ancestor already in the set has its own ancestors there too.
+            while let Some(level) = cursor {
+                if !read_through.insert(level) {
+                    break;
+                }
+                cursor = parents.get(&level).copied().flatten();
+            }
+        }
+        read_through
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): from `start` up the parents: reclaim every merged
+    /// level with nothing left to read it or finish it. Stops at the first that is
+    /// Active (a `MERGE … ABORT` returns a source there), has an unfinished merge, or
+    /// still has a live descendant. Never fails: what stays is finished at an open.
+    pub(crate) fn reclaim_merged_chain(&self, start: Option<BranchId>) {
+        let main_id = self.registry.read().main_branch;
+        let mut cursor = start;
+        while let Some(id) = cursor.filter(|id| *id != main_id) {
+            let Some(name) = self.get_branch_name(id) else {
+                return;
+            };
+            let Ok(meta) = self.get_branch_by_name(&name) else {
+                return;
+            };
+            if meta.branch_id != id || !matches!(meta.state, BranchState::Merged { .. }) {
+                return;
+            }
+            let reclaimed = self.unfinished_merge_sources().and_then(|unfinished| {
+                let branches = self.list_branches_for_catalog()?;
+                if unfinished.contains(&id) || Self::levels_with_live_descendants(&branches, &unfinished).contains(&id)
+                {
+                    return Ok(false);
+                }
+                self.reclaim_branch_keys(id).map(|_| true)
+            });
+            match reclaimed {
+                Ok(true) => cursor = meta.parent_id,
+                Ok(false) => return,
+                Err(e) => {
+                    tracing::warn!("The keys of merged branch '{}' stay until the next open: {}", name, e);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): at a writable open, after every unfinished merge
+    /// had its chance: delete the keys of every level that is gone: a drop or a merge
+    /// the crash stopped half way, a merged level whose last descendant went, a branch
+    /// whose creation never finished (its id has no metadata). A level with a live
+    /// state, an unfinished merge or a live descendant is left alone. Walks the ids
+    /// present in each family, a seek per id, whatever the volume of the keys. Returns
+    /// the keys deleted.
+    pub(crate) fn reclaim_dead_levels(&self) -> Result<u64> {
+        let unfinished = self.unfinished_merge_sources()?;
+        let branches = self.list_branches_for_catalog()?;
+        let mut keep = Self::levels_with_live_descendants(&branches, &unfinished);
+        keep.insert(self.registry.read().main_branch);
+        for branch in &branches {
+            if branch.state == BranchState::Active || unfinished.contains(&branch.branch_id) {
+                keep.insert(branch.branch_id);
+            }
+        }
+        let mut deleted = 0u64;
+        for family in LEVEL_FAMILIES {
+            let mut cursor = family.as_bytes().to_vec();
+            loop {
+                let mut iter = self.db.iterator_opt(
+                    rocksdb::IteratorMode::From(&cursor, rocksdb::Direction::Forward),
+                    super::time_travel::bounded_read_options(family.as_bytes()),
+                );
+                let Some(item) = iter.next() else {
+                    break;
+                };
+                let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                let Some(rest) = key.strip_prefix(family.as_bytes()) else {
+                    break;
+                };
+                match super::branch_freeze::level_and_rest(rest) {
+                    Some((id, _)) => {
+                        if !keep.contains(&id) {
+                            deleted += self.delete_prefix_in_batches(format!("{family}{id}:").as_bytes())?;
+                        }
+                        // `;` is the byte after `:`: the next id.
+                        cursor = format!("{family}{id};").into_bytes();
+                    }
+                    // Not a level's key: the binary format of the `BranchTransaction`
+                    // API, which no SQL path writes. Left alone.
+                    None => {
+                        cursor = key.to_vec();
+                        cursor.push(0);
+                    }
+                }
+            }
+        }
+        if self
+            .db
+            .get_pinned(LEGACY_PENDING_GC_KEY)
+            .map_err(|e| Error::storage(format!("Get failed: {}", e)))?
+            .is_some()
+        {
+            self.gate
+                .delete(&self.db, LEGACY_PENDING_GC_KEY, None)
+                .map_err(|e| Error::storage(format!("Failed to delete a stale key: {}", e)))?;
+        }
+        Ok(deleted)
+    }
+
+    /// A branch with a child cannot be dropped: 2BP01, naming the child and what to do.
+    /// A merged child counts until it is dropped: its record names this as its parent.
+    fn refuse_if_it_has_a_child(&self, id: BranchId, name: &str) -> Result<()> {
+        let children = self.get_child_branches(id)?;
+        if children.is_empty() {
             return Ok(());
         }
-
-        let current_ts = self.current_timestamp();
-
-        match self.gc_config.gc_mode {
-            BranchGcMode::Immediate => {
-                tracing::info!("Starting immediate GC for branch '{}' (ID: {})", branch_name, branch_id);
-                self.gc_branch_data(branch_id)?;
-                tracing::info!("Completed immediate GC for branch '{}'", branch_name);
-                Ok(())
+        // One that still reads through this first: it is the one to act on.
+        let mut named: Option<(String, bool)> = None;
+        for child in &children {
+            let Some(child_name) = self.get_branch_name(*child) else {
+                continue;
+            };
+            let merged = matches!(
+                self.get_branch_by_name(&child_name).map(|meta| meta.state),
+                Ok(BranchState::Merged { .. })
+            );
+            if !merged {
+                named = Some((child_name, false));
+                break;
             }
-            BranchGcMode::Deferred => {
-                tracing::debug!(
-                    "Scheduling deferred GC for branch '{}' (ID: {})",
-                    branch_name,
-                    branch_id
-                );
-
-                // Add to pending GC queue
-                self.pending_gc.write().insert(branch_id, current_ts);
-                self.save_pending_gc()?;
-
-                // In deferred mode, don't run GC immediately
-                // GC will be triggered by explicit run_gc() calls or periodic background tasks
-
-                Ok(())
+            if named.is_none() {
+                named = Some((child_name, true));
             }
         }
+        let (child, merged) =
+            named.unwrap_or_else(|| (children.first().map_or_else(String::new, ToString::to_string), false));
+        Err(Error::branch_has_child(name, &child, children.len(), merged))
     }
 
-    /// Garbage collect data for a specific branch
-    ///
-    /// Deletes all data keys associated with the branch using prefix scan.
-    /// This is the core GC operation that frees storage.
-    fn gc_branch_data(&self, branch_id: BranchId) -> Result<()> {
-        // Build key prefix for this branch: data:{branch_id}:
-        let mut prefix = Vec::new();
-        prefix.extend_from_slice(BRANCH_DATA_PREFIX);
-        prefix.extend_from_slice(&branch_id.to_be_bytes());
-        prefix.push(b':');
-
-        let mut delete_count = 0;
-        let mut keys_to_delete = Vec::new();
-
-        // Collect all keys with this prefix
-        let iter = self.db.prefix_iterator(&prefix);
-        for item in iter {
-            let (key, _value) = item.map_err(|e| Error::storage(format!("GC iterator error: {}", e)))?;
-
-            keys_to_delete.push(key.to_vec());
-        }
-
-        // Delete collected keys
-        for key in keys_to_delete {
-            self.gate
-                .delete(&self.db, &key, None)
-                .map_err(|e| Error::storage(format!("Failed to delete branch data: {}", e)))?;
-            delete_count += 1;
-        }
-
-        tracing::info!(
-            "Branch GC deleted {} data keys for branch ID {}",
-            delete_count,
-            branch_id
-        );
-
-        Ok(())
-    }
-
-    /// Garbage collect eligible branches from pending queue
-    ///
-    /// Processes branches that have been in the queue longer than min_retention_seconds.
-    /// Returns the number of branches garbage collected.
-    pub fn gc_eligible_branches(&self) -> Result<usize> {
-        let current_ts = self.current_timestamp();
-        let min_retention = self.gc_config.min_retention_seconds;
-
-        let mut gc_count = 0;
-        let mut pending = self.pending_gc.write();
-        let mut to_remove = Vec::new();
-
-        // Find branches eligible for GC
-        for (branch_id, drop_ts) in pending.iter() {
-            let age_seconds = current_ts.saturating_sub(*drop_ts);
-
-            if age_seconds >= min_retention {
-                tracing::debug!(
-                    "Branch ID {} eligible for GC (age: {}s >= {}s)",
-                    branch_id,
-                    age_seconds,
-                    min_retention
-                );
-                to_remove.push(*branch_id);
+    /// See [`Self::refuse_if_it_has_a_child`], by name; nothing to refuse for a branch
+    /// there is none of.
+    pub(crate) fn refuse_drop_of_branch_with_child(&self, name: &str) -> Result<()> {
+        match self.get_branch_by_name(name) {
+            Ok(meta) if !matches!(meta.state, BranchState::Dropped { .. }) => {
+                self.refuse_if_it_has_a_child(meta.branch_id, name)
             }
+            _ => Ok(()),
         }
-
-        // Process eligible branches
-        for branch_id in to_remove {
-            match self.gc_branch_data(branch_id) {
-                Ok(()) => {
-                    pending.remove(&branch_id);
-                    gc_count += 1;
-                    tracing::info!("Successfully GC'd branch ID {}", branch_id);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to GC branch ID {}: {}. Will retry later.", branch_id, e);
-                    // Keep in queue for retry
-                }
-            }
-        }
-
-        // Persist updated queue
-        drop(pending);
-        self.save_pending_gc()?;
-
-        if gc_count > 0 {
-            tracing::info!("Branch GC completed: {} branches cleaned up", gc_count);
-        }
-
-        Ok(gc_count)
-    }
-
-    /// Manually trigger garbage collection for all eligible branches
-    ///
-    /// This can be called periodically or on-demand to clean up dropped branches.
-    /// Returns the number of branches garbage collected.
-    pub fn run_gc(&self) -> Result<usize> {
-        tracing::info!("Starting manual branch GC run");
-        self.gc_eligible_branches()
-    }
-
-    /// Get number of branches pending garbage collection
-    pub fn pending_gc_count(&self) -> usize {
-        self.pending_gc.read().len()
-    }
-
-    /// Get GC configuration
-    pub fn gc_config(&self) -> &BranchGcConfig {
-        &self.gc_config
     }
 
     /// Get branch metadata by name
@@ -1395,9 +1535,7 @@ impl BranchManager {
     /// List branches for catalog/history views: `Active` **and** `Merged`.
     ///
     /// `list_branches` returns only `Active` branches, which is what operational
-    /// callers want — version GC, branch resolution, "which branches can I use".
-    /// Do not widen that one: `version_gc` iterates it to decide what may be
-    /// collected, and including merged branches there would change retention.
+    /// callers want — branch resolution, "which branches can I use".
     ///
     /// The catalog views are different: they project a state/status column, and
     /// `handle_show_branches` even carries a formatting arm for
@@ -1409,6 +1547,7 @@ impl BranchManager {
     ///
     /// `Dropped` stays hidden here: a drop is a delete, not history.
     pub fn list_branches_for_catalog(&self) -> Result<Vec<BranchMetadata>> {
+        self.catalog_listings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let registry = self.registry.read();
         let mut branches = Vec::new();
 
@@ -1431,6 +1570,13 @@ impl BranchManager {
             .branches
             .iter()
             .any(|(branch_id, name)| *branch_id != registry.main_branch && name != "main")
+    }
+
+    /// How many times the catalog's branches were listed. For the tests: an open must
+    /// not do that per branch.
+    #[doc(hidden)]
+    pub fn debug_catalog_listings(&self) -> u64 {
+        self.catalog_listings.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Get branch name by ID
@@ -1498,425 +1644,6 @@ impl BranchManager {
         let mut ts = self.timestamp.write();
         *ts += 1;
         *ts
-    }
-
-    /// Merge a source branch into a target branch
-    ///
-    /// Performs a three-way merge using the common ancestor as the merge base.
-    /// Supports multiple merge strategies for conflict resolution.
-    pub fn merge_branch(&self, source_name: &str, target_name: &str, strategy: MergeStrategy) -> Result<MergeResult> {
-        tracing::info!(
-            "Starting merge: {} -> {} (strategy: {:?})",
-            source_name,
-            target_name,
-            strategy
-        );
-
-        // Get source and target metadata
-        let source = self.get_branch_by_name(source_name)?;
-        let target = self.get_branch_by_name(target_name)?;
-
-        // Validate branches are active
-        if source.state != BranchState::Active {
-            return Err(Error::branch_merge(format!(
-                "Source branch '{}' is not active",
-                source_name
-            )));
-        }
-        if target.state != BranchState::Active {
-            return Err(Error::branch_merge(format!(
-                "Target branch '{}' is not active",
-                target_name
-            )));
-        }
-
-        // sprinter 6bc4a4040eb7 (B1): take the source out of `Active` BEFORE
-        // copying anything — after the statements running on it have finished
-        // (the drain) — so no session can write to it while, or after, its
-        // rows are merged. A failed apply puts the source back as it was.
-        let _drained = self.drains.close(source.branch_id, source_name, BRANCH_DRAIN_TIMEOUT)?;
-        // B1 second fix pass: re-read both ends after the close (it may have
-        // waited out a DROP of the source, or a statement creating a branch
-        // under its name), hold the TARGET for the merge's duration (a DROP /
-        // MERGE of the target waits for this merge; one already closing it
-        // refuses the merge, 55006), and only then collect the keys — those
-        // collected before the close missed every write the drain waited for.
-        let (closed_source_id, read_target_id) = (source.branch_id, target.branch_id);
-        let (source, target) = (
-            self.get_branch_by_name(source_name)?,
-            self.get_branch_by_name(target_name)?,
-        );
-        if source.branch_id != closed_source_id || target.branch_id != read_target_id {
-            return Err(Error::branch_merge(format!(
-                "branch '{}' or '{}' was replaced while the merge waited; retry",
-                source_name, target_name
-            )));
-        }
-        if source.state != BranchState::Active {
-            return Err(Error::branch_merge(format!(
-                "Source branch '{}' is not active",
-                source_name
-            )));
-        }
-        if target.state != BranchState::Active {
-            return Err(Error::branch_merge(format!(
-                "Target branch '{}' is not active",
-                target_name
-            )));
-        }
-        let _target_hold = if target.branch_id == self.registry.read().main_branch {
-            BranchHold::none()
-        } else {
-            self.drains.enter(target.branch_id, target_name)?
-        };
-
-        // Find common ancestor (merge base)
-        let merge_base = self.find_merge_base(source.branch_id, target.branch_id)?;
-
-        tracing::debug!("Merge base found: snapshot_id = {}", merge_base);
-
-        // Collect all modified keys from both branches
-        let source_keys = self.collect_modified_keys(source.branch_id, merge_base)?;
-        let target_keys = self.collect_modified_keys(target.branch_id, merge_base)?;
-
-        // Detect conflicts
-        let conflicts = self.detect_conflicts(
-            &source_keys,
-            &target_keys,
-            source.branch_id,
-            target.branch_id,
-            merge_base,
-        )?;
-
-        tracing::info!(
-            "Merge analysis: {} source keys, {} target keys, {} conflicts",
-            source_keys.len(),
-            target_keys.len(),
-            conflicts.len()
-        );
-
-        // Check if we should fail on conflicts
-        if strategy == MergeStrategy::Manual && !conflicts.is_empty() {
-            return Ok(MergeResult {
-                merge_timestamp: self.current_timestamp(),
-                merged_keys: 0,
-                conflicts,
-                completed: false,
-            });
-        }
-
-        let merge_timestamp = self.next_timestamp();
-        let mut updated_source = source.clone();
-        updated_source.state = BranchState::Merged {
-            into_branch: target.branch_id,
-            at_timestamp: merge_timestamp,
-        };
-        self.write_branch_metadata(&updated_source)?;
-
-        // Perform merge with selected strategy
-        let merged_keys = match self.apply_merge(
-            source.branch_id,
-            target.branch_id,
-            merge_base,
-            &source_keys,
-            &target_keys,
-            &conflicts,
-            strategy,
-            merge_timestamp,
-        ) {
-            Ok(keys) => keys,
-            Err(e) => {
-                if let Err(restore) = self.write_branch_metadata(&source) {
-                    tracing::warn!("MERGE BRANCH failed and the source could not be restored: {restore}");
-                }
-                return Err(e);
-            }
-        };
-
-        // Update target's merge_base for future merges
-        let mut updated_target = target.clone();
-        updated_target.merge_base = Some(merge_timestamp);
-
-        let target_meta_key = encode_branch_meta_key(target_name);
-        let target_meta_value = bincode::serialize(&updated_target)
-            .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-        self.gate
-            .put(&self.db, &target_meta_key, &target_meta_value, None)
-            .map_err(|e| Error::storage(format!("Failed to save target branch metadata: {}", e)))?;
-
-        // Update cache
-        self.metadata_cache.write().insert(target.branch_id, updated_target);
-
-        tracing::info!(
-            "Merge completed: {} keys merged, {} conflicts",
-            merged_keys,
-            conflicts.len()
-        );
-
-        Ok(MergeResult {
-            merge_timestamp,
-            merged_keys,
-            conflicts,
-            completed: true,
-        })
-    }
-
-    /// Find common ancestor (merge base) between two branches
-    ///
-    /// Uses the snapshot IDs to find the most recent common ancestor
-    fn find_merge_base(&self, source_id: BranchId, target_id: BranchId) -> Result<SnapshotId> {
-        // Build parent chains for both branches
-        let source_chain = self.build_parent_chain(source_id)?;
-        let target_chain = self.build_parent_chain(target_id)?;
-
-        // Convert chains to sets for O(1) lookup
-        let source_snapshots: HashSet<SnapshotId> = source_chain.iter().map(|(_, snapshot)| *snapshot).collect();
-
-        // Find first common snapshot in target chain (most recent ancestor)
-        for (_, target_snapshot) in &target_chain {
-            if source_snapshots.contains(target_snapshot) {
-                return Ok(*target_snapshot);
-            }
-        }
-
-        // Check if target is ancestor of source or vice versa
-        let source_meta = self.get_branch_by_id(source_id)?;
-        let target_meta = self.get_branch_by_id(target_id)?;
-
-        // If branches diverged from same snapshot, use that
-        if source_meta.created_from_snapshot == target_meta.created_from_snapshot {
-            return Ok(source_meta.created_from_snapshot);
-        }
-
-        // Fallback: use the earlier creation snapshot
-        let merge_base = source_meta.created_from_snapshot.min(target_meta.created_from_snapshot);
-
-        tracing::warn!("No common ancestor found, using earlier snapshot: {}", merge_base);
-
-        Ok(merge_base)
-    }
-
-    /// Collect all modified keys in a branch since merge base
-    fn collect_modified_keys(&self, branch_id: BranchId, since_snapshot: SnapshotId) -> Result<HashSet<String>> {
-        let mut keys = HashSet::new();
-
-        // Build key prefix for this branch
-        let prefix = {
-            let mut p = Vec::new();
-            p.extend_from_slice(BRANCH_DATA_PREFIX);
-            p.extend_from_slice(&branch_id.to_be_bytes());
-            p.push(b':');
-            p
-        };
-
-        // Scan all keys with this branch prefix
-        let iter = self.db.prefix_iterator(&prefix);
-
-        for item in iter {
-            let (key, _value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
-            // Decode the key
-            if let Some((_branch_id, user_key)) = decode_branch_data_key(&key) {
-                // Include all keys from this branch
-                // Note: Without timestamp in key, we can't detect modification time
-                // This is acceptable since we're scanning all branch keys
-                keys.insert(user_key);
-            }
-        }
-
-        Ok(keys)
-    }
-
-    /// Detect conflicts between source and target branches
-    fn detect_conflicts(
-        &self,
-        source_keys: &HashSet<String>,
-        target_keys: &HashSet<String>,
-        source_id: BranchId,
-        target_id: BranchId,
-        merge_base: SnapshotId,
-    ) -> Result<Vec<MergeConflict>> {
-        let mut conflicts = Vec::new();
-
-        // Find keys that exist in both branches (potential conflicts)
-        let common_keys: HashSet<_> = source_keys.intersection(target_keys).collect();
-
-        for key in common_keys {
-            // Get values from all three versions
-            let base_value = self.get_key_at_snapshot(target_id, key, merge_base)?;
-            let source_value = self.get_latest_key_value(source_id, key)?;
-            let target_value = self.get_latest_key_value(target_id, key)?;
-
-            // Check if there's an actual conflict (both modified differently)
-            let source_modified = source_value != base_value;
-            let target_modified = target_value != base_value;
-
-            if source_modified && target_modified && source_value != target_value {
-                // Get timestamps
-                let source_ts = self.get_key_timestamp(source_id, key)?;
-                let target_ts = self.get_key_timestamp(target_id, key)?;
-
-                conflicts.push(MergeConflict {
-                    key: key.to_string(),
-                    base_value: base_value.map(|v| v.0),
-                    source_value: source_value.map(|v| v.0),
-                    target_value: target_value.map(|v| v.0),
-                    source_timestamp: source_ts,
-                    target_timestamp: target_ts,
-                });
-            }
-        }
-
-        Ok(conflicts)
-    }
-
-    /// Apply merge with given strategy
-    fn apply_merge(
-        &self,
-        source_id: BranchId,
-        target_id: BranchId,
-        merge_base: SnapshotId,
-        source_keys: &HashSet<String>,
-        target_keys: &HashSet<String>,
-        conflicts: &[MergeConflict],
-        strategy: MergeStrategy,
-        merge_timestamp: u64,
-    ) -> Result<usize> {
-        let mut merged_count = 0;
-
-        // Build conflict set for quick lookup
-        let conflict_keys: HashSet<String> = conflicts.iter().map(|c| c.key.clone()).collect();
-
-        // Merge keys from source branch
-        for key in source_keys {
-            // Skip if in target (will be handled by conflict resolution or kept as-is)
-            if target_keys.contains(key) {
-                // Check if it's a conflict
-                if conflict_keys.contains(key) {
-                    // Resolve conflict based on strategy
-                    match strategy {
-                        MergeStrategy::Auto | MergeStrategy::Theirs => {
-                            // Use source value
-                            self.copy_key_to_branch(source_id, target_id, key, merge_timestamp)?;
-                            merged_count += 1;
-                        }
-                        MergeStrategy::Ours => {
-                            // Keep target value (do nothing)
-                        }
-                        MergeStrategy::Manual => {
-                            // Should not reach here (handled earlier)
-                        }
-                    }
-                } else {
-                    // Not a conflict, check if source changed from base
-                    let base_value = self.get_key_at_snapshot(target_id, key, merge_base)?;
-                    let source_value = self.get_latest_key_value(source_id, key)?;
-
-                    if source_value != base_value {
-                        // Source modified, target didn't -> use source
-                        self.copy_key_to_branch(source_id, target_id, key, merge_timestamp)?;
-                        merged_count += 1;
-                    }
-                }
-            } else {
-                // Key only in source -> copy to target
-                self.copy_key_to_branch(source_id, target_id, key, merge_timestamp)?;
-                merged_count += 1;
-            }
-        }
-
-        Ok(merged_count)
-    }
-
-    /// Copy a key from source branch to target branch
-    fn copy_key_to_branch(&self, source_id: BranchId, target_id: BranchId, key: &str, timestamp: u64) -> Result<()> {
-        // Get value from source. `get_latest_key_value` has already decoded it,
-        // so `data` here is the in-memory value, not the stored bytes.
-        let value = self.get_latest_key_value(source_id, key)?;
-
-        // Encode target key
-        let target_key = encode_branch_data_key(target_id, key, timestamp);
-
-        if let Some((data, _ts)) = value {
-            // Seal for the key it is LANDING under, rather than copying the
-            // source's stored bytes across. Both keys are in the `bdata:`
-            // keyspace, which this rule seals, so the transform is
-            // form-preserving; it is written this way because the correct form
-            // of a stored value is a property of its key, and because the
-            // tolerant open on the read side is what lets a source value written
-            // by an earlier build be copied correctly. Zero cost with encryption
-            // disabled.
-            let stored = super::tde::seal_row_value(self.key_manager.as_deref(), &target_key, &data)?;
-            self.gate
-                .put(&self.db, &target_key, stored.as_ref(), None)
-                .map_err(|e| Error::storage(format!("Failed to copy key: {}", e)))?;
-        } else {
-            // Tombstone (deleted key)
-            self.gate
-                .delete(&self.db, &target_key, None)
-                .map_err(|e| Error::storage(format!("Failed to delete key: {}", e)))?;
-        }
-
-        Ok(())
-    }
-
-    /// Get key value at specific snapshot
-    fn get_key_at_snapshot(
-        &self,
-        branch_id: BranchId,
-        key: &str,
-        snapshot: SnapshotId,
-    ) -> Result<Option<(Vec<u8>, u64)>> {
-        let branch_key = encode_branch_data_key(branch_id, key, snapshot);
-
-        match self.db.get(&branch_key) {
-            // Decoded through the shared rule, like every other read of a
-            // stored value. It matters here beyond readability: the merge
-            // conflict detector COMPARES the values this returns against each
-            // other, and two AES-GCM frames of the same plaintext differ (fresh
-            // nonce per seal), so comparing stored bytes would report a conflict
-            // between two identical rows.
-            Ok(Some(data)) => Ok(Some((
-                super::tde::open_owned(self.key_manager.as_deref(), &branch_key, data)?,
-                snapshot,
-            ))),
-            Ok(None) => Ok(None),
-            Err(e) => Err(Error::storage(format!("Failed to read key: {}", e))),
-        }
-    }
-
-    /// Get latest key value from branch
-    fn get_latest_key_value(&self, branch_id: BranchId, key: &str) -> Result<Option<(Vec<u8>, u64)>> {
-        // Build prefix for this key in branch
-        let mut prefix = Vec::new();
-        prefix.extend_from_slice(BRANCH_DATA_PREFIX);
-        prefix.extend_from_slice(&branch_id.to_be_bytes());
-        prefix.push(b':');
-        prefix.extend_from_slice(key.as_bytes());
-        prefix.push(b':');
-
-        // Get the current value for this key
-        // Since we no longer store timestamps in the key, we just return the value directly
-        let mut iter = self.db.prefix_iterator(&prefix);
-        if let Some(item) = iter.next() {
-            let (k, v) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            // Return the first (and only) match for this key, decoded through
-            // the shared rule (see `get_key_at_snapshot` for why the comparison
-            // callers require the decoded form).
-            let decoded = super::tde::open_owned(self.key_manager.as_deref(), &k, v.to_vec())?;
-            return Ok(Some((decoded, 0))); // Return 0 as default timestamp since it's not stored
-        }
-
-        Ok(None)
-    }
-
-    /// Get timestamp of latest key version
-    fn get_key_timestamp(&self, branch_id: BranchId, key: &str) -> Result<u64> {
-        if let Some((_data, ts)) = self.get_latest_key_value(branch_id, key)? {
-            Ok(ts)
-        } else {
-            Ok(0)
-        }
     }
 
     /// Build parent chain for a branch
@@ -2476,525 +2203,80 @@ mod tests {
         assert_eq!(chain[1].0, 1); // main
     }
 
+    /// Sprinter 6bc4a4040eb7 (B4): a reclaim takes the level's keys in every family and
+    /// no other level's: `1:` does not match `12:`. The open's walk does the same for
+    /// a level that is gone, leaves a live one and a key that is no level's, and takes
+    /// the stale queue of the GC this replaced.
     #[test]
-    fn test_find_merge_base() {
+    fn a_reclaim_takes_exactly_a_levels_keys() {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
-
+        let db = Arc::clone(&engine.db);
         let manager = BranchManager::new(
-            Arc::clone(&engine.db),
+            Arc::clone(&db),
             Arc::clone(engine.write_gate()),
             Arc::clone(&engine.timestamp),
         )
         .unwrap();
-
-        // Create two branches from main
-        let dev_id = manager
-            .create_branch("dev", Some("main"), 100, BranchOptions::default())
+        let live = manager
+            .create_branch("live", Some("main"), 100, BranchOptions::default())
             .unwrap();
-
-        let staging_id = manager
-            .create_branch("staging", Some("main"), 100, BranchOptions::default())
-            .unwrap();
-
-        // Find merge base (should be snapshot 100)
-        let merge_base = manager.find_merge_base(dev_id, staging_id).unwrap();
-        assert_eq!(merge_base, 100);
-    }
-
-    #[test]
-    fn test_merge_branch_auto_strategy() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-        )
-        .unwrap();
-
-        // Create dev branch from main
-        manager
-            .create_branch("dev", Some("main"), 100, BranchOptions::default())
-            .unwrap();
-
-        // Simulate adding keys to dev branch (would normally come from transactions)
-        // For testing, we'll just test the merge infrastructure
-
-        // Perform merge
-        let result = manager.merge_branch("dev", "main", MergeStrategy::Auto).unwrap();
-
-        assert!(result.completed);
-        assert_eq!(result.conflicts.len(), 0);
-    }
-
-    #[test]
-    fn test_merge_branch_manual_strategy_no_conflicts() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-        )
-        .unwrap();
-
-        // Create staging branch from main
-        manager
-            .create_branch("staging", Some("main"), 100, BranchOptions::default())
-            .unwrap();
-
-        // Merge with manual strategy (no conflicts)
-        let result = manager.merge_branch("staging", "main", MergeStrategy::Manual).unwrap();
-
-        assert!(result.completed);
-        assert_eq!(result.conflicts.len(), 0);
-    }
-
-    #[test]
-    fn test_merge_updates_branch_state() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-        )
-        .unwrap();
-
-        // Create and merge feature branch
-        manager
-            .create_branch("feature", Some("main"), 100, BranchOptions::default())
-            .unwrap();
-
-        manager.merge_branch("feature", "main", MergeStrategy::Auto).unwrap();
-
-        // Verify feature branch is marked as merged
-        let feature_meta = manager.get_branch_by_name("feature").unwrap();
-        match feature_meta.state {
-            BranchState::Merged { into_branch, .. } => {
-                assert_eq!(into_branch, 1); // main branch ID
+        let keys = |id: u64| -> Vec<String> {
+            LEVEL_FAMILIES
+                .iter()
+                .map(|family| format!("{family}{id}:table:{id}"))
+                .collect()
+        };
+        for id in [live, 7, 70] {
+            for key in keys(id) {
+                db.put(key.as_bytes(), b"x").unwrap();
             }
-            _ => panic!("Expected branch to be in Merged state"),
         }
-    }
+        let binary = encode_branch_data_key(7, "user_key", 0);
+        db.put(&binary, b"x").unwrap();
+        db.put(LEGACY_PENDING_GC_KEY, b"x").unwrap();
 
-    #[test]
-    fn test_cannot_merge_inactive_branch() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-        )
-        .unwrap();
-
-        // Create and drop a branch
-        manager
-            .create_branch("temp", Some("main"), 100, BranchOptions::default())
-            .unwrap();
-
-        manager.drop_branch("temp", false).unwrap();
-
-        // Try to merge dropped branch
-        let result = manager.merge_branch("temp", "main", MergeStrategy::Auto);
-
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_merge_theirs_strategy() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-        )
-        .unwrap();
-
-        // Create hotfix branch
-        manager
-            .create_branch("hotfix", Some("main"), 100, BranchOptions::default())
-            .unwrap();
-
-        // Merge with Theirs strategy (prefer source)
-        let result = manager.merge_branch("hotfix", "main", MergeStrategy::Theirs).unwrap();
-
-        assert!(result.completed);
-    }
-
-    #[test]
-    fn test_merge_ours_strategy() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-        )
-        .unwrap();
-
-        // Create experimental branch
-        manager
-            .create_branch("experimental", Some("main"), 100, BranchOptions::default())
-            .unwrap();
-
-        // Merge with Ours strategy (prefer target)
-        let result = manager
-            .merge_branch("experimental", "main", MergeStrategy::Ours)
-            .unwrap();
-
-        assert!(result.completed);
-    }
-
-    // --- Garbage Collection Tests ---
-
-    #[test]
-    fn test_gc_config_default() {
-        let config = BranchGcConfig::default();
-        assert_eq!(config.min_retention_seconds, 300);
-        assert!(config.auto_gc_enabled);
-        assert_eq!(config.gc_mode, BranchGcMode::Deferred);
-    }
-
-    #[test]
-    fn test_branch_gc_immediate_mode() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        // Create manager with immediate GC
-        let gc_config = BranchGcConfig {
-            min_retention_seconds: 0,
-            auto_gc_enabled: true,
-            gc_mode: BranchGcMode::Immediate,
-        };
-
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        )
-        .unwrap();
-
-        // Create and drop a branch
-        let branch_id = manager
-            .create_branch("test_gc", Some("main"), 100, BranchOptions::default())
-            .unwrap();
-
-        // Insert some data for the branch
-        let key = encode_branch_data_key(branch_id, "test_key", 100);
-        manager.db.put(&key, b"test_value").unwrap();
-
-        // Verify data exists
-        assert!(manager.db.get(&key).unwrap().is_some());
-
-        // Drop branch (should trigger immediate GC)
-        manager.drop_branch("test_gc", false).unwrap();
-
-        // Verify data was deleted
-        assert!(manager.db.get(&key).unwrap().is_none());
-
-        // Verify branch is not in pending GC queue
-        assert_eq!(manager.pending_gc_count(), 0);
-    }
-
-    #[test]
-    fn test_branch_gc_deferred_mode() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        // Create manager with deferred GC (short retention for testing)
-        let gc_config = BranchGcConfig {
-            min_retention_seconds: 2,
-            auto_gc_enabled: true,
-            gc_mode: BranchGcMode::Deferred,
-        };
-
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        )
-        .unwrap();
-
-        // Create and drop a branch
-        let branch_id = manager
-            .create_branch("test_deferred", Some("main"), 100, BranchOptions::default())
-            .unwrap();
-
-        // Insert some data for the branch
-        let key = encode_branch_data_key(branch_id, "test_key", 100);
-        manager.db.put(&key, b"test_value").unwrap();
-
-        // Drop branch (should add to pending GC)
-        manager.drop_branch("test_deferred", false).unwrap();
-
-        // Verify data still exists (not GC'd yet)
-        assert!(manager.db.get(&key).unwrap().is_some());
-
-        // Verify branch is in pending GC queue
-        assert_eq!(manager.pending_gc_count(), 1);
-
-        // Advance timestamp to make branch eligible for GC
-        {
-            let mut ts = manager.timestamp.write();
-            *ts += 3; // Advance past retention period
+        assert_eq!(manager.reclaim_branch_keys(7).unwrap(), LEVEL_FAMILIES.len() as u64);
+        for key in keys(7) {
+            assert!(db.get(key.as_bytes()).unwrap().is_none(), "{key}");
+        }
+        for key in keys(70).into_iter().chain(keys(live)) {
+            assert!(db.get(key.as_bytes()).unwrap().is_some(), "{key}");
         }
 
-        // Run GC manually
-        let gc_count = manager.run_gc().unwrap();
-        assert_eq!(gc_count, 1);
-
-        // Verify data was deleted
-        assert!(manager.db.get(&key).unwrap().is_none());
-
-        // Verify branch is removed from pending GC queue
-        assert_eq!(manager.pending_gc_count(), 0);
+        assert_eq!(manager.reclaim_dead_levels().unwrap(), LEVEL_FAMILIES.len() as u64);
+        for key in keys(70) {
+            assert!(db.get(key.as_bytes()).unwrap().is_none(), "{key}: no such branch");
+        }
+        for key in keys(live) {
+            assert!(db.get(key.as_bytes()).unwrap().is_some(), "{key}: an active branch");
+        }
+        assert!(db.get(&binary).unwrap().is_some(), "not a level's key");
+        assert!(db.get(LEGACY_PENDING_GC_KEY).unwrap().is_none());
     }
 
+    /// The id is durable before the branch: a later manager over the same store does
+    /// not hand it out again, and the create takes the id it was given.
     #[test]
-    fn test_gc_disabled() {
+    fn a_reserved_id_is_not_handed_out_again() {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        // Create manager with GC disabled
-        let gc_config = BranchGcConfig {
-            min_retention_seconds: 0,
-            auto_gc_enabled: false,
-            gc_mode: BranchGcMode::Immediate,
-        };
-
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        )
-        .unwrap();
-
-        // Create and drop a branch
-        let branch_id = manager
-            .create_branch("test_no_gc", Some("main"), 100, BranchOptions::default())
-            .unwrap();
-
-        // Insert some data for the branch
-        let key = encode_branch_data_key(branch_id, "test_key", 100);
-        manager.db.put(&key, b"test_value").unwrap();
-
-        // Drop branch (GC disabled, data should remain)
-        manager.drop_branch("test_no_gc", false).unwrap();
-
-        // Verify data still exists
-        assert!(manager.db.get(&key).unwrap().is_some());
-
-        // Verify no pending GC
-        assert_eq!(manager.pending_gc_count(), 0);
-    }
-
-    #[test]
-    fn test_gc_multiple_branches() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        // Create manager with deferred GC
-        let gc_config = BranchGcConfig {
-            min_retention_seconds: 1,
-            auto_gc_enabled: true,
-            gc_mode: BranchGcMode::Deferred,
-        };
-
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        )
-        .unwrap();
-
-        // Create and drop multiple branches
-        for i in 0..5 {
-            let branch_name = format!("branch_{}", i);
-            let branch_id = manager
-                .create_branch(&branch_name, Some("main"), 100 + i as u64, BranchOptions::default())
-                .unwrap();
-
-            // Add data
-            let key = encode_branch_data_key(branch_id, "key", 100 + i as u64);
-            manager.db.put(&key, b"value").unwrap();
-
-            // Drop branch
-            manager.drop_branch(&branch_name, false).unwrap();
-        }
-
-        // Verify all 5 branches are pending GC
-        assert_eq!(manager.pending_gc_count(), 5);
-
-        // Advance timestamp
-        {
-            let mut ts = manager.timestamp.write();
-            *ts += 2;
-        }
-
-        // Run GC
-        let gc_count = manager.run_gc().unwrap();
-        assert_eq!(gc_count, 5);
-
-        // Verify queue is empty
-        assert_eq!(manager.pending_gc_count(), 0);
-    }
-
-    #[test]
-    fn test_gc_retention_period() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        // Create manager with longer retention
-        let gc_config = BranchGcConfig {
-            min_retention_seconds: 10,
-            auto_gc_enabled: true,
-            gc_mode: BranchGcMode::Deferred,
-        };
-
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        )
-        .unwrap();
-
-        // Create and drop branch
-        let branch_id = manager
-            .create_branch("test_retention", Some("main"), 100, BranchOptions::default())
-            .unwrap();
-
-        let key = encode_branch_data_key(branch_id, "key", 100);
-        manager.db.put(&key, b"value").unwrap();
-
-        manager.drop_branch("test_retention", false).unwrap();
-
-        // Advance timestamp but not enough
-        {
-            let mut ts = manager.timestamp.write();
-            *ts += 5; // Only 5 seconds, need 10
-        }
-
-        // Run GC - should not delete yet
-        let gc_count = manager.run_gc().unwrap();
-        assert_eq!(gc_count, 0);
-
-        // Data should still exist
-        assert!(manager.db.get(&key).unwrap().is_some());
-
-        // Advance past retention period
-        {
-            let mut ts = manager.timestamp.write();
-            *ts += 6; // Total 11 seconds now
-        }
-
-        // Run GC again - should delete now
-        let gc_count = manager.run_gc().unwrap();
-        assert_eq!(gc_count, 1);
-
-        // Data should be gone
-        assert!(manager.db.get(&key).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_gc_persistence() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        let gc_config = BranchGcConfig {
-            min_retention_seconds: 100,
-            auto_gc_enabled: true,
-            gc_mode: BranchGcMode::Deferred,
-        };
-
-        // Create manager and drop a branch
-        {
-            let manager = BranchManager::with_gc_config(
+        let new_manager = || {
+            BranchManager::new(
                 Arc::clone(&engine.db),
                 Arc::clone(engine.write_gate()),
                 Arc::clone(&engine.timestamp),
-                gc_config.clone(),
             )
-            .unwrap();
-
-            manager
-                .create_branch("test_persist", Some("main"), 100, BranchOptions::default())
-                .unwrap();
-
-            manager.drop_branch("test_persist", false).unwrap();
-
-            assert_eq!(manager.pending_gc_count(), 1);
-        }
-
-        // Create new manager (simulates restart)
-        let manager2 = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        )
-        .unwrap();
-
-        // Verify pending GC was persisted and restored
-        assert_eq!(manager2.pending_gc_count(), 1);
-    }
-
-    #[test]
-    fn test_gc_with_multiple_keys() {
-        let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config).unwrap();
-
-        let gc_config = BranchGcConfig {
-            min_retention_seconds: 0,
-            auto_gc_enabled: true,
-            gc_mode: BranchGcMode::Immediate,
+            .unwrap()
         };
-
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(engine.write_gate()),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        )
-        .unwrap();
-
-        let branch_id = manager
-            .create_branch("multi_key", Some("main"), 100, BranchOptions::default())
+        let first = new_manager();
+        let reserved = first.reserve_branch_id().unwrap();
+        let second = new_manager();
+        let other = second.reserve_branch_id().unwrap();
+        assert!(other > reserved);
+        let created = first
+            .create_reserved_branch(reserved, "r", Some("main"), 1, BranchOptions::default(), |_, _| Ok(()))
             .unwrap();
-
-        // Insert multiple keys for the branch
-        for i in 0..100 {
-            let key = encode_branch_data_key(branch_id, &format!("key_{}", i), 100);
-            manager.db.put(&key, b"value").unwrap();
-        }
-
-        // Verify all keys exist
-        for i in 0..100 {
-            let key = encode_branch_data_key(branch_id, &format!("key_{}", i), 100);
-            assert!(manager.db.get(&key).unwrap().is_some());
-        }
-
-        // Drop branch (immediate GC)
-        manager.drop_branch("multi_key", false).unwrap();
-
-        // Verify all keys were deleted
-        for i in 0..100 {
-            let key = encode_branch_data_key(branch_id, &format!("key_{}", i), 100);
-            assert!(manager.db.get(&key).unwrap().is_none());
-        }
+        assert_eq!(created, reserved);
     }
 }

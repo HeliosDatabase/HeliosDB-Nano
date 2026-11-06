@@ -4006,10 +4006,22 @@ impl<'a> Executor<'a> {
                                 return Ok(op);
                             }
 
+                            // `AS OF`: the row-counter knows now only. Declined like every
+                            // sibling (`try_count_pk_cardinality`, …), so the generic
+                            // aggregate answers on main and the scan refuses on a branch.
                             let scan_table = match input.as_ref() {
-                                LogicalPlan::Scan { table_name, .. } => Some(table_name.as_str()),
+                                LogicalPlan::Scan {
+                                    table_name,
+                                    as_of: None,
+                                    ..
+                                } => Some(table_name.as_str()),
                                 LogicalPlan::Project { input: inner, .. } => {
-                                    if let LogicalPlan::Scan { table_name, .. } = inner.as_ref() {
+                                    if let LogicalPlan::Scan {
+                                        table_name,
+                                        as_of: None,
+                                        ..
+                                    } = inner.as_ref()
+                                    {
                                         Some(table_name.as_str())
                                     } else {
                                         None

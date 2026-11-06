@@ -1214,8 +1214,9 @@ fn overlay_rows(db: &EmbeddedDatabase, branch_id: u64) -> usize {
 }
 
 /// THE DRAIN: a session writing to branch `d` in a loop while another session
-/// drops `d`. Every write that succeeded did so before the DROP returned, and
-/// nothing is written to the dropped branch after it.
+/// drops `d`. Nothing is written to the dropped branch after it: the DROP deleted
+/// the branch's keys (sprinter 6bc4a4040eb7, B4), so anything found there later came
+/// after it returned.
 #[test]
 fn nothing_is_written_to_a_branch_after_its_drop_returns() {
     let db = Arc::new(seeded());
@@ -1246,14 +1247,14 @@ fn nothing_is_written_to_a_branch_after_its_drop_returns() {
     };
     std::thread::sleep(Duration::from_millis(50));
     db.execute("DROP BRANCH d").unwrap();
-    let at_drop = overlay_rows(&db, branch_id);
+    assert_eq!(overlay_rows(&db, branch_id), 0, "the DROP reclaimed the branch's keys");
     let written = writer.join().unwrap();
     assert_eq!(
         overlay_rows(&db, branch_id),
-        at_drop,
+        0,
         "*** a statement bound to the dropped branch wrote after the DROP returned ***"
     );
-    assert_eq!(at_drop, written, "every acknowledged write landed before the drop");
+    assert!(written > 0, "the writer got to write");
 }
 
 /// The same for MERGE: the source is drained and marked merged BEFORE its rows
@@ -1342,13 +1343,16 @@ fn a_concurrent_switch_never_splits_a_statement() {
     let db = Arc::new(seeded());
     db.execute("CREATE TABLE s (id INT PRIMARY KEY, code INT)").unwrap();
     db.execute("CREATE INDEX s_code ON s (code)").unwrap();
+    // After the table: a branch is a fork, and one from before it has no `s`
+    // (sprinter 6bc4a4040eb7, B4).
+    db.execute("CREATE BRANCH sw AS OF NOW").unwrap();
     let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let switcher = {
         let db = Arc::clone(&db);
         let done = Arc::clone(&done);
         std::thread::spawn(move || {
             while !done.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = db.switch_branch("b");
+                let _ = db.switch_branch("sw");
                 let _ = db.switch_branch("main");
             }
         })
@@ -1972,11 +1976,9 @@ mod held {
             .join()
             .unwrap()
             .expect("the DROP completes once the statement is done");
-        assert_eq!(
-            overlay_rows(&db, d_id),
-            1,
-            "the held statement's row was written before the DROP returned"
-        );
+        // That row, written before the DROP returned, went with the branch's keys: it
+        // is not there to write it afterwards (sprinter 6bc4a4040eb7, B4).
+        assert_eq!(overlay_rows(&db, d_id), 0, "the DROP reclaimed the branch's keys");
         let gone = session_rows(&db, probe, "SELECT v FROM t").expect_err("d is dropped");
         assert!(gone.to_string().contains(BRANCH_BINDING_GONE_MARKER), "got: {gone}");
     }

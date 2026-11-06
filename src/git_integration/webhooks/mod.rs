@@ -613,12 +613,10 @@ impl<'a> StorageWebhookHandler<'a> {
         // pass): the fork record of table incarnations is born in the creation
         // batch.
         let branch_id = match self.engine {
-            Some(engine) => engine.create_branch_at_snapshot(
-                &preview_branch_name,
-                Some(target_branch),
-                Some(snapshot_ts),
-                options,
-            )?,
+            // A fork of now: no anchor (sprinter 6bc4a4040eb7, B4).
+            Some(engine) => {
+                engine.create_branch_at_snapshot(&preview_branch_name, Some(target_branch), None, options)?
+            }
             None => {
                 self.branch_manager
                     .create_branch(&preview_branch_name, Some(target_branch), snapshot_ts, options)?

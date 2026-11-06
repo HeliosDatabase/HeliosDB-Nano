@@ -36,7 +36,7 @@ use heliosdb_nano::storage::BranchState;
 use heliosdb_nano::{
     EmbeddedDatabase, Error, Tuple, Value, BRANCH_MERGE_BUSY_MARKER, BRANCH_MERGE_DUPLICATE_KEY_MARKER,
     BRANCH_MERGE_KEY_CLAIMED_MARKER, BRANCH_MERGE_PENDING_MARKER, BRANCH_MERGE_SCHEMA_REFUSED_MARKER,
-    BRANCH_SCHEMA_UNSUPPORTED_MARKER, BRANCH_TABLE_BUSY_MARKER, BRANCH_WRITE_UNSUPPORTED_MARKER,
+    BRANCH_SCHEMA_UNSUPPORTED_MARKER, BRANCH_TABLE_BUSY_MARKER,
 };
 use tokio_postgres::{Client, NoTls};
 
@@ -1627,10 +1627,10 @@ fn a_branch_reverse_fk_answer_follows_its_ddl() {
     }
 }
 
-/// A branch with live children refuses its DDL (0A000): they read through it,
-/// and freezing what they see is phase B4. After the child is gone it works.
+/// sprinter 6bc4a4040eb7 (phase B4, the refusal of B3 is lifted): DDL on a branch with a
+/// live child. The child keeps what it saw: it takes its own copy of each table first.
 #[test]
-fn ddl_on_a_branch_with_live_children_is_refused() {
+fn ddl_on_a_branch_with_live_children_leaves_them_what_they_saw() {
     for family in FAMILIES {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
@@ -1638,40 +1638,38 @@ fn ddl_on_a_branch_with_live_children_is_refused() {
         branch(&db, "b");
         ok(&db, family, "CREATE TABLE own (id INT PRIMARY KEY)", &[]);
         db.execute("CREATE BRANCH c AS OF NOW").unwrap();
-        let catalog_before = branch_catalog_state(&db);
+        // A no-op is not a change.
+        ok(&db, family, "CREATE TABLE IF NOT EXISTS own (other INT)", &[]);
         for sql in [
             "DROP TABLE own",
             "CREATE TABLE fresh (id INT)",
             "CREATE TABLE fresh2 AS SELECT id FROM t",
             "ALTER TABLE t ADD COLUMN x INT",
         ] {
-            let err = exec(&db, family, sql, &[]).expect_err(sql).to_string();
+            ok(&db, family, sql, &[]);
+        }
+        assert_eq!(listed_columns(&db, family, "t"), vec!["id", "v", "x"], "[{family:?}]");
+        db.execute("USE BRANCH c").unwrap();
+        assert_eq!(listed_columns(&db, family, "t"), vec!["id", "v"], "[{family:?}]");
+        assert_eq!(
+            ids(&rows(&db, family, "SELECT id FROM t", &[])),
+            vec![1],
+            "[{family:?}]"
+        );
+        assert_eq!(ids(&rows(&db, family, "SELECT id FROM own", &[])), Vec::<i64>::new());
+        for missing in ["fresh", "fresh2"] {
             assert!(
-                err.contains(BRANCH_WRITE_UNSUPPORTED_MARKER) && err.contains("child branches"),
-                "[{family:?}] {sql}: {err}"
-            );
-            assert_eq!(
-                branch_catalog_state(&db),
-                catalog_before,
-                "[{family:?}] {sql}: nothing changed"
+                try_rows(&db, family, &format!("SELECT * FROM {missing}"), &[]).is_err(),
+                "[{family:?}] {missing}"
             );
         }
-        // A no-op is not a change.
-        ok(&db, family, "CREATE TABLE IF NOT EXISTS own (other INT)", &[]);
-        db.execute("USE BRANCH c").unwrap();
-        assert_eq!(listed_columns(&db, family, "t"), vec!["id", "v"]);
-        assert_eq!(ids(&rows(&db, family, "SELECT id FROM own", &[])), Vec::<i64>::new());
-        db.execute("USE BRANCH b").unwrap();
-        db.execute("DROP BRANCH c").unwrap();
-        ok(&db, family, "ALTER TABLE t ADD COLUMN x INT", &[]);
-        ok(&db, family, "DROP TABLE own", &[]);
-        ok(&db, family, "CREATE TABLE fresh (id INT)", &[]);
     }
 }
 
-/// A schema-changing MERGE into a branch with OTHER live children is refused too.
+/// sprinter 6bc4a4040eb7 (phase B4): a schema-changing MERGE into a branch with OTHER
+/// live children: they keep what they saw.
 #[test]
-fn a_schema_changing_merge_into_a_branch_with_other_children_is_refused() {
+fn a_schema_changing_merge_into_a_branch_leaves_its_other_children_alone() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
     branch(&db, "b");
@@ -1680,15 +1678,11 @@ fn a_schema_changing_merge_into_a_branch_with_other_children_is_refused() {
     db.execute("USE BRANCH c1").unwrap();
     db.execute("ALTER TABLE t ADD COLUMN x INT").unwrap();
     db.execute("USE BRANCH main").unwrap();
-    let err = db.execute("MERGE BRANCH c1 INTO b").unwrap_err().to_string();
-    assert!(
-        err.contains(BRANCH_WRITE_UNSUPPORTED_MARKER) && err.contains("c2"),
-        "{err}"
-    );
-    assert!(branch_is_active(&db, "c1"), "the source stays mergeable");
-    assert_eq!(count_keys(&db, "branch:merge:"), 0);
-    db.execute("DROP BRANCH c2").unwrap();
     db.execute("MERGE BRANCH c1 INTO b").unwrap();
+    db.execute("USE BRANCH b").unwrap();
+    assert_eq!(listed_columns(&db, Family::Text, "t"), vec!["id", "v", "x"]);
+    db.execute("USE BRANCH c2").unwrap();
+    assert_eq!(listed_columns(&db, Family::Text, "t"), vec!["id", "v"]);
 }
 
 /// `pg_indexes` on a branch: main's index of a table the branch dropped is gone,
@@ -1867,35 +1861,31 @@ fn merge_refused_when_main_recreated_a_table_since_the_fork() {
     }
 }
 
-/// Created on main AFTER the fork, written on the branch (B3 reads main live): no
-/// fork entry to compare, so it merges. Phase B4's fork point tightens this.
+/// sprinter 6bc4a4040eb7 (phase B4, in place of B3's refusal): a table created on main
+/// AFTER the fork is invisible to the branch, so it cannot have changed its rows, and a
+/// merge has nothing to refuse.
 #[test]
-fn merge_of_rows_of_a_table_created_on_the_target_after_the_fork_is_refused() {
+fn a_table_created_on_the_target_after_the_fork_is_invisible_to_the_branch() {
     for family in FAMILIES {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE BRANCH r AS OF NOW").unwrap();
-        db.execute("CREATE BRANCH untouched AS OF NOW").unwrap();
         db.execute("CREATE TABLE later (id INT PRIMARY KEY)").unwrap();
         db.execute("USE BRANCH r").unwrap();
-        ok(&db, family, "INSERT INTO later VALUES ($1)", &[i(1)]);
-        db.execute("USE BRANCH main").unwrap();
-        let err = db
-            .execute("MERGE BRANCH r INTO main")
-            .expect_err("no fork entry")
-            .to_string();
         assert!(
-            err.contains(BRANCH_MERGE_SCHEMA_REFUSED_MARKER)
-                && err.contains("later was created on main after branch r forked"),
-            "[{family:?}] {err}"
+            exec(&db, family, "INSERT INTO later VALUES ($1)", &[i(1)]).is_err(),
+            "[{family:?}]"
         );
-        assert!(branch_is_active(&db, "r"), "[{family:?}]");
+        assert!(
+            try_rows(&db, family, "SELECT id FROM later", &[]).is_err(),
+            "[{family:?}]"
+        );
+        db.execute("USE BRANCH main").unwrap();
+        db.execute("MERGE BRANCH r INTO main").expect("nothing to carry");
         assert_eq!(
             ids(&rows(&db, family, "SELECT id FROM later", &[])),
             Vec::<i64>::new(),
-            "[{family:?}] nothing landed"
+            "[{family:?}]"
         );
-        db.execute("MERGE BRANCH untouched INTO main")
-            .expect("a branch that changed no rows of it");
     }
 }
 
@@ -2774,12 +2764,14 @@ fn a_merge_is_refused_while_a_transaction_has_staged_writes_on_the_target() {
 }
 
 /// M4: a merged child stays in its own children's chains: b → c → d, c merged into
-/// b. b's DDL would change what d reads.
+/// b. sprinter 6bc4a4040eb7 (phase B4): b's DDL no longer waits for d: d takes its own
+/// copy, through the merged level, and keeps what it read.
 #[test]
-fn ddl_is_refused_while_a_live_branch_reads_through_a_merged_child() {
+fn ddl_leaves_a_live_branch_reading_through_a_merged_child_what_it_saw() {
     for family in FAMILIES {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 1)").unwrap();
         branch(&db, "b");
         db.execute("CREATE BRANCH c AS OF NOW").unwrap();
         db.execute("USE BRANCH c").unwrap();
@@ -2788,20 +2780,23 @@ fn ddl_is_refused_while_a_live_branch_reads_through_a_merged_child() {
         db.execute("MERGE BRANCH c INTO b").unwrap();
         db.execute("USE BRANCH b").unwrap();
         for sql in [
-            "DROP TABLE t",
             "ALTER TABLE t ADD COLUMN x INT",
             "CREATE TABLE fresh (id INT)",
+            "DROP TABLE t",
         ] {
-            let err = exec(&db, family, sql, &[]).expect_err(sql).to_string();
-            assert!(
-                err.contains(BRANCH_WRITE_UNSUPPORTED_MARKER) && err.contains("children: d"),
-                "[{family:?}] {sql}: {err}"
-            );
+            ok(&db, family, sql, &[]);
         }
-        db.execute("USE BRANCH main").unwrap();
-        db.execute("DROP BRANCH d").unwrap();
-        db.execute("USE BRANCH b").unwrap();
-        ok(&db, family, "ALTER TABLE t ADD COLUMN x INT", &[]);
+        db.execute("USE BRANCH d").unwrap();
+        assert_eq!(listed_columns(&db, family, "t"), vec!["id", "v"], "[{family:?}]");
+        assert_eq!(
+            ids(&rows(&db, family, "SELECT id FROM t", &[])),
+            vec![1],
+            "[{family:?}]"
+        );
+        assert!(
+            try_rows(&db, family, "SELECT * FROM fresh", &[]).is_err(),
+            "[{family:?}]"
+        );
     }
 }
 
@@ -4272,9 +4267,9 @@ fn a_finished_merge_survives_the_replay_of_older_wal_entries() {
 /// after it shows the new value. A transaction begun after it reads the merged rows
 /// (a scan used to answer with the pre-merge row); one begun before it does not.
 ///
-/// A row the merge deleted is absent from `AS OF` at any point, exactly as a row main
-/// itself deleted is: `scan_table_at_snapshot` starts from the current rows, and that
-/// is B4's to change (`B4_branch_fork_point.md`).
+/// A row the merge deleted is there `AS OF` a time before it, and gone after, exactly as
+/// a row main itself deleted is: the commit wrote its delete event (phase B4). A
+/// transaction's snapshot scan starts from the rows that exist, which B4 left alone.
 #[test]
 fn time_travel_and_snapshots_see_a_merge_like_any_commit() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
@@ -4315,7 +4310,7 @@ fn time_travel_and_snapshots_see_a_merge_like_any_commit() {
     let scn_after = last_scn(&db);
     assert!(scn_after > scn_before, "the merge's commit is a snapshot");
 
-    assert_eq!(at(scn_before), some_pairs(&[(1, "a"), (3, "c")]));
+    assert_eq!(at(scn_before), some_pairs(&[(1, "a"), (2, "b"), (3, "c")]));
     assert_eq!(at(scn_after), some_pairs(&[(1, "z"), (3, "c"), (4, "d")]));
 
     assert_eq!(

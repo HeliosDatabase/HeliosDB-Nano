@@ -17,11 +17,11 @@
 //! 2. **Pinned snapshots** (`WriteConflictRegistry::min_pinned_snapshot`):
 //!    every open transaction pins its snapshot; statement-scoped `AS OF`
 //!    readers and in-flight `CREATE BRANCH ... AS OF` pin theirs.
-//! 3. **Branch anchors**: every active non-main branch pins its
-//!    `created_from_snapshot`. Branch reads today overlay *current* main
-//!    data, but merge-base resolution and `AS OF`-anchored branches hold
-//!    the anchor timestamp, so a live branch conservatively pins history
-//!    at its anchor.
+//!
+//! A branch pins nothing once it exists (sprinter 6bc4a4040eb7, B4): it holds its
+//! parent's old rows in its own overlay, frozen as the parent changes them, and an
+//! `AS OF` anchor is materialized once at its creation, under a pin of the second
+//! kind.
 //!
 //! ## Chain-preservation rule
 //!
@@ -31,8 +31,11 @@
 //! at the horizon and at every `t >= horizon` until the next version),
 //! plus everything above the horizon. It never deletes the only/latest
 //! version of a row, and reconstruction at any `t >= horizon` is exact.
-//! Deleted rows have no tombstone version (pre-existing schema), so their
-//! final pre-delete version is also retained.
+//! A row deleted before delete events existed has none, so its final pre-delete
+//! version is retained. One whose delete event is at or below the horizon is gone at
+//! every time a read can still ask about (sprinter 6bc4a4040eb7, B4), so all of it
+//! goes, the event too: with no event left a read falls back to `data:`, which has no
+//! such row.
 //!
 //! ## Beyond-horizon semantics
 //!
@@ -54,12 +57,11 @@
 
 use crate::{Error, Result};
 use parking_lot::{Mutex, RwLock};
-use rocksdb::{ReadOptions, WriteBatch, DB};
+use rocksdb::{WriteBatch, DB};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use super::branch::BranchManager;
 use super::conflict::WriteConflictRegistry;
 use super::time_travel::SnapshotManager;
 use super::write_gate::WriteGate;
@@ -120,7 +122,6 @@ pub struct VersionGc {
     gate: Arc<WriteGate>,
     snapshot_manager: Arc<SnapshotManager>,
     conflict_registry: Arc<WriteConflictRegistry>,
-    branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
     /// Engine logical timestamp counter (read-only here, for anchors).
     timestamp: Arc<RwLock<u64>>,
     config: VersionGcConfig,
@@ -138,7 +139,6 @@ impl VersionGc {
         gate: Arc<WriteGate>,
         snapshot_manager: Arc<SnapshotManager>,
         conflict_registry: Arc<WriteConflictRegistry>,
-        branch_manager: Arc<RwLock<Option<Arc<BranchManager>>>>,
         timestamp: Arc<RwLock<u64>>,
         config: VersionGcConfig,
     ) -> Self {
@@ -161,7 +161,6 @@ impl VersionGc {
             gate,
             snapshot_manager,
             conflict_registry,
-            branch_manager,
             timestamp,
             config,
             cursor: Mutex::new(None),
@@ -239,7 +238,7 @@ impl VersionGc {
             });
         };
 
-        // 2. Clamp by pinned snapshots and branch anchors.
+        // 2. Clamp by pinned snapshots.
         let horizon = self.clamp_horizon(retention_ts)?;
 
         // 3. Publish the watermark BEFORE deleting (see module docs: after
@@ -295,11 +294,9 @@ impl VersionGc {
         // Persisted anchors (survive restarts; keys sort by unix seconds).
         let mut stale_anchor_keys: Vec<Vec<u8>> = Vec::new();
         let mut best_anchor: Option<(Vec<u8>, u64)> = None;
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
         let iter = self.db.iterator_opt(
             rocksdb::IteratorMode::From(ANCHOR_PREFIX, rocksdb::Direction::Forward),
-            read_opts,
+            super::time_travel::bounded_read_options(ANCHOR_PREFIX),
         );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("version-gc anchor scan: {}", e)))?;
@@ -335,7 +332,8 @@ impl VersionGc {
         Ok(best)
     }
 
-    /// min(candidate, pinned snapshots, active branch anchors).
+    /// min(candidate, pinned snapshots). A `CREATE BRANCH … AS OF` holds its pin
+    /// while it materializes; a branch that exists needs no history.
     fn clamp_horizon(&self, candidate: u64) -> Result<u64> {
         let mut horizon = candidate;
 
@@ -343,18 +341,37 @@ impl VersionGc {
             horizon = horizon.min(pin_min);
         }
 
-        // Active non-main branches pin their creation anchor.
-        let manager = self.branch_manager.read().clone();
-        if let Some(mgr) = manager {
-            for branch in mgr.list_branches()? {
-                if branch.name == "main" || branch.created_from_snapshot == 0 {
-                    continue;
-                }
-                horizon = horizon.min(branch.created_from_snapshot);
-            }
-        }
-
         Ok(horizon)
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): when the newest event of the row of `prefix`
+    /// (`v:{table}:{row_id}:`) at or below `horizon` is its delete, its events at or
+    /// below the horizon, newest first. `None` for any other row: one seek.
+    fn deleted_row_events(&self, prefix: &[u8], horizon: u64) -> Result<Option<Vec<Vec<u8>>>> {
+        let Some(row) = prefix.get(2..) else {
+            return Ok(None);
+        };
+        let mut index_prefix = Vec::with_capacity(row.len() + 6);
+        index_prefix.extend_from_slice(b"v_idx:");
+        index_prefix.extend_from_slice(row);
+        let mut seek = index_prefix.clone();
+        seek.extend_from_slice(format!("{:020}", u64::MAX - horizon).as_bytes());
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(&seek, rocksdb::Direction::Forward),
+            super::time_travel::bounded_read_options(&index_prefix),
+        );
+        let mut events: Vec<Vec<u8>> = Vec::new();
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::storage(format!("version-gc index scan: {}", e)))?;
+            if !key.starts_with(&index_prefix) {
+                break;
+            }
+            if events.is_empty() && !super::time_travel::is_delete_event(&value) {
+                return Ok(None);
+            }
+            events.push(key.to_vec());
+        }
+        Ok((!events.is_empty()).then_some(events))
     }
 
     /// Scan the `v:` keyspace from the cursor and delete, per row, every
@@ -371,11 +388,11 @@ impl VersionGc {
         // total_order_seek: the column family uses a fixed 5-byte prefix
         // extractor; a cross-prefix scan over the whole `v:` range needs
         // total-order iteration.
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
+        // Bounded at the end of `v:` (sprinter 6bc4a4040eb7, B4 fix pass): the pass
+        // ends where the family does, not after the deleted keys past it.
         let iter = self.db.iterator_opt(
             rocksdb::IteratorMode::From(&start_key, rocksdb::Direction::Forward),
-            read_opts,
+            super::time_travel::bounded_read_options(b"v:"),
         );
 
         let mut batch = WriteBatch::default();
@@ -413,6 +430,29 @@ impl VersionGc {
                                 batch_keys: &mut usize,
                                 stats: &mut VersionGcCycleStats|
          -> Result<()> {
+            // Sprinter 6bc4a4040eb7 (B4): the newest event at or below the horizon
+            // is the row's delete: nothing can read any of it at or above the
+            // horizon. Every version and event at or below it goes, that event too.
+            if let Some(events) = self.deleted_row_events(prefix, horizon)? {
+                for ts in versions.iter().copied().filter(|ts| *ts <= horizon) {
+                    let mut vkey = Vec::with_capacity(prefix.len() + 20);
+                    vkey.extend_from_slice(prefix);
+                    vkey.extend_from_slice(ts.to_string().as_bytes());
+                    batch.delete(&vkey);
+                    stats.versions_deleted += 1;
+                    *batch_keys += 1;
+                }
+                for event in events {
+                    batch.delete(&event);
+                    stats.index_entries_deleted += 1;
+                    *batch_keys += 1;
+                }
+                if *batch_keys >= DELETE_BATCH_KEYS {
+                    flush(batch, batch_keys, &self.db, &self.gate)?;
+                }
+                versions.clear();
+                return Ok(());
+            }
             if versions.len() > 1 {
                 if let Some(keep) = versions.iter().copied().filter(|ts| *ts <= horizon).max() {
                     // C15 interaction: the autocommit UPDATE/DELETE paths
@@ -532,11 +572,9 @@ impl VersionGc {
 pub fn version_storage_stats(db: &DB) -> Result<VersionStorageStats> {
     let mut stats = VersionStorageStats::default();
     for (prefix, counter) in [(b"v:".as_slice(), 0usize), (b"v_idx:".as_slice(), 1usize)] {
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
         let iter = db.iterator_opt(
             rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
-            read_opts,
+            super::time_travel::bounded_read_options(prefix),
         );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("version stats scan: {}", e)))?;

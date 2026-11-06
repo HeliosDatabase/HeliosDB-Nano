@@ -335,11 +335,17 @@ impl<'a> MaterializedViewCatalog<'a> {
         // those orphaned rows were read back instead of the freshly materialized
         // value, so a COUNT(DISTINCT) view returned a stale slice's count). Purging
         // by key range guarantees the re-populated view contains only new rows.
-        if catalog.table_exists(&data_table)? {
+        let replaced = catalog.table_exists(&data_table)?;
+        if replaced {
             catalog.drop_table(&data_table)?;
         }
         self.storage.purge_table_data(&data_table)?;
         catalog.create_table(&data_table, schema.clone())?;
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): a branch anchored before this cannot be
+        // given the rows it replaced: they have no history left, and it is refused.
+        if replaced {
+            catalog.record_materialized_view_refresh(&data_table)?;
+        }
 
         // Insert all tuples
         let row_count = tuples.len() as u64;

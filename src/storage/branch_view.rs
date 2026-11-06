@@ -17,13 +17,14 @@
 //! row id.
 //!
 //! Phase B4 freezes a parent's pre-image into each live child at the parent's
-//! write (marked `bfrz:`); the frozen copy is an ordinary `bdata` / `bdel` of
-//! the child, so the read model here stays exactly "nearest level wins" and
-//! nothing in this module reads history. [`BranchView::for_chain`] and
-//! [`BranchView::own_entry`] are the two entry points that hook needs (a view
-//! of any level `P`, and "does `C` already have its own entry for this row"),
-//! and [`bump_write_generation`] is what it must call for every level it
-//! writes.
+//! write (marked `bfrz:`, `branch_freeze.rs`); the frozen copy is an ordinary
+//! `bdata` / `bdel` of the child, so the read model here stays exactly "nearest
+//! level wins" and nothing in this module reads history. One rule is added to
+//! keep that true against a write in progress: main FIRST, the levels after. A
+//! reader that saw a parent's new row then finds the copy of the old one, which
+//! came in the same write ([`BranchView::get`], [`BranchView::scan`],
+//! [`BranchView::rows_with_key`]), and a cached overlay is not trusted while a
+//! copy is on its way into it ([`BranchView::committed_overlay`]).
 //!
 //! # Writes
 //!
@@ -216,18 +217,18 @@ fn key_index_key_prefix(level: u64, table: &str, set: &KeyIndexSet, encoded: &[u
     )
 }
 
-fn key_index_key(level: u64, table: &str, set: &KeyIndexSet, encoded: &[u8], row_id: u64) -> Vec<u8> {
+pub fn key_index_key(level: u64, table: &str, set: &KeyIndexSet, encoded: &[u8], row_id: u64) -> Vec<u8> {
     format!("{}{row_id}", key_index_key_prefix(level, table, set, encoded)).into_bytes()
 }
 
 /// sprinter 6bc4a4040eb7 (B3 fix pass): one column set a level's key index of
 /// an isolated table covers.
 #[derive(Debug, Clone)]
-struct KeyIndexSet {
+pub struct KeyIndexSet {
     /// The rule's index name, or `fk_{i}`.
     name: String,
     /// Sorted schema positions: the form key maps and probes encode in.
-    positions: Vec<usize>,
+    pub(crate) positions: Vec<usize>,
     /// The definition's incarnation id: random, and sealed in the catalog record.
     salt: u64,
 }
@@ -235,7 +236,7 @@ struct KeyIndexSet {
 /// The key sets of a definition: its PRIMARY KEY / UNIQUE rules (what a write
 /// on the table probes, and what a FOREIGN KEY referencing it probes) and its
 /// own FOREIGN KEY column sets (what a parent's DELETE or UPDATE probes).
-fn key_index_sets(definition: &super::branch_catalog::BranchTableDefinition) -> Vec<KeyIndexSet> {
+pub fn key_index_sets(definition: &super::branch_catalog::BranchTableDefinition) -> Vec<KeyIndexSet> {
     let mut sets: Vec<KeyIndexSet> = Vec::new();
     let mut add = |name: String, columns: &[String]| {
         let Some(mut positions) = column_positions(&definition.schema, columns) else {
@@ -276,16 +277,22 @@ const MATERIALIZE_CHUNK_ROWS: usize = 10_000;
 
 /// How many bytes of copies a materialization writes per batch, whatever the
 /// row count: wide rows must not grow a batch towards the write-group limit.
-const MATERIALIZE_CHUNK_BYTES: usize = 256 * 1024 * 1024;
+pub const MATERIALIZE_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 
 /// A test's smaller chunk: see `StorageEngine::debug_set_materialize_chunk_rows`.
 static MATERIALIZE_CHUNK_ROWS_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// What runs between `BranchView::get`'s read of its own level and the rest.
+    static AFTER_OWN_ENTRY: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
 
 pub fn set_materialize_chunk_rows(rows: u64) {
     MATERIALIZE_CHUNK_ROWS_OVERRIDE.store(rows, Ordering::Relaxed);
 }
 
-fn materialize_chunk_rows() -> usize {
+pub fn materialize_chunk_rows() -> usize {
     match MATERIALIZE_CHUNK_ROWS_OVERRIDE.load(Ordering::Relaxed) {
         0 => MATERIALIZE_CHUNK_ROWS,
         rows => usize::try_from(rows).unwrap_or(MATERIALIZE_CHUNK_ROWS),
@@ -441,12 +448,31 @@ fn current_generation(engine: u64, level: u64, table: &str) -> u64 {
 
 /// Bump the write generation of `table` on `level` (and return the new
 /// value) — for every writer that makes branch overlay writes visible outside
-/// the view's own bookkeeping (MERGE into a branch; phase B4's freeze hook
-/// must call it for every child level it writes).
+/// the view's own bookkeeping (MERGE into a branch; phase B4's freeze hook, for
+/// every child level it writes).
 pub fn bump_write_generation(engine: u64, level: u64, table: &str) -> u64 {
     let mut generation = GENERATIONS.entry((engine, level, table.to_string())).or_insert(0);
     *generation += 1;
     *generation
+}
+
+/// Phase B4: forget what this process holds for a level whose keys are gone, so a
+/// long-lived server does not keep an entry per branch it ever had. A level's id is
+/// never reused.
+pub fn forget_level(engine: u64, level: u64) {
+    GENERATIONS.retain(|(owner, cached_level, _), _| !(*owner == engine && *cached_level == level));
+    let mut cache = COMMITTED.lock();
+    let gone: Vec<CommittedKey> = cache
+        .entries
+        .keys()
+        .filter(|key| key.engine == engine && key.branch == level)
+        .cloned()
+        .collect();
+    for key in gone {
+        if let Some(entry) = cache.entries.remove(&key) {
+            cache.rows = cache.rows.saturating_sub(entry.rows);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -903,7 +929,7 @@ thread_local! {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn encode_positions(tuple: &Tuple, positions: &[usize]) -> Option<Vec<u8>> {
+pub fn encode_positions(tuple: &Tuple, positions: &[usize]) -> Option<Vec<u8>> {
     let mut values: Vec<&Value> = Vec::with_capacity(positions.len());
     for position in positions {
         match tuple.values.get(*position) {
@@ -1452,6 +1478,14 @@ impl<'a> BranchView<'a> {
             branch: self.branch_id,
             table: table.to_string(),
         };
+        // Phase B4, read BEFORE the generations: a parent's write this statement
+        // may have seen in main brought a copy of the old row with it. While that
+        // copy is on its way a cached overlay cannot be told from one that has it;
+        // once the mark is gone the generation has moved. So: from storage, and not
+        // kept.
+        let copy_in_flight = self
+            .engine
+            .branch_freeze_in_flight(self.chain.get(first_level..).unwrap_or(&[]), table);
         // Read BEFORE loading: a write that becomes visible while the overlay
         // loads leaves the copy behind its recorded generations, so its next
         // use reloads it (a reload that was not needed costs time, never
@@ -1466,7 +1500,7 @@ impl<'a> BranchView<'a> {
         // A physical standby's rows arrive through the WAL applier, below
         // every write-generation bump, so nothing could tell a cached copy it
         // is stale: never cache there (reads only; a standby takes no writes).
-        if self.engine.is_physical_standby() {
+        if copy_in_flight || self.engine.is_physical_standby() {
             let rows = self.load_committed_rows(table, width, first_level)?;
             return Ok(Arc::new(parking_lot::Mutex::new(CommittedOverlay {
                 width,
@@ -1622,16 +1656,54 @@ impl<'a> BranchView<'a> {
         if let Some(entry) = self.own_entry(txn, table, row_id, width)? {
             return Ok(entry.into_visible());
         }
+        #[cfg(test)]
+        {
+            if let Some(hook) = AFTER_OWN_ENTRY.with(|hook| hook.borrow_mut().take()) {
+                hook();
+            }
+        }
         let ancestors = self.ancestors().get(scope.first_level..).unwrap_or(&[]);
-        for &level in ancestors.iter().rev() {
+        for (position, &level) in ancestors.iter().enumerate().rev() {
             if let Some(entry) = self.committed_entry(level, table, row_id, width)? {
+                // Phase B4: that may be a parent's write this read raced: the levels
+                // nearer than it said nothing before it, and its copy came with it.
+                if self.engine.branch_reads_may_race() {
+                    let nearer = scope.first_level.saturating_add(position).saturating_add(1);
+                    for &level in self.chain.iter().skip(nearer).rev() {
+                        if let Some(copy) = self.committed_entry(level, table, row_id, width)? {
+                            return Ok(copy.into_visible());
+                        }
+                    }
+                }
                 return Ok(entry.into_visible());
             }
         }
         if !scope.include_main {
             return Ok(None);
         }
-        self.main_row(table, row_id, schema)
+        self.main_row_for_level(table, row_id, schema, scope.first_level)
+    }
+
+    /// Main's row `row_id`, as this level sees it: phase B4: read main first, and
+    /// then ask the levels, which said nothing before. If that row is a parent's
+    /// write this statement raced, the copy of the old one came in the same write.
+    fn main_row_for_level(
+        &self,
+        table: &str,
+        row_id: u64,
+        schema: &Schema,
+        first_level: usize,
+    ) -> Result<Option<Tuple>> {
+        let row = self.main_row(table, row_id, schema)?;
+        if self.engine.branch_reads_may_race() {
+            let width = schema.columns.len();
+            for &level in self.chain.iter().skip(first_level).rev() {
+                if let Some(entry) = self.committed_entry(level, table, row_id, width)? {
+                    return Ok(entry.into_visible());
+                }
+            }
+        }
+        Ok(row)
     }
 
     /// Every row of `table` the branch sees, ordered by row id, with `txn`'s
@@ -1897,7 +1969,7 @@ impl<'a> BranchView<'a> {
             // Main's index can hold a key a still-open MAIN transaction claimed
             // but has not committed, or a stale entry: count the row only when
             // main holds it, with this key.
-            if let Some(tuple) = self.main_row(table, row_id, schema)? {
+            if let Some(tuple) = self.main_row_for_level(table, row_id, schema, scope.first_level)? {
                 if row_matches(&tuple, &positions, key) {
                     out.push(tuple);
                 }
@@ -2289,8 +2361,10 @@ impl<'a> BranchView<'a> {
     /// No lookups for a table no level defines.
     fn refuse_taken_row_id(&self, txn: Option<&Transaction>, table: &str, row_id: u64) -> Result<()> {
         let scope = self.scope(table)?;
-        if scope.include_main {
-            // Main's rows and every level share one counter: no collision.
+        if scope.include_main && scope.rules.is_none() {
+            // Main's rows and every level share one counter: no collision. Phase B4:
+            // not so for a table the level keeps a copy of the definition of: main
+            // may have dropped it, and with it the counter.
             return Ok(());
         }
         let own_row = branch_row_key(self.branch_id, table, row_id);
@@ -2443,6 +2517,17 @@ impl<'a> BranchView<'a> {
         let frozen = self.engine.branch_frozen_row_ids(level, table)?;
         let changed_here = |row_id: u64| own.contains(&row_id) && !frozen.contains(&row_id);
         let key_sets = record.definition().map(key_index_sets).unwrap_or_default();
+        // Phase B4, in this order: a parent's write the iterator sees brought its copy
+        // of the old row to this level before the overlay below is read, and one it
+        // does not see is a row this rewrites as what it read, which is that copy.
+        let main_rows = scope.include_main.then(|| {
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            self.engine.db.iterator_opt(
+                IteratorMode::From(format!("data:{table}:").as_bytes(), Direction::Forward),
+                read_opts,
+            )
+        });
         let overlay = self.load_committed_rows(table, width, scope.first_level)?;
         let stage = |batch: &mut WriteBatch, row_id: u64, values: Vec<Value>, copy: bool| -> Result<()> {
             let mut values = values;
@@ -2491,17 +2576,21 @@ impl<'a> BranchView<'a> {
             }
             Ok(())
         };
-        if scope.include_main {
+        if let Some(main_rows) = main_rows {
             let prefix = format!("data:{table}:");
-            self.for_each_with_prefix(prefix.as_bytes(), |key, raw| {
-                let Some(row_id) = StorageEngine::parse_row_id_after_prefix(key, prefix.len()) else {
-                    return Ok(());
+            for item in main_rows {
+                let (key, raw) = item.map_err(|e| Error::storage(format!("Iterator error: {e}")))?;
+                if !key.starts_with(prefix.as_bytes()) {
+                    break;
+                }
+                let Some(row_id) = StorageEngine::parse_row_id_after_prefix(&key, prefix.len()) else {
+                    continue;
                 };
                 if overlay.contains_key(&row_id) {
-                    return Ok(());
+                    continue;
                 }
-                emit_copy(row_id, self.decode_main_row(table, key, raw, row_id, current)?.values)
-            })?;
+                emit_copy(row_id, self.decode_main_row(table, &key, &raw, row_id, current)?.values)?;
+            }
         }
         for (row_id, state) in &overlay {
             if let (false, Some(tuple)) = (changed_here(*row_id), state) {
@@ -3014,6 +3103,27 @@ mod tests {
         twelve.insert(None, "t", 4, &row(4, "twelve")).unwrap();
         assert!(one.scan(None, "t", &schema).unwrap().is_empty());
         assert_eq!(ids(&twelve.scan(None, "t", &schema).unwrap()), vec![4]);
+    }
+
+    /// Phase B4: a parent branch's write lands between a read's two levels. The read
+    /// finds the parent's new image, and the copy of the old one that came with it
+    /// answers: the level that said nothing before is asked again.
+    #[test]
+    fn a_read_that_raced_a_parent_branchs_write_gets_what_it_froze() {
+        let engine = std::sync::Arc::new(engine());
+        put_main(&engine, 1, &row(1, "old"));
+        let p = engine.create_branch("p", Some("main"), Default::default()).unwrap();
+        let c = engine.create_branch("c", Some("p"), Default::default()).unwrap();
+        let writer = std::sync::Arc::clone(&engine);
+        AFTER_OWN_ENTRY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let parent = BranchView::for_chain(&writer, "p", vec![p]).unwrap();
+                parent.put(None, "t", 1, &row(1, "new")).unwrap();
+            }));
+        });
+        let child = BranchView::for_chain(&engine, "c", vec![p, c]).unwrap();
+        let read = child.get(None, "t", 1, &schema()).unwrap();
+        assert_eq!(read.map(|tuple| tuple.values), Some(row(1, "old").values));
     }
 
     /// `rows_with_key` with no index over the columns falls back to scanning

@@ -342,13 +342,14 @@ pub use crypto::{
     ZkeRequestContext,
 };
 pub use error::{
-    Error, Result, BRANCH_BINDING_GONE_MARKER, BRANCH_BUSY_MARKER, BRANCH_CLOSING_MARKER, BRANCH_IN_USE_MARKER,
-    BRANCH_MATERIALIZE_TOO_LARGE_MARKER, BRANCH_MERGE_BUSY_MARKER, BRANCH_MERGE_DUPLICATE_KEY_MARKER,
-    BRANCH_MERGE_KEY_CLAIMED_MARKER, BRANCH_MERGE_PENDING_MARKER, BRANCH_MERGE_SCHEMA_REFUSED_MARKER,
-    BRANCH_NOT_ACTIVE_MARKER, BRANCH_SCHEMA_RUNNING_MARKER, BRANCH_SCHEMA_UNSUPPORTED_MARKER,
-    BRANCH_STATEMENT_UNSUPPORTED_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER, BRANCH_TABLE_BUSY_MARKER,
-    BRANCH_WRITE_UNSUPPORTED_MARKER, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE,
-    NOT_NULL_VIOLATION_MARKER, PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED,
+    Error, Result, BRANCH_ANCHOR_UNREADABLE_MARKER, BRANCH_BINDING_GONE_MARKER, BRANCH_BUSY_MARKER,
+    BRANCH_CLOSING_MARKER, BRANCH_HAS_CHILD_MARKER, BRANCH_IN_USE_MARKER, BRANCH_MATERIALIZE_TOO_LARGE_MARKER,
+    BRANCH_MERGE_BUSY_MARKER, BRANCH_MERGE_DUPLICATE_KEY_MARKER, BRANCH_MERGE_KEY_CLAIMED_MARKER,
+    BRANCH_MERGE_PENDING_MARKER, BRANCH_MERGE_SCHEMA_REFUSED_MARKER, BRANCH_NOT_ACTIVE_MARKER,
+    BRANCH_SCHEMA_RUNNING_MARKER, BRANCH_SCHEMA_UNSUPPORTED_MARKER, BRANCH_STATEMENT_UNSUPPORTED_MARKER,
+    BRANCH_SWITCH_IN_TRANSACTION_MARKER, BRANCH_TABLE_BUSY_MARKER, BRANCH_WRITE_UNSUPPORTED_MARKER,
+    COMMIT_OF_FAILED_TRANSACTION_MESSAGE, IN_FAILED_TRANSACTION_MESSAGE, NOT_NULL_VIOLATION_MARKER,
+    PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED, TABLE_NAME_HOLDS_COLON_MARKER,
 };
 pub use storage::StorageEngine;
 pub use types::{
@@ -4475,7 +4476,8 @@ impl EmbeddedDatabase {
     /// WITH query without `nextval` / `setval` / `INTO` / row locks, EXPLAIN of
     /// one, SET / SHOW / RESET, and transaction control. Everything else is
     /// refused rather than guessed: DML (`… RETURNING` too), DDL, `CALL`,
-    /// PREPARE / EXECUTE, COPY FROM, maintenance, branch statements, PRAGMA,
+    /// PREPARE / EXECUTE, COPY FROM, maintenance, branch statements but `USE
+    /// BRANCH` (it binds this session, as `SET` does), PRAGMA,
     /// unrecognised utility statements, and several statements in one string.
     /// A UDF called by an admitted SELECT runs its body through this same API
     /// (`sql::udf_bridge`), so a body that writes is refused here as well.
@@ -6597,6 +6599,9 @@ impl EmbeddedDatabase {
         // schema is main's catalog object, so on a branch the whole statement
         // is refused (0A000) before its first part runs.
         self.refuse_schema_entry_on_branch("CREATE SCHEMA")?;
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): its tables are named only by the elements
+        // it runs, each a statement of its own: all of them on one side of a fork.
+        let _whole_statement = self.storage.enter_main_statement_of_unnamed_tables()?;
         // Did the schema already exist before this statement? Governs whether a
         // failure may tear it down (only if WE created it fresh).
         let schema_preexisted = self.storage.catalog().schema_exists(&spec.schema_name).unwrap_or(false);
@@ -11745,6 +11750,11 @@ impl EmbeddedDatabase {
         // run left unfinished, once the indexes it maintains row by row exist.
         // Failures are logged and stay pending; the open never fails for one.
         let _ = storage.finish_pending_branch_merges();
+        // Sprinter 6bc4a4040eb7 (B4): then whatever a crash left of a level that is
+        // gone. A source with an unfinished merge stays.
+        let _ = storage.reclaim_dead_branches();
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): a history purge a crash stopped.
+        let _ = storage.catalog().finish_pending_history_purges();
 
         // v3.60.0: register THIS database's sequence namespace once, here at
         // DB-open (a `Weak<StorageEngine>` downgrade — does not affect the move
@@ -12151,6 +12161,9 @@ impl EmbeddedDatabase {
                 // sprinter 6bc4a4040eb7 (B3 fix pass): see `new`. A physical
                 // engine does not get here: its primary's completion replicates.
                 let _ = storage.finish_pending_branch_merges();
+                let _ = storage.reclaim_dead_branches();
+                // Sprinter 6bc4a4040eb7 (B4 fix pass): a history purge a crash stopped.
+                let _ = storage.catalog().finish_pending_history_purges();
             }
         }
 
@@ -28103,9 +28116,8 @@ impl EmbeddedDatabase {
     /// connection. Refused with SQLSTATE 3D000 when `name` is not an active
     /// branch; `"main"` returns the session to main.
     pub fn switch_branch(&self, name: &str) -> Result<u64> {
-        // Spec P1.4: refused with the other branch operations on a physical
-        // standby (a standby's branches are its primary's).
-        self.refuse_write_on_physical_standby("switch_branch")?;
+        // Not refused on a physical standby: this binds the session and writes
+        // nothing, as `USE BRANCH` and a startup packet's `db@branch` (B4 fix pass).
         // B1 fix pass: the branch cannot change under an open transaction of
         // this handle (25001), exactly as `USE BRANCH` inside one is refused.
         // Second pass: whichever thread owns the handle's transaction, and a
@@ -43980,6 +43992,62 @@ mod tests {
         // A fresh autocommit read observes the overwrite.
         let fresh = db.query("SELECT * FROM fw", &[]).unwrap();
         assert_eq!(fresh[0].values[1], Value::Int4(999));
+    }
+
+    #[test]
+    fn copy_marker_row_deleted_later_is_there_as_of_before_its_delete() {
+        // Sprinter 6bc4a4040eb7 (B4): `AS OF` adds the rows whose newest event is a
+        // delete. A marker-covered row has no event of its own until the delete
+        // materializes its insert version, and a row deleted after a COPY is there at
+        // a time between the two, on `AS OF` and on a branch anchored there.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE cvm10 (id INT PRIMARY KEY, v INT)").unwrap();
+        let ts_before = db.storage.current_timestamp();
+        db.copy_bulk_insert(
+            "cvm10",
+            &[],
+            &copy_rows(&[
+                &[Some("1"), Some("10")],
+                &[Some("2"), Some("20")],
+                &[Some("3"), Some("30")],
+            ]),
+        )
+        .expect("fast path taken")
+        .unwrap();
+        let ts_after_copy = db.storage.current_timestamp();
+        assert_eq!(db.storage.snapshot_manager().debug_copy_marker_len(), 1);
+
+        db.execute("DELETE FROM cvm10 WHERE id = 1").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("DELETE FROM cvm10 WHERE id = 2").unwrap();
+        db.execute("COMMIT").unwrap();
+        let ts_after_deletes = db.storage.current_timestamp();
+
+        let at = |ts: u64| -> Vec<i32> {
+            let mut ids: Vec<i32> = db
+                .storage
+                .scan_table_at_snapshot("cvm10", ts)
+                .unwrap()
+                .iter()
+                .map(|row| match row.values[0] {
+                    Value::Int4(id) => id,
+                    ref other => panic!("{other:?}"),
+                })
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(at(ts_before), Vec::<i32>::new(), "before the COPY");
+        assert_eq!(at(ts_after_copy), vec![1, 2, 3], "after it, before the deletes");
+        assert_eq!(at(ts_after_deletes), vec![3], "after them");
+
+        db.storage
+            .create_branch_at_snapshot("rewind", Some("main"), Some(ts_after_copy), Default::default())
+            .unwrap();
+        let on_branch = db
+            .with_request_branch_scope("rewind", || db.query("SELECT id FROM cvm10", &[]))
+            .unwrap();
+        assert_eq!(on_branch.len(), 3, "and on a branch anchored there");
     }
 
     #[test]

@@ -2151,7 +2151,12 @@ impl Touched {
             // index and main's table-incarnation id are bytes a read uses
             // straight from the store; no standby cache derives from them, and
             // only a writable primary's MERGE BRANCH compares an incarnation.
-            KeyClass::BranchFrozen | KeyClass::BranchKey | KeyClass::MetaTableIncarnation => {}
+            // So is a table's shape record: only creating a branch reads it.
+            KeyClass::BranchFrozen
+            | KeyClass::BranchKey
+            | KeyClass::MetaTableIncarnation
+            | KeyClass::MetaTableShape
+            | KeyClass::MetaHistoryPurge => {}
             KeyClass::VgcWatermark => self.vgc_watermark = true,
             // Spec P5.1: the dataset's epoch; no derived state, only the
             // engine's cache of it (what this standby reports and announces).

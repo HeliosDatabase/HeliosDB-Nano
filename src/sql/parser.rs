@@ -4160,8 +4160,10 @@ impl Parser {
     pub fn parse_use_branch_sql(sql: &str) -> Result<String> {
         // Word-based, like `is_use_branch` (sprinter 6bc4a4040eb7, B1 fix
         // pass): the old byte-offset slicing assumed exactly one space between
-        // the keywords and could slice into the middle of a character.
-        let trimmed = sql.trim();
+        // the keywords and could slice into the middle of a character. Comments go
+        // first, as `parse` drops them: they are no words (B4 fix pass).
+        let uncommented = Self::strip_sql_comments(sql);
+        let trimmed = uncommented.trim();
         let trimmed = trimmed.strip_suffix(';').unwrap_or(trimmed);
         let mut words = trimmed.split_whitespace();
         let _use = words.next();
@@ -4179,6 +4181,12 @@ impl Parser {
 
         if branch_name.is_empty() {
             return Err(Error::query_execution("USE BRANCH requires a branch name"));
+        }
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): it used to answer success and ignore them.
+        if let Some(extra) = words.next() {
+            return Err(Error::sql_parse(format!(
+                "syntax error at or near \"{extra}\": USE BRANCH takes one branch name"
+            )));
         }
 
         Ok(branch_name)

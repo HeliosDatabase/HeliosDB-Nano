@@ -220,7 +220,7 @@ pub struct Transaction {
     /// R4.3: id of this transaction's version-GC snapshot pin in the
     /// conflict registry. EVERY transaction with a registry pins its
     /// snapshot (ReadCommitted session transactions also scan at their
-    /// snapshot via `scan_table_at_snapshot`), so the version GC never
+    /// snapshot via `scan_table_at_transaction_snapshot`), so the version GC never
     /// reclaims a version an open transaction may still read.
     gc_pin_id: Option<u64>,
     /// TDE key manager, mirroring `StorageEngine::key_manager`.
@@ -1766,6 +1766,18 @@ impl Transaction {
                 }
                 None => {
                     batch.delete(key);
+                    // Sprinter 6bc4a4040eb7 (B4): when the row went. In the same
+                    // batch: `AS OF` a time before this returns the row, and an
+                    // `AS OF` branch anchored there too.
+                    if self.versioning_enabled {
+                        Self::put_delete_event_batch(
+                            &mut batch,
+                            key,
+                            commit_ts,
+                            reverse_ts_text.as_bytes(),
+                            &mut version_index_key_buf,
+                        );
+                    }
                     // W3.2: buffered DELETE tombstone (`data:` key bytes).
                     if crate::write_volume::enabled() {
                         crate::write_volume::add_row();
@@ -2389,6 +2401,41 @@ impl Transaction {
         }
     }
 
+    /// Sprinter 6bc4a4040eb7 (B4): the delete event of a `data:{table}:{row_id}` key
+    /// this commit removes (`time_travel::encode_delete_event`). Any other key is
+    /// left alone, by the parse `put_version_index_batch` applies.
+    fn put_delete_event_batch(
+        batch: &mut rocksdb::WriteBatch,
+        key: &[u8],
+        commit_ts: u64,
+        reverse_ts_text: &[u8],
+        version_index_key_buf: &mut Vec<u8>,
+    ) {
+        let Some(rest) = key.strip_prefix(b"data:") else {
+            return;
+        };
+        let Some(colon_pos) = rest.iter().position(|b| *b == b':') else {
+            return;
+        };
+        let (Some(table_name), Some(row_id)) = (rest.get(..colon_pos), rest.get(colon_pos + 1..)) else {
+            return;
+        };
+        if table_name.is_empty() || row_id.is_empty() || !row_id.iter().all(u8::is_ascii_digit) {
+            return;
+        }
+        version_index_key_buf.clear();
+        version_index_key_buf.extend_from_slice(b"v_idx:");
+        version_index_key_buf.extend_from_slice(table_name);
+        version_index_key_buf.push(b':');
+        version_index_key_buf.extend_from_slice(row_id);
+        version_index_key_buf.push(b':');
+        version_index_key_buf.extend_from_slice(reverse_ts_text);
+        batch.put(
+            &*version_index_key_buf,
+            super::time_travel::encode_delete_event(commit_ts),
+        );
+    }
+
     /// Commit the transaction
     ///
     /// Atomically apply all buffered writes and create version index entries.
@@ -2478,7 +2525,7 @@ impl Transaction {
             registry.register_txn(self.transaction_id, self.snapshot_ts);
         }
         // R4.3: pin this snapshot against MVCC version GC regardless of
-        // isolation level — snapshot scans (`scan_table_at_snapshot`) read
+        // isolation level — snapshot scans (`scan_table_at_transaction_snapshot`) read
         // version history for every transaction kind. Released in Drop.
         self.gc_pin_id = Some(registry.pin_snapshot(self.snapshot_ts));
         self.conflict_registry = Some(registry);

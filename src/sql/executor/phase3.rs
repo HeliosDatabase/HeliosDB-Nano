@@ -165,8 +165,9 @@ fn handle_create_branch(
                 // R4.3: resolve_as_of errors when the anchor lies below the
                 // version-GC low watermark (history already collected), and
                 // the pin guard keeps GC from advancing past the anchor
-                // until the branch metadata is persisted (after which the
-                // branch itself pins its anchor).
+                // until the branch is created. Sprinter 6bc4a4040eb7 (B4): from
+                // then on it holds what it needs in its own overlay, and pins
+                // nothing.
                 let snapshot_manager = storage.snapshot_manager();
                 let resolved_snapshot = snapshot_manager.resolve_as_of(other_as_of)?;
                 _gc_pin = Some(storage.pin_historical_snapshot(resolved_snapshot)?);
@@ -290,8 +291,14 @@ fn handle_merge_branch(
         // Determine merge strategy from options
         let strategy = resolve_merge_strategy(options);
 
-        // Perform the merge
-        let result = storage.merge_branch(source, target, strategy)?;
+        // Perform the merge. Sprinter 6bc4a4040eb7 (B4 fix pass): a drop that would be
+        // refused is refused before the merge lands, under the merge's close of the
+        // source, where no child can appear.
+        let result = if should_delete_branch_after_merge(options) {
+            storage.merge_branch_to_drop_source(source, target, strategy)?
+        } else {
+            storage.merge_branch(source, target, strategy)?
+        };
 
         // Log results
         if result.completed {
@@ -389,6 +396,15 @@ fn handle_create_materialized_view(
             }
         }
     } // Storage borrow ends here
+
+    // Sprinter 6bc4a4040eb7 (B4 fix pass): before anything is registered: a name the
+    // data table cannot have, and a statement that registers a view and fills its table
+    // in several writes, wholly before a fork of main or wholly after it.
+    crate::storage::Catalog::refuse_unstorable_table_name(name)?;
+    let _main_ddl = executor
+        .storage()
+        .ok_or_else(|| Error::execution("No storage engine available"))?
+        .enter_main_statement(&[crate::storage::MaterializedViewCatalog::mv_data_table_name(name).as_str()])?;
 
     // Optimize the view query the same way direct queries are (issue #2 / Quirk J):
     // the raw plan undercounts aggregates at scale. Materialize AND persist the
@@ -561,6 +577,18 @@ fn handle_refresh_materialized_view(
         concurrent,
         incremental_requested
     );
+
+    // Sprinter 6bc4a4040eb7 (B4 fix pass): a refresh replaces the view's rows in several
+    // writes, so it is wholly before a fork of main or wholly after it. Here, not in the
+    // statement funnels: the auto-refresh worker gets here too, with no statement of its
+    // own. On a branch it is refused just below, before it could write.
+    let _main_ddl = {
+        let storage = executor
+            .storage()
+            .ok_or_else(|| Error::execution("No storage engine available"))?;
+        storage.refuse_statement_on_branch("REFRESH MATERIALIZED VIEW")?;
+        storage.enter_main_statement(&[crate::storage::MaterializedViewCatalog::mv_data_table_name(name).as_str()])?
+    };
 
     // Phase 1: Read metadata from storage
     let (metadata, delta_count, use_incremental, total_deltas) = {

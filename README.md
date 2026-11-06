@@ -371,9 +371,8 @@ destructive change (a migration, an experiment, an AI agent's writes) against
 real data, then discard the branch. `main` is never touched. This is the
 recommended pattern for giving every agent run its own sandbox.
 
-`CREATE BRANCH` **requires an `AS OF` clause** — use `AS OF NOW` to fork current
-state, or `AS OF TIMESTAMP '…'` to fork from the past. Without it the statement is
-rejected with `CREATE BRANCH requires AS OF clause` (`src/sql/parser.rs:3490`).
+`AS OF` is optional: with none, or `AS OF NOW`, the branch forks from its parent's
+current state; `AS OF TIMESTAMP '…'` forks `main` as it was then.
 
 ```sql
 CREATE DATABASE BRANCH agent_run_42 FROM main AS OF NOW;
@@ -392,21 +391,98 @@ Branches can also fork from a past point in time:
 `CREATE DATABASE BRANCH rewind FROM main AS OF TIMESTAMP '2026-08-24 09:00:00'`
 (requires time-travel, which the `agent` profile keeps enabled).
 
+**A branch is a fork.** It sees its parent as it was at its fork point: the `AS OF` anchor, or the
+creation when there is none. What the parent does after that does not show on it: rows, `ADD COLUMN`,
+`DROP TABLE`, a table it creates. The parent's write copies what a live child sees into the child's own
+overlay, in the same write, so reads stay as cheap as they were and no history is pinned. A table of a
+million rows dropped under a live child is a million copies, written in chunks.
+
+What that write costs, per row written and per live child of the level written: one or two point reads
+to see whether the child holds the row, and the first time, one more read and two keys for the copy. The
+reads are paid on every write of the row, also when the child holds it already, so the cost follows the
+number of live children and stays after the first touch: 100 branches of main made an `UPDATE` by primary
+key about 16 times slower, on first touch and afterwards alike (about 1.4 times with one, 2.6 with ten;
+debug build, as ratios). Drop the branches you are done with. With no branch at all, the hook is one atomic
+load per write, and dropping every branch goes back to that.
+
+One cost is not the hook's: with time travel on, `DELETE` of a row now writes its delete event in the
+version index, branch or no branch, so that `AS OF` can return the row (below). An autocommit `DELETE` by
+primary key also writes a snapshot record. Measured about 15% fewer such `DELETE`s per second, and about 30%
+longer for a 10,000-row `DELETE` (debug build).
+
+- **Per session.** `USE BRANCH x` moves that session only; so do `SET heliosdb.branch = 'x'` and the
+  PostgreSQL startup forms `dbname=<db>@<branch>` and `options=-c heliosdb.branch=<branch>`. A physical
+  standby takes all of them: binding a session writes nothing. HeliosProxy's `hba` and tenant rules do not
+  match `db@branch` yet, so do not rely on it through the proxy.
+- **Writes and constraints.** PRIMARY KEY, UNIQUE and FOREIGN KEY hold over the rows the branch sees.
+  `TRUNCATE` on a branch empties the table on that branch only. Sequences are shared: `nextval` on a
+  branch moves main's.
+- **Schema.** `CREATE TABLE`, `DROP TABLE` and `ALTER TABLE … ADD COLUMN` apply to the branch only. Every
+  other schema statement is refused (`0A000`). They run on the branch alone, and a live child keeps what
+  it saw: it first takes its own copy of the table, in chunks (`55006` while it has staged writes of it).
+  A schema statement on main, and a `CREATE` or `REFRESH MATERIALIZED VIEW`, is wholly before a fork of main
+  or wholly after it: `CREATE BRANCH` waits for the running ones, and new ones wait for it to register.
+- **Views, materialized views, functions and procedures are not forked: all branches share them**, as they
+  share sequences. So what main does to one shows on every branch, at once, whatever its fork point:
+
+  ```sql
+  CREATE FUNCTION dbl(x INT) RETURNS INT AS $$ SELECT $1 * 2 $$ LANGUAGE sql;
+  CREATE BRANCH dev;
+  CREATE OR REPLACE FUNCTION dbl(x INT) RETURNS INT AS $$ SELECT $1 * 3 $$ LANGUAGE sql;
+  USE BRANCH dev;
+  SELECT dbl(21);    -- 63, not 42
+  ```
+
+  After `DROP VIEW v` on main, `SELECT * FROM v` on a branch fails (`42P01`) though the tables it read are
+  all there; `CREATE OR REPLACE VIEW` changes what it returns there; a view main creates appears there. A
+  view's body reads the session's branch. Rows are forked, though: a `REFRESH MATERIALIZED VIEW` on main does
+  not change the rows a branch reads from it. A branch session cannot change any of these, so it cannot
+  change them for main: `CREATE`, `REPLACE`, `DROP` and `REFRESH` of them on a branch are refused (`0A000`).
+- **`AS OF` a past time** is materialized once, at creation, from main's version history: the rows that
+  differ, as they were then. It needs `time_travel_enabled` and an anchor inside the retention window,
+  and main as the parent: a branch keeps no history. The definitions are the current ones, so a column
+  added since the anchor shows, NULL or padded. A table dropped since is gone, and one created since is
+  there, empty. An anchor before a `DROP COLUMN`, `RENAME COLUMN`, `ALTER COLUMN … SET STORAGE` or `RENAME
+  TO` of a table on main, or a `REFRESH` of a materialized view, is refused (`0A000`, naming it): the rows as
+  they were then cannot be read now. That refuses the branch as a whole, for any table of the store, not just
+  that one: a branch holds every table at its anchor or none. It goes on for later anchors too: one is refused
+  if some row's last version at it is from before that statement and the row has changed since, and one more
+  versioned write of such a row, before the anchor, is what ends that. A row not changed since is what it is
+  now. `AS OF NOW` always works. Such a statement run before 4.42.0 left no record, so nothing refuses an
+  anchor before it, and its rows read by position, wrongly.
+  `SELECT … AS OF` on a session bound to a branch is refused because only main has history. An
+  autocommit `UPDATE` on main by primary key, or of several rows on the extended protocol, records no
+  version `AS OF` can find, so `AS OF`, query or branch, shows such a row as of its last versioned write; a
+  transaction's `UPDATE` is versioned.
+- **A fork lands between writes, not between statements.** A transaction is one write, and so is a statement
+  on the simple protocol. On the extended protocol an autocommit `UPDATE`, `DELETE`, `INSERT … SELECT` or
+  `TRUNCATE` of many rows on main is written row by row, so a fork can land inside it, as main's own readers
+  can see it half done. Run it in a transaction if a branch must not.
+- **Dropping reclaims.** `DROP BRANCH` deletes the branch's keys, in batches, and a finished merge deletes
+  its source's, once no live branch reads through it. A crash on the way is finished by the next open.
+  The name is free at once. A branch with a child cannot be dropped (`2BP01`, naming the child): a merged
+  child counts until it is dropped itself, which loses nothing, its rows being in its target.
+- **REST and MCP** are scoped: `/v1/branches/:name/…` and an MCP call that names a branch run on it alone.
+  `heliosdb_branch_drop` exists.
+
 > **⚠️ `MERGE BRANCH` moves rows, but does not detect conflicts.**
 > Merging is **last-writer-wins**: if `main` and the branch both changed the same
 > row, one value silently wins and you get no warning. Merge strategies are not
 > implemented — `WITH (conflict_resolution = …)` errors with *not implemented*.
-> `WITH (delete_branch_after = true)` is honoured and works.
+> `WITH (delete_branch_after = true)` is honoured and works; on a branch with a child it is refused
+> (`2BP01`) before anything is merged.
 >
-> Merge is safe when the target has not been written since the fork. When you
-> cannot guarantee that — and an agent never can — use fork-test-discard as
-> designed: drop the branch and re-run the validated SQL against `main`.
+> A merge carries what the branch itself changed, and never what it only copied: a row
+> the target changed after the fork stays the target's, unless the branch changed that
+> same row. It carries the branch's schema changes too. When you need more than that, and
+> an agent always does, use fork-test-discard as designed: drop the branch and re-run the
+> validated SQL against `main`.
 >
 > A merge is **refused before anything changes** when it could not apply cleanly: the
 > target changed the definition of a table the branch changed, even only its rows, or
-> dropped and recreated one since the fork, even identically (`55000`); the branch changed
-> rows of a table created on the target after it forked, or it was created by an earlier
-> release and so has no recorded fork point (`55000`: recreate the branch, or copy its rows);
+> dropped and recreated one since the fork, even identically (`55000`); the branch was
+> created by an earlier release, so it has no recorded fork point, and it changed rows
+> (`55000`: recreate the branch, or copy its rows);
 > a merged row's PRIMARY KEY / UNIQUE key is held by another target row (`23505`); or an open
 > transaction with staged writes on one of the merge's tables, on `main` too, stands in the
 > way (`55006`). The branch stays active and mergeable.
@@ -426,10 +502,6 @@ Branches can also fork from a past point in time:
 > merge (`55006`: run it again once that is resolved); one that comes after gets its ordinary `23505`.
 > A transaction that read a row before the merge and commits a change to it after gets a serialization
 > failure (`40001`), at any isolation level.
->
-> Schema statements on a branch (`CREATE TABLE`, `DROP TABLE`, `ADD COLUMN`) are refused
-> with `0A000` while the branch has live descendants, and with `55006` while another
-> open transaction has staged writes of the table.
 >
 > **An earlier version of this warning said `MERGE BRANCH` "merges nothing and
 > reports success". That was wrong** and is retracted — see `CHANGELOG.md`

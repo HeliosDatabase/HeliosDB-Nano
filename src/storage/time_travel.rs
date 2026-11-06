@@ -90,6 +90,65 @@ fn decode_version_index_value(bytes: &[u8]) -> Option<(u64, bool)> {
     Some((raw & !VERSION_VALUE_ELIDED_FLAG, elided))
 }
 
+/// Sprinter 6bc4a4040eb7 (B4): the trailing byte of a DELETE's `v_idx:` event,
+/// after the 8-byte big-endian commit timestamp. A delete event has no `v:` key: it
+/// says the row is absent from this time on.
+///
+/// A trailing byte, not a flag in the timestamp: a binary that predates it decodes
+/// the first eight bytes, finds no `v:` key and answers "absent", which is what the
+/// event means, and every other reader of a `v_idx:` value already takes the first
+/// eight bytes (`decode_version_index_value`).
+const DELETE_EVENT_TAG: u8 = b'D';
+
+/// The value of a delete event of commit `commit_ts`.
+#[inline]
+pub(crate) fn encode_delete_event(commit_ts: u64) -> [u8; 9] {
+    let mut event = [DELETE_EVENT_TAG; 9];
+    for (slot, byte) in event.iter_mut().zip(commit_ts.to_be_bytes()) {
+        *slot = byte;
+    }
+    event
+}
+
+/// Is this `v_idx:` value a delete event?
+#[inline]
+pub(crate) fn is_delete_event(value: &[u8]) -> bool {
+    value.len() == 9 && value.get(8) == Some(&DELETE_EVENT_TAG)
+}
+
+/// Sprinter 6bc4a4040eb7 (B4 fix pass): read options for a walk that stays inside
+/// `prefix`. Total order, and an upper bound at the prefix's end: without one, finding
+/// the first key at or after a seek steps through every deleted key past the prefix
+/// before it gives up, and a history purge or a branch reclaim leaves long runs of them
+/// (until compaction) right after a table's or a level's keys. A per-row probe paid that
+/// run once per row. No range deletes: they cut prefix-mode walks short
+/// (`tests/prefix_mode_scans.rs`).
+pub(crate) fn bounded_read_options(prefix: &[u8]) -> ReadOptions {
+    let mut read = ReadOptions::default();
+    read.set_total_order_seek(true);
+    if let Some(end) = prefix_end(prefix) {
+        read.set_iterate_upper_bound(end);
+    }
+    read
+}
+
+/// The first key past every key that starts with `prefix`; `None` for none.
+pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if let Some(next) = last.checked_add(1) {
+            end.push(next);
+            return Some(end);
+        }
+    }
+    None
+}
+
+/// The `v_idx:` key of an event of row `row_id` of `table` at `commit_ts`.
+pub(crate) fn version_index_key(table: &str, row_id: u64, commit_ts: u64) -> String {
+    format!("v_idx:{}:{}:{:020}", table, row_id, u64::MAX - commit_ts)
+}
+
 /// Snapshot metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
@@ -924,11 +983,9 @@ impl SnapshotManager {
         // the whole keyspace with prefix-mode options, which a range tombstone
         // anywhere before `v:` could cut short (see
         // `recover_snapshots_with_policy`), losing the versions after it.
-        let mut read = ReadOptions::default();
-        read.set_total_order_seek(true);
         let iter = self.db.iterator_opt(
             rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
-            read,
+            bounded_read_options(prefix.as_bytes()),
         );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
@@ -957,11 +1014,34 @@ impl SnapshotManager {
             }
         }
 
+        // Sprinter 6bc4a4040eb7 (B4): a delete event has no `v:` key, so this scan
+        // cannot see one: the row is gone at any time at or after it.
+        if self.newest_event_is_a_delete(table_name, row_id, snapshot_ts)? {
+            return Ok(None);
+        }
+
         // Return the best version found, decoded like every other version read.
         // The scan above keeps only the value, so the exact key is gone by here;
         // the placeholder keeps the real `v:` prefix because the decode rule and
         // the plaintext-passthrough diagnostic are both keyed on the keyspace.
         self.decode_stored_opt(b"v:<version value>", best_version.map(|(_, value)| value))
+    }
+
+    /// Is the newest `v_idx:` event of the row at or before `snapshot_ts` its delete?
+    fn newest_event_is_a_delete(&self, table_name: &str, row_id: u64, snapshot_ts: u64) -> Result<bool> {
+        let seek = version_index_key(table_name, row_id, snapshot_ts);
+        let prefix = format!("v_idx:{}:{}:", table_name, row_id);
+        let mut iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(seek.as_bytes(), rocksdb::Direction::Forward),
+            bounded_read_options(prefix.as_bytes()),
+        );
+        match iter.next() {
+            Some(item) => {
+                let (key, value) = item.map_err(|e| Error::storage(format!("Version index read failed: {}", e)))?;
+                Ok(key.starts_with(prefix.as_bytes()) && is_delete_event(&value))
+            }
+            None => Ok(false),
+        }
     }
 
     /// Read a versioned value at a specific snapshot (optimized with reverse index and cache)
@@ -1023,12 +1103,11 @@ impl SnapshotManager {
         // Since we use reverse timestamps (larger actual_ts -> smaller reverse_ts),
         // we need to seek forward to find versions with actual_ts <= snapshot_ts
         // (which have reverse_ts >= our target reverse_ts)
-        let mut iter = self.db.iterator(rocksdb::IteratorMode::From(
-            seek_key.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
-
         let expected_prefix = format!("v_idx:{}:{}:", table_name, row_id);
+        let mut iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(seek_key.as_bytes(), rocksdb::Direction::Forward),
+            bounded_read_options(expected_prefix.as_bytes()),
+        );
 
         // Check if we found a matching index entry
         if let Some(Ok((key, value))) = iter.next() {
@@ -1044,6 +1123,11 @@ impl SnapshotManager {
                         // overwrite materializes the prior flagged event first), so
                         // only a truly-latest event can be elided here.
                         if actual_ts <= snapshot_ts {
+                            // Sprinter 6bc4a4040eb7 (B4): the newest event at or
+                            // before this snapshot is the row's delete.
+                            if is_delete_event(&value) {
+                                return Ok(None);
+                            }
                             if elided {
                                 // W3.2: the `v:` copy was elided — this is the
                                 // latest version and its value is the current
@@ -1069,10 +1153,10 @@ impl SnapshotManager {
         // the row was written through a non-versioned path (fast insert) and should
         // be visible to all snapshots (it predates MVCC tracking).
         let any_prefix = format!("v_idx:{}:{}:", table_name, row_id);
-        let any_iter = self.db.iterator(rocksdb::IteratorMode::From(
-            any_prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let any_iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(any_prefix.as_bytes(), rocksdb::Direction::Forward),
+            bounded_read_options(any_prefix.as_bytes()),
+        );
         let has_any_versions = any_iter
             .take(1)
             .filter_map(|item| item.ok())
@@ -1255,6 +1339,108 @@ impl SnapshotManager {
         self.finish_version_snapshot(table_name, row_id, timestamp, txn_id, scn, metadata)
     }
 
+    /// Sprinter 6bc4a4040eb7 (B4): a version-skipping fast DELETE, with its delete
+    /// event and the snapshot an `AS OF` of a later time resolves to, in one batch.
+    /// Without that snapshot, `AS OF` a time after the delete would resolve to the
+    /// one before it and show the row again.
+    pub(crate) fn delete_data_and_record_event(
+        &self,
+        data_key: &[u8],
+        table_name: &str,
+        row_id: u64,
+        timestamp: u64,
+        lsn: Option<u64>,
+        write_options: Option<&WriteOptions>,
+    ) -> Result<SnapshotMetadata> {
+        let (metadata, txn_id, scn) = self.allocate_snapshot_metadata(timestamp, lsn);
+        let mut batch = WriteBatch::default();
+        batch.delete(data_key);
+        batch.put(
+            version_index_key(table_name, row_id, timestamp).as_bytes(),
+            encode_delete_event(timestamp),
+        );
+        self.append_snapshot_metadata_to_batch(&mut batch, &metadata)?;
+        match write_options {
+            Some(options) => self
+                .gate
+                .write(&self.db, batch, Some(options))
+                .map_err(|e| Error::storage(format!("Failed to write delete event batch: {}", e)))?,
+            None => self.write_batch(batch, "Failed to write delete event batch")?,
+        }
+        self.finish_version_snapshot(table_name, row_id, timestamp, txn_id, scn, metadata)
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4 fix pass): row `row_id` of `table` around `ts`: its
+    /// newest event at or before it (the event's time, and whether it is a delete), and
+    /// whether it has a later one.
+    pub(crate) fn row_events_around(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        ts: u64,
+    ) -> Result<(Option<(u64, bool)>, bool)> {
+        let prefix = format!("v_idx:{}:{}:", table_name, row_id);
+        let seek = version_index_key(table_name, row_id, ts);
+        let first_from = |from: &[u8]| -> Result<Option<(Box<[u8]>, Box<[u8]>)>> {
+            let read = bounded_read_options(prefix.as_bytes());
+            let mut iter = self
+                .db
+                .iterator_opt(rocksdb::IteratorMode::From(from, rocksdb::Direction::Forward), read);
+            match iter.next() {
+                Some(item) => {
+                    let (key, value) = item.map_err(|e| Error::storage(format!("Version index read failed: {}", e)))?;
+                    Ok(key.starts_with(prefix.as_bytes()).then_some((key, value)))
+                }
+                None => Ok(None),
+            }
+        };
+        let at_or_before = first_from(seek.as_bytes())?.and_then(|(_, value)| {
+            decode_version_index_value(&value).map(|(event_ts, _)| (event_ts, is_delete_event(&value)))
+        });
+        // Newest first: a key before the seek position is a later event.
+        let later = first_from(prefix.as_bytes())?.is_some_and(|(key, _)| &*key < seek.as_bytes());
+        Ok((at_or_before, later))
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): the rows of `table` whose newest event is a
+    /// delete: what `AS OF` and a branch's anchor add to the current rows. A row
+    /// deleted before delete events existed has none and stays out, which is what
+    /// it always was: absent at every time.
+    pub(crate) fn rows_with_delete_event(&self, table_name: &str) -> Result<Vec<u64>> {
+        let prefix = format!("v_idx:{}:", table_name);
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            bounded_read_options(prefix.as_bytes()),
+        );
+        let mut rows = Vec::new();
+        let mut current: Option<Vec<u8>> = None;
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::storage(format!("Version index scan failed: {}", e)))?;
+            let Some(rest) = key.strip_prefix(prefix.as_bytes()) else {
+                break;
+            };
+            // `{row_id}:{reverse_ts}`. A row's events are contiguous, newest first.
+            // Anything else is a table whose name extends this one past a ':'.
+            let Some(colon) = rest.iter().position(|byte| *byte == b':') else {
+                continue;
+            };
+            let Some(row_text) = rest.get(..colon) else {
+                continue;
+            };
+            if current.as_deref() == Some(row_text) {
+                continue;
+            }
+            current = Some(row_text.to_vec());
+            if !is_delete_event(&value) {
+                continue;
+            }
+            if let Some(row_id) = std::str::from_utf8(row_text).ok().and_then(|text| text.parse().ok()) {
+                rows.push(row_id);
+            }
+        }
+        Ok(rows)
+    }
+
     fn allocate_snapshot_metadata(&self, timestamp: u64, lsn: Option<u64>) -> (SnapshotMetadata, TransactionId, Scn) {
         let txn_id = match lsn {
             Some(lsn) => {
@@ -1298,10 +1484,10 @@ impl SnapshotManager {
     /// row still needs its insert version backfilled.
     fn has_any_version_index(&self, table_name: &str, row_id: u64) -> Result<bool> {
         let prefix = format!("v_idx:{}:{}:", table_name, row_id);
-        let mut iter = self.db.iterator(rocksdb::IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let mut iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            bounded_read_options(prefix.as_bytes()),
+        );
         Ok(match iter.next() {
             Some(Ok((k, _))) => k.starts_with(prefix.as_bytes()),
             _ => false,
@@ -1390,10 +1576,10 @@ impl SnapshotManager {
     /// `v_idx:` or its newest event is already materialized (flag clear).
     fn find_flagged_latest_version(&self, table_name: &str, row_id: u64) -> Result<Option<(u64, Vec<u8>)>> {
         let prefix = format!("v_idx:{}:{}:", table_name, row_id);
-        let mut iter = self.db.iterator(rocksdb::IteratorMode::From(
-            prefix.as_bytes(),
-            rocksdb::Direction::Forward,
-        ));
+        let mut iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            bounded_read_options(prefix.as_bytes()),
+        );
         if let Some(item) = iter.next() {
             let (key, value) = item.map_err(|e| Error::storage(format!("flagged version seek failed: {}", e)))?;
             if key.starts_with(prefix.as_bytes()) {
@@ -1566,13 +1752,18 @@ impl SnapshotManager {
             crate::write_volume::add(crate::write_volume::Category::Version, version_bytes);
         }
 
+        self.append_snapshot_metadata_to_batch(batch, metadata)
+    }
+
+    /// The `snapshot:` record of `metadata`, into `batch`.
+    fn append_snapshot_metadata_to_batch(&self, batch: &mut WriteBatch, metadata: &SnapshotMetadata) -> Result<()> {
         if self.persist_metadata {
             // R1.4: snapshot: alone — txn_map:/scn_map: were write-only
             // (recover_snapshots rebuilds every in-memory map from the
             // snapshot: entries; nothing ever read the other two), costing
             // two keys of write amplification per autocommit statement.
             let snapshot_key = format!("snapshot:{}", metadata.timestamp);
-            let snapshot_value = bincode::serialize(&metadata)
+            let snapshot_value = bincode::serialize(metadata)
                 .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
             batch.put(snapshot_key.as_bytes(), snapshot_value);
         }
@@ -2033,11 +2224,9 @@ impl SnapshotManager {
         // 5-byte prefix extractor, so this scan crosses one extractor prefix
         // per table and row: it must be total-order (spec P1.1b), or a range
         // tombstone on the way drops older files from it.
-        let mut read = ReadOptions::default();
-        read.set_total_order_seek(true);
         let iter = self.db.iterator_opt(
             rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
-            read,
+            bounded_read_options(prefix.as_bytes()),
         );
 
         for item in iter {
@@ -2087,11 +2276,9 @@ impl SnapshotManager {
         // table name the prefix (`v:t:`) is shorter than the store's 5-byte
         // extractor, and the scan crosses one extractor prefix per row: it
         // must be total-order (spec P1.1b), as `calculate_snapshot_size` is.
-        let mut read = ReadOptions::default();
-        read.set_total_order_seek(true);
         let iter = self.db.iterator_opt(
             rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
-            read,
+            bounded_read_options(prefix.as_bytes()),
         );
 
         for item in iter {
@@ -2492,6 +2679,71 @@ mod tests {
     }
 
     // ----- W3.2: single-copy latest version (elide_latest_version) -----
+
+    /// Sprinter 6bc4a4040eb7 (B4): a delete event makes the row absent from its
+    /// time on, leaves earlier reads as they were, is decoded as an ordinary event
+    /// by everything else, and names the rows `AS OF` adds.
+    #[test]
+    fn a_delete_event_ends_the_row_at_its_time() {
+        let (db, _dir) = create_test_db();
+        let manager = SnapshotManager::new(Arc::clone(&db), WriteGate::open());
+        manager.write_version("t", 1, 10, b"ten").unwrap();
+        manager.write_version("t", 2, 10, b"other").unwrap();
+        manager.write_version("t", 3, 10, b"old").unwrap();
+        assert!(manager.rows_with_delete_event("t").unwrap().is_empty());
+        assert!(manager
+            .delete_data_and_record_event(b"data:t:1", "t", 1, 20, None, None)
+            .is_ok());
+        // Deleted, and put back by a later event: its newest event is no delete.
+        manager
+            .delete_data_and_record_event(b"data:t:3", "t", 3, 20, None, None)
+            .unwrap();
+        manager.write_version("t", 3, 30, b"new").unwrap();
+
+        assert_eq!(
+            manager.read_at_snapshot("t", 1, 19).unwrap().as_deref(),
+            Some(b"ten".as_slice())
+        );
+        assert_eq!(manager.read_at_snapshot("t", 1, 20).unwrap(), None);
+        assert_eq!(manager.read_at_snapshot("t", 1, 99).unwrap(), None);
+        assert_eq!(manager.read_at_snapshot("t", 1, 5).unwrap(), None, "not there yet");
+        assert_eq!(
+            manager.read_at_snapshot("t", 2, 99).unwrap().as_deref(),
+            Some(b"other".as_slice())
+        );
+        assert_eq!(manager.read_at_snapshot("t", 3, 25).unwrap(), None);
+        assert_eq!(
+            manager.read_at_snapshot("t", 3, 30).unwrap().as_deref(),
+            Some(b"new".as_slice())
+        );
+        assert_eq!(
+            manager.row_events_around("t", 1, 19).unwrap(),
+            (Some((10, false)), true)
+        );
+        assert_eq!(
+            manager.row_events_around("t", 1, 20).unwrap(),
+            (Some((20, true)), false)
+        );
+        assert_eq!(manager.row_events_around("t", 1, 5).unwrap(), (None, true));
+        assert_eq!(manager.row_events_around("t", 9, 5).unwrap(), (None, false));
+        // The linear reader, which only sees `v:` keys, says the same.
+        assert_eq!(
+            manager.read_at_snapshot_linear("t", 1, 19).unwrap().as_deref(),
+            Some(b"ten".as_slice())
+        );
+        assert_eq!(manager.read_at_snapshot_linear("t", 1, 20).unwrap(), None);
+        assert_eq!(manager.rows_with_delete_event("t").unwrap(), vec![1]);
+        assert!(manager.rows_with_delete_event("t2").unwrap().is_empty());
+        // Nothing else takes the event for a version: no `v:` key, and the range
+        // scan of versions has no entry for it.
+        let versions = manager.scan_versions_between("t", 0, 99).unwrap();
+        assert!(versions.iter().all(|(_, ts, _)| *ts != 20));
+        // What a build without this byte would read: the timestamp, no flag.
+        let event = encode_delete_event(20);
+        assert_eq!(decode_version_index_value(&event), Some((20, false)));
+        assert!(is_delete_event(&event));
+        assert!(!is_delete_event(&encode_version_index_value(20, false)));
+    }
 
     #[test]
     fn test_w3_2_encode_decode_flag_roundtrip_and_legacy_fallback() {

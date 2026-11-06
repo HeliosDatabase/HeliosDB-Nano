@@ -159,12 +159,12 @@ fn should_apply_columnar_predicates(predicates: &[AnalyzedPredicate]) -> bool {
 /// W2.5: base tuples for an in-transaction read of `actual_table_name`.
 ///
 /// Every in-transaction read otherwise routes through
-/// `scan_table_at_snapshot`, which walks the table's `data:` keyspace and does
+/// `scan_table_at_transaction_snapshot`, which walks the table's `data:` keyspace and does
 /// a per-row `read_at_snapshot` version probe (a global-`Mutex` LRU) — the
 /// 30-150x-vs-autocommit cost the perf analysis measured. When the table's
 /// committed-write watermark is at or below the reader's snapshot (no commit
 /// touched it since) AND the transaction has no own staged writes to it, the
-/// current `data:` image is row-for-row identical to `scan_table_at_snapshot`
+/// current `data:` image is row-for-row identical to `scan_table_at_transaction_snapshot`
 /// (and `merge_with_write_set` is a no-op), so serve it directly.
 ///
 /// Correctness under concurrency: a committer raises the watermark to its
@@ -190,11 +190,14 @@ fn txn_base_tuples(
     // the branch view with this transaction's staged branch writes merged in
     // (read-your-own-writes). B1 refused every in-transaction statement on a
     // branch because this function then read MAIN's snapshot and write set.
-    // `AS OF` keeps the snapshot path below (B4 shapes branch history).
     if as_of_absent {
         if let Some(view) = storage.branch_view()? {
             return view.scan(Some(txn), actual_table_name, schema);
         }
+    } else {
+        // Sprinter 6bc4a4040eb7 (B4): version history is main's. On a branch it would
+        // show what main did after the fork.
+        storage.refuse_statement_on_branch("SELECT … AS OF")?;
     }
     let snapshot = txn.snapshot_id();
     if as_of_absent
@@ -211,7 +214,7 @@ fn txn_base_tuples(
             return Ok(tuples);
         }
     }
-    let base_tuples = storage.scan_table_at_snapshot(actual_table_name, snapshot)?;
+    let base_tuples = storage.scan_table_at_transaction_snapshot(actual_table_name, snapshot)?;
     txn.merge_with_write_set_to_width(actual_table_name, base_tuples, schema.columns.len())
 }
 
@@ -2148,6 +2151,9 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                         "AS OF / time-travel queries require time_travel_enabled = true",
                     ));
                 }
+                // Sprinter 6bc4a4040eb7 (B4): version history is main's. On a branch
+                // it would show what main did after the fork.
+                storage.refuse_statement_on_branch("SELECT … AS OF")?;
                 tracing::debug!(
                     "Time-travel query on table '{}' (actual: '{}') with AS OF clause: {:?}",
                     table_name,
@@ -2507,6 +2513,9 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                         "AS OF / time-travel queries require time_travel_enabled = true",
                     ));
                 }
+                // Sprinter 6bc4a4040eb7 (B4): version history is main's. On a branch
+                // it would show what main did after the fork.
+                storage.refuse_statement_on_branch("SELECT … AS OF")?;
                 tracing::debug!(
                     "Time-travel FilteredScan on table '{}' with AS OF clause: {:?}",
                     table_name,

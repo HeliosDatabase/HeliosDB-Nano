@@ -10,6 +10,57 @@ use crate::sql::{TriggerDefinition, TriggerPersistence};
 use crate::{DataType, Error, Result, Schema, Value};
 use serde::{Deserialize, Serialize};
 
+/// Sprinter 6bc4a4040eb7 (B4 fix pass): the last change of main's table that a row
+/// version written before it cannot be read under: `meta:table_shape:{t}`, in the
+/// DDL's own write. A version is positional and nothing rewrites it, and a rename takes
+/// a table's versions away. A branch anchored before the change is refused
+/// (`StorageEngine::materialize_branch_anchor`). `ADD COLUMN` writes none: a shorter
+/// version reads with the new columns NULL.
+///
+/// A drop takes it with the table. A rename puts it on BOTH names: on the new one for
+/// the rows, and on the old one for whatever table takes that name next, so an anchor
+/// from before the rename is refused there too, whatever becomes of the renamed table.
+/// A statement of an earlier release left none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableShapeChange {
+    /// When. A version older than this was written for another shape.
+    pub(crate) changed_at: u64,
+    kind: TableShapeChangeKind,
+    /// The highest row id the table held when it was last renamed. A row at or under
+    /// it has history this name does not hold; one above it was created since.
+    pub(crate) renamed_through_row: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum TableShapeChangeKind {
+    Columns,
+    Renamed,
+    /// A materialized view's rows were replaced: `table` is its data table.
+    Refreshed,
+}
+
+impl TableShapeChange {
+    /// What happened to `table`, for a refusal.
+    pub(crate) fn describe(&self, table: &str) -> String {
+        match self.kind {
+            TableShapeChangeKind::Columns => {
+                format!("table \"{table}\" had a column dropped, renamed or moved to other storage")
+            }
+            TableShapeChangeKind::Renamed => format!("table \"{table}\" was renamed"),
+            TableShapeChangeKind::Refreshed => format!(
+                "materialized view \"{}\" was refreshed",
+                table.strip_prefix("__mv_").unwrap_or(table)
+            ),
+        }
+    }
+}
+
+/// How many keys of a table's version history go in one write.
+const VERSION_PURGE_CHUNK_KEYS: usize = 10_000;
+
+/// Never taken: the stripes of `Catalog::history_purge_lock` are never empty.
+static HISTORY_PURGE_FALLBACK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 /// Persisted CREATE INDEX definition.
 ///
 /// The actual ART and non-persistent HNSW structures are rebuilt in memory on
@@ -923,7 +974,21 @@ impl<'a> Catalog<'a> {
 
     /// Create a table with the given schema
     pub fn create_table(&self, table_name: &str, schema: Schema) -> Result<()> {
+        if !self.storage.in_wal_replay() {
+            Self::refuse_unstorable_table_name(table_name)?;
+        }
         self.create_table_with_incarnation(table_name, schema, super::branch_catalog::fresh_table_incarnation())
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4 fix pass): a row's key is `data:{table}:{row}`, so
+    /// the rows of a table named `a:1` are under the prefix of a table named `a` and read
+    /// as its rows. Refused 42602 for a new name. A store that already holds one keeps
+    /// opening, and keeps that table.
+    pub(crate) fn refuse_unstorable_table_name(table_name: &str) -> Result<()> {
+        if table_name.contains(':') {
+            return Err(Error::table_name_holds_colon(table_name));
+        }
+        Ok(())
     }
 
     /// [`Self::create_table`], with the table's incarnation id given — MERGE
@@ -1063,6 +1128,13 @@ impl<'a> Catalog<'a> {
             Self::table_incarnation_key(table_name),
             super::tde::seal(key_manager.as_deref(), &incarnation_value)?.as_ref(),
         );
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): this table's row ids start over, so
+        // whatever history is left under its name goes first: a drop or rename that
+        // stopped part way, or an earlier release's. Until this batch the name is no
+        // table, and the lock keeps a drop's purge from reaching what comes after.
+        let history = Self::history_purge_lock(table_name);
+        self.purge_version_history_locked(table_name)?;
+        batch.delete(Self::history_purge_key(table_name));
         let written = self.storage.write_ddl_batch(
             super::WalOperation::CreateTable {
                 table: table_name.to_string(),
@@ -1071,6 +1143,7 @@ impl<'a> Catalog<'a> {
             batch,
         )?;
         super::engine::exit_after_ddl_write("create", table_name);
+        drop(history);
 
         // Update in-memory schema cache
         self.storage.cache_schema(table_name, schema.clone());
@@ -1230,6 +1303,7 @@ impl<'a> Catalog<'a> {
         batch.delete(Self::table_metadata_key(table_name));
         batch.delete(Self::table_counter_key(table_name));
         batch.delete(Self::table_incarnation_key(table_name));
+        batch.delete(Self::table_shape_key(table_name));
         match self.storage.write_ddl_batch(
             super::WalOperation::DropTable {
                 table: table_name.to_string(),
@@ -1867,9 +1941,150 @@ impl<'a> Catalog<'a> {
         let value =
             bincode::serialize(schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
 
-        self.storage.put(&key, &value)?;
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): every column-shape ALTER funnels through
+        // here but RENAME COLUMN (below), replay included.
+        if Self::schema_change_strands_versions(&self.main_table_schema(table_name)?, schema) {
+            let key_manager = self.storage.key_manager_arc();
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.put(&key, super::tde::seal(key_manager.as_deref(), &value)?.as_ref());
+            self.stage_table_shape_change(table_name, &mut batch)?;
+            self.storage
+                .write_batch_through_gate(batch)
+                .map_err(|e| Error::storage(format!("Schema batch write failed: {}", e)))?;
+        } else {
+            self.storage.put(&key, &value)?;
+        }
         self.publish_table_schema(table_name, schema, &value);
 
+        Ok(())
+    }
+
+    /// Can a row version written under `before` not be read under `after`? Reading one
+    /// pads the columns it lacks, so only appending columns leaves them readable.
+    fn schema_change_strands_versions(before: &Schema, after: &Schema) -> bool {
+        before.columns.len() > after.columns.len()
+            || before.columns.iter().zip(after.columns.iter()).any(|(old, new)| {
+                old.name != new.name || old.data_type != new.data_type || old.storage_mode != new.storage_mode
+            })
+    }
+
+    /// `meta:table_shape:{t}`: [`TableShapeChange`].
+    fn table_shape_key(table_name: &str) -> Vec<u8> {
+        format!("meta:table_shape:{}", table_name).into_bytes()
+    }
+
+    /// The last change of main's table `table_name` that older row versions cannot be
+    /// read under; `None` when none is recorded.
+    pub(crate) fn main_table_shape_change(&self, table_name: &str) -> Result<Option<TableShapeChange>> {
+        match self.storage.get(&Self::table_shape_key(table_name))? {
+            Some(bytes) => bincode::deserialize(&bytes).map(Some).map_err(|e| {
+                Error::storage(format!(
+                    "the shape record of table '{}' does not decode: {}",
+                    table_name, e
+                ))
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// A rename's records; see [`TableShapeChange`]. The MV swap's renames replace a
+    /// view's rows under its stable name: the view was refreshed, and nothing was renamed,
+    /// so no later table takes the old name (the replay of one looks like a rename but for
+    /// its names).
+    fn stage_rename_shape_records(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        move_side_records: bool,
+        highest_row: u64,
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<()> {
+        let is_temp = crate::sql::temp_tables::is_temp_key;
+        let swap = !move_side_records || new_name.starts_with("__mv_");
+        let changed_at = self.storage.next_timestamp();
+        if swap || is_temp(old_name) {
+            batch.delete(Self::table_shape_key(old_name));
+        } else {
+            self.stage_table_shape_record(
+                old_name,
+                &TableShapeChange {
+                    changed_at,
+                    kind: TableShapeChangeKind::Renamed,
+                    renamed_through_row: None,
+                },
+                batch,
+            )?;
+        }
+        if is_temp(new_name) {
+            batch.delete(Self::table_shape_key(new_name));
+            return Ok(());
+        }
+        self.stage_table_shape_record(
+            new_name,
+            &TableShapeChange {
+                changed_at,
+                kind: if swap {
+                    TableShapeChangeKind::Refreshed
+                } else {
+                    TableShapeChangeKind::Renamed
+                },
+                renamed_through_row: Some(highest_row),
+            },
+            batch,
+        )
+    }
+
+    /// A materialized view's rows were replaced in place: a `REFRESH` that dropped and
+    /// recreated its data table `data_table`, which took the last record with it.
+    pub(crate) fn record_materialized_view_refresh(&self, data_table: &str) -> Result<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+        self.stage_table_shape_record(
+            data_table,
+            &TableShapeChange {
+                changed_at: self.storage.next_timestamp(),
+                kind: TableShapeChangeKind::Refreshed,
+                renamed_through_row: None,
+            },
+            &mut batch,
+        )?;
+        self.storage
+            .write_batch_through_gate(batch)
+            .map_err(|e| Error::storage(format!("Shape record write failed: {}", e)))
+    }
+
+    /// Into the batch that changes `table_name`'s columns: the record of that. What
+    /// the last rename said stays true.
+    fn stage_table_shape_change(&self, table_name: &str, batch: &mut rocksdb::WriteBatch) -> Result<()> {
+        if crate::sql::temp_tables::is_temp_key(table_name) {
+            return Ok(());
+        }
+        let renamed_through_row = self
+            .main_table_shape_change(table_name)?
+            .and_then(|change| change.renamed_through_row);
+        self.stage_table_shape_record(
+            table_name,
+            &TableShapeChange {
+                changed_at: self.storage.next_timestamp(),
+                kind: TableShapeChangeKind::Columns,
+                renamed_through_row,
+            },
+            batch,
+        )
+    }
+
+    fn stage_table_shape_record(
+        &self,
+        table_name: &str,
+        change: &TableShapeChange,
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<()> {
+        let value = bincode::serialize(change)
+            .map_err(|e| Error::storage(format!("Failed to serialize a shape record: {}", e)))?;
+        let key_manager = self.storage.key_manager_arc();
+        batch.put(
+            Self::table_shape_key(table_name),
+            super::tde::seal(key_manager.as_deref(), &value)?.as_ref(),
+        );
         Ok(())
     }
 
@@ -1931,6 +2146,7 @@ impl<'a> Catalog<'a> {
             );
             rewritten.push(index_name);
         }
+        self.stage_table_shape_change(table_name, &mut batch)?;
         self.storage
             .db_write(batch, None)
             .map_err(|e| Error::storage(format!("Rename column batch write failed: {}", e)))?;
@@ -2087,6 +2303,11 @@ impl<'a> Catalog<'a> {
         // entries are redundant; one batched write is O(1) fsyncs. A failed
         // scan refuses the drop here, before anything has changed.
         self.stage_prefix_delete(&format!("data:{}:", table_name), &mut batch)?;
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): a later table of the name is another
+        // table, whose row ids start over. The history goes after this batch, which
+        // records that it is to go: from here on no table of the name can be read before
+        // it is gone (`Self::finish_history_purge`).
+        self.stage_history_purge_intent(table_name, &mut batch)?;
 
         // Tear down the physical structures of the indexes whose definitions
         // the batch deletes. Per-index best effort: a structure that refuses
@@ -2173,6 +2394,10 @@ impl<'a> Catalog<'a> {
         // Spec R1 §4: the standbys' acknowledgement last, after every
         // in-memory step above.
         written.wait_replicated();
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): the history, after every other step of
+        // the drop (its side records went in its own batch), so a crash in it stops
+        // nothing else.
+        self.finish_history_purge(table_name);
         Ok(children)
     }
 
@@ -2217,6 +2442,7 @@ impl<'a> Catalog<'a> {
         // sprinter 6bc4a4040eb7 (B3 fix pass): a later CREATE of the name is
         // another table, with another id.
         batch.delete(Self::table_incarnation_key(table_name));
+        batch.delete(Self::table_shape_key(table_name));
         batch.delete(Self::table_counter_key(table_name));
         batch.delete(Self::compression_config_key(table_name));
         batch.delete(Self::compression_stats_key(table_name));
@@ -2329,6 +2555,200 @@ impl<'a> Catalog<'a> {
             None => Vec::new(),
         };
         Ok(children)
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4 fix pass): a table's version history leaves with its
+    /// name, on a drop and on a rename. It is keyed by name and row id, and a later table
+    /// of the name reuses the row ids, so an `AS OF` or a branch anchored in the past would
+    /// read the old table's rows as the new one's, and a merge could put one on main.
+    ///
+    /// A history is never partly gone under a name that is a table, so `AS OF` and an
+    /// anchored branch never read part of one (a chunk can end inside a row's events and
+    /// make an older version its newest):
+    ///
+    /// * `DROP` and `RENAME` (for the old name) write `meta:history_purge:{t}` in the
+    ///   DDL's own batch, which takes the table off the name; then the history goes in
+    ///   writes of at most [`VERSION_PURGE_CHUNK_KEYS`] keys, and the last deletes the
+    ///   record ([`Self::finish_history_purge`]). A crash or an error on the way leaves
+    ///   the record, and no table of the name.
+    /// * `CREATE` and `RENAME` (for the new name) first delete what is left under the
+    ///   name, while it is no table, and their batch deletes the record.
+    /// * A writable open finishes every record left ([`Self::finish_pending_history_purges`]).
+    ///
+    /// One lock per name (striped) is held by a purge and by a `CREATE` or `RENAME` onto
+    /// the name until its batch is written, so a purge never reaches a later table's
+    /// history. A purge takes nothing else, and writes no row keys.
+    fn history_purge_lock(table_name: &str) -> parking_lot::MutexGuard<'static, ()> {
+        use std::hash::{Hash, Hasher};
+        static STRIPES: std::sync::LazyLock<Vec<parking_lot::Mutex<()>>> =
+            std::sync::LazyLock::new(|| (0..64).map(|_| parking_lot::Mutex::new(())).collect());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        table_name.hash(&mut hasher);
+        let index = (hasher.finish() % 64) as usize;
+        // The index is reduced by the length just above, and the list is never empty.
+        STRIPES
+            .get(index)
+            .or_else(|| STRIPES.first())
+            .map_or_else(|| HISTORY_PURGE_FALLBACK.lock(), |stripe| stripe.lock())
+    }
+
+    /// `meta:history_purge:{t}`: the history under name `t` is to go, and no table has
+    /// the name. See [`Self::history_purge_lock`].
+    fn history_purge_key(table_name: &str) -> Vec<u8> {
+        format!("meta:history_purge:{}", table_name).into_bytes()
+    }
+
+    fn stage_history_purge_intent(&self, table_name: &str, batch: &mut rocksdb::WriteBatch) -> Result<()> {
+        // The original's own write holds it; during the replay the name may be a later
+        // table's by now.
+        if self.storage.in_wal_replay() {
+            return Ok(());
+        }
+        let key_manager = self.storage.key_manager_arc();
+        batch.put(
+            Self::history_purge_key(table_name),
+            super::tde::seal(key_manager.as_deref(), &[])?.as_ref(),
+        );
+        Ok(())
+    }
+
+    /// After a `DROP` or `RENAME` took the table off `table_name`: its history goes, and
+    /// the record with it. Never fails the statement, which is done: what is left is
+    /// finished by the next `CREATE` or `RENAME` onto the name, or the next open.
+    fn finish_history_purge(&self, table_name: &str) {
+        if self.storage.in_wal_replay() {
+            return;
+        }
+        let _history = Self::history_purge_lock(table_name);
+        if let Err(e) = self.finish_history_purge_locked(table_name) {
+            tracing::warn!(
+                "The version history of '{}' is not all deleted yet; the next open, or the next CREATE or \
+                 RENAME of the name, finishes it: {}",
+                table_name,
+                e
+            );
+        }
+    }
+
+    fn finish_history_purge_locked(&self, table_name: &str) -> Result<()> {
+        // A `CREATE` or `RENAME` onto the name finished it already, and its table's
+        // history is not this.
+        let pending = self
+            .storage
+            .db
+            .get_pinned(Self::history_purge_key(table_name))
+            .map_err(|e| Error::storage(format!("Get failed: {}", e)))?
+            .is_some();
+        if !pending {
+            return Ok(());
+        }
+        if self.main_table_exists(table_name)? {
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.delete(Self::history_purge_key(table_name));
+            return self.storage.write_batch_through_gate(batch);
+        }
+        self.purge_version_history_locked(table_name)?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.delete(Self::history_purge_key(table_name));
+        self.storage.write_batch_through_gate(batch)
+    }
+
+    /// At a writable open: finish every history purge a crash or an error stopped.
+    /// Never fails the open. Returns how many it finished.
+    pub(crate) fn finish_pending_history_purges(&self) -> usize {
+        if !self.storage.engine_may_write() || !self.storage.write_gate().is_open() {
+            return 0;
+        }
+        let prefix: &[u8] = b"meta:history_purge:";
+        let mut names = Vec::new();
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            super::time_travel::bounded_read_options(prefix),
+        );
+        for item in iter {
+            let Ok((key, _)) = item else {
+                break;
+            };
+            let Some(name) = key.strip_prefix(prefix) else {
+                break;
+            };
+            names.push(String::from_utf8_lossy(name).into_owned());
+        }
+        let mut finished = 0;
+        for name in names {
+            let _history = Self::history_purge_lock(&name);
+            match self.finish_history_purge_locked(&name) {
+                Ok(()) => finished += 1,
+                Err(e) => tracing::warn!("The version history of '{}' is not all deleted yet: {}", name, e),
+            }
+        }
+        finished
+    }
+
+    /// Delete `v_idx:`, `vmeta:` and `v:` of `table_name`, in writes of at most
+    /// [`VERSION_PURGE_CHUNK_KEYS`] keys, and what the store's readers keep of them.
+    /// Holding [`Self::history_purge_lock`], while the name is no table.
+    ///
+    /// A key whose rest is not `{row}:{number}` is another table's: an older store may
+    /// hold a table whose name extends this one past a `:`. Nothing during the log's
+    /// replay: what is under the name by now may be a later table's.
+    fn purge_version_history_locked(&self, table_name: &str) -> Result<()> {
+        if self.storage.in_wal_replay() {
+            return Ok(());
+        }
+        let snapshots = self.storage.snapshot_manager();
+        let mut chunk = rocksdb::WriteBatch::default();
+        let mut keys = 0usize;
+        let mut markers: Vec<Vec<u8>> = Vec::new();
+        let write_chunk = |chunk: rocksdb::WriteBatch, markers: &mut Vec<Vec<u8>>| -> Result<()> {
+            self.storage
+                .write_batch_through_gate(chunk)
+                .map_err(|e| Error::storage(format!("Version history purge failed: {}", e)))?;
+            for key in markers.drain(..) {
+                snapshots.forget_copy_marker(&key);
+            }
+            snapshots.invalidate_cached_versions(table_name);
+            Ok(())
+        };
+        for prefix in [
+            format!("v_idx:{}:", table_name),
+            format!("vmeta:{}:", table_name),
+            format!("v:{}:", table_name),
+        ] {
+            let is_markers = prefix.starts_with("vmeta");
+            let iter = self.storage.db.iterator_opt(
+                rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+                super::time_travel::bounded_read_options(prefix.as_bytes()),
+            );
+            for item in iter {
+                let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                let Some(rest) = key.strip_prefix(prefix.as_bytes()) else {
+                    break;
+                };
+                let mut parts = rest.split(|byte| *byte == b':');
+                let shaped = parts.next().is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+                    && parts.next().is_some_and(|part| part.iter().all(u8::is_ascii_digit))
+                    && parts.next().is_none();
+                if !shaped {
+                    continue;
+                }
+                if is_markers {
+                    markers.push(key.to_vec());
+                }
+                chunk.delete(&key);
+                keys += 1;
+                if keys >= VERSION_PURGE_CHUNK_KEYS {
+                    write_chunk(std::mem::take(&mut chunk), &mut markers)?;
+                    keys = 0;
+                    self.storage
+                        .merge_failpoint_tick(super::branch_catalog::MergeFailSite::HistoryPurge)?;
+                }
+            }
+        }
+        if keys > 0 {
+            write_chunk(chunk, &mut markers)?;
+        }
+        Ok(())
     }
 
     /// Stage into `batch` a delete of every key under `prefix`; returns how
@@ -3687,6 +4107,7 @@ impl<'a> Catalog<'a> {
     /// The internal three-step swap of a CONCURRENT materialized-view refresh is
     /// a different operation and uses [`Self::rename_table_data_swap`].
     pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
+        Self::refuse_unstorable_table_name(new_name)?;
         // Check that new table name is not already in use (MAIN's catalog —
         // `rename_table_inner` refuses a branch session).
         if self.main_table_exists(new_name)? {
@@ -3845,6 +4266,7 @@ impl<'a> Catalog<'a> {
         let old_data_prefix = format!("data:{}:", old_name);
         let old_prefix_bytes = old_data_prefix.as_bytes();
         let new_data_prefix = format!("data:{}:", new_name);
+        let mut highest_row = 0u64;
 
         // Seek to the table's data prefix instead of scanning from the start
         // of the keyspace; stage each move (raw bytes, verbatim) in the batch.
@@ -3866,6 +4288,7 @@ impl<'a> Catalog<'a> {
                 let new_key = format!("{}{}", new_data_prefix, row_id_str).into_bytes();
                 batch.put(&new_key, &value);
                 batch.delete(&key);
+                highest_row = highest_row.max(row_id_str.parse().unwrap_or(0));
             }
         }
 
@@ -3876,6 +4299,22 @@ impl<'a> Catalog<'a> {
         batch.delete(&old_counter_key);
         batch.delete(Self::compression_config_key(old_name));
         batch.delete(Self::compression_stats_key(old_name));
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): the old name's history goes after this
+        // batch, as a drop's does, and what is left under the new one before it: the name
+        // is no table until the batch, and the lock is held until it is written.
+        let new_history = Self::history_purge_lock(new_name);
+        self.purge_version_history_locked(new_name)?;
+        batch.delete(Self::history_purge_key(new_name));
+        self.stage_history_purge_intent(old_name, &mut batch)?;
+        self.stage_rename_shape_records(old_name, new_name, move_side_records, highest_row, &mut batch)?;
+        // B4 fix pass (R1): the side records in this same batch, so no crash leaves the
+        // table renamed without its CHECK constraints (the purge after it widened what
+        // was a separate write's window to the whole purge). Read now, staged here.
+        let moved_constraints = if move_side_records {
+            self.stage_table_side_records_move(old_name, new_name, &mut batch)?
+        } else {
+            Vec::new()
+        };
 
         // Spec R1 §4 (sprinter e21903322db7): the rename and its logical-WAL
         // `RenameTable` entry are ONE write group (as `drop_table`'s) — no
@@ -3893,6 +4332,7 @@ impl<'a> Catalog<'a> {
             )
             .map_err(|e| Error::storage(format!("Rename batch write failed: {}", e)))?;
         super::engine::exit_after_ddl_write("rename", old_name);
+        drop(new_history);
 
         // Carry the VOLATILE in-memory row-id counter to the new name. The batch
         // above moved the durable `counter:{table}` key, but `next_row_id_volatile`
@@ -4022,16 +4462,17 @@ impl<'a> Catalog<'a> {
         // statement must report failure rather than return success over it. This
         // is the same posture `alter_table_set_schema` already had (`?`).
         //
-        // LAST, because it is the one step here that can fail: everything above
-        // (the durable batch, the ART/trigger moves, the caches) has already
-        // taken effect, so nothing that must hold on both outcomes is sequenced
-        // behind it.
+        // Since B4 they are staged into the rename's batch itself, read before it,
+        // so a refusal to read them refuses the rename before anything changed.
         //
         // Skipped by `rename_table_data_swap` (the CONCURRENT MV refresh), where
         // the rename moves a ROW SET under a stable name rather than renaming a
         // relation — see that function for why the records must stay put.
+        //
+        // Sprinter 6bc4a4040eb7 (B4 fix pass, R1): moved in the rename's own batch
+        // above (`stage_table_side_records_move`); what is left here is the caches.
         if move_side_records {
-            self.move_table_side_records(old_name, new_name)?;
+            self.forget_moved_constraints(&moved_constraints);
         }
 
         // GH#56: cached rows are keyed by table NAME. Rows cached under the old
@@ -4043,30 +4484,53 @@ impl<'a> Catalog<'a> {
         // Spec R1 §4: the standbys' acknowledgement last, after the row
         // counter, the ART and index-definition moves and the caches.
         written.wait_replicated();
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): the old name's history, after every
+        // other step of the rename, so a crash in it stops nothing else.
+        self.finish_history_purge(old_name);
         Ok(())
     }
 
-    /// Migrate the per-table SIDE records that the `rename_table` write batch
-    /// itself does not carry — the constraint metadata (CHECK / FOREIGN KEY /
-    /// table-level UNIQUE), the IDENTITY-column record and the Stage-0 partition
-    /// registry.
+    /// Migrate the per-table SIDE records of a renamed table — the constraint
+    /// metadata (CHECK / FOREIGN KEY / table-level UNIQUE, its own and other tables'
+    /// foreign keys that name it), the IDENTITY-column record and the Stage-0
+    /// partition registry — in one write of their own.
     ///
-    /// Called from [`Self::rename_table`], so every RELATION rename gets them:
-    /// plain `ALTER TABLE … RENAME TO`, `ALTER TABLE … SET SCHEMA` (which
-    /// relocates a table by renaming its storage key) and WAL replay alike.
-    /// Leaving them behind makes the moved table lose its FK/CHECK enforcement
-    /// and its partition-cascade links — silently, since an absent constraint
-    /// record reads as "no constraints".
-    ///
-    /// NOT called by [`Self::rename_table_data_swap`], the CONCURRENT MV refresh
-    /// swap: there the key move replaces a row set under a stable name, so a
-    /// side record must stay with the name rather than ride the backup table
-    /// into its own drop.
+    /// A relation rename does not call this: it stages the same records into its own
+    /// batch ([`Self::stage_table_side_records_move`], sprinter 6bc4a4040eb7 B4 fix
+    /// pass), so the rename is one atomic write and no crash leaves a renamed table
+    /// without its CHECK constraints. Leaving them behind makes the moved table lose
+    /// its FK/CHECK enforcement and its partition-cascade links — silently, since an
+    /// absent constraint record reads as "no constraints".
     ///
     /// A missing record is a no-op, and every step is idempotent, so calling it
-    /// twice (or replaying it) is harmless. Not atomic with the `rename_table`
-    /// batch (Stage-0 DDL is non-transactional generally).
+    /// twice (or after a rename that already moved them) is harmless.
     pub fn move_table_side_records(&self, old: &str, new: &str) -> Result<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+        let constraint_tables = self.stage_table_side_records_move(old, new, &mut batch)?;
+        self.storage
+            .write_batch_through_gate(batch)
+            .map_err(|e| Error::storage(format!("Side record move failed: {}", e)))?;
+        self.forget_moved_constraints(&constraint_tables);
+        Ok(())
+    }
+
+    /// Into `batch`: the moves [`Self::move_table_side_records`] makes, read now. Returns
+    /// the tables whose constraint record the batch rewrites, for
+    /// [`Self::forget_moved_constraints`] once it is written. Every value is sealed as
+    /// `StorageEngine::put` seals it.
+    fn stage_table_side_records_move(
+        &self,
+        old: &str,
+        new: &str,
+        batch: &mut rocksdb::WriteBatch,
+    ) -> Result<Vec<String>> {
+        let key_manager = self.storage.key_manager_arc();
+        let put = |batch: &mut rocksdb::WriteBatch, key: Vec<u8>, value: Vec<u8>| -> Result<()> {
+            batch.put(key, super::tde::seal(key_manager.as_deref(), &value)?.as_ref());
+            Ok(())
+        };
+        let mut constraint_tables = vec![old.to_string(), new.to_string()];
+
         // Constraint metadata (FK / UNIQUE / CHECK). Rewrite each constraint's
         // owning-table field to the new key, and any SELF-referential FK's
         // `references_table` too (a table that references itself moves both
@@ -4088,25 +4552,22 @@ impl<'a> Catalog<'a> {
             || !constraints.unique_constraints.is_empty()
             || !constraints.check_constraints.is_empty()
         {
-            self.save_table_constraints(new, &constraints)?;
+            let value = bincode::serialize(&constraints)
+                .map_err(|e| Error::storage(format!("Failed to serialize table constraints: {}", e)))?;
+            put(batch, Self::table_constraints_key(new), value)?;
         }
-        self.storage.delete(&Self::table_constraints_key(old))?;
-        // The durable record is gone, but `load_table_constraints` memoises per
-        // table NAME — leaving `old` cached would hand the constraint set of a
-        // table that no longer exists to the next `CREATE TABLE <old>` (which
-        // reads through the same cache), and would keep answering for the old
-        // name until the process restarts.
-        self.storage.invalidate_table_constraints_cache(old);
-        self.storage.clear_referencing_fk_cache();
+        batch.delete(Self::table_constraints_key(old));
 
         // The INBOUND half: every OTHER table's foreign keys that name `old`.
-        self.move_inbound_foreign_keys(old, new)?;
+        self.stage_inbound_foreign_keys_move(old, new, batch, &mut constraint_tables)?;
 
         // IDENTITY-column side record.
         let identity = self.list_identity_columns(old)?;
         if !identity.is_empty() {
-            self.register_identity_columns(new, &identity)?;
-            self.drop_identity_columns(old)?;
+            let value = bincode::serialize(&identity)
+                .map_err(|e| Error::query_execution(format!("identity serialize: {e}")))?;
+            put(batch, Self::identity_key(new), value)?;
+            batch.delete(Self::identity_key(old));
         }
 
         // Partition registry — reverse link: `old` is itself a child of `parent`.
@@ -4123,11 +4584,11 @@ impl<'a> Catalog<'a> {
             }
             let value = bincode::serialize(&siblings)
                 .map_err(|e| Error::query_execution(format!("partition-child serialize: {e}")))?;
-            self.storage.put(&Self::partition_children_key(&parent), &value)?;
-            self.storage.delete(&Self::partition_parent_key(old))?;
+            put(batch, Self::partition_children_key(&parent), value)?;
+            batch.delete(Self::partition_parent_key(old));
             let pv = bincode::serialize(new)
                 .map_err(|e| Error::query_execution(format!("partition-parent serialize: {e}")))?;
-            self.storage.put(&Self::partition_parent_key(new), &pv)?;
+            put(batch, Self::partition_parent_key(new), pv)?;
         }
 
         // Partition registry — forward list: `old` is a parent with children.
@@ -4138,14 +4599,25 @@ impl<'a> Catalog<'a> {
             for child in &children {
                 let pv = bincode::serialize(new)
                     .map_err(|e| Error::query_execution(format!("partition-parent serialize: {e}")))?;
-                self.storage.put(&Self::partition_parent_key(child), &pv)?;
+                put(batch, Self::partition_parent_key(child), pv)?;
             }
             let value = bincode::serialize(&children)
                 .map_err(|e| Error::query_execution(format!("partition-child serialize: {e}")))?;
-            self.storage.put(&Self::partition_children_key(new), &value)?;
-            self.storage.delete(&Self::partition_children_key(old))?;
+            put(batch, Self::partition_children_key(new), value)?;
+            batch.delete(Self::partition_children_key(old));
         }
-        Ok(())
+        Ok(constraint_tables)
+    }
+
+    /// What `load_table_constraints` memoises of the tables a side-record move
+    /// rewrote, once it is written: per table NAME, so leaving `old` cached would hand
+    /// the constraint set of a table that no longer exists to the next `CREATE TABLE
+    /// <old>`.
+    fn forget_moved_constraints(&self, tables: &[String]) {
+        for table in tables {
+            self.storage.invalidate_table_constraints_cache(table);
+        }
+        self.storage.clear_referencing_fk_cache();
     }
 
     /// Repoint every OTHER table's INBOUND foreign keys from `old` to `new`.
@@ -4182,10 +4654,19 @@ impl<'a> Catalog<'a> {
     /// the CONCURRENT MV-refresh swap (`rename_table_data_swap`) deliberately
     /// does not — there the row set moves under a STABLE name, so an inbound
     /// foreign key must keep naming that name.
-    fn move_inbound_foreign_keys(&self, old: &str, new: &str) -> Result<()> {
+    ///
+    /// Staged into the rename's batch (sprinter 6bc4a4040eb7, B4 fix pass); each table
+    /// it rewrites is added to `tables`.
+    fn stage_inbound_foreign_keys_move(
+        &self,
+        old: &str,
+        new: &str,
+        batch: &mut rocksdb::WriteBatch,
+        tables: &mut Vec<String>,
+    ) -> Result<()> {
+        let key_manager = self.storage.key_manager_arc();
         for table in self.list_tables()? {
-            // The moved table's own record was handled by the caller (and by
-            // this point it lives under `new`, not `old`).
+            // The moved table's own record is the caller's.
             if table == old || table == new {
                 continue;
             }
@@ -4198,7 +4679,13 @@ impl<'a> Catalog<'a> {
                 }
             }
             if changed {
-                self.save_table_constraints(&table, &constraints)?;
+                let value = bincode::serialize(&constraints)
+                    .map_err(|e| Error::storage(format!("Failed to serialize table constraints: {}", e)))?;
+                batch.put(
+                    Self::table_constraints_key(&table),
+                    super::tde::seal(key_manager.as_deref(), &value)?.as_ref(),
+                );
+                tables.push(table);
             }
         }
         Ok(())
@@ -4208,7 +4695,7 @@ impl<'a> Catalog<'a> {
     // COLUMN-level DDL vs. the persisted constraint records
     // (sprinter 0f258ed23d13)
     //
-    // `move_inbound_foreign_keys` above is the TABLE-level sibling of this
+    // `stage_inbound_foreign_keys_move` above is the TABLE-level sibling of this
     // block (sprinter 6d501be6013f): a `RENAME TO` used to leave other
     // tables' foreign keys naming a relation that no longer existed. A
     // `RENAME COLUMN` / `DROP COLUMN` leaves the same wreckage one level
@@ -4406,7 +4893,7 @@ impl<'a> Catalog<'a> {
     ///     `references_columns`, and its CHECK bodies;
     ///   * every OTHER table's foreign keys whose `references_table` is this
     ///     one — the PARENT side, which lives in the CHILD's record and which
-    ///     `move_inbound_foreign_keys` is the table-level analogue of;
+    ///     `stage_inbound_foreign_keys_move` is the table-level analogue of;
     ///   * the IDENTITY side record (`is_identity_column` is a name lookup, so
     ///     a stale entry silently turns a GENERATED … AS IDENTITY column back
     ///     into an ordinary one).
@@ -4791,6 +5278,11 @@ impl<'a> Catalog<'a> {
     pub fn register_schema(&self, name: &str) -> Result<bool> {
         if self.schema_exists(name)? {
             return Ok(false);
+        }
+        // Sprinter 6bc4a4040eb7 (B4 fix pass): no table could be created in it, its name
+        // being part of theirs (`Self::refuse_unstorable_table_name`).
+        if name.contains(':') && !self.storage.in_wal_replay() {
+            return Err(Error::schema_name_holds_colon(name));
         }
         let key = Self::schema_metadata_key(name);
         self.storage.put(&key, &[])?;

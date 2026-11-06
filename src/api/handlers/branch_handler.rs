@@ -97,10 +97,9 @@ pub async fn create_branch(
         )
     })?;
 
-    // Get current snapshot ID or use provided one
-    let snapshot_id = request
-        .snapshot_id
-        .unwrap_or_else(|| branch_manager.current_timestamp());
+    // Sprinter 6bc4a4040eb7 (B4): a snapshot asked for is an anchor, materialized
+    // from version history; none is a fork of now.
+    let snapshot_id = request.snapshot_id;
 
     // Convert options
     let options = request.options.map(BranchOptions::from).unwrap_or_default();
@@ -113,7 +112,7 @@ pub async fn create_branch(
         state
             .db
             .storage
-            .create_branch_at_snapshot(&request.name, request.parent.as_deref(), Some(snapshot_id), options)
+            .create_branch_at_snapshot(&request.name, request.parent.as_deref(), snapshot_id, options)
     });
     let branch_id = created.map_err(|e| {
         error!("Failed to create branch '{}': {}", request.name, e);

@@ -9,6 +9,9 @@ mod branch;
 // definitions (and drops) of tables, `bmeta:{level}:table:{t}`, resolved
 // through the session's chain by every catalog reader.
 pub mod branch_catalog;
+// sprinter 6bc4a4040eb7 (phase B4): a branch is a fork: the write gate's hook that
+// freezes what a live child sees before its parent changes it.
+pub(crate) mod branch_freeze;
 // sprinter 6bc4a4040eb7 (phase B2): the branch view — every read and write of
 // a table on a branch. An ordinary module (it used to be a `#[path]` child of
 // `engine`), so the write-gate funnel scan checks its writes like any other.
@@ -98,11 +101,10 @@ pub mod parallel_filter;
 pub mod speculative_filter;
 
 pub use branch::{
-    BranchCloseGuard, BranchDrainState, BranchDrains, BranchExclusiveGuard, BranchGcConfig, BranchGcMode, BranchHold,
-    BranchId, BranchManager, BranchMetadata, BranchOptions, BranchRegistry, BranchState, BranchStats,
-    BranchTransaction, GitLinkMetadata, MergeConflict, MergeResult, MergeStrategy, BRANCH_DRAIN_TIMEOUT,
-    GIT_COMMIT_PREFIX, GIT_CONFIG_KEY, GIT_DDL_HISTORY_PREFIX, GIT_LINK_PREFIX, GIT_PR_PREFIX,
-    GIT_SCHEMA_SNAPSHOT_PREFIX,
+    BranchCloseGuard, BranchDrainState, BranchDrains, BranchExclusiveGuard, BranchHold, BranchId, BranchManager,
+    BranchMetadata, BranchOptions, BranchRegistry, BranchState, BranchStats, BranchTransaction, GitLinkMetadata,
+    MergeConflict, MergeResult, MergeStrategy, BRANCH_DRAIN_TIMEOUT, GIT_COMMIT_PREFIX, GIT_CONFIG_KEY,
+    GIT_DDL_HISTORY_PREFIX, GIT_LINK_PREFIX, GIT_PR_PREFIX, GIT_SCHEMA_SNAPSHOT_PREFIX,
 };
 pub(crate) use branch_view::OverlayCacheScope;
 pub use branch_view::{

@@ -5794,6 +5794,10 @@ fn statement_can_write_data(stmt: &str) -> bool {
         // and `CREATE MATERIALIZED VIEW … AS SELECT` populate rows, and the
         // CTAS executor joins an open session transaction — so they open one.
         "CREATE" => pg_contains_keyword(&upper, "SELECT"),
+        // sprinter 6bc4a4040eb7 (B4 fix pass): binds the session, as `SET
+        // heliosdb.branch` does. In a block it would be refused for being in one, and
+        // the batch's next statement would never be answered for itself.
+        "USE" if crate::sql::Parser::is_use_branch(trimmed) => false,
         // Read-only, session-local, or non-transactional by nature.
         "SHOW" | "SET" | "RESET" | "VALUES" | "TABLE" | "DISCARD" | "VACUUM" | "ANALYZE" | "REINDEX" | "CHECKPOINT"
         | "PREPARE" | "DEALLOCATE" | "LISTEN" | "UNLISTEN" | "NOTIFY" | "COMMENT" | "GRANT" | "REVOKE" | "ALTER"
@@ -5879,6 +5883,19 @@ mod statement_write_classifier_tests {
         ] {
             assert!(!can_write(sql), "`{sql}` must NOT open an implicit block");
         }
+    }
+
+    /// sprinter 6bc4a4040eb7 (B4 fix pass): `USE BRANCH` binds the session, like `SET`,
+    /// so a batch's next statement is answered for itself: on a standby, 25006 for a
+    /// write. It used to open the block, and be refused 25001 for being in it.
+    #[test]
+    fn use_branch_opens_no_block() {
+        assert!(!can_write("USE BRANCH dev"));
+        assert!(!can_write("use database branch dev"));
+        assert!(
+            can_write("USE dev"),
+            "not a branch statement: anything unknown opens it"
+        );
     }
 
     #[test]
@@ -6824,6 +6841,17 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
         || message.contains(crate::error::BRANCH_CLOSING_MARKER)
     {
         return sqlstate::OBJECT_IN_USE; // 55006
+    }
+    // sprinter 6bc4a4040eb7 (B4): a branch with a child, an anchor whose rows cannot be
+    // read, and a table name a row's key cannot hold.
+    if message.contains(crate::error::BRANCH_HAS_CHILD_MARKER) {
+        return sqlstate::DEPENDENT_OBJECTS_STILL_EXIST; // 2BP01
+    }
+    if message.contains(crate::error::BRANCH_ANCHOR_UNREADABLE_MARKER) {
+        return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
+    }
+    if message.contains(crate::error::TABLE_NAME_HOLDS_COLON_MARKER) {
+        return sqlstate::INVALID_NAME; // 42602
     }
     // sprinter 6bc4a4040eb7 (B2): a main-only write path refused on a branch
     // (0A000), and a branch switch inside a transaction (25001).
@@ -8448,6 +8476,11 @@ pub(crate) fn guarded_standby_statement_allowed(sql: &str) -> bool {
     if let Some(copy) = super::copy::parse_copy(sql) {
         return copy.to_stdout;
     }
+    // sprinter 6bc4a4040eb7 (B4 fix pass): binds this session, like `SET
+    // heliosdb.branch` and the startup packet's `db@branch`. Nothing is written.
+    if is_use_branch_statement(sql) {
+        return true;
+    }
     // These RESET forms have explicit session-only interceptors. The SQL parser
     // does not support every RESET spelling accepted by the wire layer.
     if starts_with_icase(sql, "RESET ")
@@ -8486,6 +8519,12 @@ pub(crate) fn guarded_standby_statement_allowed(sql: &str) -> bool {
         // GRANT/REVOKE, branch/HA utilities and unsupported/custom statements.
         _ => false,
     }
+}
+
+/// `USE [DATABASE] BRANCH x`, which the SQL parser does not know.
+#[cfg(any(feature = "ha-tier1", test))]
+fn is_use_branch_statement(sql: &str) -> bool {
+    starts_with_icase(sql, "USE ") && crate::sql::Parser::is_use_branch(sql)
 }
 
 /// Spec P1.3: whether `sql` — a statement [`guarded_standby_statement_allowed`]
@@ -8577,8 +8616,9 @@ pub(crate) fn standby_statement_reads_data(sql: &str, is_user_function: impl Fn(
     if super::copy::parse_copy(sql).is_some() {
         return true;
     }
-    if starts_with_icase(sql, "RESET ") {
-        // The admitted RESET forms are session-only (see the admission rule).
+    if starts_with_icase(sql, "RESET ") || is_use_branch_statement(sql) {
+        // The admitted RESET forms are session-only (see the admission rule), and so
+        // is binding a branch, as `SET heliosdb.branch` is.
         return false;
     }
     let rewritten = pg_rewrite_empty_projection(sql);
@@ -8944,11 +8984,53 @@ mod guarded_standby_admission_tests {
             "SHOW application_name",
             "RESET application_name",
             "SELECT currval('s')",
+            "USE BRANCH dev",
+            "use database branch dev;",
             "",
             "-- only a comment",
         ] {
             assert!(allowed(sql), "read/session statement denied: {sql}");
         }
+    }
+
+    /// sprinter 6bc4a4040eb7 (B4 fix pass): every other branch statement writes.
+    #[test]
+    fn denies_the_branch_statements_that_write() {
+        for sql in [
+            "CREATE BRANCH dev AS OF NOW",
+            "DROP BRANCH dev",
+            "MERGE BRANCH dev INTO main",
+            "MERGE BRANCH dev ABORT",
+            "USE dev",
+            "USE BRANCH dev; INSERT INTO t VALUES (1)",
+            "/* leading */ USE BRANCH dev; DROP TABLE t",
+        ] {
+            assert!(!allowed(sql), "a write admitted: {sql}");
+        }
+    }
+
+    /// sprinter 6bc4a4040eb7 (B4 fix pass): both wires' codes for the refusals of the
+    /// fork point.
+    #[test]
+    fn the_refusals_of_the_fork_point_have_their_sqlstates() {
+        use super::sqlstate_for_error as code;
+        use crate::Error;
+        assert_eq!(code(&Error::table_name_holds_colon("a:b")), "42602");
+        assert_eq!(code(&Error::branch_has_child("p", "c", 1, true)), "2BP01");
+        assert_eq!(code(&Error::schema_name_holds_colon("s:1")), "42602");
+        assert_eq!(
+            code(&Error::branch_anchor_before_shape_change(
+                "x",
+                "table \"t\" was renamed"
+            )),
+            "0A000"
+        );
+        assert_eq!(code(&Error::sql_parse("trailing words")), "42601");
+        assert_eq!(
+            code(&Error::branch_statement_unsupported("SELECT … AS OF", "x")),
+            "0A000"
+        );
+        assert_eq!(code(&Error::branch_schema_waited_for_fork("t")), "55006");
     }
 
     #[test]

@@ -38,7 +38,7 @@ heliosdb-nano mcp --help \
 | `heliosdb_insert` | INSERT rows from JSON |
 | `heliosdb_branch_create` | `CREATE DATABASE BRANCH` |
 | `heliosdb_branch_list` | List branches |
-| `heliosdb_branch_merge` ❌ | `MERGE BRANCH` — **merges nothing, reports success**; see the branches skill |
+| `heliosdb_branch_merge` | `MERGE BRANCH`: the source's own changes, last-writer-wins; see the branches skill |
 | `heliosdb_branch_drop` | `DROP BRANCH` (refuses `main`); a session bound to the dropped branch fails closed (3D000) |
 | `heliosdb_search` | Full-text search |
 | `heliosdb_time_travel` | `SELECT … AS OF …` shorthand |
@@ -153,7 +153,7 @@ The MCP server also exposes Resources via `resources/list` and `resources/read`.
 - **Stdio transport conflicts with stdout logging.** When using stdio MCP, redirect tracing to stderr (`RUST_LOG=warn` and never log to stdout).
 - **`heliosdb_query` returns errors as JSON, not exceptions.** Agents must check the `error` field.
 - **Branches created via MCP persist** — agents that don't clean up `agent_run_*` branches leak state. Treat branches as fork-test-discard sandboxes: wrap agent runs with `branch_create` and always drop the branch in a `finally` block.
-- **`heliosdb_branch_merge` DOES NOT MERGE.** It reports success (`completed = true`, `conflicts = []`) and applies zero rows, leaving the target unchanged (see the MERGE warning in `heliosdb-nano-branches`). Never call it. Discard the branch and re-apply validated SQL via `heliosdb_query` instead — merging and then discarding the branch loses the work silently.
+- **`heliosdb_branch_merge` is last-writer-wins.** It moves the source's own changes with no conflict detection (see the MERGE section of `heliosdb-nano-branches`). An agent cannot verify that outcome: prefer discarding the branch and re-applying validated SQL via `heliosdb_query`.
 - **`heliosdb_embed_and_store` downloads a model on first call** (`code-embed`). Provision the model into `./.fastembed_cache/` ahead of time in CI.
 
 ## See also

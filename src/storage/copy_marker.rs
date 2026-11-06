@@ -128,9 +128,10 @@ impl CopyMarkers {
     /// standby mirrors its primary's markers from the replicated records, so a
     /// delete must leave the interval index too: a stale interval would keep
     /// hiding the covered rows from AS-OF reads older than the marker. Nothing
-    /// on a primary deletes markers today (materialization is a documented
-    /// follow-up); this keeps the mirror exact when something does. Returns
-    /// whether an interval was removed.
+    /// on a primary deletes a live table's markers (materialization is a documented
+    /// follow-up); a `DROP TABLE` or `RENAME TO` deletes them with the table's
+    /// history, and this keeps the mirror exact. Returns whether an interval was
+    /// removed.
     #[cfg_attr(not(feature = "ha-tier1"), allow(dead_code))]
     pub(crate) fn remove_record(&self, key: &[u8]) -> bool {
         let Some((table, first, last)) = Self::parse_marker_key(key) else {

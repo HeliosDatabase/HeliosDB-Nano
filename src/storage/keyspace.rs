@@ -59,6 +59,15 @@ pub enum KeyClass {
     /// what tells "dropped and recreated identically" from "unchanged"
     /// (sprinter 6bc4a4040eb7, B3 fix pass).
     MetaTableIncarnation,
+    /// `meta:table_shape:{table}` — when main's table last changed in a way a row
+    /// version written before it cannot be read under (`DROP COLUMN`, `RENAME
+    /// COLUMN`, `RENAME TO`, `SET STORAGE`), in the DDL's own write: what refuses a
+    /// branch anchored before it (sprinter 6bc4a4040eb7, B4 fix pass).
+    MetaTableShape,
+    /// `meta:history_purge:{table}` — the version history under the name is to be
+    /// deleted, and no table has the name: written in a `DROP` or `RENAME` batch,
+    /// deleted when the history is (sprinter 6bc4a4040eb7, B4 fix pass).
+    MetaHistoryPurge,
     /// `meta:index:{index}` — persisted index definition.
     MetaIndex,
     /// `meta:schema:{schema}` — declared schema marker.
@@ -248,6 +257,10 @@ pub const PREFIXES: &[(&[u8], KeyClass)] = &[
     (b"meta:table:", KeyClass::MetaTable),
     // storage/catalog.rs `table_incarnation_key` (sprinter 6bc4a4040eb7, B3 fix pass)
     (b"meta:table_incarnation:", KeyClass::MetaTableIncarnation),
+    // storage/catalog.rs `table_shape_key` (sprinter 6bc4a4040eb7, B4 fix pass)
+    (b"meta:table_shape:", KeyClass::MetaTableShape),
+    // storage/catalog.rs `history_purge_key` (sprinter 6bc4a4040eb7, B4 fix pass)
+    (b"meta:history_purge:", KeyClass::MetaHistoryPurge),
     // storage/catalog.rs:3899 `index_metadata_key`
     (b"meta:index:", KeyClass::MetaIndex),
     // storage/catalog.rs:3914 `schema_metadata_key`
@@ -383,7 +396,7 @@ pub const FIXED_KEYS: &[(&[u8], KeyClass)] = &[
     (b"meta:tde:keycheck", KeyClass::MetaTdeKeyCheck),
     // storage/branch.rs:24 `BRANCH_REGISTRY_KEY`
     (b"branch:registry", KeyClass::Branch),
-    // storage/branch.rs:475 `save_pending_gc` `PENDING_GC_KEY`
+    // storage/branch.rs `LEGACY_PENDING_GC_KEY`: written through 4.41, deleted at open
     (b"branch:pending_gc", KeyClass::Branch),
     // storage/branch.rs:29 `GIT_CONFIG_KEY`
     (b"git:config", KeyClass::Git),
@@ -596,6 +609,8 @@ mod tests {
         (b"bkey:2:7573657273:75:0102:42", KeyClass::BranchKey, None),
         (b"branch:merge:2", KeyClass::Branch, None),
         (b"meta:table_incarnation:users", KeyClass::MetaTableIncarnation, None),
+        (b"meta:table_shape:users", KeyClass::MetaTableShape, None),
+        (b"meta:history_purge:users", KeyClass::MetaHistoryPurge, None),
         (b"git:config", KeyClass::Git, None),
         (b"git:link:feature", KeyClass::Git, None),
         (b"git:commit:abc123", KeyClass::Git, None),

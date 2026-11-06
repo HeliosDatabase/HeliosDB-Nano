@@ -926,10 +926,9 @@ pub(super) fn handle_truncate(executor: &Executor, table_name: &str) -> Result<B
             keys_to_delete.push(key.to_vec());
         }
 
-        // Delete all collected keys
-        for key in &keys_to_delete {
-            storage.delete(key)?;
-        }
+        // Delete all collected keys. Sprinter 6bc4a4040eb7 (B4): each with its delete
+        // event, so `AS OF` before this shows the rows.
+        storage.delete_rows_with_events(&keys_to_delete)?;
 
         // R3.3: purge columnar sidecars (col:/colz:/colzm:/colp:/colpm:) with
         // the rows — stale batches or live-row presence must not resurrect
