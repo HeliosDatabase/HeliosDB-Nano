@@ -2093,6 +2093,9 @@ pub struct StorageEngine {
     write_census: Arc<super::UncommittedWriteCensus>,
     /// Spec R5.1: the per-table writer lock (`storage::table_locks`).
     table_locks: Arc<super::table_locks::TableLocks>,
+    /// Spec R5.4 (P12): the per-row write locks and change epochs
+    /// (`storage::row_locks`).
+    row_locks: Arc<super::row_locks::RowLocks>,
     /// R4.3: MVCC version garbage collector (watermark + collector state).
     version_gc: Arc<super::version_gc::VersionGc>,
     /// R4.3: background version-GC thread; joined on engine drop. None
@@ -3680,6 +3683,7 @@ impl StorageEngine {
             conflict_registry,
             write_census: Arc::new(super::UncommittedWriteCensus::new()),
             table_locks,
+            row_locks: Arc::new(super::row_locks::RowLocks::new()),
             version_gc,
             version_gc_worker,
             branch_manager,
@@ -4147,6 +4151,7 @@ impl StorageEngine {
             conflict_registry,
             write_census: Arc::new(super::UncommittedWriteCensus::new()),
             table_locks,
+            row_locks: Arc::new(super::row_locks::RowLocks::new()),
             version_gc,
             version_gc_worker,
             branch_manager,
@@ -5458,6 +5463,26 @@ impl StorageEngine {
             .exclusive(level, tables, what, self.table_locks.timeout())
     }
 
+    /// Spec R5.4 (P12): the engine's row write locks and per-table change epochs.
+    pub fn row_locks(&self) -> &Arc<super::row_locks::RowLocks> {
+        &self.row_locks
+    }
+
+    /// Spec R5.4 (P12): lock row `row_id` of main's `table` for one fast-path write,
+    /// which holds it until the guard drops, after its write group is applied and the
+    /// table's change epoch bumped. Waits like a table lock, bounded the same way.
+    pub fn lock_row_for_fast_write(&self, table: &str, row_id: u64) -> Result<super::row_locks::RowLockGuard<'_>> {
+        super::row_locks::RowLockGuard::acquire(&self.row_locks, table, row_id, self.table_locks.row_lock_bounds())
+    }
+
+    /// For the tests: lower the write-group ceiling (spec R5 decision 6,
+    /// `WriteGate::debug_set_write_group_ceiling`); `None` restores
+    /// `write_gate::MAX_WRITE_GROUP_BYTES`.
+    #[doc(hidden)]
+    pub fn debug_set_write_group_ceiling(&self, bytes: Option<usize>) {
+        self.gate.debug_set_write_group_ceiling(bytes);
+    }
+
     /// For the tests: `[session] lock_timeout_ms` on a running engine.
     #[doc(hidden)]
     pub fn debug_set_table_lock_timeout(&self, timeout: std::time::Duration) {
@@ -5598,6 +5623,8 @@ impl StorageEngine {
         // NEVER on `begin_autocommit_transaction`: that one ends inside its
         // statement, whose scope holds them.
         txn.set_table_locks(Arc::clone(&self.table_locks));
+        // Spec R5.4 (P12): it locks the rows it changes until it ends.
+        self.attach_row_locks(&mut txn);
         Ok(txn)
     }
 
@@ -5637,7 +5664,22 @@ impl StorageEngine {
         // `Transaction::set_removal_census` for why, and why this is not the
         // `set_write_census` enrollment `begin_transaction` makes.
         txn.set_removal_census(self.write_census());
+        // Spec R5.4 (P12): it locks the rows it changes until it commits.
+        self.attach_row_locks(&mut txn);
+        txn.mark_statement_scoped();
         Ok(txn)
+    }
+
+    /// Spec R5.4 (P12): give `txn` this engine's row write locks, and the clock a commit
+    /// holding any takes its fresh timestamp from. Every transaction built on this
+    /// engine gets them: `begin_transaction`, `begin_autocommit_transaction`, and the
+    /// session transactions `lib.rs` builds with `Transaction::new_with_session`.
+    pub fn attach_row_locks(&self, txn: &mut Transaction) {
+        txn.set_row_locks(
+            Arc::clone(&self.row_locks),
+            Arc::clone(&self.table_locks),
+            Arc::clone(&self.timestamp),
+        );
     }
 
     /// Power-loss durability barrier for AUTOCOMMIT fast-path statements.
@@ -15821,38 +15863,104 @@ impl StorageEngine {
         };
 
         // W2.5: allocate the version timestamp and raise the committed-write
-        // watermark BEFORE the `data:` row becomes visible via `self.put` below.
-        // The in-transaction fast read serves rows straight from `data:` (not
-        // from version history), so the watermark — not the later `write_version`
-        // — is what must be raised before the row is observable: otherwise a
-        // concurrent older-snapshot reader could fast-read this not-yet-permitted
-        // row in the window between the `data:` put and the bump. This mirrors the
-        // commit-path fence (transaction.rs) and the batched-insert path, and
-        // upholds the invariant `txn_base_tuples` relies on (scan.rs). Over-raising
-        // on a later failed write only forces the safe snapshot path.
+        // watermark BEFORE the `data:` row becomes visible. The in-transaction fast
+        // read serves rows straight from `data:` (not from version history), so the
+        // watermark — not the version — is what must be raised before the row is
+        // observable: otherwise a concurrent older-snapshot reader could fast-read
+        // this not-yet-permitted row in the window before the bump. This mirrors the
+        // commit-path fence (transaction.rs) and the batched-insert path, and upholds
+        // the invariant `txn_base_tuples` relies on (scan.rs). Over-raising on a
+        // later failed write only forces the safe snapshot path. Spec R5.4: a commit
+        // timestamp, announced in flight, so a snapshot taken after it waits for the
+        // row as it waits for a commit.
         let version_timestamp = if self.config.storage.time_travel_enabled {
-            let timestamp = self.next_timestamp();
+            let timestamp = self.next_commit_timestamp(true);
             self.note_committed_write(table_name, timestamp);
             Some(timestamp)
         } else {
             None
         };
 
-        // Write current version (for fast non-time-travel queries)
+        // Spec R5.4 (F1.2): the row's whole durable effect is ONE write group — the
+        // `data:` image, the table's row counter, the version and the `snapshot:`
+        // record `AS OF` resolves to, the MV delta and its id, and the logical-WAL
+        // entry. Each of them used to be a write group of its own (about eight per
+        // row), the row visible before its version, its counter and its entry.
         let key = Self::build_data_key(table_name, row_id);
-        self.put(&key, &value)?;
+        let written = (|| -> Result<Option<super::time_travel::StagedVersion>> {
+            self.check_direct_write_budget(key.len() + value.len())?;
+            let mut batch = WriteBatch::default();
+            let staged_version = match version_timestamp {
+                Some(timestamp) => Some(self.snapshot_manager.stage_data_version_snapshot(
+                    &mut batch,
+                    &key,
+                    &value,
+                    table_name,
+                    row_id,
+                    timestamp,
+                    &logical_value,
+                    self.wal_lsn(),
+                    false,
+                )?),
+                None => {
+                    let sealed = super::tde::seal(self.key_manager.as_deref(), &value)?;
+                    batch.put(&key, sealed.as_ref());
+                    None
+                }
+            };
+            self.stage_row_counter_into(&mut batch, table_name)?;
+            // Skip delta tracking in bulk load mode for improved performance. A
+            // delta that cannot be staged is reported, never the insert's failure.
+            if !bulk_mode {
+                if let Err(e) = self
+                    .mv_delta_tracker
+                    .stage_insert(&mut batch, table_name, row_id, tuple.clone())
+                {
+                    tracing::warn!("Failed to record insert delta for table '{}': {}", table_name, e);
+                }
+            }
+            // R1.1: the logical-WAL entry rides the row's batch (`append_with_batch`,
+            // which an autocommit statement's capture frame defers to its commit);
+            // fsynced only under strict per-statement logging (P0#2).
+            match &self.wal {
+                Some(wal) if !self.is_replaying.load(Ordering::Acquire) => {
+                    let mut sync_options = WriteOptions::default();
+                    let options = if self.config.storage.logical_wal_per_statement {
+                        sync_options.set_sync(true);
+                        Some(&sync_options)
+                    } else {
+                        self.memory_write_options.as_ref()
+                    };
+                    wal.read()
+                        .append_with_batch(
+                            WalOperation::Insert {
+                                table: table_name.to_string(),
+                                key: key.clone(),
+                                tuple: logical_value.clone(),
+                            },
+                            batch,
+                            options,
+                        )
+                        .map(drop)?;
+                }
+                _ => self
+                    .gate
+                    .write(&self.db, batch, self.memory_write_options.as_ref())
+                    .map_err(|e| Error::storage(format!("Put failed: {}", e)))?,
+            }
+            Ok(staged_version)
+        })();
+        if let Some(timestamp) = version_timestamp {
+            self.conflict_registry.end_commit(timestamp);
+        }
+        let staged_version = written?;
         // sprinter 5a78b8288153: durability point — the claimed entries now
         // describe a stored row and must be kept whatever follows.
         claim.row_is_durable();
-        self.flush_row_counter(table_name)?;
-
-        // R1.1: logical-WAL append without a per-statement fsync by default
-        // (P0#2 contract); strict per-statement durability is opt-in via
-        // storage.logical_wal_per_statement.
-        if self.fast_dml_requires_logical_wal() {
-            self.log_data_insert(table_name, &key, &logical_value)?;
-        } else {
-            self.log_data_insert_nosync(table_name, &key, &logical_value)?;
+        if let Some(staged) = staged_version {
+            // Register snapshot (with the WAL LSN for AS OF TRANSACTION queries,
+            // staged above) in memory, as `register_snapshot_with_lsn` did.
+            let _ = self.snapshot_manager.finish_staged_version(staged);
         }
 
         // sprinter 5a78b8288153: the PK/unique ART entries were claimed above,
@@ -15861,34 +15969,10 @@ impl StorageEngine {
         // with the race it could only report on.
 
         // R5.V1: maintain HNSW vector indexes (single atomic load when the
-        // table has none).
+        // table has none) — after the row's group, as before (decision 8).
         let _ = self.vector_indexes.on_row_insert(table_name, row_id, schema, &tuple);
 
-        if let Some(timestamp) = version_timestamp {
-            // Write versioned copy (for time-travel queries). The committed-write
-            // watermark was already raised to `timestamp` above, before the
-            // `data:` row became visible (W2.5 ordering).
-            self.snapshot_manager
-                .write_version(table_name, row_id, timestamp, &logical_value)?;
-
-            // Register snapshot with WAL LSN for AS OF TRANSACTION queries.
-            // This ensures the transaction ID matches what users see in the REPL.
-            if let Some(lsn) = self.wal_lsn() {
-                let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
-            } else {
-                // Fallback to auto-generated transaction ID if WAL is disabled
-                let _ = self.snapshot_manager.register_snapshot(timestamp);
-            }
-        }
-
-        // Skip delta tracking in bulk load mode for improved performance
         if !bulk_mode {
-            // Record delta for incremental MV refresh
-            if let Err(e) = self.mv_delta_tracker.record_insert(table_name, row_id, tuple.clone()) {
-                tracing::warn!("Failed to record insert delta for table '{}': {}", table_name, e);
-                // Don't fail the insert if delta recording fails
-            }
-
             // Record delta for SMFI (Self-Maintaining Filter Index)
             self.filter_delta_tracker.on_insert(table_name, row_id, &tuple, &schema);
 
@@ -15901,6 +15985,21 @@ impl StorageEngine {
         }
 
         Ok(row_id)
+    }
+
+    /// Spec R5.4 (F1.2): stage `counter:{table}` at the table's current in-memory row
+    /// counter into a row's batch, sealed as `put_internal` seals it, instead of a
+    /// write group of its own after the row (`flush_row_counter`).
+    fn stage_row_counter_into(&self, batch: &mut WriteBatch, table_name: &str) -> Result<()> {
+        let current = self
+            .row_counters
+            .get(table_name)
+            .map_or(0, |counter| counter.load(Ordering::Relaxed));
+        let value =
+            bincode::serialize(&current).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+        let stored = super::tde::seal(self.key_manager.as_deref(), &value)?;
+        batch.put(format!("counter:{}", table_name).as_bytes(), stored.as_ref());
+        Ok(())
     }
 
     /// Fast-path INSERT: writes data + ART index, with logical WAL and
@@ -16030,23 +16129,73 @@ impl StorageEngine {
                 }
             }
         } else {
-            self.put(&key, &value)?;
+            // Spec R5.4 (F1.3): the strict-WAL / HA-primary and side-storage
+            // variant writes the row, its version and `snapshot:` record (time
+            // travel on) and its logical-WAL entry (when the configuration needs
+            // one) as ONE write group. It was three: the row, then the entry, then
+            // the version — a standby and a crash saw the row with neither.
+            self.check_direct_write_budget(key.len() + value.len())?;
+            let mut batch = WriteBatch::default();
+            let staged_version = match version_timestamp {
+                Some(timestamp) => {
+                    let logical = logical_value
+                        .as_deref()
+                        .ok_or_else(|| Error::internal("missing logical insert value"))?;
+                    // W3.2: eliding the `v:` copy is sound only when `data:` holds
+                    // this version's logical value byte-for-byte (not side storage).
+                    Some(self.snapshot_manager.stage_data_version_snapshot(
+                        &mut batch,
+                        &key,
+                        &value,
+                        table_name,
+                        row_id,
+                        timestamp,
+                        logical,
+                        self.wal_lsn(),
+                        !uses_side_storage,
+                    )?)
+                }
+                None => {
+                    let sealed = super::tde::seal(self.key_manager.as_deref(), &value)?;
+                    batch.put(&key, sealed.as_ref());
+                    None
+                }
+            };
+            match &self.wal {
+                Some(wal) if requires_logical_wal && !self.is_replaying.load(Ordering::Acquire) => {
+                    let logical = logical_value
+                        .as_deref()
+                        .ok_or_else(|| Error::internal("missing logical insert value"))?;
+                    let mut sync_options = WriteOptions::default();
+                    let options = if self.config.storage.logical_wal_per_statement {
+                        sync_options.set_sync(true);
+                        Some(&sync_options)
+                    } else {
+                        self.memory_write_options.as_ref()
+                    };
+                    wal.read()
+                        .append_with_batch(
+                            WalOperation::Insert {
+                                table: table_name.to_string(),
+                                key: key.clone(),
+                                tuple: logical.to_vec(),
+                            },
+                            batch,
+                            options,
+                        )
+                        .map(drop)?;
+                }
+                _ => self
+                    .gate
+                    .write(&self.db, batch, self.memory_write_options.as_ref())
+                    .map_err(|e| Error::storage(format!("Put failed: {}", e)))?,
+            }
             // sprinter 5a78b8288153: the row is durable HERE on this branch. From
             // this point the claimed entries belong to a stored row and must be
             // kept — a later failure must not strip it of its PRIMARY KEY entry.
-            // (The batched branch above writes nothing yet; it disarms further
-            // down, where its row actually lands.)
             claim.row_is_durable();
-        }
-
-        if requires_logical_wal {
-            let logical_value = logical_value
-                .as_deref()
-                .ok_or_else(|| Error::internal("missing logical insert value"))?;
-            if self.config.storage.logical_wal_per_statement {
-                self.log_data_insert(table_name, &key, logical_value)?;
-            } else {
-                self.log_data_insert_nosync(table_name, &key, logical_value)?;
+            if let Some(staged) = staged_version {
+                let _ = self.snapshot_manager.finish_staged_version(staged);
             }
         }
 
@@ -16098,6 +16247,8 @@ impl StorageEngine {
             // and `logical_value` is the full tuple). Gate on `!uses_side_storage`;
             // the funnel then elides iff `storage.elide_latest_version` is on.
             let allow_elide = !uses_side_storage;
+            // Spec R5.4: the other versioned variant wrote its version with its row,
+            // above.
             if data_and_version_batched {
                 self.snapshot_manager.write_data_version_and_register_snapshot(
                     &key,
@@ -16115,15 +16266,6 @@ impl StorageEngine {
                 // this is its durability point — the claim stops being a phantom
                 // and its entries must be kept from now on.
                 claim.row_is_durable();
-            } else {
-                self.snapshot_manager.write_version_and_register_snapshot(
-                    table_name,
-                    row_id,
-                    timestamp,
-                    logical_value,
-                    self.wal_lsn(),
-                    allow_elide,
-                )?;
             }
         }
 
@@ -16449,6 +16591,12 @@ impl StorageEngine {
         };
 
         drop(_cps_bb);
+        // Spec R5.4 (F1.5): the `snapshot:` record rides the rows' own batch (it was
+        // a write group of its own after it).
+        let staged_snapshot = match commit_ts {
+            Some(ts) => Some(self.snapshot_manager.stage_snapshot_record(&mut batch, ts, None)?),
+            None => None,
+        };
         // W3.4: the durable RocksDB write itself (the funnel's I/O phase).
         let _cps_cm = crate::copy_phase_stats::time(crate::copy_phase_stats::Phase::Commit, batch_rows);
         let result = self.gate.write(&self.db, batch, self.memory_write_options.as_ref());
@@ -16461,7 +16609,9 @@ impl StorageEngine {
         drop(_cps_cm);
 
         if let Some(ts) = commit_ts {
-            let _ = self.snapshot_manager.register_snapshot(ts);
+            if let Some(metadata) = staged_snapshot {
+                self.snapshot_manager.publish_staged_snapshot(metadata);
+            }
             // Item #2: publish the just-committed COPY marker into the in-memory
             // interval index so AS-OF reads + UPDATE/DELETE materialization see
             // it immediately (the durable `vmeta:` key is already in the batch).
@@ -16809,7 +16959,11 @@ impl StorageEngine {
     }
 
     /// Fast UPDATE: overwrites a row in-place, updates ART indexes, invalidates row cache.
-    /// Skips WAL fsync, snapshot versioning, and MV delta tracking.
+    /// Skips MV delta tracking. Spec R5.4 (F1.3): the row, its version and the snapshot
+    /// a later `AS OF` resolves to, and its logical-WAL entry when the configuration
+    /// needs one, are ONE write group ([`Self::write_fast_row_change`]); the caller must
+    /// NOT log the entry itself. It holds the row's write lock
+    /// ([`Self::lock_row_for_fast_write`]) from before it read `old_tuple`.
     pub fn update_tuple_fast(
         &self,
         table_name: &str,
@@ -16832,38 +16986,9 @@ impl StorageEngine {
     ) -> Result<u64> {
         // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
         self.refuse_main_only_write_on_branch("the fast UPDATE path")?;
-        // W3.2: UPDATE class scope. This fast path is version-SKIPPING (no
-        // `v:`/`v_idx:` write), so the census records `data:` bytes only — the
-        // measured absence of version bytes here is itself a W3.2 finding.
+        // W3.2: UPDATE class scope.
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Update);
-        // Item #2: preserve a COPY marker-covered row's insert version before
-        // this version-skipping fast UPDATE overwrites `data:` (no-op — one
-        // atomic load — when no COPY markers are live).
-        self.snapshot_manager
-            .materialize_copy_marker_row_durable(table_name, row_id)?;
-        // Serialize the storage-format tuple; logical WAL is emitted by callers
-        // before this fast storage write. Default row-store tables can serialize
-        // directly and avoid a full tuple clone in the hot UPDATE path.
-        let value = if schema_uses_column_storage(schema) {
-            let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &new_tuple, schema)?;
-            bincode::serialize(&stored_tuple)
-                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
-        } else {
-            bincode::serialize(&new_tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
-        };
-
-        // Overwrite the row in storage
-        let key = Self::build_data_key(table_name, row_id);
-        // W2.5: versionless overwrite — drop the fast-read watermark BEFORE the
-        // new value becomes visible so in-transaction readers take the snapshot
-        // path (see `invalidate_write_watermark`). Always main's `data:` here
-        // (SQL fast paths bail on branches), so no branch guard is needed.
-        self.invalidate_write_watermark(table_name);
-        self.put(&key, &value)?;
-        if crate::write_volume::enabled() {
-            crate::write_volume::add_row();
-            crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + value.len()) as u64);
-        }
+        self.write_fast_row_update(table_name, row_id, &new_tuple, schema)?;
 
         // Update ART indexes only if an indexed column actually changed.
         // Common OLTP updates mutate payload columns while the PK/unique keys
@@ -16891,16 +17016,14 @@ impl StorageEngine {
             }
         }
 
-        // R5.V1: maintain HNSW vector indexes. Deliberately independent of
-        // the ART `update_indexes` gate above — vector columns are not ART
-        // columns, so an UPDATE can change the vector while leaving every
-        // ART key untouched. The hook itself skips unchanged vector columns.
+        // R5.V1: maintain HNSW vector indexes, after the row's group (F1.3).
+        // Deliberately independent of the ART `update_indexes` gate above —
+        // vector columns are not ART columns, so an UPDATE can change the vector
+        // while leaving every ART key untouched. The hook itself skips unchanged
+        // vector columns.
         let _ = self
             .vector_indexes
             .on_row_update(table_name, row_id, schema, Some(old_tuple), &new_tuple);
-
-        // Invalidate row cache for this row
-        self.row_cache.invalidate(table_name, row_id);
 
         Ok(1)
     }
@@ -16914,7 +17037,8 @@ impl StorageEngine {
     /// (R5.V1). Callers that already checked
     /// `vector_indexes().table_has_indexes(..)` returned `false` may pass
     /// `None`; otherwise pass the old row so unchanged vector columns are
-    /// skipped instead of pointlessly re-indexed.
+    /// skipped instead of pointlessly re-indexed. Spec R5.4: one write group, as
+    /// [`Self::update_tuple_fast`].
     pub fn update_tuple_fast_no_index(
         &self,
         table_name: &str,
@@ -16925,61 +17049,215 @@ impl StorageEngine {
     ) -> Result<u64> {
         // sprinter 6bc4a4040eb7 (B2): main-only writer — refused on a branch.
         self.refuse_main_only_write_on_branch("the fast UPDATE path")?;
-        // W3.2: UPDATE class scope (version-skipping; `data:` bytes only).
+        // W3.2: UPDATE class scope.
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Update);
-        // Item #2: preserve a COPY marker-covered row's insert version before
-        // this version-skipping fast UPDATE overwrites `data:`.
-        self.snapshot_manager
-            .materialize_copy_marker_row_durable(table_name, row_id)?;
-        let value = if schema_uses_column_storage(schema) {
-            let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &new_tuple, schema)?;
-            bincode::serialize(&stored_tuple)
-                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
-        } else {
-            bincode::serialize(&new_tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
-        };
-
-        let key = Self::build_data_key(table_name, row_id);
-        // W2.5: versionless overwrite — see `invalidate_write_watermark`.
-        self.invalidate_write_watermark(table_name);
-        self.put(&key, &value)?;
-        if crate::write_volume::enabled() {
-            crate::write_volume::add_row();
-            crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + value.len()) as u64);
-        }
+        self.write_fast_row_update(table_name, row_id, &new_tuple, schema)?;
 
         // R5.V1: callers proved no *ART* index column changed, which says
-        // nothing about vector columns; maintain HNSW indexes here. The
-        // `has_any_index` gate inside the hook keeps this free for
-        // non-vector tables.
+        // nothing about vector columns; maintain HNSW indexes here, after the
+        // row's group. The `has_any_index` gate inside the hook keeps this free
+        // for non-vector tables.
         if vector_old_tuple.is_some() || self.vector_indexes.table_has_indexes(table_name) {
             let _ = self
                 .vector_indexes
                 .on_row_update(table_name, row_id, schema, vector_old_tuple, &new_tuple);
         }
-
-        self.row_cache.invalidate(table_name, row_id);
         Ok(1)
     }
 
-    /// Sprinter 6bc4a4040eb7 (B4): the `data:` write of a fast DELETE. With time
-    /// travel on it carries the row's delete event, and the snapshot a later `AS OF`
-    /// resolves to, in one batch.
-    fn delete_row_fast(&self, key: &[u8], table_name: &str, row_id: u64) -> Result<()> {
-        if !self.config.storage.time_travel_enabled {
-            return self.gate.delete(&self.db, key, self.memory_write_options.as_ref());
+    /// Spec R5.4 (F1.3): serialize a fast UPDATE's new image (its stored form for a
+    /// side-storage table, and the logical one its version and log entry carry) and
+    /// write it in one group.
+    fn write_fast_row_update(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        new_tuple: &Tuple,
+        schema: &crate::Schema,
+    ) -> Result<()> {
+        let logical =
+            bincode::serialize(new_tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+        let stored_side;
+        let stored: &[u8] = if schema_uses_column_storage(schema) {
+            let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, new_tuple, schema)?;
+            stored_side = bincode::serialize(&stored_tuple)
+                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            &stored_side
+        } else {
+            &logical
+        };
+        let key = Self::build_data_key(table_name, row_id);
+        self.write_fast_row_change(table_name, row_id, &key, Some((stored, logical.as_slice())))?;
+        if crate::write_volume::enabled() {
+            crate::write_volume::add_row();
+            crate::write_volume::add(crate::write_volume::Category::Data, (key.len() + stored.len()) as u64);
         }
-        let timestamp = self.next_timestamp();
-        self.snapshot_manager
-            .delete_data_and_record_event(
-                key,
-                table_name,
-                row_id,
-                timestamp,
-                self.wal_lsn(),
-                self.memory_write_options.as_ref(),
-            )
-            .map(drop)
+        Ok(())
+    }
+
+    /// Spec R5.4 (F1.3): a fast UPDATE's (`Some((stored, logical))`) or DELETE's
+    /// (`None`) whole durable effect on one main row, in ONE write group:
+    ///
+    /// * the `data:` image (sealed as `put` seals it), or its removal;
+    /// * with time travel on, the row's event at a fresh commit timestamp: its version
+    ///   (the logical image) or its delete event, the history older snapshots still
+    ///   need (`SnapshotManager::stage_row_change_history`), and the `snapshot:` record
+    ///   `AS OF` resolves to. Before this the fast UPDATE wrote no version at all, so
+    ///   a later transaction's scan and every `AS OF` read the row as it was before;
+    ///   and a COPY or elided row's history was materialized in a group of its own;
+    /// * the logical-WAL entry when the configuration needs one
+    ///   (`fast_dml_requires_logical_wal`), staged into the same batch
+    ///   (`WriteAheadLog::append_with_batch`): it used to be appended first, in a
+    ///   group of its own.
+    ///
+    /// The timestamp is announced in flight inside the clock's lock and ended after the
+    /// write, so a snapshot taken after it waits for the row (the commit path's
+    /// barrier), and the table's committed-write watermark is raised to it before the
+    /// row is visible (W2.5). The caller holds the row's write lock; the table's change
+    /// epoch moves after the write (`storage::row_locks`), before the caller lets it go.
+    fn write_fast_row_change(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        key: &[u8],
+        image: Option<(&[u8], &[u8])>,
+    ) -> Result<()> {
+        if let Some((stored, _)) = image {
+            self.check_direct_write_budget(key.len() + stored.len())?;
+        }
+        let versioned = self.config.storage.time_travel_enabled;
+        let log_entry = self.fast_dml_requires_logical_wal() && !self.is_replaying.load(Ordering::Acquire);
+        let timestamp = versioned.then(|| self.next_commit_timestamp(true));
+        let mut replication_barrier = None;
+        let written = (|| -> Result<Option<super::time_travel::SnapshotMetadata>> {
+            let mut batch = WriteBatch::default();
+            match image {
+                Some((stored, logical)) => {
+                    let sealed = super::tde::seal(self.key_manager.as_deref(), stored)?;
+                    batch.put(key, sealed.as_ref());
+                    if let Some(ts) = timestamp {
+                        let sealed_version = super::tde::seal(self.key_manager.as_deref(), logical)?;
+                        self.snapshot_manager.stage_row_change_history(
+                            &mut batch,
+                            table_name,
+                            row_id,
+                            ts,
+                            Some(sealed_version.as_ref()),
+                        )?;
+                    }
+                }
+                None => {
+                    batch.delete(key);
+                    if let Some(ts) = timestamp {
+                        self.snapshot_manager
+                            .stage_row_change_history(&mut batch, table_name, row_id, ts, None)?;
+                    }
+                }
+            }
+            let metadata = match timestamp {
+                Some(ts) => Some(
+                    self.snapshot_manager
+                        .stage_snapshot_record(&mut batch, ts, self.wal_lsn())?,
+                ),
+                None => None,
+            };
+            // W2.5: a versioned change raises the watermark BEFORE it is visible, as
+            // a commit does; a versionless one (time travel off) drops it.
+            match timestamp {
+                Some(ts) => self.note_committed_write(table_name, ts),
+                None => self.invalidate_write_watermark(table_name),
+            }
+            match (log_entry, &self.wal) {
+                (true, Some(wal)) => {
+                    let operation = match image {
+                        Some((_, logical)) => WalOperation::Update {
+                            table: table_name.to_string(),
+                            key: key.to_vec(),
+                            tuple: logical.to_vec(),
+                        },
+                        None => WalOperation::Delete {
+                            table: table_name.to_string(),
+                            key: key.to_vec(),
+                        },
+                    };
+                    // Staged into THIS batch, never offered to a statement-capture
+                    // frame: this write is not part of the frame's transaction, and
+                    // deferred to its commit the entry would land a group later.
+                    let wal = wal.read();
+                    let staged = wal.stage(vec![operation], &mut batch)?;
+                    let written = self
+                        .gate
+                        .write(&self.db, batch, self.memory_write_options.as_ref())
+                        .map_err(|e| Error::storage(format!("Fast row write failed: {}", e)));
+                    let barrier = if written.is_ok() {
+                        wal.replication_barrier()
+                    } else {
+                        None
+                    };
+                    if let Some(staged) = staged {
+                        if written.is_ok() {
+                            wal.publish_staged(staged);
+                        } else {
+                            wal.abandon_staged(staged);
+                        }
+                    }
+                    written?;
+                    replication_barrier = barrier;
+                }
+                _ => self
+                    .gate
+                    .write(&self.db, batch, self.memory_write_options.as_ref())
+                    .map_err(|e| Error::storage(format!("Fast row write failed: {}", e)))?,
+            }
+            // Before the snapshot barrier lifts: a fresh snapshot must not find the
+            // row's old image in the cache.
+            self.row_cache.invalidate(table_name, row_id);
+            Ok(metadata)
+        })();
+        if let Some(ts) = timestamp {
+            self.conflict_registry.end_commit(ts);
+        }
+        // Moved after a failure too: the write may have reached RocksDB.
+        self.row_locks.note_rows_changed(table_name);
+        if let Some(metadata) = written? {
+            self.snapshot_manager.publish_staged_snapshot(metadata);
+            self.snapshot_manager.invalidate_cached_versions(table_name);
+        }
+        // Spec P2.1: a sync/semi-sync primary's write waits for its standbys, as
+        // `append_with_batch` waited; after the snapshot barrier lifted, so no new
+        // snapshot waits for the acknowledgement too.
+        WriteAheadLog::wait_replicated_sequence(replication_barrier);
+        Ok(())
+    }
+
+    /// The disk-space and memory-limit checks [`Self::put`] makes, for a write that
+    /// builds its own batch.
+    fn check_direct_write_budget(&self, bytes: usize) -> Result<()> {
+        if let Some(ref db_path) = self.db_path {
+            let count = self.write_counter.fetch_add(1, Ordering::Relaxed);
+            if count % 1000 == 0 {
+                Self::check_disk_space(db_path)?;
+            }
+        }
+        if self.memory_limit_bytes > 0 {
+            let write_size = bytes as u64;
+            let current = self.data_bytes_written.fetch_add(write_size, Ordering::Relaxed);
+            if current + write_size > self.memory_limit_bytes {
+                self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
+                return Err(Error::storage(format!(
+                    "Memory limit exceeded ({} MB). Increase resource_quotas.memory_limit_per_user_mb or use disk-backed mode.",
+                    self.memory_limit_bytes / (1024 * 1024)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): the `data:` write of a fast DELETE, with its delete
+    /// event and the snapshot a later `AS OF` resolves to. Spec R5.4: one write group,
+    /// its logical-WAL entry in it ([`Self::write_fast_row_change`]).
+    fn delete_row_fast(&self, key: &[u8], table_name: &str, row_id: u64) -> Result<()> {
+        self.write_fast_row_change(table_name, row_id, key, None)
     }
 
     /// Sprinter 6bc4a4040eb7 (B4): [`Self::delete`] of a main row, with its delete
@@ -17050,10 +17328,8 @@ impl StorageEngine {
         self.refuse_main_only_write_on_branch("the fast DELETE path")?;
         // W3.2: DELETE class scope. A tombstone carries the `data:` key only.
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Delete);
-        // Item #2: preserve a COPY marker-covered row's insert version before
-        // this version-skipping fast DELETE removes `data:`.
-        self.snapshot_manager
-            .materialize_copy_marker_row_durable(table_name, row_id)?;
+        // Item #2 / spec R5.4: a COPY marker-covered row's insert version is staged
+        // into the delete's own group (`write_fast_row_change`).
         let key = Self::build_data_key(table_name, row_id);
         self.delete_row_fast(&key, table_name, row_id)
             .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
@@ -17096,10 +17372,7 @@ impl StorageEngine {
         self.refuse_main_only_write_on_branch("the fast DELETE path")?;
         // W3.2: DELETE class scope (PK-only tombstone; `data:` key bytes).
         let _wv = crate::write_volume::stmt_scope(crate::write_volume::StmtClass::Delete);
-        // Item #2: preserve a COPY marker-covered row's insert version before
-        // this version-skipping fast DELETE removes `data:`.
-        self.snapshot_manager
-            .materialize_copy_marker_row_durable(table_name, row_id)?;
+        // Item #2 / spec R5.4: see `delete_tuple_fast`.
         let key = Self::build_data_key(table_name, row_id);
         self.delete_row_fast(&key, table_name, row_id)
             .map_err(|e| Error::storage(format!("Fast PK delete failed: {}", e)))?;

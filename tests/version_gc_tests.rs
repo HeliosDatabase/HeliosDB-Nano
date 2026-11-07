@@ -6,7 +6,7 @@
 //! wall-clock, mapped through snapshot-metadata wall clocks (second
 //! resolution). Tests therefore use 1-2s retentions and >= 2s sleeps.
 
-use heliosdb_nano::{Config, EmbeddedDatabase, Value};
+use heliosdb_nano::{Config, EmbeddedDatabase, Tuple, Value};
 
 fn db_with_retention(retention: &str) -> EmbeddedDatabase {
     let mut config = Config::in_memory();
@@ -401,17 +401,21 @@ fn watermark_survives_reopen_and_collection_is_idempotent() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Mixed indexed/un-indexed chains: the PARAMETERIZED autocommit
-//    UPDATE path (`execute_params` with no open transaction — the
-//    extended-query wire path) runs `update_tuples_branch_aware`, which
+// 8. Mixed indexed/un-indexed chains. Before 4.42.0 the PARAMETERIZED
+//    autocommit UPDATE path (`execute_params` with no open transaction — the
+//    extended-query wire path) ran `update_tuples_branch_aware`, which
 //    writes `v:` versions WITHOUT `v_idx:` entries, while snapshot reads
-//    resolve through `v_idx:` only (C15 interaction). The simple-query
-//    `execute()` path wraps DML in an implicit transaction whose commit
-//    writes fully indexed chains, so it cannot reproduce this. When the
-//    newest version at-or-below the horizon is un-indexed, the collector
-//    must also keep the newest INDEXED version at-or-below the horizon —
-//    otherwise an AS OF read at t >= horizon silently changes its answer
-//    after GC (falls back to the current data key here).
+//    resolve through `v_idx:` only (C15 interaction). Spec R5.4 (decision
+//    10) runs that UPDATE in an implicit transaction whose commit indexes
+//    its versions, as the simple-query path always did, so no SQL statement
+//    writes such a version any more (`params_autocommit_update_versions_are_
+//    indexed` below). A store an earlier release wrote still holds them, so
+//    the chain is planted through that writer here, exactly as that release
+//    wrote it. When the newest version at-or-below the horizon is
+//    un-indexed, the collector must also keep the newest INDEXED version
+//    at-or-below the horizon — otherwise an AS OF read at t >= horizon
+//    silently changes its answer after GC (falls back to the current data
+//    key here).
 // ---------------------------------------------------------------------------
 #[test]
 fn gc_preserves_indexed_reads_over_unindexed_autocommit_versions() {
@@ -421,8 +425,25 @@ fn gc_preserves_indexed_reads_over_unindexed_autocommit_versions() {
 
     update_rounds(&db, "m", 1); // val=1, transactional commit => indexed version
     sleep_secs(1.2);
-    // Parameterized autocommit update: un-indexed `v:` version only.
-    db.execute_params("UPDATE m SET val = val + 10", &[]).unwrap(); // val=11
+    // The pre-4.42.0 parameterized autocommit update: an un-indexed `v:` version
+    // only. No statement holds the table's writer lock around a planted write.
+    let updates: Vec<(u64, Tuple)> = db
+        .storage
+        .scan_table_branch_aware("m")
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            let row_id = row.row_id.expect("a scanned row has its row id");
+            let mut updated = row.clone();
+            updated.values[1] = Value::Int4(as_i64(&row.values[1]) as i32 + 10);
+            (row_id, updated)
+        })
+        .collect();
+    let written = db
+        .storage
+        .debug_plant_rows(|| db.storage.update_tuples_branch_aware("m", updates))
+        .unwrap(); // val=11
+    assert_eq!(written, ROWS as u64);
     sleep_secs(1.2);
     let ts_probe = now_sql_timestamp(); // resolves AT the horizon after GC
 
@@ -474,6 +495,30 @@ fn gc_preserves_indexed_reads_over_unindexed_autocommit_versions() {
     for row in &rows {
         assert_eq!(as_i64(&row.values[0]), 11);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 8b. Spec R5.4: the parameterized autocommit UPDATE indexes its versions
+//     now (its implicit transaction's commit writes a `v_idx:` entry per row),
+//     so a snapshot read finds them with no help from the collector's
+//     mixed-chain rule above.
+// ---------------------------------------------------------------------------
+#[test]
+fn params_autocommit_update_versions_are_indexed() {
+    let db = db_with_retention("1s");
+    const ROWS: usize = 5;
+    setup_rows(&db, "p", ROWS);
+    let before = db.version_storage_stats().unwrap();
+    assert_eq!(
+        db.execute_params("UPDATE p SET val = val + 10", &[]).unwrap(),
+        ROWS as u64
+    );
+    let after = db.version_storage_stats().unwrap();
+    assert_eq!(
+        after.version_index_keys,
+        before.version_index_keys + ROWS as u64,
+        "one indexed version per updated row: before {before:?}, after {after:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

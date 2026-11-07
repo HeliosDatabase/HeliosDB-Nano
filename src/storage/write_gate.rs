@@ -590,6 +590,36 @@ mod tests {
         assert!(gate.wait_for_writes(Duration::ZERO));
     }
 
+    /// Spec R5 decision 6: a group above the ceiling is refused, 54000, and nothing
+    /// reaches RocksDB; one at the ceiling goes through.
+    #[test]
+    fn a_group_above_the_ceiling_is_refused_before_rocksdb_sees_it() {
+        let (_dir, db) = scratch_db();
+        let gate = WriteGate::open();
+        let mut small = WriteBatch::default();
+        small.put(b"k", b"v");
+        gate.debug_set_write_group_ceiling(Some(small.size_in_bytes()));
+        gate.write(&db, small, None).unwrap();
+        let sequence = db.latest_sequence_number();
+        let mut large = WriteBatch::default();
+        large.put(b"k2", vec![7_u8; 64]);
+        let refused = gate.write(&db, large, None).unwrap_err().to_string();
+        assert!(
+            refused.contains(crate::error::BRANCH_MATERIALIZE_TOO_LARGE_MARKER),
+            "{refused}"
+        );
+        assert_eq!(db.latest_sequence_number(), sequence, "nothing reached RocksDB");
+        assert_eq!(db.get(b"k2").unwrap(), None);
+        gate.debug_set_write_group_ceiling(None);
+        let mut again = WriteBatch::default();
+        again.put(b"k2", vec![7_u8; 64]);
+        gate.write(&db, again, None).unwrap();
+        assert!(
+            gate.wait_for_writes(Duration::ZERO),
+            "a refused write leaves nothing in flight"
+        );
+    }
+
     /// The fence waits for a write that was past the gate when it was raised
     /// (module documentation, "Fencing").
     #[test]

@@ -331,6 +331,11 @@ pub const BRANCH_TABLE_BUSY_MARKER: &str = "has uncommitted writes in another tr
 /// changed in the table has changed; retry. SQLSTATE 55P03.
 pub const TABLE_LOCK_TIMEOUT_MARKER: &str = "could not obtain lock on table";
 
+/// Spec R5.4 (P12): the marker of a statement that could not get a row's write lock
+/// within `[session] lock_timeout_ms` ([`Error::row_lock_timeout`]): another
+/// transaction is changing the row. PostgreSQL's words. SQLSTATE 55P03.
+pub const ROW_LOCK_TIMEOUT_MARKER: &str = "could not obtain lock on row in relation";
+
 /// Database error type
 ///
 /// All errors from HeliosDB Lite operations are represented by this enum.
@@ -792,6 +797,39 @@ impl Error {
             "{TABLE_LOCK_TIMEOUT_MARKER} {table}: {holder} (waited {} ms; SET lock_timeout or [session] \
              lock_timeout_ms bounds this): retry when it has finished",
             waited.as_millis()
+        ))
+    }
+
+    /// Spec R5.4 (P12): this statement waited `waited` for the write lock of row
+    /// `row_id` of `table`, held by another transaction that is changing it, and gave
+    /// up. Nothing it would have changed has changed. SQLSTATE 55P03.
+    pub fn row_lock_timeout(table: &str, row_id: u64, waited: std::time::Duration) -> Self {
+        Error::QueryExecution(format!(
+            "{ROW_LOCK_TIMEOUT_MARKER} \"{table}\": another transaction is changing row {row_id} (waited {} ms; \
+             SET lock_timeout or [session] lock_timeout_ms bounds this): retry when it has finished",
+            waited.as_millis()
+        ))
+    }
+
+    /// Spec R5.4 (P12): a REPEATABLE READ or SERIALIZABLE transaction found that the
+    /// row it is about to change was changed by a transaction that committed after
+    /// its snapshot. PostgreSQL's words. SQLSTATE 40001.
+    pub fn concurrent_update(table: &str) -> Self {
+        Error::Transaction(format!(
+            "could not serialize access due to concurrent update of a row of table {table} (serialization \
+             failure); retry the transaction"
+        ))
+    }
+
+    /// Spec R5.4 (P12): row `row_id` of `table` is held by the embedded handle's own
+    /// transaction (`BEGIN` on the handle), which only the thread that opened it can
+    /// end, and this statement runs on that thread: a wait could never end. Refused at
+    /// once. SQLSTATE 40001.
+    pub fn row_held_by_this_threads_transaction(table: &str, row_id: u64) -> Self {
+        Error::Transaction(format!(
+            "could not serialize access to row {row_id} of table {table}: the transaction this thread opened on \
+             the embedded handle holds it, and only this thread can end it (serialization failure); COMMIT or \
+             ROLLBACK that transaction first"
         ))
     }
 

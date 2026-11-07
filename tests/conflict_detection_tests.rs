@@ -76,9 +76,17 @@ fn embedded_global_transaction_validates() {
     let db = setup();
 
     // Global txn snapshots, then a session transaction commits a conflicting
-    // write; the global commit must abort instead of losing the update.
+    // write; the global transaction's write of the same row after it must abort at
+    // COMMIT instead of losing the update.
+    //
+    // Spec R5.4: the global transaction takes its snapshot at BEGIN and does not
+    // write row 1 before the session commits. It used to write first, and the two
+    // conflicting writes were both buffered; a writer of a row now holds the row's
+    // lock to its COMMIT, so the session would wait for a transaction only this
+    // thread can end (see `a_wait_for_this_threads_own_global_transaction_is_refused`).
     db.execute("BEGIN").unwrap();
-    db.execute("UPDATE t SET v = 111 WHERE id = 1").unwrap();
+    let seen = db.query("SELECT v FROM t WHERE id = 1", &[]).unwrap();
+    assert_eq!(seen.len(), 1);
 
     let s = db.create_session("s", IsolationLevel::RepeatableRead).unwrap();
     db.begin_transaction_for_session(s).unwrap();
@@ -86,13 +94,50 @@ fn embedded_global_transaction_validates() {
     db.commit_transaction_for_session(s).unwrap();
     db.destroy_session(s).unwrap();
 
-    let err = db.execute("COMMIT").unwrap_err();
+    let err = db
+        .execute("UPDATE t SET v = 111 WHERE id = 1")
+        .and_then(|_| db.execute("COMMIT"))
+        .unwrap_err();
     assert!(
         err.to_string().contains("serialization failure"),
         "expected serialization failure, got: {err}"
     );
+    let _ = db.execute("ROLLBACK");
     let rows = db.query("SELECT * FROM t WHERE id = 1", &[]).unwrap();
     assert_eq!(rows[0].values[1], Value::Int4(222), "session commit must survive");
+}
+
+/// Spec R5.4: the embedded handle's own transaction holds a row it wrote until its
+/// COMMIT, and only the thread that opened it may COMMIT it. A session statement on
+/// that thread that wants the row cannot wait for it: it is refused at once with a
+/// serialization failure (it used to wait out `lock_timeout`, 30 s, then fail 55P03),
+/// and nothing is lost.
+#[test]
+fn a_wait_for_this_threads_own_global_transaction_is_refused() {
+    let db = setup();
+    db.execute("BEGIN").unwrap();
+    db.execute("UPDATE t SET v = 111 WHERE id = 1").unwrap();
+
+    let s = db.create_session("s", IsolationLevel::RepeatableRead).unwrap();
+    db.begin_transaction_for_session(s).unwrap();
+    let started = std::time::Instant::now();
+    let err = db
+        .execute_in_session(s, "UPDATE t SET v = 222 WHERE id = 1")
+        .unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "refused at once, not at the lock timeout"
+    );
+    assert!(
+        err.to_string().contains("serialization failure"),
+        "expected serialization failure, got: {err}"
+    );
+    let _ = db.rollback_transaction_for_session(s);
+    db.destroy_session(s).unwrap();
+
+    db.execute("COMMIT").unwrap();
+    let rows = db.query("SELECT * FROM t WHERE id = 1", &[]).unwrap();
+    assert_eq!(rows[0].values[1], Value::Int4(111), "the global transaction's commit");
 }
 
 #[test]

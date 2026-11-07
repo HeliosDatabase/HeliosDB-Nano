@@ -83,3 +83,46 @@ the wire; a three-client lost-update test that asserts the final counter equals 
 
 Code, tests, docs, CHANGELOG text, perf numbers, and a report of every path converted and every
 finding closed, with anything left open stated plainly.
+
+## As built (what turned out different)
+
+Code: `src/storage/row_locks.rs` (new), `Transaction::{lock_row, commit, commit_with_timestamp}`,
+`StorageEngine::{write_fast_row_change, insert_tuple_versioned_with_schema, insert_tuple_fast}`,
+`WriteGate::write`, the DML arms of both families in `src/lib.rs`. Tests: `tests/statement_atomicity_dml.rs`.
+
+**P12 is a row lock, not a retry.** Every writer of an existing row (UPDATE and DELETE on both families, the PK
+fast paths, both `ON CONFLICT DO UPDATE` legs) locks the row for its owner (a transaction's id, or a fresh owner for
+a fast-path write) before it computes the new image, and holds it until its write is visible: a transaction to its
+commit's write, a fast path to its one group. A second writer waits (off the async workers, bounded by
+`lock_timeout`, `statement_timeout` and a cancel; a wait closing a cycle is 40P01 at once) and then changes the row
+as committed under the lock. Re-reading every row costs a point read per row, so a statement loads its table's
+change epoch before it reads its rows, every writer bumps it after its write is visible and before it lets its
+locks go, and a row is re-read only if the epoch moved. A re-read row is evaluated again (WHERE, RLS, assignments);
+gone, it is skipped. A validating transaction (RR, SERIALIZABLE, the embedded handle's) gets 40001 instead of a
+moved row. R5.1's table lock is taken first and stays the outer lock (`branch_freeze`'s "Lock order", 2).
+
+**Commit timestamps.** An autocommit transaction committed at its snapshot's timestamp, which can be below the commit
+of the transaction it waited for; its version then sorted under the older one and a later snapshot read the older
+value. A commit that holds row locks takes a fresh timestamp, announced in flight as `next_commit_timestamp` does.
+The fast UPDATE and DELETE take one too (they had none, or an unannounced one).
+
+**ON CONFLICT DO UPDATE against a row deleted meanwhile is 40001.** PostgreSQL re-runs the speculative insert;
+here the arms' structure (one `match` per proposed row) made that a larger change than this step. It is a clean,
+retryable refusal and never a duplicate key.
+
+**Params-family WAL.** The params family's DML arms stage and log nothing per row, so its implicit transactions
+would have committed rows with no logical-WAL entry (design §11 pre-existing defect 3). The commit derives the
+entries from what it staged (`Transaction::log_staged_writes_at_commit`), into the same group; the text family's
+autocommit `INSERT … SELECT` uses the same mechanism now that it stages.
+
+**What stays as it was.** Decision 8: persistent HNSW keeps today's order relative to the row (after the row's
+group in the UPDATE, DELETE and plan-path INSERT funnels, before it in the fast INSERT's batched branch). The fast
+INSERT's every-64-rows counter flush stays its own (reader-invisible) group. A side-storage table's columnar values
+are still written by `transform_tuple_for_column_storage` before the row's group, and a fast DELETE's columnar
+nulling after it. The tenant-context exclusion of `INSERT … SELECT` staging was #100's rollout caution and is gone.
+
+**Left open.** Branch DML takes no row lock (branch writes go through the branch view; lost updates there are not
+addressed). FK cascade child writes, `Transaction::{update_tuples, delete_tuples}` (storage API) and
+`update_tuples_branch_aware` / `delete_tuples_branch_aware` (no main SQL statement reaches them since decision 10)
+lock nothing. A cycle through a table-lock upgrade and a row lock is not detected; the timeouts end it. The fork
+test of B4 F7 is the one-group test: a fork lands between write groups (B4).

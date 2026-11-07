@@ -88,7 +88,10 @@
 //!    level). A parent branch's schema statement takes a child's after its own
 //!    (`StorageEngine::freeze_table_into_children`), and a merge the target's, then
 //!    the source's, then the target's other children's: parent before child, always,
-//!    and a branch's statement takes no lock of another level;
+//!    and a branch's statement takes no lock of another level; then spec R5.4's row
+//!    write locks of main's rows (`storage::row_locks`), taken after the statement's
+//!    table locks, in any order between rows (a cycle of waiters is refused, 40P01), and
+//!    never waited for while holding anything below;
 //! 3. a definition stripe ([`BranchFreeze::lock_definition`]), for a frozen record;
 //! 4. the registry, shared, for the rest of the write;
 //! 5. the hook's table locks of the batch, in ascending index, shared or exclusive;

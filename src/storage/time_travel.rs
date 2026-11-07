@@ -213,6 +213,19 @@ impl SnapshotSpan {
     }
 }
 
+/// Spec R5.4: a row's version and `snapshot:` record staged into a caller's write
+/// group (`SnapshotManager::stage_data_version_snapshot`), to be finished once the
+/// group is written (`SnapshotManager::finish_staged_version`).
+#[derive(Debug)]
+pub struct StagedVersion {
+    table_name: String,
+    row_id: u64,
+    timestamp: u64,
+    txn_id: TransactionId,
+    scn: Scn,
+    metadata: SnapshotMetadata,
+}
+
 /// Snapshot metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMetadata {
@@ -1454,8 +1467,47 @@ impl SnapshotManager {
         write_options: Option<&WriteOptions>,
         allow_elide: bool,
     ) -> Result<SnapshotMetadata> {
-        let (metadata, txn_id, scn) = self.allocate_snapshot_metadata(timestamp, lsn);
         let mut batch = WriteBatch::default();
+        let staged = self.stage_data_version_snapshot(
+            &mut batch,
+            data_key,
+            data_value,
+            table_name,
+            row_id,
+            timestamp,
+            version_value,
+            lsn,
+            allow_elide,
+        )?;
+        if let Some(opts) = write_options {
+            self.gate
+                .write(&self.db, batch, Some(opts))
+                .map_err(|e| Error::storage(format!("Failed to write data/version snapshot batch: {}", e)))?;
+        } else {
+            self.write_batch(batch, "Failed to write data/version snapshot batch")?;
+        }
+        self.finish_staged_version(staged)
+    }
+
+    /// Spec R5.4 (F1.2, F1.3): what [`Self::write_data_version_and_register_snapshot`]
+    /// writes, a new row's `data:` image, its version and the `snapshot:` record,
+    /// staged into the caller's `batch`, so that the caller can add to the same write
+    /// group what belongs to the row (its counter, its logical-WAL entry, its MV delta)
+    /// and write it once. Finish with [`Self::finish_staged_version`] after the write.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage_data_version_snapshot(
+        &self,
+        batch: &mut WriteBatch,
+        data_key: &[u8],
+        data_value: &[u8],
+        table_name: &str,
+        row_id: u64,
+        timestamp: u64,
+        version_value: &[u8],
+        lsn: Option<u64>,
+        allow_elide: bool,
+    ) -> Result<StagedVersion> {
+        let (metadata, txn_id, scn) = self.allocate_snapshot_metadata(timestamp, lsn);
         // THE DEFAULT AUTOCOMMIT INSERT'S ONLY `data:` WRITE. `insert_tuple_fast`
         // skips `StorageEngine::put` on this arm, so if this put is not sealed
         // the row never is.
@@ -1481,7 +1533,7 @@ impl SnapshotManager {
             _ => None,
         };
         self.append_version_snapshot_to_batch(
-            &mut batch,
+            batch,
             table_name,
             row_id,
             timestamp,
@@ -1490,22 +1542,37 @@ impl SnapshotManager {
             &metadata,
             allow_elide,
         )?;
+        Ok(StagedVersion {
+            table_name: table_name.to_string(),
+            row_id,
+            timestamp,
+            txn_id,
+            scn,
+            metadata,
+        })
+    }
 
-        if let Some(opts) = write_options {
-            self.gate
-                .write(&self.db, batch, Some(opts))
-                .map_err(|e| Error::storage(format!("Failed to write data/version snapshot batch: {}", e)))?;
-        } else {
-            self.write_batch(batch, "Failed to write data/version snapshot batch")?;
-        }
-
-        self.finish_version_snapshot(table_name, row_id, timestamp, txn_id, scn, metadata)
+    /// Spec R5.4: the batch [`Self::stage_data_version_snapshot`] staged into was
+    /// written: the snapshot exists in memory too, and what readers cached from
+    /// before the row no longer holds.
+    pub(crate) fn finish_staged_version(&self, staged: StagedVersion) -> Result<SnapshotMetadata> {
+        self.finish_version_snapshot(
+            &staged.table_name,
+            staged.row_id,
+            staged.timestamp,
+            staged.txn_id,
+            staged.scn,
+            staged.metadata,
+        )
     }
 
     /// Sprinter 6bc4a4040eb7 (B4): a version-skipping fast DELETE, with its delete
     /// event and the snapshot an `AS OF` of a later time resolves to, in one batch.
     /// Without that snapshot, `AS OF` a time after the delete would resolve to the
     /// one before it and show the row again.
+    // Spec R5.4: the fast DELETE stages its event in its own group now
+    // (`StorageEngine::write_fast_row_change`); the unit tests below still drive this.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn delete_data_and_record_event(
         &self,
         data_key: &[u8],
@@ -1872,38 +1939,146 @@ impl SnapshotManager {
         timestamp: u64,
         sealed: &[u8],
     ) -> Result<()> {
-        let data_key = format!("data:{}:{}", table_name, row_id);
-        if self.copy_markers.covering_ts(table_name, row_id).is_some() {
-            self.materialize_copy_marker_row(batch, table_name, row_id, timestamp)?;
-        } else if !self.has_any_version_index(table_name, row_id)? {
-            let previous = self
-                .db
-                .get(data_key.as_bytes())
-                .map_err(|e| Error::storage(format!("rewrite version data read failed: {}", e)))?;
-            if let Some(previous) = previous {
-                const OLDER_THAN_ANY_SNAPSHOT: u64 = REWRITE_PRE_IMAGE_TS;
-                let version_key = format!("v:{}:{}:{}", table_name, row_id, OLDER_THAN_ANY_SNAPSHOT);
-                batch.put(version_key.as_bytes(), &previous);
-                let index_key = format!(
-                    "v_idx:{}:{}:{:020}",
-                    table_name,
-                    row_id,
-                    u64::MAX - OLDER_THAN_ANY_SNAPSHOT
-                );
-                batch.put(
-                    index_key.as_bytes(),
-                    encode_version_index_value(OLDER_THAN_ANY_SNAPSHOT, false),
-                );
-            }
-        }
-        if self.maybe_elided_rows() {
-            self.materialize_elided_latest_version(batch, table_name, row_id)?;
-        }
+        self.stage_row_pre_history(batch, table_name, row_id, timestamp)?;
         let version_key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
         batch.put(version_key.as_bytes(), sealed);
         let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, u64::MAX - timestamp);
         batch.put(index_key.as_bytes(), encode_version_index_value(timestamp, false));
         Ok(())
+    }
+
+    /// Spec R5.4 (F1.3): stage, beside a fast UPDATE's or DELETE's `data:` change in
+    /// `batch`, the row's event at `timestamp`: its new version (`Some(image)`, the
+    /// version value as stored, i.e. sealed) or its delete event (`None`). Without the
+    /// version a later transaction's scan and `AS OF` read the row as it was before
+    /// the UPDATE. What older snapshots read stays as it was
+    /// ([`Self::stage_rewritten_row_version`]).
+    pub(crate) fn stage_row_change_history(
+        &self,
+        batch: &mut WriteBatch,
+        table_name: &str,
+        row_id: u64,
+        timestamp: u64,
+        image: Option<&[u8]>,
+    ) -> Result<()> {
+        match image {
+            Some(sealed) => self.stage_rewritten_row_version(batch, table_name, row_id, timestamp, sealed),
+            None => {
+                self.stage_row_pre_history(batch, table_name, row_id, timestamp)?;
+                batch.put(
+                    version_index_key(table_name, row_id, timestamp).as_bytes(),
+                    encode_delete_event(timestamp),
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// What a row's history needs in `batch` before its current image changes, so that
+    /// a snapshot older than the change reads what it read before: a COPY-marker
+    /// row's insert version, an elided latest version made real, and, for a row with
+    /// no version at all (which reads `data:` at every snapshot), its current image as
+    /// a version older than any snapshot. One seek of the row's version index when no
+    /// COPY marker covers it.
+    ///
+    /// The `data:` reads return the image before the change: `batch` is not applied.
+    fn stage_row_pre_history(
+        &self,
+        batch: &mut WriteBatch,
+        table_name: &str,
+        row_id: u64,
+        timestamp: u64,
+    ) -> Result<()> {
+        let data_key = format!("data:{}:{}", table_name, row_id);
+        if self.copy_markers.covering_ts(table_name, row_id).is_some() {
+            self.materialize_copy_marker_row(batch, table_name, row_id, timestamp)?;
+            if self.maybe_elided_rows() {
+                self.materialize_elided_latest_version(batch, table_name, row_id)?;
+            }
+            return Ok(());
+        }
+        let prefix = format!("v_idx:{}:{}:", table_name, row_id);
+        let newest = {
+            let mut iter = self.db.iterator_opt(
+                rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+                bounded_read_options(prefix.as_bytes()),
+            );
+            match iter.next() {
+                Some(item) => {
+                    let (key, value) = item.map_err(|e| Error::storage(format!("version index seek failed: {}", e)))?;
+                    if key.starts_with(prefix.as_bytes()) {
+                        Some((key.to_vec(), decode_version_index_value(&value)))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        };
+        match newest {
+            None => {
+                let previous = self
+                    .db
+                    .get(data_key.as_bytes())
+                    .map_err(|e| Error::storage(format!("row history data read failed: {}", e)))?;
+                if let Some(previous) = previous {
+                    const OLDER_THAN_ANY_SNAPSHOT: u64 = REWRITE_PRE_IMAGE_TS;
+                    let version_key = format!("v:{}:{}:{}", table_name, row_id, OLDER_THAN_ANY_SNAPSHOT);
+                    batch.put(version_key.as_bytes(), &previous);
+                    let index_key = format!(
+                        "v_idx:{}:{}:{:020}",
+                        table_name,
+                        row_id,
+                        u64::MAX - OLDER_THAN_ANY_SNAPSHOT
+                    );
+                    batch.put(
+                        index_key.as_bytes(),
+                        encode_version_index_value(OLDER_THAN_ANY_SNAPSHOT, false),
+                    );
+                }
+            }
+            // W3.2: the newest event is elided; its value is `data:` until now.
+            Some((index_key, Some((event_ts, true)))) => {
+                let previous = self
+                    .db
+                    .get(data_key.as_bytes())
+                    .map_err(|e| Error::storage(format!("elided version backfill data read failed: {}", e)))?;
+                if let Some(previous) = previous {
+                    let version_key = format!("v:{}:{}:{}", table_name, row_id, event_ts);
+                    batch.put(version_key.as_bytes(), &previous);
+                    batch.put(&index_key, encode_version_index_value(event_ts, false));
+                }
+            }
+            Some(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Spec R5.4 (F1.5): stage the `snapshot:` record of `timestamp` into the batch of
+    /// the write that commits at it, so the record is durable exactly when the write is
+    /// (it used to be a write group of its own after every commit). `lsn` is the
+    /// logical-WAL position `AS OF TRANSACTION` names it by, when there is one.
+    /// Publish it with [`Self::publish_staged_snapshot`] once the batch is written.
+    pub(crate) fn stage_snapshot_record(
+        &self,
+        batch: &mut WriteBatch,
+        timestamp: u64,
+        lsn: Option<u64>,
+    ) -> Result<SnapshotMetadata> {
+        let (metadata, _, _) = self.allocate_snapshot_metadata(timestamp, lsn);
+        self.append_snapshot_metadata_to_batch(batch, &metadata)?;
+        Ok(metadata)
+    }
+
+    /// Spec R5.4 (F1.5): the batch carrying a staged `snapshot:` record was written:
+    /// `AS OF` resolves to it from now on, as after [`Self::register_snapshot`].
+    pub(crate) fn publish_staged_snapshot(&self, metadata: SnapshotMetadata) {
+        self.publish_snapshot_metadata(metadata);
+        if self.gc_config.auto_gc_enabled {
+            if let Err(e) = self.gc_if_needed() {
+                tracing::warn!("snapshot GC failed: {}", e);
+            }
+        }
     }
 
     /// Stage the `snapshot:` record of a rewrite's one timestamp in its group, so
