@@ -201,6 +201,31 @@ pub fn decode_raw_batch(raw: &[u8]) -> Result<Vec<RawOp<'_>>> {
     Ok(ops)
 }
 
+/// Does `batch` write or delete a key of the branch registry (`branch:`, the git
+/// links)? Such a batch ends a run (`PhysicalApplier::apply_run`).
+fn changes_branch_registry(batch: &PhysicalBatch) -> Result<bool> {
+    let mut found = false;
+    walk_raw_batch(batch.data(), |op| {
+        let key = match op {
+            RawOp::Put { key, .. } | RawOp::Delete { key } => key,
+            RawOp::DeleteRange { start, .. } => start,
+        };
+        found |= matches!(classify(key).class, KeyClass::Branch | KeyClass::Git);
+    })?;
+    Ok(found)
+}
+
+/// Two parts of one run, as one result: the later position, every row and rebuild.
+fn merge_applied(earlier: Option<Applied>, later: Applied) -> Applied {
+    let Some(mut total) = earlier else {
+        return later;
+    };
+    total.source_sequence = later.source_sequence;
+    total.rows += later.rows;
+    total.tables_rebuilt.extend(later.tables_rebuilt);
+    total
+}
+
 /// What the applier tells the layer above the engine — the SQL layer's
 /// registries and caches (function, procedure and trigger registries, plan,
 /// parse and result caches), which `EmbeddedDatabase` owns (spec P1.4).
@@ -561,7 +586,22 @@ impl PhysicalApplier {
         if let Some(pace) = self.hooks.pace {
             return self.apply_paced(batches, durability, pace);
         }
-        self.apply_run_once(batches, durability)
+        // Merged-tree review, M5: the batches after one that changes the branch
+        // registry are a run of their own, applied after it is published. A `DROP
+        // BRANCH` marks the branch dropped and then deletes its keys in groups; in one
+        // run, a session bound to it went on resolving it as live while those groups
+        // landed, and read half its rows, none, or main's through it, before 3D000.
+        let mut start = 0;
+        let mut total: Option<Applied> = None;
+        for (index, batch) in batches.iter().enumerate() {
+            if index + 1 < batches.len() && changes_branch_registry(batch)? {
+                let part = self.apply_run_once(batches.get(start..=index).unwrap_or_default(), durability)?;
+                total = Some(merge_applied(total, part));
+                start = index + 1;
+            }
+        }
+        let last = self.apply_run_once(batches.get(start..).unwrap_or_default(), durability)?;
+        Ok(merge_applied(total, last))
     }
 
     /// `internal-tests` builds only — plan decision 7 (`PHYSICAL_STANDBY_REPLICATION.md`
@@ -674,13 +714,22 @@ impl PhysicalApplier {
                 ..Applied::default()
             });
         }
+        // 4a. What a reader of the run's new catalog reads the rows with, BEFORE the
+        //     bump puts that catalog in reach of every cached reader (merged-tree
+        //     review, M3): the clock and snapshot records, so a new snapshot is past
+        //     a rewrite's versions, the cached versions, and the missing values. The
+        //     other way round, a reader planned on a volatile ADD COLUMN's schema read
+        //     its rows at a snapshot from before the rewrite, every value NULL, until
+        //     the time-travel publication further down. Until the bump, a reader that
+        //     still holds the old schema reads the new rows cut to it.
+        self.publish_row_reading_state(&touched, &mut state);
         if touched.touches_catalog() {
             // Existence and plan caches key off the schema generation; bump
             // it as soon as the new catalog bytes are visible.
             self.engine.bump_schema_generation();
         }
 
-        // 4. Publish, once for the run.
+        // 4b. Publish the rest, once for the run.
         self.publish(&touched, &mut work, &mut state);
 
         // 5. Re-derive what the run created or queued.
@@ -971,6 +1020,21 @@ impl PhysicalApplier {
     // Step 4
     // ---------------------------------------------------------------------
 
+    /// Step 4a of a run: what a reader decodes and resolves a table's rows with, so a
+    /// reader that gets the run's new catalog does not pair it with the rows from
+    /// before. The time-travel state goes here only; the missing values and the
+    /// dictionaries go again in [`Self::publish`], after the bump, which refuses a fill
+    /// that read the old ones and landed in between.
+    fn publish_row_reading_state(&self, touched: &Touched, state: &mut ApplierState) {
+        if touched.dictionaries {
+            self.engine.forget_cached_dictionaries();
+        }
+        if touched.missing_values {
+            self.engine.clear_missing_values();
+        }
+        self.publish_time_travel(touched, state);
+    }
+
     fn publish(&self, touched: &Touched, work: &mut BatchWork, state: &mut ApplierState) {
         if touched.dictionaries {
             // Before any row below is decoded against a dictionary.
@@ -986,7 +1050,7 @@ impl PhysicalApplier {
         self.publish_constraints(touched, work);
         self.publish_index_puts(work);
         self.publish_appended_unique_columns(work);
-        self.publish_time_travel(touched, state);
+        // The time-travel state was published before the bump (step 4a).
         self.publish_counters(touched);
         if touched.branch_registry || state.branch_reload_pending {
             self.reload_branches(state);
@@ -1537,6 +1601,9 @@ impl PhysicalApplier {
         if let Some(timestamp) = touched.max_version_ts {
             self.engine.raise_timestamp(timestamp);
         }
+        if touched.table_shapes {
+            self.engine.raise_timestamp_past_shape_records();
+        }
         for key in &touched.copy_markers {
             match db.get(key) {
                 Ok(Some(value)) => {
@@ -1848,6 +1915,7 @@ impl PhysicalApplier {
             .filter(|timestamp| !durable.contains(timestamp))
             .collect();
         snapshots.forget_snapshots(&unrecorded);
+        engine.raise_timestamp_past_shape_records();
         if let Some(raw) = self.writer.db().get(crate::storage::version_gc::LOW_WATERMARK_KEY)? {
             if let Some(bytes) = raw.get(0..8).and_then(|b| <[u8; 8]>::try_from(b).ok()) {
                 let watermark = u64::from_be_bytes(bytes);
@@ -1993,6 +2061,8 @@ struct Touched {
     vidx: BTreeSet<Vec<u8>>,
     branch_tables: BTreeSet<String>,
     branch_registry: bool,
+    /// A table's shape record (`meta:table_shape:`): its time moves the clock.
+    table_shapes: bool,
     dictionaries: bool,
     column_storage_tables: BTreeSet<String>,
     statistics_tables: BTreeSet<String>,
@@ -2166,11 +2236,13 @@ impl Touched {
             // index and main's table-incarnation id are bytes a read uses
             // straight from the store; no standby cache derives from them, and
             // only a writable primary's MERGE BRANCH compares an incarnation.
-            // So is a table's shape record: only creating a branch reads it.
+            // So is a table's shape record: only creating a branch reads it. Its
+            // time is the clock's, though, and a promoted standby's clock must be past
+            // it (merged-tree review, M12): `publish_time_travel`.
+            KeyClass::MetaTableShape => self.table_shapes = true,
             KeyClass::BranchFrozen
             | KeyClass::BranchKey
             | KeyClass::MetaTableIncarnation
-            | KeyClass::MetaTableShape
             | KeyClass::MetaHistoryPurge => {}
             KeyClass::VgcWatermark => self.vgc_watermark = true,
             // Spec P5.1: the dataset's epoch; no derived state, only the

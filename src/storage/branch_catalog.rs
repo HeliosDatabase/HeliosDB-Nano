@@ -108,7 +108,7 @@ use crate::sql::{LogicalExpr, TableConstraints};
 use crate::storage::EnforcedUniqueIndex;
 use crate::{Column, ColumnStorageMode, DataType, Error, Result, Schema};
 use dashmap::DashMap;
-use rocksdb::{Direction, IteratorMode, ReadOptions, WriteBatch};
+use rocksdb::{Direction, IteratorMode, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -936,11 +936,10 @@ static ROW_ID_FLOORS: LazyLock<DashMap<RecordKey, ()>> = LazyLock::new(DashMap::
 
 impl StorageEngine {
     fn branch_keys_with_prefix(&self, prefix: &[u8], mut each: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix, Direction::Forward), read_opts);
+        let iter = self.db.iterator_opt(
+            IteratorMode::From(prefix, Direction::Forward),
+            super::time_travel::bounded_read_options(prefix),
+        );
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {e}")))?;
             if !key.starts_with(prefix) {
@@ -1388,13 +1387,17 @@ impl StorageEngine {
     /// Phase B4: a schema statement on main, or a write of main's catalog, on `tables`
     /// starts. It runs wholly before a fork of main or wholly after it ("Definitions" in
     /// `storage::branch_freeze`): it waits while a branch of main registers, and a new
-    /// branch waits for it. Before anything looks for children, and BEFORE the table
-    /// locks: a statement waiting here holds none, so a fork waiting for the statements
-    /// in the fence never waits, through one of them, for a lock such a statement holds.
-    /// Once per thread: what nests under a statement is that statement. Refused 55006 if
-    /// the time ran out, which takes a fork waiting for a statement that outlasts its
-    /// budget; and at once, when this thread's statement holds table locks already (a
-    /// transaction's DDL after its writes): it must not wait on the fence while it does.
+    /// branch waits for it. Before anything looks for children, and BEFORE the
+    /// statement's own table locks, so a fork waiting for the statements in the fence
+    /// never waits, through one of them, for a lock held by a statement that waits for
+    /// the fork (see below for one whose transaction holds locks already).
+    /// Once per thread: what nests under a statement is that statement. The wait has a
+    /// table lock wait's budget: 55P03 after `lock_timeout`, 57014 at `statement_timeout`
+    /// or a cancel, with nothing done. A statement whose transaction holds writer locks
+    /// already (its earlier DDL, or a write) does not wait for a fork that is waiting for
+    /// the running statements, one of which may be waiting for those locks: it runs, and
+    /// the fork waits for it too (`BranchFreeze::enter_schema_statement`). Nothing is
+    /// refused at once, so a migration's later DDL is not refused after its first landed.
     fn enter_fork_fence(&self, tables: &[&str], guard: &mut MainDdlGuard) -> Result<()> {
         if tables.iter().all(|table| crate::sql::temp_tables::is_temp_key(table)) {
             return Ok(());
@@ -1419,13 +1422,14 @@ impl StorageEngine {
         if FORK_FENCE_ENTERED.with(std::cell::Cell::get) == Some(engine) {
             return Ok(());
         }
-        let budget = if self.table_locks().current_statement_holds_any() {
-            std::time::Duration::ZERO
-        } else {
-            super::BRANCH_DRAIN_TIMEOUT
-        };
-        if !freeze.enter_schema_statement(budget) {
-            return Err(Error::branch_schema_waited_for_fork(named));
+        let holds_locks = self.table_locks().current_statement_holds_any();
+        if !freeze.enter_schema_statement(std::time::Duration::ZERO, holds_locks) {
+            self.table_locks().wait_like_a_lock(
+                named,
+                "a CREATE BRANCH of main is registering",
+                |longest| freeze.enter_schema_statement(longest, holds_locks),
+                || freeze.leave_schema_statement(),
+            )?;
         }
         let previous = FORK_FENCE_ENTERED.with(|entered| entered.replace(Some(engine)));
         guard.fork_fence = Some((Arc::clone(freeze), previous));

@@ -1344,10 +1344,24 @@ fn set_lock_timeout_bounds_the_session_and_zero_is_the_servers() {
     assert_eq!(show(), "60ms", "a bare number is milliseconds");
     set("SET lock_timeout_ms = 70");
     assert_eq!(show(), "70ms", "the config file's spelling is not ignored either");
+    set("SET SESSION innodb_lock_wait_timeout = 3");
+    assert_eq!(show(), "3s", "MySQL's spelling, in seconds");
+    set("SET @@session.innodb_lock_wait_timeout = 4");
+    assert_eq!(show(), "4s");
     assert!(
         db.execute_for_session(session, "SET lock_timeout = 'banana'").is_err(),
         "a value that is no duration"
     );
+    // Bounded, as in PostgreSQL: INT_MAX milliseconds.
+    set("SET lock_timeout = 2147483647");
+    for too_long in [
+        "SET lock_timeout = 2147483648",
+        "SET innodb_lock_wait_timeout = 1073741824",
+    ] {
+        let err = db.execute_for_session(session, too_long).expect_err(too_long);
+        assert!(err.to_string().contains("at most 2147483647 ms"), "{too_long}: {err}");
+    }
+    assert_eq!(show(), "2147483647ms", "a refused SET changes nothing");
 
     // 0 accepted, and bounded by the server's.
     db.storage.debug_set_table_lock_timeout(Duration::from_millis(100));
@@ -1722,6 +1736,19 @@ async fn copy_and_the_wire_wait_off_the_workers_and_time_out_as_55p03() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancel_request_ends_a_wait_and_nothing_commits() {
     let _watchdog = watchdog("a_cancel_request_ends_a_wait_and_nothing_commits", TEST_AT_MOST);
+    a_cancel_ends_a_wait(16).await;
+}
+
+/// The same with every connection slot taken, by the holder and the waiter: PostgreSQL serves a
+/// cancel request whatever the connection count, and a full server is when one is needed. It
+/// used to be dropped unread with the connection it came on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_request_gets_in_when_every_connection_is_taken() {
+    let _watchdog = watchdog("a_cancel_request_gets_in_when_every_connection_is_taken", TEST_AT_MOST);
+    a_cancel_ends_a_wait(2).await;
+}
+
+async fn a_cancel_ends_a_wait(max_connections: usize) {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     seed(&db, 10);
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1729,7 +1756,7 @@ async fn a_cancel_request_ends_a_wait_and_nothing_commits() {
     drop(probe);
     let db = Arc::new(db);
     let server = PgServer::new(
-        PgServerConfig::with_address(addr).with_max_connections(16),
+        PgServerConfig::with_address(addr).with_max_connections(max_connections),
         Arc::clone(&db),
     )
     .unwrap();
@@ -1782,6 +1809,67 @@ async fn a_cancel_request_ends_a_wait_and_nothing_commits() {
     holder_connection.abort();
     waiter_connection.abort();
     listener.abort();
+}
+
+/// A function body that writes runs statements of its own. After the transaction's own `ALTER`,
+/// `CREATE INDEX` or `TRUNCATE` they waited for that transaction, the whole lock timeout, and
+/// then 55P03 with the `ALTER` persisted. With a writer queued behind the transaction it was a
+/// cycle the timeout ended. The body runs for the transaction now. (Its writes still commit by
+/// themselves, as they did: a separate, older item.)
+#[test]
+fn a_writing_function_in_a_transaction_does_not_wait_for_it() {
+    let _watchdog = watchdog("a_writing_function_in_a_transaction_does_not_wait_for_it", TEST_AT_MOST);
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    db.execute(
+        "CREATE FUNCTION fins(x INT) RETURNS INT AS $$ INSERT INTO t VALUES ($1, 0) RETURNING 1 $$ LANGUAGE sql",
+    )
+    .unwrap();
+    db.storage.debug_set_table_lock_timeout(Duration::from_secs(20));
+    let session = db.create_session("migration", IsolationLevel::ReadCommitted).unwrap();
+    let call = |id: i64| {
+        let started = Instant::now();
+        db.query_with_columns_for_session(session, &format!("SELECT fins({id})"))
+            .unwrap_or_else(|e| panic!("fins({id}): {e}"));
+        started.elapsed()
+    };
+
+    // A new id each time: nothing may answer the call from a cache.
+    for (id, first) in [
+        (21, "ALTER TABLE t ADD COLUMN x INT"),
+        (22, "CREATE INDEX t_v ON t (v)"),
+        (23, "TRUNCATE t"),
+        (24, "INSERT INTO t VALUES (2, 2)"),
+    ] {
+        db.begin_transaction_for_session(session).unwrap();
+        db.execute_for_session(session, first).unwrap();
+        let took = call(id);
+        assert!(
+            took < Duration::from_secs(10),
+            "after `{first}`: it waited {took:?} for its own transaction"
+        );
+        db.commit_transaction_for_session(session).unwrap();
+        assert_eq!(
+            rows(&db, &format!("SELECT id FROM t WHERE id = {id}")).len(),
+            1,
+            "after `{first}`"
+        );
+    }
+
+    // A schema statement queued behind the transaction: the body's writes went in behind it, and
+    // it waited for the transaction, which waited for them.
+    db.begin_transaction_for_session(session).unwrap();
+    db.execute_for_session(session, "INSERT INTO t VALUES (3, 3)").unwrap();
+    std::thread::scope(|scope| {
+        let altering = scope.spawn(|| db.execute("ALTER TABLE t ADD COLUMN y INT"));
+        wait_for("the ALTER to wait", || db.storage.debug_table_lock_waiters("t").0 == 1);
+        let took = call(13);
+        assert!(took < Duration::from_secs(10), "behind a queued ALTER: {took:?}");
+        db.commit_transaction_for_session(session).unwrap();
+        altering.join().unwrap().unwrap();
+    });
+    assert_eq!(rows(&db, "SELECT id FROM t WHERE id IN (3, 13)").len(), 2);
 }
 
 /// The detector: in a test build a row written with no lock on its table is a missed

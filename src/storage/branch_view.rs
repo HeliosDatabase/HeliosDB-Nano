@@ -140,7 +140,7 @@ use crate::storage::art_index::ArtIndexError;
 use crate::storage::{ArtIndexManager, EnforcedUniqueIndex, Transaction};
 use crate::{Error, Result, Schema, Tuple, Value};
 use dashmap::DashMap;
-use rocksdb::{Direction, IteratorMode, ReadOptions, WriteBatch};
+use rocksdb::{Direction, IteratorMode, WriteBatch};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1315,12 +1315,12 @@ impl<'a> BranchView<'a> {
     // ---- low-level reads ----
 
     fn for_each_with_prefix(&self, prefix: &[u8], mut each: impl FnMut(&[u8], &[u8]) -> Result<()>) -> Result<()> {
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .engine
-            .db
-            .iterator_opt(IteratorMode::From(prefix, Direction::Forward), read_opts);
+        // Bounded at the prefix's end (merged-tree review, M8): a reclaimed level's
+        // deleted keys right after it are not stepped through before the walk ends.
+        let iter = self.engine.db.iterator_opt(
+            IteratorMode::From(prefix, Direction::Forward),
+            super::time_travel::bounded_read_options(prefix),
+        );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {e}")))?;
             if !key.starts_with(prefix) {
@@ -2584,11 +2584,10 @@ impl<'a> BranchView<'a> {
         // of the old row to this level before the overlay below is read, and one it
         // does not see is a row this rewrites as what it read, which is that copy.
         let main_rows = scope.include_main.then(|| {
-            let mut read_opts = ReadOptions::default();
-            read_opts.set_total_order_seek(true);
+            let prefix = format!("data:{table}:");
             self.engine.db.iterator_opt(
-                IteratorMode::From(format!("data:{table}:").as_bytes(), Direction::Forward),
-                read_opts,
+                IteratorMode::From(prefix.as_bytes(), Direction::Forward),
+                super::time_travel::bounded_read_options(prefix.as_bytes()),
             )
         });
         let overlay = self.load_committed_rows(table, width, scope.first_level)?;

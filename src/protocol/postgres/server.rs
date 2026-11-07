@@ -99,6 +99,16 @@ impl PgServerConfig {
     }
 }
 
+/// Spec R5.1: how many connections past `max_connections` are read at once, each for at
+/// most [`CANCEL_PROBE_TIMEOUT`], to see whether they are a cancel request. PostgreSQL
+/// serves those whatever the connection count, and a full server is exactly when an
+/// operator needs one: every slot waiting for a table. Past this they are dropped unread,
+/// as every connection over the limit used to be.
+const CANCEL_PROBES: usize = 64;
+
+/// See [`CANCEL_PROBES`]. A cancel request is 16 bytes sent at once.
+const CANCEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// PostgreSQL server
 pub struct PgServer {
     config: PgServerConfig,
@@ -106,6 +116,9 @@ pub struct PgServer {
     auth_manager: Arc<AuthManager>,
     ssl_negotiator: Option<Arc<SslNegotiator>>,
     connection_limiter: Arc<Semaphore>,
+    /// Spec R5.1: connections read for a cancel request while `max_connections` are in
+    /// use ([`CANCEL_PROBES`]).
+    cancel_probes: Arc<Semaphore>,
     /// GH#28: edge trigger for the utilisation WARN — `true` while in-use
     /// connections are at or above `max_connections_warn_percent`, so the
     /// line is logged once per crossing, never once per accept.
@@ -157,6 +170,7 @@ impl PgServer {
             auth_manager,
             ssl_negotiator,
             connection_limiter,
+            cancel_probes: Arc::new(Semaphore::new(CANCEL_PROBES)),
             utilisation_warned: AtomicBool::new(false),
         })
     }
@@ -201,6 +215,7 @@ impl PgServer {
             auth_manager,
             ssl_negotiator,
             connection_limiter,
+            cancel_probes: Arc::new(Semaphore::new(CANCEL_PROBES)),
             utilisation_warned: AtomicBool::new(false),
         })
     }
@@ -290,7 +305,16 @@ impl PgServer {
                                 self.config.max_connections,
                                 addr
                             );
-                            drop(stream);
+                            // Unless it is a cancel request (`CANCEL_PROBES`).
+                            if let Ok(probe) = Arc::clone(&self.cancel_probes).try_acquire_owned() {
+                                tokio::spawn(async move {
+                                    let _probe = probe;
+                                    let _ = tokio::time::timeout(CANCEL_PROBE_TIMEOUT, Self::serve_cancel_only(stream))
+                                        .await;
+                                });
+                            } else {
+                                drop(stream);
+                            }
                             continue;
                         }
                     };
@@ -417,15 +441,7 @@ impl PgServer {
         // a client sends it in the clear on a connection of its own, and is told nothing.
         // What it reaches is a wait for a table lock (`storage::table_locks`).
         if code == super::ssl::CANCEL_REQUEST_CODE {
-            let mut key = [0u8; 8];
-            stream
-                .read_exact(&mut key)
-                .await
-                .map_err(|e| Error::network(format!("Failed to read cancel request: {}", e)))?;
-            let (pid, secret) = key.split_at(4);
-            if let (Ok(pid), Ok(secret)) = (<[u8; 4]>::try_from(pid), <[u8; 4]>::try_from(secret)) {
-                crate::session::scoped::request_cancel(i32::from_be_bytes(pid), i32::from_be_bytes(secret));
-            }
+            Self::serve_cancel_request(&mut stream).await?;
             return Ok(None);
         }
         let is_ssl_request = code == super::ssl::SSL_REQUEST_CODE;
@@ -502,6 +518,39 @@ impl PgServer {
         let secure_conn = SecureConnection::Plain(stream);
         let handler = PgConnectionHandler::new_with_stream(secure_conn, database, auth_manager, Some(&initial_data));
         Ok(Some(handler.with_connection_policy(policy)))
+    }
+
+    /// Spec R5.1: the rest of a CancelRequest whose 8-byte header has been read, its pid
+    /// and key. The backend is told if they match; the peer is told nothing.
+    async fn serve_cancel_request(stream: &mut TcpStream) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+        let mut key = [0u8; 8];
+        stream
+            .read_exact(&mut key)
+            .await
+            .map_err(|e| Error::network(format!("Failed to read cancel request: {}", e)))?;
+        let (pid, secret) = key.split_at(4);
+        if let (Ok(pid), Ok(secret)) = (<[u8; 4]>::try_from(pid), <[u8; 4]>::try_from(secret)) {
+            crate::session::scoped::request_cancel(i32::from_be_bytes(pid), i32::from_be_bytes(secret));
+        }
+        Ok(())
+    }
+
+    /// Spec R5.1: a connection past `max_connections`, served only if it is a cancel
+    /// request (in the clear, as clients send it), and closed either way.
+    async fn serve_cancel_only(mut stream: TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut header = [0u8; 8];
+        if stream.read_exact(&mut header).await.is_err() {
+            return;
+        }
+        let (len, code) = header.split_at(4);
+        let (Ok(len), Ok(code)) = (<[u8; 4]>::try_from(len), <[u8; 4]>::try_from(code)) else {
+            return;
+        };
+        if i32::from_be_bytes(len) == 16 && i32::from_be_bytes(code) == super::ssl::CANCEL_REQUEST_CODE {
+            let _ = Self::serve_cancel_request(&mut stream).await;
+        }
     }
 
     /// Get server configuration

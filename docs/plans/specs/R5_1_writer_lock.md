@@ -158,3 +158,9 @@ if a statement itself never returns.
 - *`SET lock_timeout`*: a registered, user-settable GUC read when a wait begins. 0 is the server's value, not an unbounded wait.
 - *A commit lets go before its standby wait*: a transaction's owner in `commit_with_timestamp`, an autocommit TRUNCATE through `defer_commit_replication_wait`. A merge's landing still waits holding its lock, and DDL in an explicit transaction keeps the table through its wait.
 - *`execute_in_session` outside a transaction* opened no statement scope, so its commit wrote with no lock: the only embedded entry point that did. Raw `begin_transaction` callers (`delta_applicator`, the protocol adapter) get theirs at the first staged write and keep it through the commit.
+
+**The merged tree's review.**
+- *A writing function waited for its own transaction*: its body runs statements of its own on the caller's thread, and a read statement bound no owner, so after the transaction's DDL they queued behind it. `run_statement_in_transaction` now binds the transaction's existing owner for every statement (`Transaction::bind_existing_table_locks`), reads included; a transaction that has written nothing has no owner and binds none. `CALL` already ran under the statement's binding, and trigger bodies run no SQL.
+- *MySQL wire*: DDL inside a transaction commits it first and runs by itself, as MySQL does (`causes_implicit_commit`).
+- *`innodb_lock_wait_timeout`* (seconds) is `lock_timeout`; *`lock_timeout`* is at most `INT_MAX` ms. A plain `SET` in a rolled-back transaction is not undone, for this setting as for every other session setting here: only `SET LOCAL` has an undo (`gucs_saved`).
+- *A CancelRequest past `max_connections`* is read by a bounded probe (64 at once, 2 s each) and served.

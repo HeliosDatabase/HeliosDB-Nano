@@ -3727,6 +3727,9 @@ impl StorageEngine {
 
         // Load counters from storage
         engine.load_counters()?;
+        // Sprinter 6bc4a4040eb7 (B4): a table's change of shape is timed by the clock
+        // and recorded with no snapshot record; the clock starts past it too.
+        engine.raise_timestamp_past_shape_records();
 
         // R4.2: arm the snapshot invalidation hooks BEFORE any mutation can
         // run (WAL replay below included), so post-checkpoint mutations

@@ -3158,6 +3158,8 @@ impl EmbeddedDatabase {
             "helios.bulk_load_mode" => "bulk_load_mode",
             // The config file's spelling, which it would be a trap to accept and ignore.
             "lock_timeout_ms" => "lock_timeout",
+            // MySQL's, which its ORMs send (in seconds: `lock_timeout_unit_ms`).
+            other if Self::is_mysql_lock_wait_timeout(other) => "lock_timeout",
             other => other,
         };
         // `sql::is_user_settable` is registered-AND-not-server-level, so an
@@ -3204,6 +3206,21 @@ impl EmbeddedDatabase {
     ///
     /// `None` state is engine-internal evaluation: nothing to set, and `SHOW`
     /// answers the server default.
+    /// Spec R5.1: MySQL's `innodb_lock_wait_timeout`, also as `@@innodb_lock_wait_timeout`
+    /// or `@@session.innodb_lock_wait_timeout`: this server's `lock_timeout`, in seconds.
+    /// MySQL's `lock_wait_timeout` is not mapped: its default is a year, beyond
+    /// [`Self::MAX_LOCK_TIMEOUT_MS`], and clients send it.
+    fn is_mysql_lock_wait_timeout(name: &str) -> bool {
+        let name = name.strip_prefix("@@").unwrap_or(name);
+        let name = name.strip_prefix("session.").unwrap_or(name);
+        name == "innodb_lock_wait_timeout"
+    }
+
+    /// Spec R5.1: the most a session may set `lock_timeout` to, PostgreSQL's (`INT_MAX`
+    /// milliseconds, about 24 days): a wait here is always bounded, and that bound has to
+    /// be one a person can mean.
+    const MAX_LOCK_TIMEOUT_MS: u64 = 2_147_483_647;
+
     fn apply_session_guc_setting(
         &self,
         statement: &DbSettingStatement,
@@ -3213,7 +3230,9 @@ impl EmbeddedDatabase {
         state: Option<std::sync::Arc<crate::session::scoped::SessionScopedState>>,
     ) -> Result<(Vec<Tuple>, std::sync::Arc<Schema>)> {
         match statement {
-            DbSettingStatement::Set { value, .. } => {
+            DbSettingStatement::Set {
+                name: raw_name, value, ..
+            } => {
                 // `SET <name> TO DEFAULT` is `RESET <name>` (PostgreSQL), which
                 // for an overlay means DROPPING the override rather than writing
                 // the default over it — otherwise a later change to the server
@@ -3232,11 +3251,34 @@ impl EmbeddedDatabase {
                 // is not a duration fails closed with PostgreSQL's 22023 wording,
                 // exactly as GH#28 made the idle timeouts fail.
                 let parsed = match name {
-                    "statement_timeout" | "query_timeout" | "lock_timeout" => sql::SettingValue::Duration(
+                    "statement_timeout" | "query_timeout" => sql::SettingValue::Duration(
                         crate::protocol::postgres::timeouts::parse_guc_duration_ms(value, 1).map_err(|bad| {
                             Error::query_execution(format!("invalid value for parameter \"{}\": \"{}\"", name, bad))
                         })?,
                     ),
+                    "lock_timeout" => {
+                        // A bare number is milliseconds, and seconds in MySQL's spelling.
+                        let bare_unit_ms = if Self::is_mysql_lock_wait_timeout(raw_name) {
+                            1000
+                        } else {
+                            1
+                        };
+                        let ms = crate::protocol::postgres::timeouts::parse_guc_duration_ms(value, bare_unit_ms)
+                            .map_err(|bad| {
+                                Error::query_execution(format!(
+                                    "invalid value for parameter \"{}\": \"{}\"",
+                                    raw_name, bad
+                                ))
+                            })?;
+                        if ms > Self::MAX_LOCK_TIMEOUT_MS {
+                            return Err(Error::query_execution(format!(
+                                "invalid value for parameter \"{raw_name}\": \"{value}\": lock_timeout is at most {} \
+                                 ms (about 24 days)",
+                                Self::MAX_LOCK_TIMEOUT_MS
+                            )));
+                        }
+                        sql::SettingValue::Duration(ms)
+                    }
                     _ => sql::parse_setting_value(value),
                 };
                 // Validate through the ONE validator, so a session-scoped `SET`
@@ -3689,6 +3731,7 @@ impl EmbeddedDatabase {
         let name = match name {
             "helios.bulk_load_mode" => "bulk_load_mode",
             "lock_timeout_ms" => "lock_timeout",
+            other if Self::is_mysql_lock_wait_timeout(other) => "lock_timeout",
             other => other,
         };
         sql::REGISTERED_PARAMETERS
@@ -5080,6 +5123,12 @@ impl EmbeddedDatabase {
         body: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         Self::refuse_if_transaction_failed(txn, sql)?;
+        // Spec R5.1: a read acts for the transaction too. A function body that writes runs
+        // statements of its own on this thread, and after the transaction's `ALTER` they
+        // waited for the transaction itself, for the whole lock timeout: `BEGIN; ALTER t;
+        // SELECT f()` where f inserts into t. Under the transaction's owner they find its
+        // locks as theirs. Its writes still commit by themselves, as they always have.
+        let _bound_locks = txn.bind_existing_table_locks();
         let result = body();
         match &result {
             Err(_) => txn.mark_sql_aborted(),

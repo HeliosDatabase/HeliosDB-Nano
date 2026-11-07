@@ -650,8 +650,9 @@ impl TableLocks {
     }
 
     /// Does this thread's statement hold any table lock of this engine, in any mode?
-    /// Sprinter 6bc4a4040eb7 (B4): such a statement never waits on the fork fence, which
-    /// is outside these locks (`storage::branch_freeze`, "Lock order").
+    /// Sprinter 6bc4a4040eb7 (B4): such a statement does not wait for a fork that waits
+    /// for the running statements, one of which may wait for these locks
+    /// (`storage::branch_freeze`, "Lock order").
     pub(crate) fn current_statement_holds_any(&self) -> bool {
         CURRENT.with(|current| {
             current
@@ -659,6 +660,35 @@ impl TableLocks {
                 .as_ref()
                 .is_some_and(|owner| owner.engine == self.engine && owner.held.lock().iter().next().is_some())
         })
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4): the fork fence's wait, which stands in a schema
+    /// statement's way as a table lock does, with a lock wait's budget: the session's
+    /// `lock_timeout` (55P03), its `statement_timeout` and a cancel (57014), the last two
+    /// looked at again once it is through, so a statement the client gave up on does not
+    /// start. `wait(longest)` waits at most that long and says whether it is through;
+    /// `give_back` undoes it. `table` and `holder` name what it waited for.
+    pub(crate) fn wait_like_a_lock(
+        &self,
+        table: &str,
+        holder: &str,
+        mut wait: impl FnMut(Duration) -> bool,
+        give_back: impl FnOnce(),
+    ) -> Result<()> {
+        let budget = WaitBudget::new(self, self.timeout());
+        loop {
+            budget.check_statement(table)?;
+            if let Some(waited) = budget.lock_timed_out() {
+                return Err(Error::table_lock_timeout(table, holder, waited));
+            }
+            if wait(budget.tick(SHARED_TICK)) {
+                if let Err(e) = budget.check_statement(table) {
+                    give_back();
+                    return Err(e);
+                }
+                return Ok(());
+            }
+        }
     }
 
     /// Shared locks taken late, at a transaction's first staged write of the table.

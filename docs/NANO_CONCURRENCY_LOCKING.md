@@ -116,12 +116,14 @@ Separate from the row-level `LockManager` above, and what writers see during DDL
   **55P03** (MySQL wire: 1205 `ER_LOCK_WAIT_TIMEOUT`, REST: 409) naming what holds the table. It changed nothing; retry it.
   In a transaction it aborts the transaction like any other failed statement. **`SET lock_timeout = 0` is not PostgreSQL's
   unbounded wait**: it means the server's `lock_timeout_ms`, so a `pg_dump` script, which starts with it, still ends. A wait
-  here is always bounded.
+  here is always bounded: a session may set at most 2147483647 ms (about 24 days), PostgreSQL's limit. MySQL's
+  `innodb_lock_wait_timeout` (in seconds) sets the same thing; its `lock_wait_timeout` is accepted and does nothing. Unlike
+  PostgreSQL, a plain `SET` inside a transaction that rolls back is not undone (no session setting here is); `SET LOCAL` is.
 - **A wait also ends at `statement_timeout`, and at a cancel** (PostgreSQL's CancelRequest, which psql's Ctrl-C and every
   driver's cancel send): SQLSTATE **57014**, and the statement does not run when the lock comes free. It looks every 50 ms.
   Each wait counts its `statement_timeout` from where it starts, so a statement that waits for several tables can overrun
-  it by that. A cancel needs a free connection slot to arrive on; there is no cancel for a REST request or on the MySQL
-  wire. **A client that vanishes during a wait is not noticed**: nothing reads its socket while its statement runs, so the
+  it by that. A cancel request is served even with every connection slot taken; there is no cancel for a REST request or
+  on the MySQL wire. **A client that vanishes during a wait is not noticed**: nothing reads its socket while its statement runs, so the
   statement waits on and runs when the lock comes free, unless one of these timeouts ends it first. Set a `statement_timeout`
   or a short `lock_timeout` where that matters.
 - **At most 256 statements wait at once**, across the server. The next is refused with 55P03 at once, saying so. Each waiter
@@ -136,7 +138,11 @@ Separate from the row-level `LockManager` above, and what writers see during DDL
   ahead of any DDL already queued (which is waiting for this transaction). It is refused with 55P03 at once only where waiting
   is certain to deadlock: another transaction is already waiting to upgrade the same table. A `MERGE BRANCH` inside a
   transaction that wrote one of its tables is refused at once too: it lands in commits of its own, and would be waiting
-  for the transaction it runs in.
+  for the transaction it runs in. A function called in the transaction runs its statements for the transaction, so a
+  writing function after the transaction's `ALTER` does not wait for it (its writes still commit by themselves).
+- **On the MySQL wire, DDL commits the open transaction first** and runs as a statement of its own, as MySQL does
+  (`CREATE`, `ALTER`, `DROP`, `RENAME`, `TRUNCATE`, but not on a `TEMPORARY` table): nothing is held after it. The
+  PostgreSQL wire and the embedded API keep transactional DDL.
 - **A DELETE takes every table its foreign keys make it write** (`ON DELETE CASCADE` and `SET NULL`) up front, in sorted
   order, so its 55P03 means no child has lost a row.
 - **Getting out.** Whoever holds a table is named by kind in the 55P03, not by session: end the transaction that holds it

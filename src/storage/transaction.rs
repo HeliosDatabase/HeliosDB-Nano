@@ -1048,6 +1048,17 @@ impl Transaction {
         }
     }
 
+    /// Spec R5.1: [`Self::bind_table_locks`], for a statement that may only read: it
+    /// binds the transaction's owner if the transaction has one (it has written), and
+    /// creates none. What the statement runs on this thread, a function body that
+    /// writes included, then finds the transaction's locks as its own.
+    pub(crate) fn bind_existing_table_locks(&self) -> super::table_locks::BoundLockOwner {
+        match &self.table_locks {
+            Some(locks) => locks.bind_existing(),
+            None => super::table_locks::BoundLockOwner::inert(),
+        }
+    }
+
     /// Spec R5.1: a copy of what keeps this transaction's table locks, for work that
     /// outlives it: a FAILED commit consumes it, and the caller still has to replay
     /// its eager index undo with nobody else in the table. The sibling of

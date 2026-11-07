@@ -77,9 +77,12 @@
 //!
 //! 1. a schema statement's place in the fork fence
 //!    ([`BranchFreeze::enter_schema_statement`], a count, not held as a lock). Entered
-//!    before anything below, and never waited for by a thread whose statement already
-//!    holds a writer lock (it is refused at once instead): a fork waiting for the
-//!    statements in the fence never waits, through one of them, for such a lock;
+//!    before anything below. A thread whose transaction already holds a writer lock
+//!    does not wait for a fork that is waiting for the running statements (it enters,
+//!    and the fork waits for it too), only for a fork that is registering, which waits
+//!    for no writer lock: so a fork never waits, through a statement in the fence, for
+//!    a lock held by a thread that waits for the fork. Every wait here has a lock
+//!    wait's budget (`lock_timeout`, `statement_timeout`, cancel);
 //! 2. statement-long: a branch's drain section (`BranchDrains`), then the writer locks
 //!    of spec R5.1 (`storage::table_locks`, per level and table, sorted within a
 //!    level). A parent branch's schema statement takes a child's after its own
@@ -163,7 +166,9 @@
 //! [`BranchFreeze::enter_schema_statement`] before it looks for children, and the
 //! creation of a branch of main holds new ones out and waits for the running ones
 //! ([`BranchFreeze::hold_schema_statements`]) across the registration. One that ran
-//! finished before the child existed; one that starts afterwards finds it.
+//! finished before the child existed; one that starts afterwards finds it. A new one
+//! whose transaction holds writer locks is let in while the creation still waits for
+//! the running ones (it is one more to wait for), never once it registers.
 //!
 //! # The fork record, and a branch from before all this
 //!
@@ -483,8 +488,13 @@ pub struct BranchFreeze {
 struct SchemaStatements {
     /// Running on main now.
     running: usize,
-    /// A branch of main is registering: new ones wait.
+    /// A branch of main waits for the running ones: new ones wait too, but a
+    /// statement whose transaction holds writer locks, which a running one may be
+    /// waiting for (see [`BranchFreeze::enter_schema_statement`]).
     held: bool,
+    /// None is running and the branch registers: every new one waits. The
+    /// registration waits for writes in the gate, never for a writer lock.
+    closed: bool,
 }
 
 /// New schema statements on main wait while this lives, and none is running.
@@ -495,7 +505,10 @@ pub struct SchemaStatementsHeld<'f> {
 
 impl Drop for SchemaStatementsHeld<'_> {
     fn drop(&mut self) {
-        self.freeze.schema_statements.lock().held = false;
+        let mut statements = self.freeze.schema_statements.lock();
+        statements.held = false;
+        statements.closed = false;
+        drop(statements);
         self.freeze.schema_statements_changed.notify_all();
     }
 }
@@ -637,12 +650,20 @@ impl BranchFreeze {
 
     // ---- main's schema statements and a fork of main ----
 
-    /// A schema statement on main starts: it waits while a branch of main registers.
-    /// Call before looking for children. False: the time ran out, and it did not enter.
-    pub(crate) fn enter_schema_statement(&self, timeout: Duration) -> bool {
+    /// A schema statement on main starts: it waits while a branch of main registers,
+    /// at most `timeout`. Call before looking for children. False: the time ran out,
+    /// and it did not enter.
+    ///
+    /// `holds_locks`: its transaction holds writer locks already (its own earlier DDL,
+    /// or a write). It does not wait for a branch that is still waiting for the running
+    /// statements: one of them may be waiting for those locks, and it would wait for the
+    /// branch, the branch for that statement, and that statement for it. It runs, and
+    /// the branch waits for it as for the others. It waits only while the branch
+    /// registers, which waits for no writer lock.
+    pub(crate) fn enter_schema_statement(&self, timeout: Duration, holds_locks: bool) -> bool {
         let deadline = Instant::now() + timeout;
         let mut statements = self.schema_statements.lock();
-        while statements.held {
+        while statements.closed || (statements.held && !holds_locks) {
             if self
                 .schema_statements_changed
                 .wait_until(&mut statements, deadline)
@@ -691,7 +712,16 @@ impl BranchFreeze {
                 return None;
             }
         }
+        // From here nobody enters, a statement holding locks included: none is
+        // running, and none may start until the registration is over.
+        statements.closed = true;
         Some(SchemaStatementsHeld { freeze: self })
+    }
+
+    /// For the tests: is a branch of main waiting for, or holding out, the schema
+    /// statements?
+    pub(crate) fn fork_fence_held(&self) -> bool {
+        self.schema_statements.lock().held
     }
 
     // ---- what a reader asks ----
@@ -1198,6 +1228,44 @@ impl StorageEngine {
     /// groups do the same to it. One atomic load on a store with no branch.
     pub(crate) fn branch_reads_may_race(&self) -> bool {
         self.write_gate().active_freeze().is_some() || self.is_physical_standby()
+    }
+
+    /// Sprinter 6bc4a4040eb7 (B4), merged-tree review M12: raise the clock past every
+    /// table's recorded change of shape (`meta:table_shape:`). A shape record's time is
+    /// a timestamp no snapshot record or version carries, and the clock is seeded from
+    /// those at an open: after a crash in a `RENAME`'s purge (nothing written after the
+    /// rename's batch), the reopened or promoted node's clock started below it, and an
+    /// anchor taken after the rename was refused as from before it. At every open, and
+    /// on a standby as the records arrive. A record that does not decode is skipped: it
+    /// refuses anchors when read, which is the safe side.
+    pub(crate) fn raise_timestamp_past_shape_records(&self) {
+        let prefix: &[u8] = b"meta:table_shape:";
+        let records = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            super::time_travel::bounded_read_options(prefix),
+        );
+        for item in records {
+            let Ok((key, raw)) = item else {
+                break;
+            };
+            if !key.starts_with(prefix) {
+                break;
+            }
+            let change = self
+                .decode_stored_ref(&key, &raw)
+                .ok()
+                .and_then(|plain| bincode::deserialize::<TableShapeChange>(&plain).ok());
+            if let Some(change) = change {
+                self.raise_timestamp(change.changed_at);
+            }
+        }
+    }
+
+    /// For the tests' handshakes: is a branch of main waiting for, or holding out,
+    /// main's schema statements (the fork fence)?
+    #[doc(hidden)]
+    pub fn debug_fork_fence_held(&self) -> bool {
+        self.branch_freeze().is_some_and(|freeze| freeze.fork_fence_held())
     }
 
     /// Is a copy of `table` on its way into one of `levels`?
@@ -1779,22 +1847,52 @@ mod tests {
     fn a_schema_statement_and_a_fork_of_main_take_turns() {
         let freeze = freeze();
         let short = Duration::from_millis(5);
-        assert!(freeze.enter_schema_statement(short));
+        assert!(freeze.enter_schema_statement(short, false));
         assert!(
-            freeze.enter_schema_statement(short),
+            freeze.enter_schema_statement(short, false),
             "statements do not exclude each other"
         );
         assert!(freeze.hold_schema_statements(short).is_none(), "two are running");
         // It gave up, and holds nothing.
-        assert!(freeze.enter_schema_statement(short));
+        assert!(freeze.enter_schema_statement(short, false));
         freeze.leave_schema_statement();
         freeze.leave_schema_statement();
         freeze.leave_schema_statement();
         let held = freeze.hold_schema_statements(short).expect("none is running");
-        assert!(!freeze.enter_schema_statement(short), "held out");
+        assert!(!freeze.enter_schema_statement(short, false), "held out");
+        assert!(
+            !freeze.enter_schema_statement(short, true),
+            "a registering fork holds out a statement holding locks too"
+        );
         assert!(freeze.hold_schema_statements(short).is_none(), "one at a time");
         drop(held);
-        assert!(freeze.enter_schema_statement(short));
+        assert!(freeze.enter_schema_statement(short, false));
+        freeze.leave_schema_statement();
+    }
+
+    /// The review's M1: a fork waiting for a running statement holds out a statement
+    /// with no locks, and lets in one whose transaction holds writer locks (the running
+    /// one may be waiting for them); it then waits for that one too.
+    #[test]
+    fn a_fork_waiting_for_statements_lets_in_one_that_holds_locks() {
+        let freeze = freeze();
+        let short = Duration::from_millis(5);
+        assert!(freeze.enter_schema_statement(short, false), "the running one");
+        std::thread::scope(|scope| {
+            let fork = scope.spawn(|| freeze.hold_schema_statements(Duration::from_secs(60)).is_some());
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !freeze.fork_fence_held() {
+                assert!(Instant::now() < deadline, "the fork never waited");
+                std::thread::yield_now();
+            }
+            assert!(!freeze.enter_schema_statement(short, false), "held out");
+            assert!(freeze.enter_schema_statement(short, true), "let in");
+            freeze.leave_schema_statement();
+            assert!(!fork.is_finished(), "the first one still runs");
+            freeze.leave_schema_statement();
+            assert!(fork.join().unwrap_or(false), "then the fork goes through");
+        });
+        assert!(freeze.enter_schema_statement(short, false), "and lets go");
         freeze.leave_schema_statement();
     }
 

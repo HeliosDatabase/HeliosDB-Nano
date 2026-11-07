@@ -999,6 +999,26 @@ fn split_sql_respecting_quotes(sql: &str) -> Vec<String> {
     statements
 }
 
+/// Spec R5.1: a statement MySQL commits the open transaction for before it runs, and
+/// runs by itself: one that defines data (`CREATE`, `ALTER`, `DROP`, `RENAME`,
+/// `TRUNCATE`), except on a `TEMPORARY` table.
+fn causes_implicit_commit(sql: &str) -> bool {
+    let mut words = sql.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    if ["ALTER", "RENAME", "TRUNCATE"]
+        .iter()
+        .any(|keyword| first.eq_ignore_ascii_case(keyword))
+    {
+        return true;
+    }
+    if first.eq_ignore_ascii_case("CREATE") || first.eq_ignore_ascii_case("DROP") {
+        return !words.next().is_some_and(|word| word.eq_ignore_ascii_case("TEMPORARY"));
+    }
+    false
+}
+
 #[inline]
 fn starts_with_icase(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len()
@@ -1826,6 +1846,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             if lower.contains("information_schema") {
                 return self.handle_information_schema(trimmed).await;
             }
+        }
+
+        // Spec R5.1: MySQL commits the open transaction before a statement that defines
+        // data, which then runs by itself, so nothing is left open after it. Its clients
+        // count on that. Here a transaction's DDL would hold its table until the
+        // transaction ended, and that transaction's earlier writes would be invisible
+        // meanwhile and lost on a ROLLBACK that MySQL would not have had. The
+        // PostgreSQL wire and the embedded API keep their transactional DDL.
+        if self.in_transaction && causes_implicit_commit(trimmed) {
+            let outcome = self.database.commit_transaction_for_session(self.session_id);
+            if let Err(e) = outcome {
+                self.sync_transaction_state_after_error();
+                return Err(e.into());
+            }
+            self.in_transaction = false;
+            self.status_flags.clear(StatusFlags::SERVER_STATUS_IN_TRANS);
         }
 
         // ---- SELECT / DML / DDL — delegate to EmbeddedDatabase ----

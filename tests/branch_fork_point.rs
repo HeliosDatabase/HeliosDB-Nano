@@ -3005,3 +3005,114 @@ fn no_branch_no_hook() {
     writes(&db);
     assert_eq!(runs(), merged, "a merged branch is written by nobody");
 }
+
+// ---------------------------------------------------------------------------
+// The fork fence beside table locks (merged-tree review, M1 and M4)
+// ---------------------------------------------------------------------------
+
+/// A condition another thread will make true: wait on its state, never on time.
+fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !condition() {
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::yield_now();
+    }
+}
+
+/// A `CREATE BRANCH` of main waits in the fork fence for a schema statement that waits
+/// behind an open transaction. A migration whose transaction holds its first DDL's table
+/// goes on with its second statement: it used to be refused 55006 at once, with the
+/// first one landed and a rerun failing on the column it had added. A schema statement
+/// holding nothing waits for the fork as for a lock, and `lock_timeout` ends it with
+/// 55P03 and nothing done: it used to wait 30 s whatever the timeout, and then run.
+#[test]
+fn a_migration_goes_on_while_a_fork_waits_and_other_ddl_waits_like_a_lock() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    for table in ["m1", "big", "other"] {
+        db.execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, v INT)"))
+            .unwrap();
+        db.execute(&format!("INSERT INTO {table} VALUES (1, 1)")).unwrap();
+    }
+    let holder = txn_session(&db, "holder");
+    db.begin_transaction_for_session(holder).unwrap();
+    db.execute_for_session(holder, "UPDATE big SET v = 2 WHERE id = 1")
+        .unwrap();
+    let migration = txn_session(&db, "migration");
+    db.begin_transaction_for_session(migration).unwrap();
+    db.execute_for_session(migration, "ALTER TABLE m1 ADD COLUMN c1 INT")
+        .unwrap();
+
+    std::thread::scope(|scope| {
+        let blocked = scope.spawn(|| db.execute("ALTER TABLE big ADD COLUMN z INT"));
+        wait_until("the ALTER of big to wait", || {
+            db.storage.debug_table_lock_waiters("big").0 == 1
+        });
+        let forking = scope.spawn(|| db.execute("CREATE BRANCH f1 FROM main AS OF NOW"));
+        wait_until("the fork to wait in the fence", || db.storage.debug_fork_fence_held());
+
+        db.execute_for_session(migration, "ALTER TABLE m1 ADD COLUMN c2 INT")
+            .expect("the migration's second statement goes on");
+
+        db.storage
+            .debug_set_table_lock_timeout(std::time::Duration::from_millis(100));
+        let err = db
+            .execute("ALTER TABLE other ADD COLUMN q INT")
+            .expect_err("it waits for the fork as for a lock");
+        assert!(
+            err.to_string().contains(heliosdb_nano::TABLE_LOCK_TIMEOUT_MARKER),
+            "{err}"
+        );
+        db.storage
+            .debug_set_table_lock_timeout(std::time::Duration::from_secs(30));
+        assert!(!forking.is_finished() && !blocked.is_finished());
+
+        db.commit_transaction_for_session(migration).unwrap();
+        db.rollback_transaction_for_session(holder).unwrap();
+        blocked
+            .join()
+            .unwrap()
+            .expect("big's ALTER runs once its holder is gone");
+        forking.join().unwrap().expect("and then the fork");
+    });
+    let columns = |table: &str| db.storage.catalog().get_table_schema(table).unwrap().columns.len();
+    assert_eq!(columns("m1"), 4, "both of the migration's columns");
+    assert_eq!(columns("other"), 2, "the statement that gave up did nothing");
+    assert_eq!(columns("big"), 3);
+    assert_eq!(rows_on(&db, "f1", Family::Text, "SELECT * FROM m1")[0].values.len(), 4);
+}
+
+/// The merged-tree review's M12. A table's change of shape is timed by the clock, and
+/// no snapshot record carries that time, while an open seeds the clock from snapshot
+/// records: a store reopened (or promoted) with nothing written after a `RENAME` came
+/// back with its clock below the rename's record, and an anchor taken after it, on a
+/// table recreated under the old name, was refused as if from before the rename. The
+/// renames of `z` move the clock with no snapshot record, so the gap is wide.
+#[test]
+fn an_anchor_after_a_rename_is_accepted_after_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = on_disk(dir.path());
+        db.execute("CREATE TABLE big (id INT PRIMARY KEY, v INT)").unwrap();
+        db.execute("BEGIN").unwrap();
+        db.execute("INSERT INTO big VALUES (1, 1), (2, 2)").unwrap();
+        db.execute("COMMIT").unwrap();
+        db.execute("CREATE TABLE z0 (id INT PRIMARY KEY)").unwrap();
+        for step in 0..40 {
+            db.execute(&format!("ALTER TABLE z{step} RENAME TO z{}", step + 1))
+                .unwrap();
+        }
+        db.execute("ALTER TABLE big RENAME TO big2").unwrap();
+    }
+    let db = on_disk(dir.path());
+    db.execute("CREATE TABLE big (id INT PRIMARY KEY, v INT)").unwrap();
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO big VALUES (1, 10)").unwrap();
+    db.execute("COMMIT").unwrap();
+    let anchor = last_scn(&db);
+    db.execute(&format!("CREATE BRANCH after FROM main AS OF SCN {anchor}"))
+        .expect("an anchor after the rename");
+    assert_eq!(
+        pairs(&rows_on(&db, "after", Family::Text, "SELECT id, v FROM big")),
+        vec![(1, 10)]
+    );
+}

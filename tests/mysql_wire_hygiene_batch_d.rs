@@ -483,3 +483,47 @@ async fn merge_branch_abort_answers_with_its_tables() {
         String::from_utf8_lossy(&refused)
     );
 }
+
+/// Spec R5.1: MySQL commits the open transaction before a statement that defines data, which then
+/// runs by itself. Here the `ALTER` used to stay in the transaction and hold the table until the
+/// client ended it, with the `INSERT` before it invisible to others and lost on a `ROLLBACK`.
+#[tokio::test]
+async fn ddl_in_a_transaction_commits_it_first_as_mysql_does() {
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("in-memory db"));
+    db.execute("CREATE TABLE u (id INT PRIMARY KEY, v INT)")
+        .expect("create");
+    let mut c = MySqlTestClient::login(Arc::clone(&db)).await;
+
+    let status = c.ok("START TRANSACTION").await;
+    assert_eq!(status & SERVER_STATUS_IN_TRANS, SERVER_STATUS_IN_TRANS);
+    c.ok("INSERT INTO u VALUES (1, 1)").await;
+    let status = c.ok("ALTER TABLE u ADD COLUMN my1 INT").await;
+    assert_eq!(status & SERVER_STATUS_IN_TRANS, 0, "the ALTER ended the transaction");
+    assert!(
+        !db.storage.debug_table_lock_held_exclusively("u"),
+        "and nothing holds the table after it"
+    );
+    assert_eq!(
+        db.query("SELECT id FROM u", &[]).expect("select").len(),
+        1,
+        "the INSERT was committed before the ALTER"
+    );
+    c.ok("ROLLBACK").await;
+    assert_eq!(
+        db.query("SELECT id FROM u", &[]).expect("select").len(),
+        1,
+        "nothing to roll back"
+    );
+
+    // A TEMPORARY table is not data definition to MySQL: the transaction goes on.
+    c.ok("START TRANSACTION").await;
+    c.ok("INSERT INTO u VALUES (2, 2)").await;
+    let _ = c.send("CREATE TEMPORARY TABLE tmp_u (id INT)").await;
+    c.ok("ROLLBACK").await;
+    assert!(
+        db.query("SELECT id FROM u WHERE id = 2", &[])
+            .expect("select")
+            .is_empty(),
+        "rolled back"
+    );
+}

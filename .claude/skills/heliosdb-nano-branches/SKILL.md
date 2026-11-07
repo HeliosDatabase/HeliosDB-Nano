@@ -54,7 +54,13 @@ Per write of the level with live children, for each row and each of those childr
 **A schema statement on main is wholly before a fork of main or wholly after it**, never across one, and so
 are `CREATE` and `REFRESH MATERIALIZED VIEW` and a `CREATE SCHEMA` with elements: `CREATE BRANCH` waits for the ones
 running (30 s, then `55006`), and new ones wait for it to register. So a branch's definition of a table and its rows
-always come from the same side of the statement.
+always come from the same side of the statement. That wait is a lock wait: `lock_timeout` ends it with `55P03`,
+`statement_timeout` or a cancel with `57014`, and nothing has run. A schema statement in a transaction that already
+holds tables (its own earlier DDL, or a write) does not wait for a `CREATE BRANCH` that is waiting for the running
+ones, so a migration's second statement is not stopped after its first landed; the `CREATE BRANCH` waits for it too.
+While a `CREATE BRANCH` waits for a statement that is itself waiting for a table (behind an open transaction), every
+other new schema statement on main waits with it, up to its `lock_timeout`: a long-open transaction stalls branch
+creation and main's DDL together. `SET lock_timeout` lower for DDL that must not wait.
 
 **A fork lands between writes, not between DML statements.** A transaction is one write, and so is a statement on
 the simple protocol. On the extended protocol an autocommit `UPDATE`, `DELETE`, `INSERT … SELECT` or `TRUNCATE` of
@@ -371,9 +377,12 @@ staging or jurisdiction-pinned data. See `docs/guides/ha_cluster_tutorial.md`.
 - **Branches are per-DB-instance.** Without `ha-tier2` / `ha-branch-replication`, a
   branch created on one node is local to that node.
 - **Branches are not free while they live.** A row its parent changes costs a copy on every live
-  child that still reads it, and a table its parent drops is a copy of every row. Drop branches you no
-  longer need: `DROP BRANCH` deletes the branch's keys, in batches; a crash on the way is finished by the
-  next open. The name is free at once.
+  child that still reads it, and a table its parent drops is a copy of every row. A row the parent
+  INSERTS gives every such child a tombstone (the row is not there at its fork point), which the child's
+  reads load from then on, and which stays when the parent deletes the row again: a branch's reads of a
+  table grow with the rows its parent inserted since the fork (about 15 ms per 100,000 rows on a
+  point read, release build). Drop branches you no longer need: `DROP BRANCH` deletes the branch's
+  keys, in batches; a crash on the way is finished by the next open. The name is free at once.
 - **Long-lived branches diverge.** The longer a branch lives, the more likely an
   undetected merge conflict, and the more it holds. Treat branches as short-lived units of work.
 - **Schema statements on a branch run alone.** `CREATE TABLE`, `CREATE TABLE … AS`,
