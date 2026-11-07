@@ -55,6 +55,11 @@ pub(crate) fn unique_index_columns(
 /// COMPLETE key (one entry for the single-column spelling, several for a
 /// composite one) — a unique index must constrain every column it names, while
 /// an ordinary composite index deliberately indexes only its leading column.
+///
+/// Spec R5.3 (decision 7): the index is registered HIDDEN — writers maintain it,
+/// the read path's index choice skips it — and becomes visible in `ddl`'s
+/// publication, after the statement's durable group. A batch that is not written
+/// drops it.
 fn create_art_secondary_index(
     storage: &crate::storage::StorageEngine,
     name: &str,
@@ -62,6 +67,7 @@ fn create_art_secondary_index(
     column_name: &str,
     if_not_exists: bool,
     unique_columns: Option<Vec<String>>,
+    ddl: &mut crate::storage::DdlBatch<'_>,
 ) -> Result<Option<usize>> {
     if storage.is_branch_active() {
         return Err(Error::query_execution(
@@ -87,6 +93,17 @@ fn create_art_secondary_index(
     }
 
     let columns = vec![column_name.to_string()];
+    // Hidden before it is registered, so no reader takes it while it is empty.
+    // Exactly one of the two reveals runs.
+    art_manager.hide_index(name);
+    {
+        let art = Arc::clone(art_manager);
+        let hidden = name.to_string();
+        ddl.on_commit(move || art.reveal_index(&hidden));
+        let art = Arc::clone(art_manager);
+        let hidden = name.to_string();
+        ddl.on_abort(move || art.reveal_index(&hidden));
+    }
     if let Some(unique_columns) = unique_columns {
         // `CREATE UNIQUE INDEX` — registered as a UNIQUE index, so
         // `check_unique_constraints` (INSERT, INSERT…SELECT, COPY, the
@@ -104,6 +121,7 @@ fn create_art_secondary_index(
         art_manager
             .create_unique_index(table_name, &unique_columns, Some(name))
             .map_err(|e| Error::query_execution(format!("Failed to create UNIQUE ART index: {}", e)))?;
+        drop_index_unless_written(art_manager, name, ddl);
 
         let tuples = storage.scan_table_with_schema(table_name, &schema)?;
         return match art_manager.backfill_unique_index(name, &schema, &tuples) {
@@ -125,6 +143,7 @@ fn create_art_secondary_index(
     art_manager
         .create_manual_index(name, table_name, &columns)
         .map_err(|e| Error::query_execution(format!("Failed to create ART index: {}", e)))?;
+    drop_index_unless_written(art_manager, name, ddl);
 
     let tuples = storage.scan_table_with_schema(table_name, &schema)?;
     match art_manager.backfill_manual_index(name, &schema, &tuples) {
@@ -134,6 +153,35 @@ fn create_art_secondary_index(
             Err(Error::query_execution(format!("Failed to backfill ART index: {}", e)))
         }
     }
+}
+
+/// Spec R5.3: the index this statement registered goes again if its batch is not
+/// written. Registered only once the registration succeeded, so a statement never
+/// drops an index of the same name it failed to register.
+fn drop_index_unless_written(
+    art_manager: &Arc<crate::storage::ArtIndexManager>,
+    name: &str,
+    ddl: &mut crate::storage::DdlBatch<'_>,
+) {
+    let art = Arc::clone(art_manager);
+    let index = name.to_string();
+    ddl.on_abort(move || {
+        let _ = art.drop_index(&index);
+    });
+}
+
+/// Spec R5.3: an HNSW index this statement built goes again if its batch is not
+/// written.
+fn drop_vector_index_unless_written(
+    storage: &crate::storage::StorageEngine,
+    name: &str,
+    ddl: &mut crate::storage::DdlBatch<'_>,
+) {
+    let vectors = Arc::clone(storage.vector_indexes_arc());
+    let index = name.to_string();
+    ddl.on_abort(move || {
+        let _ = vectors.drop_index(&index);
+    });
 }
 
 fn vector_distance_metric(options: &[crate::sql::logical_plan::IndexOption]) -> Result<crate::vector::DistanceMetric> {
@@ -226,13 +274,17 @@ fn backfill_vector_index(
     Ok(vectors.len())
 }
 
-fn persist_index_definition(
+/// Spec R5.3: the index's `meta:index:` definition and its logical-WAL
+/// `CreateIndex` entry, staged into the statement's batch: ONE write group, which
+/// is what makes the index reachable (at open, on a standby, by `DROP INDEX`).
+fn stage_index_definition(
     storage: &crate::storage::StorageEngine,
     name: &str,
     table_name: &str,
     column_name: &str,
     index_type: Option<&str>,
     options: &[crate::sql::logical_plan::IndexOption],
+    ddl: &mut crate::storage::DdlBatch<'_>,
 ) -> Result<()> {
     let definition = crate::storage::PersistedIndexDefinition {
         table_name: table_name.to_string(),
@@ -240,7 +292,15 @@ fn persist_index_definition(
         index_type: index_type.map(str::to_string),
         options: options.to_vec(),
     };
-    storage.catalog().save_index_definition(name, &definition)
+    storage.catalog().stage_index_definition(name, &definition, ddl)?;
+    ddl.log(crate::storage::WalOperation::CreateIndex {
+        name: name.to_string(),
+        table: table_name.to_string(),
+        column: column_name.to_string(),
+        index_type: index_type.map(str::to_string),
+        options: encoded_index_options(options),
+    });
+    Ok(())
 }
 
 fn encoded_index_options(options: &[crate::sql::logical_plan::IndexOption]) -> Vec<u8> {
@@ -289,9 +349,18 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                 // it as UNIQUE) and reach a standby.
                 let unique_columns = unique_index_columns(options, column_name);
                 let unique = unique_columns.is_some();
-                if let Some(backfilled) =
-                    create_art_secondary_index(storage, name, table_name, column_name, *if_not_exists, unique_columns)?
-                {
+                // Spec R5.3: the definition and its WAL entry are ONE group; the index
+                // is hidden until it is written.
+                let mut ddl = crate::storage::DdlBatch::new(storage);
+                if let Some(backfilled) = create_art_secondary_index(
+                    storage,
+                    name,
+                    table_name,
+                    column_name,
+                    *if_not_exists,
+                    unique_columns,
+                    &mut ddl,
+                )? {
                     tracing::info!(
                         "Created {}ART index '{}' on table '{}' column '{}' with {} existing rows",
                         if unique { "UNIQUE " } else { "" },
@@ -300,14 +369,8 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                         column_name,
                         backfilled
                     );
-                    persist_index_definition(storage, name, table_name, column_name, Some("art"), options)?;
-
-                    let encoded_options = encoded_index_options(options);
-                    if let Err(e) =
-                        storage.log_create_index(name, table_name, column_name, Some("art"), &encoded_options)
-                    {
-                        tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
-                    }
+                    stage_index_definition(storage, name, table_name, column_name, Some("art"), options, &mut ddl)?;
+                    ddl.commit()?.wait_replicated();
                 }
             } else if let Some(idx_type) = index_type {
                 if family == Some(IndexFamily::DdlOnly) {
@@ -332,17 +395,17 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                         table_name,
                         column_name
                     );
-                    persist_index_definition(storage, name, table_name, column_name, Some(idx_type.as_str()), options)?;
-                    let encoded_options = encoded_index_options(options);
-                    if let Err(e) = storage.log_create_index(
+                    let mut ddl = crate::storage::DdlBatch::new(storage);
+                    stage_index_definition(
+                        storage,
                         name,
                         table_name,
                         column_name,
                         Some(idx_type.as_str()),
-                        &encoded_options,
-                    ) {
-                        tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
-                    }
+                        options,
+                        &mut ddl,
+                    )?;
+                    ddl.commit()?.wait_replicated();
                 } else if family == Some(IndexFamily::Vector) {
                     // Check if index already exists
                     let vector_indexes = storage.vector_indexes();
@@ -429,6 +492,9 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                         }
                     }
 
+                    // Spec R5.3: the definition and its WAL entry, ONE group, after the
+                    // index is built; a batch that is not written drops the index.
+                    let mut ddl = crate::storage::DdlBatch::new(storage);
                     if persistent {
                         let training_vectors: Vec<crate::vector::Vector> =
                             existing_vectors.iter().map(|(_, vector)| vector.clone()).collect();
@@ -449,19 +515,28 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             None
                         };
 
-                        vector_indexes.create_persistent_index(
-                            name.clone(),
-                            table_name.clone(),
-                            column_name.clone(),
-                            dimension,
-                            distance_metric,
-                            pq_config,
-                            rerank_precision,
-                            &training_vectors,
-                            storage.db(),
-                            std::sync::Arc::clone(storage.write_gate()),
-                        )?;
-                        let backfilled = backfill_vector_index(vector_indexes, name, &existing_vectors)?;
+                        // Decision 8: a persistent graph keeps TODAY's order — its own
+                        // writes, BEFORE the definition that makes it reachable (a dangling
+                        // id is filtered on read). Not folded into the statement's group.
+                        let backfilled = {
+                            let _own_batch = crate::storage::ddl_batch::allow_side_write(
+                                "a persistent HNSW graph, written before the definition that makes it reachable",
+                            );
+                            vector_indexes.create_persistent_index(
+                                name.clone(),
+                                table_name.clone(),
+                                column_name.clone(),
+                                dimension,
+                                distance_metric,
+                                pq_config,
+                                rerank_precision,
+                                &training_vectors,
+                                storage.db(),
+                                std::sync::Arc::clone(storage.write_gate()),
+                            )?;
+                            drop_vector_index_unless_written(storage, name, &mut ddl);
+                            backfill_vector_index(vector_indexes, name, &existing_vectors)?
+                        };
                         tracing::info!(
                             "Created persistent HNSW index '{}' on table '{}' column '{}' with {} existing vectors",
                             name,
@@ -469,25 +544,16 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             column_name,
                             backfilled
                         );
-                        persist_index_definition(
+                        stage_index_definition(
                             storage,
                             name,
                             table_name,
                             column_name,
                             Some("persistent_hnsw"),
                             options,
+                            &mut ddl,
                         )?;
-
-                        let encoded_options = encoded_index_options(options);
-                        if let Err(e) = storage.log_create_index(
-                            name,
-                            table_name,
-                            column_name,
-                            Some("persistent_hnsw"),
-                            &encoded_options,
-                        ) {
-                            tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
-                        }
+                        ddl.commit()?.wait_replicated();
                         return Ok(empty_ddl_result(executor));
                     }
 
@@ -527,6 +593,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 hnsw_m,
                                 hnsw_ef_construction,
                             )?;
+                            drop_vector_index_unless_written(storage, name, &mut ddl);
                             let backfilled = backfill_vector_index(vector_indexes, name, &existing_vectors)?;
                             tracing::info!(
                                 "Created quantized HNSW index '{}' on table '{}' column '{}' with {} existing vectors",
@@ -535,19 +602,16 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 column_name,
                                 backfilled
                             );
-                            persist_index_definition(storage, name, table_name, column_name, Some("hnsw_pq"), options)?;
-
-                            // Log to WAL for replication
-                            let encoded_options = encoded_index_options(options);
-                            if let Err(e) = storage.log_create_index(
+                            stage_index_definition(
+                                storage,
                                 name,
                                 table_name,
                                 column_name,
                                 Some("hnsw_pq"),
-                                &encoded_options,
-                            ) {
-                                tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
-                            }
+                                options,
+                                &mut ddl,
+                            )?;
+                            ddl.commit()?.wait_replicated();
                         }
                         _ => {
                             // Create standard non-quantized index
@@ -560,6 +624,7 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                                 hnsw_m,
                                 hnsw_ef_construction,
                             )?;
+                            drop_vector_index_unless_written(storage, name, &mut ddl);
                             let backfilled = backfill_vector_index(vector_indexes, name, &existing_vectors)?;
                             tracing::info!(
                                 "Created HNSW index '{}' on table '{}' column '{}' with {} existing vectors",
@@ -577,15 +642,16 @@ pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Re
                             // for a standard in-memory HNSW — otherwise the open
                             // path would try to reopen a persistent backend that
                             // was never created.
-                            persist_index_definition(storage, name, table_name, column_name, Some("hnsw"), options)?;
-
-                            // Log to WAL for replication
-                            let encoded_options = encoded_index_options(options);
-                            if let Err(e) =
-                                storage.log_create_index(name, table_name, column_name, Some("hnsw"), &encoded_options)
-                            {
-                                tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
-                            }
+                            stage_index_definition(
+                                storage,
+                                name,
+                                table_name,
+                                column_name,
+                                Some("hnsw"),
+                                options,
+                                &mut ddl,
+                            )?;
+                            ddl.commit()?.wait_replicated();
                         }
                     }
                 } else {
@@ -769,18 +835,36 @@ pub(super) fn handle_drop_index(executor: &Executor, name: &str, if_exists: bool
     // stays HERE is what is specific to the DROP INDEX statement: the branch
     // refusal, the constraint-index safety gate, `IF EXISTS` / undecodable-record
     // handling, the definition delete and `log_drop_index`.
-    let recorded_type = definition.as_ref().and_then(|d| d.index_type.as_deref());
-    crate::storage::teardown_index_structures(storage, name, recorded_type)?;
-
-    // Durability: this is the step that makes the drop survive a restart.
-    catalog.drop_index_definition(name)?;
-
-    // Replication / recovery. Same warn-and-continue posture as
-    // `handle_create_index`'s `log_create_index`: the local drop has already
-    // been made durable above, so a WAL append failure must not resurrect it.
-    if let Err(e) = storage.log_drop_index(name) {
-        tracing::warn!("Failed to log DROP INDEX to WAL: {}", e);
+    let recorded_type = definition.as_ref().and_then(|d| d.index_type.clone());
+    // An unclassifiable tag is refused by name, before anything changes: this
+    // build cannot tell which structure to remove, and does not report a drop
+    // that did not happen.
+    if crate::storage::index_family(recorded_type.as_deref()).is_none() {
+        crate::storage::teardown_index_structures(storage, name, recorded_type.as_deref())?;
     }
+
+    // Spec R5.3: the definition delete (the step that makes the drop survive a
+    // restart) and its logical-WAL `DropIndex` entry are ONE write group. The live
+    // structure comes down after it: an index is reachable exactly while its
+    // definition is, and a persistent graph's keyspace and a dropped HNSW's
+    // snapshot artefacts are purged after the group that removed the definition
+    // (decision 8's order), as derived state no reader can reach any more.
+    let mut ddl = crate::storage::DdlBatch::new(storage);
+    crate::storage::Catalog::stage_index_definition_drop(name, &mut ddl);
+    ddl.log(crate::storage::WalOperation::DropIndex { name: name.to_string() });
+    {
+        let index = name.to_string();
+        ddl.on_commit(move || {
+            if let Err(e) = crate::storage::teardown_index_structures(storage, &index, recorded_type.as_deref()) {
+                tracing::warn!(
+                    "DROP INDEX '{}': the definition is removed, but the index could not be torn down: {}",
+                    index,
+                    e
+                );
+            }
+        });
+    }
+    ddl.commit()?.wait_replicated();
 
     tracing::info!("Dropped index '{}'", name);
     Ok(empty_ddl_result(executor))
@@ -812,15 +896,14 @@ pub(super) fn handle_drop_table(
 /// Drop `table_name` and, recursively, its registered Stage-0 partition
 /// children. `if_exists` governs only the top-level target; the cascade drops
 /// children with IF-EXISTS semantics (a child dropped directly earlier is
-/// simply absent). Every table is removed via the same `Catalog::drop_table`
-/// funnel a plain DROP uses.
+/// simply absent). Every table is staged through the same `Catalog::
+/// stage_drop_table` funnel a plain DROP uses.
 ///
-/// NON-ATOMIC (review-pinned): a mid-cascade child-drop failure leaves the
-/// parent and earlier children dropped and the failing child alive with a
-/// dangling `meta:partparent:` record pointing at the gone parent. That record
-/// self-heals on the child's next direct drop and cannot mis-drop anything
-/// (cascade reads only the parent's forward list, which is consumed up front)
-/// — matching the engine's non-transactional DDL semantics generally.
+/// Spec R5.3: ONE write group for the whole cascade — the parent, every child and
+/// grandchild, their columnar sidecars and every `DropTable` entry. A failure part
+/// way (a child's read refuses its drop) leaves nothing dropped; a crash leaves all
+/// or none, and no reader or standby sees a parent gone with its partitions still
+/// there.
 fn drop_table_and_partition_children(
     storage: &crate::storage::StorageEngine,
     table_name: &str,
@@ -838,27 +921,55 @@ fn drop_table_and_partition_children(
         return Ok(());
     }
 
-    // Drop this table via the ordinary funnel. It deletes the table's IDENTITY
-    // record (KanttBan #23) and its partition registry links in the same
-    // write group as everything else it owns (spec P1.1b: they used to be
-    // separate writes made here, after the drop), and hands back the children
-    // the registry named — detaching this table from its own parent, if it is
-    // itself a partition child, rides the same group.
-    let children = catalog.drop_table_taking_partition_children(table_name)?;
-    // sprinter 29ecb34e3245: purge this table's storage-level pushdown
-    // structures (bloom filters + zone maps). Keeping them past the drop is a
-    // leak AND a wrong-answer hazard: a bloom filter is an authoritative
-    // "no such value in this table" answer, so a stale one left behind by
-    // `DROP TABLE t` would prune real rows out of a later `CREATE TABLE t`
-    // with different data. Inside the recursion, so every cascaded partition
-    // child is purged too. Infallible and cheap (two hash-map removes).
-    storage.predicate_pushdown().remove_table(table_name);
+    let mut ddl = crate::storage::DdlBatch::new(storage);
+    let mut dropped: Vec<String> = Vec::new();
+    stage_table_and_partition_children_drop(&catalog, table_name, &mut ddl, &mut dropped)?;
+    catalog.stage_dropped_tables_sidecar_purge(&dropped, &mut ddl);
+    // sprinter 29ecb34e3245: purge each dropped table's storage-level pushdown
+    // structures (bloom filters + zone maps), after the write. Keeping them past
+    // the drop is a leak AND a wrong-answer hazard: a bloom filter is an
+    // authoritative "no such value in this table" answer, so a stale one left
+    // behind by `DROP TABLE t` would prune real rows out of a later `CREATE TABLE
+    // t` with different data. Every cascaded partition child is purged too.
+    {
+        let tables = dropped.clone();
+        ddl.on_commit(move || {
+            for table in &tables {
+                storage.predicate_pushdown().remove_table(table);
+            }
+        });
+    }
+    ddl.commit()
+        .map_err(|e| Error::storage(format!("DROP TABLE '{}': batch delete failed: {}", table_name, e)))?
+        .wait_replicated();
+    catalog.finish_dropped_table_history(&dropped);
+    Ok(())
+}
 
+/// Stage the drop of `table_name` and, recursively, of the partition children the
+/// registry names, into `ddl`; `dropped` collects every table staged.
+fn stage_table_and_partition_children_drop<'d>(
+    catalog: &crate::storage::Catalog<'d>,
+    table_name: &str,
+    ddl: &mut crate::storage::DdlBatch<'d>,
+    dropped: &mut Vec<String>,
+) -> Result<()> {
+    // It deletes the table's IDENTITY record (KanttBan #23) and its partition
+    // registry links in the same write group as everything else it owns (spec
+    // P1.1b), and hands back the children the registry named — detaching this
+    // table from its own parent, if it is itself a partition child and that parent
+    // is not being dropped with it, rides the same group.
+    let children = catalog.stage_drop_table(table_name, dropped.as_slice(), ddl)?;
+    dropped.push(table_name.to_string());
     // Cascade to partition children (dependents); empty for a non-partition
     // table. Each recursion repeats the same funnel + registry cleanup, so
-    // sub-partitioned children unwind fully.
+    // sub-partitioned children unwind fully. A child dropped directly earlier is
+    // simply absent.
     for child in children {
-        drop_table_and_partition_children(storage, &child, true)?;
+        if dropped.contains(&child) || !catalog.main_table_exists(&child)? {
+            continue;
+        }
+        stage_table_and_partition_children_drop(catalog, &child, ddl, dropped)?;
     }
     Ok(())
 }

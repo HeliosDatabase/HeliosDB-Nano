@@ -186,6 +186,13 @@ pub struct Transaction {
     /// immediate append wrote even when the transaction then rolled back.
     /// Dropped with a rollback; cut back by `ROLLBACK TO SAVEPOINT`.
     commit_wal_ops: RwLock<Vec<WalOperation>>,
+    /// Spec R5.3: in-memory changes a statement of this transaction made durable
+    /// only by its COMMIT ([`Self::after_commit`]): run right after the commit's
+    /// write succeeded, dropped unrun with a failed commit or a rollback. An
+    /// autocommit TRUNCATE's clear of the table's ART trees, which used to run at
+    /// the statement, before the deletes were durable (a failed commit left a table
+    /// with its rows and empty trees, and a reader of the index saw none of them).
+    after_commit: parking_lot::Mutex<Vec<Box<dyn FnOnce() + Send>>>,
     /// R1.3: fsync the commit WriteBatch (power-loss durable commits).
     sync_commit: bool,
     /// R1.3 phase 2: engine-wide leader/follower group committer. When set
@@ -853,6 +860,7 @@ impl Transaction {
             logical_wal_sync: false,
             statement_wal: None,
             commit_wal_ops: RwLock::new(Vec::new()),
+            after_commit: parking_lot::Mutex::new(Vec::new()),
             sync_commit: false,
             group_committer: None,
             row_cache: None,
@@ -1193,6 +1201,13 @@ impl Transaction {
         true
     }
 
+    /// Spec R5.3: run `hook` once this transaction's commit has written its batch,
+    /// never if it fails or rolls back. For an in-memory change that must not be
+    /// visible before the change it describes is durable.
+    pub(crate) fn after_commit(&self, hook: impl FnOnce() + Send + 'static) {
+        self.after_commit.lock().push(Box::new(hook));
+    }
+
     /// Open the statement-capture frame for this transaction. Hold the guard for the
     /// statement's whole lifetime including the commit: dropping it discards anything
     /// the commit did not take, which is exactly what a rollback needs.
@@ -1252,6 +1267,7 @@ impl Transaction {
             logical_wal_sync: false,
             statement_wal: None,
             commit_wal_ops: RwLock::new(Vec::new()),
+            after_commit: parking_lot::Mutex::new(Vec::new()),
             sync_commit: false,
             group_committer: None,
             row_cache: None,
@@ -2103,6 +2119,15 @@ impl Transaction {
                         }
                     }
                 }
+            }
+        }
+
+        // Spec R5.3: what the transaction's statements deferred to its commit, now
+        // that the write is applied (never after a failed one).
+        let after_commit = std::mem::take(&mut *self.after_commit.lock());
+        if result.is_ok() {
+            for hook in after_commit {
+                hook();
             }
         }
 

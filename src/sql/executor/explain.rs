@@ -79,6 +79,13 @@ pub(super) fn handle_explain(
     // (would require Arc<StorageEngine> instead of &StorageEngine)
     let storage_features = Vec::new();
 
+    // Spec R5.3: TRUNCATE runs through `ddl::handle_truncate`, which deletes at
+    // once and ignores the statement's transaction, so `BEGIN; EXPLAIN ANALYZE
+    // TRUNCATE t; ROLLBACK` emptied `t` for good. Refused before anything runs.
+    if options.analyze && matches!(plan, LogicalPlan::Truncate { .. }) {
+        return Err(crate::Error::explain_analyze_unsupported("TRUNCATE"));
+    }
+
     // Execute query for ANALYZE mode
     let (actual_rows, actual_time_ms, execution_error) = if options.analyze {
         execute_for_analyze(executor, plan)

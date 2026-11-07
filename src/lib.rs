@@ -349,8 +349,9 @@ pub use error::{
     BRANCH_NOT_ACTIVE_MARKER, BRANCH_SCHEMA_RUNNING_MARKER, BRANCH_SCHEMA_UNSUPPORTED_MARKER,
     BRANCH_STATEMENT_UNSUPPORTED_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER, BRANCH_TABLE_BUSY_MARKER,
     BRANCH_WRITE_UNSUPPORTED_MARKER, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, DDL_OVER_STAGED_ROWS_MARKER,
-    IN_FAILED_TRANSACTION_MESSAGE, NOT_NULL_VIOLATION_MARKER, PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED,
-    ROW_DESCRIPTION_MISMATCH_MARKER, TABLE_LOCK_TIMEOUT_MARKER, TABLE_NAME_HOLDS_COLON_MARKER,
+    EXPLAIN_ANALYZE_UNSUPPORTED_MARKER, IN_FAILED_TRANSACTION_MESSAGE, NOT_NULL_VIOLATION_MARKER,
+    PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED, ROW_DESCRIPTION_MISMATCH_MARKER, TABLE_LOCK_TIMEOUT_MARKER,
+    TABLE_NAME_HOLDS_COLON_MARKER,
 };
 pub use storage::StorageEngine;
 pub use types::{
@@ -6453,8 +6454,15 @@ impl EmbeddedDatabase {
         // of a surviving key was then accepted on main), it stripped OTHER open
         // transactions' eager entries, and it did not arm the census, so a
         // concurrent probe (main's or a branch's) trusted the emptied trees.
+        //
+        // Spec R5.3: the statement-scoped transaction's clear runs once its commit
+        // has written the deletes (`Transaction::after_commit`), never before: an
+        // eager clear left every reader of the index with no rows while the rows
+        // were still there, and a commit that then failed left them so for good.
         if !explicit {
-            self.storage.art_indexes().clear_table_indexes(table_name);
+            let art = std::sync::Arc::clone(self.storage.art_indexes());
+            let table = table_name.to_string();
+            txn.after_commit(move || art.clear_table_indexes(&table));
         } else if !self.storage.art_indexes().list_table_indexes(table_name).is_empty() {
             for tuple in &rows {
                 let Some(row_id) = tuple.row_id else {
@@ -6938,6 +6946,16 @@ impl EmbeddedDatabase {
             .unwrap_or(0)
     }
 
+    /// Spec R5.3: [`Self::delete_routine_meta`], staged into the statement's batch.
+    fn stage_routine_meta_drop(&self, prefix: &str, name: &str, ddl: &mut storage::DdlBatch<'_>) -> Result<()> {
+        for (suffix, _blob) in self.storage.meta_blobs_with_prefix(prefix)? {
+            if suffix.eq_ignore_ascii_case(name) {
+                ddl.delete(Self::routine_meta_key(prefix, &suffix));
+            }
+        }
+        Ok(())
+    }
+
     /// Delete every durable definition under `prefix` whose name matches `name`
     /// case-insensitively.
     ///
@@ -6990,23 +7008,36 @@ impl EmbeddedDatabase {
             .map_err(|e| Error::internal(format!("Failed to serialize function '{}': {}", name, e)))?;
 
         // The existence / OR REPLACE rule lives in the registry — one rule, one
-        // place. This is what produces `Function 'x' already exists`.
+        // place. This is what produces `Function 'x' already exists`. Registered
+        // first, so the rule is decided atomically; spec R5.3: undone if the
+        // statement's group is not written (the replaced definition comes back).
+        let previous = self.function_registry.get_function(name);
         self.function_registry.register_function(stored_func)?;
-
-        // WAL, for replication and replay. Warn-only, exactly as this arm has
-        // always been: a standby missing the record is a replication problem,
-        // not a reason to fail the user's DDL.
-        if let Err(e) = self.storage.log_create_function(name, &definition) {
-            tracing::warn!("Failed to log CREATE FUNCTION to WAL: {}", e);
+        let mut ddl = storage::DdlBatch::new(&self.storage);
+        {
+            let registry = &self.function_registry;
+            let routine = name.to_string();
+            ddl.on_abort(move || match previous {
+                Some(previous) => {
+                    let _ = registry.load_function(previous);
+                }
+                None => {
+                    let _ = registry.drop_function(&routine, true);
+                }
+            });
         }
 
-        // DURABLE definition. WAL replay writes this same key with these same
-        // bytes, so the two are idempotent; writing it here is what makes a
-        // function survive a restart even once the WAL has been checkpointed
-        // away. LOUD on failure — swallowing it would reintroduce exactly the
-        // "registered, then silently gone after restart" behaviour this fixes.
-        self.storage
-            .put(&Self::routine_meta_key(Self::FUNCTION_META_PREFIX, name), &definition)?;
+        // Spec R5.3: the DURABLE definition and its logical-WAL entry, ONE write
+        // group. WAL replay writes this same key with these same bytes, so the two
+        // are idempotent; the definition is what makes a function survive a
+        // restart once the WAL has been checkpointed away. LOUD on failure: the
+        // statement fails and the registry is put back.
+        ddl.put(Self::routine_meta_key(Self::FUNCTION_META_PREFIX, name), &definition)?;
+        ddl.log(storage::WalOperation::CreateFunction {
+            name: name.to_string(),
+            definition,
+        });
+        ddl.commit()?.wait_replicated();
         Ok(0)
     }
 
@@ -7034,14 +7065,27 @@ impl EmbeddedDatabase {
         let definition = bincode::serialize(&stored_proc)
             .map_err(|e| Error::internal(format!("Failed to serialize procedure '{}': {}", name, e)))?;
 
+        let previous = self.function_registry.get_procedure(name);
         self.function_registry.register_procedure(stored_proc)?;
-
-        if let Err(e) = self.storage.log_create_procedure(name, &definition) {
-            tracing::warn!("Failed to log CREATE PROCEDURE to WAL: {}", e);
+        let mut ddl = storage::DdlBatch::new(&self.storage);
+        {
+            let registry = &self.function_registry;
+            let routine = name.to_string();
+            ddl.on_abort(move || match previous {
+                Some(previous) => {
+                    let _ = registry.load_procedure(previous);
+                }
+                None => {
+                    let _ = registry.drop_procedure(&routine, true);
+                }
+            });
         }
-
-        self.storage
-            .put(&Self::routine_meta_key(Self::PROCEDURE_META_PREFIX, name), &definition)?;
+        ddl.put(Self::routine_meta_key(Self::PROCEDURE_META_PREFIX, name), &definition)?;
+        ddl.log(storage::WalOperation::CreateProcedure {
+            name: name.to_string(),
+            definition,
+        });
+        ddl.commit()?.wait_replicated();
         Ok(0)
     }
 
@@ -7050,26 +7094,39 @@ impl EmbeddedDatabase {
     /// removed either way, so a stale key left by an interrupted create can
     /// never resurrect the function.
     fn execute_drop_function_plan(&self, name: &str, if_exists: bool) -> Result<u64> {
+        let previous = self.function_registry.get_function(name);
         self.function_registry.drop_function(name, if_exists)?;
-        // Durable removal BEFORE the WAL record: if the process dies between the
-        // two, the definition is already gone from disk, which is what the caller
-        // was told. The reverse order could log the drop, die, and leave a
-        // definition for the next open's loader to reload.
-        self.delete_routine_meta(Self::FUNCTION_META_PREFIX, name)?;
-        if let Err(e) = self.storage.log_drop_function(name) {
-            tracing::warn!("Failed to log DROP FUNCTION to WAL: {}", e);
+        let mut ddl = storage::DdlBatch::new(&self.storage);
+        if let Some(previous) = previous {
+            let registry = &self.function_registry;
+            ddl.on_abort(move || {
+                let _ = registry.load_function(previous);
+            });
         }
+        // Spec R5.3: the durable removal and its logical-WAL entry, ONE write group
+        // (they used to be two, removal first so a crash between them left the
+        // definition gone rather than a logged drop over a surviving definition).
+        self.stage_routine_meta_drop(Self::FUNCTION_META_PREFIX, name, &mut ddl)?;
+        ddl.log(storage::WalOperation::DropFunction { name: name.to_string() });
+        ddl.commit()?.wait_replicated();
         Ok(0)
     }
 
     /// `DROP PROCEDURE [IF EXISTS]`. See
     /// [`EmbeddedDatabase::execute_drop_function_plan`].
     fn execute_drop_procedure_plan(&self, name: &str, if_exists: bool) -> Result<u64> {
+        let previous = self.function_registry.get_procedure(name);
         self.function_registry.drop_procedure(name, if_exists)?;
-        self.delete_routine_meta(Self::PROCEDURE_META_PREFIX, name)?;
-        if let Err(e) = self.storage.log_drop_procedure(name) {
-            tracing::warn!("Failed to log DROP PROCEDURE to WAL: {}", e);
+        let mut ddl = storage::DdlBatch::new(&self.storage);
+        if let Some(previous) = previous {
+            let registry = &self.function_registry;
+            ddl.on_abort(move || {
+                let _ = registry.load_procedure(previous);
+            });
         }
+        self.stage_routine_meta_drop(Self::PROCEDURE_META_PREFIX, name, &mut ddl)?;
+        ddl.log(storage::WalOperation::DropProcedure { name: name.to_string() });
+        ddl.commit()?.wait_replicated();
         Ok(0)
     }
 
@@ -7174,60 +7231,51 @@ impl EmbeddedDatabase {
             from_constraint: from_constraint.clone(),
         };
 
-        self.trigger_registry.register_trigger(definition.clone())?;
-
-        // Durable definition. Warn-only: the trigger IS registered for this
-        // process, and failing the statement after the registry already accepted
-        // it would leave the two disagreeing. A lost record degrades to "the
-        // trigger disappears at the next restart", which the docs describe.
-        if let Err(e) = self.storage.catalog().save_trigger(&definition) {
-            tracing::warn!(
-                "CREATE TRIGGER '{}' on '{}': failed to persist definition ({}) — it will not survive a restart",
-                name,
-                table_name,
-                e
-            );
-        }
-
         // Resolve the invoked function body into a BEFORE-row NEW mutation
         // recipe (`NEW.col = expr; RETURN NEW|NULL`). Best effort: an
         // unsupported body simply registers no recipe, so the trigger is
-        // accepted but performs no row rewrite.
-        if matches!(timing, sql::logical_plan::TriggerTiming::Before)
+        // accepted but performs no row rewrite. The recipe MUST be persisted
+        // rather than rebuilt at open: it is derived from the trigger function's
+        // body, and the function registry is repopulated from `meta:function:`
+        // records that a database created by an older build does not have. See
+        // `TriggerRowMutation`'s doc comment.
+        let mutation = if matches!(timing, sql::logical_plan::TriggerTiming::Before)
             && matches!(for_each, sql::logical_plan::TriggerFor::Row)
         {
-            if let Some(fname) = function_name {
-                if let Some(mutation) = self.build_trigger_row_mutation(fname, events) {
-                    // The recipe MUST be persisted rather than rebuilt at open:
-                    // it is derived from the trigger function's body, and the
-                    // function registry is repopulated from `meta:function:`
-                    // records that a database created by an older build does not
-                    // have. See `TriggerRowMutation`'s doc comment.
-                    let saved = self
-                        .storage
-                        .catalog()
-                        .save_trigger_row_mutation(table_name, name, &mutation);
-                    if let Err(e) = saved {
-                        tracing::warn!(
-                            "CREATE TRIGGER '{}' on '{}': failed to persist row-rewrite recipe ({}) — \
-                             the trigger will be inert after a restart",
-                            name,
-                            table_name,
-                            e
-                        );
-                    }
-                    self.trigger_registry.register_row_mutation(table_name, name, mutation);
-                }
-            }
+            function_name
+                .as_ref()
+                .and_then(|fname| self.build_trigger_row_mutation(fname, events))
+        } else {
+            None
+        };
+
+        // The registry decides whether the name is taken (atomically); spec R5.3:
+        // undone if the statement's group is not written.
+        self.trigger_registry.register_trigger(definition.clone())?;
+        let mut ddl = storage::DdlBatch::new(&self.storage);
+        {
+            let registry = &self.trigger_registry;
+            let table = table_name.to_string();
+            let trigger = name.to_string();
+            ddl.on_abort(move || {
+                let _ = registry.drop_trigger(&table, &trigger);
+            });
         }
 
-        // Log to WAL for replication.
-        if let Ok(serialized) = bincode::serialize(&definition) {
-            if let Err(e) = self.storage.log_create_trigger(name, table_name, &serialized) {
-                tracing::warn!("Failed to log CREATE TRIGGER to WAL: {}", e);
-            }
+        // Spec R5.3: the definition, the recipe and the logical-WAL entry are ONE
+        // write group, and a failed write fails the statement (it was warn-only, so
+        // a trigger could be accepted with no durable record and be gone at the
+        // next restart). The recipe is published to the registry after the write.
+        self.storage
+            .catalog()
+            .stage_trigger(&definition, mutation.as_ref(), &mut ddl)?;
+        if let Some(mutation) = mutation {
+            let registry = &self.trigger_registry;
+            let table = table_name.to_string();
+            let trigger = name.to_string();
+            ddl.on_commit(move || registry.register_row_mutation(&table, &trigger, mutation));
         }
-
+        ddl.commit()?.wait_replicated();
         Ok(0)
     }
 
@@ -7238,39 +7286,30 @@ impl EmbeddedDatabase {
             return Err(Error::query_execution("DROP TRIGGER requires ON <table_name> clause"));
         };
 
-        let dropped = self.trigger_registry.drop_trigger(tbl, name)?;
-        self.trigger_registry.drop_row_mutation(tbl, name);
-
-        if !dropped && !if_exists {
+        let registered = self.trigger_registry.get_trigger(tbl, name)?.is_some();
+        if !registered && !if_exists {
             let msg = format!("Trigger '{}' does not exist on table '{}'", name, tbl);
             return Err(Error::query_execution(msg));
         }
 
         // Durable removal happens even when the in-memory registry had nothing:
         // a stale key left behind by an interrupted create must never resurrect
-        // a dropped trigger at the next open.
-        let catalog = self.storage.catalog();
-        if let Err(e) = catalog.delete_trigger(tbl, name) {
-            tracing::warn!(
-                "DROP TRIGGER '{}' on '{}': failed to delete definition: {}",
-                name,
-                tbl,
-                e
-            );
+        // a dropped trigger at the next open. Spec R5.3: both removals and the
+        // logical-WAL entry are ONE write group, and the registry lets go of the
+        // trigger after it (a failed write leaves the trigger as it was, and fails
+        // the statement).
+        let mut ddl = storage::DdlBatch::new(&self.storage);
+        storage::Catalog::stage_trigger_drop(tbl, name, &mut ddl);
+        {
+            let registry = &self.trigger_registry;
+            let table = tbl.clone();
+            let trigger = name.to_string();
+            ddl.on_commit(move || {
+                let _ = registry.drop_trigger(&table, &trigger);
+                registry.drop_row_mutation(&table, &trigger);
+            });
         }
-        if let Err(e) = catalog.delete_trigger_row_mutation(tbl, name) {
-            tracing::warn!(
-                "DROP TRIGGER '{}' on '{}': failed to delete rewrite recipe: {}",
-                name,
-                tbl,
-                e
-            );
-        }
-
-        if let Err(e) = self.storage.log_drop_trigger(name, table_name.as_deref()) {
-            tracing::warn!("Failed to log DROP TRIGGER to WAL: {}", e);
-        }
-
+        ddl.commit()?.wait_replicated();
         Ok(0)
     }
 
@@ -8721,9 +8760,15 @@ impl EmbeddedDatabase {
         // here, since the table does not exist yet at this point.
         Self::validate_create_table_fk_targets(&catalog, name, columns, constraints)?;
 
-        // `Catalog::create_table` logs the CreateTable itself; logging here too put every
-        // table into the replicated history twice.
-        catalog.create_table(name, schema)?;
+        // Spec R5.3: the whole statement is ONE write group — the schema, the counter,
+        // the incarnation, the identity and partition records, every constraint record
+        // and every logical-WAL entry — so no reader, standby, branch fork or crash
+        // ever sees the table without its constraints. The in-memory publication (the
+        // schema and constraint caches) runs after the write, and a statement that
+        // fails before it leaves nothing: its batch is not written, and the trees it
+        // registered on the new table are taken back out.
+        let mut ddl = storage::DdlBatch::new(&self.storage);
+        catalog.stage_create_table(name, schema, &mut ddl)?;
 
         // KanttBan #23 (v3.31.1 phase 2): persist the list of
         // IDENTITY / SERIAL columns to a side-table so
@@ -8735,7 +8780,7 @@ impl EmbeddedDatabase {
             .map(|c| c.name.clone())
             .collect();
         if !identity_cols.is_empty() {
-            catalog.register_identity_columns(name, &identity_cols)?;
+            catalog.stage_identity_columns(name, &identity_cols, &mut ddl)?;
         }
 
         // Round-3 PARTITION BY Stage-0: if this CREATE was a
@@ -8747,24 +8792,13 @@ impl EmbeddedDatabase {
         // SAME resolved names that key the catalog — so a schema-scoped
         // `s.parent`/`s.child` resolves to the same qualified keys the
         // tables are stored under. A plain, non-partition CREATE returns
-        // `None`
-        // here → no registry write (zero cost). This runs only after
-        // `create_table` above succeeded (the `?` short-circuits a
-        // duplicate-name / bad-DDL failure before we reach this point).
+        // `None` here → no registry write (zero cost).
         //
-        // COVERAGE CONSTRAINT (review-pinned): this arm is reached by
-        // embedded execute()/execute_batch and the PG/MySQL SIMPLE-query
-        // wire path. The EXTENDED/parameterized route has NO CreateTable
-        // handler today (executor default arm errors on every CREATE),
-        // so no child can be created — and thus none can miss
-        // registration — over Parse/Bind/Execute. If executor CreateTable
-        // support is ever added, it MUST register partition children the
-        // same way, or parent DROPs will orphan extended-created
-        // children. Stage-0 semantics also pinned here: DDL is
-        // non-transactional (ROLLBACK keeps both the child and its
-        // registry entry — consistent), and dump/restore flattens
-        // children to standalone CREATEs (a restored setup does not
-        // cascade-drop; Stage 1 owns the durable partition catalog).
+        // Stage-0 semantics pinned here: DDL is non-transactional (ROLLBACK
+        // keeps both the child and its registry entry — consistent), and
+        // dump/restore flattens children to standalone CREATEs (a restored
+        // setup does not cascade-drop; Stage 1 owns the durable partition
+        // catalog).
         if let Some(spec) = original_sql.and_then(sql::Parser::extract_partition_of) {
             // Resolve the parent through the SAME session-aware
             // resolution that produced the child's key `name`: a bare
@@ -8781,16 +8815,25 @@ impl EmbeddedDatabase {
                 .with_current_schema(self.current_schema())
                 .with_search_path(self.current_search_path())
                 .resolve_partition_name(&spec.parent);
-            catalog.register_partition_child(&parent, name)?;
+            catalog.stage_partition_child(&parent, name, &mut ddl)?;
         }
+
+        // A list-less self-`REFERENCES` binds to the PRIMARY KEY this statement
+        // declares: the table is not in the catalog until the batch is written.
+        let own_primary_key: Vec<String> = columns
+            .iter()
+            .filter(|c| c.primary_key)
+            .map(|c| c.name.clone())
+            .collect();
 
         // Save table constraints if any. The set this statement saved, kept
         // for the column-level merge below.
         let statement_constraints: Option<sql::TableConstraints> = if constraints.is_empty() {
             None
         } else {
-            let table_constraints = Self::create_table_statement_constraints(&catalog, name, constraints)?;
-            catalog.save_table_constraints(name, &table_constraints)?;
+            let table_constraints =
+                Self::create_table_statement_constraints(&catalog, name, constraints, Some(&own_primary_key))?;
+            catalog.stage_table_constraints(name, &table_constraints, &mut ddl)?;
             // A composite `UNIQUE (a, b)` needs an ART index to be
             // enforced by anything, and `Catalog::create_table` cannot
             // create it: it only sees `Schema`, and a table-level
@@ -8805,40 +8848,23 @@ impl EmbeddedDatabase {
             // duplicates — the reported defect. Registration mints its
             // own key with a free-name fallback, so this is unreachable
             // short of a genuine structural failure; when it does fire,
-            // the statement must leave NO table behind.
-            //
-            // `catalog.drop_table` rather than a bespoke teardown: it
-            // emits the compensating `DropTable` WAL record a standby
-            // that already applied `CreateTable` needs, and clears the
-            // ART indexes, the `meta:index:` definitions, the schema,
-            // the counter, the compression keys, the triggers, the rows
-            // and — since spec P1.1b, in the same write group — the
-            // constraint record just saved, invalidating the memoised
-            // constraint set with it (otherwise the next `CREATE TABLE`
-            // of this name would be handed the dead one).
-            if let Err(e) = catalog.register_unique_constraint_indexes(name, &table_constraints) {
-                if let Err(unwind) = catalog.drop_table(name) {
-                    tracing::warn!(
-                        "CREATE TABLE '{}' unwind: failed to drop the half-created table: {}",
-                        name,
-                        unwind
-                    );
-                }
-                return Err(e);
-            }
+            // the statement leaves NO table behind: its batch is not
+            // written, and its undo drops the trees registered so far.
+            catalog.register_unique_constraint_indexes(name, &table_constraints)?;
             Some(table_constraints)
         };
 
         // Also add column-level UNIQUE and PRIMARY KEY constraints
         // These are stored in ColumnDef but need to be in table_constraints for enforcement
         // (`create_table_column_constraints`, shared with a branch's CREATE TABLE).
-        let catalog = self.storage.catalog();
         if let Some(col_constraints) =
             Self::create_table_column_constraints(name, columns, constraints, statement_constraints)
         {
-            catalog.save_table_constraints(name, &col_constraints)?;
+            catalog.stage_table_constraints(name, &col_constraints, &mut ddl)?;
         }
 
+        // Spec R1 §4: the standbys' acknowledgement last, after the publication.
+        ddl.commit()?.wait_replicated();
         Ok(1)
     }
 
@@ -8849,10 +8875,18 @@ impl EmbeddedDatabase {
     /// (sprinter 6bc4a4040eb7, phase B3). A list-less `REFERENCES` binds to
     /// the referenced table's PRIMARY KEY through `catalog`, so the target —
     /// for a self-reference, the table being created — must already resolve.
+    ///
+    /// `own_primary_key` (spec R5.3): main's statement stages the table and its
+    /// constraints in one write group, so the table is not in the catalog yet when
+    /// a list-less self-reference is bound; it binds to the key the statement
+    /// declares (the PRIMARY KEY column flags, in schema order, which is what the
+    /// catalog answered for a table created a moment before). `None`: ask the
+    /// catalog (a branch's CREATE TABLE, whose table exists by then).
     fn create_table_statement_constraints(
         catalog: &storage::Catalog<'_>,
         name: &str,
         constraints: &[sql::logical_plan::TableConstraint],
+        own_primary_key: Option<&[String]>,
     ) -> Result<sql::TableConstraints> {
         let mut table_constraints = sql::TableConstraints::new();
         for constraint in constraints {
@@ -8893,13 +8927,17 @@ impl EmbeddedDatabase {
                     // `public` search_path the planner left the
                     // parent bare (`emp`, not `s.emp`), which the
                     // catalog cannot look up (see `fk_targets_self`).
-                    let pk_source = if Self::fk_targets_self(name, references_table) {
-                        name
-                    } else {
-                        references_table.as_str()
+                    let targets_self = Self::fk_targets_self(name, references_table);
+                    let pk_source = if targets_self { name } else { references_table.as_str() };
+                    let references_columns = match own_primary_key {
+                        Some(own) if targets_self && references_columns.is_empty() => {
+                            if own.is_empty() {
+                                return Err(Self::fk_no_primary_key_error(name));
+                            }
+                            own.to_vec()
+                        }
+                        _ => Self::resolve_fk_referenced_columns(&catalog, pk_source, references_columns)?,
                     };
-                    let references_columns =
-                        Self::resolve_fk_referenced_columns(&catalog, pk_source, references_columns)?;
                     let fk = sql::ForeignKeyConstraint::new(
                         fk_name.clone().unwrap_or_else(|| {
                             sql::ForeignKeyConstraint::generate_unique_name(
@@ -16156,6 +16194,12 @@ impl EmbeddedDatabase {
         }
 
         let art = self.storage.art_indexes();
+        // Spec R5.3: the constraint record and its WAL entry are ONE write group, and
+        // the index that enforces it is registered HIDDEN (writers maintain it, the
+        // read path's index choice skips it) until that group is written: a reader
+        // never takes it while its backfill runs, and a statement that fails leaves
+        // neither.
+        let mut ddl = storage::DdlBatch::new(&self.storage);
         // A column set already backed by a CONSTRAINT-OWNED PK/UNIQUE index (an
         // inline UNIQUE, or a constraint added earlier) is already enforced;
         // record the new constraint but do not register a second index for the
@@ -16177,13 +16221,24 @@ impl EmbeddedDatabase {
             // unique index over a table that may already hold duplicates — a
             // brand-new fail-open.
             let index_name = art
-                .create_constraint_unique_index(table_name, &resolved, Some(&name))
+                .create_constraint_unique_index_hidden(table_name, &resolved, Some(&name))
                 .map_err(|e| {
                     Error::query_execution(format!("could not create unique constraint \"{}\": {}", name, e))
                 })?;
+            {
+                let shown = std::sync::Arc::clone(art);
+                let hidden = index_name.clone();
+                ddl.on_commit(move || shown.reveal_index(&hidden));
+                let dropped = std::sync::Arc::clone(art);
+                let unwritten = index_name.clone();
+                ddl.on_abort(move || {
+                    let _ = dropped.drop_index(&unwritten);
+                    dropped.reveal_index(&unwritten);
+                });
+            }
             let tuples = self.storage.scan_table_with_schema(table_name, &schema)?;
             if let Err(e) = art.backfill_unique_index(&index_name, &schema, &tuples) {
-                let _ = art.drop_index(&index_name);
+                // The batch is dropped unwritten: its undo drops the index.
                 return Err(Error::constraint_violation(format!(
                     "could not create unique constraint \"{}\" on relation \"{}\": {}",
                     name, table_name, e
@@ -16197,7 +16252,8 @@ impl EmbeddedDatabase {
             resolved.clone(),
             false,
         ));
-        catalog.save_table_constraints(table_name, &constraints)?;
+        catalog.stage_table_constraints(table_name, &constraints, &mut ddl)?;
+        ddl.commit()?.wait_replicated();
         tracing::info!(
             "Added UNIQUE constraint '{}' on {}({})",
             name,
@@ -17294,16 +17350,37 @@ impl EmbeddedDatabase {
             .get_column_at_mut(col_idx)
             .ok_or_else(|| Error::internal("column index out of bounds"))?
             .name = new_column_name.to_string();
-        // The schema and every `meta:index:` definition naming the column, in
-        // ONE write group (spec P1.1b): a definition left on the old name made
-        // the reopen register its index over a column that no longer exists,
-        // and strict physical hydration refuse the store.
-        let rewritten = catalog.rename_column_in_schema_and_index_definitions(
-            table_name,
-            &schema,
-            old_column_name,
-            new_column_name,
-        )?;
+
+        // Spec R5.3: ONE write group for the statement — the schema, every
+        // `meta:index:` definition naming the column (a definition left on the old
+        // name made the reopen register its index over a column that no longer
+        // exists, spec P1.1b), the missing value, every constraint record that
+        // names it (its own and other tables' foreign keys) and the identity
+        // record, each with its logical-WAL entry. Published after the write, the
+        // live ART entries first, then the schema, then the constraints, so the
+        // UNIQUE rule is never bound to a name the published schema does not have.
+        let mut ddl = storage::DdlBatch::new(&self.storage);
+        {
+            let storage = &self.storage;
+            let table = table_name.to_string();
+            let old = old_column_name.to_string();
+            let new = new_column_name.to_string();
+            ddl.on_commit(move || {
+                let repointed = storage.art_indexes().rename_column_in_indexes(&table, &old, &new);
+                if !repointed.is_empty() {
+                    tracing::debug!(
+                        "Repointed {} live index(es) of '{}' from column '{}' to '{}': {:?}",
+                        repointed.len(),
+                        table,
+                        old,
+                        new,
+                        repointed
+                    );
+                }
+            });
+        }
+        let rewritten =
+            catalog.stage_column_rename_in_schema(table_name, &schema, old_column_name, new_column_name, &mut ddl)?;
         if !rewritten.is_empty() {
             tracing::debug!(
                 "Rewrote {} index definition(s) of '{}' from column '{}' to '{}': {:?}",
@@ -17314,22 +17391,8 @@ impl EmbeddedDatabase {
                 rewritten
             );
         }
-
-        catalog.rename_column_in_constraints(table_name, old_column_name, new_column_name)?;
-        let repointed =
-            self.storage
-                .art_indexes()
-                .rename_column_in_indexes(table_name, old_column_name, new_column_name);
-        if !repointed.is_empty() {
-            tracing::debug!(
-                "Repointed {} live index(es) of '{}' from column '{}' to '{}': {:?}",
-                repointed.len(),
-                table_name,
-                old_column_name,
-                new_column_name,
-                repointed
-            );
-        }
+        catalog.stage_column_rename_in_constraints(table_name, old_column_name, new_column_name, &mut ddl)?;
+        ddl.commit()?.wait_replicated();
 
         tracing::info!(
             "Renamed column '{}' to '{}' in table '{}'",
@@ -20343,6 +20406,13 @@ impl EmbeddedDatabase {
             }
             return Ok(plan);
         }
+        // Spec R5.3: the text family's pre-parses of the DDL sqlparser has no grammar
+        // for and the executor runs: `REFRESH`, `DROP` and `ALTER MATERIALIZED VIEW`,
+        // `ALTER SEQUENCE`. Sent over the extended protocol (or REST), each failed to
+        // parse. Not cached (rare DDL).
+        if let Some(plan) = Self::try_preparse_executor_ddl(sql)? {
+            return Ok(std::sync::Arc::new(plan));
+        }
 
         let plan_generation = self.storage.schema_generation();
         let (statement, _) = self.parse_cached(sql)?;
@@ -20364,6 +20434,38 @@ impl EmbeddedDatabase {
             self.plan_cache_put_if_current(cache_key, std::sync::Arc::clone(&plan), plan_generation);
         }
         Ok(plan)
+    }
+
+    /// Spec R5.3: the params family's share of the text family's pre-parses
+    /// (`execute_in_transaction_inner_body`): the statements sqlparser has no grammar
+    /// for whose plan the `Executor` runs, so the params family's catch-all reaches
+    /// it. A cheap first-word gate keeps the hot path to one comparison.
+    fn try_preparse_executor_ddl(sql: &str) -> Result<Option<sql::LogicalPlan>> {
+        let head = sql.trim_start();
+        if starts_with_icase(head, "REFRESH") && sql::Parser::is_refresh_materialized_view(sql) {
+            let (name, concurrent, incremental) = sql::Parser::parse_refresh_materialized_view_sql(sql)?;
+            return Ok(Some(sql::LogicalPlan::RefreshMaterializedView {
+                name,
+                concurrent,
+                incremental,
+            }));
+        }
+        if starts_with_icase(head, "DROP") && sql::Parser::is_drop_materialized_view(sql) {
+            let (name, if_exists) = sql::Parser::parse_drop_materialized_view_sql(sql)?;
+            return Ok(Some(sql::LogicalPlan::DropMaterializedView { name, if_exists }));
+        }
+        if starts_with_icase(head, "ALTER") {
+            if sql::Parser::is_alter_materialized_view(sql) {
+                let (name, options) = sql::Parser::parse_alter_materialized_view_sql(sql)?;
+                return Ok(Some(sql::LogicalPlan::AlterMaterializedView { name, options }));
+            }
+            if sql::Parser::is_alter_sequence(sql) {
+                return Ok(Some(sql::LogicalPlan::AlterSequence(
+                    sql::Parser::parse_alter_sequence(sql)?,
+                )));
+            }
+        }
+        Ok(None)
     }
 
     /// The plan [`Self::parameterized_plan_cached`] would answer from its

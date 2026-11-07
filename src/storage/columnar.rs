@@ -672,6 +672,10 @@ impl ColumnarStore {
             write_batch.put(Self::presence_key(table, *batch_id), data);
         }
         write_batch.put(Self::presence_marker_key(table), [1u8]);
+        // Spec R5.3: a read path's lazy backfill, which a schema statement's scan
+        // can reach: derived data that describes the rows already there, and that
+        // no reader's answer depends on (a missing record re-backfills).
+        let _derived = super::ddl_batch::allow_side_write(super::ddl_batch::COLUMNAR_LAZY_BACKFILL);
         gate.write(db, write_batch, None)
             .map_err(|e| Error::storage(format!("Columnar presence backfill failed: {}", e)))?;
         Ok(built)
@@ -1001,6 +1005,9 @@ impl ColumnarStore {
                 let stats = BatchStats::from_batch(batch);
                 match tb::encode_column_batch(batch, &stats) {
                     Ok(encoded) => {
+                        // Spec R5.3: see `backfill_presence_locked`: the same batch,
+                        // re-encoded.
+                        let _derived = super::ddl_batch::allow_side_write(super::ddl_batch::COLUMNAR_LAZY_BACKFILL);
                         if let Err(e) = gate.put(db, &key, encoded, None) {
                             tracing::warn!(table, column, batch_id, error = %e, "Batch v2 migration write failed");
                         }
@@ -1235,6 +1242,8 @@ impl ColumnarStore {
             // Every batch now has a sidecar entry: record manifest completeness
             // (best-effort; reads work either way).
             let _guard = stats_write_lock();
+            // Spec R5.3: see `backfill_presence_locked`.
+            let _derived = super::ddl_batch::allow_side_write(super::ddl_batch::COLUMNAR_LAZY_BACKFILL);
             if let Err(e) = gate.put(db, Self::stats_marker_key(table, column), [1u8], None) {
                 tracing::warn!(table = table, column = column, error = %e, "Zone-stats marker write failed");
             }
@@ -1267,6 +1276,8 @@ impl ColumnarStore {
         let batch = super::typed_batch::decode_column_batch(&data)?;
         let stats_data = bincode::serialize(&BatchStats::from_batch(&batch))
             .map_err(|e| Error::storage(format!("Columnar stats serialize failed: {}", e)))?;
+        // Spec R5.3: see `backfill_presence_locked`.
+        let _derived = super::ddl_batch::allow_side_write(super::ddl_batch::COLUMNAR_LAZY_BACKFILL);
         gate.put(db, &stats_key, &stats_data, None)
             .map_err(|e| Error::storage(format!("Columnar stats store failed: {}", e)))
     }

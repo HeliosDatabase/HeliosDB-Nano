@@ -914,7 +914,10 @@ impl WriteAheadLog {
     /// The entry is written to RocksDB with a special WAL prefix.
     /// If sync_mode is Sync, the write is fsynced immediately.
     /// If sync_mode is GroupCommit, the write is queued and batched.
+    #[track_caller]
     pub fn append(&self, operation: WalOperation) -> Result<u64> {
+        // Spec R5.3: a schema statement logs through its DdlBatch.
+        super::ddl_batch::check_wal_append(&self.gate, std::panic::Location::caller());
         // Inside a statement-capture frame the entry is buffered and written with the
         // transaction's own commit batch (see `statement_capture`).
         let Some(operation) = statement_capture::offer(self.capture_id(), operation, true) else {
@@ -969,7 +972,10 @@ impl WriteAheadLog {
 
     /// Append a WAL entry without fsync (for DDL operations where metadata
     /// is already crash-safe in RocksDB). Saves ~1ms per DDL operation.
+    #[track_caller]
     pub fn append_nosync(&self, operation: WalOperation) -> Result<u64> {
+        // Spec R5.3: a schema statement logs through its DdlBatch.
+        super::ddl_batch::check_wal_append(&self.gate, std::panic::Location::caller());
         let Some(operation) = statement_capture::offer(self.capture_id(), operation, false) else {
             return Ok(0);
         };
@@ -1064,12 +1070,15 @@ impl WriteAheadLog {
     /// Append `operation` together with the caller's data `batch` in ONE write, so
     /// the entry exists exactly when the data does. Inside a statement-capture frame
     /// the data is written now and the entry is deferred to the transaction commit.
+    #[track_caller]
     pub fn append_with_batch(
         &self,
         operation: WalOperation,
         mut batch: WriteBatch,
         options: Option<&WriteOptions>,
     ) -> Result<u64> {
+        // Spec R5.3: a schema statement's writes are its DdlBatch's one commit.
+        super::ddl_batch::check_wal_append(&self.gate, std::panic::Location::caller());
         let write = |batch: WriteBatch| -> Result<()> {
             self.gate
                 .write(&self.db, batch, options)

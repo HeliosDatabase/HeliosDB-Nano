@@ -6980,6 +6980,7 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     // statement the transaction's own staged rows cannot follow.
     if message.contains(crate::error::ROW_DESCRIPTION_MISMATCH_MARKER)
         || message.contains(crate::error::DDL_OVER_STAGED_ROWS_MARKER)
+        || message.contains(crate::error::EXPLAIN_ANALYZE_UNSUPPORTED_MARKER)
     {
         return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
     }

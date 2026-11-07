@@ -252,32 +252,43 @@ impl<'a> MaterializedViewCatalog<'a> {
             )));
         }
 
-        // Delete metadata
+        // Spec R5.3: the view's record, its data table (MV results are stored as a
+        // regular table) and both logical-WAL entries are ONE write group: no
+        // reader, standby or crash sees the view without its rows or the rows
+        // without the view.
         let key = Self::mv_metadata_key(view_name);
-        self.storage.delete(&key)?;
-
-        // GH#36: represent the drop. The backing table's own `DropTable` entry
-        // comes from `Catalog::drop_table`; this names the VIEW.
-        if let Err(e) = self.storage.log_drop_materialized_view(view_name) {
-            tracing::warn!("Failed to log DROP MATERIALIZED VIEW '{}' to WAL: {}", view_name, e);
-        }
-
-        // Delete the data table (MV results are stored as a regular table)
         let data_table = Self::mv_data_table_name(view_name);
         let catalog = self.storage.catalog();
-        if catalog.table_exists(&data_table)? {
-            catalog.drop_table(&data_table)?;
-        }
-
+        let mut ddl = super::DdlBatch::new(self.storage);
+        ddl.delete(&key);
+        // GH#36: represent the drop. The backing table's own `DropTable` entry
+        // comes from the table's drop; this names the VIEW.
+        ddl.log(super::WalOperation::DropMaterializedView {
+            name: view_name.to_string(),
+        });
+        let dropped = if catalog.main_table_exists(&data_table)? {
+            catalog.stage_drop_table(&data_table, &[], &mut ddl)?;
+            vec![data_table]
+        } else {
+            Vec::new()
+        };
+        catalog.stage_dropped_tables_sidecar_purge(&dropped, &mut ddl);
         // W1.3: the view no longer exists; bump so the existence cache
-        // recomputes this name to `Missing`.
-        self.storage.bump_schema_generation();
-
-        // Invalidate schema cache for the view name itself (may have been cached
-        // by catalog.get_table_schema() which falls back to MV lookup). After the
-        // bump (R5 decision 11): a reader's fill either ran already, and is removed
-        // here, or finds the generation moved and is refused.
-        self.storage.invalidate_schema_cache(view_name);
+        // recomputes this name to `Missing`. Then the schema cache of the view
+        // name itself (it may have been cached by catalog.get_table_schema(),
+        // which falls back to MV lookup), after the bump (R5 decision 11): a
+        // reader's fill either ran already, and is removed here, or finds the
+        // generation moved and is refused.
+        {
+            let storage = self.storage;
+            let view = view_name.to_string();
+            ddl.on_commit(move || {
+                storage.bump_schema_generation();
+                storage.invalidate_schema_cache(&view);
+            });
+        }
+        ddl.commit()?.wait_replicated();
+        catalog.finish_dropped_table_history(&dropped);
 
         tracing::info!("Successfully dropped materialized view '{}'", view_name);
         Ok(())
@@ -378,6 +389,127 @@ impl<'a> MaterializedViewCatalog<'a> {
             view_name
         );
         Ok(row_count)
+    }
+
+    /// Spec R5.3: a refresh of `view_name` as ONE write group — every current row
+    /// of its data table deleted, every new row inserted under a fresh row id (never
+    /// one reused), the refreshed `meta:mv:` record (`refreshed`, which the caller
+    /// marked) and the logical-WAL entries (each row's, then `refresh`), all in one
+    /// autocommit transaction's commit, whose versions and delete events keep `AS
+    /// OF` and snapshot reads of the view right. A reader sees the old rows or the
+    /// new ones, never an empty or a partial view, and a crash keeps one or the
+    /// other. It used to drop the data table, purge it, create it again and insert
+    /// row by row (each row its own groups, its own `snapshot:` record), so a
+    /// killed refresh left a partial view, and of a refresh of more than 1000 rows
+    /// only the last 1000 snapshot records survived a restart. `CONCURRENTLY`, the
+    /// auto-refresh worker and the scheduler take the same path.
+    ///
+    /// No `Refreshed` shape record (`Catalog::record_materialized_view_refresh`): the
+    /// replaced rows keep their versions and get delete events, and the new rows are
+    /// versioned at the refresh, so a branch anchored before it reads the view as it
+    /// was at the anchor (`StorageEngine::materialize_branch_anchor`). Only the paths
+    /// that still replace the data table write the record and refuse such an anchor.
+    ///
+    /// `Ok(None)` when the data table is one this cannot rewrite in place, and the
+    /// caller refreshes it as before ([`Self::store_view_data`]): it does not exist,
+    /// its row layout is not the refresh's, a column has a storage mode (its rows
+    /// are encoded through it), or it has an index (whose keys a refresh would have
+    /// to judge row by row). A view's data table has none of these after `CREATE
+    /// MATERIALIZED VIEW` of a query with a projection or an aggregate.
+    pub fn refresh_view_in_one_group(
+        &self,
+        view_name: &str,
+        tuples: &[Tuple],
+        schema: &Schema,
+        refreshed: &MaterializedViewMetadata,
+        refresh: super::WalOperation,
+    ) -> Result<Option<u64>> {
+        self.storage.refuse_statement_on_branch("REFRESH MATERIALIZED VIEW")?;
+        let data_table = Self::mv_data_table_name(view_name);
+        // Spec R5.1: the data table's rows are rewritten whole, by a statement or by
+        // the scheduler's worker, which both come through here: they serialize on this
+        // lock, as does whatever else writes the table.
+        let _table_lock = self.storage.lock_tables_exclusive(
+            super::table_locks::MAIN_LEVEL,
+            &[data_table.as_str()],
+            "REFRESH MATERIALIZED VIEW",
+        )?;
+        let catalog = self.storage.catalog();
+        if !catalog.main_table_exists(&data_table)? {
+            return Ok(None);
+        }
+        let current = catalog.main_table_schema(&data_table)?;
+        let same_layout = current.columns.len() == schema.columns.len()
+            && current.columns.iter().zip(schema.columns.iter()).all(|(have, want)| {
+                have.name == want.name
+                    && have.data_type == want.data_type
+                    && have.storage_mode == crate::ColumnStorageMode::Default
+                    && want.storage_mode == crate::ColumnStorageMode::Default
+            });
+        if !same_layout
+            || !self.storage.art_indexes().list_table_indexes(&data_table).is_empty()
+            || self.storage.vector_indexes().table_has_indexes(&data_table)
+        {
+            return Ok(None);
+        }
+
+        let txn = self.storage.begin_autocommit_transaction()?;
+        let prefix = format!("data:{}:", data_table);
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward),
+            read_opts,
+        );
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            if StorageEngine::parse_row_id_after_prefix(&key, prefix.len()).is_none() {
+                continue;
+            }
+            let key = key.to_vec();
+            txn.log_on_commit(super::WalOperation::Delete {
+                table: data_table.clone(),
+                key: key.clone(),
+            });
+            txn.delete(key)?;
+        }
+        let row_count = tuples.len() as u64;
+        for tuple in tuples {
+            let row_id = self.storage.next_row_id_volatile(&data_table);
+            let key = format!("data:{}:{}", data_table, row_id).into_bytes();
+            let value =
+                bincode::serialize(tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            txn.log_on_commit(super::WalOperation::Insert {
+                table: data_table.clone(),
+                key: key.clone(),
+                tuple: value.clone(),
+            });
+            txn.put(key, value)?;
+            txn.stage_row_counter(&data_table, row_id)?;
+        }
+        // The `meta:mv:` record, sealed as `StorageEngine::put` seals it (the commit
+        // writes a staged `meta:` value verbatim).
+        let metadata = bincode::serialize(refreshed)
+            .map_err(|e| Error::storage(format!("Failed to serialize MV metadata: {}", e)))?;
+        let sealed = super::tde::seal(self.storage.key_manager_ref(), &metadata)?.into_owned();
+        txn.put(Self::mv_metadata_key(view_name), sealed)?;
+        txn.log_on_commit(refresh);
+        txn.commit()?;
+
+        // Readers use `schema_generation` as the "something changed outside my
+        // handle" signal for their result caches
+        // (`EmbeddedDatabase::reconcile_result_cache_with_storage`); bumped once the
+        // new rows are in place.
+        self.storage.bump_schema_generation();
+        tracing::info!(
+            "Refreshed materialized view '{}' with {} rows in one write group",
+            view_name,
+            row_count
+        );
+        Ok(Some(row_count))
     }
 
     /// Store materialized view data concurrently (zero downtime refresh)

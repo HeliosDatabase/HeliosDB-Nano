@@ -535,6 +535,19 @@ pub struct ArtIndexManager {
     table_indexes: RwLock<HashMap<String, Vec<String>>>,
     /// Statistics
     stats: AtomicArtManagerStats,
+    /// Spec R5 decision 7 (R5.3): indexes a `CREATE INDEX` is building, by name,
+    /// each with how many statements hold it hidden. Writers maintain a hidden index
+    /// (it is a registered index like any other), and the lookups that choose an
+    /// index for a read skip it ([`Self::find_column_index`],
+    /// [`Self::index_covering_columns`]), so a reader never takes an index whose
+    /// backfill has not finished for the whole truth (it used to answer 0 rows
+    /// while one ran). It becomes visible in the statement's publication, after its
+    /// durable group. A count, so two statements racing on one name cannot reveal
+    /// each other's.
+    hidden: RwLock<HashMap<String, usize>>,
+    /// How many names [`Self::hidden`] holds: the read path's one load while no
+    /// index is being built.
+    hidden_names: AtomicU64,
     /// R4.2 durable-snapshot validity tracking. `true` means the persisted
     /// snapshot markers (if any) still describe the current in-memory state.
     /// The FIRST mutation after a checkpoint flips it and fires
@@ -598,6 +611,8 @@ impl ArtIndexManager {
             fk_info: RwLock::new(HashMap::new()),
             unique_indexes: RwLock::new(HashMap::new()),
             table_indexes: RwLock::new(HashMap::new()),
+            hidden: RwLock::new(HashMap::new()),
+            hidden_names: AtomicU64::new(0),
             stats: AtomicArtManagerStats::default(),
             // Armed at startup: markers from a previous clean shutdown must
             // be invalidated by the first mutation of this process.
@@ -1053,6 +1068,29 @@ impl ArtIndexManager {
         columns: &[String],
         constraint_label: Option<&str>,
     ) -> ArtResult<String> {
+        self.create_constraint_unique_index_inner(table, columns, constraint_label, false)
+    }
+
+    /// Spec R5.3: [`Self::create_constraint_unique_index`], registered HIDDEN
+    /// ([`Self::hide_index`]) in the same critical section that mints its name, so no
+    /// reader takes it before its backfill and its statement's durable group. The
+    /// caller reveals it ([`Self::reveal_index`]) once.
+    pub(crate) fn create_constraint_unique_index_hidden(
+        &self,
+        table: &str,
+        columns: &[String],
+        constraint_label: Option<&str>,
+    ) -> ArtResult<String> {
+        self.create_constraint_unique_index_inner(table, columns, constraint_label, true)
+    }
+
+    fn create_constraint_unique_index_inner(
+        &self,
+        table: &str,
+        columns: &[String],
+        constraint_label: Option<&str>,
+        hidden: bool,
+    ) -> ArtResult<String> {
         self.note_mutation();
         let base = Self::unique_index_name(table, columns);
 
@@ -1068,6 +1106,11 @@ impl ArtIndexManager {
             IndexNamePolicy::MintFree,
             || format!("Constraint index for {}({})", table, columns.join(", ")),
             |name| {
+                // Inside the registration's critical section (lock order: `indexes`,
+                // then `hidden`, as the read path takes them).
+                if hidden {
+                    self.hide_index(name);
+                }
                 let tree = AdaptiveRadixTree::new(name, table, columns_owned, ArtIndexType::Unique);
                 // A label identical to the key carries no information; keeping it
                 // `None` there means the violation text is byte-for-byte what it
@@ -1688,6 +1731,38 @@ impl ArtIndexManager {
         crate::lock_census::rwlock_read(crate::lock_census::Site::ArtPkRegistry, &self.pk_indexes)
     }
 
+    /// Spec R5.3 (decision 7): hold `name` hidden from the read path's index
+    /// choice until a matching [`Self::reveal_index`]. Called BEFORE the index is
+    /// registered, so no reader can take it in between.
+    pub(crate) fn hide_index(&self, name: &str) {
+        let mut hidden = self.hidden.write().unwrap_or_else(|e| e.into_inner());
+        let held = hidden.entry(name.to_string()).or_insert(0);
+        if *held == 0 {
+            self.hidden_names.fetch_add(1, Ordering::SeqCst);
+        }
+        *held += 1;
+    }
+
+    /// Spec R5.3: end one [`Self::hide_index`] of `name`.
+    pub(crate) fn reveal_index(&self, name: &str) {
+        let mut hidden = self.hidden.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = hidden.get_mut(name) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                hidden.remove(name);
+                self.hidden_names.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Whether a statement holds `name` hidden. One load while none is.
+    pub fn is_index_hidden(&self, name: &str) -> bool {
+        if self.hidden_names.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        self.hidden.read().unwrap_or_else(|e| e.into_inner()).contains_key(name)
+    }
+
     /// Get a shared handle to an index by name.
     ///
     /// Returns an `Arc<RwLock<…>>` handle instead of cloning the whole tree.
@@ -1750,12 +1825,14 @@ impl ArtIndexManager {
     }
 
     /// Find an index for a specific column in a table (returns index name if found)
+    ///
+    /// Spec R5.3: never one a `CREATE INDEX` is still building ([`Self::hide_index`]).
     pub fn find_column_index(&self, table: &str, column: &str) -> Option<String> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         for (name, entry) in indexes.iter() {
             if entry.table == table && entry.columns.len() == 1 {
                 if let Some(col) = entry.columns.first() {
-                    if col == column {
+                    if col == column && !self.is_index_hidden(name) {
                         return Some(name.clone());
                     }
                 }
@@ -2915,6 +2992,10 @@ impl ArtIndexManager {
         let mut best: Option<(u8, &String, &IndexEntry)> = None;
         for (name, entry) in indexes.iter() {
             if entry.table != table || !Self::column_sets_match(&entry.columns, columns) {
+                continue;
+            }
+            // Spec R5.3: an index still being built answers for none of its rows yet.
+            if self.is_index_hidden(name) {
                 continue;
             }
             let rank = match entry.index_type {

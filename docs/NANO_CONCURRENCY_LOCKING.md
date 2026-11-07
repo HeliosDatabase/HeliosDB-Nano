@@ -148,3 +148,44 @@ Separate from the row-level `LockManager` above, and what writers see during DDL
   snapshot, and if a merge changed a row it wrote, its COMMIT gets 40001.
 
 With no DDL or merge running, a write pays one atomic load and the bookkeeping of its own lock set, and allocates nothing.
+
+## One write group per schema statement (R5.3)
+
+Spec: `docs/plans/specs/R5_3_ddl_batch.md`. A schema statement stages everything it makes durable in one batch
+(`storage::DdlBatch`) and writes it with ONE RocksDB write: the catalog records, the rows it moves or deletes, its
+logical-WAL entries, and the copies a live child branch takes of what it changes. So a reader, a physical standby (which
+applies the primary's write groups one by one), a branch fork and a crash all see the statement entirely or not at all.
+
+- **Converted** (one group, both executor families where the statement parses on both): `CREATE TABLE` (schema, counter,
+  incarnation, constraints, identity, partition link), `DROP TABLE` with the partition children it cascades to,
+  `ALTER TABLE … RENAME TO` (with its index definitions and triggers), `RENAME COLUMN` (with the constraint records that
+  name the column, other tables' foreign keys included), `CREATE [UNIQUE] INDEX` (every kind), `DROP INDEX`, `ADD CONSTRAINT …
+  UNIQUE | FOREIGN KEY`, `DROP CONSTRAINT`, `ALTER COLUMN … DROP NOT NULL`, `CREATE`/`DROP VIEW`, `CREATE`/`DROP FUNCTION`, `CREATE`/`DROP PROCEDURE`, `CREATE`/`DROP TRIGGER`,
+  `CREATE`/`ALTER`/`DROP SEQUENCE`, `REFRESH MATERIALIZED VIEW` (plain, `CONCURRENTLY`, and the auto-refresh worker's),
+  `DROP MATERIALIZED VIEW`.
+- **Publication after the write.** The in-memory state a statement changes (schema and constraint caches, the function,
+  trigger and index registries) is published after its group is durable, in the order the statement queued it; a write
+  that fails publishes nothing and takes back what the statement registered while it ran.
+- **A new index is hidden while it is built.** `CREATE INDEX` and `ADD CONSTRAINT … UNIQUE` register the index hidden:
+  writers maintain it (they are kept out by the writer lock anyway), the read path's index choice skips it, and it becomes
+  visible after its group. A reader used to take it while its backfill ran and get no rows.
+- **TRUNCATE** clears the table's index trees once its commit has written the deletes, not before.
+- **`REFRESH MATERIALIZED VIEW`** deletes every row and inserts the new ones in one transaction with the refreshed record:
+  readers see the old rows or the new ones, never an empty or a partial view, and a refresh of any size writes one
+  `snapshot:` record. A data table that has an index, a column storage mode, or a layout that is not the refresh's is
+  still refreshed the old way (several groups).
+- **The ceiling.** A write group above what a standby can receive (`MAX_BATCH_BYTES`, about 4 GiB) is refused before it
+  is written, SQLSTATE 54000, whatever made it: a schema statement, a transaction's commit, a branch freeze.
+- **Still more than one group** (and why): `CREATE TABLE … AS`, `CREATE MATERIALIZED VIEW` (the catalog half and the rows
+  half; one group needs the DDL batch to ride the statement's transaction commit, which comes with the DML step), `CREATE
+  SCHEMA` with elements (each element is a statement of its own), a multi-clause `ALTER TABLE` (each clause is one group),
+  `ADD`/`DROP COLUMN` (spec R5.2: one group for the schema; a volatile default's rewrite in the same group), `DROP
+  CONSTRAINT` of a single-column `UNIQUE` that also set the column's flag (the flag's schema rewrite is a second group),
+  `DROP TABLE a, b` (one group per table), `ALTER COLUMN … SET STORAGE` (its row migration), `CREATE`/`DROP ROLE`, `GRANT`/`REVOKE` over several objects, `CREATE DATABASE
+  BRANCH`. A persistent HNSW index keeps its own writes before its definition, and a dropped one's keyspace is purged after
+  (a dangling id is filtered on read).
+- **The detector.** While a batch is open on a thread, a write of the same store that is not its commit is a finding:
+  test builds panic naming the writer, release builds count it and warn once per site. What may write apart, and why: the
+  index-snapshot invalidation (derived markers), a dropped name's version-history purge (a name that is no table), a
+  branch's frozen copy of a definition it already reads, a columnar read's lazy backfill (derived side data), and a
+  persistent HNSW graph (above).
