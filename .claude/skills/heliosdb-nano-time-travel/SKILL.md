@@ -82,6 +82,7 @@ heliosdb> \snapshots
    …
 heliosdb> \show lsn      -- toggles LSN column in subsequent SELECTs
 ```
+`\snapshots` lists the snapshots kept in memory, the newest ones; on a busy store it says that older ones exist, which `AS OF` still reaches.
 
 ### Recipe 5: Use a system view for snapshot inventory
 ```sql
@@ -90,7 +91,8 @@ SELECT * FROM pg_vector_index_stats();     -- vector index health
 ```
 
 ## Pitfalls
-- **Snapshot retention is finite**. Configurable in `[storage]` (TOML config). Once a snapshot ages out, `AS OF` for that timestamp returns "snapshot not available".
+- **Retention is `storage.version_retention`** (`[storage]` in the TOML config: seconds or `"90s"`, `"15m"`, `"24h"`, `"7d"`, `"2w"`). `AS OF` (and `CREATE BRANCH … AS OF`) reaches any time inside it, however many commits followed. Older than it, once the version GC has run, `AS OF` is refused (the version-GC low watermark error, or "No snapshot at or before …" once that snapshot's record is gone too). The default is infinite: no history is ever collected, and the `snapshot:` records `AS OF` resolves a time through grow by one per commit (about 60 bytes each), on top of the row versions themselves, until `version_retention` is set.
+- **`\snapshots` and `pg_snapshots` list only the snapshots kept in memory** (the newest 1000 to 2000). On a busy store older ones are not listed, and `\snapshots` says so; `AS OF` still reaches them.
 - **`AS OF` reads from the version chain (MVCC)**, not from a separate copy. Heavy churn between then and now means more chain walking.
 - **`AS OF` on a session bound to a branch is refused (`0A000`)**, whichever way it is spelled, `COUNT(*)` too: only main has history. To work with main as it was, create a branch anchored there (`heliosdb-nano-branches`), which is refused itself when a `DROP COLUMN`, `RENAME COLUMN`, `SET STORAGE`, `RENAME TO` or materialized view `REFRESH` ran since.
 - **A table's history goes with its name.** `DROP TABLE` and `RENAME TO` delete its versions, so a later table of the name does not read them as its own. So `AS OF` on main is wrong for a time before a rename, also after renaming back: a row written since the rename reads as not created yet at any time before that write (it is missing), and a row not written since reads as it is now. Nothing refuses this yet; a branch anchored there is refused, and a later release refuses the query too. A crash part way through the deletion leaves no table of the name, and the next open finishes it.

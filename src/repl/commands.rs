@@ -1598,6 +1598,16 @@ impl MetaCommand {
                         .collect();
                     println!("{}", formatter::format_results(&rows, &schema));
                 }
+                // Only the snapshots kept in memory are listed; say so when
+                // there are older ones `AS OF` still reaches.
+                if db.storage.snapshot_manager().has_snapshots_beyond_memory() {
+                    println!(
+                        "{}",
+                        "Only the newest snapshots, the ones kept in memory, are listed; AS OF also reaches \
+                         the older ones inside storage.version_retention."
+                            .dimmed()
+                    );
+                }
                 println!(
                     "{}",
                     "Time-travel: SELECT * FROM <t> AS OF TIMESTAMP '...' | AS OF TRANSACTION <tx>".dimmed()

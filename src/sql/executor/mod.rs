@@ -3665,16 +3665,18 @@ impl<'a> Executor<'a> {
                     let modified_exprs: Vec<LogicalExpr> = exprs
                         .iter()
                         .enumerate()
-                        .map(|(i, expr)| {
-                            if window_indices.contains_key(&i) {
-                                // Reference the appended window column by name
-                                LogicalExpr::Column {
-                                    table: None,
-                                    name: aliases.get(i).cloned().unwrap_or_default(),
-                                }
-                            } else {
-                                expr.clone()
-                            }
+                        .map(|(i, expr)| match window_indices.get(&i) {
+                            // Reference the appended window column by POSITION. By
+                            // name, two window calls that share an output name
+                            // (`count(*) OVER (ORDER BY id), count(*) OVER ()` are
+                            // `count` both) both read the first one's column, and a
+                            // window call named like an input column read that.
+                            Some(&k) => LogicalExpr::BoundColumn {
+                                index: input_col_count + k,
+                                table: None,
+                                name: aliases.get(i).cloned().unwrap_or_default(),
+                            },
+                            None => expr.clone(),
                         })
                         .collect();
 

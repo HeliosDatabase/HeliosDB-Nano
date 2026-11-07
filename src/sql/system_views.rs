@@ -445,7 +445,9 @@ impl SystemViewRegistry {
         self.register(SystemView {
             name: "pg_snapshots".to_string(),
             category: ViewCategory::Feature,
-            description: "Lists all time-travel snapshots (HeliosDB extension)".to_string(),
+            description: "Lists the time-travel snapshots kept in memory, the newest ones; AS OF also reaches \
+                          older snapshots inside storage.version_retention (HeliosDB extension)"
+                .to_string(),
             schema: Schema {
                 columns: vec![
                     Column::new("snapshot_id", DataType::Int8),
@@ -463,7 +465,9 @@ impl SystemViewRegistry {
         self.register(SystemView {
             name: "pg_transaction_map".to_string(),
             category: ViewCategory::Feature,
-            description: "Maps transaction IDs to snapshot timestamps (HeliosDB extension)".to_string(),
+            description: "Maps transaction IDs to snapshot timestamps, for the snapshots kept in memory \
+                          (HeliosDB extension)"
+                .to_string(),
             schema: Schema {
                 columns: vec![
                     Column::new("transaction_id", DataType::Int8),
@@ -478,7 +482,9 @@ impl SystemViewRegistry {
         self.register(SystemView {
             name: "pg_scn_map".to_string(),
             category: ViewCategory::Feature,
-            description: "Maps SCN values to snapshot timestamps (HeliosDB extension)".to_string(),
+            description: "Maps SCN values to snapshot timestamps, for the snapshots kept in memory \
+                          (HeliosDB extension)"
+                .to_string(),
             schema: Schema {
                 columns: vec![
                     Column::new("scn", DataType::Int8),
