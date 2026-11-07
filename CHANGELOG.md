@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — every catalog DDL statement is one write group (spec R5.3)
+
+A schema statement wrote several RocksDB write groups (`CREATE TABLE` four, `RENAME TO` six,
+`REFRESH MATERIALIZED VIEW` one per row and more). A crash between them left a half-made catalog,
+and a reader, a physical standby (which applies the primary's groups one by one) or a branch fork
+in between saw one. Each of these statements now stages everything it makes durable — catalog
+records, moved or deleted rows, its logical-WAL entries, a live branch's frozen copies — and writes
+it once; the caches and registries it changes are published after that write, and a write that
+fails publishes nothing and takes back what the statement registered:
+
+- `CREATE TABLE` with its constraints, identity record and partition link. A crash used to be
+  able to leave the table without its CHECK, FOREIGN KEY or UNIQUE records.
+- `DROP TABLE` together with every partition child it cascades to.
+- `ALTER TABLE … RENAME TO` with its index definitions and triggers: a kill 14-30 ms in left the
+  renamed table without its secondary indexes and its trigger.
+- `ALTER TABLE … RENAME COLUMN` with every constraint record naming the column (other tables'
+  foreign keys included); `ALTER COLUMN … DROP NOT NULL`.
+- `CREATE [UNIQUE] INDEX` (every kind) and `DROP INDEX`; `ADD CONSTRAINT … UNIQUE | FOREIGN KEY`
+  and `DROP CONSTRAINT`.
+- `CREATE`/`DROP VIEW`, `FUNCTION`, `PROCEDURE`, `TRIGGER`; `CREATE`/`ALTER`/`DROP SEQUENCE`.
+  A trigger whose record could not be written used to be accepted anyway (and be gone at the next
+  restart); the statement now fails. `ALTER SEQUENCE … RESTART` out of bounds used to leave the
+  ALTER's new definition behind; it is now refused before anything is written.
+- `REFRESH MATERIALIZED VIEW` (plain, `CONCURRENTLY`, the auto-refresh worker's) deletes every row
+  and inserts the new ones in one transaction with the refreshed record: a reader never sees an
+  empty or a partial view (it saw 48 to 1018 of 2000 rows), a killed refresh keeps the old rows or
+  the new ones, and a refresh of any size writes one `snapshot:` record (one per row before, of
+  which only the last 1000 survived a restart). The rows keep their history, so a branch anchored
+  before such a refresh is no longer refused: it reads the view as it was at the anchor. A view's
+  data table with an index or a column storage mode is still refreshed the old way (and an anchor
+  before that refresh is still refused). `DROP MATERIALIZED VIEW` is one group too.
+
+Also:
+
+- **A new index is invisible to queries until it is complete.** `CREATE INDEX` and `ADD CONSTRAINT …
+  UNIQUE` register it hidden — writers maintain it, the read path's index choice skips it — and it
+  becomes visible after its write. A query during the backfill used to take the empty index and
+  return no rows.
+- **`TRUNCATE` clears the table's index trees after its commit**, not at the statement: a failed
+  commit left the rows with empty trees.
+- **`REFRESH`, `DROP` and `ALTER MATERIALIZED VIEW` and `ALTER SEQUENCE` run over the extended
+  protocol** (and REST); they did not parse there.
+- **`EXPLAIN ANALYZE TRUNCATE` is refused** (`0A000`): it deleted the rows at once, apart from the
+  statement's transaction, so `BEGIN; EXPLAIN ANALYZE TRUNCATE t; ROLLBACK` emptied `t` for good.
+  PostgreSQL has no `EXPLAIN` of `TRUNCATE`.
+- **A write group a standby could never receive is refused before it is written** (`54000`): above
+  `MAX_BATCH_BYTES` (about 4 GiB), whatever made it — a schema statement, a transaction's commit,
+  a branch freeze. It used to be written, and every standby then stopped at it for good.
+- Still more than one group (documented in `docs/NANO_CONCURRENCY_LOCKING.md`): `CREATE TABLE … AS`,
+  `CREATE MATERIALIZED VIEW`, `CREATE SCHEMA` with elements, a multi-clause `ALTER TABLE`, `ADD` /
+  `DROP COLUMN`, `SET STORAGE`, `DROP TABLE a, b`, roles and grants, `CREATE DATABASE BRANCH`.
+
 ### Added — `heliosdb-nano standby verify` (spec R1 §1)
 
 Proves that a STOPPED physical standby is byte-identical to its primary: the primary pins

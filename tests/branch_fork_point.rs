@@ -2087,11 +2087,13 @@ fn a_schema_with_elements_is_wholly_before_or_after_a_fork() {
     }
 }
 
-/// The review's N3. A `REFRESH` replaces the view's rows and keeps no history of them, so a
-/// branch anchored before it read the view as empty. Refused, naming the view; past the
-/// refresh it reads what the view held.
+/// The review's N3. A `REFRESH` that replaced the view's data table kept no history of
+/// the rows it replaced, so a branch anchored before it read the view as empty. Since spec
+/// R5.3 a refresh rewrites the rows in place, in one transaction whose delete events and
+/// versions are the view's history: a branch anchored before it reads the view as it was
+/// at the anchor, and one anchored after, as the refresh left it.
 #[test]
-fn an_anchor_before_a_refresh_is_refused_naming_the_view() {
+fn an_anchor_before_a_refresh_reads_the_view_as_it_was() {
     for concurrent in [false, true] {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         shaped(&db);
@@ -2099,6 +2101,55 @@ fn an_anchor_before_a_refresh_is_refused_naming_the_view() {
         db.execute("INSERT INTO src VALUES (1, 1), (2, 2)").unwrap();
         db.execute("CREATE MATERIALIZED VIEW m AS SELECT id, v FROM src")
             .unwrap();
+        tick(&db, 1);
+        let anchor = last_scn(&db);
+        db.execute("UPDATE src SET v = 20 WHERE id = 2").unwrap();
+        db.execute("INSERT INTO src VALUES (3, 3)").unwrap();
+        db.execute(if concurrent {
+            "REFRESH MATERIALIZED VIEW CONCURRENTLY m"
+        } else {
+            "REFRESH MATERIALIZED VIEW m"
+        })
+        .unwrap();
+        let after = vec![(1, 1), (2, 20), (3, 3)];
+        assert_eq!(
+            pairs(&rows(&db, Family::Text, "SELECT id, v FROM m")),
+            after,
+            "[concurrent {concurrent}]"
+        );
+        db.execute(&format!("CREATE BRANCH before FROM main AS OF SCN {anchor}"))
+            .unwrap_or_else(|e| panic!("[concurrent {concurrent}] an anchor before an in-place refresh: {e}"));
+        assert_eq!(
+            pairs(&rows_on(&db, "before", Family::Text, "SELECT id, v FROM m")),
+            vec![(1, 1), (2, 2)],
+            "[concurrent {concurrent}] the view as it was at the anchor"
+        );
+        tick(&db, 2);
+        let later = last_scn(&db);
+        db.execute(&format!("CREATE BRANCH past FROM main AS OF SCN {later}"))
+            .unwrap();
+        assert_eq!(
+            pairs(&rows_on(&db, "past", Family::Text, "SELECT id, v FROM m")),
+            after,
+            "[concurrent {concurrent}]"
+        );
+    }
+}
+
+/// A refresh that still replaces the data table (one with an index of its own, which the
+/// in-place refresh leaves to the old path) keeps no history of the rows it replaced: a
+/// branch anchored before it is refused, naming the view; past the refresh it reads what
+/// the view held.
+#[test]
+fn an_anchor_before_a_replacing_refresh_is_refused_naming_the_view() {
+    for concurrent in [false, true] {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        shaped(&db);
+        db.execute("CREATE TABLE src (id INT8 PRIMARY KEY, v INT8)").unwrap();
+        db.execute("INSERT INTO src VALUES (1, 1), (2, 2)").unwrap();
+        db.execute("CREATE MATERIALIZED VIEW m AS SELECT id, v FROM src")
+            .unwrap();
+        db.execute("CREATE INDEX m_v ON __mv_m (v)").unwrap();
         tick(&db, 1);
         let anchor = last_scn(&db);
         db.execute(if concurrent {

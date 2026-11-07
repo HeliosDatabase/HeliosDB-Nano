@@ -136,12 +136,15 @@ impl<'a> ViewCatalog<'a> {
         let value = bincode::serialize(&metadata)
             .map_err(|e| Error::storage(format!("Failed to serialize view metadata: {}", e)))?;
 
-        self.storage.put(&key, &value)?;
-        // GH#36: represent the view in the logical WAL, or a replica never
-        // learns it exists.
-        if let Err(e) = self.storage.log_create_view(&metadata.view_name, &value) {
-            tracing::warn!("Failed to log CREATE VIEW '{}' to WAL: {}", metadata.view_name, e);
-        }
+        // GH#36: represent the view in the logical WAL, or a replica never learns
+        // it exists. Spec R5.3: the record and the entry are ONE write group.
+        let mut ddl = super::DdlBatch::new(self.storage);
+        ddl.put(&key, &value)?;
+        ddl.log(super::WalOperation::CreateView {
+            name: metadata.view_name.clone(),
+            definition: value,
+        });
+        ddl.commit()?.wait_replicated();
         tracing::info!("Created view '{}'", metadata.view_name);
 
         Ok(())
@@ -204,13 +207,16 @@ impl<'a> ViewCatalog<'a> {
             }
         }
 
-        self.storage.delete(&key)?;
         // GH#36: represent the drop; without this the metadata delete reached
         // `StorageEngine::delete`, which (for a non-`meta:` key) logged a bogus
-        // `Delete { table: "unknown" }` row operation into the CDC stream.
-        if let Err(e) = self.storage.log_drop_view(view_name) {
-            tracing::warn!("Failed to log DROP VIEW '{}' to WAL: {}", view_name, e);
-        }
+        // `Delete { table: "unknown" }` row operation into the CDC stream. Spec
+        // R5.3: the delete and the entry are ONE write group.
+        let mut ddl = super::DdlBatch::new(self.storage);
+        ddl.delete(&key);
+        ddl.log(super::WalOperation::DropView {
+            name: view_name.to_string(),
+        });
+        ddl.commit()?.wait_replicated();
         tracing::info!("Dropped view '{}'", view_name);
 
         Ok(())

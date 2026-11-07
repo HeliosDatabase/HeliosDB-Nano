@@ -788,7 +788,7 @@ impl EmbeddedDatabase {
         let built = if constraints.is_empty() {
             Ok(None)
         } else {
-            Self::create_table_statement_constraints(&catalog, name, constraints).map(Some)
+            Self::create_table_statement_constraints(&catalog, name, constraints, None).map(Some)
         };
         let final_constraints = built.map(|statement| {
             match Self::create_table_column_constraints(name, columns, constraints, statement.clone()) {

@@ -44,8 +44,17 @@
 //! waits for the writer. Past the flag the one function is
 //! `WriteGate::write_frozen`. A standby's gate never has a hook: nothing
 //! installs one on a store that does not accept writes.
+//!
+//! # One write group per schema statement (spec R5.3)
+//!
+//! A schema statement writes its whole change with one call here, through its
+//! `storage::DdlBatch`; while the batch is open, any other write of this gate on
+//! the statement's thread is a finding of the detector in `storage::ddl_batch`
+//! (`check_gate_write`). And every group, whoever builds it, is held to the one
+//! ceiling a standby can receive ([`MAX_WRITE_GROUP_BYTES`], decision 6), after the
+//! freeze hook added its copies: refused 54000 before RocksDB sees it.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -53,6 +62,16 @@ use rocksdb::{WriteBatch, WriteOptions, DB};
 
 use super::branch_freeze::BranchFreeze;
 use crate::{Error, Result};
+
+/// Spec R5 decision 6: the most one write group may hold and still be shipped to a
+/// standby and archived, since a group is never split
+/// (`replication::physical::MAX_BATCH_BYTES`; the same limit in a build without the
+/// replication modules, whose store may be served by one that has them).
+#[cfg(feature = "ha-tier1")]
+pub const MAX_WRITE_GROUP_BYTES: usize = crate::replication::physical::MAX_BATCH_BYTES;
+/// See the `ha-tier1` definition.
+#[cfg(not(feature = "ha-tier1"))]
+pub const MAX_WRITE_GROUP_BYTES: usize = u32::MAX as usize - 4096;
 
 /// Whether a [`WriteGate`] admits writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +120,9 @@ pub struct WriteGate {
     /// How many writes went through the hook. A test surface: this is what
     /// proves the path of a store with no branch never reaches it.
     freeze_runs: AtomicU64,
+    /// Spec R5 decision 6: the largest write group this gate applies
+    /// ([`MAX_WRITE_GROUP_BYTES`]; lowered only by a test).
+    ceiling: AtomicUsize,
 }
 
 /// A write past the gate, until its RocksDB call returned.
@@ -124,6 +146,7 @@ impl WriteGate {
             freeze_active: Arc::new(AtomicBool::new(false)),
             freeze: OnceLock::new(),
             freeze_runs: AtomicU64::new(0),
+            ceiling: AtomicUsize::new(MAX_WRITE_GROUP_BYTES),
         })
     }
 
@@ -246,7 +269,7 @@ impl WriteGate {
     /// changes no level's view, so it goes through nothing further.
     pub(crate) fn write_without_freeze(&self, db: &DB, batch: WriteBatch, opts: Option<&WriteOptions>) -> Result<()> {
         let slot = self.admit()?;
-        let applied = Self::apply(db, batch, opts);
+        let applied = self.apply(db, batch, opts);
         drop(slot);
         applied
     }
@@ -257,12 +280,38 @@ impl WriteGate {
         self.freeze_runs.load(Ordering::Relaxed)
     }
 
-    fn apply(db: &DB, batch: WriteBatch, opts: Option<&WriteOptions>) -> Result<()> {
+    fn apply(&self, db: &DB, batch: WriteBatch, opts: Option<&WriteOptions>) -> Result<()> {
+        self.refuse_oversized(&batch)?;
         match opts {
             Some(opts) => db.write_opt(batch, opts),
             None => db.write(batch),
         }
         .map_err(Error::from)
+    }
+
+    /// Spec R5 decision 6 (R5.3): the one ceiling of a write group. A group above
+    /// [`MAX_WRITE_GROUP_BYTES`] can be neither served to a
+    /// standby nor archived (`GroupTooLarge` at every poll, for good), so it is
+    /// refused here, before RocksDB sees it: 54000, nothing written. Here, because
+    /// this is the one place that sees B4's frozen copies, the logical-WAL entries a
+    /// commit seals in last, and every writer that builds its own batch.
+    fn refuse_oversized(&self, batch: &WriteBatch) -> Result<()> {
+        let limit = self.ceiling.load(Ordering::Relaxed);
+        let bytes = batch.size_in_bytes();
+        if bytes > limit {
+            self.refusals.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::write_group_too_large(bytes, limit));
+        }
+        Ok(())
+    }
+
+    /// Tests only: lower the ceiling of [`Self::refuse_oversized`] (it is
+    /// [`MAX_WRITE_GROUP_BYTES`], about 4 GiB, otherwise), so a test can show a refusal
+    /// without building a 4 GiB batch.
+    #[doc(hidden)]
+    pub fn debug_set_write_group_ceiling(&self, bytes: Option<usize>) {
+        self.ceiling
+            .store(bytes.unwrap_or(MAX_WRITE_GROUP_BYTES), Ordering::Relaxed);
     }
 
     /// Sprinter 6bc4a4040eb7 (B4): THE write funnel while some level has a live
@@ -282,13 +331,13 @@ impl WriteGate {
     ) -> Result<()> {
         self.freeze_runs.fetch_add(1, Ordering::Relaxed);
         let Some(freeze) = self.freeze.get() else {
-            let applied = Self::apply(db, batch, opts);
+            let applied = self.apply(db, batch, opts);
             drop(slot);
             return applied;
         };
         let touches = BranchFreeze::row_touches(&batch);
         if touches.is_empty() {
-            let applied = Self::apply(db, batch, opts);
+            let applied = self.apply(db, batch, opts);
             drop(slot);
             return applied;
         }
@@ -296,9 +345,9 @@ impl WriteGate {
         // The registry answers for this write from here: holding it is what a
         // new branch waits for, and a fence too.
         drop(slot);
-        let mut flush = |chunk: WriteBatch| Self::apply(db, chunk, opts);
+        let mut flush = |chunk: WriteBatch| self.apply(db, chunk, opts);
         let work = freeze.stage(&registry, db, &touches, &mut batch, &mut flush)?;
-        let applied = Self::apply(db, batch, opts);
+        let applied = self.apply(db, batch, opts);
         // Bumps what the frozen rows' readers cache, also after a failure: the
         // write may have reached RocksDB.
         drop(work);
@@ -369,10 +418,12 @@ impl WriteGate {
         if super::table_locks::detector_active(&self.row_lock_detector) {
             super::table_locks::check_row_batch(&batch, std::panic::Location::caller());
         }
+        // Spec R5.3: a schema statement's writes are its batch's one commit.
+        super::ddl_batch::check_gate_write(self, std::panic::Location::caller());
         if self.freeze_active.load(Ordering::SeqCst) {
             return self.write_frozen(db, batch, opts, slot);
         }
-        let applied = Self::apply(db, batch, opts);
+        let applied = self.apply(db, batch, opts);
         drop(slot);
         applied
     }
@@ -388,6 +439,7 @@ impl WriteGate {
         if super::table_locks::detector_active(&self.row_lock_detector) {
             super::table_locks::check_row_key(key.as_ref(), std::panic::Location::caller());
         }
+        super::ddl_batch::check_gate_write(self, std::panic::Location::caller());
         if self.freeze_active.load(Ordering::SeqCst) {
             let mut batch = WriteBatch::default();
             batch.put(key, value);
@@ -409,6 +461,7 @@ impl WriteGate {
         if super::table_locks::detector_active(&self.row_lock_detector) {
             super::table_locks::check_row_key(key.as_ref(), std::panic::Location::caller());
         }
+        super::ddl_batch::check_gate_write(self, std::panic::Location::caller());
         if self.freeze_active.load(Ordering::SeqCst) {
             let mut batch = WriteBatch::default();
             batch.delete(key);

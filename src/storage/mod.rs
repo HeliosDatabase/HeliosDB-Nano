@@ -20,6 +20,8 @@ mod catalog;
 #[cfg(test)]
 pub(crate) use catalog::BRANCH_FK_CACHE_HITS;
 mod copy_marker;
+// Spec R5.3: one catalog DDL statement, one durable write group.
+pub mod ddl_batch;
 mod dirty_tracker;
 // Spec P3.1: the WAL archiver measures its filesystem with the same helper.
 pub(crate) mod disk;
@@ -117,6 +119,7 @@ pub use branch_view::{
     BranchView, KeyState, LevelEntry, COMMITTED_OVERLAY_MAX_ENTRIES, COMMITTED_OVERLAY_ROW_BUDGET,
 };
 pub use catalog::Catalog;
+pub use ddl_batch::DdlBatch;
 pub use dirty_tracker::{Change, ChangeType, DirtyTracker, DirtyTrackerError};
 pub use dump::{
     CompressionType as DumpCompressionType, DumpManager, DumpMetadata, DumpMode, DumpOptions, DumpOutputFormat,

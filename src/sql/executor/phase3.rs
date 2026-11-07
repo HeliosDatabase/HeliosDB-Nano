@@ -750,25 +750,46 @@ fn handle_refresh_materialized_view(
             .ok_or_else(|| Error::execution("No storage engine available"))?;
         let mv_catalog = storage.mv_catalog();
 
-        if concurrent {
-            tracing::info!("Using CONCURRENT refresh with atomic swap for zero downtime");
-            mv_catalog.store_view_data_concurrent(name, tuples, &schema)?;
-        } else {
-            tracing::debug!("Using non-CONCURRENT refresh (table will be briefly unavailable)");
-            mv_catalog.store_view_data(name, tuples, &schema)?;
+        // The refreshed record, marked before the write that carries it.
+        let mut refreshed = metadata;
+        if use_incremental {
+            refreshed.delta_count_since_full = 0;
+        }
+        refreshed.mark_refreshed(row_count);
+
+        // GH#36: the refresh in the logical WAL (the rows have entries of their own);
+        // spec R5.3: in the refresh's own write group.
+        let refresh_entry = crate::storage::WalOperation::RefreshMaterializedView {
+            name: name.to_string(),
+            concurrent,
+            incremental: incremental_requested,
+        };
+        // Spec R5.3: ONE write group for every row deleted, every row inserted, the
+        // refreshed record and the entries. A reader never sees an empty or a partial
+        // view, which is also what CONCURRENTLY promises, so it takes the same path;
+        // the temporary-table swap is left only for a data table this path cannot
+        // rewrite in place (see `refresh_view_in_one_group`).
+        let in_one_group = mv_catalog.refresh_view_in_one_group(name, &tuples, &schema, &refreshed, refresh_entry)?;
+        if in_one_group.is_none() {
+            if concurrent {
+                tracing::info!("Using CONCURRENT refresh with atomic swap for zero downtime");
+                mv_catalog.store_view_data_concurrent(name, tuples, &schema)?;
+            } else {
+                tracing::debug!("Using non-CONCURRENT refresh (table will be briefly unavailable)");
+                mv_catalog.store_view_data(name, tuples, &schema)?;
+            }
+            mv_catalog.update_view(&refreshed)?;
+            if let Err(e) = storage.log_refresh_materialized_view(name, concurrent, incremental_requested) {
+                tracing::warn!("Failed to log REFRESH MATERIALIZED VIEW '{}' to WAL: {}", name, e);
+            }
         }
 
         if use_incremental {
-            // Clear applied deltas (purge all deltas before current time)
+            // Clear applied deltas (purge all deltas before current time). After the
+            // refresh's group: the deltas only steer the next refresh's choice, and a
+            // crash before this purge leaves them to a refresh that recomputes anyway.
             let delta_tracker = storage.mv_delta_tracker();
             let _ = delta_tracker.purge_deltas_before(chrono::Utc::now());
-
-            // Update delta count tracking in metadata
-            let mut updated_metadata = metadata.clone();
-            updated_metadata.delta_count_since_full = 0;
-            updated_metadata.mark_refreshed(row_count);
-            mv_catalog.update_view(&updated_metadata)?;
-
             tracing::info!(
                 "Incremental refresh completed for MV '{}': {} rows (processed {} deltas)",
                 name,
@@ -776,11 +797,6 @@ fn handle_refresh_materialized_view(
                 total_deltas
             );
         } else {
-            // Update metadata with new row count and timestamp
-            let mut updated_metadata = metadata;
-            updated_metadata.mark_refreshed(row_count);
-            mv_catalog.update_view(&updated_metadata)?;
-
             tracing::info!(
                 "Successfully refreshed materialized view '{}' with {} rows{}",
                 name,
@@ -791,15 +807,6 @@ fn handle_refresh_materialized_view(
                     ""
                 }
             );
-        }
-    }
-
-    // GH#36: represent the refresh in the logical WAL. The refreshed ROWS arrive
-    // through the ordinary DML entries; this entry is what tells a replica the
-    // view was refreshed at all.
-    if let Some(storage) = executor.storage() {
-        if let Err(e) = storage.log_refresh_materialized_view(name, concurrent, incremental_requested) {
-            tracing::warn!("Failed to log REFRESH MATERIALIZED VIEW '{}' to WAL: {}", name, e);
         }
     }
 

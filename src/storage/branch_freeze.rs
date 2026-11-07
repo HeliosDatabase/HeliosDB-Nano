@@ -1388,6 +1388,11 @@ impl StorageEngine {
                     .map_err(|e| Error::storage(format!("Failed to serialize missing values: {e}")))?;
                 batch.put(&missing_key, tde::seal(self.key_manager_ref(), &encoded)?.as_ref());
             }
+            // Spec R5.3: a write of its own inside a schema statement on main, by
+            // design (see `freeze_definitions_for_children`): the copy is what the
+            // child already reads through main, so it changes nothing any reader sees,
+            // and a statement that fails or a crash after it leaves it true.
+            let _side = super::ddl_batch::allow_side_write("a branch's frozen copy of the definition it reads");
             self.write_batch_through_gate(batch)?;
         }
         self.after_branch_catalog_write(child.id, table)

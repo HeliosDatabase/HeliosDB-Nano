@@ -74,13 +74,14 @@ main as the parent: a branch keeps no history. Definitions are the CURRENT ones:
 anchor shows on the branch, a table dropped since is gone, a table created since is there and empty.
 
 **An anchor is refused (`0A000`, naming the table or view and why) when a row as it was cannot be read now.** A
-version is positional and nothing rewrites it, and a rename or a `REFRESH` deletes it. So: an anchor before a `DROP
+version is positional and nothing rewrites it, and a rename deletes it. So: an anchor before a `DROP
 COLUMN`, `RENAME COLUMN`, `ALTER COLUMN … SET STORAGE` or `RENAME TO` of a table, or a `REFRESH` of a materialized
-view; and a later anchor, if a row's last version at it is from before that statement and the row has changed
+view whose data table has an index or a column storage mode (that refresh still replaces the table); and a later anchor, if a row's last version at it is from before that statement and the row has changed
 since (a row not changed since is what it is now). The statement records this in its own write,
 `meta:table_shape:{t}`. A rename records it on the old name too, so a table that takes that name refuses an anchor
 from before the rename, whatever becomes of the renamed table. A `DROP TABLE` takes the table's own record, and its
-version history. **Such a statement run before 4.42.0 left no record**: nothing refuses an anchor before it, and its
+version history. Any other `REFRESH MATERIALIZED VIEW` (4.42.0+) replaces the view's rows in place, in one write that
+keeps their history, so a branch anchored before it reads the view as it was at the anchor. **Such a statement run before 4.42.0 left no record**: nothing refuses an anchor before it, and its
 rows read by position, wrongly.
 
 Two consequences to expect. **One table's change refuses the branch as a whole**, whichever table you care

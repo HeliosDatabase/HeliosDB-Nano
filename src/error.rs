@@ -305,6 +305,11 @@ pub const RESULT_TYPE_REFUSED_BEFORE_RUN_MARKER: &str = "the statement did not r
 /// ([`Error::ddl_over_staged_rows`]). SQLSTATE 0A000.
 pub const DDL_OVER_STAGED_ROWS_MARKER: &str = "after writing it in the same transaction is not supported";
 
+/// Spec R5.3: the marker of `EXPLAIN ANALYZE` of a statement it cannot run as
+/// part of the statement's transaction ([`Error::explain_analyze_unsupported`]).
+/// SQLSTATE 0A000.
+pub const EXPLAIN_ANALYZE_UNSUPPORTED_MARKER: &str = "is not a statement EXPLAIN ANALYZE can run";
+
 /// Spec R5.2: the marker of a volatile `ADD COLUMN` whose rewrite passes
 /// `[storage] max_atomic_rewrite_bytes` ([`Error::atomic_rewrite_too_large`]).
 /// SQLSTATE 54000.
@@ -752,6 +757,30 @@ impl Error {
             "MERGE BRANCH {source} INTO {target}: the rows it changed in table {table} need {bytes} bytes, \
              {BRANCH_MATERIALIZE_TOO_LARGE_MARKER} (the limit is {limit}): nothing was changed; copy those rows to \
              {target} in smaller transactions, or change fewer of them per branch"
+        ))
+    }
+
+    /// Spec R5.3: `EXPLAIN ANALYZE` of `statement`, which runs outside the
+    /// statement's transaction (TRUNCATE deletes at once: inside `BEGIN` a
+    /// `ROLLBACK` restored nothing). PostgreSQL has no `EXPLAIN` of these either.
+    /// Nothing ran. SQLSTATE 0A000.
+    pub fn explain_analyze_unsupported(statement: &str) -> Self {
+        Error::QueryExecution(format!(
+            "{statement} {EXPLAIN_ANALYZE_UNSUPPORTED_MARKER}: it would run apart from the statement's transaction, \
+             which a ROLLBACK could not undo; nothing ran. Run {statement} itself"
+        ))
+    }
+
+    /// Spec R5 decision 6: a write group of `bytes` above the ceiling `limit`
+    /// (`storage::write_gate::MAX_WRITE_GROUP_BYTES`), which no standby could ever
+    /// receive and no archive hold. Refused before RocksDB saw it: nothing was
+    /// written. SQLSTATE 54000 (the message carries
+    /// [`BRANCH_MATERIALIZE_TOO_LARGE_MARKER`]).
+    pub fn write_group_too_large(bytes: usize, limit: usize) -> Self {
+        Error::QueryExecution(format!(
+            "this statement's changes need {bytes} bytes in one write group, {BRANCH_MATERIALIZE_TOO_LARGE_MARKER} \
+             (the limit is {limit}, what a standby can receive): nothing was written; split it into smaller \
+             statements or transactions"
         ))
     }
 

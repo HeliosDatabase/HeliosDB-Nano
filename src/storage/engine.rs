@@ -2340,6 +2340,11 @@ pub struct DdlWrite {
 }
 
 impl DdlWrite {
+    /// Spec R5.3: a statement whose batch held nothing to write waits for nobody.
+    pub(crate) const fn nothing() -> Self {
+        Self { barrier: None }
+    }
+
     /// Wait (bounded by `[replication] sync_timeout_ms`) for the standbys to
     /// acknowledge the write; a no-op unless this node's commits wait. Spec R5.1:
     /// while this thread holds a statement's exclusive table locks the wait moves to
@@ -2833,8 +2838,17 @@ impl StorageEngine {
 
     /// Apply a raw `batch` to this engine's store through its gate, for code
     /// outside the engine that builds batches against its handle (catalog DDL).
+    /// Tracks its caller, so the detectors (R5.1's writer lock, R5.3's DDL batch)
+    /// name whoever wrote the batch rather than this line.
+    #[track_caller]
     pub(crate) fn db_write(&self, batch: WriteBatch, opts: Option<&WriteOptions>) -> Result<()> {
         self.gate.write(&self.db, batch, opts)
+    }
+
+    /// Spec R5.3: whether a DDL batch's logical-WAL entries are written at all — not
+    /// during the log's replay, and not without a logical WAL.
+    pub(crate) fn logs_ddl_operations(&self) -> bool {
+        self.wal.is_some() && !self.is_replaying.load(Ordering::Acquire)
     }
 
     /// Spec R1 §4 (sprinter e21903322db7): write a DDL statement's catalog
@@ -2850,6 +2864,7 @@ impl StorageEngine {
     /// synchronous-replication wait is NOT made here: the caller makes it
     /// last ([`DdlWrite::wait_replicated`]), after its in-memory finalization,
     /// so no standby round trip sits inside the DDL's critical section.
+    #[track_caller]
     pub(crate) fn write_ddl_batch(&self, operation: WalOperation, batch: WriteBatch) -> Result<DdlWrite> {
         self.write_ddl_batch_ops(vec![operation], batch)
     }
@@ -2857,6 +2872,7 @@ impl StorageEngine {
     /// [`Self::write_ddl_batch`] for a DDL whose logical-WAL history is several
     /// entries, all riding the one group: spec R5.2's `ADD COLUMN` (the schema
     /// and each column's missing value).
+    #[track_caller]
     pub(crate) fn write_ddl_batch_ops(&self, operations: Vec<WalOperation>, mut batch: WriteBatch) -> Result<DdlWrite> {
         let options = self.memory_write_options.as_ref();
         let wal = if self.is_replaying.load(Ordering::Acquire) {
@@ -5062,6 +5078,7 @@ impl StorageEngine {
     }
 
     /// Put a value (basic put, no MVCC yet)
+    #[track_caller]
     pub fn put(&self, key: &Key, value: &[u8]) -> Result<()> {
         // Periodic disk space check (every 1000 writes) for disk-backed mode
         if let Some(ref db_path) = self.db_path {
@@ -5096,6 +5113,7 @@ impl StorageEngine {
     }
 
     /// Delete a key
+    #[track_caller]
     pub fn delete(&self, key: &Key) -> Result<()> {
         // Logical Delete describes a table row, not an arbitrary RocksDB key.
         // DDL side records (including table_constraints:, counter:, triggers
@@ -5270,6 +5288,7 @@ impl StorageEngine {
 
     /// Internal put: encrypt and store without WAL logging
     /// Use this for internal metadata like counters, version history, etc.
+    #[track_caller]
     fn put_internal(&self, key: &[u8], value: &[u8]) -> Result<()> {
         // Seals every key it is handed, like `put` — see the note there for why
         // this takes `tde::seal` rather than `seal_row_value`.
@@ -10767,6 +10786,11 @@ impl StorageEngine {
         Ok(loaded)
     }
 
+    /// Spec R5.3: the vector index registry, shared, for a schema statement's undo.
+    pub(crate) fn vector_indexes_arc(&self) -> &Arc<VectorIndexManager> {
+        &self.vector_indexes
+    }
+
     /// Get a reference to the vector index manager
     pub fn vector_indexes(&self) -> &VectorIndexManager {
         &self.vector_indexes
@@ -10999,6 +11023,11 @@ impl StorageEngine {
         if batch.is_empty() {
             return;
         }
+        // Spec R5.3: the first index mutation after a checkpoint may be a schema
+        // statement's (a new table's PRIMARY KEY tree, an index it drops). The markers
+        // are derived state: deleting them changes no catalog and no row, and must not
+        // wait for the statement's group, which a crash could lose after the mutation.
+        let _allowed = super::ddl_batch::allow_side_write("index snapshot markers invalidated by an index mutation");
         if let Err(e) = gate.write(db, batch, None) {
             warn!("index snapshot marker invalidation failed: {}", e);
         }

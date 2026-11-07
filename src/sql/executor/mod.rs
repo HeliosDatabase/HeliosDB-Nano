@@ -4273,20 +4273,15 @@ impl<'a> Executor<'a> {
                 // migration). So we seed fresh state ONLY when the sequence is
                 // genuinely new; an existing high-water is preserved.
                 let already_exists = storage.catalog().sequence_exists(name)?;
-                storage.catalog().save_sequence(&def)?;
-                // GH#36: represent the definition change in the logical WAL.
-                if let Err(e) = storage.catalog().log_sequence_definition(&def, false) {
-                    tracing::warn!("Failed to log CREATE SEQUENCE '{}' to WAL: {}", name, e);
-                }
-                if !already_exists {
-                    storage.catalog().save_sequence_state(
-                        name,
-                        &crate::storage::PersistedSeqState {
-                            last_reserved: def.start_value,
-                            is_called: false,
-                        },
-                    )?;
-                }
+                // Spec R5.3: the definition, a new sequence's seed state and the
+                // logical-WAL entry (GH#36) are ONE write group.
+                let seed = (!already_exists).then_some(crate::storage::PersistedSeqState {
+                    last_reserved: def.start_value,
+                    is_called: false,
+                });
+                let mut ddl = crate::storage::DdlBatch::new(storage);
+                storage.catalog().stage_sequence(&def, false, seed.as_ref(), &mut ddl)?;
+                ddl.commit()?.wait_replicated();
                 // Evict any cached runtime so the next nextval lazy-loads the
                 // new durable def (and, on re-create, the PRESERVED durable
                 // state). The post-statement durability barrier fsyncs the def +
@@ -4412,36 +4407,37 @@ impl<'a> Executor<'a> {
                     )));
                 }
 
-                catalog.save_sequence(&def)?;
-                // GH#36: represent the definition change in the logical WAL.
-                if let Err(e) = catalog.log_sequence_definition(&def, true) {
-                    tracing::warn!("Failed to log ALTER SEQUENCE '{}' to WAL: {}", action.name, e);
-                }
-
                 // RESTART rewrites the durable high-water (acts like
                 // setval(., false) to the restart point): the next nextval
                 // returns exactly that value. Some(None) -> start; Some(n) -> n.
-                if let Some(restart) = action.restart {
-                    let target = restart.unwrap_or(def.start_value);
-                    // BOUND-SAFETY invariant: the not-called refill branch serves
-                    // the RESTART target directly (no clamp on `first`), so an
-                    // out-of-range target would make nextval return a value
-                    // outside [min,max]. Validate here (CREATE validates START and
-                    // setval validates its value the same way).
-                    if target < def.min_value || target > def.max_value {
-                        return Err(Error::query_execution(format!(
-                            "ALTER SEQUENCE \"{}\": RESTART value ({}) out of bounds [{}, {}]",
-                            action.name, target, def.min_value, def.max_value
-                        )));
-                    }
-                    catalog.save_sequence_state(
-                        &action.name,
-                        &crate::storage::PersistedSeqState {
+                let restart = match action.restart {
+                    Some(restart) => {
+                        let target = restart.unwrap_or(def.start_value);
+                        // BOUND-SAFETY invariant: the not-called refill branch serves
+                        // the RESTART target directly (no clamp on `first`), so an
+                        // out-of-range target would make nextval return a value
+                        // outside [min,max]. Validated BEFORE anything is written
+                        // (spec R5.3: a refused RESTART used to leave the new
+                        // definition behind; CREATE validates START and setval
+                        // validates its value the same way).
+                        if target < def.min_value || target > def.max_value {
+                            return Err(Error::query_execution(format!(
+                                "ALTER SEQUENCE \"{}\": RESTART value ({}) out of bounds [{}, {}]",
+                                action.name, target, def.min_value, def.max_value
+                            )));
+                        }
+                        Some(crate::storage::PersistedSeqState {
                             last_reserved: target,
                             is_called: false,
-                        },
-                    )?;
-                }
+                        })
+                    }
+                    None => None,
+                };
+                // Spec R5.3: the definition, the RESTART state and the logical-WAL
+                // entry (GH#36) are ONE write group.
+                let mut ddl = crate::storage::DdlBatch::new(storage);
+                catalog.stage_sequence(&def, true, restart.as_ref(), &mut ddl)?;
+                ddl.commit()?.wait_replicated();
 
                 // Evict the cached runtime so the lock-free counter discards any
                 // in-flight cached block (RESTART correctness) and the next
@@ -4468,11 +4464,11 @@ impl<'a> Executor<'a> {
                 if !*if_exists && !catalog.sequence_exists(name)? {
                     return Err(Error::query_execution(format!("sequence \"{name}\" does not exist")));
                 }
-                catalog.drop_sequence(name)?;
-                // GH#36: represent the drop in the logical WAL.
-                if let Err(e) = storage.log_drop_sequence(name) {
-                    tracing::warn!("Failed to log DROP SEQUENCE '{}' to WAL: {}", name, e);
-                }
+                // Spec R5.3: both deletes and the logical-WAL entry (GH#36) are ONE
+                // write group.
+                let mut ddl = crate::storage::DdlBatch::new(storage);
+                crate::storage::Catalog::stage_sequence_drop(name, &mut ddl);
+                ddl.commit()?.wait_replicated();
                 // sprinter d15933f528b0: bound to THIS database's namespace.
                 crate::sql::sequences::invalidate_cache_on(storage, name);
                 Ok(Box::new(
