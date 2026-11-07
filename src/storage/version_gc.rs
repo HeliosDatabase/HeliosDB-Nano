@@ -262,6 +262,17 @@ impl VersionGc {
         let mut stats = self.collect_below(delete_horizon)?;
         stats.horizon = Some(delete_horizon);
 
+        // 6. The `snapshot:` records below the watermark resolve only to reads
+        //    it refuses: the snapshot GC deletes them, a bounded number a call
+        //    (`SnapshotManager::gc_old_snapshots`). Run here too, so they go
+        //    on a store that registers too few snapshots to trigger it.
+        if let Err(e) = self.snapshot_manager.gc_old_snapshots() {
+            warn!(
+                "version-gc: deleting snapshot records below the watermark failed: {}",
+                e
+            );
+        }
+
         if stats.versions_deleted > 0 {
             debug!(
                 horizon = delete_horizon,

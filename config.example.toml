@@ -81,6 +81,15 @@ compression = "Zstd"
 # non-SQL insert entry points — see CHANGELOG "Unreleased".)
 time_travel_enabled = true
 
+# How long time-travel history is kept: AS OF TIMESTAMP / TRANSACTION / SCN and
+# CREATE BRANCH ... AS OF reach any time inside it, however many commits
+# followed. Seconds or "90s", "15m", "24h", "7d", "2w". Unset (the default) is
+# infinite: nothing is collected, and besides the row versions the `snapshot:`
+# records that resolve a time grow by one per commit (about 60 bytes each).
+# Once set, the version GC (every 300 s, or VACUUM VERSIONS) collects the
+# versions and the snapshot records older than this.
+# version_retention = "7d"
+
 # W3.2: single-copy latest version. When true, a versioned main-branch INSERT
 # skips the full `v:` row copy (~65% of INSERT byte volume on the measured
 # shapes) and writes only a flag-bearing `v_idx:` event; the value is served

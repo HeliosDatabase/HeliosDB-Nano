@@ -10172,6 +10172,25 @@ fn gh23_c3_returning_aggregate_and_window_classify_as_42803_and_42p20() {
     let unrelated = crate::Error::query_execution("Unknown scalar function: 'aggregate_me'");
     assert_eq!(super::handler::sqlstate_for_error(&unrelated), "42883");
 }
+
+/// An aggregate's FILTER clause: the planner's four refusals classify by their
+/// emitter consts (marker-const discipline), in PostgreSQL's classes.
+#[test]
+fn aggregate_filter_refusals_classify_as_postgresql_does() {
+    use crate::sql::planner::{
+        AGGREGATE_IN_FILTER, FILTER_ON_NON_AGGREGATE_PREFIX, FILTER_ON_NON_AGGREGATE_WINDOW, WINDOW_IN_FILTER,
+    };
+    let class = |message: String| super::handler::sqlstate_for_error(&crate::Error::query_execution(message));
+    assert_eq!(class(AGGREGATE_IN_FILTER.to_string()), "42803");
+    assert_eq!(class(WINDOW_IN_FILTER.to_string()), "42P20");
+    assert_eq!(class(FILTER_ON_NON_AGGREGATE_WINDOW.to_string()), "0A000");
+    assert_eq!(
+        class(format!(
+            "{FILTER_ON_NON_AGGREGATE_PREFIX}upper is not an aggregate function"
+        )),
+        "42809"
+    );
+}
 // ---- GH#28 ----
 // ===========================================================================
 // GH #28 — the wire half: the timeout GUCs do not exist on the PostgreSQL

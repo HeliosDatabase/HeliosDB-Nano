@@ -34,9 +34,9 @@ use parking_lot::{Mutex, RwLock};
 use rocksdb::{ReadOptions, WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// System Change Number (Oracle-compatible)
@@ -153,6 +153,64 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 /// The `v_idx:` key of an event of row `row_id` of `table` at `commit_ts`.
 pub(crate) fn version_index_key(table: &str, row_id: u64, commit_ts: u64) -> String {
     format!("v_idx:{}:{}:{:020}", table, row_id, u64::MAX - commit_ts)
+}
+
+/// The key family of the `snapshot:{timestamp}` records.
+const SNAPSHOT_RECORD_PREFIX: &[u8] = b"snapshot:";
+
+/// The snapshots the in-memory map has let go of by count, or left out at
+/// open-time recovery, while their `snapshot:` records stay in the store
+/// (`SnapshotManager::evict_from_memory`, `recover_snapshots_with_policy`).
+///
+/// The map keeps the newest `max_snapshots` (plus slack) so it stays bounded on
+/// a busy store; it used to drop the records with them, so `AS OF` reached only
+/// the last ~1000 snapshots, however recent the anchor. A record now lives
+/// until the version-GC low watermark passes it (`gc_old_snapshots`). A lookup the map cannot
+/// answer now walks the records (`SnapshotManager::for_each_stored_snapshot`),
+/// and these watermarks say when it cannot: every record the store holds and
+/// the map does not is at or below `through_ts` and `max_wall_secs`.
+#[derive(Default)]
+struct EvictedSnapshots {
+    /// Whether any snapshot was let go of by count.
+    any: AtomicBool,
+    /// The newest timestamp let go of.
+    through_ts: AtomicU64,
+    /// The latest wall-clock second (`wall_clock_unix_secs`) let go of.
+    max_wall_secs: AtomicI64,
+    /// Where the next sweep of expired records resumes; `None` = the start of
+    /// the family (`SnapshotManager::sweep_expired_records`).
+    sweep_cursor: Mutex<Option<Vec<u8>>>,
+}
+
+/// The wall-clock span of the snapshots a failed `AS OF TIMESTAMP` lookup saw,
+/// for its error.
+#[derive(Default, Clone, Copy)]
+struct SnapshotSpan {
+    count: usize,
+    earliest: Option<i64>,
+    latest: Option<i64>,
+}
+
+impl SnapshotSpan {
+    fn add(&mut self, wall_secs: i64) {
+        self.count += 1;
+        self.earliest = Some(self.earliest.map_or(wall_secs, |e| e.min(wall_secs)));
+        self.latest = Some(self.latest.map_or(wall_secs, |l| l.max(wall_secs)));
+    }
+
+    /// `self` (the in-memory map) widened by `stored` (the store's records,
+    /// a superset of the map's on a persistent store).
+    fn widened(self, stored: Self) -> Self {
+        let pick = |a: Option<i64>, b: Option<i64>, f: fn(i64, i64) -> i64| match (a, b) {
+            (Some(a), Some(b)) => Some(f(a, b)),
+            (a, b) => a.or(b),
+        };
+        Self {
+            count: self.count.max(stored.count),
+            earliest: pick(self.earliest, stored.earliest, i64::min),
+            latest: pick(self.latest, stored.latest, i64::max),
+        }
+    }
 }
 
 /// Snapshot metadata
@@ -344,6 +402,9 @@ pub struct SnapshotManager {
     /// `None` (the default configuration) makes every use a single `Option`
     /// check with no allocation and no copy.
     key_manager: Option<Arc<KeyManager>>,
+    /// The snapshots the in-memory map let go of by count, whose records the
+    /// store keeps for lookups the map cannot answer.
+    evicted: EvictedSnapshots,
 }
 
 /// Snapshot cache configuration
@@ -367,9 +428,13 @@ impl Default for CacheConfig {
 /// Garbage collection configuration
 #[derive(Debug, Clone)]
 pub struct GcConfig {
-    /// Minimum retention period (seconds)
+    /// Minimum retention period (seconds): a floor. A snapshot is removed
+    /// only once the version-GC low watermark has passed it (the configured
+    /// `storage.version_retention`) AND it is older than this.
     pub min_retention_seconds: u64,
-    /// Maximum number of snapshots to keep
+    /// Maximum number of snapshots the in-memory map keeps (it is let grow to
+    /// twice this, at most 1000 more, before GC runs); the records of the
+    /// older ones stay in the store, where `AS OF` finds them.
     pub max_snapshots: usize,
     /// Whether to enable automatic GC
     pub auto_gc_enabled: bool,
@@ -413,6 +478,7 @@ impl SnapshotManager {
             elide_latest_version: AtomicBool::new(false),
             maybe_elided_rows: AtomicBool::new(false),
             key_manager: None,
+            evicted: EvictedSnapshots::default(),
         }
     }
 
@@ -450,6 +516,7 @@ impl SnapshotManager {
             elide_latest_version: AtomicBool::new(false),
             maybe_elided_rows: AtomicBool::new(false),
             key_manager: None,
+            evicted: EvictedSnapshots::default(),
         }
     }
 
@@ -478,6 +545,7 @@ impl SnapshotManager {
             elide_latest_version: AtomicBool::new(false),
             maybe_elided_rows: AtomicBool::new(false),
             key_manager: None,
+            evicted: EvictedSnapshots::default(),
         }
     }
 
@@ -744,42 +812,55 @@ impl SnapshotManager {
             dt.and_utc().timestamp() as u64
         };
 
-        // Find the closest snapshot <= target time
-        let snapshots = self.snapshots.read();
-        let mut best_match: Option<u64> = None;
-        let mut best_diff = u64::MAX;
-
-        for metadata in snapshots.values() {
-            // W2.2(b): compare on epoch-micros metadata (seconds granularity, as before).
-            let snap_timestamp = metadata.wall_clock_unix_secs() as u64;
-            if snap_timestamp <= target_time {
-                let diff = target_time - snap_timestamp;
-                if diff < best_diff || (diff == best_diff && best_match.is_none_or(|best| metadata.timestamp > best)) {
-                    best_diff = diff;
-                    best_match = Some(metadata.timestamp);
-                }
+        // Find the closest snapshot <= target time: the latest wall-clock
+        // second at or before it (W2.2(b): epoch-micros metadata, seconds
+        // granularity, as before), the newest snapshot of that second. In the
+        // in-memory map first; in the store's records when the map has let go
+        // of one that could be closer (`memory_answers`).
+        let target_secs = i64::try_from(target_time).unwrap_or(i64::MAX);
+        let mut best: Option<(i64, u64)> = None;
+        let mut span = SnapshotSpan::default();
+        let memory_answers = {
+            let snapshots = self.snapshots.read();
+            for metadata in snapshots.values() {
+                span.add(metadata.wall_clock_unix_secs());
+                Self::closer_at_or_before(&mut best, metadata, target_secs);
             }
+            self.memory_answers(best)
+        };
+        if !memory_answers {
+            let mut stored = SnapshotSpan::default();
+            self.for_each_stored_snapshot(|metadata| {
+                stored.add(metadata.wall_clock_unix_secs());
+                Self::closer_at_or_before(&mut best, metadata, target_secs);
+            })?;
+            span = span.widened(stored);
         }
 
-        best_match.ok_or_else(|| {
+        best.map(|(_, timestamp)| timestamp).ok_or_else(|| {
             // Say WHY: the instant the literal was read as, and what exists.
             // "No snapshot found for timestamp" gave the user nothing to act on.
-            let mut secs: Vec<i64> = snapshots.values().map(|m| m.wall_clock_unix_secs() as i64).collect();
-            secs.sort_unstable();
             let fmt = |s: i64| {
                 chrono::DateTime::from_timestamp(s, 0)
                     .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
                     .unwrap_or_else(|| s.to_string())
             };
             let target = fmt(target_time as i64);
-            match (secs.first(), secs.last()) {
-                (Some(&lo), Some(&hi)) => Error::query_execution(format!(
+            // Snapshots below the version-GC low watermark are deleted with the
+            // history they resolved to (`gc_old_snapshots`): say so.
+            let collected = if self.gc_low_watermark() > 0 {
+                " History older than storage.version_retention has been garbage collected."
+            } else {
+                ""
+            };
+            match (span.earliest, span.latest) {
+                (Some(lo), Some(hi)) => Error::query_execution(format!(
                     "No snapshot at or before {target} (literal '{ts_str}' interpreted as UTC unless it \
                      carries an offset); earliest snapshot {}, latest {} ({} snapshots). Use an explicit \
-                     offset such as '… -03:00', a later timestamp, or AS OF TRANSACTION <id>.",
+                     offset such as '… -03:00', a later timestamp, or AS OF TRANSACTION <id>.{collected}",
                     fmt(lo),
                     fmt(hi),
-                    secs.len()
+                    span.count
                 )),
                 _ => Error::query_execution(format!(
                     "No snapshot at or before {target} (literal '{ts_str}'): this database has no \
@@ -834,48 +915,30 @@ impl SnapshotManager {
                     dt.and_utc().timestamp() as u64
                 };
 
-                // Search through snapshots to find matching LSN
-                let snapshots = self.snapshots.read();
-
-                if snapshots.is_empty() {
+                // The start is the earliest snapshot at or after the target, the
+                // end the latest at or before it (W2.2(b): epoch-micros metadata,
+                // seconds granularity, as before); in the store's records too when
+                // the in-memory map has let go of one that could be it.
+                let target_secs = i64::try_from(target_time).unwrap_or(i64::MAX);
+                let mut best_match: Option<u64> = None;
+                let (memory_empty, memory_answers) = {
+                    let snapshots = self.snapshots.read();
+                    for metadata in snapshots.values() {
+                        Self::range_candidate(&mut best_match, metadata, target_secs, is_start);
+                    }
+                    (
+                        snapshots.is_empty(),
+                        self.memory_answers_range(best_match, target_secs, is_start),
+                    )
+                };
+                if memory_empty && memory_answers {
                     // No snapshots - use boundary values for full range
                     return Ok(if is_start { 0 } else { u64::MAX });
                 }
-
-                // Find appropriate snapshot based on whether this is start or end
-                let mut best_match: Option<u64> = None;
-
-                for metadata in snapshots.values() {
-                    // W2.2(b): epoch-micros metadata, seconds granularity as before.
-                    let snap_ts_seconds = metadata.wall_clock_unix_secs() as u64;
-
-                    if is_start {
-                        // For start: find earliest snapshot >= target
-                        if snap_ts_seconds >= target_time {
-                            match best_match {
-                                Some(best) if metadata.timestamp < best => {
-                                    best_match = Some(metadata.timestamp);
-                                }
-                                None => {
-                                    best_match = Some(metadata.timestamp);
-                                }
-                                _ => {}
-                            }
-                        }
-                    } else {
-                        // For end: find latest snapshot <= target
-                        if snap_ts_seconds <= target_time {
-                            match best_match {
-                                Some(best) if metadata.timestamp > best => {
-                                    best_match = Some(metadata.timestamp);
-                                }
-                                None => {
-                                    best_match = Some(metadata.timestamp);
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
+                if !memory_answers {
+                    self.for_each_stored_snapshot(|metadata| {
+                        Self::range_candidate(&mut best_match, metadata, target_secs, is_start);
+                    })?;
                 }
 
                 // If no matching snapshot found, use boundary values
@@ -896,23 +959,117 @@ impl SnapshotManager {
         }
     }
 
-    /// Resolve transaction ID to snapshot timestamp
+    /// Resolve transaction ID to snapshot timestamp: the newest snapshot that
+    /// carries it, from the store's records when the in-memory map has let go
+    /// of one that may be newer than the one it maps the id to.
     fn resolve_transaction(&self, txn_id: TransactionId) -> Result<u64> {
-        self.txn_to_timestamp.read().get(&txn_id).copied().ok_or_else(|| {
-            Error::query_execution(format!(
-                "Transaction {} not found or has been garbage collected",
-                txn_id
-            ))
+        let mut found = self.txn_to_timestamp.read().get(&txn_id).copied();
+        if !self.memory_holds_every_snapshot_after(found) {
+            self.for_each_stored_snapshot(|metadata| {
+                if metadata.transaction_id == txn_id && found.is_none_or(|ts| metadata.timestamp > ts) {
+                    found = Some(metadata.timestamp);
+                }
+            })?;
+        }
+        found.ok_or_else(|| {
+            Error::query_execution(format!("Transaction {txn_id} not found or has been garbage collected"))
         })
     }
 
-    /// Resolve SCN to snapshot timestamp
+    /// Resolve SCN to snapshot timestamp (an SCN names one snapshot; from the
+    /// store's records when the in-memory map has let go of it).
     pub fn resolve_scn(&self, scn: Scn) -> Result<u64> {
-        self.scn_to_timestamp
-            .read()
-            .get(&scn)
-            .copied()
-            .ok_or_else(|| Error::query_execution(format!("SCN {} not found or has been garbage collected", scn)))
+        let mut found = self.scn_to_timestamp.read().get(&scn).copied();
+        if found.is_none() && self.evicted.any.load(Ordering::Acquire) {
+            self.for_each_stored_snapshot(|metadata| {
+                if metadata.scn == scn {
+                    found = Some(metadata.timestamp);
+                }
+            })?;
+        }
+        found.ok_or_else(|| Error::query_execution(format!("SCN {scn} not found or has been garbage collected")))
+    }
+
+    /// `AS OF TIMESTAMP`'s choice: keep `metadata` in `best` (as `(wall-clock
+    /// second, timestamp)`) when it is at or before `target_secs` and later than
+    /// `best` — a later second, or the same second and a newer snapshot.
+    fn closer_at_or_before(best: &mut Option<(i64, u64)>, metadata: &SnapshotMetadata, target_secs: i64) {
+        let candidate = (metadata.wall_clock_unix_secs(), metadata.timestamp);
+        if candidate.0 <= target_secs && best.is_none_or(|b| candidate > b) {
+            *best = Some(candidate);
+        }
+    }
+
+    /// `VERSIONS BETWEEN`'s choice: the earliest snapshot at or after
+    /// `target_secs` for the start, the latest at or before it for the end.
+    fn range_candidate(best: &mut Option<u64>, metadata: &SnapshotMetadata, target_secs: i64, is_start: bool) {
+        let wall_secs = metadata.wall_clock_unix_secs();
+        let timestamp = metadata.timestamp;
+        let better = if is_start {
+            wall_secs >= target_secs && best.is_none_or(|b| timestamp < b)
+        } else {
+            wall_secs <= target_secs && best.is_none_or(|b| timestamp > b)
+        };
+        if better {
+            *best = Some(timestamp);
+        }
+    }
+
+    /// Whether the in-memory map alone answers an `AS OF TIMESTAMP` lookup whose
+    /// best in-memory candidate is `best`: nothing was let go of, or `best` is
+    /// later, by wall clock and then by timestamp, than everything that was (so
+    /// no record the map lacks can be closer to the target). Call it under the
+    /// map's lock, after the walk: eviction moves the watermarks before it
+    /// removes an entry.
+    fn memory_answers(&self, best: Option<(i64, u64)>) -> bool {
+        if !self.evicted.any.load(Ordering::Acquire) {
+            return true;
+        }
+        let evicted = (
+            self.evicted.max_wall_secs.load(Ordering::Acquire),
+            self.evicted.through_ts.load(Ordering::Acquire),
+        );
+        best.is_some_and(|candidate| candidate > evicted)
+    }
+
+    /// Whether no snapshot the in-memory map let go of is newer than `found`.
+    fn memory_holds_every_snapshot_after(&self, found: Option<u64>) -> bool {
+        !self.evicted.any.load(Ordering::Acquire)
+            || found.is_some_and(|ts| ts > self.evicted.through_ts.load(Ordering::Acquire))
+    }
+
+    /// [`Self::memory_answers`] for a `VERSIONS BETWEEN` bound: a start no
+    /// evicted snapshot is late enough for, or an end newer than all of them.
+    fn memory_answers_range(&self, best: Option<u64>, target_secs: i64, is_start: bool) -> bool {
+        if is_start {
+            !self.evicted.any.load(Ordering::Acquire)
+                || self.evicted.max_wall_secs.load(Ordering::Acquire) < target_secs
+        } else {
+            self.memory_holds_every_snapshot_after(best)
+        }
+    }
+
+    /// Visit every `snapshot:` record in the store, decoded; one that does not
+    /// decode is skipped, as the open-time recovery skips it. A bounded walk of
+    /// the family (total order, an upper bound at its end; see
+    /// `tests/prefix_mode_scans.rs`), for the lookups the in-memory map cannot
+    /// answer alone ([`EvictedSnapshots`]).
+    fn for_each_stored_snapshot(&self, mut visit: impl FnMut(&SnapshotMetadata)) -> Result<()> {
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(SNAPSHOT_RECORD_PREFIX, rocksdb::Direction::Forward),
+            bounded_read_options(SNAPSHOT_RECORD_PREFIX),
+        );
+        for item in iter {
+            let (key, value) =
+                item.map_err(|e| Error::storage(format!("Iterator error reading snapshot records: {e}")))?;
+            if !key.starts_with(SNAPSHOT_RECORD_PREFIX) {
+                break;
+            }
+            if let Some(metadata) = deserialize_snapshot_metadata(&value) {
+                visit(&metadata);
+            }
+        }
+        Ok(())
     }
 
     /// Get current timestamp
@@ -1942,50 +2099,53 @@ impl SnapshotManager {
 
     /// Garbage collect old snapshots
     ///
-    /// Removes snapshots that are:
-    /// - Older than min_retention_seconds
-    /// - Beyond max_snapshots limit
-    /// - Marked as gc_eligible
+    /// A snapshot lives as long as the history it resolves to can be read:
+    /// the configured `storage.version_retention`, which the version GC
+    /// enforces through its low watermark. Among the snapshots marked
+    /// `gc_eligible`:
+    /// - one below the version-GC low watermark (every read it could resolve
+    ///   is refused there, `check_gc_horizon`) and older than
+    ///   `min_retention_seconds` (a floor) is removed, its `snapshot:` record
+    ///   with it. With infinite retention (the default) the watermark never
+    ///   moves and no record is removed: they grow by one per snapshot, about
+    ///   60 bytes, until `version_retention` is set;
+    /// - past `max_snapshots`, the oldest leave the in-memory map only: their
+    ///   records stay in the store, and `AS OF` finds them there
+    ///   (`EvictedSnapshots`). This used to delete the records too, so on a
+    ///   busy store `AS OF` and `CREATE BRANCH … AS OF` reached only the last
+    ///   ~1000 snapshots, an anchor seconds old included; and the age rule
+    ///   used to delete them after a fixed hour whatever the retention;
+    /// - a record of one the map let go of is deleted once the watermark has
+    ///   passed it, by a sweep bounded per call (`sweep_expired_records`).
+    ///   The version GC calls this after each cycle, so the sweep follows the
+    ///   watermark on a quiet store too.
+    ///
+    /// Returns how many left the in-memory map.
     pub fn gc_old_snapshots(&self) -> Result<usize> {
-        let now = Utc::now().timestamp() as u64;
-        let min_retention = self.gc_config.min_retention_seconds;
+        let now_secs = Utc::now().timestamp();
+        let min_retention = i64::try_from(self.gc_config.min_retention_seconds).unwrap_or(i64::MAX);
+        let watermark = self.gc_low_watermark();
+        // W2.2(b): wall-clock age from epoch-micros metadata (seconds granularity).
+        let expired = |metadata: &SnapshotMetadata| {
+            metadata.gc_eligible
+                && metadata.timestamp < watermark
+                && now_secs.saturating_sub(metadata.wall_clock_unix_secs()) > min_retention
+        };
 
         let mut snapshots = self.snapshots.write();
-        let mut to_remove = Vec::new();
+        let to_remove: Vec<u64> = snapshots
+            .values()
+            .filter(|&metadata| expired(metadata))
+            .map(|metadata| metadata.timestamp)
+            .collect();
 
-        // Find snapshots eligible for GC
-        for (ts, metadata) in snapshots.iter() {
-            if !metadata.gc_eligible {
-                continue;
-            }
-
-            // W2.2(b): wall-clock age from epoch-micros metadata (seconds granularity).
-            let age = now.saturating_sub(metadata.wall_clock_unix_secs() as u64);
-            if age > min_retention {
-                to_remove.push(*ts);
-            }
-        }
-
-        // If we're still over the limit, remove oldest eligible snapshots
-        if snapshots.len() - to_remove.len() > self.gc_config.max_snapshots {
-            let mut eligible: Vec<_> = snapshots
-                .iter()
-                .filter(|(_, m)| m.gc_eligible && !to_remove.contains(&m.timestamp))
-                .map(|(ts, m)| (*ts, m.clone()))
-                .collect();
-
-            eligible.sort_by_key(|(ts, _)| *ts);
-
-            let excess = (snapshots.len() - to_remove.len()).saturating_sub(self.gc_config.max_snapshots);
-            for (ts, _) in eligible.iter().take(excess) {
-                to_remove.push(*ts);
-            }
-        }
+        // If we're still over the limit, the oldest eligible leave memory only.
+        let to_evict = self.oldest_beyond_limit(&snapshots, &to_remove);
 
         // Remove snapshots
-        let count = to_remove.len();
+        let count = to_remove.len() + to_evict.len();
         let mut delete_batch = WriteBatch::default();
-        let mut removed = Vec::with_capacity(count);
+        let mut removed = Vec::with_capacity(to_remove.len());
         for ts in &to_remove {
             if let Some(metadata) = snapshots.remove(ts) {
                 if self.persist_metadata {
@@ -2017,22 +2177,172 @@ impl SnapshotManager {
         // with the running process.
         self.unmap_forgotten_snapshots(&snapshots, &removed);
 
-        if count > 0 && self.persist_metadata {
+        self.evict_from_memory(&mut snapshots, &to_evict)?;
+
+        // A manager that writes its own records (not a physical image's, which
+        // change only through replication) deletes those of evicted snapshots
+        // once the watermark has passed them; before it moves, none can be.
+        let swept = if (self.persist_metadata || self.non_durable_writes)
+            && watermark > 0
+            && self.evicted.any.load(Ordering::Acquire)
+        {
+            let budget = self.gc_config.max_snapshots.clamp(1, 1000).saturating_mul(2);
+            self.sweep_expired_records(&snapshots, &mut delete_batch, expired, budget)?
+        } else {
+            false
+        };
+
+        if (!removed.is_empty() && self.persist_metadata) || swept {
             self.write_batch(delete_batch, "Failed to delete old snapshots")?;
         }
 
         Ok(count)
     }
 
+    /// The oldest gc-eligible snapshots past `max_snapshots`, not counting the
+    /// ones in `leaving` (on their way out already).
+    fn oldest_beyond_limit(&self, snapshots: &HashMap<u64, SnapshotMetadata>, leaving: &[u64]) -> Vec<u64> {
+        let excess = snapshots
+            .len()
+            .saturating_sub(leaving.len())
+            .saturating_sub(self.gc_config.max_snapshots);
+        if excess == 0 {
+            return Vec::new();
+        }
+        let leaving: HashSet<u64> = leaving.iter().copied().collect();
+        let mut eligible: Vec<u64> = snapshots
+            .values()
+            .filter(|metadata| metadata.gc_eligible && !leaving.contains(&metadata.timestamp))
+            .map(|metadata| metadata.timestamp)
+            .collect();
+        eligible.sort_unstable();
+        eligible.truncate(excess);
+        eligible
+    }
+
+    /// Let the snapshots at `evict` go from the in-memory maps while their
+    /// `snapshot:` records stay in the store, where the lookups the maps can no
+    /// longer answer find them ([`EvictedSnapshots`]). A memory-only database
+    /// writes no record as it registers a snapshot, so it writes these now.
+    /// The watermarks move before any entry goes: a lookup that misses an
+    /// entry must see them.
+    fn evict_from_memory(&self, snapshots: &mut HashMap<u64, SnapshotMetadata>, evict: &[u64]) -> Result<()> {
+        if evict.is_empty() {
+            return Ok(());
+        }
+        if self.non_durable_writes && !self.persist_metadata {
+            let mut batch = WriteBatch::default();
+            for metadata in evict.iter().filter_map(|ts| snapshots.get(ts)) {
+                let value = bincode::serialize(metadata)
+                    .map_err(|e| Error::storage(format!("Failed to serialize metadata: {e}")))?;
+                batch.put(format!("snapshot:{}", metadata.timestamp).as_bytes(), value);
+            }
+            self.write_batch(batch, "Failed to keep the records of evicted snapshots")?;
+        }
+        for metadata in evict.iter().filter_map(|ts| snapshots.get(ts)) {
+            self.note_evicted(metadata);
+        }
+        let evicted: Vec<SnapshotMetadata> = evict.iter().filter_map(|ts| snapshots.remove(ts)).collect();
+        // The id maps follow the rule removal follows: an id that named an
+        // evicted snapshot moves to its newest one still in memory. A lookup
+        // checks that against the watermarks and walks the records when an
+        // evicted snapshot may be newer (`resolve_transaction`).
+        self.unmap_forgotten_snapshots(snapshots, &evicted);
+        Ok(())
+    }
+
+    /// Move the eviction watermarks past `metadata`, a snapshot whose record
+    /// the store keeps while the in-memory map does not hold it.
+    fn note_evicted(&self, metadata: &SnapshotMetadata) {
+        self.evicted.through_ts.fetch_max(metadata.timestamp, Ordering::AcqRel);
+        self.evicted
+            .max_wall_secs
+            .fetch_max(metadata.wall_clock_unix_secs(), Ordering::AcqRel);
+        self.evicted.any.store(true, Ordering::Release);
+    }
+
+    /// Whether the in-memory map has let go of snapshots whose records the
+    /// store may still hold: then [`Self::list_snapshots`] (`\snapshots`,
+    /// `pg_snapshots`) lists only the newest, and `AS OF` still reaches the
+    /// others inside `storage.version_retention`.
+    pub fn has_snapshots_beyond_memory(&self) -> bool {
+        self.evicted.any.load(Ordering::Acquire)
+    }
+
+    /// Delete the store's `snapshot:` records that are `expired` (see
+    /// [`Self::gc_old_snapshots`]) and not in the in-memory map: the records of
+    /// snapshots the map let go of by count, which the pass over the map never
+    /// sees. At most
+    /// `budget` records a call, resuming where the last call stopped and
+    /// starting over past the end of the family, so the cost follows the
+    /// registrations that trigger GC and every record is revisited within
+    /// about `records / budget` calls. Returns whether it staged a delete.
+    fn sweep_expired_records(
+        &self,
+        in_memory: &HashMap<u64, SnapshotMetadata>,
+        batch: &mut WriteBatch,
+        expired: impl Fn(&SnapshotMetadata) -> bool,
+        budget: usize,
+    ) -> Result<bool> {
+        let mut cursor = self.evicted.sweep_cursor.lock();
+        let start = cursor.take().unwrap_or_else(|| SNAPSHOT_RECORD_PREFIX.to_vec());
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(start.as_slice(), rocksdb::Direction::Forward),
+            bounded_read_options(SNAPSHOT_RECORD_PREFIX),
+        );
+        let mut staged = false;
+        for (visited, item) in iter.enumerate() {
+            let (key, value) =
+                item.map_err(|e| Error::storage(format!("Iterator error sweeping snapshot records: {e}")))?;
+            if !key.starts_with(SNAPSHOT_RECORD_PREFIX) {
+                break;
+            }
+            if visited == budget {
+                *cursor = Some(key.to_vec());
+                break;
+            }
+            let Some(metadata) = deserialize_snapshot_metadata(&value) else {
+                continue;
+            };
+            if in_memory.contains_key(&metadata.timestamp) || !expired(&metadata) {
+                continue;
+            }
+            batch.delete(&key);
+            // The legacy id-map records go with it, as in the age pass.
+            batch.delete(format!("txn_map:{}", metadata.transaction_id).as_bytes());
+            batch.delete(format!("scn_map:{}", metadata.scn).as_bytes());
+            staged = true;
+        }
+        Ok(staged)
+    }
+
+    /// The in-memory map size past which GC runs: `max_snapshots` plus a slack
+    /// of as many again, at most 1000, so GC runs once per slack registrations.
+    fn gc_trigger(&self) -> usize {
+        let slack = self.gc_config.max_snapshots.clamp(1, 1000);
+        self.gc_config.max_snapshots.saturating_add(slack)
+    }
+
     /// Run GC if needed
     fn gc_if_needed(&self) -> Result<()> {
         let snapshot_count = self.snapshots.read().len();
-        let slack = self.gc_config.max_snapshots.clamp(1, 1000);
-        let trigger = self.gc_config.max_snapshots.saturating_add(slack);
-        if snapshot_count > trigger {
+        if snapshot_count > self.gc_trigger() {
             self.gc_old_snapshots()?;
         }
         Ok(())
+    }
+
+    /// Bring the in-memory map back to `max_snapshots` once it has outgrown
+    /// the GC trigger, by count alone, and deleting nothing: as a physical
+    /// standby ingests the primary's records, which change only through
+    /// replication (the primary's GC deletes them).
+    fn trim_memory_if_needed(&self) -> Result<()> {
+        if !self.gc_config.auto_gc_enabled || self.snapshots.read().len() <= self.gc_trigger() {
+            return Ok(());
+        }
+        let mut snapshots = self.snapshots.write();
+        let evict = self.oldest_beyond_limit(&snapshots, &[]);
+        self.evict_from_memory(&mut snapshots, &evict)
     }
 
     /// Get snapshot metadata
@@ -2055,12 +2365,18 @@ impl SnapshotManager {
         self.current_txn_id.load(Ordering::Relaxed)
     }
 
-    /// Get snapshot count
+    /// How many snapshots the in-memory map holds: all of them until it lets
+    /// some go by count (`has_snapshots_beyond_memory`), the newest after.
     pub fn snapshot_count(&self) -> usize {
         self.snapshots.read().len()
     }
 
-    /// List all snapshots
+    /// List the snapshots the in-memory map holds, oldest first: every one
+    /// until the map lets some go by count, then only the newest
+    /// `max_snapshots` to twice that — what `\snapshots`, `pg_snapshots`,
+    /// `pg_transaction_map` and `pg_scn_map` show, and say so
+    /// ([`Self::has_snapshots_beyond_memory`]). `AS OF` reaches the older
+    /// ones through their records.
     pub fn list_snapshots(&self) -> Result<Vec<SnapshotMetadata>> {
         let snapshots = self.snapshots.read();
         let mut result: Vec<_> = snapshots.values().cloned().collect();
@@ -2079,6 +2395,17 @@ impl SnapshotManager {
 
     fn recover_snapshots_with_policy(&self, strict: bool) -> Result<usize> {
         let mut count = 0;
+        // The map holds the newest `max_snapshots`; every older record stays
+        // in the store, where a lookup the map cannot answer finds it. They
+        // are collected here in a set of that bound, never all at once: with
+        // infinite `storage.version_retention` the store keeps one record per
+        // snapshot ever taken, millions on a busy store.
+        let keep = if self.gc_config.auto_gc_enabled {
+            self.gc_config.max_snapshots
+        } else {
+            usize::MAX
+        };
+        let mut newest: BTreeMap<u64, SnapshotMetadata> = BTreeMap::new();
         // A scan across every key prefix must be a total-order iterator. The
         // engine's store has a 5-byte prefix extractor, and a prefix-mode
         // iterator is defined only within one prefix: when it steps onto a key
@@ -2112,13 +2439,23 @@ impl SnapshotManager {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if key_str.starts_with("snapshot:") {
                     if let Some(metadata) = Self::decode_snapshot_record(key_str, &value, strict)? {
-                        self.publish_snapshot_metadata(metadata);
+                        self.advance_counters(&metadata);
+                        newest.insert(metadata.timestamp, metadata);
+                        if newest.len() > keep {
+                            if let Some((_, older)) = newest.pop_first() {
+                                self.note_evicted(&older);
+                            }
+                        }
                         count += 1;
                     }
                 }
             }
         }
 
+        // Oldest first, so an id several snapshots carry maps to its newest.
+        for metadata in newest.into_values() {
+            self.publish_snapshot_metadata(metadata);
+        }
         Ok(count)
     }
 
@@ -2161,8 +2498,13 @@ impl SnapshotManager {
             .write()
             .insert(metadata.transaction_id, metadata.timestamp);
         self.scn_to_timestamp.write().insert(metadata.scn, metadata.timestamp);
+        self.advance_counters(&metadata);
+    }
 
-        // Update counters. W2.2(d): fetch_max is the atomic
+    /// Advance the SCN / transaction-id counters and the newest timestamp past
+    /// a recovered or replicated snapshot, held in memory or not.
+    fn advance_counters(&self, metadata: &SnapshotMetadata) {
+        // W2.2(d): fetch_max is the atomic
         // equivalent of the former `if id >= *counter { *counter = id + 1 }`.
         self.current_scn.fetch_max(metadata.scn + 1, Ordering::Relaxed);
         self.newest_snapshot_ts.fetch_max(metadata.timestamp, Ordering::AcqRel);
@@ -2183,6 +2525,9 @@ impl SnapshotManager {
             .ok_or_else(|| Error::storage("malformed snapshot metadata"))?;
         let timestamp = metadata.timestamp;
         self.publish_snapshot_metadata(metadata);
+        // The primary keeps every record inside retention; the map keeps the
+        // newest, as the primary's does.
+        self.trim_memory_if_needed()?;
         Ok(timestamp)
     }
 
@@ -2666,12 +3011,17 @@ mod tests {
         assert_eq!(recovered_mapping(&db), Some(200));
 
         // The id maps to the snapshot GC removes while an older one carrying
-        // it is pinned: the mapping moves to the survivor.
+        // it is pinned: the mapping moves to the survivor. Removed because the
+        // version-GC watermark passed it (and it is past the age floor): an
+        // excess by count only leaves memory now, its record kept for `AS OF`
+        // (`count_eviction_keeps_every_record_findable`).
         let (db, _temp) = create_test_db();
         let manager = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), gc_config());
         manager.register_snapshot_with_lsn(100, 7).unwrap();
         manager.register_snapshot_with_lsn(200, 7).unwrap();
         manager.snapshots.write().get_mut(&100).unwrap().gc_eligible = false;
+        manager.snapshots.write().get_mut(&200).unwrap().wall_clock_micros = 0;
+        manager.set_gc_low_watermark(201);
         let shared_scn = manager.get_snapshot_metadata(200).unwrap().scn;
         assert_eq!(manager.gc_old_snapshots().unwrap(), 1);
         assert!(manager.get_snapshot_metadata(200).is_none());
@@ -2681,6 +3031,205 @@ mod tests {
             "the removed snapshot's SCN goes with it"
         );
         assert_eq!(recovered_mapping(&db), Some(100));
+    }
+
+    /// `count` snapshots at timestamps 100, 200, …, the i-th with SCN and
+    /// transaction id `i`, registered `1000 - 10 * i` seconds ago: entries in
+    /// the in-memory map, and records in the store when the manager persists
+    /// them. Returns their wall-clock seconds, oldest first.
+    fn seed_dated_snapshots(manager: &SnapshotManager, count: u64) -> Vec<i64> {
+        let now = Utc::now().timestamp();
+        (1..=count)
+            .map(|i| {
+                let secs = now - 1000 + i64::try_from(i).unwrap() * 10;
+                let mut metadata = SnapshotMetadata::new(i * 100, i, i);
+                metadata.wall_clock_micros = secs * 1_000_000;
+                if manager.persist_metadata {
+                    manager.persist_snapshot_metadata(&metadata).unwrap();
+                }
+                manager.publish_snapshot_metadata(metadata);
+                secs
+            })
+            .collect()
+    }
+
+    fn utc(secs: i64) -> String {
+        DateTime::from_timestamp(secs, 0)
+            .unwrap()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+
+    /// Review item P2 (4.42.0): GC past `max_snapshots` deleted the records
+    /// with the in-memory entries, so `AS OF` (and `CREATE BRANCH … AS OF`)
+    /// reached only the newest ~1000 snapshots, an anchor seconds old
+    /// included. Red before the fix: every lookup of snapshot 3 below failed.
+    #[test]
+    fn count_eviction_keeps_every_record_findable() {
+        use crate::sql::logical_plan::AsOfClause;
+        let (db, _temp) = create_test_db();
+        let config = || GcConfig {
+            min_retention_seconds: 3600,
+            max_snapshots: 2,
+            auto_gc_enabled: false,
+        };
+        let manager = SnapshotManager::with_gc_config(Arc::clone(&db), WriteGate::open(), config());
+        let walls = seed_dated_snapshots(&manager, 10);
+        let wall = |i: usize| *walls.get(i - 1).unwrap();
+        assert_eq!(manager.gc_old_snapshots().unwrap(), 8);
+        assert_eq!(manager.snapshot_count(), 2);
+        assert!(
+            db.get(b"snapshot:300").unwrap().is_some(),
+            "an evicted snapshot's record stays"
+        );
+
+        let check = |manager: &SnapshotManager, when: &str| {
+            // At snapshot 3's second, and between it and snapshot 4's.
+            assert_eq!(manager.resolve_timestamp(&utc(wall(3))).unwrap(), 300, "{when}");
+            assert_eq!(manager.resolve_timestamp(&utc(wall(3) + 5)).unwrap(), 300, "{when}");
+            assert_eq!(manager.resolve_transaction(3).unwrap(), 300, "{when}");
+            assert_eq!(manager.resolve_scn(3).unwrap(), 300, "{when}");
+            let at = |secs: i64| AsOfClause::Timestamp(utc(secs));
+            assert_eq!(
+                manager.resolve_timestamp_for_range(&at(wall(3) - 5), true).unwrap(),
+                300,
+                "{when}"
+            );
+            assert_eq!(
+                manager.resolve_timestamp_for_range(&at(wall(3) + 5), false).unwrap(),
+                300,
+                "{when}"
+            );
+            // The newest, from the map.
+            assert_eq!(manager.resolve_timestamp(&utc(wall(10))).unwrap(), 1000, "{when}");
+            // Before every snapshot: the error it always was, counting them all.
+            let err = manager.resolve_timestamp(&utc(wall(1) - 100)).unwrap_err().to_string();
+            assert!(err.contains("No snapshot at or before"), "{when}: {err}");
+            assert!(err.contains("(10 snapshots)"), "{when}: {err}");
+        };
+        check(&manager, "running");
+
+        // A restart loads every record, and the map keeps the newest.
+        let recovered = SnapshotManager::with_gc_config(
+            Arc::clone(&db),
+            WriteGate::open(),
+            GcConfig {
+                auto_gc_enabled: true,
+                ..config()
+            },
+        );
+        assert_eq!(recovered.recover_snapshots().unwrap(), 10);
+        assert_eq!(recovered.snapshot_count(), 2);
+        check(&recovered, "recovered");
+    }
+
+    /// A record lives as long as the history it resolves to: while the
+    /// version-GC watermark has not passed it, no age deletes it (infinite
+    /// `storage.version_retention`, the default, keeps them all; the fixed
+    /// hour that used to apply is gone); once it has, the bounded sweep (four
+    /// records a call here) deletes the evicted snapshots' records below it,
+    /// and the rest stay.
+    #[test]
+    fn records_of_evicted_snapshots_are_swept_once_the_watermark_passes_them() {
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::with_gc_config(
+            Arc::clone(&db),
+            WriteGate::open(),
+            GcConfig {
+                // Every snapshot here is past the age floor.
+                min_retention_seconds: 0,
+                max_snapshots: 2,
+                auto_gc_enabled: false,
+            },
+        );
+        let walls = seed_dated_snapshots(&manager, 10);
+        let wall = |i: usize| *walls.get(i - 1).unwrap();
+        let stored = || -> Vec<u64> {
+            (1..=10_u64)
+                .filter(|i| db.get(format!("snapshot:{}", i * 100)).unwrap().is_some())
+                .collect()
+        };
+        // Ten records at four a call: a pass is three calls, and a call may
+        // start mid-pass, so six calls make sure.
+        assert_eq!(manager.gc_old_snapshots().unwrap(), 8);
+        for _ in 0..6 {
+            assert_eq!(manager.gc_old_snapshots().unwrap(), 0);
+        }
+        assert_eq!(
+            stored(),
+            (1..=10).collect::<Vec<u64>>(),
+            "no watermark: every record stays"
+        );
+        assert_eq!(manager.resolve_timestamp(&utc(wall(2))).unwrap(), 200);
+
+        // The version GC moved its watermark to snapshot 5: 1-4 resolve only
+        // to reads it refuses.
+        manager.set_gc_low_watermark(500);
+        for _ in 0..6 {
+            assert_eq!(manager.gc_old_snapshots().unwrap(), 0);
+        }
+        assert_eq!(stored(), (5..=10).collect::<Vec<u64>>());
+
+        let err = manager.resolve_timestamp(&utc(wall(2))).unwrap_err().to_string();
+        assert!(err.contains("No snapshot at or before"), "{err}");
+        assert!(err.contains("storage.version_retention"), "{err}");
+        assert_eq!(manager.resolve_timestamp(&utc(wall(5))).unwrap(), 500);
+    }
+
+    /// Open-time recovery holds no more than `max_snapshots` in memory however
+    /// many records the store keeps, and still advances every counter past
+    /// all of them.
+    #[test]
+    fn recovery_loads_only_the_newest_records() {
+        let (db, _temp) = create_test_db();
+        let writer = SnapshotManager::new(Arc::clone(&db), WriteGate::open());
+        seed_dated_snapshots(&writer, 10);
+        let recovered = SnapshotManager::with_gc_config(
+            Arc::clone(&db),
+            WriteGate::open(),
+            GcConfig {
+                min_retention_seconds: 3600,
+                max_snapshots: 3,
+                auto_gc_enabled: true,
+            },
+        );
+        assert_eq!(recovered.recover_snapshots().unwrap(), 10);
+        let held: Vec<u64> = recovered
+            .list_snapshots()
+            .unwrap()
+            .iter()
+            .map(|s| s.timestamp)
+            .collect();
+        assert_eq!(held, vec![800, 900, 1000]);
+        assert!(recovered.has_snapshots_beyond_memory());
+        assert_eq!(recovered.current_scn(), 11);
+        assert_eq!(recovered.current_transaction_id(), 11);
+        assert_eq!(recovered.max_snapshot_timestamp(), Some(1000));
+        assert_eq!(recovered.resolve_transaction(4).unwrap(), 400);
+    }
+
+    /// A memory-only store writes no record as it registers a snapshot; it
+    /// writes the ones its map lets go of, so `AS OF` still finds them.
+    #[test]
+    fn a_memory_only_store_writes_the_records_its_map_lets_go_of() {
+        let (db, _temp) = create_test_db();
+        let mut manager = SnapshotManager::new_non_durable(Arc::clone(&db), WriteGate::open());
+        manager.gc_config = GcConfig {
+            min_retention_seconds: 3600,
+            max_snapshots: 2,
+            auto_gc_enabled: false,
+        };
+        let walls = seed_dated_snapshots(&manager, 10);
+        let wall = |i: usize| *walls.get(i - 1).unwrap();
+        assert!(db.get(b"snapshot:300").unwrap().is_none());
+        assert_eq!(manager.gc_old_snapshots().unwrap(), 8);
+        assert!(db.get(b"snapshot:300").unwrap().is_some());
+        assert!(
+            db.get(b"snapshot:1000").unwrap().is_none(),
+            "still in memory: no record"
+        );
+        assert_eq!(manager.resolve_timestamp(&utc(wall(3))).unwrap(), 300);
+        assert_eq!(manager.resolve_transaction(3).unwrap(), 300);
     }
 
     #[test]

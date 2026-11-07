@@ -41,6 +41,24 @@ use std::sync::Arc;
 
 const ANY_ARRAY_MARKER_FUNCTION: &str = "__hdb_any_array";
 
+/// PostgreSQL's wording for an aggregate call inside an aggregate's
+/// `FILTER (WHERE …)`. The PostgreSQL wire maps it to 42803
+/// (`grouping_error`) in `sqlstate_for_query_execution_message`
+/// (marker-const discipline).
+pub const AGGREGATE_IN_FILTER: &str = "aggregate functions are not allowed in FILTER";
+
+/// The window-function twin of [`AGGREGATE_IN_FILTER`]: 42P20 (`windowing_error`).
+pub const WINDOW_IN_FILTER: &str = "window functions are not allowed in FILTER";
+
+/// PostgreSQL's wording, and its class (0A000, `feature_not_supported`), for
+/// `FILTER (WHERE …)` on a window function that is not an aggregate
+/// (`row_number() FILTER (WHERE …) OVER (…)`).
+pub const FILTER_ON_NON_AGGREGATE_WINDOW: &str = "FILTER is not implemented for non-aggregate window functions";
+
+/// The start of PostgreSQL's `FILTER specified, but f is not an aggregate
+/// function` (42809, `wrong_object_type`), raised for a FILTER on a scalar call.
+pub const FILTER_ON_NON_AGGREGATE_PREFIX: &str = "FILTER specified, but ";
+
 /// Information about an aggregate plan needed to rewrite ORDER BY expressions.
 /// The aggregate and GROUP BY expressions of a grouped plan, used to rewrite
 /// ORDER BY keys to the Aggregate operator's output columns (group_N / agg_N)
@@ -5177,6 +5195,7 @@ impl<'a> Planner<'a> {
                         }
                         _ => (vec![], false),
                     };
+                    let args = Self::filter_aggregate_args(args, self.aggregate_filter(func)?.as_ref());
 
                     Ok(Some(LogicalExpr::AggregateFunction { fun, args, distinct }))
                 } else {
@@ -5185,6 +5204,104 @@ impl<'a> Planner<'a> {
             }
             _ => Ok(None),
         }
+    }
+
+    /// The predicate of an aggregate call's `FILTER (WHERE …)`, planned, or
+    /// `None` when the call has none.
+    ///
+    /// The clause used to be dropped here without a word: `sum(v) FILTER
+    /// (WHERE id <= 1)` summed every row, on every route. PostgreSQL refuses
+    /// an aggregate or window call inside the predicate (42803 / 42P20), and
+    /// so does this; the predicate's bare names get the plan-time check the
+    /// WHERE clause gets (GH#29 V2), so an unknown column is 42703 even over
+    /// an empty table.
+    fn aggregate_filter(&self, func: &sqlparser::ast::Function) -> Result<Option<LogicalExpr>> {
+        let Some(filter) = func.filter.as_deref() else {
+            return Ok(None);
+        };
+        let predicate = self.expr_to_logical(filter)?;
+        if let Some(refusal) = Self::aggregate_or_window_in_filter(&predicate) {
+            return Err(Error::query_execution(refusal));
+        }
+        self.refuse_unresolved(std::slice::from_ref(&predicate), &[])?;
+        Ok(Some(predicate))
+    }
+
+    /// `agg(x) FILTER (WHERE p)` is planned as `agg(CASE WHEN p THEN x END)`,
+    /// and `count(*) FILTER (WHERE p)` as `count(CASE WHEN p THEN 1 END)`;
+    /// with no FILTER (`predicate` `None`) the arguments come back unchanged.
+    ///
+    /// Exact because every aggregate this engine computes skips a NULL input:
+    /// `evaluate_aggregate` drops NULLs before every function but COUNT (so
+    /// before `array_agg` / `json_agg` too, which PostgreSQL would keep; if
+    /// that is ever changed, those two need the predicate applied to the row
+    /// instead, and `tests/aggregate_filter_tests.rs` says so), COUNT of an
+    /// expression counts non-NULLs, and the streaming accumulators, the
+    /// aggregate window frame and the storage pushdowns do the same. So a row
+    /// the predicate rejects contributes nothing, and a row it accepts
+    /// contributes what it would without the clause. DISTINCT is unaffected:
+    /// the NULL the rejected rows produce is dropped after de-duplication.
+    ///
+    /// Folding the predicate into the argument rather than carrying it beside
+    /// the call is deliberate. `LogicalExpr` is bincode-encoded in persisted
+    /// plans, so a new field would make every stored plan undecodable; and an
+    /// argument is something every fast path already has to understand: the
+    /// count-star and PK-cardinality shortcuts and the columnar / row-store
+    /// pushdowns (serial and parallel) accept only `*` or a bare column, so a
+    /// CASE argument sends them to the general aggregate, and every walker
+    /// that collects the columns an aggregate reads (decode hints, projection
+    /// pruning, subquery materialisation) sees the predicate's columns too.
+    fn filter_aggregate_args(args: Vec<LogicalExpr>, predicate: Option<&LogicalExpr>) -> Vec<LogicalExpr> {
+        let Some(predicate) = predicate else {
+            return args;
+        };
+        args.into_iter()
+            .map(|arg| {
+                let value = match arg {
+                    LogicalExpr::Wildcard => LogicalExpr::Literal(Value::Int4(1)),
+                    other => other,
+                };
+                LogicalExpr::Case {
+                    expr: None,
+                    when_then: vec![(predicate.clone(), value)],
+                    else_result: None,
+                }
+            })
+            .collect()
+    }
+
+    /// [`AGGREGATE_IN_FILTER`] / [`WINDOW_IN_FILTER`] when a FILTER predicate
+    /// calls an aggregate or window function outside a subquery (a subquery
+    /// is its own query level, where both are allowed).
+    fn aggregate_or_window_in_filter(expr: &LogicalExpr) -> Option<&'static str> {
+        let children: Vec<&LogicalExpr> = match expr {
+            LogicalExpr::AggregateFunction { .. } => return Some(AGGREGATE_IN_FILTER),
+            LogicalExpr::WindowFunction { .. } => return Some(WINDOW_IN_FILTER),
+            LogicalExpr::BinaryExpr { left, right, .. } => vec![&**left, &**right],
+            LogicalExpr::UnaryExpr { expr, .. }
+            | LogicalExpr::Cast { expr, .. }
+            | LogicalExpr::IsNull { expr, .. }
+            | LogicalExpr::InSet { expr, .. }
+            | LogicalExpr::InSubquery { expr, .. } => vec![&**expr],
+            LogicalExpr::ScalarFunction { args: items, .. } | LogicalExpr::Tuple { items } => items.iter().collect(),
+            LogicalExpr::Between { expr, low, high, .. } => vec![&**expr, &**low, &**high],
+            LogicalExpr::InList { expr, list, .. } => std::iter::once(&**expr).chain(list).collect(),
+            LogicalExpr::ArraySubscript { array, index } => vec![&**array, &**index],
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_result,
+            } => {
+                let arms = when_then.iter().flat_map(|(when, then)| [when, then]);
+                expr.as_deref()
+                    .into_iter()
+                    .chain(arms)
+                    .chain(else_result.as_deref())
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        children.into_iter().find_map(Self::aggregate_or_window_in_filter)
     }
 
     /// Parse STRING_AGG(value, delimiter) aggregate function
@@ -5239,9 +5356,11 @@ impl<'a> Planner<'a> {
         let value_expr = args
             .first()
             .ok_or_else(|| Error::query_execution("STRING_AGG requires a value argument"))?;
+        // Only the value expression; a FILTER folds into it like any aggregate's.
+        let value_args = Self::filter_aggregate_args(vec![value_expr.clone()], self.aggregate_filter(func)?.as_ref());
         Ok(Some(LogicalExpr::AggregateFunction {
             fun: AggregateFunction::StringAgg { delimiter },
-            args: vec![value_expr.clone()], // Only the value expression
+            args: value_args,
             distinct,
         }))
     }
@@ -5280,7 +5399,7 @@ impl<'a> Planner<'a> {
         };
 
         // Parse function arguments
-        let args = match &func.args {
+        let args: Vec<LogicalExpr> = match &func.args {
             sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
                 .args
                 .iter()
@@ -5294,6 +5413,22 @@ impl<'a> Planner<'a> {
                 .collect(),
             _ => vec![],
         };
+
+        // `sum(v) FILTER (WHERE p) OVER (…)` folds into the argument exactly as
+        // a plain aggregate's FILTER does (`filter_aggregate_args`). `count(*)`
+        // arrives here with no argument (the frame then counts rows), so it is
+        // given the `*` the plain path would have had. PostgreSQL has FILTER for
+        // aggregate window calls only.
+        if func.filter.is_some() && !matches!(window_fun, WindowFunctionType::Aggregate(_)) {
+            return Err(Error::query_execution(FILTER_ON_NON_AGGREGATE_WINDOW));
+        }
+        let predicate = self.aggregate_filter(func)?;
+        let args = if predicate.is_some() && args.is_empty() {
+            vec![LogicalExpr::Wildcard]
+        } else {
+            args
+        };
+        let args = Self::filter_aggregate_args(args, predicate.as_ref());
 
         // Parse OVER clause
         let over = func
@@ -5761,6 +5896,13 @@ impl<'a> Planner<'a> {
                 // Check if it's an aggregate function
                 if let Some(aggr) = self.extract_aggregate_from_expr(expr)? {
                     return Ok(aggr);
+                }
+                // A FILTER on anything else used to be dropped without a word.
+                if func.filter.is_some() {
+                    return Err(Error::query_execution(format!(
+                        "{FILTER_ON_NON_AGGREGATE_PREFIX}{} is not an aggregate function",
+                        func.name
+                    )));
                 }
 
                 // Otherwise treat as scalar function

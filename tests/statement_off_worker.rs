@@ -56,6 +56,9 @@ const HOLD_SQL: &str = "SELECT heliosdb_test_hold()";
 /// The log line the hook writes once it holds.
 #[cfg(feature = "internal-tests")]
 const HOLDING: &str = "this statement holds while";
+/// A write that holds: it evaluates the hook for its one row of `held`.
+#[cfg(feature = "internal-tests")]
+const HOLD_UPDATE_SQL: &str = "UPDATE held SET flag = heliosdb_test_hold() WHERE id = 1";
 
 /// A loopback port RESERVED for the life of the test process (sprinter
 /// ffe805264aac, `support/ports.rs`): a port bound and released at once could
@@ -325,6 +328,12 @@ impl MySqlClient {
 enum HeldVia {
     PgSimple,
     PgExtended,
+    /// An autocommit UPDATE over the extended protocol: Execute's write arm,
+    /// the route a statement psycopg prepares once `prepare_threshold` is
+    /// reached takes (4.42.0 pre-release review, item P4).
+    PgExtendedWrite,
+    /// The same UPDATE with RETURNING: Execute's DML-RETURNING arm.
+    PgExtendedWriteReturning,
     PgInTransaction,
     MySql,
     Rest,
@@ -352,6 +361,25 @@ async fn hold_one_statement(via: HeldVia, pg: u16, http: u16, mysql: u16) -> Res
                 .map_err(|e| e.to_string())?;
             let answer = row.try_get::<_, bool>(0).map(|answer| answer.to_string());
             Ok(answer.or_else(|_| row.try_get::<_, String>(0)).unwrap_or_default())
+        }
+        // Parse/Bind/Execute of a write (no parameters, so no inferred
+        // parameter type is involved): `t` once it updated its one row.
+        HeldVia::PgExtendedWrite => {
+            let client = pg_connect(pg).await;
+            let updated = client.execute(HOLD_UPDATE_SQL, &[]).await.map_err(|e| e.to_string())?;
+            if updated == 1 {
+                Ok("t".to_string())
+            } else {
+                Err(format!("the held UPDATE updated {updated} rows"))
+            }
+        }
+        HeldVia::PgExtendedWriteReturning => {
+            let client = pg_connect(pg).await;
+            let row = client
+                .query_one(&format!("{HOLD_UPDATE_SQL} RETURNING id::text"), &[])
+                .await
+                .map_err(|e| e.to_string())?;
+            row.try_get::<_, String>(0).map_err(|e| e.to_string())
         }
         // Inside an explicit transaction block, then committed.
         HeldVia::PgInTransaction => {
@@ -403,6 +431,12 @@ async fn the_server_serves_while_a_statement_holds(via: HeldVia) {
         &["--mysql", "--mysql-listen", &mysql_listen],
     );
     let other = server.connect().await;
+    // The row the write variants hold an UPDATE of.
+    other
+        .batch_execute("CREATE TABLE held (id INT PRIMARY KEY, flag BOOLEAN)")
+        .await
+        .unwrap();
+    other.batch_execute("INSERT INTO held VALUES (1, false)").await.unwrap();
     std::fs::write(&hold, b"").unwrap();
     let mut held = tokio::spawn(hold_one_statement(via, server.pg, server.http, mysql));
     wait_until_held(|| server.log(), &mut held).await;
@@ -460,6 +494,18 @@ async fn simple_protocol_a_held_statement_leaves_the_server_serving() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn extended_protocol_a_held_statement_leaves_the_server_serving() {
     the_server_serves_while_a_statement_holds(HeldVia::PgExtended).await;
+}
+
+#[cfg(feature = "internal-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extended_protocol_a_held_write_leaves_the_server_serving() {
+    the_server_serves_while_a_statement_holds(HeldVia::PgExtendedWrite).await;
+}
+
+#[cfg(feature = "internal-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extended_protocol_a_held_write_returning_leaves_the_server_serving() {
+    the_server_serves_while_a_statement_holds(HeldVia::PgExtendedWriteReturning).await;
 }
 
 #[cfg(feature = "internal-tests")]

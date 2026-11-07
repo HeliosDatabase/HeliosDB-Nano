@@ -439,8 +439,9 @@ longer for a 10,000-row `DELETE` (debug build).
   not change the rows a branch reads from it. A branch session cannot change any of these, so it cannot
   change them for main: `CREATE`, `REPLACE`, `DROP` and `REFRESH` of them on a branch are refused (`0A000`).
 - **`AS OF` a past time** is materialized once, at creation, from main's version history: the rows that
-  differ, as they were then. It needs `time_travel_enabled` and an anchor inside the retention window,
-  and main as the parent: a branch keeps no history. The definitions are the current ones, so a column
+  differ, as they were then. It needs `time_travel_enabled` and an anchor inside the retention window
+  (`storage.version_retention`), and main as the parent: a branch keeps no history. The definitions are
+  the current ones, so a column
   added since the anchor shows, NULL or padded. A table dropped since is gone, and one created since is
   there, empty. An anchor before a `DROP COLUMN`, `RENAME COLUMN`, `ALTER COLUMN … SET STORAGE` or `RENAME
   TO` of a table on main, or a `REFRESH` of a materialized view, is refused (`0A000`, naming it): the rows as

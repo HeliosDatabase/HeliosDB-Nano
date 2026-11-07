@@ -7045,6 +7045,20 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     if message.contains(crate::sql::returning::WINDOW_IN_RETURNING) {
         return sqlstate::WINDOWING_ERROR; // 42P20
     }
+    // An aggregate's `FILTER (WHERE …)`: the four refusals the planner raises
+    // in PostgreSQL's wording (`sql::planner`), in PostgreSQL's classes.
+    if message.contains(crate::sql::planner::AGGREGATE_IN_FILTER) {
+        return sqlstate::GROUPING_ERROR; // 42803
+    }
+    if message.contains(crate::sql::planner::WINDOW_IN_FILTER) {
+        return sqlstate::WINDOWING_ERROR; // 42P20
+    }
+    if message.contains(crate::sql::planner::FILTER_ON_NON_AGGREGATE_WINDOW) {
+        return sqlstate::FEATURE_NOT_SUPPORTED; // 0A000
+    }
+    if message.contains(crate::sql::planner::FILTER_ON_NON_AGGREGATE_PREFIX) {
+        return sqlstate::WRONG_OBJECT_TYPE; // 42809
+    }
 
     // GH#29: plan-time name resolution (`sql::scope`). The 42703 / 42P01
     // refusals land on the shape arms below unchanged (`Column "…" does not
