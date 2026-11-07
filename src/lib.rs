@@ -3158,7 +3158,7 @@ impl EmbeddedDatabase {
             "helios.bulk_load_mode" => "bulk_load_mode",
             // The config file's spelling, which it would be a trap to accept and ignore.
             "lock_timeout_ms" => "lock_timeout",
-            // MySQL's, which its ORMs send (in seconds: `lock_timeout_unit_ms`).
+            // MySQL's two, which its clients send (in seconds).
             other if Self::is_mysql_lock_wait_timeout(other) => "lock_timeout",
             other => other,
         };
@@ -3193,6 +3193,21 @@ impl EmbeddedDatabase {
             .is_some()
     }
 
+    /// Spec R5.1: MySQL's `innodb_lock_wait_timeout` (row locks) and `lock_wait_timeout`
+    /// (metadata locks, what DDL waits on), also as `@@name` or `@@session.name`: this
+    /// server's one `lock_timeout`, in seconds. Clamped to [`Self::MAX_LOCK_TIMEOUT_MS`]
+    /// rather than refused: MySQL's own default for `lock_wait_timeout` is a year.
+    fn is_mysql_lock_wait_timeout(name: &str) -> bool {
+        let name = name.strip_prefix("@@").unwrap_or(name);
+        let name = name.strip_prefix("session.").unwrap_or(name);
+        name == "innodb_lock_wait_timeout" || name == "lock_wait_timeout"
+    }
+
+    /// Spec R5.1: the most a session may set `lock_timeout` to, PostgreSQL's (`INT_MAX`
+    /// milliseconds, about 24 days): a wait here is always bounded, and that bound has to
+    /// be one a person can mean.
+    const MAX_LOCK_TIMEOUT_MS: u64 = 2_147_483_647;
+
     /// Apply a user-settable `SET` / `RESET` / `SHOW` to `state`, THE BACKEND THE
     /// CALLER RESOLVED — sprinter a3077a3f68d8.
     ///
@@ -3206,21 +3221,6 @@ impl EmbeddedDatabase {
     ///
     /// `None` state is engine-internal evaluation: nothing to set, and `SHOW`
     /// answers the server default.
-    /// Spec R5.1: MySQL's `innodb_lock_wait_timeout`, also as `@@innodb_lock_wait_timeout`
-    /// or `@@session.innodb_lock_wait_timeout`: this server's `lock_timeout`, in seconds.
-    /// MySQL's `lock_wait_timeout` is not mapped: its default is a year, beyond
-    /// [`Self::MAX_LOCK_TIMEOUT_MS`], and clients send it.
-    fn is_mysql_lock_wait_timeout(name: &str) -> bool {
-        let name = name.strip_prefix("@@").unwrap_or(name);
-        let name = name.strip_prefix("session.").unwrap_or(name);
-        name == "innodb_lock_wait_timeout"
-    }
-
-    /// Spec R5.1: the most a session may set `lock_timeout` to, PostgreSQL's (`INT_MAX`
-    /// milliseconds, about 24 days): a wait here is always bounded, and that bound has to
-    /// be one a person can mean.
-    const MAX_LOCK_TIMEOUT_MS: u64 = 2_147_483_647;
-
     fn apply_session_guc_setting(
         &self,
         statement: &DbSettingStatement,
@@ -3258,11 +3258,8 @@ impl EmbeddedDatabase {
                     ),
                     "lock_timeout" => {
                         // A bare number is milliseconds, and seconds in MySQL's spelling.
-                        let bare_unit_ms = if Self::is_mysql_lock_wait_timeout(raw_name) {
-                            1000
-                        } else {
-                            1
-                        };
+                        let mysql = Self::is_mysql_lock_wait_timeout(raw_name);
+                        let bare_unit_ms = if mysql { 1000 } else { 1 };
                         let ms = crate::protocol::postgres::timeouts::parse_guc_duration_ms(value, bare_unit_ms)
                             .map_err(|bad| {
                                 Error::query_execution(format!(
@@ -3270,6 +3267,9 @@ impl EmbeddedDatabase {
                                     raw_name, bad
                                 ))
                             })?;
+                        // MySQL's spelling is clamped, since its defaults are above the bound;
+                        // PostgreSQL's is refused, as PostgreSQL refuses it.
+                        let ms = if mysql { ms.min(Self::MAX_LOCK_TIMEOUT_MS) } else { ms };
                         if ms > Self::MAX_LOCK_TIMEOUT_MS {
                             return Err(Error::query_execution(format!(
                                 "invalid value for parameter \"{raw_name}\": \"{value}\": lock_timeout is at most {} \

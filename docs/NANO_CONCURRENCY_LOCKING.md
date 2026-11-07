@@ -117,15 +117,17 @@ Separate from the row-level `LockManager` above, and what writers see during DDL
   In a transaction it aborts the transaction like any other failed statement. **`SET lock_timeout = 0` is not PostgreSQL's
   unbounded wait**: it means the server's `lock_timeout_ms`, so a `pg_dump` script, which starts with it, still ends. A wait
   here is always bounded: a session may set at most 2147483647 ms (about 24 days), PostgreSQL's limit. MySQL's
-  `innodb_lock_wait_timeout` (in seconds) sets the same thing; its `lock_wait_timeout` is accepted and does nothing. Unlike
-  PostgreSQL, a plain `SET` inside a transaction that rolls back is not undone (no session setting here is); `SET LOCAL` is.
+  `innodb_lock_wait_timeout` and `lock_wait_timeout` (in seconds) both set this one timeout, clamped to that limit
+  rather than refused, since MySQL's own default for `lock_wait_timeout` is a year. Unlike PostgreSQL, a plain `SET`
+  inside a transaction that rolls back is not undone (no session setting here is); `SET LOCAL` is.
 - **A wait also ends at `statement_timeout`, and at a cancel** (PostgreSQL's CancelRequest, which psql's Ctrl-C and every
   driver's cancel send): SQLSTATE **57014**, and the statement does not run when the lock comes free. It looks every 50 ms.
   Each wait counts its `statement_timeout` from where it starts, so a statement that waits for several tables can overrun
-  it by that. A cancel request is served even with every connection slot taken; there is no cancel for a REST request or
-  on the MySQL wire. **A client that vanishes during a wait is not noticed**: nothing reads its socket while its statement runs, so the
-  statement waits on and runs when the lock comes free, unless one of these timeouts ends it first. Set a `statement_timeout`
-  or a short `lock_timeout` where that matters.
+  it by that. A cancel request is served even with every connection slot taken, also one that asks for TLS first, as
+  `sslmode=prefer` does; there is no cancel for a REST request or on the MySQL wire. **A client that vanishes during a
+  wait is not noticed**: nothing reads its socket while its statement runs, so the statement waits on and runs when the
+  lock comes free, unless one of these timeouts ends it first. Set a `statement_timeout` or a short `lock_timeout` where
+  that matters.
 - **At most 256 statements wait at once**, across the server. The next is refused with 55P03 at once, saying so. Each waiter
   pins a thread of the server's blocking pool (512), and when the pool is full nothing answers, the `COMMIT` that would free
   them included. REST runs at most 384 requests at once for the same reason and queues the rest, holding no thread. With

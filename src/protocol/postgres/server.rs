@@ -307,10 +307,14 @@ impl PgServer {
                             );
                             // Unless it is a cancel request (`CANCEL_PROBES`).
                             if let Ok(probe) = Arc::clone(&self.cancel_probes).try_acquire_owned() {
+                                let ssl_negotiator = self.ssl_negotiator.clone();
                                 tokio::spawn(async move {
                                     let _probe = probe;
-                                    let _ = tokio::time::timeout(CANCEL_PROBE_TIMEOUT, Self::serve_cancel_only(stream))
-                                        .await;
+                                    let _ = tokio::time::timeout(
+                                        CANCEL_PROBE_TIMEOUT,
+                                        Self::serve_cancel_only(stream, ssl_negotiator),
+                                    )
+                                    .await;
                                 });
                             } else {
                                 drop(stream);
@@ -522,7 +526,7 @@ impl PgServer {
 
     /// Spec R5.1: the rest of a CancelRequest whose 8-byte header has been read, its pid
     /// and key. The backend is told if they match; the peer is told nothing.
-    async fn serve_cancel_request(stream: &mut TcpStream) -> Result<()> {
+    async fn serve_cancel_request<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Result<()> {
         use tokio::io::AsyncReadExt;
         let mut key = [0u8; 8];
         stream
@@ -536,19 +540,52 @@ impl PgServer {
         Ok(())
     }
 
-    /// Spec R5.1: a connection past `max_connections`, served only if it is a cancel
-    /// request (in the clear, as clients send it), and closed either way.
-    async fn serve_cancel_only(mut stream: TcpStream) {
+    /// A request's 8-byte header: its length and its code.
+    async fn read_request_header<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Option<(i32, i32)> {
         use tokio::io::AsyncReadExt;
         let mut header = [0u8; 8];
-        if stream.read_exact(&mut header).await.is_err() {
-            return;
-        }
+        stream.read_exact(&mut header).await.ok()?;
         let (len, code) = header.split_at(4);
-        let (Ok(len), Ok(code)) = (<[u8; 4]>::try_from(len), <[u8; 4]>::try_from(code)) else {
+        let len = <[u8; 4]>::try_from(len).ok()?;
+        let code = <[u8; 4]>::try_from(code).ok()?;
+        Some((i32::from_be_bytes(len), i32::from_be_bytes(code)))
+    }
+
+    /// Spec R5.1: a connection past `max_connections`, served only if it is a cancel
+    /// request, and closed either way.
+    ///
+    /// A client in `sslmode=prefer` (libpq's default, so psycopg's `cancel_safe()`) asks for
+    /// TLS first, as PostgreSQL's postmaster expects. With TLS configured here the probe does
+    /// the handshake and reads the cancel inside it, which also serves a client that requires
+    /// TLS; without, it answers 'N', and the client sends its cancel in the clear. Either way
+    /// the probe stays inside [`CANCEL_PROBE_TIMEOUT`].
+    async fn serve_cancel_only(mut stream: TcpStream, ssl_negotiator: Option<Arc<SslNegotiator>>) {
+        use tokio::io::AsyncWriteExt;
+        let Some((mut len, mut code)) = Self::read_request_header(&mut stream).await else {
             return;
         };
-        if i32::from_be_bytes(len) == 16 && i32::from_be_bytes(code) == super::ssl::CANCEL_REQUEST_CODE {
+        if len == 8 && code == super::ssl::SSL_REQUEST_CODE {
+            if let Some(acceptor) = ssl_negotiator.as_ref().and_then(|negotiator| negotiator.acceptor()) {
+                if stream.write_all(b"S").await.is_err() || stream.flush().await.is_err() {
+                    return;
+                }
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                if Self::read_request_header(&mut tls).await == Some((16, super::ssl::CANCEL_REQUEST_CODE)) {
+                    let _ = Self::serve_cancel_request(&mut tls).await;
+                }
+                return;
+            }
+            if stream.write_all(b"N").await.is_err() || stream.flush().await.is_err() {
+                return;
+            }
+            let Some(next) = Self::read_request_header(&mut stream).await else {
+                return;
+            };
+            (len, code) = next;
+        }
+        if len == 16 && code == super::ssl::CANCEL_REQUEST_CODE {
             let _ = Self::serve_cancel_request(&mut stream).await;
         }
     }

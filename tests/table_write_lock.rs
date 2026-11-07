@@ -1352,16 +1352,22 @@ fn set_lock_timeout_bounds_the_session_and_zero_is_the_servers() {
         db.execute_for_session(session, "SET lock_timeout = 'banana'").is_err(),
         "a value that is no duration"
     );
-    // Bounded, as in PostgreSQL: INT_MAX milliseconds.
+    set("SET SESSION lock_wait_timeout = 5");
+    assert_eq!(show(), "5s", "MySQL's metadata-lock spelling, in seconds");
+    // Bounded, as in PostgreSQL: INT_MAX milliseconds. PostgreSQL's spelling past it is
+    // refused; MySQL's is clamped, since its own default for lock_wait_timeout is a year.
     set("SET lock_timeout = 2147483647");
-    for too_long in [
-        "SET lock_timeout = 2147483648",
-        "SET innodb_lock_wait_timeout = 1073741824",
-    ] {
-        let err = db.execute_for_session(session, too_long).expect_err(too_long);
-        assert!(err.to_string().contains("at most 2147483647 ms"), "{too_long}: {err}");
-    }
+    let err = db
+        .execute_for_session(session, "SET lock_timeout = 2147483648")
+        .expect_err("past the bound");
+    assert!(err.to_string().contains("at most 2147483647 ms"), "{err}");
     assert_eq!(show(), "2147483647ms", "a refused SET changes nothing");
+    set("SET lock_timeout = 60");
+    set("SET lock_wait_timeout = 31536000");
+    assert_eq!(show(), "2147483647ms", "MySQL's year, clamped");
+    set("SET lock_timeout = 60");
+    set("SET innodb_lock_wait_timeout = 1073741824");
+    assert_eq!(show(), "2147483647ms", "clamped");
 
     // 0 accepted, and bounded by the server's.
     db.storage.debug_set_table_lock_timeout(Duration::from_millis(100));
@@ -1746,6 +1752,67 @@ async fn a_cancel_request_ends_a_wait_and_nothing_commits() {
 async fn a_cancel_request_gets_in_when_every_connection_is_taken() {
     let _watchdog = watchdog("a_cancel_request_gets_in_when_every_connection_is_taken", TEST_AT_MOST);
     a_cancel_ends_a_wait(2).await;
+}
+
+/// psycopg's `cancel_safe()`, with libpq's default `sslmode=prefer`, asks for TLS before it
+/// sends its cancel. At a full connection limit the probe used to read that as "not a cancel"
+/// and close, so the cancel never came. It answers as the postmaster does now: 'N' here, with
+/// no TLS configured, and then the cancel in the clear is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_that_asks_for_tls_first_is_answered_at_a_full_limit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _watchdog = watchdog(
+        "a_cancel_that_asks_for_tls_first_is_answered_at_a_full_limit",
+        TEST_AT_MOST,
+    );
+    let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+    let server = PgServer::new(
+        PgServerConfig::with_address(addr).with_max_connections(1),
+        Arc::clone(&db),
+    )
+    .unwrap();
+    let listener = tokio::spawn(async move {
+        let _ = server.serve().await;
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let connect_string = format!("host=127.0.0.1 port={} user=postgres dbname=postgres", addr.port());
+    let (client, connection) = tokio_postgres::connect(&connect_string, NoTls).await.unwrap();
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client.simple_query("SELECT 1").await.unwrap();
+
+    // The one slot is taken. An SSLRequest gets its answer, not a closed connection.
+    let mut wire = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut ssl_request = 8_i32.to_be_bytes().to_vec();
+    ssl_request.extend_from_slice(&80_877_103_i32.to_be_bytes());
+    wire.write_all(&ssl_request).await.unwrap();
+    let mut answer = [0u8; 1];
+    tokio::time::timeout(Duration::from_secs(5), wire.read_exact(&mut answer))
+        .await
+        .expect("answered in time")
+        .expect("an answer, not a closed connection");
+    assert_eq!(&answer, b"N");
+
+    // Then the cancel, in the clear: read (it names no backend here), and closed silently.
+    let mut cancel = 16_i32.to_be_bytes().to_vec();
+    cancel.extend_from_slice(&80_877_102_i32.to_be_bytes());
+    cancel.extend_from_slice(&i32::MAX.to_be_bytes());
+    cancel.extend_from_slice(&0_i32.to_be_bytes());
+    wire.write_all(&cancel).await.unwrap();
+    let mut rest = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(5), wire.read_to_end(&mut rest))
+        .await
+        .expect("closed in time")
+        .unwrap();
+    assert_eq!(read, 0, "the peer is told nothing");
+
+    drop(client);
+    connection.abort();
+    listener.abort();
 }
 
 async fn a_cancel_ends_a_wait(max_connections: usize) {
