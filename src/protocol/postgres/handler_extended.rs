@@ -737,6 +737,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         if self.database.session_on_branch(self.session_id) {
             return None;
         }
+        // Spec R5.4 (P11): and for a session holding temp tables, whose bare names
+        // resolve to its temp schema first. Planned here, with no session
+        // installed, `INSERT INTO t` named the permanent `t` (or none at all).
+        if self.database.session_holds_temp_tables(self.session_id) {
+            return None;
+        }
         let current_epoch = self.database.wire_plan_epoch();
         if let Some(plan) = &statement.cached_plan {
             if statement.cached_plan_epoch == current_epoch {
@@ -790,6 +796,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // sprinter 6bc4a4040eb7 (phase B3): likewise on a branch — the private
         // path derives the columns from the session's BRANCH catalog.
         if self.database.session_on_branch(self.session_id) {
+            return None;
+        }
+        // Spec R5.4 (P11): likewise for a session holding temp tables.
+        if self.database.session_holds_temp_tables(self.session_id) {
             return None;
         }
         let (plan, epoch) = self.database.wire_parameterized_plan(query).ok()?;
@@ -910,7 +920,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     fn session_scope(&self) -> Option<String> {
         let schema_active = self.database.session_schema_active(self.session_id);
         let on_branch = self.database.session_on_branch(self.session_id);
-        if !schema_active && !on_branch {
+        // Spec R5.4 (P11): a temp table can shadow a permanent one of its name.
+        let temp = self.database.session_holds_temp_tables(self.session_id);
+        if !schema_active && !on_branch && !temp {
             return None;
         }
         let schema = self.database.session_current_schema(self.session_id).unwrap_or(None);
@@ -920,7 +932,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         } else {
             None
         };
-        Some(format!("{schema:?} {path:?} {branch:?}"))
+        Some(format!("{schema:?} {path:?} {branch:?} {temp}"))
     }
 
     /// `statement`'s result schema derived again, by the rule Parse used, when

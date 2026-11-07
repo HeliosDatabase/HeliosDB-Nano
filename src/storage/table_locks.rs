@@ -594,6 +594,15 @@ impl TableLocks {
         ms.map(Duration::from_millis)
     }
 
+    /// Spec R5.4: what bounds a wait for a row's write lock (`storage::row_locks`): the
+    /// same as a wait for a table's. Read when a wait begins.
+    pub(crate) fn row_lock_bounds(&self) -> super::row_locks::RowLockBounds {
+        super::row_locks::RowLockBounds {
+            lock_timeout: self.timeout(),
+            statement_timeout: self.statement_timeout(),
+        }
+    }
+
     /// For the tests, which set it small on a running engine.
     pub(crate) fn set_timeout(&self, timeout: Duration) {
         let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);

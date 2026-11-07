@@ -350,7 +350,8 @@ pub use error::{
     BRANCH_STATEMENT_UNSUPPORTED_MARKER, BRANCH_SWITCH_IN_TRANSACTION_MARKER, BRANCH_TABLE_BUSY_MARKER,
     BRANCH_WRITE_UNSUPPORTED_MARKER, COMMIT_OF_FAILED_TRANSACTION_MESSAGE, DDL_OVER_STAGED_ROWS_MARKER,
     IN_FAILED_TRANSACTION_MESSAGE, NOT_NULL_VIOLATION_MARKER, PG_PROMOTE_SERVER_ONLY, PHYSICAL_STANDBY_WRITE_REFUSED,
-    ROW_DESCRIPTION_MISMATCH_MARKER, TABLE_LOCK_TIMEOUT_MARKER, TABLE_NAME_HOLDS_COLON_MARKER,
+    ROW_DESCRIPTION_MISMATCH_MARKER, ROW_LOCK_TIMEOUT_MARKER, TABLE_LOCK_TIMEOUT_MARKER, TABLE_NAME_HOLDS_COLON_MARKER,
+    WRITE_GROUP_TOO_LARGE_MARKER,
 };
 pub use storage::StorageEngine;
 pub use types::{
@@ -2234,6 +2235,33 @@ struct FastParamUpdateAssignment {
     expr: sql::LogicalExpr,
 }
 
+/// Spec R5.4 (P12): the row an UPDATE, a DELETE or an `ON CONFLICT DO UPDATE` is
+/// about to change, once its transaction holds the row's write lock
+/// ([`EmbeddedDatabase::lock_row_for_change`]).
+enum LockedRow {
+    /// As the statement read it: nothing of the table changed since it loaded its
+    /// epoch, or this transaction staged the row itself.
+    Same(Tuple),
+    /// Another transaction committed a change to it after it was read: the row as
+    /// committed now, which the statement evaluates its WHERE clause and its
+    /// assignments over again (READ COMMITTED; PostgreSQL's EvalPlanQual).
+    Moved(Tuple),
+    /// Deleted after it was read: the statement does not change it.
+    Gone,
+}
+
+/// Spec R5.4 (P12): what a fast PK write finds once it holds the row's write lock.
+enum FastPkRow {
+    /// The row as committed now (the one already read, when nothing changed since).
+    Current(Tuple),
+    /// The row is gone: the statement changes nothing.
+    Gone,
+    /// The probed key names another row now: the planner works it out.
+    Decline,
+    /// The read failed.
+    Failed(Error),
+}
+
 struct FastParamUpdateSpec {
     table_name: String,
     schema: std::sync::Arc<Schema>,
@@ -2431,6 +2459,10 @@ struct FastDeleteTarget {
     schema: std::sync::Arc<Schema>,
     existing_row: Option<Tuple>,
     pk_only_delete: bool,
+    /// Spec R5.4 (P12): the PK column's position, and the table's change epoch read
+    /// before the row was, for the check once the row's lock is held.
+    pk_col_idx: usize,
+    epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5957,6 +5989,9 @@ impl EmbeddedDatabase {
             let _scoped = SessionScopedStateGuard::install_if_absent(&self.embedded_scoped);
             txn.capture_branch_binding(self.storage.active_branch());
         }
+        // Spec R5.4: only this thread can COMMIT it, so a statement of this thread
+        // that would wait for one of its rows is refused instead of waiting forever.
+        txn.bind_row_locks_to_this_thread();
         *txn_ref = Some(txn);
         // sprinter 0d6695bf8a86: stamp the OWNER before the flag goes up, so a
         // reader that sees `global_txn_active` can never read a stale token.
@@ -7511,16 +7546,18 @@ impl EmbeddedDatabase {
     }
 
     /// Whether an `INSERT … SELECT` that holds a transaction should STAGE its
-    /// rows into it (#100). Mirrors the guards the multi-row `INSERT … VALUES`
-    /// transactional fast path applies to itself: a tenant context or a branch
-    /// falls back to the streaming engine path, keeping branch `bv:` version
-    /// keys and tenant routing exactly as today.
-    /// The TEXT arm additionally requires `skip_fast_paths` (a real, not
-    /// implicit-autocommit, transaction); the params arm's `active_txn` is
-    /// only ever a session or explicit global transaction, because its
-    /// autocommit entry passes `None` and CTAS population passes `None`.
+    /// rows into it (#100): everywhere but a branch, whose rows go through the
+    /// branch view (staged in the same transaction, B2).
+    ///
+    /// Spec R5.4 (F1.1): in autocommit too, on both families: the text family's
+    /// statement transaction, the params family's implicit one
+    /// (`params_main_dml_needs_implicit_transaction`), CTAS population included.
+    /// The tenant-context exclusion #100 started with was a rollout caution only:
+    /// the streaming path it fell back to does nothing tenant-specific
+    /// (`insert_tuple_versioned_with_schema`), and RLS WITH CHECK runs on every
+    /// row before it is staged as before it was written.
     fn insert_select_should_stage(&self) -> bool {
-        !self.has_effective_tenant_context() && !self.storage.is_branch_active()
+        !self.storage.is_branch_active()
     }
 
     fn insert_select_txn_batch_rows(&self) -> usize {
@@ -9876,13 +9913,17 @@ impl EmbeddedDatabase {
                                         let mut existing_tuple: Tuple = match branch_existing {
                                             Some(row) => row,
                                             None => {
+                                                // Spec R5.4 (P12): the row's write lock
+                                                // first, so the image updated is the one
+                                                // committed under it. A row a transaction
+                                                // that committed meanwhile deleted is not
+                                                // updated (written back, it would return
+                                                // without its index entries: duplicate
+                                                // primary keys beside a DELETE loop).
+                                                txn.lock_row(table_name, existing_row_id)?;
                                                 let existing_raw = match txn.get_latest(&existing_key)? {
                                                     Some(raw) => raw,
-                                                    None => self.storage.get(&existing_key)?.ok_or_else(|| {
-                                                        Error::query_execution(
-                                                            "ON CONFLICT DO UPDATE: existing row not found in storage",
-                                                        )
-                                                    })?,
+                                                    None => return Err(Error::concurrent_update(table_name)),
                                                 };
                                                 let mut row: Tuple =
                                                     bincode::deserialize(&existing_raw).map_err(|err| {
@@ -10525,19 +10566,23 @@ impl EmbeddedDatabase {
                     None
                 };
 
-                // #100: inside a REAL transaction, STAGE rows into it (chunked)
-                // instead of writing straight to storage around it.
+                // #100 / spec R5.4 (F1.1): STAGE rows into the statement's
+                // transaction (chunked) instead of writing straight to storage
+                // around it — under autocommit too. Streaming wrote one write group
+                // per row (about seven with versions, counter and log entry):
+                // readers, a standby and a branch fork saw the statement half done,
+                // a crash kept half, and a failure at row k left rows 1..k-1. Staged,
+                // the rows commit as ONE group, and a failure leaves nothing.
                 //
-                // `skip_fast_paths` is the discriminator this arm already has:
-                // `true` only for `Transaction::execute()` / session transactions;
-                // `false` for autocommit, whose `txn` is the IMPLICIT transaction
-                // `begin_autocommit_transaction` builds — one with no logical WAL,
-                // which the single-row arm compensates for with per-row
-                // `log_data_insert` gated on this same flag. Staging under it would
-                // silently drop those ops for HA standbys, so autocommit keeps the
-                // streaming engine path unchanged; explicit transactions get their
-                // logical WAL at COMMIT via `collect_logical_wal_ops`.
-                let staging = skip_fast_paths && self.insert_select_should_stage();
+                // An explicit transaction (`skip_fast_paths`) gets its logical WAL
+                // at COMMIT via `collect_logical_wal_ops`. The IMPLICIT autocommit
+                // transaction has no such log, and the single-row arm logs each row
+                // as it goes; staged rows are logged by the commit from what it
+                // staged instead (`log_staged_writes_at_commit`), in the same group.
+                let staging = self.insert_select_should_stage();
+                if staging && !skip_fast_paths {
+                    txn.log_staged_writes_at_commit(self.storage.logical_wal_per_statement());
+                }
                 // sprinter 6bc4a4040eb7 (B2): on a branch every row is staged in
                 // THIS statement's transaction through the branch view
                 // (constraints over the branch's rows) — the pre-B2 streaming
@@ -10624,8 +10669,9 @@ impl EmbeddedDatabase {
                             }
                         }
                     } else {
-                        // Autocommit / tenant: the streaming engine path,
-                        // unchanged. Branch: staged through the view (B2).
+                        // A branch: staged through the view (B2). (Main always
+                        // stages since spec R5.4; the engine arm below is kept
+                        // for a branch view that is not there.)
                         let (row_id, written): (u64, Option<Tuple>) = match &branch_view {
                             Some(view) => {
                                 let (row_id, written) =
@@ -10831,6 +10877,8 @@ impl EmbeddedDatabase {
                 // which the pre-B2 `scan_table_branch_aware` (committed only)
                 // could not give.
                 let branch_view = self.storage.branch_view()?;
+                // Spec R5.4 (P12): the table's change epoch, before its rows are read.
+                let row_epoch = self.storage.row_locks().table_epoch(table_name);
                 let tuples = if let Some(view) = &branch_view {
                     view.scan(Some(txn), table_name, &schema)?
                 } else if merge_txn_writes {
@@ -10865,15 +10913,28 @@ impl EmbeddedDatabase {
                 // change within one statement.
                 let index_unique_sets = self.storage.art_indexes().unique_column_sets(table_name);
 
+                let row_matches = |row: &Tuple| -> Result<bool> {
+                    Ok(match selection {
+                        Some(predicate) => matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true)),
+                        None => true,
+                    })
+                };
                 for old_tuple in tuples {
-                    let matches = if let Some(predicate) = selection {
-                        let result = evaluator.evaluate(predicate, &old_tuple)?;
-                        match result {
-                            Value::Boolean(b) => b,
-                            _ => false,
+                    let mut matches = row_matches(&old_tuple)?;
+                    // Spec R5.4 (P12): locked for this transaction, then changed as
+                    // committed under the lock (see the params family's arm).
+                    let old_tuple = match (matches, &branch_view) {
+                        (true, None) => {
+                            match self.lock_row_for_change(txn, table_name, &schema, old_tuple, row_epoch)? {
+                                LockedRow::Same(row) => row,
+                                LockedRow::Moved(row) => {
+                                    matches = row_matches(&row)?;
+                                    row
+                                }
+                                LockedRow::Gone => continue,
+                            }
                         }
-                    } else {
-                        true
+                        _ => old_tuple,
                     };
 
                     // RLS USING is a FILTER, not an error: a row this session cannot
@@ -11259,6 +11320,8 @@ impl EmbeddedDatabase {
                 // sprinter 6bc4a4040eb7 (B2): the branch view, with this
                 // transaction's staged branch writes (see the UPDATE arm).
                 let branch_view = self.storage.branch_view()?;
+                // Spec R5.4 (P12): the table's change epoch, before its rows are read.
+                let row_epoch = self.storage.row_locks().table_epoch(table_name);
                 let tuples = if let Some(view) = &branch_view {
                     view.scan(Some(txn), table_name, &schema_arc)?
                 } else if merge_txn_writes {
@@ -11294,15 +11357,28 @@ impl EmbeddedDatabase {
                     None => None,
                 };
 
+                let row_matches = |row: &Tuple| -> Result<bool> {
+                    Ok(match selection {
+                        Some(predicate) => matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true)),
+                        None => true,
+                    })
+                };
                 for tuple in tuples {
-                    let matches = if let Some(predicate) = selection {
-                        let result = evaluator.evaluate(predicate, &tuple)?;
-                        match result {
-                            Value::Boolean(b) => b,
-                            _ => false,
+                    let mut matches = row_matches(&tuple)?;
+                    // Spec R5.4 (P12): locked for this transaction, then deleted as
+                    // committed under the lock (see the params family's arm).
+                    let tuple = match (matches, &branch_view) {
+                        (true, None) => {
+                            match self.lock_row_for_change(txn, table_name, &schema_arc, tuple, row_epoch)? {
+                                LockedRow::Same(row) => row,
+                                LockedRow::Moved(row) => {
+                                    matches = row_matches(&row)?;
+                                    row
+                                }
+                                LockedRow::Gone => continue,
+                            }
                         }
-                    } else {
-                        true
+                        _ => tuple,
                     };
 
                     // RLS USING is a FILTER, not an error: a row this session cannot
@@ -14990,6 +15066,10 @@ impl EmbeddedDatabase {
         if self.storage.has_uncommitted_index_removals_for_table(&spec.table_name) {
             return None;
         }
+        // Spec R5.4 (P12): the table's change epoch BEFORE the read, then the row's
+        // write lock, then the row again if anything changed since: the image this
+        // UPDATE computes from is the one committed when it holds the lock.
+        let epoch = self.storage.row_locks().table_epoch(&spec.table_name);
         let existing_row =
             match self
                 .storage
@@ -15009,6 +15089,24 @@ impl EmbeddedDatabase {
         if row_id == 0 {
             return None;
         }
+        let _row_lock = match self.storage.lock_row_for_fast_write(&spec.table_name, row_id) {
+            Ok(guard) => guard,
+            Err(e) => return Some(Err(e)),
+        };
+        let existing_row = match self.reread_fast_pk_row(
+            &spec.table_name,
+            pk_value,
+            &spec.schema,
+            spec.pk_col_idx,
+            row_id,
+            epoch,
+            existing_row,
+        ) {
+            FastPkRow::Current(row) => row,
+            FastPkRow::Gone => return Some(Ok(0)),
+            FastPkRow::Decline => return None,
+            FastPkRow::Failed(e) => return Some(Err(e)),
+        };
 
         let mut evaluator: Option<sql::Evaluator> = None;
         let mut replacements = Vec::with_capacity(spec.assignments.len());
@@ -15061,21 +15159,8 @@ impl EmbeddedDatabase {
                 new_values[idx] = value;
             }
             let new_tuple = Tuple::new(new_values);
-            if self.storage.fast_dml_requires_logical_wal() {
-                let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
-                let value = match bincode::serialize(&new_tuple) {
-                    Ok(value) => value,
-                    Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
-                };
-                let wal_result = if self.storage.logical_wal_per_statement() {
-                    self.storage.log_data_update(&spec.table_name, &key, &value)
-                } else {
-                    self.storage.log_data_update_nosync(&spec.table_name, &key, &value)
-                };
-                if let Err(e) = wal_result {
-                    return Some(Err(e));
-                }
-            }
+            // Spec R5.4 (F1.3): the logical-WAL entry rides the row's own write group
+            // (`StorageEngine::write_fast_row_change`).
 
             self.storage.update_tuple_fast_with_index_hint(
                 &spec.table_name,
@@ -15101,21 +15186,8 @@ impl EmbeddedDatabase {
             for (idx, value) in replacements {
                 new_tuple.values[idx] = value;
             }
-            if self.storage.fast_dml_requires_logical_wal() {
-                let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
-                let value = match bincode::serialize(&new_tuple) {
-                    Ok(value) => value,
-                    Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
-                };
-                let wal_result = if self.storage.logical_wal_per_statement() {
-                    self.storage.log_data_update(&spec.table_name, &key, &value)
-                } else {
-                    self.storage.log_data_update_nosync(&spec.table_name, &key, &value)
-                };
-                if let Err(e) = wal_result {
-                    return Some(Err(e));
-                }
-            }
+            // Spec R5.4 (F1.3): the logical-WAL entry rides the row's own write group
+            // (`StorageEngine::write_fast_row_change`).
             self.storage.update_tuple_fast_no_index(
                 &spec.table_name,
                 row_id,
@@ -15207,6 +15279,8 @@ impl EmbeddedDatabase {
             return None;
         }
         let pk_key = crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(pk_value));
+        // Spec R5.4 (P12): the epoch before the read, the row's lock after it.
+        let epoch = self.storage.row_locks().table_epoch(&spec.table_name);
         let (row_id, existing_row) = if spec.pk_only_delete {
             match self.storage.art_indexes().pk_index_lookup(&spec.table_name, &pk_key) {
                 Some(row_id) => (row_id, None),
@@ -15237,16 +15311,32 @@ impl EmbeddedDatabase {
             }
             (row_id, Some(existing_row))
         };
+        let _row_lock = match self.storage.lock_row_for_fast_write(&spec.table_name, row_id) {
+            Ok(guard) => guard,
+            Err(e) => return Some(Err(e)),
+        };
+        let checked = match existing_row {
+            None => self.reread_fast_pk_entry(&spec.table_name, &pk_key, row_id, epoch),
+            Some(row) => self.reread_fast_pk_row(
+                &spec.table_name,
+                pk_value,
+                &spec.schema,
+                spec.pk_col_idx,
+                row_id,
+                epoch,
+                row,
+            ),
+        };
+        let existing_row = match checked {
+            FastPkRow::Current(row) => (!spec.pk_only_delete).then_some(row),
+            FastPkRow::Gone => return Some(Ok(0)),
+            FastPkRow::Decline => return None,
+            FastPkRow::Failed(e) => return Some(Err(e)),
+        };
 
+        // Spec R5.4 (F1.3): the logical-WAL entry rides the delete's own write group
+        // (`StorageEngine::write_fast_row_change`).
         let result = (|| {
-            if self.storage.fast_dml_requires_logical_wal() {
-                let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
-                if self.storage.logical_wal_per_statement() {
-                    self.storage.log_data_delete(&spec.table_name, &key)?;
-                } else {
-                    self.storage.log_data_delete_nosync(&spec.table_name, &key)?;
-                }
-            }
             if spec.pk_only_delete {
                 self.storage
                     .delete_tuple_fast_pk_only(&spec.table_name, row_id, &pk_key, pk_value)
@@ -15804,6 +15894,9 @@ impl EmbeddedDatabase {
         // replays the undo like a rollback (it used to discard it, leaving the
         // statement's index changes behind).
         let census_hold = txn.write_census_hold();
+        // Spec R5.4: and its row locks, so no writer of those rows goes ahead of
+        // the index undo.
+        let row_hold = txn.row_locks_hold();
         match result {
             Ok(count) => {
                 let commit_start = std::time::Instant::now();
@@ -15811,6 +15904,7 @@ impl EmbeddedDatabase {
                     let _ = txn.rollback();
                     self.rollback_art_undo_for(undo_txn_id);
                     drop(census_hold);
+                    drop(row_hold);
                     // The queued deferred checks belong to THIS (now rolled back)
                     // statement. Leaving them behind made the NEXT autocommit
                     // statement re-report the same violation at its own commit
@@ -15822,11 +15916,13 @@ impl EmbeddedDatabase {
                 if let Err(e) = txn.commit() {
                     self.rollback_art_undo_for(undo_txn_id);
                     drop(census_hold);
+                    drop(row_hold);
                     self.deferred_fk_checks.lock().clear();
                     return Err(e);
                 }
                 let _ = self.take_raii_art_undo(undo_txn_id);
                 drop(census_hold);
+                drop(row_hold);
                 self.deferred_fk_checks.lock().clear();
                 // Increment LSN to track transaction commits
                 self.storage.increment_lsn();
@@ -15842,6 +15938,7 @@ impl EmbeddedDatabase {
                 let _ = txn.rollback(); // Ignore rollback errors
                 self.rollback_art_undo_for(undo_txn_id);
                 drop(census_hold);
+                drop(row_hold);
                 self.deferred_fk_checks.lock().clear();
                 Err(e)
             }
@@ -18398,6 +18495,9 @@ impl EmbeddedDatabase {
         if self.storage.has_uncommitted_index_removals_for_table(&spec.table_name) {
             return None;
         }
+        // Spec R5.4 (P12): as the params family's fast UPDATE: the epoch before the
+        // read, the row's lock after it, the row again if anything changed since.
+        let epoch = self.storage.row_locks().table_epoch(&spec.table_name);
         // Look up the existing row by PK (needed for both literal and expression SET)
         let existing_row =
             match self
@@ -18419,6 +18519,24 @@ impl EmbeddedDatabase {
             tracing::debug!(target: "helios::fastpath", reason = "lit-update:no-row-id", "fast-update bail");
             return None; // No row_id — can't do fast update
         }
+        let _row_lock = match self.storage.lock_row_for_fast_write(&spec.table_name, row_id) {
+            Ok(guard) => guard,
+            Err(e) => return Some(Err(e)),
+        };
+        let existing_row = match self.reread_fast_pk_row(
+            &spec.table_name,
+            &pk_value,
+            &spec.schema,
+            spec.pk_col_idx,
+            row_id,
+            epoch,
+            existing_row,
+        ) {
+            FastPkRow::Current(row) => row,
+            FastPkRow::Gone => return Some(Ok(0)),
+            FastPkRow::Decline => return None,
+            FastPkRow::Failed(e) => return Some(Err(e)),
+        };
 
         // The literal, else the self-arithmetic over the existing row (an
         // operand that does not fit the column's type still yields to the
@@ -18454,21 +18572,8 @@ impl EmbeddedDatabase {
             // Preserve logical WAL / HA broadcast semantics only when strict
             // logical WAL or HA replication needs the logical stream. In the
             // standalone default, RocksDB's own WAL covers local recovery.
-            if self.storage.fast_dml_requires_logical_wal() {
-                let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
-                let value = match bincode::serialize(&new_tuple) {
-                    Ok(value) => value,
-                    Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
-                };
-                let wal_result = if self.storage.logical_wal_per_statement() {
-                    self.storage.log_data_update(&spec.table_name, &key, &value)
-                } else {
-                    self.storage.log_data_update_nosync(&spec.table_name, &key, &value)
-                };
-                if let Err(e) = wal_result {
-                    return Some(Err(e));
-                }
-            }
+            // Spec R5.4 (F1.3): the logical-WAL entry rides the row's own write group
+            // (`StorageEngine::write_fast_row_change`).
 
             self.storage.update_tuple_fast_with_index_hint(
                 &spec.table_name,
@@ -18491,21 +18596,8 @@ impl EmbeddedDatabase {
             new_tuple.branch_id = None;
             new_tuple.values[spec.set_col_idx] = new_value;
 
-            if self.storage.fast_dml_requires_logical_wal() {
-                let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
-                let value = match bincode::serialize(&new_tuple) {
-                    Ok(value) => value,
-                    Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
-                };
-                let wal_result = if self.storage.logical_wal_per_statement() {
-                    self.storage.log_data_update(&spec.table_name, &key, &value)
-                } else {
-                    self.storage.log_data_update_nosync(&spec.table_name, &key, &value)
-                };
-                if let Err(e) = wal_result {
-                    return Some(Err(e));
-                }
-            }
+            // Spec R5.4 (F1.3): the logical-WAL entry rides the row's own write group
+            // (`StorageEngine::write_fast_row_change`).
 
             self.storage.update_tuple_fast_no_index(
                 &spec.table_name,
@@ -18616,6 +18708,8 @@ impl EmbeddedDatabase {
         // with no valid key for the PK column's type (GH#15).
         let pk_value = Self::fast_parse_pk_probe_value(pk_val_str, &spec.pk_data_type)?;
         let pk_key = crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(&pk_value));
+        // Spec R5.4 (P12): before the row is read (`FastDeleteTarget::epoch`).
+        let epoch = self.storage.row_locks().table_epoch(&spec.table_name);
         let (row_id, existing_row) = if spec.pk_only_delete && !require_tuple {
             match self.storage.art_indexes().pk_index_lookup(&spec.table_name, &pk_key) {
                 Some(row_id) => (row_id, None),
@@ -18652,7 +18746,39 @@ impl EmbeddedDatabase {
             schema: std::sync::Arc::clone(&spec.schema),
             existing_row,
             pk_only_delete: spec.pk_only_delete,
+            pk_col_idx: spec.pk_col_idx,
+            epoch,
         })))
+    }
+
+    /// Spec R5.4 (P12): the target of a literal fast DELETE, checked once its row is
+    /// locked: `None` when the row is gone (nothing to delete), `Err` declines to the
+    /// planner by the caller's `?` on `Option`.
+    fn recheck_fast_delete_target(&self, target: FastDeleteTarget) -> Option<Result<Option<FastDeleteTarget>>> {
+        let checked = match &target.existing_row {
+            None => self.reread_fast_pk_entry(&target.table_name, &target.pk_key, target.row_id, target.epoch),
+            Some(row) => self.reread_fast_pk_row(
+                &target.table_name,
+                &target.pk_value,
+                &target.schema,
+                target.pk_col_idx,
+                target.row_id,
+                target.epoch,
+                row.clone(),
+            ),
+        };
+        match checked {
+            FastPkRow::Current(row) => {
+                let mut target = target;
+                if target.existing_row.is_some() {
+                    target.existing_row = Some(row);
+                }
+                Some(Ok(Some(target)))
+            }
+            FastPkRow::Gone => Some(Ok(None)),
+            FastPkRow::Decline => None,
+            FastPkRow::Failed(e) => Some(Err(e)),
+        }
     }
 
     /// Fast path for simple DELETE: `DELETE FROM table WHERE pk_col = literal`.
@@ -18660,6 +18786,16 @@ impl EmbeddedDatabase {
     fn try_fast_delete(&self, sql: &str, txn: &storage::Transaction) -> Option<Result<u64>> {
         let _locks = self.storage.table_locks().statement_scope();
         let target = match self.prepare_fast_delete(sql, true)? {
+            Ok(Some(target)) => target,
+            Ok(None) => return Some(Ok(0)),
+            Err(e) => return Some(Err(e)),
+        };
+        // Spec R5.4 (P12): the row's lock for this transaction, then the row as
+        // committed under it.
+        if let Err(e) = txn.lock_row(&target.table_name, target.row_id) {
+            return Some(Err(e));
+        }
+        let target = match self.recheck_fast_delete_target(target)? {
             Ok(Some(target)) => target,
             Ok(None) => return Some(Ok(0)),
             Err(e) => return Some(Err(e)),
@@ -18732,17 +18868,21 @@ impl EmbeddedDatabase {
             Ok(None) => return Some(Ok(0)),
             Err(e) => return Some(Err(e)),
         };
+        // Spec R5.4 (P12): the row's lock until the delete's group is applied, then
+        // the row as committed under it.
+        let _row_lock = match self.storage.lock_row_for_fast_write(&target.table_name, target.row_id) {
+            Ok(guard) => guard,
+            Err(e) => return Some(Err(e)),
+        };
+        let target = match self.recheck_fast_delete_target(target)? {
+            Ok(Some(target)) => target,
+            Ok(None) => return Some(Ok(0)),
+            Err(e) => return Some(Err(e)),
+        };
 
+        // Spec R5.4 (F1.3): the logical-WAL entry rides the delete's own write group
+        // (`StorageEngine::write_fast_row_change`).
         let result = (|| {
-            if self.storage.fast_dml_requires_logical_wal() {
-                let key = self.storage.branch_aware_data_key(&target.table_name, target.row_id);
-                if self.storage.logical_wal_per_statement() {
-                    self.storage.log_data_delete(&target.table_name, &key)?;
-                } else {
-                    self.storage.log_data_delete_nosync(&target.table_name, &key)?;
-                }
-            }
-
             if target.pk_only_delete {
                 self.storage.delete_tuple_fast_pk_only(
                     &target.table_name,
@@ -19006,6 +19146,173 @@ impl EmbeddedDatabase {
     /// `FastSelectSpec`, so the fast DELETE specs — which carry the same index —
     /// can apply the identical rule. One rule, one body: the read and the write
     /// path cannot drift on what "this index hit is honest" means.
+    /// Spec R5.4 (F1.4): the params family's `ON CONFLICT DO UPDATE` write of row
+    /// `row_id`, staged in `txn` exactly as the text family's leg stages it: the
+    /// columnar side data, the logical row (read-your-own-writes returns values),
+    /// the ART move with its undo when an indexed column changed, the HNSW move with
+    /// its undo. It used to be `update_tuple_fast`, straight to `data:` and outside
+    /// every transaction: a ROLLBACK kept it, and a row staged earlier in the same
+    /// transaction then overwrote it at COMMIT (P8: RETURNING said 2, the row ended
+    /// at 7).
+    fn stage_upsert_update(
+        &self,
+        txn: &storage::Transaction,
+        table_name: &str,
+        schema: &Schema,
+        row_id: u64,
+        pre_image: &Tuple,
+        updated: &Tuple,
+    ) -> Result<()> {
+        self.storage
+            .stage_tuple_for_column_storage_in_transaction(table_name, row_id, updated, schema, txn)?;
+        let key = self.storage.branch_aware_data_key(table_name, row_id);
+        let value = bincode::serialize(updated).map_err(|e| Error::storage(e.to_string()))?;
+        txn.put(key, value)?;
+        if self
+            .storage
+            .art_indexes()
+            .tuple_update_affects_indexes(table_name, schema, pre_image, updated)
+        {
+            let old_col_values = Self::tuple_column_values(schema, pre_image);
+            let new_col_values = Self::tuple_column_values(schema, updated);
+            if let Err(e) = self
+                .storage
+                .art_indexes()
+                .on_delete(table_name, row_id, &old_col_values)
+            {
+                tracing::debug!("ART index on-conflict/delete-old for '{}': {}", table_name, e);
+            }
+            if let Err(e) = self
+                .storage
+                .art_indexes()
+                .on_insert(table_name, row_id, &new_col_values)
+            {
+                storage::StorageEngine::note_index_maintenance_failure(table_name, row_id, &e);
+            }
+            self.push_art_undo(
+                txn,
+                ArtUndoOp::RestoreUpdated {
+                    table_name: table_name.to_string(),
+                    row_id,
+                    old_col_values,
+                    new_col_values,
+                },
+            );
+        }
+        if self.vector_dml_gate(table_name) {
+            let vops =
+                self.storage
+                    .vector_indexes()
+                    .on_row_update(table_name, row_id, schema, Some(pre_image), updated);
+            self.push_vector_undo(txn, vops);
+        }
+        self.storage.row_cache().invalidate(table_name, row_id);
+        Ok(())
+    }
+
+    /// Spec R5.4 (P12): lock `row` (main's, read by this statement after it loaded
+    /// `epoch`, the table's change epoch) for `txn` until it ends, and hand back the row
+    /// as committed now (`storage::row_locks`, "The protocol"). Unchanged since the
+    /// epoch: the row as read, at no cost but the lock. Changed: the committed image,
+    /// one point read, which the caller evaluates again. A transaction that validates
+    /// (REPEATABLE READ, SERIALIZABLE) gets 40001 instead of a changed row. A row with
+    /// no row id is handed back as it is: nothing names it to lock.
+    fn lock_row_for_change(
+        &self,
+        txn: &storage::Transaction,
+        table_name: &str,
+        schema: &Schema,
+        row: Tuple,
+        epoch: u64,
+    ) -> Result<LockedRow> {
+        let Some(row_id) = row.row_id else {
+            return Ok(LockedRow::Same(row));
+        };
+        txn.lock_row(table_name, row_id)?;
+        if !self.storage.row_locks().changed_since(table_name, epoch) {
+            return Ok(LockedRow::Same(row));
+        }
+        let key = self.storage.branch_aware_data_key(table_name, row_id);
+        let Some(raw) = txn.get_latest(&key)? else {
+            return Ok(LockedRow::Gone);
+        };
+        let mut latest: Tuple =
+            bincode::deserialize(&raw).map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+        self.storage
+            .resolve_column_storage_refs(table_name, schema, row_id, &mut latest)?;
+        self.storage.shape_row(table_name, schema.columns.len(), &mut latest)?;
+        latest.row_id = Some(row_id);
+        if latest.values == row.values {
+            return Ok(LockedRow::Same(row));
+        }
+        if txn.validates_writes() {
+            return Err(Error::concurrent_update(table_name));
+        }
+        Ok(LockedRow::Moved(latest))
+    }
+
+    /// Spec R5.4 (P12): the row a fast PK write read before it took the row's lock,
+    /// checked once it holds it: still the row committed when nothing of the table
+    /// changed since `epoch`; otherwise read again (`storage::row_locks`).
+    #[allow(clippy::too_many_arguments)]
+    fn reread_fast_pk_row(
+        &self,
+        table_name: &str,
+        pk_value: &Value,
+        schema: &Schema,
+        pk_col_idx: usize,
+        row_id: u64,
+        epoch: u64,
+        read: Tuple,
+    ) -> FastPkRow {
+        if !self.storage.row_locks().changed_since(table_name, epoch) {
+            return FastPkRow::Current(read);
+        }
+        match self
+            .storage
+            .get_row_by_typed_pk_for_write_with_schema(table_name, pk_value, schema)
+        {
+            Ok(Some(row))
+                if row.row_id == Some(row_id) && Self::fast_row_matches_probed_pk(&row, pk_col_idx, pk_value) =>
+            {
+                FastPkRow::Current(row)
+            }
+            Ok(Some(_)) => FastPkRow::Decline,
+            Ok(None) => FastPkRow::Gone,
+            Err(e) => FastPkRow::Failed(e),
+        }
+    }
+
+    /// Spec R5.4 (P12): [`Self::reread_fast_pk_row`] for a PK-only DELETE, which read
+    /// only the index: is the probed key still on `row_id`, and is `row_id` a
+    /// committed row?
+    ///
+    /// The second question is asked whatever the epoch says. An INSERT staged by an
+    /// open transaction (an upsert's insert leg, a multi-row INSERT) claims its key in
+    /// the index when it is staged, long before its row is committed, and moves no
+    /// epoch. A DELETE that took that index hit for a row deleted the row's index entry
+    /// and reported one row deleted; the INSERT then committed its row with no index
+    /// entry, and the next INSERT of the key found it free and stored a second row with
+    /// the same primary key. A DELETE does not see an uncommitted row (READ COMMITTED):
+    /// it deletes nothing. One point read.
+    fn reread_fast_pk_entry(&self, table_name: &str, pk_key: &[u8], row_id: u64, epoch: u64) -> FastPkRow {
+        if self.storage.row_locks().changed_since(table_name, epoch) {
+            match self.storage.art_indexes().pk_index_lookup(table_name, pk_key) {
+                Some(current) if current == row_id => {}
+                Some(_) => return FastPkRow::Decline,
+                None => return FastPkRow::Gone,
+            }
+        }
+        match self
+            .storage
+            .get(&self.storage.branch_aware_data_key(table_name, row_id))
+        {
+            Ok(Some(_)) => FastPkRow::Current(Tuple::new(Vec::new())),
+            Ok(None) => FastPkRow::Gone,
+            Err(e) => FastPkRow::Failed(e),
+        }
+    }
+
     fn fast_row_matches_probed_pk(row: &Tuple, pk_col_idx: usize, probe: &Value) -> bool {
         let Some(value) = row.values.get(pk_col_idx) else {
             return false;
@@ -21177,6 +21484,7 @@ impl EmbeddedDatabase {
         let result = if self.params_insert_needs_implicit_transaction(plan, session_txn)
             || self.params_call_needs_implicit_transaction(plan, session_txn)
             || self.params_branch_dml_needs_implicit_transaction(plan, session_txn)
+            || self.params_main_dml_needs_implicit_transaction(plan, session_txn)
         {
             self.execute_plan_with_params_in_implicit_transaction(plan, params, original_sql, expected)
         } else {
@@ -21253,14 +21561,9 @@ impl EmbeddedDatabase {
         if values.len() < 2 {
             return false;
         }
-        // `ON CONFLICT` is excluded deliberately, not overlooked. Its DO UPDATE
-        // leg writes the conflicting row with `update_tuple_fast`, which goes
-        // STRAIGHT to `data:` and not through the write set: staging the INSERT
-        // half while the UPDATE half bypasses the transaction would make a
-        // conflict against a row staged EARLIER IN THE SAME STATEMENT update a
-        // `data:` key the commit is about to overwrite. There is also nothing to
-        // repair here — the whole point of `ON CONFLICT` is that the duplicate
-        // does not raise. Left byte-for-byte as it was (sprinter 6780488554df).
+        // `ON CONFLICT`, any number of rows, is decided by
+        // `params_main_dml_needs_implicit_transaction` (spec R5.4): its DO UPDATE
+        // leg stages in the statement's transaction now.
         if on_conflict.is_some() {
             return false;
         }
@@ -21298,6 +21601,39 @@ impl EmbeddedDatabase {
             && self.storage.is_branch_active()
     }
 
+    /// Spec R5.4 (decision 10): the params family's main-branch statements that write
+    /// more than one row, or read a row they then change, run in an implicit
+    /// statement transaction, as every text-family statement does: `INSERT … ON
+    /// CONFLICT` (one row or many), `INSERT … SELECT`, `UPDATE`, `DELETE` and
+    /// `TRUNCATE`, with no transaction in scope. Their rows commit in ONE write group
+    /// with their logical-WAL entries, a failure part-way leaves nothing, and their
+    /// row locks (`storage::row_locks`) are held to the commit. Each of them used to
+    /// write row by row, several groups a row, visible half done to readers, to a
+    /// standby and to a branch fork, and kept half by a crash.
+    ///
+    /// The single-row hot path is untouched: a single-row `INSERT … VALUES` (no ON
+    /// CONFLICT) still writes its one group directly, and the PK-fast `UPDATE` and
+    /// `DELETE` never reach this funnel. `CREATE TABLE … AS` populates through the
+    /// `InsertSelect` arm, which this covers; the catalog half is spec R5.3's.
+    fn params_main_dml_needs_implicit_transaction(
+        &self,
+        plan: &sql::LogicalPlan,
+        session_txn: Option<&storage::Transaction>,
+    ) -> bool {
+        if session_txn.is_some() {
+            return false;
+        }
+        let statement_writes_rows = match plan {
+            sql::LogicalPlan::Insert { on_conflict, .. } => on_conflict.is_some(),
+            sql::LogicalPlan::InsertSelect { .. }
+            | sql::LogicalPlan::Update { .. }
+            | sql::LogicalPlan::Delete { .. }
+            | sql::LogicalPlan::Truncate { .. } => true,
+            _ => false,
+        };
+        statement_writes_rows && !self.global_txn_visible()
+    }
+
     /// sprinter e4bb83a1afa0: does this params-family `CALL` need an implicit
     /// statement transaction of its own?
     ///
@@ -21330,6 +21666,20 @@ impl EmbeddedDatabase {
         let _statement_locks = self.storage.table_locks().statement_scope();
         let txn = self.storage.begin_autocommit_transaction()?;
         let _wal_capture = txn.begin_statement_wal_capture();
+        // Spec R5.4: the params family's DML arms stage their rows and log nothing
+        // per row, so the commit derives the statement's logical-WAL entries from
+        // what it staged, into its own write group (an explicit transaction's
+        // rule). Not CALL, whose body logs as the text family does, nor TRUNCATE,
+        // which logs its one entry with the commit.
+        if matches!(
+            plan,
+            sql::LogicalPlan::Insert { .. }
+                | sql::LogicalPlan::InsertSelect { .. }
+                | sql::LogicalPlan::Update { .. }
+                | sql::LogicalPlan::Delete { .. }
+        ) {
+            txn.log_staged_writes_at_commit(self.storage.logical_wal_per_statement());
+        }
         // sprinter beefd0d3d069: own slot, not the shared log.
         let _undo_slot = self.claim_statement_art_undo(&txn);
         let undo_txn_id = _undo_slot.txn_id;
@@ -21337,25 +21687,29 @@ impl EmbeddedDatabase {
         // sprinter 6bc4a4040eb7 (B2 follow-up): keep this statement's removal
         // census slots until its index undo has run, however it ends — see
         // `execute_with_implicit_transaction`. A failed commit replays the undo
-        // like a rollback.
+        // like a rollback. Spec R5.4: its row locks too.
         let census_hold = txn.write_census_hold();
+        let row_hold = txn.row_locks_hold();
         match result {
             Ok(out) => {
                 if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
                     let _ = txn.rollback();
                     self.rollback_art_undo_for(undo_txn_id);
                     drop(census_hold);
+                    drop(row_hold);
                     self.deferred_fk_checks.lock().clear();
                     return Err(e);
                 }
                 if let Err(e) = txn.commit() {
                     self.rollback_art_undo_for(undo_txn_id);
                     drop(census_hold);
+                    drop(row_hold);
                     self.deferred_fk_checks.lock().clear();
                     return Err(e);
                 }
                 let _ = self.take_raii_art_undo(undo_txn_id);
                 drop(census_hold);
+                drop(row_hold);
                 self.deferred_fk_checks.lock().clear();
                 self.storage.increment_lsn();
                 Ok(out)
@@ -21364,6 +21718,7 @@ impl EmbeddedDatabase {
                 let _ = txn.rollback();
                 self.rollback_art_undo_for(undo_txn_id);
                 drop(census_hold);
+                drop(row_hold);
                 self.deferred_fk_checks.lock().clear();
                 Err(e)
             }
@@ -21984,6 +22339,9 @@ impl EmbeddedDatabase {
                             // which also hands back the conflicting row as the
                             // branch sees it (inherited, branch-own, or staged
                             // by this transaction).
+                            // Spec R5.4: the fallback's own row lock, when there is
+                            // no transaction to hold it.
+                            let mut fast_row_lock: Option<storage::row_locks::RowLockGuard<'_>> = None;
                             let (existing_row_id, branch_existing): (u64, Option<Tuple>) = if let Some(arbitration) =
                                 branch_arbitration.take()
                             {
@@ -22024,12 +22382,38 @@ impl EmbeddedDatabase {
                                     (row.clone(), row)
                                 }
                                 None => {
+                                    // Spec R5.4 (P12): the conflicting row's write lock
+                                    // first, then the row as committed under it, or as
+                                    // this transaction staged it (P8: a row staged
+                                    // earlier in the transaction is not in storage yet).
+                                    // With no transaction (a fallback no main statement
+                                    // reaches since decision 10), a lock of its own.
+                                    if let Some(txn) = active_txn {
+                                        txn.lock_row(table_name, existing_row_id)?;
+                                    } else {
+                                        fast_row_lock =
+                                            Some(self.storage.lock_row_for_fast_write(table_name, existing_row_id)?);
+                                    }
                                     let existing_key = self.storage.branch_aware_data_key(table_name, existing_row_id);
-                                    let existing_raw = self.storage.get(&existing_key)?.ok_or_else(|| {
-                                        Error::query_execution(
-                                            "ON CONFLICT DO UPDATE: existing row not found in storage",
-                                        )
-                                    })?;
+                                    let existing_raw = match active_txn {
+                                        Some(txn) => txn.get_latest(&existing_key)?,
+                                        None => self.storage.get(&existing_key)?,
+                                    };
+                                    let existing_raw = match existing_raw {
+                                        Some(raw) => raw,
+                                        // Deleted by a transaction that committed after
+                                        // the conflict was found: not an UPDATE over a
+                                        // row nobody has any more (it would come back,
+                                        // without its index entries).
+                                        None if active_txn.is_some() => {
+                                            return Err(Error::concurrent_update(table_name));
+                                        }
+                                        None => {
+                                            return Err(Error::query_execution(
+                                                "ON CONFLICT DO UPDATE: existing row not found in storage",
+                                            ))
+                                        }
+                                    };
                                     let mut current: Tuple = bincode::deserialize(&existing_raw).map_err(|err| {
                                         Error::storage(format!("Failed to deserialize tuple: {}", err))
                                     })?;
@@ -22151,9 +22535,22 @@ impl EmbeddedDatabase {
                             // view, staged in the statement's transaction — never
                             // `update_tuple_fast`, which writes MAIN's `data:` key
                             // and main's ART (it refuses on a branch now).
-                            match &branch_view {
-                                Some(view) => view.put(active_txn, table_name, existing_row_id, &updated_tuple)?,
-                                None => {
+                            // Spec R5.4 (F1.4): on main, staged in the statement's
+                            // transaction (its session's, or the implicit one,
+                            // decision 10) like the text family's leg: a ROLLBACK
+                            // undoes it, and a row this statement inserted or
+                            // changed earlier is the one it updates (P8).
+                            match (&branch_view, active_txn) {
+                                (Some(view), _) => view.put(active_txn, table_name, existing_row_id, &updated_tuple)?,
+                                (None, Some(txn)) => self.stage_upsert_update(
+                                    txn,
+                                    table_name,
+                                    &schema,
+                                    existing_row_id,
+                                    &old_tuple_for_art,
+                                    &updated_tuple,
+                                )?,
+                                (None, None) => {
                                     self.storage.update_tuple_fast(
                                         table_name,
                                         existing_row_id,
@@ -22163,6 +22560,7 @@ impl EmbeddedDatabase {
                                     )?;
                                 }
                             }
+                            drop(fast_row_lock.take());
 
                             if let Some(p) = &returning_projection {
                                 returned_tuples.push(p.project(&updated_tuple)?);
@@ -22445,6 +22843,8 @@ impl EmbeddedDatabase {
                 // the transaction's staged branch writes (the merge below keys
                 // on main's `data:` and could never find a branch row).
                 let branch_view = self.storage.branch_view()?;
+                // Spec R5.4 (P12): the table's change epoch, before its rows are read.
+                let row_epoch = self.storage.row_locks().table_epoch(table_name);
                 let base_tuples = match &branch_view {
                     Some(view) => view.scan(active_txn, table_name, &schema)?,
                     None => self.storage.scan_table_branch_aware(table_name)?,
@@ -22475,15 +22875,29 @@ impl EmbeddedDatabase {
                 // change within one statement.
                 let index_unique_sets = self.storage.art_indexes().unique_column_sets(table_name);
 
+                let row_matches = |row: &Tuple| -> Result<bool> {
+                    Ok(match selection {
+                        Some(predicate) => matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true)),
+                        None => true,
+                    })
+                };
                 for tuple in tuples {
-                    let matches = if let Some(predicate) = selection {
-                        let result = evaluator.evaluate(predicate, &tuple)?;
-                        match result {
-                            Value::Boolean(b) => b,
-                            _ => false,
+                    let mut matches = row_matches(&tuple)?;
+                    // Spec R5.4 (P12): a row this statement changes is locked for its
+                    // transaction first, and changed as committed under the lock: a
+                    // concurrent writer's commit is never thrown away.
+                    let tuple = match (matches, active_txn, &branch_view) {
+                        (true, Some(txn), None) => {
+                            match self.lock_row_for_change(txn, table_name, &schema, tuple, row_epoch)? {
+                                LockedRow::Same(row) => row,
+                                LockedRow::Moved(row) => {
+                                    matches = row_matches(&row)?;
+                                    row
+                                }
+                                LockedRow::Gone => continue,
+                            }
                         }
-                    } else {
-                        true
+                        _ => tuple,
                     };
 
                     // RLS USING filters silently — see the text family's Update arm.
@@ -22795,6 +23209,8 @@ impl EmbeddedDatabase {
                 // sprinter 6bc4a4040eb7 (B2): the branch view with the
                 // transaction's staged branch writes on a branch.
                 let branch_view = self.storage.branch_view()?;
+                // Spec R5.4 (P12): the table's change epoch, before its rows are read.
+                let row_epoch = self.storage.row_locks().table_epoch(table_name);
                 let base_tuples = match &branch_view {
                     Some(view) => view.scan(active_txn, table_name, &schema)?,
                     None => self.storage.scan_table_branch_aware(table_name)?,
@@ -22825,15 +23241,29 @@ impl EmbeddedDatabase {
                     None => None,
                 };
 
+                let row_matches = |row: &Tuple| -> Result<bool> {
+                    Ok(match selection {
+                        Some(predicate) => matches!(evaluator.evaluate(predicate, row)?, Value::Boolean(true)),
+                        None => true,
+                    })
+                };
                 for tuple in tuples {
-                    let matches = if let Some(predicate) = selection {
-                        let result = evaluator.evaluate(predicate, &tuple)?;
-                        match result {
-                            Value::Boolean(b) => b,
-                            _ => false,
+                    let mut matches = row_matches(&tuple)?;
+                    // Spec R5.4 (P12): a row this statement changes is locked for its
+                    // transaction first, and changed as committed under the lock: a
+                    // concurrent writer's commit is never thrown away.
+                    let tuple = match (matches, active_txn, &branch_view) {
+                        (true, Some(txn), None) => {
+                            match self.lock_row_for_change(txn, table_name, &schema, tuple, row_epoch)? {
+                                LockedRow::Same(row) => row,
+                                LockedRow::Moved(row) => {
+                                    matches = row_matches(&row)?;
+                                    row
+                                }
+                                LockedRow::Gone => continue,
+                            }
                         }
-                    } else {
-                        true
+                        _ => tuple,
                     };
 
                     // RLS USING filters silently — see the text family's Delete arm.
@@ -24837,6 +25267,8 @@ impl EmbeddedDatabase {
         txn.set_write_census(self.storage.write_census());
         // Spec R5.1: and it keeps its table locks across its statements.
         txn.set_table_locks(std::sync::Arc::clone(self.storage.table_locks()));
+        // Spec R5.4 (P12): and the rows it changes until it ends.
+        self.storage.attach_row_locks(&mut txn);
         // P0#1: session transactions must honor time_travel_enabled too
         // (new_with_session defaults versioning on).
         txn.set_versioning_enabled(self.storage.time_travel_enabled());
@@ -25313,6 +25745,8 @@ impl EmbeddedDatabase {
             // their commits so explicit transactions can validate against
             // them; they never validate (statement-atomic, RC semantics).
             txn.set_conflict_registry(self.storage.conflict_registry(), false);
+            // Spec R5.4 (P12): it locks the rows it changes until it commits.
+            self.storage.attach_row_locks(&mut txn);
             // ROADMAP_V5.md §1.8: this arm executes through
             // `execute_in_transaction_no_fast_path` too (see below), so its
             // statement logs nothing per-statement and COMMIT is the only
@@ -25919,6 +26353,19 @@ impl EmbeddedDatabase {
             .is_ok_and(|session| session.read().scoped.on_branch_of(self.storage.instance_id()))
     }
 
+    /// Spec R5.4 (P11): has session `session_id` created a temp table? Its bare
+    /// names then resolve to `pg_temp_<pid>.t` first, so a plan or a RowDescription
+    /// derived with no session installed (the extended protocol's Parse-time plan
+    /// pinning and Describe) names the wrong table: a permanent one of the same
+    /// name, or none. One relaxed load while no temp table exists anywhere.
+    pub(crate) fn session_holds_temp_tables(&self, session_id: crate::session::SessionId) -> bool {
+        self.storage.temp_tables_present()
+            && self
+                .session_manager
+                .get_session(session_id)
+                .is_ok_and(|session| session.read().scoped.holds_temp_tables())
+    }
+
     /// sprinter 6bc4a4040eb7 (phase B3): publish session `session_id`'s
     /// backend state (and with it its BRANCH binding) on this thread for one
     /// synchronous catalog probe made outside every engine funnel — the
@@ -25937,7 +26384,10 @@ impl EmbeddedDatabase {
         }
         let session_lock = self.session_manager.get_session(session_id).ok()?;
         let scoped = std::sync::Arc::clone(&session_lock.read().scoped);
-        if !scoped.on_branch_of(self.storage.instance_id()) {
+        // Spec R5.4 (P11): also for a session holding temp tables, whose bare
+        // names the planner resolves to its temp schema first only when this
+        // state is installed (`sql::temp_tables::caller_holds_temp_tables`).
+        if !scoped.on_branch_of(self.storage.instance_id()) && !scoped.holds_temp_tables() {
             return None;
         }
         Some(SessionCatalogProbeScope {
@@ -27069,6 +27519,9 @@ impl EmbeddedDatabase {
             return Ok(count);
         }
         let _schema_override = self.session_schema_override_guard(session_id);
+        // Spec R5.4 (P11): a plan pinned outside this session cannot have seen its
+        // temp tables; plan again with the session installed.
+        let plan_override = plan_override.filter(|_| !sql::temp_tables::caller_holds_temp_tables());
         if !self.session_transactions.contains_key(&session_id) {
             let _sync_override = self.session_durability_override_guard(session_id);
             return self.execute_params_inner(sql, params, plan_override);
@@ -27174,6 +27627,8 @@ impl EmbeddedDatabase {
             return Ok(Vec::new());
         }
         let _schema_override = self.session_schema_override_guard(session_id);
+        // Spec R5.4 (P11): see `execute_params_for_session_inner_body`.
+        let plan_override = plan_override.filter(|_| !sql::temp_tables::caller_holds_temp_tables());
         if !self.session_transactions.contains_key(&session_id) {
             return self.query_params_inner(sql, params, plan_override);
         }

@@ -299,6 +299,50 @@ pub struct Transaction {
     /// releases the claims taken after the savepoint (main frees the same keys
     /// through `rollback_art_undo_to`).
     branch_claims: parking_lot::Mutex<Vec<super::BranchKeyClaim>>,
+    /// Spec R5.4 (P12): the engine's row write locks, which this transaction takes
+    /// for every existing row it changes ([`Self::lock_row`]) and holds until its
+    /// commit is applied or it ends. `None` for a transaction built on a bare store.
+    row_locks: Option<RowLockSet>,
+    /// Spec R5.4: the rows this transaction holds locked. Shared with a
+    /// [`RowLockHold`], which lets them go instead of `Drop` when a caller still has
+    /// to replay the transaction's index undo after it ended.
+    held_rows: Arc<parking_lot::Mutex<Vec<super::row_locks::RowKey>>>,
+    /// Spec R5.4: derive this commit's logical-WAL operations from its staged writes
+    /// through `statement_wal` ([`Self::log_staged_writes_at_commit`]), and whether to
+    /// fsync them.
+    derive_wal_at_commit: AtomicBool,
+    derive_wal_sync: AtomicBool,
+    /// Spec R5.4: this transaction is bound to the thread that opened it
+    /// ([`Self::bind_row_locks_to_this_thread`]); it unbinds when it ends.
+    bound_to_thread: AtomicBool,
+}
+
+/// Spec R5.4: what a transaction needs to lock rows and to commit after the rows'
+/// previous writers.
+struct RowLockSet {
+    locks: Arc<super::row_locks::RowLocks>,
+    /// Where a wait's bounds come from (`lock_timeout`, `statement_timeout`).
+    table_locks: Arc<super::table_locks::TableLocks>,
+    /// The engine's MVCC clock: a commit holding row locks takes a FRESH timestamp
+    /// from it, above every earlier writer of those rows ([`Transaction::commit`]).
+    clock: Arc<RwLock<u64>>,
+}
+
+/// Spec R5.4: a transaction's row locks, kept past the transaction for a caller that
+/// replays its eager index undo after a rollback or a failed commit: a waiter must
+/// not change the row before the index says again what the row says. Lets them go
+/// when it drops. The sibling of [`UncommittedWriteHold`].
+pub struct RowLockHold {
+    locks: Arc<super::row_locks::RowLocks>,
+    owner: u64,
+    rows: Arc<parking_lot::Mutex<Vec<super::row_locks::RowKey>>>,
+}
+
+impl Drop for RowLockHold {
+    fn drop(&mut self) {
+        let keys = std::mem::take(&mut *self.rows.lock());
+        self.locks.unlock_all(self.owner, &keys);
+    }
 }
 
 impl Drop for Transaction {
@@ -333,6 +377,16 @@ impl Drop for Transaction {
         // `rollback_transaction_for_session_inner` are ordered that way.
         if let Some(gate) = &self.write_census {
             gate.release();
+        }
+        // Spec R5.4: the rows this transaction locked, unless a `RowLockHold` keeps
+        // them for its caller's undo.
+        if Arc::strong_count(&self.held_rows) == 1 {
+            self.release_row_locks();
+        }
+        if self.bound_to_thread.load(Ordering::Acquire) {
+            if let Some(set) = &self.row_locks {
+                set.locks.unbind_owner(self.transaction_id);
+            }
         }
     }
 }
@@ -868,6 +922,11 @@ impl Transaction {
             savepoints: RwLock::new(Vec::new()),
             branch_staged: parking_lot::Mutex::new(super::BranchStagedWrites::default()),
             branch_claims: parking_lot::Mutex::new(Vec::new()),
+            row_locks: None,
+            held_rows: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            derive_wal_at_commit: AtomicBool::new(false),
+            derive_wal_sync: AtomicBool::new(false),
+            bound_to_thread: AtomicBool::new(false),
         })
     }
 
@@ -1058,6 +1117,109 @@ impl Transaction {
             .and_then(super::table_locks::TransactionLocks::hold_copy)
     }
 
+    /// Spec R5.4 (P12): this transaction locks the rows it changes, on `locks`, and a
+    /// commit that holds any takes its timestamp fresh from `clock`.
+    pub fn set_row_locks(
+        &mut self,
+        locks: Arc<super::row_locks::RowLocks>,
+        table_locks: Arc<super::table_locks::TableLocks>,
+        clock: Arc<RwLock<u64>>,
+    ) {
+        self.row_locks = Some(RowLockSet {
+            locks,
+            table_locks,
+            clock,
+        });
+    }
+
+    /// Spec R5.4 (P12): lock row `row_id` of main's `table` for this transaction, until
+    /// its commit is applied or it ends, waiting for another transaction's hold (READ
+    /// COMMITTED's row lock). The caller then changes the row as it is NOW committed
+    /// (`storage::row_locks`, "The protocol"). A no-op on a bare store.
+    pub fn lock_row(&self, table: &str, row_id: u64) -> Result<()> {
+        let Some(set) = &self.row_locks else {
+            return Ok(());
+        };
+        if set
+            .locks
+            .lock(self.transaction_id, table, row_id, set.table_locks.row_lock_bounds())?
+        {
+            self.held_rows.lock().push(super::row_locks::RowKey::new(table, row_id));
+        }
+        Ok(())
+    }
+
+    /// Spec R5.4: only the calling thread can end this transaction (the embedded
+    /// handle's own `BEGIN`, whose `COMMIT` only the thread that opened it may run).
+    /// A statement on this thread that would wait for one of its rows is refused at
+    /// once (40001) instead of waiting for itself until `lock_timeout`.
+    pub fn bind_row_locks_to_this_thread(&self) {
+        if let Some(set) = &self.row_locks {
+            set.locks.bind_owner_to_this_thread(self.transaction_id);
+            self.bound_to_thread.store(true, Ordering::Release);
+        }
+    }
+
+    /// Spec R5.4: does this transaction keep its snapshot for the whole of it, and
+    /// validate its writes at COMMIT (REPEATABLE READ, SERIALIZABLE, the embedded
+    /// handle's own)? Such a transaction never re-evaluates a row that moved under it:
+    /// that is a serialization failure.
+    pub fn validates_writes(&self) -> bool {
+        self.conflict_validation
+    }
+
+    /// Spec R5.4: how many rows this transaction holds locked. A test surface.
+    pub fn row_locks_held(&self) -> usize {
+        self.held_rows.lock().len()
+    }
+
+    /// Spec R5.4: keep this transaction's row locks past its end, until the returned
+    /// hold drops (see [`RowLockHold`]). `None` when it holds none, or on a bare store.
+    pub fn row_locks_hold(&self) -> Option<RowLockHold> {
+        let set = self.row_locks.as_ref()?;
+        Some(RowLockHold {
+            locks: Arc::clone(&set.locks),
+            owner: self.transaction_id,
+            rows: Arc::clone(&self.held_rows),
+        })
+    }
+
+    /// Spec R5.4: let every row lock go. After the commit's write is visible and the
+    /// written tables' change epochs moved, or when the transaction ends.
+    fn release_row_locks(&self) {
+        let Some(set) = &self.row_locks else {
+            return;
+        };
+        let keys = std::mem::take(&mut *self.held_rows.lock());
+        if !keys.is_empty() {
+            set.locks.unlock_all(self.transaction_id, &keys);
+        }
+    }
+
+    /// Spec R5.4: a commit that holds row locks commits ABOVE every earlier writer of
+    /// those rows, which committed before this transaction could lock them: a fresh
+    /// timestamp, announced in flight inside the clock's lock exactly as
+    /// `StorageEngine::next_commit_timestamp` announces one. An autocommit statement
+    /// otherwise commits at its snapshot's timestamp, which may be below the commit of
+    /// the transaction it waited for, and its version would sort under that one.
+    fn fresh_commit_timestamp(&self) -> Option<u64> {
+        // Not for a transaction that cannot commit: `commit_with_timestamp` refuses it
+        // before it would end an announcement made here.
+        if !self.is_active() || self.held_rows.lock().is_empty() {
+            return None;
+        }
+        let set = self.row_locks.as_ref()?;
+        let mut clock = set.clock.write();
+        *clock += 1;
+        let ts = *clock;
+        if self.has_tracked_writes() {
+            if let Some(registry) = &self.conflict_registry {
+                registry.begin_commit(ts);
+            }
+        }
+        Some(ts)
+    }
+
     /// True once this transaction has staged a write and is therefore counted
     /// by the engine census. Diagnostic/test accessor.
     pub fn is_counted_by_write_census(&self) -> bool {
@@ -1193,6 +1355,20 @@ impl Transaction {
         true
     }
 
+    /// Spec R5.4: this autocommit statement staged rows it logged nothing for (the
+    /// params family's DML arms, an autocommit `INSERT … SELECT`): derive their
+    /// logical-WAL operations from the write set at commit, as an explicit
+    /// transaction does (`collect_logical_wal_ops`), into the commit's own group,
+    /// through the statement's log. `sync` fsyncs them (strict per-statement
+    /// logging). A no-op for a transaction that derives them already (`set_wal`) or
+    /// carries no log.
+    pub fn log_staged_writes_at_commit(&self, sync: bool) {
+        self.derive_wal_at_commit.store(true, Ordering::Release);
+        if sync {
+            self.derive_wal_sync.store(true, Ordering::Release);
+        }
+    }
+
     /// Open the statement-capture frame for this transaction. Hold the guard for the
     /// statement's whole lifetime including the commit: dropping it discards anything
     /// the commit did not take, which is exactly what a rollback needs.
@@ -1267,6 +1443,11 @@ impl Transaction {
             savepoints: RwLock::new(Vec::new()),
             branch_staged: parking_lot::Mutex::new(super::BranchStagedWrites::default()),
             branch_claims: parking_lot::Mutex::new(Vec::new()),
+            row_locks: None,
+            held_rows: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            derive_wal_at_commit: AtomicBool::new(false),
+            derive_wal_sync: AtomicBool::new(false),
+            bound_to_thread: AtomicBool::new(false),
         })
     }
 
@@ -1919,6 +2100,20 @@ impl Transaction {
                 );
                 (Arc::clone(wal), ops, self.logical_wal_sync)
             });
+        // Spec R5.4: an autocommit statement whose staged rows were not logged as
+        // they were staged (`log_staged_writes_at_commit`).
+        if wal_plan.is_none() && self.derive_wal_at_commit.load(Ordering::Acquire) {
+            if let Some(wal) = &self.statement_wal {
+                let ops = Self::collect_logical_wal_ops(
+                    &self.insert_log.read(),
+                    &self.write_set,
+                    &self.row_counter_stages.read(),
+                );
+                if !ops.is_empty() {
+                    wal_plan = Some((Arc::clone(wal), ops, self.derive_wal_sync.load(Ordering::Acquire)));
+                }
+            }
+        }
         if let Some(wal) = &self.statement_wal {
             if let Some((captured, wants_sync)) = wal.read().take_statement_capture(self.transaction_id) {
                 if !captured.is_empty() {
@@ -2031,6 +2226,23 @@ impl Transaction {
         // this is what `WriteGate::write` already did with an empty batch, so
         // COMMIT of a read-only transaction on a read-only or physical open
         // still succeeds without attempting a write.
+        // Spec R5.4 (F1.5): the `snapshot:` record `AS OF` resolves this commit by
+        // rides the commit's own group (it was a write group of its own after it).
+        // A commit that writes nothing registers it as before, below.
+        let staged_snapshot = if batch.is_empty() {
+            None
+        } else {
+            match self.snapshot_manager.stage_snapshot_record(&mut batch, commit_ts, None) {
+                Ok(metadata) => Some(metadata),
+                Err(e) => {
+                    if let Some((wal, staged)) = staged_wal.take() {
+                        wal.read().abandon_staged(staged);
+                    }
+                    return Err(self.abort_partial_commit(inflight, commit_ts, e));
+                }
+            }
+        };
+
         let wrote = !batch.is_empty();
         let result = if batch.is_empty() {
             if self.rocksdb_wal_enabled && ((self.sync_commit && !group_fsync) || wal_force_sync) && self.gate.is_open()
@@ -2122,6 +2334,23 @@ impl Transaction {
             staged.invalidate();
         }
 
+        // Spec R5.4 (P12): the rows this commit changed are visible: move their
+        // tables' change epochs, THEN let the rows go, so a writer that read one of
+        // them before this commit and waited for its lock reads it again
+        // (`storage::row_locks`, "The protocol"). Moved after a failure too: the
+        // write may have reached RocksDB. A failed commit keeps its rows locked for
+        // its caller's index undo (`RowLockHold`, else `Drop`).
+        if let Some(set) = &self.row_locks {
+            if !self.write_set.is_empty() {
+                for table in self.written_tables.iter() {
+                    set.locks.note_rows_changed(table.key());
+                }
+            }
+        }
+        if result.is_ok() {
+            self.release_row_locks();
+        }
+
         // The write is applied (or definitively failed): new snapshots may
         // proceed past this commit timestamp.
         if inflight {
@@ -2139,8 +2368,14 @@ impl Transaction {
         // BRANCH lands its tables in commits of their own, then its implicit
         // transaction ends at the timestamp it began with, and `AS OF SCN` of the
         // newest SCN read the rows from before the merge (sprinter 6bc4a4040eb7).
-        if result.is_ok() && (wrote || !self.snapshot_manager.has_snapshot_after(commit_ts)) {
-            let _ = self.snapshot_manager.register_snapshot(commit_ts);
+        if result.is_ok() {
+            match staged_snapshot {
+                Some(metadata) => self.snapshot_manager.publish_staged_snapshot(metadata),
+                None if !self.snapshot_manager.has_snapshot_after(commit_ts) => {
+                    let _ = self.snapshot_manager.register_snapshot(commit_ts);
+                }
+                None => {}
+            }
         }
 
         result.map_err(|e| {
@@ -2522,7 +2757,10 @@ impl Transaction {
     /// v3.1.0: Enhanced with lock release and dirty tracker integration
     #[track_caller]
     pub fn commit(self) -> Result<()> {
-        let ts = self.snapshot_ts.load(Ordering::Acquire);
+        // Spec R5.4: above the rows' earlier writers when it locked any.
+        let ts = self
+            .fresh_commit_timestamp()
+            .unwrap_or_else(|| self.snapshot_ts.load(Ordering::Acquire));
         self.commit_with_timestamp(ts)
     }
 

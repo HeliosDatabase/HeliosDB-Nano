@@ -450,14 +450,13 @@ longer for a 10,000-row `DELETE` (debug build).
   versioned write of such a row, before the anchor, is what ends that. A row not changed since is what it is
   now. `AS OF NOW` always works. Such a statement run before 4.42.0 left no record, so nothing refuses an
   anchor before it, and its rows read by position, wrongly.
-  `SELECT … AS OF` on a session bound to a branch is refused because only main has history. An
-  autocommit `UPDATE` on main by primary key, or of several rows on the extended protocol, records no
-  version `AS OF` can find, so `AS OF`, query or branch, shows such a row as of its last versioned write; a
-  transaction's `UPDATE` is versioned.
-- **A fork lands between writes, not between statements.** A transaction is one write, and so is a statement
-  on the simple protocol. On the extended protocol an autocommit `UPDATE`, `DELETE`, `INSERT … SELECT` or
-  `TRUNCATE` of many rows on main is written row by row, so a fork can land inside it, as main's own readers
-  can see it half done. Run it in a transaction if a branch must not.
+  `SELECT … AS OF` on a session bound to a branch is refused because only main has history. Every
+  `UPDATE` and `DELETE` is versioned since 4.42.0, the autocommit primary-key fast path included, so `AS OF`,
+  query or branch, and a later transaction's scan read it as of the time it committed.
+- **A fork lands between DML statements.** A transaction is one write, and so is a statement on the simple
+  protocol. Since 4.42.0 the extended protocol's autocommit `UPDATE`, `DELETE`, `INSERT … SELECT`,
+  `INSERT … ON CONFLICT` and `TRUNCATE` of many rows on main are one write group too, so a fork, main's
+  readers and a standby see each before or after, never half done.
 - **Dropping reclaims.** `DROP BRANCH` deletes the branch's keys, in batches, and a finished merge deletes
   its source's, once no live branch reads through it. A crash on the way is finished by the next open.
   The name is free at once. A branch with a child cannot be dropped (`2BP01`, naming the child): a merged

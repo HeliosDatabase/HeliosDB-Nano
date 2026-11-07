@@ -395,6 +395,28 @@ impl DeltaTracker {
         Ok(())
     }
 
+    /// Spec R5.4 (F1.2): [`Self::record_insert`] into the caller's write group: the
+    /// delta and the last delta id are put into `batch`, which the caller writes with
+    /// the row they describe, instead of two write groups of their own after it.
+    pub fn stage_insert(
+        &self,
+        batch: &mut rocksdb::WriteBatch,
+        table_name: &str,
+        row_id: u64,
+        tuple: Tuple,
+    ) -> Result<()> {
+        let delta_id = self.next_delta_id();
+        let delta = Delta::insert(delta_id, table_name.to_string(), row_id, tuple);
+        let key = format!("delta:{}:{:020}", table_name, delta_id);
+        let value =
+            bincode::serialize(&delta).map_err(|e| Error::storage(format!("Failed to serialize delta: {}", e)))?;
+        // The same storage boundary as `record_delta`.
+        let stored = super::tde::seal_row_value(self.key_manager.as_deref(), key.as_bytes(), &value)?;
+        batch.put(key.as_bytes(), stored.as_ref());
+        batch.put(b"meta:delta:last_id", delta_id.to_le_bytes());
+        Ok(())
+    }
+
     /// Record an insert delta
     pub fn record_insert(&self, table_name: &str, row_id: u64, tuple: Tuple) -> Result<()> {
         let delta_id = self.next_delta_id();

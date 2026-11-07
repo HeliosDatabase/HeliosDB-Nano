@@ -45,7 +45,7 @@
 //! `WriteGate::write_frozen`. A standby's gate never has a hook: nothing
 //! installs one on a store that does not accept writes.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -53,6 +53,15 @@ use rocksdb::{WriteBatch, WriteOptions, DB};
 
 use super::branch_freeze::BranchFreeze;
 use crate::{Error, Result};
+
+/// Spec R5.4 (decision 6): the largest write group this gate lets through, in
+/// `WriteBatch` bytes: a physical standby's receive bound
+/// (`replication::physical::MAX_BATCH_BYTES`, `u32::MAX - 4096`) less 64 KiB for what
+/// the frame adds. A group above it could never be received: every standby would
+/// stop at it for good. So it is refused here, once, before anything is written, with
+/// B4's frozen copies, staged logical-WAL entries and every bypass writer counted:
+/// they all pass this funnel. SQLSTATE 54000 ([`Error::write_group_too_large`]).
+pub const WRITE_GROUP_CEILING: usize = u32::MAX as usize - 4096 - 64 * 1024;
 
 /// Whether a [`WriteGate`] admits writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +110,8 @@ pub struct WriteGate {
     /// How many writes went through the hook. A test surface: this is what
     /// proves the path of a store with no branch never reaches it.
     freeze_runs: AtomicU64,
+    /// Spec R5.4: a test's lower [`WRITE_GROUP_CEILING`]; 0 = the constant.
+    ceiling_override: AtomicUsize,
 }
 
 /// A write past the gate, until its RocksDB call returned.
@@ -124,6 +135,7 @@ impl WriteGate {
             freeze_active: Arc::new(AtomicBool::new(false)),
             freeze: OnceLock::new(),
             freeze_runs: AtomicU64::new(0),
+            ceiling_override: AtomicUsize::new(0),
         })
     }
 
@@ -251,6 +263,35 @@ impl WriteGate {
         applied
     }
 
+    /// Spec R5.4: the write-group ceiling in force (module constant, or a test's).
+    pub fn write_group_ceiling(&self) -> usize {
+        match self.ceiling_override.load(Ordering::Relaxed) {
+            0 => WRITE_GROUP_CEILING,
+            lowered => lowered,
+        }
+    }
+
+    /// For the tests: lower the write-group ceiling (`None` restores the constant).
+    #[doc(hidden)]
+    pub fn debug_set_write_group_ceiling(&self, bytes: Option<usize>) {
+        self.ceiling_override.store(
+            bytes.map_or(0, |bytes| bytes.clamp(1, WRITE_GROUP_CEILING)),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Refuse a group above the ceiling, before it is applied.
+    #[inline]
+    fn check_ceiling(&self, batch: &WriteBatch) -> Result<()> {
+        let bytes = batch.size_in_bytes();
+        let ceiling = self.write_group_ceiling();
+        if bytes > ceiling {
+            self.refusals.fetch_add(1, Ordering::Relaxed);
+            return Err(Error::write_group_too_large(bytes, ceiling));
+        }
+        Ok(())
+    }
+
     /// How many writes went through the freeze hook. For the tests.
     #[doc(hidden)]
     pub fn debug_freeze_runs(&self) -> u64 {
@@ -298,6 +339,9 @@ impl WriteGate {
         drop(slot);
         let mut flush = |chunk: WriteBatch| Self::apply(db, chunk, opts);
         let work = freeze.stage(&registry, db, &touches, &mut batch, &mut flush)?;
+        // Spec R5.4: with the children's copies in it. Copies flushed in chunks of
+        // their own change no level's view, so a refusal here changes nothing.
+        self.check_ceiling(&batch)?;
         let applied = Self::apply(db, batch, opts);
         // Bumps what the frozen rows' readers cache, also after a failure: the
         // write may have reached RocksDB.
@@ -372,6 +416,7 @@ impl WriteGate {
         if self.freeze_active.load(Ordering::SeqCst) {
             return self.write_frozen(db, batch, opts, slot);
         }
+        self.check_ceiling(&batch)?;
         let applied = Self::apply(db, batch, opts);
         drop(slot);
         applied
@@ -535,6 +580,34 @@ mod tests {
             "nothing reached RocksDB after the fence"
         );
         assert!(gate.wait_for_writes(Duration::ZERO));
+    }
+
+    /// Spec R5.4 (decision 6): a group above the ceiling is refused, 54000, and
+    /// nothing reaches RocksDB; one at the ceiling goes through.
+    #[test]
+    fn a_group_above_the_ceiling_is_refused_before_rocksdb_sees_it() {
+        let (_dir, db) = scratch_db();
+        let gate = WriteGate::open();
+        let mut small = WriteBatch::default();
+        small.put(b"k", b"v");
+        gate.debug_set_write_group_ceiling(Some(small.size_in_bytes()));
+        gate.write(&db, small, None).unwrap();
+        let sequence = db.latest_sequence_number();
+        let mut large = WriteBatch::default();
+        large.put(b"k2", vec![7_u8; 64]);
+        let refused = gate.write(&db, large, None).unwrap_err().to_string();
+        assert!(
+            refused.contains(crate::error::WRITE_GROUP_TOO_LARGE_MARKER),
+            "{refused}"
+        );
+        assert_eq!(db.latest_sequence_number(), sequence, "nothing reached RocksDB");
+        assert_eq!(db.get(b"k2").unwrap(), None);
+        gate.debug_set_write_group_ceiling(None);
+        assert_eq!(gate.write_group_ceiling(), WRITE_GROUP_CEILING);
+        assert!(
+            gate.wait_for_writes(Duration::ZERO),
+            "a refused write leaves nothing in flight"
+        );
     }
 
     /// The fence waits for a write that was past the gate when it was raised

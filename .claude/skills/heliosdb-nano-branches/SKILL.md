@@ -56,10 +56,9 @@ are `CREATE` and `REFRESH MATERIALIZED VIEW` and a `CREATE SCHEMA` with elements
 running (30 s, then `55006`), and new ones wait for it to register. So a branch's definition of a table and its rows
 always come from the same side of the statement.
 
-**A fork lands between writes, not between DML statements.** A transaction is one write, and so is a statement on
-the simple protocol. On the extended protocol an autocommit `UPDATE`, `DELETE`, `INSERT … SELECT` or `TRUNCATE` of
-many rows on main is written row by row, so a fork can land inside it, as main's own readers can see it half done.
-Run it in a transaction if a branch must not.
+**A fork lands between DML statements.** A transaction is one write, and so is a statement on the simple protocol.
+Since 4.42.0 the extended protocol's autocommit `UPDATE`, `DELETE`, `INSERT … SELECT`, `INSERT … ON CONFLICT` and
+`TRUNCATE` of many rows on main are one write group too, so a fork sees each whole or not at all.
 
 `CREATE BRANCH … AS OF` a past time rewrites nothing: it writes the rows that differ between the
 anchor and now, once, at creation, in chunks. If it fails or crashes there is no such branch; the next
@@ -82,10 +81,10 @@ about: a branch holds every table at its anchor or none. And **it goes on for la
 versioned before the statement is written again (a transaction's `UPDATE` of it is enough), an anchor is refused
 once such a row has changed after it. `AS OF NOW` always works, and so does a time after the last such change.
 
-**What `AS OF` can see.** Version history, and two things are not in it. A row deleted before 4.42.0 has no
-delete event: it is absent at every time, as it always was. An autocommit `UPDATE` on main by primary key, or
-of several rows on the extended protocol, records no version `AS OF` can find, so `AS OF` shows such a row as
-of its last versioned write (a transaction's `UPDATE` is versioned). This is the same for `SELECT … AS OF` and for a branch anchored there.
+**What `AS OF` can see.** Version history. A row deleted before 4.42.0 has no delete event: it is absent at every
+time, as it always was. Since 4.42.0 every `UPDATE` and `DELETE` is versioned, the autocommit primary-key fast path
+and the extended protocol's multi-row statements included (before, they recorded no version, and `AS OF` showed such a
+row as of its last versioned write). This is the same for `SELECT … AS OF` and for a branch anchored there.
 `SELECT … AS OF` on a session bound to a branch is refused (`0A000`): only main has history.
 
 **A branch created by an earlier release** has no recorded fork point. It reads what its parent held when

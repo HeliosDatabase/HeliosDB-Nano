@@ -126,7 +126,7 @@ there are only TWO distinct behaviours:
 
 | Requested level | What runs | Anomalies still possible |
 |---|---|---|
-| `READ COMMITTED` (default) | fresh snapshot per statement | non-repeatable reads, phantoms |
+| `READ COMMITTED` (default) | fresh snapshot per statement; an UPDATE/DELETE that finds its row changed by a concurrent commit waits for it and re-evaluates over the committed row (since 4.42.0: no lost updates) | non-repeatable reads, phantoms |
 | `REPEATABLE READ` | one snapshot per transaction + first-committer-wins write-write validation (loser gets SQLSTATE `40001`) | **write skew** |
 | `SERIALIZABLE` | **identical to `REPEATABLE READ`** | **write skew** |
 

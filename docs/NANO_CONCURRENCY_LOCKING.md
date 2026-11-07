@@ -148,3 +148,31 @@ Separate from the row-level `LockManager` above, and what writers see during DDL
   snapshot, and if a merge changed a row it wrote, its COMMIT gets 40001.
 
 With no DDL or merge running, a write pays one atomic load and the bookkeeping of its own lock set, and allocates nothing.
+
+## The row write lock (R5.4)
+
+Spec: `docs/plans/specs/R5_4_dml_one_group.md`. What keeps two writers of one row from losing each other's work.
+Before 4.42.0 three clients running `UPDATE cnt SET n = n + 1 WHERE id = 1` over the extended protocol were told 576
+times that their increment committed and the counter ended at 426: each read the row, computed, and wrote it back over
+the other's commit. R5.1's table lock does not order them, since every writer holds a table shared.
+
+- **Every UPDATE, DELETE and `ON CONFLICT DO UPDATE` locks each row it changes**, before it computes the new image, on
+  both executor families, on the primary-key fast paths and in transactions. A transaction holds its row locks until its
+  commit is applied (or it ends); an autocommit statement until its one write group is applied. Inserts lock nothing:
+  their rows are new.
+- **A second writer of the row waits** and then, at READ COMMITTED and in autocommit, changes the row **as the first one
+  committed it**: it evaluates its `WHERE` clause again over the committed row and computes its assignments from it,
+  as PostgreSQL's READ COMMITTED does. A row that no longer matches is not changed; a row deleted meanwhile is not
+  changed either (and an `ON CONFLICT DO UPDATE` whose conflicting row was deleted meanwhile fails 40001: PostgreSQL
+  retries the insert there, Nano does not yet).
+- **REPEATABLE READ and SERIALIZABLE do not re-evaluate**: a row changed by a commit after the transaction's snapshot is
+  a serialization failure, SQLSTATE **40001**, at the statement or at COMMIT. Never a silent overwrite.
+- **A wait is bounded like a table-lock wait**: `lock_timeout` (55P03, "could not obtain lock on row in relation"),
+  `statement_timeout` and a cancel (57014). A wait that would close a cycle of waiters fails at once with **40P01**
+  (deadlock detected) in the waiter that closes it. A cycle through a table lock and a row lock (a transaction upgrading
+  its table lock for DDL while another statement waits for one of its rows) is not detected: the timeouts end it.
+- **Cost**: re-reading every row under its lock would cost a point read per row of a bulk UPDATE, so a statement loads
+  its table's change epoch before it reads and re-reads a row only if some writer of that table committed since. With
+  no concurrent writer of the table, a row lock is one uncontended mutex and a map insert, and a release the same.
+- A commit that holds row locks takes a fresh commit timestamp (an autocommit statement otherwise commits at its
+  snapshot's), so its version sorts after the commit it waited for.

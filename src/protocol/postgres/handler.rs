@@ -6623,6 +6623,13 @@ pub(crate) fn sqlstate_for_error(error: &Error) -> &'static str {
         // storage/lock_manager.rs): a retriable serialization failure, like the
         // string-sniffed first-committer-wins path below.
         Error::WriteConflict { .. } => sqlstate::SERIALIZATION_FAILURE, // 40001
+        // Spec R5.4 (decision 6): the write gate's ceiling, wrapped by a commit or a
+        // storage site on its way out. Anchored on the emitter's const.
+        Error::Transaction(message) | Error::Storage(message)
+            if message.contains(crate::error::WRITE_GROUP_TOO_LARGE_MARKER) =>
+        {
+            sqlstate::PROGRAM_LIMIT_EXCEEDED // 54000
+        }
         Error::Transaction(message) => {
             let lower = message.to_ascii_lowercase();
             if lower.contains("serialization failure") {
@@ -6894,7 +6901,9 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     // Spec R5.1: a table's writer lock not obtained in time. PostgreSQL's own class for
     // `lock_timeout`. Anchored on the emitters' const and checked early: the message
     // names the table and the statement holding it, which are free text.
-    if message.contains(crate::error::TABLE_LOCK_TIMEOUT_MARKER) {
+    if message.contains(crate::error::TABLE_LOCK_TIMEOUT_MARKER)
+        || message.contains(crate::error::ROW_LOCK_TIMEOUT_MARKER)
+    {
         return sqlstate::LOCK_NOT_AVAILABLE; // 55P03
     }
     // sprinter d03de7fc3b22: a tenant that has spent its `max_qps` budget (or its
@@ -6973,6 +6982,7 @@ fn sqlstate_for_query_execution_message(message: &str) -> &'static str {
     }
     if message.contains(crate::error::BRANCH_MATERIALIZE_TOO_LARGE_MARKER)
         || message.contains(crate::error::ATOMIC_REWRITE_TOO_LARGE_MARKER)
+        || message.contains(crate::error::WRITE_GROUP_TOO_LARGE_MARKER)
     {
         return sqlstate::PROGRAM_LIMIT_EXCEEDED; // 54000
     }
