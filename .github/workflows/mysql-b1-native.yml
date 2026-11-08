@@ -1,0 +1,65 @@
+name: Native MySQL B1 rerun on source31 (no publish)
+on:
+  push:
+    branches: ['ci/4420-mysql-b1-*']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  mysql-b1:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Preserve canonical source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify probe, original client wheel and source model pins
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          expected = {
+              '.github/4420-mysql-b1/controller.py': '85c1fc26b78187689d8327bfb35c02086e56515598eb2d3dd615c55078f5f6b9',
+              '.github/4420-mysql-b1/mysql_worker.py': '82938ee128713ff6e6d2dbaa4d69a88046f315b369dbab36d9830851aea0ff0c',
+              '.github/4420-mysql-b1/pymysql-1.2.0-py3-none-any.whl': '62169ce6d5510f08e140c5e7990ee884a9764024e4a9a27b2cc11f1099322ae0',
+              '.github/binary-preflight-source28.json': 'ed47e15814dd3d39b072f5fb98aa632b85cd4b11177277e2796aee7cf3991038',
+          }
+          for name, digest in expected.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit('input pin mismatch: ' + name)
+          PYBOOT
+      - name: Download fixed completed source31 binary producer
+        uses: actions/download-artifact@v4
+        with:
+          name: all-four-native-binaries
+          run-id: '42462448705'
+          github-token: ${{ github.token }}
+          path: .mysql-artifacts
+      - name: Run original six-phase native PyMySQL fixture and both admission controls
+        run: |
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_mysql_unit="nano-mysql-b1-${GITHUB_RUN_ID}"
+          sudo systemd-run --unit "$nano_mysql_unit" --wait --pipe --collect             -p User="$(id -un)" -p Group="$(id -gn)"             -p WorkingDirectory="$GITHUB_WORKSPACE"             -p MemoryMax=24G -p MemorySwapMax=0             -p RuntimeMaxSec=900 -p TimeoutStopSec=30             --setenv="PATH=$PATH" --setenv=PYTHONDONTWRITEBYTECODE=1             --setenv=PYTHONUNBUFFERED=1 --setenv="GITHUB_SHA=$GITHUB_SHA"             --setenv="GITHUB_RUN_ID=$GITHUB_RUN_ID"             python3 .github/4420-mysql-b1/controller.py               --artifact-dir "$GITHUB_WORKSPACE/.mysql-artifacts"               --out "$RUNNER_TEMP/mysql-b1-source31"
+      - name: Preserve actual native client rows, errors, resets, admission and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-b1-source31-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mysql-b1-source31/*.json
+            ${{ runner.temp }}/mysql-b1-source31/*.toml
+            ${{ runner.temp }}/mysql-b1-source31/*.log
+            ${{ runner.temp }}/mysql-b1-source31/standby-*/*.json
+            ${{ runner.temp }}/mysql-b1-source31/standby-*/*.log
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
