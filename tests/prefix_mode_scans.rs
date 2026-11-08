@@ -217,8 +217,6 @@ enum Scan {
 /// entry is a scan that reads every family between the keyspace's start and
 /// the keys it wants.
 const SITES: &[(&str, &str, usize, Scan)] = &[
-    // TRUNCATE's key collection, `data:{t}:` only (it stops past `d`).
-    ("src/sql/executor/ddl.rs", "handle_truncate", 1, Scan::TotalOrder),
     // `AS OF` row-id collection, `data:{t}:` only.
     (
         "src/storage/engine_timetravel_extension.rs",
@@ -248,6 +246,42 @@ const SITES: &[(&str, &str, usize, Scan)] = &[
     (
         "src/replication/standby_verify.rs",
         "the_comparison_names_exactly_the_leaf_that_differs",
+        1,
+        Scan::TotalOrder,
+    ),
+    // Whole-store no-repair/fault images must include every family even when
+    // the engine's prefix extractor and range tombstones are present.
+    ("src/direct_copy_native_outcome_tests.rs", "image", 1, Scan::TotalOrder),
+    ("src/sql/routine_lookup_fence_tests.rs", "image", 1, Scan::TotalOrder),
+    ("src/sql/routine_trigger_lookup_tests.rs", "image", 1, Scan::TotalOrder),
+    (
+        "src/sql/routine_uninstalled_owner_tests.rs",
+        "image",
+        1,
+        Scan::TotalOrder,
+    ),
+    (
+        "src/storage/branch_direct_outcome_tests.rs",
+        "raw_image",
+        1,
+        Scan::TotalOrder,
+    ),
+    ("src/storage/point_write_cap_tests.rs", "image", 1, Scan::TotalOrder),
+    (
+        "src/sql/executor/mod.rs",
+        "quarantined_once_subqueries_return_storage_error_without_repair_writes",
+        1,
+        Scan::TotalOrder,
+    ),
+    (
+        "src/storage/catalog.rs",
+        "persistent_definition_without_feature_fences_only_its_table_without_downgrade",
+        1,
+        Scan::TotalOrder,
+    ),
+    (
+        "src/storage/catalog.rs",
+        "mismatched_persistent_reopen_fences_only_its_table_without_downgrade_or_repair_writes",
         1,
         Scan::TotalOrder,
     ),
@@ -637,7 +671,7 @@ fn the_scan_reaches_the_known_sites() {
     assert!(files > 300, "the walk of src/ found only {files} files");
     for (file, function) in [
         ("src/storage/time_travel.rs", "recover_snapshots_with_policy"),
-        ("src/sql/executor/ddl.rs", "handle_truncate"),
+        ("src/replication/physical.rs", "highest_logical_entry"),
         ("src/sync/offline_queue.rs", "drain"),
     ] {
         assert!(

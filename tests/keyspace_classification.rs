@@ -48,6 +48,7 @@
 
 use heliosdb_nano::storage::keyspace::{classify, FIXED_KEYS, PREFIXES};
 use heliosdb_nano::storage::KeyClass;
+use regex::Regex;
 use std::path::{Path, PathBuf};
 
 /// `(path prefix, literal prefix)` pairs for literals that are provably not
@@ -110,6 +111,38 @@ const ALLOW: &[(&str, &str)] = &[
     // The raw key-value adapter's tests.
     ("src/protocols/adapters/storage.rs", "other:"),
     ("src/protocols/adapters/storage.rs", "prefix:"),
+];
+
+/// Exact literals used only by cfg(test) items or the externally test-gated
+/// point-write test module. Unlike ALLOW's historical prefix entries these do
+/// not admit a new production key, or even a different fixture in the same file.
+const TEST_LITERALS: &[(&str, &str)] = &[
+    ("src/storage/point_write_cap_tests.rs", "proof:native_retry"),
+    ("src/storage/point_write_cap_tests.rs", "proof:role"),
+    ("src/storage/point_write_cap_tests.rs", "proof:asref_small"),
+    ("src/storage/transaction.rs", "meta:uncommitted"),
+    ("src/storage/transaction.rs", "a:"),
+    ("src/storage/wal_recovery.rs", "wal:entries_extra"),
+    ("src/storage/write_gate.rs", "proof:refused"),
+    ("src/storage/write_gate.rs", "proof:applied"),
+    ("src/storage/write_gate.rs", "proof:unknown"),
+    // Deliberately malformed relative record names / apply_records inputs.
+    ("src/vector/persistent.rs", "row_image:"),
+    ("src/vector/persistent.rs", "row_image:1"),
+    ("src/vector/persistent.rs", "row_image:2"),
+];
+
+/// These are reader fragments, not top-level RocksDB keys. The third field is
+/// the real containing family (or an actual key selected by a namespace test).
+/// Admission requires the exact literal AND its starts_with/strip_prefix use;
+/// a put of the same bare fragment still fails. The real constructors remain
+/// subject to PREFIXES/FIXED_KEYS and the missing-family control below.
+const READER_FRAGMENTS: &[(&str, &str, &[u8])] = &[
+    ("src/storage/layout_epochs.rs", "table:", b"bmeta:"),
+    ("src/storage/layout_epochs.rs", "missing:", b"bmeta:"),
+    ("src/storage/write_gate.rs", "meta:delta:", b"meta:delta:last_id"),
+    ("src/vector/persistent.rs", "row_image:", b"__vidx:"),
+    ("src/vector/persistent.rs", "rmap:", b"__vidx:"),
 ];
 
 /// Whole keys that the literal scan cannot see by shape (no `:` and no `__`,
@@ -379,6 +412,8 @@ struct Candidate {
     line: usize,
     context: Context,
     text: String,
+    test_only: bool,
+    reader_fragment: bool,
 }
 
 struct Scan {
@@ -404,6 +439,143 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+fn checked_regex(expression: &str) -> Regex {
+    match Regex::new(expression) {
+        Ok(regex) => regex,
+        Err(error) => panic!("invalid keyspace-tripwire expression {expression:?}: {error}"),
+    }
+}
+
+/// Preserve byte positions while blanking literals, comments and char tokens.
+/// This is only used to prove test-item ownership; the key lexer still scans
+/// every test literal instead of silently omitting test code.
+fn ownership_code(src: &str) -> String {
+    let mut code = src.as_bytes().to_vec();
+    for literal in lex_string_literals(src) {
+        for byte in &mut code[literal.start..literal.end] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    let mut i = 0;
+    while i < code.len() {
+        let start = i;
+        if code[i..].starts_with(b"//") {
+            while i < code.len() && code[i] != b'\n' {
+                i += 1;
+            }
+        } else if code[i..].starts_with(b"/*") {
+            let mut depth = 1;
+            i += 2;
+            while i < code.len() && depth != 0 {
+                if code[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if code[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        } else if code[i] == b'\'' {
+            i = skip_char_or_lifetime(&code, i);
+        } else {
+            i += 1;
+            continue;
+        }
+        for byte in &mut code[start..i] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    match String::from_utf8(code) {
+        Ok(code) => code,
+        Err(error) => panic!("ownership lexer broke UTF-8 source: {error}"),
+    }
+}
+
+fn test_item_mask(code: &str) -> Vec<bool> {
+    let attribute = checked_regex(r"#\s*\[\s*(?:test\s*\]|cfg\s*\(\s*(?:test\s*\)|all\s*\(\s*test\b))");
+    let bytes = code.as_bytes();
+    let mut mask = vec![false; bytes.len()];
+    for found in attribute.find_iter(code) {
+        let Some(bracket) = code[found.start()..].find('[') else {
+            panic!("matched test attribute has no opening bracket at {}", found.start());
+        };
+        let mut end = found.start() + bracket;
+        let mut brackets = 0;
+        while end < bytes.len() {
+            if bytes[end] == b'[' {
+                brackets += 1;
+            }
+            if bytes[end] == b']' {
+                brackets -= 1;
+                if brackets == 0 {
+                    end += 1;
+                    break;
+                }
+            }
+            end += 1;
+        }
+        let mut braces = 0;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'{' => braces += 1,
+                b'}' => {
+                    braces -= 1;
+                    if braces == 0 {
+                        end += 1;
+                        break;
+                    }
+                }
+                b';' if braces == 0 => {
+                    end += 1;
+                    break;
+                }
+                _ => {}
+            }
+            end += 1;
+        }
+        mask[found.start()..end].fill(true);
+    }
+    mask
+}
+
+fn external_test_module(root: &Path, file: &str) -> bool {
+    if file != "src/storage/point_write_cap_tests.rs" {
+        return false;
+    }
+    let owner = root.join("src/storage/write_gate.rs");
+    let source = match std::fs::read_to_string(&owner) {
+        Ok(source) => source,
+        Err(error) => panic!("read external test owner {}: {error}", owner.display()),
+    };
+    let code = ownership_code(&source);
+    let mask = test_item_mask(&code);
+    let declaration = checked_regex(r"\bmod\s+point_write_cap_tests\s*;");
+    let declarations: Vec<_> = declaration.find_iter(&code).collect();
+    let attributed = checked_regex(r"#\s*\[\s*path\s*=\s*[^\]]*\]\s*mod\s+point_write_cap_tests\s*;");
+    // Removing the cfg or adding a production declaration revokes fixture
+    // admission. The explicit source path is checked too, rather than inferred
+    // from a filename ending in _tests.rs.
+    !declarations.is_empty()
+        && declarations.iter().all(|item| mask[item.start()])
+        && declarations.iter().all(|item| {
+            attributed.find_iter(&code).any(|attribute| {
+                attribute.start() < item.start()
+                    && attribute.end() == item.end()
+                    && lex_string_literals(&source[attribute.start()..attribute.end()])
+                        .iter()
+                        .map(|literal| literal.text.as_str())
+                        .collect::<Vec<_>>()
+                        == ["point_write_cap_tests.rs"]
+            })
+        })
+}
+
 fn scan_src() -> Scan {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
@@ -418,6 +590,10 @@ fn scan_src() -> Scan {
         let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         let file = path.strip_prefix(root).unwrap_or(&path).display().to_string();
         scan.files += 1;
+        let code = ownership_code(&src);
+        let mask = test_item_mask(&code);
+        let external_test = external_test_module(root, &file);
+        let reader = checked_regex(r"\.\s*(?:starts_with|strip_prefix)\s*\(\s*$");
         for lit in lex_string_literals(&src) {
             if let Some(context) = candidate_context(&src, &lit) {
                 scan.candidates.push(Candidate {
@@ -425,6 +601,8 @@ fn scan_src() -> Scan {
                     line: lit.line,
                     context,
                     text: lit.text.clone(),
+                    test_only: external_test || mask[lit.start],
+                    reader_fragment: reader.is_match(&code[..lit.start]),
                 });
             }
             if !lit.raw {
@@ -436,9 +614,13 @@ fn scan_src() -> Scan {
 }
 
 fn allowed(candidate: &Candidate) -> bool {
-    ALLOW
-        .iter()
-        .any(|(path, prefix)| candidate.file.starts_with(path) && candidate.text.starts_with(prefix))
+    (candidate.test_only
+        && TEST_LITERALS
+            .iter()
+            .any(|(file, text)| candidate.file == *file && candidate.text == *text))
+        || ALLOW
+            .iter()
+            .any(|(path, prefix)| candidate.file.starts_with(path) && candidate.text.starts_with(prefix))
 }
 
 /// `file:line: "literal" [context]` for every candidate the classifier calls
@@ -446,7 +628,13 @@ fn allowed(candidate: &Candidate) -> bool {
 fn offenders(candidates: &[Candidate], class_of: impl Fn(&[u8]) -> KeyClass) -> Vec<String> {
     candidates
         .iter()
-        .filter(|c| !allowed(c) && class_of(c.text.as_bytes()) == KeyClass::Unknown)
+        .filter(|c| {
+            let key = READER_FRAGMENTS
+                .iter()
+                .find(|(file, text, _)| c.reader_fragment && c.file == *file && c.text == *text)
+                .map_or(c.text.as_bytes(), |(_, _, parent)| *parent);
+            !allowed(c) && class_of(key) == KeyClass::Unknown
+        })
         .map(|c| format!("  {}:{}: {:?} [{:?}]", c.file, c.line, c.text, c.context))
         .collect()
 }
@@ -677,4 +865,118 @@ fn candidate_rules_separate_keys_from_prose_urls_and_paths() {
     for not_prefix in ["meta:index", "a::", ":", "", "host:5433", "9a:"] {
         assert!(!is_prefix_literal(not_prefix), "{not_prefix:?} is not a prefix literal");
     }
+}
+
+#[test]
+fn scoped_literals_never_admit_a_production_write_or_another_family() {
+    let scan = scan_src();
+    for &(file, text) in TEST_LITERALS {
+        assert!(
+            scan.candidates
+                .iter()
+                .any(|c| c.file == file && c.text == text && c.test_only),
+            "stale or no longer test-only fixture: {file} {text}"
+        );
+        let production = Candidate {
+            file: file.into(),
+            line: 1,
+            context: Context::Byte,
+            text: text.into(),
+            test_only: false,
+            reader_fragment: false,
+        };
+        assert!(!offenders(&[production], |key| classify(key).class).is_empty());
+    }
+    for &(file, text, family) in READER_FRAGMENTS {
+        assert_eq!(classify(text.as_bytes()).class, KeyClass::Unknown);
+        assert_ne!(classify(family).class, KeyClass::Unknown);
+        assert!(
+            scan.candidates
+                .iter()
+                .any(|c| c.file == file && c.text == text && c.reader_fragment),
+            "stale relative-family reader: {file} {text}"
+        );
+        let write = Candidate {
+            file: file.into(),
+            line: 1,
+            context: Context::Byte,
+            text: text.into(),
+            test_only: false,
+            reader_fragment: false,
+        };
+        assert!(!offenders(&[write], |key| classify(key).class).is_empty());
+        let other_file = Candidate {
+            file: "src/new_writer.rs".into(),
+            line: 1,
+            context: Context::Byte,
+            text: text.into(),
+            test_only: false,
+            reader_fragment: true,
+        };
+        assert!(!offenders(&[other_file], |key| classify(key).class).is_empty());
+        let reader = Candidate {
+            file: file.into(),
+            line: 1,
+            context: Context::Byte,
+            text: text.into(),
+            test_only: false,
+            reader_fragment: true,
+        };
+        assert!(
+            !offenders(&[reader], |key| if key == family {
+                KeyClass::Unknown
+            } else {
+                classify(key).class
+            })
+            .is_empty(),
+            "lost containing-family red proof"
+        );
+    }
+}
+
+#[test]
+fn fixture_ownership_ignores_comments_and_literals_and_ends_with_the_item() {
+    let source = r##"
+// #[cfg(test)] mod pretend { }
+const TEXT: &str = "#[test] fn pretend() { }";
+#[cfg(test)]
+mod tests { fn fixture() { put(b"proof:fixture"); } }
+fn shipping() { put(b"proof:shipping"); }
+#[test]
+fn individual() { put(b"proof:individual"); }
+"##;
+    let mask = test_item_mask(&ownership_code(source));
+    let literals = lex_string_literals(source);
+    let ownership: Vec<_> = literals
+        .iter()
+        .filter(|l| l.text.starts_with("proof:"))
+        .map(|l| (l.text.as_str(), mask[l.start]))
+        .collect();
+    assert_eq!(
+        ownership,
+        [
+            ("proof:fixture", true),
+            ("proof:shipping", false),
+            ("proof:individual", true)
+        ]
+    );
+}
+
+#[test]
+fn external_fixture_admission_requires_its_real_test_gated_path() -> std::io::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::create_dir_all(root.path().join("src/storage"))?;
+    let owner = root.path().join("src/storage/write_gate.rs");
+    let path = "src/storage/point_write_cap_tests.rs";
+    for (source, expected) in [
+        ("#[cfg(test)]\n#[path=\"point_write_cap_tests.rs\"]\nmod point_write_cap_tests;", true),
+        ("#[path=\"point_write_cap_tests.rs\"]\nmod point_write_cap_tests;", false),
+        ("// #[path=\"point_write_cap_tests.rs\"]\n#[cfg(test)]\nmod point_write_cap_tests;", false),
+        ("#[cfg(test)]\n#[path=\"different.rs\"]\nmod point_write_cap_tests;", false),
+        ("#[cfg(test)]\n#[path=\"point_write_cap_tests.rs\"]\nmod point_write_cap_tests;\nmod point_write_cap_tests;", false),
+    ] {
+        std::fs::write(&owner, source)?;
+        assert_eq!(external_test_module(root.path(), path), expected, "{source}");
+    }
+    Ok(())
 }

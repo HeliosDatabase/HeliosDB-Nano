@@ -205,9 +205,11 @@ fn mutate(db: &EmbeddedDatabase, branch: u64, schema: &Schema, change: Change) -
 }
 
 fn raw_image(db: &EmbeddedDatabase) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut read = rocksdb::ReadOptions::default();
+    read.set_total_order_seek(true);
     db.storage
         .db()
-        .iterator(IteratorMode::Start)
+        .iterator_opt(IteratorMode::Start, read)
         .map(|item| {
             let (key, value) = item.unwrap();
             (key.to_vec(), value.to_vec())

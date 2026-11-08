@@ -52,9 +52,11 @@ fn scalar(db: &EmbeddedDatabase, family: Family, sql: &str) -> i64 {
 }
 
 fn image(db: &EmbeddedDatabase) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut read = rocksdb::ReadOptions::default();
+    read.set_total_order_seek(true);
     db.storage
         .db()
-        .iterator(rocksdb::IteratorMode::Start)
+        .iterator_opt(rocksdb::IteratorMode::Start, read)
         .map(|entry| {
             let (key, value) = entry.unwrap();
             (key.to_vec(), value.to_vec())

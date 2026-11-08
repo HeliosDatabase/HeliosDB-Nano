@@ -6179,7 +6179,9 @@ mod once_subquery_context_tests {
         let inner_plan = scan(&db);
         let raw = db.storage.db();
         let image = || {
-            raw.iterator(rocksdb::IteratorMode::Start)
+            let mut read = rocksdb::ReadOptions::default();
+            read.set_total_order_seek(true);
+            raw.iterator_opt(rocksdb::IteratorMode::Start, read)
                 .collect::<std::result::Result<Vec<_>, _>>()
                 .unwrap()
         };

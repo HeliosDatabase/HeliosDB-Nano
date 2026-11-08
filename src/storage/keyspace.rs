@@ -173,7 +173,11 @@ pub enum KeyClass {
     BranchKey,
     /// `git:*` — Git integration state.
     Git,
-    /// `__vidx:{index_id}:*` — a persistent HNSW index's own keyspace.
+    /// `__vidx:{index_id}:*` — a persistent HNSW index's own keyspace,
+    /// including `row_image:{row_id}` (durable row-image overlay) and
+    /// `rmap:{row_id}` (row-to-node mapping). These are suffixes below the
+    /// index prefix, never top-level `row_image:` / `rmap:` key families
+    /// (`vector::persistent::{row_image_key, key_rmap}`).
     Vidx,
     /// `idxsnap:{table}` — a durable ART index snapshot.
     IdxSnap,
@@ -649,6 +653,8 @@ mod tests {
         (b"git:schema_snapshot:next_id", KeyClass::Git, None),
         (b"git:pr:17", KeyClass::Git, None),
         (b"__vidx:3:meta", KeyClass::Vidx, None),
+        (b"__vidx:3:row_image:7", KeyClass::Vidx, None),
+        (b"__vidx:3:rmap:7", KeyClass::Vidx, None),
         (b"idxsnap:users", KeyClass::IdxSnap, None),
         (b"idxsnapv:users", KeyClass::IdxSnapMarker, None),
         (b"vecsnap:docs_emb_idx", KeyClass::VecSnap, None),

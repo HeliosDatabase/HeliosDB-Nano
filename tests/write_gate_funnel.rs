@@ -375,7 +375,10 @@ fn module_dir(file: &Path) -> PathBuf {
 /// test-gated item are test code and are not followed.
 fn compiled_sources(root: &Path) -> BTreeSet<PathBuf> {
     let declaration = Regex::new(r"(?:^|[^A-Za-z0-9_])mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;").unwrap();
-    let path_attribute = Regex::new(r"#\s*\[\s*path\s*=").unwrap();
+    let path_attribute = match Regex::new(r"#\s*\[\s*(?:path\s*=|cfg_attr\b[^\]]*\bpath\s*=)") {
+        Ok(attribute) => attribute,
+        Err(error) => panic!("invalid module-path tripwire expression: {error}"),
+    };
     let mut seen = BTreeSet::new();
     let mut pending = vec![root.join("src/lib.rs"), root.join("src/main.rs")];
     while let Some(file) = pending.pop() {
@@ -383,12 +386,12 @@ fn compiled_sources(root: &Path) -> BTreeSet<PathBuf> {
             continue;
         }
         let code = code_only(&read(&file));
+        let mask = test_mask(&code);
         assert!(
-            !path_attribute.is_match(&code),
-            "{} uses #[path]; teach compiled_sources to follow it",
+            path_attribute.find_iter(&code).all(|attribute| mask[attribute.start()]),
+            "{} uses production #[path]; teach compiled_sources to follow it",
             file.display()
         );
-        let mask = test_mask(&code);
         let dir = module_dir(&file);
         for caps in declaration.captures_iter(&code) {
             let name = caps.get(1).expect("module name");
@@ -572,4 +575,39 @@ fn the_lexer_keeps_offsets_and_blanks_only_comments_and_literals() {
     assert!(code.starts_with("let a = \""));
     assert!(!code.contains('x') && !code.contains('z') && !code.contains("// c"));
     assert!(code.contains("'static"), "a lifetime is not a char literal: {code}");
+}
+
+#[test]
+fn test_only_path_modules_are_skipped_but_production_paths_refuse() -> std::io::Result<()> {
+    let root = tempfile::tempdir()?;
+    std::fs::create_dir(root.path().join("src"))?;
+    std::fs::write(root.path().join("src/main.rs"), "fn main() {}\n")?;
+    let lib = root.path().join("src/lib.rs");
+    std::fs::write(
+        &lib,
+        "#[cfg(test)]\n#[path = \"absent.rs\"]\nmod unit;\n\
+         #[cfg(all(test, feature = \"vector-search\"))]\n#[path = \"absent2.rs\"]\nmod feature_unit;\n\
+         mod real;\n",
+    )?;
+    std::fs::write(root.path().join("src/real.rs"), "fn real(db: &DB) { db.put(k, v); }\n")?;
+    std::fs::write(root.path().join("src/renamed.rs"), "fn harmless() {}\n")?;
+    let files = compiled_sources(root.path());
+    assert_eq!(files.len(), 3);
+    assert!(files.contains(&root.path().join("src/real.rs")));
+    assert_eq!(
+        raw_writes("src/real.rs", &read(&root.path().join("src/real.rs"))).len(),
+        1
+    );
+
+    // An explicit production path must fail closed, even if its target exists;
+    // it must never silently remove a possible raw writer from the walk.
+    for declaration in [
+        "#[path = \"real.rs\"]\nmod renamed;\n",
+        "#[cfg(feature = \"server\")]\n#[path = \"real.rs\"]\nmod renamed;\n",
+        "#[cfg_attr(feature = \"server\", path = \"real.rs\")]\nmod renamed;\n",
+    ] {
+        std::fs::write(&lib, declaration)?;
+        assert!(std::panic::catch_unwind(|| compiled_sources(root.path())).is_err());
+    }
+    Ok(())
 }
