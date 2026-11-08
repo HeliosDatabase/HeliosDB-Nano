@@ -17,14 +17,18 @@
     ".github/4420-full-gates-v5/count-adjudicator/adjudicate.py",
     ".github/4420-full-gates-v5/count-adjudicator/collect-gated.sh",
     ".github/4420-full-gates-v5/count-adjudicator/critical-expectations.json",
+    ".github/4420-full-gates-v5/count-adjudicator/lineage-checks.json",
     ".github/4420-full-gates-v5/count-adjudicator/manifest.json",
     ".github/4420-full-gates-v5/count-adjudicator/primary-source.json",
     ".github/4420-full-gates-v5/count-adjudicator/selfcheck-r1.json",
     ".github/4420-full-gates-v5/count-adjudicator/selfcheck-r2.json",
     ".github/4420-full-gates-v5/count-adjudicator/selfcheck-r3.json",
     ".github/4420-full-gates-v5/count-adjudicator/selfcheck-r4.json",
+    ".github/4420-full-gates-v5/count-adjudicator/selfcheck-v6-r1.json",
     ".github/4420-full-gates-v5/count-adjudicator/selfcheck.py",
+    ".github/4420-full-gates-v5/count-adjudicator/static-checks-v6.json",
     ".github/4420-full-gates-v5/count-adjudicator/static-checks.json",
+    ".github/4420-full-gates-v5/count-adjudicator/v1-to-v2.delta.patch",
     ".github/4420-full-gates-v5/expectation-source-check.json",
     ".github/4420-full-gates-v5/ignored-diagnostics.md",
     ".github/4420-full-gates-v5/inherited-wip-identity.json",
@@ -20292,7 +20296,7 @@
     }
   },
   "product_commit": "2ca5f68022a2339045a247899b5c2132ea8a46c7",
-  "schema": "4420-isolated-correctness-v1",
+  "schema": "4420-isolated-supported-optins-v6",
   "targeted_preflight": [
     {
       "cargo_args": [
@@ -20349,5 +20353,6 @@
       ],
       "timeout_seconds": 1800
     }
-  ]
+  ],
+  "unsupported_disabled_surface": "sync-experimental unavailable, Sprinter6f78323f6029OPEN; no sync acceptance"
 }

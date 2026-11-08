@@ -1,0 +1,16 @@
+{
+  "accepted_v6_bundle_sha256": "ab3fc4d38d6120283df857cfd5a24f7002cbb74b3a6f9952f03ee01ab3706568",
+  "adjudicator_functions_ast_identical": 20,
+  "all_executable_ast_identical_after_only_pin_normalization": true,
+  "critical_bytes_identical": true,
+  "critical_expectations_sha256": "f0e314cb9cdaf01369ba0723fc6df31c05f5146dc5a884124ec7e87ac4f64e8a",
+  "disabled_preset": "sync-experimental only; Sprinter6f78323f6029 remainsOPEN",
+  "gated_collector_bytes_identical": true,
+  "native_cargo_compiler_child_execution": false,
+  "old_v5_bundle_sha256": "1c2884e87666bc46e4b4571c174467b46a374ac52f285a95398d433146fbd5a2",
+  "predecessor_manifest_sha256": "1e223b3ed2e218e62402e0c27f1ec96b4ad936f60c38897b7c07ff1b77bc1423",
+  "release_acceptance_pass": false,
+  "schema": 1,
+  "selfcheck_ast_identical_after_only_bundle_path_normalization": true,
+  "v5_kind_field_and_error_schema_preserved": true
+}

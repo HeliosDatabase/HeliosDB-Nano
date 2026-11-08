@@ -1,14 +1,11 @@
 {
   "schema_version": 1,
-  "package": "full-tier-count-adjudicator-v1",
   "frozen": true,
   "status": "SOURCE_PREPARED_STATIC_VALIDATION_ONLY; ROOT_NATIVE_LIST_EXECUTION_PENDING",
   "release_acceptance_pass": false,
   "native_binaries_executed_during_preparation": 0,
   "cargo_compiler_invocations_during_preparation": 0,
   "compilation_freshness_proof": "Not established by native listings/current-checkout hashes; root must retain separate fresh-target/build-artifact/source linkage.",
-  "raw_log_attestation": "Existing v5 raw-log SHA first bound at postrun intake; no retroactive original-run hash claim.",
-  "accepts_final_source_capture": "Explicit fresh v5 relative-key source/expected manifest paths and supplied exact SHA256s, not hardcoded whole28 identity; critical unchanged Rust fixtures remain pinned.",
   "critical_default": {
     "parents": 8,
     "cells": 73
@@ -22,23 +19,31 @@
     "source_backed_native_cases": 10,
     "dimension": "logical_wal_per_statement=false/true; NOT TT"
   },
+  "package": "full-tier-count-adjudicator-v2",
+  "created_utc": "2026-11-08T08:36:07.586863+00:00",
+  "predecessor_manifest_sha256": "1e223b3ed2e218e62402e0c27f1ec96b4ad936f60c38897b7c07ff1b77bc1423",
+  "accepted_bundle": "final-gates-v6",
+  "accepted_bundle_sha256": "ab3fc4d38d6120283df857cfd5a24f7002cbb74b3a6f9952f03ee01ab3706568",
+  "preserved_legacy_receipt_schema": true,
+  "raw_log_attestation": "Unchanged runner raw-log SHA first bound at postrun intake; no retroactive original-run hash claim.",
+  "accepts_final_source_capture": "Explicit fresh v6 relative-key source/expected manifest paths and supplied exactSHA256s, not hardcoded source identity; critical unchanged Rust fixtures remain pinned.",
   "static_validation": {
-    "receipt": "selfcheck-r4.json",
+    "receipt": "selfcheck-v6-r1.json",
     "positive": 17,
     "rejections": 146,
     "child_processes": 0,
-    "syntax": "Python AST and bash -n; no native execution"
+    "syntax": "Python3.11 AST, provenance/semantic equivalence checks; no native execution"
   },
-  "peer_review": "R56 checkpoint2 source64ee39d6 bounded read-only CLEAR; final manifest verification receipt follows externally.",
-  "changes_after_checkpoint2": "README/HANDOFF compilation-freshness boundary only; producer and fixture bytes unchanged.",
+  "peer_review": "Final bounded peer review requested externally; no runtime acceptance.",
+  "changes_vs_v1": "Only supported V6 provenance pin and module docstring, selfcheck bundle path and derived package/README/HANDOFF references. All20 function ASTs and critical bytes identical. Legacy v5 field/kind names unchanged.",
   "files": {
     "HANDOFF.md": {
-      "sha256": "d95cc7e37871d19bab258d7416b8a6bc5e96d7e190a27df9acc7c54384b35481",
-      "bytes": 2096
+      "sha256": "8386c721b77caee8ef5fd9f71dff7904f6f6198b9237a28ece7ab22b64916faa",
+      "bytes": 2341
     },
     "README.md": {
-      "sha256": "738b25352cea734d81a744063e3db7623fe5375e4f8bfefe92eaf17b30a8d4b6",
-      "bytes": 8701
+      "sha256": "914957cb8dae4832ed6b6a2dc75619b101ecc3383e2ee03fb06cfa6fc2d40298",
+      "bytes": 9538
     },
     "REVIEW-CHECKPOINT-1.json": {
       "sha256": "3f6c47510bef1c0a06a98666f1d7f9012f61e3ab358fa92b617f6558ea7a0574",
@@ -49,7 +54,7 @@
       "bytes": 1284
     },
     "adjudicate.py": {
-      "sha256": "64ee39d64ecb996d1af41abea30e1d8db9c2f2f4ea9f0251b163f4a604a52ba2",
+      "sha256": "d16ac233d7af05a6b0af90f5ae2c11721fa11850224c7042bf9e01a7f89fbf7a",
       "bytes": 29676
     },
     "collect-gated.sh": {
@@ -59,6 +64,10 @@
     "critical-expectations.json": {
       "sha256": "f0e314cb9cdaf01369ba0723fc6df31c05f5146dc5a884124ec7e87ac4f64e8a",
       "bytes": 11761
+    },
+    "lineage-checks.json": {
+      "sha256": "5889b65c7245cadcdb66c31a4826fd76af36b7d234a09cfaf825994124e97a86",
+      "bytes": 898
     },
     "primary-source.json": {
       "sha256": "a1854bf6b9e714ceb3238446e407c9385a3b6c47cde198b589da2d63131c5214",
@@ -80,13 +89,25 @@
       "sha256": "568bb14767dcea7c0430863cf06dde549469d4e41d7f8b50ee495aef727705c6",
       "bytes": 12640
     },
+    "selfcheck-v6-r1.json": {
+      "sha256": "ce1b74d791ed65698bb5cd1b9d716c76365a12affd04650d19e7ae4dea09f872",
+      "bytes": 12640
+    },
     "selfcheck.py": {
-      "sha256": "e4b7e630f9017546d71abe15fcdab989a46bc059539ad439dffbbcc67b3e1555",
+      "sha256": "bcdb0587e3b19b3d8da8457cea8506481a8bd2415712e053b9205e050e295c46",
       "bytes": 17188
+    },
+    "static-checks-v6.json": {
+      "sha256": "2d75f317274b8af2294824c979225980fcd80548c30efe5c0203984f47d77289",
+      "bytes": 549
     },
     "static-checks.json": {
       "sha256": "428dabff2908ecf2ed99eb74611d661966c5b2060335d0920a5cbe2fa6cc1abd",
       "bytes": 2131
+    },
+    "v1-to-v2.delta.patch": {
+      "sha256": "e83cd9fc349e10d654c96e8362157bc85c1cb017c718c0c47ad9ee0909cae255",
+      "bytes": 17323
     }
   }
 }

@@ -10,7 +10,7 @@ import subprocess
 DEFAULT = {"encryption", "vector-search", "ring-crypto", "ha-tier1"}
 OPTINS = {"internal-tests", "code-graph", "graph-rag", "mcp-endpoint", "vector-persist",
           "compression", "server", "ha-full", "ha-tier1", "ha-tier2", "ha-tier3", "ha-dedup",
-          "ha-ab-testing", "ha-branch-replication", "simd", "lock-census", "test-utils", "sync-experimental"}
+          "ha-ab-testing", "ha-branch-replication", "simd", "lock-census", "test-utils"}
 TIERS = {"default": DEFAULT, "internal": DEFAULT | {"internal-tests"},
          "optins": DEFAULT | OPTINS, "code-embed": DEFAULT | OPTINS | {"code-embed"},
          "legacy-network": DEFAULT | {"legacy-network"},

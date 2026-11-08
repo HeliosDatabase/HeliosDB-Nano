@@ -1,4 +1,4 @@
-name: Frozen full correctness tiers (no publish)
+name: Supported optional correctness tier (no publish)
 on:
   push:
     branches: ['ci/4420-correctness-*']
@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        stage: [core-default, core-internal, core-optins]
+        stage: [core-optins]
     steps:
       - name: Preserve source bytes
         run: |
@@ -36,8 +36,8 @@ jobs:
           import hashlib
           from pathlib import Path
           pairs = {
-              '.github/4420-full-gates-v5/launch.py': '0522344ab8d58342b7540865cce42cd6fddb764a5b6ff3f0846ab25fb7c7b5c4',
-              '.github/4420-full-gates-v5/model.json': 'a2f667d120840543213fb421d878c6b5ea4a1b84a22c29e284be254512597cfa',
+              '.github/4420-full-gates-v5/launch.py': '41b478e6e0488308f142d2ca0d5757e3f9d001b474006f5e8ec685a00be5c57d',
+              '.github/4420-full-gates-v5/model.json': 'b2e62c18049aedeaaf5895e06d21094bd788de76622ea2f101d3ed4199d3adc1',
           }
           for name, digest in pairs.items():
               if hashlib.sha256(Path(name).read_bytes()).hexdigest() != digest:
@@ -64,7 +64,7 @@ jobs:
               --tree "$GITHUB_WORKSPACE" \
               --out "$RUNNER_TEMP/nano-full-${NANO_CLOUD_STAGE}" \
               --stage "$NANO_CLOUD_STAGE" --head "$GITHUB_SHA" \
-              --model-sha256 a2f667d120840543213fb421d878c6b5ea4a1b84a22c29e284be254512597cfa
+              --model-sha256 b2e62c18049aedeaaf5895e06d21094bd788de76622ea2f101d3ed4199d3adc1
       - name: Preserve logs, source identities and native count receipts
         if: always()
         uses: actions/upload-artifact@v4

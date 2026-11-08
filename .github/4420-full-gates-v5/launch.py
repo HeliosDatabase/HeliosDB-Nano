@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Isolated CI adapter for the unchanged v5 correctness runner; draft only."""
+"""Isolated CI adapter for the frozen supported-feature correctness runner."""
 import argparse
 import fcntl
 import hashlib
@@ -11,8 +11,8 @@ import subprocess
 import sys
 
 HERE = Path(__file__).resolve().parent
-V5_BUNDLE_SHA256 = '1c2884e87666bc46e4b4571c174467b46a374ac52f285a95398d433146fbd5a2'
-COUNT_MANIFEST_SHA256 = '1e223b3ed2e218e62402e0c27f1ec96b4ad936f60c38897b7c07ff1b77bc1423'
+V5_BUNDLE_SHA256 = 'ab3fc4d38d6120283df857cfd5a24f7002cbb74b3a6f9952f03ee01ab3706568'
+COUNT_MANIFEST_SHA256 = '02a9a0898e9f58fda682552a52c92ea5e283556022fa0f9b8c3e8679cd540c5a'
 
 
 def git(tree, *args):

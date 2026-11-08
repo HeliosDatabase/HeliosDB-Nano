@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.11
-"""Post-v5 native test inventory/count proof. No test body or Cargo execution."""
+"""Post-v6 native test inventory/count proof. No test body or Cargo execution."""
 import argparse
 from collections import Counter
 import hashlib
@@ -13,7 +13,7 @@ import time
 import tomllib
 
 HERE = Path(__file__).resolve().parent
-V5_BUNDLE_SHA = '1c2884e87666bc46e4b4571c174467b46a374ac52f285a95398d433146fbd5a2'
+V5_BUNDLE_SHA = 'ab3fc4d38d6120283df857cfd5a24f7002cbb74b3a6f9952f03ee01ab3706568'
 FLEET = Path('/home/gpc/HDB/sprint/coordination/build.lock')
 STAGES = {'lib': 'default', 'core-default': 'default', 'core-internal': 'internal',
           'core-optins': 'optins', 'core-embed-optins': 'code-embed'}
