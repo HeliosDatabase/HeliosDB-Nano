@@ -1273,7 +1273,10 @@ impl Transaction {
     /// transactions retain their normal owner; an autocommit statement borrows
     /// its ambient Statement owner, or lazily retains an owner until commit.
     fn ensure_staged_table_shared(&self, table: &str) -> Result<()> {
-        let level = super::table_locks::MAIN_LEVEL;
+        self.ensure_staged_table_shared_on_level(super::table_locks::MAIN_LEVEL, table)
+    }
+
+    fn ensure_staged_table_shared_on_level(&self, level: u64, table: &str) -> Result<()> {
         if let Some(locks) = self.table_locks.as_ref().or_else(|| self.raw_table_locks.get()) {
             return locks.ensure_raw_write_shared(level, table);
         }
@@ -2168,13 +2171,20 @@ impl Transaction {
     /// side staging map keeps only the highest row ID per table and emits one
     /// `counter:<table>` write in the final WriteBatch.
     pub fn stage_row_counter(&self, table_name: &str, row_id: u64) -> Result<()> {
+        self.stage_row_counter_on_level(super::table_locks::MAIN_LEVEL, table_name, row_id)
+    }
+
+    /// Managed SQL supplies its validated statement level. The public raw
+    /// counter API remains main-owned; a branch INSERT must not acquire a
+    /// second, main-table lock for its shared allocation high-water mark.
+    pub(super) fn stage_row_counter_on_level(&self, level: u64, table_name: &str, row_id: u64) -> Result<()> {
         let state_value = self.state.load(Ordering::Acquire);
         let state = TransactionState::from_u8(state_value);
         if state != TransactionState::Active {
             return Err(Error::transaction("Transaction is not active"));
         }
 
-        self.ensure_staged_table_shared(table_name)?;
+        self.ensure_staged_table_shared_on_level(level, table_name)?;
         #[cfg(test)]
         super::art_manager::test_at_cardinality_enrollment_attempt(table_name);
 

@@ -19472,7 +19472,13 @@ impl StorageEngine {
         row_id: u64,
         txn: &crate::storage::Transaction,
     ) -> Result<()> {
-        txn.stage_row_counter(table_name, row_id)
+        // Raw transactions stage main-owned metadata. SQL already writes on
+        // its session's validated branch: preserve that lock namespace while
+        // sharing the counter's existing commit-time monotonic normalization.
+        let level = self
+            .check_active_branch()?
+            .map_or(super::table_locks::MAIN_LEVEL, |binding| binding.branch_id);
+        txn.stage_row_counter_on_level(level, table_name, row_id)
     }
 
     /// Persist the current row counter value for a table.
