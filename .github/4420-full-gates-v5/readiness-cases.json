@@ -1,0 +1,26 @@
+[
+  {
+    "target": "ha_integration",
+    "case": "a_standby_started_before_its_primary_waits_and_then_bootstraps"
+  },
+  {
+    "target": "ha_integration",
+    "case": "both_sides_restart_and_the_pair_converges"
+  },
+  {
+    "target": "ha_integration",
+    "case": "a_sigterm_between_the_readiness_gate_and_the_main_loop_is_honoured"
+  },
+  {
+    "target": "ha_integration",
+    "case": "a_sigterm_right_after_a_refused_directory_is_not_fatal"
+  },
+  {
+    "target": "physical_promote_online",
+    "case": "a_dead_primary_is_promoted_past_only_when_allowed"
+  },
+  {
+    "target": "physical_fast_forward",
+    "case": "a_standby_of_another_history_needs_a_full_copy_and_replace"
+  }
+]
