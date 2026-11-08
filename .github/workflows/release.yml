@@ -156,7 +156,7 @@ jobs:
             os: ubuntu-24.04-arm
             archive: tar.gz
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
             archive: tar.gz
           - target: x86_64-pc-windows-msvc
             os: windows-2022
@@ -195,6 +195,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: echo 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
+
+      - name: Preserve released macOS minimum (11.0)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=11.0' >> "$GITHUB_ENV"
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
