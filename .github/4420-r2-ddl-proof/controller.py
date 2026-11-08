@@ -16,7 +16,7 @@ import time
 
 HERE = Path(__file__).resolve().parent
 BUNDLE_SHA256 = '36ca1433e8255835e2eaec6a39475ca35173d2917253fbb1128368828554d6a2'
-FIXED = '5451dd091cebebc3dd6bf10900f3f19a53686a5f'
+FIXED = '7605bf697cdbfce506693cda8c103d0bd917792c'
 NAMES = ['standby_readers_never_see_a_torn_state_while_the_primary_runs_ddl',
          'standby_readers_never_see_a_torn_state_while_the_primary_runs_ddl',
          'standby_readers_never_see_a_torn_state_when_every_write_group_is_published_on_its_own',

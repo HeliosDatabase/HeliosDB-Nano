@@ -20,7 +20,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v5
         with:
-          ref: 5451dd091cebebc3dd6bf10900f3f19a53686a5f
+          ref: 7605bf697cdbfce506693cda8c103d0bd917792c
           path: product
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -40,8 +40,8 @@ jobs:
           import hashlib
           from pathlib import Path
           pairs = {
-              '.github/4420-r2-ddl-proof/controller.py': 'd478c33415c3a7967d5a0306e15bf39af9b8f5eeaa245f89b8b47c3a3200e6e6',
-              '.github/4420-r2-ddl-proof/model.json': 'df5af55916c8540de0db9f21e1e0b0fef60a69b8bf018242e796bf09d4741e2b',
+              '.github/4420-r2-ddl-proof/controller.py': 'a75ae7770ca621c55365e25721dfbec5ca6cc75d86779d3e103fb44b19a9464c',
+              '.github/4420-r2-ddl-proof/model.json': '34797fc671958974e8cf91760fde4db68165a992900addf63e01f9a8cf497fc8',
           }
           for name, wanted in pairs.items():
               if hashlib.sha256(Path(name).read_bytes()).hexdigest() != wanted:
@@ -64,7 +64,7 @@ jobs:
             --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
             python3 .github/4420-r2-ddl-proof/controller.py \
               --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product" \
-              --out "$RUNNER_TEMP/r2-ddl-proof" --model-sha256 df5af55916c8540de0db9f21e1e0b0fef60a69b8bf018242e796bf09d4741e2b
+              --out "$RUNNER_TEMP/r2-ddl-proof" --model-sha256 34797fc671958974e8cf91760fde4db68165a992900addf63e01f9a8cf497fc8
       - name: Preserve all raw R2 stage and daemon outcome evidence
         if: always()
         uses: actions/upload-artifact@v4

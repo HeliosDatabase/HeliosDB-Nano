@@ -20351,8 +20351,8 @@
   "product_entries": {
     ".cargo/audit.toml": {
       "mode": "100644",
-      "oid": "6d0fed2ce00162a35c3817d3061215c443cde7ab",
-      "sha256": "2ef7315ff192912bb32d84622ecf63f1a255654b6ea33cdcc0e6c20aeeabe1ab"
+      "oid": "6394a500f2fb1aee97c63ba73fc2953713474ae3",
+      "sha256": "26185a4e2e694071a185b35cc85528b1a08efb29c8cd07e27a3027f5bba73f01"
     },
     ".cargo/config.toml": {
       "mode": "100644",
@@ -20646,8 +20646,13 @@
     },
     "benches/public/common.sh": {
       "mode": "100755",
-      "oid": "0f9ca45592e0e4379dac2ad5eedf312627ba82d6",
-      "sha256": "88cd8c6357285b253b4ec0eec9edab20cc7c7f938774fc3e71c939c29f4f359a"
+      "oid": "b4feb3924c7c49f533dedd96495be88c7eec8ed9",
+      "sha256": "b66e30714e772ab6900543ea438c1290c9fbd6a81ffe0c34f5ff1dff33b68ff4"
+    },
+    "benches/public/native_ci_proof.py": {
+      "mode": "100644",
+      "oid": "064b7cbd5a80ad87fd3b5eb1db70ca7e4adc0c5c",
+      "sha256": "94bd0a3dba0fc8f9e529fac5d68a474528252d4d97d66ad138c85f6b7ef3f583"
     },
     "benches/public/regen_ci_baseline.sh": {
       "mode": "100755",
@@ -20668,6 +20673,11 @@
       "mode": "100755",
       "oid": "c5d289934600379b505e94e3b7952e263470eeed",
       "sha256": "6309f9f159f549bacc825a644628db264c855f5095bc4e91840c8a5098433a0f"
+    },
+    "benches/public/test_native_ci_proof.py": {
+      "mode": "100644",
+      "oid": "71bcfe00f27365be0a9e4f96325bca4b2c3d36e1",
+      "sha256": "ad7f46ddae8fc8ed1b451db7b78f7c0ae30feae9b461a3fddb714c6eb3314153"
     },
     "benches/simd_benchmark.rs": {
       "mode": "100644",
@@ -20736,8 +20746,8 @@
     },
     "deny.toml": {
       "mode": "100644",
-      "oid": "2431fb2b43f3f5e302c55cbe9c72aa5a04c5e60a",
-      "sha256": "546a6f5a2f4fecdbb9853ecb19c28692b9c4eb4af70b3bd47c04c2e8d862a359"
+      "oid": "50de936c419196ee558057291e300a360af9f77e",
+      "sha256": "2544ed3726d60cb679d4e04cd43e25710d0577b4f8b14ce82083c0e10eb708be"
     },
     "deployment/docker/Dockerfile": {
       "mode": "100644",
@@ -20788,6 +20798,11 @@
       "mode": "100644",
       "oid": "2063c3943d3f1828f8a15b2d1b2dc9bd43523217",
       "sha256": "bffaa63164cc6c33303bb31fe8f5519fed94479be813291d04115a37e096545b"
+    },
+    "docs/SECURITY_MAINTENANCE_EXCEPTIONS.md": {
+      "mode": "100644",
+      "oid": "c23bf16bb330277cf5f779257a49105331e1e2cd",
+      "sha256": "a661d9945a528e0b6fccc3c48b25c8ec266c32ec47af9078859284df2f86f876"
     },
     "docs/TRACING_GUIDE.md": {
       "mode": "100644",
@@ -23189,6 +23204,11 @@
       "oid": "935bf3e4e4fa77e57d24e1ecf12a41d76144920a",
       "sha256": "d7aba2700ba295e4fcab4b9dddd1f4891f32198d4c7447146114da7b5469018b"
     },
+    "src/branch_counter_lock_tests.rs": {
+      "mode": "100644",
+      "oid": "73c142f92bdc76c965f024becaf30865fca61c91",
+      "sha256": "b14d547444b36f502d4ea1ac7244e8ac3f7e975d011d91e229b5f40cad3a090d"
+    },
     "src/branch_schema.rs": {
       "mode": "100644",
       "oid": "92210c95bd206125e039fd3a67da7918d0df6ed9",
@@ -23271,8 +23291,8 @@
     },
     "src/code_graph/storage.rs": {
       "mode": "100644",
-      "oid": "7932028d80945d568606b4e862e47c29e9eea640",
-      "sha256": "82d18b6e53df8570cf0cd215e72fce18996b9801c97a59bb302df3eddf57cce3"
+      "oid": "10ead4d453e4bd91e2828a39fff8681a566f3ab8",
+      "sha256": "a47778dd194044bccd07763371ade81050f767242f044f579bc2d57bc9047899"
     },
     "src/code_graph/symbols.rs": {
       "mode": "100644",
@@ -23308,6 +23328,11 @@
       "mode": "100644",
       "oid": "82727057bb145b24889cde7d85654babe1be9538",
       "sha256": "7d40d431cb4f24fe315dcf01a9b1cdedf7c6d1dc285c963b3b16238bac50200d"
+    },
+    "src/count_publication_tests.rs": {
+      "mode": "100644",
+      "oid": "326b441079cc725d23279a385354dd589377d7e5",
+      "sha256": "4f4ce7fe98df3decfe12d420ed29d925724f9aac1bdfd669e0657e8fd335136b"
     },
     "src/crypto/key_manager.rs": {
       "mode": "100644",
@@ -23459,6 +23484,11 @@
       "oid": "ef5042fe3526cac0fcdf0b6a03c03e6db55bda30",
       "sha256": "fbfaf568ea61dd36c29b03a9527c1071bd2dd81b5339668c412e27313a332df7"
     },
+    "src/layout_error_boundary_tests.rs": {
+      "mode": "100644",
+      "oid": "2882fd17bddc10b8305b82ce6ba65630fded0217",
+      "sha256": "c4c6ab10c176bbcf16f05d4983db0bd970d7ee470599f4c6bc26c2042e2470be"
+    },
     "src/layout_error_retry_tests.rs": {
       "mode": "100644",
       "oid": "e2df521a3eb6071af018bb9b63632bf8a9898aa5",
@@ -23466,8 +23496,8 @@
     },
     "src/lib.rs": {
       "mode": "100644",
-      "oid": "e733cacef57c051f0aa8733ba356430881cef62b",
-      "sha256": "aba1d5ed5e59ec31e0220fa51683d23d8cffe991481c3867a80d43702c73c3b9"
+      "oid": "4e78a048f35c134f34afaf56872b88bce49ff334",
+      "sha256": "ad44eccda1919bddd7d58e6e4c80bd336e77706f1fa46cfef2d892172b6fc81f"
     },
     "src/lock_census.rs": {
       "mode": "100644",
@@ -23931,8 +23961,8 @@
     },
     "src/replication/physical.rs": {
       "mode": "100644",
-      "oid": "7d31fd244249bbb18b17dcd6930a0fb8743a3134",
-      "sha256": "9f749cc75bb8f6c747b02c9f50eb490340b2522f70ba1c202d7f2e935ef1d728"
+      "oid": "0f0ddd29ed24a2ee37e480a171a22554b0166782",
+      "sha256": "8592a9801b07a45654aed0887b4cf497139842b407631b37fa094899c0dba4de"
     },
     "src/replication/physical_applier.rs": {
       "mode": "100644",
@@ -23958,6 +23988,11 @@
       "mode": "100644",
       "oid": "ec58ac693fb52dadd69bc8a8c95d4b32cdbb5357",
       "sha256": "f6db5526a0d37cc6a37600b7fd0e9a43acd325d15a665560b999b4de2e22a28d"
+    },
+    "src/replication/physical_wal_tail_tests.rs": {
+      "mode": "100644",
+      "oid": "28a441e30fc0628b2ce9b501d790a31e814a30a6",
+      "sha256": "6ab108e2226f63d0407782c32a81002ae58dfbc90a14aed4ad064b7a8e5e5e6e"
     },
     "src/replication/physical_wire.rs": {
       "mode": "100644",
@@ -24150,10 +24185,9 @@
       "sha256": "a62b29ff152552b8a0541ab1f39e684c364074b3554a9e1f7826ab0be2efd3bd"
     },
     "src/sql/executor/scan.rs": {
-      "bytes": 148109,
       "mode": "100644",
-      "oid": "2723c358a7719080ec78912098285dfdd2409489",
-      "sha256": "9176828fc34f633419ec58b15d3d88fb103125b7830c7e28c334f434ec20218d"
+      "oid": "3dac7d3587d33de11047a99cc5e106acd7a6db42",
+      "sha256": "a766c981afe55ec2eaffd6947b325b2c5452063ff23f686caf0f5384f0847fa0"
     },
     "src/sql/executor/set_ops.rs": {
       "mode": "100644",
@@ -24452,8 +24486,8 @@
     },
     "src/storage/art_manager.rs": {
       "mode": "100644",
-      "oid": "e967d2ad2b8b6c291edb70fa837dab923a520390",
-      "sha256": "a4608500c0c0a00c149ad38a8aa6a0a033f2d6cfd9ed9de09febcc12897feabc"
+      "oid": "cb0f87f0970ab364424bb32f43844a36de6cd40c",
+      "sha256": "e66ec7593e39221937356aa6ac7a36f8106fd183d76a2a2ab5316837dd198f96"
     },
     "src/storage/art_node.rs": {
       "mode": "100644",
@@ -24567,8 +24601,8 @@
     },
     "src/storage/engine.rs": {
       "mode": "100644",
-      "oid": "67c211a8dac48f60b7157c01cc190e737f14bdf6",
-      "sha256": "73f13ab705cd8f16087b1569f131e3eb6f9c2728251bf7bbe23634f76f82fc9d"
+      "oid": "0804342e086e47b26443109435b40dc6d47273f1",
+      "sha256": "ac8c37b72543d33d30956349f97690f3379ad2f3911b818bfe12f23b3779c989"
     },
     "src/storage/engine_timetravel_extension.rs": {
       "mode": "100644",
@@ -24777,8 +24811,8 @@
     },
     "src/storage/transaction.rs": {
       "mode": "100644",
-      "oid": "593a7c44fa3eec51e52f2dcc0a4df050e5f99e88",
-      "sha256": "f831cd421e33f3712d18a4b45fbdd88950dc77cbcbb563b830d0d4a7491040be"
+      "oid": "60cef90c75db7332e947a39cfd2143daa7e88ba7",
+      "sha256": "b7f9729c5edf9e955fd656ab80c53cdbc8813898e144ec7cc7cdec4ea208ac55"
     },
     "src/storage/typed_batch.rs": {
       "mode": "100644",
@@ -25222,8 +25256,8 @@
     },
     "tests/branch_schema_isolation.rs": {
       "mode": "100644",
-      "oid": "e8898dd09687bcd5895c88b71215c48a764cd7d6",
-      "sha256": "50a54c840ca9f29a030ab5e980c5989d9b8363454889160ce943f0490bba909f"
+      "oid": "dfe85809d3762e8cfd8b23f0aea725710c48d989",
+      "sha256": "215f583e8224cc484177568dc023fe4d38f0bbc15892e92bc1b720ea307c0af2"
     },
     "tests/branch_session_isolation.rs": {
       "mode": "100644",
@@ -25339,6 +25373,11 @@
       "mode": "100644",
       "oid": "b7230593b977c01e6dd12f62226a424c084f416d",
       "sha256": "e4cb31d69cf85dd3b74f725aa714fde5e7bd876c112dbc27463692012ceff1aa"
+    },
+    "tests/code_graph_transaction_ownership.rs": {
+      "mode": "100644",
+      "oid": "f4b29837e1e51bc5ff30f526c47c87996f8d5334",
+      "sha256": "04483b865b243c4e09e4b4bd798f83dce28e9215e062ed498a88fe1eec766598"
     },
     "tests/column_storage_rename.rs": {
       "mode": "100644",
@@ -25877,8 +25916,8 @@
     },
     "tests/generic_mutation_indexes.rs": {
       "mode": "100644",
-      "oid": "52e5b38efbe93bad836b3eef35d41238672e9d13",
-      "sha256": "246d17c069451855de543845736426179c7281ef47c1367949cc41cb7c9d132c"
+      "oid": "9e90fd58da557a95d3f448fd6136b9173406d875",
+      "sha256": "2d547844e05434ba21cf520b34d95b2e25e3e01f56421722f1283be540fb1fc2"
     },
     "tests/gh_issue_21.rs": {
       "mode": "100644",
@@ -39680,6 +39719,11 @@
       "oid": "5dbca081b235c056165dffdb5dd2e4440a95c72d",
       "sha256": "d7afe0fef24e044a644974733ad74fbf37ab15a0de9dde6652fb99bc61f5abd5"
     },
+    "tests/raii_drop_publication.rs": {
+      "mode": "100644",
+      "oid": "785d5b9658af518ee444faeeb8e09456654f80c5",
+      "sha256": "aef29aface40ecf48c77876f04107bf4465ae8d26d4c1ac552548103f38e2aa2"
+    },
     "tests/raw_metadata_locks.rs": {
       "mode": "100644",
       "oid": "3c974e095bf6c3af3cb2fb5d8b09e3affe6ad9c8",
@@ -39697,8 +39741,8 @@
     },
     "tests/rename_table_trigger_tests.rs": {
       "mode": "100644",
-      "oid": "ca9faa10e3442e228f5f1d3e0d428e701c598b20",
-      "sha256": "f760985bba8fda3fc061a862f01528172e4271dd6fda9664e6f3c38a3ee48527"
+      "oid": "39c60f2aee95b981ef5f30c7858eec9fe55ddd0e",
+      "sha256": "dbc35a9152981166bc1fe732a8760425af00c456ae0edda459dccec1ebfee1a5"
     },
     "tests/repl_meta_commands.rs": {
       "mode": "100644",
@@ -40157,8 +40201,8 @@
     },
     "tests/time_travel_integration_tests.rs": {
       "mode": "100644",
-      "oid": "d03d2a2f47f1f81338ddf159d89b9ee2a4188c0c",
-      "sha256": "ebd8ee1c1b4d3aa96d323c4fa6c28bab894ed7b66d890f1333a430ff63ff9c41"
+      "oid": "05cbcdafb794a841c8eee4e760550e3ab12193c7",
+      "sha256": "b8e617c60ed8f31a1c9106ca10463035869442d5e93ce86bd2d01d7ea8dd372d"
     },
     "tests/time_travel_optimization_tests.rs": {
       "mode": "100644",
@@ -40167,8 +40211,8 @@
     },
     "tests/time_travel_system_views_tests.rs": {
       "mode": "100644",
-      "oid": "5b74830a916e195d9b2843a4468d4b98a0ad9412",
-      "sha256": "126e8c699fd9b606eb6ae33c735757285295f4cf1ca181fd5c8e2ae8246808fd"
+      "oid": "109f38c26e012112d615197588482e0e25a3b166",
+      "sha256": "34150ec049c1dba87d1bf9fb1e1b434be46dddfd6a77eb1ff77044e86300942a"
     },
     "tests/tps_workloads.rs": {
       "mode": "100644",
@@ -40417,8 +40461,8 @@
     },
     "tests/version_gc_tests.rs": {
       "mode": "100644",
-      "oid": "418b74c1b254c088e1f71015c3a24965eb89e843",
-      "sha256": "f5eea0bf3169ffd4553860510c63126caabf88ab051ee3e9373638c7123303d3"
+      "oid": "6bdf95d1adafc1d5a8f88b1865f75d4a7c77b311",
+      "sha256": "4289e954372fa1e0607712cf7f48fe925a374a1daa7f8de926ccf383de9a1ff6"
     },
     "tests/w2_5_watermark_read_tests.rs": {
       "mode": "100644",
@@ -40601,18 +40645,43 @@
       "sha256": "24ca9e1c2dc03bd0618cb30acbb67bb53ec63dd93ea936e58b01cae901a4060d"
     }
   },
-  "product_head": "5451dd091cebebc3dd6bf10900f3f19a53686a5f",
-  "product_paths": 4050,
-  "product_regular_paths": 4046,
-  "purpose": "exact original four R2 daemon commands after minimal layout-error read-set correction; not broad-suite or release acceptance",
+  "product_head": "7605bf697cdbfce506693cda8c103d0bd917792c",
+  "product_paths": 4059,
+  "product_regular_paths": 4055,
+  "purpose": "exact original four R2 daemon commands on reviewed COUNT/RAII/managed-branch-counter diagnostic join; focused source-specific evidence, not final product or release acceptance",
   "schema": 1,
   "source_refresh_lineage": {
     "changed_product_paths": [
-      "src/layout_error_retry_tests.rs",
-      "src/lib.rs"
+      ".cargo/audit.toml",
+      "benches/public/common.sh",
+      "benches/public/native_ci_proof.py",
+      "benches/public/test_native_ci_proof.py",
+      "deny.toml",
+      "docs/SECURITY_MAINTENANCE_EXCEPTIONS.md",
+      "src/branch_counter_lock_tests.rs",
+      "src/code_graph/storage.rs",
+      "src/count_publication_tests.rs",
+      "src/layout_error_boundary_tests.rs",
+      "src/lib.rs",
+      "src/replication/physical.rs",
+      "src/replication/physical_wal_tail_tests.rs",
+      "src/sql/executor/scan.rs",
+      "src/storage/art_manager.rs",
+      "src/storage/engine.rs",
+      "src/storage/transaction.rs",
+      "tests/branch_schema_isolation.rs",
+      "tests/code_graph_transaction_ownership.rs",
+      "tests/generic_mutation_indexes.rs",
+      "tests/raii_drop_publication.rs",
+      "tests/rename_table_trigger_tests.rs",
+      "tests/time_travel_integration_tests.rs",
+      "tests/time_travel_system_views_tests.rs",
+      "tests/version_gc_tests.rs"
     ],
+    "historical_pair_input_note": "input_pair_manifest_sha256 identifies inherited layout-V2 proof only; the canonical current product is product_head/product_entries, not a new paired-role source claim",
     "original_four_commands_unchanged": true,
-    "predecessor_manifest_sha256": "625850df76d161079e77c8ddb306a8491840bc6e999a61cbe7663c391bdeaa0b",
-    "predecessor_product_head": "202891f4d8cf890eb837349d172f759e30e29659"
+    "predecessor_manifest_sha256": "c38ee09fe2a0bcc6d9969f0c5923f7fa278dd56b3302439a4fbf1f52a194be52",
+    "predecessor_product_head": "5451dd091cebebc3dd6bf10900f3f19a53686a5f",
+    "required_focused_prerequisites": "Count fixed default/internal5parents88cells bothgreen; current combined local internal gate pending at preparation"
   }
 }
