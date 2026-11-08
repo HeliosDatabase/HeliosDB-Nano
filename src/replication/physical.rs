@@ -559,6 +559,19 @@ impl FlushMemo {
     }
 }
 
+/// A WAL iterator captures its file list when opened. RocksDB can report
+/// `TryAgain` from its eager advance after returning a valid batch when a
+/// newer WAL appeared. A validated prefix remains usable: its original
+/// barrier still advertises the remainder, and the next poll opens a fresh
+/// iterator at `through`. No-progress and every other failure stay errors.
+fn wal_poll_tail_changed(status: std::result::Result<(), rocksdb::Error>, made_progress: bool) -> Result<bool> {
+    match status {
+        Ok(()) => Ok(false),
+        Err(error) if made_progress && error.kind() == rocksdb::ErrorKind::TryAgain => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Poll committed physical changes. The owner must ensure all source writes
 /// retain the RocksDB WAL; this function detects gaps but cannot manufacture a
 /// retention lease. Only use cursors from a completed checkpoint or full batch.
@@ -599,12 +612,19 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize, memo: 
         return Ok(result);
     }
     let mut iterator = db.get_updates_since(after)?;
+    #[cfg(test)]
+    physical_wal_tail_tests::after_iterator_open(db)?;
     let mut bytes = 0_usize;
     // A poll of tiny groups stops at a count too (`MAX_POLL_GROUPS`), so it
     // answers within seconds; the rest is the next poll's.
     while result.through < barrier && result.batches.len() < MAX_POLL_GROUPS {
         let Some(entry) = iterator.next() else {
-            iterator.status()?;
+            let status = iterator.status();
+            #[cfg(test)]
+            physical_wal_tail_tests::observe_status(&status);
+            if wal_poll_tail_changed(status, result.through > after)? {
+                break;
+            }
             // No record at all although the interval is not empty: the WAL
             // that held it is gone, or `after` is inside the last write group.
             if result.through == after {
@@ -660,7 +680,10 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize, memo: 
         result.through = batch.last;
         result.batches.push(batch);
     }
-    iterator.status()?;
+    let status = iterator.status();
+    #[cfg(test)]
+    physical_wal_tail_tests::observe_status(&status);
+    wal_poll_tail_changed(status, result.through > after)?;
     Ok(result)
 }
 
@@ -4371,3 +4394,7 @@ mod tests {
         drop(writer);
     }
 }
+
+#[cfg(test)]
+#[path = "physical_wal_tail_tests.rs"]
+mod physical_wal_tail_tests;
