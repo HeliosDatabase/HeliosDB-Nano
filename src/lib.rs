@@ -19377,6 +19377,8 @@ impl EmbeddedDatabase {
         // query that raced a write transaction for this table; it is the
         // difference between "may be stale by a microsecond" (fine — so is every
         // count) and "reports rows that were never committed" (not fine).
+        #[cfg(test)]
+        storage::art_manager::test_after_cardinality_probe(&spec.table_name, count);
         if self.storage.has_uncommitted_writes_for_table(&spec.table_name) {
             return None;
         }

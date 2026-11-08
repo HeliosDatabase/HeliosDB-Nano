@@ -819,7 +819,11 @@ impl WriteCensusGate {
     }
 
     fn arm_table_write(&self, table: &str) {
+        #[cfg(test)]
+        super::art_manager::test_at_cardinality_enrollment_attempt(table);
         if self.tables_written.insert(table.to_string()) {
+            #[cfg(test)]
+            super::art_manager::test_before_cardinality_enrollment(table);
             self.census.enter_table_write(table);
         }
     }
@@ -2140,6 +2144,8 @@ impl Transaction {
         }
 
         self.ensure_staged_table_shared(table_name)?;
+        #[cfg(test)]
+        super::art_manager::test_at_cardinality_enrollment_attempt(table_name);
 
         // A staged row counter implies staged rows (see `note_written_key`).
         if let Some(gate) = &self.write_census {
@@ -3818,6 +3824,8 @@ impl Transaction {
                 // (`"a:b"` must not lock, or count as, table `a`).
                 if let Some(pos) = text.rfind(':') {
                     let table = &text[..pos];
+                    #[cfg(test)]
+                    super::art_manager::test_at_cardinality_enrollment_attempt(table);
                     if !self.written_tables.contains(table) {
                         // All staging entry points acquired the table boundary
                         // before dirty tracking/census in enroll_staged_key.

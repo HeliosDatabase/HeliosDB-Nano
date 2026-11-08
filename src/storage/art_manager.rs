@@ -1987,6 +1987,8 @@ impl ArtIndexManager {
 
     /// Check if a PK value exists without cloning the tree
     pub fn pk_index_contains(&self, table: &str, key: &[u8]) -> Option<bool> {
+        #[cfg(test)]
+        count_publication_tests::before_cardinality_probe(table);
         let pk_name = {
             let pk_indexes = self.pk_indexes_read();
             pk_indexes.get(table).cloned()
@@ -2004,6 +2006,8 @@ impl ArtIndexManager {
     /// the index read lock once. Callers are responsible for SQL-level
     /// duplicate handling before passing keys.
     pub fn pk_index_count_keys(&self, table: &str, keys: &[Vec<u8>]) -> Option<usize> {
+        #[cfg(test)]
+        count_publication_tests::before_cardinality_probe(table);
         let pk_name = {
             let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
             pk_indexes.get(table).cloned()
@@ -2019,6 +2023,8 @@ impl ArtIndexManager {
     /// For a PK index this is the table row count. This avoids cloning the ART
     /// and lets COUNT(*) skip a RocksDB key-prefix walk on ordinary PK tables.
     pub fn pk_index_len(&self, table: &str) -> Option<usize> {
+        #[cfg(test)]
+        count_publication_tests::before_cardinality_probe(table);
         let pk_name = {
             let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
             pk_indexes.get(table).cloned()
@@ -2059,6 +2065,8 @@ impl ArtIndexManager {
         lower: Option<(i64, bool)>,
         upper: Option<(i64, bool)>,
     ) -> Option<usize> {
+        #[cfg(test)]
+        count_publication_tests::before_cardinality_probe(table);
         let key_width = match pk_type {
             DataType::Int2 => 2,
             DataType::Int4 => 4,
@@ -3621,8 +3629,14 @@ impl ArtIndexManager {
             HoldRule::Claim(claimant),
             &mut held,
         );
+        #[cfg(test)]
+        drop(indexes);
         match (outcome, held) {
-            (Ok(()), _) => Ok(None),
+            (Ok(()), _) => {
+                #[cfg(test)]
+                count_publication_tests::after_index_insertion(table, row_id);
+                Ok(None)
+            }
             (Err(_), Some(hold)) => Ok(Some(hold)),
             (Err(refusal), None) => Err(refusal),
         }
@@ -3774,7 +3788,11 @@ impl ArtIndexManager {
         let mut held = None;
         let outcome = self.collect_index_values_inner(table, row_id, schema, tuple, row_state, rule, &mut held);
         match (outcome, held) {
-            (Ok(values), _) => Ok(Ok(values)),
+            (Ok(values), _) => {
+                #[cfg(test)]
+                count_publication_tests::after_index_insertion(table, row_id);
+                Ok(Ok(values))
+            }
             (Err(_), Some(hold)) => Ok(Err(hold)),
             (Err(refusal), None) => Err(refusal),
         }
@@ -6254,3 +6272,22 @@ mod tests {
         assert!(message.contains("v = 1"), "{message}");
     }
 }
+
+#[cfg(test)]
+pub(crate) fn test_after_cardinality_probe(table: &str, count: usize) {
+    count_publication_tests::after_cardinality_probe(table, count);
+}
+
+#[cfg(test)]
+pub(crate) fn test_before_cardinality_enrollment(table: &str) {
+    count_publication_tests::before_cardinality_enrollment(table);
+}
+
+#[cfg(test)]
+pub(crate) fn test_at_cardinality_enrollment_attempt(table: &str) {
+    count_publication_tests::at_cardinality_enrollment_attempt(table);
+}
+
+#[cfg(test)]
+#[path = "../count_publication_tests.rs"]
+mod count_publication_tests;

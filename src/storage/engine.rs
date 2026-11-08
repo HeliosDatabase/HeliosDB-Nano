@@ -10333,6 +10333,8 @@ impl StorageEngine {
         // comes from the write-set merge path.
         if !has_user_branches && !self.has_uncommitted_writes_for_table(table_name) {
             if let Some(count) = self.art_index_manager.pk_index_len(table_name) {
+                #[cfg(test)]
+                super::art_manager::test_after_cardinality_probe(table_name, count);
                 // Re-check after the probe: a transaction that armed the census
                 // between the gate above and the read here would otherwise have
                 // its staged rows counted. Costs one more atomic load.
@@ -10421,6 +10423,10 @@ impl StorageEngine {
         let count = self
             .art_index_manager
             .pk_index_count_int_range(table_name, &pk_col.data_type, lower, upper);
+        #[cfg(test)]
+        if let Some(count) = count {
+            super::art_manager::test_after_cardinality_probe(table_name, count);
+        }
         // Re-check: a transaction that armed the census between the gate above
         // and the probe would otherwise have its staged rows counted here.
         if self.has_uncommitted_writes_for_table(table_name) {
