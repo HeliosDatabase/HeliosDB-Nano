@@ -1,0 +1,100 @@
+{
+  "status": "SOURCE ONLY, no final inventory/runtime",
+  "targets": [
+    {
+      "target": "persistent_mv_atomicity",
+      "source_reference": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage18/tests/persistent_mv_atomicity.rs",
+      "sha256": "11b428c604ae93e2bdd4f32f3ed8bdef0ec7a2c10241015ddef02b0cfd259700",
+      "declared_test_names": [
+        "persistent_refresh_rows_graph_wal_and_snapshot_share_one_group_in_both_routes",
+        "persistent_drop_funnel_purges_exact_namespace_and_allows_name_reuse",
+        "refused_persistent_refresh_preserves_live_rows_graph_and_writes_without_reopen",
+        "applied_refresh_error_publishes_no_error_path_writes_and_reopens_actual_graph",
+        "purge_retires_the_waiting_direct_mutator_before_releasing_its_lease",
+        "crash_before_any_ram_publication_keeps_complete_persistent_refresh_or_drop",
+        "physical_standby_applies_persistent_mv_graph_in_the_original_group_without_derived_writes"
+      ],
+      "required_tests_for_selected_tier": 7,
+      "scope": "current static selected-target expectation, not final-source inventory or runtime"
+    },
+    {
+      "target": "vector_row_overlay_recovery",
+      "source_reference": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage18/tests/vector_row_overlay_recovery.rs",
+      "sha256": "0b21f6873395327247d24b4937b4bad7dcc29194daf28876078436262bfb199d",
+      "declared_test_names": [
+        "savepoint_rollback_and_commit_publish_only_final_persistent_membership",
+        "unversioned_columnar_vector_transaction_uses_pending_sidecars_in_its_authoritative_image",
+        "every_heap_before_graph_crash_reopens_same_persistent_backend_read_only_without_writes",
+        "native_refusals_preserve_old_graph_and_unknown_applied_errors_refuse_until_reopen",
+        "encrypted_authoritative_images_stay_sealed_after_crash_and_wrong_key_open_writes_nothing",
+        "physical_standby_derives_unpublished_persistent_images_without_changing_source_bytes",
+        "applied_heap_commit_reports_graph_publication_error_and_keeps_committed_primary_keys",
+        "live_logical_applier_pairs_overlay_and_cursor_for_success_refusal_unknown_and_crash",
+        "live_logical_no_vector_unknown_fences_applied_keys_and_refusal_restores_old_keys",
+        "native_ok_standard_hook_fault_returns_unavailable_instead_of_success"
+      ],
+      "required_tests_for_selected_tier": 10,
+      "scope": "current static selected-target expectation, not final-source inventory or runtime"
+    },
+    {
+      "target": "mv_uncertain_publication",
+      "source_reference": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage18/tests/mv_uncertain_publication.rs",
+      "sha256": "fee5c627df305fdfd9194caa17da5e87d7c32dd614b8bf0acdd1a80de7b15abf",
+      "declared_test_names": [
+        "applied_create_error_keeps_actual_rows_metadata_and_snapshot",
+        "applied_compatible_refresh_error_rebuilds_manual_keys_and_current_side_storage",
+        "shape_replacement_reconciles_the_actual_schema_for_both_write_outcomes",
+        "unreadable_applied_schema_retires_indexes_and_fences_cached_and_direct_reads_until_reopen",
+        "uncertain_vector_refresh_retires_only_memory_and_refuses_the_table_until_reopen",
+        "refused_vector_populations_keep_the_old_table_readable_and_writable_without_reopen",
+        "applied_public_population_creation_rebuilds_explicit_schema_owned_primary_keys"
+      ],
+      "required_tests_for_selected_tier": 7,
+      "scope": "current static selected-target expectation, not final-source inventory or runtime"
+    },
+    {
+      "target": "fast_side_storage_atomicity",
+      "source_reference": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage18/tests/fast_side_storage_atomicity.rs",
+      "sha256": "24e83b8cfbc3b2afbac786887fce5ca337d7a9a34fb12910757555e3d87cf9fb",
+      "declared_test_names": [
+        "both_direct_insert_routes_commit_sidecars_with_the_row",
+        "fast_update_captures_preimage_before_sidecars_and_freezes_child_in_one_group",
+        "refused_direct_side_storage_writes_leave_rows_payloads_and_dictionary_unchanged",
+        "concurrent_fast_dictionary_updates_keep_every_committed_id",
+        "stale_raw_dictionary_transaction_refuses_id_collision_with_a_fast_writer",
+        "fast_delete_keeps_cold_columnar_manifest_history_and_wal_in_its_row_group",
+        "a_refused_fast_side_storage_delete_keeps_heap_indexes_and_sidecars"
+      ],
+      "required_tests_for_selected_tier": 7,
+      "scope": "current static selected-target expectation, not final-source inventory or runtime"
+    },
+    {
+      "target": "correlated_exists_index",
+      "source_reference": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage18/tests/correlated_exists_index.rs",
+      "sha256": "a2512578c999b08cb668b685a14980e1f92d023af0edec97ff220f788bbb088a",
+      "declared_test_names": [
+        "exists_and_not_exists_use_the_current_point_in_and_range_candidate",
+        "pg35_selective_range_ordered_topk_and_counts_keep_correlated_predicates",
+        "correlated_candidate_subquery_effect_runs_once_and_errors_propagate",
+        "correlated_exists_keeps_staged_inner_rows_savepoints_and_repeatable_read"
+      ],
+      "required_tests_for_selected_tier": 4,
+      "scope": "current static selected-target expectation, not final-source inventory or runtime"
+    },
+    {
+      "target": "once_subquery_context",
+      "source_reference": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage18/tests/once_subquery_context.rs",
+      "sha256": "43429676954ddb1f61f81d947e9a1dd44daaa822c7f79dc404dfeede198ee2c5",
+      "declared_test_names": [
+        "once_in_scalar_and_exists_see_staged_rows_and_savepoint_restore",
+        "once_in_scalar_and_exists_keep_repeatable_read_while_fresh_reads_advance"
+      ],
+      "required_tests_for_selected_tier": 2,
+      "scope": "current static selected-target expectation, not final-source inventory or runtime"
+    }
+  ],
+  "pq_module_tests": 6,
+  "pq_public_exact": 1,
+  "overlay_required_markers": 10,
+  "overlay_asserted_cells": 193
+}

@@ -1,0 +1,16 @@
+{
+  "status": "SYNTHETIC SELF-CHECKS ONLY; no Cargo/product/server runs",
+  "passed": 10,
+  "checks": [
+    "compound cfg feature tier",
+    "nonzero expected, missing target, cfg-empty, command selection, no-run",
+    "readiness exact named one-pass, no ignored/empty/failed cells",
+    "Cargo artifact binds test kind/profile/executable",
+    "whole source file-set and content identity fail closed",
+    "manifest inputs parsed once, exact byte hash change/deletion refused",
+    "mocked runner keeps pinned demands, records changed input and fixed debug0; no command launched",
+    "mixed-command features inferred from actual Cargo argv before test separator",
+    "exact audited test minima, all10 overlay receipts, local readiness and fixed release/smoke flags",
+    "public smoke exact12 labels, copied raw/JSON and isolated harness hash, incomplete result refused"
+  ]
+}

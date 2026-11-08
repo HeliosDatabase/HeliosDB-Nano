@@ -1,0 +1,1382 @@
+{
+  "lib": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "--no-fail-fast",
+        "--",
+        "--nocapture"
+      ]
+    ],
+    "minimum_passed": 1,
+    "required_markers": [
+      "test sql::executor::scan::tests::correlated_filtered_scan_binds_qualified_outer_rows_before_output_projection ... ok",
+      "test sql::executor::once_subquery_context_tests::once_subqueries_share_the_expired_parent_deadline_without_false_or_null ... ok",
+      "test sql::executor::once_subquery_context_tests::once_subqueries_return_obsolete_inner_layout_errors_without_fallback ... ok",
+      "test sql::executor::once_subquery_context_tests::quarantined_once_subqueries_return_storage_error_without_repair_writes ... ok",
+      "test sql::executor::once_subquery_context_tests::legacy_unbound_introspection_fallback_stays_false_or_null ... ok",
+      "test storage::catalog::tests::persistent_definition_without_feature_fences_only_its_table_without_downgrade ... ok"
+    ],
+    "features": []
+  },
+  "core-default": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--tests",
+        "--no-fail-fast",
+        "--",
+        "--skip",
+        "lock_management",
+        "--nocapture"
+      ]
+    ],
+    "tier": "default",
+    "all_targets": true,
+    "features": [],
+    "timeout_seconds": 43200,
+    "required_tools": [
+      "openssl"
+    ],
+    "forbidden_log_markers": [
+      "skipped: the openssl CLI is not available"
+    ],
+    "minimum_by_target": {
+      "correlated_exists_index": 4,
+      "once_subquery_context": 2
+    },
+    "required_markers": [
+      "test sql::executor::scan::tests::correlated_filtered_scan_binds_qualified_outer_rows_before_output_projection ... ok",
+      "test sql::executor::once_subquery_context_tests::once_subqueries_share_the_expired_parent_deadline_without_false_or_null ... ok",
+      "test sql::executor::once_subquery_context_tests::once_subqueries_return_obsolete_inner_layout_errors_without_fallback ... ok",
+      "test sql::executor::once_subquery_context_tests::quarantined_once_subqueries_return_storage_error_without_repair_writes ... ok",
+      "test sql::executor::once_subquery_context_tests::legacy_unbound_introspection_fallback_stays_false_or_null ... ok",
+      "test storage::catalog::tests::persistent_definition_without_feature_fences_only_its_table_without_downgrade ... ok"
+    ]
+  },
+  "core-internal": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--tests",
+        "--no-fail-fast",
+        "--features",
+        "internal-tests",
+        "--",
+        "--skip",
+        "lock_management",
+        "--nocapture"
+      ]
+    ],
+    "tier": "internal",
+    "all_targets": true,
+    "features": [
+      "internal-tests"
+    ],
+    "timeout_seconds": 43200,
+    "required_tools": [
+      "openssl"
+    ],
+    "forbidden_log_markers": [
+      "skipped: the openssl CLI is not available"
+    ],
+    "minimum_by_target": {
+      "correlated_exists_index": 4,
+      "once_subquery_context": 2
+    },
+    "required_markers": [
+      "test sql::executor::scan::tests::correlated_filtered_scan_binds_qualified_outer_rows_before_output_projection ... ok",
+      "test sql::executor::once_subquery_context_tests::once_subqueries_share_the_expired_parent_deadline_without_false_or_null ... ok",
+      "test sql::executor::once_subquery_context_tests::once_subqueries_return_obsolete_inner_layout_errors_without_fallback ... ok",
+      "test sql::executor::once_subquery_context_tests::quarantined_once_subqueries_return_storage_error_without_repair_writes ... ok",
+      "test sql::executor::once_subquery_context_tests::legacy_unbound_introspection_fallback_stays_false_or_null ... ok",
+      "test storage::catalog::tests::persistent_definition_without_feature_fences_only_its_table_without_downgrade ... ok"
+    ]
+  },
+  "core-optins": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--tests",
+        "--no-fail-fast",
+        "--features",
+        "internal-tests,code-graph,graph-rag,mcp-endpoint,vector-persist,compression,server,ha-full,simd,lock-census,test-utils",
+        "--",
+        "--skip",
+        "lock_management",
+        "--nocapture"
+      ]
+    ],
+    "tier": "optins",
+    "all_targets": true,
+    "features": [
+      "internal-tests",
+      "code-graph",
+      "graph-rag",
+      "mcp-endpoint",
+      "vector-persist",
+      "compression",
+      "server",
+      "ha-full",
+      "simd",
+      "lock-census",
+      "test-utils"
+    ],
+    "timeout_seconds": 43200,
+    "required_tools": [
+      "openssl"
+    ],
+    "forbidden_log_markers": [
+      "skipped: the openssl CLI is not available"
+    ],
+    "minimum_by_target": {
+      "correlated_exists_index": 4,
+      "once_subquery_context": 2
+    },
+    "required_markers": [
+      "test sql::executor::scan::tests::correlated_filtered_scan_binds_qualified_outer_rows_before_output_projection ... ok",
+      "test sql::executor::once_subquery_context_tests::once_subqueries_share_the_expired_parent_deadline_without_false_or_null ... ok",
+      "test sql::executor::once_subquery_context_tests::once_subqueries_return_obsolete_inner_layout_errors_without_fallback ... ok",
+      "test sql::executor::once_subquery_context_tests::quarantined_once_subqueries_return_storage_error_without_repair_writes ... ok",
+      "test sql::executor::once_subquery_context_tests::legacy_unbound_introspection_fallback_stays_false_or_null ... ok",
+      "test storage::vector_index::tests::persistent_reopen_metadata_follows_durable_precision_and_pq_and_refuses_wrong_layout ... ok",
+      "test storage::catalog::tests::mismatched_persistent_reopen_fences_only_its_table_without_downgrade_or_repair_writes ... ok"
+    ]
+  },
+  "docs": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--doc"
+      ]
+    ],
+    "minimum_passed": 1,
+    "features": []
+  },
+  "fmt-repo": {
+    "commands": [
+      [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ]
+    ],
+    "note": "No autoformat; compare repository drift separately, changed Rust paths must pass standalone rustfmt --check --config skip_children=true.",
+    "features": []
+  },
+  "msrv-default": {
+    "commands": [
+      [
+        "cargo",
+        "+1.88.0",
+        "check",
+        "--locked",
+        "--lib",
+        "--bins"
+      ]
+    ],
+    "note": "Default MSRV exactly1.88.0",
+    "features": []
+  },
+  "msrv-embed": {
+    "commands": [
+      [
+        "cargo",
+        "+1.92.0",
+        "check",
+        "--locked",
+        "--lib",
+        "--bins",
+        "--features",
+        "code-embed"
+      ]
+    ],
+    "required_env": [
+      "ORT_LIB_PATH",
+      "ORT_PREFER_DYNAMIC_LINK"
+    ],
+    "note": "On older glibc use an existing compatible ONNX1.24.x lib; LD_LIBRARY_PATH required for runtime, ORT_PREFER_DYNAMIC_LINK=1. Missing ORT is a blocker, not skip.",
+    "features": [
+      "code-embed"
+    ]
+  },
+  "embed-runtime": {
+    "commands": [
+      [
+        "cargo",
+        "+1.92.0",
+        "test",
+        "--locked",
+        "--features",
+        "code-embed",
+        "--test",
+        "code_graph_local_embedder",
+        "fastembed_populates_body_vec",
+        "--",
+        "--exact",
+        "--include-ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "minimum_passed": 1,
+    "required_env": [
+      "ORT_LIB_PATH",
+      "ORT_PREFER_DYNAMIC_LINK",
+      "LD_LIBRARY_PATH"
+    ],
+    "note": "Requires model cache/download. Count1 with exact vector dimension384; not compile-only.",
+    "features": [
+      "code-embed"
+    ]
+  },
+  "fips": {
+    "commands": [
+      [
+        "cargo",
+        "check",
+        "--locked",
+        "--all-targets",
+        "--no-default-features",
+        "--features",
+        "fips,encryption,vector-search,ha-tier1,internal-tests"
+      ],
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "--no-default-features",
+        "--features",
+        "fips,encryption,vector-search,ha-tier1,internal-tests"
+      ],
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--no-default-features",
+        "--features",
+        "fips,encryption,vector-search,ha-tier1,internal-tests",
+        "--test",
+        "encryption_at_rest_tests",
+        "--test",
+        "physical_standby_embedded",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "features": [
+      "fips",
+      "encryption",
+      "vector-search",
+      "ha-tier1",
+      "internal-tests"
+    ],
+    "minimum_passed": 1,
+    "note": "Never combine fips with ring-crypto. Crypto/native AWS-LC prerequisites must exist."
+  },
+  "minimal-ring": {
+    "commands": [
+      [
+        "cargo",
+        "check",
+        "--locked",
+        "--all-targets",
+        "--no-default-features",
+        "--features",
+        "ring-crypto"
+      ]
+    ],
+    "features": [
+      "ring-crypto"
+    ],
+    "note": "Compile compatibility, no claim that vector/encryption-using tests run meaningfully without their features."
+  },
+  "legacy-network": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "legacy-network",
+        "--test",
+        "network_protocol_test",
+        "--",
+        "--nocapture"
+      ]
+    ],
+    "minimum_passed": 2,
+    "note": "Only2asserttrue placeholders; builds compatibility surface but credits ZERO real wire coverage. Do not expose legacy listener.",
+    "features": [
+      "legacy-network"
+    ]
+  },
+  "security": {
+    "commands": [
+      [
+        "cargo",
+        "audit",
+        "--deny",
+        "warnings"
+      ],
+      [
+        "cargo",
+        "deny",
+        "check"
+      ],
+      [
+        "cargo",
+        "deny",
+        "--all-features",
+        "check"
+      ],
+      [
+        "cargo",
+        "tree",
+        "--locked",
+        "--all-features",
+        "--target",
+        "all",
+        "-i",
+        "webpki-roots"
+      ],
+      [
+        "cargo",
+        "tree",
+        "--locked",
+        "--all-features",
+        "--target",
+        "all",
+        "-i",
+        "rkyv"
+      ]
+    ],
+    "note": "Policy productd371a9c73c92e77bf74f3648cb773a608afec0ed explicitly records the four existing maintenance exceptions and NEW paste RUSTSEC-2024-0436 in BOTH deny.toml and .cargo/audit.toml; see docs/SECURITY_MAINTENANCE_EXCEPTIONS.md and open Sprinter12d7fb448cd0. Retain EXACT cargo audit --deny warnings, including fatal cargo-audit/rustsec self-advisories, and fatal default/all-feature cargo-deny. Re-review current maintenance classification, advisory-ID-wide scope, and exact optional FastEmbed7.5.0 -> Tokenizers0.23.2 -> paste1.0.15 graph/versions before releases;2026-12-08 is manual follow-up, not automatic expiry. No currently vulnerability/unsound/yanked advisory exception or pin-utils ignore is added; existing rkyv entry is unchanged and its all-feature inverse graph MUST remain empty. Require actual webpki-roots>=1.0.10 and fresh security results for this policy source. All-feature graph inspection is not an all-feature compile preset.",
+    "features": []
+  },
+  "clippy-capture": {
+    "commands": [
+      [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--message-format=json",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    ],
+    "capture_diagnostics_only": true,
+    "note": "Capture identically for main/released/latest/candidate in separate immutable trees/targets. clippy-diff.py must find0new; any hard E-code compile error invalidates comparison.",
+    "features": []
+  },
+  "physical-default": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "physical_standby_open_mode",
+        "--test",
+        "physical_standby_local_namespace",
+        "--test",
+        "physical_standby_embedded",
+        "--test",
+        "physical_standby_derived_state",
+        "--test",
+        "physical_standby_serving",
+        "--test",
+        "physical_standby_refusals",
+        "--test",
+        "physical_standby_sync",
+        "--test",
+        "physical_standby_tls",
+        "--test",
+        "physical_archive",
+        "--test",
+        "physical_archive_recovery",
+        "--test",
+        "physical_fast_forward",
+        "--test",
+        "physical_large_write_group",
+        "--test",
+        "physical_promote",
+        "--test",
+        "physical_promote_online",
+        "--test",
+        "physical_rewind",
+        "--test",
+        "physical_switchover",
+        "--test",
+        "physical_standby_verify",
+        "--test",
+        "physical_explicit_transactions",
+        "--test",
+        "physical_standby_vector",
+        "--test",
+        "physical_standby_fireproof",
+        "--test",
+        "ha_integration",
+        "--test",
+        "layout_epochs",
+        "--test",
+        "physical_storage_hydration",
+        "--test",
+        "physical_snapshot_hydration",
+        "--no-fail-fast",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "minimum_passed": 1,
+    "features": [],
+    "required_targets": [
+      "physical_standby_open_mode",
+      "physical_standby_local_namespace",
+      "physical_standby_embedded",
+      "physical_standby_derived_state",
+      "physical_standby_serving",
+      "physical_standby_refusals",
+      "physical_standby_sync",
+      "physical_standby_tls",
+      "physical_archive",
+      "physical_archive_recovery",
+      "physical_fast_forward",
+      "physical_large_write_group",
+      "physical_promote",
+      "physical_promote_online",
+      "physical_rewind",
+      "physical_switchover",
+      "physical_standby_verify",
+      "physical_explicit_transactions",
+      "physical_standby_vector",
+      "physical_standby_fireproof",
+      "ha_integration",
+      "layout_epochs",
+      "physical_storage_hydration",
+      "physical_snapshot_hydration"
+    ],
+    "note": "Actual native child daemons: Cargo supplies same-build CARGO_BIN_EXE; platform Linux+ha-tier1. Require every target nonzero; derived throughput ignored runs separately.",
+    "timeout_seconds": 43200,
+    "required_tools": [
+      "openssl"
+    ],
+    "forbidden_log_markers": [
+      "skipped: the openssl CLI is not available"
+    ]
+  },
+  "physical-internal": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "internal-tests",
+        "--test",
+        "physical_standby_open_mode",
+        "--test",
+        "physical_standby_local_namespace",
+        "--test",
+        "physical_standby_embedded",
+        "--test",
+        "physical_standby_derived_state",
+        "--test",
+        "physical_standby_serving",
+        "--test",
+        "physical_standby_refusals",
+        "--test",
+        "physical_standby_sync",
+        "--test",
+        "physical_standby_tls",
+        "--test",
+        "physical_snapshot_resume",
+        "--test",
+        "physical_archive",
+        "--test",
+        "physical_archive_recovery",
+        "--test",
+        "physical_fast_forward",
+        "--test",
+        "physical_large_write_group",
+        "--test",
+        "physical_promote",
+        "--test",
+        "physical_promote_online",
+        "--test",
+        "physical_rewind",
+        "--test",
+        "physical_switchover",
+        "--test",
+        "physical_standby_verify",
+        "--test",
+        "physical_explicit_transactions",
+        "--test",
+        "physical_standby_vector",
+        "--test",
+        "physical_standby_fireproof",
+        "--test",
+        "ha_integration",
+        "--test",
+        "layout_epochs",
+        "--test",
+        "physical_storage_hydration",
+        "--test",
+        "physical_snapshot_hydration",
+        "--no-fail-fast",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "minimum_passed": 1,
+    "features": [
+      "internal-tests"
+    ],
+    "required_targets": [
+      "physical_standby_open_mode",
+      "physical_standby_local_namespace",
+      "physical_standby_embedded",
+      "physical_standby_derived_state",
+      "physical_standby_serving",
+      "physical_standby_refusals",
+      "physical_standby_sync",
+      "physical_standby_tls",
+      "physical_snapshot_resume",
+      "physical_archive",
+      "physical_archive_recovery",
+      "physical_fast_forward",
+      "physical_large_write_group",
+      "physical_promote",
+      "physical_promote_online",
+      "physical_rewind",
+      "physical_switchover",
+      "physical_standby_verify",
+      "physical_explicit_transactions",
+      "physical_standby_vector",
+      "physical_standby_fireproof",
+      "ha_integration",
+      "layout_epochs",
+      "physical_storage_hydration",
+      "physical_snapshot_hydration"
+    ],
+    "note": "Actual native child daemons: Cargo supplies same-build CARGO_BIN_EXE; platform Linux+ha-tier1. Require every target nonzero; derived throughput ignored runs separately.",
+    "timeout_seconds": 43200,
+    "required_tools": [
+      "openssl"
+    ],
+    "forbidden_log_markers": [
+      "skipped: the openssl CLI is not available"
+    ]
+  },
+  "physical-persistent": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "internal-tests,vector-persist",
+        "--test",
+        "physical_standby_open_mode",
+        "--test",
+        "physical_standby_local_namespace",
+        "--test",
+        "physical_standby_embedded",
+        "--test",
+        "physical_standby_derived_state",
+        "--test",
+        "physical_standby_serving",
+        "--test",
+        "physical_standby_refusals",
+        "--test",
+        "physical_standby_sync",
+        "--test",
+        "physical_standby_tls",
+        "--test",
+        "physical_snapshot_resume",
+        "--test",
+        "physical_archive",
+        "--test",
+        "physical_archive_recovery",
+        "--test",
+        "physical_fast_forward",
+        "--test",
+        "physical_large_write_group",
+        "--test",
+        "physical_promote",
+        "--test",
+        "physical_promote_online",
+        "--test",
+        "physical_rewind",
+        "--test",
+        "physical_switchover",
+        "--test",
+        "physical_standby_verify",
+        "--test",
+        "physical_explicit_transactions",
+        "--test",
+        "physical_standby_vector",
+        "--test",
+        "physical_standby_fireproof",
+        "--test",
+        "ha_integration",
+        "--test",
+        "layout_epochs",
+        "--test",
+        "physical_storage_hydration",
+        "--test",
+        "physical_snapshot_hydration",
+        "--no-fail-fast",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "minimum_passed": 1,
+    "features": [
+      "internal-tests",
+      "vector-persist"
+    ],
+    "required_targets": [
+      "physical_standby_open_mode",
+      "physical_standby_local_namespace",
+      "physical_standby_embedded",
+      "physical_standby_derived_state",
+      "physical_standby_serving",
+      "physical_standby_refusals",
+      "physical_standby_sync",
+      "physical_standby_tls",
+      "physical_snapshot_resume",
+      "physical_archive",
+      "physical_archive_recovery",
+      "physical_fast_forward",
+      "physical_large_write_group",
+      "physical_promote",
+      "physical_promote_online",
+      "physical_rewind",
+      "physical_switchover",
+      "physical_standby_verify",
+      "physical_explicit_transactions",
+      "physical_standby_vector",
+      "physical_standby_fireproof",
+      "ha_integration",
+      "layout_epochs",
+      "physical_storage_hydration",
+      "physical_snapshot_hydration"
+    ],
+    "note": "Actual native child daemons: Cargo supplies same-build CARGO_BIN_EXE; platform Linux+ha-tier1. Require every target nonzero; derived throughput ignored runs separately.",
+    "timeout_seconds": 43200,
+    "required_tools": [
+      "openssl"
+    ],
+    "forbidden_log_markers": [
+      "skipped: the openssl CLI is not available"
+    ]
+  },
+  "ddl-window": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "physical_ddl_window",
+        "standby_readers_never_see_a_torn_state_while_the_primary_runs_ddl",
+        "--",
+        "--exact",
+        "--include-ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "internal-tests",
+        "--test",
+        "physical_ddl_window",
+        "standby_readers_never_see_a_torn_state_while_the_primary_runs_ddl",
+        "--",
+        "--exact",
+        "--include-ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "internal-tests",
+        "--test",
+        "physical_ddl_window",
+        "standby_readers_never_see_a_torn_state_when_every_write_group_is_published_on_its_own",
+        "--",
+        "--exact",
+        "--include-ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "internal-tests",
+        "--test",
+        "physical_ddl_window",
+        "the_detector_reports_a_write_group_split_by_the_test_hook",
+        "--",
+        "--exact",
+        "--include-ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "minimum_passed": 1,
+    "note": "Each of4commands mustpass1nonzero. Positive logs require0torn on primary/standby and nonzero checked reads; detector requires synthetic tears>0. include-ignored works whether source ignore is still present or removed.",
+    "features": [
+      "internal-tests"
+    ]
+  },
+  "readiness20": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "internal-tests",
+        "--no-run",
+        "--message-format=json",
+        "--test",
+        "ha_integration",
+        "--test",
+        "physical_promote_online",
+        "--test",
+        "physical_fast_forward"
+      ],
+      [
+        "python3",
+        "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates-v5/readiness20.py",
+        "--tree-env",
+        "--build-log",
+        "00.log",
+        "--repeat",
+        "20",
+        "--workers",
+        "2"
+      ]
+    ],
+    "features": [
+      "internal-tests"
+    ],
+    "readiness_case_count": 6,
+    "minimum_passed": 1,
+    "timeout_seconds": 43200,
+    "note": "Build once in the same bounded scope. Run 6 actual-daemon exact controls x20 as immutable test executables with two overlapping native processes; script enforces exact120 identities, one pass per invocation, no ignored/empty results, source/binary identities and overlap. Per-case timeout1200s. No runtime yet.",
+    "required_tools": [
+      "openssl"
+    ],
+    "forbidden_log_markers": [
+      "skipped: the openssl CLI is not available"
+    ]
+  },
+  "branch-all-interfaces": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "internal-tests,code-graph,mcp-endpoint",
+        "--test",
+        "branch_session_isolation",
+        "--test",
+        "branch_write_isolation",
+        "--test",
+        "branch_schema_isolation",
+        "--test",
+        "branch_fork_point",
+        "--test",
+        "branch_as_of_tests",
+        "--test",
+        "branch_sql_integration_tests",
+        "--test",
+        "branch_merge_surface_tests",
+        "--test",
+        "branch_merge_conflict_tests",
+        "--test",
+        "code_graph_on_branch",
+        "--test",
+        "fk_update_actions",
+        "--test",
+        "fk_delete_actions",
+        "--test",
+        "fk_merge_constraints",
+        "--no-fail-fast",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "minimum_passed": 1,
+    "required_targets": [
+      "branch_session_isolation",
+      "branch_write_isolation",
+      "branch_schema_isolation",
+      "branch_fork_point",
+      "branch_as_of_tests",
+      "branch_sql_integration_tests",
+      "branch_merge_surface_tests",
+      "branch_merge_conflict_tests",
+      "code_graph_on_branch",
+      "fk_update_actions",
+      "fk_delete_actions",
+      "fk_merge_constraints"
+    ],
+    "note": "PGsimple/extended/native Rust clients, embedded text/params, REST handler tests, MCP/codegraph optins. MySQL branch-specific live client still must be confirmed, not inferred from params parity.",
+    "features": [
+      "internal-tests",
+      "code-graph",
+      "mcp-endpoint"
+    ]
+  },
+  "recall-measure": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--release",
+        "--test",
+        "hnsw_recall_measurement",
+        "--",
+        "--include-ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "minimum_passed": 3,
+    "load_below": 6,
+    "note": "Measurement2tests assertnothing: independently require zero misses exact50seeded indexbuilds +10enginebuilds percell; public search strictthirdtest nonzero. Keep raw tables; graph-only approximate misses are separate from public-result correctness.",
+    "features": []
+  },
+  "applier-throughput": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--release",
+        "--test",
+        "physical_standby_derived_state",
+        "applier_throughput_on_a_100k_row_corpus",
+        "--",
+        "--exact",
+        "--include-ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "minimum_passed": 1,
+    "load_below": 6,
+    "note": "Independent physical throughput/tail + sync latency A/B remains perf-matrix task; timing alone not correctness.",
+    "features": []
+  },
+  "codegraph-field": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--release",
+        "--features",
+        "code-graph",
+        "--test",
+        "code_graph_parallel_index_bench",
+        "field_benchmark_nano_src_tree",
+        "--",
+        "--exact",
+        "--include-ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "minimum_passed": 1,
+    "load_below": 6,
+    "note": "Release/load-gated field measurement; retain raw timings and source/compiler/features identity. This is separate from the release <3% performance matrix.",
+    "features": [
+      "code-graph"
+    ]
+  },
+  "clippy-internal-capture": {
+    "commands": [
+      [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--message-format=json",
+        "--features",
+        "internal-tests",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    ],
+    "capture_diagnostics_only": true,
+    "note": "Compare JSON diagnostic multiset against identical feature/toolchain/environment baseline using clippy-diff.py; compile errors always fail.",
+    "features": [
+      "internal-tests"
+    ]
+  },
+  "clippy-optins-capture": {
+    "commands": [
+      [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--message-format=json",
+        "--features",
+        "internal-tests,code-graph,graph-rag,mcp-endpoint,vector-persist,compression,server,ha-full,simd,lock-census,test-utils",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    ],
+    "capture_diagnostics_only": true,
+    "note": "Compare JSON diagnostic multiset against identical feature/toolchain/environment baseline using clippy-diff.py; compile errors always fail.",
+    "features": [
+      "internal-tests",
+      "code-graph",
+      "graph-rag",
+      "mcp-endpoint",
+      "vector-persist",
+      "compression",
+      "server",
+      "ha-full",
+      "simd",
+      "lock-census",
+      "test-utils"
+    ]
+  },
+  "clippy-fips-capture": {
+    "commands": [
+      [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--message-format=json",
+        "--no-default-features",
+        "--features",
+        "fips,encryption,vector-search,ha-tier1,internal-tests",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    ],
+    "capture_diagnostics_only": true,
+    "note": "Compare JSON diagnostic multiset against identical feature/toolchain/environment baseline using clippy-diff.py; compile errors always fail.",
+    "features": [
+      "fips",
+      "encryption",
+      "vector-search",
+      "ha-tier1",
+      "internal-tests"
+    ]
+  },
+  "p4-scale": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "internal-tests",
+        "--test",
+        "physical_fast_forward",
+        "a_gib_dataset_with_one_percent_changed_resumes_after_kill_and_tails_new_writes",
+        "--",
+        "--exact",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "features": [
+      "internal-tests"
+    ],
+    "minimum_passed": 1,
+    "required_targets": [
+      "physical_fast_forward"
+    ],
+    "required_markers": [
+      "P4_SCALE_CASE "
+    ],
+    "timeout_seconds": 43200,
+    "note": "Mandatory real >=1GiB source,1% clustered baseline changes, actual nativeSIGKILL/dirty503/resume, whole-CF cut digest, report shipbytes ratio<10%, acknowledged post-cut write tails afterrestart. Receipt must explicitly name added retention-pruning rows and locality. This is NOT a generic bounded fixture substitute."
+  },
+  "persistent-publication": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "internal-tests,vector-persist",
+        "--test",
+        "persistent_mv_atomicity",
+        "--test",
+        "vector_row_overlay_recovery",
+        "--test",
+        "mv_uncertain_publication",
+        "--test",
+        "fast_side_storage_atomicity",
+        "--no-fail-fast",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "features": [
+      "internal-tests",
+      "vector-persist"
+    ],
+    "minimum_passed": 1,
+    "required_targets": [
+      "persistent_mv_atomicity",
+      "vector_row_overlay_recovery",
+      "mv_uncertain_publication",
+      "fast_side_storage_atomicity"
+    ],
+    "timeout_seconds": 43200,
+    "note": "Final integrated producer/recovery source required: 7 MV +10 overlay +7 uncertain +7 side-storage tests. All10 overlay markers/193 cells must execute; missing targets fail. Inspect actual crash/cap/nativeUnknown, read-only zero writes, sealed row images, all PQ/precision, physical byte identity and applied-publication proof.",
+    "required_markers": [
+      "vector-overlay-receipt savepoint=24",
+      "vector-overlay-receipt unversioned_columnar=12",
+      "vector-overlay-receipt crash=96",
+      "vector-overlay-receipt native_outcome=24",
+      "vector-overlay-receipt sealed=6",
+      "vector-overlay-receipt physical=6",
+      "vector-overlay-receipt publication_error=16",
+      "vector-overlay-receipt live_logical=6",
+      "vector-overlay-receipt live_logical_no_vector=2",
+      "vector-overlay-receipt standard_hook_fault=1"
+    ],
+    "minimum_by_target": {
+      "persistent_mv_atomicity": 7,
+      "vector_row_overlay_recovery": 10,
+      "mv_uncertain_publication": 7,
+      "fast_side_storage_atomicity": 7
+    }
+  },
+  "archive-reserve-native": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "internal-tests",
+        "--test",
+        "physical_archive",
+        "free_space_below_the_disk_reserve_prunes_inside_the_window",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "features": [
+      "internal-tests"
+    ],
+    "minimum_passed": 1,
+    "required_targets": [
+      "physical_archive"
+    ],
+    "timeout_seconds": 1800,
+    "note": "Exact P3_1\u00a76 required scenario uses HELIOSDB_NANO_TEST_ARCHIVE_FREE_BYTES in a REAL managed daemon, validates prune and continuing primary ACKs. Actual quota filesystem is optional additional stress."
+  },
+  "core-embed-optins": {
+    "commands": [
+      [
+        "cargo",
+        "+1.92.0",
+        "test",
+        "--locked",
+        "--tests",
+        "--no-fail-fast",
+        "--features",
+        "internal-tests,code-graph,graph-rag,mcp-endpoint,vector-persist,compression,server,ha-full,simd,lock-census,test-utils,code-embed",
+        "--",
+        "--skip",
+        "lock_management",
+        "--nocapture"
+      ]
+    ],
+    "features": [
+      "internal-tests",
+      "code-graph",
+      "graph-rag",
+      "mcp-endpoint",
+      "vector-persist",
+      "compression",
+      "server",
+      "ha-full",
+      "simd",
+      "lock-census",
+      "test-utils",
+      "code-embed"
+    ],
+    "tier": "code-embed",
+    "all_targets": true,
+    "required_env": [
+      "ORT_LIB_PATH",
+      "ORT_PREFER_DYNAMIC_LINK",
+      "LD_LIBRARY_PATH"
+    ],
+    "timeout_seconds": 43200,
+    "note": "Valid nonFIPS full optional feature tier including code-embed, Rust1.92/ORT/model prerequisites. Still run explicit ignored fastembed384-dimension control. No all-features compile.",
+    "required_tools": [
+      "openssl"
+    ],
+    "forbidden_log_markers": [
+      "skipped: the openssl CLI is not available"
+    ],
+    "minimum_by_target": {
+      "correlated_exists_index": 4,
+      "once_subquery_context": 2
+    },
+    "required_markers": [
+      "test sql::executor::scan::tests::correlated_filtered_scan_binds_qualified_outer_rows_before_output_projection ... ok",
+      "test sql::executor::once_subquery_context_tests::once_subqueries_share_the_expired_parent_deadline_without_false_or_null ... ok",
+      "test sql::executor::once_subquery_context_tests::once_subqueries_return_obsolete_inner_layout_errors_without_fallback ... ok",
+      "test sql::executor::once_subquery_context_tests::quarantined_once_subqueries_return_storage_error_without_repair_writes ... ok",
+      "test sql::executor::once_subquery_context_tests::legacy_unbound_introspection_fallback_stays_false_or_null ... ok",
+      "test storage::vector_index::tests::persistent_reopen_metadata_follows_durable_precision_and_pq_and_refuses_wrong_layout ... ok",
+      "test storage::catalog::tests::mismatched_persistent_reopen_fences_only_its_table_without_downgrade_or_repair_writes ... ok"
+    ]
+  },
+  "standard-publication-default": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--test",
+        "standard_vector_row_recovery",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "features": [],
+    "minimum_passed": 1,
+    "minimum_by_target": {
+      "standard_vector_row_recovery": 1
+    },
+    "required_targets": [
+      "standard_vector_row_recovery"
+    ],
+    "required_markers": [
+      "standard-row-receipt checkpoint=2"
+    ],
+    "timeout_seconds": 3600,
+    "note": "Default visible realdump load proof. Separate internal command proves native owning-row crash seam."
+  },
+  "standard-publication-internal": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--features",
+        "internal-tests",
+        "--test",
+        "standard_vector_row_recovery",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "features": [
+      "internal-tests"
+    ],
+    "minimum_passed": 2,
+    "minimum_by_target": {
+      "standard_vector_row_recovery": 2
+    },
+    "required_targets": [
+      "standard_vector_row_recovery"
+    ],
+    "required_markers": [
+      "standard-row-receipt checkpoint=2",
+      "standard-row-receipt native_crash=6"
+    ],
+    "timeout_seconds": 3600,
+    "note": "Default Standard backend; olddumpLoaded1+rearm, real native INSERT/UPDATE/DELETE xTT2 beforegraphhooks, markerdelete exactlyowninggroup, oldblobretained, RO0writes andRWreload0/rebuild1."
+  },
+  "checkpoint-interleaving": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "vector_checkpoint_interleaving_tests",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "art_checkpoint_serialization_tests",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "features": [],
+    "minimum_passed": 2,
+    "minimum_passed_by_command": {
+      "0": 2,
+      "1": 3
+    },
+    "required_markers_by_command": {
+      "0": [
+        "vector-checkpoint-receipt captured_dirty_policy=1",
+        "vector-checkpoint-receipt preexisting_raw_publication=1"
+      ],
+      "1": [
+        "art-checkpoint-receipt native_before_art_history_false=1",
+        "art-checkpoint-receipt native_before_art_history_true=1",
+        "art-checkpoint-receipt existing_owner_skip=1"
+      ]
+    },
+    "timeout_seconds": 3600,
+    "note": "Exactly5 targeted controls via two definitive module filters; generic vector_checkpoint_tests is incorrect. No vector-index assumption for actualfastART controls; true out-of-order timestamp and owner-upgrade skip are asserted."
+  },
+  "pq-live-codec": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "vector::quantized_hnsw::tests::",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "storage::vector_index::tests::public_quantized_save_load_preserves_deleted_and_replaced_membership",
+        "--",
+        "--exact",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "features": [],
+    "minimum_passed": 1,
+    "note": "Backend module includes live-filter/config/training/codec proofs; publicmanager exact path adjusted by source discovery beforefreeze. Newencoded bytes preserve latest/live membership and codec/config/codebook; old missing tombstone information remains documented historicallimit.",
+    "minimum_passed_by_command": {
+      "0": 6,
+      "1": 1
+    }
+  },
+  "applied-publication-errors": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "applied_publication",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "features": [],
+    "minimum_passed": 5,
+    "note": "Known-NativeOK applied-error helper, PG simple/extended frame, MySQL priority and nested-layout classifier5 units; preserve original NativeErr. Final source/runtime acceptance needs actual fresh receipts."
+  },
+  "ann-publication": {
+    "commands": [
+      [
+        "cargo",
+        "test",
+        "--locked",
+        "--lib",
+        "ann_publication_tests",
+        "--",
+        "--nocapture",
+        "--test-threads=1"
+      ]
+    ],
+    "features": [],
+    "minimum_passed": 8,
+    "note": "Actual512-vector consumer/writer publication controls, durable+sequence/advisory once boundaries, partial hook fault, same source default ANN backend. Repeat through fullinternal/persistent libtiers; no smallindexfalseANNproof."
+  },
+  "public-perf-smoke": {
+    "commands": [
+      [
+        "bash",
+        "benches/public/ci_perf_smoke.sh"
+      ]
+    ],
+    "features": [],
+    "env": {
+      "PERF_GATE_REPS": "3",
+      "PERF_GATE_THRESHOLD": "2.5"
+    },
+    "minimum_passed": 1,
+    "required_markers": [
+      "test run_tps_suite ... ok",
+      "test run_fk_bulk_insert_bench ... ok",
+      "--- gate rep 3/3:",
+      "perf gate passed."
+    ],
+    "public_perf_smoke": true,
+    "load_below": 6,
+    "timeout_seconds": 21600,
+    "required_tools": [
+      "bash",
+      "cargo",
+      "rustc",
+      "python3",
+      "git"
+    ],
+    "note": "Run unchanged public script/common helpers under run-one outer fleet lock/scope. No inner flock/systemd lock exists. Fixed 3 reps,12 exact measured labels (11 TPS+FK),stored baseline unchanged,2.5x cliff only. Copies raw/JSON outputs and records harness/source/compiler identity; does not replace <3% original/latest/final ABBA."
+  }
+}
