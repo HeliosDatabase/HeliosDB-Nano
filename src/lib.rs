@@ -11584,6 +11584,18 @@ impl EmbeddedDatabase {
                 let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let tuples = if let Some(view) = &branch_view {
                     view.scan(Some(txn), table_name, &schema)?
+                } else if let Some(candidates) =
+                    self.pk_in_write_candidates(table_name, &schema, selection.as_ref(), &[])?
+                {
+                    if merge_txn_writes {
+                        txn.merge_with_write_set_shaped(
+                            table_name,
+                            candidates,
+                            &self.storage.row_shape(table_name, schema.columns.len())?,
+                        )?
+                    } else {
+                        candidates
+                    }
                 } else if merge_txn_writes {
                     let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
                     let width = self.storage.catalog().get_table_schema(table_name)?.columns.len();
@@ -12039,6 +12051,18 @@ impl EmbeddedDatabase {
                 let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let tuples = if let Some(view) = &branch_view {
                     view.scan(Some(txn), table_name, &schema_arc)?
+                } else if let Some(candidates) =
+                    self.pk_in_write_candidates(table_name, &schema_arc, selection.as_ref(), &[])?
+                {
+                    if merge_txn_writes {
+                        txn.merge_with_write_set_shaped(
+                            table_name,
+                            candidates,
+                            &self.storage.row_shape(table_name, schema_arc.columns.len())?,
+                        )?
+                    } else {
+                        candidates
+                    }
                 } else if merge_txn_writes {
                     let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
                     let width = self.storage.catalog().get_table_schema(table_name)?.columns.len();
@@ -22960,7 +22984,10 @@ impl EmbeddedDatabase {
                 let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let base_tuples = match &branch_view {
                     Some(view) => view.scan(active_txn, table_name, &schema)?,
-                    None => self.storage.scan_table_branch_aware(table_name)?,
+                    None => match self.pk_in_write_candidates(table_name, &schema, selection.as_ref(), params)? {
+                        Some(candidates) => candidates,
+                        None => self.storage.scan_table_branch_aware(table_name)?,
+                    },
                 };
                 let tuples = if let (Some(txn), None) = (active_txn, &branch_view) {
                     let width = self.storage.catalog().get_table_schema(table_name)?.columns.len();
@@ -23270,7 +23297,10 @@ impl EmbeddedDatabase {
                 let row_epoch = self.row_epoch_for(branch_view.as_ref(), table_name);
                 let base_tuples = match &branch_view {
                     Some(view) => view.scan(active_txn, table_name, &schema)?,
-                    None => self.storage.scan_table_branch_aware(table_name)?,
+                    None => match self.pk_in_write_candidates(table_name, &schema, selection.as_ref(), params)? {
+                        Some(candidates) => candidates,
+                        None => self.storage.scan_table_branch_aware(table_name)?,
+                    },
                 };
                 let tuples = if let (Some(txn), None) = (active_txn, &branch_view) {
                     let width = self.storage.catalog().get_table_schema(table_name)?.columns.len();
@@ -32744,6 +32774,88 @@ impl EmbeddedDatabase {
         // guaranteed miss; declining sends the caller to a scan, which is the
         // only thing that keeps UPDATE/DELETE matching exactly what SELECT does.
         sql::executor::coerce_literal_to_column_type(literal, &pk_col.data_type)
+    }
+
+    /// A committed candidate superset for a sole, bound integer-PK IN predicate.
+    /// The caller MUST merge its complete staged rows before filtering: an index
+    /// miss cannot exclude this owner's INSERT, PK change, raw put or tombstone.
+    /// All normal predicate/row-lock/constraint/outcome logic remains downstream.
+    fn pk_in_write_candidates(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        selection: Option<&sql::LogicalExpr>,
+        params: &[Value],
+    ) -> Result<Option<Vec<Tuple>>> {
+        let Some(
+            predicate @ sql::LogicalExpr::InList {
+                expr,
+                list,
+                negated: false,
+            },
+        ) = selection
+        else {
+            return Ok(None);
+        };
+        // No ordinary non-IN mutation pays schema/index probes or allocations.
+        // Keep expressions/casts/NULL/NOT IN and noninteger encoding ambiguity
+        // on the existing scan. The resolver's BIGSERIAL is Int8.
+        if list.is_empty()
+            || !list.iter().all(|item| match item {
+                sql::LogicalExpr::Literal(Value::Int2(_) | Value::Int4(_) | Value::Int8(_)) => true,
+                sql::LogicalExpr::Parameter { index } => index
+                    .checked_sub(1)
+                    .and_then(|position| params.get(position))
+                    .is_some_and(|value| matches!(value, Value::Int2(_) | Value::Int4(_) | Value::Int8(_))),
+                _ => false,
+            })
+            || !schema.has_single_column_pk()
+            || self.storage.is_branch_active()
+        {
+            return Ok(None);
+        }
+        let sql::LogicalExpr::Column { table, name } = expr.as_ref() else {
+            return Ok(None);
+        };
+        if table.as_deref().is_some_and(|qualifier| qualifier != table_name) {
+            return Ok(None);
+        }
+        let Some(column) = schema.columns.iter().find(|column| column.primary_key) else {
+            return Ok(None);
+        };
+        if name != &column.name || !matches!(column.data_type, DataType::Int2 | DataType::Int4 | DataType::Int8) {
+            return Ok(None);
+        }
+        let Some((_index, values)) =
+            sql::executor::scan::indexed_in_list_lookup(&self.storage, table_name, schema, predicate, params)
+        else {
+            return Ok(None);
+        };
+        // Missing/retired primary registry is not an authoritative empty row set.
+        if self.storage.art_indexes().pk_index_len(table_name).is_none()
+            || self.storage.cached_table_kind(table_name)? != storage::TableKind::Table
+        {
+            return Ok(None);
+        }
+        let mut seen = std::collections::HashSet::with_capacity(values.len());
+        let mut candidates = Vec::with_capacity(values.len());
+        for value in values {
+            // Current storage, not the row cache or an old read snapshot. This
+            // getter retains foreign removed-key holds and misdirected-claim
+            // reconciliation; a native/shape/availability error propagates.
+            if let Some(tuple) = self
+                .storage
+                .get_row_by_typed_pk_for_write_with_schema(table_name, &value, schema)?
+            {
+                let row_id = tuple
+                    .row_id
+                    .ok_or_else(|| Error::storage("PK-IN write candidate has no stored row identity"))?;
+                if seen.insert(row_id) {
+                    candidates.push(tuple);
+                }
+            }
+        }
+        Ok(Some(candidates))
     }
 
     /// Apply RLS policies to a query plan by injecting Filter operators

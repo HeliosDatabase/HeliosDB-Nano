@@ -537,7 +537,7 @@ pub(super) fn try_index_point_lookup_for_scan(
 /// lookup value. `NOT IN` and any non-resolvable element (column, NULL,
 /// expression, subquery) → `None` (fall back to the filtered scan). Mirrors
 /// `indexed_equality_lookup` for the multi-value case.
-pub(super) fn indexed_in_list_lookup(
+pub(crate) fn indexed_in_list_lookup(
     storage: &crate::storage::StorageEngine,
     table_name: &str,
     schema: &Schema,
