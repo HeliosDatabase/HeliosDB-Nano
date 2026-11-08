@@ -1,0 +1,83 @@
+name: Historical-plan and quarantine fixture proof (no publish)
+on:
+  push:
+    branches: ['ci/4420-history-fixture-*']
+permissions:
+  contents: read
+jobs:
+  proof:
+    name: Three exact internal historical/generic targets (32 parents)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - name: Preserve Git source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: 3f2b9afea52303a2b27498338dd3db3f4f9359d8
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install native build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev cmake ninja-build
+          dpkg-query -W -f='${Package}\t${Version}\n' > "$RUNNER_TEMP/history-proof-packages.txt"
+      - name: Verify fixed controller and model
+        working-directory: controller
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          pairs = {
+              '.github/4420-history-proof/controller.py': '1add2e23e10d9ac534ea23824644ef10e4164c912c85084d528eebd01ed1640c',
+              '.github/4420-history-proof/model.json': '0c1356be1075fd1c134b9e53cffb396975d7b73f235220878151f42840c00b47',
+          }
+          for name, wanted in pairs.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != wanted:
+                  raise SystemExit('paired-proof bootstrap mismatch: ' + name)
+          PYBOOT
+      - name: Build, list and execute all three native targets / 32 parents
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_history_unit="nano-history-proof-${GITHUB_RUN_ID}"
+          sudo systemd-run --unit "$nano_history_unit" --wait --pipe --collect \
+            -p User="$(id -un)" -p Group="$(id -gn)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE/controller" \
+            -p MemoryMax=24G -p MemorySwapMax=0 -p KillMode=control-group \
+            -p RuntimeMaxSec=5700 -p TimeoutStopSec=30 \
+            --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo" \
+            --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.95.0 \
+            --setenv="GITHUB_SHA=$GITHUB_SHA" \
+            --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
+            python3 .github/4420-history-proof/controller.py \
+              --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product" \
+              --out "$RUNNER_TEMP/history-proof" \
+              --model-sha256 0c1356be1075fd1c134b9e53cffb396975d7b73f235220878151f42840c00b47
+      - name: Preserve all exact native fixture results, including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: history-fixture-proof-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/history-proof-packages.txt
+            ${{ runner.temp }}/history-proof/*.json
+            ${{ runner.temp }}/history-proof/*.stdout
+            ${{ runner.temp }}/history-proof/*.stderr
+            ${{ runner.temp }}/history-proof/*.elf
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
