@@ -4377,6 +4377,10 @@ impl Transaction {
 }
 
 #[cfg(test)]
+#[path = "../branch_counter_lock_tests.rs"]
+mod branch_counter_lock_tests;
+
+#[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
