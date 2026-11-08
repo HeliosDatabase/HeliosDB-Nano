@@ -1,0 +1,1 @@
+V5 is a minimal command/receipt derivative of frozen v4. Source capture is intentionally absent: root will capture the final immutable source after its safe copy. V4 and its historical captures are unchanged. No Cargo/product/client/server/load run was performed by this preparation. All runtime acceptance stays pending independent receipt review.
