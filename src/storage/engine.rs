@@ -16603,7 +16603,15 @@ impl StorageEngine {
                 executor.execute(&crate::sql::LogicalPlan::Truncate {
                     table_name: table.clone(),
                 })?;
-                txn.commit()?;
+                let attempt = super::write_outcome::WriteAttempt::default();
+                txn.commit_settled(&attempt, |_, outcome, _| {
+                    if outcome == super::write_outcome::WriteOutcome::Unknown {
+                        // Neither an undo nor success publication is justified.
+                        // Retire derived handles before releasing the commit
+                        // barrier and table/census ownership; reopen rebuilds.
+                        let _ = self.quarantine_generic_indexes(&table, "explicit TRUNCATE replay outcome is unknown");
+                    }
+                })?;
 
                 debug!("Replayed truncate: table={}", table);
                 Ok(())
