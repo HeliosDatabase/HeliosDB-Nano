@@ -16584,34 +16584,26 @@ impl StorageEngine {
                     return Ok(());
                 }
 
-                // Delete all data rows for this table
-                let prefix = format!("data:{}:", table);
-                let prefix_bytes = prefix.as_bytes();
-                let mut keys_to_delete = Vec::new();
-
-                // Spec P1.1b: seek to the table's rows with a total-order
-                // iterator. A prefix-mode walk from the start of the keyspace
-                // crossed every family before `data:`, and one range tombstone
-                // on the way dropped whole older files from the scan (see
-                // `load_counters`): their rows survived the replayed TRUNCATE.
-                // An iterator error is propagated for the same reason — it
-                // was skipped, leaving the rows after it in place, too.
-                let mut read = ReadOptions::default();
-                read.set_total_order_seek(true);
-                let iter = self
-                    .db
-                    .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read);
-                for item in iter {
-                    let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-                    if !key.starts_with(prefix_bytes) {
-                        break;
-                    }
-                    keys_to_delete.push(key.to_vec());
-                }
-
-                for key in keys_to_delete {
-                    self.delete(&key)?;
-                }
+                // Explicit replay operates on a live store: deleting raw keys
+                // leaves COUNT, result caches and enforcing/vector indexes on
+                // the old rows. Use the same transaction and publication hooks
+                // as a direct TRUNCATE, retaining main ownership through commit.
+                let _main_scope = crate::main_statement_scope(self.instance_id);
+                let _statement = self.table_locks().statement_scope();
+                let _table = self.lock_tables_exclusive(
+                    super::table_locks::MAIN_LEVEL,
+                    &[table.as_str()],
+                    "explicit WAL TRUNCATE",
+                )?;
+                let mut txn = self.begin_autocommit_transaction()?;
+                // replay_wal_after already owns this entry and holds the WAL
+                // reader. Re-logging would duplicate it and deadlock that lock.
+                txn.set_statement_wal(None);
+                let mut executor = crate::sql::Executor::with_storage(self).with_transaction(&txn);
+                executor.execute(&crate::sql::LogicalPlan::Truncate {
+                    table_name: table.clone(),
+                })?;
+                txn.commit()?;
 
                 debug!("Replayed truncate: table={}", table);
                 Ok(())
