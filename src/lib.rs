@@ -4956,14 +4956,18 @@ impl EmbeddedDatabase {
                 // An old decoder can fail while reading a row rewritten by DDL
                 // before it reaches normal final validation (for example, a TEXT
                 // predicate sees the VECTOR now at that column's old position).
-                // Retry only execution/type errors whose recorded layout actually
-                // moved, and only while repeating the attempt is safe. Preserve
-                // native/control errors, applied-publication diagnostics and errors
-                // after a durable or non-repeatable effect exactly as returned.
+                // Revalidate only pure comparison/type failures. A moved layout
+                // refuses non-repeatable side effects with 40001; the loop below
+                // decides whether another attempt is safe. Durable writes,
+                // applied-publication diagnostics and native/control failures
+                // retain their original errors.
                 Err(error)
-                    if scope.retriable()
-                        && !error.is_applied_publication_failure()
-                        && matches!(&error, Error::QueryExecution(_) | Error::TypeConversion(_)) =>
+                    if !error.is_applied_publication_failure()
+                        && match &error {
+                            Error::QueryExecution(message) => message.starts_with("Cannot compare "),
+                            Error::TypeConversion(_) => true,
+                            _ => false,
+                        } =>
                 {
                     match scope.finish() {
                         Ok(()) => return Err(error),

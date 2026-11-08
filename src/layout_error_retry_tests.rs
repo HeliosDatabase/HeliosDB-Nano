@@ -155,7 +155,11 @@ fn overlap(params: bool, warm: bool, history: bool, volatile: bool) -> TestResul
         let error = result
             .err()
             .ok_or_else(|| std::io::Error::other("volatile stale predicate unexpectedly succeeded"))?;
-        exact_type_error(&error);
+        assert!(
+            matches!(&error, Error::Transaction(_)) && layout_epochs::is_layout_changed(&error),
+            "a moved layout after nextval must refuse without repeating: {error}"
+        );
+        assert_eq!(crate::protocol::postgres::handler::sqlstate_for_error(&error), "40001");
         assert_eq!(attempts, 1, "a consumed sequence value forbids another evaluation");
         let rows = current.ok_or_else(|| std::io::Error::other("reader did not capture currval"))??;
         assert_eq!(rows.first().and_then(|row| row.values.first()), Some(&Value::Int8(1)));
@@ -210,7 +214,7 @@ fn a_current_layout_keeps_the_real_type_error_without_repeating_it() -> TestResu
 }
 
 #[test]
-fn a_sequence_side_effect_keeps_the_original_stale_predicate_error_once() -> TestResult {
+fn a_sequence_side_effect_refuses_changed_layout_without_repeating_it() -> TestResult {
     for history in [false, true] {
         for params in [false, true] {
             overlap(params, false, history, true)?;
