@@ -1349,3 +1349,7 @@ mod tests {
         assert_eq!(next_pause(RETRY_BUDGET, FIRST_PAUSE), None);
     }
 }
+
+#[cfg(test)]
+#[path = "branch_layout_identity_tests.rs"]
+mod branch_layout_identity_tests;

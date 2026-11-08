@@ -275,3 +275,57 @@ fn explicit_truncate_native_outcomes_preserve_truth_no_relogging_and_reopen() ->
     assert!(failures.is_empty(), "{}", failures.join("; "));
     Ok(())
 }
+
+#[test]
+fn retained_main_truncate_is_independent_of_callers_branch_catalog() -> Result<()> {
+    let mut failures = Vec::new();
+    for history in [false, true] {
+        for shadow in [false, true] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                let dir = tempfile::tempdir().map_err(|error| Error::storage(error.to_string()))?;
+                let db = open(dir.path(), history)?;
+                seed(&db)?;
+                db.create_branch("replay_branch")?;
+                db.with_request_branch_scope("replay_branch", || {
+                    db.execute("DROP TABLE replay_rows")?;
+                    if shadow {
+                        db.execute("CREATE TABLE replay_rows(id INT PRIMARY KEY,u INT UNIQUE,v TEXT)")?;
+                        db.execute("INSERT INTO replay_rows VALUES(9,99,'branch')")?;
+                    }
+                    Ok(())
+                })?;
+                let (after, latest) = queue(&db)?;
+                db.with_request_branch_scope("replay_branch", || {
+                    assert_eq!(db.storage.replay_wal_after(after)?, 0);
+                    // The internal main scope must have restored this caller's
+                    // branch before control returns from explicit replay.
+                    if shadow {
+                        let rows = db.query("SELECT id FROM replay_rows", &[])?;
+                        assert_eq!(
+                            rows.first().map(|row| row.values.as_slice()),
+                            Some([Value::Int4(9)].as_slice())
+                        );
+                        assert_eq!(rows.len(), 1);
+                    } else {
+                        assert!(db.query("SELECT id FROM replay_rows", &[]).is_err());
+                    }
+                    Ok(())
+                })?;
+                assert_eq!(db.storage.wal_lsn(), Some(latest));
+                assert_empty_and_reuse(&db)?;
+                Ok(())
+            }));
+            eprintln!(
+                "explicit-replay-branch-cell history={history} shadow={shadow} ok={}",
+                matches!(&outcome, Ok(Ok(())))
+            );
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failures.push(format!("history={history} shadow={shadow}: {error}")),
+                Err(_) => failures.push(format!("history={history} shadow={shadow}: native assertion")),
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+    Ok(())
+}
