@@ -91,11 +91,15 @@ fn abandoned_raii_handle_restores_unique_and_vector_indexes_during_unwind() -> R
                 db.execute("CREATE INDEX abandoned_vector ON abandoned_indexes USING hnsw(embedding vector_l2_ops)")?;
                 let ending = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                     let tx = db.begin_transaction()?;
-                    tx.execute(match operation {
-                        "insert" => "INSERT INTO abandoned_indexes VALUES(2,20,'[100,0,0]')",
-                        "delete" => "DELETE FROM abandoned_indexes WHERE id=1",
-                        _ => "UPDATE abandoned_indexes SET id=2,u=20,embedding='[100,0,0]' WHERE id=1",
-                    })?;
+                    assert_eq!(
+                        tx.execute(match operation {
+                            "insert" => "INSERT INTO abandoned_indexes VALUES(2,20,'[100,0,0]')",
+                            "delete" => "DELETE FROM abandoned_indexes WHERE id=1",
+                            _ => "UPDATE abandoned_indexes SET id=2,u=20,embedding='[100,0,0]' WHERE id=1",
+                        })?,
+                        1,
+                        "the intended write must succeed before abandonment"
+                    );
                     if unwind {
                         // A real Rust stack unwind exercises the handle's field
                         // cleanup, including its eager ART and HNSW undo.
@@ -108,7 +112,14 @@ fn abandoned_raii_handle_restores_unique_and_vector_indexes_during_unwind() -> R
                         result?;
                         assert!(!unwind);
                     }
-                    Err(_) => assert!(unwind),
+                    Err(payload) => {
+                        assert!(unwind);
+                        assert_eq!(
+                            payload.downcast_ref::<&str>(),
+                            Some(&"abandoned public transaction"),
+                            "only the planned unwind after a successful write is a valid premise"
+                        );
+                    }
                 }
                 let rows = db.query("SELECT id,u FROM abandoned_indexes ORDER BY id", &[])?;
                 let actual: Vec<_> = rows.into_iter().map(|row| row.values).collect();
