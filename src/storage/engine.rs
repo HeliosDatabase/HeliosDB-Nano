@@ -2200,6 +2200,7 @@ struct IndexClaim<'a> {
     /// phantom that has to be given back.
     pending: bool,
     attempt: super::write_outcome::WriteAttempt,
+    _cardinality: super::UncommittedWriteHold,
     _vector_write: Option<VectorRowWrite<'a>>,
 }
 
@@ -2228,6 +2229,7 @@ impl<'a> IndexClaim<'a> {
         schema: &'a crate::Schema,
         tuple: &'a Tuple,
     ) -> Result<Self> {
+        let cardinality = engine.write_census.hold_for_index_insert(table_name);
         let vector_write = engine.vector_row_write(table_name, [row_id]);
         engine.claim_index_entries(table_name, row_id, schema, tuple)?;
         Ok(Self {
@@ -2238,6 +2240,7 @@ impl<'a> IndexClaim<'a> {
             tuple,
             pending: true,
             attempt: super::write_outcome::WriteAttempt::default(),
+            _cardinality: cardinality,
             _vector_write: vector_write,
         })
     }
@@ -2295,6 +2298,7 @@ struct BatchIndexClaim<'a> {
     claimed: usize,
     pending: bool,
     attempt: super::write_outcome::WriteAttempt,
+    _cardinality: super::UncommittedWriteHold,
     _vector_write: Option<VectorRowWrite<'a>>,
 }
 
@@ -2313,6 +2317,7 @@ impl<'a> BatchIndexClaim<'a> {
             claimed: 0,
             pending: true,
             attempt: super::write_outcome::WriteAttempt::default(),
+            _cardinality: engine.write_census.hold_for_index_insert(table_name),
             _vector_write: engine.vector_row_write(table_name, rows.iter().map(|(row, _)| *row)),
         };
         for (row_id, tuple) in rows {
@@ -6357,6 +6362,20 @@ impl StorageEngine {
         self.write_census.any_uncommitted_writes() && self.write_census.table_has_staged_index_removals(table)
     }
 
+    /// Begin an optimistic probe of the dirty, eagerly maintained ART. A
+    /// generation also detects a writer that both entered and exited while
+    /// the probe ran, including a multi-key IN probe.
+    pub(crate) fn cardinality_read_epoch(&self, table: &str) -> Option<u64> {
+        let epoch = self.write_census.cardinality_generation();
+        (!self.has_uncommitted_writes_for_table(table)).then_some(epoch)
+    }
+
+    pub(crate) fn cardinality_epoch_is_current(&self, table: &str, epoch: u64) -> bool {
+        // Keep the generation load LAST: membership clearing publishes its
+        // preceding epoch change before a reader can accept an idle table.
+        !self.has_uncommitted_writes_for_table(table) && self.write_census.cardinality_generation() == epoch
+    }
+
     /// Begin a transaction
     pub fn begin_transaction(&self) -> Result<Transaction> {
         // Spec R5.1: the generation first, then the snapshot.
@@ -6392,15 +6411,9 @@ impl StorageEngine {
         // `begin_autocommit_transaction` below — that path already logs per
         // statement and would double-log every autocommit write.
         txn.set_wal(self.wal_arc(), self.config.storage.logical_wal_per_statement);
-        // Explicit transactions stage writes that no other transaction may
-        // see, while eagerly mutating the shared PK ART index. Enrolling them
-        // in the census is what lets a concurrent `COUNT(*)` know it must not
-        // answer from that index. NEVER add this to
-        // `begin_autocommit_transaction` below: a statement-scoped transaction
-        // publishes within its own statement, and counting it would hold the
-        // census non-zero (and the count fast paths off) under any write load.
-        // (That one enrolls for its index REMOVALS only —
-        // `Transaction::set_removal_census`, sprinter 6bc4a4040eb7.)
+        // Explicit transactions enroll their staged writes. Autocommit uses
+        // narrower explicit index-addition/removal enrollment below: staged
+        // metadata alone must not demote cardinality probes of other tables.
         txn.set_write_census(self.write_census());
         // Spec R5.1: an explicit transaction keeps its table locks across statements.
         // NEVER on `begin_autocommit_transaction`: that one ends inside its
@@ -6443,10 +6456,9 @@ impl StorageEngine {
         // Autocommit statements log per statement; buffering those operations until the
         // commit lets them be written atomically with the data (or dropped on rollback).
         txn.set_statement_wal(self.wal.clone());
-        // sprinter 6bc4a4040eb7 (B2 follow-up): the statement's index REMOVALS
-        // are counted for its duration (never its plain writes) — see
-        // `Transaction::set_removal_census` for why, and why this is not the
-        // `set_write_census` enrollment `begin_transaction` makes.
+        // Staged metadata does not arm unrelated tables. Eager enforcing-key
+        // reservations explicitly enroll cardinality before their first index
+        // mutation; removals also arm the narrower missing-key gate.
         txn.set_removal_census(self.write_census());
         // Spec R5.4 (P12): it locks the rows it changes until it commits.
         self.attach_row_locks(&mut txn);
@@ -10331,20 +10343,21 @@ impl StorageEngine {
         // declines these fast paths for any table its transaction has written
         // (`txn_forces_slow_reads_for_table`), so read-your-own-writes still
         // comes from the write-set merge path.
-        if !has_user_branches && !self.has_uncommitted_writes_for_table(table_name) {
-            if let Some(count) = self.art_index_manager.pk_index_len(table_name) {
-                // Re-check after the probe: a transaction that armed the census
-                // between the gate above and the read here would otherwise have
-                // its staged rows counted. Costs one more atomic load.
-                if !self.has_uncommitted_writes_for_table(table_name) {
-                    tracing::debug!(
-                        phase = "count_pk_art_path",
-                        table = table_name,
-                        count = count,
-                        "COUNT(*) primary-key ART fast path completed"
-                    );
-                    return Ok(count);
-                }
+        let count_epoch = self.cardinality_read_epoch(table_name);
+        if !has_user_branches {
+            if let Some(count) = count_epoch.and_then(|epoch| {
+                let count = self.art_index_manager.pk_index_len(table_name)?;
+                #[cfg(test)]
+                super::art_manager::test_after_cardinality_probe(table_name, count);
+                self.cardinality_epoch_is_current(table_name, epoch).then_some(count)
+            }) {
+                tracing::debug!(
+                    phase = "count_pk_art_path",
+                    table = table_name,
+                    count = count,
+                    "COUNT(*) primary-key ART fast path completed"
+                );
+                return Ok(count);
             }
         }
 
@@ -10410,9 +10423,9 @@ impl StorageEngine {
         // the ART carries another transaction's staged inserts for this table
         // (and is already missing its staged deletes). `Ok(None)` sends the
         // caller to the planner path, which reads through row storage.
-        if self.has_uncommitted_writes_for_table(table_name) {
+        let Some(epoch) = self.cardinality_read_epoch(table_name) else {
             return Ok(None);
-        }
+        };
         let mut pk_cols = schema.columns.iter().filter(|col| col.primary_key);
         let pk_col = match (pk_cols.next(), pk_cols.next()) {
             (Some(col), None) => col,
@@ -10421,9 +10434,12 @@ impl StorageEngine {
         let count = self
             .art_index_manager
             .pk_index_count_int_range(table_name, &pk_col.data_type, lower, upper);
-        // Re-check: a transaction that armed the census between the gate above
-        // and the probe would otherwise have its staged rows counted here.
-        if self.has_uncommitted_writes_for_table(table_name) {
+        #[cfg(test)]
+        if let Some(count) = count {
+            super::art_manager::test_after_cardinality_probe(table_name, count);
+        }
+        // Also reject a writer that finished between the two probes.
+        if !self.cardinality_epoch_is_current(table_name, epoch) {
             return Ok(None);
         }
         Ok(count)

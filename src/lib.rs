@@ -17887,6 +17887,7 @@ impl EmbeddedDatabase {
             };
             // Spec R5.4 (review F3): a key another open transaction took out is waited
             // for (`StorageEngine::wait_out_key_hold`), then claimed again.
+            txn.note_index_key_insertion(table_name);
             loop {
                 match self.storage.art_indexes().on_insert_tuple_collect_index_values_as(
                     table_name,
@@ -19005,6 +19006,7 @@ impl EmbeddedDatabase {
         schema: &Schema,
         tuple: &Tuple,
     ) -> Result<()> {
+        txn.note_index_key_insertion(table_name);
         loop {
             match self.storage.art_indexes().reserve_insert_tuple_as(
                 table_name,
@@ -19347,9 +19349,7 @@ impl EmbeddedDatabase {
         // The census gate is per TABLE, so it waits until the table is known:
         // a transaction staging rows in `orders` must not push `COUNT(*) FROM
         // users` off this path. Re-checked after the probes below.
-        if self.storage.has_uncommitted_writes_for_table(table_name) {
-            return None;
-        }
+        let count_epoch = self.storage.cardinality_read_epoch(table_name)?;
 
         let pk_col = if count_arg == "*" { None } else { Some(count_arg) };
         let spec = match self.fast_count_pk_spec(table_name, pk_col)? {
@@ -19378,7 +19378,9 @@ impl EmbeddedDatabase {
         // query that raced a write transaction for this table; it is the
         // difference between "may be stale by a microsecond" (fine — so is every
         // count) and "reports rows that were never committed" (not fine).
-        if self.storage.has_uncommitted_writes_for_table(&spec.table_name) {
+        #[cfg(test)]
+        storage::art_manager::test_after_cardinality_probe(&spec.table_name, count);
+        if !self.storage.cardinality_epoch_is_current(&spec.table_name, count_epoch) {
             return None;
         }
 
