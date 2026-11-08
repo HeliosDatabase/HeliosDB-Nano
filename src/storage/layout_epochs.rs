@@ -1353,3 +1353,7 @@ mod tests {
 #[cfg(test)]
 #[path = "branch_layout_identity_tests.rs"]
 mod branch_layout_identity_tests;
+
+#[cfg(all(test, feature = "ha-tier1"))]
+#[path = "branch_layout_physical_tests.rs"]
+mod branch_layout_physical_tests;

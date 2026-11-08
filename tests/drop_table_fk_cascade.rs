@@ -38,11 +38,15 @@ fn fixture(history: bool) -> Result<EmbeddedDatabase> {
     db.execute("CREATE TABLE refd_table (id INT PRIMARY KEY)")?;
     db.execute("CREATE TABLE healthy_parent (id INT PRIMARY KEY)")?;
     db.execute("INSERT INTO healthy_parent VALUES (7)")?;
+    db.execute("CREATE TABLE trig_table (id INT PRIMARY KEY, fk INT, h INT)")?;
+    // CREATE persists FK definitions but does not install their optional
+    // lookup graphs. ALTER owns the actual registration/backfill path, so this
+    // fixture proves that CASCADE retires a graph which really existed.
     db.execute(
-        "CREATE TABLE trig_table (id INT PRIMARY KEY, fk INT, h INT, \
-         CONSTRAINT gone_fk FOREIGN KEY (fk) REFERENCES refd_table(id) DEFERRABLE INITIALLY DEFERRED, \
-         CONSTRAINT kept_fk FOREIGN KEY (h) REFERENCES healthy_parent(id))",
+        "ALTER TABLE trig_table ADD CONSTRAINT gone_fk FOREIGN KEY (fk) \
+         REFERENCES refd_table(id) DEFERRABLE INITIALLY DEFERRED",
     )?;
+    db.execute("ALTER TABLE trig_table ADD CONSTRAINT kept_fk FOREIGN KEY (h) REFERENCES healthy_parent(id)")?;
     db.execute("INSERT INTO trig_table VALUES (0, NULL, 7)")?;
     require(
         db.storage.art_indexes().get_fk_info("gone_fk").is_some()
