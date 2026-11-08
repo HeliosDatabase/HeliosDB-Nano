@@ -1,0 +1,88 @@
+{
+  "status": "FROZEN PREPARATION ONLY",
+  "parent": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates-v4",
+  "parent_manifest": {
+    "path": "v4-input-sha256.json",
+    "sha256": "b3507d91cb97a38cb502f3023817660a3f74859ed7d0ff4d0719ed66e8083c0a"
+  },
+  "modified": {
+    "README.md": {
+      "before": "05a170dee0d68c0b216bbf9e11c552103b1f4853f1962cfdd5176c84a2001438",
+      "after": "733d0013dfcedc9526daf59fffc5138a347e9cc9839357ab0be813483b196810"
+    },
+    "ROOT-STATUS.md": {
+      "before": "4fb18f44d9107b24fe422590e95eb1d6acba1f221136ff7139ee53393a10bb4f",
+      "after": "f42a6b4a6108229329a39b43f988fa6aa6d56dc25d8f69f2cbb6db3bc6b60bd2"
+    },
+    "WIP-STATUS.json": {
+      "before": "396d148254cda9391b241632d2c36434d68010d0461c4c637748b82d5a604408",
+      "after": "b880d3385ed67b8c64861447f7ac1a37bf1c0a68c14693d4219f0632f7aa010f"
+    },
+    "commands.json": {
+      "before": "a0475c63a627a2dfc63e300d5a878491e672834f7d3905a4d2ee3a5c770a9aab",
+      "after": "f6169256f15b27318e3e2011752a08f531f39ae12283412ed1f0022aa2172e02"
+    },
+    "ignored-diagnostics.md": {
+      "before": "5fd6eb2b3d627662c3080a4e7ad6c39fc32c6411b092ffadb2ee19fda2261ae8",
+      "after": "46760a1684dbcbc7e300bc48eadebe3b7ade9a057f092d8a3a1df81550ad4b8e"
+    },
+    "requirements.json": {
+      "before": "7e9d5bfe3cabbd2ab090ea914c99a3117acfa72aace63ac4946052eab0456ad2",
+      "after": "22084791b6fe9a0643076c7937f1d3ab02338bdd4a62258e3d885078246048e0"
+    },
+    "requirements.md": {
+      "before": "24e3b7d9557c6b75d3822e2ec0935c3d26ef4c5b85a850cfd9efbf4a40c35d77",
+      "after": "efbb52f888461f543cf2ce90256fb8e9ffc5bb804762a5495c7e290cf375800f"
+    },
+    "run_stage.py": {
+      "before": "5f5f8c8b92c6fd244683d1fc6d6170c1d5c0e555f3ce0437cf1f88b74a398173",
+      "after": "34027b4a9ebc2f2bc9cd7e352fa42022fdab873dd59bdae2e7e2084fed98eb3f"
+    },
+    "selfcheck-receipt.json": {
+      "before": "21806bf4f954330971dc564fb9c2cff63ef28bcc95160a6d93a5108ad155fa29",
+      "after": "935b55e9fadc1c3a616f85d8a23e9d589677793a3891f06aadf2501c4fde7273"
+    },
+    "selfcheck.py": {
+      "before": "3f73873d0012bbeaebecf47be8a1ce3799fc6aeb140dd3886402dcff7de63837",
+      "after": "cdd65a07ffccedcd93ab5c68f4b85477b889bd4a64743c1b83e7117f01c2d168"
+    }
+  },
+  "copied_unchanged": [
+    "clippy-diff.py",
+    "control-identities.json",
+    "inherited-wip-identity.json",
+    "inventory.py",
+    "readiness-cases.json",
+    "readiness20.py",
+    "run-one.sh"
+  ],
+  "new": [
+    "HANDOFF.md",
+    "REVIEW.md",
+    "expectation-source-check.json",
+    "ort-prerequisite-reference.json",
+    "syntax-check-receipt.json",
+    "v4-input-sha256.json"
+  ],
+  "historical_not_copied": [
+    "bundle-sha256.json",
+    "capture-stage14-prefinal/empty-suite-tiers.md",
+    "capture-stage14-prefinal/expected-manifest.json",
+    "capture-stage14-prefinal/source-sha256.json",
+    "capture-stage15-prefinal/empty-suite-tiers.md",
+    "capture-stage15-prefinal/expected-manifest.json",
+    "capture-stage15-prefinal/source-sha256.json",
+    "capture-stage16-r12-prefinal/empty-suite-tiers.md",
+    "capture-stage16-r12-prefinal/expected-manifest.json",
+    "capture-stage16-r12-prefinal/source-sha256.json",
+    "inherited-r5-empty-suite-tiers.md",
+    "inherited-r5-expected-manifest.json",
+    "inherited-r5-source-sha256.json",
+    "inherited-v3-bundle-sha256.json",
+    "stage15-root-source-join.json",
+    "v2-input-sha256.json"
+  ],
+  "product_runs": 0,
+  "cargo_runs": 0,
+  "final_source_capture": null
+}
