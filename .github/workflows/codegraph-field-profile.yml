@@ -1,0 +1,67 @@
+name: CodeGraph unchanged field owned-process diagnostic (no publish)
+on:
+  push:
+    branches: ['ci/4420-codegraph-field-profile-*']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Preserve source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: e503c537a35ae4c108ddf1e5e73ea1a24ec615ee
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify pinned controller and source model
+        working-directory: controller
+        run: |
+          python3 - <<'BOOT'
+          import hashlib
+          from pathlib import Path
+          for path, wanted in {
+              '.github/4420-codegraph-field-profile/controller.py': '059895ee51f39d37cad0e5872f4e6c1ed4c74e911de4e9f15b2e9b83acd074b1',
+              '.github/4420-codegraph-field-profile/model.json': 'e7df05ac6b25f242306d286f22ba09166f34ba7abca52a5bbb07df2a6f96ed3f',
+          }.items():
+              if hashlib.sha256(Path(path).read_bytes()).hexdigest() != wanted:
+                  raise SystemExit('diagnostic bootstrap changed: ' + path)
+          BOOT
+      - name: Download and verify exactly the original native artifact
+        working-directory: controller
+        env:
+          NANO_ARTIFACT_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/4420-codegraph-field-profile/controller.py             --download-only --download "$RUNNER_TEMP/codegraph-field-artifact"             --model-sha256 e7df05ac6b25f242306d286f22ba09166f34ba7abca52a5bbb07df2a6f96ed3f
+      - name: Sample only the owned native PID and threads under the original600s bound
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_profile_unit="nano-codegraph-profile-${GITHUB_RUN_ID}"
+          sudo systemd-run --unit "$nano_profile_unit" --wait --pipe --collect             -p User="$(id -un)" -p Group="$(id -gn)"             -p WorkingDirectory="$GITHUB_WORKSPACE/controller"             -p MemoryMax=24G -p MemorySwapMax=0 -p KillMode=control-group             -p RuntimeMaxSec=720 -p TimeoutStopSec=30             --setenv="PATH=$PATH" --setenv="GITHUB_SHA=$GITHUB_SHA"             --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1             python3 .github/4420-codegraph-field-profile/controller.py               --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product"               --download "$RUNNER_TEMP/codegraph-field-artifact"               --out "$RUNNER_TEMP/codegraph-field-state" --model-sha256 e7df05ac6b25f242306d286f22ba09166f34ba7abca52a5bbb07df2a6f96ed3f
+      - name: Preserve genuine native red and state evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegraph-field-state-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/codegraph-field-state/**
+            ${{ runner.temp }}/codegraph-field-artifact/download-identity.json
+            ${{ runner.temp }}/codegraph-field-artifact/provider-metadata.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
