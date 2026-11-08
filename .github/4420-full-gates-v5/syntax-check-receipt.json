@@ -1,0 +1,13 @@
+{
+  "status": "AST and bash syntax only; no native execution",
+  "python_ast": [
+    "run_stage.py",
+    "selfcheck.py",
+    "native_ci_proof.py",
+    "test_native_ci_proof.py",
+    "test_v8_consumer.py"
+  ],
+  "bash_n": [
+    "benches/public/common.sh"
+  ]
+}

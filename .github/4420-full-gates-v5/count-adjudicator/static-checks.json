@@ -1,0 +1,51 @@
+{
+  "status": "STATIC_SOURCE_AND_SYNTAX_ONLY",
+  "pass": true,
+  "native_binaries_invoked": 0,
+  "cargo_compiler_invocations": 0,
+  "rust_sources_changed": false,
+  "critical_fixture_pins": [
+    {
+      "path": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage28-final-settlement/src/storage/point_write_cap_tests.rs",
+      "sha256": "b57ab83fb393eeaade83980b646fd89a9d84ab2c80ac80e2bd121a4fad0b199d",
+      "parents": 5,
+      "nominal_cells": 63
+    },
+    {
+      "path": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage28-final-settlement/tests/sequence_setval_outcomes.rs",
+      "sha256": "37a8fa77ece7d9562234b82ce4be72dde8becab2bc51a5602284456b168a1d7f",
+      "parents": 7,
+      "nominal_cells": 36
+    },
+    {
+      "path": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage28-final-settlement/src/sql/routine_trigger_lookup_tests.rs",
+      "sha256": "e6aa1066dea729bdd7875dfe016772e95c9917d937b5a79fd4c0eca0684c9a63",
+      "parents": 2,
+      "nominal_cells": 8
+    },
+    {
+      "path": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage28-final-settlement/tests/sequence_refill_funnel.rs",
+      "sha256": "27f584016be5d2b83fc06f94659abbe9d69de772a0ffa5ae02ca1bbcdef37983",
+      "parents": 4,
+      "nominal_cells": 16
+    },
+    {
+      "path": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage28-final-settlement/src/sql/routine_uninstalled_owner_tests.rs",
+      "sha256": "9907e9f7b02b3ab506f17bf76b6da46280ad1c5af3dfadec083333ff7721cf85",
+      "parents": 3,
+      "nominal_cells": 10
+    }
+  ],
+  "r57": {
+    "path": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/integration-stage28-final-settlement/tests/row_shape.rs",
+    "sha256": "bbb601c20d917be5e2e1b68162ebeaabd7da1d10b1f0b1f29692804f3f887a44",
+    "parents": 5,
+    "source_backed_cases": 10,
+    "dimension": "logical_wal_per_statement=false/true"
+  },
+  "python_ast_files": [
+    "adjudicate.py",
+    "selfcheck.py"
+  ],
+  "shell_syntax": "bash -n collect-gated.sh exited0 (no collector execution)"
+}

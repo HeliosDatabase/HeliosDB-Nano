@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "frozen": true,
+  "status": "SOURCE_PREPARED_STATIC_VALIDATION_ONLY; ROOT_NATIVE_LIST_EXECUTION_PENDING",
+  "release_acceptance_pass": false,
+  "native_binaries_executed_during_preparation": 0,
+  "cargo_compiler_invocations_during_preparation": 0,
+  "compilation_freshness_proof": "Not established by native listings/current-checkout hashes; root must retain separate fresh-target/build-artifact/source linkage.",
+  "critical_default": {
+    "parents": 8,
+    "cells": 73
+  },
+  "critical_internal_optins": {
+    "parents": 21,
+    "cells": 133
+  },
+  "r57": {
+    "parents": 5,
+    "source_backed_native_cases": 10,
+    "dimension": "logical_wal_per_statement=false/true; NOT TT"
+  },
+  "package": "full-tier-count-adjudicator-source32-v3",
+  "created_utc": "2026-11-08T09:21:12.277268+00:00",
+  "predecessor_manifest_sha256": "02a9a0898e9f58fda682552a52c92ea5e283556022fa0f9b8c3e8679cd540c5a",
+  "accepted_bundle": "final-gates-v8-public-proof",
+  "accepted_bundle_sha256": "f80f9a18a3c2d4d008049ddb8e1261a393c8dcf2aff819c4ea89dfe4a1d6572f",
+  "preserved_legacy_receipt_schema": true,
+  "raw_log_attestation": "Unchanged runner raw-log SHA first bound at postrun intake; no retroactive original-run hash claim.",
+  "accepts_final_source_capture": "Explicit fresh v6 relative-key source/expected manifest paths and supplied exactSHA256s, not hardcoded source identity; critical unchanged Rust fixtures remain pinned.",
+  "static_validation": {
+    "receipt": "selfcheck-v6-r1.json",
+    "positive": 17,
+    "rejections": 146,
+    "child_processes": 0,
+    "syntax": "Python3.11 AST, provenance/semantic equivalence checks; no native execution"
+  },
+  "peer_review": "Final bounded peer review requested externally; no runtime acceptance.",
+  "changes_vs_v1": "Only supported V6 provenance pin and module docstring, selfcheck bundle path and derived package/README/HANDOFF references. All20 function ASTs and critical bytes identical. Legacy v5 field/kind names unchanged.",
+  "files": {
+    "HANDOFF.md": {
+      "sha256": "b2dd3a6305c467b71f6af8aa16dc7713432e8ec02bbabc28d66beee77beb10b6"
+    },
+    "README.md": {
+      "sha256": "c133e45ba3f48f53cbd3bb68268ccbb51538428713f791e0f43ceb6ba810d57d"
+    },
+    "REVIEW-CHECKPOINT-1.json": {
+      "sha256": "3f6c47510bef1c0a06a98666f1d7f9012f61e3ab358fa92b617f6558ea7a0574"
+    },
+    "REVIEW-CHECKPOINT-2.json": {
+      "sha256": "df164720ef372469b75ca96c153d561f873378b312bf5fd55b13bb0116b0d6a2"
+    },
+    "adjudicate.py": {
+      "sha256": "b222f7bc417c20ebd223f49f2ec79abeab4d420a5252c30415c48cbfb349bff3"
+    },
+    "collect-gated.sh": {
+      "sha256": "cb82985ada6a9024be0139d6f41efdba706f666572c5f6347e23f5e2a7e877b9"
+    },
+    "critical-expectations.json": {
+      "sha256": "c227471f832dd7f77f8b7cf2deeac02e656c66837da2640ddd61f617bf39d9b7"
+    },
+    "lineage-checks.json": {
+      "sha256": "5889b65c7245cadcdb66c31a4826fd76af36b7d234a09cfaf825994124e97a86"
+    },
+    "primary-source.json": {
+      "sha256": "a1854bf6b9e714ceb3238446e407c9385a3b6c47cde198b589da2d63131c5214"
+    },
+    "selfcheck-r1.json": {
+      "sha256": "24dcbb9f9764afbfb8c87e80f3950b7a53dcf5bee32a5d299955414a0c036cdc"
+    },
+    "selfcheck-r2.json": {
+      "sha256": "43e1fc31ee9dad83c9b79e25b1fc8fe924f48336d4e1f9e9be4d74c87f8791df"
+    },
+    "selfcheck-r3.json": {
+      "sha256": "cf71c7bb7d49008f79c59c6f26ecd1d1d261579f822dd9b37abe8038bb261f4f"
+    },
+    "selfcheck-r4.json": {
+      "sha256": "568bb14767dcea7c0430863cf06dde549469d4e41d7f8b50ee495aef727705c6"
+    },
+    "selfcheck-v6-r1.json": {
+      "sha256": "ce1b74d791ed65698bb5cd1b9d716c76365a12affd04650d19e7ae4dea09f872"
+    },
+    "selfcheck.py": {
+      "sha256": "c053baaf4beefd704b66fa1b58423e89e4c21d819bad1b2bf1ee081e76e2e671"
+    },
+    "static-checks-v6.json": {
+      "sha256": "2d75f317274b8af2294824c979225980fcd80548c30efe5c0203984f47d77289"
+    },
+    "static-checks.json": {
+      "sha256": "428dabff2908ecf2ed99eb74611d661966c5b2060335d0920a5cbe2fa6cc1abd"
+    },
+    "v1-to-v2.delta.patch": {
+      "sha256": "e83cd9fc349e10d654c96e8362157bc85c1cb017c718c0c47ad9ee0909cae255"
+    }
+  },
+  "changes_vs_v2": "Only critical point_write_cap_tests.rs source SHA refresh after source32 reviewed lint changes; exact5parents/63cells and all marker/count/listing/receipt algorithms unchanged. All other17 installed files byte-identical.",
+  "source32_provenance": {
+    "product_commit": "caa9557118eaa32f08856b753c17c52602c208b2",
+    "freeze_sha256": "802651f1cca97171a6d9a28c135e604b580ba9552f72d8351a9e20604b985551",
+    "critical_source": "src/storage/point_write_cap_tests.rs",
+    "before_sha256": "b57ab83fb393eeaade83980b646fd89a9d84ab2c80ac80e2bd121a4fad0b199d",
+    "after_sha256": "f34496f243b41e856aac0bccd0068ccb4010a3fd4509f929b3f9f905a4cdde61",
+    "counting_logic_unchanged": true,
+    "install_file_count": 19,
+    "historical_source28_fields_preserved": true
+  },
+  "source34_product": "00b58922b030797da5b262dd680442eb93f37038",
+  "source34_targets": 451,
+  "changes_vs_v3": "V8 provenance; additive source-pinned layout/boundary/WAL/CodeGraph exact critical names+markers. Only critical_checks function adds optional tier selection and case_count display; new marker regex recognizes exact new families. All native inventory/count/discovery/source/resource logic retained.",
+  "preparation_selfcheck": {
+    "path": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/full-tier-count-adjudicator-source34-v4/selfcheck-source34-v4.json",
+    "sha256": "06cdcf954849b67ff7274f2963a781ec8fa9a0a843117dccaaae3c45b6a0a0ed",
+    "positive": 20,
+    "rejected": 747,
+    "children": 0
+  },
+  "source_checkpoint_sha256": "233e75905a02af0b9d44f29b3707988b06199cdf30648917907c12c4c2fbbf02"
+}

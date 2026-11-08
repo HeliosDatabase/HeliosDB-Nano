@@ -1,0 +1,10 @@
+{
+  "status": "SOURCE CHECKPOINT FOR READ-ONLY PEER REVIEW; no native/Cargo execution",
+  "source": {
+    "adjudicate.py": "a18f657740a4f5077e3898c07a9dad48b4da778940e3895eb04a5f5f1a0e8cfe",
+    "critical-expectations.json": "f0e314cb9cdaf01369ba0723fc6df31c05f5146dc5a884124ec7e87ac4f64e8a",
+    "collect-gated.sh": "cb82985ada6a9024be0139d6f41efdba706f666572c5f6347e23f5e2a7e877b9",
+    "selfcheck.py": "f29f675154515655fffce0695aa7233e216608a8612d8efa85dbba3a88b4f700",
+    "selfcheck-r1.json": "24dcbb9f9764afbfb8c87e80f3950b7a53dcf5bee32a5d299955414a0c036cdc"
+  }
+}

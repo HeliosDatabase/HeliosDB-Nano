@@ -1,0 +1,19 @@
+{
+  "status": "SOURCE CHECKPOINT2 FOR READ-ONLY PEER REVIEW; no native/Cargo execution",
+  "changes_from_checkpoint1": [
+    "Remove private libtest invoker environment after all environment merge, before Popen; record names only.",
+    "Verify/pin daemon binary artifact too without listing it; recheck native hashes via complete artifact pins.",
+    "Require ordinary expected target/source mapping; clarify malformed input refusal."
+  ],
+  "source": {
+    "adjudicate.py": "64ee39d64ecb996d1af41abea30e1d8db9c2f2f4ea9f0251b163f4a604a52ba2",
+    "critical-expectations.json": "f0e314cb9cdaf01369ba0723fc6df31c05f5146dc5a884124ec7e87ac4f64e8a",
+    "collect-gated.sh": "cb82985ada6a9024be0139d6f41efdba706f666572c5f6347e23f5e2a7e877b9",
+    "selfcheck.py": "e4b7e630f9017546d71abe15fcdab989a46bc059539ad439dffbbcc67b3e1555",
+    "selfcheck-r4.json": "568bb14767dcea7c0430863cf06dde549469d4e41d7f8b50ee495aef727705c6",
+    "README.md": "da4f5d0bfc0f09fe238099736f42a3d88b187406b75c0c8da8f3edbea6e91702",
+    "HANDOFF.md": "728721093cdc9060e1eae1d5fe57ce92a044e02cd056d23fee5c13eb7b8b8ceb",
+    "primary-source.json": "a1854bf6b9e714ceb3238446e407c9385a3b6c47cde198b589da2d63131c5214",
+    "static-checks.json": "428dabff2908ecf2ed99eb74611d661966c5b2060335d0920a5cbe2fa6cc1abd"
+  }
+}

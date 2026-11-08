@@ -1,0 +1,13 @@
+{
+  "actual_v6_bundle_all24pins_verified": true,
+  "lineage_checks_sha256": "5889b65c7245cadcdb66c31a4826fd76af36b7d234a09cfaf825994124e97a86",
+  "native_compiler_cargo_child_process_execution": false,
+  "python_requirement": "3.11+ (tomllib; same as V1)",
+  "release_acceptance_pass": false,
+  "selfcheck": "selfcheck-v6-r1.json",
+  "selfcheck_positive": 17,
+  "selfcheck_rejections": 146,
+  "selfcheck_sha256": "ce1b74d791ed65698bb5cd1b9d716c76365a12affd04650d19e7ae4dea09f872",
+  "syntax": "AST source only",
+  "wrong_v5_bundle_rejected": true
+}

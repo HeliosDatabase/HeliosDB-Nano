@@ -1,0 +1,455 @@
+{
+  "schema_version": 1,
+  "release_acceptance_pass": false,
+  "source28_projected_whole": {
+    "path": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/combined-r22-projected-source.sha256.json",
+    "sha256": "aff1e198096c35e9de74e43e7936acbe005888cc0213d8b5f8ff93ed3ee8b54e"
+  },
+  "independent_case_manifest": {
+    "path": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/r22-settlement-recipe-v1/expected-probes.json",
+    "sha256": "0f7b2f04271459b6953b41d83d6a7f985bb70ffb9281eba6bd8ce58764942f1c"
+  },
+  "probes": [
+    {
+      "target": "unittests src/lib.rs",
+      "source": "src/storage/point_write_cap_tests.rs",
+      "source_sha256": "f34496f243b41e856aac0bccd0068ccb4010a3fd4509f929b3f9f905a4cdde61",
+      "internal_only": false,
+      "names": [
+        "storage::write_gate::point_write_cap_tests::point_put_delete_obey_the_actual_encoder_ceiling_for_keyclasses_and_options",
+        "storage::write_gate::point_write_cap_tests::put_cap_refusal_preserves_the_next_actual_native_fault_and_retry",
+        "storage::write_gate::point_write_cap_tests::point_cap_preserves_role_precedence_and_closes_layout_changes_on_refusal",
+        "storage::write_gate::point_write_cap_tests::real_b4_inline_copies_are_included_in_the_point_group_ceiling",
+        "storage::write_gate::point_write_cap_tests::point_owners_measure_admit_and_write_the_same_single_asref_snapshot"
+      ],
+      "markers": {
+        "POINT_CAP_ENCODER_CELL Put prefix=meta:seqstate: sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=meta:seqstate: sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=meta:seqstate: sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=meta:seqstate: sync=true boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=meta:seqstate: sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=meta:seqstate: sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=meta:seqstate: sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=meta:seqstate: sync=true boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=counter: sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=counter: sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=counter: sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=counter: sync=true boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=counter: sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=counter: sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=counter: sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=counter: sync=true boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=dict:cap_probe: sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=dict:cap_probe: sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=dict:cap_probe: sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=dict:cap_probe: sync=true boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=dict:cap_probe: sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=dict:cap_probe: sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=dict:cap_probe: sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=dict:cap_probe: sync=true boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=meta:table: sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=meta:table: sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=meta:table: sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=meta:table: sync=true boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=meta:table: sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=meta:table: sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=meta:table: sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=meta:table: sync=true boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=__vidx:999:vec: sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=__vidx:999:vec: sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=__vidx:999:vec: sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=__vidx:999:vec: sync=true boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=__vidx:999:vec: sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=__vidx:999:vec: sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=__vidx:999:vec: sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=__vidx:999:vec: sync=true boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=scn_map:@s sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=scn_map:@s sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=scn_map:@s sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Put prefix=scn_map:@s sync=true boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=scn_map:@s sync=false boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=scn_map:@s sync=false boundary=128": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=scn_map:@s sync=true boundary=127": 1,
+        "POINT_CAP_ENCODER_CELL Delete prefix=scn_map:@s sync=true boundary=128": 1,
+        "POINT_CAP_NATIVE_CELL after=false sync=false": 1,
+        "POINT_CAP_NATIVE_CELL after=false sync=true": 1,
+        "POINT_CAP_NATIVE_CELL after=true sync=false": 1,
+        "POINT_CAP_NATIVE_CELL after=true sync=true": 1,
+        "POINT_CAP_ROLE_CELL fenced=false Put": 1,
+        "POINT_CAP_ROLE_CELL fenced=false Delete": 1,
+        "POINT_CAP_ROLE_CELL fenced=true Put": 1,
+        "POINT_CAP_ROLE_CELL fenced=true Delete": 1,
+        "POINT_CAP_LAYOUT_CELL Put": 1,
+        "POINT_CAP_LAYOUT_CELL Delete": 1,
+        "POINT_CAP_B4_CELL tt=false": 1,
+        "POINT_CAP_B4_CELL tt=true": 1,
+        "POINT_ASREF_SNAPSHOT_CELL put_key": 1,
+        "POINT_ASREF_SNAPSHOT_CELL put_value": 1,
+        "POINT_ASREF_SNAPSHOT_CELL delete_key": 1
+      },
+      "families": [
+        "POINT_CAP_ENCODER_CELL",
+        "POINT_CAP_NATIVE_CELL",
+        "POINT_CAP_ROLE_CELL",
+        "POINT_CAP_LAYOUT_CELL",
+        "POINT_CAP_B4_CELL",
+        "POINT_ASREF_SNAPSHOT_CELL"
+      ]
+    },
+    {
+      "target": "sequence_setval_outcomes",
+      "source": "tests/sequence_setval_outcomes.rs",
+      "source_sha256": "37a8fa77ece7d9562234b82ce4be72dde8becab2bc51a5602284456b168a1d7f",
+      "internal_only": true,
+      "names": [
+        "known_cap_refusal_preserves_old_window_and_retry",
+        "native_before_state_apply_preserves_old_window",
+        "native_after_state_apply_honors_not_called_target",
+        "native_after_state_apply_honors_called_target",
+        "late_applied_flush_error_honors_not_called_target",
+        "late_applied_flush_error_honors_called_target",
+        "unreadable_applied_state_fences_own_namespace_without_native_repair"
+      ],
+      "markers": {
+        "sequence-setval-outcome Cap/[false, true]=8": 8,
+        "sequence-setval-outcome Before/[false, true]=8": 8,
+        "sequence-setval-outcome After/[false]=4": 4,
+        "sequence-setval-outcome After/[true]=4": 4,
+        "sequence-setval-outcome Late/[false]=4": 4,
+        "sequence-setval-outcome Late/[true]=4": 4,
+        "sequence-setval-outcome unresolved=4": 4
+      },
+      "families": [
+        "sequence-setval-outcome"
+      ]
+    },
+    {
+      "target": "unittests src/lib.rs",
+      "source": "src/sql/routine_trigger_lookup_tests.rs",
+      "source_sha256": "e6aa1066dea729bdd7875dfe016772e95c9917d937b5a79fd4c0eca0684c9a63",
+      "internal_only": true,
+      "names": [
+        "sql::functions::routine_trigger_lookup_tests::fenced_before_insert_recipe_refuses_before_any_trigger_publication",
+        "sql::functions::routine_trigger_lookup_tests::ordinary_missing_and_unsupported_recipes_stay_inert_and_healthy_recipe_rewrites"
+      ],
+      "markers": {
+        "ROUTINE_TRIGGER_FENCE_CELL params=false tt=false": 1,
+        "ROUTINE_TRIGGER_COMPAT_CELL params=false tt=false": 1,
+        "ROUTINE_TRIGGER_FENCE_CELL params=false tt=true": 1,
+        "ROUTINE_TRIGGER_COMPAT_CELL params=false tt=true": 1,
+        "ROUTINE_TRIGGER_FENCE_CELL params=true tt=false": 1,
+        "ROUTINE_TRIGGER_COMPAT_CELL params=true tt=false": 1,
+        "ROUTINE_TRIGGER_FENCE_CELL params=true tt=true": 1,
+        "ROUTINE_TRIGGER_COMPAT_CELL params=true tt=true": 1
+      },
+      "families": [
+        "ROUTINE_TRIGGER_FENCE_CELL",
+        "ROUTINE_TRIGGER_COMPAT_CELL"
+      ]
+    },
+    {
+      "target": "sequence_refill_funnel",
+      "source": "tests/sequence_refill_funnel.rs",
+      "source_sha256": "27f584016be5d2b83fc06f94659abbe9d69de772a0ffa5ae02ca1bbcdef37983",
+      "internal_only": true,
+      "names": [
+        "managed_refill_cap_is_refused_before_native_and_retries",
+        "managed_refill_native_before_error_preserves_state_and_retries",
+        "managed_refill_native_after_error_skips_unserved_block_and_reopens",
+        "managed_refill_late_error_skips_unserved_block_and_reopens"
+      ],
+      "markers": {
+        "sequence-refill-funnel Cap=4": 4,
+        "sequence-refill-funnel Before=4": 4,
+        "sequence-refill-funnel After=4": 4,
+        "sequence-refill-funnel Late=4": 4
+      },
+      "families": [
+        "sequence-refill-funnel"
+      ]
+    },
+    {
+      "target": "unittests src/lib.rs",
+      "source": "src/sql/routine_uninstalled_owner_tests.rs",
+      "source_sha256": "9907e9f7b02b3ab506f17bf76b6da46280ad1c5af3dfadec083333ff7721cf85",
+      "internal_only": false,
+      "names": [
+        "sql::udf_bridge::routine_uninstalled_owner_tests::engine_scope_without_installed_bridge_never_executes_another_database_body",
+        "sql::udf_bridge::routine_uninstalled_owner_tests::contextless_public_install_and_resolve_keep_their_legacy_behavior",
+        "sql::udf_bridge::routine_uninstalled_owner_tests::unregistered_raw_engine_scope_never_borrows_the_sequence_fallback_database_bridge"
+      ],
+      "markers": {
+        "ROUTINE_UNINSTALLED_OWNER_CELL with_schema=false tt=false": 1,
+        "ROUTINE_UNREGISTERED_SCOPE_CELL with_schema=false tt=false": 1,
+        "ROUTINE_UNINSTALLED_OWNER_CELL with_schema=false tt=true": 1,
+        "ROUTINE_UNREGISTERED_SCOPE_CELL with_schema=false tt=true": 1,
+        "ROUTINE_UNINSTALLED_OWNER_CELL with_schema=true tt=false": 1,
+        "ROUTINE_UNREGISTERED_SCOPE_CELL with_schema=true tt=false": 1,
+        "ROUTINE_UNINSTALLED_OWNER_CELL with_schema=true tt=true": 1,
+        "ROUTINE_UNREGISTERED_SCOPE_CELL with_schema=true tt=true": 1,
+        "ROUTINE_CONTEXTLESS_LEGACY_CELL with_schema=false": 1,
+        "ROUTINE_CONTEXTLESS_LEGACY_CELL with_schema=true": 1
+      },
+      "families": [
+        "ROUTINE_UNINSTALLED_OWNER_CELL",
+        "ROUTINE_UNREGISTERED_SCOPE_CELL",
+        "ROUTINE_CONTEXTLESS_LEGACY_CELL"
+      ]
+    },
+    {
+      "target": "unittests src/lib.rs",
+      "source": "src/layout_error_retry_tests.rs",
+      "source_sha256": "e8f8a8f3df955db9986f66aeb687252fd978e808eeb12aed4513a315d4ee44dd",
+      "internal_only": false,
+      "names": [
+        "sql::executor::scan::layout_error_retry_tests::indexed_layout_overlap_replans_the_actual_stale_predicate",
+        "sql::executor::scan::layout_error_retry_tests::a_current_layout_keeps_the_real_type_error_without_repeating_it",
+        "sql::executor::scan::layout_error_retry_tests::a_sequence_side_effect_refuses_changed_layout_without_repeating_it"
+      ],
+      "markers": {
+        "layout-error-overlap-premise params=false warm=false history=false volatile=false drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=2": 1,
+        "layout-error-retry-cell params=false warm=false history=false volatile=false attempts=2": 1,
+        "layout-error-overlap-premise params=false warm=true history=false volatile=false drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=2": 1,
+        "layout-error-retry-cell params=false warm=true history=false volatile=false attempts=2": 1,
+        "layout-error-overlap-premise params=false warm=false history=false volatile=true drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=1": 1,
+        "layout-error-retry-cell params=false warm=false history=false volatile=true attempts=1": 1,
+        "layout-error-current-cell params=false history=false attempts=1": 1,
+        "layout-error-overlap-premise params=true warm=false history=false volatile=false drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=2": 1,
+        "layout-error-retry-cell params=true warm=false history=false volatile=false attempts=2": 1,
+        "layout-error-overlap-premise params=true warm=true history=false volatile=false drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=2": 1,
+        "layout-error-retry-cell params=true warm=true history=false volatile=false attempts=2": 1,
+        "layout-error-overlap-premise params=true warm=false history=false volatile=true drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=1": 1,
+        "layout-error-retry-cell params=true warm=false history=false volatile=true attempts=1": 1,
+        "layout-error-current-cell params=true history=false attempts=1": 1,
+        "layout-error-overlap-premise params=false warm=false history=true volatile=false drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=2": 1,
+        "layout-error-retry-cell params=false warm=false history=true volatile=false attempts=2": 1,
+        "layout-error-overlap-premise params=false warm=true history=true volatile=false drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=2": 1,
+        "layout-error-retry-cell params=false warm=true history=true volatile=false attempts=2": 1,
+        "layout-error-overlap-premise params=false warm=false history=true volatile=true drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=1": 1,
+        "layout-error-retry-cell params=false warm=false history=true volatile=true attempts=1": 1,
+        "layout-error-current-cell params=false history=true attempts=1": 1,
+        "layout-error-overlap-premise params=true warm=false history=true volatile=false drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=2": 1,
+        "layout-error-retry-cell params=true warm=false history=true volatile=false attempts=2": 1,
+        "layout-error-overlap-premise params=true warm=true history=true volatile=false drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=2": 1,
+        "layout-error-retry-cell params=true warm=true history=true volatile=false attempts=2": 1,
+        "layout-error-overlap-premise params=true warm=false history=true volatile=true drop_done=true old_v=3 new_v=2 invalid_readset=true attempts=1": 1,
+        "layout-error-retry-cell params=true warm=false history=true volatile=true attempts=1": 1,
+        "layout-error-current-cell params=true history=true attempts=1": 1
+      },
+      "families": [
+        "layout-error-overlap-premise",
+        "layout-error-retry-cell",
+        "layout-error-current-cell"
+      ],
+      "case_count": 16
+    },
+    {
+      "target": "unittests src/lib.rs",
+      "source": "src/layout_error_boundary_tests.rs",
+      "source_sha256": "c4c6ab10c176bbcf16f05d4983db0bd970d7ee470599f4c6bc26c2042e2470be",
+      "internal_only": false,
+      "names": [
+        "sql::executor::scan::layout_error_boundary_tests::explicit_wire_session_layout_refusal_never_repeats_and_rolls_back_cleanly",
+        "sql::executor::scan::layout_error_boundary_tests::real_lock_cancellation_and_deadline_keep_their_original_error_after_layout_moves"
+      ],
+      "markers": {
+        "layout-boundary-explicit-cell family=Text history=false attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Text history=false kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Text history=false kind=Deadline attempts=1": 1,
+        "layout-boundary-explicit-cell family=Params history=false attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Params history=false kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Params history=false kind=Deadline attempts=1": 1,
+        "layout-boundary-explicit-cell family=Text history=true attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Text history=true kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Text history=true kind=Deadline attempts=1": 1,
+        "layout-boundary-explicit-cell family=Params history=true attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Params history=true kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Params history=true kind=Deadline attempts=1": 1
+      },
+      "families": [
+        "layout-boundary-explicit-cell",
+        "layout-boundary-interrupt-cell",
+        "layout-boundary-native-cell"
+      ],
+      "tiers": [
+        "default"
+      ],
+      "case_count": 12
+    },
+    {
+      "target": "unittests src/lib.rs",
+      "source": "src/layout_error_boundary_tests.rs",
+      "source_sha256": "c4c6ab10c176bbcf16f05d4983db0bd970d7ee470599f4c6bc26c2042e2470be",
+      "internal_only": false,
+      "names": [
+        "sql::executor::scan::layout_error_boundary_tests::explicit_wire_session_layout_refusal_never_repeats_and_rolls_back_cleanly",
+        "sql::executor::scan::layout_error_boundary_tests::real_lock_cancellation_and_deadline_keep_their_original_error_after_layout_moves",
+        "sql::executor::scan::layout_error_boundary_tests::real_native_unknown_and_known_applied_failures_survive_layout_changes_once"
+      ],
+      "markers": {
+        "layout-boundary-explicit-cell family=Text history=false attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Text history=false kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Text history=false kind=Deadline attempts=1": 1,
+        "layout-boundary-explicit-cell family=Params history=false attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Params history=false kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Params history=false kind=Deadline attempts=1": 1,
+        "layout-boundary-explicit-cell family=Text history=true attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Text history=true kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Text history=true kind=Deadline attempts=1": 1,
+        "layout-boundary-explicit-cell family=Params history=true attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Params history=true kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Params history=true kind=Deadline attempts=1": 1,
+        "layout-boundary-native-cell family=Text history=false fault=UnknownBefore attempts=1 applied=false reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=false fault=UnknownAfter attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=false fault=KnownAppliedLate attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=false fault=UnknownBefore attempts=1 applied=false reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=false fault=UnknownAfter attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=false fault=KnownAppliedLate attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=true fault=UnknownBefore attempts=1 applied=false reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=true fault=UnknownAfter attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=true fault=KnownAppliedLate attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=true fault=UnknownBefore attempts=1 applied=false reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=true fault=UnknownAfter attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=true fault=KnownAppliedLate attempts=1 applied=true reopen=true": 1
+      },
+      "families": [
+        "layout-boundary-explicit-cell",
+        "layout-boundary-interrupt-cell",
+        "layout-boundary-native-cell"
+      ],
+      "tiers": [
+        "internal"
+      ],
+      "case_count": 24
+    },
+    {
+      "target": "unittests src/lib.rs",
+      "source": "src/layout_error_boundary_tests.rs",
+      "source_sha256": "c4c6ab10c176bbcf16f05d4983db0bd970d7ee470599f4c6bc26c2042e2470be",
+      "internal_only": false,
+      "names": [
+        "sql::executor::scan::layout_error_boundary_tests::explicit_wire_session_layout_refusal_never_repeats_and_rolls_back_cleanly",
+        "sql::executor::scan::layout_error_boundary_tests::real_lock_cancellation_and_deadline_keep_their_original_error_after_layout_moves",
+        "sql::executor::scan::layout_error_boundary_tests::real_native_unknown_and_known_applied_failures_survive_layout_changes_once",
+        "sql::executor::scan::layout_error_boundary_tests::real_applied_graph_publication_error_beats_a_moved_layout_and_reopens_from_row_truth"
+      ],
+      "markers": {
+        "layout-boundary-explicit-cell family=Text history=false attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Text history=false kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Text history=false kind=Deadline attempts=1": 1,
+        "layout-boundary-explicit-cell family=Params history=false attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Params history=false kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Params history=false kind=Deadline attempts=1": 1,
+        "layout-boundary-explicit-cell family=Text history=true attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Text history=true kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Text history=true kind=Deadline attempts=1": 1,
+        "layout-boundary-explicit-cell family=Params history=true attempts=1 rollback_clean=true": 1,
+        "layout-boundary-interrupt-cell family=Params history=true kind=Cancel attempts=1": 1,
+        "layout-boundary-interrupt-cell family=Params history=true kind=Deadline attempts=1": 1,
+        "layout-boundary-native-cell family=Text history=false fault=UnknownBefore attempts=1 applied=false reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=false fault=UnknownAfter attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=false fault=KnownAppliedLate attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=false fault=Publication attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=false fault=UnknownBefore attempts=1 applied=false reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=false fault=UnknownAfter attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=false fault=KnownAppliedLate attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=false fault=Publication attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=true fault=UnknownBefore attempts=1 applied=false reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=true fault=UnknownAfter attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=true fault=KnownAppliedLate attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Text history=true fault=Publication attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=true fault=UnknownBefore attempts=1 applied=false reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=true fault=UnknownAfter attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=true fault=KnownAppliedLate attempts=1 applied=true reopen=true": 1,
+        "layout-boundary-native-cell family=Params history=true fault=Publication attempts=1 applied=true reopen=true": 1
+      },
+      "families": [
+        "layout-boundary-explicit-cell",
+        "layout-boundary-interrupt-cell",
+        "layout-boundary-native-cell"
+      ],
+      "tiers": [
+        "optins",
+        "code-embed"
+      ],
+      "case_count": 28
+    },
+    {
+      "target": "unittests src/lib.rs",
+      "source": "src/replication/physical_wal_tail_tests.rs",
+      "source_sha256": "6ab108e2226f63d0407782c32a81002ae58dfbc90a14aed4ad064b7a8e5e5e6e",
+      "internal_only": false,
+      "names": [
+        "replication::physical::physical_wal_tail_tests::a_real_native_wal_rotation_requests_a_fresh_iterator",
+        "replication::physical::physical_wal_tail_tests::a_completed_poll_keeps_its_sampled_barrier_after_real_wal_rotation",
+        "replication::physical::physical_wal_tail_tests::a_byte_limited_prefix_survives_real_wal_rotation_without_skipping_a_group",
+        "replication::physical::physical_wal_tail_tests::no_validated_prefix_preserves_real_try_again_and_the_interior_cursor_refusal"
+      ],
+      "markers": {
+        "physical-wal-tail-cell native_rotation": 1,
+        "physical-wal-tail-cell completed_barrier": 1,
+        "physical-wal-tail-cell bounded_prefix": 1,
+        "physical-wal-tail-cell no_prefix_refusal": 1
+      },
+      "families": [
+        "physical-wal-tail-cell"
+      ],
+      "case_count": 4
+    },
+    {
+      "target": "code_graph_transaction_ownership",
+      "source": "tests/code_graph_transaction_ownership.rs",
+      "source_sha256": "04483b865b243c4e09e4b4bd798f83dce28e9215e062ed498a88fe1eec766598",
+      "internal_only": false,
+      "names": [
+        "a_cold_public_index_joins_its_own_fk_cleanup_transaction",
+        "a_caller_transaction_owns_graph_commit_and_rollback",
+        "a_late_reference_refusal_restores_old_graph_rows_and_deletes",
+        "a_branch_index_keeps_rows_and_rollback_on_its_own_branch"
+      ],
+      "markers": {
+        "codegraph-cold-premise history=false source_rows=1 graph_rows=0 lock_timeout_ms=100": 1,
+        "codegraph-transaction-cell cold history=false": 1,
+        "codegraph-transaction-cell branch history=false": 1,
+        "codegraph-transaction-cell caller history=false commit=false": 1,
+        "codegraph-transaction-cell caller history=false commit=true": 1,
+        "codegraph-transaction-cell late-refusal history=false caller=false": 1,
+        "codegraph-transaction-cell late-refusal history=false caller=true": 1,
+        "codegraph-cold-premise history=true source_rows=1 graph_rows=0 lock_timeout_ms=100": 1,
+        "codegraph-transaction-cell cold history=true": 1,
+        "codegraph-transaction-cell branch history=true": 1,
+        "codegraph-transaction-cell caller history=true commit=false": 1,
+        "codegraph-transaction-cell caller history=true commit=true": 1,
+        "codegraph-transaction-cell late-refusal history=true caller=false": 1,
+        "codegraph-transaction-cell late-refusal history=true caller=true": 1
+      },
+      "families": [
+        "codegraph-cold-premise",
+        "codegraph-transaction-cell"
+      ],
+      "tiers": [
+        "optins",
+        "code-embed"
+      ],
+      "case_count": 12
+    }
+  ],
+  "r57": {
+    "source_sha256": "bbb601c20d917be5e2e1b68162ebeaabd7da1d10b1f0b1f29692804f3f887a44",
+    "names": [
+      "a_crash_after_a_volatile_add_column_keeps_its_values",
+      "a_crash_after_a_nextval_add_column_keeps_its_values",
+      "a_crash_keeps_committed_primary_key_updates_and_deletes",
+      "a_crash_after_drop_column_keeps_the_other_columns_values",
+      "a_crash_after_a_drop_and_readd_keeps_the_last_definition"
+    ],
+    "cases": 10,
+    "dimension": "logical_wal_per_statement=false/true; not time travel"
+  },
+  "source34": {
+    "head": "00b58922b030797da5b262dd680442eb93f37038",
+    "targets": 451,
+    "capture_sha256": "00d844c4a063b3ca152a0236b3978e0812ccf0d4f6cb6b177a4fec0655ae7e72",
+    "freeze_sha256": "039d18ab8d080485d27fac1964d2266fcfd422d2f88344bf89e0260a389c3292"
+  }
+}
