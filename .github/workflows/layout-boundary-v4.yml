@@ -1,0 +1,101 @@
+name: Focused layout boundary V4 controls (no publish)
+on:
+  push:
+    branches: ['ci/4420-layout-boundary-v4-proof-*']
+permissions:
+  contents: read
+jobs:
+  proof:
+    name: ${{ matrix.configuration }} focused native layout boundary controls
+    runs-on: ubuntu-24.04
+    timeout-minutes: 140
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration: [default, internal, persistent]
+    steps:
+      - name: Preserve Git source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: 7dec18f7a83d336ad6cbe36e35424bc3d4b5f00e
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install native build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev cmake ninja-build
+          dpkg-query -W -f='${Package}\t${Version}\n' > "$RUNNER_TEMP/layout-boundary-v4-packages.txt"
+      - name: Verify fixed controller and model
+        working-directory: controller
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          pairs = {
+              '.github/4420-layout-boundary-v4/controller.py': 'c372876351e65489619369558561d61102f446cd06223aa25db0461c52308226',
+              '.github/4420-layout-boundary-v4/model.json': 'f7304f2b34e005c019a8d94d727ea3809fc82353133340633023086830a3ec15',
+          }
+          for name, wanted in pairs.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != wanted:
+                  raise SystemExit('physical-regression bootstrap mismatch: ' + name)
+          PYBOOT
+      - name: Build, list and execute unchanged native regressions
+        env:
+          NANO_WAL_TAIL_CONFIGURATION: ${{ matrix.configuration }}
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_wal_regression_unit="nano-layout-boundary-v4-${GITHUB_RUN_ID}-${NANO_WAL_TAIL_CONFIGURATION}"
+          sudo systemd-run --unit "$nano_wal_regression_unit" --wait --pipe --collect \
+            -p User="$(id -un)" -p Group="$(id -gn)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE/controller" \
+            -p MemoryMax=24G -p MemorySwapMax=0 -p KillMode=control-group \
+            -p RuntimeMaxSec=7500 -p TimeoutStopSec=30 \
+            --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo" \
+            --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.95.0 \
+            --setenv="GITHUB_SHA=$GITHUB_SHA" \
+            --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
+            python3 .github/4420-layout-boundary-v4/controller.py \
+              --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product" \
+              --configuration "$NANO_WAL_TAIL_CONFIGURATION" --out "$RUNNER_TEMP/layout-boundary-v4-$NANO_WAL_TAIL_CONFIGURATION" \
+              --model-sha256 f7304f2b34e005c019a8d94d727ea3809fc82353133340633023086830a3ec15
+      - name: Preserve raw native results and promotion lifecycle logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: layout-boundary-v4-${{ matrix.configuration }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/layout-boundary-v4-packages.txt
+            ${{ runner.temp }}/layout-boundary-v4-${{ matrix.configuration }}/*.json
+            ${{ runner.temp }}/layout-boundary-v4-${{ matrix.configuration }}/*.stdout
+            ${{ runner.temp }}/layout-boundary-v4-${{ matrix.configuration }}/*.stderr
+            ${{ runner.temp }}/layout-boundary-v4-${{ matrix.configuration }}/promotion-daemon-logs/**
+            ${{ runner.temp }}/layout-boundary-v4-${{ matrix.configuration }}/fresh-target/tmp/readiness-diagnostics/**
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+  all-configurations:
+    name: All three focused boundary configurations required
+    if: always()
+    needs: proof
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Reject a partial or invalid regression matrix
+        env:
+          PROOF_RESULT: ${{ needs.proof.result }}
+        run: |
+          test "$PROOF_RESULT" = success
