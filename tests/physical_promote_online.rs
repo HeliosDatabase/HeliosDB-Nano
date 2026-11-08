@@ -872,13 +872,33 @@ async fn a_budget_too_short_answers_f_and_a_second_call_is_refused() {
     drop(second);
     tokio::time::sleep(Duration::from_secs(1)).await;
     // Released: it completes.
+    let released = Instant::now();
+    let completion_budget = Duration::from_secs(60);
     std::fs::remove_file(&pause).unwrap();
-    wait_primary(c.pair.pg_s, Duration::from_secs(60), &c.standby).await;
+    // A fresh SQL observer opened before the drain ends can itself retain
+    // the old store after the one-second budget was spent by the pause.
+    // Observe the real drain without creating another PostgreSQL session.
+    wait_log(
+        &c.standby,
+        "promote: no PostgreSQL session holds the standby's store any more",
+        1,
+        completion_budget,
+    )
+    .await;
+    let remaining = completion_budget.saturating_sub(released.elapsed());
+    assert!(
+        !remaining.is_zero(),
+        "the promotion drain spent the completion budget: {}",
+        c.standby.tail(16)
+    );
+    wait_primary(c.pair.pg_s, remaining, &c.standby).await;
     let body = wait_health(c.pair.http_s, Duration::from_secs(30), &c.standby, |block| {
         block["epoch"] == 2
     })
     .await;
     assert_eq!(body["replication"]["role"], "primary", "{body}");
+    let fresh = connect(c.pair.pg_s).await;
+    assert_eq!(ids(&fresh).await, Ok(c.rows.clone()));
     let final_sequence = fenced_final(&c.p_data, &c.primary).await;
     assert_eq!(epoch_record(&c.s_data), (2, true, Some(final_sequence)));
 }
