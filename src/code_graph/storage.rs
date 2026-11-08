@@ -587,7 +587,7 @@ pub fn code_index_with_embedder(
 /// per-file path called `bulk_insert_tuples` once per file × two
 /// (symbols + refs) — for the pilot's 666-file corpus that was
 /// 1 332 batched calls per chunk. This implementation collapses to
-/// **two `bulk_insert_tuples` calls per chunk** (one for all symbols
+/// **two table-wide batches per chunk** (one for all symbols
 /// across all files, one for all refs across all files) by tracking
 /// per-file slice boundaries through the batch. Per-file
 /// `upsert_file` and the SELECT/DELETE preamble remain serial — they
@@ -649,7 +649,7 @@ fn drain_chunk(
     // Step 4 — flatten ALL refs across files. For each file slice
     // its symbol_ids out of the flat result; convert per-file
     // ResolvedRef.from_idx / to_idx into absolute symbol_ids;
-    // collect into one Tuple vec; one bulk_insert_tuples call.
+    // collect into one Tuple vec; transaction-owned bounded SQL batches.
     let total_refs: usize = if opts.skip_symbol_refs {
         0
     } else {
@@ -701,8 +701,92 @@ fn delete_stale_symbols_and_refs(db: &EmbeddedDatabase, file_id: i64) -> Result<
     Ok(())
 }
 
+/// Insert engine-owned graph rows through the existing SQL transaction owner.
+/// A chunk's DELETE may hold an incoming-FK graph exclusively until commit;
+/// raw `bulk_insert_tuples` would acquire a different owner and, even without
+/// that self-wait, its direct writes would escape the chunk's rollback.
+/// Bound SQL/parameter construction while preserving input-order RETURNING IDs
+/// for the later reference mapping. Every batch joins the caller/chunk owner.
+fn insert_graph_rows(
+    db: &EmbeddedDatabase,
+    table: &str,
+    schema: &crate::Schema,
+    tuples: Vec<Tuple>,
+) -> Result<Vec<i64>> {
+    use std::fmt::Write as _;
+
+    if tuples.is_empty() {
+        return Ok(Vec::new());
+    }
+    let expected_key = match table {
+        "_hdb_code_symbols" => "node_id",
+        "_hdb_code_symbol_refs" => "edge_id",
+        _ => return Err(Error::storage("unsupported code-graph row target")),
+    };
+    let key = schema
+        .columns
+        .first()
+        .filter(|column| column.primary_key && column.name == expected_key)
+        .ok_or_else(|| Error::storage("code-graph primary-key layout changed"))?;
+    let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+    let columns = schema
+        .columns
+        .iter()
+        .skip(1)
+        .map(|column| quote(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut ids = Vec::with_capacity(tuples.len());
+    let mut pending = tuples.into_iter();
+    loop {
+        let rows: Vec<_> = pending.by_ref().take(256).collect();
+        if rows.is_empty() {
+            break;
+        }
+        let expected_rows = rows.len();
+        let mut sql = format!("INSERT INTO {} ({columns}) VALUES ", quote(table));
+        let mut params = Vec::new();
+        for (row_index, tuple) in rows.into_iter().enumerate() {
+            if tuple.values.len() != schema.columns.len() || !matches!(tuple.values.first(), Some(Value::Null)) {
+                return Err(Error::storage("code-graph row shape or generated primary key changed"));
+            }
+            if row_index != 0 {
+                sql.push_str(", ");
+            }
+            sql.push('(');
+            for (column, value) in tuple.values.into_iter().skip(1).enumerate() {
+                if column != 0 {
+                    sql.push_str(", ");
+                }
+                params.push(value);
+                write!(sql, "${}", params.len())
+                    .map_err(|error| Error::storage(format!("code-graph SQL construction: {error}")))?;
+            }
+            sql.push(')');
+        }
+        write!(sql, " RETURNING {}", quote(&key.name))
+            .map_err(|error| Error::storage(format!("code-graph RETURNING construction: {error}")))?;
+        let (affected, returned) = db.execute_params_returning(&sql, &params)?;
+        if usize::try_from(affected).ok() != Some(expected_rows) || returned.len() != expected_rows {
+            return Err(Error::storage("code-graph INSERT returned a different number of rows"));
+        }
+        for row in returned {
+            let id = match row.values.as_slice() {
+                [Value::Int8(id)] => *id,
+                [Value::Int4(id)] => i64::from(*id),
+                _ => return Err(Error::storage("code-graph INSERT returned an invalid primary key")),
+            };
+            if id <= 0 {
+                return Err(Error::storage("code-graph INSERT returned a nonpositive primary key"));
+            }
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
 /// Step 3 helper: bulk-insert all symbols across all files in a
-/// chunk in a single `bulk_insert_tuples` call. Mirror of the
+/// chunk using transaction-owned, bounded SQL INSERT batches. Mirror of the
 /// per-file `insert_symbols`; the only structural difference is
 /// the `file_id_per_symbol` parallel vector that maps each symbol
 /// row back to its owning file (the per-file `insert_symbols`
@@ -801,12 +885,11 @@ fn bulk_insert_symbols_batched(
         }
         tuples.push(Tuple::new(values));
     }
-    let row_ids = db.bulk_insert_tuples("_hdb_code_symbols", tuples)?;
-    Ok(row_ids.into_iter().map(|id| id as i64).collect())
+    insert_graph_rows(db, "_hdb_code_symbols", &schema, tuples)
 }
 
 /// Step 4 helper: bulk-insert all refs across all files in a chunk
-/// in a single `bulk_insert_tuples` call. For each file's resolved
+/// in transaction-owned, bounded SQL INSERT batches. For each file's resolved
 /// refs, slice the per-file symbol_ids out of the flat batch result
 /// and translate ResolvedRef.from_idx / to_idx into absolute ids.
 fn bulk_insert_refs_batched(
@@ -865,7 +948,7 @@ fn bulk_insert_refs_batched(
     }
     let written = tuples.len() as u64;
     if !tuples.is_empty() {
-        db.bulk_insert_tuples("_hdb_code_symbol_refs", tuples)?;
+        insert_graph_rows(db, "_hdb_code_symbol_refs", &schema, tuples)?;
     }
     Ok(written)
 }
@@ -1342,12 +1425,9 @@ fn insert_symbols(
         }
     }
 
-    // Tier 2.4 fast path: build Tuple rows in column order and
-    // bulk-insert via the engine's bypass-SQL primitive. The bulk
-    // primitive writes directly to RocksDB (matching
-    // `execute_plan_with_params`'s convention for `INSERT … RETURNING`)
-    // so subsequent SQL DELETEs in the same outer txn don't pay the
-    // O(N) `merge_with_write_set` cost that killed the v1 attempt.
+    // Build rows in the declared column order, then let the SQL INSERT
+    // join this operation's transaction. Direct bulk writes cannot be
+    // paired with the earlier transaction-owned stale-row DELETEs.
     let schema = db.storage.catalog().get_table_schema("_hdb_code_symbols")?;
     let n_cols = schema.columns.len();
     let expected_min_cols = if any_vec { 13 } else { 12 };
@@ -1365,7 +1445,7 @@ fn insert_symbols(
         //   node_id, file_id, name, qualified, kind, signature,
         //   visibility, line_start, line_end, byte_start, byte_end,
         //   parent_id, [body_vec]
-        values.push(Value::Null); // node_id — auto-fill via bulk_insert_tuples
+        values.push(Value::Null); // node_id — generated by the SQL INSERT
         values.push(Value::Int8(file_id));
         values.push(Value::String(sym.name.clone()));
         values.push(Value::String(sym.qualified.clone()));
@@ -1392,8 +1472,7 @@ fn insert_symbols(
         }
         tuples.push(Tuple::new(values));
     }
-    let row_ids = db.bulk_insert_tuples("_hdb_code_symbols", tuples)?;
-    Ok(row_ids.into_iter().map(|id| id as i64).collect())
+    insert_graph_rows(db, "_hdb_code_symbols", &schema, tuples)
 }
 
 fn insert_refs(
@@ -1406,7 +1485,7 @@ fn insert_refs(
         return Ok(0);
     }
 
-    // Tier 2.4 fast path — same as insert_symbols, see notes there.
+    // Same transaction-owned insertion as insert_symbols.
     let schema = db.storage.catalog().get_table_schema("_hdb_code_symbol_refs")?;
     let n_cols = schema.columns.len();
     if n_cols < 8 {
@@ -1449,7 +1528,7 @@ fn insert_refs(
         tuples.push(Tuple::new(values));
     }
     let written = tuples.len() as u64;
-    db.bulk_insert_tuples("_hdb_code_symbol_refs", tuples)?;
+    insert_graph_rows(db, "_hdb_code_symbol_refs", &schema, tuples)?;
     Ok(written)
 }
 
