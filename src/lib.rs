@@ -1914,8 +1914,9 @@ pub struct EmbeddedDatabase {
     /// interleave with needs its own log, so its ROLLBACK replays exactly its
     /// own entries and its COMMIT drops exactly its own. `begin_transaction`
     /// registers the slot; `Transaction::commit` / `Transaction::rollback` take
-    /// it, and `RaiiArtUndoSlot`'s `Drop` removes it however the handle ends —
-    /// including a handle dropped without either, which cannot leak an entry.
+    /// it, and `RaiiTransactionArtUndo` replays an abandoned public handle's
+    /// slot before its storage transaction releases the visibility census.
+    /// Statement-owned slots use `RaiiArtUndoSlot` for bounded cleanup.
     raii_art_undo: std::sync::Arc<dashmap::DashMap<u64, Vec<ArtUndoOp>>>,
     /// sprinter 6bc4a4040eb7 (B1 second fix pass): RAII [`Transaction`]s open
     /// on this handle right now (`begin_transaction` up, the handle's `Drop`
@@ -28992,10 +28993,7 @@ impl EmbeddedDatabase {
         Ok(Transaction {
             tx,
             db: self,
-            undo_slot: RaiiArtUndoSlot {
-                txn_id,
-                map: std::sync::Arc::clone(&self.raii_art_undo),
-            },
+            undo_slot: RaiiTransactionArtUndo { txn_id, db: self },
             _open: open,
         })
     }
@@ -33097,15 +33095,14 @@ impl EmbeddedDatabase {
 /// This struct wraps a storage::Transaction and provides SQL execution
 /// within the transaction context, ensuring proper isolation and atomicity.
 pub struct Transaction<'a> {
+    /// Restore an abandoned handle's eager indexes before `tx` releases its
+    /// census and locks. Struct fields drop in declaration order: this guard
+    /// MUST remain before `tx`. Explicit commit/rollback settle its slot first.
+    /// A field guard permits those methods to move `tx` out of this handle.
+    undo_slot: RaiiTransactionArtUndo<'a>,
     tx: storage::Transaction,
     /// Reference to the database for executing SQL
     db: &'a EmbeddedDatabase,
-    /// sprinter 8a9b60eeef87: owns this transaction's entry in
-    /// `EmbeddedDatabase::raii_art_undo` and removes it however the handle ends.
-    /// Deliberately a FIELD with a `Drop` rather than a `Drop` on `Transaction`
-    /// itself: `commit(self)` and `rollback(self)` move `tx` out of `self`,
-    /// which the compiler forbids on a type that implements `Drop`.
-    undo_slot: RaiiArtUndoSlot,
     /// sprinter 6bc4a4040eb7 (B1 second fix pass): counts this transaction in
     /// `EmbeddedDatabase::open_raii_txns` until the handle ends, however it
     /// ends (a field with a `Drop`, for the reason given on `undo_slot`).
@@ -33124,16 +33121,25 @@ impl Drop for RaiiOpenTxn {
     }
 }
 
-/// Removes a RAII transaction's `raii_art_undo` entry however its handle ends.
-///
-/// `commit` / `rollback` take the entry themselves (discarding or replaying it);
-/// this exists for the third ending — a handle simply DROPPED, which rolls the
-/// storage transaction back in `storage::Transaction::Drop`. Removing the entry
-/// there is what keeps the map bounded. It deliberately does not replay: a
-/// dropped handle behaved that way before this item too, and replaying from a
-/// `Drop` would need the storage engine handle this guard does not carry. A
-/// handle dropped mid-transaction therefore still leaves the eager index
-/// mutations standing — recorded, not fixed here.
+/// sprinter 56e5c4c975c9: an abandoned public handle rolls back its eager
+/// ART/vector changes while its storage transaction still owns the visibility
+/// census and row/table locks. Successful commits, applied/unknown failures,
+/// explicit rollbacks and pre-write commit refusals already settle the slot,
+/// so their later field drop finds no undo to replay.
+struct RaiiTransactionArtUndo<'a> {
+    txn_id: u64,
+    db: &'a EmbeddedDatabase,
+}
+
+impl Drop for RaiiTransactionArtUndo<'_> {
+    fn drop(&mut self) {
+        self.db.rollback_art_undo_for(self.txn_id);
+    }
+}
+
+/// Removes a session-less statement's undo slot on every exit path. Its
+/// owning wrapper settles commit/rollback explicitly. The public transaction
+/// handle uses `RaiiTransactionArtUndo` to restore abandoned writes as well.
 struct RaiiArtUndoSlot {
     txn_id: u64,
     map: std::sync::Arc<dashmap::DashMap<u64, Vec<ArtUndoOp>>>,
