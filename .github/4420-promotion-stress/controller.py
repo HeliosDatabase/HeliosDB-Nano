@@ -293,6 +293,7 @@ def main():
             artifacts[key] = {'compiler_artifact':message,'path':str(binary),'sha256':digest(binary)}
         require(set(artifacts) == set(targets) | {'lib','heliosdb-nano'}, 'not all native harnesses/daemon came from compiler')
         write(output / 'native-build-receipt.json',{'tools':tools,'build':built,'artifacts':artifacts})
+        (output / 'promotion-daemon-logs').mkdir(mode=0o700)
         for index, case in enumerate(plan['cases']):
             stem = '%02d-' % index + case['target']
             binary = Path(artifacts[case['target']]['path'])

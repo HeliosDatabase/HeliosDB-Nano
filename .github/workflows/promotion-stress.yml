@@ -45,7 +45,7 @@ jobs:
           import hashlib
           from pathlib import Path
           pairs = {
-              '.github/4420-promotion-stress/controller.py': '603a7fcbbcffe1bb7fbfa571e62dc17cd0871d9f7005a8edf9f79ee5d34e1b60',
+              '.github/4420-promotion-stress/controller.py': '91c5b1cb8ea79ef7070ec8fa1b2fe8389fbc1c6ee040fdfab6c2c0e4604d8318',
               '.github/4420-promotion-stress/model.json': 'e30458d1a18c52ff57624f12dd6377878208c8f6b54b349943279b688a6b1265',
           }
           for name, wanted in pairs.items():
