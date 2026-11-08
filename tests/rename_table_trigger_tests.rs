@@ -23,11 +23,9 @@
 //! `Catalog::rename_table_inner` — the ONE funnel every rename passes through
 //! (`ALTER TABLE … RENAME TO`, `ALTER TABLE … SET SCHEMA`, the MV refresh swap,
 //! WAL replay) — now calls `move_table_triggers`.
-//! That moves the DURABLE half. The LIVE in-memory registry the executor consults
-//! (`EmbeddedDatabase::trigger_registry`) is not reachable from the storage layer,
-//! so within the renaming PROCESS the trigger still answers to the old key until
-//! the next open. `renaming_a_table_does_not_deregister_the_live_trigger_yet`
-//! states that honestly rather than leaving it undiscovered.
+//! The durable rename also publishes to the attached live trigger registry.
+//! The rewrite follows the new name immediately, on both executor families;
+//! a fresh table under the old name cannot inherit the old rewrite recipe.
 //!
 //! # What triggers actually do here
 //!
@@ -289,35 +287,47 @@ fn a_new_table_under_the_old_name_does_not_inherit_the_renamed_tables_trigger() 
 }
 
 // ---------------------------------------------------------------------------
-// 3. What is NOT fixed — stated, not left to be discovered
+// 3. Live registry and immediate execution on both executor families
 // ---------------------------------------------------------------------------
 
-/// HONEST LIMIT. The fix moves the DURABLE records only. The LIVE registry the
-/// executor consults is `EmbeddedDatabase::trigger_registry`, which the storage
-/// layer has no handle on, so inside the renaming process the trigger is still
-/// registered under the OLD name until the next open.
-///
-/// This asserts the CURRENT behaviour on purpose. If it starts failing because the
-/// live registry learned to follow a rename, that is the completion of #85 —
-/// delete this test, do not relax it, and update the note in
-/// `Catalog::move_table_triggers`.
 #[test]
-fn renaming_a_table_does_not_deregister_the_live_trigger_yet() {
-    let db = EmbeddedDatabase::new_in_memory().expect("in-memory db");
-    setup(&db);
-    db.execute("ALTER TABLE ren_a RENAME TO ren_b").expect("rename");
-
-    assert!(
-        db.trigger_registry.has_triggers_for_table("ren_a"),
-        "the live registry no longer keys the trigger under the old name — if the in-memory \
-         half of #85 has been implemented, delete this test rather than relaxing it"
-    );
-    assert!(
-        !db.trigger_registry.has_triggers_for_table("ren_b"),
-        "the live registry now keys the trigger under the new name — the in-memory half of \
-         #85 appears to be implemented; delete this test"
-    );
-
-    // The durable half, which IS fixed, is what makes the next open correct.
-    assert_eq!(persisted_trigger_tables(&db), vec!["ren_b".to_string()]);
+fn renaming_a_table_moves_the_live_trigger_and_recipe_immediately() -> heliosdb_nano::Result<()> {
+    for params in [false, true] {
+        let db = EmbeddedDatabase::new_in_memory()?;
+        setup(&db);
+        if params {
+            db.execute_params("ALTER TABLE ren_a RENAME TO ren_b", &[])?;
+        } else {
+            db.execute("ALTER TABLE ren_a RENAME TO ren_b")?;
+        }
+        assert!(
+            !db.trigger_registry.has_triggers_for_table("ren_a"),
+            "the old live registry name must be retired immediately"
+        );
+        assert!(
+            db.trigger_registry.has_triggers_for_table("ren_b"),
+            "the live registry must follow the durable renamed table"
+        );
+        assert_eq!(persisted_trigger_tables(&db), vec!["ren_b".to_string()]);
+        assert_eq!(persisted_recipe_tables(&db), vec!["ren_b".to_string()]);
+        db.execute("CREATE TABLE ren_a(id INT, tag TEXT)")?;
+        for (table, expected) in [("ren_a", "original"), ("ren_b", "set-by-trigger")] {
+            if params {
+                db.execute_params(
+                    &format!("INSERT INTO {table}(id,tag) VALUES($1,$2)"),
+                    &[Value::Int4(1), Value::String("original".to_string())],
+                )?;
+            } else {
+                db.execute(&format!("INSERT INTO {table}(id,tag) VALUES(1,'original')"))?;
+            }
+            let rows = db.query(&format!("SELECT tag FROM {table} WHERE id=1"), &[])?;
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows.first().map(|row| row.values.as_slice()),
+                Some([Value::String(expected.to_string())].as_slice()),
+                "rename must move the live recipe without a restart, params={params}, table={table}"
+            );
+        }
+    }
+    Ok(())
 }
