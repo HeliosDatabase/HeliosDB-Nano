@@ -284,6 +284,7 @@ enum Scan {
 /// entry is a scan that reads every family between the keyspace's start and
 /// the keys it wants.
 const SITES: &[(&str, &str, usize, Scan)] = &[
+    ("src/layout_error_boundary_tests.rs", "image", 1, Scan::TotalOrder),
     ("src/count_publication_tests.rs", "image", 1, Scan::TotalOrder),
     ("src/count_publication_tests.rs", "row_count", 1, Scan::TotalOrder),
     ("src/branch_counter_lock_tests.rs", "raw_image", 1, Scan::TotalOrder),
