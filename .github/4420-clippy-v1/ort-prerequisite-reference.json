@@ -1,0 +1,8 @@
+{
+  "status": "REFERENCE TO STATIC PREREQUISITE ONLY; no runtime/load/inference by v5",
+  "files": {
+    "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/ort-runtime-prerequisite/artifact-manifest.json": "e1c8152b2b01ed85f3bdaee7126d8b99dd35953e2253f7a3c42c80381dafb3fb",
+    "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/ort-runtime-prerequisite/code-embed-env.sh": "f4132a89cbdfaf83dabd0dc28dbdf907d698ab549ebe0362a1c468c35c753ce9",
+    "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/ort-runtime-prerequisite/HANDOFF.md": "dae3fbc26bb2efc396da106df63c902ead412cee00d0ae965dc92c75e6306d93"
+  }
+}
