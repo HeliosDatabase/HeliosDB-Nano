@@ -13,8 +13,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: never
-  PREFLIGHT_EXPECTED_SHA256: 0abee89fe1a7fd817ed00b69e11933a74f37e39380a47ea555ef3f5e156d6fae
-  PREFLIGHT_HELPER_SHA256: c394724219b6c04ded5a20a493203d8ed99efcb551c3308be515d879334b9124
+  PREFLIGHT_EXPECTED_SHA256: 882d4dc8fa872db4d38eeb0a93d23da1253cb2d5f65d60a5345f350bfedafc58
+  PREFLIGHT_HELPER_SHA256: ea23902c06733505a8cbf093f61d88c3f93162fc48f415257b76d3b319a8fa84
 
 jobs:
   native-binaries:
@@ -30,7 +30,7 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-pc-windows-msvc
             os: windows-2022
     steps:
@@ -40,6 +40,14 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
           git config --global core.longpaths true
+      - name: Use canonical Git symlink text (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --global core.symlinks false
+          echo 'GIT_CONFIG_COUNT=1' >> "$GITHUB_ENV"
+          echo 'GIT_CONFIG_KEY_0=core.symlinks' >> "$GITHUB_ENV"
+          echo 'GIT_CONFIG_VALUE_0=false' >> "$GITHUB_ENV"
       - uses: actions/checkout@v5
         with:
           ref: ${{ github.sha }}
@@ -67,6 +75,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: echo 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
+      - name: Preserve verified released macOS minimum (11.0)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=11.0' >> "$GITHUB_ENV"
       - name: Verify source, build native release binary, execute version, package
         shell: bash
         run: python .github/scripts/binary_preflight.py build --target '${{ matrix.target }}'

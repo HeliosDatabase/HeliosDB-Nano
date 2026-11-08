@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Nonpublishing source28 native binary gate. Standard library only; never repairs source."""
+"""Nonpublishing source29 native binary gate. Standard library only; never repairs source."""
 import argparse
 import hashlib
 import json
@@ -9,6 +9,7 @@ import platform
 import re
 import shutil
 import subprocess
+import struct
 import sys
 import tarfile
 import traceback
@@ -58,7 +59,7 @@ def model():
         raise ValueError("preflight helper does not match workflow pin")
     value = json.loads(EXPECTED.read_text(encoding="utf-8"))
     if value["schema"] != 1 or value["version"] != "4.42.0":
-        raise ValueError("wrong source28 manifest schema/version")
+        raise ValueError("wrong source29 manifest schema/version")
     return value
 
 
@@ -81,7 +82,7 @@ def source_check(expected, destination):
     symlinks = {}
     for name, entry in expected["entries"].items():
         if tree[name] != {key: entry[key] for key in ("mode", "oid")}:
-            raise ValueError("Git mode/blob differs from frozen source28: " + name)
+            raise ValueError("Git mode/blob differs from frozen source29: " + name)
         path = ROOT / name
         if entry["mode"] == "120000":
             target = expected["known_host_bound_symlinks"].get(name)
@@ -151,13 +152,57 @@ def pack(binary, target, expected, destination):
     return path
 
 
+
+def macho_info(data):
+    if len(data) < 32 or data[:4] != b"\xcf\xfa\xed\xfe":
+        raise ValueError("expected a thin little-endian Mach-O64 executable")
+    _, cpu, _, kind, count, command_bytes, _, _ = struct.unpack_from("<8I", data)
+    if cpu != 0x100000C or kind != 2 or command_bytes > len(data) - 32:
+        raise ValueError("expected bounded ARM64 Mach-O executable commands")
+    found = []
+    offset = 32
+    for _ in range(count):
+        if offset + 8 > 32 + command_bytes:
+            raise ValueError("truncated Mach-O load command")
+        command, size = struct.unpack_from("<2I", data, offset)
+        if size < 8 or offset + size > 32 + command_bytes:
+            raise ValueError("invalid Mach-O load command size")
+        if command == 0x32:
+            if size < 24:
+                raise ValueError("truncated LC_BUILD_VERSION")
+            _, _, system, minimum, sdk, tools = struct.unpack_from("<6I", data, offset)
+            if system != 1 or size < 24 + tools * 8:
+                raise ValueError("not a macOS LC_BUILD_VERSION")
+            decode = lambda value: [value >> 16, (value >> 8) & 255, value & 255]
+            found.append({"cpu": "arm64", "command": "LC_BUILD_VERSION", "minimum": decode(minimum), "sdk": decode(sdk)})
+        offset += size
+    if offset != 32 + command_bytes or len(found) != 1:
+        raise ValueError("need exactly one complete macOS build-version command")
+    return found[0]
+
+
+def check_macos_receipt(receipt, data, target_model):
+    info = macho_info(data)
+    proof = receipt["macos_deployment"]
+    if proof["environment"] != target_model["deployment_target"] or proof["macho"] != info:
+        raise ValueError("macOS deployment environment/actual Mach-O mismatch")
+    if tuple(info["minimum"]) > tuple(target_model["maximum_minos"]):
+        raise ValueError("macOS minimum requirement exceeds verified released binary")
+    match = re.search(r"\bminos\s+([0-9.]+)", proof["vtool_stdout"])
+    version = [int(part) for part in match[1].split(".")] if match else []
+    version += [0] * (3 - len(version))
+    if version != info["minimum"]:
+        raise ValueError("vtool and actual Mach-O disagree")
+    return info
+
+
 def build(target):
     expected = model()
     if target not in expected["targets"]:
         raise ValueError("unexpected matrix target")
     directory = OUTPUT / target
     directory.mkdir(parents=True, exist_ok=True)
-    receipt = {"schema": 1, "success": False, "target": target}
+    receipt = {"schema": 1, "success": False, "target": target, "macos_deployment": None}
     try:
         before = source_check(expected, directory / "source-before.json")
         import tomllib
@@ -203,6 +248,13 @@ def build(target):
         receipt["native_version"] = {"exit": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr}
         if completed.returncode or not re.fullmatch(r"heliosdb-nano 4\.42\.0\s*", completed.stdout):
             raise ValueError("native binary version/loader check failed")
+        if target == "aarch64-apple-darwin":
+            receipt["macos_deployment"] = {
+                "environment": os.environ.get("MACOSX_DEPLOYMENT_TARGET"),
+                "macho": macho_info(binary.read_bytes()),
+                "vtool_stdout": run(["xcrun", "vtool", "-show-build", str(binary)], timeout=30).decode(),
+            }
+            check_macos_receipt(receipt, binary.read_bytes(), expected["targets"][target])
         after = source_check(expected, directory / "source-after.json")
         if before != after:
             raise ValueError("source identity changed during build")
@@ -286,6 +338,11 @@ def aggregate(root, destination, matrix_result):
         members = member_hashes(archive)
         if set(members) != names or members[binary_name(target)] != receipt["binary_sha256"]:
             raise ValueError("binary/flat archive mismatch")
+        if target == "aarch64-apple-darwin":
+            with tarfile.open(archive, "r:gz") as packed:
+                check_macos_receipt(receipt, packed.extractfile(binary_name(target)).read(), expected["targets"][target])
+        elif receipt.get("macos_deployment") is not None:
+            raise ValueError("macOS deployment setting leaked into another target")
         for name in ("LICENSE", "README.md"):
             if members[name] != expected["entries"][name]["sha256"]:
                 raise ValueError("archive source asset mismatch")

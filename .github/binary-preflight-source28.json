@@ -4,6 +4,7 @@
     ".github/scripts/binary_preflight.py",
     ".github/workflows/binary-preflight.yml"
   ],
+  "auxiliary_manifest_filename_lineage": "source28 filename deliberately retained; product bytes and records are source29",
   "base_commit": "967c3704bae2bb94b3a896fbd419615e140f15e9",
   "default_features": [
     "encryption",
@@ -181,10 +182,10 @@
       "sha256": "eea523dad1c9543b4fcf661b076589034f11882946c6b16658d3194b348aaceb"
     },
     ".github/workflows/release.yml": {
-      "bytes": 18224,
+      "bytes": 18398,
       "mode": "100644",
-      "oid": "ed007de9999c5e2416424fffb97c0035dc0a3ff8",
-      "sha256": "92e9dca8e6bce848371fb1254500050a2746e2dbaa00392841bebff9806e537d"
+      "oid": "7e937197ff7f2c39d90d73aa9621985146ea8ce0",
+      "sha256": "a964c1f42d6b3aad6e33cc7c22e8ca03cfdc4a3f65f9b6cfc2108c84380f4f34"
     },
     ".github/workflows/tests.yml": {
       "bytes": 15550,
@@ -24301,18 +24302,52 @@
     "tests/protocol_tests/venv/lib64": "lib"
   },
   "local_whole_file_count": 4045,
-  "local_whole_manifest_sha256": "aff1e198096c35e9de74e43e7936acbe005888cc0213d8b5f8ff93ed3ee8b54e",
+  "local_whole_manifest_sha256": "2a5a08a3c7a83969cd7c01dbb2c151f9dbd0d4a634a0346487ffd78e5e5370aa",
   "local_whole_omitted_symlinks": [
     "tests/protocol_tests/venv/lib64"
   ],
   "package": "heliosdb-nano",
   "regular_files": 4042,
+  "released_macos_compatibility": {
+    "archive_sha256": "32f02fc6f634902302e604e7de6ceed57d72adf59dd75a7ece646d74c589cc7a",
+    "binary_bytes": 37258816,
+    "binary_sha256": "7c2a357eae6f23d18222e9c57fe50e8e4bc8ee5d6563e6f19badb272d8ecc158",
+    "checksums_sha256": "1c653db0e49dd8f17a7efcda37d4706c1aa3c0b5169fdfac457de59cdd6de9d5",
+    "cpu_type": "0x100000c",
+    "github_asset_digest_independently_matches": true,
+    "load_commands": [
+      {
+        "command": "LC_BUILD_VERSION",
+        "minos": [
+          11,
+          0,
+          0
+        ],
+        "platform": 1,
+        "sdk": [
+          14,
+          5,
+          0
+        ]
+      }
+    ],
+    "official_archive_url": "https://github.com/HeliosDatabase/HeliosDB-Nano/releases/download/v4.41.1/heliosdb-nano-v4.41.1-aarch64-apple-darwin.tar.gz",
+    "official_checksums_url": "https://github.com/HeliosDatabase/HeliosDB-Nano/releases/download/v4.41.1/SHA256SUMS",
+    "product_binary_executed": false,
+    "retrieved_at_utc": "2026-11-08T06:59:34.590213+00:00"
+  },
   "schema": 1,
-  "source28_overlay_manifest_sha256": "4d45bc684f4a241485f66ebea8edd7d4e315cc129063f9f031988abaf8d3cc84",
+  "source29_overlay_manifest_sha256": "ae23bd96de4b5b1eaab6ae07f65829f65b31d2b70ed913e8d6b77a821b0d7aca",
   "targets": {
     "aarch64-apple-darwin": {
       "archive": "tar.gz",
-      "os": "macos-14"
+      "deployment_target": "11.0",
+      "maximum_minos": [
+        11,
+        0,
+        0
+      ],
+      "os": "macos-15"
     },
     "aarch64-unknown-linux-gnu": {
       "archive": "tar.gz",
