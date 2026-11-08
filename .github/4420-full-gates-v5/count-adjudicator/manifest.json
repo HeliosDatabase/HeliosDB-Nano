@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "package": "full-tier-count-adjudicator-v1",
+  "frozen": true,
+  "status": "SOURCE_PREPARED_STATIC_VALIDATION_ONLY; ROOT_NATIVE_LIST_EXECUTION_PENDING",
+  "release_acceptance_pass": false,
+  "native_binaries_executed_during_preparation": 0,
+  "cargo_compiler_invocations_during_preparation": 0,
+  "compilation_freshness_proof": "Not established by native listings/current-checkout hashes; root must retain separate fresh-target/build-artifact/source linkage.",
+  "raw_log_attestation": "Existing v5 raw-log SHA first bound at postrun intake; no retroactive original-run hash claim.",
+  "accepts_final_source_capture": "Explicit fresh v5 relative-key source/expected manifest paths and supplied exact SHA256s, not hardcoded whole28 identity; critical unchanged Rust fixtures remain pinned.",
+  "critical_default": {
+    "parents": 8,
+    "cells": 73
+  },
+  "critical_internal_optins": {
+    "parents": 21,
+    "cells": 133
+  },
+  "r57": {
+    "parents": 5,
+    "source_backed_native_cases": 10,
+    "dimension": "logical_wal_per_statement=false/true; NOT TT"
+  },
+  "static_validation": {
+    "receipt": "selfcheck-r4.json",
+    "positive": 17,
+    "rejections": 146,
+    "child_processes": 0,
+    "syntax": "Python AST and bash -n; no native execution"
+  },
+  "peer_review": "R56 checkpoint2 source64ee39d6 bounded read-only CLEAR; final manifest verification receipt follows externally.",
+  "changes_after_checkpoint2": "README/HANDOFF compilation-freshness boundary only; producer and fixture bytes unchanged.",
+  "files": {
+    "HANDOFF.md": {
+      "sha256": "d95cc7e37871d19bab258d7416b8a6bc5e96d7e190a27df9acc7c54384b35481",
+      "bytes": 2096
+    },
+    "README.md": {
+      "sha256": "738b25352cea734d81a744063e3db7623fe5375e4f8bfefe92eaf17b30a8d4b6",
+      "bytes": 8701
+    },
+    "REVIEW-CHECKPOINT-1.json": {
+      "sha256": "3f6c47510bef1c0a06a98666f1d7f9012f61e3ab358fa92b617f6558ea7a0574",
+      "bytes": 571
+    },
+    "REVIEW-CHECKPOINT-2.json": {
+      "sha256": "df164720ef372469b75ca96c153d561f873378b312bf5fd55b13bb0116b0d6a2",
+      "bytes": 1284
+    },
+    "adjudicate.py": {
+      "sha256": "64ee39d64ecb996d1af41abea30e1d8db9c2f2f4ea9f0251b163f4a604a52ba2",
+      "bytes": 29676
+    },
+    "collect-gated.sh": {
+      "sha256": "cb82985ada6a9024be0139d6f41efdba706f666572c5f6347e23f5e2a7e877b9",
+      "bytes": 458
+    },
+    "critical-expectations.json": {
+      "sha256": "f0e314cb9cdaf01369ba0723fc6df31c05f5146dc5a884124ec7e87ac4f64e8a",
+      "bytes": 11761
+    },
+    "primary-source.json": {
+      "sha256": "a1854bf6b9e714ceb3238446e407c9385a3b6c47cde198b589da2d63131c5214",
+      "bytes": 1659
+    },
+    "selfcheck-r1.json": {
+      "sha256": "24dcbb9f9764afbfb8c87e80f3950b7a53dcf5bee32a5d299955414a0c036cdc",
+      "bytes": 12418
+    },
+    "selfcheck-r2.json": {
+      "sha256": "43e1fc31ee9dad83c9b79e25b1fc8fe924f48336d4e1f9e9be4d74c87f8791df",
+      "bytes": 12486
+    },
+    "selfcheck-r3.json": {
+      "sha256": "cf71c7bb7d49008f79c59c6f26ecd1d1d261579f822dd9b37abe8038bb261f4f",
+      "bytes": 12486
+    },
+    "selfcheck-r4.json": {
+      "sha256": "568bb14767dcea7c0430863cf06dde549469d4e41d7f8b50ee495aef727705c6",
+      "bytes": 12640
+    },
+    "selfcheck.py": {
+      "sha256": "e4b7e630f9017546d71abe15fcdab989a46bc059539ad439dffbbcc67b3e1555",
+      "bytes": 17188
+    },
+    "static-checks.json": {
+      "sha256": "428dabff2908ecf2ed99eb74611d661966c5b2060335d0920a5cbe2fa6cc1abd",
+      "bytes": 2131
+    }
+  }
+}

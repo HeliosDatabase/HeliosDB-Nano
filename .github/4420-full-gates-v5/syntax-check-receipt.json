@@ -1,0 +1,6 @@
+{
+  "status": "PREPARATION ONLY",
+  "python_ast": "all bundle .py pass",
+  "bash_n": "run-one.sh pass",
+  "cargo_or_product_runs": 0
+}
