@@ -27,7 +27,7 @@ jobs:
           import hashlib
           from pathlib import Path
           expected = {
-              '.github/4420-mysql-b1/controller.py': '85c1fc26b78187689d8327bfb35c02086e56515598eb2d3dd615c55078f5f6b9',
+              '.github/4420-mysql-b1/controller.py': '61eefb42a996be29cd95bbc43980419d268a5afd2492bd78e47a071438bb0e9e',
               '.github/4420-mysql-b1/mysql_worker.py': '82938ee128713ff6e6d2dbaa4d69a88046f315b369dbab36d9830851aea0ff0c',
               '.github/4420-mysql-b1/pymysql-1.2.0-py3-none-any.whl': '62169ce6d5510f08e140c5e7990ee884a9764024e4a9a27b2cc11f1099322ae0',
               '.github/binary-preflight-source28.json': 'ed47e15814dd3d39b072f5fb98aa632b85cd4b11177277e2796aee7cf3991038',

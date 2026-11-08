@@ -391,7 +391,8 @@ def main():
             worker_result = output / 'mysql-worker.json'
             worker_argv = [client['python'], '-S', str(HERE / 'mysql_worker.py'), '--execute', '--port', str(mysql_port),
                            '--server-identity', str(server_identity), '--client-package', client['package'], '--out', str(worker_result)]
-            worker_env = dict(environment, PYTHONPYCACHEPREFIX=str(output / 'new-python-cache'))
+            worker_env = dict(environment, NANO_PERF_BOUNDED_SCOPE='24G-noswap',
+                              PYTHONPYCACHEPREFIX=str(output / 'new-python-cache'))
             worker, worker_ticks, worker_owner = start_process(worker_argv, worker_env, output, worker_log)
             report['worker_identity'] = {'pid': worker.pid, 'start_ticks': worker_ticks, 'command': worker_argv}
             deadline = time.monotonic() + 150
