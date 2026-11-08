@@ -16,7 +16,7 @@ use crate::crypto::KeyManager;
 use crate::session::{IsolationLevel, SessionId};
 use crate::{Error, Result, Tuple};
 use dashmap::{DashMap, DashSet};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rocksdb::{WriteOptions, DB};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -526,16 +526,14 @@ impl Drop for Transaction {
 /// ## Who is counted
 ///
 /// Explicit transactions (`Transaction::set_write_census`) for every staged
-/// write. AUTOCOMMIT statement transactions (`Transaction::set_removal_census`,
-/// sprinter 6bc4a4040eb7) for their index REMOVALS only, for the duration of
-/// the statement: their eager removals are just as visible to a concurrent
-/// probe until the statement commits — a large `DELETE … WHERE` keeps them
-/// for seconds, and the statement can still fail and restore them — while a
-/// plain INSERT, which can never cause a miss, takes no slot (so an insert
-/// workload never turns the COUNT fast paths off). The direct autocommit fast
-/// paths (`delete_tuple_fast` & co.) write row storage BEFORE they touch the
-/// index, so they never leave a committed row without its entry and need no
-/// slot.
+/// write. Autocommit transactions enroll on their eager index additions and
+/// removals, before those mutations: a single multi-row statement can still
+/// fail or roll back, and its partial cardinality is never committed truth.
+/// Additions take only cardinality slots, leaving the narrower miss gate
+/// unchanged. Their ordinary staged metadata does not arm unrelated tables.
+/// Direct INSERT claims hold the same cardinality slots until publication or
+/// rejected-claim undo. Direct removals that publish row storage before their
+/// index maintenance keep their existing behavior.
 ///
 /// A transaction contributes at most 1 to each counter for a given table,
 /// however many rows it stages, and releases exactly what it took in its
@@ -544,6 +542,9 @@ impl Drop for Transaction {
 #[derive(Debug, Default)]
 pub struct UncommittedWriteCensus {
     open: AtomicUsize,
+    /// Changes before cardinality membership is armed or released, closing
+    /// a complete writer lifetime between two otherwise idle census probes.
+    cardinality_generation: AtomicU64,
     tables: DashMap<String, TableWriteCensus>,
     /// Transactions holding a staged key this census could not attribute to a
     /// table. Fail-closed: while non-zero, EVERY table reports both staged
@@ -613,14 +614,17 @@ impl UncommittedWriteCensus {
     }
 
     fn enter_unattributed(&self) {
+        self.cardinality_generation.fetch_add(1, Ordering::AcqRel);
         self.unattributed.fetch_add(1, Ordering::AcqRel);
     }
 
     fn leave_unattributed(&self) {
+        self.cardinality_generation.fetch_add(1, Ordering::AcqRel);
         Self::decrement(&self.unattributed);
     }
 
     fn enter_table_write(&self, table: &str) {
+        self.cardinality_generation.fetch_add(1, Ordering::AcqRel);
         self.tables
             .entry(table.to_string())
             .or_default()
@@ -630,6 +634,9 @@ impl UncommittedWriteCensus {
 
     fn leave_table_write(&self, table: &str) {
         if let Some(counts) = self.tables.get(table) {
+            // Publish the epoch BEFORE clearing membership. A reader observing
+            // its absence must also observe this completed writer lifetime.
+            self.cardinality_generation.fetch_add(1, Ordering::AcqRel);
             Self::decrement(&counts.writes);
         }
     }
@@ -673,6 +680,22 @@ impl UncommittedWriteCensus {
             unattributed: every_table,
             tables_written: tables.clone(),
             tables_removed: tables,
+        })
+    }
+
+    /// Stamp an optimistic cardinality probe. Validate after the index read
+    /// AND after checking that its table still has no dirty index entries.
+    pub(crate) fn cardinality_generation(&self) -> u64 {
+        self.cardinality_generation.load(Ordering::Acquire)
+    }
+
+    /// An INSERT may add enforcing keys before its row reaches committed
+    /// storage. Hold only cardinality slots: additions cannot cause a miss.
+    pub(crate) fn hold_for_index_insert(self: &Arc<Self>, table: &str) -> UncommittedWriteHold {
+        self.hold(CensusMembership {
+            counted: true,
+            tables_written: vec![table.to_string()],
+            ..CensusMembership::default()
         })
     }
 
@@ -757,6 +780,9 @@ impl Drop for UncommittedWriteHold {
 #[derive(Debug)]
 struct WriteCensusGate {
     census: Arc<UncommittedWriteCensus>,
+    /// Only first enrollment is serialized. A ready flag/set entry is
+    /// published after the shared census has become visible to readers.
+    enrollment: Mutex<()>,
     /// Holds the global `open` slot.
     counted: AtomicBool,
     /// Holds the `unattributed` slot (a staged key with no attributable table).
@@ -765,10 +791,9 @@ struct WriteCensusGate {
     tables_written: DashSet<String>,
     /// Tables whose `removals` slot this transaction holds.
     tables_removed: DashSet<String>,
-    /// sprinter 6bc4a4040eb7 (B2 follow-up): an AUTOCOMMIT statement's gate —
-    /// it takes slots only for index REMOVALS (a staged DELETE, a key-moving
-    /// UPDATE, a TRUNCATE), never for a plain staged write. See
-    /// [`Transaction::set_removal_census`].
+    /// Ordinary staged values do not arm autocommit membership. Eager index
+    /// additions explicitly arm cardinality; removals also arm missing-key
+    /// probes. See [`Transaction::set_removal_census`].
     removals_only: bool,
 }
 
@@ -776,6 +801,7 @@ impl WriteCensusGate {
     fn new(census: Arc<UncommittedWriteCensus>) -> Self {
         Self {
             census,
+            enrollment: Mutex::new(()),
             counted: AtomicBool::new(false),
             unattributed: AtomicBool::new(false),
             tables_written: DashSet::new(),
@@ -795,15 +821,17 @@ impl WriteCensusGate {
     }
 
     fn arm_counted(&self) {
-        if self.counted.load(Ordering::Relaxed) {
+        if self.counted.load(Ordering::Acquire) {
             return;
         }
-        if self
-            .counted
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
+        let _enrollment = self.enrollment.lock();
+        self.arm_counted_locked();
+    }
+
+    fn arm_counted_locked(&self) {
+        if !self.counted.load(Ordering::Relaxed) {
             self.census.enter();
+            self.counted.store(true, Ordering::Release);
         }
     }
 
@@ -819,8 +847,18 @@ impl WriteCensusGate {
     }
 
     fn arm_table_write(&self, table: &str) {
-        if self.tables_written.insert(table.to_string()) {
+        #[cfg(test)]
+        super::art_manager::test_at_cardinality_enrollment_attempt(table);
+        if self.tables_written.contains(table) {
+            return;
+        }
+        let _enrollment = self.enrollment.lock();
+        if !self.tables_written.contains(table) {
+            #[cfg(test)]
+            super::art_manager::test_before_cardinality_enrollment(table);
+            self.arm_counted_locked();
             self.census.enter_table_write(table);
+            self.tables_written.insert(table.to_string());
         }
     }
 
@@ -831,16 +869,11 @@ impl WriteCensusGate {
         if self.tables_removed.contains(table) {
             return;
         }
-        // Counted first (a removals-only gate is counted by its first removal;
-        // for any other gate the staged write already counted it), then — a
-        // removal is also a write for cardinality purposes — the table's write
-        // slot, BEFORE the removal slot: a reader that saw `removals` armed
-        // while `writes` was not would have a window in which a COUNT still
-        // took the index fast path with an entry already stripped from it.
-        self.arm_counted();
         self.arm_table_write(table);
-        if self.tables_removed.insert(table.to_string()) {
+        let _enrollment = self.enrollment.lock();
+        if !self.tables_removed.contains(table) {
             self.census.enter_table_removal(table);
+            self.tables_removed.insert(table.to_string());
         }
     }
 
@@ -849,18 +882,14 @@ impl WriteCensusGate {
     /// until this transaction ends. A no-op for a removals-only gate, which
     /// answers for index removals only (they always name their table).
     fn note_unattributed(&self) {
-        if self.removals_only {
+        if self.removals_only || self.unattributed.load(Ordering::Acquire) {
             return;
         }
-        if self.unattributed.load(Ordering::Relaxed) {
-            return;
-        }
-        if self
-            .unattributed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
+        let _enrollment = self.enrollment.lock();
+        if !self.unattributed.load(Ordering::Relaxed) {
+            self.arm_counted_locked();
             self.census.enter_unattributed();
+            self.unattributed.store(true, Ordering::Release);
         }
     }
 
@@ -1160,10 +1189,9 @@ impl Transaction {
     }
 
     /// Enroll this transaction in the engine's uncommitted-write census (see
-    /// [`UncommittedWriteCensus`]). For EXPLICIT transactions only — autocommit
-    /// transactions publish their writes within the statement that made them,
-    /// and enrolling them would hold the census non-zero (and the COUNT fast
-    /// paths off) for the whole of any write workload.
+    /// [`UncommittedWriteCensus`]). Explicit transactions enroll every staged
+    /// write. Autocommit uses explicit index-addition/removal enrollment so
+    /// ordinary staged metadata does not arm unrelated tables.
     ///
     /// Enrollment costs nothing until the transaction stages its first write.
     ///
@@ -1175,8 +1203,9 @@ impl Transaction {
         self.write_census = Some(WriteCensusGate::new(census));
     }
 
-    /// Enroll an AUTOCOMMIT (statement-scoped) transaction in the census for
-    /// its index REMOVALS only — sprinter 6bc4a4040eb7 (B2 follow-up).
+    /// Enroll an autocommit transaction without counting ordinary staged
+    /// metadata. Eager additions explicitly take cardinality slots through
+    /// `note_index_key_insertion`; removals also take the narrower miss slots.
     ///
     /// The eager ART maintenance does not wait for COMMIT in a statement
     /// transaction either: its DELETE / key-moving UPDATE / TRUNCATE takes the
@@ -1191,13 +1220,10 @@ impl Transaction {
     /// whose DELETE then rolled back) and main's own miss-based fast paths (a
     /// point lookup reported "no row" for a row that was never deleted).
     ///
-    /// Removals only, because only a removal can make an index probe MISS a
-    /// committed row. A plain staged write (every INSERT) takes NO slot, so the
-    /// reason autocommit transactions stay out of `set_write_census` — the
-    /// census would be non-zero, and the COUNT fast paths off, for the whole of
-    /// any insert workload — does not apply: a removing statement holds its
-    /// table's slots only for its own duration, which is exactly the window
-    /// in which the index under-reports that table.
+    /// Only removals can make an index probe miss a committed row. An eager
+    /// addition instead fences cardinality alone: an INSERT cannot cause a
+    /// miss, but its reserved, uncommitted keys must not be counted. Both
+    /// memberships last until committed publication or rejected-write undo.
     ///
     /// Same contract as `set_write_census`: call before anything is staged.
     pub fn set_removal_census(&mut self, census: Arc<UncommittedWriteCensus>) {
@@ -1502,6 +1528,15 @@ impl Transaction {
             return None;
         }
         Some(gate.census.hold(membership))
+    }
+
+    /// Fence a cardinality probe BEFORE an eager enforcing-key reservation
+    /// or insertion. Unlike a staged value, that mutation is already globally
+    /// visible, including inside an autocommit statement that can still fail.
+    pub(crate) fn note_index_key_insertion(&self, table: &str) {
+        if let Some(gate) = &self.write_census {
+            gate.arm_table_write(table);
+        }
     }
 
     /// Record that this transaction REMOVED index entries for `table`.
@@ -2140,6 +2175,8 @@ impl Transaction {
         }
 
         self.ensure_staged_table_shared(table_name)?;
+        #[cfg(test)]
+        super::art_manager::test_at_cardinality_enrollment_attempt(table_name);
 
         // A staged row counter implies staged rows (see `note_written_key`).
         if let Some(gate) = &self.write_census {
@@ -2147,11 +2184,10 @@ impl Transaction {
         }
         // R2.3: a staged row counter implies staged rows for this table.
         if !self.written_tables.contains(table_name) {
-            if self.written_tables.insert(table_name.to_string()) {
-                if let Some(gate) = &self.write_census {
-                    gate.note_table_write(table_name);
-                }
+            if let Some(gate) = &self.write_census {
+                gate.note_table_write(table_name);
             }
+            self.written_tables.insert(table_name.to_string());
         }
 
         let mut stages = self.row_counter_stages.write();
@@ -3818,17 +3854,18 @@ impl Transaction {
                 // (`"a:b"` must not lock, or count as, table `a`).
                 if let Some(pos) = text.rfind(':') {
                     let table = &text[..pos];
+                    #[cfg(test)]
+                    super::art_manager::test_at_cardinality_enrollment_attempt(table);
                     if !self.written_tables.contains(table) {
                         // All staging entry points acquired the table boundary
                         // before dirty tracking/census in enroll_staged_key.
                         // Arming the census rides the branch that discovers the
                         // table is new to this transaction, so the per-row cost
                         // of the census stays at the one relaxed load above.
-                        if self.written_tables.insert(table.to_string()) {
-                            if let Some(gate) = &self.write_census {
-                                gate.note_table_write(table);
-                            }
+                        if let Some(gate) = &self.write_census {
+                            gate.note_table_write(table);
                         }
+                        self.written_tables.insert(table.to_string());
                     }
                     // A tombstone REMOVES the row's index entries, which is the
                     // only thing that can make a probe MISS for a still-committed
