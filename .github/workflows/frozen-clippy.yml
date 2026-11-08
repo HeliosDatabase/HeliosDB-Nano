@@ -1,0 +1,79 @@
+name: Matched pristine and candidate Clippy (no publish)
+on:
+  push:
+    branches: ['ci/4420-clippy-*']
+permissions:
+  contents: read
+jobs:
+  matched-clippy:
+    name: ${{ matrix.stage }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [clippy-capture, clippy-internal-capture, clippy-optins-capture, clippy-fips-capture]
+    steps:
+      - name: Preserve canonical source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Checkout pristine inherited comparison source
+        uses: actions/checkout@v5
+        with:
+          ref: 967c3704bae2bb94b3a896fbd419615e140f15e9
+          path: baseline
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - name: Install identical native prerequisites for both sources
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev cmake ninja-build nasm perl golang-go
+      - name: Verify frozen adapter and source model
+        working-directory: candidate
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          expected = {
+              '.github/4420-clippy-v1/launch.py': '4328a8a8b1d635a51117ffce409f2271b5850badac5a1c7920022dcd3e74b0a6',
+              '.github/4420-clippy-v1/model.json': '280896f47911e1fa497165346c9ffd11931276681da16e7c2ce4eb793d104cbf',
+          }
+          for name, digest in expected.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit('bootstrap pin mismatch: ' + name)
+          PYBOOT
+      - name: Capture both pristine and candidate in one bounded service
+        env:
+          NANO_CLIPPY_STAGE: ${{ matrix.stage }}
+        run: |
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_clippy_unit="nano-clippy-${GITHUB_RUN_ID}-${NANO_CLIPPY_STAGE}"
+          sudo systemd-run --unit "$nano_clippy_unit" --wait --pipe --collect             -p User="$(id -un)" -p Group="$(id -gn)"             -p WorkingDirectory="$GITHUB_WORKSPACE"             -p MemoryMax=24G -p MemorySwapMax=0             -p RuntimeMaxSec=19800 -p TimeoutStopSec=30             --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo"             --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.95.0             --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1             --setenv=RUST_TEST_THREADS=2 --setenv=CMAKE_BUILD_PARALLEL_LEVEL=2             python3 candidate/.github/4420-clippy-v1/launch.py               --candidate "$GITHUB_WORKSPACE/candidate" --baseline "$GITHUB_WORKSPACE/baseline"               --out "$RUNNER_TEMP/nano-clippy-${NANO_CLIPPY_STAGE}"               --stage "$NANO_CLIPPY_STAGE" --head "$GITHUB_SHA" --model-sha256 280896f47911e1fa497165346c9ffd11931276681da16e7c2ce4eb793d104cbf
+      - name: Preserve both source captures and actual diagnostic comparison
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matched-clippy-${{ matrix.stage }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/nano-clippy-${{ matrix.stage }}/*.json
+            ${{ runner.temp }}/nano-clippy-${{ matrix.stage }}/*.stderr
+            ${{ runner.temp }}/nano-clippy-${{ matrix.stage }}/*/capture/*.json
+            ${{ runner.temp }}/nano-clippy-${{ matrix.stage }}/*/stage/*.json
+            ${{ runner.temp }}/nano-clippy-${{ matrix.stage }}/*/stage/*.log
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
