@@ -227,7 +227,12 @@ fn real_lock_cancellation_and_deadline_keep_their_original_error_after_layout_mo
                 let (holder_release_tx, holder_release_rx) = mpsc::channel();
                 let locks = Arc::clone(db.storage.table_locks());
                 let holder = std::thread::spawn(move || -> Result<()> {
-                    let _guard = locks.exclusive(0, &[MUT], "layout boundary interrupt control", WAIT)?;
+                    let _guard = locks.exclusive(
+                        crate::storage::table_locks::MAIN_LEVEL,
+                        &[MUT],
+                        "layout boundary interrupt control",
+                        WAIT,
+                    )?;
                     holder_ready_tx
                         .send(())
                         .map_err(|error| Error::internal(error.to_string()))?;
@@ -278,7 +283,13 @@ fn real_lock_cancellation_and_deadline_keep_their_original_error_after_layout_mo
                 let started = Instant::now();
                 let mut waiting = false;
                 while started.elapsed() < WAIT && !done.load(Ordering::Acquire) {
-                    if db.storage.table_locks().waiters(0, MUT).1 > 0 {
+                    if db
+                        .storage
+                        .table_locks()
+                        .waiters(crate::storage::table_locks::MAIN_LEVEL, MUT)
+                        .1
+                        > 0
+                    {
                         waiting = true;
                         break;
                     }
