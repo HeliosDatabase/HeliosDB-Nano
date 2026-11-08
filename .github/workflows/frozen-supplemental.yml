@@ -1,0 +1,85 @@
+name: Frozen standby stress and measurements (no publish)
+on:
+  push:
+    branches: ['ci/4420-supplemental-*']
+permissions:
+  contents: read
+jobs:
+  supplemental:
+    name: ${{ matrix.group }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [physical, measure]
+    steps:
+      - name: Preserve source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev pkg-config libssl-dev
+      - name: Check frozen adapter and canonical source model
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          pairs = {
+              '.github/4420-full-gates-v5/launch.py': '0522344ab8d58342b7540865cce42cd6fddb764a5b6ff3f0846ab25fb7c7b5c4',
+              '.github/4420-full-gates-v5/supplement.py': 'c3012cdd9a2dfa3266993d53574b85872fdfdca80f47b4eacf114feb363821b4',
+              '.github/4420-full-gates-v5/model.json': '961053e98d784c0c0e2153c85b8bafe12103d65dca65114139ac4834c4cd1dea',
+          }
+          for name, digest in pairs.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit('frozen bootstrap input changed: ' + name)
+          PYBOOT
+      - name: Run complete frozen tier in an isolated bounded service
+        env:
+          NANO_CLOUD_GROUP: ${{ matrix.group }}
+        run: |
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107
+          ln -s "$GITHUB_WORKSPACE/.github/4420-full-gates-v5" /home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates-v5
+          nano_cloud_unit="nano-supplemental-${GITHUB_RUN_ID}-${NANO_CLOUD_GROUP}"
+          sudo systemd-run --unit "$nano_cloud_unit" --wait --pipe --collect \
+            -p User="$(id -un)" -p Group="$(id -gn)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE" \
+            -p MemoryMax=24G -p MemorySwapMax=0 \
+            -p RuntimeMaxSec=19800 -p TimeoutStopSec=30 \
+            --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo" \
+            --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.95.0 \
+            --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
+            --setenv=RUST_TEST_THREADS=2 --setenv=NANO_FULL_LIST_BOUNDED=24G-noswap \
+            --setenv="NANO_FULL_LIST_SCOPE=$nano_cloud_unit.service" \
+            python3 .github/4420-full-gates-v5/supplement.py \
+              --tree "$GITHUB_WORKSPACE" \
+              --out "$RUNNER_TEMP/nano-supplemental-${NANO_CLOUD_GROUP}" \
+              --group "$NANO_CLOUD_GROUP" --head "$GITHUB_SHA" \
+              --model-sha256 961053e98d784c0c0e2153c85b8bafe12103d65dca65114139ac4834c4cd1dea
+      - name: Preserve logs, source identities and native count receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: supplemental-${{ matrix.group }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/nano-supplemental-${{ matrix.group }}/*.json
+            ${{ runner.temp }}/nano-supplemental-${{ matrix.group }}/capture/*.json
+            ${{ runner.temp }}/nano-supplemental-${{ matrix.group }}/*/*.json
+            ${{ runner.temp }}/nano-supplemental-${{ matrix.group }}/*/*.log
+            ${{ runner.temp }}/nano-supplemental-${{ matrix.group }}/readiness20/readiness20-native/**
+            ${{ runner.temp }}/nano-supplemental-${{ matrix.group }}/public-perf-smoke/public-smoke-results/**
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
