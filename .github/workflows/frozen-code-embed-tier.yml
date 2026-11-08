@@ -1,0 +1,79 @@
+name: Frozen full code-embed tier and native384 inference (no publish)
+on:
+  push:
+    branches: ['ci/4420-code-embed-*']
+permissions:
+  contents: read
+jobs:
+  full-code-embed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Preserve product source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev pkg-config libssl-dev
+      - name: Check portable adapter and immutable runtime/model-source inputs
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          pairs = {
+              '.github/4420-full-gates-v5/launch_embed.py': '1e265c570699aebb987003b4761856e2e87c0348776b7b3a308115b51aea530f',
+              '.github/4420-full-gates-v5/embed-model.json': '4ce6583c219247a25cd08c8b75153a4741312d5801da746885c5de9395c15aba',
+              '.github/4420-full-gates-v5/ort_prereq.py': '900ae089677b4db646deac632ec65dbef9f1e8c19f90add78ddd6e80d032805b',
+              '.github/4420-full-gates-v5/ort-prereq.json': '00dde27899411b54d1a0878cd6a91231f6475b8b5ad76ce5947c30b08665e5e9',
+          }
+          for name, digest in pairs.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit('frozen bootstrap changed: ' + name)
+          PYBOOT
+      - name: Run complete unchanged full tier, native inventory and actual ignored384 test
+        run: |
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_embed_unit="nano-cloud-${GITHUB_RUN_ID}-code-embed"
+          sudo systemd-run --unit "$nano_embed_unit" --wait --pipe --collect \
+            -p User="$(id -un)" -p Group="$(id -gn)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE" \
+            -p MemoryMax=24G -p MemorySwapMax=0 \
+            -p RuntimeMaxSec=19800 -p TimeoutStopSec=30 \
+            --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo" \
+            --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.92.0 \
+            --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
+            --setenv=RUST_TEST_THREADS=2 --setenv=NANO_FULL_LIST_BOUNDED=24G-noswap \
+            --setenv="NANO_FULL_LIST_SCOPE=$nano_embed_unit.service" \
+            python3 .github/4420-full-gates-v5/launch_embed.py \
+              --tree "$GITHUB_WORKSPACE" --out "$RUNNER_TEMP/nano-full-code-embed" \
+              --head "$GITHUB_SHA" --model-sha256 4ce6583c219247a25cd08c8b75153a4741312d5801da746885c5de9395c15aba --execute
+      - name: Preserve full tier, ORT API, model identities and native inference receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-code-embed-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/nano-full-code-embed/*.json
+            ${{ runner.temp }}/nano-full-code-embed/capture/*.json
+            ${{ runner.temp }}/nano-full-code-embed/stage/*.json
+            ${{ runner.temp }}/nano-full-code-embed/stage/*.log
+            ${{ runner.temp }}/nano-full-code-embed/embed-runtime/*.json
+            ${{ runner.temp }}/nano-full-code-embed/embed-runtime/*.log
+            ${{ runner.temp }}/nano-full-code-embed/ort/*.json
+            ${{ runner.temp }}/nano-full-code-embed/count-plan/**
+            ${{ runner.temp }}/nano-full-code-embed/native-lists/**
+            ${{ runner.temp }}/nano-full-code-embed/count-report/**
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14

@@ -117,7 +117,7 @@ def check_context():
             (tree / rel).write_text('// synthetic source only\n')
         source = {str(p.relative_to(tree)): aid.sha(p) for p in tree.rglob('*') if p.is_file()}
         source_path = root / 'source.json'; source_sha = dump(source_path, source)
-        commands = json.loads((HERE.parent / 'final-gates-v5/commands.json').read_text())
+        commands = json.loads((HERE.parent / 'final-gates-v6/commands.json').read_text())
         expected = {'source': str(tree), 'tiers': {tier: commands[stage].get('features', []) for stage, tier in aid.STAGES.items()},
                     'targets': [{'target': name, 'source': 'tests/' + name + '.rs', 'sha256': source['tests/' + name + '.rs'],
                                  'tiers': {tier: {'minimum_passed': int(name == 'generated')} for tier in aid.STAGES.values()}}
@@ -129,7 +129,7 @@ def check_context():
             binaries.append({'path': str(binary), 'sha256': aid.sha(binary)})
         receipt_path = root / 'receipt.json'; log_path = root / 'run.log'
         request = {'tree': str(tree), 'target_root': str(target), 'receipt': str(receipt_path), 'source_manifest': str(source_path), 'source_sha': source_sha,
-                   'expected_manifest': str(expected_path), 'expected_sha': expected_sha, 'bundle': str(HERE.parent / 'final-gates-v5')}
+                   'expected_manifest': str(expected_path), 'expected_sha': expected_sha, 'bundle': str(HERE.parent / 'final-gates-v6')}
         for stage in aid.STAGES:
             units = [('unittests src/lib.rs', 'lib', ['generated_macro::case_0', 'generated_macro::case_1'])]
             if stage != 'lib': units += [('unittests src/main.rs', 'main', []), ('tests/generated.rs', 'generated', ['macro_case']), ('tests/disabled.rs', 'disabled', [])]

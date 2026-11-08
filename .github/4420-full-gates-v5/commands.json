@@ -109,7 +109,7 @@
         "--tests",
         "--no-fail-fast",
         "--features",
-        "internal-tests,code-graph,graph-rag,mcp-endpoint,vector-persist,compression,server,ha-full,simd,lock-census,test-utils,sync-experimental",
+        "internal-tests,code-graph,graph-rag,mcp-endpoint,vector-persist,compression,server,ha-full,simd,lock-census,test-utils",
         "--",
         "--skip",
         "lock_management",
@@ -129,8 +129,7 @@
       "ha-full",
       "simd",
       "lock-census",
-      "test-utils",
-      "sync-experimental"
+      "test-utils"
     ],
     "timeout_seconds": 43200,
     "required_tools": [
@@ -961,7 +960,7 @@
         "--all-targets",
         "--message-format=json",
         "--features",
-        "internal-tests,code-graph,graph-rag,mcp-endpoint,vector-persist,compression,server,ha-full,simd,lock-census,test-utils,sync-experimental",
+        "internal-tests,code-graph,graph-rag,mcp-endpoint,vector-persist,compression,server,ha-full,simd,lock-census,test-utils",
         "--",
         "-D",
         "warnings"
@@ -980,8 +979,7 @@
       "ha-full",
       "simd",
       "lock-census",
-      "test-utils",
-      "sync-experimental"
+      "test-utils"
     ]
   },
   "clippy-fips-capture": {
@@ -1132,7 +1130,7 @@
         "--tests",
         "--no-fail-fast",
         "--features",
-        "internal-tests,code-graph,graph-rag,mcp-endpoint,vector-persist,compression,server,ha-full,simd,lock-census,test-utils,sync-experimental,code-embed",
+        "internal-tests,code-graph,graph-rag,mcp-endpoint,vector-persist,compression,server,ha-full,simd,lock-census,test-utils,code-embed",
         "--",
         "--skip",
         "lock_management",
@@ -1151,7 +1149,6 @@
       "simd",
       "lock-census",
       "test-utils",
-      "sync-experimental",
       "code-embed"
     ],
     "tier": "code-embed",
