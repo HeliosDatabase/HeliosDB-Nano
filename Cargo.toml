@@ -61,6 +61,8 @@ rocksdb = { version = "0.22", default-features = false, features = ["snappy", "z
 
 # SQL Parsing
 sqlparser = { version = "0.53", features = ["visitor"] }
+# Lexically borrowed scalar routine callers; no lifetime escape into the installed bridge.
+scoped-tls = "1.0.1"
 
 # Async Runtime
 tokio = { version = "1.40", features = ["full"] }

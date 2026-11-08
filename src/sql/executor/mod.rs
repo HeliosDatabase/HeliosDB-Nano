@@ -855,6 +855,20 @@ impl<'a> Executor<'a> {
 
     /// Execute a logical plan and return all results
     pub fn execute(&mut self, plan: &LogicalPlan) -> Result<Vec<Tuple>> {
+        // A direct storage-backed executor is an execution owner too, including
+        // explicit absence of a transaction. Copy these borrows before the
+        // mutable operator build/drain; no borrowed scope survives this call.
+        let owner = self.storage.map(|storage| storage.instance_id());
+        let transaction = self.transaction;
+        match owner {
+            Some(engine) => {
+                crate::sql::udf_bridge::with_caller_transaction(engine, transaction, || self.execute_body(plan))
+            }
+            None => self.execute_body(plan),
+        }
+    }
+
+    fn execute_body(&mut self, plan: &LogicalPlan) -> Result<Vec<Tuple>> {
         // sprinter d15933f528b0: publish WHICH database this statement runs
         // against for its whole duration. `nextval`/`currval`/`setval` are
         // evaluated inside `sql::evaluator`, which holds no engine, so this
@@ -896,6 +910,17 @@ impl<'a> Executor<'a> {
     /// the extended protocol's Describe already reads through
     /// `LogicalPlan::schema()`.
     pub fn execute_with_schema(&mut self, plan: &LogicalPlan) -> Result<(Vec<Tuple>, Arc<Schema>)> {
+        let owner = self.storage.map(|storage| storage.instance_id());
+        let transaction = self.transaction;
+        match owner {
+            Some(engine) => crate::sql::udf_bridge::with_caller_transaction(engine, transaction, || {
+                self.execute_with_schema_body(plan)
+            }),
+            None => self.execute_with_schema_body(plan),
+        }
+    }
+
+    fn execute_with_schema_body(&mut self, plan: &LogicalPlan) -> Result<(Vec<Tuple>, Arc<Schema>)> {
         // sprinter d15933f528b0: publish WHICH database this statement runs
         // against for its whole duration. `nextval`/`currval`/`setval` are
         // evaluated inside `sql::evaluator`, which holds no engine, so this

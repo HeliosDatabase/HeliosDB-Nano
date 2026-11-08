@@ -55,8 +55,10 @@
 //! dispatch uses the calling database already bound by `sequences::EngineScope`:
 //! a healthy same-name routine belongs to that registry, and a quarantined
 //! negative lookup must return Storage before another database/body or a once
-//! subquery fallback can run. No new per-statement scope or built-in dispatch
-//! cost is needed. Registry availability is checked only for a missing name.
+//! subquery fallback can run. Registry ownership reuses the existing engine
+//! scope; the borrowed caller transaction is propagated separately during
+//! synchronous planning/evaluation. Built-in scalar dispatch remains unchanged.
+//! Registry availability is checked only for a missing name.
 //!
 //! Public contextless `install`/`resolve` retain the legacy newest-live-name
 //! resolution when no engine context is installed. A current engine without
@@ -178,6 +180,53 @@ thread_local! {
     /// planner and evaluator, so a self-recursive body would otherwise recurse
     /// until the thread's stack is exhausted (an abort, not an error).
     static CALL_DEPTH: Cell<u32> = const { Cell::new(0) };
+    // The owned frame distinguishes an explicitly absent caller from a nested
+    // storage-less evaluation. No reference is retained in this metadata.
+    static CALLER_OWNER: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
+}
+
+scoped_tls::scoped_thread_local!(static CALLER_TRANSACTION: crate::storage::Transaction);
+
+struct CallerOwnerGuard(Option<(u64, bool)>);
+
+impl Drop for CallerOwnerGuard {
+    fn drop(&mut self) {
+        CALLER_OWNER.with(|owner| owner.set(self.0));
+    }
+}
+
+/// Run synchronous planning/evaluation with this execution's actual caller.
+/// An explicit None masks even a same-engine outer caller. A storage-less
+/// nested evaluator inherits by not introducing a new execution boundary.
+pub(crate) fn with_caller_transaction<R>(
+    engine_id: u64,
+    txn: Option<&crate::storage::Transaction>,
+    body: impl FnOnce() -> R,
+) -> R {
+    let previous = CALLER_OWNER.with(|owner| owner.get());
+    // Ordinary autocommit execution has no borrowed caller to mask. Leave
+    // its metadata untouched; nested explicit absence already masks the key.
+    if txn.is_none() && !previous.is_some_and(|(_, borrowed)| borrowed) {
+        return body();
+    }
+    CALLER_OWNER.with(|owner| owner.set(Some((engine_id, txn.is_some()))));
+    let _owner = CallerOwnerGuard(previous);
+    match txn {
+        Some(txn) => CALLER_TRANSACTION.set(txn, body),
+        None => body(),
+    }
+}
+
+/// Borrow only within this synchronous call; the returned SQL values are owned.
+pub(crate) fn with_matching_caller_transaction<R>(
+    engine_id: u64,
+    body: impl FnOnce(Option<&crate::storage::Transaction>) -> R,
+) -> R {
+    if CALLER_OWNER.with(|owner| owner.get()) == Some((engine_id, true)) && CALLER_TRANSACTION.is_set() {
+        CALLER_TRANSACTION.with(|txn| body(Some(txn)))
+    } else {
+        body(None)
+    }
 }
 
 /// Restores the depth counter on every exit path, including the `?` early
@@ -341,3 +390,7 @@ mod tests {
 #[cfg(test)]
 #[path = "routine_uninstalled_owner_tests.rs"]
 mod routine_uninstalled_owner_tests;
+
+#[cfg(test)]
+#[path = "routine_caller_transaction_scope_tests.rs"]
+mod routine_caller_transaction_scope_tests;

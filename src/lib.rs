@@ -5514,15 +5514,20 @@ impl EmbeddedDatabase {
         body: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         Self::refuse_if_transaction_failed(txn, sql)?;
+        // Direct default/VALUES evaluators can run before an Executor exists.
+        let _routine_engine = sql::sequences::EngineScope::enter(&self.storage);
         // Spec R5.1: a read acts for the transaction too. A function body that writes runs
         // statements of its own on this thread, and after the transaction's `ALTER` they
         // waited for the transaction itself, for the whole lock timeout: `BEGIN; ALTER t;
         // SELECT f()` where f inserts into t. Under the transaction's owner they find its
-        // locks as theirs. Its writes still commit by themselves, as they always have.
+        // locks as theirs. Scalar body reads and writes use this same borrowed
+        // transaction; this boundary alone owns its failed-statement state.
         let _bound_locks = txn.bind_existing_table_locks();
         // Spec R5.6: the statement's layout read set is validated inside the boundary, so
         // a schema change under it aborts the transaction (40001) like any other error.
-        let result = body().and_then(|value| storage::layout_epochs::validate_statement().map(|()| value));
+        let result = sql::udf_bridge::with_caller_transaction(self.storage.instance_id(), Some(txn), || {
+            body().and_then(|value| storage::layout_epochs::validate_statement().map(|()| value))
+        });
         match &result {
             Err(_) => txn.mark_sql_aborted(),
             Ok(_) if Self::is_rollback_to_savepoint(sql) => txn.clear_sql_aborted(),
@@ -7454,16 +7459,7 @@ impl EmbeddedDatabase {
         // Body statements run on the CALLER's transaction. Neither branch takes
         // the global `current_transaction` mutex, so this is safe to reach from
         // `execute()`'s in-transaction branch, which holds it across the call.
-        let sql_executor = |body_sql: &str| -> Result<Vec<Vec<Value>>> {
-            let trimmed = body_sql.trim();
-            if starts_with_icase(trimmed, "SELECT") || starts_with_icase(trimmed, "WITH") {
-                let tuples = self.query_in_transaction(trimmed, txn)?;
-                Ok(tuples.iter().map(|t| t.values.clone()).collect())
-            } else {
-                self.execute_in_transaction_no_fast_path(trimmed, txn)?;
-                Ok(vec![])
-            }
-        };
+        let sql_executor = |body_sql: &str| self.execute_routine_body_in_transaction(body_sql, txn);
 
         // Errors here include `Procedure '<name>' does not exist` — the existence
         // check both families share.
@@ -7472,6 +7468,24 @@ impl EmbeddedDatabase {
         // `CALL` affects no rows of its own. PostgreSQL's command tag is a bare
         // `CALL` with no count; 0 is what both families return.
         Ok(0)
+    }
+
+    /// Shared by CALL and a scalar body's lexically borrowed caller. These
+    /// helpers stage against the supplied transaction without re-locking its
+    /// session/global slot or committing it independently.
+    fn execute_routine_body_in_transaction(
+        &self,
+        body_sql: &str,
+        txn: &storage::Transaction,
+    ) -> Result<Vec<Vec<Value>>> {
+        let trimmed = body_sql.trim();
+        if starts_with_icase(trimmed, "SELECT") || starts_with_icase(trimmed, "WITH") {
+            let tuples = self.query_in_transaction(trimmed, txn)?;
+            Ok(tuples.iter().map(|t| t.values.clone()).collect())
+        } else {
+            self.execute_in_transaction_no_fast_path(trimmed, txn)?;
+            Ok(vec![])
+        }
     }
 
     /// Read one statement inside an explicit transaction, without going near the
@@ -9017,9 +9031,8 @@ impl EmbeddedDatabase {
                 // NOT affected, because neither populates the global slot: a WIRE
                 // session transaction (`BEGIN` over PG/MySQL, which uses the
                 // per-session slot) and the embedded RAII `begin_transaction()`
-                // handle. A UDF works there, with the same body-runs-outside-the-
-                // caller's-transaction semantics `CALL` already ships
-                // (ROADMAP_V5 §2.11).
+                // handle. Those callers publish their actual borrowed
+                // transaction for the synchronous evaluation below, like CALL.
                 if handle.global_txn_active.load(std::sync::atomic::Ordering::Acquire)
                     || GLOBAL_TXN_LOCK_HELD.with(|held| held.get())
                 {
@@ -9031,14 +9044,19 @@ impl EmbeddedDatabase {
                          the function body as ordinary SQL.",
                     ));
                 }
-                let sql_trimmed = sql.trim();
-                if starts_with_icase(sql_trimmed, "SELECT") || starts_with_icase(sql_trimmed, "WITH") {
-                    let tuples = handle.query(sql, &[])?;
-                    Ok(tuples.iter().map(|t| t.values.clone()).collect())
-                } else {
-                    handle.execute(sql)?;
-                    Ok(vec![])
-                }
+                sql::udf_bridge::with_matching_caller_transaction(handle.storage.instance_id(), |caller| {
+                    if let Some(txn) = caller {
+                        return handle.execute_routine_body_in_transaction(sql, txn);
+                    }
+                    let sql_trimmed = sql.trim();
+                    if starts_with_icase(sql_trimmed, "SELECT") || starts_with_icase(sql_trimmed, "WITH") {
+                        let tuples = handle.query(sql, &[])?;
+                        Ok(tuples.iter().map(|t| t.values.clone()).collect())
+                    } else {
+                        handle.execute(sql)?;
+                        Ok(vec![])
+                    }
+                })
             }),
         });
         // The database owns the only strong reference; the process-global slot
@@ -9793,7 +9811,12 @@ impl EmbeddedDatabase {
         skip_fast_paths: bool,
     ) -> Result<u64> {
         // sprinter ccebc95977f1: off the async worker serving the client (`runtime_offload`).
-        offload_statement(|| self.execute_in_transaction_inner_body(sql, txn, skip_fast_paths))
+        offload_statement(|| {
+            let _routine_engine = sql::sequences::EngineScope::enter(&self.storage);
+            sql::udf_bridge::with_caller_transaction(self.storage.instance_id(), Some(txn), || {
+                self.execute_in_transaction_inner_body(sql, txn, skip_fast_paths)
+            })
+        })
     }
 
     /// The body of [`Self::execute_in_transaction_inner`], which runs it through
@@ -11651,6 +11674,7 @@ impl EmbeddedDatabase {
                                 &schema,
                                 table_name,
                                 &[],
+                                Some(txn),
                             )?;
                             let mut new_value = evaluator.evaluate(&bound, &old_tuple)?;
                             let col_index = evaluator
@@ -21754,6 +21778,20 @@ impl EmbeddedDatabase {
         original_sql: Option<&str>,
         expected: Option<ExpectedResultShape<'_>>,
     ) -> Result<(u64, Vec<Tuple>)> {
+        let _routine_engine = sql::sequences::EngineScope::enter(&self.storage);
+        sql::udf_bridge::with_caller_transaction(self.storage.instance_id(), session_txn, || {
+            self.execute_plan_with_params_inner_body(plan, params, session_txn, original_sql, expected)
+        })
+    }
+
+    fn execute_plan_with_params_inner_body(
+        &self,
+        plan: &sql::LogicalPlan,
+        params: &[Value],
+        session_txn: Option<&storage::Transaction>,
+        original_sql: Option<&str>,
+        expected: Option<ExpectedResultShape<'_>>,
+    ) -> Result<(u64, Vec<Tuple>)> {
         if self.params_main_dml_needs_implicit_transaction(plan, session_txn) {
             return self.execute_plan_with_params_in_implicit_transaction(plan, params, original_sql, expected);
         }
@@ -22987,7 +23025,7 @@ impl EmbeddedDatabase {
                         let mut tuple = tuple;
                         for (col_name, value_expr) in assignments {
                             let bound = self.materialize_scalar_subqueries_for_row(
-                                value_expr, &tuple, &schema, table_name, params,
+                                value_expr, &tuple, &schema, table_name, params, active_txn,
                             )?;
                             let mut new_value = evaluator.evaluate(&bound, &tuple)?;
                             let col_index = evaluator
@@ -23727,7 +23765,8 @@ impl EmbeddedDatabase {
                 // investigation (and a fix for the same latent re-entrancy in the
                 // Insert/Update/Delete arms above, which already lock
                 // unconditionally). So this arm shares the RLS rule via
-                // `rls_filtered_plan` and leaves its executor construction alone.
+                // `rls_filtered_plan`. A supplied session/statement transaction
+                // is forwarded directly; no new global-slot lookup is made.
                 //
                 // Captured BEFORE `plan` is shadowed by the RLS-filtered copy:
                 // DROP TABLE reaches the `Executor` from here, and the `Executor`
@@ -23741,6 +23780,11 @@ impl EmbeddedDatabase {
                 let mut executor = sql::Executor::with_storage(&self.storage)
                     .with_timeout(self.effective_statement_timeout_ms())
                     .with_parameters(params.to_vec());
+                // A supplied session/statement caller is already borrowed;
+                // forward it without consulting the non-reentrant global slot.
+                if let Some(txn) = session_txn {
+                    executor = executor.with_transaction(txn);
+                }
                 let results = executor.execute(&plan)?;
                 for table in dropped_tables {
                     self.on_table_dropped(&table);
@@ -32403,6 +32447,7 @@ impl EmbeddedDatabase {
         outer_schema: &Schema,
         outer_table: &str,
         params: &[Value],
+        txn: Option<&storage::Transaction>,
     ) -> Result<sql::LogicalExpr> {
         use sql::LogicalExpr;
         match expr {
@@ -32417,6 +32462,9 @@ impl EmbeddedDatabase {
                 let mut executor = sql::Executor::with_storage(&self.storage)
                     .with_timeout(self.effective_statement_timeout_ms())
                     .with_parameters(params.to_vec());
+                if let Some(txn) = txn {
+                    executor = executor.with_transaction(txn);
+                }
                 let rows = executor.execute(&bound_plan)?;
                 let value = rows
                     .first()
@@ -32431,6 +32479,7 @@ impl EmbeddedDatabase {
                     outer_schema,
                     outer_table,
                     params,
+                    txn,
                 )?),
                 op: *op,
                 right: Box::new(self.materialize_scalar_subqueries_for_row(
@@ -32439,6 +32488,7 @@ impl EmbeddedDatabase {
                     outer_schema,
                     outer_table,
                     params,
+                    txn,
                 )?),
             }),
             LogicalExpr::UnaryExpr { op, expr: inner } => Ok(LogicalExpr::UnaryExpr {
@@ -32449,6 +32499,7 @@ impl EmbeddedDatabase {
                     outer_schema,
                     outer_table,
                     params,
+                    txn,
                 )?),
             }),
             LogicalExpr::Cast { expr: inner, data_type } => Ok(LogicalExpr::Cast {
@@ -32458,6 +32509,7 @@ impl EmbeddedDatabase {
                     outer_schema,
                     outer_table,
                     params,
+                    txn,
                 )?),
                 data_type: data_type.clone(),
             }),
