@@ -1,0 +1,84 @@
+name: Source32 full correctness tiers (no publish)
+on:
+  push:
+    branches: ['ci/4420-correctness-*']
+permissions:
+  contents: read
+jobs:
+  full-tier:
+    name: ${{ matrix.stage }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [core-default, core-internal, core-optins]
+    steps:
+      - name: Preserve source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install native build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev pkg-config libssl-dev
+      - name: Check frozen adapter and canonical source model
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          pairs = {
+              '.github/4420-full-gates-v5/launch.py': '97388dac7d10552b2fe86b43b5669b930dd75304963a62258fdc1636b9dcd976',
+              '.github/4420-full-gates-v5/model.json': '5faa2a3fdf7d46c777fea156a3fd4919f67bd24469dab90ae3f6891592d9e75b',
+          }
+          for name, digest in pairs.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit('frozen bootstrap input changed: ' + name)
+          PYBOOT
+      - name: Run complete frozen tier in an isolated bounded service
+        env:
+          NANO_CLOUD_STAGE: ${{ matrix.stage }}
+        run: |
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_cloud_unit="nano-cloud-${GITHUB_RUN_ID}-${NANO_CLOUD_STAGE}"
+          sudo systemd-run --unit "$nano_cloud_unit" --wait --pipe --collect \
+            -p User="$(id -un)" -p Group="$(id -gn)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE" \
+            -p MemoryMax=24G -p MemorySwapMax=0 \
+            -p RuntimeMaxSec=19800 -p TimeoutStopSec=30 \
+            --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo" \
+            --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.95.0 \
+            --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
+            --setenv=RUST_TEST_THREADS=2 --setenv=NANO_FULL_LIST_BOUNDED=24G-noswap \
+            --setenv="NANO_FULL_LIST_SCOPE=$nano_cloud_unit.service" \
+            python3 .github/4420-full-gates-v5/launch.py \
+              --tree "$GITHUB_WORKSPACE" \
+              --out "$RUNNER_TEMP/nano-full-${NANO_CLOUD_STAGE}" \
+              --stage "$NANO_CLOUD_STAGE" --head "$GITHUB_SHA" \
+              --model-sha256 5faa2a3fdf7d46c777fea156a3fd4919f67bd24469dab90ae3f6891592d9e75b
+      - name: Preserve logs, source identities and native count receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-tier-${{ matrix.stage }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/nano-full-${{ matrix.stage }}/*.json
+            ${{ runner.temp }}/nano-full-${{ matrix.stage }}/*.log
+            ${{ runner.temp }}/nano-full-${{ matrix.stage }}/capture/*.json
+            ${{ runner.temp }}/nano-full-${{ matrix.stage }}/stage/*.json
+            ${{ runner.temp }}/nano-full-${{ matrix.stage }}/stage/*.log
+            ${{ runner.temp }}/nano-full-${{ matrix.stage }}/count-plan/**
+            ${{ runner.temp }}/nano-full-${{ matrix.stage }}/native-lists/**
+            ${{ runner.temp }}/nano-full-${{ matrix.stage }}/count-report/**
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14

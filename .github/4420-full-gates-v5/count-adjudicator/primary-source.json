@@ -1,0 +1,35 @@
+{
+  "status": "READ_ONLY_REFERENCE_NOT_RUNTIME_ACCEPTANCE",
+  "references": [
+    {
+      "label": "terse discovery format",
+      "official_local_source": "/home/gpc/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/share/doc/rust/html/src/test/formatters/terse.rs.html",
+      "sha256": "51367883c000627e1555663baf813a0dcb9a2812e944bd6850f53e62baa3c316",
+      "verified_terms": [
+        "{test_type}",
+        "write_discovery_finish"
+      ],
+      "reference": "Local official Rust1.95.0 standard test crate source; actual native output is parsed strictly and incompatible formats refuse."
+    },
+    {
+      "label": "test mode converts benchmarks",
+      "official_local_source": "/home/gpc/.rustup/toolchains/1.95.0-x86_64-unknown-linux-gnu/share/doc/rust/html/src/test/lib.rs.html",
+      "sha256": "af4cb622ad9a669bd3f97b54cc44d124c5719665f6e25e44d97f079290f8a9d3",
+      "verified_terms": [
+        "convert_benchmarks_to_tests",
+        "filter_tests",
+        "RunIgnored::Only",
+        "__RUST_TEST_INVOKE",
+        "__RUST_TEST_BENCH_BENCHMARKS"
+      ],
+      "reference": "Local official Rust1.95.0 standard test crate source; actual native output is parsed strictly and incompatible formats refuse.",
+      "safety_note": "Secondary invoker is recognized before CLI parsing; collector removes private child-runner variable names after environment merge."
+    },
+    {
+      "label": "only documented full-tier skip",
+      "source": "/home/gpc/HDB/worktrees/nano-codex-combined/docs/GATES.md",
+      "sha256": "6ce335b744dd3e16686efb6ee8b98f8fc55ae814e478f10fc6a68465c4e8c45f",
+      "verified_term": "--skip lock_management"
+    }
+  ]
+}
