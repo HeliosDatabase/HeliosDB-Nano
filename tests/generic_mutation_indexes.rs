@@ -293,6 +293,8 @@ fn unreadable_reconciliation_retires_indexes_and_blocks_every_direct_write_route
     {
         let db = open(temp.path());
         let old = seed(&db);
+        // Resolve the invocation schema while the target is still readable.
+        let schema = Catalog::new(&db.storage).get_table_schema("t").unwrap();
         let row = old[0].row_id.unwrap();
         let raw = db.storage.db();
         let key = format!("data:t:{row}").into_bytes();
@@ -318,7 +320,6 @@ fn unreadable_reconciliation_retires_indexes_and_blocks_every_direct_write_route
             None,
             "unusable trees are absent, never authoritative empty"
         );
-        let schema = Catalog::new(&db.storage).get_table_schema("t").unwrap();
         assert!(db.storage.insert_tuple("t", tuple(99, 99, 99, "common")).is_err());
         assert!(db
             .storage
