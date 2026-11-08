@@ -31,9 +31,9 @@ jobs:
           import hashlib
           from pathlib import Path
           pairs = {
-              '.github/4420-full-gates-v5/launch_embed.py': '1e265c570699aebb987003b4761856e2e87c0348776b7b3a308115b51aea530f',
+              '.github/4420-full-gates-v5/launch_embed.py': '23c7f11b8a04ed9a5da307ed85f514c37a4d228991e42958622e1a84f69e3cea',
               '.github/4420-full-gates-v5/embed-model.json': '4ce6583c219247a25cd08c8b75153a4741312d5801da746885c5de9395c15aba',
-              '.github/4420-full-gates-v5/ort_prereq.py': '900ae089677b4db646deac632ec65dbef9f1e8c19f90add78ddd6e80d032805b',
+              '.github/4420-full-gates-v5/ort_prereq.py': 'ba6845dd2476846e7320233e7fbb1d35c3b53aa5abee0af91d638321ecf64a6a',
               '.github/4420-full-gates-v5/ort-prereq.json': '00dde27899411b54d1a0878cd6a91231f6475b8b5ad76ce5947c30b08665e5e9',
           }
           for name, digest in pairs.items():

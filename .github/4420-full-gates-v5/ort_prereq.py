@@ -1,11 +1,14 @@
 """Portable fixed-asset ORT preparation; importing this file performs no work."""
 import ctypes
+import errno
 import hashlib
 import json
 import os
+import socket
 from pathlib import Path, PurePosixPath
 import tarfile
 import time
+import urllib.error
 import urllib.request
 
 
@@ -36,25 +39,98 @@ def verify_runtime(root, spec):
         raise ValueError('ORT runtime member set changed')
 
 
+def retryable_download_error(error):
+    """Retry transport failures only; integrity/extraction refusals stay final."""
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code == 429 or 500 <= error.code < 600
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, socket.gaierror):
+        return reason.errno == socket.EAI_AGAIN
+    return isinstance(reason, (TimeoutError, ConnectionError)) or (
+        isinstance(reason, OSError) and reason.errno in {
+            errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED,
+            errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EPIPE,
+        })
+
+
+def download_archive(directory, spec):
+    """One asset;3 attempts,180s budget plus <=60s in-flight socket overrun."""
+    archive = directory / 'onnxruntime-linux-x64-1.24.4.tgz'
+    started = time.monotonic()
+    deadline = started + 180
+    receipt = {'url': spec['url'], 'asset_id': spec['asset_id'],
+               'archive_sha256_expected': spec['archive_sha256'],
+               'archive_bytes_expected': spec['archive_bytes'],
+               'max_attempts': 3, 'shared_deadline_seconds': 180,
+               'request_timeout_seconds_max': 60, 'inflight_socket_overrun_seconds_max': 60,
+               'transport_budget_including_socket_overrun_seconds': 240,
+               'attempts': [], 'verified': False}
+    receipt_path = directory / 'download-attempts.json'
+    write(receipt_path, receipt)
+    for number in range(1, 4):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            receipt.update(deadline_exceeded=True, elapsed_seconds=time.monotonic() - started)
+            write(receipt_path, receipt)
+            raise TimeoutError('official ORT download exceeded shared180s deadline')
+        partial = directory / ('download-attempt-%d.part' % number)
+        attempt = {'attempt': number, 'outcome': 'running', 'bytes_received': 0,
+                   'request_timeout_seconds': min(60, remaining)}
+        receipt['attempts'].append(attempt)
+        write(receipt_path, receipt)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            request = urllib.request.Request(spec['url'], headers={'User-Agent': 'Nano-code-embed-fixed-prerequisite'})
+            with urllib.request.urlopen(request, timeout=attempt['request_timeout_seconds']) as incoming, partial.open('xb') as stream:
+                # read1 returns after one buffered/raw read rather than waiting
+                # for a full chunk; check the shared deadline between reads.
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('official ORT download exceeded shared180s deadline')
+                    block = incoming.read1(256 * 1024)
+                    if not block:
+                        break
+                    size += len(block)
+                    if time.monotonic() > deadline:
+                        raise TimeoutError('official ORT download exceeded shared180s deadline')
+                    if size > spec['archive_bytes']:
+                        raise ValueError('official ORT archive exceeds pinned length')
+                    digest.update(block)
+                    stream.write(block)
+            if time.monotonic() > deadline:
+                raise TimeoutError('official ORT download exceeded shared180s deadline')
+            if size != spec['archive_bytes'] or digest.hexdigest() != spec['archive_sha256']:
+                raise ValueError('official ORT release asset digest/length mismatch')
+            partial.rename(archive)
+            attempt.update(outcome='verified', bytes_received=size, archive_sha256=digest.hexdigest())
+            receipt.update(verified=True, elapsed_seconds=time.monotonic() - started)
+            write(receipt_path, receipt)
+            return archive, size
+        except Exception as error:
+            if isinstance(error, urllib.error.HTTPError):
+                error.close()
+            if partial.exists():
+                partial.unlink()
+            retryable = retryable_download_error(error)
+            remaining = deadline - time.monotonic()
+            retry = retryable and number < 3 and remaining > 0
+            attempt.update(outcome='failed', bytes_received=size, error_type=type(error).__name__,
+                           http_status=error.code if isinstance(error, urllib.error.HTTPError) else None,
+                           reason_type=type(error.reason).__name__ if isinstance(error, urllib.error.URLError) else None,
+                           retryable_transport=retryable, retry_scheduled=retry)
+            receipt['elapsed_seconds'] = time.monotonic() - started
+            write(receipt_path, receipt)
+            if not retry:
+                raise
+            time.sleep(min(2 ** (number - 1), remaining))
+    raise AssertionError('bounded ORT download loop exhausted without outcome')
+
+
 def prepare(directory, spec):
     """Download/verify/extract only; caller owns source/resource admission."""
     directory.mkdir(exist_ok=False)
-    archive = directory / 'onnxruntime-linux-x64-1.24.4.tgz'
-    digest = hashlib.sha256()
-    size = 0
-    deadline = time.monotonic() + 180
-    request = urllib.request.Request(spec['url'], headers={'User-Agent': 'Nano-code-embed-fixed-prerequisite'})
-    with urllib.request.urlopen(request, timeout=60) as incoming, archive.open('xb') as stream:
-        while block := incoming.read(256 * 1024):
-            if time.monotonic() > deadline:
-                raise TimeoutError('official ORT download exceeded180s')
-            size += len(block)
-            if size > spec['archive_bytes']:
-                raise ValueError('official ORT archive exceeds pinned length')
-            digest.update(block)
-            stream.write(block)
-    if size != spec['archive_bytes'] or digest.hexdigest() != spec['archive_sha256']:
-        raise ValueError('official ORT release asset digest/length mismatch')
+    archive, size = download_archive(directory, spec)
     runtime = directory / 'runtime'
     runtime.mkdir()
     seen = set()
