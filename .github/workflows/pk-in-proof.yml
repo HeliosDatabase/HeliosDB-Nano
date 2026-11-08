@@ -1,0 +1,125 @@
+name: Matched PK-IN native semantics, grouped timings and full field gate (no publish)
+on:
+  push:
+    branches: ['ci/4420-pk-in-proof-*']
+permissions:
+  contents: read
+jobs:
+  proof:
+    name: ${{ matrix.cell }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cell: baseline-contract
+            role: baseline
+            mode: contract
+            product: 5a3f5c5d9608ffc5f71f8b3b3f309abc5d66785b
+            service_seconds: 3900
+          - cell: fixed-contract
+            role: fixed
+            mode: contract
+            product: 77b385f79e1d94a44fe87f9749533feacf4048da
+            service_seconds: 3900
+          - cell: baseline-grouped
+            role: baseline
+            mode: grouped
+            product: 5a3f5c5d9608ffc5f71f8b3b3f309abc5d66785b
+            service_seconds: 5700
+          - cell: fixed-grouped
+            role: fixed
+            mode: grouped
+            product: 77b385f79e1d94a44fe87f9749533feacf4048da
+            service_seconds: 5700
+          - cell: fixed-field
+            role: fixed
+            mode: field
+            product: 77b385f79e1d94a44fe87f9749533feacf4048da
+            service_seconds: 5700
+    steps:
+      - name: Preserve source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.product }}
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install native build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev cmake ninja-build
+          dpkg-query -W -f='${Package}\t${Version}\n' > "$RUNNER_TEMP/pk-in-proof-packages.txt"
+      - name: Verify frozen bootstrap
+        working-directory: controller
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          for name, wanted in {
+              '.github/4420-pk-in-proof/controller.py': 'bc6dc86f0c395bf50380cfa72fd9d8dc6e7d627278a09ed7bda970ab609c93e7',
+              '.github/4420-pk-in-proof/model.json': '483b94f8dd1c43a8a3c93382d35f53d11d8232d3dad3b67d3432fe2d10e1ca14',
+          }.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != wanted:
+                  raise SystemExit('codegraph bootstrap changed: ' + name)
+          PYBOOT
+      - name: Build, list and execute source-pinned native proof
+        env:
+          NANO_CG_CELL: ${{ matrix.cell }}
+          NANO_CG_ROLE: ${{ matrix.role }}
+          NANO_CG_MODE: ${{ matrix.mode }}
+          NANO_CG_SERVICE_SECONDS: ${{ matrix.service_seconds }}
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_cg_unit="nano-pk-in-${GITHUB_RUN_ID}-${NANO_CG_CELL}"
+          sudo systemd-run --unit "$nano_cg_unit" --wait --pipe --collect \
+            -p User="$(id -un)" -p Group="$(id -gn)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE/controller" \
+            -p MemoryMax=24G -p MemorySwapMax=0 -p KillMode=control-group \
+            -p RuntimeMaxSec="$NANO_CG_SERVICE_SECONDS" -p TimeoutStopSec=30 \
+            --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo" \
+            --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.95.0 \
+            --setenv="GITHUB_SHA=$GITHUB_SHA" \
+            --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
+            python3 .github/4420-pk-in-proof/controller.py \
+              --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product" \
+              --mode "$NANO_CG_MODE" --role "$NANO_CG_ROLE" \
+              --out "$RUNNER_TEMP/pk-in-$NANO_CG_CELL" --model-sha256 483b94f8dd1c43a8a3c93382d35f53d11d8232d3dad3b67d3432fe2d10e1ca14
+      - name: Preserve actual native evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pk-in-proof-${{ matrix.cell }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/pk-in-proof-packages.txt
+            ${{ runner.temp }}/pk-in-${{ matrix.cell }}/*.json
+            ${{ runner.temp }}/pk-in-${{ matrix.cell }}/*.stdout
+            ${{ runner.temp }}/pk-in-${{ matrix.cell }}/*.stderr
+            ${{ runner.temp }}/pk-in-${{ matrix.cell }}/native-test.elf
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+  all-proofs:
+    if: always()
+    needs: proof
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require both complete contracts, both diagnostic cells and unchanged full field
+        env:
+          PROOF_RESULT: ${{ needs.proof.result }}
+        run: test "$PROOF_RESULT" = success
