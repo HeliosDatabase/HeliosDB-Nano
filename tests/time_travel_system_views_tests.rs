@@ -288,7 +288,7 @@ fn test_system_view_consistency() {
 }
 
 #[test]
-fn test_time_travel_with_system_views() {
+fn test_time_travel_with_system_views() -> heliosdb_nano::Result<()> {
     let engine = create_test_engine_with_snapshots();
     let registry = SystemViewRegistry::new();
 
@@ -305,9 +305,12 @@ fn test_time_travel_with_system_views() {
     };
 
     // Execute time-travel query using this transaction ID
+    // A direct plan must describe the actual layout, as a catalog-backed planner does.
+    let scan_schema = Arc::new(engine.catalog().get_table_schema("test_table")?);
+
     let plan = LogicalPlan::Scan {
         table_name: "test_table".to_string(),
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: Some(AsOfClause::Transaction(txn_id)),
         alias: None,
@@ -325,10 +328,11 @@ fn test_time_travel_with_system_views() {
         "Should not exceed 3 rows for transaction {}",
         txn_id
     );
+    Ok(())
 }
 
 #[test]
-fn test_scn_based_time_travel() {
+fn test_scn_based_time_travel() -> heliosdb_nano::Result<()> {
     let engine = create_test_engine_with_snapshots();
     let registry = SystemViewRegistry::new();
 
@@ -345,9 +349,12 @@ fn test_scn_based_time_travel() {
     };
 
     // Execute time-travel query using this SCN
+    // A direct plan must describe the actual layout, as a catalog-backed planner does.
+    let scan_schema = Arc::new(engine.catalog().get_table_schema("test_table")?);
+
     let plan = LogicalPlan::Scan {
         table_name: "test_table".to_string(),
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: Some(AsOfClause::Scn(scn)),
         alias: None,
@@ -359,6 +366,7 @@ fn test_scn_based_time_travel() {
     // Should see data up to this SCN
     assert!(results.len() >= 1, "Should have at least one row");
     assert!(results.len() <= 2, "Should not exceed 2 rows for SCN {}", scn);
+    Ok(())
 }
 
 #[test]

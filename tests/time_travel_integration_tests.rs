@@ -80,14 +80,17 @@ fn create_test_engine_with_history_inner(space_last_insert: bool) -> StorageEngi
 }
 
 #[test]
-fn test_current_snapshot_query() {
+fn test_current_snapshot_query() -> heliosdb_nano::Result<()> {
     let engine = create_test_engine_with_history();
 
     // Query current state (no AS OF)
+    // A direct plan must describe the actual layout, as a catalog-backed planner does.
+    let scan_schema = Arc::new(engine.catalog().get_table_schema("orders")?);
+
     let plan = LogicalPlan::Scan {
         table_name: "orders".to_string(),
         alias: None,
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: None,
     };
@@ -97,10 +100,11 @@ fn test_current_snapshot_query() {
 
     // Should see all 3 orders
     assert_eq!(results.len(), 3);
+    Ok(())
 }
 
 #[test]
-fn test_as_of_transaction() {
+fn test_as_of_transaction() -> heliosdb_nano::Result<()> {
     let engine = create_test_engine_with_history();
     let snapshot_mgr = engine.snapshot_manager();
 
@@ -109,10 +113,13 @@ fn test_as_of_transaction() {
     let txn_id = 2;
 
     // Query AS OF TRANSACTION 2
+    // A direct plan must describe the actual layout, as a catalog-backed planner does.
+    let scan_schema = Arc::new(engine.catalog().get_table_schema("orders")?);
+
     let plan = LogicalPlan::Scan {
         table_name: "orders".to_string(),
         alias: None,
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: Some(AsOfClause::Transaction(txn_id)),
     };
@@ -140,10 +147,11 @@ fn test_as_of_transaction() {
     assert!(customer_names.contains(&"Alice".to_string()));
     assert!(customer_names.contains(&"Bob".to_string()));
     assert!(!customer_names.contains(&"Charlie".to_string()));
+    Ok(())
 }
 
 #[test]
-fn test_as_of_scn() {
+fn test_as_of_scn() -> heliosdb_nano::Result<()> {
     let engine = create_test_engine_with_history();
     let snapshot_mgr = engine.snapshot_manager();
 
@@ -151,10 +159,13 @@ fn test_as_of_scn() {
     let scn = 1;
 
     // Query AS OF SCN 1
+    // A direct plan must describe the actual layout, as a catalog-backed planner does.
+    let scan_schema = Arc::new(engine.catalog().get_table_schema("orders")?);
+
     let plan = LogicalPlan::Scan {
         table_name: "orders".to_string(),
         alias: None,
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: Some(AsOfClause::Scn(scn)),
     };
@@ -171,10 +182,11 @@ fn test_as_of_scn() {
     } else {
         panic!("Expected text value for customer name");
     }
+    Ok(())
 }
 
 #[test]
-fn test_as_of_timestamp() {
+fn test_as_of_timestamp() -> heliosdb_nano::Result<()> {
     // AS OF TIMESTAMP resolution is WHOLE-SECOND granular: `resolve_timestamp`
     // parses the RFC3339 string with `DateTime::timestamp()` (seconds) and
     // compares it against `SnapshotMetadata::wall_clock_unix_secs()` (also
@@ -198,10 +210,13 @@ fn test_as_of_timestamp() {
     let timestamp_str = snapshots[1].wall_clock_rfc3339();
 
     // Query AS OF TIMESTAMP
+    // A direct plan must describe the actual layout, as a catalog-backed planner does.
+    let scan_schema = Arc::new(engine.catalog().get_table_schema("orders")?);
+
     let plan = LogicalPlan::Scan {
         table_name: "orders".to_string(),
         alias: None,
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: Some(AsOfClause::Timestamp(timestamp_str.clone())),
     };
@@ -213,17 +228,21 @@ fn test_as_of_timestamp() {
 
     // Should see first 2 orders
     assert_eq!(results.len(), 2);
+    Ok(())
 }
 
 #[test]
-fn test_as_of_now() {
+fn test_as_of_now() -> heliosdb_nano::Result<()> {
     let engine = create_test_engine_with_history();
 
     // Query AS OF NOW
+    // A direct plan must describe the actual layout, as a catalog-backed planner does.
+    let scan_schema = Arc::new(engine.catalog().get_table_schema("orders")?);
+
     let plan = LogicalPlan::Scan {
         table_name: "orders".to_string(),
         alias: None,
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: Some(AsOfClause::Now),
     };
@@ -233,17 +252,21 @@ fn test_as_of_now() {
 
     // Should see all 3 orders (same as current)
     assert_eq!(results.len(), 3);
+    Ok(())
 }
 
 #[test]
-fn test_snapshot_not_found() {
+fn test_snapshot_not_found() -> heliosdb_nano::Result<()> {
     let engine = create_test_engine_with_history();
 
     // Try to query with non-existent transaction ID
+    // A direct plan must describe the actual layout, as a catalog-backed planner does.
+    let scan_schema = Arc::new(engine.catalog().get_table_schema("orders")?);
+
     let plan = LogicalPlan::Scan {
         table_name: "orders".to_string(),
         alias: None,
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: Some(AsOfClause::Transaction(99999)),
     };
@@ -255,17 +278,21 @@ fn test_snapshot_not_found() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("not found") || err.to_string().contains("garbage collected"));
+    Ok(())
 }
 
 #[test]
-fn test_snapshot_isolation() {
+fn test_snapshot_isolation() -> heliosdb_nano::Result<()> {
     let engine = create_test_engine_with_history();
 
     // Get snapshot at transaction 1
+    // A direct plan must describe the actual layout, as a catalog-backed planner does.
+    let scan_schema = Arc::new(engine.catalog().get_table_schema("orders")?);
+
     let plan1 = LogicalPlan::Scan {
         table_name: "orders".to_string(),
         alias: None,
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: Some(AsOfClause::Transaction(1)),
     };
@@ -274,7 +301,7 @@ fn test_snapshot_isolation() {
     let plan3 = LogicalPlan::Scan {
         table_name: "orders".to_string(),
         alias: None,
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: Some(AsOfClause::Transaction(3)),
     };
@@ -292,6 +319,7 @@ fn test_snapshot_isolation() {
     // Both queries should return consistent results if executed again
     let results1_again = executor.execute(&plan1).expect("Failed to execute first query again");
     assert_eq!(results1.len(), results1_again.len());
+    Ok(())
 }
 
 #[test]
@@ -455,16 +483,19 @@ fn test_snapshot_recovery() {
 }
 
 #[test]
-fn test_performance_overhead() {
+fn test_performance_overhead() -> heliosdb_nano::Result<()> {
     use std::time::Instant;
 
     let engine = create_test_engine_with_history();
 
     // Benchmark normal scan
+    // A direct plan must describe the actual layout, as a catalog-backed planner does.
+    let scan_schema = Arc::new(engine.catalog().get_table_schema("orders")?);
+
     let plan_normal = LogicalPlan::Scan {
         table_name: "orders".to_string(),
         alias: None,
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: None,
     };
@@ -481,7 +512,7 @@ fn test_performance_overhead() {
     let plan_timetravel = LogicalPlan::Scan {
         table_name: "orders".to_string(),
         alias: None,
-        schema: Arc::new(Schema { columns: vec![] }),
+        schema: Arc::clone(&scan_schema),
         projection: None,
         as_of: Some(AsOfClause::Transaction(2)),
     };
@@ -499,4 +530,5 @@ fn test_performance_overhead() {
     // This is a soft check - in practice overhead should be <2x
     // but we allow up to 3x for test environment variability
     assert!(overhead < 3.0, "Time-travel overhead too high: {:.2}x", overhead);
+    Ok(())
 }
