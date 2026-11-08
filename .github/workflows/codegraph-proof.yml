@@ -1,0 +1,115 @@
+name: CodeGraph native ownership pair and unchanged field benchmark (no publish)
+on:
+  push:
+    branches: ['ci/4420-codegraph-proof-*']
+permissions:
+  contents: read
+jobs:
+  proof:
+    name: ${{ matrix.cell }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cell: baseline-focused
+            role: baseline
+            mode: focused
+            product: 9ab65060fbd3889452fa165f8f03e119d6f33151
+            service_seconds: 3900
+          - cell: fixed-focused
+            role: fixed
+            mode: focused
+            product: e503c537a35ae4c108ddf1e5e73ea1a24ec615ee
+            service_seconds: 3900
+          - cell: fixed-release-field
+            role: fixed
+            mode: field
+            product: e503c537a35ae4c108ddf1e5e73ea1a24ec615ee
+            service_seconds: 5700
+    steps:
+      - name: Preserve source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.product }}
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install native build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev cmake ninja-build
+          dpkg-query -W -f='${Package}\t${Version}\n' > "$RUNNER_TEMP/codegraph-proof-packages.txt"
+      - name: Verify frozen bootstrap
+        working-directory: controller
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          for name, wanted in {
+              '.github/4420-codegraph-proof/controller.py': '3a493a210dda900885c4dac5356d8517715dfcf6e5de6bb423a1d142f856d262',
+              '.github/4420-codegraph-proof/model.json': '18f4146c4a9b5db7dd68f02addfe8862213b6436d3e3b5d772c6511138159514',
+          }.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != wanted:
+                  raise SystemExit('codegraph bootstrap changed: ' + name)
+          PYBOOT
+      - name: Build, list and execute source-pinned native proof
+        env:
+          NANO_CG_CELL: ${{ matrix.cell }}
+          NANO_CG_ROLE: ${{ matrix.role }}
+          NANO_CG_MODE: ${{ matrix.mode }}
+          NANO_CG_SERVICE_SECONDS: ${{ matrix.service_seconds }}
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_cg_unit="nano-codegraph-${GITHUB_RUN_ID}-${NANO_CG_CELL}"
+          sudo systemd-run --unit "$nano_cg_unit" --wait --pipe --collect \
+            -p User="$(id -un)" -p Group="$(id -gn)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE/controller" \
+            -p MemoryMax=24G -p MemorySwapMax=0 -p KillMode=control-group \
+            -p RuntimeMaxSec="$NANO_CG_SERVICE_SECONDS" -p TimeoutStopSec=30 \
+            --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo" \
+            --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.95.0 \
+            --setenv="GITHUB_SHA=$GITHUB_SHA" \
+            --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
+            python3 .github/4420-codegraph-proof/controller.py \
+              --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product" \
+              --mode "$NANO_CG_MODE" --role "$NANO_CG_ROLE" \
+              --out "$RUNNER_TEMP/codegraph-$NANO_CG_CELL" --model-sha256 18f4146c4a9b5db7dd68f02addfe8862213b6436d3e3b5d772c6511138159514
+      - name: Preserve actual native evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegraph-proof-${{ matrix.cell }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/codegraph-proof-packages.txt
+            ${{ runner.temp }}/codegraph-${{ matrix.cell }}/*.json
+            ${{ runner.temp }}/codegraph-${{ matrix.cell }}/*.stdout
+            ${{ runner.temp }}/codegraph-${{ matrix.cell }}/*.stderr
+            ${{ runner.temp }}/codegraph-${{ matrix.cell }}/native-test.elf
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
+  all-proofs:
+    if: always()
+    needs: proof
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require both role proofs and independent field result
+        env:
+          PROOF_RESULT: ${{ needs.proof.result }}
+        run: test "$PROOF_RESULT" = success
