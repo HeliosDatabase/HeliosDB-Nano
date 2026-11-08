@@ -20443,7 +20443,7 @@
       "sha256": "24ca9e1c2dc03bd0618cb30acbb67bb53ec63dd93ea936e58b01cae901a4060d"
     }
   },
-  "execution_note": "Focused native boundary controls only; isolated Count-fixed c6 plus exact test-only interrupt fixture V4. No production/config/100ms alteration; old source34 failed receipts retained.",
+  "execution_note": "BoundaryV5 focused native controls: V4 product plus ONLY two canonical MAIN_LEVEL substitutions. Native command/parser/status field names remain inheritedV4; exact same9parents64cells/budgets/oracles. Earlier V4wrong-namespace actualred retained; no productbypass claim.",
   "product_entries": {
     ".cargo/audit.toml": {
       "mode": "100644",
@@ -23577,8 +23577,8 @@
     },
     "src/layout_error_boundary_tests.rs": {
       "mode": "100644",
-      "oid": "778b2a0055c3aa5d11f91fe0d04c442e22568a1e",
-      "sha256": "adddba234574dbe328a255342c0f747258ab4ddd32d77e5173a674d1a9a48009"
+      "oid": "283a8ee87c422e6784c6dae3057bedb1b4e44f30",
+      "sha256": "7dc829741732ee546e82ab983689fea36aee86555c9636e77f66d8c37d9b8f76"
     },
     "src/layout_error_retry_tests.rs": {
       "mode": "100644",
@@ -40731,12 +40731,12 @@
       "sha256": "24ca9e1c2dc03bd0618cb30acbb67bb53ec63dd93ea936e58b01cae901a4060d"
     }
   },
-  "product_head": "7dec18f7a83d336ad6cbe36e35424bc3d4b5f00e",
+  "product_head": "d04d8ac7a3723b5d8a8ec2464e13357fc99b979b",
   "product_paths": 4057,
   "runtime_executed": false,
   "schema": 1,
   "source_sha256": {
-    "src/layout_error_boundary_tests.rs": "adddba234574dbe328a255342c0f747258ab4ddd32d77e5173a674d1a9a48009",
+    "src/layout_error_boundary_tests.rs": "7dc829741732ee546e82ab983689fea36aee86555c9636e77f66d8c37d9b8f76",
     "src/sql/executor/scan.rs": "a766c981afe55ec2eaffd6947b325b2c5452063ff23f686caf0f5384f0847fa0",
     "src/lib.rs": "66b6ff0d749cb5a6c748e21b68a403bf4fa8a10fd5b4869819758445ad0294ee",
     "src/storage/transaction.rs": "7c9ef25be83ed919b4b5ee69dd4f916baca4a2018b6aa5ef22f54e10229aeb44",
@@ -40746,7 +40746,7 @@
   },
   "upstream_pair_head": "c6d1b0f9b5f99d0f06cd72e65ce9eb2164b554e2",
   "upstream_pair_run": null,
-  "parent_product": "c6d1b0f9b5f99d0f06cd72e65ce9eb2164b554e2",
-  "fixture_manifest_sha256": "bcc8e979d3516a0130caf5f30d90802a3c3b237698fd3b8e93dc8daf01ba8bcd",
-  "fixture_peer_sha256": "b0cc14f564abc2d6b5df8a0d393075e2931002b03d0fb2d045cb53e92f7e0ae8"
+  "parent_product": "7dec18f7a83d336ad6cbe36e35424bc3d4b5f00e",
+  "fixture_manifest_sha256": "9a5fd5f9db184ddbeec6c8d9fdafd93c39b03d7bb18103396247dd7459597fd8",
+  "fixture_peer_sha256": "52ad1d206ac7d882ea1c451bb499f40a94572013df3b7d938538759182cc22e0"
 }

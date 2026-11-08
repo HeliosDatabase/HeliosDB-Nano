@@ -1,7 +1,7 @@
-name: Focused layout boundary V4 controls (no publish)
+name: Focused layout boundary V5 controls (no publish)
 on:
   push:
-    branches: ['ci/4420-layout-boundary-v4-proof-*']
+    branches: ['ci/4420-layout-boundary-v5-proof-*']
 permissions:
   contents: read
 jobs:
@@ -25,7 +25,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v5
         with:
-          ref: 7dec18f7a83d336ad6cbe36e35424bc3d4b5f00e
+          ref: d04d8ac7a3723b5d8a8ec2464e13357fc99b979b
           path: product
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -45,8 +45,8 @@ jobs:
           import hashlib
           from pathlib import Path
           pairs = {
-              '.github/4420-layout-boundary-v4/controller.py': 'c372876351e65489619369558561d61102f446cd06223aa25db0461c52308226',
-              '.github/4420-layout-boundary-v4/model.json': 'f7304f2b34e005c019a8d94d727ea3809fc82353133340633023086830a3ec15',
+              '.github/4420-layout-boundary-v4/controller.py': 'f0f35ef6a48c22c77bb5ffbf193349af74c97dbb6a68359df688e806150597b0',
+              '.github/4420-layout-boundary-v4/model.json': 'cbec79100d9180529dcaae56936cf4a4ef8f87e557a475aed8db8647d6b0f026',
           }
           for name, wanted in pairs.items():
               if hashlib.sha256(Path(name).read_bytes()).hexdigest() != wanted:
@@ -72,7 +72,7 @@ jobs:
             python3 .github/4420-layout-boundary-v4/controller.py \
               --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product" \
               --configuration "$NANO_WAL_TAIL_CONFIGURATION" --out "$RUNNER_TEMP/layout-boundary-v4-$NANO_WAL_TAIL_CONFIGURATION" \
-              --model-sha256 f7304f2b34e005c019a8d94d727ea3809fc82353133340633023086830a3ec15
+              --model-sha256 cbec79100d9180529dcaae56936cf4a4ef8f87e557a475aed8db8647d6b0f026
       - name: Preserve raw native results and promotion lifecycle logs
         if: always()
         uses: actions/upload-artifact@v4
