@@ -4401,8 +4401,8 @@ fn time_travel_and_snapshots_see_a_merge_like_any_commit() {
 
     assert_eq!(
         read_in(before_the_merge),
-        some_pairs(&[(1, "a"), (3, "c")]),
-        "a snapshot from before the merge"
+        some_pairs(&[(1, "a"), (2, "b"), (3, "c")]),
+        "a snapshot from before the merge retains the row deleted by the later commit"
     );
     let after_the_merge = db.create_session("new", IsolationLevel::RepeatableRead).unwrap();
     db.begin_transaction_for_session(after_the_merge).unwrap();
