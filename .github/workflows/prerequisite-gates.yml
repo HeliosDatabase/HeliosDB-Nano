@@ -1,0 +1,96 @@
+name: Source31 prerequisite gates (no publish)
+on:
+  push:
+    branches: ['ci/4420-prerequisites-*']
+permissions:
+  contents: read
+jobs:
+  prerequisites:
+    name: ${{ matrix.stage }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        stage: [security, msrv-default, msrv-embed, minimal-ring, fips]
+    steps:
+      - name: Preserve source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install the exact default MSRV
+        if: matrix.stage == 'msrv-default'
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Install the exact code-embed MSRV
+        if: matrix.stage == 'msrv-embed'
+        run: rustup toolchain install 1.92.0 --profile minimal
+      - name: Install native build prerequisites
+        env:
+          NANO_PREREQUISITE_STAGE: ${{ matrix.stage }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev
+          if [ "$NANO_PREREQUISITE_STAGE" = fips ]; then
+            sudo apt-get install -y cmake ninja-build nasm perl golang-go
+          fi
+          dpkg-query -W -f='${Package}\t${Version}\n' > "$RUNNER_TEMP/prerequisite-packages-${NANO_PREREQUISITE_STAGE}.txt"
+      - name: Verify frozen bootstrap inputs
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          pairs = {
+              '.github/4420-prerequisite-v1/launch.py': '8669a169509599d321c6c781495a671801e8f94d8798ddde66f486634ee1266f',
+              '.github/4420-prerequisite-v1/model.json': '9cc5606f2f97c509c016a3dd84b49c9f42c2ae8226ae025a5e5b924ebfc3985b',
+          }
+          for name, digest in pairs.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit('frozen bootstrap input changed: ' + name)
+          PYBOOT
+      - name: Run exact frozen v5 prerequisite commands
+        env:
+          NANO_PREREQUISITE_STAGE: ${{ matrix.stage }}
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_prerequisite_unit="nano-prerequisite-${GITHUB_RUN_ID}-${NANO_PREREQUISITE_STAGE}"
+          sudo systemd-run --unit "$nano_prerequisite_unit" --wait --pipe --collect \
+            -p User="$(id -un)" -p Group="$(id -gn)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE" \
+            -p MemoryMax=24G -p MemorySwapMax=0 \
+            -p RuntimeMaxSec=19800 -p TimeoutStopSec=30 \
+            --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo" \
+            --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.95.0 \
+            --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
+            --setenv=RUST_TEST_THREADS=2 --setenv=CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            python3 .github/4420-prerequisite-v1/launch.py \
+              --tree "$GITHUB_WORKSPACE" \
+              --out "$RUNNER_TEMP/nano-prerequisite-${NANO_PREREQUISITE_STAGE}" \
+              --stage "$NANO_PREREQUISITE_STAGE" --head "$GITHUB_SHA" \
+              --model-sha256 9cc5606f2f97c509c016a3dd84b49c9f42c2ae8226ae025a5e5b924ebfc3985b
+      - name: Preserve raw prerequisite evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prerequisite-${{ matrix.stage }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/prerequisite-packages-${{ matrix.stage }}.txt
+            ${{ runner.temp }}/nano-prerequisite-${{ matrix.stage }}/*.json
+            ${{ runner.temp }}/nano-prerequisite-${{ matrix.stage }}/*.log
+            ${{ runner.temp }}/nano-prerequisite-${{ matrix.stage }}/capture/*.json
+            ${{ runner.temp }}/nano-prerequisite-${{ matrix.stage }}/stage/*.json
+            ${{ runner.temp }}/nano-prerequisite-${{ matrix.stage }}/stage/*.log
+            ${{ runner.temp }}/nano-prerequisite-${{ matrix.stage }}/ort-prerequisite/preparation.json
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14

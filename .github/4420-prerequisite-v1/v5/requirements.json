@@ -1,0 +1,444 @@
+{
+  "status": "PREPARED MAPPING, ALL ACCEPTANCE OPEN",
+  "requirements": [
+    {
+      "id": "R0",
+      "promise": "Standby posture stays up, typed data refusal, readiness/lag/history binding",
+      "spec": "docs/plans/STANDBY_RECOVERY_PLAN.md#52-standby-posture-r0",
+      "test_targets": [
+        "physical_standby_serving",
+        "physical_standby_refusals",
+        "ha_integration",
+        "physical_promote_online"
+      ],
+      "prepared_stages": [
+        "physical-default",
+        "physical-internal",
+        "readiness20"
+      ],
+      "required_receipts": [
+        "Liveness /health returns200 while /ready is503 until servable. Unavailable reads return55000; writes return25006. History mismatch fails closed, with safe stop/restart."
+      ],
+      "open_evidence_gaps": [],
+      "accepted": false
+    },
+    {
+      "id": "R1",
+      "promise": "Stopped standby verify, safe leftover recovery, keyrotation guard and explicit txn replication",
+      "spec": "docs/plans/specs/R1_standby_tooling.md",
+      "test_targets": [
+        "physical_standby_verify",
+        "physical_fast_forward",
+        "physical_explicit_transactions",
+        "physical_standby_embedded",
+        "wal_replay_crash_residuals"
+      ],
+      "prepared_stages": [
+        "physical-default",
+        "physical-internal",
+        "core-internal"
+      ],
+      "required_receipts": [
+        "Stopped verify: exit0 for identical digests at one source sequence, exit1 after an altered leaf, exit2 for running/pruned input. Prove stale completed copies are recopied, fresh copies adopted, key rotation refused, and explicit transactions/savepoints/rollback replicate across both PG protocols."
+      ],
+      "open_evidence_gaps": [],
+      "accepted": false
+    },
+    {
+      "id": "R2",
+      "promise": "No torn DDL reads on primary or physical standby; detector itself catches synthetic split",
+      "spec": "docs/plans/specs/R2_ddl_window_cut.md",
+      "test_targets": [
+        "physical_ddl_window",
+        "physical_ddl_window_repro",
+        "layout_epochs"
+      ],
+      "prepared_stages": [
+        "ddl-window",
+        "physical-default",
+        "physical-internal"
+      ],
+      "required_receipts": [
+        "Run all4 exact window controls with1 pass each. Positive controls require0 torn answers and nonzero queries/groups/iterations; the deliberately split detector must observe torn answers. No skipped positive acceptance."
+      ],
+      "open_evidence_gaps": [],
+      "accepted": false
+    },
+    {
+      "id": "R3",
+      "promise": "Rewind and online switchover, preserved acknowledged writes, epoch/role/failure handling",
+      "spec": "docs/plans/specs/R3_switchover_rewind.md",
+      "test_targets": [
+        "physical_rewind",
+        "physical_switchover",
+        "physical_promote_online"
+      ],
+      "prepared_stages": [
+        "physical-default",
+        "physical-internal"
+      ],
+      "required_receipts": [
+        "Switchover in both directions over TLS preserves every acknowledged row, fences the old primary before accepting new writes, and converges to an identical digest at one sequence. Killed targets and lost responses never create dual writers; stale history is refused."
+      ],
+      "open_evidence_gaps": [],
+      "accepted": false
+    },
+    {
+      "id": "R4",
+      "promise": "Durable HNSW dump cache lifecycle, encryption, no visible recall misses",
+      "spec": "docs/plans/specs/R4_hnsw_dump_recall.md",
+      "test_targets": [
+        "durable_index_tests",
+        "hnsw_recall_measurement",
+        "physical_standby_fireproof",
+        "vector_sql_integration_test",
+        "standard_vector_row_recovery"
+      ],
+      "prepared_stages": [
+        "core-default",
+        "core-internal",
+        "recall-measure",
+        "standard-publication-default",
+        "standard-publication-internal",
+        "checkpoint-interleaving",
+        "pq-live-codec",
+        "ann-publication"
+      ],
+      "required_receipts": [
+        "Reload/close/reopen has no orphan dumps or dump failures; configured M and ef are observed. TDE leaves no plaintext graph dump. Public top1 controls stay strict, with retained raw results for50 seeded measurement cells.",
+        "DefaultStandard real checkpoint/native-owning-row crash proof2checkpoint+6nativecells; actualcheckpoint serialization5controls; PQlive/latest save/load exactcodec+config/codebook with deletion and replacement."
+      ],
+      "open_evidence_gaps": [
+        "graph-only measurement tests print without asserting; independently adjudicate against strictpublicsearch and spec, never call2greenmeasurements recallacceptance"
+      ],
+      "accepted": false
+    },
+    {
+      "id": "R5",
+      "promise": "One durable statement group, logical rows/history, bounded rewrites, layout coherence, startup adoption",
+      "spec": "docs/plans/specs/R5_statement_atomicity.md",
+      "test_targets": [
+        "table_write_lock",
+        "row_shape",
+        "statement_atomicity_ddl",
+        "statement_atomicity_dml",
+        "statement_atomicity_alter",
+        "statement_atomicity_mv",
+        "layout_epochs",
+        "direct_write_atomicity",
+        "direct_mutation_atomicity",
+        "fast_side_storage_atomicity",
+        "generic_mutation_indexes",
+        "historical_side_storage",
+        "rr_snapshot_deletes",
+        "transaction_snapshot_history",
+        "mv_delta_id_durability",
+        "raw_metadata_locks",
+        "row_counter_ordering",
+        "wal_atomic_adoption",
+        "fk_update_actions",
+        "fk_delete_actions",
+        "fk_merge_constraints",
+        "mv_uncertain_publication",
+        "mv_staged_dml_refresh",
+        "sql_prepare_params",
+        "alter_storage_params",
+        "fk_commit_boundaries",
+        "fk_merge_custom_routing",
+        "persistent_mv_atomicity",
+        "vector_row_overlay_recovery",
+        "commit_outcome_boundaries"
+      ],
+      "prepared_stages": [
+        "lib",
+        "core-default",
+        "core-internal",
+        "physical-internal",
+        "branch-all-interfaces",
+        "ddl-window",
+        "persistent-publication",
+        "applied-publication-errors",
+        "checkpoint-interleaving"
+      ],
+      "required_receipts": [
+        "Execute all R5.1-R5.7 success/abort/savepoint/uncertain-write/crash controls with nonzero counts, relaxed+strict WAL, time travel on/off and both executor families. Count native groups containing data+catalog+WAL+sidecars+snapshot. Prove no sequence/advisory retry, exact FK actions/concurrency, strict partial MERGE resume, RR history and nonmutating54000 refusal."
+      ],
+      "open_evidence_gaps": [
+        "Final acceptance requires exact final-source compile and all applied/publication errors, overlay193/checkpoint5/newPQ and query-context controls to pass with source-bound receipts. Older focused results do not replace the full final matrix.",
+        "Full R5.8 release ABBA and nativeclient/protocol matrix via E/perf-matrix-v3 + perf-build-orchestrator-v2 remain mandatory."
+      ],
+      "accepted": false,
+      "pending_source_targets": [
+        "fk_commit_boundaries",
+        "fk_merge_custom_routing"
+      ]
+    },
+    {
+      "id": "R6",
+      "promise": "Readiness diagnostics and startup/promotion stability under parallel load",
+      "spec": "docs/plans/specs/R6_harness_readiness.md",
+      "test_targets": [
+        "ha_integration",
+        "physical_promote_online",
+        "physical_fast_forward"
+      ],
+      "prepared_stages": [
+        "readiness20",
+        "physical-internal"
+      ],
+      "required_receipts": [
+        "Each named readiness/promotion control succeeds20/20 under actual bounded parallel load. Capture first HTTP response and logs/process/listener diagnostics on failure; serial repetitions alone do not satisfy load coverage."
+      ],
+      "open_evidence_gaps": [
+        "New readiness20 stage prepares two concurrent native test processes,6casesx20, exact120identity receipts plus interval overlap. Runtime remains open; old serial repetitions do not satisfy this gate."
+      ],
+      "accepted": false
+    },
+    {
+      "id": "R7",
+      "promise": "Supported fastembed7/ORT API+MSRV with no obsolete truststore advisory waiver",
+      "spec": "docs/plans/specs/R7_fastembed.md",
+      "test_targets": [
+        "code_graph_local_embedder",
+        "code_graph_body_vec"
+      ],
+      "prepared_stages": [
+        "msrv-default",
+        "msrv-embed",
+        "embed-runtime",
+        "security",
+        "core-optins"
+      ],
+      "required_receipts": [
+        "Compile default on Rust1.88 and code-embed on1.92 using the patched lockfile; resolve webpki-roots>=1.0.10 and run the actual embedder/model for384 dimensions. No obsolete RUSTSEC-2026-0381 waiver."
+      ],
+      "open_evidence_gaps": [
+        "compatibleORT1.24.x library/modelcache prerequisite mustbeprovided for olderhostglibc; compilation isnot runtimeembedcoverage"
+      ],
+      "accepted": false
+    },
+    {
+      "id": "P0",
+      "promise": "Keyspace/writefunnel/openmode/localCF/options/diskbytesize foundations",
+      "spec": "docs/plans/PHYSICAL_STANDBY_REPLICATION.md#phases",
+      "test_targets": [
+        "keyspace_classification",
+        "keyspace_wal_corpus",
+        "write_gate_funnel",
+        "physical_standby_open_mode",
+        "physical_standby_local_namespace",
+        "physical_storage_hydration"
+      ],
+      "prepared_stages": [
+        "core-default",
+        "core-internal",
+        "physical-default"
+      ],
+      "required_receipts": [
+        "No unclassified durable keys. Default-column-family bytes/digest match at one source sequence; local cursor is never copied. Read-only sequence/commit/open/close causes0 source writes; node options match supported open modes."
+      ],
+      "open_evidence_gaps": [],
+      "accepted": false
+    },
+    {
+      "id": "P1",
+      "promise": "Serving derived state, SQL readonlyadmission, startup/readiness, embeddedstandby",
+      "spec": "docs/plans/specs/P1_1_physical_applier.md",
+      "test_targets": [
+        "physical_standby_derived_state",
+        "physical_standby_vector",
+        "physical_standby_embedded",
+        "physical_standby_serving",
+        "physical_snapshot_hydration",
+        "ha_integration"
+      ],
+      "prepared_stages": [
+        "physical-default",
+        "physical-internal",
+        "physical-persistent",
+        "applier-throughput"
+      ],
+      "required_receipts": [
+        "SQL rows/counts/indexes/kNN/AS OF agree with the source. Durable cursor resumes after a kill; every typed write entry refuses without sequence movement. Routines/triggers/schema hydrate strictly."
+      ],
+      "open_evidence_gaps": [
+        "LiveMySQL+REST/COPY standbyadmission mustbeproven through actuallisteners or currentdeployment harness, not inferred from embeddedrefusal"
+      ],
+      "accepted": false
+    },
+    {
+      "id": "P2",
+      "promise": "Oneversionedcontrolconnection, physicalACKsync, TLS/remote/resumablebootstrap",
+      "spec": "docs/plans/specs/P2_2_tls_remote_resumable.md",
+      "test_targets": [
+        "physical_standby_sync",
+        "txn_replication_sync",
+        "physical_standby_tls",
+        "physical_snapshot_resume",
+        "physical_standby_refusals",
+        "logical_standby_removed"
+      ],
+      "prepared_stages": [
+        "physical-default",
+        "physical-internal"
+      ],
+      "required_receipts": [
+        "Paused applier blocks SYNC; minimum ACK/timeout policy preserves commit truth. Heartbeats never regress. TLS/mTLS reject wrong CA and wrong token; interrupted bootstrap really resumes; native v3 protocol is refused.",
+        "P2_2\u00a74 explicitly uses real daemons on127.0.0.2/.3 plus nonloopback SocketAddr admission unit; no independent-host requirement is introduced.",
+        "OpenSSL CLI is a checked runtime prerequisite; its fixture-skip line is forbidden, so a6test green wrapper cannot bypass actual TLS/mTLS execution."
+      ],
+      "open_evidence_gaps": [
+        "Exact specified real-daemon TLS/mTLS scenarios on127.0.0.2/.3 plus nonloopback SocketAddr admission unit, wrongCA/token, interruption/reconnect/resume and native-v3 refusal remain runtime gates. Independent hosts/namespaces are optional additional battle-testing."
+      ],
+      "accepted": false
+    },
+    {
+      "id": "P3",
+      "promise": "Archive/window/catalog/recovery/cascading, prune-never-stall",
+      "spec": "docs/plans/specs/P3_1_archive_segments_recovery_window.md",
+      "test_targets": [
+        "physical_archive",
+        "physical_archive_recovery",
+        "archive_cli_tests"
+      ],
+      "prepared_stages": [
+        "physical-default",
+        "physical-internal",
+        "archive-reserve-native"
+      ],
+      "required_receipts": [
+        "Outage beyond retention recovers from copied archive segments with exact digest. Corrupt/missing/cross-history/key input is refused; encrypted segments are0600. Killed archiver repairs correctly; window/max-bytes/reserve controls never stall the primary.",
+        "P3_1\u00a76 reserve failure uses HELIOSDB_NANO_TEST_ARCHIVE_FREE_BYTES in a REAL managed daemon; primary inserts must continue without errors."
+      ],
+      "open_evidence_gaps": [
+        "Run P3_1\u00a76 reserve injection in REAL daemons with no insert errors, pruning/window/max-bytes ACK proofs. Real quota/full-filesystem probing is optional extended stress, not an additional mandatory spec gap."
+      ],
+      "accepted": false
+    },
+    {
+      "id": "P4",
+      "promise": "Tail/incremental/full recovery ladder, batch/leaf crashresume",
+      "spec": "docs/plans/specs/P4_1_recover_from_primary_fast_forward.md",
+      "test_targets": [
+        "physical_fast_forward",
+        "physical_large_write_group",
+        "physical_archive_recovery",
+        "physical_snapshot_resume"
+      ],
+      "prepared_stages": [
+        "physical-default",
+        "physical-internal",
+        "p4-scale"
+      ],
+      "required_receipts": [
+        "Measure shipped bytes for1% changed data and prove the full-copy threshold, delete propagation, refusal of ordinary startup on a dirty recovery record, resumable rerun, and multi-MB group convergence on standby/archive."
+      ],
+      "open_evidence_gaps": [
+        "Exact explicitly ignored >=1GiB/1% scale probe now prepared in E/p4-scale-acceptance-v2; no runtime result yet. Require cut whole-CF digest, shippedbytes report, SIGKILL/resume, dirty503 and acknowledged postcut tail. Report locality and retention version churn and0extra rows; uniform random1% can legitimately select full-copy. Existing threshold-control remains separately required."
+      ],
+      "accepted": false
+    },
+    {
+      "id": "P5",
+      "promise": "Offline/online/forcedpromotion fencing epochs and postpromotion recovery",
+      "spec": "docs/plans/specs/P5_1_epoch_promote_fence.md",
+      "test_targets": [
+        "physical_promote",
+        "physical_promote_online",
+        "physical_switchover",
+        "physical_rewind"
+      ],
+      "prepared_stages": [
+        "physical-default",
+        "physical-internal"
+      ],
+      "required_receipts": [
+        "Reachable old primary is fenced before promotion; forced unreachable promotion emits an explicit data-loss warning. Idle/prepared sessions receive57P01; new epoch accepts writes, stale primary self-fences, interrupted promotion resumes. Reopen preserves AS OF, vector and byte/digest checks."
+      ],
+      "open_evidence_gaps": [
+        "Final persistent MV/row publication follows same configured backend through physical/read-only/promotion with exact rows/vectors/ASOF/byte image; run final integrated proof sources and existing promotion/rewind suites."
+      ],
+      "accepted": false
+    },
+    {
+      "id": "B1",
+      "promise": "Perconnection/request branch binding and caches/startup/drop races",
+      "spec": "docs/plans/specs/B1_session_branch.md",
+      "test_targets": [
+        "branch_session_isolation"
+      ],
+      "prepared_stages": [
+        "branch-all-interfaces",
+        "core-default",
+        "core-internal"
+      ],
+      "required_receipts": [
+        "Independent PG simple/extended and embedded sessions, concurrent REST requests and MCP calls keep branch binding and caches isolated. Cover bound branch DROP/recreate and startup options with actual interface receipts."
+      ],
+      "open_evidence_gaps": [
+        "MySQL per-connection binding is a declared path requiring explicit native-client proof. The specified40 concurrent REST requests and MCP branch scopes can be proven by current request/tool integration harnesses; external HTTP hosting is optional additional deployment evidence."
+      ],
+      "accepted": false
+    },
+    {
+      "id": "B2",
+      "promise": "All branch writes/constraints/txns/COPY/TRUNCATE stay in overlay",
+      "spec": "docs/plans/specs/B2_branch_writes.md",
+      "test_targets": [
+        "branch_write_isolation",
+        "fk_update_actions",
+        "fk_delete_actions"
+      ],
+      "prepared_stages": [
+        "branch-all-interfaces",
+        "core-default",
+        "core-internal"
+      ],
+      "required_receipts": [
+        "PK/UNIQUE/FK/upsert/recursive cascades enforce the final branch dataset; rollback/savepoints preserve the overlay. Compare branch and main, including actual PG COPY/RETURNING."
+      ],
+      "open_evidence_gaps": [],
+      "accepted": false
+    },
+    {
+      "id": "B3",
+      "promise": "Branchcatalog isolation and MERGE finaldataset/conflicts/crashresume",
+      "spec": "docs/plans/specs/B3_branch_schema.md",
+      "test_targets": [
+        "branch_schema_isolation",
+        "branch_merge_surface_tests",
+        "fk_merge_constraints"
+      ],
+      "prepared_stages": [
+        "branch-all-interfaces",
+        "core-default",
+        "core-internal"
+      ],
+      "required_receipts": [
+        "Supported DDL affects only its branch; unsupported DDL returns0A000 without effects. Cover DROP/recreate incarnations, target key claims, genuine FK conflicts, explicit abort, partial crash/resume, intent+policy in one group and a non-main target."
+      ],
+      "open_evidence_gaps": [],
+      "accepted": false
+    },
+    {
+      "id": "B4",
+      "promise": "Forkpoint NOW/ASOF ancestry/freezes/reclaim and documentation",
+      "spec": "docs/plans/specs/B4_branch_fork_point.md",
+      "test_targets": [
+        "branch_fork_point",
+        "branch_as_of_tests",
+        "code_graph_on_branch"
+      ],
+      "prepared_stages": [
+        "branch-all-interfaces",
+        "core-default",
+        "core-internal"
+      ],
+      "required_receipts": [
+        "Child/grandchild row/side-storage/schema anchors remain frozen, including historical anchors and concurrent parent commit. Cover TDE, reclaim after DROP/MERGE, fresh branch IDs and crash/reopen."
+      ],
+      "open_evidence_gaps": [],
+      "accepted": false
+    }
+  ]
+}
