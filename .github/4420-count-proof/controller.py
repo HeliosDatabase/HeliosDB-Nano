@@ -205,6 +205,32 @@ def cells(text):
     return result
 
 
+def native_diagnostics(text):
+    writers = r'(Sql\(Text\)|Sql\(Params\)|Single|Batch)'
+    premises = re.findall(r'count-publication-eager-premise writer=' + writers
+        + r' art=Some\((\d+)\) raw_rows=Ok\((\d+)\) native_sequence=(\d+) before_sequence=(\d+)(?=\s|$)', text)
+    expected = {'Sql(Text)': 30, 'Sql(Params)': 30, 'Single': 12, 'Batch': 12}
+    require(text.count('count-publication-eager-premise') == len(premises) == 84,
+            'all84 real eager/raw/native-sequence premises required')
+    require({writer: sum(row[0] == writer for row in premises) for writer in expected} == expected,
+            'eager writer premise distribution changed')
+    require(all(int(art) == (1 if writer == 'Single' else 6) and int(raw) == 0
+                and sequence == before for writer, art, raw, sequence, before in premises),
+            'actual partialART/raw0/native-sequence premise failed')
+    refusals = re.findall(r'count-publication-resource-refusal writer=' + writers
+                         + r' sqlstate=(\S+) outer=([^\r\n]+)', text)
+    expected_refusals = {'Sql(Text)': 12, 'Sql(Params)': 12, 'Single': 6, 'Batch': 6}
+    require(text.count('count-publication-resource-refusal') == len(refusals) == 36,
+            'all36 actual refused-owner error diagnostics required')
+    require({writer: sum(row[0] == writer for row in refusals) for writer in expected_refusals} == expected_refusals,
+            'resource refusal writer distribution changed')
+    require(all(state == '54000' and 'too large for one atomic write' in outer
+                and 'AppliedPublication' not in outer for writer, state, outer in refusals),
+            'resource refusal cause/SQLSTATE/native-outcome identity differs')
+    return {'eager_premises': 84, 'resource_refusals': 36,
+            'eager_writer_counts': expected, 'refusal_writer_counts': expected_refusals}
+
+
 def judge(text, role, code):
     summaries = re.findall(r'test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; (\d+) measured; (\d+) filtered out', text)
     require(len(summaries) == 1, 'exactly one native Rust summary required')
@@ -214,6 +240,7 @@ def judge(text, role, code):
     require(actual['passed'] + actual['failed'] == 5 and actual['ignored'] == actual['measured'] == 0,
             'wrong/empty/ignored native parent inventory')
     observed = cells(text)
+    diagnostics = native_diagnostics(text)
     failed_cells = {family: sum(not ok for ok in rows.values()) for family, rows in observed.items()}
     parents = dict(zip(('public', 'aba', 'direct', 'unrelated', 'shared_raii'), PARENTS))
     failed_names = {FILTER + '::' + parents[family] for family, count in failed_cells.items() if count}
@@ -245,6 +272,7 @@ def judge(text, role, code):
     return {'status': outcome, 'native_summary': actual, 'native_case_count': 88,
             'case_family_counts': {family: len(rows) for family, rows in observed.items()},
             'failed_case_counts': failed_cells, 'regression_evidence': evidence,
+            'native_diagnostics': diagnostics,
             'full_suite_or_release_acceptance': False}
 
 
@@ -277,7 +305,7 @@ def main():
         if key.startswith('__RUST_TEST_'):
             env.pop(key)
     env.update(RUSTUP_TOOLCHAIN='1.95.0', CARGO_BUILD_JOBS='2', CMAKE_BUILD_PARALLEL_LEVEL='2',
-               CARGO_PROFILE_TEST_DEBUG='0', CARGO_PROFILE_DEV_DEBUG='0', RUST_TEST_THREADS='2',
+               CARGO_PROFILE_TEST_DEBUG='0', CARGO_PROFILE_DEV_DEBUG='0', RUST_TEST_THREADS='1',
                CARGO_INCREMENTAL='0', CARGO_TERM_COLOR='never', CARGO_TARGET_DIR=str(output / 'fresh-target'),
                HELIOS_STATEMENT_OFFLOAD='on')
     before = model = fleet = None
@@ -291,8 +319,8 @@ def main():
         require(model['parents'] == 5 and model['cases'] == 88, 'source-pair counts changed')
         require(set(model['entries']['baseline']) == set(model['entries']['fixed']), 'pair path sets differ')
         changes = {name for name in model['entries']['baseline'] if model['entries']['baseline'][name] != model['entries']['fixed'][name]}
-        require(changes == set(model['source_pair']['only_differing_paths']) == {'src/lib.rs', 'src/storage/engine.rs', 'src/storage/transaction.rs'}, 'unexpected production difference')
-        for name, value in model['source_pair']['identical_native_tests_and_manager_seams'].items():
+        require(changes == set(model['source_pair']['only_runtime_differences']) == {'src/lib.rs', 'src/storage/engine.rs', 'src/storage/transaction.rs'}, 'unexpected production difference')
+        for name, value in model['shared_fixture_inputs'].items():
             require(all(model['entries'][role][name]['sha256'] == value for role in ('baseline', 'fixed')), 'native fixture/seam mismatch')
         require(not any(env.get(key) for key in ('RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTC', 'RUSTDOC', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER')), 'undeclared compiler override')
         group = next(line.split(':', 2)[2] for line in Path('/proc/self/cgroup').read_text().splitlines() if line.startswith('0::'))
@@ -350,7 +378,7 @@ def main():
             require(listed['exit_code'] == 0 and not listed['timed_out'], 'native listing failed')
             require(native_list((output / (stem + '.stdout')).read_text()) == (set() if ignored else NAMES), 'exact5/unignored native inventory differs')
             require(digest(binary) == binary_sha, 'native image changed while listing')
-        runtime = run_owned([str(binary), FILTER, '--nocapture', '--test-threads=2'], product, env, output, 'native', remaining(600), native_sha=binary_sha)
+        runtime = run_owned([str(binary), FILTER, '--nocapture', '--test-threads=1'], product, env, output, 'native', remaining(600), native_sha=binary_sha)
         require(not runtime['timed_out'] and runtime['leader_reaped'], 'native timed out/not reaped')
         require(digest(binary) == binary_sha, 'native ELF changed after run')
         text = (output / 'native.stdout').read_text(errors='replace') + '\n' + (output / 'native.stderr').read_text(errors='replace')

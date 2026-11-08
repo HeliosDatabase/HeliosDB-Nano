@@ -23240,8 +23240,8 @@
       },
       "src/count_publication_tests.rs": {
         "mode": "100644",
-        "oid": "218ee5b45f5b80ea49ff1dce2db33fd4d46ef0f0",
-        "sha256": "ca1b1405349c8b56d7e828f88b2043fdbe062a2ce78921f72b8f74e0c9bea9cb"
+        "oid": "326b441079cc725d23279a385354dd589377d7e5",
+        "sha256": "4f4ce7fe98df3decfe12d420ed29d925724f9aac1bdfd669e0657e8fd335136b"
       },
       "src/crypto/key_manager.rs": {
         "mode": "100644",
@@ -43531,8 +43531,8 @@
       },
       "src/count_publication_tests.rs": {
         "mode": "100644",
-        "oid": "218ee5b45f5b80ea49ff1dce2db33fd4d46ef0f0",
-        "sha256": "ca1b1405349c8b56d7e828f88b2043fdbe062a2ce78921f72b8f74e0c9bea9cb"
+        "oid": "326b441079cc725d23279a385354dd589377d7e5",
+        "sha256": "4f4ce7fe98df3decfe12d420ed29d925724f9aac1bdfd669e0657e8fd335136b"
       },
       "src/crypto/key_manager.rs": {
         "mode": "100644",
@@ -60848,42 +60848,36 @@
   "parents": 5,
   "release_acceptance_pass": false,
   "roles": {
-    "baseline": "9dc744636d06a94eca6e025e420279d2b098d05c",
-    "fixed": "c6d1b0f9b5f99d0f06cd72e65ce9eb2164b554e2"
+    "baseline": "9ba88f3c68cd4ed8c7dfd14127ba524751db8521",
+    "fixed": "b1cba858296db3db838660a83aa21557df2e3b90"
   },
-  "schema": "nano-count-publication-pair-v1",
+  "schema": "nano-count-publication-pair-v3-late-cap",
+  "shared_fixture_inputs": {
+    "src/count_publication_tests.rs": "4f4ce7fe98df3decfe12d420ed29d925724f9aac1bdfd669e0657e8fd335136b",
+    "src/storage/art_manager.rs": "e66ec7593e39221937356aa6ac7a36f8106fd183d76a2a2ab5316837dd198f96"
+  },
   "source_pair": {
-    "base": "00b58922b030797da5b262dd680442eb93f37038",
-    "baseline_semantics": "Only cfgtest hooks added to3 oldruntimefiles: realcount postprobe, actual enrollment attempts beforelower/outerready fastouts, firsttable pause immediatelybefore sharedcounterincrement afterlegacyownset publication. No runtime correction.",
-    "cases": 88,
-    "configs": [
-      "default",
-      "internal-tests"
-    ],
-    "created_at": "2026-11-08T14:05:51.006386+00:00",
-    "fixed_semantics": "Exact f1cbc proposedfix +same manager/tests; firsttable pause undercoldmutex beforemembership publication. No fakeerrors/counts.",
+    "cells": 88,
+    "common_test_sha256": "4f4ce7fe98df3decfe12d420ed29d925724f9aac1bdfd669e0657e8fd335136b",
+    "created_at": "2026-11-08T14:37:01.384045+00:00",
     "heads": {
-      "baseline": "9dc744636d06a94eca6e025e420279d2b098d05c",
-      "fixed": "c6d1b0f9b5f99d0f06cd72e65ce9eb2164b554e2"
+      "baseline": "9ba88f3c68cd4ed8c7dfd14127ba524751db8521",
+      "fixed": "b1cba858296db3db838660a83aa21557df2e3b90"
     },
-    "identical_native_tests_and_manager_seams": {
-      "src/count_publication_tests.rs": "ca1b1405349c8b56d7e828f88b2043fdbe062a2ce78921f72b8f74e0c9bea9cb",
-      "src/storage/art_manager.rs": "e66ec7593e39221937356aa6ac7a36f8106fd183d76a2a2ab5316837dd198f96"
-    },
+    "intracase_concurrency_unchanged": true,
+    "module_parent_threads": 1,
     "native_execution": false,
-    "only_differing_paths": [
+    "only_runtime_differences": [
       "src/lib.rs",
       "src/storage/engine.rs",
       "src/storage/transaction.rs"
     ],
     "parents": 5,
+    "predecessor_source_pair_sha256": "9dfa3198cd48a843bdcf96a42930816e8e7f0028e555182f8affd7d4d9d22681",
+    "production_unchanged_from_c6": true,
     "release_acceptance_pass": false,
-    "roles_expected": {
-      "baseline": "Actual observable regression; no guessed partialpass count. Require all intended nativeparents/caseattempts and genuine realART/rawcommittedtruth/sharedRAII evidence.",
-      "fixed": "5parents0fail0ignored, all88caseidentities mustcompletepass"
-    },
-    "source_peer": "b6c21d0655e135cfd84ab6a6dc99df956ae7aa6292789b292963f6edf663f83e",
-    "tests_peer": "10dc9a8d7e8e0a89fbadeb0de976cc981dbecf4cb0c64a38d5232a79345e6e6c"
+    "test_manifest_sha256": "669003fef7328e2fe0378b901e2a0ae1414b2da5989130e97d2bd9147d3f153c",
+    "test_peer_sha256": "42d4a2ca0430d6a6699dd616f623cc867dccac45000546c39a25e1afb7fdc4bb"
   },
-  "source_pair_sha256": "9dfa3198cd48a843bdcf96a42930816e8e7f0028e555182f8affd7d4d9d22681"
+  "source_pair_sha256": "80ef5973045cffd7c9cb000ab63e54b1c228419bc87fb558121d9a3621c7bd6d"
 }

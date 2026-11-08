@@ -16,9 +16,9 @@ jobs:
         config: [default, internal-tests]
         include:
           - role: baseline
-            product: 9dc744636d06a94eca6e025e420279d2b098d05c
+            product: 9ba88f3c68cd4ed8c7dfd14127ba524751db8521
           - role: fixed
-            product: c6d1b0f9b5f99d0f06cd72e65ce9eb2164b554e2
+            product: b1cba858296db3db838660a83aa21557df2e3b90
     steps:
       - name: Preserve Git source bytes
         run: |
@@ -51,8 +51,8 @@ jobs:
           import hashlib
           from pathlib import Path
           pairs = {
-              '.github/4420-count-proof/controller.py': '9b4d4a53e7e95da201f2d96fca4854a226c92b7196fdc1688983350ae9bc711b',
-              '.github/4420-count-proof/model.json': 'b126a88aeedb0d748e44c290a2e65b671b2108f4d057482ff2b79b4cb80c5d81',
+              '.github/4420-count-proof/controller.py': 'a9b5c2187910992f084699fe82c43fcacd9e5178acb8ef133d9d96a852edac4f',
+              '.github/4420-count-proof/model.json': '44ab4b8c67e7a5b9c1fff85ac96c8e9c506bf2d4c6c545a2a2fba2f2923c20d5',
           }
           for name, wanted in pairs.items():
               if hashlib.sha256(Path(name).read_bytes()).hexdigest() != wanted:
@@ -80,7 +80,7 @@ jobs:
               --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product" \
               --role "$NANO_COUNT_PROOF_ROLE" --config "$NANO_COUNT_PROOF_CONFIG" \
               --out "$RUNNER_TEMP/count-proof-$NANO_COUNT_PROOF_ROLE-$NANO_COUNT_PROOF_CONFIG" \
-              --model-sha256 b126a88aeedb0d748e44c290a2e65b671b2108f4d057482ff2b79b4cb80c5d81
+              --model-sha256 44ab4b8c67e7a5b9c1fff85ac96c8e9c506bf2d4c6c545a2a2fba2f2923c20d5
       - name: Preserve raw focused proof (including expected-red baseline)
         if: always()
         uses: actions/upload-artifact@v4
