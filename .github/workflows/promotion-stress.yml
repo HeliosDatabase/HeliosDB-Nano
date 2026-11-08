@@ -1,4 +1,4 @@
-name: Unchanged short-budget promotion stress diagnostic (no publish)
+name: Promotion observer sequencing stress diagnostic (no publish)
 on:
   push:
     branches: ['ci/4420-promotion-stress-*']
@@ -6,7 +6,7 @@ permissions:
   contents: read
 jobs:
   proof:
-    name: ${{ matrix.configuration }} twenty unchanged promotion invocations
+    name: ${{ matrix.configuration }} twenty promotion observer invocations
     runs-on: ubuntu-24.04
     timeout-minutes: 140
     strategy:
@@ -25,7 +25,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v5
         with:
-          ref: 24787ceebc36e4809495dbef7d1b7f3978209ad9
+          ref: 68f97fe226ba677d063e91348e1a411d16bd59c5
           path: product
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -45,8 +45,8 @@ jobs:
           import hashlib
           from pathlib import Path
           pairs = {
-              '.github/4420-promotion-stress/controller.py': '91c5b1cb8ea79ef7070ec8fa1b2fe8389fbc1c6ee040fdfab6c2c0e4604d8318',
-              '.github/4420-promotion-stress/model.json': 'e30458d1a18c52ff57624f12dd6377878208c8f6b54b349943279b688a6b1265',
+              '.github/4420-promotion-stress/controller.py': 'eb588d220311c87ffd74f840789fbe96b54704f792eaff18bef940d328278ff9',
+              '.github/4420-promotion-stress/model.json': 'daa38ef693bd2c83a0a2811ee3fc794abb2a09c2c51928a73483dd30fb5b94df',
           }
           for name, wanted in pairs.items():
               if hashlib.sha256(Path(name).read_bytes()).hexdigest() != wanted:
@@ -72,7 +72,7 @@ jobs:
             python3 .github/4420-promotion-stress/controller.py \
               --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product" \
               --configuration "$NANO_WAL_TAIL_CONFIGURATION" --out "$RUNNER_TEMP/wal-tail-regressions-$NANO_WAL_TAIL_CONFIGURATION" \
-              --model-sha256 e30458d1a18c52ff57624f12dd6377878208c8f6b54b349943279b688a6b1265
+              --model-sha256 daa38ef693bd2c83a0a2811ee3fc794abb2a09c2c51928a73483dd30fb5b94df
       - name: Preserve raw native results and promotion lifecycle logs
         if: always()
         uses: actions/upload-artifact@v4

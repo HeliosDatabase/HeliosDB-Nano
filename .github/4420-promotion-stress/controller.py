@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Twenty unchanged short-budget promotion invocations per immutable-source profile."""
+"""Twenty promotion observer sequencing invocations per immutable-source profile."""
 import argparse
 import fcntl
 import hashlib
@@ -15,7 +15,7 @@ import threading
 import time
 
 HERE = Path(__file__).resolve().parent
-FIXED = '24787ceebc36e4809495dbef7d1b7f3978209ad9'
+FIXED = '68f97fe226ba677d063e91348e1a411d16bd59c5'
 ENV_KEYS = ('RUSTUP_TOOLCHAIN','CARGO_HOME','RUSTUP_HOME','CARGO_TARGET_DIR',
             'CARGO_PROFILE_TEST_DEBUG','CARGO_PROFILE_DEV_DEBUG','CARGO_BUILD_JOBS',
             'CMAKE_BUILD_PARALLEL_LEVEL','RUST_TEST_THREADS','RUSTFLAGS','CARGO_ENCODED_RUSTFLAGS',

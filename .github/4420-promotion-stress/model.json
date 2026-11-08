@@ -21287,7 +21287,7 @@
       "sha256": "24ca9e1c2dc03bd0618cb30acbb67bb53ec63dd93ea936e58b01cae901a4060d"
     }
   },
-  "execution_note": "Source-specific stress diagnostic only: original one Rust parent invoked twenty times per profile, unique invocation IDs/TMPDIR/log pairs. Earlier source32 failures retained; no timeout/assertion/source change or final release credit.",
+  "execution_note": "Test-only observer sequencing derivative68f97 from24787; no production change. All20invocations/profile retainoriginal1s/f/second55000/epoch/fence, one shared60s drain+primary budget, exactseedrows added. Earlieractual37pass/3fail andoriginalsource retained. Native configurations andlegacy payload/type labels unchanged.",
   "product_entries": {
     ".cargo/audit.toml": {
       "mode": "100644",
@@ -27521,8 +27521,8 @@
     },
     "tests/physical_promote_online.rs": {
       "mode": "100644",
-      "oid": "1e156e5dc18f39704a6f9e723e3906bbd1a0e5ae",
-      "sha256": "2e80803118e736f5b04002bdf8893a8390ffbe912c91d56e7a115acc1cc10741"
+      "oid": "a0a6b400012cb55e973dc4cc0884ffa989c979a8",
+      "sha256": "57ace25622f078afcdbcccb8d0e6295d7576a2d184c7f24ee23c5b75eee5ffbb"
     },
     "tests/physical_rewind.rs": {
       "mode": "100644",
@@ -41540,7 +41540,7 @@
       "sha256": "24ca9e1c2dc03bd0618cb30acbb67bb53ec63dd93ea936e58b01cae901a4060d"
     }
   },
-  "product_head": "24787ceebc36e4809495dbef7d1b7f3978209ad9",
+  "product_head": "68f97fe226ba677d063e91348e1a411d16bd59c5",
   "product_paths": 4050,
   "runtime_executed": false,
   "schema": 1,
@@ -41548,10 +41548,12 @@
     "src/replication/physical.rs": "8592a9801b07a45654aed0887b4cf497139842b407631b37fa094899c0dba4de",
     "tests/physical_archive_recovery.rs": "badf6939659e78dea22d044d7a2a53c478d592bb955cea6391fa30fd06e1d10d",
     "tests/physical_large_write_group.rs": "8644021adc88a862aadfe7c50d0c5d8b9f364c679a23a600ee1df84544514b60",
-    "tests/physical_promote_online.rs": "2e80803118e736f5b04002bdf8893a8390ffbe912c91d56e7a115acc1cc10741",
+    "tests/physical_promote_online.rs": "57ace25622f078afcdbcccb8d0e6295d7576a2d184c7f24ee23c5b75eee5ffbb",
     "tests/physical_standby_local_namespace.rs": "3a566a6ff4a5879ed14aee74bc3586c643cc31530d226e3cf42398ab1541d0fb",
     "tests/support/physical_pair.rs": "061b8209ab7804e4c27a06562745c03b5f7cf2b2b134ef2d5c004fe0043373cf"
   },
   "upstream_pair_head": "dfef2d1c639553a40f380f9e66d1af76be583b1b",
-  "upstream_pair_run": 42484304314
+  "upstream_pair_run": 42484304314,
+  "observer_fixture_manifest_sha256": "8a63d57c68514dd3f3c8b6bf28aeafa9d3464473a31770f0f45989a2b24c6dc2",
+  "observer_fixture_peer_sha256": "884ecba14d72d7c4a56e7e9e43ce3dfe41d39d5e25cdcf88a4ff6f1bac64f46f"
 }
