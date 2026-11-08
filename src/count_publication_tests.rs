@@ -299,7 +299,7 @@ struct Paused {
     errors: Arc<Mutex<Vec<String>>>,
 }
 
-fn paused(db: &Arc<EmbeddedDatabase>, writer: Writer) -> Paused {
+fn paused(db: &Arc<EmbeddedDatabase>, writer: Writer, refused: bool) -> Paused {
     let (start, start_rx) = mpsc::channel();
     let (ready_tx, ready) = mpsc::channel();
     let (release, release_rx) = mpsc::channel();
@@ -320,6 +320,11 @@ fn paused(db: &Arc<EmbeddedDatabase>, writer: Writer) -> Paused {
                     rows: row_count(&hook_db),
                     sequence: hook_db.storage.db().latest_sequence_number(),
                 };
+                // Let legitimate planning/preflight finish, then refuse the
+                // owning native group after these real eager claims exist.
+                if refused {
+                    hook_db.storage.debug_set_write_group_ceiling(Some(0));
+                }
                 if let Err(error) = ready_tx.send(premise) {
                     hook_error(&errors, error);
                 }
@@ -343,6 +348,10 @@ fn paused(db: &Arc<EmbeddedDatabase>, writer: Writer) -> Paused {
 }
 
 fn valid_premise(premise: &Premise, writer: Writer, sequence: u64) -> Check {
+    eprintln!(
+        "count-publication-eager-premise writer={writer:?} art={:?} raw_rows={:?} native_sequence={} before_sequence={sequence}",
+        premise.art, premise.rows, premise.sequence
+    );
     assert_eq!(premise.art, Some(writer.partial()), "actual unique ART prefix");
     assert_eq!(
         premise.rows.as_ref().map_err(ToString::to_string)?,
@@ -369,13 +378,16 @@ fn finish(
         let error = written
             .err()
             .ok_or_else(|| std::io::Error::other("cap0 writer succeeded"))?;
-        assert!(matches!(error, Error::QueryExecution(_)), "{error}");
+        let sqlstate = crate::protocol::postgres::handler::sqlstate_for_error(&error);
+        eprintln!("count-publication-resource-refusal writer={writer:?} sqlstate={sqlstate} outer={error:?}");
         assert!(
             error
                 .to_string()
                 .contains(crate::error::BRANCH_MATERIALIZE_TOO_LARGE_MARKER),
             "{error}"
         );
+        assert_eq!(sqlstate, "54000", "{error}");
+        assert!(!error.is_applied_publication_failure(), "{error}");
         assert_eq!(image(db)?, *before, "proven NotWritten whole KV truth");
         assert_eq!(db.storage.db().latest_sequence_number(), sequence);
     } else {
@@ -424,10 +436,7 @@ fn public_sql_counts_never_publish_an_uncommitted_eager_prefix() -> Check {
                         let db = open(temp.path(), history, writer)?;
                         let before = image(&db)?;
                         let sequence = db.storage.db().latest_sequence_number();
-                        if refused {
-                            db.storage.debug_set_write_group_ceiling(Some(0));
-                        }
-                        let paused = paused(&db, writer);
+                        let paused = paused(&db, writer, refused);
                         let started = paused.start.send(());
                         let ready = paused.ready.recv_timeout(WAIT);
                         let reader_db = Arc::clone(&db);
@@ -486,10 +495,7 @@ fn completed_sql_writers_invalidate_the_entire_cardinality_probe() -> Check {
                         let db = open(temp.path(), history, writer)?;
                         let before = image(&db)?;
                         let sequence = db.storage.db().latest_sequence_number();
-                        if refused {
-                            db.storage.debug_set_write_group_ceiling(Some(0));
-                        }
-                        let paused = paused(&db, writer);
+                        let paused = paused(&db, writer, refused);
                         let Paused {
                             start,
                             ready,
@@ -594,10 +600,7 @@ fn direct_single_and_batch_claims_cover_the_first_eager_key() -> Check {
                         let db = open(temp.path(), history, writer)?;
                         let before = image(&db)?;
                         let sequence = db.storage.db().latest_sequence_number();
-                        if refused {
-                            db.storage.debug_set_write_group_ceiling(Some(0));
-                        }
-                        let paused = paused(&db, writer);
+                        let paused = paused(&db, writer, refused);
                         let started = paused.start.send(());
                         let ready = paused.ready.recv_timeout(WAIT);
                         let probe = db.try_fast_count_pk_query(&form.sql(TABLE));
@@ -634,7 +637,7 @@ fn insertion_census_preserves_unrelated_counts_and_index_miss_gates() -> Check {
                 let db = open(temp.path(), history, writer)?;
                 let before = image(&db)?;
                 let sequence = db.storage.db().latest_sequence_number();
-                let paused = paused(&db, writer);
+                let paused = paused(&db, writer, false);
                 let started = paused.start.send(());
                 let ready = paused.ready.recv_timeout(WAIT);
                 let fast = db.try_fast_count_pk_query(&form.sql(OTHER));
