@@ -244,41 +244,37 @@ fn real_lock_cancellation_and_deadline_keep_their_original_error_after_layout_mo
                     return Err(error.into());
                 }
                 let (recorded_tx, recorded_rx) = mpsc::channel();
-                let (release_tx, release_rx) = mpsc::channel();
                 let (invalid_tx, invalid_rx) = mpsc::channel();
                 let done = Arc::new(AtomicBool::new(false));
                 let reader_done = Arc::clone(&done);
                 let reader_db = Arc::clone(&db);
                 let reader = std::thread::spawn(move || {
-                    let mut once = Some((recorded_tx, release_rx, invalid_tx));
+                    let mut once = Some(recorded_tx);
                     let mut attempts = 0;
                     let result = reader_db.run_layout_statement(false, || {
                         attempts += 1;
                         reader_db.storage.catalog().get_table_schema(ROWS)?;
-                        let (recorded, release, invalid) = once
+                        let recorded = once
                             .take()
                             .ok_or_else(|| Error::internal("an interrupted operation was incorrectly repeated"))?;
                         recorded.send(()).map_err(|error| Error::internal(error.to_string()))?;
-                        release
-                            .recv_timeout(WAIT)
+                        // Enter the actual lock wait while this old read set is
+                        // still valid. Starting nested SQL after the DROP would
+                        // correctly refuse its stale context before lock entry.
+                        let result = family.execute(&reader_db, sid, UPDATE);
+                        invalid_tx
+                            .send(
+                                layout_epochs::validate_statement()
+                                    .err()
+                                    .is_some_and(|error| layout_epochs::is_layout_changed(&error)),
+                            )
                             .map_err(|error| Error::internal(error.to_string()))?;
-                        invalid
-                            .send(layout_epochs::validate_statement().is_err())
-                            .map_err(|error| Error::internal(error.to_string()))?;
-                        family.execute(&reader_db, sid, UPDATE)
+                        result
                     });
                     reader_done.store(true, Ordering::Release);
                     (result, attempts)
                 });
                 let recorded = recorded_rx.recv_timeout(WAIT);
-                let written = if recorded.is_ok() {
-                    db.execute("ALTER TABLE layout_boundary_rows DROP COLUMN mid")
-                } else {
-                    Err(Error::internal("interrupt reader did not record its layout"))
-                };
-                let before_release = image(&db);
-                let sequence = db.storage.db().latest_sequence_number();
-                let _release = release_tx.send(());
                 let started = Instant::now();
                 let mut waiting = false;
                 while started.elapsed() < WAIT && !done.load(Ordering::Acquire) {
@@ -288,6 +284,13 @@ fn real_lock_cancellation_and_deadline_keep_their_original_error_after_layout_mo
                     }
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                let written = if recorded.is_ok() && waiting {
+                    db.execute("ALTER TABLE layout_boundary_rows DROP COLUMN mid")
+                } else {
+                    Err(Error::internal("interrupt SQL did not reach its real shared lock wait"))
+                };
+                let before_release = image(&db);
+                let sequence = db.storage.db().latest_sequence_number();
                 let cancelled = !matches!(interrupt, Interrupt::Cancel)
                     || (waiting && crate::session::scoped::request_cancel(pid, 7241));
                 let read = reader.join();
@@ -296,8 +299,12 @@ fn real_lock_cancellation_and_deadline_keep_their_original_error_after_layout_mo
                 let (result, attempts) = joined(read, "interrupted reader")?;
                 joined(held, "table holder")??;
                 recorded?;
+                let observed = result.as_ref().err().map(ToString::to_string);
+                assert!(
+                    waiting,
+                    "the SQL write must actually wait on the held table; family={family:?} history={history} kind={interrupt:?} observed={observed:?} attempts={attempts}"
+                );
                 written?;
-                assert!(waiting, "the SQL write must actually wait on the held table");
                 assert!(cancelled, "the real backend cancel key must be accepted");
                 assert!(
                     invalid_rx.recv_timeout(WAIT)?,
