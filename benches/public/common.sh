@@ -32,6 +32,10 @@ EOF
 
 # Build the TPS harness once with the perf profile (release-like, faster build).
 build_perf_harness() {
+    # The strict Linux gate owns a fresh perf build and its Cargo JSON receipt.
+    if [ "${HELIOS_PERF_NATIVE_PROOF:-0}" = 1 ]; then
+        return
+    fi
     echo "== building tps_workloads harness (cargo --profile perf) =="
     (cd "$ROOT" && cargo test --profile perf --test tps_workloads --no-run --quiet)
 }
@@ -67,6 +71,13 @@ new_results_dir() {
 run_ci_gate_workloads() {
     local dir="$1" reps="${2:-3}"
     : > "$dir/ci_raw.txt"
+    if [ "${HELIOS_PERF_NATIVE_PROOF:-0}" = 1 ]; then
+        python3 "$PUB/native_ci_proof.py" --tree "$ROOT" \
+            --target "${CARGO_TARGET_DIR:-$ROOT/target}" \
+            --out "$dir/native-proof" --repetitions "$reps" 2>&1 | tee -a "$dir/ci_raw.txt"
+        python3 "$TOOLS" parse "$dir/ci_raw.txt" > "$dir/ci_measured.json"
+        return
+    fi
     for rep in $(seq 1 "$reps"); do
         echo "--- gate rep $rep/$reps: tps suite (mem, N=1000, M=200) ---"
         (cd "$ROOT" && env HELIOS_TPS=1 HELIOS_TPS_MODE=mem \

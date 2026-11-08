@@ -27,7 +27,7 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # modern cargo-deny, silently disabling this gate.
 
 # Ignore specific advisories (use sparingly and document why).
-# All entries below are PRE-EXISTING debt surfaced 2026-07-17 when this config
+# The first four entries below are PRE-EXISTING debt surfaced 2026-07-17 when this config
 # was repaired (the old-schema keys had made the whole file unparseable, so the
 # gate had been silently disabled). Each has a filed remediation.
 ignore = [
@@ -52,6 +52,13 @@ ignore = [
     # Replacing serde_yaml can change EXPLAIN (FORMAT YAML) output, so it is
     # tracked for a minor release rather than done in a patch.
     { id = "RUSTSEC-2024-0449", reason = "serde_yaml backend; parses only the compiled-in OpenAPI spec" },
+    # NEW maintenance exception for 4.42.0, adopted2026-11-08 (not pre-existing debt).
+    # Reviewed graph: fastembed 7.5.0 -> tokenizers 0.23.2 -> paste 1.0.15,
+    # optional code-embed only. This advisory reports unmaintained software,
+    # not a vulnerability. The same explicit ID is aligned in audit.toml; remove
+    # both entries when a compatible published graph removes paste. Review scope,
+    # ownership and removal conditions: docs/SECURITY_MAINTENANCE_EXCEPTIONS.md.
+    { id = "RUSTSEC-2024-0436", reason = "optional Tokenizers compile-time macro; maintenance-only exception tracked12d7fb448cd0; see security maintenance record" },
 ]
 
 [licenses]

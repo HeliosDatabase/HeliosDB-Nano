@@ -4953,6 +4953,27 @@ impl EmbeddedDatabase {
                 Err(error) if storage::layout_epochs::is_layout_changed(&error) => {
                     scope.finish().err().unwrap_or(error)
                 }
+                // An old decoder can fail while reading a row rewritten by DDL
+                // before it reaches normal final validation (for example, a TEXT
+                // predicate sees the VECTOR now at that column's old position).
+                // Revalidate only pure comparison/type failures. A moved layout
+                // refuses non-repeatable side effects with 40001; the loop below
+                // decides whether another attempt is safe. Durable writes,
+                // applied-publication diagnostics and native/control failures
+                // retain their original errors.
+                Err(error)
+                    if !error.is_applied_publication_failure()
+                        && match &error {
+                            Error::QueryExecution(message) => message.starts_with("Cannot compare "),
+                            Error::TypeConversion(_) => true,
+                            _ => false,
+                        } =>
+                {
+                    match scope.finish() {
+                        Ok(()) => return Err(error),
+                        Err(failure) => failure,
+                    }
+                }
                 Err(error) => return Err(error),
             };
             if in_transaction || !scope.retriable() {
