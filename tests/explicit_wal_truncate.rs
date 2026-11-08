@@ -9,6 +9,7 @@ fn open(path: &std::path::Path, history: bool) -> Result<EmbeddedDatabase> {
     config.storage.version_gc_interval_secs = Some(0);
     config.storage.wal_enabled = true;
     config.storage.wal_checkpoint_on_close = false;
+    config.storage.wal_replay_destructive_ddl = heliosdb_nano::config::DestructiveDdlReplay::Apply;
     EmbeddedDatabase::with_config(config)
 }
 
