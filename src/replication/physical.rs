@@ -599,12 +599,17 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize, memo: 
         return Ok(result);
     }
     let mut iterator = db.get_updates_since(after)?;
+    #[cfg(test)]
+    physical_wal_tail_tests::after_iterator_open(db)?;
     let mut bytes = 0_usize;
     // A poll of tiny groups stops at a count too (`MAX_POLL_GROUPS`), so it
     // answers within seconds; the rest is the next poll's.
     while result.through < barrier && result.batches.len() < MAX_POLL_GROUPS {
         let Some(entry) = iterator.next() else {
-            iterator.status()?;
+            let status = iterator.status();
+            #[cfg(test)]
+            physical_wal_tail_tests::observe_status(&status);
+            status?;
             // No record at all although the interval is not empty: the WAL
             // that held it is gone, or `after` is inside the last write group.
             if result.through == after {
@@ -660,7 +665,10 @@ pub fn poll_source(db: &DB, history: Uuid, after: u64, byte_limit: usize, memo: 
         result.through = batch.last;
         result.batches.push(batch);
     }
-    iterator.status()?;
+    let status = iterator.status();
+    #[cfg(test)]
+    physical_wal_tail_tests::observe_status(&status);
+    status?;
     Ok(result)
 }
 
@@ -4371,3 +4379,7 @@ mod tests {
         drop(writer);
     }
 }
+
+#[cfg(test)]
+#[path = "physical_wal_tail_tests.rs"]
+mod physical_wal_tail_tests;
