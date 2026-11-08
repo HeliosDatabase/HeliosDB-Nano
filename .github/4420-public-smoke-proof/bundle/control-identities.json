@@ -1,0 +1,91 @@
+{
+  "status": "READ ONLY IDENTITY CAPTURE; NOT A BUILD/RUN RECEIPT",
+  "refs": {
+    "main": {
+      "ref": "main",
+      "commit": "571d40f4853d75c06c2247eff6cea8516a24dc7b",
+      "source_archive_sha256": "0dfdbf326ce02cca30bb70c053b93d8875a71d90e47795ba0fe18c9044769ea5"
+    },
+    "origin_main": {
+      "ref": "origin/main",
+      "commit": "4af19e1c447b8b9f8a621a984e8cc0558195bf3b",
+      "source_archive_sha256": "be4a4edbb3c9a34a560233334c520c6be634a11c881dc7ab022deeeeadb72961"
+    },
+    "released_v4_41_1": {
+      "ref": "v4.41.1",
+      "commit": "4af19e1c447b8b9f8a621a984e8cc0558195bf3b",
+      "source_archive_sha256": "be4a4edbb3c9a34a560233334c520c6be634a11c881dc7ab022deeeeadb72961"
+    },
+    "latest_inherited": {
+      "ref": "967c3704bae2bb94b3a896fbd419615e140f15e9",
+      "commit": "967c3704bae2bb94b3a896fbd419615e140f15e9",
+      "source_archive_sha256": "26f7ee34fbd772b6ded5e6f8d7c7dc906bee6ba7d49120c1fac068260516001d"
+    }
+  },
+  "controls": {
+    "heliosdb-nano-rel-v4.41.1": {
+      "path": "/tmp/claude-1001/-home-gpc-HDB-Nano/b60533cf-cabd-4abd-8bf1-a06a99c935cf/scratchpad/bin/heliosdb-nano-rel-v4.41.1",
+      "historical_metadata": {
+        "source": "/tmp/claude-1001/-home-gpc-HDB-Nano/b60533cf-cabd-4abd-8bf1-a06a99c935cf/scratchpad/bin/heliosdb-nano-rel-v4.41.1",
+        "size": 44323784,
+        "mtime_ns": 1794053068787274350,
+        "version": "heliosdb-nano 4.41.1"
+      },
+      "present": true,
+      "sha256": "fa82b244acdf373bee6942f837a4cef67092c6d78bce944957594d880e6c216f",
+      "size": 44323784,
+      "stable_during_hash": true
+    },
+    "heliosdb-nano-rel-967c3704": {
+      "path": "/tmp/claude-1001/-home-gpc-HDB-Nano/b60533cf-cabd-4abd-8bf1-a06a99c935cf/scratchpad/bin/heliosdb-nano-rel-967c3704",
+      "historical_metadata": {
+        "source": "/tmp/claude-1001/-home-gpc-HDB-Nano/b60533cf-cabd-4abd-8bf1-a06a99c935cf/scratchpad/bin/heliosdb-nano-rel-967c3704",
+        "size": 50963312,
+        "mtime_ns": 1794052325416154909,
+        "version": "heliosdb-nano 4.41.1"
+      },
+      "present": true,
+      "sha256": "dd840cfabe8fab859fc610961f4f15f35b438d1f62ff71083d9664d4fbd7a384",
+      "size": 50963312,
+      "stable_during_hash": true
+    },
+    "heliosdb-nano-rel-99a3a85e": {
+      "path": "/tmp/claude-1001/-home-gpc-HDB-Nano/b60533cf-cabd-4abd-8bf1-a06a99c935cf/scratchpad/bin/heliosdb-nano-rel-99a3a85e",
+      "historical_metadata": {
+        "source": "/tmp/claude-1001/-home-gpc-HDB-Nano/b60533cf-cabd-4abd-8bf1-a06a99c935cf/scratchpad/bin/heliosdb-nano-rel-99a3a85e",
+        "size": 50812920,
+        "mtime_ns": 1793978254676733040
+      },
+      "present": true,
+      "sha256": "6c2ee600f329b0775a611a46cb7c43d2a3e207830f64a9409d319d7bd45df968",
+      "size": 50812920,
+      "stable_during_hash": true
+    },
+    "heliosdb-nano-prof-v4.41.1": {
+      "path": "/tmp/claude-1001/-home-gpc-HDB-Nano/b60533cf-cabd-4abd-8bf1-a06a99c935cf/scratchpad/bin/heliosdb-nano-prof-v4.41.1",
+      "historical_metadata": {
+        "source": "/tmp/claude-1001/-home-gpc-HDB-Nano/b60533cf-cabd-4abd-8bf1-a06a99c935cf/scratchpad/bin/heliosdb-nano-prof-v4.41.1",
+        "size": 489494088,
+        "mtime_ns": 1794065222062524602
+      },
+      "present": true,
+      "sha256": "56cce1fce0633e5e73c296c29cd70033fffaaa96365f5ab65286e1f8813500b6",
+      "size": 489494088,
+      "stable_during_hash": true
+    },
+    "heliosdb-nano-prof-967c3704": {
+      "path": "/tmp/claude-1001/-home-gpc-HDB-Nano/b60533cf-cabd-4abd-8bf1-a06a99c935cf/scratchpad/bin/heliosdb-nano-prof-967c3704",
+      "historical_metadata": {
+        "source": "/tmp/claude-1001/-home-gpc-HDB-Nano/b60533cf-cabd-4abd-8bf1-a06a99c935cf/scratchpad/bin/heliosdb-nano-prof-967c3704",
+        "size": 520458000,
+        "mtime_ns": 1794063937548816745
+      },
+      "present": true,
+      "sha256": "a84b2072177215a5c81f178d283b53d6568374fd581e20f2200a882fc2a9e8ab",
+      "size": 520458000,
+      "stable_during_hash": true
+    }
+  },
+  "current_tree": "/home/gpc/HDB/worktrees/nano-codex-combined",
+  "current_source_gate_manifest": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/combined-r5-all-source.sha256.json"
+}

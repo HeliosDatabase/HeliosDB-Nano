@@ -1,0 +1,97 @@
+{
+  "inventory.py": {
+    "sha256": "c8aae539081eba238ff34584abd7acd70cb6a0f9505c775eaeacc1544a68cf6a",
+    "bytes": 7202,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/inventory.py"
+  },
+  "run_stage.py": {
+    "sha256": "732d63ac70cb399a8e1e3195568a6694e1f710b04136418b6fb18e5bf135dbc1",
+    "bytes": 6226,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/run_stage.py"
+  },
+  "run-one.sh": {
+    "sha256": "ce65e619d331b3d12cd39da9f2ab9d80ed02bc66ab32c22246a463707c90f1fa",
+    "bytes": 464,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/run-one.sh"
+  },
+  "clippy-diff.py": {
+    "sha256": "90718082f95d664c65fe08db0f56b3d23517d9842075bb67f1782409d13e1157",
+    "bytes": 1471,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/clippy-diff.py"
+  },
+  "main-source.tar": {
+    "sha256": "0dfdbf326ce02cca30bb70c053b93d8875a71d90e47795ba0fe18c9044769ea5",
+    "bytes": 142469120,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/main-source.tar"
+  },
+  "origin_main-source.tar": {
+    "sha256": "be4a4edbb3c9a34a560233334c520c6be634a11c881dc7ab022deeeeadb72961",
+    "bytes": 146462720,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/origin_main-source.tar"
+  },
+  "released_v4_41_1-source.tar": {
+    "sha256": "be4a4edbb3c9a34a560233334c520c6be634a11c881dc7ab022deeeeadb72961",
+    "bytes": 146462720,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/released_v4_41_1-source.tar"
+  },
+  "latest_inherited-source.tar": {
+    "sha256": "26f7ee34fbd772b6ded5e6f8d7c7dc906bee6ba7d49120c1fac068260516001d",
+    "bytes": 152606720,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/latest_inherited-source.tar"
+  },
+  "control-identities.json": {
+    "sha256": "1493491ee622345ead283b083045abdb707765734c06345c5632b4b90bd6a367",
+    "bytes": 4172,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/control-identities.json"
+  },
+  "current-overlay.patch": {
+    "sha256": "47fee736e128dd67bc13a2ae21b0dba623d106991991af8ac7ce07ea5c554ea5",
+    "bytes": 1225671,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/current-overlay.patch"
+  },
+  "commands.json": {
+    "sha256": "a18fc94d8fd4490d29b37813109ea992efb6b8cf6dfed092c1013ca2cfd70028",
+    "bytes": 56329,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/commands.json"
+  },
+  "expected-manifest.json": {
+    "sha256": "30e9990d790c96fa809bb9e9b9b5950a2328d9c5382387d0948e5768cc39a310",
+    "bytes": 1298898,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/expected-manifest.json"
+  },
+  "source-sha256.json": {
+    "sha256": "e5c6360cadf8e4f4db96dd5daa4f31313f676363f4f5442fb7802cb924a9d084",
+    "bytes": 588812,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/source-sha256.json"
+  },
+  "empty-suite-tiers.md": {
+    "sha256": "afb76acab2b055342210c5f62f29fa55a3a2bacf2558b3620357bdbc31e481a4",
+    "bytes": 9156,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/empty-suite-tiers.md"
+  },
+  "requirements.json": {
+    "sha256": "3934fc0504f036210d8047188e1c236581183332f49e38293b621daf3aeba2f5",
+    "bytes": 16990,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/requirements.json"
+  },
+  "current-untracked-source.tar": {
+    "sha256": "c8661c4ccc3c89606cf630d78af709eab8c574909fe4686bce8811611fe96ba9",
+    "bytes": 645120,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/current-untracked-source.tar"
+  },
+  "requirements.md": {
+    "sha256": "0404f4093bc3e7f88cbbf49f60fe66520a3bcccd51c39dcbb3663de9d0b415f6",
+    "bytes": 10708,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/requirements.md"
+  },
+  "WIP-STATUS.json": {
+    "sha256": "d15a07c57cfd1193c07becc401152d47229fb655db94cc4d8c1df902d84519a9",
+    "bytes": 471,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/WIP-STATUS.json"
+  },
+  "README.md": {
+    "sha256": "75cfe23ef0aae762809bcadf89b388022b41c926020c600c4525a28b0474e0cf",
+    "bytes": 2493,
+    "original": "/home/gpc/HDB/sprint/baselines/nano/4420-resume-20261107/final-gates/README.md"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "status": "PURE SOURCE PREPARATION ONLY; no Cargo/native/server/load runs",
+  "producer_parent_tests": 13,
+  "consumer_parent_tests": 5,
+  "producer_source_sha256": "94bd0a3dba0fc8f9e529fac5d68a474528252d4d97d66ad138c85f6b7ef3f583",
+  "consumer_source_sha256": "1376ab6a42a584a0b97538b882f712fca08cdd45773eee20a07b67d8dd03730c",
+  "commands": [
+    "python3 ../public-perf-native-proof-producer-v1/CHECKPOINT-2/source/benches/public/test_native_ci_proof.py",
+    "python3 ../public-perf-native-proof-producer-v1/test_v8_consumer.py"
+  ],
+  "inherited_selfcheck": "not executed wholesale; inherited exact readiness-local-path assertion retained and documented"
+}
