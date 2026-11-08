@@ -2787,7 +2787,7 @@ impl EmbeddedDatabase {
     #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_spec_cache<V: Clone>() -> std::sync::Arc<sharded_lru::ShardedLruCache<String, V>> {
         std::sync::Arc::new(sharded_lru::ShardedLruCache::new(
-            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+            std::num::NonZeroUsize::new(128).unwrap_or(std::num::NonZeroUsize::MIN),
         ))
     }
 
@@ -12702,19 +12702,19 @@ impl EmbeddedDatabase {
             )),
             plan_cache: std::sync::Arc::new(PlanCache::new(
                 sharded_lru::ShardedLruCache::new(
-                    std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
+                    std::num::NonZeroUsize::new(256).unwrap_or(std::num::NonZeroUsize::MIN),
                 )
                 .with_site(lock_census::Site::PlanCache),
             )),
             parse_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(
-                    std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
+                    std::num::NonZeroUsize::new(512).unwrap_or(std::num::NonZeroUsize::MIN),
                 )
                 .with_site(lock_census::Site::ParseCache),
             ),
             result_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(
-                    std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+                    std::num::NonZeroUsize::new(128).unwrap_or(std::num::NonZeroUsize::MIN),
                 )
                 .with_site(lock_census::Site::ResultCache),
             ),
@@ -12860,19 +12860,19 @@ impl EmbeddedDatabase {
             )),
             plan_cache: std::sync::Arc::new(PlanCache::new(
                 sharded_lru::ShardedLruCache::new(
-                    std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
+                    std::num::NonZeroUsize::new(256).unwrap_or(std::num::NonZeroUsize::MIN),
                 )
                 .with_site(lock_census::Site::PlanCache),
             )),
             parse_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(
-                    std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
+                    std::num::NonZeroUsize::new(512).unwrap_or(std::num::NonZeroUsize::MIN),
                 )
                 .with_site(lock_census::Site::ParseCache),
             ),
             result_cache: std::sync::Arc::new(
                 sharded_lru::ShardedLruCache::new(
-                    std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+                    std::num::NonZeroUsize::new(128).unwrap_or(std::num::NonZeroUsize::MIN),
                 )
                 .with_site(lock_census::Site::ResultCache),
             ),
@@ -13170,16 +13170,22 @@ impl EmbeddedDatabase {
             embedded_scoped: crate::session::scoped::SessionScopedState::new_for_engine(engine_instance),
             any_session_schema_active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             plan_cache: std::sync::Arc::new(PlanCache::new(
-                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero"))
-                    .with_site(lock_census::Site::PlanCache),
+                sharded_lru::ShardedLruCache::new(
+                    std::num::NonZeroUsize::new(256).unwrap_or(std::num::NonZeroUsize::MIN),
+                )
+                .with_site(lock_census::Site::PlanCache),
             )),
             parse_cache: std::sync::Arc::new(
-                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero"))
-                    .with_site(lock_census::Site::ParseCache),
+                sharded_lru::ShardedLruCache::new(
+                    std::num::NonZeroUsize::new(512).unwrap_or(std::num::NonZeroUsize::MIN),
+                )
+                .with_site(lock_census::Site::ParseCache),
             ),
             result_cache: std::sync::Arc::new(
-                sharded_lru::ShardedLruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero"))
-                    .with_site(lock_census::Site::ResultCache),
+                sharded_lru::ShardedLruCache::new(
+                    std::num::NonZeroUsize::new(128).unwrap_or(std::num::NonZeroUsize::MIN),
+                )
+                .with_site(lock_census::Site::ResultCache),
             ),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             result_cache_epoch: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),

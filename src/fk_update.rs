@@ -9,15 +9,15 @@ use crate::{
     sql, storage, EmbeddedDatabase, Error, FkValidationMode, FkValidationSource, LockedRow, Result, Schema, Tuple,
     Value,
 };
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 type Change = (u64, Tuple, Tuple);
 type Event = (u64, Tuple, Option<Tuple>);
 
-pub(crate) type FkTimingKey = (String, String);
+pub type FkTimingKey = (String, String);
 
-pub(crate) fn fk_timing_key(fk: &ForeignKeyConstraint) -> FkTimingKey {
+pub fn fk_timing_key(fk: &ForeignKeyConstraint) -> FkTimingKey {
     (fk.table_name.clone(), fk.name.clone())
 }
 
@@ -25,7 +25,7 @@ pub(crate) fn fk_timing_key(fk: &ForeignKeyConstraint) -> FkTimingKey {
 /// never capture or mutate this cache, so SET IMMEDIATE, COMMIT and savepoint
 /// rewind always start with a fresh view of the current staged dataset.
 #[derive(Default)]
-pub(crate) struct FkValidationRun {
+pub struct FkValidationRun {
     // A high-level commit preflight must detect strict refusals before consuming
     // its ART undo owner. Nonfatal audit publication belongs to actual COMMIT.
     preflight_only: bool,
@@ -202,7 +202,7 @@ impl EmbeddedDatabase {
             return Ok(Vec::new());
         }
         let catalog = self.storage.catalog();
-        let mut found = BTreeMap::new();
+        let mut found = BTreeSet::new();
         let mut pending = vec![table.to_string()];
         while let Some(parent) = pending.pop() {
             for fk in catalog.get_referencing_fks(&parent)? {
@@ -218,7 +218,7 @@ impl EmbeddedDatabase {
                 {
                     continue;
                 }
-                if found.insert(fk.table_name.clone(), ()).is_none() && fk.table_name != table {
+                if found.insert(fk.table_name.clone()) && fk.table_name != table {
                     pending.push(fk.table_name);
                 }
             }
@@ -226,8 +226,8 @@ impl EmbeddedDatabase {
         if found.is_empty() {
             return Ok(Vec::new());
         }
-        found.insert(table.to_string(), ());
-        Ok(found.into_keys().collect())
+        found.insert(table.to_string());
+        Ok(found.into_iter().collect())
     }
 
     /// A current child-row obligation, rather than a validation of historical
@@ -674,7 +674,10 @@ impl EmbeddedDatabase {
                                 let index = child_schema
                                     .get_column_index(column)
                                     .ok_or_else(|| Error::internal("FK child column is absent"))?;
-                                let definition = &child_schema.columns[index];
+                                let definition = child_schema
+                                    .columns
+                                    .get(index)
+                                    .ok_or_else(|| Error::internal("FK child column index is outside its schema"))?;
                                 let value = match action {
                                     ReferentialAction::Cascade => {
                                         let value = new_key
@@ -712,7 +715,11 @@ impl EmbeddedDatabase {
                                         return Err(Error::constraint_violation("conflicting ON UPDATE actions assign different values to the same child column"));
                                     }
                                 }
-                                updated.values[index] = value;
+                                *updated
+                                    .values
+                                    .get_mut(index)
+                                    .ok_or_else(|| Error::internal("FK child value is absent from its stored row"))? =
+                                    value;
                             }
                             if current_child.values == updated.values {
                                 continue;

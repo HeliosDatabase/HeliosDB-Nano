@@ -272,7 +272,13 @@ impl RowCache {
         }
         h ^= row_id;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
-        &self.shards[(h as usize) & self.shard_mask]
+        // The constructor fixes a nonempty, power-of-two shard array and its
+        // immutable mask. Preserve the old indexing panic if that invariant
+        // is ever violated; a broken cache must not silently report a miss.
+        let Some(shard) = self.shards.get((h as usize) & self.shard_mask) else {
+            unreachable!("private cache geometry invariant");
+        };
+        shard
     }
 
     /// Current live entry count across all shards.

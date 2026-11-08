@@ -14459,7 +14459,11 @@ impl StorageEngine {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 child_columns.sort_unstable();
-                if child_columns.windows(2).any(|pair| pair[0] == pair[1]) {
+                if child_columns
+                    .iter()
+                    .zip(child_columns.iter().skip(1))
+                    .any(|(first, second)| first == second)
+                {
                     return Err(invalid("child column is repeated"));
                 }
                 let parent = definitions
@@ -14476,7 +14480,11 @@ impl StorageEngine {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 referenced.sort_unstable();
-                if referenced.windows(2).any(|pair| pair[0] == pair[1]) {
+                if referenced
+                    .iter()
+                    .zip(referenced.iter().skip(1))
+                    .any(|(first, second)| first == second)
+                {
                     return Err(invalid("referenced parent column is repeated"));
                 }
                 let unique = parent.unique_rules.iter().any(|rule| {
@@ -14580,7 +14588,10 @@ impl StorageEngine {
                                 )?,
                             );
                         }
-                        for row in &final_rows[&fk.references_table] {
+                        let rows = final_rows
+                            .get(&fk.references_table)
+                            .ok_or_else(|| Error::internal("FK MERGE parent row set is absent after preparation"))?;
+                        for row in rows {
                             keys.insert(values(&parent.schema, row, &fk.references_columns)?);
                         }
                     }
@@ -14598,7 +14609,16 @@ impl StorageEngine {
                     }
                     before_keys.insert(set_key.clone(), keys);
                 }
-                for row in &final_rows[child] {
+                let child_rows = final_rows
+                    .get(child)
+                    .ok_or_else(|| Error::internal("FK MERGE child row set is absent after preparation"))?;
+                let prior_parent_keys = before_keys
+                    .get(&set_key)
+                    .ok_or_else(|| Error::internal("FK MERGE prior parent keys are absent after preparation"))?;
+                let merged_parent_keys = final_keys
+                    .get(&set_key)
+                    .ok_or_else(|| Error::internal("FK MERGE final parent keys are absent after preparation"))?;
+                for row in child_rows {
                     let child_values = values(&definition.schema, row, &fk.columns)?;
                     if child_values.iter().any(|value| matches!(value, Value::Null)) {
                         continue;
@@ -14618,10 +14638,10 @@ impl StorageEngine {
                         },
                     );
                     let touched = fresh || row.row_id.is_some_and(|id| changed_ids.contains(&id));
-                    if !touched && !before_keys[&set_key].contains(&wanted) {
+                    if !touched && !prior_parent_keys.contains(&wanted) {
                         continue;
                     }
-                    if final_keys[&set_key].contains(&wanted) {
+                    if merged_parent_keys.contains(&wanted) {
                         continue;
                     }
                     if policy == MergeFkPolicy::Audit || fk.enforcement == ConstraintEnforcement::LockFree {
@@ -18104,7 +18124,10 @@ impl StorageEngine {
                 }
                 ColumnStorageMode::Default => value.clone(),
             };
-            stored.values[position] = physical;
+            *stored
+                .values
+                .get_mut(position)
+                .ok_or_else(|| Error::storage("physical row value is absent from its column layout"))? = physical;
         }
         if new_row
             && locks.columnar.is_some()
@@ -21737,8 +21760,7 @@ impl StorageEngine {
             let mut state = state.lock();
             (state.applied, state.settle_error.take(), state.claim.take())
         };
-        let mut reconciled = None;
-        if !applied || settle_error.is_some() {
+        let reconciled = if !applied || settle_error.is_some() {
             if let Some(claim) = claim {
                 claim.disarm_for_reconciliation();
             }
@@ -21760,8 +21782,10 @@ impl StorageEngine {
             self.art_index_manager
                 .reconcile_mutated_rows(table, schema, &proposed, &actual)
                 .map_err(|error| self.quarantine_generic_indexes(table, &error.to_string()))?;
-            reconciled = Some(actual_rows);
-        }
+            Some(actual_rows)
+        } else {
+            None
+        };
         // Actual-state reconciliation, including a possibly-applied error,
         // changes only RAM. Persistent row images already rode the heap group;
         // rollback must not emit a graph/snapshot repair write.
@@ -22183,7 +22207,12 @@ mod vector_checkpoint_interleaving_tests {
             engine.db.get(&marker_b).unwrap().is_none(),
             "later raw B mutation cannot trust a stale dump"
         );
-        assert_eq!(manager.search("idx_cache_b", &vec![0.0, 0.0], 1).unwrap()[0].1, 0.0);
+        assert_eq!(
+            manager.search("idx_cache_b", &vec![0.0, 0.0], 1).unwrap()[0]
+                .1
+                .classify(),
+            std::num::FpCategory::Zero
+        );
         drop(db);
         let reopened = database(root.path());
         let report = reopened.storage.last_index_open_report().unwrap();
@@ -22198,8 +22227,9 @@ mod vector_checkpoint_interleaving_tests {
                 .vector_indexes()
                 .search("idx_cache_b", &vec![0.0, 0.0], 1)
                 .unwrap()[0]
-                .1,
-            0.0
+                .1
+                .classify(),
+            std::num::FpCategory::Zero
         );
         eprintln!("vector-checkpoint-receipt captured_dirty_policy=1");
     }
@@ -22232,9 +22262,10 @@ mod read_only_hydration_tests {
     use super::*;
 
     #[test]
-    fn ordinary_read_only_open_rebuilds_indexes_and_counters_without_repair_writes() {
+    fn ordinary_read_only_open_rebuilds_indexes_and_counters_without_repair_writes(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         for history in [false, true] {
-            let path = tempfile::tempdir().unwrap();
+            let path = tempfile::tempdir()?;
             let mut cfg = Config::default();
             cfg.storage.path = Some(path.path().to_path_buf());
             cfg.storage.memory_only = false;
@@ -22243,36 +22274,34 @@ mod read_only_hydration_tests {
             cfg.storage.flush_on_close = false;
             cfg.storage.wal_checkpoint_on_close = false;
             cfg.storage.version_gc_interval_secs = Some(0);
-            let primary = crate::EmbeddedDatabase::with_config(cfg.clone()).unwrap();
+            let primary = crate::EmbeddedDatabase::with_config(cfg.clone())?;
             primary.storage.set_index_snapshots_on_close(false);
             primary.storage.set_row_counter_flush_on_close(false);
-            primary.execute("CREATE TABLE ro_rows (id INT PRIMARY KEY)").unwrap();
-            primary.execute("INSERT INTO ro_rows VALUES (1), (2)").unwrap();
+            primary.execute("CREATE TABLE ro_rows (id INT PRIMARY KEY)")?;
+            primary.execute("INSERT INTO ro_rows VALUES (1), (2)")?;
             let before = primary.storage.db.latest_sequence_number();
             // ON is the default the public read-only opener uses, even when
             // this existing store was written with elision disabled.
             cfg.storage.elide_latest_version = true;
-            let readonly = StorageEngine::open_read_only(path.path(), &cfg).unwrap();
-            readonly.catalog().rebuild_all_indexes().unwrap();
-            let schema = readonly.catalog().get_table_schema("ro_rows").unwrap();
-            assert_eq!(readonly.scan_table_with_schema("ro_rows", &schema).unwrap().len(), 2);
+            let readonly = StorageEngine::open_read_only(path.path(), &cfg)?;
+            readonly.catalog().rebuild_all_indexes()?;
+            let schema = readonly.catalog().get_table_schema("ro_rows")?;
+            assert_eq!(readonly.scan_table_with_schema("ro_rows", &schema)?.len(), 2);
             // Actual-state counter reconciliation remains available in RAM.
-            readonly.reseed_row_counter_from_max_row_id("ro_rows", 999).unwrap();
+            readonly.reseed_row_counter_from_max_row_id("ro_rows", 999)?;
             assert_eq!(readonly.write_gate().refusals(), 0);
             assert!(!readonly.index_snapshots_on_close());
             assert!(!readonly.row_counter_flush_on_close());
             assert!(!readonly.wal_checkpoint_on_close());
             drop(readonly);
-            let public = crate::EmbeddedDatabase::open_read_only(path.path()).unwrap();
-            assert_eq!(
-                public.query("SELECT id FROM ro_rows ORDER BY id", &[]).unwrap().len(),
-                2
-            );
+            let public = crate::EmbeddedDatabase::open_read_only(path.path())?;
+            assert_eq!(public.query("SELECT id FROM ro_rows ORDER BY id", &[])?.len(), 2);
             assert_eq!(public.storage.write_gate().refusals(), 0);
             drop(public);
             assert_eq!(primary.storage.db.latest_sequence_number(), before);
             assert_eq!(primary.storage.write_gate().refusals(), 0);
         }
+        Ok(())
     }
 }
 

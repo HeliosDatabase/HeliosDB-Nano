@@ -144,11 +144,11 @@ fn put_cap_refusal_preserves_the_next_actual_native_fault_and_retry() {
                 gate.debug_fail_next_native_write_before_apply();
             }
             gate.debug_set_write_group_ceiling(Some(0));
-            cap(gate.put(&db, key, &value, opts).unwrap_err());
+            cap(gate.put(&db, key, value, opts).unwrap_err());
             assert_eq!(image(&db), before);
             assert_eq!(db.latest_sequence_number(), sequence);
             gate.debug_set_write_group_ceiling(None);
-            let error = gate.put(&db, key, &value, opts).unwrap_err();
+            let error = gate.put(&db, key, value, opts).unwrap_err();
             let marker = if after {
                 "injected native write error after apply; outcome is unknown"
             } else {
@@ -269,7 +269,7 @@ fn real_b4_inline_copies_are_included_in_the_point_group_ceiling() {
             .filter(|(key, _)| key.starts_with(b"data:point_cap_rows:"))
             .collect();
         assert_eq!(rows.len(), 1);
-        let (key, value) = &rows[0];
+        let (key, value) = rows.first().unwrap();
         let single = Op::Put.batch(key, value).size_in_bytes();
         let before = image(&raw);
         let sequence = raw.latest_sequence_number();
@@ -299,7 +299,7 @@ fn real_b4_inline_copies_are_included_in_the_point_group_ceiling() {
         db.execute("USE BRANCH cap_child").unwrap();
         let child = db.query("SELECT v FROM point_cap_rows WHERE id = 1", &[]).unwrap();
         assert_eq!(child.len(), 1);
-        assert_eq!(child[0].values, vec![crate::Value::Int4(7)]);
+        assert_eq!(child.first().unwrap().values, vec![crate::Value::Int4(7)]);
         db.execute("USE BRANCH main").unwrap();
         eprintln!("POINT_CAP_B4_CELL tt={history}");
     }

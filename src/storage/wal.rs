@@ -2189,22 +2189,22 @@ mod tests {
         ] {
             let (_temp, db) = create_test_db();
             db.put(key, [1_u8; 9]).unwrap();
-            let error = match WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync) {
-                Ok(_) => panic!("a malformed high-water marker was accepted"),
-                Err(error) => error,
-            };
-            assert!(
-                error.to_string().contains("Invalid WAL high-water mark format"),
-                "{error}"
-            );
+            let opened = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync);
+            assert!(opened.is_err(), "a malformed high-water marker must be refused");
+            if let Err(error) = opened {
+                assert!(
+                    error.to_string().contains("Invalid WAL high-water mark format"),
+                    "{error}"
+                );
+            }
         }
         let (_temp, db) = create_test_db();
         db.put(b"wal:last_lsn", u64::MAX.to_le_bytes()).unwrap();
-        let error = match WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync) {
-            Ok(_) => panic!("an exhausted LSN was accepted"),
-            Err(error) => error,
-        };
-        assert!(error.to_string().contains("WAL sequence exhausted"), "{error}");
+        let opened = WriteAheadLog::open(Arc::clone(&db), WriteGate::open(), WalSyncMode::Sync);
+        assert!(opened.is_err(), "an exhausted LSN must be refused");
+        if let Err(error) = opened {
+            assert!(error.to_string().contains("WAL sequence exhausted"), "{error}");
+        }
     }
 
     #[test]

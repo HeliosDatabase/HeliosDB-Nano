@@ -255,10 +255,8 @@ fn expected_canary_notes() -> Vec<String> {
 /// through a different writer, and the stored form of a value is a property of
 /// its KEY, so each one is a separate opportunity for the two to disagree:
 ///
-///   1. single-row autocommit `INSERT` — `insert_tuple_fast`, whose only
-///      `data:` write on stock defaults (`time_travel_enabled = true`) is
-///      `SnapshotManager::write_data_version_and_register_snapshot`;
-///   2. multi-row `INSERT ... VALUES` — `insert_prepared_tuples_fast_batch`;
+///   1. single-row autocommit `INSERT` through the text executor;
+///   2. multi-row `INSERT ... VALUES` through the same public SQL surface;
 ///   3. explicit transaction commit — `Transaction::commit`'s `WriteBatch`;
 ///   4. autocommit `UPDATE`, which additionally writes the pre-image into the
 ///      `v:` chain — a full second copy of the row (`OLD_MARKER`);
@@ -269,29 +267,29 @@ fn expected_canary_notes() -> Vec<String> {
 ///      conflicting row back and rewrites it;
 ///   7. `INSERT ... SELECT` — rows sourced from a scan rather than from
 ///      literals, so they arrive as decoded `Tuple`s from another table;
-///   8. `DELETE`, which keeps the removed row in the `v:` chain and in a
-///      `delta:` record;
+///   8. `DELETE`, which keeps the removed row in the `v:` chain;
 ///   9. bulk load — `StorageEngine::direct_bulk_load`, which builds its own
 ///      `WriteBatch` and bypasses MVCC, the logical WAL and the row cache;
 ///  10. a write on a NON-`main` BRANCH, which lands in the `bdata:` overlay;
-///  11. a materialized-view refresh, which re-materializes rows through
-///      `StorageEngine::insert_tuple` (into the MV's own `data:` table) and
-///      records `delta:` entries;
+///  11. a materialized-view refresh, which stages its rows, metadata and
+///      applied-delta cleanup in one DDL group;
 ///  12. `ALTER TABLE ... RENAME TO`, which stages a synthesized schema and row
-///      counter and moves every row key in one batch.
+///      counter and moves every row key in one batch;
+///  13. public `StorageEngine::insert_tuple`, which stages a real row and its
+///      sealed `delta:` record in the same group, after the last MV refresh.
 ///
 /// COPY NOTE. `COPY ... FROM STDIN` is reachable ONLY through the PostgreSQL
 /// wire protocol (`src/protocol/postgres/copy.rs` parses it;
 /// `EmbeddedDatabase::copy_bulk_insert` is `pub(crate)`), and it is not part of
 /// the SQL surface an embedded caller can reach — so an in-process test cannot
-/// issue one without standing up a server. It does not need to: after its
-/// decode, CHECK and FK phases, `copy_bulk_insert` performs its single storage
-/// write with
+/// issue one without standing up a server. After its decode, CHECK and FK
+/// phases, `copy_bulk_insert` performs its single storage write with
 /// `self.storage.insert_prepared_tuples_fast_batch(table_name, prepared, &spec.schema)`
-/// (`src/lib.rs`) — the very same call, with the same argument shape, that the
-/// multi-row `INSERT ... VALUES` fast batch makes. Route (2) therefore exercises
-/// COPY's storage boundary exactly, and route (9) covers the other bulk writer,
-/// which builds its batch itself.
+/// (`src/lib.rs`), also used when multi-row `INSERT ... VALUES` selects its
+/// fast batch. This embedded workload does not establish native wire COPY
+/// coverage. Route (9) exercises the other public bulk writer. The SQL seeds
+/// here do not require a particular fast-path admission decision: this fixture
+/// disables the logical WAL, and the executor may choose the transaction writer.
 ///
 /// Every route asserts its own effect before the next one runs, so a route that
 /// silently stops writing fails HERE, by name, instead of quietly shrinking the
@@ -377,8 +375,8 @@ fn write_rows_through_every_route(db: &EmbeddedDatabase) {
         "route 7 (INSERT ... SELECT) must write exactly one row"
     );
 
-    // (8) DELETE — the removed row survives in the `v:` chain and in a `delta:`
-    //     record, which is why its contents carry the marker too.
+    // (8) DELETE — the removed row survives in the `v:` chain, which is why
+    //     its contents carry the marker too.
     db.execute(&format!("INSERT INTO canary VALUES (9, '{MARKER}-deleted')"))
         .expect("insert the row that will be deleted");
     assert_eq!(
@@ -430,8 +428,8 @@ fn write_rows_through_every_route(db: &EmbeddedDatabase) {
     );
 
     // (11) a materialized-view refresh. The base row is inserted AFTER the view
-    //      exists, so the refresh has work to do and re-materializes rows
-    //      through `insert_tuple` (which also records `delta:` entries).
+    //      exists, so the refresh has work to do. Its atomic DDL group stages
+    //      the materialized rows and cleans up already-applied deltas.
     db.execute("CREATE MATERIALIZED VIEW canary_mv AS SELECT id, note FROM canary")
         .expect("create materialized view");
     db.execute(&format!("INSERT INTO canary VALUES (10, '{MARKER}-mv-base')"))
@@ -464,6 +462,58 @@ fn write_rows_through_every_route(db: &EmbeddedDatabase) {
         vec![format!("1|{MARKER}-renamed")],
         "route 12 (RENAME TABLE) must carry the row across with the table"
     );
+
+    // (13) The public native writer owns a row-plus-delta batch. SQL fast paths
+    // may skip delta tracking, and a completed MV refresh removes old deltas;
+    // neither guarantees that the final keyspace walk will encounter one.
+    // Exercise this real writer after the last refresh, with an independent
+    // table, SQL row/PK readback and the tracker's decoded row-image oracle.
+    let native_table = "canary_delta_native";
+    db.execute("CREATE TABLE canary_delta_native (id INT PRIMARY KEY, note TEXT)")
+        .expect("create the native row-plus-delta table");
+    let native_values = vec![Value::Int4(1), Value::String(format!("{MARKER}-native-delta"))];
+    let since = chrono::Utc::now() - chrono::Duration::seconds(60);
+    let native_row_id = db
+        .storage
+        .insert_tuple(native_table, Tuple::new(native_values.clone()))
+        .expect("insert a real row through the public native writer");
+    assert_eq!(
+        render(
+            &db.query("SELECT id, note FROM canary_delta_native WHERE id = 1", &[])
+                .expect("read the native row through its SQL primary key")
+        ),
+        vec![format!("1|{MARKER}-native-delta")],
+        "route 13 (native INSERT) must publish its actual row and primary key"
+    );
+    let deltas = db
+        .storage
+        .mv_delta_tracker()
+        .get_deltas_since(&[native_table.to_string()], since)
+        .expect("read the native INSERT's sealed delta through its public reader");
+    let delta_set = deltas.get(native_table).expect("native table must have a delta set");
+    assert_eq!(
+        delta_set.deltas.len(),
+        1,
+        "the single native INSERT must retain exactly one delta"
+    );
+    let delta = &delta_set.deltas[0];
+    assert_eq!(
+        delta.table_name, native_table,
+        "the retained delta must belong to the native table"
+    );
+    assert_eq!(
+        delta.row_id, native_row_id,
+        "the retained delta must identify the actual inserted row"
+    );
+    match &delta.operation {
+        heliosdb_nano::storage::MvDeltaOperation::Insert { tuple } => {
+            assert_eq!(
+                tuple.values, native_values,
+                "the retained delta must hold the inserted logical values"
+            );
+        }
+        operation => panic!("route 13 must record an INSERT, got {operation:?}"),
+    }
 
     assert_eq!(
         canary_notes(db),

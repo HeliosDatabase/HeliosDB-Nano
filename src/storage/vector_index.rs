@@ -227,7 +227,7 @@ impl Drop for RegistryOperation {
 /// Snapshot once, before the batch's FIRST purge lease. Later cascade targets
 /// never need a manager registry lock while an earlier lease remains held.
 #[derive(Default)]
-pub(crate) struct PersistentRetirementHandles {
+pub struct PersistentRetirementHandles {
     #[cfg(feature = "vector-persist")]
     handles: HashMap<String, crate::vector::persistent::PersistentVectorIndex>,
     #[cfg(feature = "vector-persist")]
@@ -315,7 +315,7 @@ fn advance_publication(epoch: &std::sync::atomic::AtomicU64, delta: u64) {
     });
 }
 
-pub(crate) struct VectorPublication<'a>(&'a std::sync::atomic::AtomicU64);
+pub struct VectorPublication<'a>(&'a std::sync::atomic::AtomicU64);
 
 impl Drop for VectorPublication<'_> {
     fn drop(&mut self) {
@@ -689,7 +689,7 @@ impl VectorIndexManager {
             .filter(|meta| meta.table_name == table)
             .cloned()
             .collect();
-        for (name, _) in &desired {
+        for name in desired.keys() {
             if !live.iter().any(|meta| meta.name == *name) {
                 return Err(Error::storage(format!(
                     "vector index '{name}' needs actual-state rebuild"
@@ -3022,7 +3022,15 @@ mod tests {
         }));
         manager.mark_snapshot_clean();
         let undo = manager.on_row_update_staged("t", 1, &schema, Some(&old), &new);
-        assert_eq!(manager.search("t_vec", &vec![0.0, 1.0], 1).unwrap()[0].0, 1);
+        assert_eq!(
+            manager
+                .search("t_vec", &vec![0.0, 1.0], 1)
+                .unwrap()
+                .first()
+                .expect("staged row must be searchable")
+                .0,
+            1
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -3036,19 +3044,24 @@ mod tests {
         manager
             .stage_row_images("t", 1, &schema, Some(&new), &mut batch, usize::MAX)
             .unwrap();
-        struct Deleted(std::collections::BTreeSet<Vec<u8>>);
+        #[derive(Default)]
+        struct Deleted {
+            keys: std::collections::BTreeSet<Vec<u8>>,
+            saw_put: bool,
+        }
         impl rocksdb::WriteBatchIterator for Deleted {
             fn put(&mut self, _: Box<[u8]>, _: Box<[u8]>) {
-                panic!("Standard snapshot staging has no value writes");
+                self.saw_put = true;
             }
             fn delete(&mut self, key: Box<[u8]>) {
-                self.0.insert(key.into_vec());
+                self.keys.insert(key.into_vec());
             }
         }
-        let mut deleted = Deleted(std::collections::BTreeSet::new());
+        let mut deleted = Deleted::default();
         batch.iterate(&mut deleted);
+        assert!(!deleted.saw_put, "Standard snapshot staging has no value writes");
         assert_eq!(
-            deleted.0,
+            deleted.keys,
             [
                 super::super::index_snapshot::vec_snapshot_marker_key("t_vec"),
                 super::super::index_snapshot::vec_snapshot_marker_key("u_vec"),
@@ -3062,7 +3075,16 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 0, "ROLLBACK is RAM only");
         assert!(manager.snapshot_is_clean());
-        assert_eq!(manager.search("t_vec", &vec![1.0, 0.0], 1).unwrap()[0].1, 0.0);
+        assert_eq!(
+            manager
+                .search("t_vec", &vec![1.0, 0.0], 1)
+                .unwrap()
+                .first()
+                .expect("undone row must be searchable")
+                .1
+                .classify(),
+            std::num::FpCategory::Zero
+        );
         // Only an applied owning group consumes the flag. A subsequent raw
         // vector API still has its original explicit snapshot-hook contract.
         manager.row_group_applied();
@@ -3173,7 +3195,7 @@ mod tests {
         manager.delete_vector("pq_saved", 3).unwrap();
         let expected = manager.search("pq_saved", &vec![0.0, 0.0], 10).unwrap();
         assert_eq!(expected.len(), 1);
-        assert_eq!(expected[0].0, 2);
+        assert_eq!(expected.first().expect("the live row must remain searchable").0, 2);
         let saved = manager.save_index("pq_saved").unwrap();
         let loaded = VectorIndexManager::new();
         loaded.load_index(&saved).unwrap();
@@ -3189,7 +3211,15 @@ mod tests {
         let again = VectorIndexManager::new();
         again.load_index(&loaded.save_index("pq_saved").unwrap()).unwrap();
         assert_eq!(again.index_live_size("pq_saved"), Some(1));
-        assert_eq!(again.search("pq_saved", &vec![0.0, 0.0], 10).unwrap()[0].0, 4);
+        assert_eq!(
+            again
+                .search("pq_saved", &vec![0.0, 0.0], 10)
+                .unwrap()
+                .first()
+                .expect("replacement row must survive reload")
+                .0,
+            4
+        );
         again.delete_vector("pq_saved", 4).unwrap();
         let empty = VectorIndexManager::new();
         empty.load_index(&again.save_index("pq_saved").unwrap()).unwrap();
@@ -3243,7 +3273,15 @@ mod tests {
             .unwrap();
         for name in ["standard", "quantized"] {
             assert_eq!(manager.index_live_size(name), Some(1));
-            assert_eq!(manager.search(name, &vec![0.0, 0.0], 1).unwrap()[0].0, 2);
+            assert_eq!(
+                manager
+                    .search(name, &vec![0.0, 0.0], 1)
+                    .unwrap()
+                    .first()
+                    .expect("reconciled row must be searchable")
+                    .0,
+                2
+            );
             manager.apply_undo_ram_only(&VectorIndexUndoOp::RemoveInserted {
                 index_name: name.into(),
                 row_id: 2,
@@ -3254,7 +3292,15 @@ mod tests {
                 row_id: 1,
                 vector: vec![9.0, 0.0],
             });
-            assert_eq!(manager.search(name, &vec![9.0, 0.0], 1).unwrap()[0].0, 1);
+            assert_eq!(
+                manager
+                    .search(name, &vec![9.0, 0.0], 1)
+                    .unwrap()
+                    .first()
+                    .expect("restored row must be searchable")
+                    .0,
+                1
+            );
             manager.apply_undo_ram_only(&VectorIndexUndoOp::RestoreUpdated {
                 index_name: name.into(),
                 row_id: 1,
@@ -3328,16 +3374,22 @@ mod tests {
                         Arc::clone(&readonly_gate),
                     )
                     .unwrap();
-                let VectorIndexType::Persistent(actual) = reopened.get_metadata("reopen_config").unwrap().index_type
-                else {
-                    panic!("reopen must retain persistent backend")
-                };
+                let actual = match reopened.get_metadata("reopen_config").unwrap().index_type {
+                    VectorIndexType::Persistent(config) => Some(config),
+                    _ => None,
+                }
+                .expect("reopen must retain persistent backend");
                 assert_eq!(actual.dimension, 4);
                 assert_eq!(actual.distance_metric, DistanceMetric::L2);
                 assert_eq!(actual.pq_enabled, pq);
                 assert_eq!(actual.rerank_precision, persistent_precision_name(precision));
                 assert_eq!(
-                    reopened.search("reopen_config", &vec![1.0, 0.0, 1.0, 0.0], 1).unwrap()[0].0,
+                    reopened
+                        .search("reopen_config", &vec![1.0, 0.0, 1.0, 0.0], 1)
+                        .unwrap()
+                        .first()
+                        .expect("durable row must survive reopen")
+                        .0,
                     7
                 );
                 for (dimension, metric) in [(3, DistanceMetric::L2), (4, DistanceMetric::Cosine)] {
@@ -3405,7 +3457,15 @@ mod tests {
         .unwrap();
         durable.remove(1).unwrap();
         durable.insert(2, &vec![0.0, 0.0]).unwrap();
-        assert_eq!(manager.search("persistent", &vec![0.0, 0.0], 1).unwrap()[0].0, 1);
+        assert_eq!(
+            manager
+                .search("persistent", &vec![0.0, 0.0], 1)
+                .unwrap()
+                .first()
+                .expect("persistent row must be searchable")
+                .0,
+            1
+        );
         let sequence = db.latest_sequence_number();
         let prefix = format!("__vidx:{}:", stable_index_id("persistent"));
         let before = VectorIndexManager::index_image_digest(&db, prefix.as_bytes(), |_| {}).unwrap();
@@ -3427,7 +3487,15 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(manager.search("persistent", &vec![0.0, 0.0], 1).unwrap()[0].0, 2);
+        assert_eq!(
+            manager
+                .search("persistent", &vec![0.0, 0.0], 1)
+                .unwrap()
+                .first()
+                .expect("persistent row must be searchable")
+                .0,
+            2
+        );
         assert_eq!(manager.index_live_size("persistent"), Some(1));
         assert_eq!(db.latest_sequence_number(), sequence);
         assert_eq!(

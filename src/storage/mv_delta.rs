@@ -43,11 +43,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Permanent, bounded allocator evidence. Each lane is monotone independently;
 /// a delayed producer never overwrites another lane's higher durable ID.
-pub(crate) const DELTA_ID_LANES: usize = 64;
-pub(crate) const DELTA_FLOOR_PREFIX: &[u8] = b"meta:delta:floor:";
-pub(crate) const LEGACY_DELTA_ID_KEY: &[u8] = b"meta:delta:last_id";
+pub const DELTA_ID_LANES: usize = 64;
+pub const DELTA_FLOOR_PREFIX: &[u8] = b"meta:delta:floor:";
+pub const LEGACY_DELTA_ID_KEY: &[u8] = b"meta:delta:last_id";
 
-pub(crate) fn delta_key_id(key: &[u8]) -> Option<u64> {
+pub fn delta_key_id(key: &[u8]) -> Option<u64> {
     let suffix = key.strip_prefix(b"delta:")?;
     let split = suffix.iter().rposition(|byte| *byte == b':')?;
     let digits = suffix.get(split + 1..)?;
@@ -57,20 +57,23 @@ pub(crate) fn delta_key_id(key: &[u8]) -> Option<u64> {
     std::str::from_utf8(digits).ok()?.parse().ok()
 }
 
-pub(crate) fn delta_floor_key(lane: usize) -> String {
+pub fn delta_floor_key(lane: usize) -> String {
     format!("meta:delta:floor:{lane:02}")
 }
 
-pub(crate) fn delta_floor_lane(key: &[u8]) -> Option<usize> {
+pub fn delta_floor_lane(key: &[u8]) -> Option<usize> {
     let suffix = key.strip_prefix(DELTA_FLOOR_PREFIX)?;
-    if suffix.len() != 2 || !suffix.iter().all(u8::is_ascii_digit) {
+    let [tens, ones] = suffix else {
+        return None;
+    };
+    if !suffix.iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let lane = usize::from(suffix[0] - b'0') * 10 + usize::from(suffix[1] - b'0');
+    let lane = usize::from(*tens - b'0') * 10 + usize::from(*ones - b'0');
     (lane < DELTA_ID_LANES).then_some(lane)
 }
 
-pub(crate) fn decode_delta_id(bytes: &[u8]) -> Result<u64> {
+pub fn decode_delta_id(bytes: &[u8]) -> Result<u64> {
     Ok(u64::from_le_bytes(
         bytes
             .try_into()

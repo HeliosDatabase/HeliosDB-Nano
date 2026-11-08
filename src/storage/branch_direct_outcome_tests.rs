@@ -118,7 +118,7 @@ fn setup(db: &EmbeddedDatabase, child: bool) -> (u64, Option<u64>, Schema) {
     assert_eq!(sql_rows(db, "b", "SELECT id,u,payload FROM s ORDER BY id"), original());
     assert_eq!(
         sql_rows(db, "b", "SELECT id,u,payload FROM s WHERE id=1"),
-        vec![original()[0].clone()]
+        vec![original().first().unwrap().clone()]
     );
     (branch, child_id, schema)
 }
@@ -365,7 +365,9 @@ fn exercise(fault: Fault, change: Change, history: bool, child: bool) {
         let view = BranchView::for_chain(&db.storage, "b", vec![branch]).unwrap();
         let original_row_id = view
             .rows_with_key(None, "s", &schema, &["id".into()], &[Value::Int4(1)])
-            .unwrap()[0]
+            .unwrap()
+            .first()
+            .unwrap()
             .row_id
             .unwrap();
         // Warm scan plus primary/unique and non-index payload memo maps on
@@ -402,7 +404,7 @@ fn exercise(fault: Fault, change: Change, history: bool, child: bool) {
                     Change::Delete | Change::Truncate => assert!(own.is_none()),
                     Change::Insert => assert_eq!(
                         bincode::deserialize::<Tuple>(&own.unwrap()).unwrap().values,
-                        original()[0]
+                        original().first().unwrap().clone()
                     ),
                 }
             }
@@ -470,7 +472,7 @@ fn exercise(fault: Fault, change: Change, history: bool, child: bool) {
     // Constraint enforcement remains usable after the failed caller and reopen.
     if let Some(existing) = final_rows.first() {
         let duplicate = Tuple::new(vec![
-            existing[0].clone(),
+            existing.first().unwrap().clone(),
             Value::Int4(9999),
             Value::String("duplicate".into()),
         ]);

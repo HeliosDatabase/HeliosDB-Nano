@@ -8319,11 +8319,19 @@ mod tests {
         seed.storage.set_index_snapshots_on_close(false);
         seed.storage.set_row_counter_flush_on_close(false);
         assert_eq!(
-            seed.query("SELECT id FROM needs_feature", &[]).unwrap()[0].values,
+            seed.query("SELECT id FROM needs_feature", &[])
+                .unwrap()
+                .first()
+                .expect("needs_feature must contain its seeded row")
+                .values,
             vec![Value::Int4(1)]
         );
         assert_eq!(
-            seed.query("SELECT id FROM unaffected", &[]).unwrap()[0].values,
+            seed.query("SELECT id FROM unaffected", &[])
+                .unwrap()
+                .first()
+                .expect("unaffected must contain its seeded row")
+                .values,
             vec![Value::Int4(7)]
         );
         assert!(seed.storage.vector_indexes().index_exists("a_recorded_persistent"));
@@ -8393,7 +8401,7 @@ mod tests {
             let schema = engine.catalog().get_table_schema("unaffected").unwrap();
             let rows = engine.scan_table_with_schema("unaffected", &schema).unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].values[0], Value::Int4(7));
+            assert_eq!(rows.first().unwrap().values.first(), Some(&Value::Int4(7)));
         }
 
         let primary = EmbeddedDatabase::with_config(cfg).unwrap();
@@ -8441,7 +8449,12 @@ mod tests {
             .find_indexes("needs_feature", "v")
             .is_empty());
         assert_eq!(
-            primary.query("SELECT id FROM unaffected", &[]).unwrap()[0].values,
+            primary
+                .query("SELECT id FROM unaffected", &[])
+                .unwrap()
+                .first()
+                .expect("unaffected must contain its seeded row")
+                .values,
             vec![Value::Int4(7)]
         );
         primary
@@ -8489,11 +8502,19 @@ mod tests {
         seed.storage.set_index_snapshots_on_close(false);
         seed.storage.set_row_counter_flush_on_close(false);
         assert_eq!(
-            seed.query("SELECT id FROM bad_rows", &[]).unwrap()[0].values,
+            seed.query("SELECT id FROM bad_rows", &[])
+                .unwrap()
+                .first()
+                .expect("bad_rows must contain its seeded row")
+                .values,
             vec![Value::Int4(1)]
         );
         assert_eq!(
-            seed.query("SELECT id FROM healthy_rows", &[]).unwrap()[0].values,
+            seed.query("SELECT id FROM healthy_rows", &[])
+                .unwrap()
+                .first()
+                .expect("healthy_rows must contain its seeded row")
+                .values,
             vec![Value::Int4(7)]
         );
         assert!(seed.storage.vector_indexes().index_exists("a_persistent_bad"));
@@ -8579,7 +8600,12 @@ mod tests {
         assert!(error.to_string().contains("unavailable"), "{error}");
         assert_eq!(primary.storage.db().latest_sequence_number(), before);
         assert_eq!(
-            primary.query("SELECT id FROM healthy_rows", &[]).unwrap()[0].values,
+            primary
+                .query("SELECT id FROM healthy_rows", &[])
+                .unwrap()
+                .first()
+                .expect("healthy_rows must contain its seeded row")
+                .values,
             vec![Value::Int4(7)]
         );
         primary.execute("INSERT INTO healthy_rows VALUES (8,'[1,0]')").unwrap();

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Owned component handles, never an Engine Arc or a transaction slot.
-pub(crate) struct VectorRowContext {
+pub struct VectorRowContext {
     db: Arc<DB>,
     manager: Arc<VectorIndexManager>,
     snapshots: Arc<SnapshotManager>,
@@ -60,7 +60,7 @@ impl VectorRowContext {
     }
 }
 
-pub(crate) struct VectorRowPlan {
+pub struct VectorRowPlan {
     context: Arc<VectorRowContext>,
     rows: BTreeSet<(String, u64)>,
     schemas: HashMap<String, Schema>,

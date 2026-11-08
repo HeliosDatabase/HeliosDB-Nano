@@ -618,14 +618,14 @@ mod tests {
         index.insert(2, &vec![0.0, 0.0]).unwrap();
         let nearest = index.search(&vec![0.0, 0.0], 1).unwrap();
         assert_eq!(nearest.len(), 1);
-        assert_eq!(nearest[0].0, 2);
-        assert!(nearest[0].1.is_finite());
+        assert_eq!(nearest.first().expect("nearest live row must exist").0, 2);
+        assert!(nearest.first().expect("nearest live row must exist").1.is_finite());
         // Replacing a row keeps only its newest internal id live, even if a
         // deleted older point has an equal or smaller ADC distance.
         index.insert(2, &vec![9.0, 0.0]).unwrap();
         let result = index.search(&vec![0.0, 0.0], 1).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, 2);
+        assert_eq!(result.first().expect("replacement live row must exist").0, 2);
         assert_eq!(index.len(), 1);
         index.delete(2).unwrap();
         assert!(index.search(&vec![0.0, 0.0], 1).unwrap().is_empty());
@@ -662,7 +662,10 @@ mod tests {
         index.delete(3).unwrap();
         let expected = index.search(&vec![0.0, 0.0], 10).unwrap();
         assert_eq!(expected.len(), 1);
-        assert_eq!(expected[0].0, 2);
+        assert_eq!(
+            expected.first().expect("roundtrip fixture must retain its live row").0,
+            2
+        );
         let bytes = index.to_bytes().unwrap();
         // Decode using the exact original field order/types, with no format tag
         // or added live-map field. Surviving vector bytes and codebook are exact.
@@ -670,7 +673,12 @@ mod tests {
         assert_eq!(legacy.id_mapping, vec![2]);
         assert_eq!(
             legacy.quantized_vectors,
-            vec![index.quantized_vectors.read()[3].clone()]
+            vec![index
+                .quantized_vectors
+                .read()
+                .get(3)
+                .expect("replacement must occupy the fourth fixture slot")
+                .clone()]
         );
         assert_eq!(
             bincode::serialize(&legacy.config).unwrap(),
@@ -687,7 +695,15 @@ mod tests {
         loaded.delete(2).unwrap();
         let again = QuantizedHnswIndex::from_bytes(&loaded.to_bytes().unwrap()).unwrap();
         assert_eq!(again.len(), 1);
-        assert_eq!(again.search(&vec![0.0, 0.0], 10).unwrap()[0].0, 4);
+        assert_eq!(
+            again
+                .search(&vec![0.0, 0.0], 10)
+                .unwrap()
+                .first()
+                .expect("new live row must survive the second reload")
+                .0,
+            4
+        );
         again.delete(4).unwrap();
         let empty = QuantizedHnswIndex::from_bytes(&again.to_bytes().unwrap()).unwrap();
         assert_eq!(empty.len(), 0);

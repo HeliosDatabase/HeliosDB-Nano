@@ -13614,9 +13614,9 @@ fn a_shape_change_after_the_handlers_check_is_refused_by_the_arm_before_it_write
 /// was XX000. Classified by the emitter's marker
 /// (`Error::sequence_parameter_invalid`).
 #[test]
-fn sequence_parameters_out_of_range_classify_as_22023() {
-    let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute("CREATE SEQUENCE sq MINVALUE 1 MAXVALUE 10").expect("create");
+fn sequence_parameters_out_of_range_classify_as_22023() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE SEQUENCE sq MINVALUE 1 MAXVALUE 10")?;
     for sql in [
         "ALTER SEQUENCE sq RESTART WITH 50",
         "ALTER SEQUENCE sq MAXVALUE 20 RESTART WITH 50",
@@ -13626,12 +13626,13 @@ fn sequence_parameters_out_of_range_classify_as_22023() {
         "CREATE SEQUENCE sq3 START WITH 50 MAXVALUE 10",
     ] {
         for params in [false, true] {
-            let refused = if params {
+            let Err(refused) = (if params {
                 db.execute_params(sql, &[])
             } else {
                 db.execute(sql)
-            }
-            .expect_err(sql);
+            }) else {
+                return Err(format!("invalid sequence parameters unexpectedly succeeded: {sql}").into());
+            };
             assert!(
                 refused
                     .to_string()
@@ -13645,4 +13646,5 @@ fn sequence_parameters_out_of_range_classify_as_22023() {
             );
         }
     }
+    Ok(())
 }

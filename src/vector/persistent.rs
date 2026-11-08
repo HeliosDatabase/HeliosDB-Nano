@@ -326,6 +326,13 @@ struct RowImageV1 {
     vector: Option<Vector>,
 }
 
+/// An existing authoritative record; a missing vector is its tombstone.
+/// Absence of this wrapper means there is no overlay for the legacy graph.
+#[derive(PartialEq)]
+struct CommittedRowImage {
+    vector: Option<Vector>,
+}
+
 pub(crate) fn encode_row_image(
     key_manager: Option<&crate::crypto::KeyManager>,
     vector: Option<&Vector>,
@@ -1421,12 +1428,14 @@ impl PersistentVectorIndex {
 
     /// Row hooks consume the latest committed overlay, never their caller's
     /// possibly older tuple. None means a legacy/raw index without an overlay.
-    pub(crate) fn latest_row_image(&self, row: u64) -> Result<Option<Option<Vector>>> {
+    fn latest_row_image(&self, row: u64) -> Result<Option<CommittedRowImage>> {
         let key = row_image_key(self.index_id, row);
         self.db
             .get(&key)
             .map_err(map_db)?
-            .map(|value| decode_row_image(self.key_manager.as_deref(), &key, &value))
+            .map(|value| {
+                decode_row_image(self.key_manager.as_deref(), &key, &value).map(|vector| CommittedRowImage { vector })
+            })
             .transpose()
     }
 
@@ -1441,8 +1450,8 @@ impl PersistentVectorIndex {
                 Some(element) => self.db.get(key_vec(&prefix(self.index_id), *element)).map_err(map_db)?,
                 None => None,
             };
-            let matches = row_image_matches(&current, row, &image, full.as_deref())?;
-            current.row_images.insert(row, image.clone());
+            let matches = row_image_matches(&current, row, &image.vector, full.as_deref())?;
+            current.row_images.insert(row, image.vector.clone());
             if matches {
                 return Ok(true);
             }
@@ -1451,7 +1460,7 @@ impl PersistentVectorIndex {
         // lease and reload actual state on error. The authoritative row image
         // remains in its owning heap group throughout remove/insert.
         self.remove_holding_lease(row)?;
-        if let Some(vector) = &image {
+        if let Some(vector) = &image.vector {
             self.insert_holding_lease(row, vector)?;
         }
         if self.latest_row_image(row)? != Some(image) {
@@ -2273,7 +2282,15 @@ mod tests {
         assert!(recovered.elem_of(1).unwrap() > other_id);
         assert!(recovered.elem_of(4).unwrap() > other_id);
         assert_eq!(recovered.elem_of(2), None);
-        assert_eq!(recovered.search(&vec![9.0, 0.0, 0.0], 1, 32).unwrap()[0].0, 1);
+        assert_eq!(
+            recovered
+                .search(&vec![9.0, 0.0, 0.0], 1, 32)
+                .unwrap()
+                .first()
+                .expect("recovered row must be searchable")
+                .0,
+            1
+        );
         assert_eq!(raw_index_image(&db, 92), before, "recovery is RAM only");
         assert_eq!(db.latest_sequence_number(), sequence);
         // Two successive owning row groups may beat the first delayed hook.
@@ -2286,7 +2303,15 @@ mod tests {
         assert!(recovered.apply_latest_row_image(1).unwrap());
         assert_eq!(db.get(&other_key).unwrap().unwrap(), other_value);
         let reopened = PersistentVectorIndex::open(Arc::clone(&db), WriteGate::closed("read-only"), 92).unwrap();
-        assert_eq!(reopened.search(&vec![10.0, 0.0, 0.0], 1, 32).unwrap()[0].0, 1);
+        assert_eq!(
+            reopened
+                .search(&vec![10.0, 0.0, 0.0], 1, 32)
+                .unwrap()
+                .first()
+                .expect("latest row must survive reopen")
+                .0,
+            1
+        );
         assert_eq!(reopened.elem_of(3), Some(other_id));
         assert!(reopened.elem_of(2).is_none());
     }
@@ -2312,8 +2337,18 @@ mod tests {
                 } else {
                     PersistentVectorIndex::create(Arc::clone(&db), WriteGate::open(), 93, config).unwrap()
                 };
-                index.insert(1, &training[0]).unwrap();
-                index.insert(2, &training[1]).unwrap();
+                index
+                    .insert(
+                        1,
+                        training.first().expect("training fixture must have its first vector"),
+                    )
+                    .unwrap();
+                index
+                    .insert(
+                        2,
+                        training.get(1).expect("training fixture must have its second vector"),
+                    )
+                    .unwrap();
                 let config = ser(&index.config()).unwrap();
                 let codebook = db.get(key_pq(&prefix(93))).unwrap();
                 let value = encode_row_image(None, Some(&vec![7.25, -2.5, 1.125, 3.0])).unwrap();
@@ -2371,7 +2406,12 @@ mod tests {
                 } else {
                     PersistentVectorIndex::create(Arc::clone(&db), Arc::clone(&gate), 77, config).unwrap()
                 };
-                index.insert(1, &training[0]).unwrap();
+                index
+                    .insert(
+                        1,
+                        training.first().expect("training fixture must have its first vector"),
+                    )
+                    .unwrap();
                 let before_config = ser(&index.config()).unwrap();
                 let before_codebook = db.get(key_pq(&prefix(77))).unwrap();
                 let before_sequence = db.latest_sequence_number();
@@ -2397,13 +2437,28 @@ mod tests {
                     "codebook is preserved"
                 );
                 assert_eq!(index.pq_active(), pq);
-                let answer = index.search(&rows[2].1, 8, 64).unwrap();
+                let answer = index
+                    .search(
+                        &rows.get(2).expect("replacement fixture must have its third vector").1,
+                        8,
+                        64,
+                    )
+                    .unwrap();
                 assert_eq!(answer.len(), rows.len());
                 assert!(answer.iter().all(|(row, _)| *row >= 100));
                 let current_sequence = db.latest_sequence_number();
                 let readonly =
                     PersistentVectorIndex::open(Arc::clone(&db), WriteGate::closed("read-only vector"), 77).unwrap();
-                assert_eq!(readonly.search(&rows[2].1, 8, 64).unwrap(), answer);
+                assert_eq!(
+                    readonly
+                        .search(
+                            &rows.get(2).expect("replacement fixture must have its third vector").1,
+                            8,
+                            64
+                        )
+                        .unwrap(),
+                    answer
+                );
                 assert_eq!(ser(&readonly.config()).unwrap(), before_config);
                 assert_eq!(
                     db.latest_sequence_number(),
@@ -2429,7 +2484,15 @@ mod tests {
         drop(prepared);
         gate.debug_set_write_group_ceiling(None);
         assert_eq!(db.latest_sequence_number(), before);
-        assert_eq!(index.search(&vec![1.0, 0.0, 0.0], 1, 16).unwrap()[0].0, 1);
+        assert_eq!(
+            index
+                .search(&vec![1.0, 0.0, 0.0], 1, 16)
+                .unwrap()
+                .first()
+                .expect("rejected replacement must retain the old row")
+                .0,
+            1
+        );
         index.insert(2, &vec![0.0, 0.0, 1.0]).unwrap();
         let mut batch = WriteBatch::default();
         let prepared = index.stage_replacement(&rows, &mut batch).unwrap();

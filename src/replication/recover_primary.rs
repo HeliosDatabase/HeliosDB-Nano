@@ -2913,10 +2913,13 @@ fn rewind_census(dir: &Path, export_dir: &Path) -> Result<RewindCensus, String> 
     let entries = fs::read_dir(dir).map_err(|error| format!("{} cannot be listed: {error}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|error| format!("{} cannot be listed: {error}", dir.display()))?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|name| format!("{} holds an entry whose name is not UTF-8 ({name:?})", dir.display()))?;
+        let name = entry.file_name().into_string().map_err(|name| {
+            format!(
+                "{} holds an entry whose name is not UTF-8 ({})",
+                dir.display(),
+                name.to_string_lossy()
+            )
+        })?;
         let metadata = match fs::symlink_metadata(entry.path()) {
             Ok(metadata) => metadata,
             // Gone since the listing (a running primary's compaction, when

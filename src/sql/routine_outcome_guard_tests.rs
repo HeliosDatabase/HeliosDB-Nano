@@ -91,7 +91,7 @@ fn callable(db: &EmbeddedDatabase, kind: Kind, name: &str, value: Option<i32>) {
             if let Some(value) = value {
                 let rows = result.unwrap();
                 assert_eq!(rows.len(), 1);
-                let got = match rows[0].values.first().unwrap() {
+                let got = match rows.first().unwrap().values.first().unwrap() {
                     Value::Int4(value) => i64::from(*value),
                     Value::Int8(value) => *value,
                     other => panic!("{other:?}"),
@@ -108,7 +108,7 @@ fn callable(db: &EmbeddedDatabase, kind: Kind, name: &str, value: Option<i32>) {
                 assert_eq!(result.unwrap(), 0);
                 let rows = db.query("SELECT observed FROM sink", &[]).unwrap();
                 assert_eq!(rows.len(), 1);
-                let got = match rows[0].values.first().unwrap() {
+                let got = match rows.first().unwrap().values.first().unwrap() {
                     Value::Int4(value) => i64::from(*value),
                     Value::Int8(value) => *value,
                     other => panic!("{other:?}"),

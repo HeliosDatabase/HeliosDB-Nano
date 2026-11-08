@@ -959,7 +959,10 @@ impl ColumnarStore {
                         continue;
                     }
                     let mut destination = new_prefix.as_bytes().to_vec();
-                    destination.extend_from_slice(&key[old_prefix.len()..]);
+                    let suffix = key
+                        .get(old_prefix.len()..)
+                        .ok_or_else(|| Error::storage("columnar sidecar key is shorter than its validated prefix"))?;
+                    destination.extend_from_slice(suffix);
                     removed.insert(key);
                     moved.push((destination, value));
                 }
@@ -1876,10 +1879,10 @@ mod tests {
     /// suppress the statement's final catalog validation. Run the migration arm
     /// in a fresh process: its opt-in flags are intentionally cached globally.
     #[test]
-    fn derived_read_writes_do_not_end_layout_validation() {
+    fn derived_read_writes_do_not_end_layout_validation() -> std::result::Result<(), Box<dyn std::error::Error>> {
         const CHILD: &str = "HELIOS_R56_DERIVED_READ_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
+            let output = std::process::Command::new(std::env::current_exe()?)
                 .args([
                     "--exact",
                     "storage::columnar::tests::derived_read_writes_do_not_end_layout_validation",
@@ -1888,8 +1891,7 @@ mod tests {
                 .env(CHILD, "1")
                 .env("HELIOS_BATCH_V2_MIGRATE", "1")
                 .env_remove("HELIOS_BATCH_V2_OFF")
-                .output()
-                .unwrap();
+                .output()?;
             assert!(
                 output.status.success(),
                 "derived read child failed: {:?}\n{}\n{}",
@@ -1897,7 +1899,7 @@ mod tests {
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            return;
+            return Ok(());
         }
         use crate::storage::layout_epochs::{self, LayoutEpochs, StatementScope};
         use std::sync::Arc;
@@ -1907,22 +1909,18 @@ mod tests {
             let gate = WriteGate::open();
             let mut batch = ColumnBatch::new("v", 0);
             batch.set(0, Value::Int4(7));
-            let legacy = bincode::serialize(&batch).unwrap();
+            let legacy = bincode::serialize(&batch)?;
             let key = ColumnarStore::batch_key("t", "v", 0);
             let stats = BatchStats::from_batch(&batch);
             let stored = if case == "manifest" {
-                super::super::typed_batch::encode_column_batch(&batch, &stats).unwrap()
+                super::super::typed_batch::encode_column_batch(&batch, &stats)?
             } else {
                 legacy.clone()
             };
-            db.put(&key, &stored).unwrap();
-            db.put(b"data:t:0", b"row").unwrap();
+            db.put(&key, &stored)?;
+            db.put(b"data:t:0", b"row")?;
             if case == "manifest" {
-                db.put(
-                    ColumnarStore::stats_key("t", "v", 0),
-                    bincode::serialize(&stats).unwrap(),
-                )
-                .unwrap();
+                db.put(ColumnarStore::stats_key("t", "v", 0), bincode::serialize(&stats)?)?;
             }
 
             let epochs = Arc::new(LayoutEpochs::new());
@@ -1930,33 +1928,40 @@ mod tests {
             layout_epochs::note_table(&epochs, "t");
             match case {
                 "presence" => {
-                    let presence = ColumnarStore::presence_scan_map(&db, &gate, "t").unwrap();
+                    let presence = ColumnarStore::presence_scan_map(&db, &gate, "t")?;
                     assert_eq!(presence.len(), 1);
                     assert!(ColumnarStore::presence_manifest_complete(&db, "t"));
                 }
                 "stats" => {
-                    ColumnarStore::backfill_batch_stats(&db, &gate, "t", "v", 0).unwrap();
-                    assert_eq!(ColumnarStore::load_stats_map(&db, "t", "v").unwrap().len(), 1);
+                    ColumnarStore::backfill_batch_stats(&db, &gate, "t", "v", 0)?;
+                    assert_eq!(ColumnarStore::load_stats_map(&db, "t", "v")?.len(), 1);
                 }
                 "manifest" => {
-                    let batches =
-                        ColumnarStore::scan_column_batches_pruned(&db, &gate, "t", "v", &HashSet::new()).unwrap();
+                    let batches = ColumnarStore::scan_column_batches_pruned(&db, &gate, "t", "v", &HashSet::new())?;
                     assert_eq!(batches.len(), 1);
                     assert!(ColumnarStore::stats_manifest_complete(&db, "t", "v"));
                 }
                 "migration" => {
                     ColumnarStore::maybe_migrate_v1_batch(&db, &gate, "t", "v", 0, &legacy, &batch);
-                    let migrated = db.get(&key).unwrap().unwrap();
+                    let migrated = db
+                        .get(&key)?
+                        .ok_or_else(|| std::io::Error::other("migration must leave the stored batch present"))?;
                     assert!(migrated.starts_with(&super::super::typed_batch::BATCH_V2_MAGIC));
                 }
                 _ => unreachable!(),
             }
             assert!(scope.retriable(), "{case}: no durable SQL row effect occurred");
             let other = Arc::clone(&epochs);
-            std::thread::spawn(move || drop(other.debug_begin_change(&["t"])))
-                .join()
-                .unwrap();
-            let error = scope.finish().unwrap_err();
+            assert!(
+                std::thread::spawn(move || drop(other.debug_begin_change(&["t"])))
+                    .join()
+                    .is_ok(),
+                "catalog epoch changer must complete"
+            );
+            let error = scope
+                .finish()
+                .err()
+                .ok_or_else(|| std::io::Error::other("derived read must retain the final layout refusal"))?;
             assert!(layout_epochs::is_layout_changed(&error), "{case}: {error}");
         }
 
@@ -1965,8 +1970,9 @@ mod tests {
         let (_dir, db) = test_db();
         let gate = WriteGate::open();
         let scope = StatementScope::enter();
-        gate.put(&db, b"data:t:1", b"row", None).unwrap();
+        gate.put(&db, b"data:t:1", b"row", None)?;
         assert!(!scope.retriable(), "ordinary writes still end retries");
+        Ok(())
     }
 
     #[test]

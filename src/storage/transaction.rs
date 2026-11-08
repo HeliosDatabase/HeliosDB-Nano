@@ -54,17 +54,17 @@ thread_local! {
 }
 
 #[cfg(feature = "internal-tests")]
-pub(crate) fn debug_fail_next_applied_commit() {
+pub fn debug_fail_next_applied_commit() {
     FAIL_NEXT_APPLIED_COMMIT.with(|fail| fail.set(true));
 }
 
 #[cfg(feature = "internal-tests")]
-pub(crate) fn debug_next_after_commit_barrier(hook: impl FnOnce() + Send + 'static) {
+pub fn debug_next_after_commit_barrier(hook: impl FnOnce() + Send + 'static) {
     NEXT_AFTER_COMMIT_BARRIER.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
 }
 
 #[cfg(feature = "internal-tests")]
-pub(crate) fn debug_next_after_native_transaction_write(hook: impl FnOnce() + Send + 'static) {
+pub fn debug_next_after_native_transaction_write(hook: impl FnOnce() + Send + 'static) {
     NEXT_AFTER_NATIVE_TRANSACTION_WRITE.with(|next| *next.borrow_mut() = Some(Box::new(hook)));
 }
 
@@ -3737,7 +3737,7 @@ impl Transaction {
                 rest
             } else if let Some(rest) = key.strip_prefix(b"bdata:").or_else(|| key.strip_prefix(b"bdel:")) {
                 let colon = rest.iter().position(|byte| *byte == b':')?;
-                &rest[colon + 1..]
+                rest.get(colon + 1..)?
             } else {
                 return None;
             };
@@ -4388,10 +4388,11 @@ mod tests {
         let map = ColumnarStore::load_presence_map(&engine.db, "p").unwrap();
         let expected_batch = newer / super::super::BATCH_SIZE as u64;
         assert_eq!(map.len(), 1);
-        assert_eq!(map[0].0, expected_batch);
-        assert_eq!(map[0].1.live_count, 1);
-        assert!(map[0].1.is_live((newer % super::super::BATCH_SIZE as u64) as usize));
-        assert!(!map[0].1.is_live(999));
+        let (batch, presence) = map.first().expect("exactly one batch presence entry");
+        assert_eq!(*batch, expected_batch);
+        assert_eq!(presence.live_count, 1);
+        assert!(presence.is_live((newer % super::super::BATCH_SIZE as u64) as usize));
+        assert!(!presence.is_live(999));
         assert!(engine
             .db
             .get(StorageEngine::build_data_key("p", old))
@@ -4545,10 +4546,11 @@ mod tests {
                 drop(guard);
                 writer.join().unwrap().unwrap();
             });
-            Arc::try_unwrap(txn)
-                .unwrap_or_else(|_| panic!("writer released its transaction"))
-                .rollback()
-                .unwrap();
+            let transaction = Arc::try_unwrap(txn);
+            assert!(transaction.is_ok(), "writer released its transaction");
+            if let Ok(transaction) = transaction {
+                transaction.rollback().unwrap();
+            }
         }
     }
 

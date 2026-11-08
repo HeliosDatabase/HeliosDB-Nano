@@ -3,14 +3,14 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WriteOutcome {
+pub enum WriteOutcome {
     NotWritten,
     Applied,
     Unknown,
 }
 
 #[derive(Default)]
-pub(crate) struct WriteAttempt(AtomicU8);
+pub struct WriteAttempt(AtomicU8);
 
 impl WriteAttempt {
     pub(crate) fn outcome(&self) -> WriteOutcome {
@@ -33,7 +33,7 @@ impl WriteAttempt {
 /// A native error does not prove rejection. Fence affected row tables before
 /// the caller releases the transaction/census; reopen rebuilds actual state.
 /// This path performs no durable repair writes.
-pub(crate) fn quarantine_unknown_transaction(engine: &super::StorageEngine, txn: &super::Transaction) {
+pub fn quarantine_unknown_transaction(engine: &super::StorageEngine, txn: &super::Transaction) {
     let tables = txn.affected_row_tables();
     if tables.is_empty() {
         return;

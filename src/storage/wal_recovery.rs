@@ -5,7 +5,7 @@ use super::{time_travel::bounded_read_options, WriteGate};
 use crate::{Error, Result};
 use rocksdb::{WriteBatch, WriteOptions, DB};
 
-pub(crate) const ATOMIC_GROUPS_KEY: &[u8] = b"wal:atomic_groups";
+pub const ATOMIC_GROUPS_KEY: &[u8] = b"wal:atomic_groups";
 const ATOMIC_GROUPS_V1: &[u8] = &[1];
 const LAST_LSN_KEY: &[u8] = b"wal:last_lsn";
 const CHECKPOINT_KEY: &[u8] = b"wal:checkpoint";
@@ -25,7 +25,7 @@ pub struct WalAdoptionReport {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct State {
+pub struct State {
     pub atomic_groups: bool,
     pub checkpoint: Option<u64>,
     pub highest: u64,
@@ -47,7 +47,7 @@ fn marker(db: &DB, key: &[u8]) -> Result<Option<u64>> {
         .transpose()
 }
 
-pub(crate) fn inspect(db: &DB) -> Result<State> {
+pub fn inspect(db: &DB) -> Result<State> {
     let atomic_groups = match db
         .get(ATOMIC_GROUPS_KEY)
         .map_err(|error| Error::storage(format!("WAL format marker read failed: {error}")))?
@@ -134,7 +134,7 @@ impl State {
     }
 }
 
-pub(crate) fn adopt(db: &DB, gate: &WriteGate, state: State) -> Result<WalAdoptionReport> {
+pub fn adopt(db: &DB, gate: &WriteGate, state: State) -> Result<WalAdoptionReport> {
     let floor = state.history_floor();
     if !state.atomic_groups
         || state.checkpoint != Some(state.highest)
@@ -161,7 +161,7 @@ pub(crate) fn adopt(db: &DB, gate: &WriteGate, state: State) -> Result<WalAdopti
 /// Read-only eligibility check before any open-time bookkeeping writes.
 /// The caller verifies its encryption key again on the locked handle before
 /// calling `adopt`; unknown/ambiguous legacy stores refuse before sentinel writes.
-pub(crate) fn validate_open(db: &DB, writable: bool) -> Result<State> {
+pub fn validate_open(db: &DB, writable: bool) -> Result<State> {
     let state = inspect(db)?;
     if writable && state.needs_explicit_adoption() {
         return Err(Error::storage(

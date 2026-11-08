@@ -487,7 +487,7 @@ impl<'a> MaterializedViewCatalog<'a> {
         } else {
             None
         };
-        let compatible = current.as_ref().is_some_and(|have| {
+        let compatible_schema = current.as_ref().filter(|have| {
             have.columns.len() == requested.columns.len()
                 && have
                     .columns
@@ -495,11 +495,8 @@ impl<'a> MaterializedViewCatalog<'a> {
                     .zip(&requested.columns)
                     .all(|(have, want)| have.name == want.name && have.data_type == want.data_type)
         });
-        let schema = if compatible {
-            current.as_ref().unwrap()
-        } else {
-            requested
-        };
+        let compatible = compatible_schema.is_some();
+        let schema = compatible_schema.unwrap_or(requested);
         for tuple in tuples {
             if tuple.values.len() != schema.columns.len() {
                 return Err(Error::storage("materialized view row does not match its result schema"));
@@ -650,7 +647,11 @@ impl<'a> MaterializedViewCatalog<'a> {
             let mut stored_tuple = tuple.clone();
             for (index, column) in schema.columns.iter().enumerate() {
                 if column.storage_mode == crate::ColumnStorageMode::Columnar {
-                    stored_tuple.values[index] = crate::Value::ColumnarRef;
+                    *stored_tuple
+                        .values
+                        .get_mut(index)
+                        .ok_or_else(|| Error::storage("materialized view row does not match its result schema"))? =
+                        crate::Value::ColumnarRef;
                 }
             }
             let stored = bincode::serialize(&stored_tuple).map_err(|e| Error::storage(format!("MV tuple: {e}")))?;
@@ -750,10 +751,14 @@ impl<'a> MaterializedViewCatalog<'a> {
                 }
                 let mut batches: BTreeMap<u64, Vec<(u64, crate::Value)>> = BTreeMap::new();
                 for (id, tuple) in &rows {
+                    let value = tuple
+                        .values
+                        .get(index)
+                        .ok_or_else(|| Error::storage("materialized view row does not match its result schema"))?;
                     batches
                         .entry(*id / BATCH_SIZE as u64)
                         .or_default()
-                        .push((*id, tuple.values[index].clone()));
+                        .push((*id, value.clone()));
                 }
                 for (batch_id, values) in batches {
                     if compatible {
@@ -1113,7 +1118,7 @@ impl<'a> MaterializedViewCatalog<'a> {
         }
         for column in schema.columns.iter().filter(|c| c.unique && !c.primary_key) {
             indexes
-                .create_constraint_unique_index(table, &[column.name.clone()], None)
+                .create_constraint_unique_index(table, std::slice::from_ref(&column.name), None)
                 .map_err(|e| Error::storage(format!("MV unique key: {e}")))?;
         }
         Ok(())

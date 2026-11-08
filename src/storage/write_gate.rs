@@ -104,7 +104,7 @@ pub enum GateMode {
     },
 }
 
-pub(crate) type RowCounterValues = dashmap::DashMap<String, AtomicU64>;
+pub type RowCounterValues = dashmap::DashMap<String, AtomicU64>;
 
 /// The one place that decides whether this process may write to the default
 /// column family. Created at open and shared, as an `Arc`, by every component
@@ -212,32 +212,37 @@ impl Default for DeltaFloors {
 }
 
 impl DeltaFloors {
-    fn id(&mut self, id: u64) {
+    fn id(&mut self, id: u64) -> Result<()> {
         let lane = (id % super::mv_delta::DELTA_ID_LANES as u64) as usize;
-        self.lane(lane, id);
+        self.lane(lane, id)
     }
 
-    fn lane(&mut self, lane: usize, id: u64) {
+    fn lane(&mut self, lane: usize, id: u64) -> Result<()> {
+        let maximum = self
+            .maxima
+            .get_mut(lane)
+            .ok_or_else(|| Error::storage("Invalid delta allocator lane"))?;
+        *maximum = (*maximum).max(id);
         self.touched |= 1u64 << lane;
-        self.maxima[lane] = self.maxima[lane].max(id);
+        Ok(())
     }
 
     fn key(&mut self, db: &DB, key: &[u8], value: Option<&[u8]>) -> Result<()> {
         use super::mv_delta::*;
         if key.starts_with(b"delta:") {
-            self.id(delta_key_id(key).ok_or_else(|| Error::storage("Invalid delta record key"))?);
+            self.id(delta_key_id(key).ok_or_else(|| Error::storage("Invalid delta record key"))?)?;
         } else if key.starts_with(DELTA_FLOOR_PREFIX) {
             let lane = delta_floor_lane(key).ok_or_else(|| Error::storage("Invalid delta allocator floor key"))?;
             let id = value.map(decode_delta_id).transpose()?.unwrap_or(0);
-            self.lane(lane, id);
+            self.lane(lane, id)?;
         } else if key == LEGACY_DELTA_ID_KEY {
             // Preserve even a legacy marker's deletion. A regressing late put
             // remains compatible input, but cannot lower a permanent floor.
             if let Some(value) = value {
-                self.id(decode_delta_id(value)?);
+                self.id(decode_delta_id(value)?)?;
             }
             if let Some(old) = db.get(key)? {
-                self.id(decode_delta_id(&old)?);
+                self.id(decode_delta_id(&old)?)?;
             }
         }
         Ok(())
@@ -379,8 +384,8 @@ impl WriteGate {
         }
         fn bytes<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
             let length = varint(input)? as usize;
-            let value = input.get(..length)?;
-            *input = &input[length..];
+            let (value, rest) = (*input).split_at_checked(length)?;
+            *input = rest;
             Some(value)
         }
         let invalid = || Error::storage("cannot validate write batch while a table's indexes are unavailable");
@@ -750,13 +755,13 @@ impl WriteGate {
         // dictionary/stats/table lock while holding these sorted lane locks.
         let mut guards = Vec::new();
         if floors.touched != 0 {
-            for lane in 0..super::mv_delta::DELTA_ID_LANES {
+            for (lane, lock) in self.delta_floor_locks.iter().enumerate() {
                 if floors.touched & (1u64 << lane) == 0 {
                     continue;
                 }
-                guards.push(self.delta_floor_locks[lane].lock());
+                guards.push(lock.lock());
             }
-            for lane in 0..super::mv_delta::DELTA_ID_LANES {
+            for (lane, maximum) in floors.maxima.iter().enumerate() {
                 if floors.touched & (1u64 << lane) == 0 {
                     continue;
                 }
@@ -767,7 +772,7 @@ impl WriteGate {
                     .map(super::mv_delta::decode_delta_id)
                     .transpose()?
                     .unwrap_or(0);
-                let floor = durable.max(floors.maxima[lane]);
+                let floor = durable.max(*maximum);
                 self.observe_delta_id(floor);
                 // Appending overrides a stale put/delete/range in the original
                 // group without cloning any payload. Floor evidence is permanent.

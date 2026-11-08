@@ -200,7 +200,7 @@ impl TableLayout {
     }
 }
 
-pub(crate) fn has_physical_storage_refs(tuple: &Tuple) -> bool {
+pub fn has_physical_storage_refs(tuple: &Tuple) -> bool {
     fn physical(value: &crate::Value) -> bool {
         match value {
             crate::Value::DictRef { .. } | crate::Value::CasRef { .. } | crate::Value::ColumnarRef => true,
@@ -213,7 +213,7 @@ pub(crate) fn has_physical_storage_refs(tuple: &Tuple) -> bool {
 
 /// Refuse unresolved references after layout mapping and immutable-payload
 /// decoding. A retained ColumnarRef has no historical payload identity.
-pub(crate) fn refuse_physical_version(table: &str, row: u64, tuple: &Tuple) -> Result<()> {
+pub fn refuse_physical_version(table: &str, row: u64, tuple: &Tuple) -> Result<()> {
     if has_physical_storage_refs(tuple) {
         return Err(Error::history_before_layout_change(
             table,

@@ -3267,7 +3267,7 @@ mod tests {
                 // optimizer declining the plan or choosing Filter(Scan) instead.
                 let mut operator = handle_filtered_scan(&executor, &plan).unwrap();
                 assert_eq!(operator.schema().columns.len(), 1);
-                assert_eq!(operator.schema().columns[0].name, "name");
+                assert_eq!(operator.schema().columns.first().unwrap().name, "name");
                 let mut rows = Vec::new();
                 while let Some(row) = operator.next().unwrap() {
                     rows.push(row.values);

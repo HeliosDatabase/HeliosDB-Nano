@@ -359,10 +359,11 @@ mod tests {
         adapter.execute_query("INSERT INTO users VALUES (1, 'Alice')")?;
         let prepared = adapter.prepare_statement("SELECT * FROM users")?;
         let before = adapter.execute_prepared(&prepared, &[])?;
-        assert_eq!(
-            before.rows[0].values,
-            vec![Value::Int4(1), Value::String("Alice".into())]
-        );
+        let before_row = before
+            .rows
+            .first()
+            .ok_or_else(|| crate::Error::execution("prepared SELECT returned no row before the layout change"))?;
+        assert_eq!(before_row.values, vec![Value::Int4(1), Value::String("Alice".into())]);
 
         let catalog = storage.catalog();
         let mut schema = catalog.get_table_schema("users")?;
@@ -373,7 +374,11 @@ mod tests {
         let fresh = adapter.prepare_statement("SELECT id, name FROM users")?;
         let after = adapter.execute_prepared(&fresh, &[])?;
         assert_eq!(after.rows.len(), 1);
-        assert_eq!(after.rows[0].values, before.rows[0].values);
+        let after_row = after
+            .rows
+            .first()
+            .ok_or_else(|| crate::Error::execution("fresh prepared SELECT returned no row after the layout change"))?;
+        assert_eq!(after_row.values, before_row.values);
         Ok(())
     }
 

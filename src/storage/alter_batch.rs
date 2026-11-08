@@ -91,7 +91,7 @@ pub struct RewriteLimit<'l> {
 /// be any u64, so use the longest key form, include the frozen marker, and allow
 /// the full varint/tag overhead of both puts. The supplied image is already sealed
 /// with the row codec, whose framing size is the same for data: and bdata:.
-pub(crate) fn frozen_row_copy_bytes(table: &str, row: u64, sealed_logical_bytes: usize) -> u64 {
+pub fn frozen_row_copy_bytes(table: &str, row: u64, sealed_logical_bytes: usize) -> u64 {
     let row_key = super::branch_view::branch_row_key(u64::MAX, table, row);
     let marker_key = super::branch_view::branch_frozen_key(u64::MAX, table, row);
     u64::try_from(sealed_logical_bytes)

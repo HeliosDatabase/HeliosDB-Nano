@@ -42,11 +42,12 @@ fn query(db: &EmbeddedDatabase, family: Family, sql: &str) -> Result<Vec<Tuple>>
 fn scalar(db: &EmbeddedDatabase, family: Family, sql: &str) -> i64 {
     let rows = query(db, family, sql).unwrap();
     assert_eq!(rows.len(), 1, "{sql}");
-    assert_eq!(rows[0].values.len(), 1, "{sql}");
-    match rows[0].values[0] {
-        Value::Int4(value) => i64::from(value),
-        Value::Int8(value) => value,
-        ref other => panic!("{sql}: {other:?}"),
+    let row = rows.first().unwrap();
+    assert_eq!(row.values.len(), 1, "{sql}");
+    match row.values.first().unwrap() {
+        Value::Int4(value) => i64::from(*value),
+        Value::Int8(value) => *value,
+        other => panic!("{sql}: {other:?}"),
     }
 }
 

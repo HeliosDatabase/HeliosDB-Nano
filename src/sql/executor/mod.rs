@@ -6143,7 +6143,9 @@ mod once_subquery_context_tests {
         for expression in expressions(scan(&db)) {
             let mut executor = Executor::with_storage(&db.storage);
             let mut timeout = TimeoutContext::new(Some(1));
-            timeout.start_time = Instant::now() - Duration::from_secs(2);
+            timeout.start_time = Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .expect("the test clock must allow a deadline two seconds in the past");
             executor.timeout_ctx = Some(timeout);
             let error = executor.materialize_subqueries(&expression).unwrap_err();
             assert!(matches!(error, Error::QueryTimeout(_)), "{expression:?}: {error}");
@@ -6209,7 +6211,12 @@ mod once_subquery_context_tests {
             }
         }
         assert_eq!(
-            db.query_with_columns("SELECT id FROM once_healthy").unwrap().0[0].values,
+            db.query_with_columns("SELECT id FROM once_healthy")
+                .unwrap()
+                .0
+                .first()
+                .unwrap()
+                .values,
             vec![Value::Int4(7)]
         );
         assert_eq!(

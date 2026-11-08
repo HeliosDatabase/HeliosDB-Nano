@@ -1113,14 +1113,14 @@ mod tests {
     #[test]
     fn quarantine_refuses_old_and_new_stamps_and_survives_change_publication() {
         let epochs = LayoutEpochs::new();
-        let (_, old) = collect_stamp(|| note_table(&epochs, "t"));
+        let ((), old) = collect_stamp(|| note_table(&epochs, "t"));
         assert!(old.is_current());
         let change = epochs.begin_change(["t"]);
         epochs.quarantine("t");
         drop(change);
         assert!(!old.is_current());
         assert!(epochs.check_available("t").is_err());
-        let (_, fresh) = collect_stamp(|| note_table(&epochs, "t"));
+        let ((), fresh) = collect_stamp(|| note_table(&epochs, "t"));
         assert!(!fresh.is_current(), "planning afresh cannot clear quarantine");
         drop(epochs.begin_change(["t"]));
         assert!(!fresh.is_current());
@@ -1137,7 +1137,7 @@ mod tests {
             drop(epochs.begin_change(["t"]));
             assert_eq!(epochs.current("t"), UNAVAILABLE);
             assert!(epochs.check_available("t").is_err());
-            let (_, stamp) = collect_stamp(|| note_table(&epochs, "t"));
+            let ((), stamp) = collect_stamp(|| note_table(&epochs, "t"));
             assert!(!stamp.is_current());
             drop(epochs.begin_change(["t"]));
             assert_eq!(epochs.current("t"), UNAVAILABLE);

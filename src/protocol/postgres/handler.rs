@@ -7532,43 +7532,51 @@ mod failed_transaction_state_tests {
     }
 
     #[tokio::test]
-    async fn applied_publication_error_frames_use_58000_for_simple_and_extended() {
+    async fn applied_publication_error_frames_use_58000_for_simple_and_extended(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         use tokio::io::AsyncReadExt;
         for wait_for_sync in [false, true] {
-            let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+            let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
             let (mut handler, mut client) = test_handler(db);
             let cause = Error::write_group_too_large(1024, 64);
             let original = cause.to_string();
             let applied = Error::applied_publication_failure(cause);
-            handler.send_error_for_query(&applied, wait_for_sync).await.unwrap();
+            handler.send_error_for_query(&applied, wait_for_sync).await?;
             drop(handler);
             let mut wire = Vec::new();
-            client.read_to_end(&mut wire).await.unwrap();
-            assert_eq!(wire[0], b'E');
-            let frame_len = u32::from_be_bytes(wire[1..5].try_into().unwrap()) as usize;
-            let fields = wire[5..1 + frame_len].split(|byte| *byte == 0).collect::<Vec<_>>();
+            client.read_to_end(&mut wire).await?;
+            assert_eq!(wire.first(), Some(&b'E'));
+            let length: [u8; 4] = wire.get(1..5).ok_or("missing ErrorResponse frame length")?.try_into()?;
+            let frame_len = usize::try_from(u32::from_be_bytes(length))?;
+            let fields = wire
+                .get(5..=frame_len)
+                .ok_or("truncated ErrorResponse fields")?
+                .split(|byte| *byte == 0)
+                .collect::<Vec<_>>();
             assert!(
                 fields.contains(&b"C58000".as_slice()),
                 "wire SQLSTATE must be a system error"
             );
-            let message = fields.iter().find(|field| field.first() == Some(&b'M')).unwrap();
-            let message = std::str::from_utf8(&message[1..]).unwrap();
+            let message = fields
+                .iter()
+                .find(|field| field.first() == Some(&b'M'))
+                .ok_or("missing ErrorResponse message field")?;
+            let message = std::str::from_utf8(message.get(1..).ok_or("truncated message field")?)?;
             assert!(message.contains(crate::error::APPLIED_PUBLICATION_FAILURE_MARKER));
             assert!(message.contains("do not retry these row changes"));
             assert!(
                 message.contains(&original),
                 "wire retains original derived cap cause: {message}"
             );
+            let next_frame = frame_len.checked_add(1).ok_or("ErrorResponse length overflow")?;
+            let trailing = wire.get(next_frame..).ok_or("ErrorResponse length exceeds response")?;
             if wait_for_sync {
-                assert!(wire[1 + frame_len..].is_empty(), "extended error awaits Sync");
+                assert!(trailing.is_empty(), "extended error awaits Sync");
             } else {
-                assert_eq!(
-                    &wire[1 + frame_len..],
-                    b"Z\0\0\0\x05I",
-                    "simple error sends ReadyForQuery"
-                );
+                assert_eq!(trailing, b"Z\0\0\0\x05I", "simple error sends ReadyForQuery");
             }
         }
+        Ok(())
     }
 
     #[tokio::test]

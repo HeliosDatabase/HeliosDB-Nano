@@ -14,7 +14,7 @@ thread_local! {
     static SERVED: Cell<usize> = const { Cell::new(0) };
     static REACHED: Cell<usize> = const { Cell::new(0) };
 }
-pub(crate) fn run_hook(phase: &str) {
+pub fn run_hook(phase: &str) {
     let hook = HOOK.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.as_ref().is_some_and(|(wanted, _)| *wanted == phase) {
@@ -31,7 +31,7 @@ pub(crate) fn run_hook(phase: &str) {
 pub(super) fn note_served() {
     SERVED.with(|n| n.set(n.get() + 1));
 }
-pub(crate) fn arm(phase: &'static str, action: impl FnOnce() + 'static) {
+pub fn arm(phase: &'static str, action: impl FnOnce() + 'static) {
     HOOK.with(|slot| assert!(slot.borrow_mut().replace((phase, Box::new(action))).is_none()));
 }
 struct Reset;

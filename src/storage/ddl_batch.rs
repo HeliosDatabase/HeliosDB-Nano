@@ -658,7 +658,7 @@ impl<'e> DdlBatch<'e> {
         }
         // Release the lifecycle planning lease only after every graph lease,
         // and before any existing callback takes a manager registry.
-        drop(self.persistent_handles.take());
+        self.persistent_handles = None;
         let outcome = match written {
             Ok(written) => {
                 for publish in on_commit {
@@ -728,7 +728,7 @@ impl Drop for DdlBatch<'_> {
         for settle in std::mem::take(&mut self.after_write) {
             settle(false);
         }
-        drop(self.persistent_handles.take());
+        self.persistent_handles = None;
         self.on_commit.clear();
         drop(self.marker.take());
         for undo in std::mem::take(&mut self.on_abort).into_iter().rev() {
