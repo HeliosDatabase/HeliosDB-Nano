@@ -10,7 +10,7 @@ enum Family {
 impl Family {
     fn write(self, db: &EmbeddedDatabase, text: &str, bound: &str, values: &[Value]) -> Result<(u64, Vec<Tuple>)> {
         match self {
-            Self::Text => db.execute_returning(text),
+            Self::Text => db.execute(text).map(|count| (count, Vec::new())),
             Self::Params => db.execute_params_returning(bound, values),
         }
     }
@@ -48,6 +48,17 @@ fn ints(rows: Vec<Tuple>) -> Result<Vec<Vec<i64>>> {
     Ok(result)
 }
 
+// execute() is the real text family and exposes only an affected count.
+// RETURNING row values are asserted only where the params API exposes them;
+// independent complete row queries below verify the text mutation too.
+fn assert_returned(family: Family, rows: Vec<Tuple>, expected: Vec<Vec<i64>>) -> Result<()> {
+    match family {
+        Family::Text => assert!(rows.is_empty()),
+        Family::Params => assert_eq!(ints(rows)?, expected),
+    }
+    Ok(())
+}
+
 fn image(db: &EmbeddedDatabase) -> Result<Vec<Vec<i64>>> {
     ints(db.query("SELECT id,v,u,pid FROM t ORDER BY id", &[])?)
 }
@@ -70,9 +81,19 @@ fn update_in(family: Family, db: &EmbeddedDatabase) -> Result<()> {
         &[7, 2, 3, 10, 11, 3, 99].map(Value::Int4),
     )?;
     assert_eq!(count, 3);
+    assert_returned(
+        family,
+        returned,
+        vec![vec![3, 37, 103, 1], vec![10, 107, 110, 1], vec![11, 17, 101, 1]],
+    )?;
     assert_eq!(
-        ints(returned)?,
-        vec![vec![3, 37, 103, 1], vec![10, 107, 110, 1], vec![11, 17, 101, 1]]
+        image(db)?,
+        vec![
+            vec![3, 37, 103, 1],
+            vec![4, 40, 104, 1],
+            vec![10, 107, 110, 1],
+            vec![11, 17, 101, 1]
+        ]
     );
     let (count, returned) = family.write(
         db,
@@ -81,7 +102,7 @@ fn update_in(family: Family, db: &EmbeddedDatabase) -> Result<()> {
         &[4, 10, 10, 98].map(Value::Int4),
     )?;
     assert_eq!(count, 2);
-    assert_eq!(ints(returned)?, vec![vec![4], vec![10]]);
+    assert_returned(family, returned, vec![vec![4], vec![10]])?;
     assert_eq!(image(db)?, vec![vec![3, 37, 103, 1], vec![11, 17, 101, 1]]);
     Ok(())
 }
@@ -128,7 +149,7 @@ fn implicit_owner_duplicates_bound_values_and_absent_keys_keep_exact_counts() ->
                 &[1, 1, 2, 2, 99].map(Value::Int4),
             )?;
             assert_eq!(count, 2);
-            assert_eq!(ints(returned)?, vec![vec![1, 11], vec![2, 21]]);
+            assert_returned(family, returned, vec![vec![1, 11], vec![2, 21]])?;
             let (count, returned) = family.write(
                 &db,
                 "DELETE FROM t WHERE id IN (3,3,99) RETURNING id",
@@ -136,7 +157,7 @@ fn implicit_owner_duplicates_bound_values_and_absent_keys_keep_exact_counts() ->
                 &[3, 3, 99].map(Value::Int4),
             )?;
             assert_eq!(count, 1);
-            assert_eq!(ints(returned)?, vec![vec![3]]);
+            assert_returned(family, returned, vec![vec![3]])?;
             let (count, returned) = family.write(
                 &db,
                 "UPDATE t SET v=99 WHERE id IN (88,99) RETURNING id",
@@ -246,7 +267,7 @@ fn composite_absent_indexes_and_null_predicates_retain_the_scan_contract() -> Re
                 &[1, 1, 99].map(Value::Int4),
             )?;
             assert_eq!(count, 2);
-            assert_eq!(ints(returned)?, vec![vec![1, 1, 11], vec![1, 2, 21]]);
+            assert_returned(family, returned, vec![vec![1, 1, 11], vec![1, 2, 21]])?;
             db.execute("CREATE TABLE no_pk (id INT,v INT)")?;
             db.execute("INSERT INTO no_pk VALUES (1,10),(1,20),(2,30)")?;
             let (count, returned) = family.write(
@@ -256,7 +277,7 @@ fn composite_absent_indexes_and_null_predicates_retain_the_scan_contract() -> Re
                 &[1, 1, 99].map(Value::Int4),
             )?;
             assert_eq!(count, 2);
-            assert_eq!(ints(returned)?, vec![vec![10], vec![20]]);
+            assert_returned(family, returned, vec![vec![10], vec![20]])?;
             let (count, _) = family.write(
                 &db,
                 "UPDATE t SET v=99 WHERE id NOT IN (1,NULL)",
@@ -271,7 +292,21 @@ fn composite_absent_indexes_and_null_predicates_retain_the_scan_contract() -> Re
                 &[Value::Int4(1), Value::Null, Value::Int4(99)],
             )?;
             assert_eq!(count, 1);
-            assert_eq!(ints(returned)?, vec![vec![1, 11]]);
+            assert_returned(family, returned, vec![vec![1, 11]])?;
+            assert_eq!(
+                ints(db.query("SELECT a,b,v FROM composite ORDER BY a,b", &[])?)?,
+                vec![vec![1, 1, 11], vec![1, 2, 21], vec![2, 1, 30]]
+            );
+            assert_eq!(ints(db.query("SELECT id,v FROM no_pk", &[])?)?, vec![vec![2, 30]]);
+            assert_eq!(
+                image(&db)?,
+                vec![
+                    vec![1, 11, 101, 1],
+                    vec![2, 20, 102, 1],
+                    vec![3, 30, 103, 1],
+                    vec![4, 40, 104, 1]
+                ]
+            );
             eprintln!("transaction-pk-in-cell fallback history={history} family={family:?}");
         }
     }
@@ -289,10 +324,10 @@ fn session_owners_join_the_supplied_transaction_for_both_families() -> Result<()
                 db.begin_transaction_for_session(sid)?;
                 db.execute_for_session(sid, "INSERT INTO t VALUES (10,100,110,1)")?;
                 let (count, returned) = match family {
-                    Family::Text => db.execute_returning_for_session(
-                        sid,
-                        "UPDATE t SET v=v+1 WHERE id IN (1,10,10,99) RETURNING id,v",
-                    )?,
+                    Family::Text => (
+                        db.execute_for_session(sid, "UPDATE t SET v=v+1 WHERE id IN (1,10,10,99) RETURNING id,v")?,
+                        Vec::new(),
+                    ),
                     Family::Params => db.execute_params_returning_for_session(
                         sid,
                         "UPDATE t SET v=v+$1 WHERE id IN ($2,$3,$4,$5) RETURNING id,v",
@@ -300,7 +335,14 @@ fn session_owners_join_the_supplied_transaction_for_both_families() -> Result<()
                     )?,
                 };
                 assert_eq!(count, 2);
-                assert_eq!(ints(returned)?, vec![vec![1, 11], vec![10, 101]]);
+                assert_returned(family, returned, vec![vec![1, 11], vec![10, 101]])?;
+                assert_eq!(
+                    ints(
+                        db.query_with_columns_for_session(sid, "SELECT id,v FROM t WHERE id IN (1,10) ORDER BY id")?
+                            .0
+                    )?,
+                    vec![vec![1, 11], vec![10, 101]]
+                );
                 if commit {
                     db.commit_transaction_for_session(sid)?;
                 } else {
