@@ -1,0 +1,81 @@
+name: CodeGraph grouped-IN native timing diagnostic (no publish)
+on:
+  push:
+    branches: ['ci/4420-codegraph-grouped-in-*']
+permissions:
+  contents: read
+jobs:
+  proof:
+    name: grouped-IN native diagnostic
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    steps:
+      - name: Preserve source bytes
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          persist-credentials: false
+      - uses: actions/checkout@v5
+        with:
+          ref: d1c9c0c7c231c7aad30a26ed54be9edb613c0a9a
+          path: product
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Install native build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang libclang-dev pkg-config libssl-dev cmake ninja-build
+          dpkg-query -W -f='${Package}\t${Version}\n' > "$RUNNER_TEMP/codegraph-proof-packages.txt"
+      - name: Verify frozen bootstrap
+        working-directory: controller
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          for name, wanted in {
+              '.github/4420-codegraph-grouped-in/controller.py': '48a2bb89fc608df4a0d2f509110695e5c59886e0a631ce2a47bbbf6c7b042142',
+              '.github/4420-codegraph-grouped-in/model.json': '6c4546c37faef8f568d223fdef6c764606f5298f1dd6b356c07b52b3284247d1',
+          }.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != wanted:
+                  raise SystemExit('codegraph bootstrap changed: ' + name)
+          PYBOOT
+      - name: Build, list and execute source-pinned native proof
+        run: |
+          set -euo pipefail
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" /home/gpc/HDB/sprint/coordination
+          touch /home/gpc/HDB/sprint/coordination/build.lock
+          nano_cg_unit="nano-codegraph-grouped-in-${GITHUB_RUN_ID}"
+          sudo systemd-run --unit "$nano_cg_unit" --wait --pipe --collect \
+            -p User="$(id -un)" -p Group="$(id -gn)" \
+            -p WorkingDirectory="$GITHUB_WORKSPACE/controller" \
+            -p MemoryMax=24G -p MemorySwapMax=0 -p KillMode=control-group \
+            -p RuntimeMaxSec=5700 -p TimeoutStopSec=30 \
+            --setenv="PATH=$PATH" --setenv="CARGO_HOME=$HOME/.cargo" \
+            --setenv="RUSTUP_HOME=$HOME/.rustup" --setenv=RUSTUP_TOOLCHAIN=1.95.0 \
+            --setenv="GITHUB_SHA=$GITHUB_SHA" \
+            --setenv=PYTHONDONTWRITEBYTECODE=1 --setenv=PYTHONUNBUFFERED=1 \
+            python3 .github/4420-codegraph-grouped-in/controller.py \
+              --controller "$GITHUB_WORKSPACE/controller" --product "$GITHUB_WORKSPACE/product" \
+              --out "$RUNNER_TEMP/codegraph-grouped-in" --model-sha256 6c4546c37faef8f568d223fdef6c764606f5298f1dd6b356c07b52b3284247d1
+      - name: Preserve actual native evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegraph-grouped-in-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/codegraph-proof-packages.txt
+            ${{ runner.temp }}/codegraph-grouped-in/*.json
+            ${{ runner.temp }}/codegraph-grouped-in/*.stdout
+            ${{ runner.temp }}/codegraph-grouped-in/*.stderr
+            ${{ runner.temp }}/codegraph-grouped-in/native-test.elf
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 14
