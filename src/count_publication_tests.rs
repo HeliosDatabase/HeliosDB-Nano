@@ -208,9 +208,11 @@ fn open(path: &std::path::Path, history: bool, writer: Writer) -> Result<Arc<Emb
 }
 
 fn image(db: &EmbeddedDatabase) -> Result<Image> {
+    let mut read = rocksdb::ReadOptions::default();
+    read.set_total_order_seek(true);
     db.storage
         .db()
-        .iterator(IteratorMode::Start)
+        .iterator_opt(IteratorMode::Start, read)
         .map(|item| {
             item.map(|(key, value)| (key.into_vec(), value.into_vec()))
                 .map_err(Error::from)
@@ -219,10 +221,12 @@ fn image(db: &EmbeddedDatabase) -> Result<Image> {
 }
 
 fn row_count(db: &EmbeddedDatabase) -> Result<usize> {
+    let mut read = rocksdb::ReadOptions::default();
+    read.set_total_order_seek(true);
     let prefix = format!("data:{TABLE}:");
     db.storage
         .db()
-        .iterator(IteratorMode::Start)
+        .iterator_opt(IteratorMode::Start, read)
         .try_fold(0, |count, record| {
             let (key, _) = record.map_err(Error::from)?;
             Ok(count + usize::from(key.starts_with(prefix.as_bytes())))

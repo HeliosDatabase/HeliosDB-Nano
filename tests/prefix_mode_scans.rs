@@ -162,13 +162,12 @@ fn truncate_then_reopen_keeps_the_row_counter_past_a_range_tombstone() {
     );
 }
 
-/// The crash window logical-WAL redo exists for: a TRUNCATE whose entry is
-/// durable above the checkpoint while its row deletes never landed. Replayed
-/// (with the destructive-DDL policy at `apply`), it must delete every row. Red
-/// before the fix: the replay arm walked from the start of the keyspace in
-/// prefix mode, lost the rows' file past the tombstone, and left all of them.
+/// Explicit logical replay of TRUNCATE must reach every row past a range
+/// tombstone. Startup adopts current-format history without applying it; this
+/// exercises the actual explicit replay API under the `apply` policy. Before
+/// the scan fix a prefix-mode walk lost the rows' file past the tombstone.
 #[test]
-fn a_replayed_truncate_deletes_every_row_past_a_range_tombstone() {
+fn a_replayed_truncate_deletes_every_row_past_a_range_tombstone() -> heliosdb_nano::Result<()> {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = EmbeddedDatabase::with_config(config(dir.path())).unwrap();
@@ -192,11 +191,79 @@ fn a_replayed_truncate_deletes_every_row_past_a_range_tombstone() {
 
     let mut replaying = config(dir.path());
     replaying.storage.wal_replay_destructive_ddl = DestructiveDdlReplay::Apply;
-    let db = EmbeddedDatabase::with_config(replaying).unwrap();
-    assert!(
-        db.query("SELECT id FROM t", &[]).unwrap().is_empty(),
-        "rows of 't' survived the replayed TRUNCATE"
+    let db = EmbeddedDatabase::with_config(replaying)?;
+    // R5.7 adopts current-format local groups instead of replaying standalone
+    // logical history during open. The policy cannot turn startup redo back on.
+    // Repeating the identical SQL also retains the ordinary result-cache path.
+    for _ in 0..2 {
+        assert_eq!(
+            db.query("SELECT id FROM t", &[])?.len(),
+            3,
+            "startup must retain the durable rows instead of applying history"
+        );
+    }
+    assert_eq!(
+        db.storage.scan_table("t")?.len(),
+        3,
+        "canonical rows before explicit replay"
     );
+    let after = db
+        .storage
+        .wal_lsn()
+        .ok_or_else(|| heliosdb_nano::Error::storage("explicit replay fixture requires logical WAL"))?;
+    let expected_lsn = after
+        .checked_add(1)
+        .ok_or_else(|| heliosdb_nano::Error::storage("explicit replay fixture LSN exhausted"))?;
+    // Append through the live engine's owner, never a second open WAL handle.
+    db.storage.log_truncate("t")?;
+    assert_eq!(db.storage.wal_lsn(), Some(expected_lsn));
+    match db.storage.logical_wal_catchup(after)? {
+        heliosdb_nano::storage::LogicalCatchup::Entries { latest, entries } => {
+            assert_eq!(latest, expected_lsn);
+            let [entry] = entries.as_slice() else {
+                return Err(heliosdb_nano::Error::storage(format!(
+                    "expected one explicit TRUNCATE entry, found {}",
+                    entries.len()
+                )));
+            };
+            assert_eq!(entry.lsn, expected_lsn);
+            assert!(matches!(&entry.operation, WalOperation::Truncate { table } if table == "t"));
+        }
+        other => {
+            return Err(heliosdb_nano::Error::storage(format!(
+                "explicit TRUNCATE history unavailable: {other:?}"
+            )))
+        }
+    }
+    // The existing replay API counts batched row operations. Immediate DDL is
+    // applied with Ok(false), so its truthful return is zero; the real effect
+    // is proved independently by both canonical storage and identical SQL.
+    assert_eq!(
+        db.storage.replay_wal_after(after)?,
+        0,
+        "TRUNCATE is not a batched row operation"
+    );
+    let raw_after = db.storage.scan_table("t")?;
+    let sql_after = db.query("SELECT id FROM t", &[])?;
+    eprintln!(
+        "explicit-truncate-replay observed raw_after={} sql_after={}",
+        raw_after.len(),
+        sql_after.len()
+    );
+    assert!(
+        raw_after.is_empty(),
+        "canonical rows survived the explicitly replayed TRUNCATE"
+    );
+    assert!(
+        sql_after.is_empty(),
+        "same SQL retained rows after the explicitly replayed TRUNCATE"
+    );
+    assert_eq!(
+        db.storage.wal_lsn(),
+        Some(expected_lsn),
+        "explicit replay must not log itself again"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -217,6 +284,9 @@ enum Scan {
 /// entry is a scan that reads every family between the keyspace's start and
 /// the keys it wants.
 const SITES: &[(&str, &str, usize, Scan)] = &[
+    ("src/count_publication_tests.rs", "image", 1, Scan::TotalOrder),
+    ("src/count_publication_tests.rs", "row_count", 1, Scan::TotalOrder),
+    ("src/branch_counter_lock_tests.rs", "raw_image", 1, Scan::TotalOrder),
     // `AS OF` row-id collection, `data:{t}:` only.
     (
         "src/storage/engine_timetravel_extension.rs",
