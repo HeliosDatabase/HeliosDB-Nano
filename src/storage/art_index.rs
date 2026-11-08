@@ -420,6 +420,7 @@ impl AdaptiveRadixTree {
 
             // Add both leaves as children (or store value at node if key exhausted)
             let new_depth = depth + prefix_len;
+            let creates_two_leaves = new_depth < existing_key.len() && new_depth < key.len();
             if new_depth < existing_key.len() {
                 let child_byte = existing_key[new_depth];
                 let existing_leaf = ArtNode::Leaf(LeafNode::from_values(existing_key, primary, extra));
@@ -438,7 +439,7 @@ impl AdaptiveRadixTree {
             }
 
             self.stats.node4_count += 1;
-            self.stats.leaf_count += 1; // New leaf added
+            self.stats.leaf_count += u64::from(creates_two_leaves);
             return Ok(ArtNode::Node4(Box::new(new_node)));
         }
 
@@ -806,7 +807,6 @@ impl AdaptiveRadixTree {
         if removed_value.is_some() {
             self.size -= 1;
             self.stats.key_count = self.size;
-            self.stats.leaf_count -= 1;
         }
 
         Ok(removed_value)
@@ -824,6 +824,7 @@ impl AdaptiveRadixTree {
                 if leaf.matches(key) {
                     let first_value = Some(leaf.value());
                     let count = leaf.values_count() as u64;
+                    self.stats.leaf_count -= 1;
                     // Adjust size for extra values beyond the first (first is handled by caller)
                     if count > 1 {
                         self.size -= count - 1;
@@ -852,7 +853,7 @@ impl AdaptiveRadixTree {
                         self.size -= (values.len() - 1) as u64;
                         self.stats.key_count = self.size;
                     }
-                    return Ok((Some(inner), first_value));
+                    return Ok((self.normalize_after_remove(inner, key), first_value));
                 }
 
                 let next_byte = key[new_depth];
@@ -924,9 +925,7 @@ impl AdaptiveRadixTree {
                     ArtNode::Leaf(_) => unreachable!(),
                 };
 
-                // Shrink node if necessary
-                let final_node = self.maybe_shrink_node(inner);
-                Ok((Some(final_node), removed))
+                Ok((self.normalize_after_remove(inner, &key[..new_depth]), removed))
             }
         }
     }
@@ -994,7 +993,7 @@ impl AdaptiveRadixTree {
                     let values = &mut inner.header_mut().values;
                     if let Some(pos) = values.iter().position(|&v| v == row_id) {
                         values.swap_remove(pos);
-                        return Ok((Some(inner), true));
+                        return Ok((self.normalize_after_remove(inner, key), true));
                     }
                     return Ok((Some(inner), false));
                 }
@@ -1070,10 +1069,33 @@ impl AdaptiveRadixTree {
                     ArtNode::Leaf(_) => unreachable!(),
                 };
 
-                let final_node = self.maybe_shrink_node(inner);
-                Ok((Some(final_node), removed))
+                Ok((self.normalize_after_remove(inner, &key[..new_depth]), removed))
             }
         }
+    }
+
+    /// A childless inner node cannot recover a compressed prefix's hidden tail
+    /// from a descendant leaf. Drop it when empty, or keep its terminal values
+    /// in a full-key leaf. `key_prefix` is the matched path to this node, before
+    /// the child byte used by the deletion, so no prefix reconstruction can fail
+    /// after the mutation. Nodes with children must retain their terminal values.
+    fn normalize_after_remove(&mut self, mut node: ArtNode, key_prefix: &[u8]) -> Option<ArtNode> {
+        if node.header().num_children != 0 {
+            return Some(self.maybe_shrink_node(node));
+        }
+
+        let mut values = std::mem::take(&mut node.header_mut().values).into_iter();
+        match node {
+            ArtNode::Node4(_) => self.stats.node4_count -= 1,
+            ArtNode::Node16(_) => self.stats.node16_count -= 1,
+            ArtNode::Node48(_) => self.stats.node48_count -= 1,
+            ArtNode::Node256(_) => self.stats.node256_count -= 1,
+            ArtNode::Leaf(_) => unreachable!("only inner nodes are normalized after removal"),
+        }
+        values.next().map(|first| {
+            self.stats.leaf_count += 1;
+            ArtNode::Leaf(LeafNode::from_values(key_prefix.to_vec(), first, values.collect()))
+        })
     }
 
     /// Shrink a node if it has too few children
@@ -1689,5 +1711,216 @@ mod tests {
         let user42_orders = tree.get_all(b"\x00\x00\x00\x2a");
         assert_eq!(user42_orders.len(), 2);
         assert_eq!(tree.len(), 3);
+    }
+
+    fn assert_node_statistics(tree: &AdaptiveRadixTree) {
+        fn count(node: &ArtNode, totals: &mut [u64; 5]) {
+            let children: Vec<&ArtNode> = match node {
+                ArtNode::Node4(n) => {
+                    totals[0] += 1;
+                    n.iter_children().map(|(_, child)| child).collect()
+                }
+                ArtNode::Node16(n) => {
+                    totals[1] += 1;
+                    n.iter_children().map(|(_, child)| child).collect()
+                }
+                ArtNode::Node48(n) => {
+                    totals[2] += 1;
+                    n.iter_children().map(|(_, child)| child).collect()
+                }
+                ArtNode::Node256(n) => {
+                    totals[3] += 1;
+                    n.iter_children().map(|(_, child)| child).collect()
+                }
+                ArtNode::Leaf(_) => {
+                    totals[4] += 1;
+                    return;
+                }
+            };
+            for child in children {
+                count(child, totals);
+            }
+        }
+        let mut totals = [0; 5];
+        if let Some(root) = &tree.root {
+            count(root, &mut totals);
+        }
+        let stats = tree.stats();
+        assert_eq!(
+            totals,
+            [
+                stats.node4_count,
+                stats.node16_count,
+                stats.node48_count,
+                stats.node256_count,
+                stats.leaf_count
+            ]
+        );
+        assert_eq!(stats.key_count, tree.len());
+        assert_eq!(tree.iter().count() as u64, tree.len());
+    }
+
+    #[test]
+    fn test_delete_all_long_prefix_unique_keys_then_reinsert() {
+        for index_type in [ArtIndexType::PrimaryKey, ArtIndexType::Unique] {
+            let mut tree = AdaptiveRadixTree::new("id", "draft", vec!["id".into()], index_type);
+            let keys = [
+                b"d8810000-0000-4000-8000-000000000010",
+                b"d8810000-0000-4000-8000-000000000011",
+            ];
+            for (i, key) in keys.iter().enumerate() {
+                tree.insert(*key, i as RowId + 1).unwrap();
+            }
+            for (i, key) in keys.iter().enumerate() {
+                assert_eq!(tree.remove(*key).unwrap(), Some(i as RowId + 1));
+                assert_node_statistics(&tree);
+            }
+            assert!(tree.root.is_none());
+            assert!(tree.is_empty());
+            tree.insert(b"a-new-random-id", 3).unwrap();
+            assert_eq!(tree.get(b"a-new-random-id"), Some(3));
+            assert!(matches!(
+                tree.insert(b"a-new-random-id", 4),
+                Err(ArtIndexError::DuplicateKey(_))
+            ));
+            assert_node_statistics(&tree);
+        }
+    }
+
+    #[test]
+    fn test_delete_all_long_prefix_multi_values_then_reinsert() {
+        for index_type in [ArtIndexType::Manual, ArtIndexType::ForeignKey] {
+            let mut tree = AdaptiveRadixTree::new("recipient", "draft", vec!["recipientId".into()], index_type);
+            let keys = [b"envelope-shared-prefix-012345-a", b"envelope-shared-prefix-012345-b"];
+            for (i, key) in keys.iter().enumerate() {
+                tree.insert(*key, i as RowId * 10).unwrap();
+                tree.insert(*key, i as RowId * 10 + 1).unwrap();
+            }
+            assert!(!tree.remove_value(keys[0], 999).unwrap());
+            for (i, key) in keys.iter().enumerate() {
+                assert!(tree.remove_value(*key, i as RowId * 10).unwrap());
+                assert_eq!(tree.get_all(*key), vec![i as RowId * 10 + 1]);
+                assert!(tree.remove_value(*key, i as RowId * 10 + 1).unwrap());
+                assert_node_statistics(&tree);
+            }
+            assert!(tree.root.is_none());
+            tree.insert(b"different-envelope-and-recipient", 50).unwrap();
+            tree.insert(b"different-envelope-and-recipient", 51).unwrap();
+            assert_eq!(tree.get_all(b"different-envelope-and-recipient"), vec![50, 51]);
+            assert_node_statistics(&tree);
+        }
+    }
+
+    #[test]
+    fn test_empty_long_prefix_subtree_is_pruned_without_losing_sibling() {
+        for remove_specific in [false, true] {
+            let mut tree = AdaptiveRadixTree::new("id", "draft", vec!["id".into()], ArtIndexType::Manual);
+            let keys = [b"a-long-shared-subtree-prefix-0", b"a-long-shared-subtree-prefix-1"];
+            tree.insert(b"unrelated-survivor", 99).unwrap();
+            for (i, key) in keys.iter().enumerate() {
+                tree.insert(*key, i as RowId).unwrap();
+            }
+            for (i, key) in keys.iter().enumerate() {
+                if remove_specific {
+                    assert!(tree.remove_value(*key, i as RowId).unwrap());
+                } else {
+                    assert_eq!(tree.remove(*key).unwrap(), Some(i as RowId));
+                }
+                assert_eq!(tree.get(b"unrelated-survivor"), Some(99));
+                assert_node_statistics(&tree);
+            }
+            tree.insert(b"a-long-shared-subtree-replacement", 100).unwrap();
+            assert_eq!(tree.get(b"a-long-shared-subtree-replacement"), Some(100));
+            assert_eq!(tree.get(b"unrelated-survivor"), Some(99));
+            assert_eq!(tree.len(), 2);
+            assert_node_statistics(&tree);
+        }
+    }
+
+    #[test]
+    fn test_childless_long_prefix_terminal_values_become_full_key_leaf() {
+        for remove_specific in [false, true] {
+            let mut tree = AdaptiveRadixTree::new("path", "draft", vec!["path".into()], ArtIndexType::Manual);
+            let prefix = b"long-terminal-key-over-header-capacity";
+            let child = b"long-terminal-key-over-header-capacity/child";
+            tree.insert(prefix, 1).unwrap();
+            tree.insert(prefix, 2).unwrap();
+            tree.insert(child, 3).unwrap();
+            assert_node_statistics(&tree);
+            if remove_specific {
+                assert!(tree.remove_value(child, 3).unwrap());
+            } else {
+                assert_eq!(tree.remove(child).unwrap(), Some(3));
+            }
+            assert!(matches!(tree.root, Some(ArtNode::Leaf(_))));
+            assert_eq!(tree.get_all(prefix), vec![1, 2]);
+            assert_eq!(
+                tree.iter().collect::<Vec<_>>(),
+                vec![(prefix.to_vec(), 1), (prefix.to_vec(), 2)]
+            );
+            assert_node_statistics(&tree);
+            tree.insert(b"long-terminal-key-over-header-different", 4).unwrap();
+            assert_eq!(tree.get_all(prefix), vec![1, 2]);
+            assert_eq!(tree.get(b"long-terminal-key-over-header-different"), Some(4));
+            assert_node_statistics(&tree);
+        }
+    }
+
+    #[test]
+    fn test_terminal_value_removal_keeps_children_and_correct_counts() {
+        for remove_specific in [false, true] {
+            let mut tree = AdaptiveRadixTree::new("path", "draft", vec!["path".into()], ArtIndexType::Manual);
+            let prefix = b"long-terminal-key-over-header-capacity";
+            let child = b"long-terminal-key-over-header-capacity/child";
+            tree.insert(prefix, 1).unwrap();
+            tree.insert(prefix, 2).unwrap();
+            tree.insert(child, 3).unwrap();
+            if remove_specific {
+                assert!(tree.remove_value(prefix, 1).unwrap());
+                assert_eq!(tree.get_all(prefix), vec![2]);
+                assert!(tree.remove_value(prefix, 2).unwrap());
+            } else {
+                assert_eq!(tree.remove(prefix).unwrap(), Some(1));
+            }
+            assert_eq!(tree.get_all(prefix), Vec::<RowId>::new());
+            assert_eq!(tree.get(child), Some(3));
+            assert_node_statistics(&tree);
+            if remove_specific {
+                assert!(tree.remove_value(child, 3).unwrap());
+            } else {
+                assert_eq!(tree.remove(child).unwrap(), Some(3));
+            }
+            assert!(tree.root.is_none());
+            assert_node_statistics(&tree);
+        }
+    }
+
+    #[test]
+    fn test_repeated_clear_reinsert_after_every_node_size() {
+        for remove_specific in [false, true] {
+            let mut tree = AdaptiveRadixTree::new("id", "draft", vec!["id".into()], ArtIndexType::Manual);
+            for round in 0..3 {
+                let keys: Vec<_> = (0..100u8)
+                    .map(|n| [b"shared-compressed-prefix-".as_slice(), &[n]].concat())
+                    .collect();
+                for (i, key) in keys.iter().enumerate() {
+                    tree.insert(key, i as RowId).unwrap();
+                }
+                assert_node_statistics(&tree);
+                for (i, key) in keys.iter().enumerate() {
+                    if remove_specific {
+                        assert!(tree.remove_value(key, i as RowId).unwrap());
+                    } else {
+                        assert_eq!(tree.remove(key).unwrap(), Some(i as RowId));
+                    }
+                    assert_node_statistics(&tree);
+                }
+                assert!(tree.root.is_none(), "round {round}");
+                tree.insert(b"different-key-after-clear", 999).unwrap();
+                assert_eq!(tree.get(b"different-key-after-clear"), Some(999));
+                assert_eq!(tree.remove(b"different-key-after-clear").unwrap(), Some(999));
+                assert_node_statistics(&tree);
+            }
+        }
     }
 }
