@@ -1,4 +1,4 @@
-name: Source32 prerequisite gates (no publish)
+name: Source32 code-embed compiler minimum retry (no publish)
 on:
   push:
     branches: ['ci/4420-prerequisites-*']
@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        stage: [security, msrv-default, msrv-embed, minimal-ring, fips]
+        stage: [msrv-embed]
     steps:
       - name: Preserve source bytes
         run: |
@@ -49,7 +49,7 @@ jobs:
           import hashlib
           from pathlib import Path
           pairs = {
-              '.github/4420-prerequisite-v1/launch.py': '8669a169509599d321c6c781495a671801e8f94d8798ddde66f486634ee1266f',
+              '.github/4420-prerequisite-v1/launch.py': 'fbbe294566014cf6b81af1b1b01d6700ca9a9912ca2ad7ed80d060bd9a5be01f',
               '.github/4420-prerequisite-v1/model.json': '3836def1ede436a363f90791e3fb7f2756ce21aedafccfcd3f73dfb5594a51cb',
           }
           for name, digest in pairs.items():

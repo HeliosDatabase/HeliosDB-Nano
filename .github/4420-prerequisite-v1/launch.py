@@ -17,7 +17,7 @@ HERE = Path(__file__).resolve().parent
 V5_SHA = '1c2884e87666bc46e4b4571c174467b46a374ac52f285a95398d433146fbd5a2'
 STAGES = ('security', 'msrv-default', 'msrv-embed', 'minimal-ring', 'fips')
 TOOLS = {'cargo-audit': '0.22.2', 'cargo-deny': '0.19.9'}
-ORT_PINS = {'ort_prereq.py': '900ae089677b4db646deac632ec65dbef9f1e8c19f90add78ddd6e80d032805b', 'ort-prereq.json': '00dde27899411b54d1a0878cd6a91231f6475b8b5ad76ce5947c30b08665e5e9'}
+ORT_PINS = {'ort_prereq.py': 'ba6845dd2476846e7320233e7fbb1d35c3b53aa5abee0af91d638321ecf64a6a', 'ort-prereq.json': '00dde27899411b54d1a0878cd6a91231f6475b8b5ad76ce5947c30b08665e5e9'}
 
 
 def sha(path):
