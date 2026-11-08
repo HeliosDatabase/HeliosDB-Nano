@@ -410,8 +410,8 @@ fn watermark_survives_reopen_and_collection_is_idempotent() {
 //    its versions, as the simple-query path always did, so no SQL statement
 //    writes such a version any more (`params_autocommit_update_versions_are_
 //    indexed` below). A store an earlier release wrote still holds them, so
-//    the chain is planted through that writer here, exactly as that release
-//    wrote it. When the newest version at-or-below the horizon is
+//    the legacy writer's bare version/data/snapshot byte shape is planted
+//    explicitly here; the repaired managed writer no longer creates it. When the newest version at-or-below the horizon is
 //    un-indexed, the collector must also keep the newest INDEXED version
 //    at-or-below the horizon — otherwise an AS OF read at t >= horizon
 //    silently changes its answer after GC (falls back to the current data
@@ -439,11 +439,47 @@ fn gc_preserves_indexed_reads_over_unindexed_autocommit_versions() {
             (row_id, updated)
         })
         .collect();
+    // The managed generic updater now writes complete indexed versions. Plant
+    // the old 4af19e1c main-branch byte shape directly: old/new bare v: values,
+    // the changed data: image and snapshot metadata, with NO new v_idx: event.
+    // This table has no side storage, filters, MVs or vector indexes.
+    let indexed_before = db.version_storage_stats().unwrap().version_index_keys;
     let written = db
         .storage
-        .debug_plant_rows(|| db.storage.update_tuples_branch_aware("m", updates))
-        .unwrap(); // val=11
+        .debug_plant_rows(|| -> heliosdb_nano::Result<u64> {
+            for (row_id, updated) in &updates {
+                db.storage.invalidate_write_watermark("m");
+                let timestamp = db.storage.next_timestamp();
+                let data_key = format!("data:m:{row_id}").into_bytes();
+                let old_value = db.storage.get(&data_key)?.ok_or_else(|| {
+                    heliosdb_nano::Error::storage("legacy fixture requires an existing committed row")
+                })?;
+                let old_version = format!("v:m:{row_id}:{}", timestamp.saturating_sub(1)).into_bytes();
+                if db.storage.get(&old_version)?.is_none() {
+                    db.storage.put(&old_version, &old_value)?;
+                }
+                let bytes = bincode::serialize(updated)
+                    .map_err(|error| heliosdb_nano::Error::storage(format!("legacy fixture tuple: {error}")))?;
+                db.storage.put(&data_key, &bytes)?;
+                let new_version = format!("v:m:{row_id}:{timestamp}").into_bytes();
+                db.storage.put(&new_version, &bytes)?;
+                db.storage.snapshot_manager().register_snapshot(timestamp)?;
+                assert_eq!(db.storage.get(&new_version)?, Some(bytes));
+                let index_key = format!("v_idx:m:{row_id}:{:020}", u64::MAX - timestamp).into_bytes();
+                assert!(
+                    db.storage.get(&index_key)?.is_none(),
+                    "the legacy newest version must genuinely have no reverse-index event"
+                );
+            }
+            Ok(updates.len() as u64)
+        })
+        .unwrap(); // val=11 in current data, newest bare versions un-indexed
     assert_eq!(written, ROWS as u64);
+    assert_eq!(
+        db.version_storage_stats().unwrap().version_index_keys,
+        indexed_before,
+        "preparation must preserve all original indexed history and add no v_idx entries"
+    );
     sleep_secs(1.2);
     let ts_probe = now_sql_timestamp(); // resolves AT the horizon after GC
 
