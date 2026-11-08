@@ -1,0 +1,62 @@
+name: Native routine transaction semantic probe
+on:
+  push:
+    branches: ['ci/4420-routine-txn-*']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  native-routine-txn:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Preserve physical source bytes
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check probe and source-model pins
+        shell: bash
+        run: |
+          python3 - <<'PYBOOT'
+          import hashlib
+          from pathlib import Path
+          expected = {
+              '.github/scripts/routine_txn_native.py': 'd4e6a2bc0e49716d7f6ea15fab87c2b489ddfb4b97ed02bab04cc7c3ac06af20',
+              '.github/binary-preflight-source28.json': 'ed47e15814dd3d39b072f5fb98aa632b85cd4b11177277e2796aee7cf3991038',
+          }
+          for name, digest in expected.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != digest:
+                  raise SystemExit('bootstrap hash mismatch: ' + name)
+          PYBOOT
+      - name: Download the completed fixed-run binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: all-four-native-binaries
+          run-id: '42462448705'
+          github-token: ${{ github.token }}
+          path: .routine-artifacts
+      - name: Run all twelve native semantic cells
+        shell: bash
+        run: python3 .github/scripts/routine_txn_native.py --artifact-dir .routine-artifacts --output .routine-txn-out
+      - name: Preserve semantic failures and owned cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: routine-txn-native-${{ github.run_id }}
+          path: |
+            .routine-txn-out/*.json
+            .routine-txn-out/*/*.json
+            .routine-txn-out/*/*.toml
+            .routine-txn-out/*/server.stdout
+            .routine-txn-out/*/server.stderr
+          if-no-files-found: warn
+          include-hidden-files: true
+          retention-days: 14
