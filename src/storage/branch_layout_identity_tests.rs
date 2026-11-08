@@ -181,3 +181,38 @@ fn branch_metadata_ranges_fence_old_and_mid_publication_plans_and_reload_cached_
     }
     Ok(())
 }
+
+#[test]
+fn dead_branch_slot_churn_is_bounded_without_detaching_a_live_reader() {
+    let epochs = LayoutEpochs::new();
+    let ((), live) = collect_stamp(|| note_branch_table(&epochs, 7, "live"));
+    assert_eq!(live.entries.len(), 1, "the reader really retains its slot");
+    for level in 100..4196 {
+        drop(epochs.begin_scoped_change(std::iter::empty(), [(level, "dead")], false));
+    }
+    assert!(live.is_current(), "unrelated dead branches do not alter the reader");
+    assert!(
+        epochs.branch_slots.len() <= 128,
+        "one live slot plus cold cleanup windows, not all 4096 dead branch ids: {}",
+        epochs.branch_slots.len()
+    );
+    let mutation = epochs.begin_scoped_change(std::iter::empty(), [(7, "live")], false);
+    assert!(
+        !live.is_current(),
+        "cleanup must preserve the live reader's exact allocation"
+    );
+    drop(mutation);
+    assert!(!live.is_current());
+    let ((), fresh) = collect_stamp(|| note_branch_table(&epochs, 7, "live"));
+    assert_eq!(fresh.entries.len(), 1);
+    assert!(fresh.is_current());
+    drop((live, fresh));
+    for level in 5000..9096 {
+        drop(epochs.begin_scoped_change(std::iter::empty(), [(level, "dead")], false));
+    }
+    assert!(
+        epochs.branch_slots.len() <= 128,
+        "the final dead reader is reclaimable too"
+    );
+    eprintln!("branch-layout-identity-cell registry churn=8192 live_reader_preserved=true");
+}

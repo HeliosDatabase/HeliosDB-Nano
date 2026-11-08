@@ -19,6 +19,10 @@
 //! the life of the engine: an epoch that went back to zero would let a reader
 //! validate across a `DROP` and a `CREATE` of the name. Session-private
 //! (`pg_temp_*`) tables have none (decision 1); the writer lock still covers them.
+//! Branch table slots instead have weak registry entries: every read stamp,
+//! statement read set and in-flight publication owns its slot strongly. A slot
+//! can be replaced only when none of those can still validate it. Cold cleanup
+//! removes dead branch identities; the branch-wide range fence is permanent.
 //! The low 16 bits count the changes of the table's layout in flight (the seqlock's
 //! "odd", generalised so that two changes in flight at once are both seen), the rest
 //! count the changes done. A reader's value is usable only when nothing is in
@@ -167,6 +171,13 @@ fn settled(value: u64) -> bool {
 #[derive(Debug, Default)]
 pub struct LayoutEpochs {
     slots: DashMap<String, Arc<EpochSlot>>,
+    // Branch-only catalog identities never alias a main table with the same
+    // name. Ordinary main reads/writes do not touch this cold registry.
+    branch_slots: DashMap<(u64, String), std::sync::Weak<EpochSlot>>,
+    branch_slot_churn: std::sync::atomic::AtomicUsize,
+    // Only branch readers and unattributable branch metadata ranges use this.
+    // It is allocated lazily; main's slot/lookup path remains unchanged.
+    branch_wide: std::sync::OnceLock<Arc<EpochSlot>>,
 }
 
 impl LayoutEpochs {
@@ -189,6 +200,45 @@ impl LayoutEpochs {
                 .or_insert_with(|| Arc::new(EpochSlot::new(table)))
                 .value(),
         ))
+    }
+
+    fn branch_slot(&self, level: u64, table: &str) -> Arc<EpochSlot> {
+        let key = (level, table.to_string());
+        if let Some(slot) = self.branch_slots.get(&key).and_then(|known| known.upgrade()) {
+            return slot;
+        }
+        // Upgrade/replacement is atomic under the entry guard: a live stamp,
+        // read set, own/deferred publication or change holds a strong Arc, so
+        // every writer must advance that SAME allocation while it can validate.
+        let (slot, created) = {
+            let mut known = self.branch_slots.entry(key).or_default();
+            match known.upgrade() {
+                Some(slot) => (slot, false),
+                None => {
+                    let slot = Arc::new(EpochSlot::new(table));
+                    *known = Arc::downgrade(&slot);
+                    (slot, true)
+                }
+            }
+        };
+        if created {
+            // Sweep only after releasing the entry guard. Scale the interval
+            // with live registry size so a large active batch cannot turn
+            // cold cleanup into a quadratic scan. Dead churn alone stays small.
+            let seen = self.branch_slot_churn.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            let interval = (self.branch_slots.len() / 2).max(64);
+            if seen >= interval && self.branch_slot_churn.swap(0, Ordering::Relaxed) >= interval {
+                self.branch_slots.retain(|_, known| known.strong_count() != 0);
+            }
+        }
+        slot
+    }
+
+    fn branch_wide_slot(&self) -> Arc<EpochSlot> {
+        Arc::clone(
+            self.branch_wide
+                .get_or_init(|| Arc::new(EpochSlot::new("branch catalog"))),
+        )
     }
 
     /// `table`'s epoch now: 0 for a name nothing ever changed or read. For tests and
@@ -246,8 +296,35 @@ impl LayoutEpochs {
         }
         LayoutChange {
             slots,
+            branches: Vec::new(),
+            branch_wide: None,
             _thread: std::marker::PhantomData,
         }
+    }
+
+    pub(crate) fn begin_scoped_change<'t>(
+        &self,
+        tables: impl IntoIterator<Item = &'t str>,
+        branches: impl IntoIterator<Item = (u64, &'t str)>,
+        branch_wide: bool,
+    ) -> LayoutChange {
+        let mut change = self.begin_change(tables);
+        for (level, table) in branches {
+            let slot = self.branch_slot(level, table);
+            if change.branches.iter().any(|(_, known)| Arc::ptr_eq(known, &slot)) {
+                continue;
+            }
+            slot.advance(1);
+            let _ = STATE.try_with(|state| state.borrow_mut().own.push(Arc::clone(&slot)));
+            change.branches.push((level, slot));
+        }
+        if branch_wide {
+            let slot = self.branch_wide_slot();
+            slot.advance(1);
+            let _ = STATE.try_with(|state| state.borrow_mut().own.push(Arc::clone(&slot)));
+            change.branch_wide = Some(slot);
+        }
+        change
     }
 }
 
@@ -258,6 +335,8 @@ impl LayoutEpochs {
 #[must_use = "a layout change ends when this drops"]
 pub struct LayoutChange {
     slots: Vec<Arc<EpochSlot>>,
+    branches: Vec<(u64, Arc<EpochSlot>)>,
+    branch_wide: Option<Arc<EpochSlot>>,
     // Drop updates the creator thread's read set and own-change list.
     _thread: std::marker::PhantomData<*const ()>,
 }
@@ -267,31 +346,52 @@ impl LayoutChange {
     pub(crate) fn none() -> Self {
         Self {
             slots: Vec::new(),
+            branches: Vec::new(),
+            branch_wide: None,
             _thread: std::marker::PhantomData,
         }
     }
 
     /// Whether this change names no table.
     pub(crate) fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.slots.is_empty() && self.branches.is_empty() && self.branch_wide.is_none()
     }
 
-    /// The tables this change marks.
+    /// Only the main tables this change marks. Branch identities publish through
+    /// their separate hook and must never invalidate a main table's layout.
     pub(crate) fn tables(&self) -> Vec<String> {
         self.slots.iter().map(|slot| slot.table().to_string()).collect()
+    }
+
+    pub(crate) fn branch_tables(&self) -> Vec<(u64, String)> {
+        self.branches
+            .iter()
+            .map(|(level, slot)| (*level, slot.table().to_string()))
+            .collect()
+    }
+
+    pub(crate) fn branch_wide(&self) -> bool {
+        self.branch_wide.is_some()
+    }
+
+    fn all_slots(&self) -> impl Iterator<Item = &Arc<EpochSlot>> {
+        self.slots
+            .iter()
+            .chain(self.branches.iter().map(|(_, slot)| slot))
+            .chain(self.branch_wide.iter())
     }
 }
 
 impl Drop for LayoutChange {
     fn drop(&mut self) {
-        for slot in &self.slots {
+        for slot in self.all_slots() {
             slot.advance(ONE_CHANGE - 1);
         }
         // `try_with`: a change can end while the thread's locals are being torn down.
-        if !self.slots.is_empty() {
+        if !self.is_empty() {
             let _ = STATE.try_with(|state| {
                 let mut state = state.borrow_mut();
-                for slot in &self.slots {
+                for slot in self.all_slots() {
                     if let Some(at) = state.own.iter().position(|own| Arc::ptr_eq(own, slot)) {
                         state.own.swap_remove(at);
                     }
@@ -367,6 +467,11 @@ pub trait LayoutHook: Send + Sync {
     /// readers cache of each table's layout, so a reader that loads an epoch after
     /// the change cannot find a cache from before it.
     fn publish(&self, tables: &[String]);
+
+    /// Branch catalog cache publication, without treating a branch identity
+    /// as a changed main table. Implementations without branch caches need
+    /// nothing beyond the scoped epoch fence.
+    fn publish_branches(&self, _tables: &[(u64, String)], _all_branches: bool) {}
 }
 
 /// The table a layout key names, when the key alone says (`meta:index:` does not:
@@ -376,6 +481,8 @@ pub(crate) enum LayoutKey<'k> {
     /// One table, or two readings of an ambiguous key (`meta:attmissing:{t}:{c}` with
     /// a ':' in either name): both are marked.
     Tables(&'k str, Option<&'k str>),
+    /// A table/missing-values record owned by one immutable branch level.
+    BranchTable(u64, &'k str),
     /// `meta:index:{name}`.
     Index(&'k str),
 }
@@ -417,10 +524,17 @@ pub(crate) fn layout_key(key: &[u8]) -> Option<LayoutKey<'_>> {
         if level.is_empty() || !level.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
         }
+        let level = level.parse().ok()?;
         let table = rest.strip_prefix("table:").or_else(|| rest.strip_prefix("missing:"))?;
-        return (!table.is_empty()).then_some(LayoutKey::Tables(table, None));
+        return (!table.is_empty()).then_some(LayoutKey::BranchTable(level, table));
     }
     None
+}
+
+/// Half-open byte range overlapping any branch catalog record. A broad raw
+/// range cannot be attributed from its start key alone.
+pub(crate) fn branch_catalog_range(start: &[u8], end: &[u8]) -> bool {
+    start < b"bmeta;".as_slice() && end > b"bmeta:".as_slice()
 }
 
 /// One default-family operation, borrowed from a RocksDB batch without copying
@@ -695,6 +809,27 @@ pub(crate) fn note_table(epochs: &LayoutEpochs, table: &str) {
         return;
     }
     note_table_slow(epochs, table);
+}
+
+/// Only an actual session catalog lookup records branch dependencies. Internal
+/// main-side freezing/reclaim must not make a main statement depend on branch
+/// bookkeeping that another thread can safely retire.
+pub(crate) fn note_branch_table(epochs: &LayoutEpochs, level: u64, table: &str) {
+    if ACTIVE.with(Cell::get) == 0 {
+        return;
+    }
+    let slot = epochs.branch_slot(level, table);
+    let value = slot.load();
+    STATE.with(|state| state.borrow_mut().record(&slot, value));
+}
+
+pub(crate) fn note_branch_catalog(epochs: &LayoutEpochs) {
+    if ACTIVE.with(Cell::get) == 0 {
+        return;
+    }
+    let slot = epochs.branch_wide_slot();
+    let value = slot.load();
+    STATE.with(|state| state.borrow_mut().record(&slot, value));
 }
 
 /// A main-table dependency sampled before branch resolution, but recorded only
@@ -1312,9 +1447,13 @@ mod tests {
         assert_eq!(layout_key(b"meta:table_shape:t"), Some(LayoutKey::Tables("t", None)));
         assert_eq!(layout_key(b"meta:table_layout:t"), Some(LayoutKey::Tables("t", None)));
         assert_eq!(layout_key(b"meta:index:i"), Some(LayoutKey::Index("i")));
-        assert_eq!(layout_key(b"bmeta:3:table:t"), Some(LayoutKey::Tables("t", None)));
-        assert_eq!(layout_key(b"bmeta:3:missing:t"), Some(LayoutKey::Tables("t", None)));
+        assert_eq!(layout_key(b"bmeta:3:table:t"), Some(LayoutKey::BranchTable(3, "t")));
+        assert_eq!(layout_key(b"bmeta:3:missing:t"), Some(LayoutKey::BranchTable(3, "t")));
         assert_eq!(layout_key(b"bmeta:3:fork"), None);
+        assert!(branch_catalog_range(b"bmeta:", b"bmeta;"));
+        assert!(branch_catalog_range(b"a", b"z"));
+        assert!(!branch_catalog_range(b"a", b"bmeta:"));
+        assert!(!branch_catalog_range(b"bmeta;", b"z"));
         assert_eq!(layout_key(b"meta:table_incarnation:t"), None);
         assert_eq!(layout_key(b"data:t:1"), None);
         assert_eq!(layout_key(b"meta:history_purge:t"), None);

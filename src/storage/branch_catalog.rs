@@ -1069,7 +1069,18 @@ impl StorageEngine {
         let Some(chain) = self.session_branch_chain() else {
             return Ok(None);
         };
-        let resolution = self.resolve_branch_table(&chain, table)?;
+        super::layout_epochs::note_branch_catalog(self.layout_epochs());
+        // Sample every nearer negative probe, as well as the defining level,
+        // BEFORE the record cache. A new nearer definition can shadow the old
+        // ancestor even if that ancestor's own bytes never change.
+        let mut resolution = BranchTableResolution::Inherited;
+        for (index, &level) in chain.iter().enumerate().rev() {
+            super::layout_epochs::note_branch_table(self.layout_epochs(), level, table);
+            if let Some(record) = self.branch_table_record(level, table)? {
+                resolution = BranchTableResolution::from_record(index, level, record);
+                break;
+            }
+        }
         if let BranchTableResolution::Defined { index, record, .. } = &resolution {
             // Phase B4: a copy of main's definition too: the main table may be gone,
             // and its counter with it, while the branch still holds its rows.

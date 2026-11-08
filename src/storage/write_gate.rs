@@ -608,7 +608,13 @@ impl WriteGate {
     }
 
     /// Spec R5.6: the tables a layout key names, into `tables`.
-    fn layout_tables_of(wiring: &LayoutWiring, key: LayoutKey<'_>, value: Option<&[u8]>, tables: &mut Vec<String>) {
+    fn layout_tables_of(
+        wiring: &LayoutWiring,
+        key: LayoutKey<'_>,
+        value: Option<&[u8]>,
+        tables: &mut Vec<String>,
+        branches: &mut Vec<(u64, String)>,
+    ) {
         match key {
             LayoutKey::Tables(table, other) => {
                 tables.push(table.to_string());
@@ -616,6 +622,7 @@ impl WriteGate {
                     tables.push(other.to_string());
                 }
             }
+            LayoutKey::BranchTable(level, table) => branches.push((level, table.to_string())),
             LayoutKey::Index(name) => {
                 if let Some(table) = wiring.hook.index_table(name, value) {
                     tables.push(table);
@@ -636,6 +643,8 @@ impl WriteGate {
             return Ok((LayoutChange::none(), floors));
         }
         let mut tables: Vec<String> = Vec::new();
+        let mut branches = Vec::new();
+        let mut branch_wide = false;
         let mut inspected = Ok(());
         // One borrowed key pass, shared with the layout detector already on the
         // hot write path. Values are skipped in place; only metadata is decoded.
@@ -644,12 +653,15 @@ impl WriteGate {
                 inspected = floors.inspect(db, operation);
             }
             if let Some(wiring) = wiring {
+                if let BatchKey::Range(start, end) = operation {
+                    branch_wide |= super::layout_epochs::branch_catalog_range(start, end);
+                }
                 let (key, value) = match operation {
                     BatchKey::Put(key, value) => (key, Some(value)),
                     BatchKey::Delete(key) | BatchKey::Merge(key) | BatchKey::Range(key, _) => (key, None),
                 };
                 if let Some(found) = super::layout_epochs::layout_key(key) {
-                    Self::layout_tables_of(wiring, found, value, &mut tables);
+                    Self::layout_tables_of(wiring, found, value, &mut tables, &mut branches);
                 }
             }
         });
@@ -661,18 +673,25 @@ impl WriteGate {
                 ));
             }
             tables.clear();
+            branches.clear();
             let mut collector = LayoutKeyCollector(Vec::new());
             batch.iterate(&mut collector);
             if let Some(wiring) = wiring {
                 for (key, value) in &collector.0 {
                     if let Some(found) = super::layout_epochs::layout_key(key) {
-                        Self::layout_tables_of(wiring, found, value.as_deref(), &mut tables);
+                        Self::layout_tables_of(wiring, found, value.as_deref(), &mut tables, &mut branches);
                     }
                 }
             }
         }
         let change = match wiring {
-            Some(wiring) if !tables.is_empty() => wiring.epochs.begin_change(tables.iter().map(String::as_str)),
+            Some(wiring) if !tables.is_empty() || !branches.is_empty() || branch_wide => {
+                wiring.epochs.begin_scoped_change(
+                    tables.iter().map(String::as_str),
+                    branches.iter().map(|(level, table)| (*level, table.as_str())),
+                    branch_wide,
+                )
+            }
             _ => LayoutChange::none(),
         };
         Ok((change, floors))
@@ -687,8 +706,13 @@ impl WriteGate {
             return LayoutChange::none();
         };
         let mut tables = Vec::new();
-        Self::layout_tables_of(wiring, found, value, &mut tables);
-        wiring.epochs.begin_change(tables.iter().map(String::as_str))
+        let mut branches = Vec::new();
+        Self::layout_tables_of(wiring, found, value, &mut tables, &mut branches);
+        wiring.epochs.begin_scoped_change(
+            tables.iter().map(String::as_str),
+            branches.iter().map(|(level, table)| (*level, table.as_str())),
+            false,
+        )
     }
 
     /// Spec R5.6: the write is done (or failed: what readers cache is dropped either
@@ -702,7 +726,14 @@ impl WriteGate {
             return;
         }
         if let Some(wiring) = self.layout.get() {
-            wiring.hook.publish(&change.tables());
+            let tables = change.tables();
+            if !tables.is_empty() {
+                wiring.hook.publish(&tables);
+            }
+            let branches = change.branch_tables();
+            if !branches.is_empty() || change.branch_wide() {
+                wiring.hook.publish_branches(&branches, change.branch_wide());
+            }
         }
         super::layout_epochs::end_or_defer(change);
     }

@@ -223,7 +223,10 @@ fn run_bounds(batch: &PhysicalBatch) -> Result<(bool, bool)> {
     walk_raw_batch(batch.data(), |op| {
         let key = match op {
             RawOp::Put { key, .. } | RawOp::Delete { key } => key,
-            RawOp::DeleteRange { start, .. } => start,
+            RawOp::DeleteRange { start, end } => {
+                layout |= crate::storage::layout_epochs::branch_catalog_range(start, end);
+                start
+            }
         };
         layout |= crate::storage::layout_epochs::layout_key(key).is_some();
         registry |= matches!(classify(key).class, KeyClass::Branch | KeyClass::Git);
@@ -264,6 +267,17 @@ pub trait DerivedStateListener: Send + Sync {
     /// under the old layouts. Called before the change ends, so no reader trusts an
     /// epoch while one of those plans can still be served. By default nothing.
     fn on_layout_change(&self, _tables: &[String]) {}
+
+    /// Branch-scoped catalog publication. The compatibility default preserves
+    /// existing SQL cache invalidation without marking any main-table epoch.
+    fn on_branch_layout_change(&self, tables: &[(u64, String)], all_branches: bool) {
+        if all_branches {
+            self.on_full_rebuild();
+        } else {
+            let names: BTreeSet<_> = tables.iter().map(|(_, table)| table.clone()).collect();
+            self.on_layout_change(&names.into_iter().collect::<Vec<_>>());
+        }
+    }
 }
 
 /// A listener for an engine nobody serves SQL from (tests, tools).
@@ -701,19 +715,28 @@ impl PhysicalApplier {
         // Spec R5.6: the tables whose layout the run changes, named before its write (a
         // deleted index definition is still in the store).
         let mut layout_tables: BTreeSet<String> = BTreeSet::new();
+        let mut branch_layout_tables = BTreeSet::new();
+        let mut branch_wide = false;
         for (index, batch) in run.iter().enumerate() {
             touched.batch = index;
             for op in decode_raw_batch(batch.data())? {
                 match op {
                     RawOp::Put { key, value } => {
-                        self.note_layout_key(key, Some(value), &mut layout_tables);
+                        self.note_layout_key(key, Some(value), &mut layout_tables, &mut branch_layout_tables);
                         touched.note(key, true);
                     }
                     RawOp::Delete { key } => {
-                        self.note_layout_key(key, None, &mut layout_tables);
+                        self.note_layout_key(key, None, &mut layout_tables, &mut branch_layout_tables);
                         touched.note(key, false);
                     }
-                    RawOp::DeleteRange { start, end } => self.enumerate_range(start, end, &mut touched)?,
+                    RawOp::DeleteRange { start, end } => self.enumerate_range(
+                        start,
+                        end,
+                        &mut touched,
+                        &mut layout_tables,
+                        &mut branch_layout_tables,
+                        &mut branch_wide,
+                    )?,
                 }
             }
         }
@@ -755,10 +778,14 @@ impl PhysicalApplier {
 
         // Spec R5.6: the run's layout change is in flight from before its write until
         // the layout half of its publication is done (`Self::publish`).
-        let mut layout = (!layout_tables.is_empty()).then(|| {
-            self.engine
-                .layout_epochs()
-                .begin_change(layout_tables.iter().map(String::as_str))
+        let mut layout = (!layout_tables.is_empty() || !branch_layout_tables.is_empty() || branch_wide).then(|| {
+            self.engine.layout_epochs().begin_scoped_change(
+                layout_tables.iter().map(String::as_str),
+                branch_layout_tables
+                    .iter()
+                    .map(|(level, table)| (*level, table.as_str())),
+                branch_wide,
+            )
         });
 
         // 3. Apply verbatim: one write per batch, in order.
@@ -968,7 +995,15 @@ impl PhysicalApplier {
     // ---------------------------------------------------------------------
 
     /// Note every key a range deletion will remove, while they still exist.
-    fn enumerate_range(&self, start: &[u8], end: &[u8], touched: &mut Touched) -> crate::Result<()> {
+    fn enumerate_range(
+        &self,
+        start: &[u8],
+        end: &[u8],
+        touched: &mut Touched,
+        layout_tables: &mut BTreeSet<String>,
+        branch_layout_tables: &mut BTreeSet<(u64, String)>,
+        branch_wide: &mut bool,
+    ) -> crate::Result<()> {
         let mut read = ReadOptions::default();
         read.set_total_order_seek(true);
         read.set_iterate_upper_bound(end.to_vec());
@@ -984,6 +1019,10 @@ impl PhysicalApplier {
             }
             seen += 1;
             if seen > RANGE_ENUMERATION_CAP {
+                // Preserve the enumeration cap and full-rebuild fallback. A
+                // range that may contain unenumerated branch metadata fences
+                // branch catalog plans globally, including mid-apply readers.
+                *branch_wide |= crate::storage::layout_epochs::branch_catalog_range(start, end);
                 match single_table_data_range(start, end) {
                     Some(table) => {
                         touched.overflow_tables.insert(table);
@@ -992,6 +1031,7 @@ impl PhysicalApplier {
                 }
                 return Ok(());
             }
+            self.note_layout_key(&key, None, layout_tables, branch_layout_tables);
             touched.note(&key, false);
         }
         Ok(())
@@ -1165,7 +1205,13 @@ impl PhysicalApplier {
 
     /// Spec R5.6: the tables a layout key of the run names, into `tables`. Read before
     /// the run's first write: a deleted index definition is still in the store.
-    fn note_layout_key(&self, key: &[u8], value: Option<&[u8]>, tables: &mut BTreeSet<String>) {
+    fn note_layout_key(
+        &self,
+        key: &[u8],
+        value: Option<&[u8]>,
+        tables: &mut BTreeSet<String>,
+        branches: &mut BTreeSet<(u64, String)>,
+    ) {
         use crate::storage::layout_epochs::{layout_key, LayoutKey};
         match layout_key(key) {
             None => {}
@@ -1174,6 +1220,9 @@ impl PhysicalApplier {
                 if let Some(other) = other {
                     tables.insert(other.to_string());
                 }
+            }
+            Some(LayoutKey::BranchTable(level, table)) => {
+                branches.insert((level, table.to_string()));
             }
             Some(LayoutKey::Index(name)) => {
                 let definition = match value {
@@ -1199,8 +1248,15 @@ impl PhysicalApplier {
             return;
         };
         let tables = change.tables();
-        self.engine.drop_layout_caches(&tables);
-        self.listener.on_layout_change(&tables);
+        if !tables.is_empty() {
+            self.engine.drop_layout_caches(&tables);
+            self.listener.on_layout_change(&tables);
+        }
+        let branches = change.branch_tables();
+        if !branches.is_empty() || change.branch_wide() {
+            self.engine.drop_branch_layout_caches(&branches, change.branch_wide());
+            self.listener.on_branch_layout_change(&branches, change.branch_wide());
+        }
         drop(change);
     }
 
@@ -1996,6 +2052,11 @@ impl PhysicalApplier {
 
     fn rebuild_all_locked(&self, state: &mut ApplierState) -> crate::Result<()> {
         let engine = &self.engine;
+        // Images and unknown-range rebuilds may replace branch definitions.
+        // Existing cache/generation publication below precedes this fence's end.
+        let _branch_layout = engine
+            .layout_epochs()
+            .begin_scoped_change(std::iter::empty(), std::iter::empty(), true);
         engine.mv_delta_tracker().recover_durable_ids()?;
         let art = engine.art_indexes();
         let _hold = engine.write_census().hold_for_replay(Vec::new(), true);

@@ -1079,6 +1079,15 @@ impl super::layout_epochs::LayoutHook for EngineLayoutHook {
             }
         }
     }
+
+    fn publish_branches(&self, tables: &[(u64, String)], all_branches: bool) {
+        // RECORDS, FROZEN_MISSING and committed overlays read this generation
+        // before loading bytes. Keep their admission fence, without treating
+        // a branch definition/reclaim as a changed main schema or row layout.
+        if !tables.is_empty() || all_branches {
+            self.schema_generation.fetch_add(1, Ordering::Release);
+        }
+    }
 }
 
 /// Spec R5.6: drop what readers cache of `tables`' layouts, in R5 decision 11's order:
@@ -6196,6 +6205,15 @@ impl StorageEngine {
         );
         for table in tables {
             self.snapshot_manager.invalidate_table_layout(table);
+        }
+    }
+
+    /// Branch catalog publication for physical apply. Its resolver/overlay
+    /// caches keep the same generation fence as a primary's hook; main's
+    /// table layout, row cache and history are independent identities.
+    pub(crate) fn drop_branch_layout_caches(&self, tables: &[(u64, String)], all_branches: bool) {
+        if !tables.is_empty() || all_branches {
+            self.schema_generation.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -16576,6 +16594,7 @@ impl StorageEngine {
             }
 
             WalOperation::Truncate { table } => {
+                let _main_scope = crate::main_statement_scope(self.instance_id);
                 let catalog = Catalog::new(self);
 
                 // Check if table exists
@@ -16588,7 +16607,6 @@ impl StorageEngine {
                 // leaves COUNT, result caches and enforcing/vector indexes on
                 // the old rows. Use the same transaction and publication hooks
                 // as a direct TRUNCATE, retaining main ownership through commit.
-                let _main_scope = crate::main_statement_scope(self.instance_id);
                 let _statement = self.table_locks().statement_scope();
                 let _table = self.lock_tables_exclusive(
                     super::table_locks::MAIN_LEVEL,
