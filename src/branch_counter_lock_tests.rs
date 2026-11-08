@@ -4,9 +4,11 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 fn raw_image(db: &EmbeddedDatabase) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut options = rocksdb::ReadOptions::default();
+    options.set_total_order_seek(true);
     db.storage
         .db()
-        .iterator(rocksdb::IteratorMode::Start)
+        .iterator_opt(rocksdb::IteratorMode::Start, options)
         .map(|entry| {
             entry
                 .map(|(key, value)| (key.to_vec(), value.to_vec()))
@@ -27,7 +29,7 @@ fn owner_cell(history: bool, bound: bool, commit: bool) -> Result<()> {
     db.execute("INSERT INTO counter_owner VALUES (1, 10)")?;
     db.execute("CREATE BRANCH b AS OF NOW")?;
     db.storage.debug_set_table_lock_timeout(Duration::from_millis(40));
-    let session = db.create_session("branch_counter", crate::IsolationLevel::ReadCommitted)?;
+    let session = db.create_session("branch_counter", crate::session::IsolationLevel::ReadCommitted)?;
     db.execute_for_session(session, "USE BRANCH b")?;
 
     let (ready_tx, ready_rx) = mpsc::channel();
